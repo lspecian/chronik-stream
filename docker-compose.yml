@@ -1,0 +1,111 @@
+version: '3.8'
+
+services:
+  controller:
+    build:
+      context: .
+      dockerfile: deploy/docker/controller.Dockerfile
+    environment:
+      METADATA_PATH: /data/metadata
+      NODE_ID: 1
+      RUST_LOG: info
+    volumes:
+      - controller_metadata:/data/metadata
+    ports:
+      - "9090:9090"
+    networks:
+      - chronik
+    restart: unless-stopped
+    user: root
+
+  ingest:
+    build:
+      context: .
+      dockerfile: deploy/docker/ingest.Dockerfile
+    environment:
+      CONTROLLER_ADDR: controller:9090
+      STORAGE_PATH: /home/chronik/data
+      RUST_LOG: info
+    depends_on:
+      - controller
+    ports:
+      - "9092:9092"
+    volumes:
+      - ingest_data:/home/chronik/data
+    networks:
+      - chronik
+    restart: unless-stopped
+
+  admin:
+    build:
+      context: .
+      dockerfile: deploy/docker/admin.Dockerfile
+    environment:
+      METADATA_PATH: /data/metadata
+      CONTROLLER_ENDPOINTS: controller:9090
+      RUST_LOG: info
+    volumes:
+      - admin_metadata:/data/metadata
+    depends_on:
+      - controller
+    ports:
+      - "8080:8080"  # Admin API
+      - "8081:8081"  # Metrics
+    networks:
+      - chronik
+    restart: unless-stopped
+    user: root
+
+  # Optional: Jaeger for tracing
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"  # Jaeger UI
+      - "4317:4317"    # OTLP gRPC
+      - "4318:4318"    # OTLP HTTP
+    networks:
+      - chronik
+
+  # Optional: Prometheus for metrics
+  prometheus:
+    image: prom/prometheus:latest
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    volumes:
+      - ./deploy/docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9091:9090"
+    networks:
+      - chronik
+
+  # Optional: Grafana for dashboards
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./deploy/docker/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./deploy/docker/grafana/datasources:/etc/grafana/provisioning/datasources
+    ports:
+      - "3001:3000"
+    networks:
+      - chronik
+    depends_on:
+      - prometheus
+
+volumes:
+  controller_metadata:
+  admin_metadata:
+  ingest_data:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  chronik:
+    driver: bridge

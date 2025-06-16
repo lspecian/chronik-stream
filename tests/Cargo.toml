@@ -1,0 +1,32 @@
+[package]
+name = "chronik-integration-tests"
+version = "0.1.0"
+edition = "2021"
+
+[[test]]
+name = "integration"
+path = "integration/mod.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+
+# Test dependencies
+testcontainers = { workspace = true }
+rdkafka = { workspace = true }
+reqwest = { workspace = true }
+aws-sdk-s3 = { workspace = true }
+aws-credential-types = { workspace = true }
+opendal = { workspace = true }
+
+# For time measurements
+chrono = { workspace = true }
+
+[dev-dependencies]
+# Additional test utilities
+pretty_assertions = "1.4"
+env_logger = "0.11"

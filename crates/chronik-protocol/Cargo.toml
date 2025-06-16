@@ -1,0 +1,35 @@
+[package]
+name = "chronik-protocol"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+chronik-common = { path = "../chronik-common" }
+
+# Kafka protocol - temporarily disabled due to compatibility issues
+# kafka-protocol = { workspace = true }
+
+# Core
+bytes = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+
+# Compression
+flate2 = { workspace = true }
+crc32fast = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Tracing
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio-test = "0.4"
+proptest = { workspace = true }

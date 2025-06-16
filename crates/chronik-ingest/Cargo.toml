@@ -1,0 +1,48 @@
+[package]
+name = "chronik-ingest"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+chronik-common = { path = "../chronik-common" }
+chronik-protocol = { path = "../chronik-protocol" }
+chronik-storage = { path = "../chronik-storage" }
+chronik-search = { path = "../chronik-search" }
+
+# Async runtime
+tokio = { workspace = true, features = ["net", "sync", "time"] }
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
+
+# Collections
+dashmap = { workspace = true }
+parking_lot = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+bytes = { workspace = true }
+byteorder = { workspace = true }
+
+# Utils
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Tracing & Metrics
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+prometheus = { workspace = true }
+
+[dev-dependencies]
+tokio-test = "0.4"
+proptest = { workspace = true }
+tempfile = { workspace = true }
+
+[[bin]]
+name = "chronik-ingest"
+path = "src/main.rs"

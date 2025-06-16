@@ -1,0 +1,32 @@
+# Rust build artifacts
+target/
+**/*.rs.bk
+*.pdb
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test data
+test-data/
+*.log
+
+# Documentation
+docs/
+*.md
+
+# Development
+.env
+.env.*
+!.env.example

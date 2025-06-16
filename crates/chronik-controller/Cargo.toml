@@ -1,0 +1,58 @@
+[package]
+name = "chronik-controller"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+chronik-common = { path = "../chronik-common" }
+chronik-protocol = { path = "../chronik-protocol" }
+
+# Consensus
+raft = "0.7"
+protobuf = "2.28"
+slog = "2.7"
+slog-term = "2.9"
+slog-async = "2.8"
+
+# Database - removed sqlx, using Sled via chronik-common
+sled = { workspace = true }
+
+# Web framework for admin API
+axum = "0.7"
+tower = "0.4"
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+bincode = "1.3"
+
+# Async
+tokio = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+
+# Collections
+dashmap = { workspace = true }
+parking_lot = { workspace = true }
+
+# Utils
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Tracing & Metrics
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+prometheus = { workspace = true }
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[[bin]]
+name = "chronik-controller"
+path = "src/main.rs"

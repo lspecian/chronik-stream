@@ -1,0 +1,58 @@
+[package]
+name = "chronik-storage"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+chronik-common = { path = "../chronik-common" }
+chronik-protocol = { path = "../chronik-protocol" }
+
+# Storage backends
+opendal = { workspace = true }
+aws-sdk-s3 = "1.15"
+aws-credential-types = "1.1"
+aws-types = "1.1"
+aws-config = "1.1"
+fastrand = "2.0"
+md5 = "0.7"
+
+# Search
+tantivy = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+bytes = { workspace = true }
+byteorder = { workspace = true }
+bincode = { workspace = true }
+
+# Compression
+flate2 = { workspace = true }
+
+# Checksum
+crc32fast = { workspace = true }
+
+# Utils
+uuid = { workspace = true }
+chrono = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = "6.0"
+tempfile = "3.8"
+
+# Async
+tokio = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Tracing
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.8"
+criterion = { workspace = true }

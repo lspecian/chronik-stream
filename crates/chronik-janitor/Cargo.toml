@@ -1,0 +1,33 @@
+[package]
+name = "chronik-janitor"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+chronik-common = { path = "../chronik-common" }
+chronik-storage = { path = "../chronik-storage" }
+
+# Database - removed sqlx, using Sled via chronik-common
+
+# Async
+tokio = { workspace = true }
+futures = { workspace = true }
+
+# Storage
+opendal = { workspace = true }
+
+# Utils
+chrono = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Tracing & Metrics
+tracing = { workspace = true }
+prometheus = { workspace = true }
+
+[dev-dependencies]
+tokio-test = "0.4"
