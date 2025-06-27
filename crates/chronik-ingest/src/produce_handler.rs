@@ -12,14 +12,16 @@ use crate::storage::{StorageConfig, StorageService};
 use chronik_common::{Result, Error};
 use chronik_protocol::{
     ProduceRequest, ProduceResponse, ProduceResponseTopic, ProduceResponsePartition,
-    records::{RecordBatch as KafkaRecordBatch, RecordAttributes, TimestampType},
-    compression::CompressionType,
     kafka_protocol::ErrorCode,
 };
-use chronik_search::{
-    realtime_indexer::{RealtimeIndexer, JsonDocument, RealtimeIndexerConfig},
-    json_pipeline::JsonPipeline,
+use chronik_storage::kafka_records::{
+    KafkaRecordBatch, CompressionType, TimestampType, RecordHeader as KafkaRecordHeader,
 };
+// Search indexing disabled temporarily
+// use chronik_search::{
+//     realtime_indexer::{RealtimeIndexer, JsonDocument, RealtimeIndexerConfig},
+//     json_pipeline::JsonPipeline,
+// };
 use chronik_storage::{
     RecordBatch, Record, SegmentWriter,
     chronik_segment::{ChronikSegmentBuilder, CompressionType as ChronikCompression},
@@ -56,7 +58,7 @@ pub struct ProduceHandlerConfig {
     /// Storage configuration
     pub storage_config: StorageConfig,
     /// Indexer configuration
-    pub indexer_config: RealtimeIndexerConfig,
+    // pub indexer_config: RealtimeIndexerConfig,
     /// Enable real-time indexing
     pub enable_indexing: bool,
     /// Enable idempotent producer support
@@ -82,7 +84,7 @@ impl Default for ProduceHandlerConfig {
         Self {
             node_id: 0,
             storage_config: StorageConfig::default(),
-            indexer_config: RealtimeIndexerConfig::default(),
+            // indexer_config: RealtimeIndexerConfig::default(),
             enable_indexing: true,
             enable_idempotence: true,
             enable_transactions: true,
@@ -128,8 +130,10 @@ struct PartitionState {
     log_start_offset: AtomicU64,
     /// Current segment writer
     current_writer: Arc<Mutex<SegmentWriter>>,
-    /// Segment creation time
-    segment_created: Instant,
+    /// Segment creation time (millis since start)
+    segment_created: AtomicU64,
+    /// Start time for calculating relative times
+    start_time: Instant,
     /// Current segment size
     segment_size: AtomicU64,
     /// Pending records buffer
@@ -169,8 +173,8 @@ pub struct ProduceMetrics {
 pub struct ProduceHandler {
     config: ProduceHandlerConfig,
     storage: Arc<dyn ObjectStore>,
-    indexer: Option<Arc<RealtimeIndexer>>,
-    json_pipeline: Arc<JsonPipeline>,
+    // indexer: Option<Arc<RealtimeIndexer>>,
+    // json_pipeline: Arc<JsonPipeline>,
     metadata_store: Arc<dyn MetadataStore>,
     partition_states: Arc<RwLock<HashMap<(String, i32), Arc<PartitionState>>>>,
     producer_info: Arc<RwLock<HashMap<i64, ProducerInfo>>>,
@@ -199,23 +203,23 @@ impl ProduceHandler {
         metadata_store: Arc<dyn MetadataStore>,
     ) -> Result<Self> {
         // Create indexer if enabled
-        let (indexer, index_sender) = if config.enable_indexing {
-            let (sender, receiver) = mpsc::channel(10000);
-            let indexer = Arc::new(RealtimeIndexer::new(config.indexer_config.clone())?);
-            
-            // Start indexing pipeline
-            let indexer_clone = Arc::clone(&indexer);
-            tokio::spawn(async move {
-                let _ = indexer_clone.start(receiver).await;
-            });
-            
-            (Some(indexer), Some(sender))
-        } else {
-            (None, None)
-        };
+        // let (indexer, index_sender) = if config.enable_indexing {
+        //     let (sender, receiver) = mpsc::channel(10000);
+        //     let indexer = Arc::new(RealtimeIndexer::new(config.indexer_config.clone())?);
+        //     
+        //     // Start indexing pipeline
+        //     let indexer_clone = Arc::clone(&indexer);
+        //     tokio::spawn(async move {
+        //         let _ = indexer_clone.start(receiver).await;
+        //     });
+        //     
+        //     (Some(indexer), Some(sender))
+        // } else {
+        //     (None, None)
+        // };
         
         // Create JSON pipeline for transformation
-        let json_pipeline = Arc::new(JsonPipeline::new(Default::default())?);
+        // let json_pipeline = Arc::new(JsonPipeline::new(Default::default())?);
         
         // Create memory limiter
         let memory_limiter = Arc::new(Semaphore::new(
@@ -225,8 +229,8 @@ impl ProduceHandler {
         Ok(Self {
             config,
             storage,
-            indexer,
-            json_pipeline,
+            // indexer,
+            // json_pipeline,
             metadata_store,
             partition_states: Arc::new(RwLock::new(HashMap::new())),
             producer_info: Arc::new(RwLock::new(HashMap::new())),
@@ -377,7 +381,7 @@ impl ProduceHandler {
             
             for partition_data in topic_data.partitions {
                 // Validate partition exists
-                if partition_data.index >= topic_metadata.partition_count {
+                if partition_data.index >= topic_metadata.config.partition_count as i32 {
                     response_partitions.push(ProduceResponsePartition {
                         index: partition_data.index,
                         error_code: ErrorCode::UnknownTopicOrPartition.code(),
@@ -389,12 +393,16 @@ impl ProduceHandler {
                 }
                 
                 // Check if we're the leader for this partition
-                let partition_meta = self.metadata_store
-                    .get_partition(&topic_data.name, partition_data.index)
+                let assignments = self.metadata_store
+                    .get_partition_assignments(&topic_data.name)
                     .await?;
                 
-                if let Some(meta) = partition_meta {
-                    if meta.leader != self.config.node_id {
+                let is_leader = assignments.iter()
+                    .find(|a| a.partition == partition_data.index as u32)
+                    .map(|a| a.is_leader && a.broker_id == self.config.node_id)
+                    .unwrap_or(false);
+                
+                if !is_leader {
                         response_partitions.push(ProduceResponsePartition {
                             index: partition_data.index,
                             error_code: ErrorCode::NotLeaderForPartition.code(),
@@ -403,16 +411,6 @@ impl ProduceHandler {
                             log_start_offset: 0,
                         });
                         continue;
-                    }
-                } else {
-                    response_partitions.push(ProduceResponsePartition {
-                        index: partition_data.index,
-                        error_code: ErrorCode::LeaderNotAvailable.code(),
-                        base_offset: -1,
-                        log_append_time: -1,
-                        log_start_offset: 0,
-                    });
-                    continue;
                 }
                 
                 // Process the partition data
@@ -435,10 +433,10 @@ impl ProduceHandler {
                         self.metrics.produce_errors.fetch_add(1, Ordering::Relaxed);
                         
                         let error_code = match e {
-                            Error::DuplicateSequenceNumber => ErrorCode::DuplicateSequenceNumber.code(),
-                            Error::InvalidProducerEpoch => ErrorCode::InvalidProducerEpoch.code(),
-                            Error::OutOfOrderSequenceNumber => ErrorCode::OutOfOrderSequenceNumber.code(),
-                            Error::InvalidTransactionState => ErrorCode::InvalidTxnState.code(),
+                            Error::DuplicateSequenceNumber(_) => ErrorCode::DuplicateSequenceNumber.code(),
+                            Error::InvalidProducerEpoch(_) => ErrorCode::InvalidProducerEpoch.code(),
+                            Error::OutOfOrderSequenceNumber(_) => ErrorCode::OutOfOrderSequenceNumber.code(),
+                            Error::InvalidTransactionState(_) => ErrorCode::InvalidTxnState.code(),
                             _ => ErrorCode::None.code(),
                         };
                         
@@ -479,10 +477,10 @@ impl ProduceHandler {
             .map_err(|_| Error::Internal("Memory limit exceeded".into()))?;
         
         // Decode record batch
-        let kafka_batch = KafkaRecordBatch::decode(Bytes::copy_from_slice(records_data))?;
+        let kafka_batch = KafkaRecordBatch::decode(records_data)?;
         
         // Validate producer info for idempotence
-        if kafka_batch.producer_id >= 0 {
+        if kafka_batch.header.producer_id >= 0 {
             self.validate_producer_sequence(
                 &kafka_batch,
                 topic,
@@ -501,19 +499,20 @@ impl ProduceHandler {
         let mut total_bytes = 0u64;
         
         for (i, kafka_record) in kafka_batch.records.iter().enumerate() {
+            let timestamp = kafka_batch.header.base_timestamp + kafka_record.timestamp_delta;
             let record = ProduceRecord {
-                offset: current_offset + i as i64,
-                timestamp: kafka_record.timestamp,
+                offset: (current_offset as i64) + i as i64,
+                timestamp,
                 key: kafka_record.key.as_ref().map(|k| k.to_vec()),
                 value: kafka_record.value.as_ref().map(|v| v.to_vec()).unwrap_or_default(),
                 headers: kafka_record.headers.iter()
                     .map(|h| (h.key.clone(), h.value.as_ref().map(|v| v.to_vec()).unwrap_or_default()))
                     .collect(),
-                producer_id: kafka_batch.producer_id,
-                producer_epoch: kafka_batch.producer_epoch,
-                sequence: kafka_batch.base_sequence + i as i32,
-                is_transactional: kafka_batch.attributes.is_transactional,
-                is_control: kafka_batch.attributes.is_control_batch,
+                producer_id: kafka_batch.header.producer_id,
+                producer_epoch: kafka_batch.header.producer_epoch,
+                sequence: kafka_batch.header.base_sequence + i as i32,
+                is_transactional: (kafka_batch.header.attributes & 0x10) != 0,
+                is_control: (kafka_batch.header.attributes & 0x20) != 0,
             };
             
             total_bytes += record.value.len() as u64;
@@ -524,10 +523,10 @@ impl ProduceHandler {
             records.push(record);
         }
         
-        let last_offset = base_offset + records.len() as i64 - 1;
+        let last_offset = (base_offset as i64) + records.len() as i64 - 1;
         
         // Update next offset atomically
-        partition_state.next_offset.store(last_offset + 1, Ordering::SeqCst);
+        partition_state.next_offset.store((last_offset + 1) as u64, Ordering::SeqCst);
         
         // Buffer records
         {
@@ -581,7 +580,7 @@ impl ProduceHandler {
                             debug!("Acks=-1: Replication to all ISR completed");
                             
                             // Update high watermark
-                            partition_state.high_watermark.store(last_offset + 1, Ordering::SeqCst);
+                            partition_state.high_watermark.store((last_offset + 1) as u64, Ordering::SeqCst);
                         }
                         Ok(Some(Err(e))) => {
                             return Err(Error::Internal(format!("Replication failed: {}", e)));
@@ -592,7 +591,7 @@ impl ProduceHandler {
                     }
                 } else {
                     // No replication configured, just update high watermark
-                    partition_state.high_watermark.store(last_offset + 1, Ordering::SeqCst);
+                    partition_state.high_watermark.store((last_offset + 1) as u64, Ordering::SeqCst);
                 }
             }
             _ => {
@@ -601,12 +600,12 @@ impl ProduceHandler {
         }
         
         // Update producer sequence for idempotence
-        if kafka_batch.producer_id >= 0 {
+        if kafka_batch.header.producer_id >= 0 {
             self.update_producer_sequence(
-                kafka_batch.producer_id,
+                kafka_batch.header.producer_id,
                 topic,
                 partition,
-                kafka_batch.base_sequence + records.len() as i32 - 1,
+                kafka_batch.header.base_sequence + records.len() as i32 - 1,
             ).await;
         }
         
@@ -619,9 +618,9 @@ impl ProduceHandler {
         Ok(ProduceResponsePartition {
             index: partition,
             error_code: ErrorCode::None.code(),
-            base_offset,
-            log_append_time: if kafka_batch.attributes.timestamp_type == TimestampType::LogAppendTime {
-                kafka_batch.max_timestamp
+            base_offset: base_offset as i64,
+            log_append_time: if (kafka_batch.header.attributes >> 3) & 0b111 == TimestampType::LogAppendTime as u16 {
+                kafka_batch.header.max_timestamp
             } else {
                 -1
             },
@@ -653,28 +652,43 @@ impl ProduceHandler {
             return Ok(Arc::clone(state));
         }
         
-        // Get partition metadata from metastore
-        let partition_meta = self.metadata_store
-            .get_partition(topic, partition)
+        // Check if partition exists by checking topic metadata
+        let topic_meta = self.metadata_store
+            .get_topic(topic)
             .await?
-            .ok_or_else(|| Error::Internal(format!("Partition {}-{} not found", topic, partition)))?;
+            .ok_or_else(|| Error::Internal(format!("Topic {} not found", topic)))?;
+        
+        if partition as u32 >= topic_meta.config.partition_count {
+            return Err(Error::Internal(format!("Partition {} does not exist for topic {}", partition, topic)));
+        }
         
         // Create segment writer
-        let segment_path = format!("{}/{}/partition-{}", self.config.storage_config.base_path, topic, partition);
+        let segment_path = format!("{}/{}/partition-{}", self.config.storage_config.segment_writer_config.data_dir.to_string_lossy(), topic, partition);
         let writer = Arc::new(Mutex::new(
             SegmentWriter::new(
-                self.storage.clone(),
-                segment_path,
                 self.config.storage_config.segment_writer_config.clone(),
             ).await?
         ));
         
+        // Get current offsets from segments
+        let segments = self.metadata_store.list_segments(topic, Some(partition as u32)).await?;
+        let high_watermark = segments.iter()
+            .map(|s| s.end_offset + 1)
+            .max()
+            .unwrap_or(0);
+        let log_start_offset = segments.iter()
+            .map(|s| s.start_offset)
+            .min()
+            .unwrap_or(0);
+        
+        let now = Instant::now();
         let state = Arc::new(PartitionState {
-            next_offset: AtomicU64::new(partition_meta.high_watermark as u64),
-            high_watermark: AtomicU64::new(partition_meta.high_watermark as u64),
-            log_start_offset: AtomicU64::new(partition_meta.log_start_offset as u64),
+            next_offset: AtomicU64::new(high_watermark as u64),
+            high_watermark: AtomicU64::new(high_watermark as u64),
+            log_start_offset: AtomicU64::new(log_start_offset as u64),
             current_writer: writer,
-            segment_created: Instant::now(),
+            segment_created: AtomicU64::new(0),
+            start_time: now,
             segment_size: AtomicU64::new(0),
             pending_records: Arc::new(Mutex::new(Vec::new())),
             last_flush: Arc::new(Mutex::new(Instant::now())),
@@ -699,10 +713,10 @@ impl ProduceHandler {
         let mut producers = self.producer_info.write().await;
         
         // Get or create producer info
-        let producer_info = producers.entry(batch.producer_id).or_insert_with(|| {
+        let producer_info = producers.entry(batch.header.producer_id).or_insert_with(|| {
             ProducerInfo {
-                producer_id: batch.producer_id,
-                producer_epoch: batch.producer_epoch,
+                producer_id: batch.header.producer_id,
+                producer_epoch: batch.header.producer_epoch,
                 sequence_numbers: HashMap::new(),
                 transactional_id: transactional_id.map(String::from),
                 transaction_state: TransactionState::None,
@@ -711,12 +725,12 @@ impl ProduceHandler {
         });
         
         // Validate producer epoch
-        if producer_info.producer_epoch != batch.producer_epoch {
-            if batch.producer_epoch < producer_info.producer_epoch {
-                return Err(Error::InvalidProducerEpoch);
+        if producer_info.producer_epoch != batch.header.producer_epoch {
+            if batch.header.producer_epoch < producer_info.producer_epoch {
+                return Err(Error::InvalidProducerEpoch("Producer epoch does not match".to_string()));
             }
             // Newer epoch, reset state
-            producer_info.producer_epoch = batch.producer_epoch;
+            producer_info.producer_epoch = batch.header.producer_epoch;
             producer_info.sequence_numbers.clear();
         }
         
@@ -724,7 +738,7 @@ impl ProduceHandler {
         if let Some(txn_id) = transactional_id {
             if let Some(ref existing_txn_id) = producer_info.transactional_id {
                 if existing_txn_id != txn_id {
-                    return Err(Error::InvalidTransactionState);
+                    return Err(Error::InvalidTransactionState("Producer is not in a transaction".to_string()));
                 }
             } else {
                 producer_info.transactional_id = Some(txn_id.to_string());
@@ -738,17 +752,17 @@ impl ProduceHandler {
             .map(|&seq| seq + 1)
             .unwrap_or(0);
         
-        if batch.base_sequence < expected_sequence {
+        if batch.header.base_sequence < expected_sequence {
             // Duplicate
             warn!(
                 "Duplicate sequence number detected: producer={}, topic={}, partition={}, expected={}, received={}",
-                batch.producer_id, topic, partition, expected_sequence, batch.base_sequence
+                batch.header.producer_id, topic, partition, expected_sequence, batch.header.base_sequence
             );
             self.metrics.duplicate_records.fetch_add(batch.records.len() as u64, Ordering::Relaxed);
-            return Err(Error::DuplicateSequenceNumber);
-        } else if batch.base_sequence > expected_sequence {
+            return Err(Error::DuplicateSequenceNumber(format!("Duplicate sequence: {}", batch.header.base_sequence)));
+        } else if batch.header.base_sequence > expected_sequence {
             // Out of order
-            return Err(Error::OutOfOrderSequenceNumber);
+            return Err(Error::OutOfOrderSequenceNumber(format!("Expected sequence: {}, got: {}", expected_sequence, batch.header.base_sequence)));
         }
         
         // Update last activity
@@ -765,53 +779,17 @@ impl ProduceHandler {
         partition: i32,
         last_sequence: i32,
     ) {
-        if let Ok(mut producers) = self.producer_info.write().await {
-            if let Some(producer_info) = producers.get_mut(&producer_id) {
-                let key = (topic.to_string(), partition);
-                producer_info.sequence_numbers.insert(key, last_sequence);
-            }
+        let mut producers = self.producer_info.write().await;
+        if let Some(producer_info) = producers.get_mut(&producer_id) {
+            let key = (topic.to_string(), partition);
+            producer_info.sequence_numbers.insert(key, last_sequence);
         }
     }
     
     /// Send records to indexing pipeline
-    async fn send_to_indexer(&self, topic: &str, partition: i32, records: &[ProduceRecord]) {
-        if let Some(ref indexer) = self.indexer {
-            let index_start = Instant::now();
-            
-            for record in records {
-                // Try to parse as JSON
-                let json_value = if let Ok(json) = serde_json::from_slice::<JsonValue>(&record.value) {
-                    json
-                } else {
-                    // Fallback to string value
-                    serde_json::json!({
-                        "value": String::from_utf8_lossy(&record.value),
-                        "binary": true
-                    })
-                };
-                
-                let doc = JsonDocument {
-                    id: format!("{}-{}-{}", topic, partition, record.offset),
-                    topic: topic.to_string(),
-                    partition,
-                    offset: record.offset,
-                    timestamp: record.timestamp,
-                    content: json_value,
-                    metadata: Some(serde_json::Map::from_iter([
-                        ("producer_id".to_string(), serde_json::json!(record.producer_id)),
-                        ("is_transactional".to_string(), serde_json::json!(record.is_transactional)),
-                    ])),
-                };
-                
-                // Send to indexer (non-blocking)
-                if let Some(ref sender) = self.index_sender {
-                    let _ = sender.try_send(doc);
-                }
-            }
-            
-            let duration = index_start.elapsed();
-            self.metrics.indexing_lag_ms.store(duration.as_millis() as u64, Ordering::Relaxed);
-        }
+    async fn send_to_indexer(&self, _topic: &str, _partition: i32, _records: &[ProduceRecord]) {
+        // Indexing disabled temporarily
+        // TODO: Re-enable when chronik-search is fixed
     }
     
     /// Flush partition if needed based on size or time
@@ -852,7 +830,35 @@ impl ProduceHandler {
             std::mem::take(&mut *pending)
         };
         
-        // Convert to storage format
+        // Create Kafka batch for writing
+        if records.is_empty() {
+            return Ok(());
+        }
+        
+        let first_record = &records[0];
+        let mut kafka_batch = KafkaRecordBatch::new(
+            first_record.offset,
+            first_record.timestamp,
+            first_record.producer_id,
+            first_record.producer_epoch,
+            first_record.sequence,
+            self.config.compression_type,
+            false, // is_transactional
+        );
+        
+        for record in &records {
+            kafka_batch.add_record(
+                record.key.as_ref().map(|k| Bytes::from(k.clone())),
+                Some(Bytes::from(record.value.clone())),
+                record.headers.iter().map(|(k, v)| KafkaRecordHeader {
+                    key: k.clone(),
+                    value: Some(Bytes::from(v.clone())),
+                }).collect(),
+                record.timestamp,
+            );
+        }
+        
+        // Convert ProduceRecords to Records for storage
         let storage_records: Vec<Record> = records.iter().map(|r| Record {
             offset: r.offset,
             timestamp: r.timestamp,
@@ -861,36 +867,20 @@ impl ProduceHandler {
             headers: r.headers.clone(),
         }).collect();
         
-        let batch = RecordBatch { records: storage_records };
+        // Convert KafkaRecordBatch to RecordBatch
+        let record_batch = RecordBatch {
+            records: storage_records,
+        };
         
-        // Build Chronik segment
-        let segment = ChronikSegmentBuilder::new(topic.to_string(), partition)
-            .add_batch(batch)
-            .compression(match self.config.compression_type {
-                CompressionType::None => ChronikCompression::None,
-                CompressionType::Gzip => ChronikCompression::Gzip,
-                _ => ChronikCompression::Gzip, // Default to gzip for unsupported types
-            })
-            .with_index(self.config.enable_indexing)
-            .with_bloom_filter(true)
-            .build()?;
-        
-        // Write segment
-        let writer = state.current_writer.lock().await;
-        writer.write_segment(segment).await?;
+        // Write batch
+        let mut writer = state.current_writer.lock().await;
+        writer.write_batch(topic, partition, record_batch).await?;
         
         // Update state
         state.segment_size.fetch_add(records.len() as u64 * 100, Ordering::Relaxed); // Approximate size
         *state.last_flush.lock().await = Instant::now();
         
-        // Update metadata store
-        if let Some(last_record) = records.last() {
-            self.metadata_store.update_partition_offset(
-                topic,
-                partition,
-                last_record.offset + 1,
-            ).await?;
-        }
+        // Offsets are tracked in segment metadata, no need to update separately
         
         debug!("Flushed {} records to {}-{}", records.len(), topic, partition);
         
@@ -902,27 +892,32 @@ impl ProduceHandler {
         let states = self.partition_states.read().await;
         
         for ((topic, partition), state) in states.iter() {
+            let segment_created_ms = state.segment_created.load(Ordering::Relaxed);
+            let segment_age = Duration::from_millis(
+                Instant::now().duration_since(state.start_time).as_millis() as u64 - segment_created_ms
+            );
             let should_rotate = state.segment_size.load(Ordering::Relaxed) >= MAX_SEGMENT_SIZE ||
-                               state.segment_created.elapsed() >= MAX_SEGMENT_AGE;
+                               segment_age >= MAX_SEGMENT_AGE;
             
             if should_rotate {
                 // Flush current segment
-                self.flush_partition(topic, partition, state).await?;
+                self.flush_partition(topic, *partition, state).await?;
                 
                 // Create new segment writer
                 let segment_path = format!("{}/{}/partition-{}", 
-                    self.config.storage_config.base_path, topic, partition);
+                    self.config.storage_config.segment_writer_config.data_dir.to_string_lossy(), topic, partition);
                     
                 let new_writer = SegmentWriter::new(
-                    self.storage.clone(),
-                    segment_path,
                     self.config.storage_config.segment_writer_config.clone(),
                 ).await?;
                 
                 // Replace writer
                 *state.current_writer.lock().await = new_writer;
                 state.segment_size.store(0, Ordering::SeqCst);
-                state.segment_created = Instant::now();
+                state.segment_created.store(
+                    Instant::now().duration_since(state.start_time).as_millis() as u64,
+                    Ordering::SeqCst
+                );
                 
                 self.metrics.segments_created.fetch_add(1, Ordering::Relaxed);
                 
@@ -956,15 +951,15 @@ impl ProduceHandler {
         // Flush all partitions
         let states = self.partition_states.read().await;
         for ((topic, partition), state) in states.iter() {
-            if let Err(e) = self.flush_partition(topic, partition, state).await {
+            if let Err(e) = self.flush_partition(topic, *partition, state).await {
                 error!("Error flushing partition {}-{} during shutdown: {}", topic, partition, e);
             }
         }
         
         // Stop indexer
-        if let Some(ref indexer) = self.indexer {
-            indexer.stop().await?;
-        }
+        // if let Some(ref indexer) = self.indexer {
+        //     indexer.stop().await?;
+        // }
         
         info!("Produce handler shutdown complete");
         Ok(())
@@ -977,8 +972,6 @@ impl Clone for ProduceHandler {
         Self {
             config: self.config.clone(),
             storage: Arc::clone(&self.storage),
-            indexer: self.indexer.as_ref().map(Arc::clone),
-            json_pipeline: Arc::clone(&self.json_pipeline),
             metadata_store: Arc::clone(&self.metadata_store),
             partition_states: Arc::clone(&self.partition_states),
             producer_info: Arc::clone(&self.producer_info),
@@ -1030,7 +1023,7 @@ mod tests {
     
     fn create_test_record_batch(producer_id: i64, sequence: i32, records: Vec<(&str, &str)>) -> Vec<u8> {
         let mut batch = KafkaRecordBatch::new(0, producer_id, 0);
-        batch.base_sequence = sequence;
+        batch.header.base_sequence = sequence;
         
         for (key, value) in records {
             batch.add_record(

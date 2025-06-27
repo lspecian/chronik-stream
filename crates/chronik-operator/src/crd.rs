@@ -10,6 +10,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+
 /// Install all CRDs
 pub async fn install_crds(client: Client) -> Result<(), kube::Error> {
     install_chronik_cluster_crd(client.clone()).await?;
@@ -31,9 +32,11 @@ pub async fn install_crds(client: Client) -> Result<(), kube::Error> {
 #[serde(rename_all = "camelCase")]
 pub struct ChronikClusterSpec {
     /// Number of controller nodes
+    #[serde(default = "default_controllers")]
     pub controllers: i32,
     
     /// Number of ingest nodes
+    #[serde(default = "default_ingest_nodes")]
     pub ingest_nodes: i32,
     
     /// Number of search nodes
@@ -486,4 +489,70 @@ async fn install_chronik_cluster_crd(client: Client) -> Result<(), kube::Error> 
         }
         Err(e) => Err(e),
     }
+}
+
+// Manual Default implementation for ChronikClusterSpec
+impl Default for ChronikClusterSpec {
+    fn default() -> Self {
+        Self {
+            controllers: 3,
+            ingest_nodes: 3,
+            search_nodes: None,
+            storage: StorageSpec {
+                backend: StorageBackend::Local,
+                size: "10Gi".to_string(),
+                storage_class: None,
+            },
+            metastore: MetastoreSpec {
+                database: DatabaseType::Postgres,
+                connection: ConnectionSpec {
+                    host: "postgres".to_string(),
+                    port: 5432,
+                    database: "chronik".to_string(),
+                    credentials_secret: "chronik-postgres-secret".to_string(),
+                },
+            },
+            resources: None,
+            image: None,
+            monitoring: None,
+            network: None,
+            security: None,
+            autoscaling: None,
+            pod_disruption_budget: None,
+            pod_annotations: None,
+            pod_labels: None,
+            node_selector: None,
+            tolerations: None,
+            affinity: None,
+        }
+    }
+}
+
+// Default functions for serde
+fn default_controllers() -> i32 {
+    3
+}
+
+fn default_ingest_nodes() -> i32 {
+    3
+}
+
+fn default_storage_size() -> String {
+    "10Gi".to_string()
+}
+
+fn default_host() -> String {
+    "postgres".to_string()
+}
+
+fn default_port() -> i32 {
+    5432
+}
+
+fn default_database() -> String {
+    "chronik".to_string()
+}
+
+fn default_credentials_secret() -> String {
+    "chronik-postgres-secret".to_string()
 }

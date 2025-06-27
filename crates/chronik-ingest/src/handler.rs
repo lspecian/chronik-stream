@@ -1,12 +1,12 @@
 //! Request handler for Kafka protocol requests.
 
-use crate::indexer::IndexRecord;
 use crate::consumer_group::GroupManager;
 use crate::produce_handler::{ProduceHandler, ProduceHandlerConfig};
 use chronik_common::Result;
+use chronik_auth::{AuthMiddleware, AuthError, SaslMechanism, Resource, Operation};
 use chronik_protocol::{
     Request, Response, RequestBody,
-    ProduceRequest, ProduceResponse, ProduceResponseTopic, ProduceResponsePartition,
+    ProduceRequest,
     FetchRequest, FetchResponse, FetchResponseTopic, FetchResponsePartition,
     MetadataRequest, MetadataResponse, MetadataBroker, MetadataTopic, MetadataPartition,
     JoinGroupRequest, JoinGroupResponse, JoinGroupMember,
@@ -16,6 +16,7 @@ use chronik_protocol::{
     OffsetCommitRequest, OffsetCommitResponse, OffsetCommitResponseTopic, OffsetCommitResponsePartition,
     OffsetFetchRequest, OffsetFetchResponse, OffsetFetchResponseTopic, OffsetFetchResponsePartition,
     ApiVersionsRequest, ApiVersionsResponse, ApiVersionsResponseKey,
+    SaslHandshakeRequest, SaslHandshakeResponse, SaslAuthenticateRequest, SaslAuthenticateResponse,
     parser::ResponseHeader,
 };
 use chronik_storage::{SegmentReader, object_store::storage::ObjectStore};
@@ -23,7 +24,7 @@ use chronik_common::metadata::traits::MetadataStore;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::RwLock;
 
 /// Handler configuration
 #[derive(Debug, Clone)]
@@ -68,6 +69,7 @@ pub struct RequestHandler {
     produce_handler: Arc<ProduceHandler>,
     segment_reader: Arc<SegmentReader>,
     group_manager: Arc<GroupManager>,
+    auth_middleware: Arc<AuthMiddleware>,
 }
 
 impl RequestHandler {
@@ -83,7 +85,10 @@ impl RequestHandler {
             producer_state: HashMap::new(),
         }));
         
-        let group_manager = Arc::new(GroupManager::new());
+        let group_manager = Arc::new(GroupManager::new(metadata_store.clone()));
+        
+        // Start group expiration checker
+        group_manager.clone().start_expiration_checker();
         
         // Create produce handler configuration
         let produce_config = ProduceHandlerConfig {
@@ -99,42 +104,76 @@ impl RequestHandler {
             ProduceHandler::new(produce_config, storage, metadata_store).await?
         );
         
+        // Initialize auth middleware
+        let auth_middleware = Arc::new(AuthMiddleware::new(false)); // Don't allow anonymous
+        auth_middleware.init_defaults().await
+            .map_err(|e| chronik_common::Error::Internal(format!("Failed to init auth: {:?}", e)))?;
+        
         Ok(Self {
             config,
             state,
             produce_handler,
             segment_reader,
             group_manager,
+            auth_middleware,
         })
     }
     
     /// Handle a request
-    pub async fn handle_request(&self, request: Request) -> Result<Response> {
+    pub async fn handle_request(&self, request: Request, session_id: &str) -> Result<Response> {
         let correlation_id = request.header.correlation_id;
         
+        // Handle SASL-related requests without auth check
+        match &request.body {
+            RequestBody::SaslHandshake(_) | RequestBody::SaslAuthenticate(_) | RequestBody::ApiVersions(_) => {
+                // These don't require authentication
+            }
+            _ => {
+                // All other requests require authentication - check session
+                let ctx = self.auth_middleware.get_or_create_context(session_id).await;
+                if !ctx.is_authenticated() {
+                    return Err(chronik_common::Error::Unauthorized("Not authenticated".to_string()));
+                }
+            }
+        }
+        
         match request.body {
-            RequestBody::Produce(produce) => self.handle_produce(produce, correlation_id).await,
-            RequestBody::Fetch(fetch) => self.handle_fetch(fetch, correlation_id).await,
+            RequestBody::Produce(produce) => self.handle_produce(produce, correlation_id, session_id).await,
+            RequestBody::Fetch(fetch) => self.handle_fetch(fetch, correlation_id, session_id).await,
             RequestBody::Metadata(metadata) => self.handle_metadata(metadata, correlation_id).await,
-            RequestBody::JoinGroup(join) => self.handle_join_group(join, correlation_id).await,
-            RequestBody::SyncGroup(sync) => self.handle_sync_group(sync, correlation_id).await,
-            RequestBody::Heartbeat(heartbeat) => self.handle_heartbeat(heartbeat, correlation_id).await,
-            RequestBody::LeaveGroup(leave) => self.handle_leave_group(leave, correlation_id).await,
-            RequestBody::OffsetCommit(commit) => self.handle_offset_commit(commit, correlation_id).await,
-            RequestBody::OffsetFetch(fetch) => self.handle_offset_fetch(fetch, correlation_id).await,
+            RequestBody::JoinGroup(join) => self.handle_join_group(join, correlation_id, session_id).await,
+            RequestBody::SyncGroup(sync) => self.handle_sync_group(sync, correlation_id, session_id).await,
+            RequestBody::Heartbeat(heartbeat) => self.handle_heartbeat(heartbeat, correlation_id, session_id).await,
+            RequestBody::LeaveGroup(leave) => self.handle_leave_group(leave, correlation_id, session_id).await,
+            RequestBody::OffsetCommit(commit) => self.handle_offset_commit(commit, correlation_id, session_id).await,
+            RequestBody::OffsetFetch(fetch) => self.handle_offset_fetch(fetch, correlation_id, session_id).await,
             RequestBody::ApiVersions(api_versions) => self.handle_api_versions(api_versions, correlation_id).await,
+            RequestBody::SaslHandshake(handshake) => self.handle_sasl_handshake(handshake, correlation_id).await,
+            RequestBody::SaslAuthenticate(auth) => self.handle_sasl_authenticate(auth, correlation_id, session_id).await,
         }
     }
     
     /// Handle produce request
-    async fn handle_produce(&self, request: ProduceRequest, correlation_id: i32) -> Result<Response> {
+    async fn handle_produce(&self, request: ProduceRequest, correlation_id: i32, session_id: &str) -> Result<Response> {
+        // Check write permission for each topic
+        for topic_data in &request.topics {
+            self.auth_middleware.check_topic_write(session_id, &topic_data.name).await
+                .map_err(|e| chronik_common::Error::Unauthorized(format!("Permission denied for topic {}: {:?}", topic_data.name, e)))?;
+        }
+        
         // Delegate to the produce handler
         let response = self.produce_handler.handle_produce(request, correlation_id).await?;
         Ok(Response::Produce(response))
     }
     
     /// Handle fetch request
-    async fn handle_fetch(&self, request: FetchRequest, correlation_id: i32) -> Result<Response> {
+    async fn handle_fetch(&self, request: FetchRequest, correlation_id: i32, session_id: &str) -> Result<Response> {
+        // Check read permission for each topic
+        for topic_request in &request.topics {
+            self.auth_middleware.check_topic_read(session_id, &topic_request.name).await
+                .map_err(|e| chronik_common::Error::Unauthorized(format!("Permission denied for topic {}: {:?}", topic_request.name, e)))?;
+        }
+        
         let mut response_topics = Vec::new();
         
         for topic_request in request.topics {
@@ -230,7 +269,10 @@ impl RequestHandler {
     }
     
     /// Handle join group request
-    async fn handle_join_group(&self, request: JoinGroupRequest, correlation_id: i32) -> Result<Response> {
+    async fn handle_join_group(&self, request: JoinGroupRequest, correlation_id: i32, session_id: &str) -> Result<Response> {
+        // Check consumer group permission
+        self.auth_middleware.check_consumer_group(session_id, &request.group_id).await
+            .map_err(|e| chronik_common::Error::Unauthorized(format!("Permission denied for group {}: {:?}", request.group_id, e)))?;
         let protocols: Vec<(String, Vec<u8>)> = request.protocols
             .into_iter()
             .map(|p| (p.name, p.metadata))
@@ -245,6 +287,7 @@ impl RequestHandler {
             Duration::from_millis(request.rebalance_timeout as u64),
             request.protocol_type,
             protocols,
+            None, // TODO: Add static_member_id support from KIP-345
         ).await?;
         
         Ok(Response::JoinGroup(JoinGroupResponse {
@@ -263,7 +306,10 @@ impl RequestHandler {
     }
     
     /// Handle sync group request
-    async fn handle_sync_group(&self, request: SyncGroupRequest, correlation_id: i32) -> Result<Response> {
+    async fn handle_sync_group(&self, request: SyncGroupRequest, correlation_id: i32, session_id: &str) -> Result<Response> {
+        // Check consumer group permission
+        self.auth_middleware.check_consumer_group(session_id, &request.group_id).await
+            .map_err(|e| chronik_common::Error::Unauthorized(format!("Permission denied for group {}: {:?}", request.group_id, e)))?;
         let assignments = if request.assignments.is_empty() {
             None
         } else {
@@ -276,6 +322,7 @@ impl RequestHandler {
             request.group_id,
             request.generation_id,
             request.member_id,
+            0, // TODO: Add member_epoch from KIP-848
             assignments,
         ).await?;
         
@@ -288,11 +335,15 @@ impl RequestHandler {
     }
     
     /// Handle heartbeat request
-    async fn handle_heartbeat(&self, request: HeartbeatRequest, correlation_id: i32) -> Result<Response> {
+    async fn handle_heartbeat(&self, request: HeartbeatRequest, correlation_id: i32, session_id: &str) -> Result<Response> {
+        // Check consumer group permission
+        self.auth_middleware.check_consumer_group(session_id, &request.group_id).await
+            .map_err(|e| chronik_common::Error::Unauthorized(format!("Permission denied for group {}: {:?}", request.group_id, e)))?;
         let response = self.group_manager.heartbeat(
             request.group_id,
             request.member_id,
             request.generation_id,
+            None, // TODO: Add member_epoch from KIP-848
         ).await?;
         
         Ok(Response::Heartbeat(HeartbeatResponse {
@@ -303,7 +354,10 @@ impl RequestHandler {
     }
     
     /// Handle leave group request
-    async fn handle_leave_group(&self, request: LeaveGroupRequest, correlation_id: i32) -> Result<Response> {
+    async fn handle_leave_group(&self, request: LeaveGroupRequest, correlation_id: i32, session_id: &str) -> Result<Response> {
+        // Check consumer group permission
+        self.auth_middleware.check_consumer_group(session_id, &request.group_id).await
+            .map_err(|e| chronik_common::Error::Unauthorized(format!("Permission denied for group {}: {:?}", request.group_id, e)))?;
         self.group_manager.leave_group(
             request.group_id,
             request.member_id,
@@ -317,7 +371,10 @@ impl RequestHandler {
     }
     
     /// Handle offset commit request
-    async fn handle_offset_commit(&self, request: OffsetCommitRequest, correlation_id: i32) -> Result<Response> {
+    async fn handle_offset_commit(&self, request: OffsetCommitRequest, correlation_id: i32, session_id: &str) -> Result<Response> {
+        // Check consumer group permission
+        self.auth_middleware.check_consumer_group(session_id, &request.group_id).await
+            .map_err(|e| chronik_common::Error::Unauthorized(format!("Permission denied for group {}: {:?}", request.group_id, e)))?;
         use crate::consumer_group::TopicPartitionOffset;
         
         let mut offsets = Vec::new();
@@ -332,25 +389,32 @@ impl RequestHandler {
             }
         }
         
-        self.group_manager.commit_offsets(
+        let response = self.group_manager.commit_offsets(
             request.group_id,
             request.generation_id,
             request.member_id,
+            None, // TODO: Add member_epoch from KIP-848
             offsets,
         ).await?;
         
-        // Build response
-        let response_topics = request.topics.into_iter().map(|topic| {
-            OffsetCommitResponseTopic {
-                name: topic.name,
-                partitions: topic.partitions.into_iter().map(|p| {
-                    OffsetCommitResponsePartition {
-                        partition_index: p.partition_index,
-                        error_code: 0,
-                    }
-                }).collect(),
-            }
-        }).collect();
+        // Build response from actual commit results
+        let mut response_topics_map: HashMap<String, Vec<OffsetCommitResponsePartition>> = HashMap::new();
+        
+        for error in response.partition_errors {
+            response_topics_map.entry(error.topic)
+                .or_insert_with(Vec::new)
+                .push(OffsetCommitResponsePartition {
+                    partition_index: error.partition,
+                    error_code: error.error_code,
+                });
+        }
+        
+        let response_topics: Vec<_> = response_topics_map.into_iter()
+            .map(|(topic, partitions)| OffsetCommitResponseTopic {
+                name: topic,
+                partitions,
+            })
+            .collect();
         
         Ok(Response::OffsetCommit(OffsetCommitResponse {
             header: ResponseHeader { correlation_id },
@@ -360,24 +424,67 @@ impl RequestHandler {
     }
     
     /// Handle offset fetch request
-    async fn handle_offset_fetch(&self, request: OffsetFetchRequest, correlation_id: i32) -> Result<Response> {
-        // TODO: Implement actual offset fetching from metastore
-        let response_topics = if let Some(topics) = request.topics {
-            topics.into_iter().map(|topic| {
-                OffsetFetchResponseTopic {
-                    name: topic,
-                    partitions: vec![
+    async fn handle_offset_fetch(&self, request: OffsetFetchRequest, correlation_id: i32, session_id: &str) -> Result<Response> {
+        // Check consumer group permission
+        self.auth_middleware.check_consumer_group(session_id, &request.group_id).await
+            .map_err(|e| chronik_common::Error::Unauthorized(format!("Permission denied for group {}: {:?}", request.group_id, e)))?;
+        // Fetch offsets from the group manager
+        let offsets = self.group_manager.fetch_offsets(
+            request.group_id,
+            request.topics.clone().unwrap_or_default(),
+        ).await?;
+        
+        // Group offsets by topic
+        let mut topics_map: HashMap<String, Vec<(i32, i64, Option<String>)>> = HashMap::new();
+        for offset in offsets {
+            topics_map.entry(offset.topic)
+                .or_insert_with(Vec::new)
+                .push((offset.partition, offset.offset, offset.metadata));
+        }
+        
+        // Build response
+        let response_topics = if let Some(requested_topics) = request.topics {
+            // Return offsets for requested topics
+            requested_topics.into_iter().map(|topic| {
+                let partitions = if let Some(topic_offsets) = topics_map.get(&topic) {
+                    topic_offsets.iter().map(|(partition, offset, metadata)| {
                         OffsetFetchResponsePartition {
-                            partition_index: 0,
-                            committed_offset: 0,
-                            metadata: None,
+                            partition_index: *partition,
+                            committed_offset: *offset,
+                            metadata: metadata.clone(),
                             error_code: 0,
                         }
-                    ],
+                    }).collect()
+                } else {
+                    // No offsets for this topic - return default
+                    vec![OffsetFetchResponsePartition {
+                        partition_index: 0,
+                        committed_offset: -1, // No offset committed
+                        metadata: None,
+                        error_code: 0,
+                    }]
+                };
+                
+                OffsetFetchResponseTopic {
+                    name: topic,
+                    partitions,
                 }
             }).collect()
         } else {
-            vec![]
+            // Return all offsets for the group
+            topics_map.into_iter().map(|(topic, topic_offsets)| {
+                OffsetFetchResponseTopic {
+                    name: topic,
+                    partitions: topic_offsets.into_iter().map(|(partition, offset, metadata)| {
+                        OffsetFetchResponsePartition {
+                            partition_index: partition,
+                            committed_offset: offset,
+                            metadata,
+                            error_code: 0,
+                        }
+                    }).collect(),
+                }
+            }).collect()
         };
         
         Ok(Response::OffsetFetch(OffsetFetchResponse {
@@ -453,6 +560,53 @@ impl RequestHandler {
         };
         
         Ok(Response::ApiVersions(response))
+    }
+    
+    /// Get produce handler metrics
+    pub fn metrics(&self) -> &crate::produce_handler::ProduceMetrics {
+        self.produce_handler.metrics()
+    }
+    
+    /// Handle SASL handshake request
+    async fn handle_sasl_handshake(&self, request: SaslHandshakeRequest, correlation_id: i32) -> Result<Response> {
+        // Get supported mechanisms
+        let mechanisms = self.auth_middleware.get_sasl_mechanisms(&[request.mechanism.clone()]).await;
+        
+        let error_code = if mechanisms.contains(&request.mechanism) {
+            0 // No error
+        } else {
+            33 // Unsupported SASL mechanism
+        };
+        
+        Ok(Response::SaslHandshake(SaslHandshakeResponse {
+            error_code,
+            mechanisms,
+        }))
+    }
+    
+    /// Handle SASL authenticate request
+    async fn handle_sasl_authenticate(&self, request: SaslAuthenticateRequest, correlation_id: i32, session_id: &str) -> Result<Response> {
+        // For now, only support PLAIN mechanism
+        let mechanism = SaslMechanism::Plain;
+        
+        match self.auth_middleware.authenticate_sasl(session_id, &mechanism, &request.auth_bytes).await {
+            Ok(principal) => {
+                Ok(Response::SaslAuthenticate(SaslAuthenticateResponse {
+                    error_code: 0,
+                    error_message: None,
+                    auth_bytes: vec![],
+                    session_lifetime_ms: 3600000, // 1 hour
+                }))
+            }
+            Err(e) => {
+                Ok(Response::SaslAuthenticate(SaslAuthenticateResponse {
+                    error_code: 58, // SASL authentication failed
+                    error_message: Some(format!("Authentication failed: {:?}", e)),
+                    auth_bytes: vec![],
+                    session_lifetime_ms: 0,
+                }))
+            }
+        }
     }
 }
 

@@ -4,6 +4,7 @@ use chronik_common::{Result, Error};
 use chronik_common::metadata::traits::MetadataStore;
 use chronik_protocol::{FetchRequest, FetchResponse, FetchResponseTopic, FetchResponsePartition};
 use chronik_storage::{SegmentReader, RecordBatch};
+use chronik_storage::kafka_records::{KafkaRecordBatch, KafkaRecord, RecordHeader as KafkaRecordHeader, CompressionType};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -122,7 +123,7 @@ impl FetchHandler {
         };
         
         // Check partition exists
-        if partition < 0 || partition >= topic_metadata.partition_count {
+        if partition < 0 || partition >= topic_metadata.config.partition_count as i32 {
             return Ok(FetchResponsePartition {
                 partition,
                 error_code: 3, // UNKNOWN_TOPIC_OR_PARTITION
@@ -135,12 +136,19 @@ impl FetchHandler {
             });
         }
         
-        // Get partition metadata
-        let partition_meta = self.metadata_store.get_partition(topic, partition).await?
-            .ok_or_else(|| Error::NotFound(format!("Partition {}-{} not found", topic, partition)))?;
+        // Get partition segments to determine watermarks
+        let segments = self.metadata_store.list_segments(topic, Some(partition as u32)).await?;
         
-        let high_watermark = partition_meta.high_watermark;
-        let log_start_offset = partition_meta.log_start_offset;
+        // Calculate high watermark from segments
+        let high_watermark = segments.iter()
+            .map(|s| s.end_offset + 1)
+            .max()
+            .unwrap_or(0);
+        
+        let log_start_offset = segments.iter()
+            .map(|s| s.start_offset)
+            .min()
+            .unwrap_or(0);
         
         // Check if offset is out of range
         if fetch_offset < log_start_offset {
@@ -179,11 +187,11 @@ impl FetchHandler {
             max_bytes,
         ).await?;
         
-        // Encode records
+        // Encode records in Kafka format
         let records_bytes = if records.is_empty() {
             vec![]
         } else {
-            RecordBatch { records }.encode()?
+            self.encode_kafka_records(&records, 0)? // TODO: Get actual leader epoch
         };
         
         Ok(FetchResponsePartition {
@@ -302,15 +310,15 @@ impl FetchHandler {
         }
         
         // Query metadata store
-        let segments = self.metadata_store.list_segments(topic, Some(partition)).await?;
+        let segments = self.metadata_store.list_segments(topic, Some(partition as u32)).await?;
         
         let segment_infos: Vec<_> = segments.into_iter()
-            .filter(|s| s.last_offset >= start_offset && s.base_offset < end_offset)
+            .filter(|s| s.end_offset >= start_offset && s.start_offset < end_offset)
             .map(|s| SegmentInfo {
-                segment_id: s.id,
-                base_offset: s.base_offset,
-                last_offset: s.last_offset,
-                object_key: s.object_key,
+                segment_id: s.segment_id,
+                base_offset: s.start_offset,
+                last_offset: s.end_offset,
+                object_key: s.path,
             })
             .collect();
         
@@ -388,5 +396,53 @@ impl FetchHandler {
         state.buffers.retain(|(t, _), _| t != topic);
         state.segment_cache.retain(|(t, _), _| t != topic);
         Ok(())
+    }
+    
+    /// Encode records in Kafka RecordBatch format
+    fn encode_kafka_records(
+        &self,
+        records: &[chronik_storage::Record],
+        _leader_epoch: i32,
+    ) -> Result<Vec<u8>> {
+        use bytes::Bytes;
+        
+        if records.is_empty() {
+            return Ok(vec![]);
+        }
+        
+        // Group records into batches (simple approach: one batch for all)
+        let base_offset = records[0].offset;
+        let base_timestamp = records[0].timestamp;
+        
+        let mut batch = KafkaRecordBatch::new(
+            base_offset,
+            base_timestamp,
+            -1, // No producer ID for fetched records
+            -1, // No producer epoch
+            -1, // No base sequence
+            CompressionType::None, // No compression for now
+            false, // Not transactional
+        );
+        
+        // Add all records to the batch
+        for record in records {
+            let headers: Vec<KafkaRecordHeader> = record.headers.iter()
+                .map(|(k, v)| KafkaRecordHeader {
+                    key: k.clone(),
+                    value: Some(Bytes::from(v.clone())),
+                })
+                .collect();
+            
+            batch.add_record(
+                record.key.as_ref().map(|k| Bytes::from(k.clone())),
+                Some(Bytes::from(record.value.clone())),
+                headers,
+                record.timestamp,
+            );
+        }
+        
+        // Encode the batch
+        let encoded = batch.encode()?;
+        Ok(encoded.to_vec())
     }
 }

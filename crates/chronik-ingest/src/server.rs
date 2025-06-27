@@ -8,30 +8,28 @@
 //! - Comprehensive logging and metrics
 //! - Integration with Kafka protocol parser and frame codec
 
-use crate::handler::{RequestHandler, HandlerConfig};
-use crate::indexer::{Indexer, IndexerConfig};
 use crate::kafka_handler::KafkaProtocolHandler;
 use crate::produce_handler::{ProduceHandler, ProduceHandlerConfig};
 use crate::storage::{StorageService, StorageConfig};
+use chronik_auth::tls::TlsAcceptor;
 use chronik_common::{Result, Error};
 use chronik_common::metadata::traits::MetadataStore;
 use chronik_common::metadata::sled_store::SledMetadataStore;
-use chronik_monitoring::{ServerMetrics, ConnectionMetrics};
-use chronik_protocol::frame::{KafkaFrameCodec, Frame};
-use chronik_storage::{SegmentWriter, SegmentWriterConfig, SegmentReader, SegmentReaderConfig};
+use chronik_monitoring::ServerMetrics;
+use chronik_protocol::frame::KafkaFrameCodec;
+use chronik_storage::{SegmentReader, SegmentReaderConfig};
 use futures::{SinkExt, StreamExt};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, RwLock, Semaphore, oneshot};
+use tokio::sync::{RwLock, Semaphore, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{timeout, interval};
-use tokio_native_tls::{TlsAcceptor, native_tls};
 use tokio_util::codec::Framed;
 use tracing::{debug, error, info, warn, instrument};
 use uuid::Uuid;
@@ -118,11 +116,12 @@ struct ConnectionInfo {
     id: Uuid,
     peer_addr: SocketAddr,
     connected_at: Instant,
-    last_activity: Instant,
+    last_activity: AtomicU64, // Stores milliseconds since start
     request_count: AtomicUsize,
     bytes_sent: AtomicUsize,
     bytes_received: AtomicUsize,
     is_tls: bool,
+    start_time: Instant, // For calculating relative times
 }
 
 /// Connection state
@@ -170,19 +169,24 @@ impl IngestServer {
         std::fs::create_dir_all(&metadata_path)
             .map_err(|e| Error::Io(e))?;
         let metadata_store: Arc<dyn MetadataStore> = Arc::new(
-            SledMetadataStore::new(metadata_path)?
+            SledMetadataStore::new(metadata_path)
+                .map_err(|e| Error::Internal(format!("Failed to create metadata store: {}", e)))?
         );
         
         // Create storage service
         let storage_config = StorageConfig {
             object_store_config: chronik_storage::ObjectStoreConfig {
-                backend: chronik_storage::ObjectStoreBackend::Local { 
+                backend: chronik_storage::object_store::config::StorageBackend::Local { 
                     path: data_dir.join("segments").to_string_lossy().to_string() 
                 },
                 bucket: "chronik".to_string(),
                 prefix: None,
-                retry_attempts: 3,
-                connection_timeout: Duration::from_secs(10),
+                connection: Default::default(),
+                performance: Default::default(),
+                retry: Default::default(),
+                auth: Default::default(),
+                default_metadata: None,
+                encryption: None,
             },
             segment_writer_config: chronik_storage::SegmentWriterConfig {
                 data_dir: data_dir.join("segments"),
@@ -195,7 +199,7 @@ impl IngestServer {
         
         // Create segment reader
         let segment_reader = Arc::new(SegmentReader::new(
-            storage_config.segment_reader_config,
+            storage_config.segment_reader_config.clone(),
             storage_service.object_store(),
         ));
         
@@ -203,11 +207,18 @@ impl IngestServer {
         let produce_config = ProduceHandlerConfig {
             node_id: 1, // TODO: Make configurable
             storage_config: storage_config.clone(),
-            indexer_config: IndexerConfig::default(),
             enable_indexing: true,
+            enable_idempotence: true,
+            enable_transactions: false,
+            max_in_flight_requests: 5,
+            batch_size: 1000,
+            linger_ms: 100,
+            compression_type: chronik_storage::kafka_records::CompressionType::None,
+            request_timeout_ms: 30000,
+            buffer_memory: 32 * 1024 * 1024, // 32MB
         };
         let produce_handler = Arc::new(
-            ProduceHandler::new(produce_config, storage_service, metadata_store.clone()).await?
+            ProduceHandler::new(produce_config, storage_service.object_store(), metadata_store.clone()).await?
         );
         
         // Create Kafka protocol handler
@@ -223,29 +234,21 @@ impl IngestServer {
         );
         
         // Setup TLS if configured
-        let tls_acceptor = if let Some(ref tls_cfg) = config.tls_config {
-            let cert = std::fs::read(&tls_cfg.cert_path)
-                .map_err(|e| Error::Io(e))?;
-            let key = std::fs::read(&tls_cfg.key_path)
-                .map_err(|e| Error::Io(e))?;
+        let tls_acceptor = if let Some(tls_config) = &config.tls_config {
+            use chronik_auth::tls::{TlsAcceptor, TlsConfig as AuthTlsConfig};
             
-            let mut builder = native_tls::TlsAcceptor::builder(
-                native_tls::Identity::from_pkcs8(&cert, &key)
-                    .map_err(|e| Error::Internal(format!("TLS setup failed: {}", e)))?
-            );
+            let auth_tls_config = AuthTlsConfig {
+                cert_file: tls_config.cert_path.to_string_lossy().to_string(),
+                key_file: tls_config.key_path.to_string_lossy().to_string(),
+                ca_file: tls_config.ca_path.as_ref().map(|p| p.to_string_lossy().to_string()),
+                verify_client: tls_config.require_client_cert,
+                min_version: "1.2".to_string(),
+            };
             
-            if tls_cfg.require_client_cert {
-                if let Some(ref ca_path) = tls_cfg.ca_path {
-                    let ca = std::fs::read(ca_path)
-                        .map_err(|e| Error::Io(e))?;
-                    let ca_cert = native_tls::Certificate::from_pem(&ca)
-                        .map_err(|e| Error::Internal(format!("CA cert load failed: {}", e)))?;
-                    builder.add_root_certificate(ca_cert);
-                }
-            }
+            let acceptor = TlsAcceptor::new(&auth_tls_config)
+                .map_err(|e| Error::Configuration(format!("Failed to create TLS acceptor: {}", e)))?;
             
-            Some(TlsAcceptor::from(builder.build()
-                .map_err(|e| Error::Internal(format!("TLS acceptor build failed: {}", e)))?))
+            Some(acceptor)
         } else {
             None
         };
@@ -323,7 +326,7 @@ impl IngestServer {
                                 }
                                 
                                 // Try to acquire connection permit
-                                let permit = match connection_limiter.try_acquire() {
+                                let permit = match connection_limiter.clone().try_acquire_owned() {
                                     Ok(permit) => permit,
                                     Err(_) => {
                                         warn!("Max connections reached, rejecting {}", addr);
@@ -341,15 +344,17 @@ impl IngestServer {
                                 
                                 // Create connection info
                                 let conn_id = Uuid::new_v4();
+                                let now = Instant::now();
                                 let conn_info = Arc::new(ConnectionInfo {
                                     id: conn_id,
                                     peer_addr: addr,
-                                    connected_at: Instant::now(),
-                                    last_activity: Instant::now(),
+                                    connected_at: now,
+                                    last_activity: AtomicU64::new(0),
                                     request_count: AtomicUsize::new(0),
                                     bytes_sent: AtomicUsize::new(0),
                                     bytes_received: AtomicUsize::new(0),
                                     is_tls: tls_acceptor.is_some(),
+                                    start_time: now,
                                 });
                                 
                                 // Track connection
@@ -369,7 +374,7 @@ impl IngestServer {
                                 }
                                 
                                 connection_count.fetch_add(1, Ordering::SeqCst);
-                                metrics.connections_active.set(connection_count.load(Ordering::SeqCst) as i64);
+                                metrics.connections_active.set(connection_count.load(Ordering::SeqCst) as f64);
                                 metrics.connections_total.inc();
                                 
                                 // Spawn connection handler
@@ -497,7 +502,7 @@ impl IngestServer {
                     total_requests += state.info.request_count.load(Ordering::SeqCst);
                 }
                 
-                metrics.pending_requests.set(total_pending as i64);
+                metrics.pending_requests.set(total_pending as f64);
                 
                 debug!(
                     "Server metrics - connections: {}, pending requests: {}, total requests: {}",
@@ -527,7 +532,9 @@ impl IngestServer {
                 {
                     let conns = connections.read().await;
                     for (id, state) in conns.iter() {
-                        if now.duration_since(state.info.last_activity) > idle_timeout {
+                        let last_activity_ms = state.info.last_activity.load(Ordering::SeqCst);
+                        let last_activity = state.info.start_time + Duration::from_millis(last_activity_ms);
+                        if now.duration_since(last_activity) > idle_timeout {
                             to_remove.push(*id);
                         }
                     }
@@ -568,18 +575,21 @@ async fn handle_connection(
     
     // Handle TLS if configured
     let stream = if let Some(acceptor) = tls_acceptor {
-        match timeout(Duration::from_secs(10), acceptor.accept(stream)).await {
+        match tokio::time::timeout(
+            Duration::from_secs(10),
+            acceptor.inner().accept(stream)
+        ).await {
             Ok(Ok(tls_stream)) => {
                 info!("TLS handshake completed");
-                ConnectionStream::Tls(tls_stream)
+                ConnectionStream::Tls(Box::pin(tls_stream))
             }
             Ok(Err(e)) => {
-                metrics.tls_handshake_failures.inc();
+                error!("TLS handshake failed: {}", e);
                 return Err(Error::Network(format!("TLS handshake failed: {}", e)));
             }
             Err(_) => {
-                metrics.tls_handshake_failures.inc();
-                return Err(Error::Network("TLS handshake timeout".into()));
+                error!("TLS handshake timeout");
+                return Err(Error::Network("TLS handshake timeout".to_string()));
             }
         }
     } else {
@@ -587,10 +597,7 @@ async fn handle_connection(
     };
     
     // Create framed codec
-    let mut framed = match stream {
-        ConnectionStream::Plain(s) => Framed::new(s, KafkaFrameCodec::new()),
-        ConnectionStream::Tls(s) => Framed::new(s, KafkaFrameCodec::new()),
-    };
+    let mut framed = Framed::new(stream, KafkaFrameCodec::new());
     
     info!("Connection established");
     
@@ -601,9 +608,10 @@ async fn handle_connection(
                 match frame_result {
                     Some(Ok(frame_data)) => {
                         // Update activity time
-                        if let Some(state) = connections.read().await.get(&info.id) {
-                            state.info.last_activity = Instant::now();
-                        }
+                        info.last_activity.store(
+                            Instant::now().duration_since(info.start_time).as_millis() as u64,
+                            Ordering::SeqCst
+                        );
                         
                         // Check backpressure
                         if let Some(state) = connections.read().await.get(&info.id) {
@@ -613,7 +621,7 @@ async fn handle_connection(
                                 metrics.backpressure_events.inc();
                                 // Send error response
                                 let error_response = create_error_response(35); // NOT_COORDINATOR
-                                framed.send(Bytes::from(error_response)).await
+                                framed.send(error_response.body).await
                                     .map_err(|e| Error::Network(format!("Failed to send backpressure response: {}", e)))?;
                                 continue;
                             }
@@ -624,7 +632,7 @@ async fn handle_connection(
                         info.request_count.fetch_add(1, Ordering::SeqCst);
                         info.bytes_received.fetch_add(frame_data.len(), Ordering::SeqCst);
                         metrics.requests_total.inc();
-                        metrics.bytes_received.inc_by(frame_data.len() as i64);
+                        metrics.bytes_received.inc_by(frame_data.len() as f64);
                         
                         // Process request
                         let start_time = Instant::now();
@@ -634,41 +642,38 @@ async fn handle_connection(
                         let metrics = metrics.clone();
                         let timeout_duration = config.request_timeout;
                         
-                        // Spawn request handler to avoid blocking connection loop
-                        let mut response_framed = framed.clone();
-                        tokio::spawn(async move {
-                            let response = match timeout(timeout_duration, kafka_handler.handle_request(&frame_data)).await {
-                                Ok(Ok(resp)) => resp,
-                                Ok(Err(e)) => {
-                                    error!("Request handling error: {}", e);
-                                    metrics.request_errors.inc();
-                                    create_error_response(1) // UNKNOWN_ERROR
-                                }
-                                Err(_) => {
-                                    warn!("Request timeout");
-                                    metrics.request_timeouts.inc();
-                                    create_error_response(7) // REQUEST_TIMED_OUT
-                                }
-                            };
-                            
-                            // Send response
-                            let response_size = response.body.len() + 4;
-                            if let Err(e) = response_framed.send(response.body).await {
-                                error!("Failed to send response: {}", e);
-                            } else {
-                                // Update metrics
-                                if let Some(state) = connections.read().await.get(&conn_id) {
-                                    state.info.bytes_sent.fetch_add(response_size, Ordering::SeqCst);
-                                    state.pending_requests.fetch_sub(1, Ordering::SeqCst);
-                                }
-                                metrics.bytes_sent.inc_by(response_size as i64);
-                                
-                                let duration = start_time.elapsed();
-                                metrics.request_duration.record(duration.as_secs_f64());
-                                
-                                debug!("Request processed in {:?}", duration);
+                        // Handle request
+                        let response = match timeout(timeout_duration, kafka_handler.handle_request(&frame_data)).await {
+                            Ok(Ok(resp)) => resp,
+                            Ok(Err(e)) => {
+                                error!("Request handling error: {}", e);
+                                metrics.request_errors.inc();
+                                create_error_response(1) // UNKNOWN_ERROR
                             }
-                        });
+                            Err(_) => {
+                                warn!("Request timeout");
+                                metrics.request_timeouts.inc();
+                                create_error_response(7) // REQUEST_TIMED_OUT
+                            }
+                        };
+                        
+                        // Send response
+                        let response_size = response.body.len() + 4;
+                        if let Err(e) = framed.send(response.body).await {
+                            error!("Failed to send response: {}", e);
+                        } else {
+                            // Update metrics
+                            if let Some(state) = connections.read().await.get(&conn_id) {
+                                state.info.bytes_sent.fetch_add(response_size, Ordering::SeqCst);
+                                state.pending_requests.fetch_sub(1, Ordering::SeqCst);
+                            }
+                            metrics.bytes_sent.inc_by(response_size as f64);
+                            
+                            let duration = start_time.elapsed();
+                            metrics.request_duration.observe(duration.as_secs_f64());
+                            
+                            debug!("Request processed in {:?}", duration);
+                        }
                     }
                     Some(Err(e)) => {
                         error!("Frame error: {}", e);
@@ -690,11 +695,11 @@ async fn handle_connection(
             
             // Handle idle timeout
             _ = tokio::time::sleep(config.idle_timeout) => {
-                if let Some(state) = connections.read().await.get(&info.id) {
-                    if Instant::now().duration_since(state.info.last_activity) >= config.idle_timeout {
-                        info!("Connection idle timeout");
-                        break;
-                    }
+                let last_activity_ms = info.last_activity.load(Ordering::SeqCst);
+                let last_activity = info.start_time + Duration::from_millis(last_activity_ms);
+                if Instant::now().duration_since(last_activity) >= config.idle_timeout {
+                    info!("Connection idle timeout");
+                    break;
                 }
             }
         }
@@ -707,7 +712,7 @@ async fn handle_connection(
 /// Connection stream type (plain or TLS)
 enum ConnectionStream {
     Plain(TcpStream),
-    Tls(tokio_native_tls::TlsStream<TcpStream>),
+    Tls(Pin<Box<tokio_rustls::server::TlsStream<TcpStream>>>),
 }
 
 // Implement AsyncRead/AsyncWrite for ConnectionStream
@@ -719,7 +724,7 @@ impl tokio::io::AsyncRead for ConnectionStream {
     ) -> std::task::Poll<std::io::Result<()>> {
         match &mut *self {
             ConnectionStream::Plain(s) => std::pin::Pin::new(s).poll_read(cx, buf),
-            ConnectionStream::Tls(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            ConnectionStream::Tls(s) => s.as_mut().poll_read(cx, buf),
         }
     }
 }
@@ -732,7 +737,7 @@ impl tokio::io::AsyncWrite for ConnectionStream {
     ) -> std::task::Poll<std::io::Result<usize>> {
         match &mut *self {
             ConnectionStream::Plain(s) => std::pin::Pin::new(s).poll_write(cx, buf),
-            ConnectionStream::Tls(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            ConnectionStream::Tls(s) => s.as_mut().poll_write(cx, buf),
         }
     }
     
@@ -742,7 +747,7 @@ impl tokio::io::AsyncWrite for ConnectionStream {
     ) -> std::task::Poll<std::io::Result<()>> {
         match &mut *self {
             ConnectionStream::Plain(s) => std::pin::Pin::new(s).poll_flush(cx),
-            ConnectionStream::Tls(s) => std::pin::Pin::new(s).poll_flush(cx),
+            ConnectionStream::Tls(s) => s.as_mut().poll_flush(cx),
         }
     }
     
@@ -752,7 +757,7 @@ impl tokio::io::AsyncWrite for ConnectionStream {
     ) -> std::task::Poll<std::io::Result<()>> {
         match &mut *self {
             ConnectionStream::Plain(s) => std::pin::Pin::new(s).poll_shutdown(cx),
-            ConnectionStream::Tls(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            ConnectionStream::Tls(s) => s.as_mut().poll_shutdown(cx),
         }
     }
 }
@@ -816,9 +821,9 @@ async fn check_ip_limit(
 }
 
 /// Create error response bytes
-fn create_error_response(error_code: i16) -> Vec<u8> {
+fn create_error_response(error_code: i16) -> chronik_protocol::handler::Response {
     use bytes::BytesMut;
-    use chronik_protocol::parser::Encoder;
+    use chronik_protocol::parser::{Encoder, ResponseHeader};
     
     let mut buf = BytesMut::new();
     let mut encoder = Encoder::new(&mut buf);
@@ -826,10 +831,11 @@ fn create_error_response(error_code: i16) -> Vec<u8> {
     // Write a minimal error response
     encoder.write_i16(error_code);
     
-    buf.to_vec()
+    chronik_protocol::handler::Response {
+        header: ResponseHeader { correlation_id: 0 }, // We don't have correlation_id here
+        body: buf.freeze(),
+    }
 }
-
-use bytes::Bytes;
 
 #[cfg(test)]
 mod tests {

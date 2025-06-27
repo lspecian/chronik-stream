@@ -42,8 +42,8 @@
 ### 5. Distributed Architecture
 - Stateless nodes (compute/storage separation)
 - Consistent hashing for work distribution
-- PostgreSQL metastore for coordination
-- No external consensus (unlike Chronik's approach)
+- Embedded Sled database for metadata storage
+- Raft consensus for controller coordination
 
 ## Implementation Order
 1. Foundation: Project structure, core types

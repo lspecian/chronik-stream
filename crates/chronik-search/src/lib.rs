@@ -6,6 +6,7 @@ pub mod indexer;
 pub mod integration;
 pub mod realtime_indexer;
 pub mod json_pipeline;
+pub mod aggregations;
 
 pub use api::SearchApi;
 pub use indexer::{TantivyIndexer, IndexerConfig, SearchResult};

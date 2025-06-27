@@ -9,17 +9,15 @@ use axum::{
     routing::get,
     Router,
 };
-use prometheus::{Encoder, TextEncoder};
-use prometheus_client::metrics::{counter::Counter, gauge::Gauge, histogram::Histogram};
+use prometheus::{Encoder, TextEncoder, Counter, Gauge, Histogram, HistogramOpts};
 use std::net::SocketAddr;
-use std::sync::atomic::AtomicI64;
 use tower_http::trace::TraceLayer;
 
 /// Server metrics for monitoring TCP server performance
 pub struct ServerMetrics {
     // Connection metrics
     pub connections_total: Counter,
-    pub connections_active: Gauge<i64, AtomicI64>,
+    pub connections_active: Gauge,
     pub connections_rejected: Counter,
     
     // Request metrics
@@ -33,7 +31,7 @@ pub struct ServerMetrics {
     pub bytes_sent: Counter,
     
     // Backpressure metrics
-    pub pending_requests: Gauge<i64, AtomicI64>,
+    pub pending_requests: Gauge,
     pub backpressure_events: Counter,
     
     // Protocol metrics
@@ -44,22 +42,23 @@ pub struct ServerMetrics {
 impl ServerMetrics {
     /// Create new server metrics
     pub fn new() -> Self {
+        let histogram_opts = HistogramOpts::new("request_duration", "Request duration in seconds")
+            .buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]);
+        
         Self {
-            connections_total: Counter::default(),
-            connections_active: Gauge::default(),
-            connections_rejected: Counter::default(),
-            requests_total: Counter::default(),
-            request_errors: Counter::default(),
-            request_timeouts: Counter::default(),
-            request_duration: Histogram::new(vec![
-                0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0
-            ].into_iter()),
-            bytes_received: Counter::default(),
-            bytes_sent: Counter::default(),
-            pending_requests: Gauge::default(),
-            backpressure_events: Counter::default(),
-            frame_errors: Counter::default(),
-            tls_handshake_failures: Counter::default(),
+            connections_total: Counter::new("connections_total", "Total connections").unwrap(),
+            connections_active: Gauge::new("connections_active", "Active connections").unwrap(),
+            connections_rejected: Counter::new("connections_rejected", "Rejected connections").unwrap(),
+            requests_total: Counter::new("requests_total", "Total requests").unwrap(),
+            request_errors: Counter::new("request_errors", "Request errors").unwrap(),
+            request_timeouts: Counter::new("request_timeouts", "Request timeouts").unwrap(),
+            request_duration: Histogram::with_opts(histogram_opts).unwrap(),
+            bytes_received: Counter::new("bytes_received", "Bytes received").unwrap(),
+            bytes_sent: Counter::new("bytes_sent", "Bytes sent").unwrap(),
+            pending_requests: Gauge::new("pending_requests", "Pending requests").unwrap(),
+            backpressure_events: Counter::new("backpressure_events", "Backpressure events").unwrap(),
+            frame_errors: Counter::new("frame_errors", "Frame errors").unwrap(),
+            tls_handshake_failures: Counter::new("tls_handshake_failures", "TLS handshake failures").unwrap(),
         }
     }
 }
@@ -82,10 +81,10 @@ impl ConnectionMetrics {
     /// Create new connection metrics
     pub fn new() -> Self {
         Self {
-            requests: Counter::default(),
-            errors: Counter::default(),
-            bytes_sent: Counter::default(),
-            bytes_received: Counter::default(),
+            requests: Counter::new("connection_requests", "Requests per connection").unwrap(),
+            errors: Counter::new("connection_errors", "Errors per connection").unwrap(),
+            bytes_sent: Counter::new("connection_bytes_sent", "Bytes sent per connection").unwrap(),
+            bytes_received: Counter::new("connection_bytes_received", "Bytes received per connection").unwrap(),
         }
     }
 }

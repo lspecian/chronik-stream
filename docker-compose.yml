@@ -56,6 +56,24 @@ services:
     restart: unless-stopped
     user: root
 
+  search:
+    build:
+      context: .
+      dockerfile: Dockerfile.search
+    environment:
+      RUST_LOG: info
+      INDEX_PATH: /data/index
+    volumes:
+      - search_index:/data/index
+    depends_on:
+      - controller
+      - ingest
+    ports:
+      - "9200:9200"  # Elasticsearch-compatible API
+    networks:
+      - chronik
+    restart: unless-stopped
+
   # Optional: Jaeger for tracing
   jaeger:
     image: jaegertracing/all-in-one:latest
@@ -103,6 +121,7 @@ volumes:
   controller_metadata:
   admin_metadata:
   ingest_data:
+  search_index:
   prometheus_data:
   grafana_data:
 

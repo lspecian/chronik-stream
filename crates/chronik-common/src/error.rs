@@ -47,6 +47,26 @@ pub enum Error {
     /// Invalid segment errors
     #[error("Invalid segment: {0}")]
     InvalidSegment(String),
+    
+    /// Unauthorized access
+    #[error("Unauthorized: {0}")]
+    Unauthorized(String),
+    
+    /// Duplicate sequence number
+    #[error("Duplicate sequence number: {0}")]
+    DuplicateSequenceNumber(String),
+    
+    /// Out of order sequence number
+    #[error("Out of order sequence number: {0}")]
+    OutOfOrderSequenceNumber(String),
+    
+    /// Invalid producer epoch
+    #[error("Invalid producer epoch: {0}")]
+    InvalidProducerEpoch(String),
+    
+    /// Invalid transaction state
+    #[error("Invalid transaction state: {0}")]
+    InvalidTransactionState(String),
 
     /// Internal errors
     #[error("Internal error: {0}")]
@@ -60,6 +80,12 @@ pub enum Error {
 impl From<serde_json::Error> for Error {
     fn from(e: serde_json::Error) -> Self {
         Error::Serialization(e.to_string())
+    }
+}
+
+impl From<crate::metadata::MetadataError> for Error {
+    fn from(e: crate::metadata::MetadataError) -> Self {
+        Error::Database(e.to_string())
     }
 }
 

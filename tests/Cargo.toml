@@ -8,6 +8,7 @@ name = "integration"
 path = "integration/mod.rs"
 
 [dependencies]
+chronik-common = { path = "../crates/chronik-common" }
 anyhow = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }

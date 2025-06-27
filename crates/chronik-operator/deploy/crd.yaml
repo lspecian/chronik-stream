@@ -1,0 +1,673 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: chronikclusters.chronik.stream
+spec:
+  group: chronik.stream
+  names:
+    categories: []
+    kind: ChronikCluster
+    plural: chronikclusters
+    shortNames:
+    - ck
+    singular: chronikcluster
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns: []
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for ChronikClusterSpec via `CustomResource`
+        properties:
+          spec:
+            description: ChronikCluster custom resource
+            properties:
+              affinity:
+                description: Affinity rules for pod scheduling
+                nullable: true
+                properties:
+                  nodeAffinity:
+                    description: Node affinity
+                    nullable: true
+                  podAffinity:
+                    description: Pod affinity
+                    nullable: true
+                  podAntiAffinity:
+                    description: Pod anti-affinity
+                    nullable: true
+                type: object
+              autoscaling:
+                description: Autoscaling configuration
+                nullable: true
+                properties:
+                  controllers:
+                    description: Enable autoscaling for controllers
+                    nullable: true
+                    properties:
+                      customMetrics:
+                        description: Custom metrics
+                        items:
+                          description: Custom metric for autoscaling
+                          properties:
+                            name:
+                              description: Metric name
+                              type: string
+                            targetType:
+                              description: Target type (Utilization, Value, AverageValue)
+                              type: string
+                            targetValue:
+                              description: Target value
+                              type: string
+                          required:
+                          - name
+                          - targetType
+                          - targetValue
+                          type: object
+                        nullable: true
+                        type: array
+                      maxReplicas:
+                        description: Maximum replicas
+                        format: int32
+                        type: integer
+                      minReplicas:
+                        description: Minimum replicas
+                        format: int32
+                        type: integer
+                      targetCpuUtilizationPercentage:
+                        description: Target CPU utilization percentage
+                        format: int32
+                        nullable: true
+                        type: integer
+                      targetMemoryUtilizationPercentage:
+                        description: Target memory utilization percentage
+                        format: int32
+                        nullable: true
+                        type: integer
+                    required:
+                    - maxReplicas
+                    - minReplicas
+                    type: object
+                  ingestNodes:
+                    description: Enable autoscaling for ingest nodes
+                    nullable: true
+                    properties:
+                      customMetrics:
+                        description: Custom metrics
+                        items:
+                          description: Custom metric for autoscaling
+                          properties:
+                            name:
+                              description: Metric name
+                              type: string
+                            targetType:
+                              description: Target type (Utilization, Value, AverageValue)
+                              type: string
+                            targetValue:
+                              description: Target value
+                              type: string
+                          required:
+                          - name
+                          - targetType
+                          - targetValue
+                          type: object
+                        nullable: true
+                        type: array
+                      maxReplicas:
+                        description: Maximum replicas
+                        format: int32
+                        type: integer
+                      minReplicas:
+                        description: Minimum replicas
+                        format: int32
+                        type: integer
+                      targetCpuUtilizationPercentage:
+                        description: Target CPU utilization percentage
+                        format: int32
+                        nullable: true
+                        type: integer
+                      targetMemoryUtilizationPercentage:
+                        description: Target memory utilization percentage
+                        format: int32
+                        nullable: true
+                        type: integer
+                    required:
+                    - maxReplicas
+                    - minReplicas
+                    type: object
+                  searchNodes:
+                    description: Enable autoscaling for search nodes
+                    nullable: true
+                    properties:
+                      customMetrics:
+                        description: Custom metrics
+                        items:
+                          description: Custom metric for autoscaling
+                          properties:
+                            name:
+                              description: Metric name
+                              type: string
+                            targetType:
+                              description: Target type (Utilization, Value, AverageValue)
+                              type: string
+                            targetValue:
+                              description: Target value
+                              type: string
+                          required:
+                          - name
+                          - targetType
+                          - targetValue
+                          type: object
+                        nullable: true
+                        type: array
+                      maxReplicas:
+                        description: Maximum replicas
+                        format: int32
+                        type: integer
+                      minReplicas:
+                        description: Minimum replicas
+                        format: int32
+                        type: integer
+                      targetCpuUtilizationPercentage:
+                        description: Target CPU utilization percentage
+                        format: int32
+                        nullable: true
+                        type: integer
+                      targetMemoryUtilizationPercentage:
+                        description: Target memory utilization percentage
+                        format: int32
+                        nullable: true
+                        type: integer
+                    required:
+                    - maxReplicas
+                    - minReplicas
+                    type: object
+                type: object
+              controllers:
+                description: Number of controller nodes
+                format: int32
+                type: integer
+              image:
+                description: Image configuration
+                nullable: true
+                properties:
+                  controller:
+                    description: Controller image
+                    type: string
+                  ingest:
+                    description: Ingest image
+                    type: string
+                  pullPolicy:
+                    description: Image pull policy
+                    nullable: true
+                    type: string
+                  pullSecrets:
+                    description: Image pull secrets
+                    items:
+                      type: string
+                    nullable: true
+                    type: array
+                  search:
+                    description: Search image
+                    nullable: true
+                    type: string
+                required:
+                - controller
+                - ingest
+                type: object
+              ingestNodes:
+                description: Number of ingest nodes
+                format: int32
+                type: integer
+              metastore:
+                description: Metastore configuration
+                properties:
+                  connection:
+                    description: Connection configuration
+                    properties:
+                      credentialsSecret:
+                        description: Secret name for credentials
+                        type: string
+                      database:
+                        description: Database name
+                        type: string
+                      host:
+                        description: Host or service name
+                        type: string
+                      port:
+                        description: Port number
+                        format: int32
+                        type: integer
+                    required:
+                    - credentialsSecret
+                    - database
+                    - host
+                    - port
+                    type: object
+                  database:
+                    description: Database type
+                    enum:
+                    - postgres
+                    type: string
+                required:
+                - connection
+                - database
+                type: object
+              monitoring:
+                description: Monitoring configuration
+                nullable: true
+                properties:
+                  otlpEndpoint:
+                    description: OTLP endpoint for traces
+                    nullable: true
+                    type: string
+                  prometheus:
+                    description: Enable Prometheus metrics
+                    type: boolean
+                  tracing:
+                    description: Enable OpenTelemetry tracing
+                    type: boolean
+                required:
+                - prometheus
+                - tracing
+                type: object
+              network:
+                description: Network configuration
+                nullable: true
+                properties:
+                  dnsPolicy:
+                    description: DNS policy
+                    nullable: true
+                    type: string
+                  hostNetwork:
+                    description: Enable host network
+                    nullable: true
+                    type: boolean
+                  loadBalancerSourceRanges:
+                    description: Load balancer source ranges
+                    items:
+                      type: string
+                    nullable: true
+                    type: array
+                  serviceType:
+                    description: Service type for ingress (ClusterIP, NodePort, LoadBalancer)
+                    nullable: true
+                    type: string
+                type: object
+              nodeSelector:
+                additionalProperties:
+                  type: string
+                description: Node selector for pod scheduling
+                nullable: true
+                type: object
+              podAnnotations:
+                additionalProperties:
+                  type: string
+                description: Additional pod annotations
+                nullable: true
+                type: object
+              podDisruptionBudget:
+                description: Pod disruption budget configuration
+                nullable: true
+                properties:
+                  maxUnavailable:
+                    anyOf:
+                    - format: int32
+                      type: integer
+                    - type: string
+                    description: Maximum unavailable pods
+                    nullable: true
+                  minAvailable:
+                    anyOf:
+                    - format: int32
+                      type: integer
+                    - type: string
+                    description: Minimum available pods
+                    nullable: true
+                type: object
+              podLabels:
+                additionalProperties:
+                  type: string
+                description: Additional pod labels
+                nullable: true
+                type: object
+              resources:
+                description: Resource requirements
+                nullable: true
+                properties:
+                  controller:
+                    description: Controller resources
+                    properties:
+                      cpu:
+                        description: CPU request
+                        type: string
+                      cpuLimit:
+                        description: CPU limit
+                        nullable: true
+                        type: string
+                      memory:
+                        description: Memory request
+                        type: string
+                      memoryLimit:
+                        description: Memory limit
+                        nullable: true
+                        type: string
+                    required:
+                    - cpu
+                    - memory
+                    type: object
+                  ingest:
+                    description: Ingest node resources
+                    properties:
+                      cpu:
+                        description: CPU request
+                        type: string
+                      cpuLimit:
+                        description: CPU limit
+                        nullable: true
+                        type: string
+                      memory:
+                        description: Memory request
+                        type: string
+                      memoryLimit:
+                        description: Memory limit
+                        nullable: true
+                        type: string
+                    required:
+                    - cpu
+                    - memory
+                    type: object
+                  search:
+                    description: Search node resources
+                    nullable: true
+                    properties:
+                      cpu:
+                        description: CPU request
+                        type: string
+                      cpuLimit:
+                        description: CPU limit
+                        nullable: true
+                        type: string
+                      memory:
+                        description: Memory request
+                        type: string
+                      memoryLimit:
+                        description: Memory limit
+                        nullable: true
+                        type: string
+                    required:
+                    - cpu
+                    - memory
+                    type: object
+                required:
+                - controller
+                - ingest
+                type: object
+              searchNodes:
+                description: Number of search nodes
+                format: int32
+                nullable: true
+                type: integer
+              security:
+                description: Security configuration
+                nullable: true
+                properties:
+                  containerSecurityContext:
+                    description: Container security context
+                    nullable: true
+                    properties:
+                      allowPrivilegeEscalation:
+                        description: Allow privilege escalation
+                        nullable: true
+                        type: boolean
+                      privileged:
+                        description: Privileged
+                        nullable: true
+                        type: boolean
+                      readOnlyRootFilesystem:
+                        description: Read only root filesystem
+                        nullable: true
+                        type: boolean
+                      runAsNonRoot:
+                        description: Run as non root
+                        nullable: true
+                        type: boolean
+                      runAsUser:
+                        description: Run as user
+                        format: int64
+                        nullable: true
+                        type: integer
+                    type: object
+                  mtlsEnabled:
+                    description: Enable mTLS
+                    nullable: true
+                    type: boolean
+                  podSecurityContext:
+                    description: Pod security context
+                    nullable: true
+                    properties:
+                      fsGroup:
+                        description: FS group
+                        format: int64
+                        nullable: true
+                        type: integer
+                      runAsGroup:
+                        description: Run as group
+                        format: int64
+                        nullable: true
+                        type: integer
+                      runAsNonRoot:
+                        description: Run as non root
+                        nullable: true
+                        type: boolean
+                      runAsUser:
+                        description: Run as user
+                        format: int64
+                        nullable: true
+                        type: integer
+                    type: object
+                  tlsEnabled:
+                    description: Enable TLS
+                    type: boolean
+                  tlsSecret:
+                    description: TLS secret name
+                    nullable: true
+                    type: string
+                required:
+                - tlsEnabled
+                type: object
+              storage:
+                description: Storage configuration
+                properties:
+                  azure:
+                    description: Azure configuration (when backend is Azure)
+                    nullable: true
+                    properties:
+                      account:
+                        type: string
+                      container:
+                        type: string
+                    required:
+                    - account
+                    - container
+                    type: object
+                  backend:
+                    description: Storage backend type
+                    enum:
+                    - s3
+                    - gcs
+                    - azure
+                    - local
+                    type: string
+                  gcs:
+                    description: GCS configuration (when backend is GCS)
+                    nullable: true
+                    properties:
+                      bucket:
+                        type: string
+                    required:
+                    - bucket
+                    type: object
+                  s3:
+                    description: S3 configuration (when backend is S3)
+                    nullable: true
+                    properties:
+                      bucket:
+                        type: string
+                      endpoint:
+                        nullable: true
+                        type: string
+                      region:
+                        type: string
+                    required:
+                    - bucket
+                    - region
+                    type: object
+                  size:
+                    description: Storage size per node
+                    type: string
+                  storageClass:
+                    description: Storage class name
+                    nullable: true
+                    type: string
+                required:
+                - backend
+                - size
+                type: object
+              tolerations:
+                description: Tolerations for pod scheduling
+                items:
+                  description: Toleration for pod scheduling
+                  properties:
+                    effect:
+                      description: Effect
+                      nullable: true
+                      type: string
+                    key:
+                      description: Key
+                      nullable: true
+                      type: string
+                    operator:
+                      description: Operator
+                      nullable: true
+                      type: string
+                    tolerationSeconds:
+                      description: Toleration seconds
+                      format: int64
+                      nullable: true
+                      type: integer
+                    value:
+                      description: Value
+                      nullable: true
+                      type: string
+                  type: object
+                nullable: true
+                type: array
+            required:
+            - controllers
+            - ingestNodes
+            - metastore
+            - storage
+            type: object
+          status:
+            description: ChronikCluster status
+            nullable: true
+            properties:
+              conditions:
+                description: Conditions
+                items:
+                  description: Condition
+                  properties:
+                    conditionType:
+                      description: Condition type
+                      type: string
+                    lastTransitionTime:
+                      description: Last transition time
+                      type: string
+                    message:
+                      description: Message
+                      type: string
+                    reason:
+                      description: Reason
+                      type: string
+                    status:
+                      description: Status
+                      type: string
+                  required:
+                  - conditionType
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  type: object
+                type: array
+              controllers:
+                description: Controller endpoints
+                items:
+                  type: string
+                type: array
+              ingestNodes:
+                description: Ingest endpoints
+                items:
+                  type: string
+                type: array
+              lastUpdated:
+                description: Last updated timestamp
+                type: string
+              observedGeneration:
+                description: Observed generation
+                format: int64
+                nullable: true
+                type: integer
+              phase:
+                description: Current phase
+                enum:
+                - Pending
+                - Creating
+                - Running
+                - Updating
+                - Failed
+                - Deleting
+                type: string
+              readyReplicas:
+                description: Ready replicas per component
+                nullable: true
+                properties:
+                  controllers:
+                    description: Controller ready replicas
+                    format: int32
+                    type: integer
+                  ingestNodes:
+                    description: Ingest ready replicas
+                    format: int32
+                    type: integer
+                  searchNodes:
+                    description: Search ready replicas
+                    format: int32
+                    type: integer
+                required:
+                - controllers
+                - ingestNodes
+                - searchNodes
+                type: object
+              searchNodes:
+                description: Search endpoints
+                items:
+                  type: string
+                type: array
+            required:
+            - conditions
+            - controllers
+            - ingestNodes
+            - lastUpdated
+            - phase
+            - searchNodes
+            type: object
+        required:
+        - spec
+        title: ChronikCluster
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+

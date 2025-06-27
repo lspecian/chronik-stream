@@ -15,6 +15,7 @@ pub mod kafka_protocol;
 pub mod parser;
 pub mod records;
 pub mod types;
+pub mod sasl_types;
 
 // Temporarily disabled due to kafka-protocol crate compatibility issues
 // pub mod handler_v2;
@@ -35,3 +36,4 @@ pub use parser::{
 };
 pub use records::{Record, RecordBatch, RecordHeader, RecordAttributes, TimestampType};
 pub use types::*;
+pub use sasl_types::{SaslHandshakeRequest, SaslHandshakeResponse, SaslAuthenticateRequest, SaslAuthenticateResponse};

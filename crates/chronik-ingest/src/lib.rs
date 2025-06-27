@@ -8,6 +8,8 @@ pub mod produce_handler;
 pub mod storage;
 pub mod kafka_handler;
 pub mod fetch_handler;
+pub mod health;
+pub mod metrics;
 
 pub use server::{IngestServer, ServerConfig, TlsConfig, ConnectionPoolConfig};
 pub use indexer::{Indexer, IndexerConfig, IndexRecord, IndexerStats};

@@ -2,7 +2,8 @@
 
 use chronik_common::{Result, Error, Uuid};
 use chronik_common::metadata::{MetadataStore, SegmentMetadata};
-use chronik_storage::{ObjectStore, Record, RecordBatch};
+use chronik_storage::object_store::ObjectStore;
+use chronik_storage::{Record, RecordBatch};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -117,7 +118,7 @@ impl LogCompactor {
         // Process each partition
         for partition in 0..topic_metadata.config.partition_count {
             // Get segments for partition
-            let segments = self.metadata_store.list_segments(topic).await?;
+            let segments = self.metadata_store.list_segments(topic, Some(partition)).await?;
             let mut partition_segments: Vec<SegmentMetadata> = segments
                 .into_iter()
                 .filter(|s| s.partition == partition && s.created_at < age_cutoff)
@@ -136,7 +137,7 @@ impl LogCompactor {
             let mut current_size = 0u64;
             
             for segment in partition_segments {
-                current_size += segment.size;
+                current_size += segment.size as u64;
                 current_group.push(segment);
                 
                 if current_size >= self.policy.target_segment_size {
@@ -156,7 +157,7 @@ impl LogCompactor {
                     continue;
                 }
                 
-                if let Err(e) = self.compact_segment_group(topic, partition, group).await {
+                if let Err(e) = self.compact_segment_group(topic, partition as i32, group).await {
                     tracing::error!("Failed to compact segment group: {}", e);
                 }
             }
@@ -206,7 +207,7 @@ impl LogCompactor {
             for segment in segments {
                 let path = format!("topics/{}/segments/{}", topic, segment.segment_id);
                 self.storage.delete(&path).await?;
-                self.metadata_store.delete_segment(topic, segment.segment_id).await?;
+                self.metadata_store.delete_segment(topic, &segment.segment_id).await?;
             }
             return Ok(());
         }
@@ -226,26 +227,25 @@ impl LogCompactor {
         
         // Create new segment metadata
         let new_segment = SegmentMetadata {
-            segment_id: new_segment_id,
+            segment_id: new_segment_id.to_string(),
             topic: topic.to_string(),
-            partition,
+            partition: partition as u32,
             start_offset: min_offset,
             end_offset: max_offset,
-            size: data.len() as u64,
-            record_count: batch.records.len() as u64,
+            size: data.len() as i64,
+            record_count: batch.records.len() as i64,
+            path: format!("topics/{}/segments/{}", topic, new_segment_id),
             created_at: chrono::Utc::now(),
-            closed_at: Some(chrono::Utc::now()),
-            compression: None,
         };
         
         // Save new segment metadata
-        self.metadata_store.create_segment(topic, new_segment).await?;
+        self.metadata_store.persist_segment_metadata(new_segment).await?;
         
         // Delete old segments
         for segment in segments {
             let path = format!("topics/{}/segments/{}", topic, segment.segment_id);
             self.storage.delete(&path).await?;
-            self.metadata_store.delete_segment(topic, segment.segment_id).await?;
+            self.metadata_store.delete_segment(topic, &segment.segment_id).await?;
         }
         
         tracing::info!("Compacted segments into {} with {} records", new_segment_id, batch.records.len());

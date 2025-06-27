@@ -1,6 +1,7 @@
 //! Kafka protocol types.
 
 use crate::parser::{RequestHeader, ResponseHeader};
+use crate::sasl_types::{SaslHandshakeRequest, SaslHandshakeResponse, SaslAuthenticateRequest, SaslAuthenticateResponse};
 
 /// API version type
 pub type ApiVersion = i16;
@@ -25,6 +26,8 @@ pub enum RequestBody {
     OffsetCommit(OffsetCommitRequest),
     OffsetFetch(OffsetFetchRequest),
     ApiVersions(ApiVersionsRequest),
+    SaslHandshake(SaslHandshakeRequest),
+    SaslAuthenticate(SaslAuthenticateRequest),
 }
 
 /// Response variants
@@ -40,6 +43,8 @@ pub enum Response {
     OffsetCommit(OffsetCommitResponse),
     OffsetFetch(OffsetFetchResponse),
     ApiVersions(ApiVersionsResponse),
+    SaslHandshake(SaslHandshakeResponse),
+    SaslAuthenticate(SaslAuthenticateResponse),
 }
 
 /// Produce request
@@ -699,6 +704,36 @@ impl Response {
                 
                 // Tagged fields (empty)
                 bytes.push(0);
+            }
+            Response::SaslHandshake(resp) => {
+                // Error code
+                bytes.extend_from_slice(&resp.error_code.to_be_bytes());
+                
+                // Mechanisms array
+                bytes.extend_from_slice(&(resp.mechanisms.len() as i32).to_be_bytes());
+                for mechanism in &resp.mechanisms {
+                    bytes.extend_from_slice(&(mechanism.len() as i16).to_be_bytes());
+                    bytes.extend_from_slice(mechanism.as_bytes());
+                }
+            }
+            Response::SaslAuthenticate(resp) => {
+                // Error code
+                bytes.extend_from_slice(&resp.error_code.to_be_bytes());
+                
+                // Error message
+                if let Some(error_msg) = &resp.error_message {
+                    bytes.extend_from_slice(&(error_msg.len() as i16).to_be_bytes());
+                    bytes.extend_from_slice(error_msg.as_bytes());
+                } else {
+                    bytes.extend_from_slice(&(-1i16).to_be_bytes());
+                }
+                
+                // Auth bytes
+                bytes.extend_from_slice(&(resp.auth_bytes.len() as i32).to_be_bytes());
+                bytes.extend_from_slice(&resp.auth_bytes);
+                
+                // Session lifetime
+                bytes.extend_from_slice(&resp.session_lifetime_ms.to_be_bytes());
             }
         }
         

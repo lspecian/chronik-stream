@@ -35,7 +35,7 @@ use crate::handlers::{
 /// Search API server.
 pub struct SearchApi {
     /// Map of index name to Tantivy index
-    indices: Arc<DashMap<String, IndexState>>,
+    pub indices: Arc<DashMap<String, IndexState>>,
     /// Metrics
     metrics: ApiMetrics,
 }
@@ -115,6 +115,8 @@ pub struct SearchRequest {
     pub sort: Option<Vec<SortClause>>,
     #[serde(default)]
     pub _source: Option<SourceFilter>,
+    pub aggs: Option<serde_json::Value>,
+    pub aggregations: Option<serde_json::Value>,
 }
 
 fn default_size() -> usize {
@@ -205,6 +207,8 @@ pub struct SearchResponse {
     pub timed_out: bool,
     pub _shards: ShardInfo,
     pub hits: HitsInfo,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aggregations: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]

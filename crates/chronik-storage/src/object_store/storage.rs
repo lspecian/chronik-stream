@@ -118,8 +118,8 @@ pub struct ObjectMetadata {
     /// Object size in bytes
     pub size: u64,
     
-    /// Last modified timestamp
-    pub last_modified: chrono::DateTime<chrono::Utc>,
+    /// Last modified timestamp (milliseconds since epoch)
+    pub last_modified: u64,
     
     /// ETag (if available)
     pub etag: Option<String>,
@@ -184,9 +184,9 @@ pub struct GetOptions {
     /// Byte range (start, end) inclusive
     pub range: Option<(u64, u64)>,
     
-    /// Conditional headers
-    pub if_modified_since: Option<chrono::DateTime<chrono::Utc>>,
-    pub if_unmodified_since: Option<chrono::DateTime<chrono::Utc>>,
+    /// Conditional headers (timestamps in milliseconds since epoch)
+    pub if_modified_since: Option<u64>,
+    pub if_unmodified_since: Option<u64>,
     pub if_match: Option<String>,
     pub if_none_match: Option<String>,
     
@@ -453,7 +453,7 @@ impl ObjectMetadata {
         Self {
             key,
             size,
-            last_modified: chrono::Utc::now(),
+            last_modified: chrono::Utc::now().timestamp_millis() as u64,
             etag: None,
             content_type: None,
             content_encoding: None,
@@ -466,8 +466,9 @@ impl ObjectMetadata {
     }
     
     /// Check if object is recently modified
-    pub fn is_recently_modified(&self, threshold: chrono::Duration) -> bool {
-        chrono::Utc::now() - self.last_modified < threshold
+    pub fn is_recently_modified(&self, threshold_millis: u64) -> bool {
+        let now = chrono::Utc::now().timestamp_millis() as u64;
+        now - self.last_modified < threshold_millis
     }
 }
 
@@ -567,9 +568,12 @@ mod tests {
     #[test]
     fn test_object_metadata_recent_modification() {
         let mut metadata = ObjectMetadata::new("test".to_string(), 1024);
-        metadata.last_modified = chrono::Utc::now() - chrono::Duration::minutes(5);
+        // Set last modified to 5 minutes ago
+        metadata.last_modified = (chrono::Utc::now() - chrono::Duration::minutes(5)).timestamp_millis() as u64;
         
-        assert!(metadata.is_recently_modified(chrono::Duration::hours(1)));
-        assert!(!metadata.is_recently_modified(chrono::Duration::minutes(1)));
+        // 1 hour = 3600000 milliseconds
+        assert!(metadata.is_recently_modified(3600000));
+        // 1 minute = 60000 milliseconds
+        assert!(!metadata.is_recently_modified(60000));
     }
 }

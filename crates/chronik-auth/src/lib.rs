@@ -4,11 +4,13 @@ pub mod tls;
 pub mod sasl;
 pub mod jwt;
 pub mod acl;
+pub mod middleware;
 
 pub use tls::{TlsConfig, TlsAcceptor, TlsConnector};
 pub use sasl::{SaslMechanism, SaslAuthenticator, SaslCredentials};
 pub use jwt::{JwtConfig, JwtManager, Claims};
 pub use acl::{Acl, Permission, Resource, Operation};
+pub use middleware::{AuthMiddleware, AuthContext, KafkaApiKey};
 
 use thiserror::Error;
 

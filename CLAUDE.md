@@ -1,25 +1,29 @@
 # Chronik Stream - Claude Memory
 
-## Test Results Summary
+## Metadata Storage Migration to Sled
 
-Successfully tested the Chronik Stream services after fixing issues:
+Successfully migrated from PostgreSQL to Sled embedded database for metadata storage.
 
 ### Services Running:
-- **PostgreSQL**: ✓ Running on port 5432 (healthy)
-- **Controller**: ✓ Running on port 9090 (gRPC protocol)
+- **Controller**: ✓ Running on port 9090 (gRPC protocol) with Sled metadata store
 - **Ingest**: ✓ Running on port 9092 (Kafka protocol)
+
+### Migration Completed:
+1. Implemented MetadataStore trait for abstract metadata operations
+2. Created Sled-based storage implementation
+3. Updated controller to use embedded Sled database
+4. Removed PostgreSQL dependency entirely
 
 ### Fixes Applied:
 1. Updated Rust version in all Dockerfiles from 1.75 to latest
 2. Increased ingest buffer size from 64KB to 100MB
 3. Removed Prometheus scraping of ingest port 9092
-4. Fixed admin service to read DATABASE_URL from environment
 
 ### Verified:
-- Database migrations applied successfully
+- Sled metadata store initialized successfully
 - No more "Request too large" errors
 - Services are stable and not crashing
-- Database connectivity works
+- Metadata persistence working via volume mounts
 
 # Chronik Stream - Claude Memory
 

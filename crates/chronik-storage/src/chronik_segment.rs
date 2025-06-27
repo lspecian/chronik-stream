@@ -9,13 +9,14 @@
 
 use chronik_common::{Result, Error};
 use crate::{RecordBatch, Record};
+use crate::checksum::{ChecksumUtils, ChecksumMode, StreamingChecksum};
 use tantivy::{
     schema::{Schema, TEXT, STORED, STRING, NumericOptions, Field},
     Index,
 };
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write, Seek, SeekFrom, Cursor};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use flate2::write::GzEncoder;
 use flate2::read::GzDecoder;
 use flate2::Compression;
@@ -125,7 +126,7 @@ impl SegmentHeader {
     }
     
     /// Read header from a reader
-    fn read_from<R: Read>(reader: &mut R) -> Result<Self> {
+    pub fn read_from<R: Read>(reader: &mut R) -> Result<Self> {
         let mut magic = [0u8; 8];
         reader.read_exact(&mut magic)?;
         
@@ -464,7 +465,7 @@ impl ChronikSegment {
     }
     
     /// Serialize segment to writer
-    pub fn write_to<W: Write + Seek + Read>(&mut self, writer: &mut W) -> Result<()> {
+    pub fn write_to<W: Write + Seek>(&mut self, writer: &mut W) -> Result<()> {
         // Build index and bloom filter if not already built
         if self.tantivy_index.is_none() {
             self.build_index()?;
@@ -526,13 +527,21 @@ impl ChronikSegment {
         writer.write_all(&bloom_data)?;
         let bloom_size = bloom_data.len() as u64;
         
-        // Calculate checksum
+        // Calculate checksum using streaming approach
         let end_pos = writer.seek(SeekFrom::Current(0))?;
-        writer.seek(SeekFrom::Start(header_pos + SegmentHeader::SIZE as u64))?;
         
-        let mut checksum_data = Vec::new();
-        std::io::Read::read_to_end(writer, &mut checksum_data)?;
-        let checksum = crc32fast::hash(&checksum_data);
+        // Calculate checksum of all data sections (using compressed data)
+        let mut checksum_calculator = StreamingChecksum::new();
+        checksum_calculator.update(&metadata_data);
+        checksum_calculator.update(&compressed_data);
+        checksum_calculator.update(&index_data);
+        checksum_calculator.update(&bloom_data);
+        let checksum = checksum_calculator.finalize();
+        
+        debug!(
+            "Calculated checksum {} for segment data",
+            checksum
+        );
         
         // Update and write header
         self.header.metadata_offset = metadata_offset;
@@ -589,21 +598,31 @@ impl ChronikSegment {
     
     /// Read segment from reader
     pub fn read_from<R: Read + Seek>(reader: &mut R) -> Result<Self> {
+        Self::read_from_with_mode(reader, ChecksumMode::Warn)
+    }
+    
+    /// Read segment from reader with checksum verification mode
+    pub fn read_from_with_mode<R: Read + Seek>(reader: &mut R, checksum_mode: ChecksumMode) -> Result<Self> {
         // Read header
         let header = SegmentHeader::read_from(reader)?;
         
-        // Verify checksum
-        let saved_checksum = header.checksum;
-        reader.seek(SeekFrom::Start(header.metadata_offset))?;
-        let mut checksum_data = Vec::new();
-        std::io::Read::read_to_end(reader, &mut checksum_data)?;
-        let calculated_checksum = crc32fast::hash(&checksum_data);
+        // Calculate the total data length for checksum verification
+        let data_length = if header.bloom_size > 0 {
+            header.bloom_offset + header.bloom_size - header.metadata_offset
+        } else if header.index_size > 0 {
+            header.index_offset + header.index_size - header.metadata_offset
+        } else {
+            header.kafka_offset + header.kafka_size - header.metadata_offset
+        };
         
-        if saved_checksum != calculated_checksum {
-            warn!("Checksum mismatch: expected {}, got {}", saved_checksum, calculated_checksum);
-            // In production, you might want to fail here
-            // return Err(Error::InvalidSegment("Checksum mismatch".into()));
-        }
+        // Verify checksum using the utility
+        ChecksumUtils::verify_checksum(
+            reader,
+            header.metadata_offset,
+            data_length,
+            header.checksum,
+            checksum_mode,
+        )?;
         
         // Read metadata
         reader.seek(SeekFrom::Start(header.metadata_offset))?;

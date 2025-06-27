@@ -6,22 +6,21 @@ use crate::finalizer::{FINALIZER_NAME, add_finalizer, remove_finalizer};
 use chrono::Utc;
 use k8s_openapi::{
     api::{
-        apps::v1::{StatefulSet, Deployment},
-        core::v1::{ConfigMap, Service, ServiceAccount, Secret},
-        rbac::v1::{ClusterRole, ClusterRoleBinding, Role, RoleBinding},
+        apps::v1::StatefulSet,
+        core::v1::{ConfigMap, Service, ServiceAccount},
         policy::v1::PodDisruptionBudget,
         autoscaling::v2::HorizontalPodAutoscaler,
     },
 };
 use kube::{
-    api::{Api, Patch, PatchParams, PostParams, DeleteParams, ListParams},
+    api::{Api, Patch, PatchParams, PostParams},
     client::Client,
     runtime::controller::Action,
     Resource, ResourceExt,
 };
 use serde_json::json;
 use std::time::Duration;
-use tracing::{info, warn, error, debug};
+use tracing::{info, debug};
 
 /// Reconciler for ChronikCluster
 pub struct Reconciler {
@@ -166,7 +165,7 @@ impl Reconciler {
     }
     
     /// Ensure RBAC rules
-    async fn ensure_rbac_rules(&self, cluster: &ChronikCluster) -> Result<(), kube::Error> {
+    async fn ensure_rbac_rules(&self, _cluster: &ChronikCluster) -> Result<(), kube::Error> {
         // This is a simplified version. In production, you'd create proper roles
         // with minimal required permissions for each component
         Ok(())
@@ -176,7 +175,7 @@ impl Reconciler {
     async fn reconcile_config_map(
         &self, 
         cluster: &ChronikCluster,
-        generator: &ResourceGenerator
+        generator: &ResourceGenerator<'_>
     ) -> Result<(), kube::Error> {
         let namespace = cluster.metadata.namespace.as_ref().unwrap();
         let config_map = generator.config_map();
@@ -202,7 +201,7 @@ impl Reconciler {
     async fn reconcile_controller_resources(
         &self,
         cluster: &ChronikCluster,
-        generator: &ResourceGenerator
+        generator: &ResourceGenerator<'_>
     ) -> Result<(), kube::Error> {
         let namespace = cluster.metadata.namespace.as_ref().unwrap();
         
@@ -226,7 +225,7 @@ impl Reconciler {
     async fn reconcile_ingest_resources(
         &self,
         cluster: &ChronikCluster,
-        generator: &ResourceGenerator
+        generator: &ResourceGenerator<'_>
     ) -> Result<(), kube::Error> {
         let namespace = cluster.metadata.namespace.as_ref().unwrap();
         
@@ -250,7 +249,7 @@ impl Reconciler {
     async fn reconcile_search_resources(
         &self,
         cluster: &ChronikCluster,
-        generator: &ResourceGenerator
+        generator: &ResourceGenerator<'_>
     ) -> Result<(), kube::Error> {
         let namespace = cluster.metadata.namespace.as_ref().unwrap();
         
@@ -276,7 +275,7 @@ impl Reconciler {
     async fn reconcile_autoscaling(
         &self,
         cluster: &ChronikCluster,
-        generator: &ResourceGenerator
+        generator: &ResourceGenerator<'_>
     ) -> Result<(), kube::Error> {
         let namespace = cluster.metadata.namespace.as_ref().unwrap();
         

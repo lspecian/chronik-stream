@@ -1,338 +1,338 @@
 # Getting Started with Chronik Stream
 
-This guide will help you get Chronik Stream up and running quickly.
-
 ## Prerequisites
 
-- Rust 1.70 or later
-- PostgreSQL 14 or later
-- Docker and Docker Compose (optional, for containerized deployment)
-- Kubernetes cluster (optional, for Kubernetes deployment)
+- Rust 1.75+ (for building from source)
+- Docker (for running pre-built images)
+- 8GB RAM minimum
+- 20GB disk space
 
-## Installation
+## Quick Start with Docker Compose
 
-### From Source
+The easiest way to get started is using Docker Compose:
 
-1. Clone the repository:
 ```bash
-git clone https://github.com/chronik-stream/chronik-stream.git
+# Clone the repository
+git clone https://github.com/your-org/chronik-stream.git
 cd chronik-stream
+
+# Start all services
+docker-compose up -d
+
+# Check service health
+docker-compose ps
 ```
 
-2. Build the project:
+This starts:
+- 1 Controller node (port 9090)
+- 1 Ingest node (port 9092)
+- 1 Search node (port 9200)
+- PostgreSQL (port 5432)
+- Prometheus (port 9091)
+- Grafana (port 3001)
+
+## Building from Source
+
 ```bash
+# Install Rust
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# Clone and build
+git clone https://github.com/your-org/chronik-stream.git
+cd chronik-stream
 cargo build --release
+
+# Run tests
+cargo test
 ```
 
-3. Install the CLI tool:
+## Basic Usage
+
+### 1. Creating a Topic
+
+Using the Kafka protocol:
+
+```python
+from kafka import KafkaAdminClient
+from kafka.admin import NewTopic
+
+admin = KafkaAdminClient(
+    bootstrap_servers=['localhost:9092'],
+    client_id='admin'
+)
+
+topic = NewTopic(
+    name='events',
+    num_partitions=3,
+    replication_factor=1
+)
+
+admin.create_topics([topic])
+```
+
+### 2. Producing Messages
+
+```python
+from kafka import KafkaProducer
+import json
+
+producer = KafkaProducer(
+    bootstrap_servers=['localhost:9092'],
+    value_serializer=lambda v: json.dumps(v).encode('utf-8')
+)
+
+# Send a message
+producer.send('events', {
+    'user_id': '123',
+    'action': 'page_view',
+    'page': '/products',
+    'timestamp': '2024-01-15T10:30:00Z'
+})
+
+producer.flush()
+```
+
+### 3. Consuming Messages
+
+```python
+from kafka import KafkaConsumer
+import json
+
+consumer = KafkaConsumer(
+    'events',
+    bootstrap_servers=['localhost:9092'],
+    auto_offset_reset='earliest',
+    value_deserializer=lambda m: json.loads(m.decode('utf-8'))
+)
+
+for message in consumer:
+    print(f"Received: {message.value}")
+```
+
+### 4. Searching Messages
+
+The search API is Elasticsearch-compatible:
+
 ```bash
-cargo install --path crates/chronik-cli
+# Search for all messages containing "page_view"
+curl -X POST "localhost:9200/events/_search" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "query": {
+      "match": {
+        "action": "page_view"
+      }
+    }
+  }'
+
+# Get aggregations
+curl -X POST "localhost:9200/events/_search" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "size": 0,
+    "aggs": {
+      "actions": {
+        "terms": {
+          "field": "action.keyword",
+          "size": 10
+        }
+      }
+    }
+  }'
 ```
 
-### Using Docker
+## Configuration
 
-Pull the pre-built images:
+### Environment Variables
+
+#### Controller Node
+- `NODE_ID`: Unique node identifier (default: 1)
+- `RAFT_ADDR`: Raft listen address (default: 0.0.0.0:9090)
+- `ADMIN_ADDR`: Admin API address (default: 0.0.0.0:8090)
+- `DATA_DIR`: Data directory (default: /var/chronik/controller)
+
+#### Ingest Node
+- `BIND_ADDRESS`: Kafka protocol address (default: 0.0.0.0:9092)
+- `STORAGE_PATH`: Local storage path (default: /var/chronik/ingest)
+- `CONTROLLER_ADDRS`: Controller addresses (default: localhost:9090)
+- `MAX_CONNECTIONS`: Max client connections (default: 10000)
+
+#### Search Node
+- `BIND_ADDRESS`: HTTP API address (default: 0.0.0.0:9200)
+- `INDEX_DIR`: Index directory (default: /var/chronik/search)
+- `CONTROLLER_ADDRS`: Controller addresses (default: localhost:9090)
+
+### Storage Configuration
+
+Configure object storage backend:
+
 ```bash
-docker pull chronik/controller:latest
-docker pull chronik/ingest:latest
-docker pull chronik/admin:latest
+# S3 Storage
+export OBJECT_STORE_TYPE=s3
+export S3_BUCKET=my-chronik-bucket
+export AWS_ACCESS_KEY_ID=your-key
+export AWS_SECRET_ACCESS_KEY=your-secret
+
+# GCS Storage
+export OBJECT_STORE_TYPE=gcs
+export GCS_BUCKET=my-chronik-bucket
+export GOOGLE_APPLICATION_CREDENTIALS=/path/to/credentials.json
+
+# Azure Storage
+export OBJECT_STORE_TYPE=azure
+export AZURE_CONTAINER=my-chronik-container
+export AZURE_STORAGE_ACCOUNT=myaccount
+export AZURE_STORAGE_ACCESS_KEY=your-key
+
+# Local Storage (development)
+export OBJECT_STORE_TYPE=local
+export LOCAL_STORAGE_PATH=/var/chronik/segments
 ```
 
-## Quick Start
+## Monitoring
 
-### 1. Start PostgreSQL
+### Prometheus Metrics
 
-Using Docker:
-```bash
-docker run -d \
-  --name chronik-postgres \
-  -e POSTGRES_PASSWORD=chronik \
-  -e POSTGRES_DB=chronik \
-  -p 5432:5432 \
-  postgres:14
-```
-
-### 2. Run Database Migrations
-
-```bash
-export DATABASE_URL=postgres://postgres:chronik@localhost/chronik
-sqlx migrate run
-```
-
-### 3. Start Controller Node
-
-```bash
-./target/release/chronik-controller \
-  --node-id 1 \
-  --listen-addr 0.0.0.0:9090 \
-  --db-url postgres://postgres:chronik@localhost/chronik
-```
-
-### 4. Start Ingest Node
+All components expose metrics at `/metrics`:
 
 ```bash
-./target/release/chronik-ingest \
-  --listen-addr 0.0.0.0:9092 \
-  --controller-addr localhost:9090 \
-  --storage-path /tmp/chronik-data
+# Controller metrics
+curl http://localhost:8090/metrics
+
+# Ingest metrics
+curl http://localhost:9093/metrics
+
+# Search metrics
+curl http://localhost:9201/metrics
 ```
 
-### 5. Start Admin API
+### Grafana Dashboards
+
+Pre-built dashboards are available at http://localhost:3001:
+- Cluster Overview
+- Ingest Performance
+- Search Performance
+- Storage Usage
+
+### Health Checks
 
 ```bash
-./target/release/chronik-admin \
-  --port 8080 \
-  --db-url postgres://postgres:chronik@localhost/chronik \
-  --controller-addr localhost:9090
+# Controller health
+curl http://localhost:8090/health
+
+# Search health
+curl http://localhost:9200/health
 ```
 
-## Using the CLI
+## Client Libraries
 
-### Authentication
-
-First, login to get an access token:
+### Python
 ```bash
-chronik-ctl auth login -u admin -p admin
-export CHRONIK_API_TOKEN="<token>"
+pip install kafka-python elasticsearch
 ```
+
+### Java
+```xml
+<dependency>
+    <groupId>org.apache.kafka</groupId>
+    <artifactId>kafka-clients</artifactId>
+    <version>3.6.0</version>
+</dependency>
+```
+
+### Node.js
+```bash
+npm install kafkajs @elastic/elasticsearch
+```
+
+## Common Operations
 
 ### Topic Management
 
-Create a topic:
 ```bash
-chronik-ctl topic create my-events -p 6 -r 3
+# List topics
+curl http://localhost:8090/api/topics
+
+# Get topic details
+curl http://localhost:8090/api/topics/events
+
+# Update topic config
+curl -X PUT http://localhost:8090/api/topics/events/config \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "retention.ms": "604800000",
+    "compression.type": "snappy"
+  }'
 ```
 
-List topics:
-```bash
-chronik-ctl topic list
-```
-
-Get topic details:
-```bash
-chronik-ctl topic get my-events
-```
-
-### Producing Messages
-
-Using Kafka command-line tools:
-```bash
-kafka-console-producer \
-  --broker-list localhost:9092 \
-  --topic my-events
-```
-
-Using kafkacat:
-```bash
-echo "Hello, Chronik!" | kafkacat -P -b localhost:9092 -t my-events
-```
-
-### Consuming Messages
-
-Using Kafka command-line tools:
-```bash
-kafka-console-consumer \
-  --bootstrap-server localhost:9092 \
-  --topic my-events \
-  --from-beginning
-```
-
-Using kafkacat:
-```bash
-kafkacat -C -b localhost:9092 -t my-events -o beginning
-```
-
-### Searching Messages
-
-Search for messages containing specific text:
-```bash
-curl -X GET "http://localhost:8080/api/v1/search?q=hello&index=my-events"
-```
-
-## Docker Compose Setup
-
-Create a `docker-compose.yml` file:
-
-```yaml
-version: '3.8'
-
-services:
-  postgres:
-    image: postgres:14
-    environment:
-      POSTGRES_PASSWORD: chronik
-      POSTGRES_DB: chronik
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    networks:
-      - chronik
-
-  controller:
-    image: chronik/controller:latest
-    environment:
-      DATABASE_URL: postgres://postgres:chronik@postgres/chronik
-      NODE_ID: 1
-    depends_on:
-      - postgres
-    networks:
-      - chronik
-    ports:
-      - "9090:9090"
-
-  ingest:
-    image: chronik/ingest:latest
-    environment:
-      CONTROLLER_ADDR: controller:9090
-      STORAGE_PATH: /data
-    volumes:
-      - ingest_data:/data
-    depends_on:
-      - controller
-    networks:
-      - chronik
-    ports:
-      - "9092:9092"
-
-  admin:
-    image: chronik/admin:latest
-    environment:
-      DATABASE_URL: postgres://postgres:chronik@postgres/chronik
-      CONTROLLER_ENDPOINTS: controller:9090
-    depends_on:
-      - controller
-    networks:
-      - chronik
-    ports:
-      - "8080:8080"
-
-volumes:
-  postgres_data:
-  ingest_data:
-
-networks:
-  chronik:
-```
-
-Start the cluster:
-```bash
-docker-compose up -d
-```
-
-## Kubernetes Deployment
-
-### Install the Operator
+### Consumer Group Management
 
 ```bash
-kubectl apply -f deploy/k8s/operator.yaml
+# List consumer groups
+curl http://localhost:8090/api/groups
+
+# Get group details
+curl http://localhost:8090/api/groups/my-group
+
+# Reset offsets
+curl -X POST http://localhost:8090/api/groups/my-group/reset-offsets \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "topic": "events",
+    "partition": 0,
+    "offset": 0
+  }'
 ```
 
-### Create a Namespace
+## Troubleshooting
 
-```bash
-kubectl create namespace chronik-system
-```
+### Connection Issues
 
-### Deploy PostgreSQL
+1. Check service is running:
+   ```bash
+   docker-compose ps
+   # or
+   systemctl status chronik-*
+   ```
 
-```bash
-kubectl apply -f deploy/k8s/postgres.yaml -n chronik-system
-```
+2. Check logs:
+   ```bash
+   docker-compose logs ingest
+   # or
+   journalctl -u chronik-ingest -f
+   ```
 
-### Create a Chronik Cluster
+3. Test connectivity:
+   ```bash
+   telnet localhost 9092
+   ```
 
-Create a file `chronik-cluster.yaml`:
+### Performance Issues
 
-```yaml
-apiVersion: chronik.stream/v1alpha1
-kind: ChronikCluster
-metadata:
-  name: my-cluster
-  namespace: chronik-system
-spec:
-  controllers: 3
-  ingestNodes: 5
-  storage:
-    backend:
-      local: {}
-    size: 100Gi
-  metastore:
-    database: Postgres
-    connection:
-      host: postgres.chronik-system.svc.cluster.local
-      port: 5432
-      database: chronik
-      credentialsSecret: postgres-credentials
-```
+1. Check metrics:
+   - Message lag
+   - Storage usage
+   - Memory usage
 
-Apply it:
-```bash
-kubectl apply -f chronik-cluster.yaml
-```
+2. Common tuning:
+   - Increase batch size
+   - Adjust flush intervals
+   - Scale horizontally
 
-### Access the Cluster
+### Data Issues
 
-Port-forward to access the services:
-```bash
-# Admin API
-kubectl port-forward -n chronik-system svc/my-cluster-admin 8080:8080
+1. Verify data integrity:
+   ```bash
+   curl http://localhost:8090/api/topics/events/verify
+   ```
 
-# Kafka endpoint
-kubectl port-forward -n chronik-system svc/my-cluster-ingest 9092:9092
-```
-
-## Configuration Options
-
-### Storage Backends
-
-#### S3
-```yaml
-storage:
-  backend: s3
-  bucket: my-chronik-bucket
-  region: us-east-1
-  access_key: <access-key>
-  secret_key: <secret-key>
-```
-
-#### Google Cloud Storage
-```yaml
-storage:
-  backend: gcs
-  bucket: my-chronik-bucket
-  credentials_path: /path/to/credentials.json
-```
-
-#### Azure Blob Storage
-```yaml
-storage:
-  backend: azure
-  container: my-chronik-container
-  account: myaccount
-  access_key: <access-key>
-```
-
-### Security Configuration
-
-Enable TLS:
-```yaml
-server:
-  tls:
-    cert_file: /path/to/cert.pem
-    key_file: /path/to/key.pem
-```
-
-Enable authentication:
-```yaml
-auth:
-  enabled: true
-  mechanisms:
-    - PLAIN
-    - SCRAM-SHA-256
-```
+2. Check consumer offsets:
+   ```bash
+   curl http://localhost:8090/api/groups/my-group/offsets
+   ```
 
 ## Next Steps
 
-- Read the [Architecture Guide](architecture.md) to understand how Chronik Stream works
-- Check out the [API Reference](api-reference.md) for detailed API documentation
-- See [Production Deployment](production.md) for production best practices
-- Join our [Community](https://github.com/chronik-stream/chronik-stream/discussions) for help and discussions
+- Read the [Architecture Guide](architecture.md)
+- Explore [Advanced Configuration](configuration.md)
+- Check out [Example Applications](examples/)

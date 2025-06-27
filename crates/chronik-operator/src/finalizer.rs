@@ -3,7 +3,6 @@
 use crate::crd::ChronikCluster;
 use kube::{
     api::{Api, Patch, PatchParams},
-    Resource,
 };
 use serde_json::json;
 use tracing::info;
@@ -33,7 +32,7 @@ pub async fn remove_finalizer(api: &Api<ChronikCluster>, name: &str) -> Result<(
     
     // Get the current resource to check finalizers
     let cluster = api.get(name).await?;
-    let mut finalizers = cluster.finalizers();
+    let mut finalizers = cluster.metadata.finalizers.clone().unwrap_or_default();
     
     // Remove our finalizer
     finalizers.retain(|f| f != FINALIZER_NAME);

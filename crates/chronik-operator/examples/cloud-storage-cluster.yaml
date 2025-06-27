@@ -1,0 +1,47 @@
+apiVersion: chronik.stream/v1alpha1
+kind: ChronikCluster
+metadata:
+  name: cloud-storage-cluster
+  namespace: chronik-stream
+spec:
+  controllers: 3
+  ingestNodes: 4
+  searchNodes: 2
+  
+  # AWS S3 storage backend
+  storage:
+    backend: s3
+    s3:
+      bucket: my-chronik-bucket
+      region: us-east-1
+    size: "50Gi"
+    storageClass: gp3
+  
+  metastore:
+    database: postgres
+    connection:
+      host: postgres.rds.amazonaws.com
+      port: 5432
+      database: chronik
+      credentialsSecret: rds-credentials
+  
+  resources:
+    controller:
+      cpu: "1"
+      memory: "2Gi"
+    ingest:
+      cpu: "2"
+      memory: "4Gi"
+    search:
+      cpu: "1"
+      memory: "2Gi"
+  
+  monitoring:
+    prometheus: true
+    tracing: false
+  
+  security:
+    tlsEnabled: false
+    podSecurityContext:
+      runAsNonRoot: true
+      runAsUser: 1000

@@ -2,7 +2,7 @@
 
 use chronik_common::Result;
 use chronik_storage::{
-    ObjectStore, ObjectStoreConfig, OpenDalObjectStore,
+    ObjectStoreTrait as ObjectStore, ObjectStoreConfig, ObjectStoreFactory,
     SegmentWriter, SegmentWriterConfig, SegmentReader, SegmentReaderConfig,
 };
 use std::sync::Arc;
@@ -41,12 +41,12 @@ pub struct StorageService {
 impl StorageService {
     /// Create a new storage service
     pub async fn new(config: StorageConfig) -> Result<Self> {
-        let object_store = OpenDalObjectStore::new(config.object_store_config).await?;
+        let object_store = ObjectStoreFactory::create(config.object_store_config).await?;
         
         info!("Storage service initialized");
         
         Ok(Self {
-            object_store,
+            object_store: Arc::from(object_store),
         })
     }
     

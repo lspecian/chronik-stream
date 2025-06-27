@@ -57,13 +57,9 @@ spec:
     backend:
       local: {}
     size: 10Gi
-  metastore:
-    database: Postgres
-    connection:
-      host: postgres.default.svc.cluster.local
-      port: 5432
-      database: chronik
-      credentialsSecret: postgres-credentials
+  metadataStorage:
+    type: sled
+    volumeSize: 10Gi
 ```
 
 Apply the manifest:

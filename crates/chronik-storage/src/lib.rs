@@ -3,11 +3,15 @@
 pub mod index;
 pub mod object_store;
 pub mod record_batch;
+pub mod kafka_records;
 pub mod segment;
 pub mod segment_writer;
 pub mod segment_reader;
 pub mod chronik_segment;
 pub mod chronik_segment_example;
+pub mod checksum;
+pub mod segment_checksum;
+pub mod segment_cache;
 
 pub use index::{IndexBuilder, Document, FieldType, FieldValue, SegmentSearcher, SearchHit};
 pub use object_store::{
@@ -19,3 +23,6 @@ pub use segment::{Segment, SegmentBuilder};
 pub use segment_writer::{SegmentWriter, SegmentWriterConfig};
 pub use segment_reader::{SegmentReader, SegmentReaderConfig, FetchResult};
 pub use chronik_segment::{ChronikSegment, ChronikSegmentBuilder, SegmentMetadata, CompressionType, BloomFilter};
+pub use checksum::{ChecksumUtils, ChecksumMode, StreamingChecksum};
+pub use segment_checksum::{SegmentChecksumCalculator, SegmentChecksumVerifier, BatchChecksumVerifier};
+pub use segment_cache::{SegmentCache, SegmentCacheConfig, CachedSegmentReader, CacheStats, EvictionPolicy};

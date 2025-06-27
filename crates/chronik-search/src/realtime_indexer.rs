@@ -13,9 +13,9 @@ use serde_json::{Value as JsonValue, Map as JsonMap};
 use tantivy::{
     schema::{
         Schema, Field, FieldType, TextFieldIndexing, TextOptions, NumericOptions,
-        DateOptions, BytesOptions, Cardinality, IndexRecordOption, STORED, FAST, STRING, TEXT
+        DateOptions, BytesOptions, IndexRecordOption, STORED, FAST, STRING, TEXT
     },
-    Index, IndexWriter, Document, TantivyDocument,
+    Index, IndexWriter, TantivyDocument,
     directory::MmapDirectory,
     DateTime,
 };
@@ -32,6 +32,7 @@ use tokio::{
 };
 use tracing::{debug, info, warn, error, instrument};
 use bytes::Bytes;
+use futures::FutureExt;
 
 /// Configuration for JSON field indexing policies
 #[derive(Debug, Clone)]
@@ -353,7 +354,8 @@ impl RealtimeIndexer {
                 let indexes_read = indexes.read().await;
                 for (topic, index) in indexes_read.iter() {
                     let should_commit = {
-                        let last_commit = index.last_commit_time.lock().await;
+                        let index_read = index.read().await;
+                        let last_commit = index_read.last_commit_time.lock().await;
                         last_commit.elapsed() > config.batch_timeout
                     };
                     
@@ -467,13 +469,15 @@ async fn create_topic_index(
     
     let schema = schema_builder.build();
     
-    let directory = MmapDirectory::open(&index_path)?;
-    let index = Index::open_or_create(directory, schema)?;
+    let directory = MmapDirectory::open(&index_path)
+        .map_err(|e| Error::Internal(format!("Failed to open directory: {}", e)))?;
+    let index = Index::open_or_create(directory, schema)
+        .map_err(|e| Error::Internal(format!("Failed to create index: {}", e)))?;
     
     let index_writer = index.writer_with_num_threads(
         config.num_indexing_threads,
         config.indexing_memory_budget
-    )?;
+    ).map_err(|e| Error::Internal(format!("Failed to create index writer: {}", e)))?;
     
     Ok(TopicIndex {
         topic: topic.to_string(),
@@ -492,7 +496,7 @@ async fn index_json_document(
     schema: &Arc<RwLock<DynamicSchema>>,
     config: &RealtimeIndexerConfig,
 ) -> Result<u64> {
-    let mut tantivy_doc = Document::new();
+    let mut tantivy_doc = TantivyDocument::new();
     
     // Add system fields
     tantivy_doc.add_text(writer.index().schema().get_field("_id").unwrap(), &doc.id);
@@ -516,21 +520,25 @@ async fn index_json_document(
     ).await?;
     
     // Add document to index
-    writer.add_document(tantivy_doc)?;
+    writer.add_document(tantivy_doc)
+        .map_err(|e| Error::Internal(format!("Failed to add document: {}", e)))?;
     
     Ok(doc_size as u64)
 }
 
 /// Process a JSON value recursively
-async fn process_json_value(
-    value: &JsonValue,
-    field_path: &str,
-    tantivy_doc: &mut Document,
-    writer: &mut IndexWriter,
-    schema: &Arc<RwLock<DynamicSchema>>,
-    policy: &FieldIndexingPolicy,
+fn process_json_value<'a>(
+    value: &'a JsonValue,
+    field_path: &'a str,
+    tantivy_doc: &'a mut TantivyDocument,
+    writer: &'a mut IndexWriter,
+    schema: &'a Arc<RwLock<DynamicSchema>>,
+    policy: &'a FieldIndexingPolicy,
     depth: usize,
-) -> Result<usize> {
+) -> futures::future::BoxFuture<'a, Result<usize>> {
+    use futures::FutureExt;
+    
+    async move {
     if depth > policy.max_nesting_depth {
         return Ok(0);
     }
@@ -592,6 +600,7 @@ async fn process_json_value(
     }
     
     Ok(size)
+    }.boxed()
 }
 
 /// Get or create a field in the schema
@@ -675,7 +684,8 @@ async fn commit_topic_index(
     let index = index.read().await;
     let mut writer = index.index_writer.lock().await;
     
-    writer.commit()?;
+    writer.commit()
+        .map_err(|e| Error::Internal(format!("Failed to commit: {}", e)))?;
     
     let mut last_commit = index.last_commit_time.lock().await;
     *last_commit = Instant::now();

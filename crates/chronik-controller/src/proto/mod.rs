@@ -1,0 +1,1 @@
+// Proto definitions will be generated here when protoc is available

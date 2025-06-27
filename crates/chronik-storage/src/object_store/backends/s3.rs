@@ -247,13 +247,19 @@ impl ObjectStore for S3Backend {
         }
 
         if let Some(if_modified_since) = options.if_modified_since {
-            let system_time = std::time::SystemTime::from(if_modified_since);
-            request = request.if_modified_since(system_time.into());
+            // Convert milliseconds since epoch to SystemTime
+            use std::time::{UNIX_EPOCH, Duration};
+            let system_time = UNIX_EPOCH + Duration::from_millis(if_modified_since);
+            let aws_datetime = aws_sdk_s3::primitives::DateTime::from(system_time);
+            request = request.if_modified_since(aws_datetime);
         }
 
         if let Some(if_unmodified_since) = options.if_unmodified_since {
-            let system_time = std::time::SystemTime::from(if_unmodified_since);
-            request = request.if_unmodified_since(system_time.into());
+            // Convert milliseconds since epoch to SystemTime
+            use std::time::{UNIX_EPOCH, Duration};
+            let system_time = UNIX_EPOCH + Duration::from_millis(if_unmodified_since);
+            let aws_datetime = aws_sdk_s3::primitives::DateTime::from(system_time);
+            request = request.if_unmodified_since(aws_datetime);
         }
 
         if let Some(if_match) = options.if_match {
@@ -359,10 +365,7 @@ impl ObjectStore for S3Backend {
                     objects.push(ObjectMetadata {
                         key: stripped_key,
                         size: size as u64,
-                        last_modified: {
-                            chrono::DateTime::from_timestamp(last_modified.secs(), 0)
-                                .unwrap_or_else(chrono::Utc::now)
-                        },
+                        last_modified: last_modified.secs() as u64 * 1000, // Convert to milliseconds
                         etag: object.e_tag,
                         content_type: None, // Not available in list response
                         content_encoding: None,
@@ -409,11 +412,8 @@ impl ObjectStore for S3Backend {
             size: response.content_length.unwrap_or(0) as u64,
             last_modified: response
                 .last_modified
-                .map(|dt| {
-                    chrono::DateTime::from_timestamp(dt.secs(), 0)
-                        .unwrap_or_else(chrono::Utc::now)
-                })
-                .unwrap_or_else(chrono::Utc::now),
+                .map(|dt| dt.secs() as u64 * 1000)  // Convert to milliseconds
+                .unwrap_or_else(|| chrono::Utc::now().timestamp_millis() as u64),
             etag: response.e_tag,
             content_type: response.content_type,
             content_encoding: response.content_encoding,

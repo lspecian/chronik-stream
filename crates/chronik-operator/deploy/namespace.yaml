@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: chronik-operator-system
+  labels:
+    app.kubernetes.io/name: chronik-operator
+    app.kubernetes.io/component: operator
+    app.kubernetes.io/part-of: chronik-stream

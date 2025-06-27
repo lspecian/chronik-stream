@@ -186,7 +186,8 @@ impl ChronikStorageAdapter {
             storage_size: obj_metadata.size,
             record_count: segment_metadata.record_count,
             compression_ratio: segment_metadata.compression_ratio,
-            last_modified: obj_metadata.last_modified,
+            last_modified: chrono::DateTime::from_timestamp(obj_metadata.last_modified as i64 / 1000, 0)
+                .unwrap_or_else(chrono::Utc::now),
         })
     }
 

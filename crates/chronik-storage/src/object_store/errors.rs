@@ -88,6 +88,38 @@ pub enum ObjectStoreError {
     #[error("OpenDAL error: {0}")]
     OpenDal(String),
 
+    /// Connection error
+    #[error("Connection error for backend {backend}: {details}")]
+    ConnectionError { backend: String, details: String },
+
+    /// Write error
+    #[error("Write error for key {key}: {details}")]
+    WriteError { key: String, details: String },
+
+    /// Read error
+    #[error("Read error for key {key}: {details}")]
+    ReadError { key: String, details: String },
+
+    /// Delete error
+    #[error("Delete error for key {key}: {details}")]
+    DeleteError { key: String, details: String },
+
+    /// List error
+    #[error("List error for prefix {prefix}: {details}")]
+    ListError { prefix: String, details: String },
+
+    /// Access error
+    #[error("Access error for key {key}, operation {operation}: {details}")]
+    AccessError { key: String, operation: String, details: String },
+
+    /// Copy error
+    #[error("Copy error from {from_key} to {to_key}: {details}")]
+    CopyError { from_key: String, to_key: String, details: String },
+
+    /// Stream error
+    #[error("Stream error for key {key}, operation {operation}: {details}")]
+    StreamError { key: String, operation: String, details: String },
+
     /// Other errors
     #[error("Other error: {0}")]
     Other(String),

@@ -29,7 +29,7 @@ pub use metrics::{ObjectStoreMetrics, OperationMetrics};
 pub use retry::{RetryConfig, ExponentialBackoff};
 pub use storage::{
     ObjectStore, ObjectMetadata, PutOptions, GetOptions, ListOptions,
-    MultipartUpload, MultipartUploadPart,
+    MultipartUpload, MultipartUploadPart, create_object_store,
 };
 pub use chronik_integration::{ChronikStorageAdapter, SegmentLocation, SegmentCache};
 

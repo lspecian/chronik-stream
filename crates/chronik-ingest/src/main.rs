@@ -5,6 +5,7 @@ use chronik_common::Result;
 use std::path::PathBuf;
 use std::time::Duration;
 use tracing::{info, error};
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -113,6 +114,34 @@ async fn main() -> Result<()> {
     let handle = server.start().await?;
     
     info!("Server started successfully");
+    
+    // Initialize metrics
+    chronik_ingest::metrics::init_metrics()
+        .expect("Failed to initialize metrics");
+    
+    // Start metrics HTTP server
+    let metrics_port = std::env::var("METRICS_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(9093);
+    
+    let metrics_exporter = chronik_ingest::metrics::MetricsExporter::new();
+    let metrics_handle = tokio::spawn(async move {
+        if let Err(e) = metrics_exporter.start_http_server(metrics_port).await {
+            error!("Metrics server error: {}", e);
+        }
+    });
+    
+    info!("Metrics server started on port {}", metrics_port);
+    
+    // Start health check server
+    let health_port = std::env::var("HEALTH_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(9094);
+    
+    // TODO: Add health check server setup once we have access to RequestHandler
+    info!("Health check endpoints would be available on port {}", health_port);
     
     // Setup shutdown handler
     tokio::select! {

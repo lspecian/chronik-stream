@@ -129,8 +129,8 @@ impl LocalBackend {
                             .map_err(|e| ObjectStoreError::Other(format!("Failed to get metadata: {}", e)))?;
 
                         let last_modified = metadata.modified()
-                            .map(|t| chrono::DateTime::from(t))
-                            .unwrap_or_else(|_| chrono::Utc::now());
+                            .map(|t| chrono::DateTime::<chrono::Utc>::from(t).timestamp_millis() as u64)
+                            .unwrap_or_else(|_| chrono::Utc::now().timestamp_millis() as u64);
 
                         objects.push(ObjectMetadata {
                             key,
@@ -303,8 +303,8 @@ impl ObjectStore for LocalBackend {
             .map_err(|e| ObjectStoreError::Other(format!("Failed to get metadata: {}", e)))?;
 
         let last_modified = metadata.modified()
-            .map(|t| chrono::DateTime::from(t))
-            .unwrap_or_else(|_| chrono::Utc::now());
+            .map(|t| chrono::DateTime::<chrono::Utc>::from(t).timestamp_millis() as u64)
+            .unwrap_or_else(|_| chrono::Utc::now().timestamp_millis() as u64);
 
         Ok(ObjectMetadata {
             key: key.to_string(),

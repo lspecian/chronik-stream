@@ -4,7 +4,7 @@ use crate::cleaner::{SegmentCleaner, CleanupPolicy};
 use crate::compactor::{LogCompactor, CompactionPolicy};
 use chronik_common::{Result, Error};
 use chronik_common::metadata::{MetadataStore, SledMetadataStore};
-use chronik_storage::{ObjectStore, ObjectStoreConfig, OpenDalObjectStore};
+use chronik_storage::object_store::{ObjectStore, ObjectStoreConfig, create_object_store};
 use std::sync::Arc;
 
 /// Janitor service configuration
@@ -50,7 +50,7 @@ impl JanitorService {
     /// Create a new janitor service
     pub async fn new(config: JanitorConfig) -> Result<Self> {
         // Create storage
-        let storage = OpenDalObjectStore::new(config.storage_config.clone()).await?;
+        let storage: Arc<dyn ObjectStore> = Arc::from(create_object_store(config.storage_config.clone()).await?);
         
         // Create metadata store
         let metadata_path = std::env::var("METADATA_PATH")
@@ -141,11 +141,11 @@ impl JanitorService {
         let mut newest_segment: Option<chrono::DateTime<chrono::Utc>> = None;
         
         for topic in topics {
-            let segments = self.metadata_store.list_segments(&topic.name).await?;
+            let segments = self.metadata_store.list_segments(&topic.name, None).await?;
             total_segments += segments.len() as u64;
             
             for segment in segments {
-                total_size += segment.size;
+                total_size += segment.size as u64;
                 
                 // Update oldest segment
                 if oldest_segment.is_none() || segment.created_at < oldest_segment.unwrap() {

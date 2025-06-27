@@ -1,8 +1,8 @@
 //! Segment cleaner for removing old data.
 
-use chronik_common::{Result, Error, Uuid};
+use chronik_common::{Result, Error};
 use chronik_common::metadata::MetadataStore;
-use chronik_storage::ObjectStore;
+use chronik_storage::object_store::ObjectStore;
 use std::time::Duration;
 use std::sync::Arc;
 use tokio::time::interval;
@@ -90,7 +90,7 @@ impl SegmentCleaner {
         
         // Find old segments across all topics
         for topic in topics {
-            let segments = self.metadata_store.list_segments(&topic.name).await?;
+            let segments = self.metadata_store.list_segments(&topic.name, None).await?;
             
             for segment in segments {
                 if segment.created_at < retention_cutoff {
@@ -110,7 +110,7 @@ impl SegmentCleaner {
             }
             
             // Delete from metadata store
-            if let Err(e) = self.metadata_store.delete_segment(&topic_name, segment.segment_id).await {
+            if let Err(e) = self.metadata_store.delete_segment(&topic_name, &segment.segment_id).await {
                 tracing::error!("Failed to delete segment metadata {}: {}", segment.segment_id, e);
                 continue;
             }
@@ -135,9 +135,9 @@ impl SegmentCleaner {
         let mut total_size = 0u64;
         
         for topic in topics {
-            let segments = self.metadata_store.list_segments(&topic.name).await?;
+            let segments = self.metadata_store.list_segments(&topic.name, None).await?;
             for segment in segments {
-                total_size += segment.size;
+                total_size += segment.size as u64;
                 all_segments.push((topic.name.clone(), segment));
             }
         }
@@ -168,12 +168,12 @@ impl SegmentCleaner {
             }
             
             // Delete from metadata store
-            if let Err(e) = self.metadata_store.delete_segment(&topic_name, segment.segment_id).await {
+            if let Err(e) = self.metadata_store.delete_segment(&topic_name, &segment.segment_id).await {
                 tracing::error!("Failed to delete segment metadata {}: {}", segment.segment_id, e);
                 continue;
             }
             
-            freed_size += segment.size;
+            freed_size += segment.size as u64;
             
             tracing::info!("Deleted segment {} to free {} bytes", segment.segment_id, segment.size);
         }
@@ -193,7 +193,7 @@ impl SegmentCleaner {
         
         // Find empty segments across all topics
         for topic in topics {
-            let segments = self.metadata_store.list_segments(&topic.name).await?;
+            let segments = self.metadata_store.list_segments(&topic.name, None).await?;
             
             for segment in segments {
                 if segment.size == 0 || segment.record_count == 0 {
@@ -211,7 +211,7 @@ impl SegmentCleaner {
             }
             
             // Delete from metadata store
-            if let Err(e) = self.metadata_store.delete_segment(&topic_name, segment.segment_id).await {
+            if let Err(e) = self.metadata_store.delete_segment(&topic_name, &segment.segment_id).await {
                 tracing::error!("Failed to delete segment metadata {}: {}", segment.segment_id, e);
                 continue;
             }

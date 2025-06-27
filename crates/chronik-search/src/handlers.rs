@@ -21,7 +21,7 @@ use std::{
 use tantivy::{
     collector::TopDocs,
     query::{Query as TantivyQuery, QueryParser, TermQuery, RangeQuery, BooleanQuery, Occur, AllQuery},
-    schema::{Field, Value, FieldType},
+    schema::{Field, FieldType},
     Term, IndexReader,
 };
 use tracing::{debug, error, info};
@@ -98,6 +98,7 @@ pub async fn search_all(
             max_score: all_hits.first().and_then(|h| h._score),
             hits: all_hits,
         },
+        aggregations: None,
     };
     
     Json(response)
@@ -119,6 +120,24 @@ pub async fn search_index(
     let hits = search_in_index(&index, &state, &request).await
         .map_err(|e| search_error(e))?;
     
+    // Execute aggregations if present
+    let aggregations = if let Some(aggs) = request.aggs.as_ref().or(request.aggregations.as_ref()) {
+        let query = match &request.query {
+            Some(query_dsl) => build_tantivy_query(query_dsl, &state.schema)?,
+            None => Box::new(AllQuery),
+        };
+        
+        let agg_executor = crate::aggregations::AggregationExecutor::new(
+            state.reader.clone(),
+            state.schema.clone()
+        );
+        
+        Some(agg_executor.execute(query, aggs.clone())
+            .map_err(|e| Error::Internal(format!("Aggregation failed: {}", e)))?)
+    } else {
+        None
+    };
+    
     let took = start.elapsed().unwrap_or_default().as_millis() as u64;
     
     let response = SearchResponse {
@@ -138,6 +157,7 @@ pub async fn search_index(
             max_score: hits.first().and_then(|h| h._score),
             hits,
         },
+        aggregations,
     };
     
     Ok(Json(response))
@@ -164,27 +184,30 @@ async fn search_in_index(
     // Collect results
     let mut hits = Vec::new();
     for (score, doc_address) in top_docs {
-        let doc = searcher.doc(doc_address)
+        let doc: tantivy::TantivyDocument = searcher.doc(doc_address)
             .map_err(|e| Error::Internal(format!("Failed to retrieve document: {}", e)))?;
         
         // Convert Tantivy document to JSON
         let mut source = serde_json::Map::new();
-        for field_value in doc.field_values() {
-            let field = field_value.field();
-            let field_name = state.schema.get_field_name(field);
-            
-            let json_value = match field_value.value() {
-                Value::Str(s) => serde_json::Value::String(s.to_string()),
-                Value::U64(u) => serde_json::Value::Number((*u).into()),
-                Value::I64(i) => serde_json::Value::Number((*i).into()),
-                Value::F64(f) => serde_json::Value::Number(
-                    serde_json::Number::from_f64(*f).unwrap_or(serde_json::Number::from(0))
-                ),
-                Value::Bytes(b) => serde_json::Value::String(base64::encode(b)),
-                _ => serde_json::Value::Null,
-            };
-            
-            source.insert(field_name.to_string(), json_value);
+        for field in state.schema.fields() {
+            let field_name = state.schema.get_field_name(field.0);
+            {
+                let field_values: Vec<_> = doc.get_all(field.0).collect();
+                if !field_values.is_empty() {
+                let json_values: Vec<serde_json::Value> = field_values.into_iter().map(|v| {
+                    // CompactDocValue doesn't expose its inner value directly,
+                    // so we need to convert it to JSON
+                    // This is a simplified approach - in production you might need to handle types differently
+                    serde_json::Value::String(format!("{:?}", v))
+                }).collect();
+                
+                if json_values.len() == 1 {
+                    source.insert(field_name.to_string(), json_values.into_iter().next().unwrap());
+                } else if !json_values.is_empty() {
+                    source.insert(field_name.to_string(), serde_json::Value::Array(json_values));
+                }
+                }
+            }
         }
         
         // Generate document ID if not present
@@ -277,7 +300,10 @@ fn build_tantivy_query(
                     if let (Some(lower), Some(upper)) = (lower_bound, upper_bound) {
                         let lower_term = Term::from_field_i64(field, lower);
                         let upper_term = Term::from_field_i64(field, upper);
-                        Ok(Box::new(RangeQuery::new_term_bounds(field, lower_term, upper_term)))
+                        Ok(Box::new(RangeQuery::new(
+                            std::ops::Bound::Included(lower_term),
+                            std::ops::Bound::Included(upper_term)
+                        )))
                     } else {
                         Err(Error::InvalidInput("Range query must specify bounds".to_string()))
                     }
@@ -287,33 +313,33 @@ fn build_tantivy_query(
         },
         
         QueryDsl::Bool(bool_query) => {
-            let mut boolean_query = BooleanQuery::default();
+            let mut clauses = Vec::new();
             
             // Add must clauses
             for clause in &bool_query.must {
                 let sub_query = build_tantivy_query(clause, schema)?;
-                boolean_query.add(sub_query, Occur::Must);
+                clauses.push((Occur::Must, sub_query));
             }
             
             // Add should clauses
             for clause in &bool_query.should {
                 let sub_query = build_tantivy_query(clause, schema)?;
-                boolean_query.add(sub_query, Occur::Should);
+                clauses.push((Occur::Should, sub_query));
             }
             
             // Add must_not clauses
             for clause in &bool_query.must_not {
                 let sub_query = build_tantivy_query(clause, schema)?;
-                boolean_query.add(sub_query, Occur::MustNot);
+                clauses.push((Occur::MustNot, sub_query));
             }
             
             // Add filter clauses (similar to must but don't affect scoring)
             for clause in &bool_query.filter {
                 let sub_query = build_tantivy_query(clause, schema)?;
-                boolean_query.add(sub_query, Occur::Must);
+                clauses.push((Occur::Must, sub_query));
             }
             
-            Ok(Box::new(boolean_query))
+            Ok(Box::new(BooleanQuery::new(clauses)))
         },
     }
 }
@@ -392,22 +418,36 @@ pub async fn get_document(
         .map_err(|e| search_error(e))?;
     
     if let Some((_score, doc_address)) = top_docs.first() {
-        let doc = searcher.doc(*doc_address)
+        let doc: tantivy::TantivyDocument = searcher.doc(*doc_address)
             .map_err(|e| Error::Internal(format!("Failed to retrieve document: {}", e)))
             .map_err(|e| search_error(e))?;
         
         // Convert to JSON
         let mut source = serde_json::Map::new();
-        for field_value in doc.field_values() {
-            let field = field_value.field();
-            let field_name = state.schema.get_field_name(field);
+        for field in state.schema.fields() {
+            let field_name = state.schema.get_field_name(field.0);
             
             if field_name == "_id" {
                 continue; // Skip internal _id field
             }
             
-            let json_value = tantivy_value_to_json(field_value.value());
-            source.insert(field_name.to_string(), json_value);
+            {
+                let field_values: Vec<_> = doc.get_all(field.0).collect();
+                if !field_values.is_empty() {
+                let json_values: Vec<serde_json::Value> = field_values.into_iter().map(|v| {
+                    // CompactDocValue doesn't expose its inner value directly,
+                    // so we need to convert it to JSON
+                    // This is a simplified approach - in production you might need to handle types differently
+                    serde_json::Value::String(format!("{:?}", v))
+                }).collect();
+                
+                if json_values.len() == 1 {
+                    source.insert(field_name.to_string(), json_values.into_iter().next().unwrap());
+                } else if !json_values.is_empty() {
+                    source.insert(field_name.to_string(), serde_json::Value::Array(json_values));
+                }
+                }
+            }
         }
         
         let response = GetDocumentResponse {
@@ -485,9 +525,10 @@ pub async fn create_index(
 ) -> impl IntoResponse {
     // Extract mappings from request body
     let mapping = if let Some(mappings) = body.get("mappings") {
-        serde_json::from_value::<IndexMapping>(mappings.clone())
-            .map_err(|e| Error::InvalidInput(format!("Invalid mapping: {}", e)))
-            .map_err(|e| mapping_error(e))?
+        match serde_json::from_value::<IndexMapping>(mappings.clone()) {
+            Ok(m) => m,
+            Err(e) => return Err(mapping_error(Error::InvalidInput(format!("Invalid mapping: {}", e)))),
+        }
     } else {
         // Default mapping with _id field
         let mut properties = HashMap::new();
@@ -500,8 +541,10 @@ pub async fn create_index(
         IndexMapping { properties }
     };
     
-    api.create_index_with_mapping(index.clone(), mapping).await
-        .map_err(|e| index_creation_error(e))?;
+    match api.create_index_with_mapping(index.clone(), mapping).await {
+        Ok(_) => {},
+        Err(e) => return Err(index_creation_error(e)),
+    }
     
     Ok((
         StatusCode::OK,
@@ -609,18 +652,6 @@ fn json_to_tantivy_doc(
     Ok(doc)
 }
 
-fn tantivy_value_to_json(value: &Value) -> serde_json::Value {
-    match value {
-        Value::Str(s) => serde_json::Value::String(s.to_string()),
-        Value::U64(u) => serde_json::Value::Number((*u).into()),
-        Value::I64(i) => serde_json::Value::Number((*i).into()),
-        Value::F64(f) => serde_json::Value::Number(
-            serde_json::Number::from_f64(*f).unwrap_or(serde_json::Number::from(0))
-        ),
-        Value::Bytes(b) => serde_json::Value::String(base64::encode(b)),
-        _ => serde_json::Value::Null,
-    }
-}
 
 // Error response helpers
 

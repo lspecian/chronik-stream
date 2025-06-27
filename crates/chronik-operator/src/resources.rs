@@ -1,14 +1,15 @@
 //! Resource generation for Chronik Stream operator.
 
 use crate::crd::{ChronikCluster, StorageBackend};
+use kube::Resource;
 use k8s_openapi::{
     api::{
         apps::v1::{StatefulSet, StatefulSetSpec, StatefulSetUpdateStrategy, RollingUpdateStatefulSetStrategy},
         core::v1::{
             ConfigMap, Container, ContainerPort, EmptyDirVolumeSource, EnvVar, EnvVarSource,
-            PersistentVolumeClaim, PersistentVolumeClaimSpec, PersistentVolumeClaimVolumeSource,
+            PersistentVolumeClaim, PersistentVolumeClaimSpec,
             PodSpec, PodTemplateSpec, Probe, ResourceRequirements as K8sResourceRequirements,
-            Secret, SecretKeySelector, Service, ServicePort, ServiceSpec, Volume, VolumeMount,
+            SecretKeySelector, Service, ServicePort, ServiceSpec, Volume, VolumeMount,
             HTTPGetAction, PodSecurityContext as K8sPodSecurityContext,
             SecurityContext as K8sSecurityContext,
         },
@@ -562,16 +563,22 @@ impl<'a> ResourceGenerator<'a> {
                     container_port: CONTROLLER_PORT,
                     name: Some("grpc".to_string()),
                     protocol: Some("TCP".to_string()),
+                    host_ip: None,
+                    host_port: None,
                 },
                 ContainerPort {
                     container_port: METRICS_PORT,
                     name: Some("metrics".to_string()),
                     protocol: Some("TCP".to_string()),
+                    host_ip: None,
+                    host_port: None,
                 },
                 ContainerPort {
                     container_port: HEALTH_PORT,
                     name: Some("health".to_string()),
                     protocol: Some("TCP".to_string()),
+                    host_ip: None,
+                    host_port: None,
                 },
             ]),
             env: Some(self.controller_env()),
@@ -602,16 +609,22 @@ impl<'a> ResourceGenerator<'a> {
                     container_port: INGEST_PORT,
                     name: Some("kafka".to_string()),
                     protocol: Some("TCP".to_string()),
+                    host_ip: None,
+                    host_port: None,
                 },
                 ContainerPort {
                     container_port: METRICS_PORT,
                     name: Some("metrics".to_string()),
                     protocol: Some("TCP".to_string()),
+                    host_ip: None,
+                    host_port: None,
                 },
                 ContainerPort {
                     container_port: HEALTH_PORT,
                     name: Some("health".to_string()),
                     protocol: Some("TCP".to_string()),
+                    host_ip: None,
+                    host_port: None,
                 },
             ]),
             env: Some(self.ingest_env()),
@@ -642,16 +655,22 @@ impl<'a> ResourceGenerator<'a> {
                     container_port: SEARCH_PORT,
                     name: Some("grpc".to_string()),
                     protocol: Some("TCP".to_string()),
+                    host_ip: None,
+                    host_port: None,
                 },
                 ContainerPort {
                     container_port: METRICS_PORT,
                     name: Some("metrics".to_string()),
                     protocol: Some("TCP".to_string()),
+                    host_ip: None,
+                    host_port: None,
                 },
                 ContainerPort {
                     container_port: HEALTH_PORT,
                     name: Some("health".to_string()),
                     protocol: Some("TCP".to_string()),
+                    host_ip: None,
+                    host_port: None,
                 },
             ]),
             env: Some(self.search_env()),

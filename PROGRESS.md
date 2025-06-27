@@ -35,10 +35,12 @@
 - Implement controller state machine
 - Handle partition leader assignments
 
-### Task 6: Setup PostgreSQL Metastore Schema
-- Design schema for topics, segments, ACLs
-- Create migration scripts
-- Implement type-safe queries with sqlx
+### ✅ Task 6: Implement Sled-based Metadata Storage
+- Implemented MetadataStore trait for abstract metadata operations
+- Created Sled-based storage implementation with separate trees
+- Added support for topics, segments, brokers, assignments, groups, offsets
+- Implemented cascading deletes and system state initialization
+- Full test coverage for metadata operations
 
 ### Task 7: Implement Ingest Node TCP Server
 - Build TCP server with TLS support

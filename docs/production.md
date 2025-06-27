@@ -18,15 +18,12 @@ This guide covers best practices for deploying Chronik Stream in production envi
 - Storage: 100GB SSD (local cache)
 - Network: 10Gbps
 
-#### PostgreSQL Database
-- CPU: 8+ cores
-- Memory: 32GB RAM
-- Storage: 500GB SSD
-- Backup: Daily snapshots
+#### Storage Requirements
+- Metadata: 10GB SSD per controller node
+- Object Storage: Based on retention and throughput
 
 ### Software Requirements
 - Kubernetes 1.25+
-- PostgreSQL 14+
 - Object Storage (S3, GCS, or Azure Blob)
 
 ## Pre-Production Checklist
@@ -43,11 +40,11 @@ This guide covers best practices for deploying Chronik Stream in production envi
 ### High Availability
 - [ ] Deploy 3+ controller nodes
 - [ ] Configure replication factor ≥ 3
-- [ ] Set up PostgreSQL replication
 - [ ] Configure pod disruption budgets
 - [ ] Enable leader election
 - [ ] Set up health checks
 - [ ] Configure automatic failover
+- [ ] Enable Raft consensus for metadata
 
 ### Monitoring
 - [ ] Deploy Prometheus
@@ -128,77 +125,7 @@ allowVolumeExpansion: true
 volumeBindingMode: WaitForFirstConsumer
 ```
 
-### 3. PostgreSQL Setup
-
-```yaml
-apiVersion: v1
-kind: Secret
-metadata:
-  name: postgres-credentials
-  namespace: chronik-prod
-type: Opaque
-stringData:
-  username: chronik
-  password: <strong-password>
----
-apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: postgres
-  namespace: chronik-prod
-spec:
-  serviceName: postgres
-  replicas: 1
-  selector:
-    matchLabels:
-      app: postgres
-  template:
-    metadata:
-      labels:
-        app: postgres
-    spec:
-      containers:
-      - name: postgres
-        image: postgres:14
-        env:
-        - name: POSTGRES_USER
-          valueFrom:
-            secretKeyRef:
-              name: postgres-credentials
-              key: username
-        - name: POSTGRES_PASSWORD
-          valueFrom:
-            secretKeyRef:
-              name: postgres-credentials
-              key: password
-        - name: POSTGRES_DB
-          value: chronik
-        - name: PGDATA
-          value: /var/lib/postgresql/data/pgdata
-        ports:
-        - containerPort: 5432
-        volumeMounts:
-        - name: postgres-storage
-          mountPath: /var/lib/postgresql/data
-        resources:
-          requests:
-            memory: "8Gi"
-            cpu: "2"
-          limits:
-            memory: "32Gi"
-            cpu: "8"
-  volumeClaimTemplates:
-  - metadata:
-      name: postgres-storage
-    spec:
-      accessModes: ["ReadWriteOnce"]
-      storageClassName: chronik-ssd
-      resources:
-        requests:
-          storage: 500Gi
-```
-
-### 4. Chronik Cluster Configuration
+### 3. Chronik Cluster Configuration
 
 ```yaml
 apiVersion: chronik.stream/v1alpha1
@@ -219,13 +146,10 @@ spec:
     size: 1Ti
     storageClass: chronik-ssd
   
-  metastore:
-    database: Postgres
-    connection:
-      host: postgres.chronik-prod.svc.cluster.local
-      port: 5432
-      database: chronik
-      credentialsSecret: postgres-credentials
+  metadataStorage:
+    type: sled
+    volumeSize: 10Gi
+    storageClass: chronik-ssd
   
   resources:
     controller:
@@ -287,11 +211,6 @@ spec:
     - podSelector:
         matchLabels:
           app.kubernetes.io/part-of: chronik
-  - to:
-    - namespaceSelector: {}
-      podSelector:
-        matchLabels:
-          app: postgres
   - to:
     - namespaceSelector: {}
     ports:
@@ -416,7 +335,7 @@ groups:
 ### Backup Strategy
 
 1. **Metadata Backup**
-   - PostgreSQL: Daily full backup + continuous WAL archiving
+   - Sled database: Daily snapshots of metadata volume
    - Retention: 30 days
 
 2. **Data Backup**
@@ -433,10 +352,10 @@ groups:
    - Automatic failover to standby
    - No manual intervention required
 
-2. **Database Recovery**
-   - Restore from latest backup
-   - Apply WAL logs
-   - Verify consistency
+2. **Metadata Recovery**
+   - Restore Sled database from volume snapshot
+   - Verify metadata consistency
+   - Restart controller nodes
 
 3. **Data Recovery**
    - Restore segments from object storage

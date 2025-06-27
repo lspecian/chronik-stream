@@ -20,6 +20,9 @@ jsonwebtoken = "9.2"
 argon2 = "0.5"
 ring = "0.17"
 base64 = "0.21"
+hmac = "0.12"
+sha2 = "0.10"
+pbkdf2 = "0.12"
 
 # SASL
 sasl2-sys = { version = "0.1", optional = true }

@@ -13,6 +13,7 @@ use chronik_protocol::{
     parser::ResponseHeader,
 };
 use chronik_storage::SegmentReader;
+use bytes::{Bytes, BytesMut};
 use std::sync::Arc;
 
 /// Kafka protocol handler with storage integration
@@ -81,52 +82,55 @@ impl KafkaProtocolHandler {
         use chronik_protocol::parser::Decoder;
         use bytes::BytesMut;
         
-        let mut decoder = Decoder::new(&mut body);
-        
-        // Parse produce request
-        let transactional_id = if header.api_version >= 3 {
-            decoder.read_string()?
-        } else {
-            None
-        };
-        
-        let acks = decoder.read_i16()?;
-        let timeout_ms = decoder.read_i32()?;
-        
-        // Read topics
-        let topic_count = decoder.read_i32()? as usize;
-        let mut topics = Vec::with_capacity(topic_count);
-        
-        for _ in 0..topic_count {
-            let topic_name = decoder.read_string()?
-                .ok_or_else(|| Error::Protocol("Topic name cannot be null".into()))?;
+        // Parse the request completely before any await
+        let request = {
+            let mut decoder = Decoder::new(&mut body);
             
-            let partition_count = decoder.read_i32()? as usize;
-            let mut partitions = Vec::with_capacity(partition_count);
+            // Parse produce request
+            let transactional_id = if header.api_version >= 3 {
+                decoder.read_string()?
+            } else {
+                None
+            };
             
-            for _ in 0..partition_count {
-                let partition_index = decoder.read_i32()?;
-                let records = decoder.read_bytes()?
-                    .ok_or_else(|| Error::Protocol("Records cannot be null".into()))?;
+            let acks = decoder.read_i16()?;
+            let timeout_ms = decoder.read_i32()?;
+            
+            // Read topics
+            let topic_count = decoder.read_i32()? as usize;
+            let mut topics = Vec::with_capacity(topic_count);
+            
+            for _ in 0..topic_count {
+                let topic_name = decoder.read_string()?
+                    .ok_or_else(|| Error::Protocol("Topic name cannot be null".into()))?;
                 
-                partitions.push(chronik_protocol::types::ProduceRequestPartition {
-                    index: partition_index,
-                    records: records.to_vec(),
+                let partition_count = decoder.read_i32()? as usize;
+                let mut partitions = Vec::with_capacity(partition_count);
+                
+                for _ in 0..partition_count {
+                    let partition_index = decoder.read_i32()?;
+                    let records = decoder.read_bytes()?
+                        .ok_or_else(|| Error::Protocol("Records cannot be null".into()))?;
+                    
+                    partitions.push(chronik_protocol::types::ProduceRequestPartition {
+                        index: partition_index,
+                        records: records.to_vec(),
+                    });
+                }
+                
+                topics.push(chronik_protocol::types::ProduceRequestTopic {
+                    name: topic_name,
+                    partitions,
                 });
             }
             
-            topics.push(chronik_protocol::types::ProduceRequestTopic {
-                name: topic_name,
-                partitions,
-            });
-        }
-        
-        let request = ProduceRequest {
-            transactional_id,
-            acks,
-            timeout_ms,
-            topics,
-        };
+            ProduceRequest {
+                transactional_id,
+                acks,
+                timeout_ms,
+                topics,
+            }
+        }; // decoder is dropped here
         
         // Handle through produce handler
         let response = self.produce_handler.handle_produce(request, header.correlation_id).await?;
@@ -150,88 +154,91 @@ impl KafkaProtocolHandler {
         use chronik_protocol::parser::Decoder;
         use bytes::BytesMut;
         
-        let mut decoder = Decoder::new(&mut body);
-        
-        // Parse fetch request
-        let replica_id = decoder.read_i32()?;
-        let max_wait_ms = decoder.read_i32()?;
-        let min_bytes = decoder.read_i32()?;
-        
-        let max_bytes = if header.api_version >= 3 {
-            decoder.read_i32()?
-        } else {
-            i32::MAX
-        };
-        
-        let isolation_level = if header.api_version >= 4 {
-            decoder.read_i8()?
-        } else {
-            0
-        };
-        
-        let session_id = if header.api_version >= 7 {
-            decoder.read_i32()?
-        } else {
-            0
-        };
-        
-        let session_epoch = if header.api_version >= 7 {
-            decoder.read_i32()?
-        } else {
-            -1
-        };
-        
-        // Read topics
-        let topic_count = decoder.read_i32()? as usize;
-        let mut topics = Vec::with_capacity(topic_count);
-        
-        for _ in 0..topic_count {
-            let topic_name = decoder.read_string()?
-                .ok_or_else(|| Error::Protocol("Topic name cannot be null".into()))?;
+        // Parse the request completely before any await
+        let request = {
+            let mut decoder = Decoder::new(&mut body);
             
-            let partition_count = decoder.read_i32()? as usize;
-            let mut partitions = Vec::with_capacity(partition_count);
+            // Parse fetch request
+            let replica_id = decoder.read_i32()?;
+            let max_wait_ms = decoder.read_i32()?;
+            let min_bytes = decoder.read_i32()?;
             
-            for _ in 0..partition_count {
-                let partition = decoder.read_i32()?;
-                let current_leader_epoch = if header.api_version >= 9 {
-                    decoder.read_i32()?
-                } else {
-                    -1
-                };
-                let fetch_offset = decoder.read_i64()?;
-                let log_start_offset = if header.api_version >= 5 {
-                    decoder.read_i64()?
-                } else {
-                    -1
-                };
-                let partition_max_bytes = decoder.read_i32()?;
+            let max_bytes = if header.api_version >= 3 {
+                decoder.read_i32()?
+            } else {
+                i32::MAX
+            };
+            
+            let isolation_level = if header.api_version >= 4 {
+                decoder.read_i8()?
+            } else {
+                0
+            };
+            
+            let session_id = if header.api_version >= 7 {
+                decoder.read_i32()?
+            } else {
+                0
+            };
+            
+            let session_epoch = if header.api_version >= 7 {
+                decoder.read_i32()?
+            } else {
+                -1
+            };
+            
+            // Read topics
+            let topic_count = decoder.read_i32()? as usize;
+            let mut topics = Vec::with_capacity(topic_count);
+            
+            for _ in 0..topic_count {
+                let topic_name = decoder.read_string()?
+                    .ok_or_else(|| Error::Protocol("Topic name cannot be null".into()))?;
                 
-                partitions.push(chronik_protocol::types::FetchRequestPartition {
-                    partition,
-                    current_leader_epoch,
-                    fetch_offset,
-                    log_start_offset,
-                    partition_max_bytes,
+                let partition_count = decoder.read_i32()? as usize;
+                let mut partitions = Vec::with_capacity(partition_count);
+                
+                for _ in 0..partition_count {
+                    let partition = decoder.read_i32()?;
+                    let current_leader_epoch = if header.api_version >= 9 {
+                        decoder.read_i32()?
+                    } else {
+                        -1
+                    };
+                    let fetch_offset = decoder.read_i64()?;
+                    let log_start_offset = if header.api_version >= 5 {
+                        decoder.read_i64()?
+                    } else {
+                        -1
+                    };
+                    let partition_max_bytes = decoder.read_i32()?;
+                    
+                    partitions.push(chronik_protocol::types::FetchRequestPartition {
+                        partition,
+                        current_leader_epoch,
+                        fetch_offset,
+                        log_start_offset,
+                        partition_max_bytes,
+                    });
+                }
+                
+                topics.push(chronik_protocol::types::FetchRequestTopic {
+                    name: topic_name,
+                    partitions,
                 });
             }
             
-            topics.push(chronik_protocol::types::FetchRequestTopic {
-                name: topic_name,
-                partitions,
-            });
-        }
-        
-        let request = FetchRequest {
-            replica_id,
-            max_wait_ms,
-            min_bytes,
-            max_bytes,
-            isolation_level,
-            session_id,
-            session_epoch,
-            topics,
-        };
+            FetchRequest {
+                replica_id,
+                max_wait_ms,
+                min_bytes,
+                max_bytes,
+                isolation_level,
+                session_id,
+                session_epoch,
+                topics,
+            }
+        }; // decoder is dropped here
         
         // Handle through fetch handler
         let response = self.fetch_handler.handle_fetch(request, header.correlation_id).await?;
@@ -255,31 +262,36 @@ impl KafkaProtocolHandler {
         use chronik_protocol::parser::Decoder;
         use bytes::BytesMut;
         
-        let mut decoder = Decoder::new(&mut body);
-        
-        // Parse metadata request
-        let topics = if header.api_version >= 1 {
-            let topic_count = decoder.read_i32()?;
-            if topic_count < 0 {
-                None // All topics
-            } else {
-                let mut topic_names = Vec::with_capacity(topic_count as usize);
-                for _ in 0..topic_count {
-                    if let Some(name) = decoder.read_string()? {
-                        topic_names.push(name);
+        // Parse the request completely before any await
+        let (topics, _allow_auto_topic_creation) = {
+            let mut decoder = Decoder::new(&mut body);
+            
+            // Parse metadata request
+            let topics = if header.api_version >= 1 {
+                let topic_count = decoder.read_i32()?;
+                if topic_count < 0 {
+                    None // All topics
+                } else {
+                    let mut topic_names = Vec::with_capacity(topic_count as usize);
+                    for _ in 0..topic_count {
+                        if let Some(name) = decoder.read_string()? {
+                            topic_names.push(name);
+                        }
                     }
+                    Some(topic_names)
                 }
-                Some(topic_names)
-            }
-        } else {
-            None
-        };
-        
-        let _allow_auto_topic_creation = if header.api_version >= 4 {
-            decoder.read_bool()?
-        } else {
-            true
-        };
+            } else {
+                None
+            };
+            
+            let allow_auto_topic_creation = if header.api_version >= 4 {
+                decoder.read_bool()?
+            } else {
+                true
+            };
+            
+            (topics, allow_auto_topic_creation)
+        }; // decoder is dropped here
         
         // Build metadata response
         let brokers = vec![MetadataBroker {
@@ -297,10 +309,10 @@ impl KafkaProtocolHandler {
                 if let Ok(Some(topic_meta)) = self.metadata_store.get_topic(&topic_name).await {
                     let mut partitions = Vec::new();
                     
-                    for i in 0..topic_meta.partition_count {
+                    for i in 0..topic_meta.config.partition_count {
                         partitions.push(MetadataPartition {
                             error_code: 0,
-                            partition_index: i,
+                            partition_index: i as i32,
                             leader_id: self.node_id, // Simplified: this node is leader
                             leader_epoch: 0,
                             replica_nodes: vec![self.node_id],
@@ -331,10 +343,10 @@ impl KafkaProtocolHandler {
                 for topic_meta in topics {
                     let mut partitions = Vec::new();
                     
-                    for i in 0..topic_meta.partition_count {
+                    for i in 0..topic_meta.config.partition_count {
                         partitions.push(MetadataPartition {
                             error_code: 0,
-                            partition_index: i,
+                            partition_index: i as i32,
                             leader_id: self.node_id,
                             leader_epoch: 0,
                             replica_nodes: vec![self.node_id],

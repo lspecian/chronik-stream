@@ -26,7 +26,7 @@ A high-performance, Kafka-compatible distributed streaming platform with built-i
                                │
                                ▼
                         ┌─────────────────┐
-                        │   PostgreSQL    │
+                        │  Sled Database  │
                         └─────────────────┘
 ```
 
@@ -70,7 +70,7 @@ kafka-console-consumer --bootstrap-server localhost:9092 --topic events --from-b
 ## Components
 
 ### Controller Node
-Manages cluster metadata, coordinates brokers, and handles administrative operations using a simplified Raft consensus protocol.
+Manages cluster metadata, coordinates brokers, and handles administrative operations using a simplified Raft consensus protocol. Uses embedded Sled database for metadata persistence.
 
 ### Ingest Node
 Handles Kafka protocol connections, processes produce/fetch requests, and manages data indexing.
@@ -95,7 +95,7 @@ Command-line interface for cluster administration and troubleshooting.
 ### Environment Variables
 
 - `CHRONIK_ROLE`: Node role (controller, ingest, query)
-- `DATABASE_URL`: PostgreSQL connection string
+- `METADATA_PATH`: Path to Sled metadata database (controller nodes)
 - `OBJECT_STORE_TYPE`: Storage backend (s3, gcs, azure, local)
 - `KAFKA_LISTENERS`: Kafka protocol listen addresses
 
@@ -115,7 +115,6 @@ storage:
 ### Prerequisites
 
 - Rust 1.70+
-- PostgreSQL 14+
 - Docker & Docker Compose (for testing)
 
 ### Building

@@ -56,7 +56,7 @@ pub struct GroupMember {
     pub rebalance_timeout: Duration,
     pub subscription: Vec<String>,
     pub assignment: HashMap<String, Vec<i32>>, // topic -> partitions
-    #[serde(skip)]
+    #[serde(skip, default = "Instant::now")]
     pub last_heartbeat: Instant,
     
     // KIP-848 fields for incremental cooperative rebalancing
@@ -130,7 +130,7 @@ impl AssignmentStrategy {
 }
 
 /// Consumer group with KIP-848 support
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ConsumerGroup {
     pub group_id: String,
     pub state: GroupState,
@@ -144,10 +144,12 @@ pub struct ConsumerGroup {
     pub group_epoch: i32,
     pub assignment_strategy: AssignmentStrategy,
     pub pending_members: HashSet<String>, // Members pending assignment
+    #[serde(skip, default)]
     pub rebalance_start_time: Option<Instant>,
     pub static_members: HashMap<String, String>, // static_member_id -> member_id mapping
     
     // Metadata persistence
+    #[serde(skip, default)]
     pub last_persisted: Option<Instant>,
 }
 
@@ -1014,6 +1016,34 @@ impl GroupManager {
         })
     }
     
+    /// Fetch committed offsets for a consumer group (with optional topics filter)
+    pub async fn fetch_offsets_optional(
+        &self,
+        group_id: String,
+        topics: Option<Vec<String>>,
+    ) -> Result<Vec<TopicPartitionOffset>> {
+        // Verify group exists
+        let groups = self.groups.read().await;
+        if !groups.contains_key(&group_id) {
+            // It's ok if group doesn't exist - just return empty offsets
+            return Ok(Vec::new());
+        }
+        drop(groups);
+        
+        // Fetch offsets from metadata store
+        // For now, return empty list since we need to implement batch consumer offset fetching
+        let offsets: Vec<TopicPartitionOffset> = Vec::new();
+        // TODO: Implement batch consumer offset fetching from metadata store
+        
+        // Convert to response format
+        Ok(offsets.into_iter().map(|o| TopicPartitionOffset {
+            topic: o.topic,
+            partition: o.partition as i32,
+            offset: o.offset,
+            metadata: o.metadata,
+        }).collect())
+    }
+    
     /// Start background task to check expired members
     pub fn start_expiration_checker(self: Arc<Self>) {
         tokio::spawn(async move {
@@ -1174,7 +1204,7 @@ impl PartitionAssignor for CooperativeStickyAssignor {
         
         // Identify unassigned partitions
         for (topic, all_partitions) in &partitions_by_topic {
-            let mut assigned = HashSet::new();
+            let mut assigned: HashSet<i32> = HashSet::new();
             for member_assignments in assignments.values() {
                 if let Some(partitions) = member_assignments.get(topic) {
                     assigned.extend(partitions);

@@ -9,12 +9,16 @@ license.workspace = true
 chronik-common = { path = "../chronik-common" }
 chronik-protocol = { path = "../chronik-protocol" }
 chronik-storage = { path = "../chronik-storage" }
-chronik-search = { path = "../chronik-search" }
+chronik-monitoring = { path = "../chronik-monitoring" }
+chronik-auth = { path = "../chronik-auth" }
+# chronik-search = { path = "../chronik-search" }
 
 # Async runtime
 tokio = { workspace = true, features = ["net", "sync", "time"] }
 tokio-util = { workspace = true }
+tokio-rustls = "0.24"
 async-trait = { workspace = true }
+futures = { workspace = true }
 
 # Collections
 dashmap = { workspace = true }
@@ -22,12 +26,20 @@ parking_lot = { workspace = true }
 
 # Serialization
 serde = { workspace = true }
+serde_json = { workspace = true }
 bytes = { workspace = true }
 byteorder = { workspace = true }
 
 # Utils
 uuid = { workspace = true }
 chrono = { workspace = true }
+lazy_static = "1.4"
+
+# HTTP
+axum = { workspace = true }
+
+# Metrics
+prometheus = { workspace = true }
 
 # Error handling
 anyhow = { workspace = true }
@@ -36,7 +48,9 @@ thiserror = { workspace = true }
 # Tracing & Metrics
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-prometheus = { workspace = true }
+
+[build-dependencies]
+tonic-build = "0.10"
 
 [dev-dependencies]
 tokio-test = "0.4"
