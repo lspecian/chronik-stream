@@ -1,0 +1,68 @@
+[package]
+name = "chronik-backup"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+chronik-common = { path = "../chronik-common" }
+chronik-storage = { path = "../chronik-storage" }
+chronik-protocol = { path = "../chronik-protocol" }
+
+# Async runtime
+tokio = { workspace = true, features = ["full"] }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+bincode = "1.3"
+bytes = { workspace = true }
+
+# Compression
+flate2 = "1.0"
+zstd = "0.13"
+lz4 = "1.25"
+
+# Checksums
+sha2 = "0.10"
+crc32fast = "1.4"
+
+# Storage
+opendal = { workspace = true }
+
+# Time
+chrono = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Utils
+uuid = { workspace = true }
+dashmap = { workspace = true }
+tempfile = { workspace = true }
+rayon = "1.10"
+
+# Encryption
+rand = "0.8"
+pbkdf2 = "0.12"
+argon2 = "0.5"
+
+# Tracing
+tracing = { workspace = true }
+
+# CLI
+clap = { version = "4.4", features = ["derive"], optional = true }
+indicatif = { version = "0.17", optional = true }
+
+[features]
+default = []
+cli = ["clap", "indicatif"]
+
+[dev-dependencies]
+tokio-test = "0.4"
+tempfile = { workspace = true }

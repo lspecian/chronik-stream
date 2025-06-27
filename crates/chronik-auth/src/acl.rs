@@ -120,6 +120,27 @@ impl Acl {
         Err(AuthError::PermissionDenied)
     }
     
+    /// Get all permissions for a user
+    pub fn get_user_permissions(&self, username: &str) -> AuthResult<Vec<Permission>> {
+        let user_perms = self.user_permissions.read()
+            .map_err(|_| AuthError::Internal("Lock poisoned".to_string()))?;
+        
+        let default_perms = self.default_permissions.read()
+            .map_err(|_| AuthError::Internal("Lock poisoned".to_string()))?;
+        
+        let mut permissions = Vec::new();
+        
+        // Add user-specific permissions
+        if let Some(perms) = user_perms.get(username) {
+            permissions.extend(perms.iter().cloned());
+        }
+        
+        // Add default permissions
+        permissions.extend(default_perms.iter().cloned());
+        
+        Ok(permissions)
+    }
+    
     /// Initialize with default Kafka-compatible ACLs
     pub fn init_kafka_defaults(&self) -> AuthResult<()> {
         // Allow all authenticated users to read from any topic

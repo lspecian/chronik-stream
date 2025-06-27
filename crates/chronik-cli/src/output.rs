@@ -9,11 +9,7 @@ use tabled::{Table, Tabled};
 pub fn format_output<T: Serialize>(data: &T, format: super::OutputFormat) -> Result<String> {
     match format {
         super::OutputFormat::Json => Ok(serde_json::to_string_pretty(data)?),
-        super::OutputFormat::Yaml => {
-            // For simplicity, using JSON format for YAML too
-            // TODO: Add serde_yaml dependency for proper YAML output
-            Ok(serde_json::to_string_pretty(data)?)
-        }
+        super::OutputFormat::Yaml => Ok(serde_yaml::to_string(data)?),
         super::OutputFormat::Table => {
             // Table format handled by specific functions
             Ok(serde_json::to_string_pretty(data)?)

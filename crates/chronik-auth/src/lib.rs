@@ -10,7 +10,7 @@ pub use tls::{TlsConfig, TlsAcceptor, TlsConnector};
 pub use sasl::{SaslMechanism, SaslAuthenticator, SaslCredentials};
 pub use jwt::{JwtConfig, JwtManager, Claims};
 pub use acl::{Acl, Permission, Resource, Operation};
-pub use middleware::{AuthMiddleware, AuthContext, KafkaApiKey};
+pub use middleware::{AuthMiddleware, AuthContext, KafkaApiKey, SaslAuthResult};
 
 use thiserror::Error;
 

@@ -47,6 +47,9 @@ enum Commands {
     
     /// Authentication
     Auth(AuthCommand),
+    
+    /// Batch operations
+    Batch(BatchCommand),
 }
 
 /// Output format
@@ -84,6 +87,7 @@ async fn main() -> Result<()> {
         Commands::Broker(cmd) => cmd.execute(&client, cli.output).await?,
         Commands::Group(cmd) => cmd.execute(&client, cli.output).await?,
         Commands::Auth(cmd) => cmd.execute(&client, cli.output).await?,
+        Commands::Batch(cmd) => cmd.execute(&client, cli.output).await?,
     }
     
     Ok(())

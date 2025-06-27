@@ -1,9 +1,26 @@
 //! Authentication middleware for Chronik Stream services.
 
-use crate::{AuthError, AuthResult, UserPrincipal, Acl, Resource, Operation, SaslAuthenticator};
+use crate::{AuthError, AuthResult, UserPrincipal, Acl, Resource, Operation, SaslAuthenticator, SaslMechanism};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, warn};
+use tracing::debug;
+
+/// SASL authentication result
+pub enum SaslAuthResult {
+    /// Authentication successful
+    Success(UserPrincipal),
+    /// Authentication needs to continue (for SCRAM)
+    Continue(Vec<u8>),
+}
+
+/// Session state for SASL authentication
+#[derive(Clone)]
+struct SessionState {
+    /// The SASL mechanism being used
+    mechanism: Option<SaslMechanism>,
+    /// Session ID for SCRAM state
+    scram_session_id: Option<String>,
+}
 
 /// Authentication context attached to connections
 #[derive(Clone)]
@@ -45,6 +62,7 @@ pub struct AuthMiddleware {
     acl: Arc<Acl>,
     sasl: Arc<RwLock<SaslAuthenticator>>,
     contexts: Arc<RwLock<HashMap<String, AuthContext>>>,
+    session_states: Arc<RwLock<HashMap<String, SessionState>>>,
     allow_anonymous: bool,
 }
 
@@ -54,12 +72,13 @@ impl AuthMiddleware {
     /// Create new authentication middleware
     pub fn new(allow_anonymous: bool) -> Self {
         let acl = Arc::new(Acl::new());
-        let sasl = Arc::new(RwLock::new(SaslAuthenticator::new()));
+        let sasl = Arc::new(RwLock::new(SaslAuthenticator::with_acl(acl.clone())));
         
         Self {
             acl,
             sasl,
             contexts: Arc::new(RwLock::new(HashMap::new())),
+            session_states: Arc::new(RwLock::new(HashMap::new())),
             allow_anonymous,
         }
     }
@@ -97,19 +116,108 @@ impl AuthMiddleware {
         session_id: &str,
         mechanism: &crate::SaslMechanism,
         auth_bytes: &[u8],
-    ) -> AuthResult<UserPrincipal> {
-        let sasl = self.sasl.read().await;
-        let principal = sasl.authenticate(mechanism, auth_bytes)?;
+    ) -> AuthResult<SaslAuthResult> {
+        // For PLAIN mechanism, use the old simple flow
+        if matches!(mechanism, crate::SaslMechanism::Plain) {
+            let sasl = self.sasl.read().await;
+            let principal = sasl.authenticate(mechanism, auth_bytes)?;
+            
+            // Update context
+            let mut contexts = self.contexts.write().await;
+            contexts.insert(
+                session_id.to_string(),
+                AuthContext::authenticated(principal.clone(), session_id.to_string()),
+            );
+            
+            debug!("Session {} authenticated as {}", session_id, principal.username);
+            return Ok(SaslAuthResult::Success(principal));
+        }
         
-        // Update context
-        let mut contexts = self.contexts.write().await;
-        contexts.insert(
-            session_id.to_string(),
-            AuthContext::authenticated(principal.clone(), session_id.to_string()),
-        );
+        // For SCRAM mechanisms, we need stateful authentication
+        let mut session_states = self.session_states.write().await;
+        let session_state = session_states.entry(session_id.to_string())
+            .or_insert_with(|| SessionState {
+                mechanism: Some(mechanism.clone()),
+                scram_session_id: None,
+            });
         
-        debug!("Session {} authenticated as {}", session_id, principal.username);
-        Ok(principal)
+        // Check if this is the first or subsequent message
+        let mut sasl = self.sasl.write().await;
+        match mechanism {
+            crate::SaslMechanism::ScramSha256 => {
+                if session_state.scram_session_id.is_none() {
+                    // First message
+                    match sasl.process_scram_sha256_first(session_id, auth_bytes) {
+                        Ok(server_first) => {
+                            session_state.scram_session_id = Some(session_id.to_string());
+                            Ok(SaslAuthResult::Continue(server_first))
+                        }
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    // Final message
+                    let scram_session_id = session_state.scram_session_id.as_ref().unwrap();
+                    match sasl.process_scram_sha256_final(scram_session_id, auth_bytes) {
+                        Ok((principal, server_final)) => {
+                            // Update context
+                            let mut contexts = self.contexts.write().await;
+                            contexts.insert(
+                                session_id.to_string(),
+                                AuthContext::authenticated(principal.clone(), session_id.to_string()),
+                            );
+                            
+                            // Clean up session state
+                            session_states.remove(session_id);
+                            
+                            debug!("Session {} authenticated as {} via SCRAM-SHA-256", session_id, principal.username);
+                            Ok(SaslAuthResult::Continue(server_final))
+                        }
+                        Err(e) => {
+                            // Clean up on error
+                            session_states.remove(session_id);
+                            Err(e)
+                        }
+                    }
+                }
+            }
+            crate::SaslMechanism::ScramSha512 => {
+                if session_state.scram_session_id.is_none() {
+                    // First message
+                    match sasl.process_scram_sha512_first(session_id, auth_bytes) {
+                        Ok(server_first) => {
+                            session_state.scram_session_id = Some(session_id.to_string());
+                            Ok(SaslAuthResult::Continue(server_first))
+                        }
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    // Final message
+                    let scram_session_id = session_state.scram_session_id.as_ref().unwrap();
+                    match sasl.process_scram_sha512_final(scram_session_id, auth_bytes) {
+                        Ok((principal, server_final)) => {
+                            // Update context
+                            let mut contexts = self.contexts.write().await;
+                            contexts.insert(
+                                session_id.to_string(),
+                                AuthContext::authenticated(principal.clone(), session_id.to_string()),
+                            );
+                            
+                            // Clean up session state
+                            session_states.remove(session_id);
+                            
+                            debug!("Session {} authenticated as {} via SCRAM-SHA-512", session_id, principal.username);
+                            Ok(SaslAuthResult::Continue(server_final))
+                        }
+                        Err(e) => {
+                            // Clean up on error
+                            session_states.remove(session_id);
+                            Err(e)
+                        }
+                    }
+                }
+            }
+            _ => Err(AuthError::SaslError("Unsupported mechanism".to_string())),
+        }
     }
     
     /// Check permission for operation
@@ -214,6 +322,22 @@ impl AuthMiddleware {
     pub async fn get_sasl_mechanisms(&self, requested: &[String]) -> Vec<String> {
         let sasl = self.sasl.read().await;
         sasl.handshake(requested)
+    }
+    
+    /// Get the SASL mechanism for a session
+    pub async fn get_session_mechanism(&self, session_id: &str) -> Option<SaslMechanism> {
+        let session_states = self.session_states.read().await;
+        session_states.get(session_id)
+            .and_then(|state| state.mechanism.clone())
+    }
+    
+    /// Set the SASL mechanism for a session (called after handshake)
+    pub async fn set_session_mechanism(&self, session_id: &str, mechanism: SaslMechanism) {
+        let mut session_states = self.session_states.write().await;
+        session_states.insert(session_id.to_string(), SessionState {
+            mechanism: Some(mechanism),
+            scram_session_id: None,
+        });
     }
 }
 

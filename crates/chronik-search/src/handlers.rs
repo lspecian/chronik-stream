@@ -4,7 +4,8 @@ use crate::api::{
     SearchApi, SearchRequest, SearchResponse, IndexDocumentRequest, IndexDocumentResponse,
     GetDocumentResponse, DeleteDocumentResponse, CatIndexInfo, ErrorResponse, ErrorInfo,
     ShardInfo, HitsInfo, TotalHits, Hit, IndexMapping, FieldMapping, QueryDsl, BoolQuery,
-    MatchQuery, TermQueryDsl, RangeQueryDsl, MatchAllQuery,
+    MatchQuery, TermQueryDsl, RangeQueryDsl, MatchAllQuery, HighlightConfig,
+    GeoDistanceQuery, GeoBoundingBoxQuery, GeoPolygonQuery,
 };
 use axum::{
     extract::{Path, Query as QueryExtract, State},
@@ -21,7 +22,7 @@ use std::{
 use tantivy::{
     collector::TopDocs,
     query::{Query as TantivyQuery, QueryParser, TermQuery, RangeQuery, BooleanQuery, Occur, AllQuery},
-    schema::{Field, FieldType},
+    schema::{Field, FieldType, Value},
     Term, IndexReader,
 };
 use tracing::{debug, error, info};
@@ -58,6 +59,14 @@ pub async fn search_all(
     Json(request): Json<SearchRequest>,
 ) -> impl IntoResponse {
     let start = SystemTime::now();
+    
+    // Generate cache key
+    let cache_key = crate::cache::QueryCache::generate_key(None, &request);
+    
+    // Check cache first
+    if let Some(cached_response) = api.cache.get(&cache_key) {
+        return Json(cached_response);
+    }
     
     // Search across all indices
     let mut all_hits = Vec::new();
@@ -100,6 +109,9 @@ pub async fn search_all(
         },
         aggregations: None,
     };
+    
+    // Cache the response
+    api.cache.put(cache_key, response.clone());
     
     Json(response)
 }
@@ -194,11 +206,18 @@ async fn search_in_index(
             {
                 let field_values: Vec<_> = doc.get_all(field.0).collect();
                 if !field_values.is_empty() {
-                let json_values: Vec<serde_json::Value> = field_values.into_iter().map(|v| {
-                    // CompactDocValue doesn't expose its inner value directly,
-                    // so we need to convert it to JSON
-                    // This is a simplified approach - in production you might need to handle types differently
-                    serde_json::Value::String(format!("{:?}", v))
+                let json_values: Vec<serde_json::Value> = field_values.into_iter().filter_map(|v| {
+                    // Convert Tantivy values to JSON
+                    match v {
+                        tantivy::schema::Value::Str(s) => Some(serde_json::Value::String(s.to_string())),
+                        tantivy::schema::Value::U64(n) => Some(serde_json::Value::Number((*n).into())),
+                        tantivy::schema::Value::I64(n) => Some(serde_json::Value::Number((*n).into())),
+                        tantivy::schema::Value::F64(f) => Some(serde_json::Value::Number(
+                            serde_json::Number::from_f64(*f).unwrap_or(serde_json::Number::from(0))
+                        )),
+                        tantivy::schema::Value::Bytes(_) => None, // Skip bytes for now
+                        _ => None,
+                    }
                 }).collect();
                 
                 if json_values.len() == 1 {
@@ -216,11 +235,19 @@ async fn search_in_index(
             .unwrap_or(&Uuid::new_v4().to_string())
             .to_string();
         
+        // Generate highlights if requested
+        let highlight = if request.highlight.is_some() {
+            generate_highlights(&doc, &query, &state.schema, request.highlight.as_ref().unwrap())?
+        } else {
+            None
+        };
+        
         hits.push(Hit {
             _index: index_name.to_string(),
             _id: doc_id,
             _score: Some(score),
             _source: serde_json::Value::Object(source),
+            highlight,
         });
     }
     
@@ -341,6 +368,56 @@ fn build_tantivy_query(
             
             Ok(Box::new(BooleanQuery::new(clauses)))
         },
+        
+        QueryDsl::GeoDistance(geo_query) => {
+            use crate::geo::{GeoQuery, GeoPoint, DistanceType, parse_geo_point, parse_distance_string};
+            
+            let center = parse_geo_point(&geo_query.center)?;
+            let distance = parse_distance_string(&geo_query.distance)?;
+            let distance_type = match geo_query.distance_type.as_deref() {
+                Some("plane") => DistanceType::Plane,
+                _ => DistanceType::Arc,
+            };
+            
+            let query = GeoQuery::Distance {
+                field: geo_query.field.clone(),
+                center,
+                distance,
+                distance_type,
+            };
+            
+            query.to_tantivy_query(schema)
+        },
+        
+        QueryDsl::GeoBoundingBox(geo_query) => {
+            use crate::geo::{GeoQuery, parse_geo_point};
+            
+            let top_left = parse_geo_point(&geo_query.top_left)?;
+            let bottom_right = parse_geo_point(&geo_query.bottom_right)?;
+            
+            let query = GeoQuery::BoundingBox {
+                field: geo_query.field.clone(),
+                top_left,
+                bottom_right,
+            };
+            
+            query.to_tantivy_query(schema)
+        },
+        
+        QueryDsl::GeoPolygon(geo_query) => {
+            use crate::geo::{GeoQuery, parse_geo_point};
+            
+            let points = geo_query.points.iter()
+                .map(|p| parse_geo_point(p))
+                .collect::<Result<Vec<_>>>()?;
+            
+            let query = GeoQuery::Polygon {
+                field: geo_query.field.clone(),
+                points,
+            };
+            
+            query.to_tantivy_query(schema)
+        },
     }
 }
 
@@ -434,11 +511,18 @@ pub async fn get_document(
             {
                 let field_values: Vec<_> = doc.get_all(field.0).collect();
                 if !field_values.is_empty() {
-                let json_values: Vec<serde_json::Value> = field_values.into_iter().map(|v| {
-                    // CompactDocValue doesn't expose its inner value directly,
-                    // so we need to convert it to JSON
-                    // This is a simplified approach - in production you might need to handle types differently
-                    serde_json::Value::String(format!("{:?}", v))
+                let json_values: Vec<serde_json::Value> = field_values.into_iter().filter_map(|v| {
+                    // Convert Tantivy values to JSON
+                    match v {
+                        tantivy::schema::Value::Str(s) => Some(serde_json::Value::String(s.to_string())),
+                        tantivy::schema::Value::U64(n) => Some(serde_json::Value::Number((*n).into())),
+                        tantivy::schema::Value::I64(n) => Some(serde_json::Value::Number((*n).into())),
+                        tantivy::schema::Value::F64(f) => Some(serde_json::Value::Number(
+                            serde_json::Number::from_f64(*f).unwrap_or(serde_json::Number::from(0))
+                        )),
+                        tantivy::schema::Value::Bytes(_) => None, // Skip bytes for now
+                        _ => None,
+                    }
                 }).collect();
                 
                 if json_values.len() == 1 {
@@ -642,6 +726,19 @@ fn json_to_tantivy_doc(
                                 doc.add_i64(field, n);
                             }
                         },
+                        "geo_point" => {
+                            use crate::geo::parse_geo_point;
+                            
+                            if let Ok(point) = parse_geo_point(value) {
+                                // Add lat and lon as separate fields
+                                if let Ok(lat_field) = schema.get_field(&format!("{}_lat", field_name)) {
+                                    doc.add_f64(lat_field, point.lat);
+                                }
+                                if let Ok(lon_field) = schema.get_field(&format!("{}_lon", field_name)) {
+                                    doc.add_f64(lon_field, point.lon);
+                                }
+                            }
+                        },
                         _ => {},
                     }
                 }
@@ -717,5 +814,15 @@ fn index_creation_error(error: Error) -> (StatusCode, Json<ErrorResponse>) {
     )
 }
 
-// Re-export for external base64 usage
-use base64;
+/// Generate highlights for matching fields
+fn generate_highlights(
+    _doc: &tantivy::TantivyDocument,
+    _query: &Box<dyn TantivyQuery>,
+    _schema: &tantivy::schema::Schema,
+    _config: &HighlightConfig,
+) -> Result<Option<HashMap<String, Vec<String>>>> {
+    // TODO: Implement highlighting with updated Tantivy API
+    // The snippet API has changed in recent versions of Tantivy
+    // For now, return None to allow compilation
+    Ok(None)
+}

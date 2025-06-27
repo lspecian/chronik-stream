@@ -3,7 +3,7 @@
 use crate::consumer_group::GroupManager;
 use crate::produce_handler::{ProduceHandler, ProduceHandlerConfig};
 use chronik_common::Result;
-use chronik_auth::{AuthMiddleware, AuthError, SaslMechanism, Resource, Operation};
+use chronik_auth::{AuthMiddleware, AuthError, SaslMechanism, SaslAuthResult, Resource, Operation};
 use chronik_protocol::{
     Request, Response, RequestBody,
     ProduceRequest,
@@ -148,7 +148,7 @@ impl RequestHandler {
             RequestBody::OffsetCommit(commit) => self.handle_offset_commit(commit, correlation_id, session_id).await,
             RequestBody::OffsetFetch(fetch) => self.handle_offset_fetch(fetch, correlation_id, session_id).await,
             RequestBody::ApiVersions(api_versions) => self.handle_api_versions(api_versions, correlation_id).await,
-            RequestBody::SaslHandshake(handshake) => self.handle_sasl_handshake(handshake, correlation_id).await,
+            RequestBody::SaslHandshake(handshake) => self.handle_sasl_handshake(handshake, correlation_id, session_id).await,
             RequestBody::SaslAuthenticate(auth) => self.handle_sasl_authenticate(auth, correlation_id, session_id).await,
         }
     }
@@ -568,11 +568,15 @@ impl RequestHandler {
     }
     
     /// Handle SASL handshake request
-    async fn handle_sasl_handshake(&self, request: SaslHandshakeRequest, correlation_id: i32) -> Result<Response> {
+    async fn handle_sasl_handshake(&self, request: SaslHandshakeRequest, correlation_id: i32, session_id: &str) -> Result<Response> {
         // Get supported mechanisms
         let mechanisms = self.auth_middleware.get_sasl_mechanisms(&[request.mechanism.clone()]).await;
         
         let error_code = if mechanisms.contains(&request.mechanism) {
+            // Store the mechanism for this session
+            if let Some(mechanism) = SaslMechanism::from_str(&request.mechanism) {
+                self.auth_middleware.set_session_mechanism(session_id, mechanism).await;
+            }
             0 // No error
         } else {
             33 // Unsupported SASL mechanism
@@ -586,16 +590,31 @@ impl RequestHandler {
     
     /// Handle SASL authenticate request
     async fn handle_sasl_authenticate(&self, request: SaslAuthenticateRequest, correlation_id: i32, session_id: &str) -> Result<Response> {
-        // For now, only support PLAIN mechanism
-        let mechanism = SaslMechanism::Plain;
+        // Get the active mechanism for this session
+        let mechanism = match self.auth_middleware.get_session_mechanism(session_id).await {
+            Some(mech) => mech,
+            None => {
+                // Default to PLAIN if no mechanism set (backward compatibility)
+                SaslMechanism::Plain
+            }
+        };
         
         match self.auth_middleware.authenticate_sasl(session_id, &mechanism, &request.auth_bytes).await {
-            Ok(principal) => {
+            Ok(SaslAuthResult::Success(principal)) => {
                 Ok(Response::SaslAuthenticate(SaslAuthenticateResponse {
                     error_code: 0,
                     error_message: None,
                     auth_bytes: vec![],
                     session_lifetime_ms: 3600000, // 1 hour
+                }))
+            }
+            Ok(SaslAuthResult::Continue(challenge_bytes)) => {
+                // SCRAM requires multiple round trips
+                Ok(Response::SaslAuthenticate(SaslAuthenticateResponse {
+                    error_code: 0,
+                    error_message: None,
+                    auth_bytes: challenge_bytes,
+                    session_lifetime_ms: 0, // Not authenticated yet
                 }))
             }
             Err(e) => {

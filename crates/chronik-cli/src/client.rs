@@ -101,4 +101,24 @@ impl AdminClient {
         
         Ok(())
     }
+    
+    /// PATCH request
+    pub async fn patch<B: Serialize, T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T> {
+        let url = format!("{}{}", self.base_url, path);
+        let request = self.client.patch(&url).json(body);
+        let request = self.add_auth(request);
+        
+        let response = request.send().await?;
+        
+        if !response.status().is_success() {
+            let error = response.text().await?;
+            anyhow::bail!("Request failed: {}", error);
+        }
+        
+        Ok(response.json().await?)
+    }
 }

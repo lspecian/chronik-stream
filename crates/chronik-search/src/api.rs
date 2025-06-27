@@ -38,6 +38,8 @@ pub struct SearchApi {
     pub indices: Arc<DashMap<String, IndexState>>,
     /// Metrics
     metrics: ApiMetrics,
+    /// Query cache
+    pub cache: Arc<crate::cache::QueryCache>,
 }
 
 /// State for a single index
@@ -103,7 +105,7 @@ pub struct FieldMapping {
 }
 
 /// Search request (Elasticsearch compatible)
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SearchRequest {
     #[serde(default)]
     pub query: Option<QueryDsl>,
@@ -117,14 +119,59 @@ pub struct SearchRequest {
     pub _source: Option<SourceFilter>,
     pub aggs: Option<serde_json::Value>,
     pub aggregations: Option<serde_json::Value>,
+    #[serde(default)]
+    pub highlight: Option<HighlightConfig>,
 }
 
 fn default_size() -> usize {
     10
 }
 
+/// Highlight configuration
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct HighlightConfig {
+    #[serde(default)]
+    pub fields: HashMap<String, HighlightField>,
+    #[serde(default = "default_pre_tags")]
+    pub pre_tags: Vec<String>,
+    #[serde(default = "default_post_tags")]
+    pub post_tags: Vec<String>,
+    #[serde(default = "default_fragment_size")]
+    pub fragment_size: usize,
+    #[serde(default = "default_number_of_fragments")]
+    pub number_of_fragments: usize,
+    #[serde(default)]
+    pub require_field_match: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct HighlightField {
+    #[serde(default)]
+    pub fragment_size: Option<usize>,
+    #[serde(default)]
+    pub number_of_fragments: Option<usize>,
+    #[serde(default)]
+    pub no_match_size: Option<usize>,
+}
+
+fn default_pre_tags() -> Vec<String> {
+    vec!["<em>".to_string()]
+}
+
+fn default_post_tags() -> Vec<String> {
+    vec!["</em>".to_string()]
+}
+
+fn default_fragment_size() -> usize {
+    150
+}
+
+fn default_number_of_fragments() -> usize {
+    3
+}
+
 /// Query DSL (Elasticsearch compatible)
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QueryDsl {
     Match(MatchQuery),
@@ -132,27 +179,30 @@ pub enum QueryDsl {
     Range(RangeQueryDsl),
     Bool(BoolQuery),
     MatchAll(MatchAllQuery),
+    GeoDistance(GeoDistanceQuery),
+    GeoBoundingBox(GeoBoundingBoxQuery),
+    GeoPolygon(GeoPolygonQuery),
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct MatchQuery {
     #[serde(flatten)]
     pub field_value: HashMap<String, serde_json::Value>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct TermQueryDsl {
     #[serde(flatten)]
     pub field_value: HashMap<String, serde_json::Value>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct RangeQueryDsl {
     #[serde(flatten)]
     pub field_range: HashMap<String, RangeClause>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct RangeClause {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gte: Option<serde_json::Value>,
@@ -164,7 +214,7 @@ pub struct RangeClause {
     pub lt: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct BoolQuery {
     #[serde(default)]
     pub must: Vec<QueryDsl>,
@@ -176,24 +226,47 @@ pub struct BoolQuery {
     pub filter: Vec<QueryDsl>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct MatchAllQuery {}
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GeoDistanceQuery {
+    pub field: String,
+    pub distance: String,
+    #[serde(flatten)]
+    pub center: serde_json::Value,
+    #[serde(default)]
+    pub distance_type: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GeoBoundingBoxQuery {
+    pub field: String,
+    pub top_left: serde_json::Value,
+    pub bottom_right: serde_json::Value,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GeoPolygonQuery {
+    pub field: String,
+    pub points: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum SortClause {
     Field(String),
     Object(HashMap<String, SortOrder>),
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SortOrder {
     Asc,
     Desc,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum SourceFilter {
     Bool(bool),
@@ -201,7 +274,7 @@ pub enum SourceFilter {
 }
 
 /// Search response (Elasticsearch compatible)
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SearchResponse {
     pub took: u64,
     pub timed_out: bool,
@@ -211,7 +284,7 @@ pub struct SearchResponse {
     pub aggregations: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ShardInfo {
     pub total: u32,
     pub successful: u32,
@@ -219,25 +292,27 @@ pub struct ShardInfo {
     pub failed: u32,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct HitsInfo {
     pub total: TotalHits,
     pub max_score: Option<f32>,
     pub hits: Vec<Hit>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct TotalHits {
     pub value: u64,
     pub relation: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Hit {
     pub _index: String,
     pub _id: String,
     pub _score: Option<f32>,
     pub _source: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub highlight: Option<HashMap<String, Vec<String>>>,
 }
 
 /// Index document request
@@ -322,9 +397,11 @@ pub struct ErrorInfo {
 impl SearchApi {
     /// Create a new search API.
     pub fn new() -> Result<Self> {
+        let cache_config = crate::cache::CacheConfig::default();
         Ok(Self {
             indices: Arc::new(DashMap::new()),
             metrics: ApiMetrics::new()?,
+            cache: Arc::new(crate::cache::QueryCache::new(cache_config)),
         })
     }
 
@@ -369,20 +446,22 @@ impl SearchApi {
         let mut fields = HashMap::new();
 
         for (field_name, field_mapping) in &mapping.properties {
-            let field = match field_mapping.field_type.as_str() {
+            match field_mapping.field_type.as_str() {
                 "text" => {
                     let mut options = TEXT;
                     if field_mapping.store.unwrap_or(false) {
                         options = options | STORED;
                     }
-                    schema_builder.add_text_field(field_name, options)
+                    let field = schema_builder.add_text_field(field_name, options);
+                    fields.insert(field_name.clone(), field);
                 },
                 "keyword" => {
                     let mut options = STRING;
                     if field_mapping.store.unwrap_or(false) {
                         options = options | STORED;
                     }
-                    schema_builder.add_text_field(field_name, options)
+                    let field = schema_builder.add_text_field(field_name, options);
+                    fields.insert(field_name.clone(), field);
                 },
                 "long" | "integer" => {
                     let mut options = NumericOptions::default();
@@ -392,7 +471,29 @@ impl SearchApi {
                     if field_mapping.store.unwrap_or(false) {
                         options = options.set_stored();
                     }
-                    schema_builder.add_i64_field(field_name, options)
+                    let field = schema_builder.add_i64_field(field_name, options);
+                    fields.insert(field_name.clone(), field);
+                },
+                "geo_point" => {
+                    // For geo_point, create two f64 fields: field_lat and field_lon
+                    let mut lat_options = NumericOptions::default()
+                        .set_indexed()
+                        .set_fast();
+                    let mut lon_options = NumericOptions::default()
+                        .set_indexed()
+                        .set_fast();
+                    
+                    if field_mapping.store.unwrap_or(false) {
+                        lat_options = lat_options.set_stored();
+                        lon_options = lon_options.set_stored();
+                    }
+                    
+                    let lat_field = schema_builder.add_f64_field(&format!("{}_lat", field_name), lat_options);
+                    let lon_field = schema_builder.add_f64_field(&format!("{}_lon", field_name), lon_options);
+                    
+                    // Store both fields in the fields map
+                    fields.insert(format!("{}_lat", field_name), lat_field);
+                    fields.insert(format!("{}_lon", field_name), lon_field);
                 },
                 _ => {
                     return Err(Error::InvalidInput(format!(
@@ -400,8 +501,7 @@ impl SearchApi {
                         field_mapping.field_type
                     )));
                 }
-            };
-            fields.insert(field_name.clone(), field);
+            }
         }
 
         let schema = schema_builder.build();
