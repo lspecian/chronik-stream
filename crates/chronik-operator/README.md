@@ -58,8 +58,11 @@ spec:
       local: {}
     size: 10Gi
   metadataStorage:
-    type: sled
-    volumeSize: 10Gi
+    type: tikv
+    pdEndpoints:
+      - tikv-pd-0.tikv-pd:2379
+      - tikv-pd-1.tikv-pd:2379
+      - tikv-pd-2.tikv-pd:2379
 ```
 
 Apply the manifest:

@@ -42,7 +42,7 @@
 ### 5. Distributed Architecture
 - Stateless nodes (compute/storage separation)
 - Consistent hashing for work distribution
-- Embedded Sled database for metadata storage
+- Distributed TiKV cluster for metadata storage
 - Raft consensus for controller coordination
 
 ## Implementation Order

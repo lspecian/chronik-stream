@@ -29,7 +29,7 @@ futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
-# Database - removed sqlx, using Sled via chronik-common
+# Database - using TiKV via chronik-common
 
 # Error handling
 anyhow = { workspace = true }

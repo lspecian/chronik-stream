@@ -1,24 +1,28 @@
-//! Adapter to integrate Sled metadata store with the controller.
+//! Adapter to integrate metadata store with the controller.
 
-use chronik_common::metadata::{MetadataStore, SledMetadataStore, TopicConfig as MetaTopicConfig, BrokerMetadata, BrokerStatus, PartitionAssignment};
+use chronik_common::metadata::{MetadataStore, TiKVMetadataStore, TopicConfig as MetaTopicConfig, BrokerMetadata, BrokerStatus, PartitionAssignment};
 use crate::raft_simple::{TopicConfig, BrokerInfo, BrokerId};
 use chronik_common::{Result, Error};
 use std::sync::Arc;
-use std::path::Path;
 
 /// Controller metadata store adapter
 pub struct ControllerMetadataStore {
-    store: Arc<SledMetadataStore>,
+    store: Arc<dyn MetadataStore>,
 }
 
 impl ControllerMetadataStore {
-    /// Create a new metadata store
-    pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let store = SledMetadataStore::new(path)
+    /// Create a new metadata store with TiKV backend
+    pub async fn new(pd_endpoints: Vec<String>) -> Result<Self> {
+        let store = TiKVMetadataStore::new(pd_endpoints).await
             .map_err(|e| Error::Internal(format!("Failed to create metadata store: {:?}", e)))?;
         Ok(Self {
             store: Arc::new(store),
         })
+    }
+    
+    /// Create metadata store with custom backend
+    pub fn with_backend(store: Arc<dyn MetadataStore>) -> Self {
+        Self { store }
     }
     
     /// Get the underlying metadata store

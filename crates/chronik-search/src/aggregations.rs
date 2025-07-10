@@ -338,7 +338,7 @@ impl AggregationExecutor {
         query: &dyn Query,
         count_agg: &ValueCountAggregation,
     ) -> Result<serde_json::Value> {
-        let field = self.schema.get_field(&count_agg.field)
+        let _field = self.schema.get_field(&count_agg.field)
             .map_err(|_| anyhow::anyhow!("Field not found: {}", count_agg.field))?;
         
         let mut count = 0u64;

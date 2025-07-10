@@ -9,7 +9,7 @@ license.workspace = true
 chronik-common = { path = "../chronik-common" }
 chronik-storage = { path = "../chronik-storage" }
 
-# Database - removed sqlx, using Sled via chronik-common
+# Database - using TiKV via chronik-common
 
 # Async
 tokio = { workspace = true }

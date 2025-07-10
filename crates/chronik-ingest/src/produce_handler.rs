@@ -301,6 +301,11 @@ impl ProduceHandler {
         let acks = request.acks;
         let timeout_ms = request.timeout_ms as u64;
         
+        // Clone topic names for error handling
+        let topic_names: Vec<(String, Vec<i32>)> = request.topics.iter()
+            .map(|t| (t.name.clone(), t.partitions.iter().map(|p| p.index).collect()))
+            .collect();
+        
         // Handle request with timeout
         let result = timeout(
             Duration::from_millis(timeout_ms.max(self.config.request_timeout_ms)),
@@ -315,21 +320,51 @@ impl ProduceHandler {
                 error!("Produce request processing failed: {}", e);
                 self.metrics.produce_errors.fetch_add(1, Ordering::Relaxed);
                 
-                // Return error response
+                // Return error response for all topics in the request
+                let error_topics = topic_names.iter().map(|(topic_name, partitions)| {
+                    ProduceResponseTopic {
+                        name: topic_name.clone(),
+                        partitions: partitions.iter().map(|&index| {
+                            ProduceResponsePartition {
+                                index,
+                                error_code: ErrorCode::KafkaStorageError.code(),
+                                base_offset: -1,
+                                log_append_time: -1,
+                                log_start_offset: 0,
+                            }
+                        }).collect(),
+                    }
+                }).collect();
+                
                 return Ok(ProduceResponse {
                     header: chronik_protocol::parser::ResponseHeader { correlation_id },
                     throttle_time_ms: 0,
-                    topics: vec![],
+                    topics: error_topics,
                 });
             }
             Err(_) => {
                 warn!("Produce request timed out after {}ms", timeout_ms);
                 
-                // Return timeout error
+                // Return timeout error for all topics
+                let timeout_topics = topic_names.iter().map(|(topic_name, partitions)| {
+                    ProduceResponseTopic {
+                        name: topic_name.clone(),
+                        partitions: partitions.iter().map(|&index| {
+                            ProduceResponsePartition {
+                                index,
+                                error_code: ErrorCode::RequestTimedOut.code(),
+                                base_offset: -1,
+                                log_append_time: -1,
+                                log_start_offset: 0,
+                            }
+                        }).collect(),
+                    }
+                }).collect();
+                
                 return Ok(ProduceResponse {
                     header: chronik_protocol::parser::ResponseHeader { correlation_id },
                     throttle_time_ms: 0,
-                    topics: vec![],
+                    topics: timeout_topics,
                 });
             }
         }
@@ -986,7 +1021,7 @@ impl Clone for ProduceHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chronik_common::metadata::sled_store::SledMetadataStore;
+    use chronik_common::metadata::TiKVMetadataStore;
     use chronik_storage::object_store::backends::local::LocalObjectStore;
     use tempfile::TempDir;
     use bytes::BufMut;
@@ -1000,7 +1035,8 @@ mod tests {
         std::fs::create_dir_all(&metadata_path).unwrap();
         
         let storage = Arc::new(LocalObjectStore::new(storage_path.to_str().unwrap()).unwrap());
-        let metadata_store = Arc::new(SledMetadataStore::new(metadata_path.to_str().unwrap()).unwrap());
+        let pd_endpoints = vec!["localhost:2379".to_string()];
+        let metadata_store = Arc::new(TiKVMetadataStore::new(pd_endpoints).await.unwrap());
         
         // Create test topic
         metadata_store.create_topic("test-topic", 3, 1).await.unwrap();

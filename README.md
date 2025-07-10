@@ -26,7 +26,7 @@ A high-performance, Kafka-compatible distributed streaming platform with built-i
                                │
                                ▼
                         ┌─────────────────┐
-                        │  Sled Database  │
+                        │  TiKV Cluster   │
                         └─────────────────┘
 ```
 
@@ -67,10 +67,23 @@ kafka-console-producer --broker-list localhost:9092 --topic events
 kafka-console-consumer --bootstrap-server localhost:9092 --topic events --from-beginning
 ```
 
+## Kafka Client Compatibility
+
+Chronik Stream is fully compatible with standard Kafka clients:
+
+- ✅ **kafkactl** - CLI tool for Kafka operations
+- ✅ **Sarama** - Go client library
+- ✅ **confluent-kafka-python** - Python client with C bindings
+- ✅ **librdkafka** - High-performance C/C++ library
+- ✅ **kafka-clients** - Official Java client
+- ✅ **node-rdkafka** - Node.js bindings for librdkafka
+
+See the [Kafka Client Compatibility Guide](docs/kafka-client-compatibility.md) for detailed testing results and examples.
+
 ## Components
 
 ### Controller Node
-Manages cluster metadata, coordinates brokers, and handles administrative operations using a simplified Raft consensus protocol. Uses embedded Sled database for metadata persistence.
+Manages cluster metadata, coordinates brokers, and handles administrative operations using a simplified Raft consensus protocol. Uses distributed TiKV cluster for metadata persistence.
 
 ### Ingest Node
 Handles Kafka protocol connections, processes produce/fetch requests, and manages data indexing.
@@ -95,7 +108,7 @@ Command-line interface for cluster administration and troubleshooting.
 ### Environment Variables
 
 - `CHRONIK_ROLE`: Node role (controller, ingest, query)
-- `METADATA_PATH`: Path to Sled metadata database (controller nodes)
+- `TIKV_PD_ENDPOINTS`: TiKV PD endpoints for metadata storage (default: localhost:2379)
 - `OBJECT_STORE_TYPE`: Storage backend (s3, gcs, azure, local)
 - `KAFKA_LISTENERS`: Kafka protocol listen addresses
 

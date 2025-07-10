@@ -1,0 +1,15 @@
+server:
+  host: localhost
+  port: 8080
+  workers: 4
+
+storage:
+  backend: local
+  path: /data
+  cache_size_mb: 256
+
+features:
+  search_enabled: true
+  geo_queries: false
+  rate_limit: 1000
+EOF < /dev/null

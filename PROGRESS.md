@@ -35,9 +35,9 @@
 - Implement controller state machine
 - Handle partition leader assignments
 
-### ✅ Task 6: Implement Sled-based Metadata Storage
+### ✅ Task 6: Implement TiKV-based Metadata Storage
 - Implemented MetadataStore trait for abstract metadata operations
-- Created Sled-based storage implementation with separate trees
+- Created TiKV-based distributed storage implementation
 - Added support for topics, segments, brokers, assignments, groups, offsets
 - Implemented cascading deletes and system state initialization
 - Full test coverage for metadata operations

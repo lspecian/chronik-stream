@@ -1,6 +1,6 @@
 //! Tests for the Kafka protocol implementation.
 
-use bytes::{Bytes, BytesMut, BufMut};
+use bytes::{Buf, Bytes, BytesMut, BufMut};
 use chronik_protocol::{
     compression::{CompressionHandler, CompressionType, MessageBatch},
     frame::KafkaFrameCodec,
@@ -292,4 +292,152 @@ fn test_api_key_mapping() {
     assert_eq!(ApiKey::from_i16(3), Some(ApiKey::Metadata));
     assert_eq!(ApiKey::from_i16(18), Some(ApiKey::ApiVersions));
     assert_eq!(ApiKey::from_i16(999), None); // Invalid
+}
+
+/// Test ApiVersions v0 field ordering
+#[test]
+fn test_api_versions_v0_field_ordering() {
+    let mut buf = BytesMut::new();
+    let apis = get_supported_apis();
+    
+    // Encode with v0 - field order should be: api_versions array, then error_code
+    ProtocolCodec::encode_api_versions_response(&mut buf, 123, &apis, 0).unwrap();
+    
+    // Skip correlation ID (4 bytes)
+    let mut data = &buf[4..];
+    
+    // First should be array length (4 bytes)
+    let array_len = i32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+    assert!(array_len > 0, "API versions array should not be empty");
+    
+    // Calculate where error_code should be
+    // Each API version entry is 6 bytes (api_key: 2, min_version: 2, max_version: 2)
+    let error_code_offset = 4 + (array_len as usize * 6);
+    
+    // Verify we have enough data
+    assert!(data.len() >= error_code_offset + 2, "Response too short");
+    
+    // Error code should be after the array
+    let error_code = i16::from_be_bytes([data[error_code_offset], data[error_code_offset + 1]]);
+    assert_eq!(error_code, 0, "Error code should be 0");
+}
+
+/// Test ApiVersions v1+ field ordering
+#[test]
+fn test_api_versions_v1_field_ordering() {
+    let mut buf = BytesMut::new();
+    let apis = get_supported_apis();
+    
+    // Encode with v1 - field order should be: error_code, then api_versions array
+    ProtocolCodec::encode_api_versions_response(&mut buf, 456, &apis, 1).unwrap();
+    
+    // Skip correlation ID (4 bytes)
+    let mut data = &buf[4..];
+    
+    // First should be error_code (2 bytes)
+    let error_code = i16::from_be_bytes([data[0], data[1]]);
+    assert_eq!(error_code, 0, "Error code should be 0");
+    
+    // Then array length (4 bytes)
+    let array_len = i32::from_be_bytes([data[2], data[3], data[4], data[5]]);
+    assert!(array_len > 0, "API versions array should not be empty");
+    
+    // Then throttle_time_ms (4 bytes) for v1+
+    let throttle_offset = 6 + (array_len as usize * 6);
+    assert!(data.len() >= throttle_offset + 4, "Response too short for throttle_time_ms");
+    let throttle_time = i32::from_be_bytes([
+        data[throttle_offset], 
+        data[throttle_offset + 1], 
+        data[throttle_offset + 2], 
+        data[throttle_offset + 3]
+    ]);
+    assert_eq!(throttle_time, 0, "Throttle time should be 0");
+}
+
+/// Test DescribeConfigs request/response
+#[tokio::test]
+async fn test_describe_configs() {
+    use chronik_protocol::handler::ProtocolHandler;
+    use bytes::BytesMut;
+    
+    let handler = ProtocolHandler::new();
+    
+    // Build a DescribeConfigs request (v0)
+    let mut request_buf = BytesMut::new();
+    
+    // Request header
+    request_buf.put_i16(32); // ApiKey::DescribeConfigs
+    request_buf.put_i16(0);  // Version 0
+    request_buf.put_i32(999); // Correlation ID
+    request_buf.put_i16(11); // Client ID length (corrected from 10 to 11)
+    request_buf.put_slice(b"test-client"); // 11 bytes
+    
+    // Request body
+    request_buf.put_i32(1); // 1 resource
+    request_buf.put_i8(2);  // Resource type: TOPIC
+    request_buf.put_i16(10); // Resource name length
+    request_buf.put_slice(b"test-topic");
+    // No configuration keys in v0
+    
+    // Add length prefix
+    let mut final_buf = BytesMut::new();
+    final_buf.put_i32(request_buf.len() as i32);
+    final_buf.extend_from_slice(&request_buf);
+    
+    // Handle request - skip the length prefix (first 4 bytes)
+    let response = handler.handle_request(&final_buf[4..]).await.unwrap();
+    
+    // Verify response
+    assert_eq!(response.header.correlation_id, 999);
+    assert!(!response.body.is_empty());
+    
+    // Parse response body
+    let mut body = response.body.clone();
+    
+    // Skip correlation ID (already in header)
+    let corr_id = body.get_i32();
+    assert_eq!(corr_id, 999);
+    
+    // Throttle time
+    let throttle_time = body.get_i32();
+    assert_eq!(throttle_time, 0);
+    
+    // Results array
+    let result_count = body.get_i32();
+    assert_eq!(result_count, 1);
+    
+    // First result
+    let error_code = body.get_i16();
+    assert_eq!(error_code, 0); // No error
+    
+    // Error message (null)
+    let msg_len = body.get_i16();
+    assert_eq!(msg_len, -1);
+    
+    // Resource type
+    let resource_type = body.get_i8();
+    assert_eq!(resource_type, 2); // TOPIC
+    
+    // Resource name
+    let name_len = body.get_i16() as usize;
+    assert_eq!(name_len, 10);
+    let mut name_bytes = vec![0u8; name_len];
+    body.copy_to_slice(&mut name_bytes);
+    assert_eq!(&name_bytes, b"test-topic");
+    
+    // Configs array
+    let config_count = body.get_i32();
+    assert!(config_count > 0); // Should have some configs
+    
+    // Check first config
+    let config_name_len = body.get_i16() as usize;
+    assert!(config_name_len > 0);
+    let mut config_name = vec![0u8; config_name_len];
+    body.copy_to_slice(&mut config_name);
+    let config_name_str = String::from_utf8(config_name).unwrap();
+    
+    // Should be one of our default configs
+    assert!(["retention.ms", "segment.ms", "segment.bytes", "min.insync.replicas", 
+             "compression.type", "cleanup.policy", "max.message.bytes"]
+        .contains(&config_name_str.as_str()));
 }

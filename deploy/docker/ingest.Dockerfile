@@ -1,6 +1,12 @@
 # Build stage
 FROM rust:latest AS builder
 
+# Install build dependencies including libclang for bindgen
+RUN apt-get update && apt-get install -y \
+    clang \
+    libclang-dev \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 COPY . .
 

@@ -213,7 +213,7 @@ impl RealtimeIndexer {
     /// Start the indexing pipeline
     pub async fn start(
         &self,
-        mut document_receiver: mpsc::Receiver<JsonDocument>,
+        document_receiver: mpsc::Receiver<JsonDocument>,
     ) -> Result<Vec<JoinHandle<()>>> {
         if self.running.swap(true, Ordering::SeqCst) {
             return Err(Error::Internal("Indexer already running".into()));
@@ -629,7 +629,7 @@ async fn get_or_create_field(
     // Create field based on hint
     let field_entry = match hint {
         FieldTypeHint::Text => {
-            let text_options = TextOptions::default()
+            let _text_options = TextOptions::default()
                 .set_indexing_options(
                     TextFieldIndexing::default()
                         .set_tokenizer("default")
@@ -678,8 +678,8 @@ async fn get_or_create_field(
 async fn commit_topic_index(
     topic: &str,
     index: &Arc<RwLock<TopicIndex>>,
-    config: &RealtimeIndexerConfig,
-    metrics: &Arc<IndexingMetrics>,
+    _config: &RealtimeIndexerConfig,
+    _metrics: &Arc<IndexingMetrics>,
 ) -> Result<()> {
     let index = index.read().await;
     let mut writer = index.index_writer.lock().await;

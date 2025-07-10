@@ -13,8 +13,9 @@ use chronik_common::{Result, Error};
 /// Maximum frame size (100MB) to prevent OOM attacks
 const MAX_FRAME_SIZE: usize = 100 * 1024 * 1024;
 
-/// Minimum frame size (request header is at least 14 bytes)
-const MIN_FRAME_SIZE: usize = 14;
+/// Minimum frame size - Kafka allows very small frames
+/// API versions response can be as small as 6 bytes (correlation ID + error code)
+const MIN_FRAME_SIZE: usize = 6;
 
 /// Kafka protocol frame decoder/encoder
 pub struct KafkaFrameCodec {

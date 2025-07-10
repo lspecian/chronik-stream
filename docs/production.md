@@ -147,8 +147,11 @@ spec:
     storageClass: chronik-ssd
   
   metadataStorage:
-    type: sled
-    volumeSize: 10Gi
+    type: tikv
+    pdEndpoints: 
+      - tikv-pd-0.tikv-pd:2379
+      - tikv-pd-1.tikv-pd:2379
+      - tikv-pd-2.tikv-pd:2379
     storageClass: chronik-ssd
   
   resources:
@@ -335,7 +338,7 @@ groups:
 ### Backup Strategy
 
 1. **Metadata Backup**
-   - Sled database: Daily snapshots of metadata volume
+   - TiKV cluster: Daily snapshots using TiKV backup tool
    - Retention: 30 days
 
 2. **Data Backup**
@@ -353,9 +356,9 @@ groups:
    - No manual intervention required
 
 2. **Metadata Recovery**
-   - Restore Sled database from volume snapshot
+   - Restore TiKV cluster from backup
    - Verify metadata consistency
-   - Restart controller nodes
+   - TiKV automatically handles failover
 
 3. **Data Recovery**
    - Restore segments from object storage

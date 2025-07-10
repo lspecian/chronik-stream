@@ -1,12 +1,13 @@
-//! Example showing how to use the Sled-based metadata store.
+//! Example showing how to use the TiKV-based metadata store.
 
-use chronik_common::metadata::{MetadataStore, SledMetadataStore, TopicConfig, BrokerMetadata, BrokerStatus};
+use chronik_common::metadata::{MetadataStore, TiKVMetadataStore, TopicConfig, BrokerMetadata, BrokerStatus};
 use std::collections::HashMap;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize the Sled metadata store
-    let metadata_store = SledMetadataStore::new("./data/metadata")?;
+    // Initialize the TiKV metadata store
+    let pd_endpoints = vec!["localhost:2379".to_string()];
+    let metadata_store = TiKVMetadataStore::new(pd_endpoints).await?;
     
     // Initialize system state (creates internal topics)
     println!("Initializing system state...");

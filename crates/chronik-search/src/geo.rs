@@ -104,7 +104,7 @@ impl GeoQuery {
     /// Convert geo query to Tantivy query
     pub fn to_tantivy_query(&self, schema: &Schema) -> Result<Box<dyn Query>> {
         match self {
-            GeoQuery::Distance { field, center, distance, distance_type } => {
+            GeoQuery::Distance { field, center, distance, distance_type: _ } => {
                 // Convert to bounding box for initial filtering
                 let bbox = calculate_bounding_box(center, *distance)?;
                 let lat_field = schema.get_field(&format!("{}_lat", field))

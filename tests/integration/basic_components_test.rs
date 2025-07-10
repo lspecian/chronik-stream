@@ -102,7 +102,7 @@ async fn test_segment_writer_reader_roundtrip() -> Result<()> {
 async fn test_metadata_store_operations() -> Result<()> {
     use chronik_common::metadata::{
         traits::MetadataStore,
-        sled_store::SledMetadataStore,
+        TiKVMetadataStore,
         TopicMetadata, TopicConfig,
     };
     
@@ -110,7 +110,8 @@ async fn test_metadata_store_operations() -> Result<()> {
     
     // Create temporary directory
     let temp_dir = TempDir::new()?;
-    let metadata_store = SledMetadataStore::new(temp_dir.path())?;
+    let pd_endpoints = vec!["localhost:2379".to_string()];
+    let metadata_store = TiKVMetadataStore::new(pd_endpoints).await?;
     
     // Test topic operations
     let topic_name = "test-metadata-topic";
@@ -162,7 +163,7 @@ async fn test_metadata_store_operations() -> Result<()> {
 async fn test_consumer_group_management() -> Result<()> {
     use chronik_common::metadata::{
         traits::MetadataStore,
-        sled_store::SledMetadataStore,
+        TiKVMetadataStore,
         ConsumerGroupMetadata, ConsumerOffset,
     };
     
@@ -170,7 +171,8 @@ async fn test_consumer_group_management() -> Result<()> {
     
     // Create temporary directory
     let temp_dir = TempDir::new()?;
-    let metadata_store = SledMetadataStore::new(temp_dir.path())?;
+    let pd_endpoints = vec!["localhost:2379".to_string()];
+    let metadata_store = TiKVMetadataStore::new(pd_endpoints).await?;
     
     let group_id = "test-consumer-group";
     let topic = "test-topic";

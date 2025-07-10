@@ -1,7 +1,7 @@
 //! Production controller implementation with tikv/raft-rs.
 
 use crate::raft_node::{RaftNode, RaftHandle, NodeId};
-use crate::raft_storage::SledRaftStorage;
+use crate::tikv_raft_storage::TiKVRaftStorage;
 use crate::raft_transport::{RaftTransport, TransportConfig};
 use crate::raft_simple::{Proposal, ControllerState};
 use crate::metastore_adapter::ControllerMetadataStore;
@@ -48,11 +48,20 @@ impl Controller {
         std::fs::create_dir_all(&metadata_dir)
             .map_err(|e| Error::Io(e))?;
         
-        // Create Raft storage
-        let _storage = Arc::new(SledRaftStorage::new(&raft_dir.to_string_lossy())?);
+        // Get TiKV PD endpoints
+        let pd_endpoints = std::env::var("TIKV_PD_ENDPOINTS")
+            .unwrap_or_else(|_| "localhost:2379".to_string())
+            .split(',')
+            .map(|s| s.to_string())
+            .collect::<Vec<String>>();
         
-        // Create metadata store
-        let metadata_store = Arc::new(ControllerMetadataStore::new(&metadata_dir)?);
+        // Create Raft storage using TiKV
+        let _storage = Arc::new(TiKVRaftStorage::new(pd_endpoints.clone()).await?);
+        
+        // Create metadata store using TiKV
+        use chronik_common::metadata::TiKVMetadataStore;
+        let tikv_metadata = Arc::new(TiKVMetadataStore::new(pd_endpoints).await?);
+        let metadata_store = Arc::new(ControllerMetadataStore::with_backend(tikv_metadata));
         
         // Create message channels
         let (msg_tx, _msg_rx) = mpsc::unbounded_channel();

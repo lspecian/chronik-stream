@@ -28,6 +28,7 @@ pub enum RequestBody {
     ApiVersions(ApiVersionsRequest),
     SaslHandshake(SaslHandshakeRequest),
     SaslAuthenticate(SaslAuthenticateRequest),
+    DescribeConfigs(DescribeConfigsRequest),
 }
 
 /// Response variants
@@ -45,6 +46,7 @@ pub enum Response {
     ApiVersions(ApiVersionsResponse),
     SaslHandshake(SaslHandshakeResponse),
     SaslAuthenticate(SaslAuthenticateResponse),
+    DescribeConfigs(DescribeConfigsResponse),
 }
 
 /// Produce request
@@ -409,8 +411,9 @@ impl Request {
     /// Decode a request from bytes
     pub fn decode(data: &[u8]) -> Result<Self, String> {
         use crate::parser::parse_request_header;
+        use bytes::Bytes;
         
-        let mut buf = std::io::Cursor::new(data);
+        let mut buf = Bytes::copy_from_slice(data);
         let header = parse_request_header(&mut buf)
             .map_err(|e| format!("Failed to parse header: {:?}", e))?;
         
@@ -458,8 +461,15 @@ impl Request {
 }
 
 impl Response {
-    /// Encode a response to bytes
+    /// Encode a response to bytes (deprecated - use encode_versioned)
     pub fn encode(&self) -> Result<Vec<u8>, String> {
+        // Default to highest version for backward compatibility
+        // This is incorrect but maintains existing behavior
+        self.encode_versioned(9)
+    }
+    
+    /// Encode a response to bytes with version awareness
+    pub fn encode_versioned(&self, api_version: i16) -> Result<Vec<u8>, String> {
         let mut bytes = Vec::new();
         
         match self {
@@ -467,8 +477,10 @@ impl Response {
                 // Correlation ID
                 bytes.extend_from_slice(&resp.correlation_id.to_be_bytes());
                 
-                // Throttle time
-                bytes.extend_from_slice(&resp.throttle_time_ms.to_be_bytes());
+                // Throttle time only for v3+
+                if api_version >= 3 {
+                    bytes.extend_from_slice(&resp.throttle_time_ms.to_be_bytes());
+                }
                 
                 // Brokers array
                 bytes.extend_from_slice(&(resp.brokers.len() as i32).to_be_bytes());
@@ -735,8 +747,93 @@ impl Response {
                 // Session lifetime
                 bytes.extend_from_slice(&resp.session_lifetime_ms.to_be_bytes());
             }
+            Response::DescribeConfigs(_resp) => {
+                // DescribeConfigs encoding is handled in the handler
+                // This shouldn't be called directly
+                return Err("DescribeConfigs response should be encoded in handler".into());
+            }
         }
         
         Ok(bytes)
     }
+}
+
+/// DescribeConfigs request
+#[derive(Debug, Clone)]
+pub struct DescribeConfigsRequest {
+    pub resources: Vec<ConfigResource>,
+    pub include_synonyms: bool,
+    pub include_documentation: bool,
+}
+
+/// Config resource to describe
+#[derive(Debug, Clone)]
+pub struct ConfigResource {
+    pub resource_type: i8,  // 2 = topic, 4 = broker
+    pub resource_name: String,
+    pub configuration_keys: Option<Vec<String>>,  // None = all configs
+}
+
+/// DescribeConfigs response
+#[derive(Debug, Clone)]
+pub struct DescribeConfigsResponse {
+    pub throttle_time_ms: i32,
+    pub results: Vec<DescribeConfigsResult>,
+}
+
+/// Result for a single resource
+#[derive(Debug, Clone)]
+pub struct DescribeConfigsResult {
+    pub error_code: i16,
+    pub error_message: Option<String>,
+    pub resource_type: i8,
+    pub resource_name: String,
+    pub configs: Vec<ConfigEntry>,
+}
+
+/// Configuration entry
+#[derive(Debug, Clone)]
+pub struct ConfigEntry {
+    pub name: String,
+    pub value: Option<String>,
+    pub read_only: bool,
+    pub is_default: bool,
+    pub config_source: i8,  // 0 = UNKNOWN, 1 = TOPIC_CONFIG, 2 = DYNAMIC_BROKER_CONFIG, etc.
+    pub is_sensitive: bool,
+    pub synonyms: Vec<ConfigSynonym>,
+    pub config_type: Option<i8>,  // v3+: 1 = BOOLEAN, 2 = STRING, 3 = INT, etc.
+    pub documentation: Option<String>,  // v3+
+}
+
+/// Config synonym
+#[derive(Debug, Clone)]
+pub struct ConfigSynonym {
+    pub name: String,
+    pub value: Option<String>,
+    pub source: i8,
+}
+
+/// Config source constants
+pub mod config_source {
+    pub const UNKNOWN_CONFIG: i8 = 0;
+    pub const TOPIC_CONFIG: i8 = 1;
+    pub const DYNAMIC_BROKER_CONFIG: i8 = 2;
+    pub const DYNAMIC_DEFAULT_BROKER_CONFIG: i8 = 3;
+    pub const STATIC_BROKER_CONFIG: i8 = 4;
+    pub const DEFAULT_CONFIG: i8 = 5;
+    pub const DYNAMIC_BROKER_LOGGER_CONFIG: i8 = 6;
+}
+
+/// Config type constants (v3+)
+pub mod config_type {
+    pub const UNKNOWN: i8 = 0;
+    pub const BOOLEAN: i8 = 1;
+    pub const STRING: i8 = 2;
+    pub const INT: i8 = 3;
+    pub const SHORT: i8 = 4;
+    pub const LONG: i8 = 5;
+    pub const DOUBLE: i8 = 6;
+    pub const LIST: i8 = 7;
+    pub const CLASS: i8 = 8;
+    pub const PASSWORD: i8 = 9;
 }

@@ -177,9 +177,9 @@ impl SearchIntegration {
     /// Index a document through the API
     async fn index_document(
         &self,
-        index: &str,
-        id: &str,
-        document: serde_json::Value,
+        _index: &str,
+        _id: &str,
+        _document: serde_json::Value,
     ) -> Result<()> {
         // This would normally use the HTTP client to call the API
         // For now, we'll directly use the API's internal method

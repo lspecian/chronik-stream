@@ -1575,12 +1575,13 @@ impl PartitionAssignor for RoundRobinAssignor {
 mod tests {
     use super::*;
     use tempfile::TempDir;
-    use chronik_common::metadata::sled_store::SledMetadataStore;
+    use chronik_common::metadata::TiKVMetadataStore;
     
     #[tokio::test]
     async fn test_consumer_group_lifecycle() {
         let temp_dir = TempDir::new().unwrap();
-        let metadata_store = Arc::new(SledMetadataStore::new(temp_dir.path()).unwrap());
+        let pd_endpoints = vec!["localhost:2379".to_string()];
+        let metadata_store = Arc::new(TiKVMetadataStore::new(pd_endpoints).await.unwrap());
         let manager = Arc::new(GroupManager::new(metadata_store));
         
         // Create group

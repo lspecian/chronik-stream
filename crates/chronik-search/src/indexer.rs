@@ -116,7 +116,7 @@ impl TantivyIndexer {
     
     /// Index a record batch
     pub async fn index_batch(&self, topic: &str, partition: i32, batch: &RecordBatch) -> Result<()> {
-        let mut writer = self.index_writer.write().await;
+        let writer = self.index_writer.write().await;
         
         for record in &batch.records {
             let mut doc = doc!(
@@ -232,7 +232,7 @@ impl TantivyIndexer {
     }
     
     /// Get i64 field value from document
-    fn get_i64_field(&self, doc: &tantivy::TantivyDocument, field: Field) -> i64 {
+    fn get_i64_field(&self, _doc: &tantivy::TantivyDocument, _field: Field) -> i64 {
         // CompactDocValue doesn't expose direct access to values,
         // For now return a default value
         // In production, you would need proper type handling

@@ -1,29 +1,39 @@
-//! Kafka protocol handler that integrates with storage and indexing.
+//! Kafka protocol handler for the ingest server.
+//! 
+//! This module provides a wrapper around the chronik-protocol ProtocolHandler
+//! with additional ingest-specific functionality.
 
-use crate::produce_handler::ProduceHandler;
-use crate::fetch_handler::FetchHandler;
-use crate::storage::StorageService;
+use std::sync::Arc;
 use chronik_common::{Result, Error};
 use chronik_common::metadata::traits::MetadataStore;
-use chronik_protocol::{
-    ProtocolHandler as BaseProtocolHandler,
-    ProduceRequest, ProduceResponse,
-    FetchRequest, FetchResponse,
-    MetadataRequest, MetadataResponse, MetadataBroker, MetadataTopic, MetadataPartition,
-    parser::ResponseHeader,
-};
+use chronik_protocol::{ProtocolHandler, handler::Response, parser::{parse_request_header, ApiKey, write_response_header, ResponseHeader}};
 use chronik_storage::SegmentReader;
+use crate::produce_handler::ProduceHandler;
+use crate::consumer_group::GroupManager;
+use crate::fetch_handler::FetchHandler;
+use crate::handler::{RequestHandler, HandlerConfig};
 use bytes::{Bytes, BytesMut};
-use std::sync::Arc;
+use tracing::{debug, instrument};
 
-/// Kafka protocol handler with storage integration
+/// Kafka protocol handler with ingest-specific extensions
 pub struct KafkaProtocolHandler {
-    base_handler: BaseProtocolHandler,
+    /// Core protocol handler from chronik-protocol
+    protocol_handler: ProtocolHandler,
+    /// Produce handler for writing data
     produce_handler: Arc<ProduceHandler>,
-    fetch_handler: Arc<FetchHandler>,
+    /// Segment reader for fetch operations
+    segment_reader: Arc<SegmentReader>,
+    /// Metadata store
     metadata_store: Arc<dyn MetadataStore>,
+    /// Consumer group manager
+    group_manager: Arc<GroupManager>,
+    /// Fetch handler for reading data
+    fetch_handler: Arc<FetchHandler>,
+    /// Node ID
     node_id: i32,
+    /// Host address
     host: String,
+    /// Port number
     port: i32,
 }
 
@@ -37,504 +47,316 @@ impl KafkaProtocolHandler {
         host: String,
         port: i32,
     ) -> Result<Self> {
+        let group_manager = Arc::new(GroupManager::new(metadata_store.clone()));
+        group_manager.clone().start_expiration_checker();
+        
         let fetch_handler = Arc::new(FetchHandler::new(
-            segment_reader,
+            segment_reader.clone(),
             metadata_store.clone(),
         ));
         
         Ok(Self {
-            base_handler: BaseProtocolHandler::new(),
+            protocol_handler: ProtocolHandler::with_metadata_store(metadata_store.clone()),
             produce_handler,
-            fetch_handler,
+            segment_reader,
             metadata_store,
+            group_manager,
+            fetch_handler,
             node_id,
-            host,
+            host: host.clone(),
             port,
         })
     }
     
-    /// Handle a raw request
-    pub async fn handle_request(&self, request_bytes: &[u8]) -> Result<chronik_protocol::handler::Response> {
-        use chronik_protocol::parser::{parse_request_header, ApiKey};
-        use bytes::Bytes;
+    /// Handle a Kafka protocol request
+    #[instrument(skip(self, request_bytes))]
+    pub async fn handle_request(&self, request_bytes: &[u8]) -> Result<Response> {
+        debug!("Handling request of {} bytes", request_bytes.len());
         
+        // Log first few bytes to identify request type
+        if request_bytes.len() >= 4 {
+            let api_key = i16::from_be_bytes([request_bytes[0], request_bytes[1]]);
+            let api_version = i16::from_be_bytes([request_bytes[2], request_bytes[3]]);
+            tracing::info!("Request: API key={}, version={}", api_key, api_version);
+        }
+        
+        // Parse the request header to determine which API is being called
         let mut buf = Bytes::copy_from_slice(request_bytes);
-        let header = parse_request_header(&mut buf)?;
+        let header = match parse_request_header(&mut buf) {
+            Ok(h) => h,
+            Err(_) => {
+                // If we can't parse the header, delegate to the protocol handler
+                return self.protocol_handler.handle_request(request_bytes).await;
+            }
+        };
         
-        // Route based on API key
+        // For certain APIs that have full implementations in the ingest layer,
+        // we should intercept and handle them directly
         match header.api_key {
-            ApiKey::Produce => self.handle_produce(header, buf).await,
-            ApiKey::Fetch => self.handle_fetch(header, buf).await,
-            ApiKey::Metadata => self.handle_metadata(header, buf).await,
+            ApiKey::Produce => {
+                // Parse the produce request
+                let request = self.protocol_handler.parse_produce_request(&header, &mut buf)?;
+                
+                // Call the actual produce handler
+                let response = self.produce_handler.handle_produce(request, header.correlation_id).await?;
+                
+                // Encode the response
+                let mut body_buf = BytesMut::new();
+                self.protocol_handler.encode_produce_response(&mut body_buf, &response, header.api_version)?;
+                
+                Ok(Response {
+                    header: ResponseHeader { correlation_id: header.correlation_id },
+                    body: body_buf.freeze(),
+                })
+            }
+            ApiKey::Fetch => {
+                // Parse the fetch request
+                let request = self.protocol_handler.parse_fetch_request(&header, &mut buf)?;
+                
+                // Call the actual fetch handler
+                let response = self.fetch_handler.handle_fetch(request, header.correlation_id).await?;
+                
+                // Encode the response
+                let mut body_buf = BytesMut::new();
+                self.protocol_handler.encode_fetch_response(&mut body_buf, &response, header.api_version)?;
+                
+                Ok(Response {
+                    header: ResponseHeader { correlation_id: header.correlation_id },
+                    body: body_buf.freeze(),
+                })
+            }
+            ApiKey::FindCoordinator => {
+                // Parse the FindCoordinator request
+                let request = self.protocol_handler.parse_find_coordinator_request(&header, &mut buf)?;
+                
+                // Always return self as coordinator for now
+                let response = self.handle_find_coordinator(request).await?;
+                
+                // Encode the response
+                let mut body_buf = BytesMut::new();
+                self.protocol_handler.encode_find_coordinator_response(&mut body_buf, &response, header.api_version)?;
+                
+                Ok(Response {
+                    header: ResponseHeader { correlation_id: header.correlation_id },
+                    body: body_buf.freeze(),
+                })
+            }
+            ApiKey::JoinGroup => {
+                // Parse the JoinGroup request
+                let request = self.protocol_handler.parse_join_group_request(&header, &mut buf)?;
+                
+                // Use GroupManager to handle join
+                let response = self.handle_join_group(request).await?;
+                
+                // Encode the response
+                let mut body_buf = BytesMut::new();
+                self.protocol_handler.encode_join_group_response(&mut body_buf, &response, header.api_version)?;
+                
+                Ok(Response {
+                    header: ResponseHeader { correlation_id: header.correlation_id },
+                    body: body_buf.freeze(),
+                })
+            }
+            ApiKey::SyncGroup => {
+                // Parse the SyncGroup request
+                let request = self.protocol_handler.parse_sync_group_request(&header, &mut buf)?;
+                
+                // Use GroupManager to handle sync
+                let response = self.handle_sync_group(request).await?;
+                
+                // Encode the response
+                let mut body_buf = BytesMut::new();
+                self.protocol_handler.encode_sync_group_response(&mut body_buf, &response, header.api_version)?;
+                
+                Ok(Response {
+                    header: ResponseHeader { correlation_id: header.correlation_id },
+                    body: body_buf.freeze(),
+                })
+            }
+            ApiKey::Heartbeat => {
+                // Parse the Heartbeat request
+                let request = self.protocol_handler.parse_heartbeat_request(&header, &mut buf)?;
+                
+                // Use GroupManager to handle heartbeat
+                let response = self.handle_heartbeat(request).await?;
+                
+                // Encode the response
+                let mut body_buf = BytesMut::new();
+                self.protocol_handler.encode_heartbeat_response(&mut body_buf, &response, header.api_version)?;
+                
+                Ok(Response {
+                    header: ResponseHeader { correlation_id: header.correlation_id },
+                    body: body_buf.freeze(),
+                })
+            }
+            ApiKey::LeaveGroup => {
+                // Parse the LeaveGroup request
+                let request = self.protocol_handler.parse_leave_group_request(&header, &mut buf)?;
+                
+                // Use GroupManager to handle leave
+                let response = self.handle_leave_group(request).await?;
+                
+                // Encode the response
+                let mut body_buf = BytesMut::new();
+                self.protocol_handler.encode_leave_group_response(&mut body_buf, &response, header.api_version)?;
+                
+                Ok(Response {
+                    header: ResponseHeader { correlation_id: header.correlation_id },
+                    body: body_buf.freeze(),
+                })
+            }
+            ApiKey::ListGroups => {
+                // We just implemented this, so it should work
+                self.protocol_handler.handle_request(request_bytes).await
+            }
             _ => {
-                // Delegate to base handler for other requests
-                self.base_handler.handle_request(request_bytes).await
+                // For all other APIs, use the protocol handler
+                let response = self.protocol_handler.handle_request(request_bytes).await?;
+                tracing::info!("Response body size: {}", response.body.len());
+                Ok(response)
             }
         }
     }
     
-    /// Handle produce request with actual storage
-    async fn handle_produce(
-        &self,
-        header: chronik_protocol::parser::RequestHeader,
-        mut body: Bytes,
-    ) -> Result<chronik_protocol::handler::Response> {
-        use chronik_protocol::parser::Decoder;
-        use bytes::BytesMut;
+    /// Handle FindCoordinator request
+    async fn handle_find_coordinator(&self, request: chronik_protocol::find_coordinator_types::FindCoordinatorRequest) -> Result<chronik_protocol::find_coordinator_types::FindCoordinatorResponse> {
+        use chronik_protocol::find_coordinator_types::{FindCoordinatorResponse, error_codes};
         
-        // Parse the request completely before any await
-        let request = {
-            let mut decoder = Decoder::new(&mut body);
-            
-            // Parse produce request
-            let transactional_id = if header.api_version >= 3 {
-                decoder.read_string()?
-            } else {
-                None
-            };
-            
-            let acks = decoder.read_i16()?;
-            let timeout_ms = decoder.read_i32()?;
-            
-            // Read topics
-            let topic_count = decoder.read_i32()? as usize;
-            let mut topics = Vec::with_capacity(topic_count);
-            
-            for _ in 0..topic_count {
-                let topic_name = decoder.read_string()?
-                    .ok_or_else(|| Error::Protocol("Topic name cannot be null".into()))?;
-                
-                let partition_count = decoder.read_i32()? as usize;
-                let mut partitions = Vec::with_capacity(partition_count);
-                
-                for _ in 0..partition_count {
-                    let partition_index = decoder.read_i32()?;
-                    let records = decoder.read_bytes()?
-                        .ok_or_else(|| Error::Protocol("Records cannot be null".into()))?;
-                    
-                    partitions.push(chronik_protocol::types::ProduceRequestPartition {
-                        index: partition_index,
-                        records: records.to_vec(),
-                    });
-                }
-                
-                topics.push(chronik_protocol::types::ProduceRequestTopic {
-                    name: topic_name,
-                    partitions,
-                });
-            }
-            
-            ProduceRequest {
-                transactional_id,
-                acks,
-                timeout_ms,
-                topics,
-            }
-        }; // decoder is dropped here
-        
-        // Handle through produce handler
-        let response = self.produce_handler.handle_produce(request, header.correlation_id).await?;
-        
-        // Encode response
-        let mut body_buf = BytesMut::new();
-        encode_produce_response(&mut body_buf, &response, header.api_version)?;
-        
-        Ok(chronik_protocol::handler::Response {
-            header: ResponseHeader { correlation_id: header.correlation_id },
-            body: body_buf.freeze(),
-        })
-    }
-    
-    /// Handle fetch request with actual storage
-    async fn handle_fetch(
-        &self,
-        header: chronik_protocol::parser::RequestHeader,
-        mut body: Bytes,
-    ) -> Result<chronik_protocol::handler::Response> {
-        use chronik_protocol::parser::Decoder;
-        use bytes::BytesMut;
-        
-        // Parse the request completely before any await
-        let request = {
-            let mut decoder = Decoder::new(&mut body);
-            
-            // Parse fetch request
-            let replica_id = decoder.read_i32()?;
-            let max_wait_ms = decoder.read_i32()?;
-            let min_bytes = decoder.read_i32()?;
-            
-            let max_bytes = if header.api_version >= 3 {
-                decoder.read_i32()?
-            } else {
-                i32::MAX
-            };
-            
-            let isolation_level = if header.api_version >= 4 {
-                decoder.read_i8()?
-            } else {
-                0
-            };
-            
-            let session_id = if header.api_version >= 7 {
-                decoder.read_i32()?
-            } else {
-                0
-            };
-            
-            let session_epoch = if header.api_version >= 7 {
-                decoder.read_i32()?
-            } else {
-                -1
-            };
-            
-            // Read topics
-            let topic_count = decoder.read_i32()? as usize;
-            let mut topics = Vec::with_capacity(topic_count);
-            
-            for _ in 0..topic_count {
-                let topic_name = decoder.read_string()?
-                    .ok_or_else(|| Error::Protocol("Topic name cannot be null".into()))?;
-                
-                let partition_count = decoder.read_i32()? as usize;
-                let mut partitions = Vec::with_capacity(partition_count);
-                
-                for _ in 0..partition_count {
-                    let partition = decoder.read_i32()?;
-                    let current_leader_epoch = if header.api_version >= 9 {
-                        decoder.read_i32()?
-                    } else {
-                        -1
-                    };
-                    let fetch_offset = decoder.read_i64()?;
-                    let log_start_offset = if header.api_version >= 5 {
-                        decoder.read_i64()?
-                    } else {
-                        -1
-                    };
-                    let partition_max_bytes = decoder.read_i32()?;
-                    
-                    partitions.push(chronik_protocol::types::FetchRequestPartition {
-                        partition,
-                        current_leader_epoch,
-                        fetch_offset,
-                        log_start_offset,
-                        partition_max_bytes,
-                    });
-                }
-                
-                topics.push(chronik_protocol::types::FetchRequestTopic {
-                    name: topic_name,
-                    partitions,
-                });
-            }
-            
-            FetchRequest {
-                replica_id,
-                max_wait_ms,
-                min_bytes,
-                max_bytes,
-                isolation_level,
-                session_id,
-                session_epoch,
-                topics,
-            }
-        }; // decoder is dropped here
-        
-        // Handle through fetch handler
-        let response = self.fetch_handler.handle_fetch(request, header.correlation_id).await?;
-        
-        // Encode response
-        let mut body_buf = BytesMut::new();
-        encode_fetch_response(&mut body_buf, &response, header.api_version)?;
-        
-        Ok(chronik_protocol::handler::Response {
-            header: ResponseHeader { correlation_id: header.correlation_id },
-            body: body_buf.freeze(),
-        })
-    }
-    
-    /// Handle metadata request with actual metadata
-    async fn handle_metadata(
-        &self,
-        header: chronik_protocol::parser::RequestHeader,
-        mut body: Bytes,
-    ) -> Result<chronik_protocol::handler::Response> {
-        use chronik_protocol::parser::Decoder;
-        use bytes::BytesMut;
-        
-        // Parse the request completely before any await
-        let (topics, _allow_auto_topic_creation) = {
-            let mut decoder = Decoder::new(&mut body);
-            
-            // Parse metadata request
-            let topics = if header.api_version >= 1 {
-                let topic_count = decoder.read_i32()?;
-                if topic_count < 0 {
-                    None // All topics
-                } else {
-                    let mut topic_names = Vec::with_capacity(topic_count as usize);
-                    for _ in 0..topic_count {
-                        if let Some(name) = decoder.read_string()? {
-                            topic_names.push(name);
-                        }
-                    }
-                    Some(topic_names)
-                }
-            } else {
-                None
-            };
-            
-            let allow_auto_topic_creation = if header.api_version >= 4 {
-                decoder.read_bool()?
-            } else {
-                true
-            };
-            
-            (topics, allow_auto_topic_creation)
-        }; // decoder is dropped here
-        
-        // Build metadata response
-        let brokers = vec![MetadataBroker {
+        // For now, always return self as coordinator
+        Ok(FindCoordinatorResponse {
+            throttle_time_ms: 0,
+            error_code: error_codes::NONE,
+            error_message: None,
             node_id: self.node_id,
             host: self.host.clone(),
             port: self.port,
-            rack: None,
-        }];
-        
-        let mut response_topics = Vec::new();
-        
-        // Get topics from metadata store
-        if let Some(topic_names) = topics {
-            for topic_name in topic_names {
-                if let Ok(Some(topic_meta)) = self.metadata_store.get_topic(&topic_name).await {
-                    let mut partitions = Vec::new();
-                    
-                    for i in 0..topic_meta.config.partition_count {
-                        partitions.push(MetadataPartition {
-                            error_code: 0,
-                            partition_index: i as i32,
-                            leader_id: self.node_id, // Simplified: this node is leader
-                            leader_epoch: 0,
-                            replica_nodes: vec![self.node_id],
-                            isr_nodes: vec![self.node_id],
-                            offline_replicas: vec![],
-                        });
-                    }
-                    
-                    response_topics.push(MetadataTopic {
-                        error_code: 0,
-                        name: topic_name,
-                        is_internal: false,
-                        partitions,
-                    });
-                } else {
-                    // Topic not found
-                    response_topics.push(MetadataTopic {
-                        error_code: 3, // UNKNOWN_TOPIC_OR_PARTITION
-                        name: topic_name,
-                        is_internal: false,
-                        partitions: vec![],
-                    });
-                }
-            }
-        } else {
-            // Return all topics
-            if let Ok(topics) = self.metadata_store.list_topics().await {
-                for topic_meta in topics {
-                    let mut partitions = Vec::new();
-                    
-                    for i in 0..topic_meta.config.partition_count {
-                        partitions.push(MetadataPartition {
-                            error_code: 0,
-                            partition_index: i as i32,
-                            leader_id: self.node_id,
-                            leader_epoch: 0,
-                            replica_nodes: vec![self.node_id],
-                            isr_nodes: vec![self.node_id],
-                            offline_replicas: vec![],
-                        });
-                    }
-                    
-                    response_topics.push(MetadataTopic {
-                        error_code: 0,
-                        name: topic_meta.name,
-                        is_internal: false,
-                        partitions,
-                    });
-                }
-            }
-        }
-        
-        let response = MetadataResponse {
-            correlation_id: header.correlation_id,
-            throttle_time_ms: 0,
-            brokers,
-            cluster_id: Some("chronik-stream".to_string()),
-            controller_id: 1,
-            topics: response_topics,
-        };
-        
-        // Encode response
-        let mut body_buf = BytesMut::new();
-        encode_metadata_response(&mut body_buf, &response, header.api_version)?;
-        
-        Ok(chronik_protocol::handler::Response {
-            header: ResponseHeader { correlation_id: header.correlation_id },
-            body: body_buf.freeze(),
         })
     }
-}
-
-// Helper functions for encoding responses
-fn encode_produce_response(buf: &mut BytesMut, response: &ProduceResponse, version: i16) -> Result<()> {
-    use chronik_protocol::parser::Encoder;
     
-    let mut encoder = Encoder::new(buf);
-    
-    // Topics array
-    encoder.write_i32(response.topics.len() as i32);
-    for topic in &response.topics {
-        encoder.write_string(Some(&topic.name));
+    /// Handle JoinGroup request
+    async fn handle_join_group(&self, request: chronik_protocol::join_group_types::JoinGroupRequest) -> Result<chronik_protocol::join_group_types::JoinGroupResponse> {
+        use chronik_protocol::join_group_types::{JoinGroupResponse, JoinGroupResponseMember};
+        use std::time::Duration;
         
-        // Partitions array
-        encoder.write_i32(topic.partitions.len() as i32);
-        for partition in &topic.partitions {
-            encoder.write_i32(partition.index);
-            encoder.write_i16(partition.error_code);
-            encoder.write_i64(partition.base_offset);
-            
-            if version >= 2 {
-                encoder.write_i64(partition.log_append_time);
-            }
-            
-            if version >= 5 {
-                encoder.write_i64(partition.log_start_offset);
-            }
-        }
-    }
-    
-    if version >= 1 {
-        encoder.write_i32(response.throttle_time_ms);
-    }
-    
-    Ok(())
-}
-
-fn encode_fetch_response(buf: &mut BytesMut, response: &FetchResponse, version: i16) -> Result<()> {
-    use chronik_protocol::parser::Encoder;
-    
-    let mut encoder = Encoder::new(buf);
-    
-    if version >= 1 {
-        encoder.write_i32(response.throttle_time_ms);
-    }
-    
-    // Topics array
-    encoder.write_i32(response.topics.len() as i32);
-    for topic in &response.topics {
-        encoder.write_string(Some(&topic.name));
+        // Convert protocols to the format expected by GroupManager
+        let protocols: Vec<(String, Vec<u8>)> = request.protocols.into_iter()
+            .map(|p| (p.name, p.metadata.to_vec()))
+            .collect();
         
-        // Partitions array
-        encoder.write_i32(topic.partitions.len() as i32);
-        for partition in &topic.partitions {
-            encoder.write_i32(partition.partition);
-            encoder.write_i16(partition.error_code);
-            encoder.write_i64(partition.high_watermark);
-            
-            if version >= 4 {
-                encoder.write_i64(partition.last_stable_offset);
-                
-                if version >= 5 {
-                    encoder.write_i64(partition.log_start_offset);
+        // Call GroupManager
+        let response = self.group_manager.join_group(
+            request.group_id,
+            if request.member_id.is_empty() { None } else { Some(request.member_id) },
+            "client".to_string(), // TODO: Extract from request
+            self.host.clone(),
+            Duration::from_millis(request.session_timeout_ms as u64),
+            Duration::from_millis(request.rebalance_timeout_ms as u64),
+            request.protocol_type,
+            protocols,
+            request.group_instance_id,
+        ).await?;
+        
+        // Convert response
+        Ok(JoinGroupResponse {
+            throttle_time_ms: 0,
+            error_code: response.error_code,
+            generation_id: response.generation_id,
+            protocol_type: Some(response.protocol.clone()),
+            protocol_name: Some(response.protocol),
+            leader: response.leader_id,
+            member_id: response.member_id,
+            members: response.members.into_iter().map(|m| JoinGroupResponseMember {
+                member_id: m.member_id,
+                group_instance_id: None,
+                metadata: m.metadata.into(),
+            }).collect(),
+        })
+    }
+    
+    /// Handle SyncGroup request
+    async fn handle_sync_group(&self, request: chronik_protocol::sync_group_types::SyncGroupRequest) -> Result<chronik_protocol::sync_group_types::SyncGroupResponse> {
+        use chronik_protocol::sync_group_types::SyncGroupResponse;
+        
+        // Convert assignments if this is the leader
+        let assignments = if !request.assignments.is_empty() {
+            Some(request.assignments.into_iter()
+                .map(|a| (a.member_id, a.assignment.to_vec()))
+                .collect())
+        } else {
+            None
+        };
+        
+        // Call GroupManager
+        let response = self.group_manager.sync_group(
+            request.group_id,
+            request.generation_id,
+            request.member_id,
+            0, // member_epoch - TODO: Extract from request
+            assignments,
+        ).await?;
+        
+        // Convert response
+        Ok(SyncGroupResponse {
+            throttle_time_ms: 0,
+            error_code: response.error_code,
+            protocol_type: None, // TODO: Get from group state
+            protocol_name: None, // TODO: Get from group state
+            assignment: response.assignment.into(),
+        })
+    }
+    
+    /// Handle Heartbeat request
+    async fn handle_heartbeat(&self, request: chronik_protocol::heartbeat_types::HeartbeatRequest) -> Result<chronik_protocol::heartbeat_types::HeartbeatResponse> {
+        use chronik_protocol::heartbeat_types::HeartbeatResponse;
+        
+        // Call GroupManager
+        let response = self.group_manager.heartbeat(
+            request.group_id,
+            request.member_id,
+            request.generation_id,
+            None, // member_epoch - TODO: Extract from request
+        ).await?;
+        
+        // Convert response
+        Ok(HeartbeatResponse {
+            throttle_time_ms: 0,
+            error_code: response.error_code,
+        })
+    }
+    
+    /// Handle LeaveGroup request
+    async fn handle_leave_group(&self, request: chronik_protocol::leave_group_types::LeaveGroupRequest) -> Result<chronik_protocol::leave_group_types::LeaveGroupResponse> {
+        use chronik_protocol::leave_group_types::{LeaveGroupResponse, MemberResponse};
+        
+        // Handle each member leaving
+        let mut member_responses = Vec::new();
+        for member in request.members {
+            match self.group_manager.leave_group(
+                request.group_id.clone(),
+                member.member_id.clone(),
+            ).await {
+                Ok(_) => {
+                    member_responses.push(MemberResponse {
+                        member_id: member.member_id,
+                        group_instance_id: member.group_instance_id,
+                        error_code: 0,
+                    });
                 }
-                
-                // Aborted transactions (null for now)
-                encoder.write_i32(-1);
-            }
-            
-            // Records
-            encoder.write_bytes(if partition.records.is_empty() {
-                None
-            } else {
-                Some(&partition.records)
-            });
-        }
-    }
-    
-    Ok(())
-}
-
-fn encode_metadata_response(buf: &mut BytesMut, response: &MetadataResponse, version: i16) -> Result<()> {
-    use chronik_protocol::parser::Encoder;
-    
-    let mut encoder = Encoder::new(buf);
-    
-    if version >= 3 {
-        encoder.write_i32(response.throttle_time_ms);
-    }
-    
-    // Brokers array
-    encoder.write_i32(response.brokers.len() as i32);
-    for broker in &response.brokers {
-        encoder.write_i32(broker.node_id);
-        encoder.write_string(Some(&broker.host));
-        encoder.write_i32(broker.port);
-        
-        if version >= 1 {
-            encoder.write_string(broker.rack.as_deref());
-        }
-    }
-    
-    if version >= 2 {
-        encoder.write_string(response.cluster_id.as_deref());
-    }
-    
-    if version >= 1 {
-        encoder.write_i32(response.controller_id);
-    }
-    
-    // Topics array
-    encoder.write_i32(response.topics.len() as i32);
-    for topic in &response.topics {
-        encoder.write_i16(topic.error_code);
-        encoder.write_string(Some(&topic.name));
-        
-        if version >= 1 {
-            encoder.write_bool(topic.is_internal);
-        }
-        
-        // Partitions array
-        encoder.write_i32(topic.partitions.len() as i32);
-        for partition in &topic.partitions {
-            encoder.write_i16(partition.error_code);
-            encoder.write_i32(partition.partition_index);
-            encoder.write_i32(partition.leader_id);
-            
-            if version >= 7 {
-                encoder.write_i32(partition.leader_epoch);
-            }
-            
-            // Replica nodes
-            encoder.write_i32(partition.replica_nodes.len() as i32);
-            for replica in &partition.replica_nodes {
-                encoder.write_i32(*replica);
-            }
-            
-            // ISR nodes
-            encoder.write_i32(partition.isr_nodes.len() as i32);
-            for isr in &partition.isr_nodes {
-                encoder.write_i32(*isr);
-            }
-            
-            if version >= 5 {
-                // Offline replicas
-                encoder.write_i32(partition.offline_replicas.len() as i32);
-                for offline in &partition.offline_replicas {
-                    encoder.write_i32(*offline);
+                Err(e) => {
+                    tracing::error!("Failed to leave group: {:?}", e);
+                    member_responses.push(MemberResponse {
+                        member_id: member.member_id,
+                        group_instance_id: member.group_instance_id,
+                        error_code: 25, // UNKNOWN_MEMBER_ID
+                    });
                 }
             }
         }
+        
+        Ok(LeaveGroupResponse {
+            throttle_time_ms: 0,
+            error_code: 0,
+            members: member_responses,
+        })
     }
-    
-    Ok(())
 }

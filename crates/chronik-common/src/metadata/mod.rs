@@ -1,9 +1,12 @@
 //! Metadata management module.
 
 pub mod traits;
-pub mod sled_store;
+pub mod tikv_store;
 #[cfg(test)]
 mod tests;
 
 pub use traits::*;
-pub use sled_store::SledMetadataStore;
+pub use tikv_store::TiKVMetadataStore;
+
+// Re-export TiKVMetadataStore as the default MetadataStore implementation
+pub type DefaultMetadataStore = TiKVMetadataStore;

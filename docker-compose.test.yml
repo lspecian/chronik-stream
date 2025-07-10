@@ -1,67 +1,18 @@
-version: '3.8'
-
 services:
-  # MinIO for S3-compatible object storage
-  minio:
-    image: minio/minio:latest
-    container_name: chronik-test-minio
-    ports:
-      - "9000:9000"
-      - "9001:9001"
+  controller:
+    build:
+      context: .
+      dockerfile: deploy/docker/controller.Dockerfile
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
-    command: server /data --console-address ":9001"
+      METADATA_PATH: /data/metadata
+      NODE_ID: 1
+      RUST_LOG: info
     volumes:
-      - minio-data:/data
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-      interval: 30s
-      timeout: 20s
-      retries: 3
-
-  # Create initial bucket
-  minio-init:
-    image: minio/mc:latest
-    depends_on:
-      minio:
-        condition: service_healthy
-    entrypoint: >
-      /bin/sh -c "
-      /usr/bin/mc alias set minio http://minio:9000 minioadmin minioadmin;
-      /usr/bin/mc mb minio/chronik-test || true;
-      /usr/bin/mc mb minio/chronik-segments || true;
-      /usr/bin/mc mb minio/chronik-snapshots || true;
-      exit 0;
-      "
-
-  # Jaeger for distributed tracing (optional for tests)
-  jaeger:
-    image: jaegertracing/all-in-one:latest
-    container_name: chronik-test-jaeger
+      - controller_metadata:/data/metadata
     ports:
-      - "16686:16686"
-      - "14250:14250"
-    environment:
-      COLLECTOR_OTLP_ENABLED: "true"
-
-  # Prometheus for metrics (optional for tests)
-  prometheus:
-    image: prom/prometheus:latest
-    container_name: chronik-test-prometheus
-    ports:
-      - "9091:9090"
-    volumes:
-      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
-      - prometheus-data:/prometheus
-    command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.path=/prometheus'
+      - "9090:9090"
+    user: root
 
 volumes:
-  minio-data:
-  prometheus-data:
-
-networks:
-  default:
-    name: chronik-test-network
+  controller_metadata:
+EOF < /dev/null

@@ -52,6 +52,10 @@ impl ApiKey {
             1 => Some(ApiKey::Fetch),
             2 => Some(ApiKey::ListOffsets),
             3 => Some(ApiKey::Metadata),
+            4 => Some(ApiKey::LeaderAndIsr),
+            5 => Some(ApiKey::StopReplica),
+            6 => Some(ApiKey::UpdateMetadata),
+            7 => Some(ApiKey::ControlledShutdown),
             8 => Some(ApiKey::OffsetCommit),
             9 => Some(ApiKey::OffsetFetch),
             10 => Some(ApiKey::FindCoordinator),
@@ -65,6 +69,19 @@ impl ApiKey {
             18 => Some(ApiKey::ApiVersions),
             19 => Some(ApiKey::CreateTopics),
             20 => Some(ApiKey::DeleteTopics),
+            21 => Some(ApiKey::DeleteRecords),
+            22 => Some(ApiKey::InitProducerId),
+            23 => Some(ApiKey::OffsetForLeaderEpoch),
+            24 => Some(ApiKey::AddPartitionsToTxn),
+            25 => Some(ApiKey::AddOffsetsToTxn),
+            26 => Some(ApiKey::EndTxn),
+            27 => Some(ApiKey::WriteTxnMarkers),
+            28 => Some(ApiKey::TxnOffsetCommit),
+            29 => Some(ApiKey::DescribeAcls),
+            30 => Some(ApiKey::CreateAcls),
+            31 => Some(ApiKey::DeleteAcls),
+            32 => Some(ApiKey::DescribeConfigs),
+            33 => Some(ApiKey::AlterConfigs),
             _ => None,
         }
     }
@@ -94,12 +111,12 @@ pub struct VersionRange {
 
 /// Protocol decoder for reading Kafka protocol primitives
 pub struct Decoder<'a> {
-    buf: &'a mut dyn Buf,
+    buf: &'a mut Bytes,
 }
 
 impl<'a> Decoder<'a> {
     /// Create a new decoder
-    pub fn new(buf: &'a mut dyn Buf) -> Self {
+    pub fn new(buf: &'a mut Bytes) -> Self {
         Self { buf }
     }
     
@@ -309,7 +326,7 @@ impl<'a> Encoder<'a> {
 }
 
 /// Parse a request header from bytes
-pub fn parse_request_header(buf: &mut dyn Buf) -> Result<RequestHeader> {
+pub fn parse_request_header(buf: &mut Bytes) -> Result<RequestHeader> {
     let mut decoder = Decoder::new(buf);
     
     let api_key_raw = decoder.read_i16()?;
@@ -334,6 +351,43 @@ pub fn write_response_header(buf: &mut BytesMut, header: &ResponseHeader) {
     encoder.write_i32(header.correlation_id);
 }
 
+/// Write a response header to bytes with flexible version support
+pub fn write_response_header_flexible(buf: &mut BytesMut, header: &ResponseHeader, api_key: ApiKey, api_version: i16) {
+    let mut encoder = Encoder::new(buf);
+    encoder.write_i32(header.correlation_id);
+    
+    // Check if this API version uses flexible versions
+    if is_flexible_version(api_key, api_version) {
+        // Write empty tagged fields
+        encoder.write_unsigned_varint(0);
+    }
+}
+
+/// Check if an API version uses flexible versions
+pub fn is_flexible_version(api_key: ApiKey, api_version: i16) -> bool {
+    match api_key {
+        ApiKey::Produce => api_version >= 9,
+        ApiKey::Fetch => api_version >= 12,
+        ApiKey::ListOffsets => api_version >= 6,
+        ApiKey::Metadata => api_version >= 9,
+        ApiKey::OffsetCommit => api_version >= 8,
+        ApiKey::OffsetFetch => api_version >= 6,
+        ApiKey::FindCoordinator => api_version >= 3,
+        ApiKey::JoinGroup => api_version >= 6,
+        ApiKey::Heartbeat => api_version >= 4,
+        ApiKey::LeaveGroup => api_version >= 4,
+        ApiKey::SyncGroup => api_version >= 4,
+        ApiKey::DescribeGroups => api_version >= 5,
+        ApiKey::ListGroups => api_version >= 3,
+        ApiKey::SaslHandshake => api_version >= 1,
+        ApiKey::ApiVersions => api_version >= 3,
+        ApiKey::CreateTopics => api_version >= 5,
+        ApiKey::DeleteTopics => api_version >= 4,
+        ApiKey::DescribeConfigs => api_version >= 4,
+        _ => false,
+    }
+}
+
 /// Get supported API versions
 pub fn supported_api_versions() -> HashMap<ApiKey, VersionRange> {
     let mut versions = HashMap::new();
@@ -341,12 +395,12 @@ pub fn supported_api_versions() -> HashMap<ApiKey, VersionRange> {
     // Core APIs
     versions.insert(ApiKey::Produce, VersionRange { min: 0, max: 9 });
     versions.insert(ApiKey::Fetch, VersionRange { min: 0, max: 13 });
-    versions.insert(ApiKey::ListOffsets, VersionRange { min: 0, max: 7 });
+    versions.insert(ApiKey::ListOffsets, VersionRange { min: 0, max: 4 }); // Support up to v4
     versions.insert(ApiKey::Metadata, VersionRange { min: 0, max: 12 });
     versions.insert(ApiKey::OffsetCommit, VersionRange { min: 0, max: 8 });
     versions.insert(ApiKey::OffsetFetch, VersionRange { min: 0, max: 8 });
     versions.insert(ApiKey::FindCoordinator, VersionRange { min: 0, max: 4 });
-    versions.insert(ApiKey::JoinGroup, VersionRange { min: 0, max: 9 });
+    versions.insert(ApiKey::JoinGroup, VersionRange { min: 0, max: 7 }); // Support up to v7
     versions.insert(ApiKey::Heartbeat, VersionRange { min: 0, max: 4 });
     versions.insert(ApiKey::LeaveGroup, VersionRange { min: 0, max: 5 });
     versions.insert(ApiKey::SyncGroup, VersionRange { min: 0, max: 5 });
@@ -354,8 +408,10 @@ pub fn supported_api_versions() -> HashMap<ApiKey, VersionRange> {
     versions.insert(ApiKey::ListGroups, VersionRange { min: 0, max: 4 });
     versions.insert(ApiKey::SaslHandshake, VersionRange { min: 0, max: 1 });
     versions.insert(ApiKey::ApiVersions, VersionRange { min: 0, max: 3 });
-    versions.insert(ApiKey::CreateTopics, VersionRange { min: 0, max: 7 });
+    versions.insert(ApiKey::CreateTopics, VersionRange { min: 0, max: 5 }); // Support up to v5
     versions.insert(ApiKey::DeleteTopics, VersionRange { min: 0, max: 6 });
+    versions.insert(ApiKey::DescribeConfigs, VersionRange { min: 0, max: 4 });
+    versions.insert(ApiKey::AlterConfigs, VersionRange { min: 0, max: 2 });
     
     versions
 }

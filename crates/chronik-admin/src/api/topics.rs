@@ -84,20 +84,24 @@ pub struct Partition {
 pub async fn list_topics(
     State(state): State<AppState>,
 ) -> AdminResult<Json<Vec<Topic>>> {
-    // TODO: Get from metastore
-    let topics = vec![
+    // Get topics from metadata store
+    let metadata_topics = state.metadata_store.list_topics()
+        .await
+        .map_err(|e| crate::error::AdminError::Internal(e.to_string()))?;
+    
+    let topics: Vec<Topic> = metadata_topics.into_iter().map(|mt| {
         Topic {
-            name: "events".to_string(),
-            partitions: 3,
-            replication_factor: 2,
+            name: mt.name,
+            partitions: mt.config.partition_count as i32,
+            replication_factor: mt.config.replication_factor as i32,
             config: TopicConfig {
-                retention_ms: 7 * 24 * 60 * 60 * 1000, // 7 days
-                segment_bytes: 1024 * 1024 * 1024, // 1GB
-                min_insync_replicas: 2,
+                retention_ms: mt.config.retention_ms.unwrap_or(7 * 24 * 60 * 60 * 1000),
+                segment_bytes: mt.config.segment_bytes,
+                min_insync_replicas: mt.config.replication_factor as i32,
                 compression_type: "snappy".to_string(),
             },
-        },
-    ];
+        }
+    }).collect();
     
     Ok(Json(topics))
 }
@@ -117,7 +121,37 @@ pub async fn create_topic(
     State(state): State<AppState>,
     Json(req): Json<CreateTopicRequest>,
 ) -> AdminResult<()> {
-    // TODO: Create via controller
+    use chronik_common::metadata::traits::TopicConfig as MetadataTopicConfig;
+    
+    // Check if topic already exists
+    if let Ok(Some(_)) = state.metadata_store.get_topic(&req.name).await {
+        return Err(crate::error::AdminError::Conflict(
+            format!("Topic {} already exists", req.name)
+        ));
+    }
+    
+    // Create topic configuration
+    let config = if let Some(cfg) = req.config {
+        MetadataTopicConfig {
+            partition_count: req.partitions as u32,
+            replication_factor: req.replication_factor as u32,
+            retention_ms: Some(cfg.retention_ms),
+            segment_bytes: cfg.segment_bytes,
+            config: std::collections::HashMap::new(),
+        }
+    } else {
+        MetadataTopicConfig {
+            partition_count: req.partitions as u32,
+            replication_factor: req.replication_factor as u32,
+            ..Default::default()
+        }
+    };
+    
+    // Create topic in metadata store
+    state.metadata_store.create_topic(&req.name, config)
+        .await
+        .map_err(|e| crate::error::AdminError::Internal(e.to_string()))?;
+    
     Ok(())
 }
 
@@ -138,21 +172,26 @@ pub async fn get_topic(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> AdminResult<Json<Topic>> {
-    // TODO: Get from metastore
-    if name == "events" {
-        Ok(Json(Topic {
-            name: name.clone(),
-            partitions: 3,
-            replication_factor: 2,
-            config: TopicConfig {
-                retention_ms: 7 * 24 * 60 * 60 * 1000,
-                segment_bytes: 1024 * 1024 * 1024,
-                min_insync_replicas: 2,
-                compression_type: "snappy".to_string(),
-            },
-        }))
-    } else {
-        Err(crate::error::AdminError::NotFound(format!("Topic {} not found", name)))
+    // Get from metadata store
+    let topic_metadata = state.metadata_store.get_topic(&name)
+        .await
+        .map_err(|e| crate::error::AdminError::Internal(e.to_string()))?;
+    
+    match topic_metadata {
+        Some(mt) => {
+            Ok(Json(Topic {
+                name: mt.name,
+                partitions: mt.config.partition_count as i32,
+                replication_factor: mt.config.replication_factor as i32,
+                config: TopicConfig {
+                    retention_ms: mt.config.retention_ms.unwrap_or(7 * 24 * 60 * 60 * 1000),
+                    segment_bytes: mt.config.segment_bytes,
+                    min_insync_replicas: mt.config.replication_factor as i32,
+                    compression_type: "snappy".to_string(),
+                },
+            }))
+        },
+        None => Err(crate::error::AdminError::NotFound(format!("Topic {} not found", name)))
     }
 }
 

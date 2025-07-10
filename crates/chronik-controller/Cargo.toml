@@ -16,8 +16,8 @@ slog = "2.7"
 slog-term = "2.9"
 slog-async = "2.8"
 
-# Database - removed sqlx, using Sled via chronik-common
-sled = { workspace = true }
+# Database - using TiKV via chronik-common
+tikv-client = { workspace = true }
 
 # Web framework for admin API
 axum = "0.7"

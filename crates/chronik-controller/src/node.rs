@@ -58,7 +58,22 @@ impl ControllerNode {
         
         let state_machine = Arc::new(StateMachine::new());
         
-        let metadata_store = Arc::new(ControllerMetadataStore::new(&config.metadata_path)?);
+        // Create metadata store with TiKV
+        let pd_endpoints = std::env::var("TIKV_PD_ENDPOINTS")
+            .unwrap_or_else(|_| "localhost:2379".to_string());
+        
+        let store = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                use chronik_common::metadata::TiKVMetadataStore;
+                let endpoints = pd_endpoints
+                    .split(',')
+                    .map(|s| s.to_string())
+                    .collect::<Vec<String>>();
+                TiKVMetadataStore::new(endpoints).await
+            })
+        }).map_err(|e| Error::Internal(format!("Failed to create TiKV metadata store: {:?}", e)))?;
+        
+        let metadata_store = Arc::new(ControllerMetadataStore::with_backend(Arc::new(store)));
         
         Ok(Self {
             config,

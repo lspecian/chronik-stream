@@ -12,6 +12,9 @@ pub mod chronik_segment_example;
 pub mod checksum;
 pub mod segment_checksum;
 pub mod segment_cache;
+pub mod optimized_segment;
+pub mod vector_search;
+pub mod extended_segment;
 
 pub use index::{IndexBuilder, Document, FieldType, FieldValue, SegmentSearcher, SearchHit};
 pub use object_store::{
@@ -26,3 +29,15 @@ pub use chronik_segment::{ChronikSegment, ChronikSegmentBuilder, SegmentMetadata
 pub use checksum::{ChecksumUtils, ChecksumMode, StreamingChecksum};
 pub use segment_checksum::{SegmentChecksumCalculator, SegmentChecksumVerifier, BatchChecksumVerifier};
 pub use segment_cache::{SegmentCache, SegmentCacheConfig, CachedSegmentReader, CacheStats, EvictionPolicy};
+pub use optimized_segment::{
+    OptimizedTansuSegment, OptimizedSegmentHeader, ColumnarBatch, SegmentStats,
+    CompressionType as OptimizedCompressionType
+};
+pub use vector_search::{
+    VectorIndex, VectorIndexData, DistanceMetric, HybridSearchRequest, VectorQuery,
+    FusionMethod, HybridSearchResult, HnswIndex, VectorIndexFactory, ScoreFusion
+};
+pub use extended_segment::{
+    ExtendedTansuSegment, ExtendedSegmentMetadata, ExtendedSegmentBuilder,
+    VectorFieldConfig, HybridStats, SegmentMigration
+};

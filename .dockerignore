@@ -1,5 +1,6 @@
 # Rust build artifacts
 target/
+**/target/
 **/*.rs.bk
 *.pdb
 
@@ -30,3 +31,22 @@ docs/
 .env
 .env.*
 !.env.example
+
+# TaskMaster
+.taskmaster/
+.claude/
+.cursor/
+.roomodes
+.windsurfrules
+.mcp.json
+
+# Docker
+docker-compose*.yml
+
+# Examples and benchmarks  
+examples/
+benches/
+criterion/
+
+# Test directories
+test-basic/

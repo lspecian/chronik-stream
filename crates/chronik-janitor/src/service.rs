@@ -3,7 +3,7 @@
 use crate::cleaner::{SegmentCleaner, CleanupPolicy};
 use crate::compactor::{LogCompactor, CompactionPolicy};
 use chronik_common::{Result, Error};
-use chronik_common::metadata::{MetadataStore, SledMetadataStore};
+use chronik_common::metadata::{MetadataStore, TiKVMetadataStore};
 use chronik_storage::object_store::{ObjectStore, ObjectStoreConfig, create_object_store};
 use std::sync::Arc;
 
@@ -52,10 +52,14 @@ impl JanitorService {
         // Create storage
         let storage: Arc<dyn ObjectStore> = Arc::from(create_object_store(config.storage_config.clone()).await?);
         
-        // Create metadata store
-        let metadata_path = std::env::var("METADATA_PATH")
-            .unwrap_or_else(|_| config.metadata_path.clone());
-        let metadata_store = Arc::new(SledMetadataStore::new(&metadata_path)?) as Arc<dyn MetadataStore>;
+        // Create metadata store using TiKV
+        let pd_endpoints = std::env::var("TIKV_PD_ENDPOINTS")
+            .unwrap_or_else(|_| "localhost:2379".to_string());
+        let endpoints = pd_endpoints
+            .split(',')
+            .map(|s| s.to_string())
+            .collect::<Vec<String>>();
+        let metadata_store = Arc::new(TiKVMetadataStore::new(endpoints).await?) as Arc<dyn MetadataStore>;
         
         // Initialize metadata store
         metadata_store.init_system_state().await?;

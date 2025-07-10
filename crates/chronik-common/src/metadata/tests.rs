@@ -6,15 +6,16 @@ mod tests {
     use tempfile::TempDir;
     use std::collections::HashMap;
     
-    async fn create_test_store() -> (SledMetadataStore, TempDir) {
-        let temp_dir = TempDir::new().unwrap();
-        let store = SledMetadataStore::new(temp_dir.path()).unwrap();
-        (store, temp_dir)
+    async fn create_test_store() -> TiKVMetadataStore {
+        // For tests, use a test TiKV instance or mock
+        // In a real test environment, you'd spin up a test TiKV cluster
+        let endpoints = vec!["localhost:2379".to_string()];
+        TiKVMetadataStore::new(endpoints).await.unwrap()
     }
     
     #[tokio::test]
     async fn test_init_system_state() {
-        let (store, _temp_dir) = create_test_store().await;
+        let store = create_test_store().await;
         
         // Initialize system state
         store.init_system_state().await.unwrap();
@@ -36,7 +37,7 @@ mod tests {
     
     #[tokio::test]
     async fn test_topic_crud_operations() {
-        let (store, _temp_dir) = create_test_store().await;
+        let store = create_test_store().await;
         
         // Create topic
         let config = TopicConfig {
@@ -78,7 +79,7 @@ mod tests {
     
     #[tokio::test]
     async fn test_topic_already_exists() {
-        let (store, _temp_dir) = create_test_store().await;
+        let store = create_test_store().await;
         
         let config = TopicConfig::default();
         store.create_topic("duplicate", config.clone()).await.unwrap();
@@ -96,7 +97,7 @@ mod tests {
     
     #[tokio::test]
     async fn test_segment_operations() {
-        let (store, _temp_dir) = create_test_store().await;
+        let store = create_test_store().await;
         
         // Create topic first
         store.create_topic("segments-topic", TopicConfig::default()).await.unwrap();
@@ -171,7 +172,7 @@ mod tests {
     
     #[tokio::test]
     async fn test_broker_operations() {
-        let (store, _temp_dir) = create_test_store().await;
+        let store = create_test_store().await;
         
         // Register brokers
         let brokers = vec![
@@ -216,7 +217,7 @@ mod tests {
     
     #[tokio::test]
     async fn test_partition_assignments() {
-        let (store, _temp_dir) = create_test_store().await;
+        let store = create_test_store().await;
         
         // Create topic and register brokers
         store.create_topic("assigned-topic", TopicConfig {
@@ -266,7 +267,7 @@ mod tests {
     
     #[tokio::test]
     async fn test_consumer_group_operations() {
-        let (store, _temp_dir) = create_test_store().await;
+        let store = create_test_store().await;
         
         // Create consumer group
         let group = ConsumerGroupMetadata {
@@ -303,7 +304,7 @@ mod tests {
     
     #[tokio::test]
     async fn test_consumer_offsets() {
-        let (store, _temp_dir) = create_test_store().await;
+        let store = create_test_store().await;
         
         // Create topic
         store.create_topic("offset-topic", TopicConfig {
@@ -363,7 +364,7 @@ mod tests {
     
     #[tokio::test]
     async fn test_topic_deletion_cascades() {
-        let (store, _temp_dir) = create_test_store().await;
+        let store = create_test_store().await;
         
         // Create topic with segments
         store.create_topic("cascade-topic", TopicConfig::default()).await.unwrap();

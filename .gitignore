@@ -45,10 +45,6 @@ dev-debug.log
 *.sln
 *.sw?
 # OS specific
-# Task files
-tasks.json
-tasks/ 
-
 .claude
 .cursor
 .roo
@@ -64,3 +60,7 @@ tasks/
 target/
 *target/*
 **/target/
+
+# Task files
+# tasks.json
+# tasks/ 

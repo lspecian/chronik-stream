@@ -4,7 +4,7 @@ pub mod node;
 pub mod raft_simple;
 pub mod raft_node;
 pub mod raft_transport;
-pub mod raft_storage;
+pub mod tikv_raft_storage;
 pub mod controller;
 pub mod metastore_adapter;
 pub mod client;
@@ -16,5 +16,5 @@ pub use raft_simple::{
 };
 pub use raft_node::{RaftNode, RaftHandle};
 pub use raft_transport::{RaftTransport, TransportConfig};
-pub use raft_storage::SledRaftStorage;
+pub use tikv_raft_storage::TiKVRaftStorage;
 pub use metastore_adapter::ControllerMetadataStore;

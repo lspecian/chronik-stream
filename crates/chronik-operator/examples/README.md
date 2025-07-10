@@ -34,7 +34,7 @@ A comprehensive production-ready configuration with all available features enabl
 Example configuration using cloud storage (AWS S3) with moderate resource requirements.
 
 - AWS S3 storage backend
-- Sled embedded metadata storage
+- TiKV distributed metadata storage
 - Balanced resource allocation
 - Basic monitoring enabled
 

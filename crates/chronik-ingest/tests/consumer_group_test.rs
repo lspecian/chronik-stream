@@ -1,6 +1,6 @@
 //! Integration tests for consumer group coordinator with KIP-848 support
 
-use chronik_common::metadata::sled_store::SledMetadataStore;
+use chronik_common::metadata::TiKVMetadataStore;
 use chronik_common::metadata::traits::{MetadataStore, TopicConfig};
 use chronik_ingest::consumer_group::{
     AssignmentStrategy, GroupManager, GroupState, TopicPartitionOffset,
@@ -14,7 +14,8 @@ use tokio::time::sleep;
 #[tokio::test]
 async fn test_consumer_group_lifecycle() {
     let temp_dir = TempDir::new().unwrap();
-    let metadata_store = Arc::new(SledMetadataStore::new(temp_dir.path()).unwrap());
+    let pd_endpoints = vec!["localhost:2379".to_string()];
+    let metadata_store = Arc::new(TiKVMetadataStore::new(pd_endpoints).await.unwrap());
     metadata_store.init_system_state().await.unwrap();
     
     let manager = Arc::new(GroupManager::new(metadata_store));
@@ -69,7 +70,8 @@ async fn test_consumer_group_lifecycle() {
 #[tokio::test]
 async fn test_consumer_group_rebalance() {
     let temp_dir = TempDir::new().unwrap();
-    let metadata_store = Arc::new(SledMetadataStore::new(temp_dir.path()).unwrap());
+    let pd_endpoints = vec!["localhost:2379".to_string()];
+    let metadata_store = Arc::new(TiKVMetadataStore::new(pd_endpoints).await.unwrap());
     metadata_store.init_system_state().await.unwrap();
     
     let manager = Arc::new(GroupManager::new(metadata_store));
@@ -120,7 +122,8 @@ async fn test_consumer_group_rebalance() {
 #[tokio::test]
 async fn test_consumer_group_expiration() {
     let temp_dir = TempDir::new().unwrap();
-    let metadata_store = Arc::new(SledMetadataStore::new(temp_dir.path()).unwrap());
+    let pd_endpoints = vec!["localhost:2379".to_string()];
+    let metadata_store = Arc::new(TiKVMetadataStore::new(pd_endpoints).await.unwrap());
     metadata_store.init_system_state().await.unwrap();
     
     let manager = Arc::new(GroupManager::new(metadata_store));

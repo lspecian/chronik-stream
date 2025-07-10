@@ -4,28 +4,27 @@ use crate::api::{
     SearchApi, SearchRequest, SearchResponse, IndexDocumentRequest, IndexDocumentResponse,
     GetDocumentResponse, DeleteDocumentResponse, CatIndexInfo, ErrorResponse, ErrorInfo,
     ShardInfo, HitsInfo, TotalHits, Hit, IndexMapping, FieldMapping, QueryDsl, BoolQuery,
-    MatchQuery, TermQueryDsl, RangeQueryDsl, MatchAllQuery, HighlightConfig,
-    GeoDistanceQuery, GeoBoundingBoxQuery, GeoPolygonQuery,
+    HighlightConfig,
 };
 use axum::{
-    extract::{Path, Query as QueryExtract, State},
+    extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Json},
 };
 use chronik_common::{Result, Error};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::{
     collections::HashMap,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::SystemTime,
 };
 use tantivy::{
     collector::TopDocs,
     query::{Query as TantivyQuery, QueryParser, TermQuery, RangeQuery, BooleanQuery, Occur, AllQuery},
-    schema::{Field, FieldType, Value},
-    Term, IndexReader,
+    schema::{FieldType, Value},
+    Term,
 };
-use tracing::{debug, error, info};
+use tracing::error;
 use uuid::Uuid;
 
 /// Health check response
@@ -135,7 +134,8 @@ pub async fn search_index(
     // Execute aggregations if present
     let aggregations = if let Some(aggs) = request.aggs.as_ref().or(request.aggregations.as_ref()) {
         let query = match &request.query {
-            Some(query_dsl) => build_tantivy_query(query_dsl, &state.schema)?,
+            Some(query_dsl) => build_tantivy_query(query_dsl, &state.schema)
+                .map_err(|e| search_error(e))?,
             None => Box::new(AllQuery),
         };
         
@@ -145,7 +145,7 @@ pub async fn search_index(
         );
         
         Some(agg_executor.execute(query, aggs.clone())
-            .map_err(|e| Error::Internal(format!("Aggregation failed: {}", e)))?)
+            .map_err(|e| search_error(Error::Internal(format!("Aggregation failed: {}", e))))?)
     } else {
         None
     };
@@ -208,16 +208,10 @@ async fn search_in_index(
                 if !field_values.is_empty() {
                 let json_values: Vec<serde_json::Value> = field_values.into_iter().filter_map(|v| {
                     // Convert Tantivy values to JSON
-                    match v {
-                        tantivy::schema::Value::Str(s) => Some(serde_json::Value::String(s.to_string())),
-                        tantivy::schema::Value::U64(n) => Some(serde_json::Value::Number((*n).into())),
-                        tantivy::schema::Value::I64(n) => Some(serde_json::Value::Number((*n).into())),
-                        tantivy::schema::Value::F64(f) => Some(serde_json::Value::Number(
-                            serde_json::Number::from_f64(*f).unwrap_or(serde_json::Number::from(0))
-                        )),
-                        tantivy::schema::Value::Bytes(_) => None, // Skip bytes for now
-                        _ => None,
-                    }
+                    v.as_str().map(|s| serde_json::Value::String(s.to_string()))
+                        .or_else(|| v.as_u64().map(|n| serde_json::Value::Number(n.into())))
+                        .or_else(|| v.as_i64().map(|n| serde_json::Value::Number(n.into())))
+                        .or_else(|| v.as_f64().and_then(|f| serde_json::Number::from_f64(f).map(serde_json::Value::Number)))
                 }).collect();
                 
                 if json_values.len() == 1 {
@@ -513,16 +507,10 @@ pub async fn get_document(
                 if !field_values.is_empty() {
                 let json_values: Vec<serde_json::Value> = field_values.into_iter().filter_map(|v| {
                     // Convert Tantivy values to JSON
-                    match v {
-                        tantivy::schema::Value::Str(s) => Some(serde_json::Value::String(s.to_string())),
-                        tantivy::schema::Value::U64(n) => Some(serde_json::Value::Number((*n).into())),
-                        tantivy::schema::Value::I64(n) => Some(serde_json::Value::Number((*n).into())),
-                        tantivy::schema::Value::F64(f) => Some(serde_json::Value::Number(
-                            serde_json::Number::from_f64(*f).unwrap_or(serde_json::Number::from(0))
-                        )),
-                        tantivy::schema::Value::Bytes(_) => None, // Skip bytes for now
-                        _ => None,
-                    }
+                    v.as_str().map(|s| serde_json::Value::String(s.to_string()))
+                        .or_else(|| v.as_u64().map(|n| serde_json::Value::Number(n.into())))
+                        .or_else(|| v.as_i64().map(|n| serde_json::Value::Number(n.into())))
+                        .or_else(|| v.as_f64().and_then(|f| serde_json::Number::from_f64(f).map(serde_json::Value::Number)))
                 }).collect();
                 
                 if json_values.len() == 1 {

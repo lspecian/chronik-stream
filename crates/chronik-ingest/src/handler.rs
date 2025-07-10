@@ -150,6 +150,10 @@ impl RequestHandler {
             RequestBody::ApiVersions(api_versions) => self.handle_api_versions(api_versions, correlation_id).await,
             RequestBody::SaslHandshake(handshake) => self.handle_sasl_handshake(handshake, correlation_id, session_id).await,
             RequestBody::SaslAuthenticate(auth) => self.handle_sasl_authenticate(auth, correlation_id, session_id).await,
+            RequestBody::DescribeConfigs(_) => {
+                // Not implemented in this handler - should be handled by protocol handler
+                Err(chronik_common::Error::Protocol("DescribeConfigs should be handled by protocol handler".to_string()))
+            },
         }
     }
     

@@ -15,7 +15,8 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 
-use super::{NodeId, RaftConfig as ChronikRaftConfig, RaftStorage, RaftTransport, TransportMessage, ArcRaftStorage};
+use super::{NodeId, RaftConfig as ChronikRaftConfig, RaftTransport, TransportMessage};
+use crate::tikv_raft_storage::TiKVRaftStorage;
 use super::state_machine::{ControllerStateMachine, Proposal};
 
 /// Commands to the Raft node
@@ -59,10 +60,10 @@ pub enum RaftCommand {
 /// Raft node implementation
 pub struct RaftNode {
     config: ChronikRaftConfig,
-    raw_node: RawNode<ArcRaftStorage>,
+    raw_node: RawNode<TiKVRaftStorage>,
     state_machine: Arc<ControllerStateMachine>,
     transport: Arc<RaftTransport>,
-    storage: Arc<RaftStorage>,
+    storage: Arc<TiKVRaftStorage>,
     logger: Logger,
     
     // Pending proposals
@@ -80,7 +81,7 @@ impl RaftNode {
     /// Create a new Raft node
     pub fn new(
         config: ChronikRaftConfig,
-        storage: RaftStorage,
+        storage: TiKVRaftStorage,
         transport: RaftTransport,
     ) -> Result<(Self, RaftHandle)> {
         // Setup logger

@@ -11,10 +11,11 @@
 use crate::kafka_handler::KafkaProtocolHandler;
 use crate::produce_handler::{ProduceHandler, ProduceHandlerConfig};
 use crate::storage::{StorageService, StorageConfig};
+use bytes::{Buf, Bytes, BytesMut, BufMut};
 use chronik_auth::tls::TlsAcceptor;
 use chronik_common::{Result, Error};
 use chronik_common::metadata::traits::MetadataStore;
-use chronik_common::metadata::sled_store::SledMetadataStore;
+use chronik_common::metadata::TiKVMetadataStore;
 use chronik_monitoring::ServerMetrics;
 use chronik_protocol::frame::KafkaFrameCodec;
 use chronik_storage::{SegmentReader, SegmentReaderConfig};
@@ -151,7 +152,7 @@ pub struct IngestServer {
     metrics: Arc<ServerMetrics>,
     
     // TLS acceptor
-    tls_acceptor: Option<TlsAcceptor>,
+    tls_acceptor: Option<Arc<TlsAcceptor>>,
 }
 
 /// Rate limit tracking per IP
@@ -164,13 +165,16 @@ struct RateLimitInfo {
 impl IngestServer {
     /// Create a new ingest server
     pub async fn new(config: ServerConfig, data_dir: PathBuf) -> Result<Self> {
-        // Create metadata store
-        let metadata_path = data_dir.join("metadata");
-        std::fs::create_dir_all(&metadata_path)
-            .map_err(|e| Error::Io(e))?;
+        // Create metadata store using TiKV
+        let pd_endpoints = std::env::var("TIKV_PD_ENDPOINTS")
+            .unwrap_or_else(|_| "localhost:2379".to_string());
+        let endpoints = pd_endpoints
+            .split(',')
+            .map(|s| s.to_string())
+            .collect::<Vec<String>>();
         let metadata_store: Arc<dyn MetadataStore> = Arc::new(
-            SledMetadataStore::new(metadata_path)
-                .map_err(|e| Error::Internal(format!("Failed to create metadata store: {}", e)))?
+            TiKVMetadataStore::new(endpoints).await
+                .map_err(|e| Error::Internal(format!("Failed to create TiKV metadata store: {}", e)))?
         );
         
         // Create storage service
@@ -248,7 +252,7 @@ impl IngestServer {
             let acceptor = TlsAcceptor::new(&auth_tls_config)
                 .map_err(|e| Error::Configuration(format!("Failed to create TLS acceptor: {}", e)))?;
             
-            Some(acceptor)
+            Some(Arc::new(acceptor))
         } else {
             None
         };
@@ -394,7 +398,7 @@ impl IngestServer {
                                         kafka_handler,
                                         connections.clone(),
                                         metrics,
-                                        tls_acceptor,
+                                        tls_acceptor.clone(),
                                         shutdown_rx,
                                         permit,
                                     ).await;
@@ -557,7 +561,6 @@ impl IngestServer {
 }
 
 /// Handle a single client connection
-#[instrument(skip_all, fields(conn_id = %info.id, peer = %info.peer_addr))]
 async fn handle_connection(
     stream: TcpStream,
     info: Arc<ConnectionInfo>,
@@ -565,7 +568,7 @@ async fn handle_connection(
     kafka_handler: Arc<KafkaProtocolHandler>,
     connections: Arc<RwLock<HashMap<Uuid, ConnectionState>>>,
     metrics: Arc<ServerMetrics>,
-    tls_acceptor: Option<TlsAcceptor>,
+    tls_acceptor: Option<Arc<TlsAcceptor>>,
     mut shutdown_rx: oneshot::Receiver<()>,
     _permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<()> {
@@ -619,10 +622,22 @@ async fn handle_connection(
                             if pending >= config.backpressure_threshold {
                                 warn!("Backpressure threshold reached: {} pending requests", pending);
                                 metrics.backpressure_events.inc();
-                                // Send error response
-                                let error_response = create_error_response(35); // NOT_COORDINATOR
-                                framed.send(error_response.body).await
-                                    .map_err(|e| Error::Network(format!("Failed to send backpressure response: {}", e)))?;
+                                // Send error response (need to extract correlation ID from request)
+                                let mut req_buf = frame_data.clone();
+                                if req_buf.len() >= 8 {
+                                    req_buf.advance(4); // Skip api_key and api_version
+                                    let correlation_id = req_buf.get_i32();
+                                    let error_response = create_error_response_with_correlation_id(35, correlation_id); // NOT_COORDINATOR
+                                    
+                                    let mut complete_response = BytesMut::new();
+                                    chronik_protocol::parser::write_response_header(&mut complete_response, &error_response.header);
+                                    complete_response.extend_from_slice(&error_response.body);
+                                    
+                                    framed.send(complete_response.freeze()).await
+                                        .map_err(|e| Error::Network(format!("Failed to send backpressure response: {}", e)))?;
+                                } else {
+                                    return Err(Error::Protocol("Invalid request - too short".into()));
+                                }
                                 continue;
                             }
                             state.pending_requests.fetch_add(1, Ordering::SeqCst);
@@ -648,18 +663,40 @@ async fn handle_connection(
                             Ok(Err(e)) => {
                                 error!("Request handling error: {}", e);
                                 metrics.request_errors.inc();
-                                create_error_response(1) // UNKNOWN_ERROR
+                                // Try to extract correlation ID from request
+                                let mut req_buf = frame_data.clone();
+                                let correlation_id = if req_buf.len() >= 8 {
+                                    req_buf.advance(4); // Skip api_key and api_version
+                                    req_buf.get_i32()
+                                } else {
+                                    0
+                                };
+                                create_error_response_with_correlation_id(1, correlation_id) // UNKNOWN_ERROR
                             }
                             Err(_) => {
                                 warn!("Request timeout");
                                 metrics.request_timeouts.inc();
-                                create_error_response(7) // REQUEST_TIMED_OUT
+                                // Try to extract correlation ID from request
+                                let mut req_buf = frame_data.clone();
+                                let correlation_id = if req_buf.len() >= 8 {
+                                    req_buf.advance(4); // Skip api_key and api_version
+                                    req_buf.get_i32()
+                                } else {
+                                    0
+                                };
+                                create_error_response_with_correlation_id(7, correlation_id) // REQUEST_TIMED_OUT
                             }
                         };
                         
-                        // Send response
-                        let response_size = response.body.len() + 4;
-                        if let Err(e) = framed.send(response.body).await {
+                        // Build complete response with correlation ID
+                        let mut complete_response = BytesMut::new();
+                        chronik_protocol::parser::write_response_header(&mut complete_response, &response.header);
+                        complete_response.extend_from_slice(&response.body);
+                        
+                        let response_bytes = complete_response.freeze();
+                        let response_size = response_bytes.len() + 4; // +4 for length prefix
+                        
+                        if let Err(e) = framed.send(response_bytes).await {
                             error!("Failed to send response: {}", e);
                         } else {
                             // Update metrics
@@ -820,21 +857,25 @@ async fn check_ip_limit(
     Ok(())
 }
 
-/// Create error response bytes
-fn create_error_response(error_code: i16) -> chronik_protocol::handler::Response {
-    use bytes::BytesMut;
+/// Create error response bytes with proper correlation ID
+fn create_error_response_with_correlation_id(error_code: i16, correlation_id: i32) -> chronik_protocol::handler::Response {
     use chronik_protocol::parser::{Encoder, ResponseHeader};
     
     let mut buf = BytesMut::new();
     let mut encoder = Encoder::new(&mut buf);
     
-    // Write a minimal error response
+    // Just write error code
     encoder.write_i16(error_code);
     
     chronik_protocol::handler::Response {
-        header: ResponseHeader { correlation_id: 0 }, // We don't have correlation_id here
+        header: ResponseHeader { correlation_id },
         body: buf.freeze(),
     }
+}
+
+/// Create error response bytes (for cases where we can't extract correlation ID)
+fn create_error_response(error_code: i16) -> chronik_protocol::handler::Response {
+    create_error_response_with_correlation_id(error_code, 0)
 }
 
 #[cfg(test)]

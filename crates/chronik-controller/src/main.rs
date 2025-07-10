@@ -23,10 +23,10 @@ async fn main() -> Result<()> {
     
     tracing::info!("Starting Chronik Controller node {} with peers {:?}", node_id, peers);
     
+    // For now, use the simple controller but with TiKV metadata if configured
     let metadata_path = std::env::var("METADATA_PATH")
         .unwrap_or_else(|_| "/var/chronik/metadata".to_string());
     
-    // Create controller node config
     let config = ControllerConfig {
         node_id,
         peers,
@@ -35,9 +35,9 @@ async fn main() -> Result<()> {
         metadata_path,
     };
     
+    // The controller node will use TiKV if TIKV_PD_ENDPOINTS is set
+    // This is handled internally in the node implementation
     let node = ControllerNode::new(config)?;
-    
-    // Start the node
     node.start().await?;
     
     // Keep running

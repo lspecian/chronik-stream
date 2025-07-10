@@ -30,16 +30,20 @@ bincode = { workspace = true }
 
 # Compression
 flate2 = { workspace = true }
+zstd = "0.13"
 
 # Checksum
 crc32fast = { workspace = true }
 
 # Utils
 uuid = { workspace = true }
-chrono = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
 parking_lot = { workspace = true }
 dashmap = "6.0"
 tempfile = "3.8"
+rayon = "1.10"
+crossbeam-channel = "0.5"
+memmap2 = "0.9"
 
 # Async
 tokio = { workspace = true }
@@ -56,3 +60,8 @@ tracing = { workspace = true }
 [dev-dependencies]
 tempfile = "3.8"
 criterion = { workspace = true }
+tokio = { workspace = true }
+
+[[bench]]
+name = "segment_comparison"
+harness = false

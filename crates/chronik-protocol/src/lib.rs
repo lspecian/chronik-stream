@@ -12,10 +12,19 @@ pub mod compression;
 pub mod frame;
 pub mod handler;
 pub mod kafka_protocol;
+pub mod metadata_fix;
 pub mod parser;
 pub mod records;
 pub mod types;
 pub mod sasl_types;
+pub mod create_topics_types;
+pub mod list_offsets_types;
+pub mod find_coordinator_types;
+pub mod join_group_types;
+pub mod sync_group_types;
+pub mod heartbeat_types;
+pub mod list_groups_types;
+pub mod leave_group_types;
 
 // Temporarily disabled due to kafka-protocol crate compatibility issues
 // pub mod handler_v2;

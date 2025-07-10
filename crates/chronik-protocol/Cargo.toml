@@ -30,6 +30,14 @@ thiserror = { workspace = true }
 # Tracing
 tracing = { workspace = true }
 
+# Utils
+uuid = { version = "1.10", features = ["v4"] }
+
 [dev-dependencies]
 tokio-test = "0.4"
 proptest = { workspace = true }
+criterion = "0.5"
+
+[[bench]]
+name = "protocol_bench"
+harness = false

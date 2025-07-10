@@ -83,7 +83,7 @@ impl Default for AdminConfig {
                 tls: None,
             },
             database: DatabaseConfig {
-                url: "postgres://localhost/chronik".to_string(),
+                url: "/home/chronik/metadata".to_string(),
                 max_connections: 10,
             },
             controller: ControllerConfig {

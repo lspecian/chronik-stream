@@ -441,33 +441,53 @@ impl ProtocolCodec {
         let header = ResponseHeader { correlation_id };
         header.encode(buf, flexible);
         
-        // Error code
-        buf.put_i16(ErrorCode::None.code());
+        // CRITICAL: For v0 protocol, field order matters!
+        // v0: api_versions array comes BEFORE error_code
+        // v1+: error_code comes first (standard field ordering)
         
-        // API versions array
-        if flexible {
-            ProtocolUtils::write_compact_array_len(buf, api_versions.len());
-        } else {
+        if version == 0 {
+            // v0 field order: api_versions array, then error_code
+            
+            // API versions array first
             buf.put_i32(api_versions.len() as i32);
-        }
-        
-        for api in api_versions {
-            buf.put_i16(api.api_key);
-            buf.put_i16(api.min_version);
-            buf.put_i16(api.max_version);
+            
+            for api in api_versions {
+                buf.put_i16(api.api_key);
+                buf.put_i16(api.min_version);
+                buf.put_i16(api.max_version);
+            }
+            
+            // Then error code
+            buf.put_i16(ErrorCode::None.code());
+        } else {
+            // v1+ field order: error_code first, then api_versions array
+            
+            // Error code
+            buf.put_i16(ErrorCode::None.code());
+            
+            // API versions array
+            if flexible {
+                ProtocolUtils::write_compact_array_len(buf, api_versions.len());
+            } else {
+                buf.put_i32(api_versions.len() as i32);
+            }
+            
+            for api in api_versions {
+                buf.put_i16(api.api_key);
+                buf.put_i16(api.min_version);
+                buf.put_i16(api.max_version);
+                
+                if flexible {
+                    ProtocolUtils::write_tagged_fields(buf);
+                }
+            }
+            
+            // Throttle time (v1+)
+            buf.put_i32(0);
             
             if flexible {
                 ProtocolUtils::write_tagged_fields(buf);
             }
-        }
-        
-        // Throttle time (v1+)
-        if version >= 1 {
-            buf.put_i32(0);
-        }
-        
-        if flexible {
-            ProtocolUtils::write_tagged_fields(buf);
         }
         
         Ok(())

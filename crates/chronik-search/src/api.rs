@@ -1,11 +1,7 @@
 //! REST API for search operations.
 
-use crate::indexer::{TantivyIndexer, SearchResult};
 use chronik_common::{Result, Error};
 use axum::{
-    extract::{Path, Query, State},
-    http::StatusCode,
-    response::{IntoResponse, Json},
     routing::{delete, get, post, put},
     Router,
 };
@@ -15,17 +11,12 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
 };
 use tantivy::{
-    collector::TopDocs,
-    query::{BooleanQuery, Occur, Query as TantivyQuery, TermQuery, RangeQuery},
-    schema::{Schema, Field, TEXT, STORED, STRING, NumericOptions},
+    schema::{Schema, TEXT, STORED, STRING, NumericOptions},
     Index, IndexReader, IndexWriter,
-    Term,
 };
 use tower_http::cors::CorsLayer;
-use tracing::{debug, error, info};
 
 use crate::handlers::{
     health_check, metrics_handler, search_all, search_index, index_document,

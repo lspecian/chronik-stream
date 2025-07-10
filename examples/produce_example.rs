@@ -2,7 +2,7 @@
 
 use chronik_ingest::produce_handler::{ProduceHandler, ProduceHandlerConfig};
 use chronik_storage::object_store::backends::local::LocalObjectStore;
-use chronik_common::metadata::sled_store::SledMetadataStore;
+use chronik_common::metadata::TiKVMetadataStore;
 use chronik_protocol::{
     ProduceRequest, ProduceRequestTopic, ProduceRequestPartition,
     records::RecordBatch as KafkaRecordBatch,
@@ -20,7 +20,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let storage = Arc::new(LocalObjectStore::new("/tmp/chronik-produce-example")?);
     
     // Create metadata store
-    let metadata_store = Arc::new(SledMetadataStore::new("/tmp/chronik-metadata")?);
+    let pd_endpoints = vec!["localhost:2379".to_string()];
+    let metadata_store = Arc::new(TiKVMetadataStore::new(pd_endpoints).await?);
     
     // Create topic if not exists
     if metadata_store.get_topic("events").await?.is_none() {
