@@ -58,6 +58,12 @@ pub struct ServerConfig {
     pub shutdown_timeout: Duration,
     /// Metrics collection interval
     pub metrics_interval: Duration,
+    /// Auto-create topics configuration
+    pub auto_create_topics_enable: bool,
+    /// Default number of partitions for auto-created topics
+    pub num_partitions: u32,
+    /// Default replication factor for auto-created topics
+    pub default_replication_factor: u32,
 }
 
 /// TLS configuration
@@ -97,6 +103,9 @@ impl Default for ServerConfig {
             backpressure_threshold: 1000,
             shutdown_timeout: Duration::from_secs(30),
             metrics_interval: Duration::from_secs(60),
+            auto_create_topics_enable: true,
+            num_partitions: 3,
+            default_replication_factor: 1,
         }
     }
 }
@@ -165,17 +174,26 @@ struct RateLimitInfo {
 impl IngestServer {
     /// Create a new ingest server
     pub async fn new(config: ServerConfig, data_dir: PathBuf) -> Result<Self> {
-        // Create metadata store using TiKV
-        let pd_endpoints = std::env::var("TIKV_PD_ENDPOINTS")
-            .unwrap_or_else(|_| "localhost:2379".to_string());
-        let endpoints = pd_endpoints
-            .split(',')
-            .map(|s| s.to_string())
-            .collect::<Vec<String>>();
-        let metadata_store: Arc<dyn MetadataStore> = Arc::new(
-            TiKVMetadataStore::new(endpoints).await
-                .map_err(|e| Error::Internal(format!("Failed to create TiKV metadata store: {}", e)))?
-        );
+        // Create metadata store based on environment variable
+        let metadata_store: Arc<dyn MetadataStore> = match std::env::var("METADATA_STORE_TYPE").as_deref() {
+            Ok("memory") => {
+                use chronik_common::metadata::memory::InMemoryMetadataStore;
+                Arc::new(InMemoryMetadataStore::new())
+            },
+            _ => {
+                // Default to TiKV
+                let pd_endpoints = std::env::var("TIKV_PD_ENDPOINTS")
+                    .unwrap_or_else(|_| "localhost:2379".to_string());
+                let endpoints = pd_endpoints
+                    .split(',')
+                    .map(|s| s.to_string())
+                    .collect::<Vec<String>>();
+                Arc::new(
+                    TiKVMetadataStore::new(endpoints).await
+                        .map_err(|e| Error::Internal(format!("Failed to create TiKV metadata store: {}", e)))?
+                )
+            }
+        };
         
         // Create storage service
         let storage_config = StorageConfig {
@@ -211,6 +229,7 @@ impl IngestServer {
         let produce_config = ProduceHandlerConfig {
             node_id: 1, // TODO: Make configurable
             storage_config: storage_config.clone(),
+            indexer_config: Default::default(),
             enable_indexing: true,
             enable_idempotence: true,
             enable_transactions: false,
@@ -220,6 +239,9 @@ impl IngestServer {
             compression_type: chronik_storage::kafka_records::CompressionType::None,
             request_timeout_ms: 30000,
             buffer_memory: 32 * 1024 * 1024, // 32MB
+            auto_create_topics_enable: config.auto_create_topics_enable,
+            num_partitions: config.num_partitions,
+            default_replication_factor: config.default_replication_factor
         };
         let produce_handler = Arc::new(
             ProduceHandler::new(produce_config, storage_service.object_store(), metadata_store.clone()).await?

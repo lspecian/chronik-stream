@@ -132,12 +132,13 @@ impl ConfigProvider for EnvironmentProvider {
                     .trim_start_matches('_');
                 
                 if !key_without_prefix.is_empty() {
-                    let path_parts: Vec<&str> = key_without_prefix
+                    let path_parts: Vec<String> = key_without_prefix
                         .split(&self.separator)
-                        .map(|s| s.to_lowercase().as_str())
+                        .map(|s| s.to_lowercase())
                         .collect();
                     
-                    insert_nested_value(&mut config, &path_parts, parse_env_value(&value));
+                    let path_refs: Vec<&str> = path_parts.iter().map(|s| s.as_str()).collect();
+                    insert_nested_value(&mut config, &path_refs, parse_env_value(&value));
                     debug!("Loaded env var: {} = {}", key, value);
                 }
             }

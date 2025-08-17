@@ -445,11 +445,17 @@ mod tests {
         
         // Test authentication
         let auth_bytes = b"\0admin\0admin123";
-        let principal = middleware
+        let result = middleware
             .authenticate_sasl(session_id, &crate::SaslMechanism::Plain, auth_bytes)
             .await
             .unwrap();
-        assert_eq!(principal.username, "admin");
+        
+        match result {
+            SaslAuthResult::Success(principal) => {
+                assert_eq!(principal.username, "admin");
+            }
+            _ => panic!("Expected successful authentication"),
+        }
         
         // Test authenticated access
         let result = middleware.check_topic_read(session_id, "test-topic").await;

@@ -410,12 +410,20 @@ pub struct ApiVersionsResponseKey {
 impl Request {
     /// Decode a request from bytes
     pub fn decode(data: &[u8]) -> Result<Self, String> {
-        use crate::parser::parse_request_header;
+        use crate::parser::parse_request_header_with_correlation;
         use bytes::Bytes;
+        use chronik_common::Error;
         
         let mut buf = Bytes::copy_from_slice(data);
-        let header = parse_request_header(&mut buf)
-            .map_err(|e| format!("Failed to parse header: {:?}", e))?;
+        let header = match parse_request_header_with_correlation(&mut buf) {
+            Ok((h, _)) => h,
+            Err(Error::ProtocolWithCorrelation { message, .. }) => {
+                return Err(format!("Failed to parse header: {}", message));
+            }
+            Err(e) => {
+                return Err(format!("Failed to parse header: {:?}", e));
+            }
+        };
         
         // For now, just parse metadata requests
         let body = match header.api_key {

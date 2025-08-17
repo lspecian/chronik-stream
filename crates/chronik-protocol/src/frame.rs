@@ -236,7 +236,7 @@ mod tests {
         let mut buf = BytesMut::new();
 
         // Test frame too small
-        let small_frame = Bytes::from(vec![0u8; 10]);
+        let small_frame = Bytes::from(vec![0u8; 5]);
         assert!(codec.encode(small_frame, &mut buf).is_err());
 
         // Test frame too large

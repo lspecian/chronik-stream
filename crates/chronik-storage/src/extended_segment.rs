@@ -11,7 +11,7 @@ use crate::{
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use bytes::{BytesMut, BufMut};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use tracing::{info, instrument};
 
 /// Version of the extended segment format
@@ -323,15 +323,143 @@ impl ExtendedTansuSegment {
         buf.put_slice(EXTENDED_MAGIC);
         buf.put_u32(self.version);
         
-        // Serialize and write the rest
-        let data = bincode::serialize(&(
-            &self.kafka_data,
-            &self.tantivy_index,
-            &self.vector_indices,
-            &self.metadata,
-            &self.bloom_filter,
-        ))?;
+        // Create a serializable version of the segment
+        #[derive(Serialize)]
+        struct SerializableSegment {
+            kafka_data: Vec<SerializableRecordBatch>,
+            tantivy_index: Option<Vec<u8>>,
+            vector_indices: BTreeMap<String, SerializableVectorIndexData>,
+            metadata: SerializableExtendedMetadata,
+            bloom_filter_bits: Option<Vec<u8>>,
+            bloom_filter_params: Option<(usize, usize)>, // num_hashes, num_bits
+        }
         
+        #[derive(Serialize)]
+        struct SerializableExtendedMetadata {
+            // Base metadata fields (flattened)
+            topic: String,
+            partition_id: i32,
+            base_offset: i64,
+            last_offset: i64,
+            timestamp_range: (i64, i64),
+            record_count: u64,
+            created_at: i64,
+            compression_ratio: f64,
+            total_uncompressed_size: usize,
+            // Extended fields
+            vector_fields: Vec<SerializableVectorFieldConfig>,
+            hybrid_stats: Option<HybridStats>,
+        }
+        
+        #[derive(Serialize)]
+        struct SerializableVectorFieldConfig {
+            field_name: String,
+            dimensions: usize,
+            metric: DistanceMetric,
+            index_type: String,
+            index_params_json: String, // Store as JSON string
+        }
+        
+        #[derive(Serialize)]
+        struct SerializableVectorIndexData {
+            index_type: String,
+            dimensions: usize,
+            metric: DistanceMetric,
+            data: Vec<u8>,
+            metadata_json: String, // Store as JSON string instead of Value
+        }
+        
+        #[derive(Serialize)]
+        struct SerializableRecordBatch {
+            records: Vec<SerializableRecord>,
+        }
+        
+        #[derive(Serialize)]
+        struct SerializableRecord {
+            offset: i64,
+            timestamp: i64,
+            key: Option<Vec<u8>>,
+            value: Vec<u8>,
+            headers: HashMap<String, Vec<u8>>,
+        }
+        
+        // Convert to serializable format
+        let kafka_data_serializable: Vec<SerializableRecordBatch> = self.kafka_data.iter()
+            .map(|batch| {
+                SerializableRecordBatch {
+                    records: batch.records.iter().map(|record| {
+                        SerializableRecord {
+                            offset: record.offset,
+                            timestamp: record.timestamp,
+                            key: record.key.clone(),
+                            value: record.value.clone(),
+                            headers: record.headers.clone(),
+                        }
+                    }).collect(),
+                }
+            })
+            .collect();
+        
+        // Convert vector indices to serializable format
+        let mut serializable_vector_indices = BTreeMap::new();
+        for (name, index_data) in &self.vector_indices {
+            serializable_vector_indices.insert(
+                name.clone(),
+                SerializableVectorIndexData {
+                    index_type: index_data.index_type.clone(),
+                    dimensions: index_data.dimensions,
+                    metric: index_data.metric,
+                    data: index_data.data.clone(),
+                    metadata_json: index_data.metadata.to_string(),
+                },
+            );
+        }
+        
+        // Convert metadata to serializable format
+        let serializable_metadata = SerializableExtendedMetadata {
+            // Base fields
+            topic: self.metadata.base.topic.clone(),
+            partition_id: self.metadata.base.partition_id,
+            base_offset: self.metadata.base.base_offset,
+            last_offset: self.metadata.base.last_offset,
+            timestamp_range: self.metadata.base.timestamp_range,
+            record_count: self.metadata.base.record_count,
+            created_at: self.metadata.base.created_at,
+            compression_ratio: self.metadata.base.compression_ratio,
+            total_uncompressed_size: self.metadata.base.total_uncompressed_size,
+            // Extended fields
+            vector_fields: self.metadata.vector_fields.iter()
+                .map(|vf| SerializableVectorFieldConfig {
+                    field_name: vf.field_name.clone(),
+                    dimensions: vf.dimensions,
+                    metric: vf.metric,
+                    index_type: vf.index_type.clone(),
+                    index_params_json: vf.index_params.to_string(),
+                })
+                .collect(),
+            hybrid_stats: self.metadata.hybrid_stats.clone(),
+        };
+        
+        // Since BloomFilter fields are private, we'll serialize it directly
+        let bloom_filter_data = self.bloom_filter.as_ref().map(|bf| {
+            // Serialize the entire BloomFilter using bincode
+            bincode::serialize(bf).unwrap_or_default()
+        });
+        
+        let serializable = SerializableSegment {
+            kafka_data: kafka_data_serializable,
+            tantivy_index: self.tantivy_index.clone(),
+            vector_indices: serializable_vector_indices,
+            metadata: serializable_metadata,
+            bloom_filter_bits: bloom_filter_data,
+            bloom_filter_params: None, // Not needed when serializing entire filter
+        };
+        
+        // Serialize and write the data
+        // Use bincode with bounded size for better error messages
+        let config = bincode::config();
+        let data = config.serialize(&serializable)
+            .map_err(|e| anyhow!("Failed to serialize extended segment: {}", e))?;
         buf.put_slice(&data);
         Ok(buf.freeze().to_vec())
     }
@@ -345,13 +473,136 @@ impl ExtendedTansuSegment {
         let version = Self::peek_version(data)?;
         let data_start = EXTENDED_MAGIC.len() + 4;
         
-        let (kafka_data, tantivy_index, vector_indices, metadata, bloom_filter) = 
-            bincode::deserialize(&data[data_start..])?;
+        // Define the same serializable structures for deserialization
+        #[derive(Deserialize)]
+        struct SerializableSegment {
+            kafka_data: Vec<SerializableRecordBatch>,
+            tantivy_index: Option<Vec<u8>>,
+            vector_indices: BTreeMap<String, SerializableVectorIndexData>,
+            metadata: SerializableExtendedMetadata,
+            bloom_filter_bits: Option<Vec<u8>>,
+            bloom_filter_params: Option<(usize, usize)>,
+        }
+        
+        #[derive(Deserialize)]
+        struct SerializableExtendedMetadata {
+            topic: String,
+            partition_id: i32,
+            base_offset: i64,
+            last_offset: i64,
+            timestamp_range: (i64, i64),
+            record_count: u64,
+            created_at: i64,
+            compression_ratio: f64,
+            total_uncompressed_size: usize,
+            vector_fields: Vec<SerializableVectorFieldConfig>,
+            hybrid_stats: Option<HybridStats>,
+        }
+        
+        #[derive(Deserialize)]
+        struct SerializableVectorFieldConfig {
+            field_name: String,
+            dimensions: usize,
+            metric: DistanceMetric,
+            index_type: String,
+            index_params_json: String,
+        }
+        
+        #[derive(Deserialize)]
+        struct SerializableVectorIndexData {
+            index_type: String,
+            dimensions: usize,
+            metric: DistanceMetric,
+            data: Vec<u8>,
+            metadata_json: String,
+        }
+        
+        #[derive(Deserialize)]
+        struct SerializableRecordBatch {
+            records: Vec<SerializableRecord>,
+        }
+        
+        #[derive(Deserialize)]
+        struct SerializableRecord {
+            offset: i64,
+            timestamp: i64,
+            key: Option<Vec<u8>>,
+            value: Vec<u8>,
+            headers: HashMap<String, Vec<u8>>,
+        }
+        
+        let serializable: SerializableSegment = bincode::deserialize(&data[data_start..])?;
+        
+        // Convert vector indices back to original format
+        let mut vector_indices = BTreeMap::new();
+        for (name, serializable_data) in serializable.vector_indices {
+            let metadata: serde_json::Value = serde_json::from_str(&serializable_data.metadata_json)
+                .unwrap_or(serde_json::json!({}));
+            
+            vector_indices.insert(
+                name,
+                VectorIndexData {
+                    index_type: serializable_data.index_type,
+                    dimensions: serializable_data.dimensions,
+                    metric: serializable_data.metric,
+                    data: serializable_data.data,
+                    metadata,
+                },
+            );
+        }
+        
+        // Convert metadata back to original format
+        let metadata = ExtendedSegmentMetadata {
+            base: BaseSegmentMetadata {
+                topic: serializable.metadata.topic,
+                partition_id: serializable.metadata.partition_id,
+                base_offset: serializable.metadata.base_offset,
+                last_offset: serializable.metadata.last_offset,
+                timestamp_range: serializable.metadata.timestamp_range,
+                record_count: serializable.metadata.record_count,
+                created_at: serializable.metadata.created_at,
+                bloom_filter: None, // Stored separately
+                compression_ratio: serializable.metadata.compression_ratio,
+                total_uncompressed_size: serializable.metadata.total_uncompressed_size,
+            },
+            vector_fields: serializable.metadata.vector_fields.into_iter()
+                .map(|vf| VectorFieldConfig {
+                    field_name: vf.field_name,
+                    dimensions: vf.dimensions,
+                    metric: vf.metric,
+                    index_type: vf.index_type,
+                    index_params: serde_json::from_str(&vf.index_params_json)
+                        .unwrap_or(serde_json::json!({})),
+                })
+                .collect(),
+            hybrid_stats: serializable.metadata.hybrid_stats,
+        };
+        
+        // Convert back to the original format
+        let kafka_data: Vec<RecordBatch> = serializable.kafka_data.into_iter()
+            .map(|batch| {
+                RecordBatch {
+                    records: batch.records.into_iter().map(|record| {
+                        Record {
+                            offset: record.offset,
+                            timestamp: record.timestamp,
+                            key: record.key,
+                            value: record.value,
+                            headers: record.headers,
+                        }
+                    }).collect(),
+                }
+            })
+            .collect();
+        
+        // Reconstruct bloom filter if present
+        let bloom_filter = serializable.bloom_filter_bits
+            .and_then(|data| bincode::deserialize::<BloomFilter>(&data).ok());
         
         Ok(Self {
             version,
             kafka_data,
-            tantivy_index,
+            tantivy_index: serializable.tantivy_index,
             vector_indices,
             metadata,
             bloom_filter,

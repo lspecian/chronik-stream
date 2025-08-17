@@ -298,6 +298,30 @@ impl MetadataStore for TiKVMetadataStore {
         }
     }
     
+    async fn update_partition_offset(&self, topic: &str, partition: u32, high_watermark: i64, log_start_offset: i64) -> Result<()> {
+        let key = format!("partition:{}:{}:offset", topic, partition).into_bytes();
+        let value = bincode::serialize(&(high_watermark, log_start_offset))
+            .map_err(|e| MetadataError::SerializationError(e.to_string()))?;
+        self.client.put(key, value).await
+            .map_err(|e| MetadataError::StorageError(e.to_string()))?;
+        Ok(())
+    }
+    
+    async fn get_partition_offset(&self, topic: &str, partition: u32) -> Result<Option<(i64, i64)>> {
+        let key = format!("partition:{}:{}:offset", topic, partition).into_bytes();
+        let value = self.client.get(key).await
+            .map_err(|e| MetadataError::StorageError(e.to_string()))?;
+        
+        match value {
+            Some(data) => {
+                let offsets = bincode::deserialize(&data)
+                    .map_err(|e| MetadataError::SerializationError(e.to_string()))?;
+                Ok(Some(offsets))
+            }
+            None => Ok(None),
+        }
+    }
+    
     async fn init_system_state(&self) -> Result<()> {
         // Create default system topics if they don't exist
         let system_topics = vec![
@@ -319,5 +343,54 @@ impl MetadataStore for TiKVMetadataStore {
         }
         
         Ok(())
+    }
+    
+    async fn create_topic_with_assignments(&self, 
+        topic_name: &str, 
+        config: TopicConfig,
+        assignments: Vec<PartitionAssignment>,
+        offsets: Vec<(u32, i64, i64)>
+    ) -> Result<TopicMetadata> {
+        // For now, implement this as a sequence of operations
+        // In a production system, we would use TiKV transactions for true atomicity
+        
+        let now = Utc::now();
+        let metadata = TopicMetadata {
+            id: Uuid::new_v4(),
+            name: topic_name.to_string(),
+            config,
+            created_at: now,
+            updated_at: now,
+        };
+        
+        // Create topic metadata
+        let key = Self::topic_key(topic_name);
+        if let Some(_) = self.client.get(key.clone()).await
+            .map_err(|e| MetadataError::StorageError(e.to_string()))? {
+            return Err(MetadataError::AlreadyExists(format!("Topic {} already exists", topic_name)));
+        }
+        
+        let value = Self::serialize(&metadata)?;
+        self.client.put(key, value).await
+            .map_err(|e| MetadataError::StorageError(e.to_string()))?;
+        
+        // Create partition assignments
+        for assignment in &assignments {
+            let assignment_key = Self::partition_assignment_key(&assignment.topic, assignment.partition);
+            let assignment_value = Self::serialize(assignment)?;
+            self.client.put(assignment_key, assignment_value).await
+                .map_err(|e| MetadataError::StorageError(e.to_string()))?;
+        }
+        
+        // Initialize partition offsets
+        for (partition, high_watermark, log_start_offset) in offsets {
+            let offset_key = format!("partition:{}:{}:offset", topic_name, partition).into_bytes();
+            let offset_value = bincode::serialize(&(high_watermark, log_start_offset))
+                .map_err(|e| MetadataError::SerializationError(e.to_string()))?;
+            self.client.put(offset_key, offset_value).await
+                .map_err(|e| MetadataError::StorageError(e.to_string()))?;
+        }
+        
+        Ok(metadata)
     }
 }

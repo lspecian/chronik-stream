@@ -4,9 +4,11 @@ use bytes::{Bytes, BytesMut};
 use chronik_common::{Result, Error};
 use std::collections::HashMap;
 use std::sync::Arc;
+use crate::error_codes;
 use crate::parser::{
     ApiKey, RequestHeader, ResponseHeader, VersionRange, 
-    parse_request_header, supported_api_versions,
+    parse_request_header_with_correlation,
+    supported_api_versions,
     Encoder
 };
 use crate::types::{
@@ -44,6 +46,8 @@ pub struct ProtocolHandler {
     supported_versions: HashMap<ApiKey, VersionRange>,
     /// Optional metadata store for topic management
     metadata_store: Option<Arc<dyn chronik_common::metadata::traits::MetadataStore>>,
+    /// Broker ID for this instance
+    broker_id: i32,
 }
 
 impl ProtocolHandler {
@@ -52,6 +56,7 @@ impl ProtocolHandler {
         Self {
             supported_versions: supported_api_versions(),
             metadata_store: None,
+            broker_id: 1, // Default broker ID
         }
     }
     
@@ -60,6 +65,19 @@ impl ProtocolHandler {
         Self {
             supported_versions: supported_api_versions(),
             metadata_store: Some(metadata_store),
+            broker_id: 1, // Default broker ID
+        }
+    }
+    
+    /// Create a new protocol handler with metadata store and broker ID
+    pub fn with_metadata_and_broker(
+        metadata_store: Arc<dyn chronik_common::metadata::traits::MetadataStore>,
+        broker_id: i32,
+    ) -> Self {
+        Self {
+            supported_versions: supported_api_versions(),
+            metadata_store: Some(metadata_store),
+            broker_id,
         }
     }
     
@@ -507,7 +525,21 @@ impl ProtocolHandler {
     /// Handle a raw request and return a response
     pub async fn handle_request(&self, request_bytes: &[u8]) -> Result<Response> {
         let mut buf = Bytes::copy_from_slice(request_bytes);
-        let header = parse_request_header(&mut buf)?;
+        
+        // Use the new parsing function that preserves correlation ID
+        let header = match parse_request_header_with_correlation(&mut buf) {
+            Ok((h, _)) => h,
+            Err(Error::ProtocolWithCorrelation { correlation_id, message }) => {
+                // Unknown API key but we have correlation ID
+                tracing::warn!("Unknown API key error: {}, correlation_id: {}", message, correlation_id);
+                return self.error_response(correlation_id, error_codes::UNSUPPORTED_VERSION);
+            }
+            Err(e) => {
+                // Other parsing error, no correlation ID available
+                tracing::error!("Failed to parse request header: {:?}", e);
+                return Err(e);
+            }
+        };
         
         tracing::info!(
             "Parsed request header - API: {:?} ({}), Version: {}, Correlation ID: {}",
@@ -522,7 +554,7 @@ impl ProtocolHandler {
             if header.api_version < version_range.min || header.api_version > version_range.max {
                 return self.error_response(
                     header.correlation_id,
-                    35, // UNSUPPORTED_VERSION
+                    error_codes::UNSUPPORTED_VERSION,
                 );
             }
         } else {
@@ -569,7 +601,7 @@ impl ProtocolHandler {
             ApiKey::UpdateMetadata |
             ApiKey::ControlledShutdown => {
                 tracing::warn!("Received broker-to-broker API request: {:?}", header.api_key);
-                self.error_response(header.correlation_id, 35) // UNSUPPORTED_VERSION
+                self.error_response(header.correlation_id, error_codes::UNSUPPORTED_VERSION)
             }
             
             // Transaction APIs
@@ -580,7 +612,7 @@ impl ProtocolHandler {
             ApiKey::WriteTxnMarkers |
             ApiKey::TxnOffsetCommit => {
                 tracing::warn!("Received transaction API request: {:?}", header.api_key);
-                self.error_response(header.correlation_id, 35) // UNSUPPORTED_VERSION  
+                self.error_response(header.correlation_id, error_codes::UNSUPPORTED_VERSION)  
             }
             
             // ACL APIs
@@ -588,14 +620,14 @@ impl ProtocolHandler {
             ApiKey::CreateAcls |
             ApiKey::DeleteAcls => {
                 tracing::warn!("Received ACL API request: {:?}", header.api_key);
-                self.error_response(header.correlation_id, 35) // UNSUPPORTED_VERSION
+                self.error_response(header.correlation_id, error_codes::UNSUPPORTED_VERSION)
             }
             
             // Other APIs
             ApiKey::DeleteRecords |
             ApiKey::OffsetForLeaderEpoch => {
                 tracing::warn!("Received unsupported API request: {:?}", header.api_key);
-                self.error_response(header.correlation_id, 35) // UNSUPPORTED_VERSION
+                self.error_response(header.correlation_id, error_codes::UNSUPPORTED_VERSION)
             }
         }
     }
@@ -769,17 +801,44 @@ impl ProtocolHandler {
             }
         };
         
-        let response = MetadataResponse {
-            correlation_id: header.correlation_id,
-            throttle_time_ms: 0,
-            brokers: vec![MetadataBroker {
-                node_id: 1,
+        // Get brokers from metadata store
+        let brokers = if let Some(metadata_store) = &self.metadata_store {
+            match metadata_store.list_brokers().await {
+                Ok(broker_metas) => {
+                    broker_metas.into_iter().map(|b| MetadataBroker {
+                        node_id: b.broker_id,
+                        host: b.host,
+                        port: b.port,
+                        rack: b.rack,
+                    }).collect()
+                }
+                Err(e) => {
+                    tracing::error!("Failed to get brokers from metadata: {:?}", e);
+                    // Fallback to current broker if we can't get from metadata store
+                    vec![MetadataBroker {
+                        node_id: self.broker_id,
+                        host: "localhost".to_string(),
+                        port: 9092,
+                        rack: None,
+                    }]
+                }
+            }
+        } else {
+            // No metadata store, use current broker
+            vec![MetadataBroker {
+                node_id: self.broker_id,
                 host: "localhost".to_string(),
                 port: 9092,
                 rack: None,
-            }],
+            }]
+        };
+        
+        let response = MetadataResponse {
+            correlation_id: header.correlation_id,
+            throttle_time_ms: 0,
+            brokers,
             cluster_id: Some("chronik-stream".to_string()),
-            controller_id: 1,
+            controller_id: self.broker_id, // Use actual broker ID
             topics,
         };
         tracing::info!("Metadata response has {} topics", response.topics.len());
@@ -1077,17 +1136,21 @@ impl ProtocolHandler {
         use crate::parser::Decoder;
         
         tracing::debug!("Handling DescribeConfigs request v{}", header.api_version);
+        tracing::debug!("Request body has {} bytes", body.len());
         
         let mut decoder = Decoder::new(body);
         
         // Parse resources array
         let resource_count = decoder.read_i32()? as usize;
+        tracing::debug!("Resource count: {}", resource_count);
         let mut resources = Vec::with_capacity(resource_count);
         
-        for _ in 0..resource_count {
+        for i in 0..resource_count {
             let resource_type = decoder.read_i8()?;
+            tracing::debug!("Resource {}: type = {}", i, resource_type);
             let resource_name = decoder.read_string()?
                 .unwrap_or_else(|| String::new());
+            tracing::debug!("Resource {}: name = '{}'", i, resource_name);
             
             // Configuration keys (v1+)
             let configuration_keys = if header.api_version >= 1 {
@@ -1501,29 +1564,45 @@ impl ProtocolHandler {
         
         for topic in request.topics {
             // Validate topic name
-            let error_code = if topic.name.is_empty() || topic.name.contains(' ') {
+            let error_code = if !Self::is_valid_topic_name(&topic.name) {
                 error_codes::INVALID_TOPIC_EXCEPTION
             } else if topic.num_partitions <= 0 {
                 error_codes::INVALID_PARTITIONS
+            } else if topic.num_partitions > 10000 {
+                error_codes::INVALID_PARTITIONS
             } else if topic.replication_factor <= 0 {
                 error_codes::INVALID_REPLICATION_FACTOR
-            } else if validate_only {
-                // Just validating, don't create
-                error_codes::NONE
+            } else if let Err(e) = self.validate_topic_configs(&topic.configs, topic.replication_factor) {
+                tracing::error!("Invalid topic configuration: {}", e);
+                error_codes::INVALID_CONFIG
             } else {
-                // Actually create the topic in metadata store
-                match self.create_topic_in_metadata(&topic).await {
+                // Check replication factor against available brokers
+                match self.validate_replication_factor(&topic).await {
                     Ok(_) => {
-                        tracing::info!("CreateTopics: Created topic '{}' with {} partitions, replication factor {}",
-                            topic.name, topic.num_partitions, topic.replication_factor);
-                        error_codes::NONE
+                        if validate_only {
+                            // Just validating, don't create
+                            error_codes::NONE
+                        } else {
+                            // Actually create the topic in metadata store
+                            match self.create_topic_in_metadata(&topic).await {
+                                Ok(_) => {
+                                    tracing::info!("CreateTopics: Created topic '{}' with {} partitions, replication factor {}",
+                                        topic.name, topic.num_partitions, topic.replication_factor);
+                                    error_codes::NONE
+                                }
+                                Err(e) => {
+                                    tracing::error!("Failed to create topic '{}': {:?}", topic.name, e);
+                                    match e {
+                                        Error::Internal(msg) if msg.contains("already exists") => error_codes::TOPIC_ALREADY_EXISTS,
+                                        _ => error_codes::INVALID_REQUEST,
+                                    }
+                                }
+                            }
+                        }
                     }
                     Err(e) => {
-                        tracing::error!("Failed to create topic '{}': {:?}", topic.name, e);
-                        match e {
-                            Error::Internal(msg) if msg.contains("already exists") => error_codes::TOPIC_ALREADY_EXISTS,
-                            _ => error_codes::INVALID_REQUEST,
-                        }
+                        tracing::error!("Replication factor validation failed: {}", e);
+                        error_codes::INVALID_REPLICATION_FACTOR
                     }
                 }
             };
@@ -1532,6 +1611,7 @@ impl ProtocolHandler {
                 error_codes::INVALID_TOPIC_EXCEPTION => Some("Invalid topic name".to_string()),
                 error_codes::INVALID_PARTITIONS => Some("Invalid number of partitions".to_string()),
                 error_codes::INVALID_REPLICATION_FACTOR => Some("Invalid replication factor".to_string()),
+                error_codes::INVALID_CONFIG => Some("Invalid topic configuration".to_string()),
                 _ => None,
             };
             
@@ -1893,7 +1973,7 @@ impl ProtocolHandler {
         tracing::info!("Encoding metadata response v{} with {} topics, throttle_time: {}", 
                       version, response.topics.len(), response.throttle_time_ms);
         
-        if version >= 3 {
+        if version >= 1 {
             encoder.write_i32(response.throttle_time_ms);
         }
         
@@ -2277,36 +2357,91 @@ impl ProtocolHandler {
         if let Some(metadata_store) = &self.metadata_store {
             use chronik_common::metadata::traits::{TopicConfig, PartitionAssignment};
             
+            // Parse configurations - validation already done in handle_create_topics
+            let retention_ms = topic.configs.get("retention.ms")
+                .and_then(|v| v.parse().ok());
+            let segment_bytes = topic.configs.get("segment.bytes")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1024 * 1024 * 1024); // 1GB default
+            
             let config = TopicConfig {
                 partition_count: topic.num_partitions as u32,
                 replication_factor: topic.replication_factor as u32,
-                retention_ms: topic.configs.get("retention.ms")
-                    .and_then(|v| v.parse().ok()),
-                segment_bytes: topic.configs.get("segment.bytes")
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(1024 * 1024 * 1024), // 1GB default
+                retention_ms,
+                segment_bytes,
                 config: topic.configs.clone(),
             };
             
-            metadata_store.create_topic(&topic.name, config).await
-                .map_err(|e| Error::Internal(format!("Failed to create topic: {:?}", e)))?;
+            // Get available brokers for partition assignment
+            let brokers = metadata_store.list_brokers().await
+                .map_err(|e| Error::Internal(format!("Failed to list brokers: {:?}", e)))?;
             
-            // Create partition assignments - assign all partitions to this broker for now
-            // In a real implementation, this would be done by the controller
+            let online_brokers: Vec<_> = brokers.iter()
+                .filter(|b| b.status == chronik_common::metadata::BrokerStatus::Online)
+                .collect();
+            
+            // Handle case where no brokers are registered
+            if online_brokers.is_empty() {
+                tracing::warn!("No online brokers found, using default broker ID {}", self.broker_id);
+                // Register this broker if not already registered
+                if metadata_store.get_broker(self.broker_id).await
+                    .map_err(|e| Error::Internal(format!("Failed to get broker: {:?}", e)))?
+                    .is_none() {
+                    let broker_metadata = chronik_common::metadata::BrokerMetadata {
+                        broker_id: self.broker_id,
+                        host: "localhost".to_string(), // TODO: Get from config
+                        port: 9092, // TODO: Get from config
+                        rack: None,
+                        status: chronik_common::metadata::BrokerStatus::Online,
+                        created_at: chronik_common::Utc::now(),
+                        updated_at: chronik_common::Utc::now(),
+                    };
+                    metadata_store.register_broker(broker_metadata).await
+                        .map_err(|e| Error::Internal(format!("Failed to register broker: {:?}", e)))?;
+                }
+            }
+            
+            // Create partition assignments using round-robin assignment
             let mut assignments = Vec::new();
+            let broker_count = if online_brokers.is_empty() { 1 } else { online_brokers.len() };
+            
             for partition in 0..topic.num_partitions {
+                let broker_index = (partition as usize) % broker_count;
+                let broker_id = if online_brokers.is_empty() {
+                    self.broker_id
+                } else {
+                    online_brokers[broker_index].broker_id
+                };
+                
                 assignments.push(PartitionAssignment {
                     topic: topic.name.clone(),
                     partition: partition as u32,
-                    broker_id: 1, // TODO: Get actual broker ID from config
-                    is_leader: true,
+                    broker_id,
+                    is_leader: true, // For now, all replicas are leaders
                 });
             }
             
-            for assignment in assignments {
-                metadata_store.assign_partition(assignment).await
-                    .map_err(|e| Error::Internal(format!("Failed to create partition assignment: {:?}", e)))?;
+            // Prepare offset initialization data
+            let mut offsets = Vec::new();
+            for partition in 0..topic.num_partitions {
+                offsets.push((
+                    partition as u32,
+                    0i64, // high_watermark
+                    0i64, // log_start_offset
+                ));
             }
+            
+            // Create topic atomically with all assignments and offsets
+            let topic_metadata = metadata_store.create_topic_with_assignments(
+                &topic.name,
+                config,
+                assignments,
+                offsets,
+            ).await
+                .map_err(|e| Error::Internal(format!("Failed to create topic: {:?}", e)))?;
+            
+            tracing::info!("Successfully created topic '{}' with ID {} and {} partitions atomically across {} brokers", 
+                topic.name, topic_metadata.id, topic.num_partitions, broker_count);
             
             Ok(())
         } else {
@@ -2314,6 +2449,96 @@ impl ProtocolHandler {
             tracing::warn!("No metadata store configured, topic creation not persisted");
             Ok(())
         }
+    }
+    
+    /// Validate topic name according to Kafka rules
+    fn is_valid_topic_name(name: &str) -> bool {
+        // Topic name must:
+        // - Not be empty
+        // - Not be "." or ".."
+        // - Not exceed 249 characters
+        // - Contain only alphanumeric, '.', '_', or '-'
+        if name.is_empty() || name == "." || name == ".." || name.len() > 249 {
+            return false;
+        }
+        
+        name.chars().all(|c| c.is_alphanumeric() || c == '.' || c == '_' || c == '-')
+    }
+    
+    /// Validate topic configurations
+    async fn validate_replication_factor(&self, topic: &crate::create_topics_types::CreateTopicRequest) -> Result<()> {
+        if let Some(metadata_store) = &self.metadata_store {
+            let brokers = metadata_store.list_brokers().await
+                .map_err(|e| Error::Internal(format!("Failed to list brokers: {}", e)))?;
+            
+            let online_brokers: Vec<_> = brokers.iter()
+                .filter(|b| b.status == chronik_common::metadata::BrokerStatus::Online)
+                .collect();
+            
+            if online_brokers.is_empty() {
+                return Err(Error::Protocol("No online brokers available".into()));
+            }
+            
+            if topic.replication_factor as usize > online_brokers.len() {
+                return Err(Error::Protocol(format!(
+                    "Replication factor {} exceeds available brokers {}", 
+                    topic.replication_factor, 
+                    online_brokers.len()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_topic_configs(&self, configs: &HashMap<String, String>, replication_factor: i16) -> Result<()> {
+        for (key, value) in configs {
+            match key.as_str() {
+                "retention.ms" => {
+                    if let Ok(ms) = value.parse::<i64>() {
+                        if ms < -1 {
+                            return Err(Error::Protocol("retention.ms must be >= -1".into()));
+                        }
+                    } else {
+                        return Err(Error::Protocol(format!("Invalid retention.ms value: {}", value)));
+                    }
+                }
+                "segment.bytes" => {
+                    if let Ok(bytes) = value.parse::<i64>() {
+                        if bytes < 14 {
+                            return Err(Error::Protocol("segment.bytes must be >= 14".into()));
+                        }
+                    } else {
+                        return Err(Error::Protocol(format!("Invalid segment.bytes value: {}", value)));
+                    }
+                }
+                "compression.type" => {
+                    if !["none", "gzip", "snappy", "lz4", "zstd"].contains(&value.as_str()) {
+                        return Err(Error::Protocol(format!("Invalid compression.type: {}", value)));
+                    }
+                }
+                "cleanup.policy" => {
+                    if !["delete", "compact", "delete,compact", "compact,delete"].contains(&value.as_str()) {
+                        return Err(Error::Protocol(format!("Invalid cleanup.policy: {}", value)));
+                    }
+                }
+                "min.insync.replicas" => {
+                    if let Ok(replicas) = value.parse::<i32>() {
+                        if replicas < 1 || replicas > replication_factor as i32 {
+                            return Err(Error::Protocol(format!(
+                                "min.insync.replicas must be between 1 and replication factor ({})", 
+                                replication_factor
+                            )));
+                        }
+                    } else {
+                        return Err(Error::Protocol(format!("Invalid min.insync.replicas value: {}", value)));
+                    }
+                }
+                _ => {
+                    // Other configs are allowed without validation
+                }
+            }
+        }
+        Ok(())
     }
     
     /// Get topics from metadata store
@@ -2339,17 +2564,45 @@ impl ProtocolHandler {
             for topic_meta in topics_to_return {
                 let mut partitions = Vec::new();
                 
-                // Create partition metadata
-                for partition_id in 0..topic_meta.config.partition_count {
-                    partitions.push(MetadataPartition {
-                        error_code: 0,
-                        partition_index: partition_id as i32,
-                        leader_id: 1, // This node is always the leader for now
-                        leader_epoch: 0,
-                        replica_nodes: vec![1], // Only this node for now
-                        isr_nodes: vec![1], // In-sync replica is just this node
-                        offline_replicas: vec![],
-                    });
+                // Get actual partition assignments from metadata store
+                let assignments = match metadata_store.get_partition_assignments(&topic_meta.name).await {
+                    Ok(assignments) => assignments,
+                    Err(e) => {
+                        tracing::error!("Failed to get partition assignments for topic {}: {:?}", topic_meta.name, e);
+                        vec![]
+                    }
+                };
+                
+                // Create partition metadata from assignments
+                if assignments.is_empty() {
+                    // Fallback: create default partition metadata if no assignments found
+                    for partition_id in 0..topic_meta.config.partition_count {
+                        partitions.push(MetadataPartition {
+                            error_code: 0,
+                            partition_index: partition_id as i32,
+                            leader_id: self.broker_id,
+                            leader_epoch: 0,
+                            replica_nodes: vec![self.broker_id],
+                            isr_nodes: vec![self.broker_id],
+                            offline_replicas: vec![],
+                        });
+                    }
+                } else {
+                    // Use actual partition assignments
+                    let mut sorted_assignments = assignments;
+                    sorted_assignments.sort_by_key(|a| a.partition);
+                    
+                    for assignment in sorted_assignments {
+                        partitions.push(MetadataPartition {
+                            error_code: 0,
+                            partition_index: assignment.partition as i32,
+                            leader_id: if assignment.is_leader { assignment.broker_id } else { self.broker_id },
+                            leader_epoch: 0,
+                            replica_nodes: vec![assignment.broker_id],
+                            isr_nodes: vec![assignment.broker_id], // For now, all replicas are in sync
+                            offline_replicas: vec![],
+                        });
+                    }
                 }
                 
                 result.push(MetadataTopic {

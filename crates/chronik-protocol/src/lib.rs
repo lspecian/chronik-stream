@@ -9,6 +9,7 @@
 //! - All major Kafka API implementations
 
 pub mod compression;
+pub mod error_codes;
 pub mod frame;
 pub mod handler;
 pub mod kafka_protocol;

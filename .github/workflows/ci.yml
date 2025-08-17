@@ -1,14 +1,17 @@
-name: CI
+name: CI/CD Pipeline
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, develop ]
   pull_request:
     branches: [ main ]
+  release:
+    types: [ created ]
 
 env:
   RUST_BACKTRACE: 1
   CARGO_TERM_COLOR: always
+  DOCKER_REGISTRY: ghcr.io
 
 jobs:
   lint:

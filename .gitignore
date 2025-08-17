@@ -63,4 +63,22 @@ target/
 
 # Task files
 # tasks.json
-# tasks/ 
+# tasks/
+
+# Python test artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/
+.eggs/
+*.pytest_cache
+
+# Test output
+test-results/
+tests/python/*.log
+tests/python/*.out
+benchmarks/results/ 

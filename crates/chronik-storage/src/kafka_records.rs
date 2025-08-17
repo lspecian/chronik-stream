@@ -303,8 +303,14 @@ impl KafkaRecordBatch {
         let batch_length = read_i32(&mut cursor)?;
         
         // Verify we have enough data
-        if cursor.position() as usize + batch_length as usize > data.len() {
-            return Err(Error::Internal("RecordBatch truncated".to_string()));
+        // batch_length is the size of the data after the length field (starting from partition_leader_epoch)
+        // We need to ensure we have at least batch_length bytes remaining
+        let expected_total_size = 12 + batch_length as usize; // 8 (offset) + 4 (length) + batch_length
+        if data.len() < expected_total_size {
+            return Err(Error::Internal(format!(
+                "RecordBatch truncated: expected {} bytes, got {}", 
+                expected_total_size, data.len()
+            )));
         }
         
         // Read header fields
@@ -410,10 +416,22 @@ impl KafkaRecordBatch {
             
             // Headers
             let headers_count = decode_varint(&mut cursor)?;
+            
+            // Sanity check headers count to prevent capacity overflow
+            if headers_count < 0 || headers_count > 1000 {
+                return Err(Error::Internal(format!(
+                    "Invalid headers count: {} at position {}. This might be due to incorrect message format.", 
+                    headers_count, cursor.position()
+                )));
+            }
+            
             let mut headers = Vec::with_capacity(headers_count as usize);
             
             for _ in 0..headers_count {
                 let key_len = decode_varint(&mut cursor)?;
+                if key_len < 0 || key_len > 10000 {
+                    return Err(Error::Internal(format!("Invalid header key length: {}", key_len)));
+                }
                 let mut key_buf = vec![0u8; key_len as usize];
                 cursor.read_exact(&mut key_buf)
                     .map_err(|e| Error::Internal(format!("Failed to read header key: {}", e)))?;
@@ -422,6 +440,9 @@ impl KafkaRecordBatch {
                 
                 let value_len = decode_varint(&mut cursor)?;
                 let value = if value_len >= 0 {
+                    if value_len > 1000000 {
+                        return Err(Error::Internal(format!("Invalid header value length: {}", value_len)));
+                    }
                     let mut buf = vec![0u8; value_len as usize];
                     cursor.read_exact(&mut buf)
                         .map_err(|e| Error::Internal(format!("Failed to read header value: {}", e)))?;
@@ -519,7 +540,7 @@ fn decode_varint(cursor: &mut Cursor<&[u8]>) -> Result<i32> {
         }
     }
     // Decode zigzag
-    Ok(((value >> 1) ^ (!(value & 1).wrapping_add(1))) as i32)
+    Ok(((value >> 1) as i32) ^ -((value & 1) as i32))
 }
 
 fn encode_varlong(value: i64, buf: &mut Vec<u8>) {
@@ -549,7 +570,7 @@ fn decode_varlong(cursor: &mut Cursor<&[u8]>) -> Result<i64> {
         }
     }
     // Decode zigzag
-    Ok(((value >> 1) ^ (!(value & 1).wrapping_add(1))) as i64)
+    Ok(((value >> 1) as i64) ^ -((value & 1) as i64))
 }
 
 fn calculate_crc32(data: &[u8]) -> u32 {

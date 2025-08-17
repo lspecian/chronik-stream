@@ -10,6 +10,12 @@ pub mod kafka_handler;
 pub mod fetch_handler;
 pub mod health;
 pub mod metrics;
+pub mod offset_storage;
+pub mod offset_cleanup;
+pub mod coordinator_manager;
+pub mod distributed_lock;
+pub mod heartbeat_monitor;
+pub mod protocol_metadata;
 
 pub use server::{IngestServer, ServerConfig, TlsConfig, ConnectionPoolConfig};
 pub use indexer::{Indexer, IndexerConfig, IndexRecord, IndexerStats};

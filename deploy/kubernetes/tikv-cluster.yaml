@@ -1,0 +1,124 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: pd
+  namespace: chronik-stream
+  labels:
+    app: pd
+spec:
+  ports:
+  - port: 2379
+    name: client
+  clusterIP: None
+  selector:
+    app: pd
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: pd
+  namespace: chronik-stream
+spec:
+  serviceName: pd
+  replicas: 3
+  selector:
+    matchLabels:
+      app: pd
+  template:
+    metadata:
+      labels:
+        app: pd
+    spec:
+      containers:
+      - name: pd
+        image: pingcap/pd:latest
+        ports:
+        - containerPort: 2379
+          name: client
+        - containerPort: 2380
+          name: peer
+        volumeMounts:
+        - name: data
+          mountPath: /data
+        command:
+        - /pd-server
+        - --name=$(POD_NAME)
+        - --data-dir=/data
+        - --client-urls=http://0.0.0.0:2379
+        - --advertise-client-urls=http://$(POD_NAME).pd.chronik-stream.svc.cluster.local:2379
+        - --peer-urls=http://0.0.0.0:2380
+        - --advertise-peer-urls=http://$(POD_NAME).pd.chronik-stream.svc.cluster.local:2380
+        - --initial-cluster=pd-0=http://pd-0.pd.chronik-stream.svc.cluster.local:2380,pd-1=http://pd-1.pd.chronik-stream.svc.cluster.local:2380,pd-2=http://pd-2.pd.chronik-stream.svc.cluster.local:2380
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 10Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tikv
+  namespace: chronik-stream
+  labels:
+    app: tikv
+spec:
+  ports:
+  - port: 20160
+    name: server
+  clusterIP: None
+  selector:
+    app: tikv
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: tikv
+  namespace: chronik-stream
+spec:
+  serviceName: tikv
+  replicas: 3
+  selector:
+    matchLabels:
+      app: tikv
+  template:
+    metadata:
+      labels:
+        app: tikv
+    spec:
+      containers:
+      - name: tikv
+        image: pingcap/tikv:latest
+        ports:
+        - containerPort: 20160
+          name: server
+        volumeMounts:
+        - name: data
+          mountPath: /data
+        command:
+        - /tikv-server
+        - --addr=0.0.0.0:20160
+        - --advertise-addr=$(POD_NAME).tikv.chronik-stream.svc.cluster.local:20160
+        - --data-dir=/data
+        - --pd=pd-0.pd.chronik-stream.svc.cluster.local:2379,pd-1.pd.chronik-stream.svc.cluster.local:2379,pd-2.pd.chronik-stream.svc.cluster.local:2379
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 100Gi

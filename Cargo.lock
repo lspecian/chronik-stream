@@ -1302,12 +1302,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arc-swap",
+ "async-trait",
  "chronik-common",
  "chrono",
  "config",
  "dashmap 5.5.3",
  "futures",
  "notify",
+ "regex",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -1359,17 +1361,20 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum 0.7.9",
+ "base64 0.22.1",
  "byteorder",
  "bytes",
  "chronik-auth",
  "chronik-common",
  "chronik-monitoring",
  "chronik-protocol",
+ "chronik-search",
  "chronik-storage",
  "chrono",
  "dashmap 5.5.3",
  "futures",
  "lazy_static",
+ "murmur2",
  "parking_lot",
  "prometheus",
  "proptest",
@@ -1377,6 +1382,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 1.0.69",
+ "tikv-client",
  "tokio",
  "tokio-rustls 0.24.1",
  "tokio-test",
@@ -3819,6 +3825,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d87ecb2933e8aeadb3e3a02b828fed80a7528047e68b4f424523a0981a3a084"
 
 [[package]]
+name = "murmur2"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb585ade2549a017db2e35978b77c319214fa4b37cede841e27954dd6e8f3ca8"
+
+[[package]]
 name = "murmurhash32"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5216,7 +5228,6 @@ dependencies = [
  "num_enum",
  "openssl-sys",
  "pkg-config",
- "sasl2-sys",
  "zstd-sys",
 ]
 

@@ -82,7 +82,7 @@ pub struct BrokerMetadata {
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum BrokerStatus {
     Online,
     Offline,
@@ -155,6 +155,18 @@ pub trait MetadataStore: Send + Sync {
     async fn commit_offset(&self, offset: ConsumerOffset) -> Result<()>;
     async fn get_consumer_offset(&self, group_id: &str, topic: &str, partition: u32) -> Result<Option<ConsumerOffset>>;
     
+    // Partition offset operations
+    async fn update_partition_offset(&self, topic: &str, partition: u32, high_watermark: i64, log_start_offset: i64) -> Result<()>;
+    async fn get_partition_offset(&self, topic: &str, partition: u32) -> Result<Option<(i64, i64)>>; // Returns (high_watermark, log_start_offset)
+    
     // System initialization
     async fn init_system_state(&self) -> Result<()>;
+    
+    // Batch/transactional operations
+    async fn create_topic_with_assignments(&self, 
+        topic_name: &str, 
+        config: TopicConfig,
+        assignments: Vec<PartitionAssignment>,
+        offsets: Vec<(u32, i64, i64)> // (partition, high_watermark, log_start_offset)
+    ) -> Result<TopicMetadata>;
 }

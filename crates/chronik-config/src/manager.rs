@@ -163,7 +163,7 @@ impl ConfigManager {
     
     /// Update configuration value at runtime
     pub async fn set(&self, path: &str, value: ConfigValue) -> Result<()> {
-        let mut config = (*self.config.load()).clone();
+        let mut config = self.config.load().as_ref().clone();
         
         // Parse path and update value
         let parts: Vec<&str> = path.split('.').collect();
@@ -183,7 +183,7 @@ impl ConfigManager {
         
         // Store the updated configuration
         let old_config = self.config.load();
-        self.config.store(Arc::new(config.clone()));
+        self.config.store(Arc::new(config));
         
         // Clear cache for this path and its parents
         self.invalidate_cache(path);
@@ -234,7 +234,7 @@ impl ConfigManager {
     
     /// Export current configuration
     pub fn export(&self) -> ConfigValue {
-        (*self.config.load()).clone()
+        self.config.load().as_ref().clone()
     }
     
     /// Invalidate cache for a path and its parents

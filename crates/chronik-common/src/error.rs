@@ -24,6 +24,13 @@ pub enum Error {
     #[error("Protocol error: {0}")]
     Protocol(String),
     
+    /// Protocol errors with correlation ID
+    #[error("Protocol error: {message}")]
+    ProtocolWithCorrelation {
+        message: String,
+        correlation_id: i32,
+    },
+    
     /// Network errors
     #[error("Network error: {0}")]
     Network(String),

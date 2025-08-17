@@ -9,6 +9,7 @@
 //! - Ensures high-throughput message ingestion
 
 use crate::storage::{StorageConfig, StorageService};
+use crate::fetch_handler::FetchHandler;
 use chronik_common::{Result, Error};
 use chronik_protocol::{
     ProduceRequest, ProduceResponse, ProduceResponseTopic, ProduceResponsePartition,
@@ -17,19 +18,17 @@ use chronik_protocol::{
 use chronik_storage::kafka_records::{
     KafkaRecordBatch, CompressionType, TimestampType, RecordHeader as KafkaRecordHeader,
 };
-// Search indexing disabled temporarily
-// use chronik_search::{
-//     realtime_indexer::{RealtimeIndexer, JsonDocument, RealtimeIndexerConfig},
-//     json_pipeline::JsonPipeline,
-// };
+use chronik_search::{
+    realtime_indexer::{RealtimeIndexer, JsonDocument, RealtimeIndexerConfig},
+    json_pipeline::JsonPipeline,
+};
+use serde_json::Map as JsonMap;
 use chronik_storage::{
     RecordBatch, Record, SegmentWriter,
-    chronik_segment::{ChronikSegmentBuilder, CompressionType as ChronikCompression},
     object_store::storage::ObjectStore,
 };
 use chronik_common::metadata::traits::MetadataStore;
-use serde_json::Value as JsonValue;
-use std::collections::{HashMap, BTreeMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -58,7 +57,7 @@ pub struct ProduceHandlerConfig {
     /// Storage configuration
     pub storage_config: StorageConfig,
     /// Indexer configuration
-    // pub indexer_config: RealtimeIndexerConfig,
+    pub indexer_config: RealtimeIndexerConfig,
     /// Enable real-time indexing
     pub enable_indexing: bool,
     /// Enable idempotent producer support
@@ -77,6 +76,12 @@ pub struct ProduceHandlerConfig {
     pub request_timeout_ms: u64,
     /// Buffer memory limit
     pub buffer_memory: usize,
+    /// Enable automatic topic creation
+    pub auto_create_topics_enable: bool,
+    /// Default number of partitions for auto-created topics
+    pub num_partitions: u32,
+    /// Default replication factor for auto-created topics
+    pub default_replication_factor: u32,
 }
 
 impl Default for ProduceHandlerConfig {
@@ -84,7 +89,7 @@ impl Default for ProduceHandlerConfig {
         Self {
             node_id: 0,
             storage_config: StorageConfig::default(),
-            // indexer_config: RealtimeIndexerConfig::default(),
+            indexer_config: RealtimeIndexerConfig::default(),
             enable_indexing: true,
             enable_idempotence: true,
             enable_transactions: true,
@@ -94,6 +99,9 @@ impl Default for ProduceHandlerConfig {
             compression_type: CompressionType::Gzip,
             request_timeout_ms: 30000,
             buffer_memory: 32 * 1024 * 1024, // 32MB
+            auto_create_topics_enable: true,
+            num_partitions: 3,
+            default_replication_factor: 1,
         }
     }
 }
@@ -167,14 +175,31 @@ pub struct ProduceMetrics {
     pub segments_created: AtomicU64,
     pub indexing_lag_ms: AtomicU64,
     pub compression_ratio: AtomicU64,
+    pub storage_write_errors: AtomicU64,
+    pub storage_write_retries: AtomicU64,
+    // Topic auto-creation metrics
+    pub topics_auto_created: AtomicU64,
+    pub topic_creation_errors: AtomicU64,
+    pub topic_creation_invalid_names: AtomicU64,
+    pub topic_creation_concurrent_attempts: AtomicU64,
+}
+
+/// Topic creation statistics
+#[derive(Debug, Clone)]
+pub struct TopicCreationStats {
+    pub topics_created: u64,
+    pub creation_errors: u64,
+    pub invalid_name_attempts: u64,
+    pub concurrent_attempts: u64,
 }
 
 /// Enhanced produce request handler
 pub struct ProduceHandler {
     config: ProduceHandlerConfig,
     storage: Arc<dyn ObjectStore>,
-    // indexer: Option<Arc<RealtimeIndexer>>,
-    // json_pipeline: Arc<JsonPipeline>,
+    indexer: Option<Arc<RealtimeIndexer>>,
+    json_pipeline: Arc<JsonPipeline>,
+    index_sender: Option<mpsc::Sender<JsonDocument>>,
     metadata_store: Arc<dyn MetadataStore>,
     partition_states: Arc<RwLock<HashMap<(String, i32), Arc<PartitionState>>>>,
     producer_info: Arc<RwLock<HashMap<i64, ProducerInfo>>>,
@@ -182,6 +207,9 @@ pub struct ProduceHandler {
     running: Arc<AtomicBool>,
     memory_limiter: Arc<Semaphore>,
     replication_sender: Option<mpsc::Sender<ReplicationRequest>>,
+    fetch_handler: Option<Arc<FetchHandler>>,
+    /// Track in-flight topic creation requests to prevent duplicates
+    topic_creation_cache: Arc<RwLock<HashMap<String, Arc<Mutex<Option<chronik_common::metadata::TopicMetadata>>>>>>,
 }
 
 /// Replication request for ISR management
@@ -196,6 +224,10 @@ struct ReplicationRequest {
 }
 
 impl ProduceHandler {
+    /// Get reference to metadata store
+    pub fn get_metadata_store(&self) -> &Arc<dyn MetadataStore> {
+        &self.metadata_store
+    }
     /// Create a new produce handler
     pub async fn new(
         config: ProduceHandlerConfig,
@@ -203,23 +235,23 @@ impl ProduceHandler {
         metadata_store: Arc<dyn MetadataStore>,
     ) -> Result<Self> {
         // Create indexer if enabled
-        // let (indexer, index_sender) = if config.enable_indexing {
-        //     let (sender, receiver) = mpsc::channel(10000);
-        //     let indexer = Arc::new(RealtimeIndexer::new(config.indexer_config.clone())?);
-        //     
-        //     // Start indexing pipeline
-        //     let indexer_clone = Arc::clone(&indexer);
-        //     tokio::spawn(async move {
-        //         let _ = indexer_clone.start(receiver).await;
-        //     });
-        //     
-        //     (Some(indexer), Some(sender))
-        // } else {
-        //     (None, None)
-        // };
+        let (indexer, index_sender) = if config.enable_indexing {
+            let (sender, receiver) = mpsc::channel(10000);
+            let indexer = Arc::new(RealtimeIndexer::new(config.indexer_config.clone())?);
+            
+            // Start indexing pipeline
+            let indexer_clone = Arc::clone(&indexer);
+            tokio::spawn(async move {
+                let _ = indexer_clone.start(receiver).await;
+            });
+            
+            (Some(indexer), Some(sender))
+        } else {
+            (None, None)
+        };
         
         // Create JSON pipeline for transformation
-        // let json_pipeline = Arc::new(JsonPipeline::new(Default::default())?);
+        let json_pipeline = Arc::new(JsonPipeline::new(Default::default(), config.indexer_config.clone()).await?);
         
         // Create memory limiter
         let memory_limiter = Arc::new(Semaphore::new(
@@ -229,8 +261,9 @@ impl ProduceHandler {
         Ok(Self {
             config,
             storage,
-            // indexer,
-            // json_pipeline,
+            indexer,
+            json_pipeline,
+            index_sender,
             metadata_store,
             partition_states: Arc::new(RwLock::new(HashMap::new())),
             producer_info: Arc::new(RwLock::new(HashMap::new())),
@@ -238,6 +271,8 @@ impl ProduceHandler {
             running: Arc::new(AtomicBool::new(true)),
             memory_limiter,
             replication_sender: None,
+            fetch_handler: None,
+            topic_creation_cache: Arc::new(RwLock::new(HashMap::new())),
         })
     }
     
@@ -250,6 +285,23 @@ impl ProduceHandler {
         
         // Start background tasks
         self.start_background_tasks().await;
+    }
+    
+    /// Set the fetch handler for updating buffers
+    pub fn set_fetch_handler(&mut self, fetch_handler: Arc<FetchHandler>) {
+        self.fetch_handler = Some(fetch_handler);
+    }
+    
+    /// Create a new produce handler with fetch handler connected
+    pub async fn new_with_fetch_handler(
+        config: ProduceHandlerConfig,
+        storage: Arc<dyn ObjectStore>,
+        metadata_store: Arc<dyn MetadataStore>,
+        fetch_handler: Arc<FetchHandler>,
+    ) -> Result<Self> {
+        let mut handler = Self::new(config, storage, metadata_store).await?;
+        handler.fetch_handler = Some(fetch_handler);
+        Ok(handler)
     }
     
     /// Start background tasks for segment management
@@ -389,26 +441,59 @@ impl ProduceHandler {
         let transactional_id = request.transactional_id.clone();
         
         for topic_data in request.topics {
-            // Validate topic exists
+            // Validate topic exists or auto-create if enabled
             let topic_metadata = match self.metadata_store.get_topic(&topic_data.name).await? {
                 Some(meta) => meta,
                 None => {
-                    // Topic doesn't exist, return error for all partitions
-                    let error_partitions = topic_data.partitions.into_iter().map(|p| {
-                        ProduceResponsePartition {
-                            index: p.index,
-                            error_code: ErrorCode::UnknownTopicOrPartition.code(),
-                            base_offset: -1,
-                            log_append_time: -1,
-                            log_start_offset: 0,
+                    // Topic doesn't exist - check if auto-creation is enabled
+                    if self.config.auto_create_topics_enable {
+                        debug!("Topic '{}' not found, attempting auto-creation", topic_data.name);
+                        // Attempt to auto-create the topic
+                        match self.auto_create_topic(&topic_data.name).await {
+                            Ok(meta) => {
+                                info!("Successfully auto-created topic '{}' - produce request will now proceed", 
+                                    topic_data.name);
+                                meta
+                            }
+                            Err(e) => {
+                                warn!("Failed to auto-create topic '{}': {:?} - produce request will fail", 
+                                    topic_data.name, e);
+                                // Return error for all partitions
+                                let error_partitions = topic_data.partitions.into_iter().map(|p| {
+                                    ProduceResponsePartition {
+                                        index: p.index,
+                                        error_code: ErrorCode::UnknownTopicOrPartition.code(),
+                                        base_offset: -1,
+                                        log_append_time: -1,
+                                        log_start_offset: 0,
+                                    }
+                                }).collect();
+                                
+                                response_topics.push(ProduceResponseTopic {
+                                    name: topic_data.name,
+                                    partitions: error_partitions,
+                                });
+                                continue;
+                            }
                         }
-                    }).collect();
-                    
-                    response_topics.push(ProduceResponseTopic {
-                        name: topic_data.name,
-                        partitions: error_partitions,
-                    });
-                    continue;
+                    } else {
+                        // Auto-creation disabled, return error for all partitions
+                        let error_partitions = topic_data.partitions.into_iter().map(|p| {
+                            ProduceResponsePartition {
+                                index: p.index,
+                                error_code: ErrorCode::UnknownTopicOrPartition.code(),
+                                base_offset: -1,
+                                log_append_time: -1,
+                                log_start_offset: 0,
+                            }
+                        }).collect();
+                        
+                        response_topics.push(ProduceResponseTopic {
+                            name: topic_data.name,
+                            partitions: error_partitions,
+                        });
+                        continue;
+                    }
                 }
             };
             
@@ -563,6 +648,18 @@ impl ProduceHandler {
         // Update next offset atomically
         partition_state.next_offset.store((last_offset + 1) as u64, Ordering::SeqCst);
         
+        // Persist offset to metadata store
+        let high_watermark = partition_state.high_watermark.load(Ordering::SeqCst) as i64;
+        let log_start_offset = partition_state.log_start_offset.load(Ordering::SeqCst) as i64;
+        if let Err(e) = self.metadata_store.update_partition_offset(
+            topic, 
+            partition as u32, 
+            (last_offset + 1) as i64,  // Update high watermark to next offset
+            log_start_offset
+        ).await {
+            warn!("Failed to persist partition offset to metadata store: {:?}", e);
+        }
+        
         // Buffer records
         {
             let mut pending = partition_state.pending_records.lock().await;
@@ -705,16 +802,37 @@ impl ProduceHandler {
             ).await?
         ));
         
-        // Get current offsets from segments
-        let segments = self.metadata_store.list_segments(topic, Some(partition as u32)).await?;
-        let high_watermark = segments.iter()
-            .map(|s| s.end_offset + 1)
-            .max()
-            .unwrap_or(0);
-        let log_start_offset = segments.iter()
-            .map(|s| s.start_offset)
-            .min()
-            .unwrap_or(0);
+        // Get current offsets from metadata store first
+        let (high_watermark, log_start_offset) = match self.metadata_store
+            .get_partition_offset(topic, partition as u32)
+            .await? 
+        {
+            Some((hw, lso)) => (hw, lso),
+            None => {
+                // Fall back to calculating from segments
+                let segments = self.metadata_store.list_segments(topic, Some(partition as u32)).await?;
+                let hw = segments.iter()
+                    .map(|s| s.end_offset + 1)
+                    .max()
+                    .unwrap_or(0);
+                let lso = segments.iter()
+                    .map(|s| s.start_offset)
+                    .min()
+                    .unwrap_or(0);
+                
+                // Persist the calculated offsets
+                if let Err(e) = self.metadata_store.update_partition_offset(
+                    topic, 
+                    partition as u32, 
+                    hw, 
+                    lso
+                ).await {
+                    warn!("Failed to persist initial partition offsets: {:?}", e);
+                }
+                
+                (hw, lso)
+            }
+        };
         
         let now = Instant::now();
         let state = Arc::new(PartitionState {
@@ -822,9 +940,84 @@ impl ProduceHandler {
     }
     
     /// Send records to indexing pipeline
-    async fn send_to_indexer(&self, _topic: &str, _partition: i32, _records: &[ProduceRecord]) {
-        // Indexing disabled temporarily
-        // TODO: Re-enable when chronik-search is fixed
+    async fn send_to_indexer(&self, topic: &str, partition: i32, records: &[ProduceRecord]) {
+        if let Some(sender) = &self.index_sender {
+            // Convert ProduceRecords to JsonDocuments
+            for record in records {
+                // Create metadata for the document
+                let mut metadata = serde_json::Map::new();
+                metadata.insert("_topic".to_string(), serde_json::Value::String(topic.to_string()));
+                metadata.insert("_partition".to_string(), serde_json::Value::Number(partition.into()));
+                metadata.insert("_offset".to_string(), serde_json::Value::Number(record.offset.into()));
+                metadata.insert("_timestamp".to_string(), serde_json::Value::Number(record.timestamp.into()));
+                
+                // Add headers as metadata
+                for (key, value) in &record.headers {
+                    if let Ok(header_str) = String::from_utf8(value.clone()) {
+                        metadata.insert(format!("_header_{}", key), serde_json::Value::String(header_str));
+                    }
+                }
+                
+                // Try to parse value as JSON, fallback to string
+                let document = if let Ok(json_value) = serde_json::from_slice::<serde_json::Value>(&record.value) {
+                    // Merge JSON value with metadata
+                    if let serde_json::Value::Object(mut obj) = json_value {
+                        for (k, v) in &metadata {
+                            obj.insert(k.clone(), v.clone());
+                        }
+                        JsonDocument {
+                            id: format!("{}-{}-{}", topic, partition, record.offset),
+                            topic: topic.to_string(),
+                            partition,
+                            offset: record.offset,
+                            timestamp: record.timestamp,
+                            content: serde_json::Value::Object(obj),
+                            metadata: Some(metadata),
+                        }
+                    } else {
+                        // Non-object JSON, wrap it
+                        let mut obj = metadata.clone();
+                        obj.insert("_value".to_string(), json_value);
+                        JsonDocument {
+                            id: format!("{}-{}-{}", topic, partition, record.offset),
+                            topic: topic.to_string(),
+                            partition,
+                            offset: record.offset,
+                            timestamp: record.timestamp,
+                            content: serde_json::Value::Object(obj),
+                            metadata: Some(metadata),
+                        }
+                    }
+                } else {
+                    // Not JSON, store as string
+                    let mut obj = metadata.clone();
+                    if let Ok(value_str) = String::from_utf8(record.value.clone()) {
+                        obj.insert("_value".to_string(), serde_json::Value::String(value_str));
+                    } else {
+                        // Binary data, store as base64
+                        use base64::Engine;
+                        let encoded = base64::engine::general_purpose::STANDARD.encode(&record.value);
+                        obj.insert("_value_base64".to_string(), serde_json::Value::String(encoded));
+                    }
+                    
+                    JsonDocument {
+                        id: format!("{}-{}-{}", topic, partition, record.offset),
+                        topic: topic.to_string(),
+                        partition,
+                        offset: record.offset,
+                        timestamp: record.timestamp,
+                        content: serde_json::Value::Object(obj),
+                        metadata: Some(metadata),
+                    }
+                };
+                
+                // Send to indexer (non-blocking)
+                if let Err(e) = sender.try_send(document) {
+                    debug!("Failed to send document to indexer: {}", e);
+                    self.metrics.indexing_lag_ms.store(1000, Ordering::Relaxed);
+                }
+            }
+        }
     }
     
     /// Flush partition if needed based on size or time
@@ -838,9 +1031,17 @@ impl ProduceHandler {
             let pending = state.pending_records.lock().await;
             let last_flush = state.last_flush.lock().await;
             
-            pending.len() >= MAX_BUFFER_RECORDS ||
+            // Lower threshold for testing - flush even single record after 100ms
+            let min_records = if cfg!(debug_assertions) { 1 } else { MAX_BUFFER_RECORDS };
+            let linger_time = if cfg!(debug_assertions) { 
+                Duration::from_millis(100) 
+            } else { 
+                Duration::from_millis(self.config.linger_ms) 
+            };
+            
+            pending.len() >= min_records ||
             state.segment_size.load(Ordering::Relaxed) >= MAX_SEGMENT_SIZE ||
-            last_flush.elapsed() >= Duration::from_millis(self.config.linger_ms)
+            last_flush.elapsed() >= linger_time
         };
         
         if should_flush {
@@ -907,17 +1108,71 @@ impl ProduceHandler {
             records: storage_records,
         };
         
-        // Write batch
+        // Write batch with retry logic
         let mut writer = state.current_writer.lock().await;
-        writer.write_batch(topic, partition, record_batch).await?;
+        
+        // Retry up to 3 times with exponential backoff
+        let mut retry_count = 0;
+        let max_retries = 3;
+        let mut backoff = Duration::from_millis(100);
+        
+        loop {
+            match writer.write_batch(topic, partition, record_batch.clone()).await {
+                Ok(_) => break,
+                Err(e) => {
+                    retry_count += 1;
+                    if retry_count > max_retries {
+                        error!("Failed to write batch after {} retries: {:?}", max_retries, e);
+                        return Err(Error::Internal(format!("Storage write failed after retries: {}", e)));
+                    }
+                    
+                    warn!("Storage write failed (attempt {}/{}): {:?}", retry_count, max_retries, e);
+                    
+                    // Update metrics
+                    self.metrics.storage_write_errors.fetch_add(1, Ordering::Relaxed);
+                    self.metrics.storage_write_retries.fetch_add(1, Ordering::Relaxed);
+                    
+                    // Exponential backoff
+                    tokio::time::sleep(backoff).await;
+                    backoff *= 2;
+                }
+            }
+        }
         
         // Update state
         state.segment_size.fetch_add(records.len() as u64 * 100, Ordering::Relaxed); // Approximate size
         *state.last_flush.lock().await = Instant::now();
         
-        // Offsets are tracked in segment metadata, no need to update separately
+        // Update fetch handler buffer if available
+        if let Some(ref fetch_handler) = self.fetch_handler {
+            // Convert records to storage format for fetch handler
+            let storage_records: Vec<chronik_storage::Record> = records.iter().map(|r| chronik_storage::Record {
+                offset: r.offset,
+                timestamp: r.timestamp,
+                key: r.key.clone(),
+                value: r.value.clone(),
+                headers: r.headers.clone(),
+            }).collect();
+            
+            let high_watermark = state.high_watermark.load(Ordering::Relaxed) as i64;
+            
+            if let Err(e) = fetch_handler.update_buffer(topic, partition, storage_records, high_watermark).await {
+                warn!("Failed to update fetch handler buffer: {:?}", e);
+            }
+        }
         
         debug!("Flushed {} records to {}-{}", records.len(), topic, partition);
+        
+        Ok(())
+    }
+    
+    /// Force flush all partitions (useful for testing)
+    pub async fn flush_all_partitions(&self) -> Result<()> {
+        let states = self.partition_states.read().await;
+        
+        for ((topic, partition), state) in states.iter() {
+            self.flush_partition(topic, *partition, state).await?;
+        }
         
         Ok(())
     }
@@ -963,6 +1218,177 @@ impl ProduceHandler {
         Ok(())
     }
     
+    /// Auto-create a topic with default settings
+    async fn auto_create_topic(&self, topic_name: &str) -> Result<chronik_common::metadata::TopicMetadata> {
+        let start_time = Instant::now();
+        
+        // Validate topic name according to Kafka rules
+        if !Self::is_valid_topic_name(topic_name) {
+            self.metrics.topic_creation_invalid_names.fetch_add(1, Ordering::Relaxed);
+            warn!("Rejected auto-creation of topic with invalid name: '{}'", topic_name);
+            return Err(Error::Protocol(format!("Invalid topic name: '{}'. Topic names must be 1-249 characters, containing only letters, numbers, dots, hyphens, and underscores", topic_name)));
+        }
+        
+        // Check topic creation policy (reserved names)
+        if Self::is_reserved_topic_name(topic_name) {
+            self.metrics.topic_creation_invalid_names.fetch_add(1, Ordering::Relaxed);
+            warn!("Rejected auto-creation of reserved topic: '{}'", topic_name);
+            return Err(Error::Protocol(format!("Cannot auto-create reserved topic: '{}'", topic_name)));
+        }
+        
+        // Check if there's already an in-flight creation request for this topic
+        let creation_lock = {
+            let cache = self.topic_creation_cache.read().await;
+            if let Some(existing_lock) = cache.get(topic_name) {
+                Arc::clone(existing_lock)
+            } else {
+                drop(cache);
+                // Need to create a new lock
+                let mut cache = self.topic_creation_cache.write().await;
+                // Double-check after acquiring write lock
+                if let Some(existing_lock) = cache.get(topic_name) {
+                    Arc::clone(existing_lock)
+                } else {
+                    let new_lock = Arc::new(Mutex::new(None));
+                    cache.insert(topic_name.to_string(), Arc::clone(&new_lock));
+                    new_lock
+                }
+            }
+        };
+        
+        // Try to acquire the creation lock for this topic
+        let mut creation_result = creation_lock.lock().await;
+        
+        // If another thread already completed the creation, return that result
+        if let Some(ref metadata) = *creation_result {
+            self.metrics.topic_creation_concurrent_attempts.fetch_add(1, Ordering::Relaxed);
+            info!("Topic '{}' creation already completed by another thread", topic_name);
+            return Ok(metadata.clone());
+        }
+        
+        // We are the first to attempt creation for this topic
+        info!("Starting auto-creation of topic '{}' with {} partitions and replication factor {}", 
+            topic_name, self.config.num_partitions, self.config.default_replication_factor);
+        
+        // Create topic configuration with defaults
+        let topic_config = chronik_common::metadata::TopicConfig {
+            partition_count: self.config.num_partitions,
+            replication_factor: self.config.default_replication_factor,
+            retention_ms: Some(7 * 24 * 60 * 60 * 1000), // 7 days
+            segment_bytes: 1024 * 1024 * 1024, // 1GB
+            config: std::collections::HashMap::new(),
+        };
+        
+        // Attempt to create the topic
+        let result = match self.metadata_store.create_topic(topic_name, topic_config).await {
+            Ok(metadata) => {
+                let elapsed = start_time.elapsed();
+                self.metrics.topics_auto_created.fetch_add(1, Ordering::Relaxed);
+                
+                info!("Successfully auto-created topic '{}' with {} partitions and replication factor {} in {:?}", 
+                    topic_name, 
+                    self.config.num_partitions, 
+                    self.config.default_replication_factor,
+                    elapsed);
+                
+                // Store successful result for other waiting threads
+                *creation_result = Some(metadata.clone());
+                
+                // Clean up the cache entry after a delay to prevent memory growth
+                let cache = Arc::clone(&self.topic_creation_cache);
+                let topic_name_owned = topic_name.to_string();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    let mut cache = cache.write().await;
+                    cache.remove(&topic_name_owned);
+                });
+                
+                Ok(metadata)
+            }
+            Err(chronik_common::metadata::MetadataError::AlreadyExists(_)) => {
+                // Topic was created concurrently by another server/process, try to fetch it
+                self.metrics.topic_creation_concurrent_attempts.fetch_add(1, Ordering::Relaxed);
+                info!("Topic '{}' already exists (created by another process), fetching metadata", topic_name);
+                
+                match self.metadata_store.get_topic(topic_name).await? {
+                    Some(metadata) => {
+                        let elapsed = start_time.elapsed();
+                        info!("Successfully fetched existing topic '{}' metadata in {:?}", topic_name, elapsed);
+                        
+                        // Store successful result for other waiting threads
+                        *creation_result = Some(metadata.clone());
+                        
+                        // Clean up the cache entry after a delay
+                        let cache = Arc::clone(&self.topic_creation_cache);
+                        let topic_name_owned = topic_name.to_string();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_secs(60)).await;
+                            let mut cache = cache.write().await;
+                            cache.remove(&topic_name_owned);
+                        });
+                        
+                        Ok(metadata)
+                    }
+                    None => {
+                        self.metrics.topic_creation_errors.fetch_add(1, Ordering::Relaxed);
+                        error!("Topic '{}' reported as existing but cannot be fetched from metadata store", topic_name);
+                        Err(Error::Internal(format!("Topic '{}' exists but cannot be fetched", topic_name)))
+                    }
+                }
+            }
+            Err(e) => {
+                let elapsed = start_time.elapsed();
+                self.metrics.topic_creation_errors.fetch_add(1, Ordering::Relaxed);
+                error!("Failed to auto-create topic '{}' after {:?}: {:?}", topic_name, elapsed, e);
+                
+                // On error, we don't store anything - let the next thread retry
+                // But we should still clean up the cache entry
+                let cache = Arc::clone(&self.topic_creation_cache);
+                let topic_name_owned = topic_name.to_string();
+                tokio::spawn(async move {
+                    // Shorter timeout for errors to allow retries sooner
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    let mut cache = cache.write().await;
+                    cache.remove(&topic_name_owned);
+                });
+                
+                Err(Error::Internal(format!("Topic auto-creation failed: {}", e)))
+            }
+        };
+        
+        result
+    }
+    
+    /// Validate topic name according to Kafka rules
+    fn is_valid_topic_name(name: &str) -> bool {
+        // Kafka topic naming rules:
+        // - Length between 1 and 249 characters
+        // - Contain only alphanumeric, '.', '_', and '-'
+        // - Cannot be "." or ".."
+        
+        if name.is_empty() || name.len() > 249 {
+            return false;
+        }
+        
+        if name == "." || name == ".." {
+            return false;
+        }
+        
+        name.chars().all(|c| c.is_alphanumeric() || c == '.' || c == '_' || c == '-')
+    }
+    
+    /// Check if topic name is reserved
+    fn is_reserved_topic_name(name: &str) -> bool {
+        // Reserved topic names that should not be auto-created
+        matches!(name, 
+            "__consumer_offsets" | 
+            "__transaction_state" |
+            "__cluster_metadata" |
+            "__telemetry" |
+            "__schemas"
+        ) || name.starts_with("__")  // All topics starting with __ are considered internal
+    }
+    
     /// Clean up expired producer sessions
     async fn cleanup_expired_producers(&self) {
         let mut producers = self.producer_info.write().await;
@@ -977,6 +1403,16 @@ impl ProduceHandler {
     /// Get current metrics
     pub fn metrics(&self) -> &ProduceMetrics {
         &self.metrics
+    }
+    
+    /// Get topic auto-creation statistics
+    pub fn get_topic_creation_stats(&self) -> TopicCreationStats {
+        TopicCreationStats {
+            topics_created: self.metrics.topics_auto_created.load(Ordering::Relaxed),
+            creation_errors: self.metrics.topic_creation_errors.load(Ordering::Relaxed),
+            invalid_name_attempts: self.metrics.topic_creation_invalid_names.load(Ordering::Relaxed),
+            concurrent_attempts: self.metrics.topic_creation_concurrent_attempts.load(Ordering::Relaxed),
+        }
     }
     
     /// Shutdown the handler gracefully
@@ -1007,6 +1443,9 @@ impl Clone for ProduceHandler {
         Self {
             config: self.config.clone(),
             storage: Arc::clone(&self.storage),
+            indexer: self.indexer.clone(),
+            json_pipeline: Arc::clone(&self.json_pipeline),
+            index_sender: self.index_sender.clone(),
             metadata_store: Arc::clone(&self.metadata_store),
             partition_states: Arc::clone(&self.partition_states),
             producer_info: Arc::clone(&self.producer_info),
@@ -1014,6 +1453,8 @@ impl Clone for ProduceHandler {
             running: Arc::clone(&self.running),
             memory_limiter: Arc::clone(&self.memory_limiter),
             replication_sender: self.replication_sender.clone(),
+            fetch_handler: self.fetch_handler.clone(),
+            topic_creation_cache: Arc::clone(&self.topic_creation_cache),
         }
     }
 }
@@ -1022,7 +1463,8 @@ impl Clone for ProduceHandler {
 mod tests {
     use super::*;
     use chronik_common::metadata::TiKVMetadataStore;
-    use chronik_storage::object_store::backends::local::LocalObjectStore;
+    use chronik_storage::object_store::backends::local::LocalBackend;
+    use chronik_protocol::types::{ProduceRequestTopic, ProduceRequestPartition};
     use tempfile::TempDir;
     use bytes::BufMut;
     
@@ -1034,17 +1476,27 @@ mod tests {
         std::fs::create_dir_all(&storage_path).unwrap();
         std::fs::create_dir_all(&metadata_path).unwrap();
         
-        let storage = Arc::new(LocalObjectStore::new(storage_path.to_str().unwrap()).unwrap());
+        let storage_config = chronik_storage::object_store::ObjectStoreConfig {
+            backend: chronik_storage::object_store::StorageBackend::Local {
+                path: storage_path.to_string_lossy().to_string(),
+            },
+            retry: Default::default(),
+        };
+        let storage: Arc<dyn chronik_storage::object_store::ObjectStore> = Arc::new(
+            LocalBackend::new(storage_config).await.unwrap()
+        );
         let pd_endpoints = vec!["localhost:2379".to_string()];
         let metadata_store = Arc::new(TiKVMetadataStore::new(pd_endpoints).await.unwrap());
         
         // Create test topic
-        metadata_store.create_topic("test-topic", 3, 1).await.unwrap();
-        
-        // Set partition leaders
-        for i in 0..3 {
-            metadata_store.update_partition_leader("test-topic", i, 0).await.unwrap();
-        }
+        let topic_config = chronik_common::metadata::TopicConfig {
+            partition_count: 3,
+            replication_factor: 1,
+            retention_ms: Some(7 * 24 * 60 * 60 * 1000),
+            segment_bytes: 1024 * 1024 * 1024,
+            config: std::collections::HashMap::new(),
+        };
+        metadata_store.create_topic("test-topic", topic_config).await.unwrap();
         
         let config = ProduceHandlerConfig {
             node_id: 0,
@@ -1058,14 +1510,22 @@ mod tests {
     }
     
     fn create_test_record_batch(producer_id: i64, sequence: i32, records: Vec<(&str, &str)>) -> Vec<u8> {
-        let mut batch = KafkaRecordBatch::new(0, producer_id, 0);
-        batch.header.base_sequence = sequence;
+        let mut batch = KafkaRecordBatch::new(
+            0,                                  // base_offset
+            chrono::Utc::now().timestamp_millis(), // base_timestamp
+            producer_id,                        // producer_id
+            0,                                  // producer_epoch
+            sequence,                           // base_sequence
+            CompressionType::None,              // compression
+            false,                              // is_transactional
+        );
         
         for (key, value) in records {
             batch.add_record(
                 Some(Bytes::from(key.to_string())),
                 Some(Bytes::from(value.to_string())),
                 vec![],
+                chrono::Utc::now().timestamp_millis(),
             );
         }
         
@@ -1454,5 +1914,327 @@ mod tests {
         assert_eq!(metrics.records_produced.load(Ordering::Relaxed), 3);
         assert!(metrics.bytes_produced.load(Ordering::Relaxed) > 0);
         assert_eq!(metrics.produce_errors.load(Ordering::Relaxed), 0);
+    }
+    
+    #[tokio::test]
+    async fn test_topic_auto_creation_enabled() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage_path = temp_dir.path().join("storage");
+        std::fs::create_dir_all(&storage_path).unwrap();
+        
+        let storage_config = chronik_storage::object_store::ObjectStoreConfig {
+            backend: chronik_storage::object_store::StorageBackend::Local {
+                path: storage_path.to_string_lossy().to_string(),
+            },
+            retry: Default::default(),
+        };
+        let storage: Arc<dyn chronik_storage::object_store::ObjectStore> = Arc::new(
+            LocalBackend::new(storage_config).await.unwrap()
+        );
+        let pd_endpoints = vec!["localhost:2379".to_string()];
+        let metadata_store = Arc::new(TiKVMetadataStore::new(pd_endpoints).await.unwrap());
+        
+        let config = ProduceHandlerConfig {
+            node_id: 0,
+            enable_indexing: false,
+            auto_create_topics_enable: true,
+            num_partitions: 5,
+            default_replication_factor: 3,
+            ..Default::default()
+        };
+        
+        let handler = ProduceHandler::new(config, storage, metadata_store.clone()).await.unwrap();
+        
+        // Produce to non-existent topic
+        let records_data = create_test_record_batch(
+            1234,
+            0,
+            vec![("key1", "value1")],
+        );
+        
+        let request = ProduceRequest {
+            transactional_id: None,
+            acks: 1,
+            timeout_ms: 30000,
+            topics: vec![
+                ProduceRequestTopic {
+                    name: "auto-created-topic".to_string(),
+                    partitions: vec![
+                        ProduceRequestPartition {
+                            index: 0,
+                            records: records_data,
+                        },
+                    ],
+                },
+            ],
+        };
+        
+        let response = handler.handle_produce(request, 1).await.unwrap();
+        
+        // Should succeed with auto-creation
+        assert_eq!(response.topics.len(), 1);
+        assert_eq!(response.topics[0].name, "auto-created-topic");
+        assert_eq!(response.topics[0].partitions[0].error_code, 0);
+        
+        // Verify topic was created with correct config
+        let topic_meta = metadata_store.get_topic("auto-created-topic").await.unwrap().unwrap();
+        assert_eq!(topic_meta.config.partition_count, 5);
+        assert_eq!(topic_meta.config.replication_factor, 3);
+    }
+    
+    #[tokio::test]
+    async fn test_topic_auto_creation_disabled() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage_path = temp_dir.path().join("storage");
+        std::fs::create_dir_all(&storage_path).unwrap();
+        
+        let storage_config = chronik_storage::object_store::ObjectStoreConfig {
+            backend: chronik_storage::object_store::StorageBackend::Local {
+                path: storage_path.to_string_lossy().to_string(),
+            },
+            retry: Default::default(),
+        };
+        let storage: Arc<dyn chronik_storage::object_store::ObjectStore> = Arc::new(
+            LocalBackend::new(storage_config).await.unwrap()
+        );
+        let pd_endpoints = vec!["localhost:2379".to_string()];
+        let metadata_store = Arc::new(TiKVMetadataStore::new(pd_endpoints).await.unwrap());
+        
+        let config = ProduceHandlerConfig {
+            node_id: 0,
+            enable_indexing: false,
+            auto_create_topics_enable: false, // Disabled
+            ..Default::default()
+        };
+        
+        let handler = ProduceHandler::new(config, storage, metadata_store).await.unwrap();
+        
+        let records_data = create_test_record_batch(
+            1234,
+            0,
+            vec![("key1", "value1")],
+        );
+        
+        let request = ProduceRequest {
+            transactional_id: None,
+            acks: 1,
+            timeout_ms: 30000,
+            topics: vec![
+                ProduceRequestTopic {
+                    name: "non-existent-topic".to_string(),
+                    partitions: vec![
+                        ProduceRequestPartition {
+                            index: 0,
+                            records: records_data,
+                        },
+                    ],
+                },
+            ],
+        };
+        
+        let response = handler.handle_produce(request, 1).await.unwrap();
+        
+        // Should fail with UNKNOWN_TOPIC_OR_PARTITION
+        assert_eq!(response.topics[0].partitions[0].error_code, ErrorCode::UnknownTopicOrPartition.code());
+    }
+    
+    #[tokio::test]
+    async fn test_concurrent_topic_auto_creation() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage_path = temp_dir.path().join("storage");
+        std::fs::create_dir_all(&storage_path).unwrap();
+        
+        let storage_config = chronik_storage::object_store::ObjectStoreConfig {
+            backend: chronik_storage::object_store::StorageBackend::Local {
+                path: storage_path.to_string_lossy().to_string(),
+            },
+            retry: Default::default(),
+        };
+        let storage: Arc<dyn chronik_storage::object_store::ObjectStore> = Arc::new(
+            LocalBackend::new(storage_config).await.unwrap()
+        );
+        let pd_endpoints = vec!["localhost:2379".to_string()];
+        let metadata_store = Arc::new(TiKVMetadataStore::new(pd_endpoints).await.unwrap());
+        
+        let config = ProduceHandlerConfig {
+            node_id: 0,
+            enable_indexing: false,
+            auto_create_topics_enable: true,
+            num_partitions: 3,
+            default_replication_factor: 1,
+            ..Default::default()
+        };
+        
+        let handler = Arc::new(ProduceHandler::new(config, storage, metadata_store).await.unwrap());
+        
+        // Spawn multiple concurrent produce requests to the same non-existent topic
+        let mut handles = vec![];
+        
+        for i in 0..10 {
+            let handler_clone = Arc::clone(&handler);
+            let handle = tokio::spawn(async move {
+                let records_data = create_test_record_batch(
+                    1234 + i as i64,
+                    0,
+                    vec![(format!("key{}", i).as_str(), format!("value{}", i).as_str())],
+                );
+                
+                let request = ProduceRequest {
+                    transactional_id: None,
+                    acks: 1,
+                    timeout_ms: 30000,
+                    topics: vec![
+                        ProduceRequestTopic {
+                            name: "concurrent-topic".to_string(),
+                            partitions: vec![
+                                ProduceRequestPartition {
+                                    index: 0,
+                                    records: records_data,
+                                },
+                            ],
+                        },
+                    ],
+                };
+                
+                handler_clone.handle_produce(request, i).await
+            });
+            handles.push(handle);
+        }
+        
+        // Wait for all requests to complete
+        let mut success_count = 0;
+        let mut error_count = 0;
+        
+        for handle in handles {
+            match handle.await.unwrap() {
+                Ok(response) => {
+                    if response.topics[0].partitions[0].error_code == 0 {
+                        success_count += 1;
+                    } else {
+                        error_count += 1;
+                    }
+                }
+                Err(_) => {
+                    error_count += 1;
+                }
+            }
+        }
+        
+        // All requests should succeed
+        assert_eq!(success_count, 10);
+        assert_eq!(error_count, 0);
+        
+        // Topic should have been created only once
+        // Check the cache is properly cleaned up by waiting
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    
+    #[tokio::test]
+    async fn test_invalid_topic_name_auto_creation() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage_path = temp_dir.path().join("storage");
+        std::fs::create_dir_all(&storage_path).unwrap();
+        
+        let storage_config = chronik_storage::object_store::ObjectStoreConfig {
+            backend: chronik_storage::object_store::StorageBackend::Local {
+                path: storage_path.to_string_lossy().to_string(),
+            },
+            retry: Default::default(),
+        };
+        let storage: Arc<dyn chronik_storage::object_store::ObjectStore> = Arc::new(
+            LocalBackend::new(storage_config).await.unwrap()
+        );
+        let pd_endpoints = vec!["localhost:2379".to_string()];
+        let metadata_store = Arc::new(TiKVMetadataStore::new(pd_endpoints).await.unwrap());
+        
+        let config = ProduceHandlerConfig {
+            node_id: 0,
+            enable_indexing: false,
+            auto_create_topics_enable: true,
+            ..Default::default()
+        };
+        
+        let handler = ProduceHandler::new(config, storage, metadata_store).await.unwrap();
+        
+        // Test various invalid topic names
+        let invalid_names = vec![
+            "",                    // Empty
+            "a".repeat(250),      // Too long
+            "topic with spaces",  // Contains spaces
+            "topic@name",         // Invalid character
+            ".",                  // Reserved
+            "..",                 // Reserved
+            "__consumer_offsets", // Reserved internal topic
+        ];
+        
+        for invalid_name in invalid_names {
+            let records_data = create_test_record_batch(
+                1234,
+                0,
+                vec![("key", "value")],
+            );
+            
+            let request = ProduceRequest {
+                transactional_id: None,
+                acks: 1,
+                timeout_ms: 30000,
+                topics: vec![
+                    ProduceRequestTopic {
+                        name: invalid_name.to_string(),
+                        partitions: vec![
+                            ProduceRequestPartition {
+                                index: 0,
+                                records: records_data,
+                            },
+                        ],
+                    },
+                ],
+            };
+            
+            let response = handler.handle_produce(request, 1).await.unwrap();
+            
+            // Should fail with error
+            assert_ne!(
+                response.topics[0].partitions[0].error_code, 
+                0,
+                "Topic '{}' should have failed auto-creation",
+                invalid_name
+            );
+        }
+    }
+    
+    #[test]
+    fn test_topic_name_validation() {
+        // Valid names
+        assert!(ProduceHandler::is_valid_topic_name("valid-topic"));
+        assert!(ProduceHandler::is_valid_topic_name("valid_topic"));
+        assert!(ProduceHandler::is_valid_topic_name("valid.topic"));
+        assert!(ProduceHandler::is_valid_topic_name("123"));
+        assert!(ProduceHandler::is_valid_topic_name("a"));
+        assert!(ProduceHandler::is_valid_topic_name("a".repeat(249).as_str()));
+        
+        // Invalid names
+        assert!(!ProduceHandler::is_valid_topic_name(""));
+        assert!(!ProduceHandler::is_valid_topic_name("a".repeat(250).as_str()));
+        assert!(!ProduceHandler::is_valid_topic_name("."));
+        assert!(!ProduceHandler::is_valid_topic_name(".."));
+        assert!(!ProduceHandler::is_valid_topic_name("topic with spaces"));
+        assert!(!ProduceHandler::is_valid_topic_name("topic@name"));
+        assert!(!ProduceHandler::is_valid_topic_name("topic#name"));
+        assert!(!ProduceHandler::is_valid_topic_name("topic/name"));
+    }
+    
+    #[test]
+    fn test_reserved_topic_names() {
+        assert!(ProduceHandler::is_reserved_topic_name("__consumer_offsets"));
+        assert!(ProduceHandler::is_reserved_topic_name("__transaction_state"));
+        assert!(ProduceHandler::is_reserved_topic_name("__cluster_metadata"));
+        assert!(ProduceHandler::is_reserved_topic_name("__telemetry"));
+        assert!(ProduceHandler::is_reserved_topic_name("__schemas"));
+        assert!(ProduceHandler::is_reserved_topic_name("__anything"));
+        
+        assert!(!ProduceHandler::is_reserved_topic_name("_single_underscore"));
+        assert!(!ProduceHandler::is_reserved_topic_name("normal_topic"));
+        assert!(!ProduceHandler::is_reserved_topic_name("consumer_offsets"));
     }
 }

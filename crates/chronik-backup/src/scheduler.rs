@@ -5,7 +5,7 @@ use crate::{
     metadata::BackupType, validator::{BackupValidator, ValidationLevel},
 };
 use std::sync::Arc;
-use chrono::{DateTime, Utc, Duration as ChronoDuration};
+use chrono::{DateTime, Utc, Duration as ChronoDuration, Datelike};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{RwLock, Mutex};
 use tokio::time::{interval, Duration};
@@ -52,9 +52,11 @@ impl Schedule {
     /// Get next scheduled time
     pub fn next_run(&self) -> Result<DateTime<Utc>> {
         let now = Utc::now();
-        cron_parser::parse(&self.cron, &now)
-            .and_then(|mut iter| iter.next().ok_or_else(|| "No next run".into()))
-            .map_err(|e| BackupError::Internal(format!("Failed to calculate next run: {}", e)))
+        let mut iter = cron_parser::parse(&self.cron, &now)
+            .map_err(|e| BackupError::Internal(format!("Failed to parse cron: {}", e)))?;
+        
+        iter.next()
+            .ok_or_else(|| BackupError::Internal("No next run scheduled".to_string()))
     }
 }
 
@@ -285,9 +287,11 @@ impl BackupScheduler {
         // Calculate next run time
         let next_run = match last_run {
             Some(last) => {
-                cron_parser::parse_after(&schedule.cron, last)
-                    .and_then(|mut iter| iter.next().ok_or_else(|| "No next run".into()))
-                    .map_err(|e| BackupError::Internal(format!("Failed to parse cron: {}", e)))?
+                let mut iter = cron_parser::parse_after(&schedule.cron, last)
+                    .map_err(|e| BackupError::Internal(format!("Failed to parse cron: {}", e)))?;
+                
+                iter.next()
+                    .ok_or_else(|| BackupError::Internal("No next run scheduled".to_string()))?
             }
             None => {
                 // First run - check if current time matches

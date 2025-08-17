@@ -106,6 +106,18 @@ async fn main() -> Result<()> {
             .unwrap_or(1000),
         shutdown_timeout: Duration::from_secs(30),
         metrics_interval: Duration::from_secs(60),
+        auto_create_topics_enable: std::env::var("AUTO_CREATE_TOPICS")
+            .ok()
+            .map(|s| s == "true" || s == "1")
+            .unwrap_or(true),
+        num_partitions: std::env::var("DEFAULT_NUM_PARTITIONS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3),
+        default_replication_factor: std::env::var("DEFAULT_REPLICATION_FACTOR")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1),
     };
     
     // Create and start server

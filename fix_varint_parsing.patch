@@ -1,0 +1,27 @@
+--- a/crates/chronik-storage/src/kafka_records.rs
++++ b/crates/chronik-storage/src/kafka_records.rs
+@@ -408,9 +408,21 @@ impl KafkaRecordBatch {
+             offset += offset_delta;
+             timestamp += timestamp_delta;
+             
+             // Headers
+             let headers_count = decode_varint(&mut cursor)?;
++            
++            // Sanity check headers count to prevent capacity overflow
++            if headers_count < 0 || headers_count > 1000 {
++                return Err(Error::Internal(format!(
++                    "Invalid headers count: {}. This might be due to incorrect message format.", 
++                    headers_count
++                )));
++            }
++            
+             let mut headers = Vec::with_capacity(headers_count as usize);
+             
+             for _ in 0..headers_count {
+                 let key_len = decode_varint(&mut cursor)?;
++                if key_len < 0 || key_len > 10000 {
++                    return Err(Error::Internal(format!("Invalid header key length: {}", key_len)));
++                }
+                 let mut key_buf = vec![0u8; key_len as usize];
+                 cursor.read_exact(&mut key_buf)
+                     .map_err(|e| Error::Internal(format!("Failed to read header key: {}", e)))?;

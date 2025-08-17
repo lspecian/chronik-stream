@@ -9,7 +9,11 @@ mod tests {
     async fn create_test_store() -> TiKVMetadataStore {
         // For tests, use a test TiKV instance or mock
         // In a real test environment, you'd spin up a test TiKV cluster
-        let endpoints = vec!["localhost:2379".to_string()];
+        let endpoints = if let Ok(endpoints_str) = std::env::var("TIKV_PD_ENDPOINTS") {
+            endpoints_str.split(',').map(|s| s.to_string()).collect()
+        } else {
+            vec!["localhost:2379".to_string()]
+        };
         TiKVMetadataStore::new(endpoints).await.unwrap()
     }
     

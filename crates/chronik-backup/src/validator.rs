@@ -12,9 +12,10 @@ use futures::stream::StreamExt;
 use tracing::{info, debug};
 use std::collections::{HashMap, HashSet};
 use sha2::{Sha256, Digest};
+use serde::{Serialize, Deserialize};
 
 /// Validation level
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ValidationLevel {
     /// Quick validation (metadata only)
     Quick,
@@ -475,7 +476,7 @@ impl BackupValidator {
                 let mut state = self.state.lock().await;
                 
                 // Check size
-                if object_meta.size != segment.size as usize {
+                if object_meta.size != segment.size {
                     state.errors.push(ValidationError {
                         error_type: ValidationErrorType::SizeMismatch,
                         item: key.clone(),

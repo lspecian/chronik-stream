@@ -106,7 +106,8 @@ fn decompress_zstd(data: &[u8]) -> Result<Vec<u8>> {
 
 /// Compress using LZ4
 fn compress_lz4(data: &[u8]) -> Result<Vec<u8>> {
-    let compressed = lz4::block::compress(data, None, true)
+    // Use prepend_size=false since we're manually prepending the size
+    let compressed = lz4::block::compress(data, None, false)
         .map_err(|e| BackupError::Compression(format!("LZ4 compression failed: {}", e)))?;
     
     // Prepend uncompressed size for decompression
@@ -126,6 +127,11 @@ fn decompress_lz4(data: &[u8]) -> Result<Vec<u8>> {
     // Read uncompressed size
     let uncompressed_size = u64::from_le_bytes(data[0..8].try_into().unwrap()) as usize;
     let compressed_data = &data[8..];
+    
+    // LZ4 uses i32 for size, ensure we don't overflow
+    if uncompressed_size > i32::MAX as usize {
+        return Err(BackupError::Compression("LZ4 uncompressed size too large".to_string()));
+    }
     
     let decompressed = lz4::block::decompress(compressed_data, Some(uncompressed_size as i32))
         .map_err(|e| BackupError::Compression(format!("LZ4 decompression failed: {}", e)))?;
@@ -187,7 +193,13 @@ mod tests {
     
     #[test]
     fn test_compression_roundtrip() {
-        let test_data = b"Hello, this is test data that should be compressed and decompressed correctly!";
+        // Use longer test data to ensure compression is effective
+        let test_data = b"Hello, this is test data that should be compressed and decompressed correctly! \
+                          This string is repeated multiple times to ensure there's enough redundancy for compression. \
+                          Hello, this is test data that should be compressed and decompressed correctly! \
+                          This string is repeated multiple times to ensure there's enough redundancy for compression. \
+                          Hello, this is test data that should be compressed and decompressed correctly! \
+                          This string is repeated multiple times to ensure there's enough redundancy for compression.";
         
         for compression_type in [
             CompressionType::None,

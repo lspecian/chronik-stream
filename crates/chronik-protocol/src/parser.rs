@@ -325,24 +325,51 @@ impl<'a> Encoder<'a> {
     }
 }
 
-/// Parse a request header from bytes
-pub fn parse_request_header(buf: &mut Bytes) -> Result<RequestHeader> {
+/// Partial request header for cases where API key is unknown
+#[derive(Debug, Clone)]
+pub struct PartialRequestHeader {
+    pub api_key_raw: i16,
+    pub api_version: i16,
+    pub correlation_id: i32,
+    pub client_id: Option<String>,
+}
+
+/// Parse a request header from bytes, preserving correlation ID even on error
+pub fn parse_request_header_with_correlation(buf: &mut Bytes) -> Result<(RequestHeader, Option<PartialRequestHeader>)> {
     let mut decoder = Decoder::new(buf);
     
     let api_key_raw = decoder.read_i16()?;
-    let api_key = ApiKey::from_i16(api_key_raw)
-        .ok_or_else(|| Error::Protocol(format!("Unknown API key: {}", api_key_raw)))?;
-    
     let api_version = decoder.read_i16()?;
     let correlation_id = decoder.read_i32()?;
     let client_id = decoder.read_string()?;
     
-    Ok(RequestHeader {
-        api_key,
+    let partial = PartialRequestHeader {
+        api_key_raw,
         api_version,
         correlation_id,
-        client_id,
-    })
+        client_id: client_id.clone(),
+    };
+    
+    match ApiKey::from_i16(api_key_raw) {
+        Some(api_key) => Ok((RequestHeader {
+            api_key,
+            api_version,
+            correlation_id,
+            client_id,
+        }, Some(partial))),
+        None => Err(Error::ProtocolWithCorrelation {
+            message: format!("Unknown API key: {}", api_key_raw),
+            correlation_id,
+        }),
+    }
+}
+
+/// Parse a request header from bytes
+pub fn parse_request_header(buf: &mut Bytes) -> Result<RequestHeader> {
+    match parse_request_header_with_correlation(buf) {
+        Ok((header, _)) => Ok(header),
+        Err(e) => Err(e),
+    }
 }
 
 /// Write a response header to bytes
@@ -454,5 +481,27 @@ mod tests {
         assert_eq!(decoder.read_string().unwrap(), Some("hello".to_string()));
         assert_eq!(decoder.read_string().unwrap(), None);
         assert_eq!(decoder.read_string().unwrap(), Some("".to_string()));
+    }
+    
+    #[test]
+    fn test_parse_unknown_api_key() {
+        // Build a request with unknown API key 999
+        let mut buf = BytesMut::new();
+        buf.put_i16(999);  // Unknown API key
+        buf.put_i16(0);    // API version
+        buf.put_i32(67890); // Correlation ID
+        buf.put_i16(-1);   // Client ID (null)
+        
+        let mut bytes = buf.freeze();
+        
+        // Test that it returns ProtocolWithCorrelation error
+        match parse_request_header_with_correlation(&mut bytes) {
+            Ok(_) => panic!("Expected error for unknown API key"),
+            Err(Error::ProtocolWithCorrelation { correlation_id, message }) => {
+                assert_eq!(correlation_id, 67890);
+                assert!(message.contains("999"));
+            }
+            Err(e) => panic!("Expected ProtocolWithCorrelation error, got: {:?}", e),
+        }
     }
 }

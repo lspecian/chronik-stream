@@ -11,6 +11,7 @@ chronik-common = { path = "../chronik-common" }
 # Async
 tokio = { workspace = true }
 futures = { workspace = true }
+async-trait = { workspace = true }
 
 # Configuration
 config = "0.13"
@@ -28,6 +29,7 @@ dashmap = { workspace = true }
 
 # Validation
 validator = { version = "0.16", features = ["derive"] }
+regex = "1.10"
 
 # Error handling
 anyhow = { workspace = true }

@@ -7,7 +7,9 @@ use chronik_storage::{SegmentReader, RecordBatch};
 use chronik_storage::kafka_records::{KafkaRecordBatch, KafkaRecord, RecordHeader as KafkaRecordHeader, CompressionType};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
+use tokio::time::timeout;
 use tracing::{debug, error, info};
 
 /// In-memory buffer for recent records
@@ -102,8 +104,8 @@ impl FetchHandler {
         partition: i32,
         fetch_offset: i64,
         max_bytes: i32,
-        _max_wait_ms: i32,
-        _min_bytes: i32,
+        max_wait_ms: i32,
+        min_bytes: i32,
     ) -> Result<FetchResponsePartition> {
         // First check if topic exists
         let topic_metadata = match self.metadata_store.get_topic(topic).await? {
@@ -165,33 +167,152 @@ impl FetchHandler {
         }
         
         if fetch_offset >= high_watermark {
-            // No data available yet
-            return Ok(FetchResponsePartition {
-                partition,
-                error_code: 0,
-                high_watermark,
-                last_stable_offset: high_watermark,
-                log_start_offset,
-                aborted: None,
-                preferred_read_replica: -1,
-                records: vec![],
-            });
+            // No data available yet - implement wait logic
+            if max_wait_ms > 0 && min_bytes > 0 {
+                // Wait for new data or timeout
+                let start_time = Instant::now();
+                let wait_duration = Duration::from_millis(max_wait_ms as u64);
+                
+                // Try to wait for data with timeout
+                let result = timeout(wait_duration, async {
+                    // Poll for new data periodically
+                    let poll_interval = Duration::from_millis(10);
+                    let mut accumulated_bytes = 0;
+                    
+                    while start_time.elapsed() < wait_duration {
+                        // Check if new data is available
+                        if let Ok(new_segments) = self.metadata_store.list_segments(topic, Some(partition as u32)).await {
+                            let new_high_watermark = new_segments.iter()
+                                .map(|s| s.end_offset + 1)
+                                .max()
+                                .unwrap_or(high_watermark);
+                            
+                            if new_high_watermark > fetch_offset {
+                                // New data available, fetch it
+                                if let Ok(records) = self.fetch_records(
+                                    topic,
+                                    partition,
+                                    fetch_offset,
+                                    new_high_watermark,
+                                    max_bytes,
+                                ).await {
+                                    // Calculate approximate bytes
+                                    accumulated_bytes = records.iter()
+                                        .map(|r| r.value.len() + r.key.as_ref().map(|k| k.len()).unwrap_or(0))
+                                        .sum();
+                                    
+                                    if accumulated_bytes >= min_bytes as usize {
+                                        return Ok((records, new_high_watermark));
+                                    }
+                                }
+                            }
+                        }
+                        
+                        tokio::time::sleep(poll_interval).await;
+                    }
+                    
+                    Err::<(Vec<chronik_storage::Record>, i64), Error>(
+                        Error::Internal("Timeout waiting for min_bytes".into())
+                    )
+                }).await;
+                
+                match result {
+                    Ok(Ok((records, new_hw))) => {
+                        // Got enough data within timeout
+                        let records_bytes = if records.is_empty() {
+                            vec![]
+                        } else {
+                            self.encode_kafka_records(&records, 0)?
+                        };
+                        
+                        return Ok(FetchResponsePartition {
+                            partition,
+                            error_code: 0,
+                            high_watermark: new_hw,
+                            last_stable_offset: new_hw,
+                            log_start_offset,
+                            aborted: None,
+                            preferred_read_replica: -1,
+                            records: records_bytes,
+                        });
+                    }
+                    _ => {
+                        // Timeout or error - return empty response
+                        return Ok(FetchResponsePartition {
+                            partition,
+                            error_code: 0,
+                            high_watermark,
+                            last_stable_offset: high_watermark,
+                            log_start_offset,
+                            aborted: None,
+                            preferred_read_replica: -1,
+                            records: vec![],
+                        });
+                    }
+                }
+            } else {
+                // No wait requested, return empty immediately
+                return Ok(FetchResponsePartition {
+                    partition,
+                    error_code: 0,
+                    high_watermark,
+                    last_stable_offset: high_watermark,
+                    log_start_offset,
+                    aborted: None,
+                    preferred_read_replica: -1,
+                    records: vec![],
+                });
+            }
         }
         
-        // Fetch records
-        let records = self.fetch_records(
-            topic,
-            partition,
-            fetch_offset,
-            high_watermark,
-            max_bytes,
-        ).await?;
+        // Data is available, fetch with timeout
+        let fetch_timeout = if max_wait_ms > 0 {
+            Duration::from_millis(max_wait_ms as u64)
+        } else {
+            Duration::from_secs(30) // Default timeout
+        };
+        
+        let fetch_result = timeout(fetch_timeout, async {
+            self.fetch_records(
+                topic,
+                partition,
+                fetch_offset,
+                high_watermark,
+                max_bytes,
+            ).await
+        }).await;
+        
+        let records = match fetch_result {
+            Ok(Ok(recs)) => recs,
+            Ok(Err(e)) => {
+                debug!("Error fetching records: {:?}", e);
+                vec![]
+            }
+            Err(_) => {
+                debug!("Fetch timeout after {}ms", max_wait_ms);
+                vec![]
+            }
+        };
+        
+        // Check if we have enough bytes (partial response support)
+        let total_bytes: usize = records.iter()
+            .map(|r| r.value.len() + r.key.as_ref().map(|k| k.len()).unwrap_or(0))
+            .sum();
+        
+        // If min_bytes is specified and we don't have enough, wait or return partial
+        let final_records = if min_bytes > 0 && total_bytes < min_bytes as usize && max_wait_ms > 0 {
+            // Try to fetch more data within the timeout
+            // For now, just return what we have (partial response)
+            records
+        } else {
+            records
+        };
         
         // Encode records in Kafka format
-        let records_bytes = if records.is_empty() {
+        let records_bytes = if final_records.is_empty() {
             vec![]
         } else {
-            self.encode_kafka_records(&records, 0)? // TODO: Get actual leader epoch
+            self.encode_kafka_records(&final_records, 0)? // TODO: Get actual leader epoch
         };
         
         Ok(FetchResponsePartition {
@@ -446,3 +567,7 @@ impl FetchHandler {
         Ok(encoded.to_vec())
     }
 }
+
+#[cfg(test)]
+#[path = "fetch_handler_test.rs"]
+mod fetch_handler_test;

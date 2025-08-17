@@ -1,0 +1,179 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: chronik-config
+  namespace: chronik-stream
+data:
+  config.toml: |
+    [server]
+    bind_address = "0.0.0.0:9092"
+    advertised_address = "chronik-ingest.chronik-stream.svc.cluster.local:9092"
+    
+    [storage]
+    type = "tikv"
+    endpoints = ["pd-0.pd.chronik-stream.svc.cluster.local:2379", "pd-1.pd.chronik-stream.svc.cluster.local:2379", "pd-2.pd.chronik-stream.svc.cluster.local:2379"]
+    
+    [monitoring]
+    metrics_enabled = true
+    metrics_port = 9090
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: chronik-ingest
+  namespace: chronik-stream
+  labels:
+    app: chronik-ingest
+spec:
+  type: LoadBalancer
+  ports:
+  - port: 9092
+    targetPort: 9092
+    name: kafka
+  - port: 9090
+    targetPort: 9090
+    name: metrics
+  selector:
+    app: chronik-ingest
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chronik-ingest
+  namespace: chronik-stream
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: chronik-ingest
+  template:
+    metadata:
+      labels:
+        app: chronik-ingest
+    spec:
+      containers:
+      - name: chronik-ingest
+        image: chronik-stream/ingest:latest
+        ports:
+        - containerPort: 9092
+          name: kafka
+        - containerPort: 9090
+          name: metrics
+        env:
+        - name: RUST_LOG
+          value: info
+        - name: TIKV_ENDPOINTS
+          value: "pd-0.pd.chronik-stream.svc.cluster.local:2379,pd-1.pd.chronik-stream.svc.cluster.local:2379,pd-2.pd.chronik-stream.svc.cluster.local:2379"
+        volumeMounts:
+        - name: config
+          mountPath: /etc/chronik
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+      volumes:
+      - name: config
+        configMap:
+          name: chronik-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: chronik-controller
+  namespace: chronik-stream
+  labels:
+    app: chronik-controller
+spec:
+  ports:
+  - port: 8080
+    targetPort: 8080
+    name: http
+  selector:
+    app: chronik-controller
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chronik-controller
+  namespace: chronik-stream
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: chronik-controller
+  template:
+    metadata:
+      labels:
+        app: chronik-controller
+    spec:
+      containers:
+      - name: chronik-controller
+        image: chronik-stream/controller:latest
+        ports:
+        - containerPort: 8080
+          name: http
+        env:
+        - name: RUST_LOG
+          value: info
+        - name: TIKV_ENDPOINTS
+          value: "pd-0.pd.chronik-stream.svc.cluster.local:2379,pd-1.pd.chronik-stream.svc.cluster.local:2379,pd-2.pd.chronik-stream.svc.cluster.local:2379"
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: chronik-admin
+  namespace: chronik-stream
+  labels:
+    app: chronik-admin
+spec:
+  type: LoadBalancer
+  ports:
+  - port: 3000
+    targetPort: 3000
+    name: http
+  selector:
+    app: chronik-admin
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chronik-admin
+  namespace: chronik-stream
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: chronik-admin
+  template:
+    metadata:
+      labels:
+        app: chronik-admin
+    spec:
+      containers:
+      - name: chronik-admin
+        image: chronik-stream/admin:latest
+        ports:
+        - containerPort: 3000
+          name: http
+        env:
+        - name: RUST_LOG
+          value: info
+        - name: TIKV_ENDPOINTS
+          value: "pd-0.pd.chronik-stream.svc.cluster.local:2379,pd-1.pd.chronik-stream.svc.cluster.local:2379,pd-2.pd.chronik-stream.svc.cluster.local:2379"
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "200m"

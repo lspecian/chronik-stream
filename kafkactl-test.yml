@@ -1,0 +1,5 @@
+contexts:
+  - name: chronik
+    brokers:
+      - localhost:9092
+current_context: chronik

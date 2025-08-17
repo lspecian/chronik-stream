@@ -11,7 +11,7 @@ chronik-protocol = { path = "../chronik-protocol" }
 chronik-storage = { path = "../chronik-storage" }
 chronik-monitoring = { path = "../chronik-monitoring" }
 chronik-auth = { path = "../chronik-auth" }
-# chronik-search = { path = "../chronik-search" }
+chronik-search = { path = "../chronik-search" }
 
 # Async runtime
 tokio = { workspace = true, features = ["net", "sync", "time"] }
@@ -29,11 +29,18 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 bytes = { workspace = true }
 byteorder = { workspace = true }
+base64 = "0.22"
 
 # Utils
 uuid = { workspace = true }
 chrono = { workspace = true }
 lazy_static = "1.4"
+
+# TiKV client for direct access (for cleanup)
+tikv-client = "0.3"
+
+# Hashing
+murmur2 = { workspace = true }
 
 # HTTP
 axum = { workspace = true }

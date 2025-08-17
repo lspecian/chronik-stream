@@ -6,7 +6,7 @@
 //! - Cache warming strategies
 //! - Metrics and monitoring
 
-use crate::{ChronikSegment, SegmentReader, FetchResult, RecordBatch};
+use crate::{ChronikSegment, SegmentReader, SegmentReaderConfig, FetchResult, RecordBatch};
 use chronik_common::{Result, Error};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -403,7 +403,6 @@ impl CachedSegmentReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
     
     fn create_test_config() -> SegmentCacheConfig {
         SegmentCacheConfig {
@@ -417,14 +416,29 @@ mod tests {
     
     #[tokio::test]
     async fn test_cache_basic_operations() {
+        use crate::object_store::{ObjectStoreConfig, ObjectStoreFactory, StorageBackend};
+        use tempfile::TempDir;
+        
         let temp_dir = TempDir::new().unwrap();
-        let reader_config = SegmentReaderConfig {
-            data_dir: temp_dir.path().to_path_buf(),
-            cache_size_mb: 100,
-            prefetch_size: 10,
+        let reader_config = SegmentReaderConfig::default();
+        
+        // Create a local filesystem store for testing
+        let object_store_config = ObjectStoreConfig {
+            backend: StorageBackend::Local {
+                path: temp_dir.path().to_str().unwrap().to_string(),
+            },
+            bucket: "test-bucket".to_string(),
+            prefix: Some("test".to_string()),
+            connection: Default::default(),
+            performance: Default::default(),
+            retry: Default::default(),
+            auth: Default::default(),
+            default_metadata: None,
+            encryption: None,
         };
         
-        let reader = Arc::new(SegmentReader::new(reader_config));
+        let object_store = ObjectStoreFactory::create(object_store_config).await.unwrap();
+        let reader = Arc::new(SegmentReader::new(reader_config, Arc::from(object_store)));
         let cache = SegmentCache::new(create_test_config(), reader);
         
         // Test cache miss

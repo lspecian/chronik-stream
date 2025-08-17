@@ -6,13 +6,13 @@
 use std::sync::Arc;
 use chronik_common::{Result, Error};
 use chronik_common::metadata::traits::MetadataStore;
-use chronik_protocol::{ProtocolHandler, handler::Response, parser::{parse_request_header, ApiKey, write_response_header, ResponseHeader}};
+use chronik_protocol::{ProtocolHandler, handler::Response, parser::{parse_request_header, parse_request_header_with_correlation, ApiKey, write_response_header, ResponseHeader}, error_codes};
 use chronik_storage::SegmentReader;
 use crate::produce_handler::ProduceHandler;
 use crate::consumer_group::GroupManager;
 use crate::fetch_handler::FetchHandler;
 use crate::handler::{RequestHandler, HandlerConfig};
-use bytes::{Bytes, BytesMut};
+use bytes::{Bytes, BytesMut, BufMut};
 use tracing::{debug, instrument};
 
 /// Kafka protocol handler with ingest-specific extensions
@@ -55,6 +55,9 @@ impl KafkaProtocolHandler {
             metadata_store.clone(),
         ));
         
+        // Note: The produce handler and fetch handler are connected via shared state.
+        // The produce handler will update the fetch handler's buffer after writing records.
+        
         Ok(Self {
             protocol_handler: ProtocolHandler::with_metadata_store(metadata_store.clone()),
             produce_handler,
@@ -80,13 +83,41 @@ impl KafkaProtocolHandler {
             tracing::info!("Request: API key={}, version={}", api_key, api_version);
         }
         
+        tracing::info!("KafkaProtocolHandler::handle_request called");
+        
         // Parse the request header to determine which API is being called
         let mut buf = Bytes::copy_from_slice(request_bytes);
-        let header = match parse_request_header(&mut buf) {
-            Ok(h) => h,
-            Err(_) => {
-                // If we can't parse the header, delegate to the protocol handler
+        let (header, correlation_id) = match parse_request_header_with_correlation(&mut buf) {
+            Ok((h, _)) => {
+                let correlation_id = h.correlation_id;
+                (Some(h), correlation_id)
+            }
+            Err(Error::ProtocolWithCorrelation { correlation_id, message }) => {
+                // Unknown API key but we have correlation ID
+                tracing::info!("Unknown API key detected: {}, correlation_id: {}", message, correlation_id);
+                (None, correlation_id)
+            }
+            Err(e) => {
+                // Other parsing error, delegate to protocol handler
+                tracing::warn!("Other parsing error: {:?}", e);
                 return self.protocol_handler.handle_request(request_bytes).await;
+            }
+        };
+        
+        // If we couldn't parse the header due to unknown API key, return proper error
+        let header = match header {
+            Some(h) => h,
+            None => {
+                // Return error response with preserved correlation ID
+                tracing::info!("Returning UNSUPPORTED_VERSION error with correlation_id: {}", correlation_id);
+                return Ok(Response {
+                    header: ResponseHeader { correlation_id },
+                    body: {
+                        let mut buf = BytesMut::new();
+                        buf.put_i16(error_codes::UNSUPPORTED_VERSION);
+                        buf.freeze()
+                    }
+                });
             }
         };
         

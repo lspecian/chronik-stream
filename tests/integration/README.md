@@ -1,148 +1,120 @@
-# Chronik Stream Integration Tests
+# Integration Tests for Chronik Stream
 
-This directory contains comprehensive integration tests for Chronik Stream, validating Kafka compatibility, search functionality, failure recovery, and performance.
+## Overview
+
+This directory contains integration tests that validate Chronik Stream's Kafka compatibility and core functionality.
 
 ## Test Categories
 
-### 1. Kafka Compatibility Tests (`kafka_compatibility_test.rs`)
-Tests compatibility with real Kafka clients using the rdkafka library:
-- Basic produce/consume operations
-- Consumer groups and rebalancing
-- Transactional producers
-- Message headers
+### 1. Protocol Compatibility Tests (`test_protocol_*.py`)
+- Verify wire protocol compatibility with Kafka
+- Test all supported API versions
+- Validate error handling and correlation IDs
+
+### 2. Core Functionality Tests (`test_core_*.py`)
+- Message produce/consume flows
+- Topic management operations
+- Partition assignment and rebalancing
+
+### 3. Consumer Group Tests (`test_consumer_*.py`)
+- Group coordination
 - Offset management
+- Rebalancing scenarios
 
-### 2. Search Integration Tests (`search_integration_test.rs`)
-Tests the full search pipeline:
-- Log indexing from Kafka topics
-- Search queries (term, range, full-text)
-- Aggregations (terms, stats, date histogram)
-- Kafka offset tracking in search results
+### 4. Performance Tests (`test_perf_*.py`)
+- Throughput benchmarks
+- Latency measurements
+- Concurrent client stress tests
 
-### 3. Failure Recovery Tests (`failure_recovery_test.rs`)
-Tests system resilience:
-- Node failure and recovery
-- Network partitions
-- Consumer group coordinator failover
-- Data consistency during failures
-
-### 4. Performance Tests (`performance_test.rs`)
-Benchmarks system performance:
-- Single producer throughput
-- Multiple producer throughput
-- Consumer throughput
-- End-to-end latency
-- Search indexing performance
-- Concurrent operations
-
-### 5. Multi-Language Client Tests (`multi_language_client_test.rs`)
-Tests compatibility with clients in different languages:
-- Java (using Apache Kafka client)
-- Python (using kafka-python)
-- Node.js (using kafkajs)
-- Cross-language message format compatibility
+### 5. Search Integration Tests (`test_search_*.py`)
+- Message indexing
+- Query functionality
+- Search performance
 
 ## Running Tests
 
 ### Prerequisites
-
-1. Docker (for testcontainers)
-2. Rust toolchain
-3. Optional: Java, Python, Node.js for multi-language tests
-
-### Running All Tests
-
 ```bash
-cargo test --test integration -- --test-threads=1
+# Start Chronik Stream
+docker-compose up -d
+
+# Install test dependencies
+pip install kafka-python pytest pytest-asyncio
 ```
 
-### Running Specific Test Suites
-
+### Run All Tests
 ```bash
-# Kafka compatibility only
-cargo test --test integration kafka_compatibility
-
-# Search tests only
-cargo test --test integration search_integration
-
-# Performance tests with output
-cargo test --test integration performance -- --nocapture
+pytest tests/integration/
 ```
 
-### Running with Debug Output
-
+### Run Specific Category
 ```bash
-RUST_LOG=chronik=debug,integration=debug cargo test --test integration -- --nocapture
+pytest tests/integration/test_protocol_*.py -v
 ```
 
-## Test Infrastructure
-
-### TestEnvironment
-Manages Docker containers for dependencies:
-- MinIO for S3-compatible object storage
-- Automatic bucket creation
-- Cleanup on test completion
-
-### ChronikCluster
-Manages a multi-node Chronik Stream cluster:
-- Configurable number of nodes
-- Automatic port allocation
-- Health checking
-- Graceful shutdown
-
-## CI/CD Integration
-
-Tests run automatically on:
-- Push to main/master branch
-- Pull requests
-- Nightly schedule (2 AM UTC)
-
-The CI pipeline:
-1. Builds the project
-2. Runs unit tests
-3. Runs integration tests sequentially
-4. Uploads test results
-5. Cleans up Docker resources
-
-## Performance Baselines
-
-Expected performance (on modern hardware):
-- Single producer: >10K msgs/sec, >10 MB/sec
-- Multiple producers: >20K msgs/sec
-- Consumer: >10K msgs/sec
-- P50 latency: <50ms
-- P99 latency: <200ms
-- Search query: <100ms
-- Aggregation: <200ms
-
-## Troubleshooting
-
-### Port Conflicts
-Tests use ports starting from:
-- Kafka: 19092+
-- Admin API: 18080+
-- Internal: 17000+
-
-Kill any processes using these ports before running tests.
-
-### Docker Issues
+### Run with Coverage
 ```bash
-# Clean up all containers
-docker ps -aq | xargs -r docker stop
-docker ps -aq | xargs -r docker rm
-docker volume prune -f
+pytest tests/integration/ --cov=chronik --cov-report=html
 ```
 
-### Test Timeouts
-Increase timeouts in CI environments by setting:
-```bash
-CI=true cargo test --test integration
+## Test Structure
+
+Each test file follows this pattern:
+
+```python
+import pytest
+from kafka import KafkaProducer, KafkaConsumer
+from kafka.admin import KafkaAdminClient, NewTopic
+
+class TestFeatureName:
+    @pytest.fixture
+    def kafka_client(self):
+        # Setup client
+        yield client
+        # Cleanup
+    
+    def test_specific_scenario(self, kafka_client):
+        # Test implementation
+        pass
 ```
+
+## Current Test Status
+
+### ✅ Implemented
+- Basic protocol parsing tests
+- Metadata API tests
+- API version negotiation
+
+### 🚧 In Progress
+- Message persistence tests
+- Consumer group coordination
+
+### ❌ Not Started
+- Performance benchmarks
+- Search integration
+- Multi-client scenarios
+- Failure recovery tests
 
 ## Adding New Tests
 
-1. Create a new test file in `tests/integration/`
-2. Add the module to `mod.rs`
-3. Use `TestEnvironment` and `ChronikCluster` for setup
-4. Follow the existing patterns for assertions
-5. Update this README with test descriptions
+1. Create test file following naming convention
+2. Use appropriate fixtures for setup/teardown
+3. Test both success and error cases
+4. Add performance assertions where relevant
+5. Document any special requirements
+
+## Known Limitations
+
+1. Consumer group tests currently fail (not implemented)
+2. Performance tests need baseline metrics
+3. Search tests require search service integration
+4. Some Kafka client features not compatible
+
+## CI Integration
+
+Tests run automatically on:
+- Every PR via GitHub Actions
+- Nightly for extended test suite
+- Release branches for full validation
+
+See `.github/workflows/integration-tests.yml` for configuration.

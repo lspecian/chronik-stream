@@ -1,0 +1,14 @@
+# Python dependencies for Chronik Stream integration tests
+
+# Kafka clients
+kafka-python==2.0.2
+confluent-kafka==2.3.0
+
+# Testing
+pytest==7.4.3
+pytest-asyncio==0.21.1
+pytest-timeout==2.2.0
+
+# Utilities
+colorama==0.4.6  # For colored output
+tabulate==0.9.0  # For formatted tables

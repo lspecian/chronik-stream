@@ -238,14 +238,12 @@ mod tests {
             partition_id: 0,
             base_offset: 0,
             last_offset: 10,
-            base_timestamp: 1000,
-            last_timestamp: 2000,
+            timestamp_range: (1000, 2000),
             record_count: 10,
-            uncompressed_size: 1000,
-            compressed_size: 500,
+            created_at: 1000,
+            bloom_filter: None,
             compression_ratio: 0.5,
-            index_size: 100,
-            bloom_size: 50,
+            total_uncompressed_size: 1000,
         };
         
         calculator.update_metadata(&metadata).unwrap();

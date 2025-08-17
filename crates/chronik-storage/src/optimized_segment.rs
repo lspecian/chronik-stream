@@ -204,31 +204,8 @@ impl OptimizedTansuSegment {
         // Build time index
         let time_index = Self::build_time_index(&sorted_records);
 
-        // Create header
-        let mut header = OptimizedSegmentHeader {
-            magic: OPTIMIZED_MAGIC.try_into().unwrap(),
-            version: 1,
-            compression: CompressionType::Zstd,
-            record_count: sorted_records.len() as u64,
-            offset_range,
-            timestamp_range,
-            columns: BTreeMap::new(),
-            time_index: (0, 0),
-            bloom_filter: (0, 0),
-            footer_offset: 0,
-        };
-
-        // Serialize everything
-        let mut output = BytesMut::new();
-
-        // Reserve space for header
-        let header_size = bincode::serialized_size(&header)? as usize;
-        output.put_slice(&vec![0u8; header_size]);
-
-        let mut current_offset = header_size as u64;
-
-        // Write columns
-        let columns = vec![
+        // Pre-serialize all data to calculate offsets
+        let columns_data = vec![
             ("offsets", bincode::serialize(&offsets)?),
             ("timestamps", compressed_timestamps?),
             ("keys", compressed_keys?),
@@ -237,38 +214,91 @@ impl OptimizedTansuSegment {
             ("key_offsets", bincode::serialize(&key_offsets)?),
             ("value_offsets", bincode::serialize(&value_offsets)?),
         ];
-
-        for (name, data) in columns {
-            header.columns.insert(name.to_string(), (current_offset, data.len() as u64));
-            output.put_slice(&data);
-            current_offset += data.len() as u64;
-        }
-
-        // Write time index
+        
         let time_index_data = bincode::serialize(&time_index)?;
-        header.time_index = (current_offset, time_index_data.len() as u64);
-        output.put_slice(&time_index_data);
-        current_offset += time_index_data.len() as u64;
-
-        // Write bloom filter
         let bloom_data = bincode::serialize(&bloom)?;
-        header.bloom_filter = (current_offset, bloom_data.len() as u64);
-        output.put_slice(&bloom_data);
-        current_offset += bloom_data.len() as u64;
-
-        // Write footer
+        
         let footer = SegmentFooter {
             column_checksums: BTreeMap::new(), // TODO: Calculate checksums
             file_checksum: 0, // TODO: Calculate file checksum
             compression_ratios: BTreeMap::new(), // TODO: Calculate compression ratios
         };
         let footer_data = bincode::serialize(&footer)?;
-        header.footer_offset = current_offset;
+        
+        // Create temporary header with sample columns to get accurate size
+        let temp_header = OptimizedSegmentHeader {
+            magic: OPTIMIZED_MAGIC.try_into().unwrap(),
+            version: 1,
+            compression: CompressionType::Zstd,
+            record_count: sorted_records.len() as u64,
+            offset_range,
+            timestamp_range,
+            columns: {
+                let mut cols = BTreeMap::new();
+                for (name, _) in &columns_data {
+                    cols.insert(name.to_string(), (0u64, 0u64));
+                }
+                cols
+            },
+            time_index: (0, 0),
+            bloom_filter: (0, 0),
+            footer_offset: 0,
+        };
+        
+        let header_size = bincode::serialized_size(&temp_header)? as usize;
+        let mut current_offset = header_size as u64;
+        
+        // Now create the real header with calculated offsets
+        let mut columns_map = BTreeMap::new();
+        for (name, data) in &columns_data {
+            columns_map.insert(name.to_string(), (current_offset, data.len() as u64));
+            current_offset += data.len() as u64;
+        }
+        
+        let time_index_offset = current_offset;
+        current_offset += time_index_data.len() as u64;
+        
+        let bloom_offset = current_offset;
+        current_offset += bloom_data.len() as u64;
+        
+        let footer_offset = current_offset;
+        
+        let header = OptimizedSegmentHeader {
+            magic: OPTIMIZED_MAGIC.try_into().unwrap(),
+            version: 1,
+            compression: CompressionType::Zstd,
+            record_count: sorted_records.len() as u64,
+            offset_range,
+            timestamp_range,
+            columns: columns_map,
+            time_index: (time_index_offset, time_index_data.len() as u64),
+            bloom_filter: (bloom_offset, bloom_data.len() as u64),
+            footer_offset,
+        };
+        
+        // Build output
+        let mut output = BytesMut::new();
+        
+        // Write header
+        let header_bytes = bincode::serialize(&header)?;
+        assert_eq!(header_bytes.len(), header_size, "Header size calculation was incorrect");
+        output.put_slice(&header_bytes);
+        
+        // Write columns
+        for (_, data) in columns_data {
+            output.put_slice(&data);
+        }
+        
+        // Write time index
+        output.put_slice(&time_index_data);
+        
+        // Write bloom filter
+        output.put_slice(&bloom_data);
+        
+        // Write footer
         output.put_slice(&footer_data);
 
-        // Write header at the beginning
-        let header_bytes = bincode::serialize(&header)?;
-        output[..header_size].copy_from_slice(&header_bytes);
+        // Header is already written correctly, no need to re-serialize
 
         info!("Built optimized segment: {} records, {} bytes", 
               sorted_records.len(), output.len());

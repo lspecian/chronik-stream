@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{RwLock, Mutex};
 use tracing::{debug, info, warn, error};
+use crate::distributed_lock::{DistributedLockManager, with_lock_async};
 
 /// Consumer group state
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -371,6 +372,7 @@ pub struct GroupManager {
     groups: Arc<RwLock<HashMap<String, ConsumerGroup>>>,
     metadata_store: Arc<dyn MetadataStore>,
     assignor: Arc<Mutex<Box<dyn PartitionAssignor>>>,
+    lock_manager: Option<Arc<DistributedLockManager>>,
 }
 
 impl GroupManager {
@@ -380,6 +382,20 @@ impl GroupManager {
             groups: Arc::new(RwLock::new(HashMap::new())),
             metadata_store,
             assignor: Arc::new(Mutex::new(Box::new(CooperativeStickyAssignor::new()))),
+            lock_manager: None,
+        }
+    }
+    
+    /// Create a new group manager with distributed locking
+    pub fn with_lock_manager(
+        metadata_store: Arc<dyn MetadataStore>, 
+        lock_manager: Arc<DistributedLockManager>
+    ) -> Self {
+        Self {
+            groups: Arc::new(RwLock::new(HashMap::new())),
+            metadata_store,
+            assignor: Arc::new(Mutex::new(Box::new(CooperativeStickyAssignor::new()))),
+            lock_manager: Some(lock_manager),
         }
     }
     
@@ -540,8 +556,19 @@ impl GroupManager {
             updated_at: chrono::Utc::now(),
         };
         
-        self.metadata_store.update_consumer_group(metadata).await
-            .map_err(|e| Error::Storage(format!("Failed to persist group metadata: {}", e)))?;
+        // Use distributed lock if available
+        if let Some(lock_manager) = &self.lock_manager {
+            let mut lock = lock_manager.create_group_lock(&group.group_id);
+            
+            with_lock_async(&mut lock, Duration::from_secs(5), || async {
+                self.metadata_store.update_consumer_group(metadata).await
+                    .map_err(|e| Error::Storage(format!("Failed to persist group metadata: {}", e)))
+            }).await?;
+        } else {
+            // No distributed lock, use direct update
+            self.metadata_store.update_consumer_group(metadata).await
+                .map_err(|e| Error::Storage(format!("Failed to persist group metadata: {}", e)))?;
+        }
         
         Ok(())
     }

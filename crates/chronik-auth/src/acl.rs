@@ -92,7 +92,7 @@ impl Acl {
         
         if let Some(perms) = user_perms.get(&principal.username) {
             for perm in perms {
-                if perm.resource == *resource && perm.operation == *operation {
+                if self.resource_matches(&perm.resource, resource) && perm.operation == *operation {
                     return if perm.allow {
                         Ok(())
                     } else {
@@ -107,7 +107,7 @@ impl Acl {
             .map_err(|_| AuthError::Internal("Lock poisoned".to_string()))?;
         
         for perm in default_perms.iter() {
-            if perm.resource == *resource && perm.operation == *operation {
+            if self.resource_matches(&perm.resource, resource) && perm.operation == *operation {
                 return if perm.allow {
                     Ok(())
                 } else {
@@ -118,6 +118,20 @@ impl Acl {
         
         // No explicit permission found, deny by default
         Err(AuthError::PermissionDenied)
+    }
+    
+    /// Check if a resource pattern matches a specific resource
+    fn resource_matches(&self, pattern: &Resource, resource: &Resource) -> bool {
+        match (pattern, resource) {
+            (Resource::Topic(p), Resource::Topic(r)) => {
+                p == "*" || p == r
+            }
+            (Resource::ConsumerGroup(p), Resource::ConsumerGroup(r)) => {
+                p == "*" || p == r
+            }
+            (Resource::Cluster, Resource::Cluster) => true,
+            _ => false,
+        }
     }
     
     /// Get all permissions for a user

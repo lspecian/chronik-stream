@@ -2,6 +2,8 @@
 
 use crate::consumer_group::GroupManager;
 use crate::produce_handler::{ProduceHandler, ProduceHandlerConfig};
+use crate::offset_storage::{OffsetStorage, OffsetStorageConfig};
+use crate::coordinator_manager::{CoordinatorManager, CoordinatorConfig, CoordinatorType};
 use chronik_common::Result;
 use chronik_auth::{AuthMiddleware, AuthError, SaslMechanism, SaslAuthResult, Resource, Operation};
 use chronik_protocol::{
@@ -70,6 +72,8 @@ pub struct RequestHandler {
     segment_reader: Arc<SegmentReader>,
     group_manager: Arc<GroupManager>,
     auth_middleware: Arc<AuthMiddleware>,
+    offset_storage: Arc<OffsetStorage>,
+    coordinator_manager: Arc<CoordinatorManager>,
 }
 
 impl RequestHandler {
@@ -90,6 +94,17 @@ impl RequestHandler {
         // Start group expiration checker
         group_manager.clone().start_expiration_checker();
         
+        // Create offset storage
+        let offset_storage_config = OffsetStorageConfig::default();
+        let offset_storage = Arc::new(OffsetStorage::new(
+            metadata_store.clone(),
+            offset_storage_config,
+        ));
+        
+        // Start offset cleanup task - for now we don't pass TiKV endpoints
+        // as the metadata store already has the connection
+        offset_storage.start_cleanup_task(None).await;
+        
         // Create produce handler configuration
         let produce_config = ProduceHandlerConfig {
             node_id: config.node_id,
@@ -101,13 +116,24 @@ impl RequestHandler {
         
         // Create produce handler
         let produce_handler = Arc::new(
-            ProduceHandler::new(produce_config, storage, metadata_store).await?
+            ProduceHandler::new(produce_config, storage, metadata_store.clone()).await?
         );
         
         // Initialize auth middleware
         let auth_middleware = Arc::new(AuthMiddleware::new(false)); // Don't allow anonymous
         auth_middleware.init_defaults().await
             .map_err(|e| chronik_common::Error::Internal(format!("Failed to init auth: {:?}", e)))?;
+        
+        // Create coordinator manager
+        let coordinator_config = CoordinatorConfig::default();
+        let coordinator_manager = Arc::new(CoordinatorManager::new(
+            metadata_store.clone(),
+            coordinator_config,
+            config.node_id,
+        ));
+        
+        // Initialize coordinator manager
+        coordinator_manager.init().await?;
         
         Ok(Self {
             config,
@@ -116,6 +142,8 @@ impl RequestHandler {
             segment_reader,
             group_manager,
             auth_middleware,
+            offset_storage,
+            coordinator_manager,
         })
     }
     
@@ -379,37 +407,138 @@ impl RequestHandler {
         // Check consumer group permission
         self.auth_middleware.check_consumer_group(session_id, &request.group_id).await
             .map_err(|e| chronik_common::Error::Unauthorized(format!("Permission denied for group {}: {:?}", request.group_id, e)))?;
-        use crate::consumer_group::TopicPartitionOffset;
         
-        let mut offsets = Vec::new();
+        // Validate group ID
+        if request.group_id.is_empty() {
+            return Ok(Response::OffsetCommit(OffsetCommitResponse {
+                header: ResponseHeader { correlation_id },
+                throttle_time_ms: 0,
+                topics: vec![],
+            }));
+        }
+        
+        // Validate generation ID (must be >= -1)
+        if request.generation_id < -1 {
+            let error_response = request.topics.iter().map(|topic| {
+                OffsetCommitResponseTopic {
+                    name: topic.name.clone(),
+                    partitions: topic.partitions.iter().map(|p| {
+                        OffsetCommitResponsePartition {
+                            partition_index: p.partition_index,
+                            error_code: 42, // INVALID_GROUP_ID
+                        }
+                    }).collect(),
+                }
+            }).collect();
+            
+            return Ok(Response::OffsetCommit(OffsetCommitResponse {
+                header: ResponseHeader { correlation_id },
+                throttle_time_ms: 0,
+                topics: error_response,
+            }));
+        }
+        
+        // Prepare offsets for storage with validation
+        let mut storage_offsets = Vec::new();
+        let mut validation_errors = Vec::new();
+        
         for topic in &request.topics {
+            // Validate topic name
+            if topic.name.is_empty() {
+                for partition in &topic.partitions {
+                    validation_errors.push((topic.name.clone(), partition.partition_index, 17)); // INVALID_TOPIC
+                }
+                continue;
+            }
+            
             for partition in &topic.partitions {
-                offsets.push(TopicPartitionOffset {
-                    topic: topic.name.clone(),
-                    partition: partition.partition_index,
-                    offset: partition.committed_offset,
-                    metadata: partition.committed_metadata.clone(),
-                });
+                // Validate partition index
+                if partition.partition_index < 0 {
+                    validation_errors.push((topic.name.clone(), partition.partition_index, 37)); // INVALID_PARTITION_EXCEPTION
+                    continue;
+                }
+                
+                // Validate offset
+                if partition.committed_offset < -1 {
+                    validation_errors.push((topic.name.clone(), partition.partition_index, 1)); // OFFSET_OUT_OF_RANGE
+                    continue;
+                }
+                
+                // Validate metadata size (Kafka limit is typically 4096 bytes)
+                if let Some(ref metadata) = partition.committed_metadata {
+                    if metadata.len() > 4096 {
+                        validation_errors.push((topic.name.clone(), partition.partition_index, 12)); // OFFSET_METADATA_TOO_LARGE
+                        continue;
+                    }
+                }
+                
+                storage_offsets.push((
+                    topic.name.clone(),
+                    partition.partition_index as u32,
+                    partition.committed_offset,
+                    partition.committed_metadata.clone(),
+                ));
             }
         }
         
-        let response = self.group_manager.commit_offsets(
-            request.group_id,
-            request.generation_id,
-            request.member_id,
-            None, // TODO: Add member_epoch from KIP-848
-            offsets,
-        ).await?;
+        // If all offsets failed validation, return error response
+        if !validation_errors.is_empty() && storage_offsets.is_empty() {
+            let mut response_topics_map: HashMap<String, Vec<OffsetCommitResponsePartition>> = HashMap::new();
+            
+            for (topic, partition, error_code) in validation_errors {
+                response_topics_map.entry(topic)
+                    .or_insert_with(Vec::new)
+                    .push(OffsetCommitResponsePartition {
+                        partition_index: partition,
+                        error_code,
+                    });
+            }
+            
+            let response_topics: Vec<_> = response_topics_map.into_iter()
+                .map(|(topic, partitions)| OffsetCommitResponseTopic {
+                    name: topic,
+                    partitions,
+                })
+                .collect();
+            
+            return Ok(Response::OffsetCommit(OffsetCommitResponse {
+                header: ResponseHeader { correlation_id },
+                throttle_time_ms: 0,
+                topics: response_topics,
+            }));
+        }
         
-        // Build response from actual commit results
+        // Store valid offsets in TiKV
+        let commit_results = if !storage_offsets.is_empty() {
+            self.offset_storage.commit_offsets(
+                &request.group_id,
+                request.generation_id,
+                storage_offsets,
+            ).await?
+        } else {
+            vec![]
+        };
+        
+        // Build response from storage results and validation errors
         let mut response_topics_map: HashMap<String, Vec<OffsetCommitResponsePartition>> = HashMap::new();
         
-        for error in response.partition_errors {
-            response_topics_map.entry(error.topic)
+        // Add successful commits
+        for result in commit_results {
+            response_topics_map.entry(result.topic)
                 .or_insert_with(Vec::new)
                 .push(OffsetCommitResponsePartition {
-                    partition_index: error.partition,
-                    error_code: error.error_code,
+                    partition_index: result.partition as i32,
+                    error_code: result.error_code,
+                });
+        }
+        
+        // Add validation errors
+        for (topic, partition, error_code) in validation_errors {
+            response_topics_map.entry(topic)
+                .or_insert_with(Vec::new)
+                .push(OffsetCommitResponsePartition {
+                    partition_index: partition,
+                    error_code,
                 });
         }
         
@@ -432,18 +561,59 @@ impl RequestHandler {
         // Check consumer group permission
         self.auth_middleware.check_consumer_group(session_id, &request.group_id).await
             .map_err(|e| chronik_common::Error::Unauthorized(format!("Permission denied for group {}: {:?}", request.group_id, e)))?;
-        // Fetch offsets from the group manager
-        let offsets = self.group_manager.fetch_offsets(
-            request.group_id,
-            request.topics.clone().unwrap_or_default(),
+        
+        // Validate group ID
+        if request.group_id.is_empty() {
+            return Ok(Response::OffsetFetch(OffsetFetchResponse {
+                header: ResponseHeader { correlation_id },
+                throttle_time_ms: 0,
+                topics: vec![],
+            }));
+        }
+        
+        // Determine which topic-partitions to fetch
+        let topic_partitions = if let Some(topics) = &request.topics {
+            // Validate topic names
+            let mut tp = Vec::new();
+            for topic in topics {
+                if topic.is_empty() {
+                    continue; // Skip invalid topic names
+                }
+                
+                // Query actual partition count from metadata
+                match self.produce_handler.get_metadata_store().get_topic(topic).await? {
+                    Some(topic_meta) => {
+                        for partition in 0..topic_meta.config.partition_count {
+                            tp.push((topic.clone(), partition));
+                        }
+                    }
+                    None => {
+                        // Topic doesn't exist - add default partitions for error response
+                        for partition in 0..1 {
+                            tp.push((topic.clone(), partition));
+                        }
+                    }
+                }
+            }
+            tp
+        } else {
+            // Fetch all offsets for the group - would need to scan all topics
+            // For now, return empty as fetching all is complex
+            vec![]
+        };
+        
+        // Fetch offsets from storage
+        let fetched_offsets = self.offset_storage.fetch_offsets(
+            &request.group_id,
+            topic_partitions,
         ).await?;
         
         // Group offsets by topic
         let mut topics_map: HashMap<String, Vec<(i32, i64, Option<String>)>> = HashMap::new();
-        for offset in offsets {
+        for offset in fetched_offsets {
             topics_map.entry(offset.topic)
                 .or_insert_with(Vec::new)
-                .push((offset.partition, offset.offset, offset.metadata));
+                .push((offset.partition as i32, offset.offset, offset.metadata));
         }
         
         // Build response
