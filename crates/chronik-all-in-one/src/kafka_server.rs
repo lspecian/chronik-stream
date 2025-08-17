@@ -146,8 +146,8 @@ fn handle_api_versions(header: &RequestHeader) -> Vec<u8> {
     // Error code (0 = success)
     response.extend_from_slice(&[0, 0]);
     
-    // API versions array length
-    response.extend_from_slice(&[0, 10]); // 10 APIs
+    // API versions array length (must be 4 bytes)
+    response.extend_from_slice(&10i32.to_be_bytes()); // 10 APIs
     
     // Supported APIs
     let apis: [(i16, i16, i16); 10] = [
