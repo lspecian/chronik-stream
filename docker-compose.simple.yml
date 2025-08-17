@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  chronik:
+    image: chronikstream/chronik:latest
+    container_name: chronik
+    ports:
+      - "9092:9092"   # Kafka protocol
+      - "3000:3000"   # Admin API
+      - "9090:9090"   # Metrics
+    volumes:
+      - chronik-data:/data
+    environment:
+      - RUST_LOG=info
+      - CHRONIK_ADVERTISED_ADDR=localhost:9092
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "chronik", "check"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+
+volumes:
+  chronik-data:
+    driver: local

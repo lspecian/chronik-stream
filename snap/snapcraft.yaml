@@ -1,0 +1,97 @@
+name: chronik-stream
+base: core22
+version: '0.1.0'
+summary: Kafka-compatible distributed streaming platform with search
+description: |
+  Chronik Stream is a high-performance, Kafka-compatible distributed streaming 
+  platform with built-in search capabilities. This snap provides an all-in-one 
+  deployment that's perfect for development, testing, and small production workloads.
+  
+  Features:
+  - Kafka wire protocol compatibility
+  - Built-in full-text search
+  - Single binary deployment
+  - Embedded storage (no external dependencies)
+  - REST Admin API
+  - Prometheus metrics
+
+grade: stable
+confinement: strict
+
+architectures:
+  - build-on: amd64
+  - build-on: arm64
+
+apps:
+  chronik:
+    command: bin/chronik
+    daemon: simple
+    restart-condition: on-failure
+    plugs:
+      - network
+      - network-bind
+      - home
+    environment:
+      CHRONIK_DATA_DIR: $SNAP_COMMON/data
+      RUST_LOG: info
+
+  chronik-cli:
+    command: bin/chronik
+    plugs:
+      - network
+      - home
+
+parts:
+  chronik:
+    plugin: rust
+    source: .
+    build-packages:
+      - clang
+      - libclang-dev
+      - protobuf-compiler
+      - pkg-config
+      - libssl-dev
+    stage-packages:
+      - ca-certificates
+      - libssl3
+    rust-features:
+      - embedded-storage
+    rust-path:
+      - crates/chronik-all-in-one
+    override-build: |
+      craftctl default
+      # Build the all-in-one binary
+      cargo build --release --bin chronik --package chronik-all-in-one
+      # Install to staging area
+      install -D -m755 target/release/chronik $CRAFT_PART_INSTALL/bin/chronik
+    
+    prime:
+      - bin/chronik
+      - lib/*/libssl*
+      - lib/*/libcrypto*
+      - usr/lib/*/libssl*
+      - usr/lib/*/libcrypto*
+      - etc/ssl/certs
+
+layout:
+  /etc/ssl:
+    bind: $SNAP/etc/ssl
+
+hooks:
+  install:
+    plugs: [home]
+  configure:
+    plugs: [home]
+
+slots:
+  chronik-content:
+    interface: content
+    content: chronik-data
+    write:
+      - $SNAP_COMMON
+
+plugs:
+  chronik-content:
+    interface: content
+    content: chronik-data
+    target: $SNAP_COMMON

@@ -32,10 +32,38 @@ A high-performance, Kafka-compatible distributed streaming platform with built-i
 
 ## Quick Start
 
-### Using Docker Compose
+### One-Line Installation
 
 ```bash
-docker-compose up -d
+curl -sSL https://raw.githubusercontent.com/lspecian/chronik-stream/main/install.sh | bash
+```
+
+### Using Docker (Simplest)
+
+```bash
+# Run with a single command
+docker run -d --name chronik \
+  -p 9092:9092 -p 3000:3000 -p 9090:9090 \
+  chronikstream/chronik:latest
+
+# Or use our simple docker-compose
+curl -O https://raw.githubusercontent.com/lspecian/chronik-stream/main/docker-compose.simple.yml
+docker-compose -f docker-compose.simple.yml up -d
+```
+
+### Using Snap (Linux)
+
+```bash
+sudo snap install chronik-stream
+```
+
+### Using Binary
+
+```bash
+# Download latest release
+curl -L https://github.com/lspecian/chronik-stream/releases/latest/download/chronik-linux-x86_64 -o chronik
+chmod +x chronik
+./chronik start
 ```
 
 ### Using Kubernetes

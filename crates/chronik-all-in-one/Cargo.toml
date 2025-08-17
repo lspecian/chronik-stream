@@ -1,0 +1,51 @@
+[package]
+name = "chronik-all-in-one"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "All-in-one Chronik Stream server - single binary for easy deployment"
+
+[[bin]]
+name = "chronik"
+path = "src/main.rs"
+
+[dependencies]
+chronik-common = { path = "../chronik-common" }
+chronik-protocol = { path = "../chronik-protocol" }
+chronik-storage = { path = "../chronik-storage" }
+chronik-ingest = { path = "../chronik-ingest" }
+chronik-controller = { path = "../chronik-controller" }
+chronik-admin = { path = "../chronik-admin" }
+chronik-search = { path = "../chronik-search" }
+
+# Async runtime
+tokio = { workspace = true, features = ["full"] }
+async-trait = { workspace = true }
+futures = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Configuration
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+config = { workspace = true }
+
+# CLI
+clap = { workspace = true, features = ["derive", "env"] }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Embedded storage (for single-node mode)
+sled = "0.34"
+rocksdb = "0.21"
+
+[features]
+default = ["embedded-storage"]
+embedded-storage = []
+tikv = ["chronik-common/tikv"]
