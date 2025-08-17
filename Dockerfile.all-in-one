@@ -2,7 +2,8 @@
 # Single container that runs everything needed for a functional Chronik Stream instance
 
 # Build stage
-FROM rust:latest AS builder
+# Using nightly to support edition 2024 required by some dependencies
+FROM rustlang/rust:nightly AS builder
 
 WORKDIR /app
 
@@ -13,7 +14,15 @@ RUN apt-get update && apt-get install -y \
     protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy source code
+# Copy dependency files first for better caching
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates/
+COPY tests ./tests/
+
+# Build dependencies first (this layer will be cached if dependencies don't change)
+RUN cargo fetch
+
+# Copy the rest of the source code
 COPY . .
 
 # Build the all-in-one binary
