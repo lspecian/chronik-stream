@@ -17,6 +17,7 @@ members = [
     "crates/chronik-benchmarks",
     "crates/chronik-backup",
     "crates/chronik-config",
+    "crates/chronik-all-in-one",
     "tests",
 ]
 exclude = ["test-basic"]

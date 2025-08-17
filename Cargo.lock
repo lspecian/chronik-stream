@@ -1158,6 +1158,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "chronik-all-in-one"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "chronik-auth"
 version = "0.1.0"
 dependencies = [
