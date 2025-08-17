@@ -1,0 +1,71 @@
+# All-in-one Chronik Stream Docker image with advanced caching
+# Optimized for fast builds with cargo-chef and multi-stage caching
+
+# Stage 1: Planner - prepares the build plan for dependencies
+FROM lukemathwalker/cargo-chef:latest-rust-1.80 AS chef
+WORKDIR /app
+
+FROM chef AS planner
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates/
+COPY tests ./tests/
+RUN cargo chef prepare --recipe-path recipe.json
+
+# Stage 2: Cacher - builds dependencies (this layer is cached unless dependencies change)
+FROM chef AS builder
+COPY --from=planner /app/recipe.json recipe.json
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    clang \
+    libclang-dev \
+    protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
+# Build dependencies - this is the caching layer!
+RUN cargo chef cook --release --recipe-path recipe.json
+
+# Copy source code
+COPY . .
+
+# Build the application (only rebuilds if source code changes)
+RUN cargo build --release --bin chronik --package chronik-all-in-one
+
+# Runtime stage - minimal image
+FROM debian:bookworm-slim AS runtime
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user
+RUN useradd -m -u 1000 chronik
+
+# Copy binary from builder
+COPY --from=builder /app/target/release/chronik /usr/local/bin/chronik
+
+# Create data directory
+RUN mkdir -p /data && chown chronik:chronik /data
+
+# Switch to non-root user
+USER chronik
+
+# Expose ports
+EXPOSE 9092 3000 9090
+
+# Set data directory
+ENV CHRONIK_DATA_DIR=/data
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD chronik check || exit 1
+
+# Default command
+ENTRYPOINT ["chronik"]
+CMD ["start"]
+
+# Labels
+LABEL org.opencontainers.image.source="https://github.com/lspecian/chronik-stream"
+LABEL org.opencontainers.image.description="All-in-one Chronik Stream - Kafka-compatible streaming platform"
+LABEL org.opencontainers.image.licenses="MIT"
