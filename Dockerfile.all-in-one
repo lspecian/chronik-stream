@@ -24,20 +24,23 @@ WORKDIR /app
 
 # Copy only files needed for dependency resolution
 COPY Cargo.toml Cargo.lock ./
-COPY crates/chronik-all-in-one/Cargo.toml crates/chronik-all-in-one/
-COPY crates/chronik-common/Cargo.toml crates/chronik-common/
-COPY crates/chronik-protocol/Cargo.toml crates/chronik-protocol/
-COPY crates/chronik-storage/Cargo.toml crates/chronik-storage/
+COPY crates ./crates/
+COPY tests ./tests/
 
-# Create dummy main.rs files to allow dependency compilation
-RUN mkdir -p crates/chronik-all-in-one/src && \
-    echo "fn main() {}" > crates/chronik-all-in-one/src/main.rs && \
-    mkdir -p crates/chronik-common/src && \
-    echo "" > crates/chronik-common/src/lib.rs && \
-    mkdir -p crates/chronik-protocol/src && \
-    echo "" > crates/chronik-protocol/src/lib.rs && \
-    mkdir -p crates/chronik-storage/src && \
-    echo "" > crates/chronik-storage/src/lib.rs
+# Remove all source files, keeping only Cargo.toml files
+RUN find crates -type f -name "*.rs" -delete && \
+    find tests -type f -name "*.rs" -delete
+
+# Create dummy source files for all crates
+RUN for dir in crates/*/; do \
+        mkdir -p "${dir}src" && \
+        if [ "${dir}" = "crates/chronik-all-in-one/" ]; then \
+            echo "fn main() {}" > "${dir}src/main.rs"; \
+        else \
+            echo "" > "${dir}src/lib.rs"; \
+        fi; \
+    done && \
+    mkdir -p tests/src && echo "" > tests/src/lib.rs
 
 # Build dependencies with cache mount for cargo
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
