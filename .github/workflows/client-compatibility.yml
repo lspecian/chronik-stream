@@ -25,7 +25,7 @@ jobs:
         options: --health-cmd "curl -f http://localhost:9000/minio/health/live" --health-interval 10s --health-timeout 5s --health-retries 5
     
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
     
     - name: Set up Rust
       uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -99,7 +99,7 @@ jobs:
           --output compatibility-report
     
     - name: Upload compatibility report
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: compatibility-report
         path: |

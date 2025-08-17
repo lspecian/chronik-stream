@@ -28,17 +28,17 @@ jobs:
           - dockerfile: Dockerfile.all-in-one
             image-suffix: ""
             platforms: linux/amd64,linux/arm64
-          - dockerfile: Dockerfile.ingest
+          - dockerfile: deploy/docker/ingest.Dockerfile
             image-suffix: "-ingest"
             platforms: linux/amd64,linux/arm64
-          - dockerfile: Dockerfile.controller
+          - dockerfile: deploy/docker/controller.Dockerfile
             image-suffix: "-controller"
             platforms: linux/amd64,linux/arm64
           - dockerfile: Dockerfile.search
             image-suffix: "-search"
             platforms: linux/amd64,linux/arm64
-          - dockerfile: Dockerfile.query
-            image-suffix: "-query"
+          - dockerfile: deploy/docker/admin.Dockerfile
+            image-suffix: "-admin"
             platforms: linux/amd64,linux/arm64
 
     steps:
