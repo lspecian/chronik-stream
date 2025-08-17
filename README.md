@@ -32,27 +32,116 @@ A high-performance, Kafka-compatible distributed streaming platform with built-i
 
 ## Quick Start
 
-### One-Line Installation
+### Using Docker Images
+
+#### All-in-One Image (Simplest)
+
+The all-in-one image contains all Chronik Stream services in a single container, perfect for development, testing, and small deployments:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/lspecian/chronik-stream/main/install.sh | bash
-```
-
-### Using Docker (Simplest)
-
-```bash
-# Pull from GitHub Container Registry
+# Pull the all-in-one image from GitHub Container Registry
 docker pull ghcr.io/lspecian/chronik-stream:latest
 
-# Run with a single command
+# Run with embedded storage (development/testing)
 docker run -d --name chronik \
-  -p 9092:9092 -p 3000:3000 -p 9090:9090 \
+  -p 9092:9092    # Kafka API
+  -p 3000:3000    # Admin API
+  -p 9090:9090    # Metrics
   -v chronik-data:/data \
   ghcr.io/lspecian/chronik-stream:latest
 
-# Or use our all-in-one docker-compose
+# Run with external storage (production)
+docker run -d --name chronik \
+  -p 9092:9092 -p 3000:3000 -p 9090:9090 \
+  -v chronik-data:/data \
+  -e STORAGE_BACKEND=s3 \
+  -e S3_BUCKET=my-chronik-bucket \
+  -e AWS_ACCESS_KEY_ID=your-key \
+  -e AWS_SECRET_ACCESS_KEY=your-secret \
+  ghcr.io/lspecian/chronik-stream:latest
+
+# Or use docker-compose for easier management
 curl -O https://raw.githubusercontent.com/lspecian/chronik-stream/main/docker-compose.all-in-one.yml
 docker-compose -f docker-compose.all-in-one.yml up -d
+```
+
+#### Individual Service Images
+
+For production deployments, you can use individual service images for better resource management and scaling:
+
+```bash
+# Available images:
+# - ghcr.io/lspecian/chronik-stream-ingest:latest     # Kafka protocol handler
+# - ghcr.io/lspecian/chronik-stream-controller:latest # Metadata & coordination
+# - ghcr.io/lspecian/chronik-stream-search:latest     # Search service
+# - ghcr.io/lspecian/chronik-stream-admin:latest      # Admin API
+
+# Example: Run controller
+docker run -d --name chronik-controller \
+  -p 9090:9090 \
+  -v controller-data:/data \
+  ghcr.io/lspecian/chronik-stream-controller:latest
+
+# Example: Run ingest node
+docker run -d --name chronik-ingest \
+  -p 9092:9092 \
+  -e CONTROLLER_ADDR=chronik-controller:9090 \
+  ghcr.io/lspecian/chronik-stream-ingest:latest
+```
+
+#### Docker Compose Deployment
+
+For a complete multi-service deployment:
+
+```yaml
+# docker-compose.yml
+version: '3.8'
+
+services:
+  controller:
+    image: ghcr.io/lspecian/chronik-stream-controller:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - controller-data:/data
+    environment:
+      - RUST_LOG=info
+
+  ingest:
+    image: ghcr.io/lspecian/chronik-stream-ingest:latest
+    ports:
+      - "9092:9092"
+    environment:
+      - CONTROLLER_ADDR=controller:9090
+      - RUST_LOG=info
+    depends_on:
+      - controller
+
+  search:
+    image: ghcr.io/lspecian/chronik-stream-search:latest
+    ports:
+      - "9200:9200"
+    volumes:
+      - search-data:/data
+    environment:
+      - CONTROLLER_ADDR=controller:9090
+      - RUST_LOG=info
+    depends_on:
+      - controller
+
+  admin:
+    image: ghcr.io/lspecian/chronik-stream-admin:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - CONTROLLER_ADDR=controller:9090
+      - RUST_LOG=info
+    depends_on:
+      - controller
+
+volumes:
+  controller-data:
+  search-data:
 ```
 
 ### Using Snap (Linux)
@@ -99,21 +188,108 @@ kafka-console-producer --broker-list localhost:9092 --topic events
 kafka-console-consumer --bootstrap-server localhost:9092 --topic events --from-beginning
 ```
 
+## Cloud Deployment
+
+### Deploy to Hetzner Cloud
+
+```bash
+# Download deployment script
+curl -O https://raw.githubusercontent.com/lspecian/chronik-stream/main/scripts/deploy-hetzner.sh
+chmod +x deploy-hetzner.sh
+
+# Deploy single all-in-one instance
+./deploy-hetzner.sh
+
+# Deploy cluster (3 nodes)
+./deploy-hetzner.sh cluster
+
+# Destroy deployment
+./deploy-hetzner.sh destroy
+```
+
+### Deploy to AWS
+
+```bash
+# Download deployment script
+curl -O https://raw.githubusercontent.com/lspecian/chronik-stream/main/scripts/deploy-aws.sh
+chmod +x deploy-aws.sh
+
+# Deploy single instance with persistent storage
+./deploy-aws.sh with-storage 100  # 100GB EBS volume
+
+# Deploy cluster
+./deploy-aws.sh cluster
+
+# Destroy deployment
+./deploy-aws.sh destroy
+```
+
 ## Docker Images
 
-All images are available from GitHub Container Registry:
+All images are available from GitHub Container Registry (ghcr.io):
 
-| Image | Description | Size |
-|-------|-------------|------|
-| `ghcr.io/lspecian/chronik-stream:latest` | All-in-one image with embedded storage | ~150MB |
-| `ghcr.io/lspecian/chronik-stream-ingest:latest` | Ingest service only | ~80MB |
-| `ghcr.io/lspecian/chronik-stream-controller:latest` | Controller service | ~75MB |
-| `ghcr.io/lspecian/chronik-stream-search:latest` | Search service | ~90MB |
-| `ghcr.io/lspecian/chronik-stream-query:latest` | Query engine | ~85MB |
+| Image | Description | Size | Use Case |
+|-------|-------------|------|----------|
+| `ghcr.io/lspecian/chronik-stream:latest` | All-in-one image with all services | ~91MB | Development, testing, small deployments |
+| `ghcr.io/lspecian/chronik-stream-ingest:latest` | Kafka protocol handler | ~119MB | Production ingestion nodes |
+| `ghcr.io/lspecian/chronik-stream-controller:latest` | Metadata & coordination | ~95MB | Production control plane |
+| `ghcr.io/lspecian/chronik-stream-search:latest` | Search service | ~90MB | Production search nodes |
+| `ghcr.io/lspecian/chronik-stream-admin:latest` | Admin API | ~111MB | Production management |
+
+### Environment Variables
+
+#### All-in-One Image
+```bash
+CHRONIK_DATA_DIR=/data          # Data directory (default: /data)
+STORAGE_BACKEND=embedded        # Storage backend: embedded, s3, gcs, azure
+RUST_LOG=info                   # Log level: debug, info, warn, error
+KAFKA_PORT=9092                 # Kafka API port
+ADMIN_PORT=3000                 # Admin API port
+METRICS_PORT=9090               # Prometheus metrics port
+```
+
+#### Storage Configuration
+```bash
+# S3 Backend
+STORAGE_BACKEND=s3
+S3_BUCKET=my-chronik-bucket
+S3_REGION=us-east-1
+AWS_ACCESS_KEY_ID=xxx
+AWS_SECRET_ACCESS_KEY=xxx
+
+# GCS Backend
+STORAGE_BACKEND=gcs
+GCS_BUCKET=my-chronik-bucket
+GOOGLE_APPLICATION_CREDENTIALS=/path/to/credentials.json
+
+# Azure Backend
+STORAGE_BACKEND=azure
+AZURE_CONTAINER=my-chronik-container
+AZURE_STORAGE_ACCOUNT=myaccount
+AZURE_STORAGE_KEY=xxx
+```
+
+#### Service-Specific Configuration
+```bash
+# Controller
+CONTROLLER_PORT=9090
+METADATA_STORE=tikv           # tikv or embedded
+TIKV_PD_ENDPOINTS=pd1:2379,pd2:2379
+
+# Ingest
+CONTROLLER_ADDR=controller:9090
+MAX_MESSAGE_SIZE=1048576      # 1MB default
+COMPRESSION_TYPE=snappy       # none, gzip, snappy, lz4, zstd
+
+# Search
+INDEX_PATH=/data/index
+MAX_INDEX_SIZE=10737418240    # 10GB default
+SEARCH_PORT=9200
+```
 
 ### Multi-arch Support
 
-All images support both `linux/amd64` and `linux/arm64` architectures.
+Currently supporting `linux/amd64`. ARM64 support coming soon.
 
 ## Kafka Client Compatibility
 
