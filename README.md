@@ -41,14 +41,18 @@ curl -sSL https://raw.githubusercontent.com/lspecian/chronik-stream/main/install
 ### Using Docker (Simplest)
 
 ```bash
+# Pull from GitHub Container Registry
+docker pull ghcr.io/lspecian/chronik-stream:latest
+
 # Run with a single command
 docker run -d --name chronik \
   -p 9092:9092 -p 3000:3000 -p 9090:9090 \
-  chronikstream/chronik:latest
+  -v chronik-data:/data \
+  ghcr.io/lspecian/chronik-stream:latest
 
-# Or use our simple docker-compose
-curl -O https://raw.githubusercontent.com/lspecian/chronik-stream/main/docker-compose.simple.yml
-docker-compose -f docker-compose.simple.yml up -d
+# Or use our all-in-one docker-compose
+curl -O https://raw.githubusercontent.com/lspecian/chronik-stream/main/docker-compose.all-in-one.yml
+docker-compose -f docker-compose.all-in-one.yml up -d
 ```
 
 ### Using Snap (Linux)
@@ -94,6 +98,22 @@ kafka-console-producer --broker-list localhost:9092 --topic events
 # Consume messages (using Kafka client)
 kafka-console-consumer --bootstrap-server localhost:9092 --topic events --from-beginning
 ```
+
+## Docker Images
+
+All images are available from GitHub Container Registry:
+
+| Image | Description | Size |
+|-------|-------------|------|
+| `ghcr.io/lspecian/chronik-stream:latest` | All-in-one image with embedded storage | ~150MB |
+| `ghcr.io/lspecian/chronik-stream-ingest:latest` | Ingest service only | ~80MB |
+| `ghcr.io/lspecian/chronik-stream-controller:latest` | Controller service | ~75MB |
+| `ghcr.io/lspecian/chronik-stream-search:latest` | Search service | ~90MB |
+| `ghcr.io/lspecian/chronik-stream-query:latest` | Query engine | ~85MB |
+
+### Multi-arch Support
+
+All images support both `linux/amd64` and `linux/arm64` architectures.
 
 ## Kafka Client Compatibility
 

@@ -11,8 +11,15 @@ name = "chronik"
 path = "src/main.rs"
 
 [dependencies]
+# Core chronik components
+chronik-common = { path = "../chronik-common" }
+chronik-protocol = { path = "../chronik-protocol" }
+chronik-storage = { path = "../chronik-storage" }
+
 # Async runtime
 tokio = { workspace = true, features = ["full"] }
+async-trait = { workspace = true }
+futures = { workspace = true }
 
 # Logging
 tracing = { workspace = true }
@@ -23,6 +30,24 @@ clap = { workspace = true, features = ["derive", "env"] }
 
 # Error handling
 anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+bytes = { workspace = true }
+
+# Storage
+sled = "0.34"
+
+# Time
+chrono = { workspace = true }
+
+# Networking
+axum = { workspace = true }
+
+# Metrics
+prometheus = { workspace = true }
 
 [features]
 default = []
