@@ -2,7 +2,7 @@
 # Single container that runs everything needed for a functional Chronik Stream instance
 
 # Build stage
-FROM rust:1.75-bookworm AS builder
+FROM rust:1.80-bookworm AS builder
 
 WORKDIR /app
 
