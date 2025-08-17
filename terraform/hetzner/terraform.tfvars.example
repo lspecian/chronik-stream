@@ -1,0 +1,53 @@
+# Hetzner Cloud API Token (required)
+# Get from: https://console.hetzner.cloud/projects
+hcloud_token = "YOUR_HCLOUD_TOKEN_HERE"
+
+# Project configuration
+project_name    = "chronik-stream"
+deployment_type = "single"  # or "cluster" for multi-node
+
+# Location (fsn1, nbg1, hel1, ash, hil)
+location = "fsn1"
+
+# Server configuration for single deployment
+server_type = "cpx21"  # 3 vCPU, 4GB RAM, ~€8/month
+
+# Cluster configuration (if deployment_type = "cluster")
+controller_count       = 3     # Should be odd (1, 3, 5)
+controller_server_type = "cpx11"  # 2 vCPU, 2GB RAM
+ingest_count          = 2
+ingest_server_type    = "cpx21"  # 3 vCPU, 4GB RAM
+search_count          = 1
+search_server_type    = "cpx31"  # 4 vCPU, 8GB RAM
+
+# Storage configuration
+data_volume_size = 100  # GB, set to 0 to disable
+storage_backend  = "embedded"  # or "s3" for external storage
+
+# S3 configuration (if storage_backend = "s3")
+# s3_bucket             = "my-chronik-bucket"
+# s3_region             = "us-east-1"
+# aws_access_key_id     = "YOUR_AWS_ACCESS_KEY"
+# aws_secret_access_key = "YOUR_AWS_SECRET_KEY"
+
+# Network configuration
+network_cidr = "10.0.0.0/16"
+subnet_cidr  = "10.0.1.0/24"
+enable_ipv6  = false
+
+# Security configuration
+# Restrict access by replacing "0.0.0.0/0" with your IP ranges
+ssh_allowed_ips     = ["0.0.0.0/0", "::/0"]
+kafka_allowed_ips   = ["0.0.0.0/0", "::/0"]
+admin_allowed_ips   = ["0.0.0.0/0", "::/0"]
+metrics_allowed_ips = ["0.0.0.0/0", "::/0"]
+search_allowed_ips  = ["0.0.0.0/0", "::/0"]
+
+# Feature flags
+enable_search        = true
+enable_load_balancer = true  # For cluster deployment
+
+# Application configuration
+chronik_image   = "ghcr.io/lspecian/chronik-stream"
+chronik_version = "latest"
+rust_log        = "info"

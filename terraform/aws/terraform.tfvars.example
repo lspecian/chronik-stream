@@ -1,0 +1,62 @@
+# AWS configuration
+aws_region   = "us-east-1"
+project_name = "chronik-stream"
+environment  = "dev"
+
+# Deployment configuration
+deployment_type = "single"  # or "cluster" for multi-node
+
+# Instance configuration for single deployment
+instance_type = "t3.medium"  # 2 vCPU, 4GB RAM, ~$30/month
+
+# Cluster configuration (if deployment_type = "cluster")
+controller_count         = 3         # Should be odd (1, 3, 5)
+controller_instance_type = "t3.small" # 2 vCPU, 2GB RAM
+ingest_min_count        = 2
+ingest_max_count        = 10
+ingest_desired_count    = 2
+ingest_instance_type    = "t3.medium"  # 2 vCPU, 4GB RAM
+search_count            = 1
+search_instance_type    = "t3.large"   # 2 vCPU, 8GB RAM
+
+# Network configuration
+vpc_cidr                 = "10.0.0.0/16"
+availability_zones_count = 2
+enable_nat_gateway      = true  # For cluster private subnets
+
+# Storage configuration
+root_volume_size   = 20
+root_volume_type   = "gp3"
+data_volume_size   = 100  # GB, set to 0 to disable
+data_volume_type   = "gp3"
+use_instance_store = false
+enable_encryption  = true
+
+# S3 storage backend
+storage_backend      = "embedded"  # or "s3"
+create_s3_bucket    = false
+# s3_bucket          = ""  # Auto-generated if empty
+enable_s3_versioning = false
+
+# Security configuration
+# Restrict access by replacing "0.0.0.0/0" with your CIDR blocks
+ssh_allowed_cidrs     = ["0.0.0.0/0"]
+kafka_allowed_cidrs   = ["0.0.0.0/0"]
+admin_allowed_cidrs   = ["0.0.0.0/0"]
+metrics_allowed_cidrs = ["0.0.0.0/0"]
+search_allowed_cidrs  = ["0.0.0.0/0"]
+
+# Feature flags
+enable_search        = true
+enable_load_balancer = true   # For cluster deployment
+enable_auto_scaling  = false  # Auto-scale ingest nodes
+enable_monitoring    = true   # CloudWatch monitoring
+
+# Auto-scaling configuration (if enabled)
+scale_up_threshold   = 70  # CPU %
+scale_down_threshold = 30  # CPU %
+
+# Application configuration
+chronik_image   = "ghcr.io/lspecian/chronik-stream"
+chronik_version = "latest"
+rust_log        = "info"
