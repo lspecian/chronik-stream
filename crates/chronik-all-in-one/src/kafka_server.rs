@@ -192,13 +192,13 @@ async fn handle_metadata(
     // Correlation ID
     response.extend_from_slice(&header.correlation_id.to_be_bytes());
     
-    // Throttle time ms (v3+)
+    // Throttle time ms (v3+)  
     if header.api_version >= 3 {
-        response.extend_from_slice(&[0, 0, 0, 0]);
+        response.extend_from_slice(&0i32.to_be_bytes()); // Use proper int32 encoding
     }
     
-    // Brokers array
-    response.extend_from_slice(&[0, 0, 0, 1]); // 1 broker
+    // Brokers array length (must be 4 bytes)
+    response.extend_from_slice(&1i32.to_be_bytes()); // 1 broker
     
     // Broker info
     response.extend_from_slice(&node_id.to_be_bytes()); // Node ID
