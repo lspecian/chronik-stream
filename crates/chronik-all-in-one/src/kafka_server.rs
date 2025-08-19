@@ -28,6 +28,7 @@ pub struct RequestHeader {
     pub api_version: i16,
     pub correlation_id: i32,
     pub client_id: Option<String>,
+    pub header_size: usize,  // Track how many bytes the header consumed
 }
 
 pub struct KafkaServer {
@@ -96,14 +97,15 @@ async fn handle_connection(
         debug!("Request: api_key={:?}, version={}, correlation_id={}", 
                header.api_key, header.api_version, header.correlation_id);
         
-        // Process the request
+        // Process the request - pass the body starting after the header
+        let body_start = header.header_size;
         let response = match header.api_key {
             ApiKey::ApiVersions => handle_api_versions(&header),
             ApiKey::Metadata => handle_metadata(&header, &storage, node_id).await,
-            ApiKey::CreateTopics => handle_create_topics(&header, &buffer[16..], storage.clone()).await,
-            ApiKey::Produce => handle_produce(&header, &buffer[16..], storage.clone()).await,
-            ApiKey::Fetch => handle_fetch(&header, &buffer[16..], storage.clone()).await,
-            ApiKey::ListOffsets => handle_list_offsets(&header, &buffer[16..], storage.clone()).await,
+            ApiKey::CreateTopics => handle_create_topics(&header, &buffer[body_start..], storage.clone()).await,
+            ApiKey::Produce => handle_produce(&header, &buffer[body_start..], storage.clone()).await,
+            ApiKey::Fetch => handle_fetch(&header, &buffer[body_start..], storage.clone()).await,
+            ApiKey::ListOffsets => handle_list_offsets(&header, &buffer[body_start..], storage.clone()).await,
             _ => {
                 warn!("Unsupported API: {:?}", header.api_key);
                 create_error_response(&header, 35) // UNSUPPORTED_VERSION
@@ -116,7 +118,8 @@ async fn handle_connection(
 }
 
 fn parse_request_header(data: &[u8]) -> Result<RequestHeader> {
-    if data.len() < 16 {
+    // Minimum header is 8 bytes: api_key(2) + api_version(2) + correlation_id(4)
+    if data.len() < 8 {
         return Err(anyhow!("Request too short"));
     }
     
@@ -124,13 +127,39 @@ fn parse_request_header(data: &[u8]) -> Result<RequestHeader> {
     let api_version = i16::from_be_bytes([data[2], data[3]]);
     let correlation_id = i32::from_be_bytes([data[4], data[5], data[6], data[7]]);
     
-    // Skip client_id for now (bytes 8-15 contain length and string)
+    let mut header_size = 8;
+    
+    // Parse client_id (nullable string)
+    let client_id = if data.len() >= 10 {
+        let client_id_len = i16::from_be_bytes([data[8], data[9]]);
+        header_size = 10;
+        if client_id_len >= 0 {
+            header_size += client_id_len as usize;
+            if client_id_len > 0 {
+                let start = 10;
+                let end = start + client_id_len as usize;
+                if end <= data.len() {
+                    Some(String::from_utf8_lossy(&data[start..end]).to_string())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            // client_id_len = -1 means null
+            None
+        }
+    } else {
+        None
+    };
     
     Ok(RequestHeader {
         api_key: ApiKey::from_i16(api_key).unwrap_or(ApiKey::Unknown),
         api_version,
         correlation_id,
-        client_id: None,
+        client_id,
+        header_size,
     })
 }
 
@@ -192,9 +221,12 @@ async fn handle_metadata(
     // Correlation ID
     response.extend_from_slice(&header.correlation_id.to_be_bytes());
     
-    // Throttle time ms (v3+)  
+    // NOTE: MetadataResponse structure varies by version:
+    // v0: No throttle_time_ms field at all
+    // v1-2: Still no throttle_time_ms  
+    // v3+: Has throttle_time_ms field
     if header.api_version >= 3 {
-        response.extend_from_slice(&0i32.to_be_bytes()); // Use proper int32 encoding
+        response.extend_from_slice(&0i32.to_be_bytes()); // throttle_time_ms
     }
     
     // Brokers array length (must be 4 bytes)
@@ -334,8 +366,39 @@ async fn handle_create_topics(
         let _replication_factor = i16::from_be_bytes([data[cursor], data[cursor + 1]]);
         cursor += 2;
         
-        // Skip replica assignments and configs for now
-        // This is simplified - real implementation would parse these
+        // Replica assignments array
+        let assignments_len = i32::from_be_bytes([
+            data[cursor], data[cursor + 1], data[cursor + 2], data[cursor + 3]
+        ]);
+        cursor += 4;
+        
+        // Skip assignments
+        for _ in 0..assignments_len {
+            // Partition index
+            cursor += 4;
+            // Broker IDs array
+            let broker_ids_len = i32::from_be_bytes([
+                data[cursor], data[cursor + 1], data[cursor + 2], data[cursor + 3]
+            ]);
+            cursor += 4;
+            cursor += (broker_ids_len * 4) as usize; // Each broker ID is 4 bytes
+        }
+        
+        // Config entries array
+        let configs_len = i32::from_be_bytes([
+            data[cursor], data[cursor + 1], data[cursor + 2], data[cursor + 3]
+        ]);
+        cursor += 4;
+        
+        // Skip configs
+        for _ in 0..configs_len {
+            // Config name
+            let name_len = i16::from_be_bytes([data[cursor], data[cursor + 1]]) as usize;
+            cursor += 2 + name_len;
+            // Config value
+            let value_len = i16::from_be_bytes([data[cursor], data[cursor + 1]]) as usize;
+            cursor += 2 + value_len;
+        }
         
         // Create the topic
         let mut storage_guard = storage.write().await;
