@@ -20,6 +20,7 @@ pub enum ApiKey {
     ListGroups = 16,
     ApiVersions = 18,
     CreateTopics = 19,
+    InitProducerId = 22,
     Unknown = -1,
 }
 
@@ -106,6 +107,7 @@ async fn handle_connection(
             ApiKey::Produce => handle_produce(&header, &buffer[body_start..], storage.clone()).await,
             ApiKey::Fetch => handle_fetch(&header, &buffer[body_start..], storage.clone()).await,
             ApiKey::ListOffsets => handle_list_offsets(&header, &buffer[body_start..], storage.clone()).await,
+            ApiKey::InitProducerId => handle_init_producer_id(&header),
             _ => {
                 warn!("Unsupported API: {:?}", header.api_key);
                 create_error_response(&header, 35) // UNSUPPORTED_VERSION
@@ -176,10 +178,10 @@ fn handle_api_versions(header: &RequestHeader) -> Vec<u8> {
     response.extend_from_slice(&[0, 0]);
     
     // API versions array length (must be 4 bytes)
-    response.extend_from_slice(&10i32.to_be_bytes()); // 10 APIs
+    response.extend_from_slice(&11i32.to_be_bytes()); // 11 APIs
     
     // Supported APIs
-    let apis: [(i16, i16, i16); 10] = [
+    let apis: [(i16, i16, i16); 11] = [
         (18, 0, 3),  // ApiVersions
         (3, 0, 12),  // Metadata  
         (19, 0, 7),  // CreateTopics
@@ -190,6 +192,7 @@ fn handle_api_versions(header: &RequestHeader) -> Vec<u8> {
         (9, 0, 8),   // OffsetFetch
         (11, 0, 9),  // JoinGroup
         (16, 0, 4),  // ListGroups
+        (22, 0, 4),  // InitProducerId
     ];
     
     for (api_key, min_version, max_version) in apis {
@@ -310,6 +313,17 @@ async fn handle_metadata(
     }
     
     for topic_name in topics {
+        info!("Encoding topic '{}' for Metadata v{}", topic_name, header.api_version);
+        
+        // For v12, the order is different:
+        // - Error code (int16)
+        // - Topic name (compact string)
+        // - Topic ID (UUID - 16 bytes)
+        // - Is internal (boolean)
+        // - Partitions (compact array)
+        // - Topic authorized operations (int32) - v8+
+        // - Tagged fields
+        
         // Error code
         response.extend_from_slice(&[0, 0]);
         
@@ -397,6 +411,11 @@ async fn handle_metadata(
             } else {
                 response.extend_from_slice(&0i32.to_be_bytes());
             }
+        }
+        
+        // Topic authorized operations (v8+)
+        if header.api_version >= 8 {
+            response.extend_from_slice(&(-2147483648i32).to_be_bytes()); // INT32_MIN means all operations allowed
         }
         
         // Tagged fields for topic (v9+)
@@ -742,6 +761,41 @@ async fn handle_list_offsets(
     response
 }
 
+fn handle_init_producer_id(header: &RequestHeader) -> Vec<u8> {
+    let mut response = Vec::new();
+    
+    // Response size placeholder
+    response.extend_from_slice(&[0, 0, 0, 0]);
+    
+    // Correlation ID
+    response.extend_from_slice(&header.correlation_id.to_be_bytes());
+    
+    // Throttle time ms (v3+)
+    if header.api_version >= 3 {
+        response.extend_from_slice(&[0, 0, 0, 0]);
+    }
+    
+    // Error code (0 = success)
+    response.extend_from_slice(&[0, 0]);
+    
+    // Producer ID (int64)
+    // Generate a unique producer ID - using timestamp for simplicity
+    let producer_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    response.extend_from_slice(&producer_id.to_be_bytes());
+    
+    // Producer epoch (int16) - start at 0
+    response.extend_from_slice(&0i16.to_be_bytes());
+    
+    // Update size
+    let size = (response.len() - 4) as i32;
+    response[0..4].copy_from_slice(&size.to_be_bytes());
+    
+    response
+}
+
 fn create_error_response(header: &RequestHeader, error_code: i16) -> Vec<u8> {
     let mut response = Vec::new();
     
@@ -775,6 +829,7 @@ impl ApiKey {
             16 => Some(ApiKey::ListGroups),
             18 => Some(ApiKey::ApiVersions),
             19 => Some(ApiKey::CreateTopics),
+            22 => Some(ApiKey::InitProducerId),
             _ => Some(ApiKey::Unknown),
         }
     }

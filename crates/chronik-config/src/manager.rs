@@ -183,7 +183,7 @@ impl ConfigManager {
         
         // Store the updated configuration
         let old_config = self.config.load();
-        self.config.store(Arc::new(config));
+        self.config.store(Arc::new(config.clone()));
         
         // Clear cache for this path and its parents
         self.invalidate_cache(path);
