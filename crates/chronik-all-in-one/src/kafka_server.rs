@@ -94,8 +94,8 @@ async fn handle_connection(
         
         // Parse request header
         let header = parse_request_header(&buffer)?;
-        debug!("Request: api_key={:?}, version={}, correlation_id={}", 
-               header.api_key, header.api_version, header.correlation_id);
+        info!("Request: api_key={:?}, version={}, correlation_id={}, client_id={:?}", 
+               header.api_key, header.api_version, header.correlation_id, header.client_id);
         
         // Process the request - pass the body starting after the header
         let body_start = header.header_size;
@@ -213,6 +213,7 @@ async fn handle_metadata(
     storage: &Arc<RwLock<EmbeddedStorage>>,
     node_id: i32,
 ) -> Vec<u8> {
+    info!("Handling Metadata request version {}", header.api_version);
     let mut response = Vec::new();
     
     // Response size placeholder
@@ -221,38 +222,75 @@ async fn handle_metadata(
     // Correlation ID
     response.extend_from_slice(&header.correlation_id.to_be_bytes());
     
-    // NOTE: MetadataResponse structure varies by version:
-    // v0: No throttle_time_ms field at all
-    // v1-2: Still no throttle_time_ms  
-    // v3+: Has throttle_time_ms field
-    if header.api_version >= 3 {
-        response.extend_from_slice(&0i32.to_be_bytes()); // throttle_time_ms
+    // Response header v1 for version 9+ (includes tagged fields)
+    if header.api_version >= 9 {
+        response.push(0); // Tagged fields in response header
     }
     
-    // Brokers array length (must be 4 bytes)
-    response.extend_from_slice(&1i32.to_be_bytes()); // 1 broker
+    // Handle different protocol versions
+    // Version 9+ uses compact arrays (unsigned varint for length + 1)
+    // Version 0-8 uses regular arrays (int32 for length)
+    
+    // Throttle time ms (v3+)
+    if header.api_version >= 3 {
+        response.extend_from_slice(&0i32.to_be_bytes());
+    }
+    
+    // Brokers array
+    if header.api_version >= 9 {
+        // Compact array: length + 1 as unsigned varint
+        response.push(2); // 1 broker + 1 = 2 in compact encoding
+    } else {
+        // Regular array: int32 length
+        response.extend_from_slice(&1i32.to_be_bytes());
+    }
     
     // Broker info
     response.extend_from_slice(&node_id.to_be_bytes()); // Node ID
     
     // Host string
     let host = "localhost";
-    response.extend_from_slice(&(host.len() as i16).to_be_bytes());
-    response.extend_from_slice(host.as_bytes());
+    if header.api_version >= 9 {
+        // Compact string: length + 1 as unsigned varint
+        response.push((host.len() + 1) as u8);
+        response.extend_from_slice(host.as_bytes());
+    } else {
+        // Regular string: int16 length
+        response.extend_from_slice(&(host.len() as i16).to_be_bytes());
+        response.extend_from_slice(host.as_bytes());
+    }
     
     // Port
     response.extend_from_slice(&9092i32.to_be_bytes());
     
-    // Rack (v1+)
+    // Rack
     if header.api_version >= 1 {
-        response.extend_from_slice(&(-1i16).to_be_bytes()); // null rack
+        if header.api_version >= 9 {
+            // Compact nullable string: 0 means null
+            response.push(0);
+        } else {
+            // Regular nullable string: -1 means null
+            response.extend_from_slice(&(-1i16).to_be_bytes());
+        }
+    }
+    
+    // Tagged fields for broker (v9+)
+    if header.api_version >= 9 {
+        response.push(0); // No tagged fields
     }
     
     // Cluster ID (v2+)
     if header.api_version >= 2 {
         let cluster_id = "chronik-cluster";
-        response.extend_from_slice(&(cluster_id.len() as i16).to_be_bytes());
-        response.extend_from_slice(cluster_id.as_bytes());
+        if header.api_version >= 9 {
+            // Compact nullable string
+            response.push((cluster_id.len() + 1) as u8);
+            response.extend_from_slice(cluster_id.as_bytes());
+        } else {
+            // Regular nullable string
+            response.extend_from_slice(&(cluster_id.len() as i16).to_be_bytes());
+            response.extend_from_slice(cluster_id.as_bytes());
+        }
     }
     
     // Controller ID (v1+)
@@ -263,24 +301,49 @@ async fn handle_metadata(
     // Topics array
     let storage_guard = storage.read().await;
     let topics = storage_guard.list_topics().await;
-    response.extend_from_slice(&(topics.len() as i32).to_be_bytes());
+    if header.api_version >= 9 {
+        // Compact array
+        response.push((topics.len() + 1) as u8);
+    } else {
+        // Regular array
+        response.extend_from_slice(&(topics.len() as i32).to_be_bytes());
+    }
     
     for topic_name in topics {
         // Error code
         response.extend_from_slice(&[0, 0]);
         
         // Topic name
-        response.extend_from_slice(&(topic_name.len() as i16).to_be_bytes());
-        response.extend_from_slice(topic_name.as_bytes());
+        if header.api_version >= 9 {
+            // Compact string
+            response.push((topic_name.len() + 1) as u8);
+            response.extend_from_slice(topic_name.as_bytes());
+        } else {
+            // Regular string
+            response.extend_from_slice(&(topic_name.len() as i16).to_be_bytes());
+            response.extend_from_slice(topic_name.as_bytes());
+        }
+        
+        // Topic ID (v10+)
+        if header.api_version >= 10 {
+            // 16-byte UUID (just use zeros for now)
+            response.extend_from_slice(&[0u8; 16]);
+        }
         
         // Is internal (v1+)
         if header.api_version >= 1 {
             response.push(0); // false
         }
         
-        // Partitions
+        // Partitions array
         if let Some(topic_meta) = storage_guard.get_topic(&topic_name).await {
-            response.extend_from_slice(&topic_meta.partitions.to_be_bytes());
+            if header.api_version >= 9 {
+                // Compact array
+                response.push((topic_meta.partitions + 1) as u8);
+            } else {
+                // Regular array
+                response.extend_from_slice(&topic_meta.partitions.to_be_bytes());
+            }
             
             for partition_id in 0..topic_meta.partitions {
                 // Error code
@@ -292,22 +355,59 @@ async fn handle_metadata(
                 // Leader
                 response.extend_from_slice(&node_id.to_be_bytes());
                 
+                // Leader epoch (v7+)
+                if header.api_version >= 7 {
+                    response.extend_from_slice(&0i32.to_be_bytes());
+                }
+                
                 // Replicas
-                response.extend_from_slice(&[0, 0, 0, 1]); // 1 replica
+                if header.api_version >= 9 {
+                    response.push(2); // 1 replica + 1
+                } else {
+                    response.extend_from_slice(&1i32.to_be_bytes());
+                }
                 response.extend_from_slice(&node_id.to_be_bytes());
                 
                 // ISR
-                response.extend_from_slice(&[0, 0, 0, 1]); // 1 in ISR
+                if header.api_version >= 9 {
+                    response.push(2); // 1 in-sync replica + 1
+                } else {
+                    response.extend_from_slice(&1i32.to_be_bytes());
+                }
                 response.extend_from_slice(&node_id.to_be_bytes());
                 
                 // Offline replicas (v5+)
                 if header.api_version >= 5 {
-                    response.extend_from_slice(&[0, 0, 0, 0]); // no offline replicas
+                    if header.api_version >= 9 {
+                        response.push(1); // empty compact array
+                    } else {
+                        response.extend_from_slice(&0i32.to_be_bytes());
+                    }
+                }
+                
+                // Tagged fields (v9+)
+                if header.api_version >= 9 {
+                    response.push(0); // No tagged fields
                 }
             }
         } else {
-            response.extend_from_slice(&[0, 0, 0, 0]); // 0 partitions
+            // No partitions
+            if header.api_version >= 9 {
+                response.push(1); // empty compact array
+            } else {
+                response.extend_from_slice(&0i32.to_be_bytes());
+            }
         }
+        
+        // Tagged fields for topic (v9+)
+        if header.api_version >= 9 {
+            response.push(0); // No tagged fields
+        }
+    }
+    
+    // Tagged fields for entire response (v9+)
+    if header.api_version >= 9 {
+        response.push(0); // No tagged fields
     }
     
     // Update size
@@ -340,6 +440,11 @@ async fn handle_create_topics(
     let mut response = Vec::new();
     response.extend_from_slice(&[0, 0, 0, 0]); // Size placeholder
     response.extend_from_slice(&header.correlation_id.to_be_bytes());
+    
+    // Response header v1 for version 5+ (includes tagged fields)
+    if header.api_version >= 5 {
+        response.push(0); // Tagged fields in response header
+    }
     
     // Throttle time (v2+)
     if header.api_version >= 2 {
