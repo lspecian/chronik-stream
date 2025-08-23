@@ -740,7 +740,7 @@ async fn handle_fetch(
 async fn handle_list_offsets(
     header: &RequestHeader,
     _data: &[u8],
-    _storage: Arc<RwLock<EmbeddedStorage>>,
+    storage: Arc<RwLock<EmbeddedStorage>>,
 ) -> Vec<u8> {
     let mut response = Vec::new();
     response.extend_from_slice(&[0, 0, 0, 0]); // Size placeholder
@@ -751,8 +751,44 @@ async fn handle_list_offsets(
         response.extend_from_slice(&[0, 0, 0, 0]);
     }
     
-    // Topics array
-    response.extend_from_slice(&[0, 0, 0, 0]); // 0 topics for now
+    // Parse request to get topics (simplified - assuming single topic)
+    // In a real implementation, we'd properly parse the request
+    let storage = storage.read().await;
+    let topics = storage.list_topics().await;
+    
+    // Topics array - MUST NOT be null
+    if topics.is_empty() {
+        // Even if no topics match, return empty array not null
+        response.extend_from_slice(&[0, 0, 0, 0]); // 0 topics
+    } else {
+        // Return data for first topic as example
+        response.extend_from_slice(&[0, 0, 0, 1]); // 1 topic
+        
+        // Topic name
+        let topic_name = topics[0].as_bytes();
+        response.extend_from_slice(&(topic_name.len() as i16).to_be_bytes());
+        response.extend_from_slice(topic_name);
+        
+        // Partitions array
+        response.extend_from_slice(&[0, 0, 0, 1]); // 1 partition
+        
+        // Partition 0
+        response.extend_from_slice(&[0, 0, 0, 0]); // partition index
+        response.extend_from_slice(&[0, 0]); // error code
+        
+        // Timestamp (-1 for unknown) - v1+
+        if header.api_version >= 1 {
+            response.extend_from_slice(&(-1i64).to_be_bytes());
+        }
+        
+        // Offset (0 for beginning)
+        response.extend_from_slice(&0i64.to_be_bytes());
+        
+        // Leader epoch (v4+)
+        if header.api_version >= 4 {
+            response.extend_from_slice(&0i32.to_be_bytes());
+        }
+    }
     
     // Update size
     let size = (response.len() - 4) as i32;
@@ -770,13 +806,16 @@ fn handle_init_producer_id(header: &RequestHeader) -> Vec<u8> {
     // Correlation ID
     response.extend_from_slice(&header.correlation_id.to_be_bytes());
     
-    // Throttle time ms (v3+)
-    if header.api_version >= 3 {
-        response.extend_from_slice(&[0, 0, 0, 0]);
+    // For v0-v3, the order is: error_code, producer_id, producer_epoch
+    // For v4+, the order is: throttle_time_ms, error_code, producer_id, producer_epoch
+    
+    if header.api_version >= 1 {
+        // Throttle time ms (v1+) - comes FIRST in v1+
+        response.extend_from_slice(&0i32.to_be_bytes());
     }
     
     // Error code (0 = success)
-    response.extend_from_slice(&[0, 0]);
+    response.extend_from_slice(&0i16.to_be_bytes());
     
     // Producer ID (int64)
     // Generate a unique producer ID - using timestamp for simplicity
