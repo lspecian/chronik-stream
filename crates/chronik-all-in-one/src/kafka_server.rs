@@ -668,41 +668,89 @@ async fn handle_create_topics(
 
 async fn handle_produce(
     header: &RequestHeader,
-    _data: &[u8],
-    _storage: Arc<RwLock<EmbeddedStorage>>,
+    data: &[u8],
+    storage: Arc<RwLock<EmbeddedStorage>>,
 ) -> Vec<u8> {
-    // Simplified produce handling - parse and store messages
     let mut response = Vec::new();
     response.extend_from_slice(&[0, 0, 0, 0]); // Size placeholder
     response.extend_from_slice(&header.correlation_id.to_be_bytes());
     
-    // Parse produce request (simplified)
-    // Real implementation would properly parse the request
+    // Parse produce request to get topic name
+    // Structure: transactional_id(nullable string), acks(i16), timeout(i32), topics array
+    let mut cursor = 0;
     
-    // Response: topics array
-    response.extend_from_slice(&[0, 0, 0, 1]); // 1 topic
+    // Skip transactional_id (nullable string)
+    if data.len() > cursor + 2 {
+        let str_len = i16::from_be_bytes([data[cursor], data[cursor + 1]]);
+        cursor += 2;
+        if str_len > 0 {
+            cursor += str_len as usize;
+        }
+    }
     
-    // Topic name (placeholder)
-    let topic_name = "test-topic";
+    // Skip acks and timeout
+    cursor += 2 + 4; // acks(i16) + timeout(i32)
+    
+    // Parse topics array
+    let mut topic_name = String::from("unknown");
+    if data.len() > cursor + 4 {
+        let topic_count = i32::from_be_bytes([data[cursor], data[cursor+1], data[cursor+2], data[cursor+3]]);
+        cursor += 4;
+        
+        if topic_count > 0 && data.len() > cursor + 2 {
+            // Get first topic name
+            let name_len = i16::from_be_bytes([data[cursor], data[cursor + 1]]);
+            cursor += 2;
+            if name_len > 0 && data.len() >= cursor + name_len as usize {
+                topic_name = String::from_utf8_lossy(&data[cursor..cursor + name_len as usize]).to_string();
+                cursor += name_len as usize;
+            }
+        }
+    }
+    
+    // Store the produce request (simplified - just log it)
+    info!("Produce request for topic: {}", topic_name);
+    
+    // Get storage to track the topic
+    let mut storage = storage.write().await;
+    if !storage.list_topics().await.contains(&topic_name) {
+        // Auto-create topic if it doesn't exist
+        storage.create_topic(topic_name.clone(), 1).await.ok();
+    }
+    drop(storage);
+    
+    // Response structure depends on version
+    // v1+: throttle_time first
+    // v3+: different response structure
+    
+    if header.api_version >= 1 {
+        // Throttle time (v1+) - comes FIRST
+        response.extend_from_slice(&0i32.to_be_bytes());
+    }
+    
+    // Topics array
+    response.extend_from_slice(&1i32.to_be_bytes()); // 1 topic
+    
+    // Topic name
     response.extend_from_slice(&(topic_name.len() as i16).to_be_bytes());
     response.extend_from_slice(topic_name.as_bytes());
     
     // Partitions array
-    response.extend_from_slice(&[0, 0, 0, 1]); // 1 partition
+    response.extend_from_slice(&1i32.to_be_bytes()); // 1 partition
     
     // Partition 0
-    response.extend_from_slice(&[0, 0, 0, 0]); // partition ID
-    response.extend_from_slice(&[0, 0]); // error code
-    response.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]); // base offset
+    response.extend_from_slice(&0i32.to_be_bytes()); // partition ID
+    response.extend_from_slice(&0i16.to_be_bytes()); // error code (0 = success)
+    response.extend_from_slice(&0i64.to_be_bytes()); // base offset
     
     // Log append time (v2+)
     if header.api_version >= 2 {
         response.extend_from_slice(&(-1i64).to_be_bytes()); // no append time
     }
     
-    // Throttle time (v1+)
-    if header.api_version >= 1 {
-        response.extend_from_slice(&[0, 0, 0, 0]);
+    // Log start offset (v5+)
+    if header.api_version >= 5 {
+        response.extend_from_slice(&0i64.to_be_bytes()); // log start offset
     }
     
     // Update size
@@ -714,21 +762,91 @@ async fn handle_produce(
 
 async fn handle_fetch(
     header: &RequestHeader,
-    _data: &[u8],
-    _storage: Arc<RwLock<EmbeddedStorage>>,
+    data: &[u8],
+    storage: Arc<RwLock<EmbeddedStorage>>,
 ) -> Vec<u8> {
-    // Simplified fetch handling
     let mut response = Vec::new();
     response.extend_from_slice(&[0, 0, 0, 0]); // Size placeholder
     response.extend_from_slice(&header.correlation_id.to_be_bytes());
     
-    // Throttle time
+    // Throttle time (v1+)
     if header.api_version >= 1 {
-        response.extend_from_slice(&[0, 0, 0, 0]);
+        response.extend_from_slice(&0i32.to_be_bytes());
     }
     
-    // Topics array
-    response.extend_from_slice(&[0, 0, 0, 0]); // 0 topics for now
+    // Session ID (v7+)
+    if header.api_version >= 7 {
+        response.extend_from_slice(&0i32.to_be_bytes());
+    }
+    
+    // Parse fetch request to get topics (simplified)
+    let mut cursor = 4; // Skip replica_id
+    cursor += 4; // Skip max_wait_time
+    cursor += 4; // Skip min_bytes
+    
+    if header.api_version >= 3 {
+        cursor += 4; // Skip max_bytes (v3+)
+    }
+    if header.api_version >= 4 {
+        cursor += 1; // Skip isolation_level (v4+)
+    }
+    if header.api_version >= 7 {
+        cursor += 4; // Skip session_id (v7+)
+        cursor += 4; // Skip session_epoch (v7+)
+    }
+    
+    // Parse topics array
+    let mut topic_name = String::from("unknown");
+    if data.len() > cursor + 4 {
+        let topic_count = i32::from_be_bytes([data[cursor], data[cursor+1], data[cursor+2], data[cursor+3]]);
+        cursor += 4;
+        
+        if topic_count > 0 && data.len() > cursor + 2 {
+            let name_len = i16::from_be_bytes([data[cursor], data[cursor + 1]]);
+            cursor += 2;
+            if name_len > 0 && data.len() >= cursor + name_len as usize {
+                topic_name = String::from_utf8_lossy(&data[cursor..cursor + name_len as usize]).to_string();
+            }
+        }
+    }
+    
+    info!("Fetch request for topic: {}", topic_name);
+    
+    // Get topics from storage
+    let storage = storage.read().await;
+    let topics = storage.list_topics().await;
+    
+    // Response topics array
+    if topics.is_empty() || !topics.contains(&topic_name) {
+        response.extend_from_slice(&0i32.to_be_bytes()); // 0 topics
+    } else {
+        response.extend_from_slice(&1i32.to_be_bytes()); // 1 topic
+        
+        // Topic name
+        response.extend_from_slice(&(topic_name.len() as i16).to_be_bytes());
+        response.extend_from_slice(topic_name.as_bytes());
+        
+        // Partitions array
+        response.extend_from_slice(&1i32.to_be_bytes()); // 1 partition
+        
+        // Partition 0
+        response.extend_from_slice(&0i32.to_be_bytes()); // partition ID
+        response.extend_from_slice(&0i16.to_be_bytes()); // error code
+        response.extend_from_slice(&0i64.to_be_bytes()); // high water mark
+        response.extend_from_slice(&0i64.to_be_bytes()); // last stable offset (v4+)
+        
+        if header.api_version >= 5 {
+            response.extend_from_slice(&0i64.to_be_bytes()); // log start offset
+        }
+        
+        // Aborted transactions (v4+)
+        if header.api_version >= 4 {
+            response.extend_from_slice(&0i32.to_be_bytes()); // 0 aborted transactions
+        }
+        
+        // Records - empty for now
+        response.extend_from_slice(&0i32.to_be_bytes()); // 0 bytes of records
+    }
     
     // Update size
     let size = (response.len() - 4) as i32;
