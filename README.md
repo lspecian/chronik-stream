@@ -1,33 +1,10 @@
-# Chronik Stream
+# Chronik Stream v1.0.0
 
-> ⚠️ **EXPERIMENTAL SOFTWARE - EARLY ALPHA VERSION** ⚠️
-> 
-> **This is the very first version (v0.1.0-alpha) of Chronik Stream, an experimental distributed streaming platform.**
-> 
-> **IMPORTANT DISCLAIMERS:**
-> - This software is in early development and should **NOT** be used in production environments
-> - APIs, protocols, and storage formats may change without notice
-> - Data loss, corruption, or service interruptions may occur
-> - Security features are incomplete and not suitable for sensitive data
-> - Performance optimizations are ongoing and current benchmarks are not representative
-> - Documentation may be incomplete or outdated
-> 
-> **This project is intended for:**
-> - Testing and experimentation
-> - Development and proof-of-concept work
-> - Contributing to the open-source community
-> - Learning about distributed systems
-> 
-> **By using this software, you acknowledge that:**
-> - You understand the experimental nature and associated risks
-> - You will not use it for production workloads or critical data
-> - The authors and contributors are not liable for any issues arising from its use
-> 
-> For production streaming needs, please use established solutions like Apache Kafka, Redpanda, or AWS Kinesis.
+[![Build Status](https://github.com/chronik-stream/chronik-stream/workflows/CI/badge.svg)](https://github.com/chronik-stream/chronik-stream/actions)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org)
 
----
-
-A high-performance, Kafka-compatible distributed streaming platform with built-in search capabilities and real-time analytics.
+A high-performance, Kafka-compatible distributed streaming platform built in Rust with operational excellence.
 
 ## Features
 

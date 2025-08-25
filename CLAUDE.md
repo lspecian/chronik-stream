@@ -415,3 +415,29 @@ These commands make AI calls and may take up to a minute:
 ---
 
 _This guide ensures Claude Code has immediate access to Task Master's essential functionality for agentic development workflows._
+
+
+# Work Ethic and Quality Standards
+
+## Core Principles
+1. **NO SHORTCUTS** - Always implement proper, production-ready solutions
+2. **CLEAN CODE** - Maintain a clean, organized codebase without experimental debris
+3. **OPERATIONAL EXCELLENCE** - Focus on reliability, performance, and maintainability
+4. **COMPLETE SOLUTIONS** - Finish what you start, test thoroughly, document properly
+5. **ARCHITECTURAL INTEGRITY** - One implementation, not multiple partial ones
+6. **PROFESSIONAL STANDARDS** - Write code as if it is going to production tomorrow
+
+## Development Process
+1. **Understand First** - Fully evaluate existing code before making changes
+2. **Plan Properly** - Create comprehensive plans, not quick fixes
+3. **Implement Correctly** - Use the right approach, even if it takes longer
+4. **Test Thoroughly** - Verify all functionality with real clients
+5. **Clean As You Go** - Do not leave experimental files or dead code
+6. **Document Decisions** - Explain architectural choices and trade-offs
+
+## Quality Metrics
+- Code should be production-ready on first implementation
+- All features must be tested with real Kafka clients
+- Error handling must be comprehensive
+- Performance should be considered in every decision
+- Security and reliability are non-negotiable

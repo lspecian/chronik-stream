@@ -6,6 +6,10 @@ authors.workspace = true
 license.workspace = true
 description = "All-in-one Chronik Stream server - single binary for easy deployment"
 
+[lib]
+name = "chronik_all_in_one"
+path = "src/lib.rs"
+
 [[bin]]
 name = "chronik"
 path = "src/main.rs"
@@ -15,6 +19,8 @@ path = "src/main.rs"
 chronik-common = { path = "../chronik-common" }
 chronik-protocol = { path = "../chronik-protocol" }
 chronik-storage = { path = "../chronik-storage" }
+chronik-ingest = { path = "../chronik-ingest" }
+chronik-search = { path = "../chronik-search" }
 
 # Async runtime
 tokio = { workspace = true, features = ["full"] }

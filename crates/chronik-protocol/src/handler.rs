@@ -255,6 +255,104 @@ impl ProtocolHandler {
         Ok(LeaveGroupRequest { group_id, members })
     }
     
+    /// Parse OffsetCommit request
+    pub fn parse_offset_commit_request(&self, header: &RequestHeader, body: &mut Bytes) -> Result<crate::types::OffsetCommitRequest> {
+        use crate::parser::Decoder;
+        use crate::types::{OffsetCommitRequest, OffsetCommitTopic, OffsetCommitPartition};
+        
+        let mut decoder = Decoder::new(body);
+        
+        let group_id = decoder.read_string()?
+            .ok_or_else(|| Error::Protocol("Group ID cannot be null".into()))?;
+        
+        let generation_id = decoder.read_i32()?;
+        let member_id = decoder.read_string()?
+            .ok_or_else(|| Error::Protocol("Member ID cannot be null".into()))?;
+        
+        // V2+ has retention_time field
+        if header.api_version >= 2 && header.api_version <= 4 {
+            let _retention_time = decoder.read_i64()?; // We ignore this for now
+        }
+        
+        // Read topics array
+        let topic_count = decoder.read_i32()?;
+        if topic_count < 0 || topic_count > 10000 {
+            return Err(Error::Protocol(format!("Invalid topic count: {}", topic_count)));
+        }
+        let mut topics = Vec::with_capacity(topic_count as usize);
+        
+        for _ in 0..topic_count {
+            let topic_name = decoder.read_string()?
+                .ok_or_else(|| Error::Protocol("Topic name cannot be null".into()))?;
+            
+            let partition_count = decoder.read_i32()?;
+            if partition_count < 0 || partition_count > 10000 {
+                return Err(Error::Protocol(format!("Invalid partition count: {}", partition_count)));
+            }
+            let mut partitions = Vec::with_capacity(partition_count as usize);
+            
+            for _ in 0..partition_count {
+                let partition_index = decoder.read_i32()?;
+                let committed_offset = decoder.read_i64()?;
+                let committed_metadata = decoder.read_string()?;
+                
+                partitions.push(OffsetCommitPartition {
+                    partition_index,
+                    committed_offset,
+                    committed_metadata,
+                });
+            }
+            
+            topics.push(OffsetCommitTopic {
+                name: topic_name,
+                partitions,
+            });
+        }
+        
+        Ok(OffsetCommitRequest {
+            group_id,
+            generation_id,
+            member_id,
+            topics,
+        })
+    }
+    
+    /// Parse OffsetFetch request
+    pub fn parse_offset_fetch_request(&self, header: &RequestHeader, body: &mut Bytes) -> Result<crate::types::OffsetFetchRequest> {
+        use crate::parser::Decoder;
+        use crate::types::OffsetFetchRequest;
+        
+        let mut decoder = Decoder::new(body);
+        
+        let group_id = decoder.read_string()?
+            .ok_or_else(|| Error::Protocol("Group ID cannot be null".into()))?;
+        
+        // Read topics array (null means all topics)
+        let topics = if header.api_version >= 1 {
+            let topic_count = decoder.read_i32()?;
+            if topic_count < 0 {
+                // Null array means fetch all topics
+                None
+            } else {
+                let mut topics = Vec::with_capacity(topic_count as usize);
+                for _ in 0..topic_count {
+                    let topic_name = decoder.read_string()?
+                        .ok_or_else(|| Error::Protocol("Topic name cannot be null".into()))?;
+                    topics.push(topic_name);
+                }
+                Some(topics)
+            }
+        } else {
+            // V0 doesn't have topics array, fetches all
+            None
+        };
+        
+        Ok(OffsetFetchRequest {
+            group_id,
+            topics,
+        })
+    }
+    
     // Public encode methods for use by KafkaProtocolHandler
     
     /// Encode FindCoordinator response
@@ -366,6 +464,56 @@ impl ProtocolHandler {
         Ok(())
     }
     
+    /// Encode OffsetCommit response
+    pub fn encode_offset_commit_response(&self, buf: &mut BytesMut, response: &crate::types::OffsetCommitResponse, version: i16) -> Result<()> {
+        let mut encoder = Encoder::new(buf);
+        
+        if version >= 3 {
+            encoder.write_i32(response.throttle_time_ms);
+        }
+        
+        encoder.write_i32(response.topics.len() as i32);
+        for topic in &response.topics {
+            encoder.write_string(Some(&topic.name));
+            
+            encoder.write_i32(topic.partitions.len() as i32);
+            for partition in &topic.partitions {
+                encoder.write_i32(partition.partition_index);
+                encoder.write_i16(partition.error_code);
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Encode OffsetFetch response
+    pub fn encode_offset_fetch_response(&self, buf: &mut BytesMut, response: &crate::types::OffsetFetchResponse, version: i16) -> Result<()> {
+        let mut encoder = Encoder::new(buf);
+        
+        if version >= 3 {
+            encoder.write_i32(response.throttle_time_ms);
+        }
+        
+        encoder.write_i32(response.topics.len() as i32);
+        for topic in &response.topics {
+            encoder.write_string(Some(&topic.name));
+            
+            encoder.write_i32(topic.partitions.len() as i32);
+            for partition in &topic.partitions {
+                encoder.write_i32(partition.partition_index);
+                encoder.write_i64(partition.committed_offset);
+                encoder.write_string(partition.metadata.as_deref());
+                encoder.write_i16(partition.error_code);
+            }
+        }
+        
+        if version >= 2 {
+            encoder.write_i16(0); // error_code at response level
+        }
+        
+        Ok(())
+    }
+    
     /// Parse Fetch request
     pub fn parse_fetch_request(&self, header: &RequestHeader, body: &mut Bytes) -> Result<crate::types::FetchRequest> {
         use crate::parser::Decoder;
@@ -472,34 +620,49 @@ impl ProtocolHandler {
     
     /// Encode Fetch response
     pub fn encode_fetch_response(&self, buf: &mut BytesMut, response: &crate::types::FetchResponse, version: i16) -> Result<()> {
+        let initial_len = buf.len();
         let mut encoder = Encoder::new(buf);
+        
+        tracing::debug!("Encoding Fetch response v{}", version);
         
         if version >= 1 {
             encoder.write_i32(response.throttle_time_ms);
+            tracing::trace!("  throttle_time_ms: {}", response.throttle_time_ms);
         }
         
         if version >= 7 {
             encoder.write_i16(0); // error_code
             encoder.write_i32(0); // session_id
+            tracing::trace!("  error_code: 0, session_id: 0");
         }
         
         // Topics array
         encoder.write_i32(response.topics.len() as i32);
+        tracing::debug!("  Topics count: {}", response.topics.len());
+        
         for topic in &response.topics {
             encoder.write_string(Some(&topic.name));
+            tracing::trace!("    Topic: {}", topic.name);
             
             // Partitions array
             encoder.write_i32(topic.partitions.len() as i32);
+            tracing::trace!("    Partitions count: {}", topic.partitions.len());
+            
             for partition in &topic.partitions {
                 encoder.write_i32(partition.partition);
                 encoder.write_i16(partition.error_code);
                 encoder.write_i64(partition.high_watermark);
+                
+                tracing::trace!("      Partition {}: error={}, hw={}", 
+                    partition.partition, partition.error_code, partition.high_watermark);
                 
                 if version >= 4 {
                     encoder.write_i64(partition.last_stable_offset);
                     
                     if version >= 5 {
                         encoder.write_i64(partition.log_start_offset);
+                        tracing::trace!("        lso={}, log_start={}", 
+                            partition.last_stable_offset, partition.log_start_offset);
                     }
                     
                     // Aborted transactions (empty for now)
@@ -508,16 +671,27 @@ impl ProtocolHandler {
                 
                 if version >= 11 {
                     encoder.write_i32(partition.preferred_read_replica);
+                    tracing::trace!("        preferred_read_replica={}", partition.preferred_read_replica);
                 }
                 
                 // Records
-                encoder.write_bytes(if partition.records.is_empty() {
-                    None
+                let records_len = if partition.records.is_empty() {
+                    tracing::trace!("        Records: NULL");
+                    encoder.write_bytes(None);
+                    0
                 } else {
-                    Some(&partition.records)
-                });
+                    let len = partition.records.len();
+                    tracing::debug!("        Records: {} bytes", len);
+                    tracing::trace!("        Records data (first 32 bytes): {:?}", 
+                        &partition.records[..std::cmp::min(32, len)]);
+                    encoder.write_bytes(Some(&partition.records));
+                    len
+                };
             }
         }
+        
+        let total_encoded = buf.len() - initial_len;
+        tracing::info!("Encoded Fetch response: {} bytes total", total_encoded);
         
         Ok(())
     }
@@ -1071,12 +1245,20 @@ impl ProtocolHandler {
             topics: response_topics,
         };
         
+        tracing::info!("Building Fetch response with correlation_id={}, {} topics", 
+            header.correlation_id, response.topics.len());
+        
         let mut body_buf = BytesMut::new();
         self.encode_fetch_response(&mut body_buf, &response, header.api_version)?;
         
+        let body_bytes = body_buf.freeze();
+        tracing::info!("Fetch response body encoded: {} bytes", body_bytes.len());
+        tracing::trace!("Response body (first 64 bytes): {:?}", 
+            &body_bytes[..std::cmp::min(64, body_bytes.len())]);
+        
         Ok(Response {
             header: ResponseHeader { correlation_id: header.correlation_id },
-            body: body_buf.freeze(),
+            body: body_bytes,
         })
     }
     

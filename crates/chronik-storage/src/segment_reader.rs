@@ -162,9 +162,9 @@ impl SegmentReader {
         start_offset: i64,
         max_bytes: i32,
     ) -> Result<Vec<Record>> {
-        // Decode Kafka data from segment
+        // Decode indexed records from segment  
         let mut records = Vec::new();
-        let mut buf = std::io::Cursor::new(&segment.kafka_data[..]);
+        let mut buf = std::io::Cursor::new(&segment.indexed_records[..]);
         
         // Simple decoding - read record count first
         if buf.remaining() < 4 {

@@ -3,7 +3,7 @@
 use chronik_common::{Result, Error};
 use chronik_common::metadata::traits::MetadataStore;
 use chronik_protocol::{FetchRequest, FetchResponse, FetchResponseTopic, FetchResponsePartition};
-use chronik_storage::{SegmentReader, RecordBatch};
+use chronik_storage::{SegmentReader, RecordBatch, Segment, ObjectStoreTrait};
 use chronik_storage::kafka_records::{KafkaRecordBatch, KafkaRecord, RecordHeader as KafkaRecordHeader, CompressionType};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -41,6 +41,7 @@ struct SegmentInfo {
 pub struct FetchHandler {
     segment_reader: Arc<SegmentReader>,
     metadata_store: Arc<dyn MetadataStore>,
+    object_store: Arc<dyn ObjectStoreTrait>,
     state: Arc<RwLock<FetchState>>,
 }
 
@@ -49,10 +50,12 @@ impl FetchHandler {
     pub fn new(
         segment_reader: Arc<SegmentReader>,
         metadata_store: Arc<dyn MetadataStore>,
+        object_store: Arc<dyn ObjectStoreTrait>,
     ) -> Self {
         Self {
             segment_reader,
             metadata_store,
+            object_store,
             state: Arc::new(RwLock::new(FetchState {
                 buffers: HashMap::new(),
                 segment_cache: HashMap::new(),
@@ -140,6 +143,12 @@ impl FetchHandler {
         
         // Get partition segments to determine watermarks
         let segments = self.metadata_store.list_segments(topic, Some(partition as u32)).await?;
+        
+        tracing::info!("Found {} segments for {}-{}", segments.len(), topic, partition);
+        for seg in &segments {
+            tracing::info!("  Segment: {} offsets {}-{} path: {}", 
+                seg.segment_id, seg.start_offset, seg.end_offset, seg.path);
+        }
         
         // Calculate high watermark from segments
         let high_watermark = segments.iter()
@@ -283,13 +292,16 @@ impl FetchHandler {
         }).await;
         
         let records = match fetch_result {
-            Ok(Ok(recs)) => recs,
+            Ok(Ok(recs)) => {
+                tracing::info!("Fetched {} records from {}-{}", recs.len(), topic, partition);
+                recs
+            },
             Ok(Err(e)) => {
-                debug!("Error fetching records: {:?}", e);
+                tracing::warn!("Error fetching records from {}-{}: {:?}", topic, partition, e);
                 vec![]
             }
             Err(_) => {
-                debug!("Fetch timeout after {}ms", max_wait_ms);
+                tracing::warn!("Fetch timeout after {}ms for {}-{}", max_wait_ms, topic, partition);
                 vec![]
             }
         };
@@ -308,11 +320,23 @@ impl FetchHandler {
             records
         };
         
-        // Encode records in Kafka format
+        // For better compatibility, try to fetch raw Kafka batches from segments
+        // This preserves the original CRC values
         let records_bytes = if final_records.is_empty() {
             vec![]
         } else {
-            self.encode_kafka_records(&final_records, 0)? // TODO: Get actual leader epoch
+            // Try to get raw batch data if we're fetching from segments
+            match self.try_fetch_raw_batches(topic, partition, fetch_offset, high_watermark).await {
+                Ok(raw_bytes) if !raw_bytes.is_empty() => {
+                    tracing::info!("Using raw Kafka batch data ({} bytes) for CRC compatibility", raw_bytes.len());
+                    raw_bytes
+                }
+                _ => {
+                    // Fallback to re-encoding (may cause CRC issues)
+                    tracing::warn!("Re-encoding records - may cause CRC validation issues");
+                    self.encode_kafka_records(&final_records, 0)?
+                }
+            }
         };
         
         Ok(FetchResponsePartition {
@@ -460,15 +484,131 @@ impl FetchHandler {
         end_offset: i64,
         max_bytes: i32,
     ) -> Result<Vec<chronik_storage::Record>> {
-        // Use segment reader to fetch data
-        let fetch_result = self.segment_reader.fetch_from_segment(
-            &segment_info.object_key,
-            start_offset,
-            end_offset,
-            max_bytes,
-        ).await?;
+        tracing::info!("Fetching from segment {} (offsets {}-{}) with key: {}", 
+            segment_info.segment_id, start_offset, end_offset, segment_info.object_key);
         
-        Ok(fetch_result.records)
+        // Read segment from storage using the correct Segment format (CHRN magic bytes)
+        let segment_data = self.object_store.get(&segment_info.object_key).await?;
+        
+        // Parse using the Segment format - this is what SegmentWriter creates
+        let segment = Segment::deserialize(segment_data)?;
+        
+        tracing::info!("Successfully parsed segment v{} with {} records, raw_kafka: {} bytes, indexed: {} bytes", 
+            segment.header.version,
+            segment.metadata.record_count, 
+            segment.raw_kafka_batches.len(),
+            segment.indexed_records.len());
+        
+        // Use indexed records for individual record access
+        // The indexed_records contains the encoded RecordBatch
+        if segment.indexed_records.is_empty() {
+            return Ok(vec![]);
+        }
+        
+        // Decode the RecordBatch from indexed_records
+        let record_batch = RecordBatch::decode(&segment.indexed_records)?;
+        
+        // Filter records by offset range
+        let mut filtered_records = Vec::new();
+        let mut bytes_fetched = 0;
+        
+        for record in record_batch.records {
+            if record.offset >= start_offset && record.offset < end_offset {
+                let record_size = record.value.len() + 
+                    record.key.as_ref().map(|k| k.len()).unwrap_or(0) + 24;
+                
+                if bytes_fetched + record_size > max_bytes as usize && !filtered_records.is_empty() {
+                    break;
+                }
+                
+                filtered_records.push(record);
+                bytes_fetched += record_size;
+            }
+        }
+        
+        tracing::info!("Returning {} records after filtering for offset range {}-{}", 
+            filtered_records.len(), start_offset, end_offset);
+        
+        Ok(filtered_records)
+    }
+    
+    /// Fetch raw Kafka batch data from a segment (for compatibility)
+    async fn fetch_raw_kafka_batch(
+        &self,
+        segment_info: &SegmentInfo,
+        start_offset: i64,
+        end_offset: i64,
+    ) -> Result<Vec<u8>> {
+        tracing::info!("Fetching raw Kafka batch from segment {} (offsets {}-{})", 
+            segment_info.segment_id, start_offset, end_offset);
+        
+        // Read segment from storage
+        let segment_data = self.object_store.get(&segment_info.object_key).await?;
+        
+        // Parse using the Segment format
+        let segment = Segment::deserialize(segment_data)?;
+        
+        tracing::info!("Segment v{}: raw_kafka_batches={} bytes, indexed_records={} bytes",
+            segment.header.version, segment.raw_kafka_batches.len(), segment.indexed_records.len());
+        
+        // Check if this is a v2 segment with raw Kafka batches
+        if segment.header.version >= 2 && !segment.raw_kafka_batches.is_empty() {
+            // Return the raw Kafka batch data which preserves the original wire format
+            Ok(segment.raw_kafka_batches.to_vec())
+        } else {
+            // For v1 segments, we don't have raw Kafka batches
+            // Return empty to indicate we need to re-encode
+            Ok(vec![])
+        }
+    }
+    
+    /// Try to fetch raw Kafka batches for a range (for CRC compatibility)
+    async fn try_fetch_raw_batches(
+        &self,
+        topic: &str,
+        partition: i32,
+        start_offset: i64,
+        end_offset: i64,
+    ) -> Result<Vec<u8>> {
+        // Get segments for this range
+        let segments = self.get_segments_for_range(topic, partition, start_offset, end_offset).await?;
+        
+        if segments.is_empty() {
+            return Ok(vec![]);
+        }
+        
+        // Concatenate raw Kafka batches from all segments in the range
+        let mut combined_bytes = Vec::new();
+        let num_segments = segments.len();
+        
+        for segment in segments {
+            tracing::info!("Fetching raw Kafka batch from segment {} (offsets {}-{})", 
+                segment.segment_id, segment.base_offset, segment.last_offset);
+            
+            // Fetch raw batch for this segment
+            match self.fetch_raw_kafka_batch(&segment, 
+                start_offset.max(segment.base_offset), 
+                end_offset.min(segment.last_offset + 1)).await {
+                Ok(raw_bytes) if !raw_bytes.is_empty() => {
+                    tracing::info!("Got {} bytes of raw Kafka data from segment {}", 
+                        raw_bytes.len(), segment.segment_id);
+                    combined_bytes.extend_from_slice(&raw_bytes);
+                }
+                Ok(_) => {
+                    tracing::warn!("No raw Kafka data in segment {} (may be v1 segment)", segment.segment_id);
+                    // If any segment doesn't have raw data, we can't preserve CRCs
+                    return Ok(vec![]);
+                }
+                Err(e) => {
+                    tracing::error!("Error fetching raw batch from segment {}: {:?}", segment.segment_id, e);
+                    return Ok(vec![]);
+                }
+            }
+        }
+        
+        tracing::info!("Combined {} bytes of raw Kafka data from {} segments", 
+            combined_bytes.len(), num_segments);
+        Ok(combined_bytes)
     }
     
     /// Update in-memory buffer with new records

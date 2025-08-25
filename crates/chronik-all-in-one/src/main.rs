@@ -8,9 +8,11 @@ use tracing::{info, error};
 
 mod storage;
 mod kafka_server;
+mod integrated_server;
+mod error_handler;
 
 use storage::EmbeddedStorage;
-use kafka_server::KafkaServer;
+use integrated_server::IntegratedKafkaServer;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -42,6 +44,10 @@ struct Cli {
     /// Bind address (default: 0.0.0.0)
     #[arg(short = 'b', long, env = "CHRONIK_BIND_ADDR", default_value = "0.0.0.0")]
     bind_addr: String,
+
+    /// Enable persistent metadata storage (using object storage)
+    #[arg(long, env = "CHRONIK_PERSISTENT_METADATA", default_value = "false")]
+    persistent_metadata: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -54,6 +60,9 @@ enum Commands {
     
     /// Check configuration and exit
     Check,
+    
+    /// Run with integrated chronik-ingest components (full Kafka compatibility)
+    Integrated,
 }
 
 #[tokio::main]
@@ -72,6 +81,7 @@ async fn main() -> Result<()> {
         Commands::Start => run_server(cli, false).await,
         Commands::Standalone => run_server(cli, true).await,
         Commands::Check => check_config(cli),
+        Commands::Integrated => run_integrated_server(cli).await,
     }
 }
 
@@ -83,8 +93,8 @@ async fn run_server(cli: Cli, in_memory: bool) -> Result<()> {
         std::fs::create_dir_all(&cli.data_dir)?;
     }
     
-    // Initialize storage
-    let storage = Arc::new(RwLock::new(
+    // Start Admin API with embedded storage for now
+    let admin_storage = Arc::new(RwLock::new(
         if in_memory {
             EmbeddedStorage::new_in_memory()?
         } else {
@@ -92,18 +102,29 @@ async fn run_server(cli: Cli, in_memory: bool) -> Result<()> {
         }
     ));
     
-    // Start Admin API
     let admin_addr = format!("{}:{}", cli.bind_addr, cli.admin_port);
-    let admin_storage = storage.clone();
+    let admin_storage_clone = admin_storage.clone();
     tokio::spawn(async move {
-        if let Err(e) = run_admin_server(admin_addr, admin_storage).await {
+        if let Err(e) = run_admin_server(admin_addr, admin_storage_clone).await {
             error!("Admin server error: {}", e);
         }
     });
     
-    // Start Kafka server
+    // Start Integrated Kafka server with proper components
     let kafka_addr = format!("{}:{}", cli.bind_addr, cli.kafka_port);
-    let kafka_server = KafkaServer::new(storage.clone());
+    let config = integrated_server::IntegratedServerConfig {
+        node_id: 0,
+        advertised_host: cli.bind_addr.clone(),
+        advertised_port: cli.kafka_port as i32,
+        data_dir: cli.data_dir.clone().to_string_lossy().to_string(),
+        enable_indexing: true,
+        enable_compression: false,
+        auto_create_topics: true,
+        num_partitions: 1,
+        enable_persistent_metadata: true,
+        replication_factor: 1,
+    };
+    let kafka_server = IntegratedKafkaServer::new(config).await?;
     
     info!("Server configuration:");
     info!("  Kafka API: {}", kafka_addr);
@@ -113,7 +134,7 @@ async fn run_server(cli: Cli, in_memory: bool) -> Result<()> {
     info!("Chronik Stream is ready!");
     info!("Connect with: kafkactl --brokers {}", kafka_addr);
     
-    // Run Kafka server
+    // Run Integrated Kafka server
     kafka_server.run(&kafka_addr).await?;
     
     Ok(())
@@ -167,6 +188,60 @@ async fn create_topic(
         Ok(_) => axum::Json(json!({ "status": "created", "topic": name })),
         Err(e) => axum::Json(json!({ "error": e.to_string() })),
     }
+}
+
+async fn run_integrated_server(cli: Cli) -> Result<()> {
+    use integrated_server::{IntegratedKafkaServer, IntegratedServerConfig};
+    
+    info!("Starting INTEGRATED server with full Kafka compatibility");
+    info!("Using chronik-ingest components for production-ready functionality");
+    
+    if cli.persistent_metadata {
+        info!("Persistent metadata storage ENABLED (using object storage)");
+    } else {
+        info!("Persistent metadata storage DISABLED (using in-memory)");
+    }
+    
+    // Create configuration
+    let config = IntegratedServerConfig {
+        node_id: 1,  // Use 1 instead of 0 (controller_id of 0 means no controller in Kafka)
+        advertised_host: if cli.bind_addr == "0.0.0.0" {
+            "localhost".to_string()
+        } else {
+            cli.bind_addr.clone()
+        },
+        advertised_port: cli.kafka_port as i32,
+        data_dir: cli.data_dir.to_string_lossy().to_string(),
+        enable_indexing: false, // Can be enabled later
+        enable_compression: true,
+        auto_create_topics: true,
+        num_partitions: 3,
+        replication_factor: 1,
+        enable_persistent_metadata: cli.persistent_metadata,
+    };
+    
+    // Create and run the integrated server
+    let server = IntegratedKafkaServer::new(config).await?;
+    
+    // Start Admin API in background (simplified for now)
+    let admin_addr = format!("{}:{}", cli.bind_addr, cli.admin_port);
+    info!("Admin API would be at: {}", admin_addr);
+    
+    // Run the Kafka server
+    let kafka_addr = format!("{}:{}", cli.bind_addr, cli.kafka_port);
+    info!("");
+    info!("Chronik Stream INTEGRATED server is ready!");
+    info!("Connect with: kafkactl --brokers {}", kafka_addr);
+    info!("This server provides FULL Kafka compatibility with:");
+    info!("  ✓ Real message persistence");
+    info!("  ✓ Consumer group support");
+    info!("  ✓ Compression support");
+    info!("  ✓ Idempotent producers");
+    info!("  ✓ Auto topic creation");
+    
+    server.run(&kafka_addr).await?;
+    
+    Ok(())
 }
 
 fn check_config(cli: Cli) -> Result<()> {

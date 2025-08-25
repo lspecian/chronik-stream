@@ -253,6 +253,7 @@ impl IngestServer {
                 produce_handler,
                 segment_reader,
                 metadata_store.clone(),
+                storage_service.object_store(),
                 1, // node_id
                 config.listen_addr.ip().to_string(),
                 config.listen_addr.port() as i32,

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use chronik_common::{Result, Error};
 use chronik_common::metadata::traits::MetadataStore;
 use chronik_protocol::{ProtocolHandler, handler::Response, parser::{parse_request_header, parse_request_header_with_correlation, ApiKey, write_response_header, ResponseHeader}, error_codes};
-use chronik_storage::SegmentReader;
+use chronik_storage::{SegmentReader, ObjectStoreTrait};
 use crate::produce_handler::ProduceHandler;
 use crate::consumer_group::GroupManager;
 use crate::fetch_handler::FetchHandler;
@@ -43,6 +43,7 @@ impl KafkaProtocolHandler {
         produce_handler: Arc<ProduceHandler>,
         segment_reader: Arc<SegmentReader>,
         metadata_store: Arc<dyn MetadataStore>,
+        object_store: Arc<dyn ObjectStoreTrait>,
         node_id: i32,
         host: String,
         port: i32,
@@ -53,13 +54,14 @@ impl KafkaProtocolHandler {
         let fetch_handler = Arc::new(FetchHandler::new(
             segment_reader.clone(),
             metadata_store.clone(),
+            object_store,
         ));
         
         // Note: The produce handler and fetch handler are connected via shared state.
         // The produce handler will update the fetch handler's buffer after writing records.
         
         Ok(Self {
-            protocol_handler: ProtocolHandler::with_metadata_store(metadata_store.clone()),
+            protocol_handler: ProtocolHandler::with_metadata_and_broker(metadata_store.clone(), node_id),
             produce_handler,
             segment_reader,
             metadata_store,
@@ -87,9 +89,11 @@ impl KafkaProtocolHandler {
         
         // Parse the request header to determine which API is being called
         let mut buf = Bytes::copy_from_slice(request_bytes);
+        tracing::debug!("Request bytes (first 20): {:?}", &request_bytes[..request_bytes.len().min(20)]);
         let (header, correlation_id) = match parse_request_header_with_correlation(&mut buf) {
             Ok((h, _)) => {
                 let correlation_id = h.correlation_id;
+                tracing::debug!("Parsed header: api_key={:?}, api_version={}, correlation_id={}", h.api_key, h.api_version, correlation_id);
                 (Some(h), correlation_id)
             }
             Err(Error::ProtocolWithCorrelation { correlation_id, message }) => {
@@ -147,9 +151,19 @@ impl KafkaProtocolHandler {
                 // Call the actual fetch handler
                 let response = self.fetch_handler.handle_fetch(request, header.correlation_id).await?;
                 
+                tracing::info!("Fetch handler returned response with {} topics", response.topics.len());
+                for topic in &response.topics {
+                    for partition in &topic.partitions {
+                        tracing::info!("  Topic {} partition {}: {} bytes of records", 
+                            topic.name, partition.partition, partition.records.len());
+                    }
+                }
+                
                 // Encode the response
                 let mut body_buf = BytesMut::new();
+                tracing::info!("About to encode Fetch response");
                 self.protocol_handler.encode_fetch_response(&mut body_buf, &response, header.api_version)?;
+                tracing::info!("Encoded Fetch response: {} bytes", body_buf.len());
                 
                 Ok(Response {
                     header: ResponseHeader { correlation_id: header.correlation_id },
@@ -239,6 +253,38 @@ impl KafkaProtocolHandler {
             ApiKey::ListGroups => {
                 // We just implemented this, so it should work
                 self.protocol_handler.handle_request(request_bytes).await
+            }
+            ApiKey::OffsetCommit => {
+                // Parse the OffsetCommit request
+                let request = self.protocol_handler.parse_offset_commit_request(&header, &mut buf)?;
+                
+                // Handle offset commit
+                let response = self.handle_offset_commit(request).await?;
+                
+                // Encode the response
+                let mut body_buf = BytesMut::new();
+                self.protocol_handler.encode_offset_commit_response(&mut body_buf, &response, header.api_version)?;
+                
+                Ok(Response {
+                    header: ResponseHeader { correlation_id: header.correlation_id },
+                    body: body_buf.freeze(),
+                })
+            }
+            ApiKey::OffsetFetch => {
+                // Parse the OffsetFetch request
+                let request = self.protocol_handler.parse_offset_fetch_request(&header, &mut buf)?;
+                
+                // Handle offset fetch
+                let response = self.handle_offset_fetch(request).await?;
+                
+                // Encode the response
+                let mut body_buf = BytesMut::new();
+                self.protocol_handler.encode_offset_fetch_response(&mut body_buf, &response, header.api_version)?;
+                
+                Ok(Response {
+                    header: ResponseHeader { correlation_id: header.correlation_id },
+                    body: body_buf.freeze(),
+                })
             }
             _ => {
                 // For all other APIs, use the protocol handler
@@ -388,6 +434,119 @@ impl KafkaProtocolHandler {
             throttle_time_ms: 0,
             error_code: 0,
             members: member_responses,
+        })
+    }
+    
+    /// Handle OffsetCommit request
+    async fn handle_offset_commit(&self, request: chronik_protocol::types::OffsetCommitRequest) -> Result<chronik_protocol::types::OffsetCommitResponse> {
+        use chronik_protocol::types::{OffsetCommitResponse, OffsetCommitResponseTopic, OffsetCommitResponsePartition};
+        use chronik_protocol::ResponseHeader;
+        use chronik_common::metadata::ConsumerOffset;
+        
+        let mut response_topics = Vec::new();
+        
+        for topic in request.topics {
+            let mut response_partitions = Vec::new();
+            
+            for partition in topic.partitions {
+                // Store the offset in metadata
+                let offset = ConsumerOffset {
+                    group_id: request.group_id.clone(),
+                    topic: topic.name.clone(),
+                    partition: partition.partition_index as u32,
+                    offset: partition.committed_offset,
+                    metadata: partition.committed_metadata,
+                    commit_timestamp: chrono::Utc::now(),
+                };
+                
+                match self.metadata_store.commit_offset(offset).await {
+                    Ok(_) => {
+                        response_partitions.push(OffsetCommitResponsePartition {
+                            partition_index: partition.partition_index,
+                            error_code: 0,
+                        });
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to commit offset: {:?}", e);
+                        response_partitions.push(OffsetCommitResponsePartition {
+                            partition_index: partition.partition_index,
+                            error_code: 5, // UNKNOWN_TOPIC_OR_PARTITION
+                        });
+                    }
+                }
+            }
+            
+            response_topics.push(OffsetCommitResponseTopic {
+                name: topic.name,
+                partitions: response_partitions,
+            });
+        }
+        
+        Ok(OffsetCommitResponse {
+            header: ResponseHeader {
+                correlation_id: 0, // Will be set by the caller
+            },
+            throttle_time_ms: 0,
+            topics: response_topics,
+        })
+    }
+    
+    /// Handle OffsetFetch request
+    async fn handle_offset_fetch(&self, request: chronik_protocol::types::OffsetFetchRequest) -> Result<chronik_protocol::types::OffsetFetchResponse> {
+        use chronik_protocol::types::{OffsetFetchResponse, OffsetFetchResponseTopic, OffsetFetchResponsePartition};
+        use chronik_protocol::ResponseHeader;
+        
+        let mut response_topics = Vec::new();
+        
+        // If topics is None or empty, fetch all topics for this group
+        let topics_to_fetch = if let Some(topics) = request.topics {
+            topics
+        } else {
+            // For now, return empty if no specific topics requested
+            // In a full implementation, we'd query all topics with offsets for this group
+            vec![]
+        };
+        
+        for topic_name in topics_to_fetch {
+            let mut response_partitions = Vec::new();
+            
+            // For now, check partitions 0-9 (in production, we'd know the actual partition count)
+            for partition_index in 0..10 {
+                match self.metadata_store.get_consumer_offset(&request.group_id, &topic_name, partition_index).await {
+                    Ok(Some(offset)) => {
+                        response_partitions.push(OffsetFetchResponsePartition {
+                            partition_index: partition_index as i32,
+                            committed_offset: offset.offset,
+                            metadata: offset.metadata,
+                            error_code: 0,
+                        });
+                    }
+                    Ok(None) => {
+                        // No offset found for this partition - skip it
+                        continue;
+                    }
+                    Err(_) => {
+                        // Error fetching - skip this partition
+                        continue;
+                    }
+                }
+            }
+            
+            // Only add topic if we found at least one partition with an offset
+            if !response_partitions.is_empty() {
+                response_topics.push(OffsetFetchResponseTopic {
+                    name: topic_name,
+                    partitions: response_partitions,
+                });
+            }
+        }
+        
+        Ok(OffsetFetchResponse {
+            header: ResponseHeader {
+                correlation_id: 0, // Will be set by the caller
+            },
+            throttle_time_ms: 0,
+            topics: response_topics,
         })
     }
 }

@@ -128,6 +128,16 @@ enum TransactionState {
     CompleteAbort,
 }
 
+/// Batch of records with original wire format preserved
+struct BufferedBatch {
+    /// Original wire-format bytes from Produce request (with correct CRC)
+    raw_bytes: Vec<u8>,
+    /// Parsed records for indexing
+    records: Vec<ProduceRecord>,
+    /// Base offset for this batch
+    base_offset: i64,
+}
+
 /// Partition state for tracking offsets and segments
 struct PartitionState {
     /// Next offset to assign
@@ -144,8 +154,8 @@ struct PartitionState {
     start_time: Instant,
     /// Current segment size
     segment_size: AtomicU64,
-    /// Pending records buffer
-    pending_records: Arc<Mutex<Vec<ProduceRecord>>>,
+    /// Pending batches buffer (preserves original wire format)
+    pending_batches: Arc<Mutex<Vec<BufferedBatch>>>,
     /// Last flush time
     last_flush: Arc<Mutex<Instant>>,
 }
@@ -305,7 +315,7 @@ impl ProduceHandler {
     }
     
     /// Start background tasks for segment management
-    async fn start_background_tasks(&self) {
+    pub async fn start_background_tasks(&self) {
         let handler = self.clone();
         
         // Segment rotation task
@@ -586,7 +596,7 @@ impl ProduceHandler {
         &self,
         topic: &str,
         partition: i32,
-        records_data: &[u8],
+        records_data: &[u8],  // This contains the original wire-format bytes with correct CRC!
         transactional_id: Option<&str>,
         acks: i16,
     ) -> Result<ProduceResponsePartition> {
@@ -660,10 +670,14 @@ impl ProduceHandler {
             warn!("Failed to persist partition offset to metadata store: {:?}", e);
         }
         
-        // Buffer records
+        // Buffer the batch with original wire format preserved
         {
-            let mut pending = partition_state.pending_records.lock().await;
-            pending.extend(records.clone());
+            let mut pending = partition_state.pending_batches.lock().await;
+            pending.push(BufferedBatch {
+                raw_bytes: records_data.to_vec(),  // Preserve the original wire bytes!
+                records: records.clone(),
+                base_offset: base_offset as i64,
+            });
         }
         
         // Update metrics
@@ -682,12 +696,13 @@ impl ProduceHandler {
                 debug!("Acks=0: Returning immediately without waiting for persistence");
             }
             1 => {
-                // Wait for local write
-                self.flush_partition_if_needed(topic, partition, &partition_state).await?;
-                debug!("Acks=1: Local write completed");
+                // For acks=1, we don't need to flush immediately
+                // The background task will handle flushing based on time/size thresholds
+                // We just need to ensure the data is buffered
+                debug!("Acks=1: Data buffered, will be persisted by background task");
             }
             -1 => {
-                // Wait for replication to all ISR
+                // Wait for replication to all ISR - this requires immediate flush
                 self.flush_partition_if_needed(topic, partition, &partition_state).await?;
                 
                 if let Some(ref sender) = self.replication_sender {
@@ -843,7 +858,7 @@ impl ProduceHandler {
             segment_created: AtomicU64::new(0),
             start_time: now,
             segment_size: AtomicU64::new(0),
-            pending_records: Arc::new(Mutex::new(Vec::new())),
+            pending_batches: Arc::new(Mutex::new(Vec::new())),
             last_flush: Arc::new(Mutex::new(Instant::now())),
         });
         
@@ -1028,18 +1043,19 @@ impl ProduceHandler {
         state: &Arc<PartitionState>,
     ) -> Result<()> {
         let should_flush = {
-            let pending = state.pending_records.lock().await;
+            let pending = state.pending_batches.lock().await;
             let last_flush = state.last_flush.lock().await;
             
-            // Lower threshold for testing - flush even single record after 100ms
-            let min_records = if cfg!(debug_assertions) { 1 } else { MAX_BUFFER_RECORDS };
+            // Use reasonable thresholds even in debug mode
+            // Batch at least 100 records or wait 1 second before flushing
+            let min_batches = if cfg!(debug_assertions) { 10 } else { 100 };
             let linger_time = if cfg!(debug_assertions) { 
-                Duration::from_millis(100) 
+                Duration::from_millis(1000) 
             } else { 
                 Duration::from_millis(self.config.linger_ms) 
             };
             
-            pending.len() >= min_records ||
+            pending.len() >= min_batches ||
             state.segment_size.load(Ordering::Relaxed) >= MAX_SEGMENT_SIZE ||
             last_flush.elapsed() >= linger_time
         };
@@ -1058,67 +1074,75 @@ impl ProduceHandler {
         partition: i32,
         state: &Arc<PartitionState>,
     ) -> Result<()> {
-        let records = {
-            let mut pending = state.pending_records.lock().await;
+        let batches = {
+            let mut pending = state.pending_batches.lock().await;
             if pending.is_empty() {
                 return Ok(());
             }
             std::mem::take(&mut *pending)
         };
         
-        // Create Kafka batch for writing
-        if records.is_empty() {
+        if batches.is_empty() {
             return Ok(());
         }
         
-        let first_record = &records[0];
-        let mut kafka_batch = KafkaRecordBatch::new(
-            first_record.offset,
-            first_record.timestamp,
-            first_record.producer_id,
-            first_record.producer_epoch,
-            first_record.sequence,
-            self.config.compression_type,
-            false, // is_transactional
-        );
+        // Process each batch while preserving original wire format
+        for batch in &batches {
+            // Convert ProduceRecords to Records for storage (indexed format)
+            let storage_records: Vec<Record> = batch.records.iter().map(|r| Record {
+                offset: r.offset,
+                timestamp: r.timestamp,
+                key: r.key.clone(),
+                value: r.value.clone(),
+                headers: r.headers.clone(),
+            }).collect();
+            
+            // Convert to RecordBatch for indexed storage
+            let record_batch = RecordBatch {
+                records: storage_records,
+            };
         
-        for record in &records {
-            kafka_batch.add_record(
-                record.key.as_ref().map(|k| Bytes::from(k.clone())),
-                Some(Bytes::from(record.value.clone())),
-                record.headers.iter().map(|(k, v)| KafkaRecordHeader {
-                    key: k.clone(),
-                    value: Some(Bytes::from(v.clone())),
-                }).collect(),
-                record.timestamp,
-            );
-        }
-        
-        // Convert ProduceRecords to Records for storage
-        let storage_records: Vec<Record> = records.iter().map(|r| Record {
-            offset: r.offset,
-            timestamp: r.timestamp,
-            key: r.key.clone(),
-            value: r.value.clone(),
-            headers: r.headers.clone(),
-        }).collect();
-        
-        // Convert KafkaRecordBatch to RecordBatch
-        let record_batch = RecordBatch {
-            records: storage_records,
-        };
-        
-        // Write batch with retry logic
-        let mut writer = state.current_writer.lock().await;
-        
-        // Retry up to 3 times with exponential backoff
-        let mut retry_count = 0;
-        let max_retries = 3;
-        let mut backoff = Duration::from_millis(100);
-        
-        loop {
-            match writer.write_batch(topic, partition, record_batch.clone()).await {
-                Ok(_) => break,
+            // Write batch with retry logic
+            let mut writer = state.current_writer.lock().await;
+            
+            // Retry up to 3 times with exponential backoff
+            let mut retry_count = 0;
+            let max_retries = 3;
+            let mut backoff = Duration::from_millis(100);
+            
+            loop {
+                // Write both the ORIGINAL raw Kafka batch (preserves CRC) and indexed records
+                match writer.write_dual_format(
+                    topic, 
+                    partition, 
+                    &batch.raw_bytes,  // Use original wire format bytes!
+                    record_batch.clone()
+                ).await {
+                Ok(segment_metadata) => {
+                    // If a segment was created, register it with metadata store
+                    if let Some(metadata) = segment_metadata {
+                        if let Err(e) = self.metadata_store.persist_segment_metadata(metadata).await {
+                            warn!("Failed to persist segment metadata: {:?}", e);
+                        }
+                    }
+                    
+                    // Force flush to disk for small batches
+                    // This ensures messages are persisted even if they don't reach segment size threshold
+                    match writer.flush_all().await {
+                        Ok(flushed_segments) => {
+                            // Register all flushed segments with metadata store
+                            for metadata in flushed_segments {
+                                if let Err(e) = self.metadata_store.persist_segment_metadata(metadata).await {
+                                    warn!("Failed to persist flushed segment metadata: {:?}", e);
+                                }
+                            }
+                        },
+                        Err(e) => {
+                            warn!("Failed to flush segment writer: {:?}", e);
+                        }
+                    }
+                    break;
+                },
                 Err(e) => {
                     retry_count += 1;
                     if retry_count > max_retries {
@@ -1137,31 +1161,38 @@ impl ProduceHandler {
                     backoff *= 2;
                 }
             }
-        }
+        }  // End of retry loop for current batch
+        }  // End of batch processing loop
         
         // Update state
-        state.segment_size.fetch_add(records.len() as u64 * 100, Ordering::Relaxed); // Approximate size
+        let total_records: usize = batches.iter().map(|b| b.records.len()).sum();
+        state.segment_size.fetch_add(total_records as u64 * 100, Ordering::Relaxed); // Approximate size
         *state.last_flush.lock().await = Instant::now();
         
         // Update fetch handler buffer if available
         if let Some(ref fetch_handler) = self.fetch_handler {
-            // Convert records to storage format for fetch handler
-            let storage_records: Vec<chronik_storage::Record> = records.iter().map(|r| chronik_storage::Record {
-                offset: r.offset,
-                timestamp: r.timestamp,
-                key: r.key.clone(),
-                value: r.value.clone(),
-                headers: r.headers.clone(),
-            }).collect();
+            // Collect all records from all batches for fetch handler
+            let mut all_storage_records = Vec::new();
+            for batch in &batches {
+                let storage_records: Vec<chronik_storage::Record> = batch.records.iter().map(|r| chronik_storage::Record {
+                    offset: r.offset,
+                    timestamp: r.timestamp,
+                    key: r.key.clone(),
+                    value: r.value.clone(),
+                    headers: r.headers.clone(),
+                }).collect();
+                all_storage_records.extend(storage_records);
+            }
             
             let high_watermark = state.high_watermark.load(Ordering::Relaxed) as i64;
             
-            if let Err(e) = fetch_handler.update_buffer(topic, partition, storage_records, high_watermark).await {
+            if let Err(e) = fetch_handler.update_buffer(topic, partition, all_storage_records, high_watermark).await {
                 warn!("Failed to update fetch handler buffer: {:?}", e);
             }
         }
         
-        debug!("Flushed {} records to {}-{}", records.len(), topic, partition);
+        debug!("Flushed {} batches with {} total records to {}-{}", 
+            batches.len(), total_records, topic, partition);
         
         Ok(())
     }
@@ -1282,6 +1313,21 @@ impl ProduceHandler {
         // Attempt to create the topic
         let result = match self.metadata_store.create_topic(topic_name, topic_config).await {
             Ok(metadata) => {
+                // Create partition assignments for this broker (single-node setup)
+                for partition in 0..self.config.num_partitions {
+                    let assignment = chronik_common::metadata::PartitionAssignment {
+                        topic: topic_name.to_string(),
+                        partition,
+                        broker_id: self.config.node_id,
+                        is_leader: true, // Single node is always the leader
+                    };
+                    
+                    if let Err(e) = self.metadata_store.assign_partition(assignment).await {
+                        warn!("Failed to assign partition {} for topic '{}': {:?}", 
+                            partition, topic_name, e);
+                    }
+                }
+                
                 let elapsed = start_time.elapsed();
                 self.metrics.topics_auto_created.fetch_add(1, Ordering::Relaxed);
                 
