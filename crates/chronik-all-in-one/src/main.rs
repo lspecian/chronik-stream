@@ -7,7 +7,6 @@ use tokio::sync::RwLock;
 use tracing::{info, error};
 
 mod storage;
-mod kafka_server;
 mod integrated_server;
 mod error_handler;
 

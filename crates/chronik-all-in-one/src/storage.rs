@@ -65,8 +65,8 @@ impl EmbeddedStorage {
             let topics_tree = db.open_tree("topics")?;
             for item in topics_tree.iter() {
                 let (key, value) = item?;
-                let topic_name = String::from_utf8_lossy(&key).to_string();
-                if let Ok(metadata) = serde_json::from_slice::<TopicMetadata>(&value) {
+                let _topic_name = String::from_utf8_lossy(&key).to_string();
+                if let Ok(_metadata) = serde_json::from_slice::<TopicMetadata>(&value) {
                     // We'll need to handle this differently for async
                     // For now, just skip loading from disk in the sync context
                 }
@@ -119,34 +119,32 @@ impl EmbeddedStorage {
     }
     
     pub async fn append_messages(
-        &self,
-        topic: String,
+        &mut self,
+        topic: &str,
         partition: i32,
-        messages: Vec<(Option<Vec<u8>>, Vec<u8>)>
-    ) -> Result<Vec<i64>> {
+        record_batch_data: &[u8]
+    ) -> Result<i64> {
         let mut partitions = self.partitions.write().await;
-        let key = (topic.clone(), partition);
+        let key = (topic.to_string(), partition);
         
         let partition_data = partitions.entry(key.clone())
             .or_insert_with(|| PartitionData {
-                topic: topic.clone(),
+                topic: topic.to_string(),
                 partition,
                 messages: Vec::new(),
                 high_water_mark: 0,
             });
         
-        let mut offsets = Vec::new();
-        for (key, value) in messages {
-            let offset = partition_data.high_water_mark;
-            partition_data.messages.push(Message {
-                offset,
-                key,
-                value,
-                timestamp: chrono::Utc::now().timestamp_millis(),
-            });
-            partition_data.high_water_mark += 1;
-            offsets.push(offset);
-        }
+        // Store the raw record batch as a single message for now
+        // In production, we'd parse the Kafka record batch format properly
+        let offset = partition_data.high_water_mark;
+        partition_data.messages.push(Message {
+            offset,
+            key: None,
+            value: record_batch_data.to_vec(),
+            timestamp: chrono::Utc::now().timestamp_millis(),
+        });
+        partition_data.high_water_mark += 1;
         
         // Persist to disk if available
         if let Some(db) = &self.db {
@@ -155,7 +153,7 @@ impl EmbeddedStorage {
             partitions_tree.insert(key.as_bytes(), serde_json::to_vec(&partition_data)?)?;
         }
         
-        Ok(offsets)
+        Ok(offset)
     }
     
     pub async fn fetch_messages(

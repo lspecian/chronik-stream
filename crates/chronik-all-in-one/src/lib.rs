@@ -6,7 +6,6 @@
 pub mod integrated_server;
 pub mod error_handler;
 pub mod storage;
-pub mod kafka_server;
 
 // Re-export main types for external use and tests
 pub use integrated_server::{IntegratedKafkaServer, IntegratedServerConfig};
