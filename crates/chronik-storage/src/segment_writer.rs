@@ -19,6 +19,9 @@ pub struct SegmentWriterConfig {
     pub compression_codec: String,
     /// Max segment size in bytes
     pub max_segment_size: u64,
+    /// Enable dual storage (raw Kafka + indexed records)
+    /// If false, only stores raw Kafka batches for protocol compatibility
+    pub enable_dual_storage: bool,
 }
 
 /// Active segment info
@@ -110,12 +113,18 @@ impl SegmentWriter {
         // Add raw Kafka batch data
         active.builder.add_raw_kafka_batch(raw_kafka_batch);
         
-        // Serialize indexed batch and add to segment
-        let batch_bytes = indexed_batch.encode()?;
-        active.builder.add_indexed_record(&batch_bytes);
+        // Conditionally add indexed data based on configuration
+        let indexed_size = if self.config.enable_dual_storage {
+            // Serialize indexed batch and add to segment
+            let batch_bytes = indexed_batch.encode()?;
+            active.builder.add_indexed_record(&batch_bytes);
+            batch_bytes.len() as u64
+        } else {
+            0
+        };
         
-        // Update size with both formats
-        active.current_size += raw_kafka_batch.len() as u64 + batch_bytes.len() as u64;
+        // Update size
+        active.current_size += raw_kafka_batch.len() as u64 + indexed_size;
         
         // Check if we should rotate the segment
         if active.current_size >= self.config.max_segment_size {

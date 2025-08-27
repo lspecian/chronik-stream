@@ -214,6 +214,7 @@ impl IngestServer {
                 data_dir: data_dir.join("segments"),
                 compression_codec: "snappy".to_string(),
                 max_segment_size: 1024 * 1024 * 1024, // 1GB
+                enable_dual_storage: false, // Default to raw-only for better performance
             },
             segment_reader_config: SegmentReaderConfig::default(),
         };

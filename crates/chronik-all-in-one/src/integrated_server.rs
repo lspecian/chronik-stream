@@ -55,6 +55,8 @@ pub struct IntegratedServerConfig {
     pub replication_factor: u32,
     /// Enable persistent metadata (if false, use in-memory metadata store)
     pub enable_persistent_metadata: bool,
+    /// Enable dual storage (raw Kafka + indexed records for search)
+    pub enable_dual_storage: bool,
 }
 
 impl Default for IntegratedServerConfig {
@@ -70,6 +72,7 @@ impl Default for IntegratedServerConfig {
             num_partitions: 3,
             replication_factor: 1,
             enable_persistent_metadata: false, // False = use in-memory, true = use object storage
+            enable_dual_storage: false, // Default to raw-only for better performance
         }
     }
 }
@@ -152,6 +155,7 @@ impl IntegratedKafkaServer {
                     "none".to_string() 
                 },
                 max_segment_size: 256 * 1024 * 1024, // 256MB
+                enable_dual_storage: config.enable_dual_storage,
             },
             segment_reader_config: SegmentReaderConfig::default(),
         };
@@ -220,6 +224,7 @@ impl IntegratedKafkaServer {
         info!("  Auto-create topics: {}", config.auto_create_topics);
         info!("  Compression: {}", config.enable_compression);
         info!("  Indexing: {}", config.enable_indexing);
+        info!("  Dual storage: {}", config.enable_dual_storage);
         
         Ok(Self {
             config,

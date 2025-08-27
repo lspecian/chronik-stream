@@ -48,6 +48,11 @@ struct Cli {
     /// Enable persistent metadata storage (using object storage)
     #[arg(long, env = "CHRONIK_PERSISTENT_METADATA", default_value = "false")]
     persistent_metadata: bool,
+
+    /// Enable dual storage (raw Kafka + indexed records for search)
+    /// If false, only stores raw Kafka batches for protocol compatibility
+    #[arg(long, env = "CHRONIK_DUAL_STORAGE", default_value = "false")]
+    dual_storage: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -123,6 +128,7 @@ async fn run_server(cli: Cli, in_memory: bool) -> Result<()> {
         num_partitions: 1,
         enable_persistent_metadata: true,
         replication_factor: 1,
+        enable_dual_storage: cli.dual_storage,
     };
     let kafka_server = IntegratedKafkaServer::new(config).await?;
     
@@ -205,6 +211,7 @@ async fn run_integrated_server(cli: Cli) -> Result<()> {
     // Create configuration
     let config = IntegratedServerConfig {
         node_id: 1,  // Use 1 instead of 0 (controller_id of 0 means no controller in Kafka)
+        enable_dual_storage: cli.dual_storage,
         advertised_host: if cli.bind_addr == "0.0.0.0" {
             "localhost".to_string()
         } else {
