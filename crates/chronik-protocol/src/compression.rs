@@ -100,27 +100,42 @@ impl CompressionHandler {
     }
 
     /// Compress with Snappy
-    fn compress_snappy(_data: &[u8]) -> Result<Bytes> {
-        // For now, return unsupported
-        Err(Error::Protocol("Snappy compression not yet implemented".into()))
+    fn compress_snappy(data: &[u8]) -> Result<Bytes> {
+        debug!("Compressing {} bytes with snappy", data.len());
+        let mut encoder = snap::raw::Encoder::new();
+        let compressed = encoder.compress_vec(data)
+            .map_err(|e| Error::Protocol(format!("Snappy compression failed: {}", e)))?;
+        debug!("Compressed to {} bytes", compressed.len());
+        Ok(Bytes::from(compressed))
     }
 
     /// Decompress with Snappy
-    fn decompress_snappy(_data: &[u8]) -> Result<Bytes> {
-        // For now, return unsupported
-        Err(Error::Protocol("Snappy decompression not yet implemented".into()))
+    fn decompress_snappy(data: &[u8]) -> Result<Bytes> {
+        debug!("Decompressing {} bytes with snappy", data.len());
+        let mut decoder = snap::raw::Decoder::new();
+        let decompressed = decoder.decompress_vec(data)
+            .map_err(|e| Error::Protocol(format!("Snappy decompression failed: {}", e)))?;
+        debug!("Decompressed to {} bytes", decompressed.len());
+        Ok(Bytes::from(decompressed))
     }
 
     /// Compress with LZ4
-    fn compress_lz4(_data: &[u8]) -> Result<Bytes> {
-        // For now, return unsupported
-        Err(Error::Protocol("LZ4 compression not yet implemented".into()))
+    fn compress_lz4(data: &[u8]) -> Result<Bytes> {
+        debug!("Compressing {} bytes with lz4", data.len());
+        // Note: Kafka uses LZ4 block format, not frame format
+        let compressed = lz4_flex::compress_prepend_size(data);
+        debug!("Compressed to {} bytes", compressed.len());
+        Ok(Bytes::from(compressed))
     }
 
     /// Decompress with LZ4
-    fn decompress_lz4(_data: &[u8]) -> Result<Bytes> {
-        // For now, return unsupported
-        Err(Error::Protocol("LZ4 decompression not yet implemented".into()))
+    fn decompress_lz4(data: &[u8]) -> Result<Bytes> {
+        debug!("Decompressing {} bytes with lz4", data.len());
+        // Note: Kafka uses LZ4 block format with size prefix
+        let decompressed = lz4_flex::decompress_size_prepended(data)
+            .map_err(|e| Error::Protocol(format!("LZ4 decompression failed: {}", e)))?;
+        debug!("Decompressed to {} bytes", decompressed.len());
+        Ok(Bytes::from(decompressed))
     }
 
     /// Compress with Zstd

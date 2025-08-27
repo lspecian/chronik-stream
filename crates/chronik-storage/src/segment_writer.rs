@@ -3,10 +3,11 @@
 use crate::{RecordBatch, Segment, SegmentBuilder, ObjectStoreTrait, ObjectStoreFactory, ObjectStoreConfig, ObjectStoreBackend};
 use chronik_common::{Result, types::{SegmentId, TopicPartition}};
 use chronik_common::metadata::traits::SegmentMetadata;
-use chrono::Utc;
+use chrono::{Utc, DateTime};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -22,6 +23,26 @@ pub struct SegmentWriterConfig {
     /// Enable dual storage (raw Kafka + indexed records)
     /// If false, only stores raw Kafka batches for protocol compatibility
     pub enable_dual_storage: bool,
+    /// Max segment age before rotation (in seconds)
+    pub max_segment_age_secs: u64,
+    /// Retention period for segments (in seconds)
+    pub retention_period_secs: u64,
+    /// Enable automatic cleanup of old segments
+    pub enable_cleanup: bool,
+}
+
+impl Default for SegmentWriterConfig {
+    fn default() -> Self {
+        Self {
+            data_dir: PathBuf::from("/tmp/chronik-segments"),
+            compression_codec: "none".to_string(),
+            max_segment_size: 1024 * 1024 * 1024, // 1GB
+            enable_dual_storage: true,
+            max_segment_age_secs: 3600, // 1 hour
+            retention_period_secs: 7 * 24 * 3600, // 7 days
+            enable_cleanup: true,
+        }
+    }
 }
 
 /// Active segment info
@@ -38,6 +59,8 @@ struct ActiveSegment {
     current_size: u64,
     /// Stores raw Kafka batches for v2 format
     has_raw_kafka: bool,
+    /// Time when the segment was created
+    created_at: Instant,
 }
 
 /// Segment writer for managing segment creation
@@ -99,6 +122,7 @@ impl SegmentWriter {
                 record_count: 0,
                 current_size: 0,
                 has_raw_kafka: true, // v2 format with dual storage
+                created_at: Instant::now(),
             }
         });
         
@@ -126,8 +150,11 @@ impl SegmentWriter {
         // Update size
         active.current_size += raw_kafka_batch.len() as u64 + indexed_size;
         
-        // Check if we should rotate the segment
-        if active.current_size >= self.config.max_segment_size {
+        // Check if we should rotate the segment (size-based or time-based)
+        let should_rotate = active.current_size >= self.config.max_segment_size ||
+            active.created_at.elapsed().as_secs() >= self.config.max_segment_age_secs;
+        
+        if should_rotate {
             let segment_data = segments.remove(&key).unwrap();
             
             // Create metadata for segment builder (using types::SegmentMetadata)
@@ -209,6 +236,7 @@ impl SegmentWriter {
                 record_count: 0,
                 current_size: 0,
                 has_raw_kafka: false, // v1 format - indexed only
+                created_at: Instant::now(),
             }
         });
         
@@ -225,8 +253,11 @@ impl SegmentWriter {
         active.builder.add_indexed_record(&batch_bytes);
         active.current_size += batch_bytes.len() as u64;
         
-        // Check if we should rotate the segment
-        if active.current_size >= self.config.max_segment_size {
+        // Check if we should rotate the segment (size-based or time-based)
+        let should_rotate = active.current_size >= self.config.max_segment_size ||
+            active.created_at.elapsed().as_secs() >= self.config.max_segment_age_secs;
+        
+        if should_rotate {
             let segment_data = segments.remove(&key).unwrap();
             
             // Create metadata for segment builder (using types::SegmentMetadata)
@@ -361,6 +392,124 @@ impl SegmentWriter {
         );
         
         Ok(())
+    }
+    
+    /// Clean up old segments based on retention policy
+    pub async fn cleanup_old_segments(&self, topic: &str, partition: i32) -> Result<u32> {
+        let mut deleted_count = 0;
+        
+        // List all segments for this topic-partition
+        let prefix = format!("{}/{}/", topic, partition);
+        let segment_metadata_list = self.object_store.list(&prefix).await?;
+        
+        let retention_cutoff = Utc::now() - chrono::Duration::seconds(self.config.retention_period_secs as i64);
+        
+        for segment_metadata in segment_metadata_list {
+            // Check if segment is older than retention period
+            // Use last_modified time from ObjectMetadata (u64 timestamp)
+            let segment_age = Utc::now().timestamp() as u64 - segment_metadata.last_modified;
+            
+            if segment_age > self.config.retention_period_secs {
+                // Delete old segment
+                if self.config.enable_cleanup {
+                    self.object_store.delete(&segment_metadata.key).await?;
+                    deleted_count += 1;
+                    tracing::info!("Deleted old segment: {}", segment_metadata.key);
+                }
+            }
+        }
+        
+        Ok(deleted_count)
+    }
+    
+    /// Start a background task to periodically rotate and cleanup segments
+    pub fn start_background_tasks(self: Arc<Self>) {
+        // Start rotation checker task
+        let writer_clone = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30)); // Check every 30 seconds
+            
+            loop {
+                interval.tick().await;
+                
+                // Check all active segments for time-based rotation
+                let segments = writer_clone.active_segments.read().await;
+                let mut segments_to_rotate = Vec::new();
+                
+                for (key, segment) in segments.iter() {
+                    if segment.created_at.elapsed().as_secs() >= writer_clone.config.max_segment_age_secs {
+                        segments_to_rotate.push(key.clone());
+                    }
+                }
+                drop(segments); // Release read lock
+                
+                // Rotate aged segments
+                for key in segments_to_rotate {
+                    tracing::info!("Time-based rotation for topic {} partition {}", key.0, key.1);
+                    // Force rotation by flushing
+                    // In production, you'd want a more elegant rotation mechanism
+                    let mut segments = writer_clone.active_segments.write().await;
+                    if let Some(segment_data) = segments.remove(&key) {
+                        // Upload the segment
+                        let segment_metadata = chronik_common::types::SegmentMetadata {
+                            id: segment_data.id,
+                            topic_partition: TopicPartition {
+                                topic: segment_data.topic.clone(),
+                                partition: segment_data.partition,
+                            },
+                            base_offset: segment_data.base_offset,
+                            last_offset: segment_data.last_offset,
+                            timestamp_min: segment_data.timestamp_min,
+                            timestamp_max: segment_data.timestamp_max,
+                            size_bytes: segment_data.current_size,
+                            record_count: segment_data.record_count,
+                            object_key: format!("{}/{}/{}.segment",
+                                segment_data.topic,
+                                segment_data.partition,
+                                segment_data.id.0
+                            ),
+                            created_at: Utc::now(),
+                        };
+                        
+                        let built_segment = segment_data.builder
+                            .with_metadata(segment_metadata)
+                            .build()
+                            .unwrap();
+                        writer_clone.upload_segment(built_segment).await.unwrap();
+                    }
+                }
+            }
+        });
+        
+        // Start cleanup task if enabled
+        if self.config.enable_cleanup {
+            let writer_clone = self.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(3600)); // Run cleanup every hour
+                
+                loop {
+                    interval.tick().await;
+                    
+                    tracing::info!("Running segment cleanup task");
+                    
+                    // In production, you'd want to get list of all topics and partitions
+                    // For now, this is a simplified example
+                    // You would need to integrate with metadata store to get all topics
+                    
+                    // Example cleanup for a known topic (would need to be dynamic in production)
+                    match writer_clone.cleanup_old_segments("example-topic", 0).await {
+                        Ok(count) => {
+                            if count > 0 {
+                                tracing::info!("Cleaned up {} old segments", count);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("Segment cleanup failed: {:?}", e);
+                        }
+                    }
+                }
+            });
+        }
     }
 }
 

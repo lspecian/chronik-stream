@@ -156,6 +156,9 @@ impl IntegratedKafkaServer {
                 },
                 max_segment_size: 256 * 1024 * 1024, // 256MB
                 enable_dual_storage: config.enable_dual_storage,
+                max_segment_age_secs: 3600, // 1 hour
+                retention_period_secs: 7 * 24 * 3600, // 7 days  
+                enable_cleanup: true,
             },
             segment_reader_config: SegmentReaderConfig::default(),
         };

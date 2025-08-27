@@ -467,6 +467,14 @@ async fn create_topic_index(
     schema_builder.add_i64_field("_offset", NumericOptions::default().set_indexed().set_stored().set_fast());
     schema_builder.add_date_field("_timestamp", DateOptions::default().set_indexed().set_stored().set_fast());
     
+    // Add a JSON field to store all dynamic content
+    // This allows us to index arbitrary JSON without schema evolution
+    schema_builder.add_json_field("_json_content", TEXT | STORED);
+    
+    // Add some common fields that might be used frequently
+    schema_builder.add_text_field("_key", STRING | STORED);
+    schema_builder.add_text_field("_value", TEXT | STORED);
+    
     let schema = schema_builder.build();
     
     let directory = MmapDirectory::open(&index_path)
@@ -493,31 +501,61 @@ async fn create_topic_index(
 async fn index_json_document(
     doc: &JsonDocument,
     writer: &mut IndexWriter,
-    schema: &Arc<RwLock<DynamicSchema>>,
-    config: &RealtimeIndexerConfig,
+    _schema: &Arc<RwLock<DynamicSchema>>,
+    _config: &RealtimeIndexerConfig,
 ) -> Result<u64> {
     let mut tantivy_doc = TantivyDocument::new();
     
-    // Add system fields
-    tantivy_doc.add_text(writer.index().schema().get_field("_id").unwrap(), &doc.id);
-    tantivy_doc.add_text(writer.index().schema().get_field("_topic").unwrap(), &doc.topic);
-    tantivy_doc.add_i64(writer.index().schema().get_field("_partition").unwrap(), doc.partition as i64);
-    tantivy_doc.add_i64(writer.index().schema().get_field("_offset").unwrap(), doc.offset);
-    tantivy_doc.add_date(
-        writer.index().schema().get_field("_timestamp").unwrap(),
-        DateTime::from_timestamp_millis(doc.timestamp)
-    );
+    // Add system fields - these should exist in the schema
+    let schema = writer.index().schema();
     
-    // Process JSON content
-    let doc_size = process_json_value(
-        &doc.content,
-        "",
-        &mut tantivy_doc,
-        writer,
-        schema,
-        &config.field_policy,
-        0,
-    ).await?;
+    if let Ok(field) = schema.get_field("_id") {
+        tantivy_doc.add_text(field, &doc.id);
+    }
+    
+    if let Ok(field) = schema.get_field("_topic") {
+        tantivy_doc.add_text(field, &doc.topic);
+    }
+    
+    if let Ok(field) = schema.get_field("_partition") {
+        tantivy_doc.add_i64(field, doc.partition as i64);
+    }
+    
+    if let Ok(field) = schema.get_field("_offset") {
+        tantivy_doc.add_i64(field, doc.offset);
+    }
+    
+    if let Ok(field) = schema.get_field("_timestamp") {
+        tantivy_doc.add_date(field, DateTime::from_timestamp_millis(doc.timestamp));
+    }
+    
+    // Add the entire JSON content to the _json_content field
+    // This allows full-text search across all fields without schema evolution
+    if let Ok(json_field) = schema.get_field("_json_content") {
+        // Serialize JSON to string and add as text
+        let json_str = serde_json::to_string(&doc.content)
+            .unwrap_or_else(|_| "{}".to_string());
+        // For JSON fields in Tantivy, we need to pass the JSON as a string
+        tantivy_doc.add_text(json_field, &json_str);
+    }
+    
+    // Also add key and value if they exist in the JSON
+    if let Some(key) = doc.content.get("key").and_then(|v| v.as_str()) {
+        if let Ok(field) = schema.get_field("_key") {
+            tantivy_doc.add_text(field, key);
+        }
+    }
+    
+    if let Some(value) = doc.content.get("value").and_then(|v| v.as_str()) {
+        if let Ok(field) = schema.get_field("_value") {
+            tantivy_doc.add_text(field, value);
+        }
+    }
+    
+    // Calculate document size
+    let doc_size = serde_json::to_vec(&doc.content)
+        .map(|v| v.len())
+        .unwrap_or(0);
     
     // Add document to index
     writer.add_document(tantivy_doc)

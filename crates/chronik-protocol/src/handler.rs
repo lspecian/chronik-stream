@@ -2,7 +2,7 @@
 
 use bytes::{Bytes, BytesMut};
 use chronik_common::{Result, Error};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use crate::error_codes;
 use crate::parser::{
@@ -964,9 +964,18 @@ impl ProtocolHandler {
         };
         
         // Create response with topics from metadata store
-        tracing::info!("Creating metadata response - topics requested: {:?}", _request.topics);
+        tracing::info!("Creating metadata response - topics requested: {:?}, auto_create: {}", 
+            _request.topics, _request.allow_auto_topic_creation);
         
-        // Get topics from metadata store
+        // Handle auto-topic creation if enabled
+        if _request.allow_auto_topic_creation {
+            if let Some(requested_topics) = &_request.topics {
+                // Check which topics don't exist and create them
+                self.auto_create_topics(requested_topics).await?;
+            }
+        }
+        
+        // Get topics from metadata store (including newly created ones)
         let topics = match self.get_topics_from_metadata(&_request.topics).await {
             Ok(topics) => topics,
             Err(e) => {
@@ -2799,6 +2808,99 @@ impl ProtocolHandler {
         } else {
             Ok(vec![])
         }
+    }
+    
+    /// Auto-create topics that don't exist
+    async fn auto_create_topics(&self, requested_topics: &[String]) -> Result<()> {
+        if let Some(metadata_store) = &self.metadata_store {
+            // Get list of existing topics
+            let existing_topics = metadata_store.list_topics().await
+                .map_err(|e| Error::Internal(format!("Failed to list topics: {:?}", e)))?;
+            
+            let existing_topic_names: HashSet<String> = 
+                existing_topics.into_iter().map(|t| t.name).collect();
+            
+            // Find topics that don't exist
+            let topics_to_create: Vec<&String> = requested_topics
+                .iter()
+                .filter(|t| !existing_topic_names.contains(*t))
+                .collect();
+            
+            if !topics_to_create.is_empty() {
+                tracing::info!("Auto-creating {} topics: {:?}", topics_to_create.len(), topics_to_create);
+                
+                // Get default configuration values (should be configurable)
+                let default_num_partitions = 3;
+                let default_replication_factor = 1;
+                let default_retention_ms = 604800000; // 7 days
+                let default_segment_bytes = 1073741824; // 1GB
+                
+                for topic_name in topics_to_create {
+                    // Create topic configuration
+                    let mut config_map = HashMap::new();
+                    config_map.insert("compression.type".to_string(), "none".to_string());
+                    config_map.insert("cleanup.policy".to_string(), "delete".to_string());
+                    config_map.insert("min.insync.replicas".to_string(), "1".to_string());
+                    
+                    let config = chronik_common::metadata::TopicConfig {
+                        partition_count: default_num_partitions,
+                        replication_factor: default_replication_factor,
+                        retention_ms: Some(default_retention_ms),
+                        segment_bytes: default_segment_bytes,
+                        config: config_map,
+                    };
+                    
+                    // Get broker ID for assignment
+                    let brokers = metadata_store.list_brokers().await
+                        .map_err(|e| Error::Internal(format!("Failed to list brokers: {:?}", e)))?;
+                    
+                    let online_brokers: Vec<_> = brokers.iter()
+                        .filter(|b| b.status == chronik_common::metadata::BrokerStatus::Online)
+                        .collect();
+                    
+                    if online_brokers.is_empty() {
+                        tracing::warn!("No online brokers available for auto-topic creation");
+                        continue;
+                    }
+                    
+                    let broker_id = online_brokers[0].broker_id;
+                    
+                    // Create assignments for all partitions
+                    let mut assignments = Vec::new();
+                    for partition in 0..default_num_partitions {
+                        assignments.push(chronik_common::metadata::PartitionAssignment {
+                            topic: topic_name.clone(),
+                            partition,
+                            broker_id,
+                            is_leader: true,
+                        });
+                    }
+                    
+                    // Create initial offsets
+                    let mut offsets = Vec::new();
+                    for partition in 0..default_num_partitions {
+                        offsets.push((partition, 0i64, 0i64)); // partition, high_watermark, log_start_offset
+                    }
+                    
+                    // Create topic with assignments
+                    match metadata_store.create_topic_with_assignments(
+                        topic_name,
+                        config,
+                        assignments,
+                        offsets,
+                    ).await {
+                        Ok(topic_meta) => {
+                            tracing::info!("Auto-created topic '{}' with ID {} and {} partitions",
+                                topic_name, topic_meta.id, default_num_partitions);
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to auto-create topic '{}': {:?}", topic_name, e);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 

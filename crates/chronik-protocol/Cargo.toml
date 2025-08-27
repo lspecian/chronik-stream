@@ -22,6 +22,8 @@ serde = { workspace = true }
 # Compression
 flate2 = { workspace = true }
 crc32fast = { workspace = true }
+snap = { workspace = true }
+lz4_flex = { workspace = true }
 
 # Error handling
 anyhow = { workspace = true }

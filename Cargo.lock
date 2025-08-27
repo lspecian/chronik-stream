@@ -1512,8 +1512,10 @@ dependencies = [
  "crc32fast",
  "criterion",
  "flate2",
+ "lz4_flex",
  "proptest",
  "serde",
+ "snap",
  "thiserror 1.0.69",
  "tokio",
  "tokio-test",
@@ -3738,6 +3740,9 @@ name = "lz4_flex"
 version = "0.11.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2c592ad9fbc1b7838633b3ae55ce69b17d01150c72fcef229fbb819d39ee51ee"
+dependencies = [
+ "twox-hash",
+]
 
 [[package]]
 name = "match_cfg"
@@ -6327,6 +6332,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
+name = "snap"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1b6b67fb9a61334225b5b790716f609cd58395f895b3fe8b328786812a40bc3b"
+
+[[package]]
 name = "socket2"
 version = "0.5.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7290,6 +7301,12 @@ name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
+
+[[package]]
+name = "twox-hash"
+version = "2.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b907da542cbced5261bd3256de1b3a1bf340a3d37f93425a07362a1d687de56"
 
 [[package]]
 name = "typenum"
