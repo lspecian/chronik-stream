@@ -81,4 +81,10 @@ htmlcov/
 test-results/
 tests/python/*.log
 tests/python/*.out
-benchmarks/results/ 
+benchmarks/results/
+
+# Data directories - runtime data should not be committed
+data/
+*.segment
+*.db
+*.idx 
