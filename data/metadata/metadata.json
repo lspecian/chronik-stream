@@ -21,8 +21,8 @@
       "port": 9092,
       "rack": null,
       "status": "Online",
-      "created_at": "2025-08-28T20:11:03.609757Z",
-      "updated_at": "2025-08-28T20:11:03.609758Z"
+      "created_at": "2025-08-28T20:25:13.768388Z",
+      "updated_at": "2025-08-28T20:25:13.768388Z"
     }
   },
   "consumer_groups": {},
@@ -42,5 +42,5 @@
       0
     ]
   },
-  "version": 1
+  "version": 2
 }
