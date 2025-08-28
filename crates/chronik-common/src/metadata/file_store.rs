@@ -122,12 +122,33 @@ impl MetadataStore for FileMetadataStore {
         let metadata = TopicMetadata {
             name: name.to_string(),
             id: uuid::Uuid::new_v4(),
-            config,
+            config: config.clone(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
         
         state.topics.insert(name.to_string(), metadata.clone());
+        
+        // Create partition assignments - for now, make the current broker (node 1) the leader for all partitions
+        for partition in 0..config.partition_count {
+            let assignment = PartitionAssignment {
+                topic: name.to_string(),
+                partition,
+                broker_id: 1, // Use broker ID 1 (the current node)
+                is_leader: true,
+            };
+            // Use topic-partition as string key for file store
+            let key = format!("{}-{}", name, partition);
+            state.partition_assignments.insert(key, assignment);
+        }
+        
+        // Initialize partition offsets
+        for partition in 0..config.partition_count {
+            // Use topic-partition as string key for file store
+            let key = format!("{}-{}", name, partition);
+            state.partition_offsets.insert(key, (0, 0)); // Start with offset 0
+        }
+        
         drop(state);
         
         self.persist().await?;

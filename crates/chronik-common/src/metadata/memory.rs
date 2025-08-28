@@ -43,12 +43,35 @@ impl MetadataStore for InMemoryMetadataStore {
         let metadata = TopicMetadata {
             name: name.to_string(),
             id: uuid::Uuid::new_v4(),
-            config,
+            config: config.clone(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
         
         topics.insert(name.to_string(), metadata.clone());
+        drop(topics); // Release the lock
+        
+        // Create partition assignments - for now, make the current broker (node 1) the leader for all partitions
+        let mut partition_assignments = self.partition_assignments.write().await;
+        for partition in 0..config.partition_count {
+            let assignment = PartitionAssignment {
+                topic: name.to_string(),
+                partition,
+                broker_id: 1, // Use broker ID 1 (the current node)
+                is_leader: true,
+            };
+            let key = (name.to_string(), partition);
+            partition_assignments.insert(key, assignment);
+        }
+        drop(partition_assignments);
+        
+        // Initialize partition offsets
+        let mut partition_offsets = self.partition_offsets.write().await;
+        for partition in 0..config.partition_count {
+            let key = (name.to_string(), partition);
+            partition_offsets.insert(key, (0, 0)); // Start with offset 0
+        }
+        
         Ok(metadata)
     }
     
