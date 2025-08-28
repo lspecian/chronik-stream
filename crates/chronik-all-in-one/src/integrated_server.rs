@@ -229,11 +229,51 @@ impl IntegratedKafkaServer {
         info!("  Indexing: {}", config.enable_indexing);
         info!("  Dual storage: {}", config.enable_dual_storage);
         
-        Ok(Self {
+        // Create default topic on startup to ensure clients can connect
+        // This solves the chicken-and-egg problem where clients need at least one topic
+        // in metadata responses before they can produce messages
+        let server = Self {
             config,
             kafka_handler,
-            metadata_store,
-        })
+            metadata_store: metadata_store.clone(),
+        };
+        
+        // Create default topic
+        info!("Creating default topic 'chronik-default' for client compatibility");
+        if let Err(e) = server.ensure_default_topic().await {
+            warn!("Failed to create default topic on startup: {:?}", e);
+        }
+        
+        Ok(server)
+    }
+    
+    /// Ensure a default topic exists for client connectivity
+    async fn ensure_default_topic(&self) -> Result<()> {
+        use chronik_common::metadata::TopicConfig;
+        
+        // Check if any topics exist
+        let existing_topics = self.metadata_store.list_topics().await?;
+        
+        if existing_topics.is_empty() {
+            info!("No topics exist, creating default topic 'chronik-default'");
+            
+            // Create topic config
+            let topic_config = TopicConfig {
+                partition_count: 1,
+                replication_factor: 1,
+                retention_ms: Some(604800000), // 7 days
+                segment_bytes: 1073741824, // 1GB
+                config: Default::default(),
+            };
+            
+            self.metadata_store.create_topic("chronik-default", topic_config).await?;
+            
+            info!("Successfully created default topic 'chronik-default'");
+        } else {
+            info!("Topics already exist ({}), skipping default topic creation", existing_topics.len());
+        }
+        
+        Ok(())
     }
     
     /// Run the Kafka server

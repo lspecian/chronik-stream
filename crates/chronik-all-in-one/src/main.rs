@@ -52,6 +52,7 @@ struct Cli {
     /// If false, only stores raw Kafka batches for protocol compatibility
     #[arg(long, env = "CHRONIK_DUAL_STORAGE", default_value = "false")]
     dual_storage: bool,
+    
 }
 
 #[derive(Subcommand, Debug)]
@@ -129,13 +130,15 @@ async fn run_server(cli: Cli, in_memory: bool) -> Result<()> {
         replication_factor: 1,
         enable_dual_storage: cli.dual_storage,
     };
-    let kafka_server = IntegratedKafkaServer::new(config).await?;
-    
     info!("Server configuration:");
     info!("  Kafka API: {}", kafka_addr);
     info!("  Admin API: {}:{}", cli.bind_addr, cli.admin_port);
     info!("  Data dir:  {:?}", if in_memory { "in-memory".into() } else { cli.data_dir });
     info!("");
+    
+    // Use the integrated Kafka server with chronik-ingest components
+    info!("Using IntegratedKafkaServer implementation");
+    let kafka_server = IntegratedKafkaServer::new(config).await?;
     info!("Chronik Stream is ready!");
     info!("Connect with: kafkactl --brokers {}", kafka_addr);
     

@@ -323,6 +323,16 @@ impl<'a> Encoder<'a> {
         }
         self.buf.put_u8(value as u8);
     }
+    
+    /// Write a compact array length (uses varint with +1 offset)
+    pub fn write_compact_array_len(&mut self, len: usize) {
+        self.write_unsigned_varint((len + 1) as u32);
+    }
+    
+    /// Write empty tagged fields (always writes 0 for now)
+    pub fn write_tagged_fields(&mut self) {
+        self.write_unsigned_varint(0);
+    }
 }
 
 /// Partial request header for cases where API key is unknown
@@ -341,7 +351,25 @@ pub fn parse_request_header_with_correlation(buf: &mut Bytes) -> Result<(Request
     let api_key_raw = decoder.read_i16()?;
     let api_version = decoder.read_i16()?;
     let correlation_id = decoder.read_i32()?;
-    let client_id = decoder.read_string()?;
+    
+    // Determine if this API+version uses flexible/compact encoding
+    let flexible = if let Some(api_key) = ApiKey::from_i16(api_key_raw) {
+        is_flexible_version(api_key, api_version)
+    } else {
+        false
+    };
+    
+    // Read client ID (compact string for flexible versions, standard string otherwise)
+    let client_id = if flexible {
+        decoder.read_compact_string()?
+    } else {
+        decoder.read_string()?
+    };
+    
+    // Skip tagged fields if flexible
+    if flexible {
+        let _tagged_field_count = decoder.read_unsigned_varint()?;
+    }
     
     let partial = PartialRequestHeader {
         api_key_raw,
