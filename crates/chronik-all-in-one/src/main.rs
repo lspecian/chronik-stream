@@ -44,9 +44,6 @@ struct Cli {
     #[arg(short = 'b', long, env = "CHRONIK_BIND_ADDR", default_value = "0.0.0.0")]
     bind_addr: String,
 
-    /// Enable persistent metadata storage (using object storage)
-    #[arg(long, env = "CHRONIK_PERSISTENT_METADATA", default_value = "false")]
-    persistent_metadata: bool,
 
     /// Enable dual storage (raw Kafka + indexed records for search)
     /// If false, only stores raw Kafka batches for protocol compatibility
@@ -126,7 +123,6 @@ async fn run_server(cli: Cli, in_memory: bool) -> Result<()> {
         enable_compression: false,
         auto_create_topics: true,
         num_partitions: 1,
-        enable_persistent_metadata: true,
         replication_factor: 1,
         enable_dual_storage: cli.dual_storage,
     };
@@ -204,11 +200,7 @@ async fn run_integrated_server(cli: Cli) -> Result<()> {
     info!("Starting INTEGRATED server with full Kafka compatibility");
     info!("Using chronik-ingest components for production-ready functionality");
     
-    if cli.persistent_metadata {
-        info!("Persistent metadata storage ENABLED (using object storage)");
-    } else {
-        info!("Persistent metadata storage DISABLED (using in-memory)");
-    }
+    info!("Using persistent file-based metadata storage");
     
     // Create configuration
     let config = IntegratedServerConfig {
@@ -226,7 +218,6 @@ async fn run_integrated_server(cli: Cli) -> Result<()> {
         auto_create_topics: true,
         num_partitions: 3,
         replication_factor: 1,
-        enable_persistent_metadata: cli.persistent_metadata,
     };
     
     // Create and run the integrated server

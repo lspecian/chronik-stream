@@ -40,8 +40,8 @@ use bytes::Bytes;
 /// Maximum segment size before rotation (256MB)
 const MAX_SEGMENT_SIZE: u64 = 256 * 1024 * 1024;
 
-/// Maximum time before segment rotation (30 seconds)
-const MAX_SEGMENT_AGE: Duration = Duration::from_secs(30);
+/// Maximum time before segment rotation (1 second for immediate availability)
+const MAX_SEGMENT_AGE: Duration = Duration::from_secs(1);
 
 /// Maximum number of records in memory before flush
 const MAX_BUFFER_RECORDS: usize = 10000;

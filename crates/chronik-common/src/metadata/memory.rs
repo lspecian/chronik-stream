@@ -107,6 +107,8 @@ impl MetadataStore for InMemoryMetadataStore {
     async fn persist_segment_metadata(&self, metadata: SegmentMetadata) -> Result<()> {
         let mut segments = self.segments.write().await;
         let key = (metadata.topic.clone(), metadata.segment_id.clone());
+        tracing::info!("Persisting segment metadata: topic={}, segment_id={}, offsets={}-{}", 
+            metadata.topic, metadata.segment_id, metadata.start_offset, metadata.end_offset);
         segments.insert(key, metadata);
         Ok(())
     }
@@ -119,10 +121,13 @@ impl MetadataStore for InMemoryMetadataStore {
     
     async fn list_segments(&self, topic: &str, partition: Option<u32>) -> Result<Vec<SegmentMetadata>> {
         let segments = self.segments.read().await;
-        Ok(segments.values()
+        let result: Vec<_> = segments.values()
             .filter(|s| s.topic == topic && (partition.is_none() || s.partition == partition.unwrap()))
             .cloned()
-            .collect())
+            .collect();
+        tracing::info!("Listing segments for topic={}, partition={:?}: found {} segments", 
+            topic, partition, result.len());
+        Ok(result)
     }
     
     async fn delete_segment(&self, topic: &str, segment_id: &str) -> Result<()> {

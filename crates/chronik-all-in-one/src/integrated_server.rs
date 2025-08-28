@@ -25,7 +25,6 @@ use chronik_storage::{
 
 // Metadata store
 use chronik_common::metadata::{
-    memory::InMemoryMetadataStore,
     file_store::FileMetadataStore,
     traits::MetadataStore,
 };
@@ -53,8 +52,6 @@ pub struct IntegratedServerConfig {
     pub num_partitions: u32,
     /// Default replication factor
     pub replication_factor: u32,
-    /// Enable persistent metadata (if false, use in-memory metadata store)
-    pub enable_persistent_metadata: bool,
     /// Enable dual storage (raw Kafka + indexed records for search)
     pub enable_dual_storage: bool,
 }
@@ -71,7 +68,6 @@ impl Default for IntegratedServerConfig {
             auto_create_topics: true,
             num_partitions: 3,
             replication_factor: 1,
-            enable_persistent_metadata: false, // False = use in-memory, true = use object storage
             enable_dual_storage: false, // Default to raw-only for better performance
         }
     }
@@ -94,24 +90,19 @@ impl IntegratedKafkaServer {
         let segments_dir = format!("{}/segments", config.data_dir);
         std::fs::create_dir_all(&segments_dir)?;
         
-        // Initialize metadata store (file-based for persistence, otherwise in-memory)
-        let metadata_store: Arc<dyn MetadataStore> = if config.enable_persistent_metadata {
-            info!("Using persistent file-based metadata store");
-            let metadata_dir = format!("{}/metadata", config.data_dir);
-            
-            match FileMetadataStore::new(&metadata_dir).await {
-                Ok(store) => {
-                    info!("Successfully initialized file-based metadata store at {}", metadata_dir);
-                    Arc::new(store)
-                },
-                Err(e) => {
-                    error!("Failed to initialize file-based metadata: {:?}, falling back to in-memory store", e);
-                    Arc::new(InMemoryMetadataStore::new())
-                }
+        // Always use persistent file-based metadata store
+        info!("Initializing persistent file-based metadata store");
+        let metadata_dir = format!("{}/metadata", config.data_dir);
+        std::fs::create_dir_all(&metadata_dir)?;
+        
+        let metadata_store: Arc<dyn MetadataStore> = match FileMetadataStore::new(&metadata_dir).await {
+            Ok(store) => {
+                info!("Successfully initialized file-based metadata store at {}", metadata_dir);
+                Arc::new(store)
+            },
+            Err(e) => {
+                return Err(anyhow::anyhow!("Failed to initialize file-based metadata store: {:?}. Please ensure the metadata directory {} is writable.", e, metadata_dir));
             }
-        } else {
-            info!("Using in-memory metadata store (persistence disabled)");
-            Arc::new(InMemoryMetadataStore::new())
         };
         
         // Register this broker in metadata
@@ -156,7 +147,7 @@ impl IntegratedKafkaServer {
                 },
                 max_segment_size: 256 * 1024 * 1024, // 256MB
                 enable_dual_storage: config.enable_dual_storage,
-                max_segment_age_secs: 3600, // 1 hour
+                max_segment_age_secs: 1, // 1 second for immediate availability
                 retention_period_secs: 7 * 24 * 3600, // 7 days  
                 enable_cleanup: true,
             },
