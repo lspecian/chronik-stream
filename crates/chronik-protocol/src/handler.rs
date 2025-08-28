@@ -898,7 +898,7 @@ impl ProtocolHandler {
             }
             
             if version >= 3 {
-                // Write tagged fields (empty for now)
+                // Write tagged fields at the end (empty for now)
                 encoder.write_unsigned_varint(0);
             }
         }

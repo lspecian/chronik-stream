@@ -462,7 +462,7 @@ pub fn supported_api_versions() -> HashMap<ApiKey, VersionRange> {
     versions.insert(ApiKey::DescribeGroups, VersionRange { min: 0, max: 5 });
     versions.insert(ApiKey::ListGroups, VersionRange { min: 0, max: 4 });
     versions.insert(ApiKey::SaslHandshake, VersionRange { min: 0, max: 1 });
-    versions.insert(ApiKey::ApiVersions, VersionRange { min: 0, max: 3 });
+    versions.insert(ApiKey::ApiVersions, VersionRange { min: 0, max: 4 }); // Support v4 for modern clients
     versions.insert(ApiKey::CreateTopics, VersionRange { min: 0, max: 5 }); // Support up to v5
     versions.insert(ApiKey::DeleteTopics, VersionRange { min: 0, max: 6 });
     versions.insert(ApiKey::DescribeConfigs, VersionRange { min: 0, max: 4 });
