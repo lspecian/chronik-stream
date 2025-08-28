@@ -1,0 +1,46 @@
+{
+  "topics": {
+    "chronik-default": {
+      "id": "1e880fa5-b996-4224-808b-6bd00f5638e0",
+      "name": "chronik-default",
+      "config": {
+        "partition_count": 1,
+        "replication_factor": 1,
+        "retention_ms": 604800000,
+        "segment_bytes": 1073741824,
+        "config": {}
+      },
+      "created_at": "2025-08-28T20:01:12.043614Z",
+      "updated_at": "2025-08-28T20:01:12.043614Z"
+    }
+  },
+  "brokers": {
+    "0": {
+      "broker_id": 0,
+      "host": "0.0.0.0",
+      "port": 9092,
+      "rack": null,
+      "status": "Online",
+      "created_at": "2025-08-28T20:11:03.609757Z",
+      "updated_at": "2025-08-28T20:11:03.609758Z"
+    }
+  },
+  "consumer_groups": {},
+  "consumer_offsets": {},
+  "partition_assignments": {
+    "chronik-default-0": {
+      "topic": "chronik-default",
+      "partition": 0,
+      "broker_id": 1,
+      "is_leader": true
+    }
+  },
+  "segments": {},
+  "partition_offsets": {
+    "chronik-default-0": [
+      0,
+      0
+    ]
+  },
+  "version": 1
+}

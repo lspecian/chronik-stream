@@ -13,6 +13,10 @@ use flate2::Compression;
 
 /// Magic byte for RecordBatch format v2
 const MAGIC_V2: i8 = 2;
+/// Magic byte for legacy message format v1 (with timestamps)
+const MAGIC_V1: i8 = 1;
+/// Magic byte for legacy message format v0
+const MAGIC_V0: i8 = 0;
 
 /// RecordBatch attributes flags
 pub mod attributes {
@@ -294,6 +298,30 @@ impl KafkaRecordBatch {
     
     /// Decode a RecordBatch from bytes
     pub fn decode(data: &[u8]) -> Result<Self> {
+        // First check the magic byte to determine format
+        // For v0/v1, the magic byte is at offset 16 (after offset and size)
+        // For v2, it's at offset 17 (after offset, size, and partition_leader_epoch)
+        
+        if data.len() < 17 {
+            return Err(Error::Internal("RecordBatch too short to determine format".to_string()));
+        }
+        
+        // Try to detect the format by looking at the magic byte position
+        // In v2 format: offset(8) + batch_length(4) + partition_leader_epoch(4) + magic(1) = position 16
+        // In v0/v1 format: offset(8) + size(4) + crc(4) + magic(1) = position 16
+        
+        let magic_byte_v2_position = 16;
+        if data.len() > magic_byte_v2_position {
+            let possible_magic = data[magic_byte_v2_position];
+            
+            // Check if this could be a legacy format
+            if possible_magic == MAGIC_V0 as u8 || possible_magic == MAGIC_V1 as u8 {
+                // This is a legacy message set, convert it to v2 format
+                return Self::decode_legacy_message_set(data);
+            }
+        }
+        
+        // Continue with v2 parsing
         let mut cursor = Cursor::new(data);
         
         // Read base offset
@@ -303,8 +331,6 @@ impl KafkaRecordBatch {
         let batch_length = read_i32(&mut cursor)?;
         
         // Verify we have enough data
-        // batch_length is the size of the data after the length field (starting from partition_leader_epoch)
-        // We need to ensure we have at least batch_length bytes remaining
         let expected_total_size = 12 + batch_length as usize; // 8 (offset) + 4 (length) + batch_length
         if data.len() < expected_total_size {
             return Err(Error::Internal(format!(
@@ -318,6 +344,10 @@ impl KafkaRecordBatch {
         let magic = read_i8(&mut cursor)?;
         
         if magic != MAGIC_V2 {
+            // If we still get a non-v2 magic byte here, try legacy format
+            if magic == MAGIC_V0 || magic == MAGIC_V1 {
+                return Self::decode_legacy_message_set(data);
+            }
             return Err(Error::Internal(format!("Unsupported magic byte: {}", magic)));
         }
         
@@ -377,6 +407,117 @@ impl KafkaRecordBatch {
         
         // Decode records
         let records = Self::decode_records(&records_data, records_count)?;
+        
+        Ok(Self { header, records })
+    }
+    
+    /// Decode legacy message set (v0/v1 format) and convert to v2 RecordBatch
+    fn decode_legacy_message_set(data: &[u8]) -> Result<Self> {
+        let mut cursor = Cursor::new(data);
+        let mut records = Vec::new();
+        let mut base_offset = 0i64;
+        let mut base_timestamp = 0i64;
+        let mut max_timestamp = 0i64;
+        
+        // Parse MessageSet format (series of offset + message_size + message)
+        while cursor.position() < data.len() as u64 {
+            // Check if we have at least 12 bytes for offset + size
+            let remaining = cursor.get_ref().len() - cursor.position() as usize;
+            if remaining < 12 {
+                break;
+            }
+            
+            // Read offset
+            let offset = read_i64(&mut cursor)?;
+            if base_offset == 0 {
+                base_offset = offset;
+            }
+            
+            // Read message size
+            let message_size = read_i32(&mut cursor)?;
+            
+            // Check if we have enough data for the message
+            let remaining = cursor.get_ref().len() - cursor.position() as usize;
+            if remaining < message_size as usize {
+                break;
+            }
+            
+            // Read CRC
+            let _crc = read_u32(&mut cursor)?;
+            
+            // Read magic byte
+            let magic = read_i8(&mut cursor)?;
+            
+            // Read attributes
+            let attributes = read_i8(&mut cursor)?;
+            
+            // For v1, read timestamp
+            let timestamp = if magic == MAGIC_V1 {
+                let ts = read_i64(&mut cursor)?;
+                if ts > max_timestamp {
+                    max_timestamp = ts;
+                }
+                if base_timestamp == 0 || ts < base_timestamp {
+                    base_timestamp = ts;
+                }
+                ts
+            } else {
+                // v0 doesn't have timestamps
+                0
+            };
+            
+            // Read key
+            let key_len = read_i32(&mut cursor)?;
+            let key = if key_len >= 0 {
+                let mut buf = vec![0u8; key_len as usize];
+                cursor.read_exact(&mut buf)
+                    .map_err(|e| Error::Internal(format!("Failed to read key: {}", e)))?;
+                Some(Bytes::from(buf))
+            } else {
+                None
+            };
+            
+            // Read value
+            let value_len = read_i32(&mut cursor)?;
+            let value = if value_len >= 0 {
+                let mut buf = vec![0u8; value_len as usize];
+                cursor.read_exact(&mut buf)
+                    .map_err(|e| Error::Internal(format!("Failed to read value: {}", e)))?;
+                Some(Bytes::from(buf))
+            } else {
+                None
+            };
+            
+            // Convert to v2 Record
+            let record = KafkaRecord {
+                length: 0, // Will be calculated when encoding
+                attributes: 0,
+                timestamp_delta: timestamp - base_timestamp,
+                offset_delta: (offset - base_offset) as i32,
+                key,
+                value,
+                headers: Vec::new(), // Legacy formats don't have headers
+            };
+            
+            records.push(record);
+        }
+        
+        // Create a v2 RecordBatch header with converted data
+        let header = RecordBatchHeader {
+            base_offset,
+            batch_length: 0, // Will be calculated when encoding
+            partition_leader_epoch: -1, // Not available in legacy format
+            magic: MAGIC_V2, // Convert to v2
+            crc: 0, // Will be recalculated
+            attributes: 0, // No compression or special flags from legacy
+            last_offset_delta: records.len() as i32 - 1,
+            base_timestamp,
+            max_timestamp,
+            producer_id: -1, // Not available in legacy format
+            producer_epoch: -1, // Not available in legacy format
+            base_sequence: -1, // Not available in legacy format
+            records_count: records.len() as i32,
+        };
         
         Ok(Self { header, records })
     }
