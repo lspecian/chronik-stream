@@ -1,2 +1,0 @@
-tcpdump: lo: You don't have permission to capture on that device
-(socket: Operation not permitted)
