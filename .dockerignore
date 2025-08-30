@@ -29,7 +29,6 @@ LICENSE
 .travis.yml
 
 # Test files
-tests/
 benches/
 examples/
 
