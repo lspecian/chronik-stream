@@ -1,52 +1,62 @@
-# Rust build artifacts
-target/
-**/target/
-**/*.rs.bk
-*.pdb
-
 # Git
-.git/
+.git
 .gitignore
+
+# Build artifacts
+target/
+Dockerfile
+.dockerignore
+
+# Development files
+*.swp
+*.swo
+*~
+.DS_Store
 
 # IDE
 .vscode/
 .idea/
-*.swp
-*.swo
-*~
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Test data
-test-data/
-*.log
+*.iml
 
 # Documentation
 docs/
 *.md
+LICENSE
 
-# Development
+# CI/CD
+.github/
+.gitlab-ci.yml
+.travis.yml
+
+# Test files
+tests/
+benches/
+examples/
+
+# Python test scripts
+*.py
+__pycache__/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Logs
+*.log
+
+# Environment files
 .env
 .env.*
-!.env.example
 
-# TaskMaster
+# Node modules (if any)
+node_modules/
+
+# Cargo registry cache
+.cargo/registry/
+.cargo/git/
+
+# Data directories
+data/
 .taskmaster/
 .claude/
-.cursor/
-.roomodes
-.windsurfrules
-.mcp.json
-
-# Docker
-docker-compose*.yml
-
-# Examples and benchmarks  
-examples/
-benches/
-criterion/
-
-# Test directories
-test-basic/
