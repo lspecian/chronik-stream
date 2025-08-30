@@ -14,9 +14,9 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /usr/src/chronik
 
 # Copy manifest files
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.docker.toml ./Cargo.toml
+COPY Cargo.lock ./
 COPY crates/ ./crates/
-COPY tests/ ./tests/
 
 # Build in release mode
 RUN cargo build --release --bin chronik
