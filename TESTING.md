@@ -7,7 +7,7 @@ This document describes how to test the fixes implemented for Chronik Stream's c
 
 ### 1. Install Python Kafka Client
 ```bash
-pip3 install -r test_requirements.txt
+pip3 install -r tests/python/test_requirements.txt
 # or directly:
 pip3 install kafka-python
 ```
@@ -28,7 +28,7 @@ cargo build --release
 
 2. **Run comprehensive tests** (in terminal 2):
 ```bash
-python3 test_all_fixes.py
+python3 tests/python/integration/test_all_fixes.py
 ```
 
 ### Option 2: Manual Testing
@@ -42,12 +42,12 @@ RUST_LOG=info cargo run --release --bin chronik
 
 #### Auto-Topic Creation
 ```bash
-python3 test_auto_create.py
+python3 tests/python/integration/test_auto_create.py
 ```
 
 #### Full Test Suite
 ```bash
-python3 test_all_fixes.py
+python3 tests/python/integration/test_all_fixes.py
 ```
 
 ### Option 3: Rust Unit Tests

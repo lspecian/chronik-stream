@@ -58,10 +58,10 @@ pip3 install kafka-python
 cargo run --release --bin chronik-ingest
 
 # Run all tests (in terminal 2)
-python3 test_all_fixes.py
+python3 tests/python/integration/test_all_fixes.py
 
 # Or run the critical fixes test
-python3 test_critical_fixes.py
+python3 tests/python/integration/test_critical_fixes.py
 ```
 
 This tests:
@@ -76,7 +76,7 @@ This tests:
 
 ```bash
 # Test auto-topic creation
-python3 test_auto_create.py
+python3 tests/python/integration/test_auto_create.py
 
 # Test simple produce
 python3 tests/python/integration/test_simple_produce.py
@@ -192,7 +192,7 @@ time kafka-console-consumer --bootstrap-server localhost:9092 --topic perf-test 
 ### Testing Changes
 1. Make changes in `chronik-ingest`
 2. Rebuild: `cargo build --release --bin chronik-all-in-one`
-3. Test: `python3 test_all_fixes.py`
+3. Test: `python3 tests/python/integration/test_all_fixes.py`
 4. Check logs: `RUST_LOG=debug` for debugging
 
 ## Key Files to Understand
@@ -200,7 +200,7 @@ time kafka-console-consumer --bootstrap-server localhost:9092 --topic perf-test 
 - `crates/chronik-all-in-one/src/integrated_server.rs` - Main server setup using ingest
 - `crates/chronik-ingest/src/kafka_handler.rs` - Complete protocol implementation
 - `crates/chronik-protocol/src/handler.rs` - Basic protocol structure (many unimplemented)
-- `test_all_fixes.py` - Comprehensive test suite
+- `tests/python/integration/test_all_fixes.py` - Comprehensive test suite
 
 ## Production Deployment
 

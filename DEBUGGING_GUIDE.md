@@ -157,7 +157,7 @@ print(f"Response: {response.hex()}")
 RUST_LOG=debug cargo run --bin chronik &
 
 # Run Python test suite
-python3 test_all_fixes.py
+python3 tests/python/integration/test_all_fixes.py
 
 # Check logs for errors
 grep ERROR debug.log
