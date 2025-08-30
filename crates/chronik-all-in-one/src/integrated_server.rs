@@ -147,7 +147,7 @@ impl IntegratedKafkaServer {
                 },
                 max_segment_size: 256 * 1024 * 1024, // 256MB
                 enable_dual_storage: config.enable_dual_storage,
-                max_segment_age_secs: 1, // 1 second for immediate availability
+                max_segment_age_secs: 30, // 30 seconds - flush on produce for immediate availability
                 retention_period_secs: 7 * 24 * 3600, // 7 days  
                 enable_cleanup: true,
             },
@@ -323,14 +323,26 @@ impl IntegratedKafkaServer {
                             match kafka_handler.handle_request(&request_buffer[..request_size]).await {
                                 Ok(response) => {
                                     // Build complete response with size header
-                                    let mut full_response = Vec::with_capacity(response.body.len() + 8);
+                                    // We need to handle flexible versions properly
+                                    let mut header_bytes = Vec::new();
                                     
-                                    // Add size (4 bytes) - includes correlation ID
-                                    let size = (response.body.len() + 4) as i32;
+                                    // Add correlation ID
+                                    header_bytes.extend_from_slice(&response.header.correlation_id.to_be_bytes());
+                                    
+                                    // For flexible versions (v9+), add tagged fields after correlation ID
+                                    if response.is_flexible {
+                                        // Add empty tagged fields (varint 0)
+                                        header_bytes.push(0);
+                                    }
+                                    
+                                    let mut full_response = Vec::with_capacity(header_bytes.len() + response.body.len() + 4);
+                                    
+                                    // Add size (4 bytes)
+                                    let size = (header_bytes.len() + response.body.len()) as i32;
                                     full_response.extend_from_slice(&size.to_be_bytes());
                                     
-                                    // Add correlation ID (4 bytes)
-                                    full_response.extend_from_slice(&response.header.correlation_id.to_be_bytes());
+                                    // Add header (correlation ID + optional tagged fields)
+                                    full_response.extend_from_slice(&header_bytes);
                                     
                                     // Add response body
                                     full_response.extend_from_slice(&response.body);
@@ -441,7 +453,7 @@ mod tests {
         let server = IntegratedKafkaServer::new(config).await.unwrap();
         let stats = server.get_stats().await.unwrap();
         
-        assert_eq!(stats.node_id, 0);
+        assert_eq!(stats.node_id, 1);
         assert_eq!(stats.brokers_count, 1);
     }
 }

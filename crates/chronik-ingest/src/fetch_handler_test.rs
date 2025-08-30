@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
     use crate::fetch_handler::FetchHandler;
-    use chronik_common::metadata::TiKVMetadataStore;
+    use chronik_common::metadata::FileMetadataStore;
     use chronik_storage::{
         object_store::backends::local::LocalBackend,
         SegmentReader,
@@ -18,7 +18,7 @@ mod tests {
         
         // Create metadata store
         let metadata_store = Arc::new(
-            TiKVMetadataStore::new(vec!["127.0.0.1:2379".to_string()])
+            FileMetadataStore::new(temp_dir.path().join("metadata"))
                 .await
                 .unwrap()
         );

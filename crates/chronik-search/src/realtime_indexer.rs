@@ -277,7 +277,12 @@ impl RealtimeIndexer {
         tokio::spawn(async move {
             let mut batch = Vec::with_capacity(config.batch_size);
             
-            while running.load(Ordering::Relaxed) {
+            loop {
+                // Check if we should stop
+                if !running.load(Ordering::Relaxed) {
+                    break;
+                }
+                
                 // Try to fill the batch
                 let timeout = tokio::time::sleep(config.batch_timeout);
                 tokio::pin!(timeout);
@@ -294,9 +299,8 @@ impl RealtimeIndexer {
                             }
                         }
                         _ = &mut timeout => {
-                            if !batch.is_empty() {
-                                break;
-                            }
+                            // Timeout fired - process batch if not empty or continue waiting
+                            break;
                         }
                         else => {
                             running.store(false, Ordering::SeqCst);
@@ -348,8 +352,12 @@ impl RealtimeIndexer {
         tokio::spawn(async move {
             let mut interval = interval(config.batch_timeout);
             
-            while running.load(Ordering::Relaxed) {
+            loop {
                 interval.tick().await;
+                
+                if !running.load(Ordering::Relaxed) {
+                    break;
+                }
                 
                 let indexes_read = indexes.read().await;
                 for (topic, index) in indexes_read.iter() {
@@ -377,8 +385,12 @@ impl RealtimeIndexer {
         tokio::spawn(async move {
             let mut interval = interval(Duration::from_secs(10));
             
-            while running.load(Ordering::Relaxed) {
+            loop {
                 interval.tick().await;
+                
+                if !running.load(Ordering::Relaxed) {
+                    break;
+                }
                 
                 // Update memory usage metric
                 if let Ok(usage) = get_process_memory_usage() {

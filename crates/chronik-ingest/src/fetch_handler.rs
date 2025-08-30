@@ -3,7 +3,7 @@
 use chronik_common::{Result, Error};
 use chronik_common::metadata::traits::MetadataStore;
 use chronik_protocol::{FetchRequest, FetchResponse, FetchResponseTopic, FetchResponsePartition};
-use chronik_storage::{SegmentReader, RecordBatch, Segment, ObjectStoreTrait};
+use chronik_storage::{SegmentReader, RecordBatch, Record, Segment, ObjectStoreTrait};
 use chronik_storage::kafka_records::{KafkaRecordBatch, KafkaRecord, RecordHeader as KafkaRecordHeader, CompressionType};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -175,6 +175,60 @@ impl FetchHandler {
             });
         }
         
+        // If we have data available (fetch_offset < high_watermark), fetch it
+        if fetch_offset < high_watermark {
+            // Data is available, fetch it
+            let fetch_timeout = if max_wait_ms > 0 {
+                Duration::from_millis(max_wait_ms as u64)
+            } else {
+                Duration::from_secs(30) // Default timeout
+            };
+            
+            let fetch_result = timeout(fetch_timeout, async {
+                self.fetch_records(
+                    topic,
+                    partition,
+                    fetch_offset,
+                    high_watermark,
+                    max_bytes,
+                ).await
+            }).await;
+            
+            let records = match fetch_result {
+                Ok(Ok(recs)) => {
+                    tracing::info!("Fetched {} records from {}-{}", recs.len(), topic, partition);
+                    recs
+                },
+                Ok(Err(e)) => {
+                    tracing::warn!("Error fetching records from {}-{}: {:?}", topic, partition, e);
+                    vec![]
+                }
+                Err(_) => {
+                    tracing::warn!("Fetch timeout after {}ms for {}-{}", max_wait_ms, topic, partition);
+                    vec![]
+                }
+            };
+            
+            // Encode the records
+            let records_bytes = if records.is_empty() {
+                vec![]
+            } else {
+                self.encode_kafka_records(&records, 0)?
+            };
+            
+            return Ok(FetchResponsePartition {
+                partition,
+                error_code: 0,
+                high_watermark,
+                last_stable_offset: high_watermark,
+                log_start_offset,
+                aborted: None,
+                preferred_read_replica: -1,
+                records: records_bytes,
+            });
+        }
+        
+        // No data available yet (fetch_offset >= high_watermark)
         if fetch_offset >= high_watermark {
             // No data available yet - implement wait logic
             if max_wait_ms > 0 && min_bytes > 0 {
@@ -274,81 +328,8 @@ impl FetchHandler {
             }
         }
         
-        // Data is available, fetch with timeout
-        let fetch_timeout = if max_wait_ms > 0 {
-            Duration::from_millis(max_wait_ms as u64)
-        } else {
-            Duration::from_secs(30) // Default timeout
-        };
-        
-        let fetch_result = timeout(fetch_timeout, async {
-            self.fetch_records(
-                topic,
-                partition,
-                fetch_offset,
-                high_watermark,
-                max_bytes,
-            ).await
-        }).await;
-        
-        let records = match fetch_result {
-            Ok(Ok(recs)) => {
-                tracing::info!("Fetched {} records from {}-{}", recs.len(), topic, partition);
-                recs
-            },
-            Ok(Err(e)) => {
-                tracing::warn!("Error fetching records from {}-{}: {:?}", topic, partition, e);
-                vec![]
-            }
-            Err(_) => {
-                tracing::warn!("Fetch timeout after {}ms for {}-{}", max_wait_ms, topic, partition);
-                vec![]
-            }
-        };
-        
-        // Check if we have enough bytes (partial response support)
-        let total_bytes: usize = records.iter()
-            .map(|r| r.value.len() + r.key.as_ref().map(|k| k.len()).unwrap_or(0))
-            .sum();
-        
-        // If min_bytes is specified and we don't have enough, wait or return partial
-        let final_records = if min_bytes > 0 && total_bytes < min_bytes as usize && max_wait_ms > 0 {
-            // Try to fetch more data within the timeout
-            // For now, just return what we have (partial response)
-            records
-        } else {
-            records
-        };
-        
-        // For better compatibility, try to fetch raw Kafka batches from segments
-        // This preserves the original CRC values
-        let records_bytes = if final_records.is_empty() {
-            vec![]
-        } else {
-            // Try to get raw batch data if we're fetching from segments
-            match self.try_fetch_raw_batches(topic, partition, fetch_offset, high_watermark).await {
-                Ok(raw_bytes) if !raw_bytes.is_empty() => {
-                    tracing::info!("Using raw Kafka batch data ({} bytes) for CRC compatibility", raw_bytes.len());
-                    raw_bytes
-                }
-                _ => {
-                    // Fallback to re-encoding (may cause CRC issues)
-                    tracing::warn!("Re-encoding records - may cause CRC validation issues");
-                    self.encode_kafka_records(&final_records, 0)?
-                }
-            }
-        };
-        
-        Ok(FetchResponsePartition {
-            partition,
-            error_code: 0,
-            high_watermark,
-            last_stable_offset: high_watermark,
-            log_start_offset,
-            aborted: None,
-            preferred_read_replica: -1,
-            records: records_bytes,
-        })
+        // Should not reach here - all cases should have returned above
+        unreachable!("Fetch handler logic error")
     }
     
     /// Fetch records from memory or segments
@@ -499,14 +480,34 @@ impl FetchHandler {
             segment.raw_kafka_batches.len(),
             segment.indexed_records.len());
         
-        // Use indexed records for individual record access
-        // The indexed_records contains the encoded RecordBatch
-        if segment.indexed_records.is_empty() {
+        // Use indexed records if available, otherwise decode from raw Kafka batches
+        let record_batch = if !segment.indexed_records.is_empty() {
+            // Decode the RecordBatch from indexed_records
+            RecordBatch::decode(&segment.indexed_records)?
+        } else if !segment.raw_kafka_batches.is_empty() {
+            // Decode from raw Kafka batches (preserves CRC)
+            tracing::info!("Using raw Kafka batches for fetch (no indexed records)");
+            
+            // Parse the raw Kafka batch to extract records
+            let kafka_batch = KafkaRecordBatch::decode(&segment.raw_kafka_batches)?;
+            
+            // Convert Kafka records to storage Records
+            let records: Vec<Record> = kafka_batch.records.into_iter().enumerate().map(|(i, kr)| {
+                Record {
+                    offset: kafka_batch.header.base_offset + i as i64,
+                    timestamp: kafka_batch.header.base_timestamp + kr.timestamp_delta,
+                    key: kr.key.map(|k| k.to_vec()),
+                    value: kr.value.map(|v| v.to_vec()).unwrap_or_default(),
+                    headers: kr.headers.into_iter().map(|h| {
+                        (h.key, h.value.map(|v| v.to_vec()).unwrap_or_default())
+                    }).collect(),
+                }
+            }).collect();
+            
+            RecordBatch { records }
+        } else {
             return Ok(vec![]);
-        }
-        
-        // Decode the RecordBatch from indexed_records
-        let record_batch = RecordBatch::decode(&segment.indexed_records)?;
+        };
         
         // Filter records by offset range
         let mut filtered_records = Vec::new();

@@ -155,14 +155,9 @@ impl SearchLatencyBenchmark {
             
             // Create search request
             let search_request = SearchRequest {
-                index: "test-index".to_string(),
-                query: Some(serde_json::json!({
-                    "match": {
-                        "content": format!("test query {}", i % 100)
-                    }
-                })),
-                size: Some(10),
-                from: Some(0),
+                query: None,  // TODO: Fix query type - should be QueryDsl not serde_json::Value
+                size: 10,
+                from: 0,
                 sort: None,
                 _source: None,
                 highlight: None,

@@ -17,7 +17,7 @@ slog-term = "2.9"
 slog-async = "2.8"
 
 # Database - using TiKV via chronik-common
-tikv-client = { workspace = true }
+# tikv-client = { workspace = true }  # Removed - not needed
 
 # Web framework for admin API
 axum = "0.7"

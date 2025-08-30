@@ -215,6 +215,11 @@ impl<'a> Decoder<'a> {
             .map_err(|e| Error::Protocol(format!("Invalid UTF-8 in string: {}", e)))
     }
     
+    /// Advance the buffer by n bytes
+    pub fn advance(&mut self, n: usize) {
+        self.buf.advance(n);
+    }
+    
     /// Read an unsigned varint
     pub fn read_unsigned_varint(&mut self) -> Result<u32> {
         let mut value = 0u32;
@@ -332,6 +337,11 @@ impl<'a> Encoder<'a> {
     /// Write empty tagged fields (always writes 0 for now)
     pub fn write_tagged_fields(&mut self) {
         self.write_unsigned_varint(0);
+    }
+    
+    /// Write raw bytes
+    pub fn write_raw_bytes(&mut self, bytes: &[u8]) {
+        self.buf.put_slice(bytes);
     }
 }
 

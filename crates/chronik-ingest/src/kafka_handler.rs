@@ -120,7 +120,8 @@ impl KafkaProtocolHandler {
                         let mut buf = BytesMut::new();
                         buf.put_i16(error_codes::UNSUPPORTED_VERSION);
                         buf.freeze()
-                    }
+                    },
+                    is_flexible: false,  // Error response - conservative default
                 });
             }
         };
@@ -142,6 +143,7 @@ impl KafkaProtocolHandler {
                 Ok(Response {
                     header: ResponseHeader { correlation_id: header.correlation_id },
                     body: body_buf.freeze(),
+                    is_flexible: false,  // TODO: Check API version for flexible encoding
                 })
             }
             ApiKey::Fetch => {
@@ -168,6 +170,7 @@ impl KafkaProtocolHandler {
                 Ok(Response {
                     header: ResponseHeader { correlation_id: header.correlation_id },
                     body: body_buf.freeze(),
+                    is_flexible: false,  // TODO: Check API version for flexible encoding
                 })
             }
             ApiKey::FindCoordinator => {
@@ -184,6 +187,7 @@ impl KafkaProtocolHandler {
                 Ok(Response {
                     header: ResponseHeader { correlation_id: header.correlation_id },
                     body: body_buf.freeze(),
+                    is_flexible: false,  // TODO: Check API version for flexible encoding
                 })
             }
             ApiKey::JoinGroup => {
@@ -200,6 +204,7 @@ impl KafkaProtocolHandler {
                 Ok(Response {
                     header: ResponseHeader { correlation_id: header.correlation_id },
                     body: body_buf.freeze(),
+                    is_flexible: false,  // TODO: Check API version for flexible encoding
                 })
             }
             ApiKey::SyncGroup => {
@@ -216,6 +221,7 @@ impl KafkaProtocolHandler {
                 Ok(Response {
                     header: ResponseHeader { correlation_id: header.correlation_id },
                     body: body_buf.freeze(),
+                    is_flexible: false,  // TODO: Check API version for flexible encoding
                 })
             }
             ApiKey::Heartbeat => {
@@ -232,6 +238,7 @@ impl KafkaProtocolHandler {
                 Ok(Response {
                     header: ResponseHeader { correlation_id: header.correlation_id },
                     body: body_buf.freeze(),
+                    is_flexible: false,  // TODO: Check API version for flexible encoding
                 })
             }
             ApiKey::LeaveGroup => {
@@ -248,6 +255,7 @@ impl KafkaProtocolHandler {
                 Ok(Response {
                     header: ResponseHeader { correlation_id: header.correlation_id },
                     body: body_buf.freeze(),
+                    is_flexible: false,  // TODO: Check API version for flexible encoding
                 })
             }
             ApiKey::ListGroups => {
@@ -268,6 +276,7 @@ impl KafkaProtocolHandler {
                 Ok(Response {
                     header: ResponseHeader { correlation_id: header.correlation_id },
                     body: body_buf.freeze(),
+                    is_flexible: false,  // TODO: Check API version for flexible encoding
                 })
             }
             ApiKey::OffsetFetch => {
@@ -284,7 +293,14 @@ impl KafkaProtocolHandler {
                 Ok(Response {
                     header: ResponseHeader { correlation_id: header.correlation_id },
                     body: body_buf.freeze(),
+                    is_flexible: false,  // TODO: Check API version for flexible encoding
                 })
+            }
+            ApiKey::ApiVersions => {
+                // ApiVersions must use the protocol handler for proper encoding
+                let response = self.protocol_handler.handle_request(request_bytes).await?;
+                tracing::info!("Response body size: {}", response.body.len());
+                Ok(response)
             }
             _ => {
                 // For all other APIs, use the protocol handler

@@ -40,8 +40,9 @@ use bytes::Bytes;
 /// Maximum segment size before rotation (256MB)
 const MAX_SEGMENT_SIZE: u64 = 256 * 1024 * 1024;
 
-/// Maximum time before segment rotation (1 second for immediate availability)
-const MAX_SEGMENT_AGE: Duration = Duration::from_secs(1);
+/// Maximum time before segment rotation (30 seconds - reasonable interval)
+/// We flush after each produce for immediate availability, rotation is for segment management
+const MAX_SEGMENT_AGE: Duration = Duration::from_secs(30);
 
 /// Maximum number of records in memory before flush
 const MAX_BUFFER_RECORDS: usize = 10000;
@@ -759,6 +760,13 @@ impl ProduceHandler {
         // Drop memory permit
         drop(memory_permit);
         
+        // Flush immediately to ensure data is available for fetch
+        // Note: We don't force rotation here - let the background task handle rotation
+        // based on time/size thresholds to avoid infinite rotation loops
+        if let Err(e) = self.flush_partition(topic, partition, &partition_state).await {
+            warn!("Failed to flush partition {}-{}: {:?}", topic, partition, e);
+        }
+        
         // Get partition state for response
         let log_start_offset = partition_state.log_start_offset.load(Ordering::Relaxed) as i64;
         
@@ -1208,6 +1216,42 @@ impl ProduceHandler {
         Ok(())
     }
     
+    /// Force immediate rotation of a partition's segment
+    async fn force_rotate_partition(
+        &self,
+        topic: &str,
+        partition: i32,
+        state: &Arc<PartitionState>,
+    ) -> Result<()> {
+        // Flush current segment immediately
+        self.flush_partition(topic, partition, state).await?;
+        
+        // Force rotation by creating a new segment writer
+        let segment_path = format!("{}/{}/partition-{}", 
+            self.config.storage_config.segment_writer_config.data_dir.to_string_lossy(), 
+            topic, 
+            partition
+        );
+        
+        let new_writer = SegmentWriter::new(
+            self.config.storage_config.segment_writer_config.clone(),
+        ).await?;
+        
+        // Replace writer
+        *state.current_writer.lock().await = new_writer;
+        state.segment_size.store(0, Ordering::SeqCst);
+        state.segment_created.store(
+            Instant::now().duration_since(state.start_time).as_millis() as u64,
+            Ordering::SeqCst
+        );
+        
+        self.metrics.segments_created.fetch_add(1, Ordering::Relaxed);
+        
+        debug!("Force rotated segment for {}-{}", topic, partition);
+        
+        Ok(())
+    }
+    
     /// Check and rotate segments if needed
     async fn check_and_rotate_segments(&self) -> Result<()> {
         let states = self.partition_states.read().await;
@@ -1508,7 +1552,7 @@ impl Clone for ProduceHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chronik_common::metadata::TiKVMetadataStore;
+    use chronik_common::metadata::FileMetadataStore;
     use chronik_storage::object_store::backends::local::LocalBackend;
     use chronik_protocol::types::{ProduceRequestTopic, ProduceRequestPartition};
     use tempfile::TempDir;
@@ -1532,7 +1576,8 @@ mod tests {
             LocalBackend::new(storage_config).await.unwrap()
         );
         let pd_endpoints = vec!["localhost:2379".to_string()];
-        let metadata_store = Arc::new(TiKVMetadataStore::new(pd_endpoints).await.unwrap());
+        let temp_dir = TempDir::new().unwrap();
+        let metadata_store = Arc::new(FileMetadataStore::new(temp_dir.path().join("metadata")).await.unwrap());
         
         // Create test topic
         let topic_config = chronik_common::metadata::TopicConfig {
@@ -1978,7 +2023,8 @@ mod tests {
             LocalBackend::new(storage_config).await.unwrap()
         );
         let pd_endpoints = vec!["localhost:2379".to_string()];
-        let metadata_store = Arc::new(TiKVMetadataStore::new(pd_endpoints).await.unwrap());
+        let temp_dir = TempDir::new().unwrap();
+        let metadata_store = Arc::new(FileMetadataStore::new(temp_dir.path().join("metadata")).await.unwrap());
         
         let config = ProduceHandlerConfig {
             node_id: 0,
@@ -2044,7 +2090,8 @@ mod tests {
             LocalBackend::new(storage_config).await.unwrap()
         );
         let pd_endpoints = vec!["localhost:2379".to_string()];
-        let metadata_store = Arc::new(TiKVMetadataStore::new(pd_endpoints).await.unwrap());
+        let temp_dir = TempDir::new().unwrap();
+        let metadata_store = Arc::new(FileMetadataStore::new(temp_dir.path().join("metadata")).await.unwrap());
         
         let config = ProduceHandlerConfig {
             node_id: 0,
@@ -2100,7 +2147,8 @@ mod tests {
             LocalBackend::new(storage_config).await.unwrap()
         );
         let pd_endpoints = vec!["localhost:2379".to_string()];
-        let metadata_store = Arc::new(TiKVMetadataStore::new(pd_endpoints).await.unwrap());
+        let temp_dir = TempDir::new().unwrap();
+        let metadata_store = Arc::new(FileMetadataStore::new(temp_dir.path().join("metadata")).await.unwrap());
         
         let config = ProduceHandlerConfig {
             node_id: 0,
@@ -2191,7 +2239,8 @@ mod tests {
             LocalBackend::new(storage_config).await.unwrap()
         );
         let pd_endpoints = vec!["localhost:2379".to_string()];
-        let metadata_store = Arc::new(TiKVMetadataStore::new(pd_endpoints).await.unwrap());
+        let temp_dir = TempDir::new().unwrap();
+        let metadata_store = Arc::new(FileMetadataStore::new(temp_dir.path().join("metadata")).await.unwrap());
         
         let config = ProduceHandlerConfig {
             node_id: 0,

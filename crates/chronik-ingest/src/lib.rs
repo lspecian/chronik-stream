@@ -11,9 +11,9 @@ pub mod fetch_handler;
 pub mod health;
 pub mod metrics;
 pub mod offset_storage;
-pub mod offset_cleanup;
+// pub mod offset_cleanup;  // Removed - uses tikv_client directly
 pub mod coordinator_manager;
-pub mod distributed_lock;
+// pub mod distributed_lock;  // Removed - uses tikv_client directly
 pub mod heartbeat_monitor;
 pub mod protocol_metadata;
 

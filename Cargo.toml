@@ -7,12 +7,12 @@ members = [
     "crates/chronik-ingest",
     "crates/chronik-search",
     "crates/chronik-query",
-    "crates/chronik-controller",
+    # "crates/chronik-controller",  # Removed - has raft dependency with protoc issues
     "crates/chronik-janitor",
-    "crates/chronik-operator",
+    # "crates/chronik-operator",  # Removed - not needed
     "crates/chronik-monitoring",
     "crates/chronik-auth",
-    "crates/chronik-admin",
+    # "crates/chronik-admin",  # Removed - depends on chronik-controller
     "crates/chronik-cli",
     "crates/chronik-benchmarks",
     "crates/chronik-backup",
@@ -62,7 +62,7 @@ lz4_flex = "0.11"
 
 # Database
 # sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono"] }  # Replaced with TiKV
-tikv-client = "0.3"
+# tikv-client = "0.3"  # Removed - not needed
 
 # Kubernetes (Apache 2.0)
 kube = { version = "0.87", features = ["runtime", "derive"] }
@@ -113,6 +113,7 @@ missing_docs = "warn"
 opt-level = 3
 lto = true
 codegen-units = 1
+debug = true  # Enable debug symbols for profiling
 
 [profile.bench]
 inherits = "release"

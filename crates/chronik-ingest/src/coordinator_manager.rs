@@ -396,7 +396,7 @@ pub struct CoordinatorStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chronik_common::metadata::{tikv_store::TiKVMetadataStore, traits::MetadataStore as MetadataStoreTrait};
+    use chronik_common::metadata::traits::MetadataStore as MetadataStoreTrait;
     
     // Mock metadata store for testing
     struct MockMetadataStore {

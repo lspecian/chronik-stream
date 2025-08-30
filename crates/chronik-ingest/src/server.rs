@@ -15,7 +15,7 @@ use bytes::{Buf, Bytes, BytesMut, BufMut};
 use chronik_auth::tls::TlsAcceptor;
 use chronik_common::{Result, Error};
 use chronik_common::metadata::traits::MetadataStore;
-use chronik_common::metadata::TiKVMetadataStore;
+// use chronik_common::metadata::TiKVMetadataStore;  // Removed - tikv dependency removed
 use chronik_monitoring::ServerMetrics;
 use chronik_protocol::frame::KafkaFrameCodec;
 use chronik_storage::{SegmentReader, SegmentReaderConfig};
@@ -181,16 +181,12 @@ impl IngestServer {
                 Arc::new(InMemoryMetadataStore::new())
             },
             _ => {
-                // Default to TiKV
-                let pd_endpoints = std::env::var("TIKV_PD_ENDPOINTS")
-                    .unwrap_or_else(|_| "localhost:2379".to_string());
-                let endpoints = pd_endpoints
-                    .split(',')
-                    .map(|s| s.to_string())
-                    .collect::<Vec<String>>();
+                // Default to FileMetadataStore
+                use chronik_common::metadata::file_store::FileMetadataStore;
+                let metadata_path = data_dir.join("metadata");
                 Arc::new(
-                    TiKVMetadataStore::new(endpoints).await
-                        .map_err(|e| Error::Internal(format!("Failed to create TiKV metadata store: {}", e)))?
+                    FileMetadataStore::new(metadata_path).await
+                        .map_err(|e| Error::Internal(format!("Failed to create file metadata store: {}", e)))?
                 )
             }
         };
@@ -252,6 +248,14 @@ impl IngestServer {
         );
         
         // Create Kafka protocol handler
+        // Use localhost as the advertised address instead of 0.0.0.0
+        // so that clients can connect properly
+        let advertised_host = if config.listen_addr.ip().is_unspecified() {
+            "localhost".to_string()
+        } else {
+            config.listen_addr.ip().to_string()
+        };
+        
         let kafka_handler = Arc::new(
             KafkaProtocolHandler::new(
                 produce_handler,
@@ -259,7 +263,7 @@ impl IngestServer {
                 metadata_store.clone(),
                 storage_service.object_store(),
                 1, // node_id
-                config.listen_addr.ip().to_string(),
+                advertised_host,
                 config.listen_addr.port() as i32,
             ).await?
         );
@@ -897,6 +901,7 @@ fn create_error_response_with_correlation_id(error_code: i16, correlation_id: i3
     chronik_protocol::handler::Response {
         header: ResponseHeader { correlation_id },
         body: buf.freeze(),
+        is_flexible: false,  // Error response - conservative default
     }
 }
 

@@ -37,7 +37,7 @@ chrono = { workspace = true }
 lazy_static = "1.4"
 
 # TiKV client for direct access (for cleanup)
-tikv-client = "0.3"
+# tikv-client = "0.3"  # Removed - not needed
 
 # Hashing
 murmur2 = { workspace = true }

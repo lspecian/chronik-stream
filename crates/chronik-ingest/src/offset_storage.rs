@@ -5,7 +5,7 @@
 
 use chronik_common::Result;
 use chronik_common::metadata::{MetadataStore, ConsumerOffset, MetadataError};
-use crate::offset_cleanup::OffsetCleanupManager;
+// use crate::offset_cleanup::OffsetCleanupManager;  // Removed - tikv dependency
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::collections::HashMap;
@@ -66,41 +66,14 @@ impl OffsetStorage {
     }
     
     /// Start the background cleanup task with enhanced cleanup manager
-    pub async fn start_cleanup_task(&self, pd_endpoints: Option<Vec<String>>) {
+    pub async fn start_cleanup_task(&self, _pd_endpoints: Option<Vec<String>>) {
         if !self.config.enable_cleanup {
             return;
         }
         
-        let retention_duration = self.config.retention_duration;
-        let cleanup_interval = self.config.cleanup_interval;
-        
-        tokio::spawn(async move {
-            // Initialize cleanup manager
-            let mut cleanup_manager = OffsetCleanupManager::new(retention_duration);
-            
-            // Try to initialize direct TiKV access for cleanup
-            if let Some(endpoints) = pd_endpoints {
-                if let Err(e) = cleanup_manager.init_tikv(endpoints).await {
-                    warn!("Failed to initialize TiKV for offset cleanup: {}", e);
-                }
-            }
-            
-            let mut interval = interval(cleanup_interval);
-            loop {
-                interval.tick().await;
-                
-                match cleanup_manager.cleanup_expired_offsets().await {
-                    Ok(cleaned) => {
-                        if cleaned > 0 {
-                            info!("Cleaned up {} expired consumer offsets", cleaned);
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to cleanup expired offsets: {}", e);
-                    }
-                }
-            }
-        });
+        // TiKV cleanup removed - cleanup now handled by metadata store
+        // TODO: Implement cleanup using metadata store if needed
+        info!("Offset cleanup task disabled - TiKV dependencies removed");
     }
     
     /// Commit a batch of offsets atomically

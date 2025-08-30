@@ -26,6 +26,7 @@ pub mod sync_group_types;
 pub mod heartbeat_types;
 pub mod list_groups_types;
 pub mod leave_group_types;
+pub mod consumer_group_types;
 
 // Temporarily disabled due to kafka-protocol crate compatibility issues
 // pub mod handler_v2;

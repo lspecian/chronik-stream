@@ -4,13 +4,51 @@ use bytes::{Bytes, BytesMut};
 use chronik_common::{Result, Error};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use tokio::sync::Mutex;
 use crate::error_codes;
 use crate::parser::{
     ApiKey, RequestHeader, ResponseHeader, VersionRange, 
     parse_request_header_with_correlation,
     supported_api_versions,
-    Encoder
+    Encoder,
+    is_flexible_version
 };
+
+// Consumer group state management
+#[derive(Debug, Clone)]
+pub struct ConsumerGroup {
+    pub group_id: String,
+    pub leader_id: Option<String>,
+    pub generation_id: i32,
+    pub protocol_type: Option<String>,
+    pub protocol: Option<String>,
+    pub members: Vec<GroupMember>,
+    pub state: String,
+    pub offsets: HashMap<String, HashMap<i32, OffsetInfo>>, // topic -> partition -> offset
+}
+
+#[derive(Debug, Clone)]
+pub struct GroupMember {
+    pub member_id: String,
+    pub group_instance_id: Option<String>,
+    pub client_id: String,
+    pub client_host: String,
+    pub metadata: Option<Vec<u8>>,
+    pub assignment: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OffsetInfo {
+    pub offset: i64,
+    pub metadata: Option<String>,
+    pub timestamp: i64,
+}
+
+#[derive(Debug, Default)]
+pub struct ConsumerGroupState {
+    pub groups: HashMap<String, ConsumerGroup>,
+}
+
 use crate::types::{
     ConfigEntry, ConfigSynonym, config_source, config_type,
     DescribeConfigsResponse
@@ -20,6 +58,7 @@ use crate::types::{
 pub struct Response {
     pub header: ResponseHeader,
     pub body: Bytes,
+    pub is_flexible: bool,  // Track if this response uses flexible encoding
 }
 
 /// Handler for specific API versions request
@@ -48,24 +87,42 @@ pub struct ProtocolHandler {
     metadata_store: Option<Arc<dyn chronik_common::metadata::traits::MetadataStore>>,
     /// Broker ID for this instance
     broker_id: i32,
+    /// Consumer group state
+    consumer_groups: Arc<Mutex<ConsumerGroupState>>,
 }
 
 impl ProtocolHandler {
+    /// Helper to create a Response with proper flexible tracking
+    fn make_response(header: &RequestHeader, api_key: ApiKey, body: Bytes) -> Response {
+        Response {
+            header: ResponseHeader { correlation_id: header.correlation_id },
+            body,
+            is_flexible: is_flexible_version(api_key, header.api_version),
+        }
+    }
+    
     /// Create a new protocol handler.
     pub fn new() -> Self {
         Self {
             supported_versions: supported_api_versions(),
             metadata_store: None,
             broker_id: 1, // Default broker ID
+            consumer_groups: Arc::new(Mutex::new(ConsumerGroupState::default())),
         }
     }
     
     /// Create a new protocol handler with metadata store
     pub fn with_metadata_store(metadata_store: Arc<dyn chronik_common::metadata::traits::MetadataStore>) -> Self {
+        let versions = supported_api_versions();
+        eprintln!("INIT: Creating ProtocolHandler with {} supported APIs", versions.len());
+        for (api, range) in &versions {
+            eprintln!("  - {:?}: v{}-v{}", api, range.min, range.max);
+        }
         Self {
-            supported_versions: supported_api_versions(),
+            supported_versions: versions,
             metadata_store: Some(metadata_store),
             broker_id: 1, // Default broker ID
+            consumer_groups: Arc::new(Mutex::new(ConsumerGroupState::default())),
         }
     }
     
@@ -74,10 +131,13 @@ impl ProtocolHandler {
         metadata_store: Arc<dyn chronik_common::metadata::traits::MetadataStore>,
         broker_id: i32,
     ) -> Self {
+        let versions = supported_api_versions();
+        eprintln!("INIT: Creating ProtocolHandler with broker {} and {} supported APIs", broker_id, versions.len());
         Self {
-            supported_versions: supported_api_versions(),
+            supported_versions: versions,
             metadata_store: Some(metadata_store),
             broker_id,
+            consumer_groups: Arc::new(Mutex::new(ConsumerGroupState::default())),
         }
     }
     
@@ -675,9 +735,18 @@ impl ProtocolHandler {
                 }
                 
                 // Records
+                // For v11+, we need to provide a proper RecordBatch even if empty
+                // For now, always return NULL which the client can handle
                 let records_len = if partition.records.is_empty() {
-                    tracing::trace!("        Records: NULL");
-                    encoder.write_bytes(None);
+                    if version >= 11 {
+                        // For v11+, we could return an empty RecordBatch,
+                        // but NULL is also valid and simpler
+                        tracing::trace!("        Records: NULL (v11+)");
+                        encoder.write_bytes(None);
+                    } else {
+                        tracing::trace!("        Records: NULL");
+                        encoder.write_bytes(None);
+                    }
                     0
                 } else {
                     let len = partition.records.len();
@@ -747,15 +816,15 @@ impl ProtocolHandler {
             ApiKey::ApiVersions => self.handle_api_versions(header, &mut buf).await,
             ApiKey::DescribeConfigs => self.handle_describe_configs(header, &mut buf).await,
             
-            // Consumer group APIs - TODO: implement these
-            ApiKey::OffsetCommit => self.unimplemented_api_response(header.correlation_id, "OffsetCommit"),
-            ApiKey::OffsetFetch => self.unimplemented_api_response(header.correlation_id, "OffsetFetch"),
+            // Consumer group APIs
+            ApiKey::OffsetCommit => self.handle_offset_commit(header, &mut buf).await,
+            ApiKey::OffsetFetch => self.handle_offset_fetch(header, &mut buf).await,
             ApiKey::FindCoordinator => self.handle_find_coordinator(header, &mut buf).await,
             ApiKey::JoinGroup => self.handle_join_group(header, &mut buf).await,
             ApiKey::Heartbeat => self.handle_heartbeat(header, &mut buf).await,
             ApiKey::LeaveGroup => self.unimplemented_api_response(header.correlation_id, "LeaveGroup"),
             ApiKey::SyncGroup => self.handle_sync_group(header, &mut buf).await,
-            ApiKey::DescribeGroups => self.unimplemented_api_response(header.correlation_id, "DescribeGroups"),
+            ApiKey::DescribeGroups => self.handle_describe_groups(header, &mut buf).await,
             ApiKey::ListGroups => self.handle_list_groups(header, &mut buf).await,
             
             // Administrative APIs - TODO: implement these
@@ -812,8 +881,60 @@ impl ProtocolHandler {
         header: RequestHeader,
         _body: &mut Bytes,
     ) -> Result<Response> {
-        tracing::info!("Handling ApiVersions request - correlation_id: {}, version: {}", 
+        eprintln!("PROTOCOL HANDLER: Handling ApiVersions request - correlation_id: {}, version: {}", 
             header.correlation_id, header.api_version);
+        
+        // Check if supported_versions was properly initialized
+        eprintln!("DEBUG: supported_versions.len() = {}", self.supported_versions.len());
+        eprintln!("DEBUG: supported_versions.is_empty() = {}", self.supported_versions.is_empty());
+        
+        // Try to get the versions directly
+        let test_versions = supported_api_versions();
+        eprintln!("DEBUG: Direct call to supported_api_versions() returns {} entries", test_versions.len());
+        
+        if self.supported_versions.is_empty() {
+            eprintln!("ERROR: supported_versions is EMPTY!");
+            eprintln!("Using direct call to supported_api_versions() as fallback");
+            
+            // Use the directly fetched versions instead of minimal list
+            let mut api_versions = Vec::new();
+            for (api_key, version_range) in &test_versions {
+                api_versions.push(ApiVersionInfo {
+                    api_key: *api_key as i16,
+                    min_version: version_range.min,
+                    max_version: version_range.max,
+                });
+            }
+            eprintln!("PROTOCOL HANDLER: Created response struct");
+            eprintln!("PROTOCOL HANDLER: About to encode ApiVersions response for version {}", header.api_version);
+            eprintln!("encode_api_versions_response: Starting encoding for version {}", header.api_version);
+            eprintln!("encode_api_versions_response: Encoding {} APIs", api_versions.len());
+            eprintln!("PROTOCOL HANDLER: Encoding complete");
+            
+            let response = ApiVersionsResponse {
+                error_code: 0,
+                api_versions,
+                throttle_time_ms: 0,
+            };
+            
+            let mut body_buf = BytesMut::new();
+            self.encode_api_versions_response(&mut body_buf, &response, header.api_version)?;
+            
+            tracing::info!("Encoded ApiVersions response: {} bytes", body_buf.len());
+            
+            let hex_str = body_buf.iter()
+                .take(32)
+                .map(|b| format!("{:02x}", b))
+                .collect::<Vec<_>>()
+                .join(" ");
+            tracing::info!("First 32 bytes of encoded response: {}", hex_str);
+            
+            let encoded_bytes = body_buf.freeze();
+            return Ok(Self::make_response(&header, ApiKey::ApiVersions, encoded_bytes));
+        }
+        
+        eprintln!("PROTOCOL HANDLER: supported_versions has {} entries", self.supported_versions.len());
+        
         let mut api_versions = Vec::new();
         
         for (api_key, version_range) in &self.supported_versions {
@@ -823,6 +944,11 @@ impl ProtocolHandler {
                 max_version: version_range.max,
             });
         }
+        eprintln!("PROTOCOL HANDLER: Created response struct");
+        eprintln!("PROTOCOL HANDLER: About to encode ApiVersions response for version {}", header.api_version);
+        eprintln!("encode_api_versions_response: Starting encoding for version {}", header.api_version);
+        eprintln!("encode_api_versions_response: Encoding {} APIs", api_versions.len());
+        eprintln!("PROTOCOL HANDLER: Encoding complete");
         
         let response = ApiVersionsResponse {
             error_code: 0,
@@ -835,12 +961,17 @@ impl ProtocolHandler {
         // Encode the response body (without correlation ID)
         self.encode_api_versions_response(&mut body_buf, &response, header.api_version)?;
         
-        Ok(Response {
-            header: ResponseHeader {
-                correlation_id: header.correlation_id,
-            },
-            body: body_buf.freeze(),
-        })
+        let encoded_bytes = body_buf.freeze();
+        tracing::info!("Encoded ApiVersions response: {} bytes", encoded_bytes.len());
+        // Log first 32 bytes as hex for debugging
+        let hex_preview: String = encoded_bytes.iter()
+            .take(32)
+            .map(|b| format!("{:02x}", b))
+            .collect::<Vec<_>>()
+            .join(" ");
+        tracing::info!("First 32 bytes of encoded response: {}", hex_preview);
+        
+        Ok(Self::make_response(&header, ApiKey::ApiVersions, encoded_bytes))
     }
     
     /// Encode ApiVersions response
@@ -855,8 +986,6 @@ impl ProtocolHandler {
         // CRITICAL: For v0 protocol, field order matters!
         // v0: api_versions array comes BEFORE error_code
         // v1+: error_code comes first (standard field ordering)
-        
-        tracing::debug!("Encoding ApiVersions response for version {}", version);
         
         if version == 0 {
             // v0 field order: api_versions array, then error_code
@@ -878,18 +1007,24 @@ impl ProtocolHandler {
             // Write array of API versions
             if version >= 3 {
                 // Use compact array encoding
+                // Compact arrays use length+1 encoding
                 encoder.write_unsigned_varint((response.api_versions.len() + 1) as u32);
-            } else {
-                encoder.write_i32(response.api_versions.len() as i32);
-            }
-            
-            for api in &response.api_versions {
-                encoder.write_i16(api.api_key);
-                encoder.write_i16(api.min_version);
-                encoder.write_i16(api.max_version);
-                if version >= 3 {
+                
+                for api in &response.api_versions {
+                    // In v3+, all fields are varints in compact format
+                    encoder.write_unsigned_varint(api.api_key as u32);
+                    encoder.write_unsigned_varint(api.min_version as u32);
+                    encoder.write_unsigned_varint(api.max_version as u32);
                     // Write tagged fields (empty for now)
                     encoder.write_unsigned_varint(0);
+                }
+            } else {
+                encoder.write_i32(response.api_versions.len() as i32);
+                
+                for api in &response.api_versions {
+                    encoder.write_i16(api.api_key);
+                    encoder.write_i16(api.min_version);
+                    encoder.write_i16(api.max_version);
                 }
             }
             
@@ -1052,12 +1187,20 @@ impl ProtocolHandler {
         let brokers = if let Some(metadata_store) = &self.metadata_store {
             match metadata_store.list_brokers().await {
                 Ok(broker_metas) => {
-                    broker_metas.into_iter().map(|b| MetadataBroker {
-                        node_id: b.broker_id,
-                        host: b.host,
-                        port: b.port,
-                        rack: b.rack,
-                    }).collect()
+                    // Filter out broker 0 with 0.0.0.0 - this is a phantom broker
+                    let brokers: Vec<MetadataBroker> = broker_metas.into_iter()
+                        .filter(|b| !(b.broker_id == 0 && b.host == "0.0.0.0"))
+                        .map(|b| MetadataBroker {
+                            node_id: b.broker_id,
+                            host: b.host,
+                            port: b.port,
+                            rack: b.rack,
+                        }).collect();
+                    tracing::info!("Got {} brokers from metadata store (filtered)", brokers.len());
+                    for b in &brokers {
+                        tracing::info!("  Broker {}: {}:{}", b.node_id, b.host, b.port);
+                    }
+                    brokers
                 }
                 Err(e) => {
                     tracing::error!("Failed to get brokers from metadata: {:?}", e);
@@ -1071,6 +1214,7 @@ impl ProtocolHandler {
                 }
             }
         } else {
+            tracing::warn!("No metadata store available, using default broker");
             // No metadata store, use current broker
             vec![MetadataBroker {
                 node_id: self.broker_id,
@@ -1088,17 +1232,22 @@ impl ProtocolHandler {
             controller_id: self.broker_id, // Use actual broker ID
             topics,
         };
-        tracing::info!("Metadata response has {} topics", response.topics.len());
+        tracing::info!("Metadata response has {} topics and {} brokers", 
+                      response.topics.len(), response.brokers.len());
+        
+        // Debug: Log broker details
+        for (i, broker) in response.brokers.iter().enumerate() {
+            tracing::debug!("  Broker {}: id={}, host={}, port={}", 
+                           i, broker.node_id, broker.host, broker.port);
+        }
         
         let mut body_buf = BytesMut::new();
         
+        tracing::info!("About to encode metadata response with {} brokers", response.brokers.len());
         // Encode the response body (without correlation ID)
         self.encode_metadata_response(&mut body_buf, &response, header.api_version)?;
         
-        Ok(Response {
-            header: ResponseHeader { correlation_id: header.correlation_id },
-            body: body_buf.freeze(),
-        })
+        Ok(Self::make_response(&header, ApiKey::Metadata, body_buf.freeze()))
     }
     
     /// Parse a produce request from bytes
@@ -1194,10 +1343,7 @@ impl ProtocolHandler {
         let mut body_buf = BytesMut::new();
         self.encode_produce_response(&mut body_buf, &response, header.api_version)?;
         
-        Ok(Response {
-            header: ResponseHeader { correlation_id: header.correlation_id },
-            body: body_buf.freeze(),
-        })
+        Ok(Self::make_response(&header, ApiKey::Produce, body_buf.freeze()))
     }
     
     /// Handle Fetch request
@@ -1329,10 +1475,7 @@ impl ProtocolHandler {
         tracing::trace!("Response body (first 64 bytes): {:?}", 
             &body_bytes[..std::cmp::min(64, body_bytes.len())]);
         
-        Ok(Response {
-            header: ResponseHeader { correlation_id: header.correlation_id },
-            body: body_bytes,
-        })
+        Ok(Self::make_response(&header, ApiKey::Fetch, body_bytes))
     }
     
     /// Handle SASL handshake request
@@ -1372,10 +1515,7 @@ impl ProtocolHandler {
             encoder.write_string(Some(mechanism));
         }
         
-        Ok(Response {
-            header: ResponseHeader { correlation_id: header.correlation_id },
-            body: body_buf.freeze(),
-        })
+        Ok(Self::make_response(&header, ApiKey::SaslHandshake, body_buf.freeze()))
     }
     
     /// Handle DescribeConfigs request
@@ -1503,10 +1643,7 @@ impl ProtocolHandler {
         // Encode the response body (without correlation ID)
         self.encode_describe_configs_response(&mut body_buf, &response, header.api_version)?;
         
-        Ok(Response {
-            header: ResponseHeader { correlation_id: header.correlation_id },
-            body: body_buf.freeze(),
-        })
+        Ok(Self::make_response(&header, ApiKey::DescribeConfigs, body_buf.freeze()))
     }
     
     /// Get topic configurations
@@ -1715,6 +1852,7 @@ impl ProtocolHandler {
         Ok(Response {
             header: ResponseHeader { correlation_id },
             body: body_buf.freeze(),
+            is_flexible: false,  // Conservative default for error responses
         })
     }
     
@@ -1888,10 +2026,7 @@ impl ProtocolHandler {
         let mut body_buf = BytesMut::new();
         self.encode_create_topics_response(&mut body_buf, &response, header.api_version)?;
         
-        Ok(Response {
-            header: ResponseHeader { correlation_id: header.correlation_id },
-            body: body_buf.freeze(),
-        })
+        Ok(Self::make_response(&header, ApiKey::CreateTopics, body_buf.freeze()))
     }
     
     /// Encode CreateTopics response
@@ -2069,10 +2204,7 @@ impl ProtocolHandler {
         let mut body_buf = BytesMut::new();
         self.encode_list_offsets_response(&mut body_buf, &response, header.api_version)?;
         
-        Ok(Response {
-            header: ResponseHeader { correlation_id: header.correlation_id },
-            body: body_buf.freeze(),
-        })
+        Ok(Self::make_response(&header, ApiKey::ListOffsets, body_buf.freeze()))
     }
     
     /// Encode ListOffsets response
@@ -2171,10 +2303,7 @@ impl ProtocolHandler {
         let mut body_buf = BytesMut::new();
         self.encode_find_coordinator_response(&mut body_buf, &response, header.api_version)?;
         
-        Ok(Response {
-            header: ResponseHeader { correlation_id: header.correlation_id },
-            body: body_buf.freeze(),
-        })
+        Ok(Self::make_response(&header, ApiKey::FindCoordinator, body_buf.freeze()))
     }
     
     /// Encode Produce response
@@ -2225,8 +2354,8 @@ impl ProtocolHandler {
     ) -> Result<()> {
         let mut encoder = Encoder::new(buf);
         
-        tracing::info!("Encoding metadata response v{} with {} topics, throttle_time: {}", 
-                      version, response.topics.len(), response.throttle_time_ms);
+        tracing::info!("Encoding metadata response v{} with {} topics, {} brokers, throttle_time: {}", 
+                      version, response.topics.len(), response.brokers.len(), response.throttle_time_ms);
         
         // Check if this is a flexible/compact version (v9+)
         let flexible = version >= 9;
@@ -2237,6 +2366,7 @@ impl ProtocolHandler {
         }
         
         // Brokers array
+        tracing::debug!("About to encode {} brokers", response.brokers.len());
         if flexible {
             encoder.write_compact_array_len(response.brokers.len());
         } else {
@@ -2440,8 +2570,9 @@ impl ProtocolHandler {
             request.group_id, request.member_id, request.protocol_type
         );
         
-        // For now, return a simple response
-        // In a real implementation, this would interact with group coordinator state
+        // Update consumer group state
+        let mut group_state = self.consumer_groups.lock().await;
+        
         let is_new_member = request.member_id.is_empty();
         let assigned_member_id = if is_new_member {
             format!("{}-{}", request.group_id, uuid::Uuid::new_v4())
@@ -2449,40 +2580,94 @@ impl ProtocolHandler {
             request.member_id.clone()
         };
         
+        // Get or create the consumer group
+        let group = group_state.groups.entry(request.group_id.clone())
+            .or_insert_with(|| ConsumerGroup {
+                group_id: request.group_id.clone(),
+                leader_id: None,
+                generation_id: 0,
+                protocol_type: Some(request.protocol_type.clone()),
+                protocol: None,
+                members: Vec::new(),
+                state: "Empty".to_string(),
+                offsets: HashMap::new(),
+            });
+        
+        // Update group state
+        group.state = "PreparingRebalance".to_string();
+        group.generation_id += 1;
+        group.protocol_type = Some(request.protocol_type.clone());
+        
+        // Add/update member
+        let member_exists = group.members.iter_mut()
+            .find(|m| m.member_id == assigned_member_id)
+            .map(|m| {
+                m.client_id = "kafka-python".to_string(); // TODO: Parse from metadata
+                m.client_host = "/127.0.0.1".to_string();
+                m.group_instance_id = request.group_instance_id.clone();
+                m.metadata = request.protocols.first().map(|p| p.metadata.to_vec());
+                true
+            })
+            .unwrap_or(false);
+        
+        if !member_exists {
+            group.members.push(GroupMember {
+                member_id: assigned_member_id.clone(),
+                group_instance_id: request.group_instance_id.clone(),
+                client_id: "kafka-python".to_string(),
+                client_host: "/127.0.0.1".to_string(),
+                metadata: request.protocols.first().map(|p| p.metadata.to_vec()),
+                assignment: None,
+            });
+        }
+        
+        // Make first member the leader
+        if group.leader_id.is_none() {
+            group.leader_id = Some(assigned_member_id.clone());
+        }
+        
         // Select first protocol if available
         let selected_protocol = request.protocols.first().map(|p| p.name.clone());
+        group.protocol = selected_protocol.clone();
+        
+        // Update state to Stable once we have a leader
+        group.state = "Stable".to_string();
+        
+        let is_leader = group.leader_id.as_ref() == Some(&assigned_member_id);
+        let generation_id = group.generation_id;
+        
+        // Build member list for leader
+        let members = if is_leader {
+            group.members.iter().map(|m| {
+                JoinGroupResponseMember {
+                    member_id: m.member_id.clone(),
+                    group_instance_id: m.group_instance_id.clone(),
+                    metadata: m.metadata.clone().map(Bytes::from).unwrap_or_else(|| Bytes::new()),
+                }
+            }).collect()
+        } else {
+            vec![]
+        };
         
         let response = JoinGroupResponse {
             throttle_time_ms: 0,
             error_code: error_codes::NONE,
-            generation_id: 1, // Would be tracked per group
+            generation_id,
             protocol_type: if header.api_version >= 7 {
                 Some(request.protocol_type)
             } else {
                 None
             },
             protocol_name: selected_protocol,
-            leader: assigned_member_id.clone(), // Make this member the leader for simplicity
+            leader: group.leader_id.clone().unwrap_or_default(),
             member_id: assigned_member_id,
-            members: vec![
-                // Only leader gets member list
-                JoinGroupResponseMember {
-                    member_id: request.member_id,
-                    group_instance_id: request.group_instance_id,
-                    metadata: request.protocols.first()
-                        .map(|p| p.metadata.clone())
-                        .unwrap_or_else(|| Bytes::new()),
-                }
-            ],
+            members,
         };
         
         let mut body_buf = BytesMut::new();
         self.encode_join_group_response(&mut body_buf, &response, header.api_version)?;
         
-        Ok(Response {
-            header: ResponseHeader { correlation_id: header.correlation_id },
-            body: body_buf.freeze(),
-        })
+        Ok(Self::make_response(&header, ApiKey::JoinGroup, body_buf.freeze()))
     }
     
     /// Handle SyncGroup request
@@ -2548,11 +2733,25 @@ impl ProtocolHandler {
             request.group_id, request.generation_id, request.member_id
         );
         
-        // For now, return the assignment for the requesting member if available
-        let member_assignment = request.assignments.iter()
-            .find(|a| a.member_id == request.member_id)
-            .map(|a| a.assignment.clone())
-            .unwrap_or_else(|| Bytes::new());
+        // Update consumer group state with assignments
+        let mut group_state = self.consumer_groups.lock().await;
+        let member_assignment = if let Some(group) = group_state.groups.get_mut(&request.group_id) {
+            // Update member assignments
+            for assignment in &request.assignments {
+                if let Some(member) = group.members.iter_mut()
+                    .find(|m| m.member_id == assignment.member_id) {
+                    member.assignment = Some(assignment.assignment.to_vec());
+                }
+            }
+            
+            // Return the assignment for the requesting member
+            request.assignments.iter()
+                .find(|a| a.member_id == request.member_id)
+                .map(|a| a.assignment.clone())
+                .unwrap_or_else(|| Bytes::new())
+        } else {
+            Bytes::new()
+        };
         
         let response = SyncGroupResponse {
             throttle_time_ms: 0,
@@ -2565,10 +2764,85 @@ impl ProtocolHandler {
         let mut body_buf = BytesMut::new();
         self.encode_sync_group_response(&mut body_buf, &response, header.api_version)?;
         
-        Ok(Response {
-            header: ResponseHeader { correlation_id: header.correlation_id },
-            body: body_buf.freeze(),
-        })
+        Ok(Self::make_response(&header, ApiKey::SyncGroup, body_buf.freeze()))
+    }
+    
+    /// Handle DescribeGroups request
+    async fn handle_describe_groups(
+        &self,
+        header: RequestHeader,
+        body: &mut Bytes,
+    ) -> Result<Response> {
+        use crate::consumer_group_types::{
+            DescribeGroupsRequest, DescribeGroupsResponse, DescribedGroup, GroupMember,
+            error_codes
+        };
+        
+        tracing::info!("Handling DescribeGroups request - version: {}", header.api_version);
+        
+        // Parse request
+        let request = DescribeGroupsRequest::parse(body, header.api_version)?;
+        tracing::info!("DescribeGroups for groups: {:?}", request.group_ids);
+        tracing::info!("Request include_authorized_operations: {}", request.include_authorized_operations);
+        
+        // Build response for each group
+        let mut groups = Vec::new();
+        
+        for group_id in request.group_ids {
+            // Check if this is a tracked consumer group
+            let group_state = self.consumer_groups.lock().await;
+            
+            if let Some(group) = group_state.groups.get(&group_id) {
+                // Build member list
+                let mut members = Vec::new();
+                for member in &group.members {
+                    members.push(GroupMember {
+                        member_id: member.member_id.clone(),
+                        group_instance_id: member.group_instance_id.clone(),
+                        client_id: member.client_id.clone(),
+                        client_host: member.client_host.clone(),
+                        member_metadata: member.metadata.clone().unwrap_or_default(),
+                        member_assignment: member.assignment.clone().unwrap_or_default(),
+                    });
+                }
+                
+                groups.push(DescribedGroup {
+                    error_code: error_codes::NONE,
+                    group_id: group_id.clone(),
+                    group_state: group.state.clone(),
+                    protocol_type: group.protocol_type.clone().unwrap_or_else(|| "consumer".to_string()),
+                    protocol_data: group.protocol.clone().unwrap_or_default(),
+                    members,
+                    authorized_operations: -2147483648, // No auth
+                });
+            } else {
+                // Group not found
+                groups.push(DescribedGroup {
+                    error_code: error_codes::GROUP_ID_NOT_FOUND,
+                    group_id: group_id.clone(),
+                    group_state: String::new(),
+                    protocol_type: String::new(),
+                    protocol_data: String::new(),
+                    members: Vec::new(),
+                    authorized_operations: -2147483648,
+                });
+            }
+        }
+        
+        let response = DescribeGroupsResponse {
+            throttle_time_ms: 0,
+            groups,
+        };
+        
+        tracing::info!("DescribeGroups response has {} groups", response.groups.len());
+        for group in &response.groups {
+            tracing::info!("  Group '{}': error_code={}, state='{}', members={}", 
+                group.group_id, group.error_code, group.group_state, group.members.len());
+        }
+        
+        let body = response.encode(header.api_version);
+        tracing::info!("Encoded DescribeGroups response: {} bytes", body.len());
+        Ok(Self::make_response(&header, ApiKey::DescribeGroups, body))
     }
     
     /// Handle Heartbeat request
@@ -2621,10 +2895,7 @@ impl ProtocolHandler {
         let mut body_buf = BytesMut::new();
         self.encode_heartbeat_response(&mut body_buf, &response, header.api_version)?;
         
-        Ok(Response {
-            header: ResponseHeader { correlation_id: header.correlation_id },
-            body: body_buf.freeze(),
-        })
+        Ok(Self::make_response(&header, ApiKey::Heartbeat, body_buf.freeze()))
     }
     
     /// Handle ListGroups request
@@ -2650,10 +2921,140 @@ impl ProtocolHandler {
         let mut body_buf = BytesMut::new();
         self.encode_list_groups_response(&mut body_buf, &response, header.api_version)?;
         
-        Ok(Response {
+        Ok(Self::make_response(&header, ApiKey::ListGroups, body_buf.freeze()))
+    }
+    
+    /// Handle OffsetFetch request (ListConsumerGroupOffsets)
+    async fn handle_offset_fetch(
+        &self,
+        header: RequestHeader,
+        body: &mut Bytes,
+    ) -> Result<Response> {
+        use crate::consumer_group_types::{
+            ListConsumerGroupOffsetsRequest, ListConsumerGroupOffsetsResponse,
+            OffsetFetchResponseTopic, OffsetFetchResponsePartition,
+        };
+        
+        tracing::info!("Handling OffsetFetch request - version: {}", header.api_version);
+        
+        // Parse request
+        let request = ListConsumerGroupOffsetsRequest::parse(body, header.api_version)?;
+        tracing::info!("OffsetFetch for group: {}", request.group_id);
+        
+        // Get group offsets from storage
+        let group_state = self.consumer_groups.lock().await;
+        let mut topics = Vec::new();
+        
+        if let Some(group) = group_state.groups.get(&request.group_id) {
+            // Return offsets for requested topics or all topics
+            for (topic_name, topic_offsets) in &group.offsets {
+                // Check if this topic was requested
+                let include_topic = if let Some(ref requested_topics) = request.topics {
+                    requested_topics.iter().any(|t| t.name == *topic_name)
+                } else {
+                    true // Include all topics if none specified
+                };
+                
+                if include_topic {
+                    let mut partitions = Vec::new();
+                    
+                    for (partition_id, offset_info) in topic_offsets {
+                        partitions.push(OffsetFetchResponsePartition {
+                            partition_index: *partition_id,
+                            committed_offset: offset_info.offset,
+                            committed_leader_epoch: -1,
+                            metadata: offset_info.metadata.clone(),
+                            error_code: 0,
+                        });
+                    }
+                    
+                    topics.push(OffsetFetchResponseTopic {
+                        name: topic_name.clone(),
+                        partitions,
+                    });
+                }
+            }
+        }
+        
+        let response = ListConsumerGroupOffsetsResponse {
+            throttle_time_ms: 0,
+            error_code: 0,
+            topics,
+        };
+        
+        let body = response.encode(header.api_version);
+        Ok(Self::make_response(&header, ApiKey::OffsetFetch, body))
+    }
+    
+    /// Handle OffsetCommit request
+    async fn handle_offset_commit(
+        &self,
+        header: RequestHeader,
+        body: &mut Bytes,
+    ) -> Result<Response> {
+        use crate::types::{OffsetCommitResponse, OffsetCommitResponseTopic, OffsetCommitResponsePartition};
+        
+        tracing::info!("Handling OffsetCommit request - version: {}", header.api_version);
+        
+        // Parse request
+        let request = self.parse_offset_commit_request(&header, body)?;
+        tracing::info!("OffsetCommit for group: {}", request.group_id);
+        
+        // Store offsets
+        let mut group_state = self.consumer_groups.lock().await;
+        let group = group_state.groups.entry(request.group_id.clone())
+            .or_insert_with(|| ConsumerGroup {
+                group_id: request.group_id.clone(),
+                leader_id: None,
+                generation_id: 0,
+                protocol_type: Some("consumer".to_string()),
+                protocol: None,
+                members: Vec::new(),
+                state: "Empty".to_string(),
+                offsets: std::collections::HashMap::new(),
+            });
+        
+        // Update offsets
+        let mut response_topics = Vec::new();
+        
+        for topic in &request.topics {
+            let topic_offsets = group.offsets.entry(topic.name.clone())
+                .or_insert_with(std::collections::HashMap::new);
+            
+            let mut response_partitions = Vec::new();
+            
+            for partition in &topic.partitions {
+                topic_offsets.insert(partition.partition_index, OffsetInfo {
+                    offset: partition.committed_offset,
+                    metadata: partition.committed_metadata.clone(),
+                    timestamp: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as i64,
+                });
+                
+                response_partitions.push(OffsetCommitResponsePartition {
+                    partition_index: partition.partition_index,
+                    error_code: 0,
+                });
+            }
+            
+            response_topics.push(OffsetCommitResponseTopic {
+                name: topic.name.clone(),
+                partitions: response_partitions,
+            });
+        }
+        
+        let response = OffsetCommitResponse {
             header: ResponseHeader { correlation_id: header.correlation_id },
-            body: body_buf.freeze(),
-        })
+            throttle_time_ms: 0,
+            topics: response_topics,
+        };
+        
+        let mut body_buf = BytesMut::new();
+        self.encode_offset_commit_response(&mut body_buf, &response, header.api_version)?;
+        
+        Ok(Self::make_response(&header, ApiKey::OffsetCommit, body_buf.freeze()))
     }
     
     /// Encode ListGroups response

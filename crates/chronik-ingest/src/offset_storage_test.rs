@@ -4,7 +4,6 @@
 mod tests {
     use super::super::*;
     use chronik_common::metadata::{
-        tikv_store::TiKVMetadataStore, 
         traits::{MetadataStore, MetadataError}, 
         ConsumerOffset
     };

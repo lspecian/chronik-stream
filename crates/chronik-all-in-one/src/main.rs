@@ -114,9 +114,17 @@ async fn run_server(cli: Cli, in_memory: bool) -> Result<()> {
     
     // Start Integrated Kafka server with proper components
     let kafka_addr = format!("{}:{}", cli.bind_addr, cli.kafka_port);
+    
+    // Use localhost as advertised host if binding to 0.0.0.0
+    let advertised_host = if cli.bind_addr == "0.0.0.0" {
+        "localhost".to_string()
+    } else {
+        cli.bind_addr.clone()
+    };
+    
     let config = integrated_server::IntegratedServerConfig {
-        node_id: 0,
-        advertised_host: cli.bind_addr.clone(),
+        node_id: 1,
+        advertised_host,
         advertised_port: cli.kafka_port as i32,
         data_dir: cli.data_dir.clone().to_string_lossy().to_string(),
         enable_indexing: true,
