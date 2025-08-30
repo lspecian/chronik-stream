@@ -2,7 +2,7 @@
 # Supports both x86_64 and aarch64 architectures
 
 # Build stage
-FROM rust:1.81-slim as builder
+FROM rust:latest as builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \

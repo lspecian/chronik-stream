@@ -103,7 +103,9 @@ jobs:
 
   create-release:
     name: Create GitHub Release
-    needs: [build-binaries, build-docker]
+    needs: [build-binaries]
+    # Temporarily disabled Docker until edition2024 issue resolved
+    # needs: [build-binaries, build-docker]
     runs-on: ubuntu-latest
     permissions:
       contents: write
