@@ -54,7 +54,7 @@ kafka-protocol = "0.10"
 tantivy = "0.24"
 
 # Storage
-opendal = { version = "0.45", features = ["services-s3", "services-gcs", "services-azblob"] }
+opendal = { version = "0.45", default-features = false, features = ["rustls", "services-s3", "services-gcs", "services-azblob"] }
 flate2 = "1.0"
 crc32fast = "1.3"
 snap = "1.1"

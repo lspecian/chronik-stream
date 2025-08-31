@@ -4665,7 +4665,6 @@ dependencies = [
  "http 0.2.12",
  "jsonwebtoken",
  "log",
- "once_cell",
  "percent-encoding",
  "quick-xml",
  "rand 0.8.5",
