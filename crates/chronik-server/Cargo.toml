@@ -67,3 +67,6 @@ minimal = []
 
 [lints]
 workspace = true
+
+# Force vendored OpenSSL for musl builds
+openssl = { workspace = true }
