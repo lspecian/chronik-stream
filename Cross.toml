@@ -10,28 +10,9 @@ passthrough = [
 ]
 
 [target.x86_64-unknown-linux-musl]
-# Use pre-built OpenSSL for musl targets
-pre-build = [
-    "apt-get update && apt-get install -y libssl-dev musl-tools",
-    "ln -s /usr/include/x86_64-linux-gnu/openssl /usr/include/openssl || true"
-]
-
-[target.x86_64-unknown-linux-musl.env]
-passthrough = ["OPENSSL_STATIC", "OPENSSL_DIR"]
-volumes = []
-OPENSSL_STATIC = "1"
-OPENSSL_DIR = "/usr"
+# Build in the container
+image = "ghcr.io/cross-rs/x86_64-unknown-linux-musl:main"
 
 [target.aarch64-unknown-linux-musl]
-# Use pre-built OpenSSL for musl targets
-pre-build = [
-    "dpkg --add-architecture arm64",
-    "apt-get update && apt-get install -y libssl-dev:arm64 musl-tools",
-    "ln -s /usr/include/aarch64-linux-gnu/openssl /usr/include/openssl || true"
-]
-
-[target.aarch64-unknown-linux-musl.env]
-passthrough = ["OPENSSL_STATIC", "OPENSSL_DIR"]
-volumes = []
-OPENSSL_STATIC = "1"
-OPENSSL_DIR = "/usr"
+# Build in the container  
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-musl:main"
