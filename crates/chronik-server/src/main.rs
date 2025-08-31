@@ -230,7 +230,7 @@ async fn run_standalone_server(cli: &Cli, dual_storage: bool) -> Result<()> {
             info!("Search API listening on http://{}", addr);
             
             let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-            axum::serve(listener, app).await.unwrap()
+            chronik_search::serve_app(listener, app).await.unwrap()
         });
         
         info!("Search API available at http://{}:8080", cli.bind_addr);
@@ -310,7 +310,7 @@ async fn run_all_components(cli: &Cli) -> Result<()> {
             let listener = tokio::net::TcpListener::bind(&addr).await
                 .map_err(|e| anyhow::anyhow!("Failed to bind search API port: {}", e))?;
             
-            axum::serve(listener, app).await
+            chronik_search::serve_app(listener, app).await
                 .map_err(|e| anyhow::anyhow!("Search API server error: {}", e))
         });
         tasks.push(search_task);

@@ -19,3 +19,11 @@ pub use realtime_indexer::{
     FieldIndexingPolicy, FieldTypeHint, IndexingMetricsSnapshot
 };
 pub use json_pipeline::{JsonPipeline, JsonPipelineConfig, JsonPipelineBuilder};
+
+/// Helper function to serve the search API app
+pub async fn serve_app(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+) -> Result<(), std::io::Error> {
+    axum::serve(listener, app).await
+}
