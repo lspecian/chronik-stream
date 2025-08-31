@@ -4,17 +4,13 @@ incremental = true
 target-dir = "target"
 
 [target.x86_64-unknown-linux-musl]
-linker = "clang"
 rustflags = [
-    "-C", "link-arg=-fuse-ld=lld",
     "-C", "target-cpu=x86-64-v2",
     "-C", "opt-level=2",
 ]
 
 [target.aarch64-unknown-linux-musl]
-linker = "clang"
 rustflags = [
-    "-C", "link-arg=-fuse-ld=lld",
     "-C", "target-cpu=generic",
     "-C", "opt-level=2",
 ]
