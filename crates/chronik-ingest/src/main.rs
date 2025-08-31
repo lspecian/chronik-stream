@@ -9,6 +9,20 @@ use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Show deprecation warning
+    eprintln!("╔════════════════════════════════════════════════════════════════╗");
+    eprintln!("║                        DEPRECATION WARNING                        ║");
+    eprintln!("║                                                                    ║");
+    eprintln!("║  chronik-ingest is deprecated and will be removed in v0.6.0       ║");
+    eprintln!("║                                                                    ║");
+    eprintln!("║  Please use chronik-server instead:                               ║");
+    eprintln!("║    chronik-server standalone                                      ║");
+    eprintln!("║                                                                    ║");
+    eprintln!("║  For more information, see:                                       ║");
+    eprintln!("║    https://github.com/chronik-stream/chronik-stream/releases      ║");
+    eprintln!("╚════════════════════════════════════════════════════════════════╝");
+    eprintln!();
+    
     // Initialize tracing with environment filter
     let filter = std::env::var("RUST_LOG")
         .unwrap_or_else(|_| "chronik_ingest=info,chronik_protocol=debug".to_string());

@@ -14,23 +14,36 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  CARGO_TERM_COLOR: always
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
 
 jobs:
+  # Build native binaries for releases
   build-binaries:
     name: Build Release Binaries
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         include:
+          # Linux builds using cross for proper musl static linking
           - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            artifact: chronik-linux-amd64
+            target: x86_64-unknown-linux-musl
+            artifact: chronik-server-linux-amd64
+            use_cross: true
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            artifact: chronik-server-linux-arm64
+            use_cross: true
+          # macOS builds (native)
           - os: macos-latest
             target: x86_64-apple-darwin
-            artifact: chronik-darwin-amd64
+            artifact: chronik-server-darwin-amd64
+            use_cross: false
           - os: macos-latest
             target: aarch64-apple-darwin
-            artifact: chronik-darwin-arm64
+            artifact: chronik-server-darwin-arm64
+            use_cross: false
     
     steps:
       - uses: actions/checkout@v4
@@ -40,24 +53,57 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       
-      - name: Build
-        run: cargo build --release --target ${{ matrix.target }} --bin chronik
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.3
+      
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      
+      - name: Install cross (Linux builds)
+        if: matrix.use_cross
+        run: |
+          cargo install cross --git https://github.com/cross-rs/cross
+      
+      - name: Build with cross (Linux)
+        if: matrix.use_cross
+        run: |
+          cross build --release --target ${{ matrix.target }} --bin chronik-server
+      
+      - name: Build native (macOS)
+        if: "!matrix.use_cross"
+        run: |
+          cargo build --release --target ${{ matrix.target }} --bin chronik-server
           
       - name: Package binary
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/chronik dist/
+          cp target/${{ matrix.target }}/release/chronik-server dist/
           cd dist
-          tar czf ${{ matrix.artifact }}.tar.gz chronik
+          tar -czf ${{ matrix.artifact }}.tar.gz chronik-server
+          sha256sum ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256 || \
+          shasum -a 256 ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
       
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: dist/${{ matrix.artifact }}.tar.gz
+          path: dist/${{ matrix.artifact }}*
+          retention-days: 7
+      
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats || true
 
-  build-docker:
-    name: Build Docker Images
+  # Build optimized Docker images using Linux binaries
+  docker:
+    name: Build and Push Docker Images
+    needs: build-binaries
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -65,6 +111,28 @@ jobs:
     
     steps:
       - uses: actions/checkout@v4
+      
+      - name: Download Linux binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: chronik-server-linux-*
+          path: artifacts-download
+      
+      - name: Prepare artifacts for Docker
+        run: |
+          # Extract Linux binaries for Docker
+          mkdir -p artifacts/linux/amd64
+          mkdir -p artifacts/linux/arm64
+          
+          cd artifacts-download
+          tar -xzf chronik-server-linux-amd64/chronik-server-linux-amd64.tar.gz -C ../artifacts/linux/amd64/
+          tar -xzf chronik-server-linux-arm64/chronik-server-linux-arm64.tar.gz -C ../artifacts/linux/arm64/
+          
+          # Make binaries executable
+          chmod +x ../artifacts/linux/*/chronik-server
+          
+          # Verify binaries
+          ls -la ../artifacts/linux/*/
       
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -89,23 +157,26 @@ jobs:
             type=ref,event=pr
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable={{is_default_branch}}
       
-      - name: Build and push Docker image
+      - name: Build and push Docker image (optimized)
         uses: docker/build-push-action@v5
         with:
           context: .
-          platforms: linux/amd64
+          file: ./Dockerfile.binary
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          build-args: |
+            VERSION=${{ github.ref_name }}
 
-  create-release:
-    name: Create GitHub Release
-    needs: [build-binaries]
-    # Temporarily disabled Docker until edition2024 issue resolved
-    # needs: [build-binaries, build-docker]
+  # Create GitHub release
+  release:
+    name: Create Release
+    needs: [build-binaries, docker]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -113,62 +184,39 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
-      - name: Download artifacts
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
       
-      - name: Generate release notes
-        id: notes
-        run: |
-          TAG="${{ github.event.inputs.tag || github.ref_name }}"
-          echo "# Chronik Stream ${TAG}" > release-notes.md
-          echo "" >> release-notes.md
-          echo "## 🚀 Features" >> release-notes.md
-          echo "" >> release-notes.md
-          echo "- Complete Kafka protocol compatibility (v0-v9)" >> release-notes.md
-          echo "- Fixed ApiVersions negotiation for all 19 supported APIs" >> release-notes.md
-          echo "- Improved broker advertisement for client connectivity" >> release-notes.md
-          echo "- Optimized CPU usage (reduced from 163% to 0% idle)" >> release-notes.md
-          echo "- Full support for metadata, produce, fetch, and consumer group operations" >> release-notes.md
-          echo "" >> release-notes.md
-          echo "## 📦 Docker Images" >> release-notes.md
-          echo "" >> release-notes.md
-          echo "Multi-architecture images available:" >> release-notes.md
-          echo '```bash' >> release-notes.md
-          echo "docker pull ghcr.io/${{ github.repository }}:${TAG}" >> release-notes.md
-          echo '```' >> release-notes.md
-          echo "" >> release-notes.md
-          echo "Supported architectures:" >> release-notes.md
-          echo "- linux/amd64 (x86_64)" >> release-notes.md
-          echo "- linux/arm64 (aarch64)" >> release-notes.md
-          echo "" >> release-notes.md
-          echo "## 📥 Downloads" >> release-notes.md
-          echo "" >> release-notes.md
-          echo "Pre-built binaries are available below for:" >> release-notes.md
-          echo "- Linux (x86_64, aarch64)" >> release-notes.md
-          echo "- macOS (x86_64, Apple Silicon)" >> release-notes.md
-          echo "" >> release-notes.md
-          echo "## 🔧 Installation" >> release-notes.md
-          echo "" >> release-notes.md
-          echo "### Docker" >> release-notes.md
-          echo '```bash' >> release-notes.md
-          echo "docker run -d -p 9092:9092 ghcr.io/${{ github.repository }}:${TAG}" >> release-notes.md
-          echo '```' >> release-notes.md
-          echo "" >> release-notes.md
-          echo "### Binary" >> release-notes.md
-          echo '```bash' >> release-notes.md
-          echo "tar xzf chronik-linux-amd64.tar.gz" >> release-notes.md
-          echo "./chronik --bind-addr 0.0.0.0:9092" >> release-notes.md
-          echo '```' >> release-notes.md
-
-      - name: Create Release
+      - name: Create release
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
-          name: ${{ github.event.inputs.tag || github.ref_name }}
-          body_path: release-notes.md
+          name: ${{ github.ref_name }}
           draft: false
-          prerelease: false
+          prerelease: ${{ contains(github.ref, '-rc') || contains(github.ref, '-beta') || contains(github.ref, '-alpha') }}
           files: |
-            artifacts/*/*.tar.gz
+            artifacts/**/*.tar.gz
+            artifacts/**/*.sha256
+          body: |
+            ## Chronik Stream ${{ github.ref_name }}
+            
+            ### Installation
+            
+            #### Docker (Recommended)
+            ```bash
+            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
+            ```
+            
+            #### Binary Downloads
+            - Linux AMD64: `chronik-server-linux-amd64.tar.gz`
+            - Linux ARM64: `chronik-server-linux-arm64.tar.gz`
+            - macOS AMD64: `chronik-server-darwin-amd64.tar.gz`
+            - macOS ARM64: `chronik-server-darwin-arm64.tar.gz`
+            
+            ### Verification
+            All binaries include SHA256 checksums for verification.
+            
+            ### What's Changed
+            See the full changelog below.
+          generate_release_notes: true

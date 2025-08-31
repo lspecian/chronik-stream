@@ -676,11 +676,7 @@ dependencies = [
  "pin-project-lite",
  "rustversion",
  "serde",
- "serde_json",
- "serde_path_to_error",
- "serde_urlencoded",
  "sync_wrapper 0.1.2",
- "tokio",
  "tower 0.4.13",
  "tower-layer",
  "tower-service",
@@ -1369,7 +1365,7 @@ name = "chronik-monitoring"
 version = "0.5.0"
 dependencies = [
  "anyhow",
- "axum 0.6.20",
+ "axum 0.7.9",
  "chronik-common",
  "lazy_static",
  "opentelemetry",
@@ -1381,7 +1377,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tower 0.4.13",
- "tower-http 0.4.4",
+ "tower-http",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
@@ -1428,7 +1424,7 @@ dependencies = [
  "tokio-stream",
  "tokio-test",
  "tower 0.4.13",
- "tower-http 0.5.2",
+ "tower-http",
  "tracing",
  "uuid",
 ]
@@ -1461,7 +1457,39 @@ dependencies = [
  "tokio",
  "tokio-test",
  "tower 0.4.13",
- "tower-http 0.5.2",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "chronik-server"
+version = "0.5.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "chronik-auth",
+ "chronik-backup",
+ "chronik-common",
+ "chronik-config",
+ "chronik-ingest",
+ "chronik-monitoring",
+ "chronik-protocol",
+ "chronik-query",
+ "chronik-search",
+ "chronik-storage",
+ "chrono",
+ "clap",
+ "dashmap 5.5.3",
+ "futures",
+ "parking_lot 0.12.4",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -2679,12 +2707,6 @@ dependencies = [
  "http-body 1.0.1",
  "pin-project-lite",
 ]
-
-[[package]]
-name = "http-range-header"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "add0ab9360ddbd88cfeb3bd9574a1d85cfdfa14db10b3e21d3700dbc4328758f"
 
 [[package]]
 name = "httparse"
@@ -6268,25 +6290,6 @@ dependencies = [
  "pin-project-lite",
  "sync_wrapper 1.0.2",
  "tokio",
- "tower-layer",
- "tower-service",
- "tracing",
-]
-
-[[package]]
-name = "tower-http"
-version = "0.4.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61c5bb1d698276a2443e5ecfabc1008bf15a36c12e6a7176e7bf089ea9131140"
-dependencies = [
- "bitflags 2.9.1",
- "bytes",
- "futures-core",
- "futures-util",
- "http 0.2.12",
- "http-body 0.4.6",
- "http-range-header",
- "pin-project-lite",
  "tower-layer",
  "tower-service",
  "tracing",

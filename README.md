@@ -79,14 +79,14 @@ for message in consumer:
 
 ```bash
 # Download latest release (Linux x86_64)
-curl -L https://github.com/lspecian/chronik-stream/releases/download/v0.5.0/chronik-linux-amd64.tar.gz -o chronik.tar.gz
-tar xzf chronik.tar.gz
-./chronik --bind-addr 0.0.0.0:9092
+curl -L https://github.com/lspecian/chronik-stream/releases/download/v0.5.0/chronik-server-linux-amd64.tar.gz -o chronik-server.tar.gz
+tar xzf chronik-server.tar.gz
+./chronik-server standalone
 
 # macOS (Apple Silicon)
-curl -L https://github.com/lspecian/chronik-stream/releases/download/v0.5.0/chronik-darwin-arm64.tar.gz -o chronik.tar.gz
-tar xzf chronik.tar.gz
-./chronik --bind-addr 0.0.0.0:9092
+curl -L https://github.com/lspecian/chronik-stream/releases/download/v0.5.0/chronik-server-darwin-arm64.tar.gz -o chronik-server.tar.gz
+tar xzf chronik-server.tar.gz
+./chronik-server standalone
 ```
 
 ### Building from Source
@@ -97,12 +97,51 @@ git clone https://github.com/lspecian/chronik-stream.git
 cd chronik-stream
 
 # Build release binary
-cargo build --release --bin chronik
+cargo build --release --bin chronik-server
 
 # Run
-./target/release/chronik --bind-addr 0.0.0.0:9092
+./target/release/chronik-server standalone
 ```
 
+## 🎯 Operational Modes
+
+The unified `chronik-server` binary supports multiple operational modes:
+
+### Standalone Mode (Default)
+Single-node Kafka-compatible server, perfect for development and small deployments:
+```bash
+chronik-server standalone
+# or just
+chronik-server
+```
+
+### All Mode
+Run all components (Kafka protocol, search, backup) in a single process:
+```bash
+chronik-server all
+```
+
+### Distributed Modes (Future)
+```bash
+# Run as ingest node
+chronik-server ingest --controller-url <controller>
+
+# Run as search node (requires search feature)
+chronik-server search --storage-url <storage>
+```
+
+### Configuration Options
+```bash
+chronik-server [OPTIONS] [COMMAND]
+
+Options:
+  -p, --kafka-port <PORT>      Kafka protocol port (default: 9092)
+  -a, --admin-port <PORT>      Admin API port (default: 3000)
+  -d, --data-dir <PATH>        Data directory (default: ./data)
+  -b, --bind-addr <ADDR>       Bind address (default: 0.0.0.0)
+  --enable-search              Enable search functionality
+  --enable-backup              Enable backup functionality
+```
 
 ## 📦 Docker Images
 
@@ -282,12 +321,19 @@ Apache License 2.0. See [LICENSE](LICENSE) for details.
 ## 🚀 Latest Release: v0.5.0
 
 ### What's New
+- ✅ **NEW: Unified `chronik-server` binary** - Single binary with multiple operational modes
 - ✅ Complete Kafka protocol compatibility with all 19 core APIs
 - ✅ Fixed ApiVersions negotiation for proper client compatibility
 - ✅ Optimized performance: 0% idle CPU usage (was 163%)
 - ✅ Multi-architecture Docker images (amd64, arm64)
 - ✅ Improved broker advertisement for reliable connections
 - ✅ Production-ready with comprehensive error handling
+
+### Migration Notice
+The separate `chronik-ingest` and `chronik` (all-in-one) binaries are deprecated in favor of the unified `chronik-server`:
+- `chronik` → `chronik-server standalone`
+- `chronik-ingest` → `chronik-server standalone`
+- `chronik integrated` → `chronik-server all`
 
 ### Breaking Changes
 None - fully backward compatible with Kafka clients.

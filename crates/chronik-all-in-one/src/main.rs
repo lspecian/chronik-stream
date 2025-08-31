@@ -69,6 +69,21 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Show deprecation warning
+    eprintln!("╔════════════════════════════════════════════════════════════════╗");
+    eprintln!("║                        DEPRECATION WARNING                        ║");
+    eprintln!("║                                                                    ║");
+    eprintln!("║  chronik-all-in-one is deprecated and will be removed in v0.6.0   ║");
+    eprintln!("║                                                                    ║");
+    eprintln!("║  Please use chronik-server instead:                               ║");
+    eprintln!("║    chronik-server standalone    (for single-node)                ║");
+    eprintln!("║    chronik-server all           (for all components)             ║");
+    eprintln!("║                                                                    ║");
+    eprintln!("║  For more information, see:                                       ║");
+    eprintln!("║    https://github.com/chronik-stream/chronik-stream/releases      ║");
+    eprintln!("╚════════════════════════════════════════════════════════════════╝");
+    eprintln!();
+    
     let cli = Cli::parse();
     
     // Initialize logging

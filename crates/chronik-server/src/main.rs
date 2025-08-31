@@ -1,0 +1,278 @@
+//! Unified Chronik Stream Server
+//! 
+//! This is the main entry point for Chronik Stream, supporting multiple operational modes:
+//! - Standalone (default): Single-node Kafka-compatible server
+//! - Ingest: Data ingestion node (future: for distributed mode)
+//! - Search: Search node (future: for distributed mode)
+//! - All: All components in one process
+
+use anyhow::Result;
+use clap::{Parser, Subcommand};
+use std::path::PathBuf;
+use tracing::{error, info, warn};
+use chronik_monitoring::{init_monitoring, TracingConfig};
+
+mod integrated_server;
+mod error_handler;
+
+use integrated_server::{IntegratedKafkaServer, IntegratedServerConfig};
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "chronik-server",
+    about = "Chronik Stream - Unified Kafka-compatible streaming platform",
+    version,
+    author,
+    long_about = "A high-performance, Kafka-compatible streaming platform with optional search capabilities"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+
+    /// Port for Kafka protocol (default: 9092)
+    #[arg(short = 'p', long, env = "CHRONIK_KAFKA_PORT", default_value = "9092")]
+    kafka_port: u16,
+
+    /// Port for Admin API (default: 3000)
+    #[arg(short = 'a', long, env = "CHRONIK_ADMIN_PORT", default_value = "3000")]
+    admin_port: u16,
+
+    /// Port for Metrics endpoint (default: 9093)
+    #[arg(short = 'm', long, env = "CHRONIK_METRICS_PORT", default_value = "9093")]
+    metrics_port: u16,
+
+    /// Data directory for storage
+    #[arg(short = 'd', long, env = "CHRONIK_DATA_DIR", default_value = "./data")]
+    data_dir: PathBuf,
+
+    /// Log level (error, warn, info, debug, trace)
+    #[arg(short = 'l', long, env = "RUST_LOG", default_value = "info")]
+    log_level: String,
+
+    /// Bind address (default: 0.0.0.0)
+    #[arg(short = 'b', long, env = "CHRONIK_BIND_ADDR", default_value = "0.0.0.0")]
+    bind_addr: String,
+
+    /// Enable search functionality
+    #[cfg(feature = "search")]
+    #[arg(long, env = "CHRONIK_ENABLE_SEARCH", default_value = "false")]
+    enable_search: bool,
+
+    /// Enable backup functionality
+    #[cfg(feature = "backup")]
+    #[arg(long, env = "CHRONIK_ENABLE_BACKUP", default_value = "false")]
+    enable_backup: bool,
+
+    /// Enable dynamic configuration
+    #[cfg(feature = "dynamic-config")]
+    #[arg(long, env = "CHRONIK_ENABLE_DYNAMIC_CONFIG", default_value = "false")]
+    enable_dynamic_config: bool,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Run in standalone mode (default)
+    #[command(about = "Run as a standalone Kafka-compatible server")]
+    Standalone {
+        /// Enable dual storage (raw Kafka + indexed for search)
+        #[arg(long, default_value = "false")]
+        dual_storage: bool,
+    },
+    
+    /// Run as ingest node (future: for distributed mode)
+    #[command(about = "Run as an ingest node in a distributed cluster")]
+    Ingest {
+        /// Controller URL for cluster coordination
+        #[arg(long, env = "CHRONIK_CONTROLLER_URL")]
+        controller_url: Option<String>,
+    },
+    
+    /// Run as search node (future: for distributed mode)
+    #[cfg(feature = "search")]
+    #[command(about = "Run as a search node in a distributed cluster")]
+    Search {
+        /// Storage backend URL
+        #[arg(long, env = "CHRONIK_STORAGE_URL")]
+        storage_url: String,
+    },
+    
+    /// Run with all components enabled
+    #[command(about = "Run with all components in a single process")]
+    All {
+        /// Enable experimental features
+        #[arg(long, default_value = "false")]
+        experimental: bool,
+    },
+
+    /// Show version and build information
+    #[command(about = "Display version and build information")]
+    Version,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    
+    // Initialize logging
+    std::env::set_var("RUST_LOG", &cli.log_level);
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
+
+    // Show deprecation warnings for old binaries
+    if std::env::args().next().unwrap().contains("chronik-ingest") {
+        warn!("chronik-ingest is deprecated. Please use chronik-server instead.");
+    }
+    if std::env::args().next().unwrap().contains("chronik-all-in-one") {
+        warn!("chronik-all-in-one is deprecated. Please use chronik-server instead.");
+    }
+
+    match cli.command {
+        Some(Commands::Version) => {
+            println!("Chronik Server v{}", env!("CARGO_PKG_VERSION"));
+            println!("Build features:");
+            #[cfg(feature = "search")]
+            println!("  - Search: enabled");
+            #[cfg(feature = "backup")]
+            println!("  - Backup: enabled");
+            #[cfg(feature = "dynamic-config")]
+            println!("  - Dynamic Config: enabled");
+            return Ok(());
+        }
+        
+        Some(Commands::Standalone { dual_storage }) => {
+            info!("Starting Chronik Server in standalone mode");
+            info!("Dual storage: {}", dual_storage);
+            run_standalone_server(&cli, dual_storage).await?;
+        }
+        
+        Some(Commands::Ingest { ref controller_url }) => {
+            info!("Starting Chronik Server as ingest node");
+            if controller_url.is_some() {
+                warn!("Distributed mode not yet implemented - running in standalone mode");
+            }
+            run_ingest_server(&cli).await?;
+        }
+        
+        #[cfg(feature = "search")]
+        Some(Commands::Search { ref storage_url }) => {
+            info!("Starting Chronik Server as search node");
+            info!("Storage URL: {}", storage_url);
+            warn!("Search-only mode not yet implemented - running in standalone mode");
+            run_standalone_server(&cli, true).await?;
+        }
+        
+        Some(Commands::All { experimental }) => {
+            info!("Starting Chronik Server with all components");
+            if experimental {
+                warn!("Experimental features enabled");
+            }
+            run_all_components(&cli).await?;
+        }
+        
+        None => {
+            // Default to standalone mode
+            info!("Starting Chronik Server in standalone mode (default)");
+            run_standalone_server(&cli, false).await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_standalone_server(cli: &Cli, dual_storage: bool) -> Result<()> {
+    // Create server configuration
+    let config = IntegratedServerConfig {
+        node_id: 1,
+        advertised_host: cli.bind_addr.clone(),
+        advertised_port: cli.kafka_port as i32,
+        data_dir: cli.data_dir.to_string_lossy().to_string(),
+        enable_indexing: false,
+        enable_compression: true,
+        auto_create_topics: true,
+        num_partitions: 3,
+        replication_factor: 1,
+        enable_dual_storage: dual_storage,
+    };
+
+    // Create and start the integrated server
+    let server = IntegratedKafkaServer::new(config).await?;
+    
+    // Initialize monitoring (metrics + optional tracing)
+    let _metrics_registry = init_monitoring(
+        "chronik-server",
+        cli.metrics_port,
+        None, // TODO: Add tracing config support
+    ).await?;
+    
+    let kafka_addr = format!("{}:{}", cli.bind_addr, cli.kafka_port);
+    info!("Kafka protocol listening on {}", kafka_addr);
+    info!("Metrics endpoint available at http://{}:{}/metrics", cli.bind_addr, cli.metrics_port);
+    
+    server.run(&kafka_addr).await?;
+    
+    Ok(())
+}
+
+async fn run_ingest_server(cli: &Cli) -> Result<()> {
+    // For now, just run standalone
+    // In the future, this would connect to a controller for coordination
+    run_standalone_server(cli, false).await
+}
+
+async fn run_all_components(cli: &Cli) -> Result<()> {
+    // Run with all features enabled
+    let mut tasks = vec![];
+    
+    // Initialize monitoring (metrics + optional tracing)
+    let _metrics_registry = init_monitoring(
+        "chronik-server-all",
+        cli.metrics_port,
+        None, // TODO: Add tracing config support
+    ).await?;
+    info!("Metrics endpoint available at http://{}:{}/metrics", cli.bind_addr, cli.metrics_port);
+    
+    // Create server configuration with all features
+    let config = IntegratedServerConfig {
+        node_id: 1,
+        advertised_host: cli.bind_addr.clone(),
+        advertised_port: cli.kafka_port as i32,
+        data_dir: cli.data_dir.to_string_lossy().to_string(),
+        enable_indexing: cfg!(feature = "search"),
+        enable_compression: true,
+        auto_create_topics: true,
+        num_partitions: 3,
+        replication_factor: 1,
+        enable_dual_storage: true,  // Enable dual storage for search
+    };
+    
+    // Start Kafka protocol server
+    let kafka_addr = format!("{}:{}", cli.bind_addr, cli.kafka_port);
+    let kafka_task = tokio::spawn(async move {
+        let server = IntegratedKafkaServer::new(config).await?;
+        server.run(&kafka_addr).await
+    });
+    tasks.push(kafka_task);
+    
+    info!("Kafka protocol listening on {}:{}", cli.bind_addr, cli.kafka_port);
+    
+    #[cfg(feature = "search")]
+    {
+        info!("Search API enabled");
+        // Future: Start search API server
+    }
+    
+    #[cfg(feature = "backup")]
+    {
+        info!("Backup service enabled");
+        // Future: Start backup scheduler
+    }
+    
+    // Wait for all components
+    for task in tasks {
+        task.await??;
+    }
+    
+    Ok(())
+}
+

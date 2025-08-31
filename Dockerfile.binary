@@ -1,0 +1,41 @@
+# Optimized Dockerfile using pre-built binaries
+# This avoids compilation entirely - just copies the right binary
+
+FROM debian:bookworm-slim
+
+# Automatically selects the right architecture
+ARG TARGETARCH
+
+# Install minimal runtime dependencies
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+# Create non-root user
+RUN useradd -m -u 1000 chronik
+
+# Copy the pre-built binary for the target architecture
+# Expects binaries in artifacts/linux/{amd64,arm64}/chronik-server
+COPY artifacts/linux/${TARGETARCH}/chronik-server /usr/local/bin/chronik-server
+
+# Ensure binary is executable and create data directory
+RUN chmod +x /usr/local/bin/chronik-server && \
+    mkdir -p /data && \
+    chown chronik:chronik /data
+
+# Switch to non-root user
+USER chronik
+
+# Data volume
+VOLUME ["/data"]
+
+# Expose Kafka and metrics ports
+EXPOSE 9092 9093
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD nc -z localhost 9092 || exit 1
+
+# Run the server
+ENTRYPOINT ["chronik-server"]
+CMD ["--bind-addr", "0.0.0.0", "--data-dir", "/data", "standalone"]

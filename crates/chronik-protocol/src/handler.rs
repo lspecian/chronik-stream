@@ -1011,10 +1011,10 @@ impl ProtocolHandler {
                 encoder.write_unsigned_varint((response.api_versions.len() + 1) as u32);
                 
                 for api in &response.api_versions {
-                    // In v3+, all fields are varints in compact format
-                    encoder.write_unsigned_varint(api.api_key as u32);
-                    encoder.write_unsigned_varint(api.min_version as u32);
-                    encoder.write_unsigned_varint(api.max_version as u32);
+                    // IMPORTANT: Even in v3+, these fields remain as INT16, not varints!
+                    encoder.write_i16(api.api_key);
+                    encoder.write_i16(api.min_version);
+                    encoder.write_i16(api.max_version);
                     // Write tagged fields (empty for now)
                     encoder.write_unsigned_varint(0);
                 }

@@ -119,9 +119,9 @@ impl MetricsServer {
         let addr = SocketAddr::from(([0, 0, 0, 0], self.port));
         tracing::info!("Metrics server listening on {}", addr);
         
-        axum::Server::bind(&addr)
-            .serve(app.into_make_service())
-            .await?;
+        // In axum 0.7, use the simpler serve API
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        axum::serve(listener, app).await?;
         
         Ok(())
     }

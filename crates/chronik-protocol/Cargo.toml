@@ -40,6 +40,3 @@ tokio-test = "0.4"
 proptest = { workspace = true }
 criterion = "0.5"
 
-[[bench]]
-name = "protocol_bench"
-harness = false
