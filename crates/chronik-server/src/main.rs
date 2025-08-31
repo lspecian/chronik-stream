@@ -209,6 +209,36 @@ async fn run_standalone_server(cli: &Cli, dual_storage: bool) -> Result<()> {
     info!("Kafka protocol listening on {}", kafka_addr);
     info!("Metrics endpoint available at http://{}:{}/metrics", cli.bind_addr, cli.metrics_port);
     
+    // Start search API if enabled
+    #[cfg(feature = "search")]
+    if cli.enable_search {
+        info!("Starting Search API on port 8080");
+        
+        let search_bind = cli.bind_addr.clone();
+        tokio::spawn(async move {
+            use chronik_search::api::SearchApi;
+            use std::sync::Arc;
+            
+            // Create search API instance
+            let search_api = Arc::new(SearchApi::new().unwrap());
+            
+            // Create router
+            let app = search_api.router();
+            
+            // Start server
+            let addr = format!("{}:8080", search_bind);
+            info!("Search API listening on http://{}", addr);
+            
+            let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+            axum::serve(listener, app).await.unwrap()
+        });
+        
+        info!("Search API available at http://{}:8080", cli.bind_addr);
+        info!("  - Search: POST http://{}:8080/_search", cli.bind_addr);
+        info!("  - Index: PUT http://{}:8080/{{index}}", cli.bind_addr);
+        info!("  - Document: POST http://{}:8080/{{index}}/_doc/{{id}}", cli.bind_addr);
+    }
+    
     server.run(&kafka_addr).await?;
     
     Ok(())
@@ -258,8 +288,37 @@ async fn run_all_components(cli: &Cli) -> Result<()> {
     
     #[cfg(feature = "search")]
     {
-        info!("Search API enabled");
-        // Future: Start search API server
+        info!("Search API enabled, starting on port 8080");
+        
+        // Start the search API server
+        let search_bind = cli.bind_addr.clone();
+        let search_port = 8080u16; // Search API port
+        let search_task = tokio::spawn(async move {
+            use chronik_search::api::SearchApi;
+            use std::sync::Arc;
+            
+            // Create search API instance
+            let search_api = Arc::new(SearchApi::new().map_err(|e| anyhow::anyhow!("Failed to create search API: {}", e))?);
+            
+            // Create router
+            let app = search_api.router();
+            
+            // Start server
+            let addr = format!("{}:{}", search_bind, search_port);
+            info!("Search API listening on http://{}", addr);
+            
+            let listener = tokio::net::TcpListener::bind(&addr).await
+                .map_err(|e| anyhow::anyhow!("Failed to bind search API port: {}", e))?;
+            
+            axum::serve(listener, app).await
+                .map_err(|e| anyhow::anyhow!("Search API server error: {}", e))
+        });
+        tasks.push(search_task);
+        
+        info!("Search API available at http://{}:8080", cli.bind_addr);
+        info!("  - Search: POST http://{}:8080/_search", cli.bind_addr);
+        info!("  - Index: PUT http://{}:8080/{{index}}", cli.bind_addr);
+        info!("  - Document: POST http://{}:8080/{{index}}/_doc/{{id}}", cli.bind_addr);
     }
     
     #[cfg(feature = "backup")]

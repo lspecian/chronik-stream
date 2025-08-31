@@ -1261,9 +1261,16 @@ impl ProtocolHandler {
         
         let mut decoder = Decoder::new(body);
         
+        // Check if this is a flexible/compact version (v9+)
+        let flexible = header.api_version >= 9;
+        
         // Parse produce request based on version
         let transactional_id = if header.api_version >= 3 {
-            decoder.read_string()?
+            if flexible {
+                decoder.read_compact_string()?
+            } else {
+                decoder.read_string()?
+            }
         } else {
             None
         };
@@ -1272,32 +1279,61 @@ impl ProtocolHandler {
         let timeout_ms = decoder.read_i32()?;
         
         // Read topics array
-        let topic_count = decoder.read_i32()? as usize;
+        let topic_count = if flexible {
+            decoder.read_unsigned_varint()? as usize - 1
+        } else {
+            decoder.read_i32()? as usize
+        };
         let mut topics = Vec::with_capacity(topic_count);
         
         for _ in 0..topic_count {
-            let topic_name = decoder.read_string()?
-                .ok_or_else(|| Error::Protocol("Topic name cannot be null".into()))?;
+            let topic_name = if flexible {
+                decoder.read_compact_string()?
+            } else {
+                decoder.read_string()?
+            }.ok_or_else(|| Error::Protocol("Topic name cannot be null".into()))?;
             
             // Read partitions array
-            let partition_count = decoder.read_i32()? as usize;
+            let partition_count = if flexible {
+                decoder.read_unsigned_varint()? as usize - 1
+            } else {
+                decoder.read_i32()? as usize
+            };
             let mut partitions = Vec::with_capacity(partition_count);
             
             for _ in 0..partition_count {
                 let partition_index = decoder.read_i32()?;
-                let records = decoder.read_bytes()?
-                    .ok_or_else(|| Error::Protocol("Records cannot be null".into()))?;
+                let records = if flexible {
+                    decoder.read_compact_bytes()?
+                } else {
+                    decoder.read_bytes()?
+                }.ok_or_else(|| Error::Protocol("Records cannot be null".into()))?;
                 
                 partitions.push(crate::types::ProduceRequestPartition {
                     index: partition_index,
                     records: records.to_vec(),
                 });
+                
+                if flexible {
+                    // Skip tagged fields in partition
+                    let _tagged_field_count = decoder.read_unsigned_varint()?;
+                }
+            }
+            
+            if flexible {
+                // Skip tagged fields in topic
+                let _tagged_field_count = decoder.read_unsigned_varint()?;
             }
             
             topics.push(crate::types::ProduceRequestTopic {
                 name: topic_name,
                 partitions,
             });
+        }
+        
+        if flexible {
+            // Skip tagged fields at the end
+            let _tagged_field_count = decoder.read_unsigned_varint()?;
         }
         
         Ok(ProduceRequest {
@@ -2315,13 +2351,36 @@ impl ProtocolHandler {
     ) -> Result<()> {
         let mut encoder = Encoder::new(buf);
         
+        // Check if this is a flexible/compact version (v9+)
+        let flexible = version >= 9;
+        
+        // CRITICAL FIX: throttle_time_ms comes FIRST in v1+ (not last!)
+        // This was causing memory corruption in Go clients using librdkafka
+        if version >= 1 {
+            encoder.write_i32(response.throttle_time_ms);
+        }
+        
         // Topics array
-        encoder.write_i32(response.topics.len() as i32);
+        if flexible {
+            encoder.write_unsigned_varint((response.topics.len() + 1) as u32);
+        } else {
+            encoder.write_i32(response.topics.len() as i32);
+        }
+        
         for topic in &response.topics {
-            encoder.write_string(Some(&topic.name));
+            if flexible {
+                encoder.write_compact_string(Some(&topic.name));
+            } else {
+                encoder.write_string(Some(&topic.name));
+            }
             
             // Partitions array
-            encoder.write_i32(topic.partitions.len() as i32);
+            if flexible {
+                encoder.write_unsigned_varint((topic.partitions.len() + 1) as u32);
+            } else {
+                encoder.write_i32(topic.partitions.len() as i32);
+            }
+            
             for partition in &topic.partitions {
                 encoder.write_i32(partition.index);
                 encoder.write_i16(partition.error_code);
@@ -2334,11 +2393,22 @@ impl ProtocolHandler {
                 if version >= 5 {
                     encoder.write_i64(partition.log_start_offset);
                 }
+                
+                if flexible {
+                    // Write empty tagged fields for partition
+                    encoder.write_unsigned_varint(0);
+                }
+            }
+            
+            if flexible {
+                // Write empty tagged fields for topic
+                encoder.write_unsigned_varint(0);
             }
         }
         
-        if version >= 1 {
-            encoder.write_i32(response.throttle_time_ms);
+        if flexible {
+            // Write empty tagged fields at the end
+            encoder.write_unsigned_varint(0);
         }
         
         Ok(())
