@@ -18,7 +18,7 @@ members = [
     "crates/chronik-backup",
     "crates/chronik-config",
     "crates/chronik-all-in-one",
-    "tests", "crates/chronik-server",
+    "crates/chronik-server",
 ]
 
 [workspace.package]
