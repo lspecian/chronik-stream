@@ -52,6 +52,9 @@ async-trait = { workspace = true }
 dashmap = { workspace = true }
 parking_lot = { workspace = true }
 
+# Force vendored OpenSSL for musl builds
+openssl = { workspace = true }
+
 # Metrics handled by chronik-monitoring dependency
 
 
@@ -67,6 +70,3 @@ minimal = []
 
 [lints]
 workspace = true
-
-# Force vendored OpenSSL for musl builds
-openssl = { workspace = true }
