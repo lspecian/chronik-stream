@@ -71,7 +71,12 @@ This provides:
 ## 🚀 Docker Image
 
 ```bash
-docker pull ghcr.io/lspecian/chronik-stream:v0.5.3
+# Note: Docker tags use semantic versioning WITHOUT the 'v' prefix
+docker pull ghcr.io/lspecian/chronik-stream:0.5.3
+
+# Or use these tags:
+docker pull ghcr.io/lspecian/chronik-stream:0.5     # Minor version
+docker pull ghcr.io/lspecian/chronik-stream:latest  # Latest
 ```
 
 ## 📝 Testing
