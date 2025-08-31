@@ -5,10 +5,6 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
-[[bin]]
-name = "search-server"
-path = "src/bin/search-server.rs"
-
 [dependencies]
 chronik-common = { path = "../chronik-common" }
 chronik-storage = { path = "../chronik-storage" }

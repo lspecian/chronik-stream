@@ -215,6 +215,21 @@ impl<'a> Decoder<'a> {
             .map_err(|e| Error::Protocol(format!("Invalid UTF-8 in string: {}", e)))
     }
     
+    /// Read compact bytes (uses varint length)
+    pub fn read_compact_bytes(&mut self) -> Result<Option<Bytes>> {
+        let len = self.read_unsigned_varint()? as i32 - 1;
+        if len < 0 {
+            return Ok(None);
+        }
+        
+        let len = len as usize;
+        if self.buf.remaining() < len {
+            return Err(Error::Protocol(format!("Not enough bytes for compact byte array of length {}", len)));
+        }
+        
+        Ok(Some(self.buf.copy_to_bytes(len)))
+    }
+    
     /// Advance the buffer by n bytes
     pub fn advance(&mut self, n: usize) {
         self.buf.advance(n);
@@ -313,6 +328,19 @@ impl<'a> Encoder<'a> {
             Some(s) => {
                 self.write_unsigned_varint((s.len() + 1) as u32);
                 self.buf.put_slice(s.as_bytes());
+            }
+            None => {
+                self.write_unsigned_varint(0);
+            }
+        }
+    }
+    
+    /// Write compact bytes (uses varint length)
+    pub fn write_compact_bytes(&mut self, value: Option<&[u8]>) {
+        match value {
+            Some(bytes) => {
+                self.write_unsigned_varint((bytes.len() + 1) as u32);
+                self.buf.put_slice(bytes);
             }
             None => {
                 self.write_unsigned_varint(0);
