@@ -319,6 +319,19 @@ impl IntegratedKafkaServer {
                                 }
                             }
                             
+                            // Parse correlation ID from request for error handling
+                            // Kafka protocol: API key (2), API version (2), correlation ID (4)
+                            let correlation_id = if request_size >= 8 {
+                                i32::from_be_bytes([
+                                    request_buffer[4], 
+                                    request_buffer[5], 
+                                    request_buffer[6], 
+                                    request_buffer[7]
+                                ])
+                            } else {
+                                0
+                            };
+                            
                             // Handle request using the integrated handler
                             match kafka_handler.handle_request(&request_buffer[..request_size]).await {
                                 Ok(response) => {
@@ -376,10 +389,10 @@ impl IntegratedKafkaServer {
                                     
                                     match recovery {
                                         ErrorRecovery::ReturnError(error_code) => {
-                                            // Build proper error response
+                                            // Build proper error response with preserved correlation ID
                                             let error_response = error_handler.build_error_response(
                                                 error_code,
-                                                0, // We don't have correlation ID here
+                                                correlation_id, // Use the preserved correlation ID
                                                 0, // Unknown API key
                                                 0, // Unknown API version
                                             );

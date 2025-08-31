@@ -1303,15 +1303,18 @@ impl ProtocolHandler {
             
             for _ in 0..partition_count {
                 let partition_index = decoder.read_i32()?;
-                let records = if flexible {
+                let records_opt = if flexible {
                     decoder.read_compact_bytes()?
                 } else {
                     decoder.read_bytes()?
-                }.ok_or_else(|| Error::Protocol("Records cannot be null".into()))?;
+                };
+                
+                // Allow null records (common for connectivity checks or flush operations)
+                let records = records_opt.map(|r| r.to_vec()).unwrap_or_else(Vec::new);
                 
                 partitions.push(crate::types::ProduceRequestPartition {
                     index: partition_index,
-                    records: records.to_vec(),
+                    records,
                 });
                 
                 if flexible {
