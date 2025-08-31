@@ -1,9 +1,8 @@
 # Cross compilation configuration
 
 [build.env]
+# Don't pass RUSTC_WRAPPER as sccache isn't available in the container
 passthrough = [
-    "RUSTC_WRAPPER",
-    "SCCACHE_GHA_ENABLED",
     "ACTIONS_CACHE_SERVICE_V2",
     "ACTIONS_RESULTS_URL",
     "ACTIONS_RUNTIME_TOKEN",
