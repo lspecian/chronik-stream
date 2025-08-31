@@ -53,10 +53,10 @@ bytes = "1.5"
 # Other
 uuid = { workspace = true }
 sha2 = "0.10"
-reqwest = { version = "0.11", features = ["json"] }
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
 
 [dev-dependencies]
-reqwest = { version = "0.11", features = ["json"] }
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
 tokio-test = "0.4"
 tempfile = "3.8"
 axum-test = "14.0"

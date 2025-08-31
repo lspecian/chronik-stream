@@ -1,0 +1,37 @@
+# Cross compilation configuration
+
+[build.env]
+passthrough = [
+    "RUSTC_WRAPPER",
+    "SCCACHE_GHA_ENABLED",
+    "ACTIONS_CACHE_SERVICE_V2",
+    "ACTIONS_RESULTS_URL",
+    "ACTIONS_RUNTIME_TOKEN",
+]
+
+[target.x86_64-unknown-linux-musl]
+# Use pre-built OpenSSL for musl targets
+pre-build = [
+    "apt-get update && apt-get install -y libssl-dev musl-tools",
+    "ln -s /usr/include/x86_64-linux-gnu/openssl /usr/include/openssl || true"
+]
+
+[target.x86_64-unknown-linux-musl.env]
+passthrough = ["OPENSSL_STATIC", "OPENSSL_DIR"]
+volumes = []
+OPENSSL_STATIC = "1"
+OPENSSL_DIR = "/usr"
+
+[target.aarch64-unknown-linux-musl]
+# Use pre-built OpenSSL for musl targets
+pre-build = [
+    "dpkg --add-architecture arm64",
+    "apt-get update && apt-get install -y libssl-dev:arm64 musl-tools",
+    "ln -s /usr/include/aarch64-linux-gnu/openssl /usr/include/openssl || true"
+]
+
+[target.aarch64-unknown-linux-musl.env]
+passthrough = ["OPENSSL_STATIC", "OPENSSL_DIR"]
+volumes = []
+OPENSSL_STATIC = "1"
+OPENSSL_DIR = "/usr"
