@@ -1259,6 +1259,15 @@ impl ProtocolHandler {
         use crate::types::ProduceRequest;
         use crate::parser::Decoder;
         
+        // Debug log the raw bytes for diagnostics
+        if body.len() < 100 {
+            tracing::debug!("Produce request v{} body ({} bytes): {:02x?}", 
+                header.api_version, body.len(), body.as_ref());
+        } else {
+            tracing::debug!("Produce request v{} body (first 100 of {} bytes): {:02x?}", 
+                header.api_version, body.len(), &body.as_ref()[..100]);
+        }
+        
         let mut decoder = Decoder::new(body);
         
         // Check if this is a flexible/compact version (v9+)
@@ -2363,6 +2372,9 @@ impl ProtocolHandler {
             encoder.write_i32(response.throttle_time_ms);
         }
         
+        tracing::debug!("Encoding produce response v{}: {} topics, throttle_time={}", 
+            version, response.topics.len(), response.throttle_time_ms);
+        
         // Topics array
         if flexible {
             encoder.write_unsigned_varint((response.topics.len() + 1) as u32);
@@ -2412,6 +2424,14 @@ impl ProtocolHandler {
         if flexible {
             // Write empty tagged fields at the end
             encoder.write_unsigned_varint(0);
+        }
+        
+        // Log the encoded response for debugging
+        if buf.len() < 100 {
+            tracing::debug!("Encoded produce response ({} bytes): {:02x?}", buf.len(), buf.as_ref());
+        } else {
+            tracing::debug!("Encoded produce response (first 100 of {} bytes): {:02x?}", 
+                buf.len(), &buf.as_ref()[..100]);
         }
         
         Ok(())
