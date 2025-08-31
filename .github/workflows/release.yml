@@ -72,9 +72,9 @@ jobs:
       
       - name: Build with cross (Linux)
         if: matrix.use_cross
+        env:
+          RUSTC_WRAPPER: ""
         run: |
-          # Unset RUSTC_WRAPPER for cross builds as sccache isn't available in the container
-          unset RUSTC_WRAPPER
           cross build --release --target ${{ matrix.target }} --bin chronik-server
       
       - name: Build native (macOS)
