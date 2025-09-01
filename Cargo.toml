@@ -20,6 +20,7 @@ members = [
     "crates/chronik-all-in-one",
     "crates/chronik-server",
 ]
+exclude = ["tests"]
 
 [workspace.package]
 version = "0.5.0"

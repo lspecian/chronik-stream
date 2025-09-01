@@ -300,18 +300,22 @@ impl KafkaRecordBatch {
     pub fn decode(data: &[u8]) -> Result<Self> {
         // Handle empty record batches (common during flush operations)
         if data.is_empty() {
-            return Ok(RecordBatch {
-                base_offset: 0,
-                partition_leader_epoch: -1,
-                magic: MAGIC_V2,
-                crc: 0,
-                attributes: 0,
-                last_offset_delta: 0,
-                base_timestamp: 0,
-                max_timestamp: 0,
-                producer_id: -1,
-                producer_epoch: -1,
-                base_sequence: -1,
+            return Ok(KafkaRecordBatch {
+                header: RecordBatchHeader {
+                    base_offset: 0,
+                    batch_length: 0,
+                    partition_leader_epoch: -1,
+                    magic: MAGIC_V2,
+                    crc: 0,
+                    attributes: 0,
+                    last_offset_delta: 0,
+                    base_timestamp: 0,
+                    max_timestamp: 0,
+                    producer_id: -1,
+                    producer_epoch: -1,
+                    base_sequence: -1,
+                    records_count: 0,
+                },
                 records: vec![],
             });
         }
@@ -323,18 +327,22 @@ impl KafkaRecordBatch {
         if data.len() < 17 {
             // For very short batches, return an empty batch instead of erroring
             // This can happen with flush operations or connectivity checks
-            return Ok(RecordBatch {
-                base_offset: 0,
-                partition_leader_epoch: -1,
-                magic: MAGIC_V2,
-                crc: 0,
-                attributes: 0,
-                last_offset_delta: 0,
-                base_timestamp: 0,
-                max_timestamp: 0,
-                producer_id: -1,
-                producer_epoch: -1,
-                base_sequence: -1,
+            return Ok(KafkaRecordBatch {
+                header: RecordBatchHeader {
+                    base_offset: 0,
+                    batch_length: 0,
+                    partition_leader_epoch: -1,
+                    magic: MAGIC_V2,
+                    crc: 0,
+                    attributes: 0,
+                    last_offset_delta: 0,
+                    base_timestamp: 0,
+                    max_timestamp: 0,
+                    producer_id: -1,
+                    producer_epoch: -1,
+                    base_sequence: -1,
+                    records_count: 0,
+                },
                 records: vec![],
             });
         }

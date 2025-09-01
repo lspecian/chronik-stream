@@ -460,7 +460,10 @@ impl ProtocolCodec {
             // Then error code
             buf.put_i16(ErrorCode::None.code());
         } else {
-            // v1+ field order: error_code first, then api_versions array
+            // v1+ field order: throttle_time, error_code, then api_versions array
+            
+            // Throttle time (v1+) - MUST come first!
+            buf.put_i32(0);
             
             // Error code
             buf.put_i16(ErrorCode::None.code());
@@ -474,6 +477,8 @@ impl ProtocolCodec {
             
             for api in api_versions {
                 buf.put_i16(api.api_key);
+                // IMPORTANT: librdkafka always reads min/max as INT16, regardless of version
+                // Even though Kafka protocol v3+ specifies INT8, we use INT16 for compatibility
                 buf.put_i16(api.min_version);
                 buf.put_i16(api.max_version);
                 
@@ -482,11 +487,10 @@ impl ProtocolCodec {
                 }
             }
             
-            // Throttle time (v1+)
-            buf.put_i32(0);
-            
             if flexible {
                 ProtocolUtils::write_tagged_fields(buf);
+                // Write throttle_time_ms (required in v3+)
+                buf.put_i32(0);
             }
         }
         

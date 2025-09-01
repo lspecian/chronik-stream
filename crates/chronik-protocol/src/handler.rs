@@ -905,6 +905,8 @@ impl ProtocolHandler {
                     max_version: version_range.max,
                 });
             }
+            // CRITICAL: Sort by API key for consistent ordering
+            api_versions.sort_by_key(|a| a.api_key);
             eprintln!("PROTOCOL HANDLER: Created response struct");
             eprintln!("PROTOCOL HANDLER: About to encode ApiVersions response for version {}", header.api_version);
             eprintln!("encode_api_versions_response: Starting encoding for version {}", header.api_version);
@@ -944,6 +946,8 @@ impl ProtocolHandler {
                 max_version: version_range.max,
             });
         }
+        // CRITICAL: Sort by API key for consistent ordering
+        api_versions.sort_by_key(|a| a.api_key);
         eprintln!("PROTOCOL HANDLER: Created response struct");
         eprintln!("PROTOCOL HANDLER: About to encode ApiVersions response for version {}", header.api_version);
         eprintln!("encode_api_versions_response: Starting encoding for version {}", header.api_version);
@@ -1001,7 +1005,19 @@ impl ProtocolHandler {
             // Then write error_code
             encoder.write_i16(response.error_code);
         } else {
-            // v1+ field order: error_code first, then api_versions array
+            // v1+ field order depends on version:
+            // v1-2: throttle_time_ms, error_code, api_versions
+            // v3: error_code, api_versions (NO throttle_time_ms in v3!)
+            // v4+: throttle_time_ms, error_code, api_versions
+            
+            // Write throttle_time_ms for v1-2 and v4+, but NOT v3
+            if version >= 1 && version <= 2 {
+                encoder.write_i32(response.throttle_time_ms);
+            } else if version >= 4 {
+                encoder.write_i32(response.throttle_time_ms);
+            }
+            
+            // Then error_code
             encoder.write_i16(response.error_code);
             
             // Write array of API versions
@@ -1011,7 +1027,8 @@ impl ProtocolHandler {
                 encoder.write_unsigned_varint((response.api_versions.len() + 1) as u32);
                 
                 for api in &response.api_versions {
-                    // IMPORTANT: Even in v3+, these fields remain as INT16, not varints!
+                    // IMPORTANT: librdkafka always reads min/max as INT16, regardless of version
+                    // Even though Kafka protocol v3+ specifies INT8, we use INT16 for compatibility
                     encoder.write_i16(api.api_key);
                     encoder.write_i16(api.min_version);
                     encoder.write_i16(api.max_version);
@@ -1028,13 +1045,11 @@ impl ProtocolHandler {
                 }
             }
             
-            if version >= 1 {
-                encoder.write_i32(response.throttle_time_ms);
-            }
-            
             if version >= 3 {
                 // Write tagged fields at the end (empty for now)
                 encoder.write_unsigned_varint(0);
+                // Write throttle_time_ms (required in v3+)
+                encoder.write_i32(0);
             }
         }
         

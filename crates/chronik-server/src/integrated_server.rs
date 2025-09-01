@@ -360,6 +360,17 @@ impl IntegratedKafkaServer {
                                     // Add response body
                                     full_response.extend_from_slice(&response.body);
                                     
+                                    // Debug log the actual bytes being sent
+                                    info!("DEBUG Response details: correlation_id={}, is_flexible={}, body_len={}", 
+                                        response.header.correlation_id, response.is_flexible, response.body.len());
+                                    let hex_preview: String = full_response.iter()
+                                        .skip(4) // Skip size bytes
+                                        .take(32)
+                                        .map(|b| format!("{:02x}", b))
+                                        .collect::<Vec<_>>()
+                                        .join(" ");
+                                    info!("DEBUG First 32 bytes after size: {}", hex_preview);
+                                    
                                     debug!("Sending response: size={}, correlation_id={}, body_len={}, total_len={}", 
                                         size, response.header.correlation_id, response.body.len(), full_response.len());
                                     tracing::trace!("Response bytes (first 64): {:?}", 

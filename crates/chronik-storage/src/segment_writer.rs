@@ -108,17 +108,24 @@ impl SegmentWriter {
         let active = segments.entry(key.clone()).or_insert_with(|| {
             let segment_id = SegmentId(Uuid::new_v4());
             let builder = SegmentBuilder::new();
-            let first_record = indexed_batch.records.first().unwrap();
+            
+            // Handle empty batches (null records)
+            let (base_offset, last_offset) = if let Some(first_record) = indexed_batch.records.first() {
+                (first_record.offset, first_record.offset)
+            } else {
+                // For empty batches, use default offset 0
+                (0, 0)
+            };
             
             ActiveSegment {
                 builder,
                 id: segment_id,
                 topic: topic.to_string(),
                 partition,
-                base_offset: first_record.offset,
-                last_offset: first_record.offset,
-                timestamp_min: first_record.timestamp,
-                timestamp_max: first_record.timestamp,
+                base_offset,
+                last_offset,
+                timestamp_min: indexed_batch.records.first().map(|r| r.timestamp).unwrap_or(0),
+                timestamp_max: indexed_batch.records.first().map(|r| r.timestamp).unwrap_or(0),
                 record_count: 0,
                 current_size: 0,
                 has_raw_kafka: true, // v2 format with dual storage
