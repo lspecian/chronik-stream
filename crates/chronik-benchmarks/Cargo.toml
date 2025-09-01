@@ -9,7 +9,7 @@ license.workspace = true
 chronik-common = { path = "../chronik-common" }
 chronik-protocol = { path = "../chronik-protocol" }
 chronik-storage = { path = "../chronik-storage" }
-chronik-ingest = { path = "../chronik-ingest" }
+# chronik-ingest removed - use chronik-server instead
 chronik-search = { path = "../chronik-search" }
 
 # Async runtime

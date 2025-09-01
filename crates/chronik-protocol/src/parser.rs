@@ -42,6 +42,45 @@ pub enum ApiKey {
     DeleteAcls = 31,
     DescribeConfigs = 32,
     AlterConfigs = 33,
+    AlterReplicaLogDirs = 34,
+    DescribeLogDirs = 35,
+    SaslAuthenticate = 36,
+    CreatePartitions = 37,
+    CreateDelegationToken = 38,
+    RenewDelegationToken = 39,
+    ExpireDelegationToken = 40,
+    DescribeDelegationToken = 41,
+    DeleteGroups = 42,
+    ElectLeaders = 43,
+    IncrementalAlterConfigs = 44,
+    AlterPartitionReassignments = 45,
+    ListPartitionReassignments = 46,
+    OffsetDelete = 47,
+    DescribeClientQuotas = 48,
+    AlterClientQuotas = 49,
+    DescribeUserScramCredentials = 50,
+    AlterUserScramCredentials = 51,
+    // Note: Skipping APIs 52-55 to match CP Kafka (they don't support these KRaft APIs)
+    // Vote = 52,
+    // BeginQuorumEpoch = 53,
+    // EndQuorumEpoch = 54,
+    // DescribeQuorum = 55,
+    AlterPartition = 56,
+    UpdateFeatures = 57,
+    Envelope = 58,
+    // Note: Skipping API 59 to match CP Kafka
+    // FetchSnapshot = 59,
+    DescribeCluster = 60,
+    DescribeProducers = 61,
+    // Note: Skipping APIs 62-64 to match CP Kafka (more KRaft APIs)
+    // BrokerRegistration = 62,
+    // BrokerHeartbeat = 63,
+    // UnregisterBroker = 64,
+    DescribeTransactions = 65,
+    ListTransactions = 66,
+    AllocateProducerIds = 67,
+    // Note: Skipping API 68 to match CP Kafka
+    // ConsumerGroupHeartbeat = 68,
 }
 
 impl ApiKey {
@@ -82,6 +121,41 @@ impl ApiKey {
             31 => Some(ApiKey::DeleteAcls),
             32 => Some(ApiKey::DescribeConfigs),
             33 => Some(ApiKey::AlterConfigs),
+            34 => Some(ApiKey::AlterReplicaLogDirs),
+            35 => Some(ApiKey::DescribeLogDirs),
+            36 => Some(ApiKey::SaslAuthenticate),
+            37 => Some(ApiKey::CreatePartitions),
+            38 => Some(ApiKey::CreateDelegationToken),
+            39 => Some(ApiKey::RenewDelegationToken),
+            40 => Some(ApiKey::ExpireDelegationToken),
+            41 => Some(ApiKey::DescribeDelegationToken),
+            42 => Some(ApiKey::DeleteGroups),
+            43 => Some(ApiKey::ElectLeaders),
+            44 => Some(ApiKey::IncrementalAlterConfigs),
+            45 => Some(ApiKey::AlterPartitionReassignments),
+            46 => Some(ApiKey::ListPartitionReassignments),
+            47 => Some(ApiKey::OffsetDelete),
+            48 => Some(ApiKey::DescribeClientQuotas),
+            49 => Some(ApiKey::AlterClientQuotas),
+            50 => Some(ApiKey::DescribeUserScramCredentials),
+            51 => Some(ApiKey::AlterUserScramCredentials),
+            // 52 => Some(ApiKey::Vote),  // Skipped to match CP Kafka
+            // 53 => Some(ApiKey::BeginQuorumEpoch),  // Skipped to match CP Kafka
+            // 54 => Some(ApiKey::EndQuorumEpoch),  // Skipped to match CP Kafka
+            // 55 => Some(ApiKey::DescribeQuorum),  // Skipped to match CP Kafka
+            56 => Some(ApiKey::AlterPartition),
+            57 => Some(ApiKey::UpdateFeatures),
+            58 => Some(ApiKey::Envelope),
+            // 59 => Some(ApiKey::FetchSnapshot),  // Skipped to match CP Kafka
+            60 => Some(ApiKey::DescribeCluster),
+            61 => Some(ApiKey::DescribeProducers),
+            // 62 => Some(ApiKey::BrokerRegistration),  // Skipped to match CP Kafka
+            // 63 => Some(ApiKey::BrokerHeartbeat),  // Skipped to match CP Kafka
+            // 64 => Some(ApiKey::UnregisterBroker),  // Skipped to match CP Kafka
+            65 => Some(ApiKey::DescribeTransactions),
+            66 => Some(ApiKey::ListTransactions),
+            67 => Some(ApiKey::AllocateProducerIds),
+            // 68 => Some(ApiKey::ConsumerGroupHeartbeat),  // Skipped to match CP Kafka
             _ => None,
         }
     }
@@ -350,6 +424,8 @@ impl<'a> Encoder<'a> {
     
     /// Write an unsigned varint
     pub fn write_unsigned_varint(&mut self, mut value: u32) {
+        let original_value = value;
+        let start_pos = self.buf.len();
         while (value & !0x7F) != 0 {
             self.buf.put_u8((value & 0x7F) as u8 | 0x80);
             value >>= 7;
@@ -477,6 +553,7 @@ pub fn is_flexible_version(api_key: ApiKey, api_version: i16) -> bool {
         ApiKey::CreateTopics => api_version >= 5,
         ApiKey::DeleteTopics => api_version >= 4,
         ApiKey::DescribeConfigs => api_version >= 4,
+        // All new APIs default to non-flexible for v0
         _ => false,
     }
 }
@@ -485,26 +562,91 @@ pub fn is_flexible_version(api_key: ApiKey, api_version: i16) -> bool {
 pub fn supported_api_versions() -> HashMap<ApiKey, VersionRange> {
     let mut versions = HashMap::new();
     
-    // Core APIs
+    // Core APIs (fully implemented)
     versions.insert(ApiKey::Produce, VersionRange { min: 0, max: 9 });
     versions.insert(ApiKey::Fetch, VersionRange { min: 0, max: 13 });
-    versions.insert(ApiKey::ListOffsets, VersionRange { min: 0, max: 4 }); // Support up to v4
+    versions.insert(ApiKey::ListOffsets, VersionRange { min: 0, max: 7 });
     versions.insert(ApiKey::Metadata, VersionRange { min: 0, max: 12 });
     versions.insert(ApiKey::OffsetCommit, VersionRange { min: 0, max: 8 });
     versions.insert(ApiKey::OffsetFetch, VersionRange { min: 0, max: 8 });
     versions.insert(ApiKey::FindCoordinator, VersionRange { min: 0, max: 4 });
-    versions.insert(ApiKey::JoinGroup, VersionRange { min: 0, max: 7 }); // Support up to v7
+    versions.insert(ApiKey::JoinGroup, VersionRange { min: 0, max: 9 });
     versions.insert(ApiKey::Heartbeat, VersionRange { min: 0, max: 4 });
     versions.insert(ApiKey::LeaveGroup, VersionRange { min: 0, max: 5 });
     versions.insert(ApiKey::SyncGroup, VersionRange { min: 0, max: 5 });
     versions.insert(ApiKey::DescribeGroups, VersionRange { min: 0, max: 5 });
     versions.insert(ApiKey::ListGroups, VersionRange { min: 0, max: 4 });
     versions.insert(ApiKey::SaslHandshake, VersionRange { min: 0, max: 1 });
-    versions.insert(ApiKey::ApiVersions, VersionRange { min: 0, max: 4 }); // Support v4 for modern clients
-    versions.insert(ApiKey::CreateTopics, VersionRange { min: 0, max: 5 }); // Support up to v5
+    versions.insert(ApiKey::ApiVersions, VersionRange { min: 0, max: 4 });
+    versions.insert(ApiKey::CreateTopics, VersionRange { min: 0, max: 7 });
     versions.insert(ApiKey::DeleteTopics, VersionRange { min: 0, max: 6 });
     versions.insert(ApiKey::DescribeConfigs, VersionRange { min: 0, max: 4 });
     versions.insert(ApiKey::AlterConfigs, VersionRange { min: 0, max: 2 });
+    
+    // Broker management APIs (NOT IMPLEMENTED - placeholder for librdkafka compatibility)
+    versions.insert(ApiKey::LeaderAndIsr, VersionRange { min: 0, max: 0 });
+    versions.insert(ApiKey::StopReplica, VersionRange { min: 0, max: 0 });
+    versions.insert(ApiKey::UpdateMetadata, VersionRange { min: 0, max: 0 });
+    versions.insert(ApiKey::ControlledShutdown, VersionRange { min: 0, max: 0 });
+    
+    // Transaction APIs (NOT IMPLEMENTED - placeholder for librdkafka compatibility)
+    versions.insert(ApiKey::InitProducerId, VersionRange { min: 0, max: 0 });
+    versions.insert(ApiKey::AddPartitionsToTxn, VersionRange { min: 0, max: 0 });
+    versions.insert(ApiKey::AddOffsetsToTxn, VersionRange { min: 0, max: 0 });
+    versions.insert(ApiKey::EndTxn, VersionRange { min: 0, max: 0 });
+    versions.insert(ApiKey::WriteTxnMarkers, VersionRange { min: 0, max: 0 });
+    versions.insert(ApiKey::TxnOffsetCommit, VersionRange { min: 0, max: 0 });
+    
+    // ACL APIs (NOT IMPLEMENTED - placeholder for librdkafka compatibility)
+    versions.insert(ApiKey::DescribeAcls, VersionRange { min: 0, max: 0 });
+    versions.insert(ApiKey::CreateAcls, VersionRange { min: 0, max: 0 });
+    versions.insert(ApiKey::DeleteAcls, VersionRange { min: 0, max: 0 });
+    
+    // Additional APIs (NOT IMPLEMENTED - placeholder for librdkafka compatibility)
+    versions.insert(ApiKey::DeleteRecords, VersionRange { min: 0, max: 0 });
+    versions.insert(ApiKey::OffsetForLeaderEpoch, VersionRange { min: 0, max: 0 });
+    versions.insert(ApiKey::AlterReplicaLogDirs, VersionRange { min: 0, max: 0 });
+    versions.insert(ApiKey::DescribeLogDirs, VersionRange { min: 0, max: 0 });
+    versions.insert(ApiKey::SaslAuthenticate, VersionRange { min: 0, max: 0 });
+    versions.insert(ApiKey::CreatePartitions, VersionRange { min: 0, max: 0 });
+    versions.insert(ApiKey::CreateDelegationToken, VersionRange { min: 0, max: 0 });
+    versions.insert(ApiKey::RenewDelegationToken, VersionRange { min: 0, max: 0 });
+    versions.insert(ApiKey::ExpireDelegationToken, VersionRange { min: 0, max: 0 });
+    versions.insert(ApiKey::DescribeDelegationToken, VersionRange { min: 0, max: 0 });
+    versions.insert(ApiKey::DeleteGroups, VersionRange { min: 0, max: 0 });
+    versions.insert(ApiKey::ElectLeaders, VersionRange { min: 0, max: 0 });
+    versions.insert(ApiKey::IncrementalAlterConfigs, VersionRange { min: 0, max: 0 });
+    versions.insert(ApiKey::AlterPartitionReassignments, VersionRange { min: 0, max: 0 });
+    versions.insert(ApiKey::ListPartitionReassignments, VersionRange { min: 0, max: 0 });
+    versions.insert(ApiKey::OffsetDelete, VersionRange { min: 0, max: 0 });
+    versions.insert(ApiKey::DescribeClientQuotas, VersionRange { min: 0, max: 0 });
+    versions.insert(ApiKey::AlterClientQuotas, VersionRange { min: 0, max: 0 });
+    versions.insert(ApiKey::DescribeUserScramCredentials, VersionRange { min: 0, max: 0 });
+    versions.insert(ApiKey::AlterUserScramCredentials, VersionRange { min: 0, max: 0 });
+    
+    // KRaft consensus APIs (NOT IMPLEMENTED - placeholder for librdkafka compatibility)
+    // Note: Skipping APIs 52-55, 59, 62-64 to match CP Kafka 7.5.0
+    // versions.insert(ApiKey::Vote, VersionRange { min: 0, max: 0 });  // API 52 - not in CP Kafka
+    // versions.insert(ApiKey::BeginQuorumEpoch, VersionRange { min: 0, max: 0 });  // API 53 - not in CP Kafka
+    // versions.insert(ApiKey::EndQuorumEpoch, VersionRange { min: 0, max: 0 });  // API 54 - not in CP Kafka
+    // versions.insert(ApiKey::DescribeQuorum, VersionRange { min: 0, max: 0 });  // API 55 - not in CP Kafka
+    versions.insert(ApiKey::AlterPartition, VersionRange { min: 0, max: 0 });
+    versions.insert(ApiKey::UpdateFeatures, VersionRange { min: 0, max: 0 });
+    versions.insert(ApiKey::Envelope, VersionRange { min: 0, max: 0 });
+    // versions.insert(ApiKey::FetchSnapshot, VersionRange { min: 0, max: 0 });  // API 59 - not in CP Kafka
+    versions.insert(ApiKey::DescribeCluster, VersionRange { min: 0, max: 0 });
+    versions.insert(ApiKey::DescribeProducers, VersionRange { min: 0, max: 0 });
+    // versions.insert(ApiKey::BrokerRegistration, VersionRange { min: 0, max: 0 });  // API 62 - not in CP Kafka
+    // versions.insert(ApiKey::BrokerHeartbeat, VersionRange { min: 0, max: 0 });  // API 63 - not in CP Kafka
+    // versions.insert(ApiKey::UnregisterBroker, VersionRange { min: 0, max: 0 });  // API 64 - not in CP Kafka
+    
+    // Transaction coordination APIs (NOT IMPLEMENTED - placeholder for librdkafka compatibility)
+    versions.insert(ApiKey::DescribeTransactions, VersionRange { min: 0, max: 0 });
+    versions.insert(ApiKey::ListTransactions, VersionRange { min: 0, max: 0 });
+    versions.insert(ApiKey::AllocateProducerIds, VersionRange { min: 0, max: 0 });
+    
+    // Consumer group coordination v2 (NOT IMPLEMENTED - placeholder for librdkafka compatibility)
+    // versions.insert(ApiKey::ConsumerGroupHeartbeat, VersionRange { min: 0, max: 0 });  // API 68 - not in CP Kafka
     
     versions
 }

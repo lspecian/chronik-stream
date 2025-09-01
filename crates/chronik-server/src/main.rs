@@ -14,6 +14,14 @@ use chronik_monitoring::{init_monitoring, TracingConfig};
 
 mod integrated_server;
 mod error_handler;
+mod kafka_handler;
+mod produce_handler;
+mod storage;
+mod consumer_group;
+mod fetch_handler;
+mod handler;
+mod offset_storage;
+mod coordinator_manager;
 
 use integrated_server::{IntegratedKafkaServer, IntegratedServerConfig};
 

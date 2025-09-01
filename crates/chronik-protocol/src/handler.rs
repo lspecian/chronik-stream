@@ -114,10 +114,6 @@ impl ProtocolHandler {
     /// Create a new protocol handler with metadata store
     pub fn with_metadata_store(metadata_store: Arc<dyn chronik_common::metadata::traits::MetadataStore>) -> Self {
         let versions = supported_api_versions();
-        eprintln!("INIT: Creating ProtocolHandler with {} supported APIs", versions.len());
-        for (api, range) in &versions {
-            eprintln!("  - {:?}: v{}-v{}", api, range.min, range.max);
-        }
         Self {
             supported_versions: versions,
             metadata_store: Some(metadata_store),
@@ -132,7 +128,6 @@ impl ProtocolHandler {
         broker_id: i32,
     ) -> Self {
         let versions = supported_api_versions();
-        eprintln!("INIT: Creating ProtocolHandler with broker {} and {} supported APIs", broker_id, versions.len());
         Self {
             supported_versions: versions,
             metadata_store: Some(metadata_store),
@@ -737,7 +732,7 @@ impl ProtocolHandler {
                 // Records
                 // For v11+, we need to provide a proper RecordBatch even if empty
                 // For now, always return NULL which the client can handle
-                let records_len = if partition.records.is_empty() {
+                let _records_len = if partition.records.is_empty() {
                     if version >= 11 {
                         // For v11+, we could return an empty RecordBatch,
                         // but NULL is also valid and simpler
@@ -866,9 +861,44 @@ impl ProtocolHandler {
                 self.error_response(header.correlation_id, error_codes::UNSUPPORTED_VERSION)
             }
             
-            // Other APIs
+            // Other APIs - catch all unimplemented APIs
             ApiKey::DeleteRecords |
-            ApiKey::OffsetForLeaderEpoch => {
+            ApiKey::OffsetForLeaderEpoch |
+            ApiKey::AlterReplicaLogDirs |
+            ApiKey::DescribeLogDirs |
+            ApiKey::SaslAuthenticate |
+            ApiKey::CreatePartitions |
+            ApiKey::CreateDelegationToken |
+            ApiKey::RenewDelegationToken |
+            ApiKey::ExpireDelegationToken |
+            ApiKey::DescribeDelegationToken |
+            ApiKey::DeleteGroups |
+            ApiKey::ElectLeaders |
+            ApiKey::IncrementalAlterConfigs |
+            ApiKey::AlterPartitionReassignments |
+            ApiKey::ListPartitionReassignments |
+            ApiKey::OffsetDelete |
+            ApiKey::DescribeClientQuotas |
+            ApiKey::AlterClientQuotas |
+            ApiKey::DescribeUserScramCredentials |
+            ApiKey::AlterUserScramCredentials |
+            // ApiKey::Vote |  // API 52 - not in CP Kafka
+            // ApiKey::BeginQuorumEpoch |  // API 53 - not in CP Kafka
+            // ApiKey::EndQuorumEpoch |  // API 54 - not in CP Kafka
+            // ApiKey::DescribeQuorum |  // API 55 - not in CP Kafka
+            ApiKey::AlterPartition |
+            ApiKey::UpdateFeatures |
+            ApiKey::Envelope |
+            // ApiKey::FetchSnapshot |  // API 59 - not in CP Kafka
+            ApiKey::DescribeCluster |
+            ApiKey::DescribeProducers |
+            // ApiKey::BrokerRegistration |  // API 62 - not in CP Kafka
+            // ApiKey::BrokerHeartbeat |  // API 63 - not in CP Kafka
+            // ApiKey::UnregisterBroker |  // API 64 - not in CP Kafka
+            ApiKey::DescribeTransactions |
+            ApiKey::ListTransactions |
+            ApiKey::AllocateProducerIds => {
+            // ApiKey::ConsumerGroupHeartbeat => {  // API 68 - not in CP Kafka
                 tracing::warn!("Received unsupported API request: {:?}", header.api_key);
                 self.error_response(header.correlation_id, error_codes::UNSUPPORTED_VERSION)
             }
@@ -881,22 +911,9 @@ impl ProtocolHandler {
         header: RequestHeader,
         _body: &mut Bytes,
     ) -> Result<Response> {
-        eprintln!("PROTOCOL HANDLER: Handling ApiVersions request - correlation_id: {}, version: {}", 
-            header.correlation_id, header.api_version);
-        
-        // Check if supported_versions was properly initialized
-        eprintln!("DEBUG: supported_versions.len() = {}", self.supported_versions.len());
-        eprintln!("DEBUG: supported_versions.is_empty() = {}", self.supported_versions.is_empty());
-        
-        // Try to get the versions directly
-        let test_versions = supported_api_versions();
-        eprintln!("DEBUG: Direct call to supported_api_versions() returns {} entries", test_versions.len());
-        
         if self.supported_versions.is_empty() {
-            eprintln!("ERROR: supported_versions is EMPTY!");
-            eprintln!("Using direct call to supported_api_versions() as fallback");
-            
             // Use the directly fetched versions instead of minimal list
+            let test_versions = supported_api_versions();
             let mut api_versions = Vec::new();
             for (api_key, version_range) in &test_versions {
                 api_versions.push(ApiVersionInfo {
@@ -907,11 +924,6 @@ impl ProtocolHandler {
             }
             // CRITICAL: Sort by API key for consistent ordering
             api_versions.sort_by_key(|a| a.api_key);
-            eprintln!("PROTOCOL HANDLER: Created response struct");
-            eprintln!("PROTOCOL HANDLER: About to encode ApiVersions response for version {}", header.api_version);
-            eprintln!("encode_api_versions_response: Starting encoding for version {}", header.api_version);
-            eprintln!("encode_api_versions_response: Encoding {} APIs", api_versions.len());
-            eprintln!("PROTOCOL HANDLER: Encoding complete");
             
             let response = ApiVersionsResponse {
                 error_code: 0,
@@ -922,20 +934,11 @@ impl ProtocolHandler {
             let mut body_buf = BytesMut::new();
             self.encode_api_versions_response(&mut body_buf, &response, header.api_version)?;
             
-            tracing::info!("Encoded ApiVersions response: {} bytes", body_buf.len());
-            
-            let hex_str = body_buf.iter()
-                .take(32)
-                .map(|b| format!("{:02x}", b))
-                .collect::<Vec<_>>()
-                .join(" ");
-            tracing::info!("First 32 bytes of encoded response: {}", hex_str);
             
             let encoded_bytes = body_buf.freeze();
             return Ok(Self::make_response(&header, ApiKey::ApiVersions, encoded_bytes));
         }
         
-        eprintln!("PROTOCOL HANDLER: supported_versions has {} entries", self.supported_versions.len());
         
         let mut api_versions = Vec::new();
         
@@ -948,11 +951,6 @@ impl ProtocolHandler {
         }
         // CRITICAL: Sort by API key for consistent ordering
         api_versions.sort_by_key(|a| a.api_key);
-        eprintln!("PROTOCOL HANDLER: Created response struct");
-        eprintln!("PROTOCOL HANDLER: About to encode ApiVersions response for version {}", header.api_version);
-        eprintln!("encode_api_versions_response: Starting encoding for version {}", header.api_version);
-        eprintln!("encode_api_versions_response: Encoding {} APIs", api_versions.len());
-        eprintln!("PROTOCOL HANDLER: Encoding complete");
         
         let response = ApiVersionsResponse {
             error_code: 0,
@@ -966,14 +964,6 @@ impl ProtocolHandler {
         self.encode_api_versions_response(&mut body_buf, &response, header.api_version)?;
         
         let encoded_bytes = body_buf.freeze();
-        tracing::info!("Encoded ApiVersions response: {} bytes", encoded_bytes.len());
-        // Log first 32 bytes as hex for debugging
-        let hex_preview: String = encoded_bytes.iter()
-            .take(32)
-            .map(|b| format!("{:02x}", b))
-            .collect::<Vec<_>>()
-            .join(" ");
-        tracing::info!("First 32 bytes of encoded response: {}", hex_preview);
         
         Ok(Self::make_response(&header, ApiKey::ApiVersions, encoded_bytes))
     }
@@ -1024,7 +1014,8 @@ impl ProtocolHandler {
             if version >= 3 {
                 // Use compact array encoding
                 // Compact arrays use length+1 encoding
-                encoder.write_unsigned_varint((response.api_versions.len() + 1) as u32);
+                let array_len = (response.api_versions.len() + 1) as u32;
+                encoder.write_unsigned_varint(array_len);
                 
                 for api in &response.api_versions {
                     // IMPORTANT: librdkafka always reads min/max as INT16, regardless of version
@@ -1048,8 +1039,8 @@ impl ProtocolHandler {
             if version >= 3 {
                 // Write tagged fields at the end (empty for now)
                 encoder.write_unsigned_varint(0);
-                // Write throttle_time_ms (required in v3+)
-                encoder.write_i32(0);
+                // Note: v3 does NOT have throttle_time_ms at all
+                // v4+ will have it but it's written earlier in the response
             }
         }
         

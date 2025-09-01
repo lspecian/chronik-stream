@@ -85,7 +85,6 @@ impl KafkaProtocolHandler {
             tracing::info!("Request: API key={}, version={}", api_key, api_version);
         }
         
-        tracing::info!("KafkaProtocolHandler::handle_request called");
         
         // Parse the request header to determine which API is being called
         let mut buf = Bytes::copy_from_slice(request_bytes);
@@ -299,13 +298,11 @@ impl KafkaProtocolHandler {
             ApiKey::ApiVersions => {
                 // ApiVersions must use the protocol handler for proper encoding
                 let response = self.protocol_handler.handle_request(request_bytes).await?;
-                tracing::info!("Response body size: {}", response.body.len());
                 Ok(response)
             }
             _ => {
                 // For all other APIs, use the protocol handler
                 let response = self.protocol_handler.handle_request(request_bytes).await?;
-                tracing::info!("Response body size: {}", response.body.len());
                 Ok(response)
             }
         }

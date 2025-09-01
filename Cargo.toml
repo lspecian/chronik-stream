@@ -4,7 +4,6 @@ members = [
     "crates/chronik-common",
     "crates/chronik-protocol", 
     "crates/chronik-storage",
-    "crates/chronik-ingest",
     "crates/chronik-search",
     "crates/chronik-query",
     # "crates/chronik-controller",  # Removed - has raft dependency with protoc issues
@@ -17,7 +16,6 @@ members = [
     "crates/chronik-benchmarks",
     "crates/chronik-backup",
     "crates/chronik-config",
-    "crates/chronik-all-in-one",
     "crates/chronik-server",
 ]
 exclude = ["tests"]
