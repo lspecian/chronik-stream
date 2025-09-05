@@ -121,6 +121,7 @@ impl KafkaProtocolHandler {
                         buf.freeze()
                     },
                     is_flexible: false,  // Error response - conservative default
+                    api_key: ApiKey::ApiVersions,
                 });
             }
         };
@@ -139,10 +140,20 @@ impl KafkaProtocolHandler {
                 let mut body_buf = BytesMut::new();
                 self.protocol_handler.encode_produce_response(&mut body_buf, &response, header.api_version)?;
                 
+                // Debug: log the actual body content
+                eprintln!("DEBUG: Produce response body_buf.len() = {}", body_buf.len());
+                if body_buf.len() > 0 {
+                    eprintln!("DEBUG: Produce response body first 32 bytes: {:02x?}", 
+                        &body_buf[..body_buf.len().min(32)]);
+                } else {
+                    eprintln!("DEBUG: Produce response body is EMPTY!");
+                }
+                
                 Ok(Response {
                     header: ResponseHeader { correlation_id: header.correlation_id },
                     body: body_buf.freeze(),
-                    is_flexible: false,  // TODO: Check API version for flexible encoding
+                    is_flexible: header.api_version >= 9,  // v9+ uses flexible/compact encoding
+                    api_key: ApiKey::Produce,
                 })
             }
             ApiKey::Fetch => {
@@ -169,7 +180,8 @@ impl KafkaProtocolHandler {
                 Ok(Response {
                     header: ResponseHeader { correlation_id: header.correlation_id },
                     body: body_buf.freeze(),
-                    is_flexible: false,  // TODO: Check API version for flexible encoding
+                    is_flexible: header.api_version >= 12,  // v12+ uses flexible/compact encoding
+                    api_key: ApiKey::Fetch,
                 })
             }
             ApiKey::FindCoordinator => {
@@ -186,7 +198,8 @@ impl KafkaProtocolHandler {
                 Ok(Response {
                     header: ResponseHeader { correlation_id: header.correlation_id },
                     body: body_buf.freeze(),
-                    is_flexible: false,  // TODO: Check API version for flexible encoding
+                    is_flexible: header.api_version >= 3,  // v3+ uses flexible/compact encoding
+                    api_key: ApiKey::FindCoordinator,
                 })
             }
             ApiKey::JoinGroup => {
@@ -203,7 +216,8 @@ impl KafkaProtocolHandler {
                 Ok(Response {
                     header: ResponseHeader { correlation_id: header.correlation_id },
                     body: body_buf.freeze(),
-                    is_flexible: false,  // TODO: Check API version for flexible encoding
+                    is_flexible: header.api_version >= 6,  // v6+ uses flexible/compact encoding
+                    api_key: ApiKey::JoinGroup,
                 })
             }
             ApiKey::SyncGroup => {
@@ -220,7 +234,8 @@ impl KafkaProtocolHandler {
                 Ok(Response {
                     header: ResponseHeader { correlation_id: header.correlation_id },
                     body: body_buf.freeze(),
-                    is_flexible: false,  // TODO: Check API version for flexible encoding
+                    is_flexible: header.api_version >= 4,  // v4+ uses flexible/compact encoding
+                    api_key: ApiKey::SyncGroup,
                 })
             }
             ApiKey::Heartbeat => {
@@ -237,7 +252,8 @@ impl KafkaProtocolHandler {
                 Ok(Response {
                     header: ResponseHeader { correlation_id: header.correlation_id },
                     body: body_buf.freeze(),
-                    is_flexible: false,  // TODO: Check API version for flexible encoding
+                    is_flexible: header.api_version >= 4,  // v4+ uses flexible/compact encoding
+                    api_key: ApiKey::Heartbeat,
                 })
             }
             ApiKey::LeaveGroup => {
@@ -254,7 +270,8 @@ impl KafkaProtocolHandler {
                 Ok(Response {
                     header: ResponseHeader { correlation_id: header.correlation_id },
                     body: body_buf.freeze(),
-                    is_flexible: false,  // TODO: Check API version for flexible encoding
+                    is_flexible: header.api_version >= 4,  // v4+ uses flexible/compact encoding
+                    api_key: ApiKey::LeaveGroup,
                 })
             }
             ApiKey::ListGroups => {
@@ -275,7 +292,8 @@ impl KafkaProtocolHandler {
                 Ok(Response {
                     header: ResponseHeader { correlation_id: header.correlation_id },
                     body: body_buf.freeze(),
-                    is_flexible: false,  // TODO: Check API version for flexible encoding
+                    is_flexible: header.api_version >= 8,  // v8+ uses flexible/compact encoding
+                    api_key: ApiKey::OffsetCommit,
                 })
             }
             ApiKey::OffsetFetch => {
@@ -292,7 +310,8 @@ impl KafkaProtocolHandler {
                 Ok(Response {
                     header: ResponseHeader { correlation_id: header.correlation_id },
                     body: body_buf.freeze(),
-                    is_flexible: false,  // TODO: Check API version for flexible encoding
+                    is_flexible: header.api_version >= 6,  // v6+ uses flexible/compact encoding
+                    api_key: ApiKey::OffsetFetch,
                 })
             }
             ApiKey::ApiVersions => {

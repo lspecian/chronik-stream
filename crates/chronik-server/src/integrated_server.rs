@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::path::PathBuf;
 use tokio::net::TcpListener;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::io::IoSlice;
 use tracing::{info, error, debug, warn};
 use crate::error_handler::{ErrorHandler, ErrorCode, ErrorRecovery, ServerError};
 
@@ -277,6 +278,14 @@ impl IntegratedKafkaServer {
             match listener.accept().await {
                 Ok((mut socket, addr)) => {
                     debug!("New connection from {}", addr);
+                    
+                    // Enable TCP_NODELAY to disable Nagle's algorithm for immediate sending
+                    if let Err(e) = socket.set_nodelay(true) {
+                        error!("Failed to set TCP_NODELAY for {}: {}", addr, e);
+                    } else {
+                        eprintln!("CRITICAL: TCP_NODELAY enabled for connection {}", addr);
+                    }
+                    
                     let kafka_handler = self.kafka_handler.clone();
                     let error_handler = Arc::new(ErrorHandler::new());
                     
@@ -342,40 +351,160 @@ impl IntegratedKafkaServer {
                                     // Add correlation ID
                                     header_bytes.extend_from_slice(&response.header.correlation_id.to_be_bytes());
                                     
-                                    // For flexible versions (v9+), add tagged fields after correlation ID
+                                    // For flexible versions, add tagged fields after correlation ID
+                                    // BUT ApiVersions v3 and Produce v9+ are special - the response headers have NO tagged fields!
+                                    // The tagged fields are only in the response BODY for these APIs
                                     if response.is_flexible {
-                                        // Add empty tagged fields (varint 0)
-                                        header_bytes.push(0);
+                                        // ApiVersions v3 and Produce v9+ don't have header tagged fields
+                                        // All other flexible APIs do
+                                        if response.api_key != chronik_protocol::parser::ApiKey::ApiVersions && 
+                                           response.api_key != chronik_protocol::parser::ApiKey::Produce {
+                                            // Add empty tagged fields (varint 0) for other flexible APIs
+                                            header_bytes.push(0);
+                                        }
                                     }
                                     
                                     let mut full_response = Vec::with_capacity(header_bytes.len() + response.body.len() + 4);
                                     
                                     // Add size (4 bytes)
                                     let size = (header_bytes.len() + response.body.len()) as i32;
-                                    full_response.extend_from_slice(&size.to_be_bytes());
+                                    eprintln!("DEBUG SIZE: header_bytes.len()={}, body.len()={}, calculated size={}, is_flexible={}, api_key={:?}", 
+                                        header_bytes.len(), response.body.len(), size, response.is_flexible, response.api_key);
+                                    eprintln!("DEBUG: response.body first 32 bytes: {:?}", 
+                                        &response.body[..response.body.len().min(32)]);
+                                    
+                                    let size_bytes = size.to_be_bytes();
+                                    eprintln!("DEBUG: size_bytes = {:?}", size_bytes);
+                                    full_response.extend_from_slice(&size_bytes);
+                                    eprintln!("DEBUG: After adding size, full_response.len()={}", full_response.len());
                                     
                                     // Add header (correlation ID + optional tagged fields)
+                                    eprintln!("DEBUG: header_bytes = {:?}", header_bytes);
                                     full_response.extend_from_slice(&header_bytes);
+                                    eprintln!("DEBUG: After adding header, full_response.len()={}", full_response.len());
                                     
                                     // Add response body
                                     full_response.extend_from_slice(&response.body);
+                                    eprintln!("DEBUG: After adding body, full_response.len()={} (expected={})", 
+                                        full_response.len(), 4 + header_bytes.len() + response.body.len());
                                     
+                                    // Validate the complete response before sending
+                                    eprintln!("CRITICAL: About to send {} bytes. First 16 bytes: {:02x?}", 
+                                        full_response.len(), &full_response[..std::cmp::min(16, full_response.len())]);
+                                    eprintln!("CRITICAL: Last 16 bytes: {:02x?}", 
+                                        &full_response[full_response.len().saturating_sub(16)..]);
                                     
                                     debug!("Sending response: size={}, correlation_id={}, body_len={}, total_len={}", 
                                         size, response.header.correlation_id, response.body.len(), full_response.len());
                                     tracing::trace!("Response bytes (first 64): {:?}", 
                                         &full_response[..std::cmp::min(64, full_response.len())]);
                                     
-                                    // Send response
-                                    if let Err(e) = socket.write_all(&full_response).await {
-                                        error!("Error writing response to {}: {}", addr, e);
-                                        break;
+                                    // CRITICAL FIX: Use vectored I/O and TCP coalescing for small responses
+                                    let response_size = full_response.len();
+                                    eprintln!("CRITICAL: Response size: {} bytes", response_size);
+                                    
+                                    // For small responses (< 100 bytes), disable TCP_NODELAY temporarily
+                                    // to enable Nagle's algorithm for coalescing
+                                    let should_toggle_nodelay = response_size < 100;
+                                    
+                                    if should_toggle_nodelay {
+                                        eprintln!("CRITICAL: Small response detected ({} bytes), disabling TCP_NODELAY for coalescing", response_size);
+                                        if let Err(e) = socket.set_nodelay(false) {
+                                            eprintln!("WARNING: Failed to disable TCP_NODELAY: {}", e);
+                                        }
                                     }
                                     
-                                    // Flush to ensure data is sent
-                                    if let Err(e) = socket.flush().await {
-                                        error!("Error flushing socket to {}: {}", addr, e);
-                                        break;
+                                    // Option 1: Try vectored write first (most efficient)
+                                    let size_slice = &full_response[..4];
+                                    let header_and_body = &full_response[4..];
+                                    
+                                    eprintln!("CRITICAL: Attempting vectored write with 2 IoSlices");
+                                    eprintln!("  - Size prefix: {:02x?}", size_slice);
+                                    eprintln!("  - Header+Body first 16 bytes: {:02x?}", &header_and_body[..std::cmp::min(16, header_and_body.len())]);
+                                    
+                                    let bufs = &[
+                                        IoSlice::new(size_slice),
+                                        IoSlice::new(header_and_body)
+                                    ];
+                                    
+                                    // Use write_vectored to send both parts atomically
+                                    let mut total_written = 0;
+                                    while total_written < response_size {
+                                        match socket.write_vectored(bufs).await {
+                                            Ok(n) => {
+                                                total_written += n;
+                                                eprintln!("CRITICAL: write_vectored wrote {} bytes (total: {}/{})", 
+                                                    n, total_written, response_size);
+                                                
+                                                if n == 0 {
+                                                    eprintln!("ERROR: write_vectored returned 0 bytes");
+                                                    break;
+                                                }
+                                                
+                                                // If partial write, fall back to regular write for remainder
+                                                if total_written < response_size {
+                                                    eprintln!("CRITICAL: Partial write detected, writing remaining {} bytes", 
+                                                        response_size - total_written);
+                                                    match socket.write_all(&full_response[total_written..]).await {
+                                                        Ok(()) => {
+                                                            eprintln!("CRITICAL: Remainder write_all completed");
+                                                            total_written = response_size;
+                                                        }
+                                                        Err(e) => {
+                                                            error!("Error writing remainder to {}: {}", addr, e);
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                error!("Error in write_vectored to {}: {}", addr, e);
+                                                eprintln!("CRITICAL: write_vectored FAILED: {}, falling back to write_all", e);
+                                                
+                                                // Fallback: Try single write_all
+                                                match socket.write_all(&full_response[total_written..]).await {
+                                                    Ok(()) => {
+                                                        eprintln!("CRITICAL: Fallback write_all completed successfully");
+                                                        total_written = response_size;
+                                                    }
+                                                    Err(e) => {
+                                                        error!("Error in fallback write to {}: {}", addr, e);
+                                                        break;
+                                                    }
+                                                }
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    
+                                    // Ensure all data is flushed
+                                    eprintln!("CRITICAL: Flushing socket to ensure transmission");
+                                    match socket.flush().await {
+                                        Ok(()) => {
+                                            eprintln!("CRITICAL: Socket flush completed successfully");
+                                        }
+                                        Err(e) => {
+                                            error!("Error flushing socket to {}: {}", addr, e);
+                                            eprintln!("CRITICAL: Socket flush FAILED: {}", e);
+                                        }
+                                    }
+                                    
+                                    // For small responses, add a tiny delay to ensure TCP coalescing
+                                    if should_toggle_nodelay {
+                                        eprintln!("CRITICAL: Adding 1ms delay for TCP coalescing");
+                                        tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+                                        
+                                        // Re-enable TCP_NODELAY for future requests
+                                        eprintln!("CRITICAL: Re-enabling TCP_NODELAY");
+                                        if let Err(e) = socket.set_nodelay(true) {
+                                            eprintln!("WARNING: Failed to re-enable TCP_NODELAY: {}", e);
+                                        }
+                                    }
+                                    
+                                    if total_written == response_size {
+                                        eprintln!("CRITICAL: Successfully sent complete {} byte response", response_size);
+                                    } else {
+                                        eprintln!("ERROR: Only sent {}/{} bytes!", total_written, response_size);
                                     }
                                     
                                     debug!("Response sent successfully to {}", addr);

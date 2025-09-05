@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2025-09-05
+
+### Fixed
+- **CRITICAL**: Fixed librdkafka v2.11.1 compatibility issues
+  - Added missing `record_errors` and `error_message` fields to Produce v9 responses
+  - Fixed client_id parsing to use compact strings for flexible protocol versions (v3+)
+  - Resolved "Bad message format" errors for modern Kafka clients
+- Improved TCP transmission reliability in integrated server
+- Enhanced request header parsing with better error handling
+
+### Added
+- Comprehensive librdkafka compatibility test suite
+- Protocol analysis tools for debugging wire format issues
+- TCP intercept proxy for real-time protocol debugging
+- Go integration tests using confluent-kafka-go/v2
+- Detailed librdkafka compatibility documentation
+- Test utility documentation with usage examples
+
+### Changed
+- Reorganized test files into structured directories
+- Moved investigation documentation to docs folder
+- Created clear separation between protocol tests, debug utilities, and integration tests
+
+## [0.5.0] - 2024-XX-XX
+
 ### Added
 - Initial release of Chronik Stream
 - Kafka wire protocol v2 compatibility

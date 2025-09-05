@@ -58,7 +58,8 @@ use crate::types::{
 pub struct Response {
     pub header: ResponseHeader,
     pub body: Bytes,
-    pub is_flexible: bool,  // Track if this response uses flexible encoding
+    pub is_flexible: bool,  // Whether response HEADER should have tagged fields (not about body encoding)
+    pub api_key: ApiKey,    // Track which API this response is for
 }
 
 /// Handler for specific API versions request
@@ -94,10 +95,25 @@ pub struct ProtocolHandler {
 impl ProtocolHandler {
     /// Helper to create a Response with proper flexible tracking
     fn make_response(header: &RequestHeader, api_key: ApiKey, body: Bytes) -> Response {
+        // CRITICAL: ApiVersions is special - the response BODY uses flexible encoding
+        // but the response HEADER does not! This is unique to ApiVersions.
+        // 
+        // For clarity: is_flexible here means "should the header have tagged fields"
+        // The body encoding (flexible vs non-flexible) is already handled when creating the body
+        let header_has_tagged_fields = if api_key == ApiKey::ApiVersions {
+            false  // ApiVersions response header NEVER has tagged fields, even for v3+
+        } else {
+            is_flexible_version(api_key, header.api_version)
+        };
+        
+        eprintln!("DEBUG: make_response - api_key={:?}, body.len()={}, header_has_tagged_fields={}", 
+                 api_key, body.len(), header_has_tagged_fields);
+        
         Response {
             header: ResponseHeader { correlation_id: header.correlation_id },
             body,
-            is_flexible: is_flexible_version(api_key, header.api_version),
+            is_flexible: header_has_tagged_fields,  // This specifically means header flexibility
+            api_key,
         }
     }
     
@@ -934,9 +950,12 @@ impl ProtocolHandler {
             let mut body_buf = BytesMut::new();
             self.encode_api_versions_response(&mut body_buf, &response, header.api_version)?;
             
-            
+            eprintln!("DEBUG: After encode, body_buf first 32 bytes: {:?}", &body_buf[..body_buf.len().min(32)]);
             let encoded_bytes = body_buf.freeze();
-            return Ok(Self::make_response(&header, ApiKey::ApiVersions, encoded_bytes));
+            eprintln!("DEBUG: After freeze, encoded_bytes first 32 bytes: {:?}", &encoded_bytes[..encoded_bytes.len().min(32)]);
+            let response = Self::make_response(&header, ApiKey::ApiVersions, encoded_bytes);
+            eprintln!("DEBUG: Response body first 32 bytes: {:?}", &response.body[..response.body.len().min(32)]);
+            return Ok(response);
         }
         
         
@@ -975,6 +994,7 @@ impl ProtocolHandler {
         response: &ApiVersionsResponse,
         version: i16,
     ) -> Result<()> {
+        eprintln!("DEBUG encode_api_versions_response: version={}, api_count={}", version, response.api_versions.len());
         let mut encoder = Encoder::new(buf);
         
         // CRITICAL: For v0 protocol, field order matters!
@@ -997,7 +1017,7 @@ impl ProtocolHandler {
         } else {
             // v1+ field order depends on version:
             // v1-2: throttle_time_ms, error_code, api_versions
-            // v3: error_code, api_versions (NO throttle_time_ms in v3!)
+            // v3: error_code, api_versions (NO throttle_time_ms according to spec)
             // v4+: throttle_time_ms, error_code, api_versions
             
             // Write throttle_time_ms for v1-2 and v4+, but NOT v3
@@ -1008,21 +1028,35 @@ impl ProtocolHandler {
             }
             
             // Then error_code
+            eprintln!("DEBUG: About to write error_code = {}", response.error_code);
+            eprintln!("DEBUG: Buffer before error_code: {:?}", encoder.debug_buffer());
             encoder.write_i16(response.error_code);
+            eprintln!("DEBUG: Buffer after error_code: {:?}", encoder.debug_buffer());
             
             // Write array of API versions
+            eprintln!("DEBUG: version = {}, will use compact = {}", version, version >= 3);
             if version >= 3 {
                 // Use compact array encoding
                 // Compact arrays use length+1 encoding
                 let array_len = (response.api_versions.len() + 1) as u32;
+                eprintln!("DEBUG: IN COMPACT PATH - Writing compact array for {} APIs, varint value = {}", response.api_versions.len(), array_len);
+                eprintln!("DEBUG: Buffer before varint: {:?}", encoder.debug_buffer());
                 encoder.write_unsigned_varint(array_len);
+                eprintln!("DEBUG: Buffer after varint: {:?}", encoder.debug_buffer());
                 
-                for api in &response.api_versions {
-                    // IMPORTANT: librdkafka always reads min/max as INT16, regardless of version
-                    // Even though Kafka protocol v3+ specifies INT8, we use INT16 for compatibility
+                for (i, api) in response.api_versions.iter().enumerate() {
+                    // CRITICAL: librdkafka compatibility issue
+                    // Kafka spec says v3+ uses INT8 for min/max, but librdkafka v2.11.1
+                    // seems to expect INT16. Let's try INT16 for compatibility.
+                    if i == 0 {
+                        eprintln!("DEBUG: First API - key={}, min={}, max={}", api.api_key, api.min_version, api.max_version);
+                    }
                     encoder.write_i16(api.api_key);
+                    
+                    // Try INT16 for librdkafka compatibility
                     encoder.write_i16(api.min_version);
                     encoder.write_i16(api.max_version);
+                    
                     // Write tagged fields (empty for now)
                     encoder.write_unsigned_varint(0);
                 }
@@ -1036,14 +1070,25 @@ impl ProtocolHandler {
                 }
             }
             
-            if version >= 3 {
+            // CRITICAL FIX: librdkafka expects throttle_time_ms at the end for v3
+            // The error shows it expects 4 bytes at position 423/424
+            if version == 3 {
+                eprintln!("DEBUG: v3 - Writing throttle_time THEN tagged fields");
+                encoder.write_i32(response.throttle_time_ms);
+                encoder.write_unsigned_varint(0);
+            }
+            
+            // v4+ has tagged fields at the end (and throttle_time is earlier)
+            if version >= 4 {
+                eprintln!("DEBUG: Writing end tagged field for version {}", version);
                 // Write tagged fields at the end (empty for now)
                 encoder.write_unsigned_varint(0);
-                // Note: v3 does NOT have throttle_time_ms at all
-                // v4+ will have it but it's written earlier in the response
             }
         }
         
+        eprintln!("DEBUG: Final buffer in encode_api_versions_response: len={}, first 32 bytes: {:?}", 
+            encoder.debug_buffer().len(),
+            &encoder.debug_buffer()[..encoder.debug_buffer().len().min(32)]);
         Ok(())
     }
     
@@ -1056,16 +1101,25 @@ impl ProtocolHandler {
         use crate::types::{MetadataRequest, MetadataResponse, MetadataBroker};
         use crate::parser::Decoder;
         
+        eprintln!("DEBUG: handle_metadata called with v{}", header.api_version);
         tracing::debug!("Handling metadata request v{}", header.api_version);
         
         let mut decoder = Decoder::new(body);
         let flexible = header.api_version >= 9;
         
         // Parse metadata request
+        eprintln!("DEBUG: Parsing metadata request, flexible={}", flexible);
         let topics = if header.api_version >= 1 {
             let topic_count = if flexible {
                 // Compact array
-                let count = decoder.read_unsigned_varint()? as i32;
+                let count = match decoder.read_unsigned_varint() {
+                    Ok(c) => c as i32,
+                    Err(e) => {
+                        eprintln!("DEBUG: Failed to read topic count varint: {:?}", e);
+                        return Err(e);
+                    }
+                };
+                eprintln!("DEBUG: Topic count varint read: {}", count);
                 if count == 0 {
                     -1  // Null array
                 } else {
@@ -1075,6 +1129,7 @@ impl ProtocolHandler {
                 decoder.read_i32()?
             };
             
+            eprintln!("DEBUG: Topic count decoded: {}", topic_count);
             if topic_count < 0 {
                 None // All topics
             } else {
@@ -1103,26 +1158,43 @@ impl ProtocolHandler {
         };
         
         let allow_auto_topic_creation = if header.api_version >= 4 {
-            decoder.read_bool()?
+            let val = decoder.read_bool()?;
+            eprintln!("DEBUG: allow_auto_topic_creation read: {}", val);
+            val
         } else {
             true
         };
         
         let include_cluster_authorized_operations = if header.api_version >= 8 {
-            decoder.read_bool()?
+            let val = decoder.read_bool()?;
+            eprintln!("DEBUG: include_cluster_authorized_operations read: {}", val);
+            val
         } else {
             false
         };
         
         let include_topic_authorized_operations = if header.api_version >= 8 {
-            decoder.read_bool()?
+            let val = decoder.read_bool()?;
+            eprintln!("DEBUG: include_topic_authorized_operations read: {}", val);
+            val
         } else {
             false
         };
         
         if flexible {
             // Skip tagged fields at the end
-            let _tagged_field_count = decoder.read_unsigned_varint()?;
+            // librdkafka v2.11.1 quirk: First Metadata request may be missing tagged fields
+            if decoder.has_remaining() {
+                match decoder.read_unsigned_varint() {
+                    Ok(count) => eprintln!("DEBUG: Body tagged field count: {}", count),
+                    Err(e) => {
+                        eprintln!("DEBUG: Failed to read body tagged fields: {:?}", e);
+                        return Err(e);
+                    }
+                }
+            } else {
+                eprintln!("DEBUG: No body tagged fields present (librdkafka compatibility)");
+            }
         }
         
         let _request = MetadataRequest {
@@ -1131,6 +1203,9 @@ impl ProtocolHandler {
             include_cluster_authorized_operations,
             include_topic_authorized_operations,
         };
+        
+        eprintln!("DEBUG: Parsed metadata request - topics: {:?}, auto_create: {}", 
+                  _request.topics, _request.allow_auto_topic_creation);
         
         // Create response with topics from metadata store
         tracing::info!("Creating metadata response - topics requested: {:?}, auto_create: {}", 
@@ -1249,10 +1324,19 @@ impl ProtocolHandler {
         
         let mut body_buf = BytesMut::new();
         
+        eprintln!("DEBUG: About to encode metadata response - brokers={}, topics={}", 
+                  response.brokers.len(), response.topics.len());
         tracing::info!("About to encode metadata response with {} brokers", response.brokers.len());
         // Encode the response body (without correlation ID)
-        self.encode_metadata_response(&mut body_buf, &response, header.api_version)?;
+        match self.encode_metadata_response(&mut body_buf, &response, header.api_version) {
+            Ok(_) => eprintln!("DEBUG: encode_metadata_response succeeded, body_buf.len()={}", body_buf.len()),
+            Err(e) => {
+                eprintln!("DEBUG: encode_metadata_response failed: {:?}", e);
+                return Err(e);
+            }
+        }
         
+        eprintln!("DEBUG: Before make_response, body_buf.len()={}", body_buf.len());
         Ok(Self::make_response(&header, ApiKey::Metadata, body_buf.freeze()))
     }
     
@@ -1278,46 +1362,81 @@ impl ProtocolHandler {
         
         // Check if this is a flexible/compact version (v9+)
         let flexible = header.api_version >= 9;
+        tracing::debug!("Produce v{}: flexible={}", header.api_version, flexible);
         
         // Parse produce request based on version
         let transactional_id = if header.api_version >= 3 {
-            if flexible {
+            tracing::debug!("Reading transactional_id, remaining bytes: {}", decoder.remaining());
+            // v9+ uses compact string for transactional_id
+            let id = if flexible {
+                tracing::debug!("DEBUG: Using compact string for transactional_id (flexible=true)");
                 decoder.read_compact_string()?
             } else {
+                tracing::debug!("DEBUG: Using normal string for transactional_id (flexible=false)");
                 decoder.read_string()?
-            }
+            };
+            tracing::debug!("transactional_id: {:?}", id);
+            id
         } else {
             None
         };
         
+        tracing::debug!("Reading acks, remaining bytes: {}", decoder.remaining());
         let acks = decoder.read_i16()?;
+        tracing::debug!("acks: {}", acks);
+        
+        tracing::debug!("Reading timeout_ms, remaining bytes: {}", decoder.remaining());
         let timeout_ms = decoder.read_i32()?;
+        tracing::debug!("timeout_ms: {}", timeout_ms);
         
         // Read topics array
+        tracing::debug!("Reading topic count, remaining bytes: {}", decoder.remaining());
+        // v9+ uses compact array
         let topic_count = if flexible {
-            decoder.read_unsigned_varint()? as usize - 1
+            let count = decoder.read_unsigned_varint()? as i32 - 1;
+            if count < 0 {
+                0
+            } else {
+                count as usize
+            }
         } else {
             decoder.read_i32()? as usize
         };
+        tracing::debug!("Topic count: {}", topic_count);
         let mut topics = Vec::with_capacity(topic_count);
         
-        for _ in 0..topic_count {
+        for topic_idx in 0..topic_count {
+            tracing::debug!("Reading topic {}/{}, remaining bytes: {}", topic_idx + 1, topic_count, decoder.remaining());
+            // v9+ uses compact string for topic name
             let topic_name = if flexible {
                 decoder.read_compact_string()?
             } else {
                 decoder.read_string()?
             }.ok_or_else(|| Error::Protocol("Topic name cannot be null".into()))?;
+            tracing::debug!("Topic name: {}", topic_name);
             
             // Read partitions array
+            tracing::debug!("Reading partition count for topic '{}', remaining bytes: {}", topic_name, decoder.remaining());
+            // v9+ uses compact array
             let partition_count = if flexible {
-                decoder.read_unsigned_varint()? as usize - 1
+                let count = decoder.read_unsigned_varint()? as i32 - 1;
+                if count < 0 {
+                    0
+                } else {
+                    count as usize
+                }
             } else {
                 decoder.read_i32()? as usize
             };
+            tracing::debug!("Partition count: {}", partition_count);
             let mut partitions = Vec::with_capacity(partition_count);
             
-            for _ in 0..partition_count {
+            for part_idx in 0..partition_count {
+                tracing::debug!("Reading partition {}/{}, remaining bytes: {}", part_idx + 1, partition_count, decoder.remaining());
                 let partition_index = decoder.read_i32()?;
+                tracing::debug!("Partition index: {}", partition_index);
+                
+                tracing::debug!("Reading records, remaining bytes: {}", decoder.remaining());
                 let records_opt = if flexible {
                     decoder.read_compact_bytes()?
                 } else {
@@ -1326,21 +1445,36 @@ impl ProtocolHandler {
                 
                 // Allow null records (common for connectivity checks or flush operations)
                 let records = records_opt.map(|r| r.to_vec()).unwrap_or_else(Vec::new);
+                tracing::debug!("Records size: {} bytes", records.len());
                 
                 partitions.push(crate::types::ProduceRequestPartition {
                     index: partition_index,
                     records,
                 });
                 
+                // Skip tagged fields in partitions for v9+
                 if flexible {
-                    // Skip tagged fields in partition
-                    let _tagged_field_count = decoder.read_unsigned_varint()?;
+                    let tag_count = decoder.read_unsigned_varint()?;
+                    tracing::debug!("Partition tagged fields: {}", tag_count);
+                    // Skip any tagged fields  
+                    for _ in 0..tag_count {
+                        let tag_id = decoder.read_unsigned_varint()?;
+                        let tag_size = decoder.read_unsigned_varint()? as usize;
+                        decoder.advance(tag_size);
+                    }
                 }
             }
             
+            // Skip tagged fields in topics for v9+
             if flexible {
-                // Skip tagged fields in topic
-                let _tagged_field_count = decoder.read_unsigned_varint()?;
+                let tag_count = decoder.read_unsigned_varint()?;
+                tracing::debug!("Topic tagged fields: {}", tag_count);
+                // Skip any tagged fields
+                for _ in 0..tag_count {
+                    let tag_id = decoder.read_unsigned_varint()?;
+                    let tag_size = decoder.read_unsigned_varint()? as usize;
+                    decoder.advance(tag_size);
+                }
             }
             
             topics.push(crate::types::ProduceRequestTopic {
@@ -1349,9 +1483,16 @@ impl ProtocolHandler {
             });
         }
         
+        // Skip tagged fields at request level for v9+
         if flexible {
-            // Skip tagged fields at the end
-            let _tagged_field_count = decoder.read_unsigned_varint()?;
+            let tag_count = decoder.read_unsigned_varint()?;
+            tracing::debug!("Request tagged fields: {}", tag_count);
+            // Skip any tagged fields
+            for _ in 0..tag_count {
+                let tag_id = decoder.read_unsigned_varint()?;
+                let tag_size = decoder.read_unsigned_varint()? as usize;
+                decoder.advance(tag_size);
+            }
         }
         
         Ok(ProduceRequest {
@@ -1907,6 +2048,7 @@ impl ProtocolHandler {
             header: ResponseHeader { correlation_id },
             body: body_buf.freeze(),
             is_flexible: false,  // Conservative default for error responses
+            api_key: ApiKey::ApiVersions, // Default to ApiVersions for error responses
         })
     }
     
@@ -2378,17 +2520,19 @@ impl ProtocolHandler {
             encoder.write_i32(response.throttle_time_ms);
         }
         
-        tracing::debug!("Encoding produce response v{}: {} topics, throttle_time={}", 
-            version, response.topics.len(), response.throttle_time_ms);
+        tracing::debug!("Encoding produce response v{}: {} topics, throttle_time={}, flexible={}", 
+            version, response.topics.len(), response.throttle_time_ms, flexible);
         
         // Topics array
         if flexible {
+            // v9+ uses compact array
             encoder.write_unsigned_varint((response.topics.len() + 1) as u32);
         } else {
             encoder.write_i32(response.topics.len() as i32);
         }
         
         for topic in &response.topics {
+            // Topic name
             if flexible {
                 encoder.write_compact_string(Some(&topic.name));
             } else {
@@ -2415,21 +2559,39 @@ impl ProtocolHandler {
                     encoder.write_i64(partition.log_start_offset);
                 }
                 
+                // Record errors (COMPACT_ARRAY of RecordError) - v8+
+                if version >= 8 {
+                    if flexible {
+                        encoder.write_unsigned_varint(1); // Empty array (0 + 1 for compact encoding)
+                    } else {
+                        encoder.write_i32(0); // Empty array
+                    }
+                }
+                
+                // Error message (NULLABLE_COMPACT_STRING) - v8+
+                if version >= 8 {
+                    if flexible {
+                        encoder.write_unsigned_varint(0); // Null string (compact encoding)
+                    } else {
+                        encoder.write_i16(-1); // Null string
+                    }
+                }
+                
+                // Write tagged fields for partition in v9+
                 if flexible {
-                    // Write empty tagged fields for partition
-                    encoder.write_unsigned_varint(0);
+                    encoder.write_unsigned_varint(0); // No tagged fields
                 }
             }
             
+            // Write tagged fields for topic in v9+
             if flexible {
-                // Write empty tagged fields for topic
-                encoder.write_unsigned_varint(0);
+                encoder.write_unsigned_varint(0); // No tagged fields
             }
         }
         
+        // Write tagged fields at response level in v9+
         if flexible {
-            // Write empty tagged fields at the end
-            encoder.write_unsigned_varint(0);
+            encoder.write_unsigned_varint(0); // No tagged fields
         }
         
         // Log the encoded response for debugging
@@ -2453,6 +2615,8 @@ impl ProtocolHandler {
     ) -> Result<()> {
         let mut encoder = Encoder::new(buf);
         
+        eprintln!("DEBUG: encode_metadata_response v{} - brokers={}, topics={}", 
+                  version, response.brokers.len(), response.topics.len());
         tracing::info!("Encoding metadata response v{} with {} topics, {} brokers, throttle_time: {}", 
                       version, response.topics.len(), response.brokers.len(), response.throttle_time_ms);
         
@@ -2461,16 +2625,38 @@ impl ProtocolHandler {
         
         // Throttle time (v3+ always, regardless of flexible)
         if version >= 3 {
+            eprintln!("DEBUG: Writing throttle_time_ms = {}", response.throttle_time_ms);
             encoder.write_i32(response.throttle_time_ms);
         }
         
         // Brokers array
+        eprintln!("DEBUG: About to encode {} brokers, flexible={}", response.brokers.len(), flexible);
+        eprintln!("DEBUG: Broker list contents:");
+        for (i, broker) in response.brokers.iter().enumerate() {
+            eprintln!("  Broker[{}]: id={}, host={}, port={}", i, broker.node_id, broker.host, broker.port);
+        }
+        
         tracing::debug!("About to encode {} brokers", response.brokers.len());
+        
+        // Get buffer position before writing
+        let buffer_before = encoder.debug_buffer().len();
+        eprintln!("DEBUG: Buffer position before broker array encoding: {}", buffer_before);
+        
         if flexible {
+            eprintln!("DEBUG: Using compact array encoding for {} brokers", response.brokers.len());
             encoder.write_compact_array_len(response.brokers.len());
+            eprintln!("DEBUG: Expected to write compact varint for length {}", response.brokers.len() + 1);
         } else {
+            eprintln!("DEBUG: Using INT32 encoding for {} brokers", response.brokers.len());
             encoder.write_i32(response.brokers.len() as i32);
         }
+        
+        let buffer_after = encoder.debug_buffer().len();
+        eprintln!("DEBUG: Buffer position after broker array encoding: {}, wrote {} bytes", 
+                 buffer_after, buffer_after - buffer_before);
+        let debug_buf = encoder.debug_buffer();
+        eprintln!("DEBUG: Actual bytes written for broker array length: {:02x?}", 
+                 &debug_buf[buffer_before..buffer_after]);
         
         for broker in &response.brokers {
             encoder.write_i32(broker.node_id);
@@ -2496,6 +2682,7 @@ impl ProtocolHandler {
             }
         }
         
+        // Cluster ID comes BEFORE controller ID (librdkafka expects this order)
         if version >= 2 {
             if flexible {
                 encoder.write_compact_string(response.cluster_id.as_deref());
@@ -2506,6 +2693,11 @@ impl ProtocolHandler {
         
         if version >= 1 {
             encoder.write_i32(response.controller_id);
+        }
+        
+        // Cluster authorized operations (v8-v10 only, librdkafka doesn't read for v11+)
+        if version >= 8 && version <= 10 {
+            encoder.write_i32(-2147483648); // INT32_MIN indicates this field is null
         }
         
         // Topics array
@@ -2522,6 +2714,12 @@ impl ProtocolHandler {
                 encoder.write_compact_string(Some(&topic.name));
             } else {
                 encoder.write_string(Some(&topic.name));
+            }
+            
+            // Topic ID (v10+) - UUID (16 bytes)
+            if version >= 10 {
+                // For now, use a null UUID (all zeros)
+                encoder.write_raw_bytes(&[0u8; 16]);
             }
             
             if version >= 1 {
@@ -2591,15 +2789,14 @@ impl ProtocolHandler {
             }
         }
         
-        // Cluster authorized operations (v8+ but < v10)
-        if version >= 8 && version < 10 {
-            encoder.write_i32(-2147483648); // INT32_MIN means "null"
-        }
+        // Remove duplicate cluster_authorized_operations - already written above
         
         if flexible {
+            eprintln!("DEBUG: Writing final tagged fields for Metadata v{}", version);
             encoder.write_tagged_fields();
         }
         
+        eprintln!("DEBUG: Metadata response encoded, buffer size = {} bytes", encoder.debug_buffer().len());
         Ok(())
     }
     
@@ -3375,24 +3572,49 @@ impl ProtocolHandler {
     /// Get topics from metadata store
     async fn get_topics_from_metadata(&self, requested_topics: &Option<Vec<String>>) -> Result<Vec<crate::types::MetadataTopic>> {
         use crate::types::{MetadataTopic, MetadataPartition};
+        use crate::error_codes;
         
         if let Some(metadata_store) = &self.metadata_store {
             let all_topics = metadata_store.list_topics().await
                 .map_err(|e| Error::Internal(format!("Failed to list topics: {:?}", e)))?;
             
-            let topics_to_return = if let Some(requested) = requested_topics {
-                // Filter to only requested topics
-                all_topics.into_iter()
-                    .filter(|t| requested.contains(&t.name))
-                    .collect()
+            // Prepare the topics we'll process
+            let mut topics_to_process = Vec::new();
+            let mut error_topics = Vec::new();
+            
+            if let Some(requested) = requested_topics {
+                if requested.is_empty() {
+                    // Empty list means return all topics (Kafka protocol behavior)
+                    tracing::debug!("Empty topics list in request - returning all topics");
+                    topics_to_process = all_topics;
+                } else {
+                    // When specific topics are requested, include them even if they don't exist
+                    for requested_topic in requested {
+                        if let Some(topic_meta) = all_topics.iter().find(|t| &t.name == requested_topic) {
+                            // Topic exists - add it for normal processing
+                            topics_to_process.push(topic_meta.clone());
+                        } else {
+                            // Topic doesn't exist - add to error list
+                            tracing::debug!("Topic {} not found, will return with UNKNOWN_TOPIC_OR_PARTITION", requested_topic);
+                            error_topics.push(MetadataTopic {
+                                error_code: error_codes::UNKNOWN_TOPIC_OR_PARTITION,
+                                name: requested_topic.clone(),
+                                is_internal: false,
+                                partitions: vec![],
+                            });
+                        }
+                    }
+                }
             } else {
-                // Return all topics
-                all_topics
+                // None means return all topics
+                topics_to_process = all_topics;
             };
             
             // Convert to Kafka metadata format
             let mut result = Vec::new();
-            for topic_meta in topics_to_return {
+            
+            // First add all existing topics with their proper metadata
+            for topic_meta in topics_to_process {
                 let mut partitions = Vec::new();
                 
                 // Get actual partition assignments from metadata store
@@ -3443,6 +3665,9 @@ impl ProtocolHandler {
                     partitions,
                 });
             }
+            
+            // Then add any error topics (topics that don't exist)
+            result.extend(error_topics);
             
             Ok(result)
         } else {

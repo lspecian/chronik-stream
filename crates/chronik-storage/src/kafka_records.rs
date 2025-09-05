@@ -566,13 +566,35 @@ impl KafkaRecordBatch {
     /// Decode records from bytes
     fn decode_records(data: &[u8], count: i32) -> Result<Vec<KafkaRecord>> {
         let mut cursor = Cursor::new(data);
-        let mut records = Vec::with_capacity(count as usize);
         
-        for _ in 0..count {
+        // When records_count is -1, it means we should read all available records
+        // This happens with non-transactional producers
+        let mut records = if count >= 0 {
+            Vec::with_capacity(count as usize)
+        } else {
+            Vec::new()
+        };
+        
+        // If count is -1, read until we run out of data
+        // Otherwise read exactly count records
+        let mut records_read = 0;
+        while cursor.position() < data.len() as u64 {
+            // If we have a specific count and reached it, stop
+            if count >= 0 && records_read >= count {
+                break;
+            }
+            
+            // Check if we have at least one byte for the length varint
+            if cursor.position() >= data.len() as u64 {
+                break;
+            }
+            
             let length = decode_varint(&mut cursor)?;
             let attributes = read_i8(&mut cursor)?;
             let timestamp_delta = decode_varlong(&mut cursor)?;
             let offset_delta = decode_varint(&mut cursor)?;
+            
+            records_read += 1;
             
             // Key
             let key_len = decode_varint(&mut cursor)?;

@@ -194,6 +194,16 @@ impl<'a> Decoder<'a> {
         Self { buf }
     }
     
+    /// Check if buffer has remaining bytes
+    pub fn has_remaining(&self) -> bool {
+        self.buf.has_remaining()
+    }
+    
+    /// Get number of remaining bytes
+    pub fn remaining(&self) -> usize {
+        self.buf.remaining()
+    }
+    
     /// Read a boolean
     pub fn read_bool(&mut self) -> Result<bool> {
         if self.buf.remaining() < 1 {
@@ -345,6 +355,11 @@ impl<'a> Encoder<'a> {
         Self { buf }
     }
     
+    /// Get a debug view of the buffer
+    pub fn debug_buffer(&self) -> Vec<u8> {
+        self.buf.to_vec()
+    }
+    
     /// Write a boolean
     pub fn write_bool(&mut self, value: bool) {
         self.buf.put_u8(if value { 1 } else { 0 });
@@ -435,7 +450,13 @@ impl<'a> Encoder<'a> {
     
     /// Write a compact array length (uses varint with +1 offset)
     pub fn write_compact_array_len(&mut self, len: usize) {
+        eprintln!("DEBUG: write_compact_array_len called with len={}", len);
+        let start_pos = self.buf.len();
         self.write_unsigned_varint((len + 1) as u32);
+        let end_pos = self.buf.len();
+        eprintln!("DEBUG: Wrote {} bytes for compact array length: {:02x?}", 
+                 end_pos - start_pos, 
+                 &self.buf.as_ref()[start_pos..end_pos]);
     }
     
     /// Write empty tagged fields (always writes 0 for now)
@@ -473,8 +494,25 @@ pub fn parse_request_header_with_correlation(buf: &mut Bytes) -> Result<(Request
         false
     };
     
-    // Read client ID (compact string for flexible versions, standard string otherwise)
+    // Read client ID
+    // IMPORTANT: librdkafka quirk - it ACTUALLY sends compact strings for client ID in flexible versions!
+    // This is different from what the spec says - the spec says flexible versions should use compact strings
+    // But testing shows librdkafka v2.11.1 actually does send compact strings in Produce v9
     let client_id = if flexible {
+        // Debug logging to understand what librdkafka sends
+        if decoder.remaining() >= 2 {
+            let peek_bytes = [
+                decoder.buf[0],
+                if decoder.remaining() > 0 { decoder.buf[1] } else { 0 }
+            ];
+            eprintln!("DEBUG: Next 2 bytes after correlation_id: {:02x?}", peek_bytes);
+            eprintln!("  As INT16: {}", i16::from_be_bytes(peek_bytes));
+            eprintln!("  As UINT8: {}", peek_bytes[0]);
+        }
+        
+        // Try compact string for flexible versions - this is what librdkafka actually sends
+        let api_name = ApiKey::from_i16(api_key_raw).map(|k| format!("{:?}", k)).unwrap_or_else(|| format!("Unknown({})", api_key_raw));
+        eprintln!("DEBUG: Using COMPACT string for {} v{} client ID (librdkafka sends compact)", api_name, api_version);
         decoder.read_compact_string()?
     } else {
         decoder.read_string()?
