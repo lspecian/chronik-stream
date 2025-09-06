@@ -513,7 +513,30 @@ pub fn parse_request_header_with_correlation(buf: &mut Bytes) -> Result<(Request
         // Try compact string for flexible versions - this is what librdkafka actually sends
         let api_name = ApiKey::from_i16(api_key_raw).map(|k| format!("{:?}", k)).unwrap_or_else(|| format!("Unknown({})", api_key_raw));
         eprintln!("DEBUG: Using COMPACT string for {} v{} client ID (librdkafka sends compact)", api_name, api_version);
-        decoder.read_compact_string()?
+        let client_id = decoder.read_compact_string()?;
+        
+        // WORKAROUND for librdkafka v2.11.1 bug:
+        // When client_id is null (None), librdkafka incorrectly sends the actual client_id string anyway
+        // We need to detect and skip this extra data
+        if client_id.is_none() && decoder.remaining() > 0 {
+            // Check if next byte looks like a string length (non-zero and reasonable)
+            let next_byte = decoder.buf[0];
+            eprintln!("DEBUG: librdkafka bug detection - client_id is null but next byte is 0x{:02x}", next_byte);
+            
+            // If it looks like a compact string length (>0 and <128), it's probably the bug
+            if next_byte > 0 && next_byte < 128 {
+                let string_len = (next_byte - 1) as usize;
+                eprintln!("DEBUG: Detected librdkafka v2.11.1 bug - skipping {} extra bytes", string_len + 1);
+                
+                // Skip the length byte and the string data
+                decoder.read_i8()?; // Skip length byte
+                for _ in 0..string_len {
+                    decoder.read_i8()?; // Skip string data
+                }
+            }
+        }
+        
+        client_id
     } else {
         decoder.read_string()?
     };

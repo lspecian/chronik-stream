@@ -1067,7 +1067,7 @@ checksum = "9555578bc9e57714c812a1f84e4fc5b4d21fcb063490c624de019f7464c91268"
 
 [[package]]
 name = "chronik-auth"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1098,7 +1098,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-backup"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1135,7 +1135,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-benchmarks"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1165,7 +1165,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-cli"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1184,7 +1184,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-common"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1204,7 +1204,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-config"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1229,7 +1229,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-janitor"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "chronik-common",
@@ -1246,7 +1246,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-monitoring"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "axum 0.7.9",
@@ -1269,7 +1269,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-protocol"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1291,7 +1291,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-query"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "axum 0.7.9",
@@ -1315,7 +1315,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-search"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "axum 0.7.9",
@@ -1349,7 +1349,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-server"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1384,7 +1384,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-storage"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "async-trait",

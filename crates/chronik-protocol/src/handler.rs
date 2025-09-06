@@ -1134,12 +1134,27 @@ impl ProtocolHandler {
                 None // All topics
             } else {
                 let mut topic_names = Vec::with_capacity(topic_count as usize);
-                for _ in 0..topic_count {
+                for i in 0..topic_count {
+                    eprintln!("DEBUG: Reading topic {}/{}", i+1, topic_count);
+                    
+                    // v10+ includes topic_id (UUID) before name
+                    if header.api_version >= 10 {
+                        // Skip the 16-byte UUID
+                        let mut topic_id = [0u8; 16];
+                        for j in 0..16 {
+                            topic_id[j] = decoder.read_i8()? as u8;
+                        }
+                        eprintln!("DEBUG: Topic {} ID: {:02x?}", i, &topic_id);
+                    }
+                    
                     let name = if flexible {
+                        eprintln!("DEBUG: Reading compact string for topic name");
                         decoder.read_compact_string()?
                     } else {
                         decoder.read_string()?
                     };
+                    
+                    eprintln!("DEBUG: Topic {} name: {:?}", i, name);
                     
                     if let Some(name) = name {
                         topic_names.push(name);
@@ -1147,7 +1162,8 @@ impl ProtocolHandler {
                     
                     if flexible {
                         // Skip tagged fields for each topic
-                        let _tagged_field_count = decoder.read_unsigned_varint()?;
+                        let tagged_count = decoder.read_unsigned_varint()?;
+                        eprintln!("DEBUG: Topic {} has {} tagged fields", i, tagged_count);
                     }
                 }
                 Some(topic_names)
@@ -1165,7 +1181,8 @@ impl ProtocolHandler {
             true
         };
         
-        let include_cluster_authorized_operations = if header.api_version >= 8 {
+        // include_cluster_authorized_operations was removed in v11
+        let include_cluster_authorized_operations = if header.api_version >= 8 && header.api_version <= 10 {
             let val = decoder.read_bool()?;
             eprintln!("DEBUG: include_cluster_authorized_operations read: {}", val);
             val

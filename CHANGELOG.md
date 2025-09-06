@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] - 2025-09-06
+
+### Fixed
+- **CRITICAL**: Implemented workaround for librdkafka v2.11.1 encoding bug
+  - librdkafka incorrectly sends client_id string after null marker in Metadata v12 requests
+  - Added detection and skip logic to handle malformed client_id encoding
+  - Fixes "Protocol read buffer underflow" errors with Go/librdkafka clients
+  - Maintains backward compatibility with correctly-formatted Python clients
+
 ## [0.6.0] - 2025-09-05
 
 ### Fixed
