@@ -12,6 +12,7 @@ services:
       - chronik-data:/data
     environment:
       - RUST_LOG=info
+      - CHRONIK_ADVERTISED_ADDR=localhost  # Change to your hostname/IP for remote access
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "nc", "-z", "localhost", "9092"]

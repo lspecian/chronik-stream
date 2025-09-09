@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2025-09-09
+
+### Added
+- **CRITICAL**: Advertised address configuration support
+  - New CLI arguments: `--advertised-addr` and `--advertised-port`
+  - New environment variables: `CHRONIK_ADVERTISED_ADDR` and `CHRONIK_ADVERTISED_PORT`
+  - Separate bind address from advertised address for proper client connectivity
+- Warning when advertised address is set to `0.0.0.0`
+- Comprehensive test script for verifying client connectivity
+- Detailed documentation for advertised address configuration
+
+### Fixed
+- **CRITICAL**: Kafka clients can now connect when server binds to `0.0.0.0`
+  - Metadata responses now return configured advertised address instead of bind address
+  - Resolves connectivity issues with all Kafka clients (Python, Go, Java, KSQLDB, Kafka UI)
+  - Fixes Docker deployment connectivity problems
+  - Enables proper Kubernetes deployments
+
+### Changed
+- Updated README with advertised address configuration examples
+- Updated docker-compose.yml with advertised address environment variable
+- Broker registration now uses advertised address in metadata store
+
+### Documentation
+- Added `docs/ADVERTISED_ADDRESS_FIX.md` with comprehensive fix documentation
+- Created `test_advertised_address.py` for testing client connectivity
+- Updated configuration examples across all documentation
+
 ## [0.6.1] - 2025-09-06
 
 ### Fixed

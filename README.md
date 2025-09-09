@@ -40,10 +40,11 @@ A high-performance, Kafka-compatible distributed streaming platform built in Rus
 # Quick start - single command
 docker run -d -p 9092:9092 ghcr.io/lspecian/chronik-stream:v0.5.0
 
-# With persistent storage
+# With persistent storage and advertised address
 docker run -d --name chronik \
   -p 9092:9092 \
   -v chronik-data:/data \
+  -e CHRONIK_ADVERTISED_ADDR=localhost \
   ghcr.io/lspecian/chronik-stream:v0.5.0
 
 # Using docker-compose
@@ -139,8 +140,18 @@ Options:
   -a, --admin-port <PORT>      Admin API port (default: 3000)
   -d, --data-dir <PATH>        Data directory (default: ./data)
   -b, --bind-addr <ADDR>       Bind address (default: 0.0.0.0)
+  --advertised-addr <ADDR>     Address advertised to clients (default: bind address)
+  --advertised-port <PORT>     Port advertised to clients (default: kafka port)
   --enable-search              Enable search functionality
   --enable-backup              Enable backup functionality
+
+Environment Variables:
+  CHRONIK_KAFKA_PORT           Kafka protocol port
+  CHRONIK_BIND_ADDR            Server bind address
+  CHRONIK_ADVERTISED_ADDR      Address advertised to clients (important for Docker)
+  CHRONIK_ADVERTISED_PORT      Port advertised to clients
+  CHRONIK_DATA_DIR             Data directory path
+  RUST_LOG                     Log level (error, warn, info, debug, trace)
 ```
 
 ## 📦 Docker Images

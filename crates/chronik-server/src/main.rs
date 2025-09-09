@@ -60,6 +60,14 @@ struct Cli {
     /// Bind address (default: 0.0.0.0)
     #[arg(short = 'b', long, env = "CHRONIK_BIND_ADDR", default_value = "0.0.0.0")]
     bind_addr: String,
+    
+    /// Advertised address for clients to connect (defaults to bind address)
+    #[arg(long, env = "CHRONIK_ADVERTISED_ADDR")]
+    advertised_addr: Option<String>,
+    
+    /// Advertised port for clients to connect (defaults to kafka port)
+    #[arg(long, env = "CHRONIK_ADVERTISED_PORT")]
+    advertised_port: Option<u16>,
 
     /// Enable search functionality
     #[cfg(feature = "search")]
@@ -189,11 +197,24 @@ async fn main() -> Result<()> {
 }
 
 async fn run_standalone_server(cli: &Cli, dual_storage: bool) -> Result<()> {
+    // Determine advertised address - use explicit config or fall back to bind address
+    let advertised_host = cli.advertised_addr.as_ref()
+        .unwrap_or(&cli.bind_addr)
+        .clone();
+    let advertised_port = cli.advertised_port
+        .unwrap_or(cli.kafka_port) as i32;
+    
+    // Warn if using 0.0.0.0 as advertised address
+    if advertised_host == "0.0.0.0" {
+        warn!("Advertised address is 0.0.0.0 - clients may not be able to connect.");
+        warn!("Consider setting --advertised-addr or CHRONIK_ADVERTISED_ADDR to a resolvable hostname/IP.");
+    }
+    
     // Create server configuration
     let config = IntegratedServerConfig {
         node_id: 1,
-        advertised_host: cli.bind_addr.clone(),
-        advertised_port: cli.kafka_port as i32,
+        advertised_host,
+        advertised_port,
         data_dir: cli.data_dir.to_string_lossy().to_string(),
         enable_indexing: false,
         enable_compression: true,
@@ -270,11 +291,24 @@ async fn run_all_components(cli: &Cli) -> Result<()> {
     ).await?;
     info!("Metrics endpoint available at http://{}:{}/metrics", cli.bind_addr, cli.metrics_port);
     
+    // Determine advertised address - use explicit config or fall back to bind address
+    let advertised_host = cli.advertised_addr.as_ref()
+        .unwrap_or(&cli.bind_addr)
+        .clone();
+    let advertised_port = cli.advertised_port
+        .unwrap_or(cli.kafka_port) as i32;
+    
+    // Warn if using 0.0.0.0 as advertised address
+    if advertised_host == "0.0.0.0" {
+        warn!("Advertised address is 0.0.0.0 - clients may not be able to connect.");
+        warn!("Consider setting --advertised-addr or CHRONIK_ADVERTISED_ADDR to a resolvable hostname/IP.");
+    }
+    
     // Create server configuration with all features
     let config = IntegratedServerConfig {
         node_id: 1,
-        advertised_host: cli.bind_addr.clone(),
-        advertised_port: cli.kafka_port as i32,
+        advertised_host,
+        advertised_port,
         data_dir: cli.data_dir.to_string_lossy().to_string(),
         enable_indexing: cfg!(feature = "search"),
         enable_compression: true,
