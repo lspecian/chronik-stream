@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.2] - 2025-09-09
+
+### Fixed
+- **CRITICAL**: Fixed port duplication bug when `CHRONIK_ADVERTISED_ADDR` includes port
+  - v0.7.1 incorrectly appended port to addresses like `localhost:9092` resulting in `localhost:9092:9092`
+  - Now correctly parses `host:port` format and handles port separately
+  - Supports IPv6 addresses with proper bracket notation
+- All advertised address formats now work correctly:
+  - `localhost` → advertises as `localhost:9092`
+  - `localhost:9092` → advertises as `localhost:9092` (not duplicated)
+  - `[::1]:9092` → advertises as `[::1]:9092`
+
+### Verified
+- Comprehensive testing with 6 different address formats
+- Kafka admin clients can now connect successfully
+- Backwards compatible with all v0.7.x configurations
+
 ## [0.7.1] - 2025-09-09
 
 ### Added

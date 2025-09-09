@@ -204,15 +204,68 @@ async fn run_standalone_server(cli: &Cli, dual_storage: bool) -> Result<()> {
         cli.bind_addr.clone()
     };
     
-    // Determine advertised address with smart defaults
-    let advertised_host = if let Some(ref addr) = cli.advertised_addr {
-        addr.clone()
+    // Parse advertised address and port (handle both "host" and "host:port" formats)
+    let (advertised_host, advertised_port) = if let Some(ref addr) = cli.advertised_addr {
+        // User provided advertised address - parse it
+        // Check for IPv6 format first (contains multiple colons or starts with '[')
+        if addr.starts_with('[') || addr.matches(':').count() > 1 {
+            // IPv6 address
+            if let Some(bracket_end) = addr.rfind(']') {
+                // Format: [::1]:9092
+                if let Some(colon_after_bracket) = addr[bracket_end..].find(':') {
+                    let port_str = &addr[bracket_end + colon_after_bracket + 1..];
+                    if let Ok(port) = port_str.parse::<u16>() {
+                        let host = addr[..bracket_end + 1].to_string();
+                        info!("Using advertised address '{}' with port {}", host, port);
+                        (host, port as i32)
+                    } else {
+                        // No valid port after bracket
+                        let port = cli.advertised_port.unwrap_or(cli.kafka_port) as i32;
+                        info!("Using advertised address '{}' with default port {}", addr, port);
+                        (addr.clone(), port)
+                    }
+                } else {
+                    // Format: [::1] without port
+                    let port = cli.advertised_port.unwrap_or(cli.kafka_port) as i32;
+                    info!("Using advertised address '{}' with default port {}", addr, port);
+                    (addr.clone(), port)
+                }
+            } else {
+                // IPv6 without brackets
+                let port = cli.advertised_port.unwrap_or(cli.kafka_port) as i32;
+                info!("Using IPv6 address '{}' with default port {}", addr, port);
+                (addr.clone(), port)
+            }
+        } else if let Some(colon_pos) = addr.rfind(':') {
+            // IPv4 or hostname with possible port
+            let potential_port = &addr[colon_pos + 1..];
+            if potential_port.chars().all(|c| c.is_ascii_digit()) && !potential_port.is_empty() {
+                // Has port - split it
+                let host = addr[..colon_pos].to_string();
+                let port = potential_port.parse::<u16>()
+                    .unwrap_or(cli.kafka_port) as i32;
+                info!("Using advertised address '{}' with port {}", host, port);
+                (host, port)
+            } else {
+                // Colon but not a valid port
+                let port = cli.advertised_port.unwrap_or(cli.kafka_port) as i32;
+                info!("Using advertised address '{}' with default port {}", addr, port);
+                (addr.clone(), port)
+            }
+        } else {
+            // No colon - just a hostname
+            let port = cli.advertised_port.unwrap_or(cli.kafka_port) as i32;
+            info!("Using advertised address '{}' with port {}", addr, port);
+            (addr.clone(), port)
+        }
     } else if bind_host == "0.0.0.0" || bind_host == "[::]" {
         // If binding to all interfaces and no advertised address specified,
         // try to use hostname or localhost as a better default
         let hostname = std::env::var("HOSTNAME")
             .or_else(|_| std::env::var("DOCKER_HOSTNAME"))
             .unwrap_or_else(|_| "localhost".to_string());
+        
+        let port = cli.advertised_port.unwrap_or(cli.kafka_port) as i32;
         
         if hostname != "localhost" {
             info!("Binding to all interfaces ({}), using hostname '{}' as advertised address", bind_host, hostname);
@@ -222,13 +275,12 @@ async fn run_standalone_server(cli: &Cli, dual_storage: bool) -> Result<()> {
             warn!("Using 'localhost' as advertised address - remote clients may not connect");
             warn!("Set CHRONIK_ADVERTISED_ADDR to your hostname/IP for remote access");
         }
-        hostname
+        (hostname, port)
     } else {
-        bind_host.clone()
+        // Use bind host as advertised host
+        let port = cli.advertised_port.unwrap_or(cli.kafka_port) as i32;
+        (bind_host.clone(), port)
     };
-    
-    let advertised_port = cli.advertised_port
-        .unwrap_or(cli.kafka_port) as i32;
     
     // Create server configuration
     let config = IntegratedServerConfig {
@@ -318,15 +370,68 @@ async fn run_all_components(cli: &Cli) -> Result<()> {
         cli.bind_addr.clone()
     };
     
-    // Determine advertised address with smart defaults
-    let advertised_host = if let Some(ref addr) = cli.advertised_addr {
-        addr.clone()
+    // Parse advertised address and port (handle both "host" and "host:port" formats)
+    let (advertised_host, advertised_port) = if let Some(ref addr) = cli.advertised_addr {
+        // User provided advertised address - parse it
+        // Check for IPv6 format first (contains multiple colons or starts with '[')
+        if addr.starts_with('[') || addr.matches(':').count() > 1 {
+            // IPv6 address
+            if let Some(bracket_end) = addr.rfind(']') {
+                // Format: [::1]:9092
+                if let Some(colon_after_bracket) = addr[bracket_end..].find(':') {
+                    let port_str = &addr[bracket_end + colon_after_bracket + 1..];
+                    if let Ok(port) = port_str.parse::<u16>() {
+                        let host = addr[..bracket_end + 1].to_string();
+                        info!("Using advertised address '{}' with port {}", host, port);
+                        (host, port as i32)
+                    } else {
+                        // No valid port after bracket
+                        let port = cli.advertised_port.unwrap_or(cli.kafka_port) as i32;
+                        info!("Using advertised address '{}' with default port {}", addr, port);
+                        (addr.clone(), port)
+                    }
+                } else {
+                    // Format: [::1] without port
+                    let port = cli.advertised_port.unwrap_or(cli.kafka_port) as i32;
+                    info!("Using advertised address '{}' with default port {}", addr, port);
+                    (addr.clone(), port)
+                }
+            } else {
+                // IPv6 without brackets
+                let port = cli.advertised_port.unwrap_or(cli.kafka_port) as i32;
+                info!("Using IPv6 address '{}' with default port {}", addr, port);
+                (addr.clone(), port)
+            }
+        } else if let Some(colon_pos) = addr.rfind(':') {
+            // IPv4 or hostname with possible port
+            let potential_port = &addr[colon_pos + 1..];
+            if potential_port.chars().all(|c| c.is_ascii_digit()) && !potential_port.is_empty() {
+                // Has port - split it
+                let host = addr[..colon_pos].to_string();
+                let port = potential_port.parse::<u16>()
+                    .unwrap_or(cli.kafka_port) as i32;
+                info!("Using advertised address '{}' with port {}", host, port);
+                (host, port)
+            } else {
+                // Colon but not a valid port
+                let port = cli.advertised_port.unwrap_or(cli.kafka_port) as i32;
+                info!("Using advertised address '{}' with default port {}", addr, port);
+                (addr.clone(), port)
+            }
+        } else {
+            // No colon - just a hostname
+            let port = cli.advertised_port.unwrap_or(cli.kafka_port) as i32;
+            info!("Using advertised address '{}' with port {}", addr, port);
+            (addr.clone(), port)
+        }
     } else if bind_host == "0.0.0.0" || bind_host == "[::]" {
         // If binding to all interfaces and no advertised address specified,
         // try to use hostname or localhost as a better default
         let hostname = std::env::var("HOSTNAME")
             .or_else(|_| std::env::var("DOCKER_HOSTNAME"))
             .unwrap_or_else(|_| "localhost".to_string());
+        
+        let port = cli.advertised_port.unwrap_or(cli.kafka_port) as i32;
         
         if hostname != "localhost" {
             info!("Binding to all interfaces ({}), using hostname '{}' as advertised address", bind_host, hostname);
@@ -336,13 +441,12 @@ async fn run_all_components(cli: &Cli) -> Result<()> {
             warn!("Using 'localhost' as advertised address - remote clients may not connect");
             warn!("Set CHRONIK_ADVERTISED_ADDR to your hostname/IP for remote access");
         }
-        hostname
+        (hostname, port)
     } else {
-        bind_host.clone()
+        // Use bind host as advertised host
+        let port = cli.advertised_port.unwrap_or(cli.kafka_port) as i32;
+        (bind_host.clone(), port)
     };
-    
-    let advertised_port = cli.advertised_port
-        .unwrap_or(cli.kafka_port) as i32;
     
     // Create server configuration with all features
     let config = IntegratedServerConfig {
