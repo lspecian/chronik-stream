@@ -197,18 +197,38 @@ async fn main() -> Result<()> {
 }
 
 async fn run_standalone_server(cli: &Cli, dual_storage: bool) -> Result<()> {
-    // Determine advertised address - use explicit config or fall back to bind address
-    let advertised_host = cli.advertised_addr.as_ref()
-        .unwrap_or(&cli.bind_addr)
-        .clone();
+    // Parse bind address to handle "host:port" format
+    let bind_host = if cli.bind_addr.contains(':') {
+        cli.bind_addr.split(':').next().unwrap_or("0.0.0.0").to_string()
+    } else {
+        cli.bind_addr.clone()
+    };
+    
+    // Determine advertised address with smart defaults
+    let advertised_host = if let Some(ref addr) = cli.advertised_addr {
+        addr.clone()
+    } else if bind_host == "0.0.0.0" || bind_host == "[::]" {
+        // If binding to all interfaces and no advertised address specified,
+        // try to use hostname or localhost as a better default
+        let hostname = std::env::var("HOSTNAME")
+            .or_else(|_| std::env::var("DOCKER_HOSTNAME"))
+            .unwrap_or_else(|_| "localhost".to_string());
+        
+        if hostname != "localhost" {
+            info!("Binding to all interfaces ({}), using hostname '{}' as advertised address", bind_host, hostname);
+            info!("To override, set CHRONIK_ADVERTISED_ADDR environment variable");
+        } else {
+            warn!("Binding to all interfaces ({}) without advertised address configured", bind_host);
+            warn!("Using 'localhost' as advertised address - remote clients may not connect");
+            warn!("Set CHRONIK_ADVERTISED_ADDR to your hostname/IP for remote access");
+        }
+        hostname
+    } else {
+        bind_host.clone()
+    };
+    
     let advertised_port = cli.advertised_port
         .unwrap_or(cli.kafka_port) as i32;
-    
-    // Warn if using 0.0.0.0 as advertised address
-    if advertised_host == "0.0.0.0" {
-        warn!("Advertised address is 0.0.0.0 - clients may not be able to connect.");
-        warn!("Consider setting --advertised-addr or CHRONIK_ADVERTISED_ADDR to a resolvable hostname/IP.");
-    }
     
     // Create server configuration
     let config = IntegratedServerConfig {
@@ -291,18 +311,38 @@ async fn run_all_components(cli: &Cli) -> Result<()> {
     ).await?;
     info!("Metrics endpoint available at http://{}:{}/metrics", cli.bind_addr, cli.metrics_port);
     
-    // Determine advertised address - use explicit config or fall back to bind address
-    let advertised_host = cli.advertised_addr.as_ref()
-        .unwrap_or(&cli.bind_addr)
-        .clone();
+    // Parse bind address to handle "host:port" format
+    let bind_host = if cli.bind_addr.contains(':') {
+        cli.bind_addr.split(':').next().unwrap_or("0.0.0.0").to_string()
+    } else {
+        cli.bind_addr.clone()
+    };
+    
+    // Determine advertised address with smart defaults
+    let advertised_host = if let Some(ref addr) = cli.advertised_addr {
+        addr.clone()
+    } else if bind_host == "0.0.0.0" || bind_host == "[::]" {
+        // If binding to all interfaces and no advertised address specified,
+        // try to use hostname or localhost as a better default
+        let hostname = std::env::var("HOSTNAME")
+            .or_else(|_| std::env::var("DOCKER_HOSTNAME"))
+            .unwrap_or_else(|_| "localhost".to_string());
+        
+        if hostname != "localhost" {
+            info!("Binding to all interfaces ({}), using hostname '{}' as advertised address", bind_host, hostname);
+            info!("To override, set CHRONIK_ADVERTISED_ADDR environment variable");
+        } else {
+            warn!("Binding to all interfaces ({}) without advertised address configured", bind_host);
+            warn!("Using 'localhost' as advertised address - remote clients may not connect");
+            warn!("Set CHRONIK_ADVERTISED_ADDR to your hostname/IP for remote access");
+        }
+        hostname
+    } else {
+        bind_host.clone()
+    };
+    
     let advertised_port = cli.advertised_port
         .unwrap_or(cli.kafka_port) as i32;
-    
-    // Warn if using 0.0.0.0 as advertised address
-    if advertised_host == "0.0.0.0" {
-        warn!("Advertised address is 0.0.0.0 - clients may not be able to connect.");
-        warn!("Consider setting --advertised-addr or CHRONIK_ADVERTISED_ADDR to a resolvable hostname/IP.");
-    }
     
     // Create server configuration with all features
     let config = IntegratedServerConfig {

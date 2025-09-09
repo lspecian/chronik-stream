@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] - 2025-09-09
+
+### Added
+- **Smart advertised address defaults** - automatically detect and use hostname when binding to `0.0.0.0`
+  - Uses `HOSTNAME` environment variable (set by Docker) when available
+  - Falls back to `localhost` with clear warnings when no hostname is detected
+  - Prevents silent failures from advertising `0.0.0.0` to clients
+- Enhanced bind address parsing to handle `host:port` format correctly
+- Improved logging to guide users on advertised address configuration
+
+### Fixed
+- Handle `CHRONIK_BIND_ADDR` with port specification (e.g., `0.0.0.0:9092`)
+- All server modes now properly handle advertised address configuration
+
+### Changed
+- **BREAKING**: Updated README to emphasize `CHRONIK_ADVERTISED_ADDR` is required for Docker deployments
+- Added critical Docker configuration section to README
+- Improved error messages when advertised address is misconfigured
+
+### Documentation
+- Added prominent Docker configuration warning in README
+- Updated all Docker examples to include `CHRONIK_ADVERTISED_ADDR`
+- Clarified that `CHRONIK_BIND_ADDR` should be host-only without port
+
 ## [0.7.0] - 2025-09-09
 
 ### Added

@@ -1,4 +1,4 @@
-# Chronik Stream v0.5.0
+# Chronik Stream v0.7.1
 
 [![Build Status](https://github.com/lspecian/chronik-stream/workflows/CI/badge.svg)](https://github.com/lspecian/chronik-stream/actions)
 [![Release](https://img.shields.io/github/v/release/lspecian/chronik-stream)](https://github.com/lspecian/chronik-stream/releases)
@@ -38,19 +38,41 @@ A high-performance, Kafka-compatible distributed streaming platform built in Rus
 
 ```bash
 # Quick start - single command
-docker run -d -p 9092:9092 ghcr.io/lspecian/chronik-stream:v0.5.0
+docker run -d -p 9092:9092 \
+  -e CHRONIK_ADVERTISED_ADDR=localhost \
+  ghcr.io/lspecian/chronik-stream:latest
 
-# With persistent storage and advertised address
+# With persistent storage and custom configuration
 docker run -d --name chronik \
   -p 9092:9092 \
   -v chronik-data:/data \
   -e CHRONIK_ADVERTISED_ADDR=localhost \
-  ghcr.io/lspecian/chronik-stream:v0.5.0
+  -e RUST_LOG=info \
+  ghcr.io/lspecian/chronik-stream:latest
 
 # Using docker-compose
 curl -O https://raw.githubusercontent.com/lspecian/chronik-stream/main/docker-compose.yml
 docker-compose up -d
 ```
+
+### ⚠️ Critical Docker Configuration
+
+**IMPORTANT**: When running Chronik Stream in Docker or binding to `0.0.0.0`, you **MUST** set `CHRONIK_ADVERTISED_ADDR`:
+
+```yaml
+# docker-compose.yml example
+services:
+  chronik-stream:
+    image: ghcr.io/lspecian/chronik-stream:latest
+    ports:
+      - "9092:9092"
+    environment:
+      CHRONIK_BIND_ADDR: "0.0.0.0"  # Just host, no port
+      CHRONIK_ADVERTISED_ADDR: "chronik-stream"  # REQUIRED - use container name for Docker networks
+      # or "localhost" for host access, or your public hostname/IP for remote access
+```
+
+Without `CHRONIK_ADVERTISED_ADDR`, clients will receive `0.0.0.0:9092` in metadata responses and fail to connect.
 
 ### Test with Kafka Client
 
@@ -80,14 +102,14 @@ for message in consumer:
 
 ```bash
 # Download latest release (Linux x86_64)
-curl -L https://github.com/lspecian/chronik-stream/releases/download/v0.5.0/chronik-server-linux-amd64.tar.gz -o chronik-server.tar.gz
+curl -L https://github.com/lspecian/chronik-stream/releases/latest/download/chronik-server-linux-amd64.tar.gz -o chronik-server.tar.gz
 tar xzf chronik-server.tar.gz
-./chronik-server standalone
+./chronik-server --advertised-addr localhost standalone
 
 # macOS (Apple Silicon)
-curl -L https://github.com/lspecian/chronik-stream/releases/download/v0.5.0/chronik-server-darwin-arm64.tar.gz -o chronik-server.tar.gz
+curl -L https://github.com/lspecian/chronik-stream/releases/latest/download/chronik-server-darwin-arm64.tar.gz -o chronik-server.tar.gz
 tar xzf chronik-server.tar.gz
-./chronik-server standalone
+./chronik-server --advertised-addr localhost standalone
 ```
 
 ### Building from Source
@@ -140,15 +162,15 @@ Options:
   -a, --admin-port <PORT>      Admin API port (default: 3000)
   -d, --data-dir <PATH>        Data directory (default: ./data)
   -b, --bind-addr <ADDR>       Bind address (default: 0.0.0.0)
-  --advertised-addr <ADDR>     Address advertised to clients (default: bind address)
+  --advertised-addr <ADDR>     Address advertised to clients (REQUIRED for Docker/remote access)
   --advertised-port <PORT>     Port advertised to clients (default: kafka port)
   --enable-search              Enable search functionality
   --enable-backup              Enable backup functionality
 
 Environment Variables:
   CHRONIK_KAFKA_PORT           Kafka protocol port
-  CHRONIK_BIND_ADDR            Server bind address
-  CHRONIK_ADVERTISED_ADDR      Address advertised to clients (important for Docker)
+  CHRONIK_BIND_ADDR            Server bind address (just host, no port)
+  CHRONIK_ADVERTISED_ADDR      Address advertised to clients (CRITICAL for Docker)
   CHRONIK_ADVERTISED_PORT      Port advertised to clients
   CHRONIK_DATA_DIR             Data directory path
   RUST_LOG                     Log level (error, warn, info, debug, trace)
@@ -160,7 +182,7 @@ All images support both **linux/amd64** and **linux/arm64** architectures:
 
 | Image | Tags | Size | Description |
 |-------|------|------|-------------|
-| `ghcr.io/lspecian/chronik-stream` | `v0.5.0`, `0.5`, `latest` | ~50MB | All-in-one Chronik server |
+| `ghcr.io/lspecian/chronik-stream` | `v0.7.1`, `0.7`, `latest` | ~50MB | All-in-one Chronik server |
 
 ### Supported Platforms
 
@@ -228,7 +250,8 @@ Options:
 # Core Settings
 RUST_LOG=info                    # Log level
 CHRONIK_DATA_DIR=/data          # Data directory
-CHRONIK_BIND_ADDR=0.0.0.0:9092 # Bind address
+CHRONIK_BIND_ADDR=0.0.0.0       # Bind address (host only)
+CHRONIK_ADVERTISED_ADDR=kafka.example.com  # REQUIRED for remote access
 
 # Storage Configuration (S3)
 STORAGE_BACKEND=s3
