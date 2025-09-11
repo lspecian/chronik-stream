@@ -1,0 +1,110 @@
+version: '3.8'
+
+services:
+  # Chronik Stream Server
+  chronik:
+    build:
+      context: ../
+      dockerfile: Dockerfile
+    image: chronik-stream:latest
+    container_name: chronik-compat
+    ports:
+      - "9092:9092"
+    environment:
+      CHRONIK_NODE_ID: 1
+      CHRONIK_ADVERTISED_ADDR: chronik:9092
+      CHRONIK_DATA_DIR: /data
+      CHRONIK_AUTO_CREATE_TOPICS: "true"
+      RUST_LOG: info
+    volumes:
+      - chronik-data:/data
+      - ./configs:/configs:ro
+    networks:
+      - compat-net
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "9092"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  # Python kafka-python test client
+  kafka-python-client:
+    build:
+      context: ./clients/python/kafka-python
+      dockerfile: Dockerfile
+    image: chronik-kafka-python:latest
+    container_name: kafka-python-client
+    depends_on:
+      chronik:
+        condition: service_healthy
+    environment:
+      BOOTSTRAP_SERVERS: chronik:9092
+      PYTHONUNBUFFERED: 1
+    volumes:
+      - ./results:/results
+    networks:
+      - compat-net
+    command: ["python", "/app/test.py"]
+
+  # Python confluent-kafka test client (librdkafka)
+  confluent-kafka-client:
+    build:
+      context: ./clients/python/confluent-kafka
+      dockerfile: Dockerfile
+    image: chronik-confluent-kafka:latest
+    container_name: confluent-kafka-client
+    depends_on:
+      chronik:
+        condition: service_healthy
+    environment:
+      BOOTSTRAP_SERVERS: chronik:9092
+      PYTHONUNBUFFERED: 1
+    volumes:
+      - ./results:/results
+    networks:
+      - compat-net
+    command: ["python", "/app/test.py"]
+
+  # Go Sarama test client
+  sarama-client:
+    build:
+      context: ./clients/go/sarama
+      dockerfile: Dockerfile
+    image: chronik-sarama:latest
+    container_name: sarama-client
+    depends_on:
+      chronik:
+        condition: service_healthy
+    environment:
+      BOOTSTRAP_SERVERS: chronik:9092
+    volumes:
+      - ./results:/results
+    networks:
+      - compat-net
+    command: ["/app/test"]
+
+  # Go confluent-kafka-go test client (librdkafka)
+  confluent-kafka-go-client:
+    build:
+      context: ./clients/go/librdkafka
+      dockerfile: Dockerfile
+    image: chronik-confluent-kafka-go:latest
+    container_name: confluent-kafka-go-client
+    depends_on:
+      chronik:
+        condition: service_healthy
+    environment:
+      BOOTSTRAP_SERVERS: chronik:9092
+    volumes:
+      - ./results:/results
+    networks:
+      - compat-net
+    command: ["/app/test"]
+
+networks:
+  compat-net:
+    driver: bridge
+
+volumes:
+  chronik-data:

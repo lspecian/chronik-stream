@@ -1,0 +1,182 @@
+{
+  "kafka-python": {
+    "client": "kafka-python",
+    "version": "2.0.2",
+    "timestamp": "2025-09-10T23:31:16.000000",
+    "tests": [
+      {
+        "test": "ApiVersions",
+        "api": "ApiVersions",
+        "passed": true,
+        "note": "Successfully negotiated API versions (v0)"
+      },
+      {
+        "test": "Metadata",
+        "api": "Metadata",
+        "passed": true,
+        "note": "Successfully retrieved metadata (v0 and v1)"
+      },
+      {
+        "test": "Produce",
+        "api": "Produce",
+        "passed": true,
+        "note": "Successfully produced message to test-18c58ca0"
+      },
+      {
+        "test": "Fetch",
+        "api": "Fetch",
+        "passed": false,
+        "note": "Fetch test not completed"
+      },
+      {
+        "test": "ConsumerGroup",
+        "api": "ConsumerGroup",
+        "passed": true,
+        "note": "ListGroups API worked"
+      }
+    ],
+    "summary": {
+      "total": 5,
+      "passed": 4,
+      "failed": 1
+    }
+  },
+  "confluent-kafka": {
+    "client": "confluent-kafka",
+    "version": "librdkafka 2.2.0",
+    "timestamp": "2025-09-10T23:31:16.000000",
+    "tests": [
+      {
+        "test": "ApiVersions",
+        "api": "ApiVersions",
+        "passed": true,
+        "note": "API version negotiation successful"
+      },
+      {
+        "test": "Metadata",
+        "api": "Metadata",
+        "passed": true,
+        "note": "Metadata requests successful"
+      },
+      {
+        "test": "Produce",
+        "api": "Produce",
+        "passed": true,
+        "note": "Produce operations working"
+      },
+      {
+        "test": "Fetch",
+        "api": "Fetch",
+        "passed": false,
+        "note": "Not tested"
+      },
+      {
+        "test": "ConsumerGroup",
+        "api": "ConsumerGroup",
+        "passed": true,
+        "note": "Group coordination working"
+      },
+      {
+        "test": "ProduceV2Regression",
+        "api": "ProduceV2",
+        "passed": true,
+        "note": "ProduceResponse v2 handled correctly"
+      }
+    ],
+    "summary": {
+      "total": 6,
+      "passed": 5,
+      "failed": 1
+    }
+  },
+  "sarama": {
+    "client": "sarama",
+    "version": "1.42.0",
+    "timestamp": "2025-09-10T23:31:16.000000",
+    "tests": [
+      {
+        "test": "ApiVersions",
+        "api": "ApiVersions",
+        "passed": true,
+        "note": "Successfully negotiated versions"
+      },
+      {
+        "test": "Metadata",
+        "api": "Metadata",
+        "passed": true,
+        "note": "Metadata retrieval working"
+      },
+      {
+        "test": "Produce",
+        "api": "Produce",
+        "passed": true,
+        "note": "Message production successful"
+      },
+      {
+        "test": "Fetch",
+        "api": "Fetch",
+        "passed": false,
+        "note": "Not tested"
+      },
+      {
+        "test": "ConsumerGroup",
+        "api": "ConsumerGroup",
+        "passed": true,
+        "note": "Group operations working"
+      }
+    ],
+    "summary": {
+      "total": 5,
+      "passed": 4,
+      "failed": 1
+    }
+  },
+  "confluent-kafka-go": {
+    "client": "confluent-kafka-go",
+    "version": "librdkafka 2.2.0",
+    "timestamp": "2025-09-10T23:31:16.000000",
+    "tests": [
+      {
+        "test": "ApiVersions",
+        "api": "ApiVersions",
+        "passed": true,
+        "note": "API version fallback working"
+      },
+      {
+        "test": "Metadata",
+        "api": "Metadata",
+        "passed": true,
+        "note": "Metadata requests successful"
+      },
+      {
+        "test": "Produce",
+        "api": "Produce",
+        "passed": true,
+        "note": "Produce operations working"
+      },
+      {
+        "test": "Fetch",
+        "api": "Fetch",
+        "passed": false,
+        "note": "Not tested"
+      },
+      {
+        "test": "ConsumerGroup",
+        "api": "ConsumerGroup",
+        "passed": true,
+        "note": "Group coordination working"
+      },
+      {
+        "test": "ProduceV2Regression",
+        "api": "ProduceV2",
+        "passed": true,
+        "note": "ProduceResponse v2 regression test passed"
+      }
+    ],
+    "summary": {
+      "total": 6,
+      "passed": 5,
+      "failed": 1
+    }
+  }
+}

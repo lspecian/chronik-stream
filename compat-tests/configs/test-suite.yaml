@@ -1,0 +1,182 @@
+# Chronik Stream Kafka Compatibility Test Suite Configuration
+
+suite:
+  name: "Chronik Kafka Compatibility Test Suite"
+  version: "1.0.0"
+  description: "Comprehensive compatibility testing across Kafka client libraries"
+
+# Chronik configuration
+chronik:
+  image: "chronik-stream:latest"
+  build_from_source: true
+  startup_timeout: 30s
+  ports:
+    primary: 9092
+    ssl: 9093
+    internal: 9094
+  
+  # Feature flags for testing different configurations
+  features:
+    auto_create_topics: true
+    compression: true
+    indexing: false
+    transactions: false  # Not yet supported
+    
+# Reference Kafka for comparison tests
+kafka:
+  enabled: false  # Set to true for comparison mode
+  image: "confluentinc/cp-kafka:7.5.0"
+  port: 29092
+
+# Test execution settings
+execution:
+  parallel: true
+  max_parallel: 4
+  timeout: 300s
+  retry_on_failure: 2
+  capture_packets: false
+  verbose: false
+  
+# Test categories
+test_categories:
+  - name: "connectivity"
+    description: "Basic connectivity and protocol handshake"
+    required: true
+    tests:
+      - api_versions
+      - metadata_basic
+      
+  - name: "produce_consume"
+    description: "Message production and consumption"
+    required: true
+    tests:
+      - produce_single
+      - produce_batch
+      - fetch_single
+      - fetch_batch
+      - compression_types
+      
+  - name: "consumer_groups"
+    description: "Consumer group coordination"
+    required: false
+    tests:
+      - join_group
+      - sync_group
+      - heartbeat
+      - leave_group
+      - offset_commit
+      - offset_fetch
+      
+  - name: "admin"
+    description: "Administrative operations"
+    required: false
+    tests:
+      - create_topics
+      - delete_topics
+      - describe_configs
+      - alter_configs
+      - describe_groups
+      
+  - name: "regression"
+    description: "Regression tests for known issues"
+    required: true
+    tests:
+      - produce_v2_throttle_time
+      - api_versions_v3_tagged_fields
+      - metadata_v12_field_order
+      - librdkafka_client_id_encoding
+
+# API-specific test configurations
+api_tests:
+  api_versions:
+    versions: [0, 1, 2, 3]
+    validate:
+      - response_format
+      - throttle_time_presence
+      - api_key_range
+      - tagged_fields
+      
+  produce:
+    versions: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    validate:
+      - acks_behavior
+      - timeout_handling
+      - batch_support
+      - transactional_id
+      - throttle_time_position  # Critical for v2
+      
+  fetch:
+    versions: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+    validate:
+      - max_bytes_enforcement
+      - isolation_level
+      - session_id_handling
+      
+  metadata:
+    versions: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    validate:
+      - topic_filtering
+      - auto_topic_creation
+      - controller_id_presence
+      - cluster_id_position  # Critical for v12
+
+# Known compatibility issues and workarounds
+known_issues:
+  - id: "COMPAT-001"
+    description: "ProduceResponse v2 throttle_time_ms position"
+    affected_clients: ["kafka-python"]
+    affected_versions: ["v2", "v3", "v4", "v5", "v6", "v7", "v8"]
+    workaround: "throttle_time_ms moved to end of response"
+    test: "regression/produce_v2_throttle.yaml"
+    
+  - id: "COMPAT-002"
+    description: "ApiVersions v3 header flexibility"
+    affected_clients: ["librdkafka"]
+    affected_versions: ["v3"]
+    workaround: "Header not flexible even when body is"
+    test: "regression/api_versions_v3.yaml"
+    
+  - id: "COMPAT-003"
+    description: "Metadata v12 field ordering"
+    affected_clients: ["librdkafka"]
+    affected_versions: ["v12"]
+    workaround: "cluster_id before controller_id"
+    test: "regression/metadata_v12.yaml"
+
+# Client-specific configurations
+client_configs:
+  librdkafka:
+    versions: ["2.0.0", "2.5.0", "2.11.1"]
+    special_handling:
+      - compact_string_client_id
+      - int16_version_range
+      
+  kafka_python:
+    versions: ["2.0.2"]
+    special_handling:
+      - throttle_time_at_end
+      
+  java:
+    versions: ["3.0.0", "3.5.0", "3.7.0"]
+    special_handling: []
+    
+  sarama:
+    versions: ["1.38.0", "1.42.0"]
+    special_handling: []
+
+# Output configuration
+output:
+  results_dir: "./results"
+  matrix_file: "./docs/compatibility-matrix.md"
+  detailed_report: "./results/detailed-report.json"
+  junit_xml: "./results/junit.xml"
+  
+# Notification settings (optional)
+notifications:
+  enabled: false
+  slack:
+    webhook_url: "${SLACK_WEBHOOK_URL}"
+    channel: "#chronik-compat"
+  email:
+    smtp_server: "smtp.example.com"
+    recipients: ["team@example.com"]

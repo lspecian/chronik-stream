@@ -14,20 +14,22 @@ RUN apt-get update && apt-get install -y \
 
 # Copy only Cargo files to cache dependencies
 COPY Cargo.toml Cargo.lock ./
+COPY crates/chronik-admin/Cargo.toml crates/chronik-admin/
+COPY crates/chronik-auth/Cargo.toml crates/chronik-auth/
+COPY crates/chronik-backup/Cargo.toml crates/chronik-backup/
+COPY crates/chronik-benchmarks/Cargo.toml crates/chronik-benchmarks/
+COPY crates/chronik-cli/Cargo.toml crates/chronik-cli/
 COPY crates/chronik-common/Cargo.toml crates/chronik-common/
-COPY crates/chronik-protocol/Cargo.toml crates/chronik-protocol/
-COPY crates/chronik-storage/Cargo.toml crates/chronik-storage/
-COPY crates/chronik-ingest/Cargo.toml crates/chronik-ingest/
-COPY crates/chronik-search/Cargo.toml crates/chronik-search/
-COPY crates/chronik-query/Cargo.toml crates/chronik-query/
+COPY crates/chronik-config/Cargo.toml crates/chronik-config/
+COPY crates/chronik-controller/Cargo.toml crates/chronik-controller/
 COPY crates/chronik-janitor/Cargo.toml crates/chronik-janitor/
 COPY crates/chronik-monitoring/Cargo.toml crates/chronik-monitoring/
-COPY crates/chronik-auth/Cargo.toml crates/chronik-auth/
-COPY crates/chronik-cli/Cargo.toml crates/chronik-cli/
-COPY crates/chronik-benchmarks/Cargo.toml crates/chronik-benchmarks/
-COPY crates/chronik-backup/Cargo.toml crates/chronik-backup/
-COPY crates/chronik-config/Cargo.toml crates/chronik-config/
+COPY crates/chronik-operator/Cargo.toml crates/chronik-operator/
+COPY crates/chronik-protocol/Cargo.toml crates/chronik-protocol/
+COPY crates/chronik-query/Cargo.toml crates/chronik-query/
+COPY crates/chronik-search/Cargo.toml crates/chronik-search/
 COPY crates/chronik-server/Cargo.toml crates/chronik-server/
+COPY crates/chronik-storage/Cargo.toml crates/chronik-storage/
 
 # Create dummy source files to build dependencies
 RUN for dir in crates/*/; do \
@@ -60,7 +62,7 @@ FROM debian:bookworm-slim
 
 # Install runtime dependencies
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates && \
+    apt-get install -y --no-install-recommends ca-certificates netcat-traditional && \
     rm -rf /var/lib/apt/lists/*
 
 # Create non-root user
@@ -83,7 +85,7 @@ EXPOSE 9092 9093
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD test -S /tmp/.s.PGSQL.9092 || exit 1
+    CMD nc -z localhost 9092 || exit 1
 
 # Run server
 ENTRYPOINT ["chronik-server"]
