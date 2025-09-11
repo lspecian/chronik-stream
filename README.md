@@ -1,4 +1,4 @@
-# Chronik Stream v0.7.1
+# Chronik Stream v0.7.4
 
 [![Build Status](https://github.com/lspecian/chronik-stream/workflows/CI/badge.svg)](https://github.com/lspecian/chronik-stream/actions)
 [![Release](https://img.shields.io/github/v/release/lspecian/chronik-stream)](https://github.com/lspecian/chronik-stream/releases)
@@ -8,10 +8,19 @@
 
 A high-performance, Kafka-compatible distributed streaming platform built in Rust. Drop-in replacement for Apache Kafka with enhanced search capabilities and cloud-native storage.
 
+## 🎉 What's New in v0.7.4
+
+- **Stable Consumer Groups**: Fixed partition assignment logic with proper round-robin distribution
+- **FetchResponse Fixes**: Resolved client crashes when polling past the end of topics
+- **Full Client Compatibility**: Tested with kafka-python, confluent-kafka, and other major clients
+- **Iterator Mode Support**: Consumer iterators work seamlessly without exceptions
+- **Comprehensive Testing**: Added extensive test suite for consumer group operations
+
 ## 🚀 Features
 
-- **Full Kafka Protocol Compatibility**: Complete support for Kafka wire protocol v0-v9 with all 19 core APIs
+- **Full Kafka Protocol Compatibility**: Complete support for Kafka wire protocol v0-v13 with all core APIs
 - **Drop-in Replacement**: Works with all standard Kafka clients (Java, Python, Go, Node.js, etc.)
+- **Consumer Groups**: Production-ready consumer group coordination with partition assignment and offset management
 - **Built-in Search**: Full-text search on message content powered by Tantivy search engine
 - **Cloud-Native Storage**: Pluggable object storage backends (S3, GCS, Azure Blob, Local)
 - **High Performance**: Zero-copy networking, optimized for low latency (0% idle CPU usage)
@@ -40,7 +49,7 @@ A high-performance, Kafka-compatible distributed streaming platform built in Rus
 # Quick start - single command
 docker run -d -p 9092:9092 \
   -e CHRONIK_ADVERTISED_ADDR=localhost \
-  ghcr.io/lspecian/chronik-stream:latest
+  ghcr.io/lspecian/chronik-stream:v0.7.4
 
 # With persistent storage and custom configuration
 docker run -d --name chronik \
@@ -48,7 +57,7 @@ docker run -d --name chronik \
   -v chronik-data:/data \
   -e CHRONIK_ADVERTISED_ADDR=localhost \
   -e RUST_LOG=info \
-  ghcr.io/lspecian/chronik-stream:latest
+  ghcr.io/lspecian/chronik-stream:v0.7.4
 
 # Using docker-compose
 curl -O https://raw.githubusercontent.com/lspecian/chronik-stream/main/docker-compose.yml
@@ -63,7 +72,7 @@ docker-compose up -d
 # docker-compose.yml example
 services:
   chronik-stream:
-    image: ghcr.io/lspecian/chronik-stream:latest
+    image: ghcr.io/lspecian/chronik-stream:v0.7.4
     ports:
       - "9092:9092"
     environment:
@@ -86,16 +95,20 @@ producer = KafkaProducer(
     api_version=(0, 10, 0)  # Important: specify version
 )
 producer.send('test-topic', b'Hello Chronik!')
+producer.flush()
 
-# Consumer
+# Consumer with Consumer Group (v0.7.4+ - fully supported!)
 consumer = KafkaConsumer(
     'test-topic',
     bootstrap_servers='localhost:9092',
     api_version=(0, 10, 0),
-    auto_offset_reset='earliest'
+    group_id='my-consumer-group',  # Consumer groups now fully working
+    auto_offset_reset='earliest',
+    enable_auto_commit=True
 )
 for message in consumer:
-    print(message.value)
+    print(f"Received: {message.value}")
+    # No crashes when polling past end of topic!
 ```
 
 ### Using Binary
