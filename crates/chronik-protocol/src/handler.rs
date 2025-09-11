@@ -746,27 +746,20 @@ impl ProtocolHandler {
                 }
                 
                 // Records
-                // For v11+, we need to provide a proper RecordBatch even if empty
-                // For now, always return NULL which the client can handle
-                let _records_len = if partition.records.is_empty() {
-                    if version >= 11 {
-                        // For v11+, we could return an empty RecordBatch,
-                        // but NULL is also valid and simpler
-                        tracing::trace!("        Records: NULL (v11+)");
-                        encoder.write_bytes(None);
-                    } else {
-                        tracing::trace!("        Records: NULL");
-                        encoder.write_bytes(None);
-                    }
-                    0
+                // For the records field, write the actual bytes if we have them
+                // or write an empty byte array (length 0) for no records
+                let records_len = partition.records.len();
+                if records_len == 0 {
+                    // Write empty bytes (length 0) - not NULL
+                    // This tells the client there are no records without causing parsing errors
+                    tracing::trace!("        Records: empty (0 bytes)");
+                    encoder.write_bytes(Some(&[]));
                 } else {
-                    let len = partition.records.len();
-                    tracing::debug!("        Records: {} bytes", len);
+                    tracing::debug!("        Records: {} bytes", records_len);
                     tracing::trace!("        Records data (first 32 bytes): {:?}", 
-                        &partition.records[..std::cmp::min(32, len)]);
+                        &partition.records[..std::cmp::min(32, records_len)]);
                     encoder.write_bytes(Some(&partition.records));
-                    len
-                };
+                }
             }
         }
         
@@ -2531,14 +2524,11 @@ impl ProtocolHandler {
         // Check if this is a flexible/compact version (v9+)
         let flexible = version >= 9;
         
-        // CRITICAL FIX: throttle_time_ms comes FIRST in v1+ (not last!)
-        // This was causing memory corruption in Go clients using librdkafka
-        if version >= 1 {
-            encoder.write_i32(response.throttle_time_ms);
-        }
-        
-        tracing::debug!("Encoding produce response v{}: {} topics, throttle_time={}, flexible={}", 
-            version, response.topics.len(), response.throttle_time_ms, flexible);
+        // NOTE: throttle_time_ms position differs between versions
+        // For v1-v8: throttle_time_ms goes at the END of the response
+        // For v9+: handled differently with flexible versions
+        // This was discovered through comparison with real Kafka - Python clients
+        // expect throttle_time_ms at the end for v2 responses
         
         // Topics array
         if flexible {
@@ -2611,7 +2601,14 @@ impl ProtocolHandler {
             encoder.write_unsigned_varint(0); // No tagged fields
         }
         
+        // Write throttle_time_ms at the END for v1-v8
+        // This is critical for client compatibility (especially Python kafka-python)
+        if version >= 1 && version < 9 {
+            encoder.write_i32(response.throttle_time_ms);
+        }
+        
         // Log the encoded response for debugging
+        tracing::debug!("Encoded produce response v{} total size: {} bytes", version, buf.len());
         if buf.len() < 100 {
             tracing::debug!("Encoded produce response ({} bytes): {:02x?}", buf.len(), buf.as_ref());
         } else {

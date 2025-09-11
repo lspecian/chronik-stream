@@ -736,13 +736,19 @@ impl GroupManager {
         }
         
         // If leader, compute and distribute assignments
-        if Some(&member_id) == group.leader_id.as_ref() && assignments.is_some() {
-            let assignments = assignments.unwrap();
-            
-            // Compute partition assignments
-            let computed_assignments = if group.state == GroupState::PreparingRebalance {
+        if Some(&member_id) == group.leader_id.as_ref() {
+            // Compute partition assignments if we're in a rebalance or leader has empty assignments
+            let computed_assignments = if group.state == GroupState::PreparingRebalance || 
+                                          group.state == GroupState::CompletingRebalance ||
+                                          assignments.as_ref().map(|a| a.is_empty()).unwrap_or(true) {
+                info!(
+                    group_id = %group.group_id,
+                    member_id = %member_id,
+                    state = ?group.state,
+                    "Leader computing partition assignments"
+                );
                 self.compute_assignments(group).await?
-            } else {
+            } else if let Some(assignments) = assignments {
                 // Parse provided assignments
                 let mut parsed = HashMap::new();
                 for (member_id, assignment_bytes) in assignments {
@@ -750,39 +756,64 @@ impl GroupManager {
                     parsed.insert(member_id, assignment);
                 }
                 parsed
+            } else {
+                // No assignments to process
+                HashMap::new()
             };
             
-            group.complete_rebalance(computed_assignments);
-            
-            // Persist group state after assignment
-            if let Err(e) = self.persist_group(group).await {
-                warn!(
+            if !computed_assignments.is_empty() {
+                info!(
                     group_id = %group.group_id,
-                    error = %e,
-                    "Failed to persist group state after assignment"
+                    assignments = ?computed_assignments.keys().collect::<Vec<_>>(),
+                    "Completing rebalance with assignments"
                 );
+                group.complete_rebalance(computed_assignments);
+                
+                // Persist group state after assignment
+                if let Err(e) = self.persist_group(group).await {
+                    warn!(
+                        group_id = %group.group_id,
+                        error = %e,
+                        "Failed to persist group state after assignment"
+                    );
+                }
             }
         }
         
         // Get member's assignment based on rebalance strategy
         let (assignment, epoch) = if let Some(member) = group.members.get(&member_id) {
-            if group.assignment_strategy == AssignmentStrategy::CooperativeSticky {
+            let member_assignment = if group.assignment_strategy == AssignmentStrategy::CooperativeSticky {
                 // For incremental rebalance, return target assignment if available
-                let assignment = member.target_assignment.as_ref()
-                    .unwrap_or(&member.assignment);
-                (encode_assignment(assignment), member.member_epoch)
+                member.target_assignment.as_ref()
+                    .unwrap_or(&member.assignment)
             } else {
-                (encode_assignment(&member.assignment), member.member_epoch)
-            }
+                &member.assignment
+            };
+            
+            info!(
+                group_id = %group.group_id,
+                member_id = %member_id,
+                assignment = ?member_assignment,
+                "Returning assignment to member"
+            );
+            
+            (encode_assignment(member_assignment), member.member_epoch)
         } else {
+            warn!(
+                group_id = %group.group_id,
+                member_id = %member_id,
+                "Member not found in group"
+            );
             (vec![], 0)
         };
         
-        debug!(
+        info!(
             group_id = %group.group_id,
             member_id = %member_id,
             generation = generation_id,
             state = ?group.state,
+            assignment_size = assignment.len(),
+            is_leader = Some(&member_id) == group.leader_id.as_ref(),
             "Member synced group"
         );
         
@@ -801,20 +832,44 @@ impl GroupManager {
             .cloned()
             .collect();
         
+        info!(
+            group_id = %group.group_id,
+            topics = ?topics,
+            members = ?group.members.keys().collect::<Vec<_>>(),
+            "Computing partition assignments"
+        );
+        
         let mut partitions = Vec::new();
-        for topic in topics {
-            if let Some(topic_metadata) = self.metadata_store.get_topic(&topic).await
+        for topic in &topics {
+            if let Some(topic_metadata) = self.metadata_store.get_topic(topic).await
                 .map_err(|e| Error::Storage(format!("Failed to get topic metadata: {}", e)))? {
                 
-                for partition in 0..topic_metadata.config.partition_count {
+                let partition_count = topic_metadata.config.partition_count;
+                info!(
+                    topic = %topic,
+                    partition_count = partition_count,
+                    "Adding partitions for topic"
+                );
+                
+                for partition in 0..partition_count {
                     partitions.push(PartitionInfo {
                         topic: topic.clone(),
                         partition: partition as i32,
                         leader: None, // TODO: Get from partition assignments
                     });
                 }
+            } else {
+                warn!(
+                    topic = %topic,
+                    "Topic not found in metadata"
+                );
             }
         }
+        
+        info!(
+            total_partitions = partitions.len(),
+            "Total partitions to assign"
+        );
         
         // Build assignment context
         let context = AssignmentContext {
@@ -830,6 +885,19 @@ impl GroupManager {
         // Use the configured assignor
         let assignor = self.assignor.lock().await;
         let assignments = assignor.assign(&context)?;
+        
+        // Log the assignments
+        for (member_id, member_assignments) in &assignments {
+            for (topic, partitions) in member_assignments {
+                info!(
+                    group_id = %group.group_id,
+                    member_id = %member_id,
+                    topic = %topic,
+                    partitions = ?partitions,
+                    "Assigned partitions to member"
+                );
+            }
+        }
         
         Ok(assignments)
     }

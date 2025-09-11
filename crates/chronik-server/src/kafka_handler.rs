@@ -138,7 +138,9 @@ impl KafkaProtocolHandler {
                 
                 // Encode the response
                 let mut body_buf = BytesMut::new();
+                eprintln!("CRITICAL: About to call encode_produce_response with version {}", header.api_version);
                 self.protocol_handler.encode_produce_response(&mut body_buf, &response, header.api_version)?;
+                eprintln!("CRITICAL: encode_produce_response returned, body_buf.len() = {}", body_buf.len());
                 
                 // Debug: log the actual body content
                 eprintln!("DEBUG: Produce response body_buf.len() = {}", body_buf.len());
@@ -528,6 +530,12 @@ impl KafkaProtocolHandler {
         use chronik_protocol::types::{OffsetFetchResponse, OffsetFetchResponseTopic, OffsetFetchResponsePartition};
         use chronik_protocol::ResponseHeader;
         
+        tracing::info!(
+            group_id = %request.group_id,
+            topics = ?request.topics,
+            "Handling offset fetch request"
+        );
+        
         let mut response_topics = Vec::new();
         
         // If topics is None or empty, fetch all topics for this group
@@ -542,10 +550,38 @@ impl KafkaProtocolHandler {
         for topic_name in topics_to_fetch {
             let mut response_partitions = Vec::new();
             
-            // For now, check partitions 0-9 (in production, we'd know the actual partition count)
-            for partition_index in 0..10 {
+            // Get the actual partition count from metadata
+            let partition_count = match self.metadata_store.get_topic(&topic_name).await {
+                Ok(Some(topic_meta)) => topic_meta.config.partition_count,
+                Ok(None) => {
+                    // Topic doesn't exist, skip it
+                    tracing::warn!(
+                        topic = %topic_name,
+                        "Topic not found for offset fetch"
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    tracing::error!(
+                        topic = %topic_name,
+                        error = %e,
+                        "Error getting topic metadata for offset fetch"
+                    );
+                    continue;
+                }
+            };
+            
+            // Check all partitions of this topic
+            for partition_index in 0..partition_count {
                 match self.metadata_store.get_consumer_offset(&request.group_id, &topic_name, partition_index).await {
                     Ok(Some(offset)) => {
+                        tracing::info!(
+                            group_id = %request.group_id,
+                            topic = %topic_name,
+                            partition = partition_index,
+                            offset = offset.offset,
+                            "Found committed offset"
+                        );
                         response_partitions.push(OffsetFetchResponsePartition {
                             partition_index: partition_index as i32,
                             committed_offset: offset.offset,
@@ -554,23 +590,44 @@ impl KafkaProtocolHandler {
                         });
                     }
                     Ok(None) => {
-                        // No offset found for this partition - skip it
-                        continue;
+                        // No offset found - return default offset 0 (earliest)
+                        tracing::info!(
+                            group_id = %request.group_id,
+                            topic = %topic_name,
+                            partition = partition_index,
+                            "No committed offset, returning default 0"
+                        );
+                        response_partitions.push(OffsetFetchResponsePartition {
+                            partition_index: partition_index as i32,
+                            committed_offset: 0,  // Start from beginning
+                            metadata: None,
+                            error_code: 0,
+                        });
                     }
-                    Err(_) => {
-                        // Error fetching - skip this partition
-                        continue;
+                    Err(e) => {
+                        tracing::error!(
+                            group_id = %request.group_id,
+                            topic = %topic_name,
+                            partition = partition_index,
+                            error = %e,
+                            "Error fetching offset"
+                        );
+                        // Return error for this partition
+                        response_partitions.push(OffsetFetchResponsePartition {
+                            partition_index: partition_index as i32,
+                            committed_offset: -1,
+                            metadata: None,
+                            error_code: 5, // COORDINATOR_NOT_AVAILABLE
+                        });
                     }
                 }
             }
             
-            // Only add topic if we found at least one partition with an offset
-            if !response_partitions.is_empty() {
-                response_topics.push(OffsetFetchResponseTopic {
-                    name: topic_name,
-                    partitions: response_partitions,
-                });
-            }
+            // Always add topic with all its partitions
+            response_topics.push(OffsetFetchResponseTopic {
+                name: topic_name,
+                partitions: response_partitions,
+            });
         }
         
         Ok(OffsetFetchResponse {

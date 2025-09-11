@@ -209,12 +209,8 @@ impl FetchHandler {
                 }
             };
             
-            // Encode the records
-            let records_bytes = if records.is_empty() {
-                vec![]
-            } else {
-                self.encode_kafka_records(&records, 0)?
-            };
+            // Encode the records - always use encode_kafka_records to get proper format
+            let records_bytes = self.encode_kafka_records(&records, 0)?;
             
             return Ok(FetchResponsePartition {
                 partition,
@@ -282,11 +278,7 @@ impl FetchHandler {
                 match result {
                     Ok(Ok((records, new_hw))) => {
                         // Got enough data within timeout
-                        let records_bytes = if records.is_empty() {
-                            vec![]
-                        } else {
-                            self.encode_kafka_records(&records, 0)?
-                        };
+                        let records_bytes = self.encode_kafka_records(&records, 0)?;
                         
                         return Ok(FetchResponsePartition {
                             partition,
@@ -300,7 +292,9 @@ impl FetchHandler {
                         });
                     }
                     _ => {
-                        // Timeout or error - return empty response
+                        // Timeout or error - return empty response with proper empty batch
+                        let empty_records = self.encode_kafka_records(&[], 0)?;
+                        
                         return Ok(FetchResponsePartition {
                             partition,
                             error_code: 0,
@@ -309,12 +303,14 @@ impl FetchHandler {
                             log_start_offset,
                             aborted: None,
                             preferred_read_replica: -1,
-                            records: vec![],
+                            records: empty_records,
                         });
                     }
                 }
             } else {
-                // No wait requested, return empty immediately
+                // No wait requested, return empty immediately with proper empty batch
+                let empty_records = self.encode_kafka_records(&[], 0)?;
+                
                 return Ok(FetchResponsePartition {
                     partition,
                     error_code: 0,
@@ -323,7 +319,7 @@ impl FetchHandler {
                     log_start_offset,
                     aborted: None,
                     preferred_read_replica: -1,
-                    records: vec![],
+                    records: empty_records,
                 });
             }
         }
@@ -668,6 +664,8 @@ impl FetchHandler {
     ) -> Result<Vec<u8>> {
         use bytes::Bytes;
         
+        // For empty record sets, return an empty vector
+        // The protocol handler will write this as a 0-length bytes field
         if records.is_empty() {
             return Ok(vec![]);
         }
