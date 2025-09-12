@@ -68,6 +68,8 @@ pub struct SegmentWriter {
     config: SegmentWriterConfig,
     object_store: Box<dyn ObjectStoreTrait>,
     active_segments: Arc<RwLock<HashMap<(String, i32), ActiveSegment>>>,
+    /// Track the last offset written for each partition to ensure continuity
+    last_offsets: Arc<RwLock<HashMap<(String, i32), i64>>>,
 }
 
 impl SegmentWriter {
@@ -89,6 +91,7 @@ impl SegmentWriter {
             config,
             object_store,
             active_segments: Arc::new(RwLock::new(HashMap::new())),
+            last_offsets: Arc::new(RwLock::new(HashMap::new())),
         })
     }
     
@@ -105,25 +108,41 @@ impl SegmentWriter {
         let mut segments = self.active_segments.write().await;
         
         // Get or create active segment
+        let is_new_segment = !segments.contains_key(&key);
+        
+        // If we need a new segment, determine the correct base_offset
+        let new_segment_base_offset = if is_new_segment {
+            // Check if we have a previous offset for this partition
+            let last_offsets = self.last_offsets.read().await;
+            if let Some(&last_offset) = last_offsets.get(&key) {
+                // Continue from where we left off
+                last_offset + 1
+            } else if let Some(first_record) = indexed_batch.records.first() {
+                // First segment for this partition, use the first record's offset
+                first_record.offset
+            } else {
+                0
+            }
+        } else {
+            0 // Won't be used since we're not creating a new segment
+        };
+        
         let active = segments.entry(key.clone()).or_insert_with(|| {
             let segment_id = SegmentId(Uuid::new_v4());
             let builder = SegmentBuilder::new();
             
-            // Handle empty batches (null records)
-            let (base_offset, last_offset) = if let Some(first_record) = indexed_batch.records.first() {
-                (first_record.offset, first_record.offset)
-            } else {
-                // For empty batches, use default offset 0
-                (0, 0)
-            };
+            tracing::info!(
+                "Creating new segment for {}-{} with base_offset={} (continuity from previous segment)",
+                topic, partition, new_segment_base_offset
+            );
             
             ActiveSegment {
                 builder,
                 id: segment_id,
                 topic: topic.to_string(),
                 partition,
-                base_offset,
-                last_offset,
+                base_offset: new_segment_base_offset,
+                last_offset: new_segment_base_offset,
                 timestamp_min: indexed_batch.records.first().map(|r| r.timestamp).unwrap_or(0),
                 timestamp_max: indexed_batch.records.first().map(|r| r.timestamp).unwrap_or(0),
                 record_count: 0,
@@ -133,6 +152,15 @@ impl SegmentWriter {
             }
         });
         
+        // If this is an existing segment and we're adding new records,
+        // make sure the base_offset doesn't change
+        if !is_new_segment && !indexed_batch.records.is_empty() {
+            tracing::debug!(
+                "Appending to existing segment {}-{}: base_offset={}, new_records_start={}",
+                topic, partition, active.base_offset, indexed_batch.records.first().unwrap().offset
+            );
+        }
+        
         // Update segment metadata
         for record in &indexed_batch.records {
             active.last_offset = record.offset;
@@ -140,6 +168,18 @@ impl SegmentWriter {
             active.timestamp_max = active.timestamp_max.max(record.timestamp);
             active.record_count += 1;
         }
+        
+        // Update the last offset tracker for this partition
+        if !indexed_batch.records.is_empty() {
+            let mut last_offsets = self.last_offsets.write().await;
+            let last_record_offset = indexed_batch.records.last().unwrap().offset;
+            last_offsets.insert(key.clone(), last_record_offset);
+        }
+        
+        tracing::info!(
+            "Segment {}-{} now contains {} records (offsets {}-{})",
+            topic, partition, active.record_count, active.base_offset, active.last_offset
+        );
         
         // Add raw Kafka batch data
         active.builder.add_raw_kafka_batch(raw_kafka_batch);

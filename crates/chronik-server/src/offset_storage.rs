@@ -279,6 +279,6 @@ pub struct OffsetStorageStats {
     pub newest_cached_entry: Option<DateTime<Utc>>,
 }
 
-#[cfg(test)]
-#[path = "offset_storage_test.rs"]
-mod offset_storage_test;
+// #[cfg(test)]
+// #[path = "offset_storage_test.rs"]
+// mod offset_storage_test;

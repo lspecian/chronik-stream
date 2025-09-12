@@ -646,6 +646,16 @@ impl ProduceHandler {
                 is_control: (kafka_batch.header.attributes & 0x20) != 0,
             };
             
+            // Log what we're producing for debugging
+            info!(
+                "PRODUCE: topic={} partition={} offset={} value_len={} value_preview={}",
+                topic,
+                partition,
+                record.offset,
+                record.value.len(),
+                String::from_utf8_lossy(&record.value[..std::cmp::min(50, record.value.len())])
+            );
+            
             total_bytes += record.value.len() as u64;
             if let Some(ref key) = record.key {
                 total_bytes += key.len() as u64;
@@ -695,12 +705,18 @@ impl ProduceHandler {
             0 => {
                 // No acknowledgment required, return immediately
                 debug!("Acks=0: Returning immediately without waiting for persistence");
+                
+                // Update high watermark for acks=0
+                partition_state.high_watermark.store((last_offset + 1) as u64, Ordering::SeqCst);
             }
             1 => {
                 // For acks=1, we don't need to flush immediately
                 // The background task will handle flushing based on time/size thresholds
                 // We just need to ensure the data is buffered
                 debug!("Acks=1: Data buffered, will be persisted by background task");
+                
+                // Update high watermark for acks=1
+                partition_state.high_watermark.store((last_offset + 1) as u64, Ordering::SeqCst);
             }
             -1 => {
                 // Wait for replication to all ISR - this requires immediate flush
@@ -760,10 +776,35 @@ impl ProduceHandler {
         // Drop memory permit
         drop(memory_permit);
         
+        // Update fetch handler buffer immediately so data is available for fetch
+        // This is critical for small batches that don't meet flush thresholds
+        if let Some(fetch_handler) = &self.fetch_handler {
+            let storage_records: Vec<Record> = records.iter().map(|r| Record {
+                offset: r.offset,
+                timestamp: r.timestamp,
+                key: r.key.clone(),
+                value: r.value.clone(),
+                headers: r.headers.clone(),
+            }).collect();
+            
+            let high_watermark = partition_state.high_watermark.load(Ordering::Relaxed) as i64;
+            
+            info!("Updating fetch handler buffer with {} records for {}-{}, high_watermark={}", 
+                storage_records.len(), topic, partition, high_watermark);
+            
+            if let Err(e) = fetch_handler.update_buffer(topic, partition, storage_records, high_watermark).await {
+                warn!("Failed to update fetch handler buffer: {:?}", e);
+            } else {
+                info!("Successfully updated fetch handler buffer for {}-{}", topic, partition);
+            }
+        } else {
+            warn!("No fetch handler available to update buffer for {}-{}", topic, partition);
+        }
+        
         // Flush immediately to ensure data is available for fetch
         // Note: We don't force rotation here - let the background task handle rotation
         // based on time/size thresholds to avoid infinite rotation loops
-        if let Err(e) = self.flush_partition(topic, partition, &partition_state).await {
+        if let Err(e) = self.flush_partition_if_needed(topic, partition, &partition_state).await {
             warn!("Failed to flush partition {}-{}: {:?}", topic, partition, e);
         }
         
@@ -1134,21 +1175,10 @@ impl ProduceHandler {
                         }
                     }
                     
-                    // Force flush to disk for small batches
-                    // This ensures messages are persisted even if they don't reach segment size threshold
-                    match writer.flush_all().await {
-                        Ok(flushed_segments) => {
-                            // Register all flushed segments with metadata store
-                            for metadata in flushed_segments {
-                                if let Err(e) = self.metadata_store.persist_segment_metadata(metadata).await {
-                                    warn!("Failed to persist flushed segment metadata: {:?}", e);
-                                }
-                            }
-                        },
-                        Err(e) => {
-                            warn!("Failed to flush segment writer: {:?}", e);
-                        }
-                    }
+                    // DO NOT call flush_all here - it drains all segments!
+                    // The segments will be flushed when they reach size/time thresholds
+                    // or when explicitly needed for acks=-1
+                    debug!("Batch written to segment writer");
                     break;
                 },
                 Err(e) => {
@@ -2331,5 +2361,222 @@ mod tests {
         assert!(!ProduceHandler::is_reserved_topic_name("_single_underscore"));
         assert!(!ProduceHandler::is_reserved_topic_name("normal_topic"));
         assert!(!ProduceHandler::is_reserved_topic_name("consumer_offsets"));
+    }
+
+    #[tokio::test]
+    async fn test_high_watermark_update_acks_0() {
+        use tempfile::TempDir;
+        use std::sync::atomic::Ordering;
+        
+        let temp_dir = TempDir::new().unwrap();
+        let config = ProduceConfig {
+            data_dir: temp_dir.path().to_path_buf(),
+            flush_interval_ms: 1000,
+            flush_bytes: 1024 * 1024,
+            ..Default::default()
+        };
+        
+        let metadata_store = Arc::new(chronik_common::metadata::file_store::FileMetadataStore::new(
+            temp_dir.path().join("metadata")
+        ).await.unwrap());
+        
+        let object_store = Arc::new(chronik_storage::LocalObjectStore::new(
+            temp_dir.path().join("segments")
+        ).await.unwrap());
+        
+        let mut handler = ProduceHandler::new(
+            config,
+            object_store,
+            metadata_store.clone(),
+        ).await.unwrap();
+        
+        // Create topic
+        metadata_store.create_topic("test-topic", 1, HashMap::new()).await.unwrap();
+        
+        // Produce a message with acks=0
+        let request = ProduceRequest {
+            transactional_id: None,
+            acks: 0, // acks=0
+            timeout_ms: 1000,
+            topics: vec![ProduceRequestTopic {
+                name: "test-topic".to_string(),
+                partitions: vec![ProduceRequestPartition {
+                    index: 0,
+                    records: Some(create_test_record_batch(0, vec!["msg1"])),
+                }],
+            }],
+        };
+        
+        let response = handler.handle_produce(request).await.unwrap();
+        assert_eq!(response.topics[0].partitions[0].error_code, 0);
+        
+        // Check that high watermark was updated for acks=0
+        let state = handler.partition_states.get("test-topic").unwrap();
+        let partition_state = state.get(&0).unwrap();
+        let high_watermark = partition_state.high_watermark.load(Ordering::Relaxed);
+        assert_eq!(high_watermark, 1, "High watermark should be updated to 1 for acks=0");
+    }
+
+    #[tokio::test]
+    async fn test_high_watermark_update_acks_1() {
+        use tempfile::TempDir;
+        use std::sync::atomic::Ordering;
+        
+        let temp_dir = TempDir::new().unwrap();
+        let config = ProduceConfig {
+            data_dir: temp_dir.path().to_path_buf(),
+            flush_interval_ms: 1000,
+            flush_bytes: 1024 * 1024,
+            ..Default::default()
+        };
+        
+        let metadata_store = Arc::new(chronik_common::metadata::file_store::FileMetadataStore::new(
+            temp_dir.path().join("metadata")
+        ).await.unwrap());
+        
+        let object_store = Arc::new(chronik_storage::LocalObjectStore::new(
+            temp_dir.path().join("segments")
+        ).await.unwrap());
+        
+        let mut handler = ProduceHandler::new(
+            config,
+            object_store,
+            metadata_store.clone(),
+        ).await.unwrap();
+        
+        // Create topic
+        metadata_store.create_topic("test-topic", 1, HashMap::new()).await.unwrap();
+        
+        // Produce multiple messages with acks=1
+        let request = ProduceRequest {
+            transactional_id: None,
+            acks: 1, // acks=1
+            timeout_ms: 1000,
+            topics: vec![ProduceRequestTopic {
+                name: "test-topic".to_string(),
+                partitions: vec![ProduceRequestPartition {
+                    index: 0,
+                    records: Some(create_test_record_batch(0, vec!["msg1", "msg2", "msg3"])),
+                }],
+            }],
+        };
+        
+        let response = handler.handle_produce(request).await.unwrap();
+        assert_eq!(response.topics[0].partitions[0].error_code, 0);
+        
+        // Check that high watermark was updated for acks=1
+        let state = handler.partition_states.get("test-topic").unwrap();
+        let partition_state = state.get(&0).unwrap();
+        let high_watermark = partition_state.high_watermark.load(Ordering::Relaxed);
+        assert_eq!(high_watermark, 3, "High watermark should be updated to 3 for acks=1 with 3 messages");
+    }
+
+    #[tokio::test]
+    async fn test_high_watermark_with_fetch_handler_integration() {
+        use tempfile::TempDir;
+        use std::sync::atomic::Ordering;
+        
+        let temp_dir = TempDir::new().unwrap();
+        let config = ProduceConfig {
+            data_dir: temp_dir.path().to_path_buf(),
+            flush_interval_ms: 1000,
+            flush_bytes: 1024 * 1024,
+            ..Default::default()
+        };
+        
+        let metadata_store = Arc::new(chronik_common::metadata::file_store::FileMetadataStore::new(
+            temp_dir.path().join("metadata")
+        ).await.unwrap());
+        
+        let object_store = Arc::new(chronik_storage::LocalObjectStore::new(
+            temp_dir.path().join("segments")
+        ).await.unwrap());
+        
+        // Create FetchHandler
+        let segment_reader = Arc::new(chronik_storage::SegmentReader::new(
+            object_store.clone()
+        ));
+        
+        let fetch_handler = Arc::new(crate::fetch_handler::FetchHandler::new(
+            segment_reader,
+            metadata_store.clone(),
+            object_store.clone(),
+        ));
+        
+        let mut handler = ProduceHandler::new(
+            config,
+            object_store.clone(),
+            metadata_store.clone(),
+        ).await.unwrap();
+        
+        // Connect fetch handler
+        handler.set_fetch_handler(fetch_handler.clone());
+        
+        // Create topic
+        metadata_store.create_topic("test-topic", 1, HashMap::new()).await.unwrap();
+        
+        // Produce messages
+        let request = ProduceRequest {
+            transactional_id: None,
+            acks: 1,
+            timeout_ms: 1000,
+            topics: vec![ProduceRequestTopic {
+                name: "test-topic".to_string(),
+                partitions: vec![ProduceRequestPartition {
+                    index: 0,
+                    records: Some(create_test_record_batch(0, vec!["msg1", "msg2"])),
+                }],
+            }],
+        };
+        
+        let response = handler.handle_produce(request).await.unwrap();
+        assert_eq!(response.topics[0].partitions[0].error_code, 0);
+        
+        // Verify high watermark is updated
+        let state = handler.partition_states.get("test-topic").unwrap();
+        let partition_state = state.get(&0).unwrap();
+        let high_watermark = partition_state.high_watermark.load(Ordering::Relaxed);
+        assert_eq!(high_watermark, 2);
+        
+        // Verify fetch handler buffer was updated via fetch_partition
+        let fetch_response = fetch_handler.fetch_partition(
+            "test-topic",
+            0,
+            0,     // fetch_offset
+            1024,  // max_bytes
+            0,     // max_wait_ms
+            0,     // min_bytes
+        ).await.unwrap();
+        
+        assert_eq!(fetch_response.high_watermark, 2, "Fetch handler should report correct high watermark");
+        assert!(!fetch_response.records.is_empty(), "Fetch handler should return buffered records");
+    }
+
+    // Helper function to create test record batches
+    fn create_test_record_batch(base_offset: i64, messages: Vec<&str>) -> Vec<u8> {
+        use chronik_protocol::kafka_protocol::KafkaRecordBatch;
+        use bytes::Bytes;
+        
+        let mut batch = KafkaRecordBatch::new(
+            base_offset,
+            0,  // partition_leader_epoch
+            2,  // magic
+            0,  // compression_type
+            chrono::Utc::now().timestamp_millis(),
+            -1, // producer_id
+            -1, // producer_epoch
+            -1, // base_sequence
+        );
+        
+        for (i, msg) in messages.iter().enumerate() {
+            batch.add_record(
+                (i as i64) * 1000,  // timestamp_delta
+                None,               // key
+                Some(Bytes::from(msg.to_string())),
+                vec![],            // headers
+            );
+        }
+        
+        batch.encode()
     }
 }

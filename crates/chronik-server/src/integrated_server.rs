@@ -15,6 +15,7 @@ use crate::error_handler::{ErrorHandler, ErrorCode, ErrorRecovery, ServerError};
 // Use the local server components (moved from chronik-ingest)
 use crate::kafka_handler::KafkaProtocolHandler;
 use crate::produce_handler::{ProduceHandler, ProduceHandlerConfig};
+use crate::fetch_handler::FetchHandler;
 use crate::storage::{StorageConfig as IngestStorageConfig, StorageService};
 
 // Storage components
@@ -191,22 +192,34 @@ impl IntegratedKafkaServer {
             default_replication_factor: config.replication_factor,
         };
         
+        // Create FetchHandler first
+        let fetch_handler = Arc::new(FetchHandler::new(
+            segment_reader.clone(),
+            metadata_store.clone(),
+            object_store_arc.clone(),
+        ));
+        
         // Initialize produce handler with object store directly
-        let produce_handler = Arc::new(ProduceHandler::new(
+        let mut produce_handler_inner = ProduceHandler::new(
             produce_config,
             object_store_arc.clone(),
             metadata_store.clone(),
-        ).await?);
+        ).await?;
+        
+        // Connect the fetch handler to the produce handler
+        produce_handler_inner.set_fetch_handler(fetch_handler.clone());
+        let produce_handler = Arc::new(produce_handler_inner);
         
         // Start background tasks for segment rotation
         produce_handler.start_background_tasks().await;
         
         // Initialize Kafka protocol handler with all components
-        let kafka_handler = Arc::new(KafkaProtocolHandler::new(
+        let kafka_handler = Arc::new(KafkaProtocolHandler::new_with_fetch_handler(
             produce_handler,
             segment_reader,
             metadata_store.clone(),
             object_store_arc.clone(),
+            fetch_handler,
             config.node_id,
             config.advertised_host.clone(),
             config.advertised_port,

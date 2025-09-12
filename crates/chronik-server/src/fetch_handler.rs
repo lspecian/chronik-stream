@@ -110,6 +110,10 @@ impl FetchHandler {
         max_wait_ms: i32,
         min_bytes: i32,
     ) -> Result<FetchResponsePartition> {
+        tracing::info!(
+            "fetch_partition called - topic: {}, partition: {}, fetch_offset: {}, max_bytes: {}",
+            topic, partition, fetch_offset, max_bytes
+        );
         // First check if topic exists
         let topic_metadata = match self.metadata_store.get_topic(topic).await? {
             Some(meta) => meta,
@@ -151,10 +155,25 @@ impl FetchHandler {
         }
         
         // Calculate high watermark from segments
-        let high_watermark = segments.iter()
+        let segment_high_watermark = segments.iter()
             .map(|s| s.end_offset + 1)
             .max()
             .unwrap_or(0);
+        
+        // Also check buffer for high watermark
+        let buffer_high_watermark = {
+            let state = self.state.read().await;
+            let key = (topic.to_string(), partition);
+            state.buffers.get(&key).map(|b| b.high_watermark).unwrap_or(0)
+        };
+        
+        // Use the maximum of segment and buffer high watermarks
+        let high_watermark = segment_high_watermark.max(buffer_high_watermark);
+        
+        tracing::info!(
+            "High watermark for {}-{}: segment={}, buffer={}, final={}",
+            topic, partition, segment_high_watermark, buffer_high_watermark, high_watermark
+        );
         
         let log_start_offset = segments.iter()
             .map(|s| s.start_offset)
@@ -177,6 +196,11 @@ impl FetchHandler {
         
         // If we have data available (fetch_offset < high_watermark), fetch it
         if fetch_offset < high_watermark {
+            tracing::info!(
+                "Data available for fetch - topic: {}, partition: {}, fetch_offset: {}, high_watermark: {}",
+                topic, partition, fetch_offset, high_watermark
+            );
+            
             // Data is available, fetch it
             let fetch_timeout = if max_wait_ms > 0 {
                 Duration::from_millis(max_wait_ms as u64)
@@ -337,6 +361,11 @@ impl FetchHandler {
         high_watermark: i64,
         max_bytes: i32,
     ) -> Result<Vec<chronik_storage::Record>> {
+        tracing::info!(
+            "fetch_records called - topic: {}, partition: {}, fetch_offset: {}, high_watermark: {}",
+            topic, partition, fetch_offset, high_watermark
+        );
+        
         let mut records = Vec::new();
         let mut current_offset = fetch_offset;
         let mut bytes_fetched = 0;
@@ -362,16 +391,33 @@ impl FetchHandler {
                         }
                     }
                     
-                    if current_offset >= high_watermark || bytes_fetched >= max_bytes as usize {
+                    // Don't return early - we may need to fetch more from segments
+                    // Only return early if we've reached the high watermark
+                    if current_offset >= high_watermark {
+                        tracing::info!(
+                            "Reached high watermark from buffer - returning {} records",
+                            records.len()
+                        );
                         return Ok(records);
                     }
+                    // Continue to check segments even if we hit max_bytes in buffer
                 }
             }
         }
         
         // If we need more data, fetch from segments
-        if current_offset < high_watermark {
+        if current_offset < high_watermark && bytes_fetched < max_bytes as usize {
+            tracing::info!(
+                "Fetching from segments - current_offset: {}, high_watermark: {}, bytes_fetched: {}",
+                current_offset, high_watermark, bytes_fetched
+            );
+            
             let segments = self.get_segments_for_range(topic, partition, current_offset, high_watermark).await?;
+            
+            tracing::info!(
+                "Found {} segments for range {}-{}", 
+                segments.len(), current_offset, high_watermark
+            );
             
             for segment_info in segments {
                 if bytes_fetched >= max_bytes as usize && !records.is_empty() {
@@ -392,6 +438,15 @@ impl FetchHandler {
                 ).await?;
                 
                 for record in segment_records {
+                    // Log what we're fetching for debugging
+                    tracing::info!(
+                        "FETCH: partition={} offset={} value_len={} value_preview={}",
+                        partition,
+                        record.offset,
+                        record.value.len(),
+                        String::from_utf8_lossy(&record.value[..std::cmp::min(50, record.value.len())])
+                    );
+                    
                     records.push(record.clone());
                     current_offset = record.offset + 1;
                     bytes_fetched += record.value.len() + 
@@ -400,9 +455,9 @@ impl FetchHandler {
             }
         }
         
-        debug!(
-            "Fetched {} records from {}-{} starting at offset {}", 
-            records.len(), topic, partition, fetch_offset
+        tracing::info!(
+            "fetch_records complete - fetched {} records from {}-{} starting at offset {} (current_offset: {})", 
+            records.len(), topic, partition, fetch_offset, current_offset
         );
         
         Ok(records)
@@ -416,6 +471,10 @@ impl FetchHandler {
         start_offset: i64,
         end_offset: i64,
     ) -> Result<Vec<SegmentInfo>> {
+        tracing::info!(
+            "get_segments_for_range - topic: {}, partition: {}, range: {}-{}",
+            topic, partition, start_offset, end_offset
+        );
         // Check cache first
         {
             let state = self.state.read().await;
@@ -434,8 +493,30 @@ impl FetchHandler {
         // Query metadata store
         let segments = self.metadata_store.list_segments(topic, Some(partition as u32)).await?;
         
+        tracing::info!(
+            "Retrieved {} total segments from metadata store for {}-{}",
+            segments.len(), topic, partition
+        );
+        
+        for seg in &segments {
+            tracing::debug!(
+                "  Segment {}: offsets {}-{}, path: {}",
+                seg.segment_id, seg.start_offset, seg.end_offset, seg.path
+            );
+        }
+        
         let segment_infos: Vec<_> = segments.into_iter()
-            .filter(|s| s.end_offset >= start_offset && s.start_offset < end_offset)
+            .filter(|s| {
+                // A segment is relevant if it overlaps with our range
+                let overlaps = s.end_offset >= start_offset && s.start_offset < end_offset;
+                if overlaps {
+                    tracing::info!(
+                        "  Including segment {} (offsets {}-{}) for range {}-{}",
+                        s.segment_id, s.start_offset, s.end_offset, start_offset, end_offset
+                    );
+                }
+                overlaps
+            })
             .map(|s| SegmentInfo {
                 segment_id: s.segment_id,
                 base_offset: s.start_offset,
@@ -443,6 +524,11 @@ impl FetchHandler {
                 object_key: s.path,
             })
             .collect();
+        
+        tracing::info!(
+            "Filtered to {} segments for offset range {}-{}",
+            segment_infos.len(), start_offset, end_offset
+        );
         
         // Update cache
         {
@@ -622,11 +708,14 @@ impl FetchHandler {
         
         let base_offset = records.first().unwrap().offset;
         
+        tracing::info!("update_buffer called: topic={}, partition={}, num_records={}, high_watermark={}, base_offset={}", 
+            topic, partition, records.len(), high_watermark, base_offset);
+        
         let mut state = self.state.write().await;
         let key = (topic.to_string(), partition);
         
         // Create or update buffer
-        let buffer = state.buffers.entry(key).or_insert(PartitionBuffer {
+        let buffer = state.buffers.entry(key.clone()).or_insert(PartitionBuffer {
             records: Vec::new(),
             base_offset,
             high_watermark,
@@ -635,6 +724,9 @@ impl FetchHandler {
         // Add new records
         buffer.records.extend(records);
         buffer.high_watermark = high_watermark;
+        
+        tracing::info!("Buffer updated: key={:?}, total_records={}, high_watermark={}", 
+            key, buffer.records.len(), buffer.high_watermark);
         
         // Trim old records if buffer is too large (keep last 1000 records)
         if buffer.records.len() > 1000 {

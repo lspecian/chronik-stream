@@ -73,6 +73,33 @@ impl KafkaProtocolHandler {
         })
     }
     
+    /// Create a new Kafka protocol handler with a pre-created FetchHandler
+    pub async fn new_with_fetch_handler(
+        produce_handler: Arc<ProduceHandler>,
+        segment_reader: Arc<SegmentReader>,
+        metadata_store: Arc<dyn MetadataStore>,
+        object_store: Arc<dyn ObjectStoreTrait>,
+        fetch_handler: Arc<FetchHandler>,
+        node_id: i32,
+        host: String,
+        port: i32,
+    ) -> Result<Self> {
+        let group_manager = Arc::new(GroupManager::new(metadata_store.clone()));
+        group_manager.clone().start_expiration_checker();
+        
+        Ok(Self {
+            protocol_handler: ProtocolHandler::with_metadata_and_broker(metadata_store.clone(), node_id),
+            produce_handler,
+            segment_reader,
+            metadata_store,
+            group_manager,
+            fetch_handler,
+            node_id,
+            host: host.clone(),
+            port,
+        })
+    }
+    
     /// Handle a Kafka protocol request
     #[instrument(skip(self, request_bytes))]
     pub async fn handle_request(&self, request_bytes: &[u8]) -> Result<Response> {
@@ -493,15 +520,22 @@ impl KafkaProtocolHandler {
                     commit_timestamp: chrono::Utc::now(),
                 };
                 
-                match self.metadata_store.commit_offset(offset).await {
+                match self.metadata_store.commit_offset(offset.clone()).await {
                     Ok(_) => {
+                        tracing::info!(
+                            "Successfully committed offset - group: {}, topic: {}, partition: {}, offset: {}",
+                            offset.group_id, offset.topic, offset.partition, offset.offset
+                        );
                         response_partitions.push(OffsetCommitResponsePartition {
                             partition_index: partition.partition_index,
                             error_code: 0,
                         });
                     }
                     Err(e) => {
-                        tracing::error!("Failed to commit offset: {:?}", e);
+                        tracing::error!(
+                            "Failed to commit offset - group: {}, topic: {}, partition: {}, offset: {}, error: {:?}",
+                            offset.group_id, offset.topic, offset.partition, offset.offset, e
+                        );
                         response_partitions.push(OffsetCommitResponsePartition {
                             partition_index: partition.partition_index,
                             error_code: 5, // UNKNOWN_TOPIC_OR_PARTITION
