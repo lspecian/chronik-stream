@@ -776,29 +776,32 @@ impl ProduceHandler {
         // Drop memory permit
         drop(memory_permit);
         
-        // Update fetch handler buffer immediately so data is available for fetch
-        // This is critical for small batches that don't meet flush thresholds
-        if let Some(fetch_handler) = &self.fetch_handler {
-            let storage_records: Vec<Record> = records.iter().map(|r| Record {
-                offset: r.offset,
-                timestamp: r.timestamp,
-                key: r.key.clone(),
-                value: r.value.clone(),
-                headers: r.headers.clone(),
-            }).collect();
-            
-            let high_watermark = partition_state.high_watermark.load(Ordering::Relaxed) as i64;
-            
-            info!("Updating fetch handler buffer with {} records for {}-{}, high_watermark={}", 
-                storage_records.len(), topic, partition, high_watermark);
-            
-            if let Err(e) = fetch_handler.update_buffer(topic, partition, storage_records, high_watermark).await {
-                warn!("Failed to update fetch handler buffer: {:?}", e);
-            } else {
-                info!("Successfully updated fetch handler buffer for {}-{}", topic, partition);
+        // Update fetch handler buffer with these unflushed messages so they're immediately available
+        if let Some(ref fetch_handler) = self.fetch_handler {
+            let mut records_for_buffer = Vec::new();
+            for record in &records {
+                records_for_buffer.push(Record {
+                    offset: record.offset,
+                    timestamp: record.timestamp,
+                    key: record.key.clone(),
+                    value: record.value.clone(),
+                    headers: record.headers.clone(),
+                });
             }
-        } else {
-            warn!("No fetch handler available to update buffer for {}-{}", topic, partition);
+            
+            if !records_for_buffer.is_empty() {
+                let high_watermark = partition_state.high_watermark.load(Ordering::Relaxed) as i64;
+                // Log what we're sending to the buffer
+                let first_offset = records_for_buffer.first().unwrap().offset;
+                let last_offset = records_for_buffer.last().unwrap().offset;
+                warn!("ProduceHandler: Sending {} records to buffer, offset_range=[{}-{}], high_watermark={}", 
+                    records_for_buffer.len(), first_offset, last_offset, high_watermark);
+                
+                debug!("Updating fetch handler buffer with {} unflushed records", records_for_buffer.len());
+                if let Err(e) = fetch_handler.update_buffer(topic, partition, records_for_buffer, high_watermark).await {
+                    warn!("Failed to update fetch handler buffer: {:?}", e);
+                }
+            }
         }
         
         // Flush immediately to ensure data is available for fetch
@@ -1135,15 +1138,28 @@ impl ProduceHandler {
             return Ok(());
         }
         
+        // DON'T update buffer here - records should already be in buffer from handle_partition_produce
+        // and we're about to flush them to segments. The buffer should only contain unflushed messages.
+        // After writing to segments, mark_flushed will clear them from the buffer.
+        
+        // Track the highest offset being flushed
+        let mut highest_flushed_offset = -1i64;
+        
         // Process each batch while preserving original wire format
         for batch in &batches {
             // Convert ProduceRecords to Records for storage (indexed format)
-            let storage_records: Vec<Record> = batch.records.iter().map(|r| Record {
-                offset: r.offset,
-                timestamp: r.timestamp,
-                key: r.key.clone(),
-                value: r.value.clone(),
-                headers: r.headers.clone(),
+            let storage_records: Vec<Record> = batch.records.iter().map(|r| {
+                // Track the highest offset
+                if r.offset > highest_flushed_offset {
+                    highest_flushed_offset = r.offset;
+                }
+                Record {
+                    offset: r.offset,
+                    timestamp: r.timestamp,
+                    key: r.key.clone(),
+                    value: r.value.clone(),
+                    headers: r.headers.clone(),
+                }
             }).collect();
             
             // Convert to RecordBatch for indexed storage
@@ -1207,25 +1223,20 @@ impl ProduceHandler {
         state.segment_size.fetch_add(total_records as u64 * 100, Ordering::Relaxed); // Approximate size
         *state.last_flush.lock().await = Instant::now();
         
-        // Update fetch handler buffer if available
-        if let Some(ref fetch_handler) = self.fetch_handler {
-            // Collect all records from all batches for fetch handler
-            let mut all_storage_records = Vec::new();
-            for batch in &batches {
-                let storage_records: Vec<chronik_storage::Record> = batch.records.iter().map(|r| chronik_storage::Record {
-                    offset: r.offset,
-                    timestamp: r.timestamp,
-                    key: r.key.clone(),
-                    value: r.value.clone(),
-                    headers: r.headers.clone(),
-                }).collect();
-                all_storage_records.extend(storage_records);
-            }
-            
-            let high_watermark = state.high_watermark.load(Ordering::Relaxed) as i64;
-            
-            if let Err(e) = fetch_handler.update_buffer(topic, partition, all_storage_records, high_watermark).await {
-                warn!("Failed to update fetch handler buffer: {:?}", e);
+        // NOTE: We no longer update the fetch handler buffer here because
+        // messages are already added to the buffer in handle_partition_produce.
+        // This was causing duplication - messages were being added to the buffer twice!
+        
+        // After successful flush, notify fetch handler to remove flushed records from buffer
+        if highest_flushed_offset >= 0 {
+            if let Some(ref fetch_handler) = self.fetch_handler {
+                if let Err(e) = fetch_handler.mark_flushed(topic, partition, highest_flushed_offset).await {
+                    warn!("Failed to mark records as flushed in fetch handler: {:?}", e);
+                    // Continue anyway - this is not critical for correctness
+                } else {
+                    debug!("Marked records up to offset {} as flushed for {}-{}", 
+                        highest_flushed_offset, topic, partition);
+                }
             }
         }
         

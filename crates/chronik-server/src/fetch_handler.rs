@@ -18,6 +18,8 @@ struct PartitionBuffer {
     records: Vec<chronik_storage::Record>,
     base_offset: i64,
     high_watermark: i64,
+    /// Highest offset that has been flushed to segments
+    flushed_offset: i64,
 }
 
 /// Fetch handler state
@@ -370,61 +372,25 @@ impl FetchHandler {
         let mut current_offset = fetch_offset;
         let mut bytes_fetched = 0;
         
-        // First check in-memory buffer
-        {
-            let state = self.state.read().await;
-            if let Some(buffer) = state.buffers.get(&(topic.to_string(), partition)) {
-                if fetch_offset >= buffer.base_offset && fetch_offset < buffer.high_watermark {
-                    // Fetch from buffer
-                    for record in &buffer.records {
-                        if record.offset >= fetch_offset && record.offset < high_watermark {
-                            let record_size = record.value.len() + 
-                                record.key.as_ref().map(|k| k.len()).unwrap_or(0) + 24;
-                            
-                            if bytes_fetched + record_size > max_bytes as usize && !records.is_empty() {
-                                break;
-                            }
-                            
-                            records.push(record.clone());
-                            current_offset = record.offset + 1;
-                            bytes_fetched += record_size;
-                        }
-                    }
-                    
-                    // Don't return early - we may need to fetch more from segments
-                    // Only return early if we've reached the high watermark
-                    if current_offset >= high_watermark {
-                        tracing::info!(
-                            "Reached high watermark from buffer - returning {} records",
-                            records.len()
-                        );
-                        return Ok(records);
-                    }
-                    // Continue to check segments even if we hit max_bytes in buffer
-                }
-            }
-        }
+        // First, determine the boundary between segments and buffer
+        // Get the highest offset in segments
+        let segments = self.get_segments_for_range(topic, partition, fetch_offset, high_watermark).await?;
+        let max_segment_offset = segments.iter()
+            .map(|s| s.last_offset)
+            .max()
+            .unwrap_or(-1);
         
-        // If we need more data, fetch from segments
-        if current_offset < high_watermark && bytes_fetched < max_bytes as usize {
-            tracing::info!(
-                "Fetching from segments - current_offset: {}, high_watermark: {}, bytes_fetched: {}",
-                current_offset, high_watermark, bytes_fetched
-            );
-            
-            let segments = self.get_segments_for_range(topic, partition, current_offset, high_watermark).await?;
-            
-            tracing::info!(
-                "Found {} segments for range {}-{}", 
-                segments.len(), current_offset, high_watermark
-            );
-            
+        tracing::info!("Max segment offset: {}, fetch_offset: {}", max_segment_offset, fetch_offset);
+        
+        // PHASE 1: Fetch from segments if needed
+        if fetch_offset <= max_segment_offset {
+            // We need to fetch from segments
             for segment_info in segments {
                 if bytes_fetched >= max_bytes as usize && !records.is_empty() {
                     break;
                 }
                 
-                // Skip segments before our offset
+                // Skip segments before our current offset
                 if segment_info.last_offset < current_offset {
                     continue;
                 }
@@ -433,24 +399,60 @@ impl FetchHandler {
                 let segment_records = self.fetch_from_segment(
                     &segment_info,
                     current_offset,
-                    high_watermark,
+                    std::cmp::min(high_watermark, max_segment_offset + 1), // Don't fetch beyond segment boundary
                     max_bytes - bytes_fetched as i32,
                 ).await?;
                 
                 for record in segment_records {
-                    // Log what we're fetching for debugging
-                    tracing::info!(
-                        "FETCH: partition={} offset={} value_len={} value_preview={}",
-                        partition,
-                        record.offset,
-                        record.value.len(),
-                        String::from_utf8_lossy(&record.value[..std::cmp::min(50, record.value.len())])
+                    tracing::debug!(
+                        "FETCH from segment: partition={} offset={} value_len={}",
+                        partition, record.offset, record.value.len()
                     );
                     
                     records.push(record.clone());
                     current_offset = record.offset + 1;
                     bytes_fetched += record.value.len() + 
                         record.key.as_ref().map(|k| k.len()).unwrap_or(0) + 24;
+                    
+                    if bytes_fetched >= max_bytes as usize {
+                        break;
+                    }
+                }
+            }
+            
+            // Update current_offset to continue from after segments
+            current_offset = std::cmp::max(current_offset, max_segment_offset + 1);
+        }
+        
+        // PHASE 2: Fetch from buffer ONLY for offsets > max_segment_offset
+        if current_offset < high_watermark && bytes_fetched < max_bytes as usize {
+            let state = self.state.read().await;
+            if let Some(buffer) = state.buffers.get(&(topic.to_string(), partition)) {
+                // Only fetch from buffer for offsets that are NOT in segments
+                for record in &buffer.records {
+                    // Only include records that are:
+                    // 1. At or after current_offset (which is now > max_segment_offset)
+                    // 2. Before high_watermark
+                    // 3. NOT already in segments (offset > max_segment_offset)
+                    if record.offset >= current_offset && 
+                       record.offset < high_watermark &&
+                       record.offset > max_segment_offset {
+                        let record_size = record.value.len() + 
+                            record.key.as_ref().map(|k| k.len()).unwrap_or(0) + 24;
+                        
+                        if bytes_fetched + record_size > max_bytes as usize && !records.is_empty() {
+                            break;
+                        }
+                        
+                        tracing::debug!(
+                            "FETCH from buffer: partition={} offset={} value_len={}",
+                            partition, record.offset, record.value.len()
+                        );
+                        
+                        records.push(record.clone());
+                        current_offset = record.offset + 1;
+                        bytes_fetched += record_size;
+                    }
                 }
             }
         }
@@ -694,7 +696,8 @@ impl FetchHandler {
         Ok(combined_bytes)
     }
     
-    /// Update in-memory buffer with new records
+    /// Update in-memory buffer with new records  
+    /// IMPORTANT: This should only be called with NEW unflushed records, not all records
     pub async fn update_buffer(
         &self,
         topic: &str,
@@ -707,23 +710,59 @@ impl FetchHandler {
         }
         
         let base_offset = records.first().unwrap().offset;
+        let last_offset = records.last().unwrap().offset;
         
-        tracing::info!("update_buffer called: topic={}, partition={}, num_records={}, high_watermark={}, base_offset={}", 
-            topic, partition, records.len(), high_watermark, base_offset);
+        // Log the offset range of records being added
+        tracing::warn!("update_buffer called: topic={}, partition={}, num_records={}, high_watermark={}, offset_range=[{}-{}]", 
+            topic, partition, records.len(), high_watermark, base_offset, last_offset);
+        
+        // Log first few record offsets for debugging
+        let debug_offsets: Vec<i64> = records.iter().take(5).map(|r| r.offset).collect();
+        tracing::warn!("First few offsets being added to buffer: {:?}", debug_offsets);
         
         let mut state = self.state.write().await;
         let key = (topic.to_string(), partition);
         
-        // Create or update buffer
+        // Check what's already in the buffer
+        if let Some(existing_buffer) = state.buffers.get(&key) {
+            let existing_offsets: Vec<i64> = existing_buffer.records.iter().take(5).map(|r| r.offset).collect();
+            tracing::warn!("Buffer already contains {} records, first few offsets: {:?}", 
+                existing_buffer.records.len(), existing_offsets);
+        }
+        
+        // Create or get buffer
         let buffer = state.buffers.entry(key.clone()).or_insert(PartitionBuffer {
             records: Vec::new(),
             base_offset,
             high_watermark,
+            flushed_offset: -1,  // Nothing flushed initially
         });
         
-        // Add new records
-        buffer.records.extend(records);
+        // CRITICAL FIX: Only add NEW records that aren't already in the buffer
+        // Check if these are actually new records or if we're being called with cumulative data
+        let mut new_records = Vec::new();
+        for record in records {
+            // Only add records that aren't already in the buffer
+            if !buffer.records.iter().any(|r| r.offset == record.offset) {
+                new_records.push(record);
+            } else {
+                tracing::warn!("Skipping duplicate record at offset {}", record.offset);
+            }
+        }
+        
+        // Append only the new records
+        if !new_records.is_empty() {
+            tracing::warn!("Adding {} truly new records to buffer", new_records.len());
+            buffer.records.extend(new_records);
+        }
+        
+        // Update metadata
+        if !buffer.records.is_empty() {
+            buffer.base_offset = buffer.records.first().unwrap().offset;
+        }
         buffer.high_watermark = high_watermark;
+        
+        tracing::warn!("Buffer updated: now contains {} records total", buffer.records.len());
         
         tracing::info!("Buffer updated: key={:?}, total_records={}, high_watermark={}", 
             key, buffer.records.len(), buffer.high_watermark);
@@ -745,6 +784,38 @@ impl FetchHandler {
         let mut state = self.state.write().await;
         state.buffers.retain(|(t, _), _| t != topic);
         state.segment_cache.retain(|(t, _), _| t != topic);
+        Ok(())
+    }
+    
+    /// Mark records as flushed to segment (removes them from buffer)
+    /// Clear buffer completely after flush to segments
+    pub async fn mark_flushed(
+        &self,
+        topic: &str,
+        partition: i32,
+        up_to_offset: i64,
+    ) -> Result<()> {
+        tracing::debug!("Clearing buffer after flush: topic={}, partition={}, up_to_offset={}",
+            topic, partition, up_to_offset);
+        
+        let mut state = self.state.write().await;
+        let key = (topic.to_string(), partition);
+        
+        if let Some(buffer) = state.buffers.get_mut(&key) {
+            let cleared_count = buffer.records.len();
+            
+            // Clear ALL records from buffer after flush
+            // The buffer should only contain unflushed messages
+            buffer.records.clear();
+            
+            // Update offsets to continue from where we left off
+            buffer.base_offset = up_to_offset + 1;
+            buffer.flushed_offset = up_to_offset;
+            
+            tracing::info!("Cleared {} records from buffer after flush to offset {} for {}-{}",
+                cleared_count, up_to_offset, topic, partition);
+        }
+        
         Ok(())
     }
     
