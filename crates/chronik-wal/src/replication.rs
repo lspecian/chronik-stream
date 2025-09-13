@@ -23,12 +23,17 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use parking_lot::RwLock;
-use tokio::sync::{mpsc, oneshot, broadcast};
+use tokio::sync::{mpsc, broadcast};
 use tracing::{info, warn, debug, error};
 use serde::{Serialize, Deserialize};
 
-use crate::{WalRecord, WalOffset, TopicPartition};
+use crate::{WalRecord};
+use crate::manager::TopicPartition;
 use crate::error::{Result, WalError};
+
+/// WAL offset type
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct WalOffset(pub i64);
 
 /// Replica node identifier
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -250,7 +255,7 @@ impl ReplicaSet {
                 offsets.get(&(*replica_id, topic_partition.clone()))
             })
             .min()
-            .copied()
+            .map(|offset| *offset)
     }
 }
 
@@ -360,8 +365,13 @@ impl WALLeader {
                     timestamp: chrono::Utc::now().timestamp_millis(),
                 };
                 
-                let transports = replica_set.transports.read();
-                for (_, transport) in transports.iter() {
+                // Collect transports first to avoid holding lock across await
+                let transport_list: Vec<_> = {
+                    let transports = replica_set.transports.read();
+                    transports.values().cloned().collect()
+                };
+                
+                for transport in transport_list {
                     let _ = transport.broadcast(event.clone()).await;
                 }
             }

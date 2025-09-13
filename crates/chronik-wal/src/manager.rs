@@ -6,6 +6,7 @@ use std::time::Instant;
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use tracing::{info, debug, instrument};
+use serde::{Serialize, Deserialize};
 
 use crate::{
     config::WalConfig,
@@ -18,7 +19,7 @@ use crate::{
 };
 
 /// Topic-partition identifier
-#[derive(Debug, Clone, Hash, Eq, PartialEq)]
+#[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TopicPartition {
     pub topic: String,
     pub partition: i32,

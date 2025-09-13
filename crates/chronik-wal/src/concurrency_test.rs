@@ -222,8 +222,15 @@ async fn run_producer(
         
         // Perform append with lock scoped properly
         let append_result = {
-            let mut manager = wal_manager.lock();
-            manager.append(topic.clone(), partition, vec![record]).await
+            let manager = wal_manager.clone();
+            let topic_clone = topic.clone();
+            let record_clone = record;
+            tokio::task::spawn_blocking(move || {
+                tokio::runtime::Handle::current().block_on(async move {
+                    let mut mgr = manager.lock();
+                    mgr.append(topic_clone, partition, vec![record_clone]).await
+                })
+            }).await.unwrap()
         };
         
         match append_result {
