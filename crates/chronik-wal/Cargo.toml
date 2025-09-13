@@ -1,0 +1,54 @@
+[package]
+name = "chronik-wal"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+wal = ["dep:memmap2"]
+wal-encryption = ["wal", "dep:ring"]
+wal-compression = ["wal", "dep:zstd"]
+async-io = ["dep:tokio-uring"]
+
+[dependencies]
+# Workspace dependencies
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+bytes = { workspace = true }
+byteorder = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+dashmap = { workspace = true }
+parking_lot = { workspace = true }
+
+# WAL-specific dependencies
+crc32fast = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bincode = { workspace = true }
+
+# Optional dependencies
+memmap2 = { version = "0.9", optional = true }
+ring = { version = "0.17", optional = true }
+zstd = { version = "0.13", optional = true }
+tokio-uring = { version = "0.4", optional = true }
+
+# Local dependencies
+chronik-common = { path = "../chronik-common" }
+
+[dev-dependencies]
+proptest = { workspace = true }
+criterion = { workspace = true }
+tempfile = { workspace = true }
+rand = "0.8"
+regex = "1.10"
+tokio = { workspace = true, features = ["test-util"] }
+

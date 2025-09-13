@@ -16,6 +16,7 @@ path = "src/main.rs"
 chronik-common = { path = "../chronik-common" }
 chronik-protocol = { path = "../chronik-protocol" }
 chronik-storage = { path = "../chronik-storage" }
+chronik-wal = { path = "../chronik-wal" }
 # chronik-ingest removed - code moved directly into chronik-server
 chronik-monitoring = { path = "../chronik-monitoring" }
 chronik-auth = { path = "../chronik-auth" }

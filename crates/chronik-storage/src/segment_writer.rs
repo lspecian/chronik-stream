@@ -248,6 +248,35 @@ impl SegmentWriter {
                 created_at: Utc::now(),
             };
             
+            tracing::warn!("SEGMENT→ROTATED: Rotated and finalized segment {}-{}: offsets {}-{}, {} records",
+                metadata.topic, metadata.partition, metadata.start_offset, metadata.end_offset, metadata.record_count);
+            
+            return Ok(Some(metadata));
+        }
+        
+        // CRITICAL FIX: Always return metadata for active segments with records
+        // This ensures segments are immediately discoverable without waiting for rotation
+        if active.record_count > 0 {
+            // Create metadata for the active segment
+            let metadata = SegmentMetadata {
+                segment_id: active.id.0.to_string(),
+                topic: active.topic.clone(),
+                partition: active.partition as u32,
+                start_offset: active.base_offset,
+                end_offset: active.last_offset,
+                size: active.current_size as i64,
+                record_count: active.record_count as i64,
+                path: format!("{}/{}/{}.segment",
+                    active.topic,
+                    active.partition,
+                    active.id.0
+                ),
+                created_at: Utc::now(),
+            };
+            
+            tracing::warn!("SEGMENT→METADATA: Created metadata for active segment {}-{}: offsets {}-{}, {} records (not rotated)",
+                metadata.topic, metadata.partition, metadata.start_offset, metadata.end_offset, metadata.record_count);
+            
             return Ok(Some(metadata));
         }
         

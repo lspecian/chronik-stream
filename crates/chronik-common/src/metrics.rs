@@ -24,6 +24,11 @@ pub struct Metrics {
     pub segment_writes_total: CounterVec,
     pub segment_reads_total: CounterVec,
     pub object_store_latency: HistogramVec,
+    
+    // WAL batch fsync metrics
+    pub wal_batch_flushes_total: CounterVec,
+    pub wal_batch_flush_duration_seconds: HistogramVec,
+    pub wal_batch_size: HistogramVec,
 }
 
 static METRICS: OnceLock<Metrics> = OnceLock::new();
@@ -99,6 +104,26 @@ impl Metrics {
                 "Object store operation latency",
                 &["operation", "backend"],
                 exponential_buckets(0.001, 2.0, 10)?
+            )?,
+            
+            wal_batch_flushes_total: register_counter_vec!(
+                "chronik_wal_batch_flushes_total",
+                "Total number of WAL batch flushes",
+                &["topic", "partition"]
+            )?,
+            
+            wal_batch_flush_duration_seconds: register_histogram_vec!(
+                "chronik_wal_batch_flush_duration_seconds",
+                "WAL batch flush duration in seconds",
+                &["topic", "partition"],
+                exponential_buckets(0.001, 2.0, 10)?
+            )?,
+            
+            wal_batch_size: register_histogram_vec!(
+                "chronik_wal_batch_size",
+                "WAL batch size (number of operations per batch)",
+                &["topic", "partition"],
+                exponential_buckets(1.0, 2.0, 8)?
             )?,
         };
         

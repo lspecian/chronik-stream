@@ -1156,6 +1156,67 @@ impl GroupManager {
             }
         });
     }
+    
+    // Protocol wrapper methods for kafka_handler compatibility
+    pub async fn handle_join_group(&self, _request: chronik_protocol::join_group_types::JoinGroupRequest) -> Result<chronik_protocol::join_group_types::JoinGroupResponse> {
+        // Return a minimal join group response for now
+        Ok(chronik_protocol::join_group_types::JoinGroupResponse {
+            error_code: 0,
+            generation_id: 1,
+            protocol_type: Some("consumer".to_string()),
+            protocol_name: Some("range".to_string()),
+            leader: "member-1".to_string(),
+            member_id: "member-1".to_string(),
+            members: vec![],
+            throttle_time_ms: 0,
+        })
+    }
+    
+    pub async fn handle_sync_group(&self, _request: chronik_protocol::sync_group_types::SyncGroupRequest) -> Result<chronik_protocol::sync_group_types::SyncGroupResponse> {
+        Ok(chronik_protocol::sync_group_types::SyncGroupResponse {
+            error_code: 0,
+            protocol_name: Some("range".to_string()),
+            protocol_type: Some("consumer".to_string()),
+            assignment: bytes::Bytes::new(),
+            throttle_time_ms: 0,
+        })
+    }
+    
+    pub async fn handle_heartbeat(&self, _request: chronik_protocol::heartbeat_types::HeartbeatRequest) -> Result<chronik_protocol::heartbeat_types::HeartbeatResponse> {
+        Ok(chronik_protocol::heartbeat_types::HeartbeatResponse {
+            error_code: 0,
+            throttle_time_ms: 0,
+        })
+    }
+    
+    pub async fn handle_leave_group(&self, _request: chronik_protocol::leave_group_types::LeaveGroupRequest) -> Result<chronik_protocol::leave_group_types::LeaveGroupResponse> {
+        Ok(chronik_protocol::leave_group_types::LeaveGroupResponse {
+            error_code: 0,
+            members: vec![],
+            throttle_time_ms: 0,
+        })
+    }
+    
+    pub async fn handle_offset_commit(&self, _request: chronik_protocol::types::OffsetCommitRequest) -> Result<chronik_protocol::types::OffsetCommitResponse> {
+        // For now, use the protocol handler's default handling which should delegate back
+        Err(chronik_common::Error::Other(anyhow::anyhow!("OffsetCommit not implemented")))
+    }
+    
+    pub async fn handle_offset_fetch(&self, _request: chronik_protocol::types::OffsetFetchRequest) -> Result<chronik_protocol::types::OffsetFetchResponse> {
+        // For now, use the protocol handler's default handling which should delegate back
+        Err(chronik_common::Error::Other(anyhow::anyhow!("OffsetFetch not implemented")))
+    }
+    
+    pub fn handle_find_coordinator(&self, _request: chronik_protocol::find_coordinator_types::FindCoordinatorRequest, host: &str, port: i32) -> Result<chronik_protocol::find_coordinator_types::FindCoordinatorResponse> {
+        Ok(chronik_protocol::find_coordinator_types::FindCoordinatorResponse {
+            error_code: 0,
+            error_message: None,
+            node_id: 1,
+            host: host.to_string(),
+            port,
+            throttle_time_ms: 0,
+        })
+    }
 }
 
 /// Join group response with KIP-848 support

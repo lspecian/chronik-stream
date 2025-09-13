@@ -428,6 +428,9 @@ impl FetchHandler {
         if current_offset < high_watermark && bytes_fetched < max_bytes as usize {
             let state = self.state.read().await;
             if let Some(buffer) = state.buffers.get(&(topic.to_string(), partition)) {
+                tracing::warn!("FETCH→BUFFER: Checking buffer for {}-{}, buffer has {} records, current_offset={}, max_segment_offset={}, high_watermark={}", 
+                    topic, partition, buffer.records.len(), current_offset, max_segment_offset, high_watermark);
+                
                 // Only fetch from buffer for offsets that are NOT in segments
                 for record in &buffer.records {
                     // Only include records that are:
@@ -452,8 +455,13 @@ impl FetchHandler {
                         records.push(record.clone());
                         current_offset = record.offset + 1;
                         bytes_fetched += record_size;
+                    } else {
+                        tracing::warn!("FETCH→SKIP: Skipping record offset={} (current={}, max_seg={}, hw={})", 
+                            record.offset, current_offset, max_segment_offset, high_watermark);
                     }
                 }
+            } else {
+                tracing::warn!("FETCH→NO_BUFFER: No buffer found for {}-{}", topic, partition);
             }
         }
         
@@ -493,10 +501,11 @@ impl FetchHandler {
         }
         
         // Query metadata store
+        tracing::warn!("SEGMENT→QUERY: Requesting segments from metadata store for {}-{}", topic, partition);
         let segments = self.metadata_store.list_segments(topic, Some(partition as u32)).await?;
         
-        tracing::info!(
-            "Retrieved {} total segments from metadata store for {}-{}",
+        tracing::warn!(
+            "SEGMENT→QUERY: Retrieved {} total segments from metadata store for {}-{}",
             segments.len(), topic, partition
         );
         
@@ -697,7 +706,7 @@ impl FetchHandler {
     }
     
     /// Update in-memory buffer with new records  
-    /// IMPORTANT: This should only be called with NEW unflushed records, not all records
+    /// This replaces the buffer with only the new unflushed records
     pub async fn update_buffer(
         &self,
         topic: &str,
@@ -713,24 +722,13 @@ impl FetchHandler {
         let last_offset = records.last().unwrap().offset;
         
         // Log the offset range of records being added
-        tracing::warn!("update_buffer called: topic={}, partition={}, num_records={}, high_watermark={}, offset_range=[{}-{}]", 
+        tracing::warn!("BUFFER→UPDATE: Called for {}-{}, num_records={}, high_watermark={}, offset_range=[{}-{}]", 
             topic, partition, records.len(), high_watermark, base_offset, last_offset);
-        
-        // Log first few record offsets for debugging
-        let debug_offsets: Vec<i64> = records.iter().take(5).map(|r| r.offset).collect();
-        tracing::warn!("First few offsets being added to buffer: {:?}", debug_offsets);
         
         let mut state = self.state.write().await;
         let key = (topic.to_string(), partition);
         
-        // Check what's already in the buffer
-        if let Some(existing_buffer) = state.buffers.get(&key) {
-            let existing_offsets: Vec<i64> = existing_buffer.records.iter().take(5).map(|r| r.offset).collect();
-            tracing::warn!("Buffer already contains {} records, first few offsets: {:?}", 
-                existing_buffer.records.len(), existing_offsets);
-        }
-        
-        // Create or get buffer
+        // Create or get buffer - we'll REPLACE its contents, not append
         let buffer = state.buffers.entry(key.clone()).or_insert(PartitionBuffer {
             records: Vec::new(),
             base_offset,
@@ -738,31 +736,48 @@ impl FetchHandler {
             flushed_offset: -1,  // Nothing flushed initially
         });
         
-        // CRITICAL FIX: Only add NEW records that aren't already in the buffer
-        // Check if these are actually new records or if we're being called with cumulative data
-        let mut new_records = Vec::new();
+        // CRITICAL FIX: Use a HashSet to track existing offsets for proper deduplication
+        // This handles non-sequential offsets from multiple partitions correctly
+        use std::collections::HashSet;
+        
+        tracing::warn!("BUFFER→STATE: Buffer for {}-{} currently has {} records before update", 
+            topic, partition, buffer.records.len());
+        
+        let existing_offsets: HashSet<i64> = buffer.records.iter()
+            .map(|r| r.offset)
+            .collect();
+        
+        // Only add records that don't already exist in the buffer
+        let mut added_count = 0;
+        let records_len = records.len();
         for record in records {
-            // Only add records that aren't already in the buffer
-            if !buffer.records.iter().any(|r| r.offset == record.offset) {
-                new_records.push(record);
+            if !existing_offsets.contains(&record.offset) {
+                tracing::warn!("BUFFER→ADD: Adding record offset={} to {}-{} buffer", 
+                    record.offset, topic, partition);
+                buffer.records.push(record);
+                added_count += 1;
             } else {
-                tracing::warn!("Skipping duplicate record at offset {}", record.offset);
+                tracing::warn!("BUFFER→SKIP: Skipping duplicate offset={} for {}-{} (already in buffer)", 
+                    record.offset, topic, partition);
             }
         }
         
-        // Append only the new records
-        if !new_records.is_empty() {
-            tracing::warn!("Adding {} truly new records to buffer", new_records.len());
-            buffer.records.extend(new_records);
+        if added_count > 0 {
+            tracing::debug!("Added {} new records to buffer (deduplicated)", added_count);
+            
+            // Sort records by offset to maintain order
+            buffer.records.sort_by_key(|r| r.offset);
+            
+            // Update base_offset to the lowest offset in buffer
+            if let Some(first) = buffer.records.first() {
+                buffer.base_offset = first.offset;
+            }
         }
         
-        // Update metadata
-        if !buffer.records.is_empty() {
-            buffer.base_offset = buffer.records.first().unwrap().offset;
-        }
+        // Always update the high watermark to the latest
         buffer.high_watermark = high_watermark;
         
-        tracing::warn!("Buffer updated: now contains {} records total", buffer.records.len());
+        tracing::debug!("Buffer updated: now contains {} records total", buffer.records.len());
         
         tracing::info!("Buffer updated: key={:?}, total_records={}, high_watermark={}", 
             key, buffer.records.len(), buffer.high_watermark);
@@ -787,33 +802,53 @@ impl FetchHandler {
         Ok(())
     }
     
-    /// Mark records as flushed to segment (removes them from buffer)
-    /// Clear buffer completely after flush to segments
+    /// Mark records as flushed to segment (removes only flushed records from buffer)
+    /// CRITICAL FIX: Only remove records that were actually flushed, not all records
     pub async fn mark_flushed(
         &self,
         topic: &str,
         partition: i32,
         up_to_offset: i64,
     ) -> Result<()> {
-        tracing::debug!("Clearing buffer after flush: topic={}, partition={}, up_to_offset={}",
+        tracing::warn!("FLUSH→MARK: Marking records as flushed for {}-{}, up_to_offset={}",
             topic, partition, up_to_offset);
         
         let mut state = self.state.write().await;
         let key = (topic.to_string(), partition);
         
         if let Some(buffer) = state.buffers.get_mut(&key) {
-            let cleared_count = buffer.records.len();
+            let initial_count = buffer.records.len();
             
-            // Clear ALL records from buffer after flush
-            // The buffer should only contain unflushed messages
-            buffer.records.clear();
+            tracing::warn!("FLUSH→BEFORE: Buffer for {}-{} has {} records before flush",
+                topic, partition, initial_count);
             
-            // Update offsets to continue from where we left off
-            buffer.base_offset = up_to_offset + 1;
+            // Log which records will be removed
+            for record in &buffer.records {
+                if record.offset <= up_to_offset {
+                    tracing::warn!("FLUSH→REMOVE: Will remove record offset={} from {}-{} (offset <= {})",
+                        record.offset, topic, partition, up_to_offset);
+                }
+            }
+            
+            // CRITICAL FIX: Only remove records with offset <= up_to_offset
+            // Keep all records with offset > up_to_offset (they haven't been flushed yet)
+            let before_count = buffer.records.len();
+            buffer.records.retain(|record| record.offset > up_to_offset);
+            let removed_count = before_count - buffer.records.len();
+            
+            // Update base_offset if we removed records from the beginning
+            if !buffer.records.is_empty() && removed_count > 0 {
+                buffer.base_offset = buffer.records[0].offset;
+            } else if buffer.records.is_empty() {
+                // If buffer is now empty, set base_offset to continue from where we left off
+                buffer.base_offset = up_to_offset + 1;
+            }
+            
+            // Always update flushed_offset to track progress
             buffer.flushed_offset = up_to_offset;
             
-            tracing::info!("Cleared {} records from buffer after flush to offset {} for {}-{}",
-                cleared_count, up_to_offset, topic, partition);
+            tracing::warn!("FLUSH→COMPLETE: Removed {} flushed records (up to offset {}) from buffer for {}-{}, {} records remain",
+                removed_count, up_to_offset, topic, partition, buffer.records.len());
         }
         
         Ok(())

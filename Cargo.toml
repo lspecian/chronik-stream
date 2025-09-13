@@ -17,6 +17,7 @@ members = [
     "crates/chronik-backup",
     "crates/chronik-config",
     "crates/chronik-server",
+    "crates/chronik-wal",
 ]
 exclude = ["tests"]
 

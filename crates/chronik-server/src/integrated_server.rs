@@ -17,6 +17,8 @@ use crate::kafka_handler::KafkaProtocolHandler;
 use crate::produce_handler::{ProduceHandler, ProduceHandlerConfig};
 use crate::fetch_handler::FetchHandler;
 use crate::storage::{StorageConfig as IngestStorageConfig, StorageService};
+use crate::wal_integration::WalProduceHandler;
+use chronik_wal::{WalConfig, CompressionType, CheckpointConfig, RecoveryConfig, RotationConfig};
 
 // Storage components
 use chronik_storage::{
@@ -208,18 +210,58 @@ impl IntegratedKafkaServer {
         
         // Connect the fetch handler to the produce handler
         produce_handler_inner.set_fetch_handler(fetch_handler.clone());
-        let produce_handler = Arc::new(produce_handler_inner);
+        let produce_handler_base = Arc::new(produce_handler_inner);
         
-        // Start background tasks for segment rotation
-        produce_handler.start_background_tasks().await;
+        // Create WAL configuration with default settings
+        use chronik_wal::{CompressionType, CheckpointConfig, RecoveryConfig, RotationConfig, FsyncConfig};
+        use std::path::PathBuf;
+        
+        let wal_config = WalConfig {
+            enabled: true,  // WAL is always enabled now as the default durability mechanism
+            data_dir: PathBuf::from(format!("{}/wal", config.data_dir)),
+            segment_size: 128 * 1024 * 1024, // 128MB segments
+            flush_interval_ms: 100, // Sync to disk every 100ms for durability
+            flush_threshold: 1024 * 1024, // 1MB buffer threshold
+            compression: CompressionType::None,
+            checkpointing: CheckpointConfig::default(),
+            recovery: RecoveryConfig::default(),
+            rotation: RotationConfig {
+                max_segment_age_ms: 30 * 60 * 1000, // 30 minutes
+                max_segment_size: 128 * 1024 * 1024, // 128MB
+                coordinate_with_storage: true,
+            },
+            fsync: FsyncConfig {
+                enabled: true,
+                batch_size: 8,     // Batch up to 8 writes for efficiency
+                batch_timeout_ms: 50, // Max 50ms latency for fsync batching
+            },
+        };
+        
+        // Wrap the produce handler with WAL for durability
+        let wal_handler = Arc::new(WalProduceHandler::new(wal_config, produce_handler_base.clone()).await
+            .map_err(|e| anyhow::anyhow!("Failed to initialize WAL handler: {}", e))?);
+        
+        // Recover from WAL on startup
+        info!("Recovering from WAL...");
+        wal_handler.recover().await
+            .map_err(|e| anyhow::anyhow!("Failed to recover from WAL: {}", e))?;
+        
+        // Store the WAL handler for later use (will be used in kafka_handler)
+        // For now, we pass the base handler to KafkaProtocolHandler
+        // and we'll integrate WAL at the kafka_handler level
+        
+        // Start background tasks for segment rotation on the base handler
+        produce_handler_base.start_background_tasks().await;
         
         // Initialize Kafka protocol handler with all components
-        let kafka_handler = Arc::new(KafkaProtocolHandler::new_with_fetch_handler(
-            produce_handler,
+        // WAL is MANDATORY - no longer optional
+        let kafka_handler = Arc::new(KafkaProtocolHandler::new(
+            produce_handler_base.clone(),
             segment_reader,
             metadata_store.clone(),
             object_store_arc.clone(),
             fetch_handler,
+            wal_handler.clone(),  // WAL is mandatory, not optional
             config.node_id,
             config.advertised_host.clone(),
             config.advertised_port,

@@ -95,6 +95,58 @@ lazy_static! {
         "Storage usage in bytes",
         &["backend", "bucket"]
     ).unwrap();
+
+    // WAL metrics - Phase 1 hardening
+    static ref WAL_WRITES_TOTAL: CounterVec = register_counter_vec!(
+        "chronik_wal_writes_total",
+        "Total number of WAL write operations",
+        &["topic", "partition", "result"]
+    ).unwrap();
+    
+    static ref WAL_WRITE_DURATION: HistogramVec = register_histogram_vec!(
+        "chronik_wal_write_duration_seconds",
+        "Time spent writing to WAL in seconds",
+        &["topic", "partition"],
+        vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0]
+    ).unwrap();
+    
+    static ref WAL_FSYNC_DURATION: HistogramVec = register_histogram_vec!(
+        "chronik_wal_fsync_duration_seconds",
+        "Time spent in WAL fsync operations in seconds",
+        &["topic", "partition"],
+        vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0]
+    ).unwrap();
+    
+    static ref WAL_RECOVERY_DURATION: HistogramVec = register_histogram_vec!(
+        "chronik_wal_recovery_duration_seconds",
+        "Time spent in WAL recovery operations in seconds",
+        &["topic", "partition", "phase"],
+        vec![0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0]
+    ).unwrap();
+    
+    static ref WAL_SEGMENTS_TOTAL: GaugeVec = register_gauge_vec!(
+        "chronik_wal_segments_total",
+        "Total number of WAL segments",
+        &["topic", "partition", "status"]
+    ).unwrap();
+    
+    static ref WAL_BYTES_WRITTEN: CounterVec = register_counter_vec!(
+        "chronik_wal_bytes_written_total",
+        "Total bytes written to WAL",
+        &["topic", "partition"]
+    ).unwrap();
+    
+    static ref WAL_SEGMENT_ROTATIONS: CounterVec = register_counter_vec!(
+        "chronik_wal_segment_rotations_total",
+        "Total WAL segment rotations",
+        &["topic", "partition", "trigger"]
+    ).unwrap();
+    
+    static ref WAL_ERRORS_TOTAL: CounterVec = register_counter_vec!(
+        "chronik_wal_errors_total",
+        "Total WAL operation errors",
+        &["topic", "partition", "operation", "error_type"]
+    ).unwrap();
 }
 
 /// Metrics registry
@@ -124,6 +176,16 @@ impl MetricsRegistry {
         registry.register(Box::new(COMPACTION_RUNS.clone())).unwrap();
         registry.register(Box::new(STORAGE_USAGE.clone())).unwrap();
         
+        // Register WAL metrics
+        registry.register(Box::new(WAL_WRITES_TOTAL.clone())).unwrap();
+        registry.register(Box::new(WAL_WRITE_DURATION.clone())).unwrap();
+        registry.register(Box::new(WAL_FSYNC_DURATION.clone())).unwrap();
+        registry.register(Box::new(WAL_RECOVERY_DURATION.clone())).unwrap();
+        registry.register(Box::new(WAL_SEGMENTS_TOTAL.clone())).unwrap();
+        registry.register(Box::new(WAL_BYTES_WRITTEN.clone())).unwrap();
+        registry.register(Box::new(WAL_SEGMENT_ROTATIONS.clone())).unwrap();
+        registry.register(Box::new(WAL_ERRORS_TOTAL.clone())).unwrap();
+        
         Self {
             registry: Arc::new(registry),
         }
@@ -152,6 +214,11 @@ impl MetricsRegistry {
     /// Get janitor metrics
     pub fn janitor(&self) -> JanitorMetrics {
         JanitorMetrics::new()
+    }
+    
+    /// Get WAL metrics
+    pub fn wal(&self) -> WalMetrics {
+        WalMetrics::new()
     }
 }
 
@@ -279,5 +346,107 @@ impl JanitorMetrics {
         STORAGE_USAGE
             .with_label_values(&[backend, bucket])
             .set(bytes as f64);
+    }
+}
+
+/// WAL metrics - Phase 1 hardening implementation
+pub struct WalMetrics;
+
+impl WalMetrics {
+    fn new() -> Self {
+        Self
+    }
+    
+    /// Record a WAL write operation
+    pub fn record_write(&self, topic: &str, partition: i32, success: bool, duration: f64, bytes: u64) {
+        let result = if success { "success" } else { "failure" };
+        let partition_str = partition.to_string();
+        
+        WAL_WRITES_TOTAL
+            .with_label_values(&[topic, &partition_str, result])
+            .inc();
+        
+        if success {
+            WAL_WRITE_DURATION
+                .with_label_values(&[topic, &partition_str])
+                .observe(duration);
+            
+            WAL_BYTES_WRITTEN
+                .with_label_values(&[topic, &partition_str])
+                .inc_by(bytes as f64);
+        }
+    }
+    
+    /// Record WAL fsync operation duration
+    pub fn record_fsync(&self, topic: &str, partition: i32, duration: f64) {
+        let partition_str = partition.to_string();
+        WAL_FSYNC_DURATION
+            .with_label_values(&[topic, &partition_str])
+            .observe(duration);
+    }
+    
+    /// Record WAL recovery operation
+    pub fn record_recovery(&self, topic: &str, partition: i32, phase: &str, duration: f64) {
+        let partition_str = partition.to_string();
+        WAL_RECOVERY_DURATION
+            .with_label_values(&[topic, &partition_str, phase])
+            .observe(duration);
+    }
+    
+    /// Update WAL segment count
+    pub fn set_segment_count(&self, topic: &str, partition: i32, status: &str, count: usize) {
+        let partition_str = partition.to_string();
+        WAL_SEGMENTS_TOTAL
+            .with_label_values(&[topic, &partition_str, status])
+            .set(count as f64);
+    }
+    
+    /// Record WAL segment rotation
+    pub fn record_segment_rotation(&self, topic: &str, partition: i32, trigger: &str) {
+        let partition_str = partition.to_string();
+        WAL_SEGMENT_ROTATIONS
+            .with_label_values(&[topic, &partition_str, trigger])
+            .inc();
+    }
+    
+    /// Record WAL error
+    pub fn record_error(&self, topic: &str, partition: i32, operation: &str, error_type: &str) {
+        let partition_str = partition.to_string();
+        WAL_ERRORS_TOTAL
+            .with_label_values(&[topic, &partition_str, operation, error_type])
+            .inc();
+    }
+    
+    /// Record WAL batch write operation
+    pub fn record_batch_write(&self, topic: &str, partition: i32, batch_size: usize, duration: f64, total_bytes: u64) {
+        let partition_str = partition.to_string();
+        
+        // Record batch as single successful write operation
+        WAL_WRITES_TOTAL
+            .with_label_values(&[topic, &partition_str, "success"])
+            .inc_by(batch_size as f64);
+        
+        WAL_WRITE_DURATION
+            .with_label_values(&[topic, &partition_str])
+            .observe(duration);
+        
+        WAL_BYTES_WRITTEN
+            .with_label_values(&[topic, &partition_str])
+            .inc_by(total_bytes as f64);
+    }
+    
+    /// Helper method to time WAL operations
+    pub fn time_operation<F, R>(&self, topic: &str, partition: i32, operation: F) -> R 
+    where
+        F: FnOnce() -> R,
+    {
+        let start = std::time::Instant::now();
+        let result = operation();
+        let duration = start.elapsed().as_secs_f64();
+        
+        // This is a generic timing helper - specific record methods should be called by the operation
+        // to provide proper success/failure tracking
+        
+        result
     }
 }

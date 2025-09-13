@@ -6,13 +6,13 @@
 use std::sync::Arc;
 use chronik_common::{Result, Error};
 use chronik_common::metadata::traits::MetadataStore;
-use chronik_protocol::{ProtocolHandler, handler::Response, parser::{parse_request_header, parse_request_header_with_correlation, ApiKey, write_response_header, ResponseHeader}, error_codes};
+use chronik_protocol::{ProtocolHandler, handler::Response, parser::{parse_request_header, ApiKey, write_response_header, ResponseHeader}, error_codes};
 use chronik_storage::{SegmentReader, ObjectStoreTrait};
 use crate::produce_handler::ProduceHandler;
 use crate::consumer_group::GroupManager;
 use crate::fetch_handler::FetchHandler;
-use crate::handler::{RequestHandler, HandlerConfig};
-use bytes::{Bytes, BytesMut, BufMut};
+use crate::wal_integration::WalProduceHandler;
+use bytes::{Bytes, BytesMut, BufMut, Buf};
 use tracing::{debug, instrument};
 
 /// Kafka protocol handler with ingest-specific extensions
@@ -21,6 +21,8 @@ pub struct KafkaProtocolHandler {
     protocol_handler: ProtocolHandler,
     /// Produce handler for writing data
     produce_handler: Arc<ProduceHandler>,
+    /// WAL handler for durability (MANDATORY - no longer optional)
+    wal_handler: Arc<WalProduceHandler>,
     /// Segment reader for fetch operations
     segment_reader: Arc<SegmentReader>,
     /// Metadata store
@@ -38,48 +40,15 @@ pub struct KafkaProtocolHandler {
 }
 
 impl KafkaProtocolHandler {
-    /// Create a new Kafka protocol handler
+    /// Create a new Kafka protocol handler with WAL (MANDATORY)
+    /// WAL is now required for all Chronik Stream instances - no optional paths
     pub async fn new(
         produce_handler: Arc<ProduceHandler>,
         segment_reader: Arc<SegmentReader>,
         metadata_store: Arc<dyn MetadataStore>,
         object_store: Arc<dyn ObjectStoreTrait>,
-        node_id: i32,
-        host: String,
-        port: i32,
-    ) -> Result<Self> {
-        let group_manager = Arc::new(GroupManager::new(metadata_store.clone()));
-        group_manager.clone().start_expiration_checker();
-        
-        let fetch_handler = Arc::new(FetchHandler::new(
-            segment_reader.clone(),
-            metadata_store.clone(),
-            object_store,
-        ));
-        
-        // Note: The produce handler and fetch handler are connected via shared state.
-        // The produce handler will update the fetch handler's buffer after writing records.
-        
-        Ok(Self {
-            protocol_handler: ProtocolHandler::with_metadata_and_broker(metadata_store.clone(), node_id),
-            produce_handler,
-            segment_reader,
-            metadata_store,
-            group_manager,
-            fetch_handler,
-            node_id,
-            host: host.clone(),
-            port,
-        })
-    }
-    
-    /// Create a new Kafka protocol handler with a pre-created FetchHandler
-    pub async fn new_with_fetch_handler(
-        produce_handler: Arc<ProduceHandler>,
-        segment_reader: Arc<SegmentReader>,
-        metadata_store: Arc<dyn MetadataStore>,
-        object_store: Arc<dyn ObjectStoreTrait>,
         fetch_handler: Arc<FetchHandler>,
+        wal_handler: Arc<WalProduceHandler>,  // WAL is MANDATORY, not optional
         node_id: i32,
         host: String,
         port: i32,
@@ -90,6 +59,7 @@ impl KafkaProtocolHandler {
         Ok(Self {
             protocol_handler: ProtocolHandler::with_metadata_and_broker(metadata_store.clone(), node_id),
             produce_handler,
+            wal_handler,
             segment_reader,
             metadata_store,
             group_manager,
@@ -114,72 +84,44 @@ impl KafkaProtocolHandler {
         
         
         // Parse the request header to determine which API is being called
-        let mut buf = Bytes::copy_from_slice(request_bytes);
-        tracing::debug!("Request bytes (first 20): {:?}", &request_bytes[..request_bytes.len().min(20)]);
-        let (header, correlation_id) = match parse_request_header_with_correlation(&mut buf) {
-            Ok((h, _)) => {
-                let correlation_id = h.correlation_id;
-                tracing::debug!("Parsed header: api_key={:?}, api_version={}, correlation_id={}", h.api_key, h.api_version, correlation_id);
-                (Some(h), correlation_id)
-            }
-            Err(Error::ProtocolWithCorrelation { correlation_id, message }) => {
-                // Unknown API key but we have correlation ID
-                tracing::info!("Unknown API key detected: {}, correlation_id: {}", message, correlation_id);
-                (None, correlation_id)
-            }
-            Err(e) => {
-                // Other parsing error, delegate to protocol handler
-                tracing::warn!("Other parsing error: {:?}", e);
-                return self.protocol_handler.handle_request(request_bytes).await;
-            }
-        };
+        let mut buf = bytes::Bytes::from(request_bytes.to_vec());
+        let header = parse_request_header(&mut buf)?;
         
-        // If we couldn't parse the header due to unknown API key, return proper error
-        let header = match header {
-            Some(h) => h,
-            None => {
-                // Return error response with preserved correlation ID
-                tracing::info!("Returning UNSUPPORTED_VERSION error with correlation_id: {}", correlation_id);
-                return Ok(Response {
-                    header: ResponseHeader { correlation_id },
-                    body: {
-                        let mut buf = BytesMut::new();
-                        buf.put_i16(error_codes::UNSUPPORTED_VERSION);
-                        buf.freeze()
-                    },
-                    is_flexible: false,  // Error response - conservative default
-                    api_key: ApiKey::ApiVersions,
-                });
-            }
-        };
-        
-        // For certain APIs that have full implementations in the ingest layer,
+        // Route to specific handlers for certain API keys
+        // produce and fetch are special-cased because they need access to our storage layer
         // we should intercept and handle them directly
         match header.api_key {
             ApiKey::Produce => {
                 // Parse the produce request
                 let request = self.protocol_handler.parse_produce_request(&header, &mut buf)?;
                 
-                // Call the actual produce handler
-                let response = self.produce_handler.handle_produce(request, header.correlation_id).await?;
+                // WAL is mandatory - all produce requests MUST go through WAL
+                // There is no fallback path - WAL is the only durability mechanism
+                let response = self.wal_handler.handle_produce(request, header.correlation_id).await?;
                 
                 // Encode the response
                 let mut body_buf = BytesMut::new();
                 eprintln!("CRITICAL: About to call encode_produce_response with version {}", header.api_version);
                 self.protocol_handler.encode_produce_response(&mut body_buf, &response, header.api_version)?;
-                eprintln!("CRITICAL: encode_produce_response returned, body_buf.len() = {}", body_buf.len());
                 
-                // Debug: log the actual body content
-                eprintln!("DEBUG: Produce response body_buf.len() = {}", body_buf.len());
-                if body_buf.len() > 0 {
-                    eprintln!("DEBUG: Produce response body first 32 bytes: {:02x?}", 
-                        &body_buf[..body_buf.len().min(32)]);
-                } else {
-                    eprintln!("DEBUG: Produce response body is EMPTY!");
-                }
+                // Create response header
+                let response_header = ResponseHeader {
+                    correlation_id: header.correlation_id,
+                };
+                
+                // Write response header
+                let mut header_buf = BytesMut::new();
+                write_response_header(&mut header_buf, &response_header);
+                
+                // Combine header and body
+                let mut final_buf = BytesMut::new();
+                final_buf.extend_from_slice(&header_buf);
+                final_buf.extend_from_slice(&body_buf);
                 
                 Ok(Response {
-                    header: ResponseHeader { correlation_id: header.correlation_id },
+                    header: ResponseHeader {
+                        correlation_id: header.correlation_id,
+                    },
                     body: body_buf.freeze(),
                     is_flexible: header.api_version >= 9,  // v9+ uses flexible/compact encoding
                     api_key: ApiKey::Produce,
@@ -189,487 +131,188 @@ impl KafkaProtocolHandler {
                 // Parse the fetch request
                 let request = self.protocol_handler.parse_fetch_request(&header, &mut buf)?;
                 
-                // Call the actual fetch handler
+                // Use our fetch handler to process the request
                 let response = self.fetch_handler.handle_fetch(request, header.correlation_id).await?;
-                
-                tracing::info!("Fetch handler returned response with {} topics", response.topics.len());
-                for topic in &response.topics {
-                    for partition in &topic.partitions {
-                        tracing::info!("  Topic {} partition {}: {} bytes of records", 
-                            topic.name, partition.partition, partition.records.len());
-                    }
-                }
                 
                 // Encode the response
                 let mut body_buf = BytesMut::new();
-                tracing::info!("About to encode Fetch response");
                 self.protocol_handler.encode_fetch_response(&mut body_buf, &response, header.api_version)?;
-                tracing::info!("Encoded Fetch response: {} bytes", body_buf.len());
+                
+                // Create response header
+                let response_header = ResponseHeader {
+                    correlation_id: header.correlation_id,
+                };
+                
+                // Write response header
+                let mut header_buf = BytesMut::new();
+                write_response_header(&mut header_buf, &response_header);
+                
+                // Combine header and body
+                let mut final_buf = BytesMut::new();
+                final_buf.extend_from_slice(&header_buf);
+                final_buf.extend_from_slice(&body_buf);
                 
                 Ok(Response {
-                    header: ResponseHeader { correlation_id: header.correlation_id },
+                    header: ResponseHeader {
+                        correlation_id: header.correlation_id,
+                    },
                     body: body_buf.freeze(),
-                    is_flexible: header.api_version >= 12,  // v12+ uses flexible/compact encoding
+                    is_flexible: header.api_version >= 11, // Fetch uses flexible from v11+
                     api_key: ApiKey::Fetch,
                 })
             }
-            ApiKey::FindCoordinator => {
-                // Parse the FindCoordinator request
-                let request = self.protocol_handler.parse_find_coordinator_request(&header, &mut buf)?;
-                
-                // Always return self as coordinator for now
-                let response = self.handle_find_coordinator(request).await?;
-                
-                // Encode the response
-                let mut body_buf = BytesMut::new();
-                self.protocol_handler.encode_find_coordinator_response(&mut body_buf, &response, header.api_version)?;
-                
-                Ok(Response {
-                    header: ResponseHeader { correlation_id: header.correlation_id },
-                    body: body_buf.freeze(),
-                    is_flexible: header.api_version >= 3,  // v3+ uses flexible/compact encoding
-                    api_key: ApiKey::FindCoordinator,
-                })
-            }
             ApiKey::JoinGroup => {
-                // Parse the JoinGroup request
+                debug!("Processing JoinGroup request");
+                // Parse the join group request
                 let request = self.protocol_handler.parse_join_group_request(&header, &mut buf)?;
                 
-                // Use GroupManager to handle join
-                let response = self.handle_join_group(request).await?;
+                // Handle the join group request
+                let response = self.group_manager.handle_join_group(request).await?;
                 
                 // Encode the response
                 let mut body_buf = BytesMut::new();
                 self.protocol_handler.encode_join_group_response(&mut body_buf, &response, header.api_version)?;
                 
                 Ok(Response {
-                    header: ResponseHeader { correlation_id: header.correlation_id },
+                    header: ResponseHeader {
+                        correlation_id: header.correlation_id,
+                    },
                     body: body_buf.freeze(),
-                    is_flexible: header.api_version >= 6,  // v6+ uses flexible/compact encoding
+                    is_flexible: header.api_version >= 6, // JoinGroup uses flexible from v6+
                     api_key: ApiKey::JoinGroup,
                 })
             }
             ApiKey::SyncGroup => {
-                // Parse the SyncGroup request
+                debug!("Processing SyncGroup request");
+                // Parse the sync group request
                 let request = self.protocol_handler.parse_sync_group_request(&header, &mut buf)?;
                 
-                // Use GroupManager to handle sync
-                let response = self.handle_sync_group(request).await?;
+                // Handle the sync group request
+                let response = self.group_manager.handle_sync_group(request).await?;
                 
                 // Encode the response
                 let mut body_buf = BytesMut::new();
                 self.protocol_handler.encode_sync_group_response(&mut body_buf, &response, header.api_version)?;
                 
                 Ok(Response {
-                    header: ResponseHeader { correlation_id: header.correlation_id },
+                    header: ResponseHeader {
+                        correlation_id: header.correlation_id,
+                    },
                     body: body_buf.freeze(),
-                    is_flexible: header.api_version >= 4,  // v4+ uses flexible/compact encoding
+                    is_flexible: header.api_version >= 4, // SyncGroup uses flexible from v4+
                     api_key: ApiKey::SyncGroup,
                 })
             }
             ApiKey::Heartbeat => {
-                // Parse the Heartbeat request
+                debug!("Processing Heartbeat request");
+                // Parse the heartbeat request
                 let request = self.protocol_handler.parse_heartbeat_request(&header, &mut buf)?;
                 
-                // Use GroupManager to handle heartbeat
-                let response = self.handle_heartbeat(request).await?;
+                // Handle the heartbeat request
+                let response = self.group_manager.handle_heartbeat(request).await?;
                 
                 // Encode the response
                 let mut body_buf = BytesMut::new();
                 self.protocol_handler.encode_heartbeat_response(&mut body_buf, &response, header.api_version)?;
                 
                 Ok(Response {
-                    header: ResponseHeader { correlation_id: header.correlation_id },
+                    header: ResponseHeader {
+                        correlation_id: header.correlation_id,
+                    },
                     body: body_buf.freeze(),
-                    is_flexible: header.api_version >= 4,  // v4+ uses flexible/compact encoding
+                    is_flexible: header.api_version >= 4, // Heartbeat uses flexible from v4+
                     api_key: ApiKey::Heartbeat,
                 })
             }
             ApiKey::LeaveGroup => {
-                // Parse the LeaveGroup request
+                debug!("Processing LeaveGroup request");
+                // Parse the leave group request
                 let request = self.protocol_handler.parse_leave_group_request(&header, &mut buf)?;
                 
-                // Use GroupManager to handle leave
-                let response = self.handle_leave_group(request).await?;
+                // Handle the leave group request
+                let response = self.group_manager.handle_leave_group(request).await?;
                 
                 // Encode the response
                 let mut body_buf = BytesMut::new();
                 self.protocol_handler.encode_leave_group_response(&mut body_buf, &response, header.api_version)?;
                 
                 Ok(Response {
-                    header: ResponseHeader { correlation_id: header.correlation_id },
+                    header: ResponseHeader {
+                        correlation_id: header.correlation_id,
+                    },
                     body: body_buf.freeze(),
-                    is_flexible: header.api_version >= 4,  // v4+ uses flexible/compact encoding
+                    is_flexible: header.api_version >= 4, // LeaveGroup uses flexible from v4+
                     api_key: ApiKey::LeaveGroup,
                 })
             }
-            ApiKey::ListGroups => {
-                // We just implemented this, so it should work
-                self.protocol_handler.handle_request(request_bytes).await
-            }
             ApiKey::OffsetCommit => {
-                // Parse the OffsetCommit request
+                debug!("Processing OffsetCommit request");
+                // Parse the offset commit request
                 let request = self.protocol_handler.parse_offset_commit_request(&header, &mut buf)?;
                 
-                // Handle offset commit
-                let response = self.handle_offset_commit(request).await?;
+                // Handle the offset commit request
+                let response = self.group_manager.handle_offset_commit(request).await?;
                 
                 // Encode the response
                 let mut body_buf = BytesMut::new();
                 self.protocol_handler.encode_offset_commit_response(&mut body_buf, &response, header.api_version)?;
                 
                 Ok(Response {
-                    header: ResponseHeader { correlation_id: header.correlation_id },
+                    header: ResponseHeader {
+                        correlation_id: header.correlation_id,
+                    },
                     body: body_buf.freeze(),
-                    is_flexible: header.api_version >= 8,  // v8+ uses flexible/compact encoding
+                    is_flexible: header.api_version >= 8, // OffsetCommit uses flexible from v8+
                     api_key: ApiKey::OffsetCommit,
                 })
             }
             ApiKey::OffsetFetch => {
-                // Parse the OffsetFetch request
+                debug!("Processing OffsetFetch request");
+                // Parse the offset fetch request
                 let request = self.protocol_handler.parse_offset_fetch_request(&header, &mut buf)?;
                 
-                // Handle offset fetch
-                let response = self.handle_offset_fetch(request).await?;
+                // Handle the offset fetch request
+                let response = self.group_manager.handle_offset_fetch(request).await?;
                 
                 // Encode the response
                 let mut body_buf = BytesMut::new();
                 self.protocol_handler.encode_offset_fetch_response(&mut body_buf, &response, header.api_version)?;
                 
                 Ok(Response {
-                    header: ResponseHeader { correlation_id: header.correlation_id },
+                    header: ResponseHeader {
+                        correlation_id: header.correlation_id,
+                    },
                     body: body_buf.freeze(),
-                    is_flexible: header.api_version >= 6,  // v6+ uses flexible/compact encoding
+                    is_flexible: header.api_version >= 6, // OffsetFetch uses flexible from v6+
                     api_key: ApiKey::OffsetFetch,
                 })
             }
-            ApiKey::ApiVersions => {
-                // ApiVersions must use the protocol handler for proper encoding
-                let response = self.protocol_handler.handle_request(request_bytes).await?;
-                Ok(response)
+            ApiKey::FindCoordinator => {
+                debug!("Processing FindCoordinator request");
+                // Parse the find coordinator request
+                let request = self.protocol_handler.parse_find_coordinator_request(&header, &mut buf)?;
+                
+                // Handle the find coordinator request
+                let response = self.group_manager.handle_find_coordinator(request, &self.host, self.port)?;
+                
+                // Encode the response
+                let mut body_buf = BytesMut::new();
+                self.protocol_handler.encode_find_coordinator_response(&mut body_buf, &response, header.api_version)?;
+                
+                Ok(Response {
+                    header: ResponseHeader {
+                        correlation_id: header.correlation_id,
+                    },
+                    body: body_buf.freeze(),
+                    is_flexible: header.api_version >= 3, // FindCoordinator uses flexible from v3+
+                    api_key: ApiKey::FindCoordinator,
+                })
             }
             _ => {
-                // For all other APIs, use the protocol handler
-                let response = self.protocol_handler.handle_request(request_bytes).await?;
-                Ok(response)
+                // For all other API calls, delegate to the protocol handler
+                self.protocol_handler.handle_request(request_bytes).await
             }
         }
-    }
-    
-    /// Handle FindCoordinator request
-    async fn handle_find_coordinator(&self, request: chronik_protocol::find_coordinator_types::FindCoordinatorRequest) -> Result<chronik_protocol::find_coordinator_types::FindCoordinatorResponse> {
-        use chronik_protocol::find_coordinator_types::{FindCoordinatorResponse, error_codes};
-        
-        // For now, always return self as coordinator
-        Ok(FindCoordinatorResponse {
-            throttle_time_ms: 0,
-            error_code: error_codes::NONE,
-            error_message: None,
-            node_id: self.node_id,
-            host: self.host.clone(),
-            port: self.port,
-        })
-    }
-    
-    /// Handle JoinGroup request
-    async fn handle_join_group(&self, request: chronik_protocol::join_group_types::JoinGroupRequest) -> Result<chronik_protocol::join_group_types::JoinGroupResponse> {
-        use chronik_protocol::join_group_types::{JoinGroupResponse, JoinGroupResponseMember};
-        use std::time::Duration;
-        
-        // Convert protocols to the format expected by GroupManager
-        let protocols: Vec<(String, Vec<u8>)> = request.protocols.into_iter()
-            .map(|p| (p.name, p.metadata.to_vec()))
-            .collect();
-        
-        // Call GroupManager
-        let response = self.group_manager.join_group(
-            request.group_id,
-            if request.member_id.is_empty() { None } else { Some(request.member_id) },
-            "client".to_string(), // TODO: Extract from request
-            self.host.clone(),
-            Duration::from_millis(request.session_timeout_ms as u64),
-            Duration::from_millis(request.rebalance_timeout_ms as u64),
-            request.protocol_type,
-            protocols,
-            request.group_instance_id,
-        ).await?;
-        
-        // Convert response
-        Ok(JoinGroupResponse {
-            throttle_time_ms: 0,
-            error_code: response.error_code,
-            generation_id: response.generation_id,
-            protocol_type: Some(response.protocol.clone()),
-            protocol_name: Some(response.protocol),
-            leader: response.leader_id,
-            member_id: response.member_id,
-            members: response.members.into_iter().map(|m| JoinGroupResponseMember {
-                member_id: m.member_id,
-                group_instance_id: None,
-                metadata: m.metadata.into(),
-            }).collect(),
-        })
-    }
-    
-    /// Handle SyncGroup request
-    async fn handle_sync_group(&self, request: chronik_protocol::sync_group_types::SyncGroupRequest) -> Result<chronik_protocol::sync_group_types::SyncGroupResponse> {
-        use chronik_protocol::sync_group_types::SyncGroupResponse;
-        
-        // Convert assignments if this is the leader
-        let assignments = if !request.assignments.is_empty() {
-            Some(request.assignments.into_iter()
-                .map(|a| (a.member_id, a.assignment.to_vec()))
-                .collect())
-        } else {
-            None
-        };
-        
-        // Call GroupManager
-        let response = self.group_manager.sync_group(
-            request.group_id,
-            request.generation_id,
-            request.member_id,
-            0, // member_epoch - TODO: Extract from request
-            assignments,
-        ).await?;
-        
-        // Convert response
-        Ok(SyncGroupResponse {
-            throttle_time_ms: 0,
-            error_code: response.error_code,
-            protocol_type: None, // TODO: Get from group state
-            protocol_name: None, // TODO: Get from group state
-            assignment: response.assignment.into(),
-        })
-    }
-    
-    /// Handle Heartbeat request
-    async fn handle_heartbeat(&self, request: chronik_protocol::heartbeat_types::HeartbeatRequest) -> Result<chronik_protocol::heartbeat_types::HeartbeatResponse> {
-        use chronik_protocol::heartbeat_types::HeartbeatResponse;
-        
-        // Call GroupManager
-        let response = self.group_manager.heartbeat(
-            request.group_id,
-            request.member_id,
-            request.generation_id,
-            None, // member_epoch - TODO: Extract from request
-        ).await?;
-        
-        // Convert response
-        Ok(HeartbeatResponse {
-            throttle_time_ms: 0,
-            error_code: response.error_code,
-        })
-    }
-    
-    /// Handle LeaveGroup request
-    async fn handle_leave_group(&self, request: chronik_protocol::leave_group_types::LeaveGroupRequest) -> Result<chronik_protocol::leave_group_types::LeaveGroupResponse> {
-        use chronik_protocol::leave_group_types::{LeaveGroupResponse, MemberResponse};
-        
-        // Handle each member leaving
-        let mut member_responses = Vec::new();
-        for member in request.members {
-            match self.group_manager.leave_group(
-                request.group_id.clone(),
-                member.member_id.clone(),
-            ).await {
-                Ok(_) => {
-                    member_responses.push(MemberResponse {
-                        member_id: member.member_id,
-                        group_instance_id: member.group_instance_id,
-                        error_code: 0,
-                    });
-                }
-                Err(e) => {
-                    tracing::error!("Failed to leave group: {:?}", e);
-                    member_responses.push(MemberResponse {
-                        member_id: member.member_id,
-                        group_instance_id: member.group_instance_id,
-                        error_code: 25, // UNKNOWN_MEMBER_ID
-                    });
-                }
-            }
-        }
-        
-        Ok(LeaveGroupResponse {
-            throttle_time_ms: 0,
-            error_code: 0,
-            members: member_responses,
-        })
-    }
-    
-    /// Handle OffsetCommit request
-    async fn handle_offset_commit(&self, request: chronik_protocol::types::OffsetCommitRequest) -> Result<chronik_protocol::types::OffsetCommitResponse> {
-        use chronik_protocol::types::{OffsetCommitResponse, OffsetCommitResponseTopic, OffsetCommitResponsePartition};
-        use chronik_protocol::ResponseHeader;
-        use chronik_common::metadata::ConsumerOffset;
-        
-        let mut response_topics = Vec::new();
-        
-        for topic in request.topics {
-            let mut response_partitions = Vec::new();
-            
-            for partition in topic.partitions {
-                // Store the offset in metadata
-                let offset = ConsumerOffset {
-                    group_id: request.group_id.clone(),
-                    topic: topic.name.clone(),
-                    partition: partition.partition_index as u32,
-                    offset: partition.committed_offset,
-                    metadata: partition.committed_metadata,
-                    commit_timestamp: chrono::Utc::now(),
-                };
-                
-                match self.metadata_store.commit_offset(offset.clone()).await {
-                    Ok(_) => {
-                        tracing::info!(
-                            "Successfully committed offset - group: {}, topic: {}, partition: {}, offset: {}",
-                            offset.group_id, offset.topic, offset.partition, offset.offset
-                        );
-                        response_partitions.push(OffsetCommitResponsePartition {
-                            partition_index: partition.partition_index,
-                            error_code: 0,
-                        });
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            "Failed to commit offset - group: {}, topic: {}, partition: {}, offset: {}, error: {:?}",
-                            offset.group_id, offset.topic, offset.partition, offset.offset, e
-                        );
-                        response_partitions.push(OffsetCommitResponsePartition {
-                            partition_index: partition.partition_index,
-                            error_code: 5, // UNKNOWN_TOPIC_OR_PARTITION
-                        });
-                    }
-                }
-            }
-            
-            response_topics.push(OffsetCommitResponseTopic {
-                name: topic.name,
-                partitions: response_partitions,
-            });
-        }
-        
-        Ok(OffsetCommitResponse {
-            header: ResponseHeader {
-                correlation_id: 0, // Will be set by the caller
-            },
-            throttle_time_ms: 0,
-            topics: response_topics,
-        })
-    }
-    
-    /// Handle OffsetFetch request
-    async fn handle_offset_fetch(&self, request: chronik_protocol::types::OffsetFetchRequest) -> Result<chronik_protocol::types::OffsetFetchResponse> {
-        use chronik_protocol::types::{OffsetFetchResponse, OffsetFetchResponseTopic, OffsetFetchResponsePartition};
-        use chronik_protocol::ResponseHeader;
-        
-        tracing::info!(
-            group_id = %request.group_id,
-            topics = ?request.topics,
-            "Handling offset fetch request"
-        );
-        
-        let mut response_topics = Vec::new();
-        
-        // If topics is None or empty, fetch all topics for this group
-        let topics_to_fetch = if let Some(topics) = request.topics {
-            topics
-        } else {
-            // For now, return empty if no specific topics requested
-            // In a full implementation, we'd query all topics with offsets for this group
-            vec![]
-        };
-        
-        for topic_name in topics_to_fetch {
-            let mut response_partitions = Vec::new();
-            
-            // Get the actual partition count from metadata
-            let partition_count = match self.metadata_store.get_topic(&topic_name).await {
-                Ok(Some(topic_meta)) => topic_meta.config.partition_count,
-                Ok(None) => {
-                    // Topic doesn't exist, skip it
-                    tracing::warn!(
-                        topic = %topic_name,
-                        "Topic not found for offset fetch"
-                    );
-                    continue;
-                }
-                Err(e) => {
-                    tracing::error!(
-                        topic = %topic_name,
-                        error = %e,
-                        "Error getting topic metadata for offset fetch"
-                    );
-                    continue;
-                }
-            };
-            
-            // Check all partitions of this topic
-            for partition_index in 0..partition_count {
-                match self.metadata_store.get_consumer_offset(&request.group_id, &topic_name, partition_index).await {
-                    Ok(Some(offset)) => {
-                        tracing::info!(
-                            group_id = %request.group_id,
-                            topic = %topic_name,
-                            partition = partition_index,
-                            offset = offset.offset,
-                            "Found committed offset"
-                        );
-                        response_partitions.push(OffsetFetchResponsePartition {
-                            partition_index: partition_index as i32,
-                            committed_offset: offset.offset,
-                            metadata: offset.metadata,
-                            error_code: 0,
-                        });
-                    }
-                    Ok(None) => {
-                        // No offset found - return default offset 0 (earliest)
-                        tracing::info!(
-                            group_id = %request.group_id,
-                            topic = %topic_name,
-                            partition = partition_index,
-                            "No committed offset, returning default 0"
-                        );
-                        response_partitions.push(OffsetFetchResponsePartition {
-                            partition_index: partition_index as i32,
-                            committed_offset: 0,  // Start from beginning
-                            metadata: None,
-                            error_code: 0,
-                        });
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            group_id = %request.group_id,
-                            topic = %topic_name,
-                            partition = partition_index,
-                            error = %e,
-                            "Error fetching offset"
-                        );
-                        // Return error for this partition
-                        response_partitions.push(OffsetFetchResponsePartition {
-                            partition_index: partition_index as i32,
-                            committed_offset: -1,
-                            metadata: None,
-                            error_code: 5, // COORDINATOR_NOT_AVAILABLE
-                        });
-                    }
-                }
-            }
-            
-            // Always add topic with all its partitions
-            response_topics.push(OffsetFetchResponseTopic {
-                name: topic_name,
-                partitions: response_partitions,
-            });
-        }
-        
-        Ok(OffsetFetchResponse {
-            header: ResponseHeader {
-                correlation_id: 0, // Will be set by the caller
-            },
-            throttle_time_ms: 0,
-            topics: response_topics,
-        })
     }
 }
+

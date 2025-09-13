@@ -27,6 +27,12 @@ opendal = { workspace = true }
 # For time measurements
 chrono = { workspace = true }
 
+# Additional dependencies for WAL testing
+base64 = "0.21"
+log = "0.4"
+env_logger = "0.11"
+libc = "0.2"
+
 [dev-dependencies]
 # Additional test utilities
 pretty_assertions = "1.4"

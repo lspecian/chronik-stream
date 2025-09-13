@@ -794,12 +794,14 @@ impl ProduceHandler {
                 // Log what we're sending to the buffer
                 let first_offset = records_for_buffer.first().unwrap().offset;
                 let last_offset = records_for_buffer.last().unwrap().offset;
-                warn!("ProduceHandler: Sending {} records to buffer, offset_range=[{}-{}], high_watermark={}", 
-                    records_for_buffer.len(), first_offset, last_offset, high_watermark);
+                tracing::warn!("PRODUCE→BUFFER: Sending {} records to buffer for {}-{}, offset_range=[{}-{}], high_watermark={}", 
+                    records_for_buffer.len(), topic, partition, first_offset, last_offset, high_watermark);
                 
                 debug!("Updating fetch handler buffer with {} unflushed records", records_for_buffer.len());
                 if let Err(e) = fetch_handler.update_buffer(topic, partition, records_for_buffer, high_watermark).await {
                     warn!("Failed to update fetch handler buffer: {:?}", e);
+                } else {
+                    tracing::info!("PRODUCE→BUFFER: Successfully updated buffer for {}-{}", topic, partition);
                 }
             }
         }
@@ -1126,11 +1128,15 @@ impl ProduceHandler {
         partition: i32,
         state: &Arc<PartitionState>,
     ) -> Result<()> {
+        tracing::warn!("FLUSH→START: Starting flush for {}-{}", topic, partition);
+        
         let batches = {
             let mut pending = state.pending_batches.lock().await;
             if pending.is_empty() {
                 return Ok(());
             }
+            let count = pending.len();
+            tracing::warn!("FLUSH→BATCHES: Flushing {} batches for {}-{}", count, topic, partition);
             std::mem::take(&mut *pending)
         };
         
@@ -1186,9 +1192,15 @@ impl ProduceHandler {
                 Ok(segment_metadata) => {
                     // If a segment was created, register it with metadata store
                     if let Some(metadata) = segment_metadata {
+                        tracing::warn!("SEGMENT→REGISTER: Attempting to register segment {} for {}-{}, path: {}", 
+                            metadata.segment_id, topic, partition, metadata.path);
                         if let Err(e) = self.metadata_store.persist_segment_metadata(metadata).await {
-                            warn!("Failed to persist segment metadata: {:?}", e);
+                            tracing::error!("SEGMENT→REGISTER: FAILED to persist segment metadata: {:?}", e);
+                        } else {
+                            tracing::warn!("SEGMENT→REGISTER: Successfully registered segment for {}-{}", topic, partition);
                         }
+                    } else {
+                        tracing::warn!("SEGMENT→REGISTER: No segment metadata returned for {}-{}", topic, partition);
                     }
                     
                     // DO NOT call flush_all here - it drains all segments!

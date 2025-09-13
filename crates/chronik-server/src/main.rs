@@ -22,6 +22,7 @@ mod fetch_handler;
 mod handler;
 mod offset_storage;
 mod coordinator_manager;
+mod wal_integration;
 
 use integrated_server::{IntegratedKafkaServer, IntegratedServerConfig};
 
