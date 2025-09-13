@@ -19,7 +19,7 @@
 //! - Failure detection and recovery
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use parking_lot::RwLock;
@@ -34,6 +34,12 @@ use crate::error::{Result, WalError};
 /// WAL offset type
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct WalOffset(pub i64);
+
+impl std::fmt::Display for WalOffset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 /// Replica node identifier
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -190,7 +196,7 @@ impl Default for ReplicaSetConfig {
 /// Manages a set of replicas
 pub struct ReplicaSet {
     config: ReplicaSetConfig,
-    transports: Arc<RwLock<HashMap<ReplicaId, Box<dyn ReplicationTransport>>>>,
+    transports: Arc<RwLock<HashMap<ReplicaId, Arc<dyn ReplicationTransport>>>>,
     follower_offsets: Arc<RwLock<HashMap<(ReplicaId, TopicPartition), WalOffset>>>,
     last_heartbeat: Arc<RwLock<HashMap<ReplicaId, Instant>>>,
 }
@@ -206,7 +212,7 @@ impl ReplicaSet {
     }
     
     /// Add a replica with its transport
-    pub fn add_replica(&self, replica_id: ReplicaId, transport: Box<dyn ReplicationTransport>) {
+    pub fn add_replica(&self, replica_id: ReplicaId, transport: Arc<dyn ReplicationTransport>) {
         self.transports.write().insert(replica_id, transport);
         self.last_heartbeat.write().insert(replica_id, Instant::now());
     }
@@ -365,14 +371,19 @@ impl WALLeader {
                     timestamp: chrono::Utc::now().timestamp_millis(),
                 };
                 
-                // Collect transports first to avoid holding lock across await
-                let transport_list: Vec<_> = {
+                // Collect transport ids to avoid holding lock across await
+                let transport_ids: Vec<_> = {
                     let transports = replica_set.transports.read();
-                    transports.values().cloned().collect()
+                    transports.keys().cloned().collect()
                 };
                 
-                for transport in transport_list {
-                    let _ = transport.broadcast(event.clone()).await;
+                for transport_id in transport_ids {
+                    let transport_option = {
+                        replica_set.transports.read().get(&transport_id).cloned()
+                    };
+                    if let Some(transport) = transport_option {
+                        let _ = transport.broadcast(event.clone()).await;
+                    }
                 }
             }
         });
@@ -390,7 +401,7 @@ impl WALLeader {
 pub struct WALFollower {
     replica_id: ReplicaId,
     replica_set: Arc<ReplicaSet>,
-    transport: Box<dyn ReplicationTransport>,
+    transport: Arc<Mutex<dyn ReplicationTransport>>,
     offsets: Arc<RwLock<HashMap<TopicPartition, WalOffset>>>,
     shutdown: Arc<RwLock<bool>>,
 }
@@ -399,7 +410,7 @@ impl WALFollower {
     pub fn new(
         replica_id: ReplicaId,
         replica_set: Arc<ReplicaSet>,
-        transport: Box<dyn ReplicationTransport>,
+        transport: Arc<Mutex<dyn ReplicationTransport>>,
     ) -> Self {
         Self {
             replica_id,
@@ -434,7 +445,7 @@ impl WALFollower {
                     timestamp: chrono::Utc::now().timestamp_millis(),
                 };
                 
-                self.transport.broadcast(ack).await?;
+                self.transport.lock().unwrap().broadcast(ack).await?;
             }
             ReplicationEvent::Heartbeat { replica_id, .. } => {
                 debug!("Follower {} received heartbeat from {}", self.replica_id, replica_id);
@@ -460,7 +471,7 @@ impl WALFollower {
         info!("Starting WAL follower {}", self.replica_id);
         
         while !*self.shutdown.read() {
-            match self.transport.receive().await {
+            match self.transport.lock().unwrap().receive().await {
                 Ok(event) => {
                     if let Err(e) = self.process_event(event).await {
                         warn!("Follower {} error processing event: {:?}", self.replica_id, e);
@@ -488,7 +499,7 @@ impl WALFollower {
             start_offset,
         };
         
-        self.transport.broadcast(event).await
+        self.transport.lock().unwrap().broadcast(event).await
     }
     
     /// Get current offset for topic partition
@@ -529,7 +540,7 @@ impl WALSyncManager {
     pub fn become_follower(
         &mut self,
         replica_id: ReplicaId,
-        transport: Box<dyn ReplicationTransport>,
+        transport: Arc<Mutex<dyn ReplicationTransport>>,
     ) -> Arc<WALFollower> {
         let follower = Arc::new(WALFollower::new(
             replica_id,

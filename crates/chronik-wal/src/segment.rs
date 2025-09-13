@@ -55,7 +55,7 @@ impl WalSegment {
         bytes_written = tracing::field::Empty,
         append_duration_us = tracing::field::Empty
     ))]
-    pub async fn append(&mut self, record: WalRecord) -> Result<()> {
+    pub fn append(&mut self, record: WalRecord) -> Result<()> {
         let append_start = Instant::now();
         let record_size = record.length;
         
@@ -121,12 +121,15 @@ impl WalSegment {
         fsync_duration_ms = tracing::field::Empty
     ))]
     pub async fn seal(self) -> Result<SealedSegment> {
-        let buffer = self.buffer.read();
-        let buffer_len = buffer.len();
+        // Extract buffer data without holding lock across await
+        let (buffer_data, buffer_len) = {
+            let buffer = self.buffer.read();
+            (buffer.to_vec(), buffer.len())
+        };
         
         // Write buffer to disk with timing
         let fsync_start = Instant::now();
-        tokio::fs::write(&self.path, &buffer[..]).await?;
+        tokio::fs::write(&self.path, &buffer_data).await?;
         let fsync_duration = fsync_start.elapsed();
         
         // Record metrics in span

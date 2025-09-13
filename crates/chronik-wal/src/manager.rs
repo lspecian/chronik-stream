@@ -104,43 +104,54 @@ impl WalManager {
             .ok_or_else(|| WalError::SegmentNotFound(format!("{}-{}", topic, partition)))?;
         
         // Append records to active segment
-        let mut active = partition_wal.active_segment.write();
-        
         for record in records {
             // Check if rotation is needed
-            if active.should_rotate(
-                self.config.rotation.max_segment_size,
-                self.config.rotation.max_segment_age_ms,
-            ) {
+            let needs_rotation = {
+                let active = partition_wal.active_segment.read();
+                active.should_rotate(
+                    self.config.rotation.max_segment_size,
+                    self.config.rotation.max_segment_age_ms,
+                )
+            };
+            
+            if needs_rotation {
+                let segment_info = {
+                    let active = partition_wal.active_segment.read();
+                    (active.id, active.size)
+                };
                 debug!(
-                    segment_id = active.id,
-                    segment_size = active.size,
+                    segment_id = segment_info.0,
+                    segment_size = segment_info.1,
                     "WAL segment rotation triggered"
                 );
-                drop(active);
                 self.rotate_segment(&tp).await?;
-                active = partition_wal.active_segment.write();
             }
             
-            // Release lock before async operation
+            // Perform append without holding lock
             {
-                active.append(record).await?;
+                let mut active = partition_wal.active_segment.write();
+                active.append(record)?;
             }
         }
         
-        // Update checkpoint if needed
+        // Update checkpoint if needed and get current segment stats
+        let (last_offset, record_count) = {
+            let active = partition_wal.active_segment.read();
+            (active.last_offset, active.record_count)
+        };
+        
         if self.config.checkpointing.enabled {
             self.checkpoint_manager.maybe_checkpoint(
                 &topic,
                 partition,
-                active.last_offset,
-                active.record_count,
+                last_offset,
+                record_count,
             ).await?;
         }
         
         debug!(
-            last_offset = active.last_offset,
-            total_records = active.record_count,
+            last_offset = last_offset,
+            total_records = record_count,
             "WAL append completed successfully"
         );
         
@@ -319,28 +330,34 @@ impl WalManager {
         for entry in self.partitions.iter() {
             let tp = entry.key();
             let wal = entry.value();
-            let active = wal.active_segment.read();
+            
+            // Extract data needed for flush without holding locks across await
+            let (path, buffer_data, segment_id) = {
+                let active = wal.active_segment.read();
+                let buffer = active.buffer.read();
+                if buffer.is_empty() {
+                    continue;
+                }
+                (active.path.clone(), buffer.to_vec(), active.id)
+            };
             
             // Force flush buffer to disk
-            let buffer = active.buffer.read();
-            if !buffer.is_empty() {
-                let fsync_start = Instant::now();
-                tokio::fs::write(&active.path, &buffer[..]).await?;
-                let fsync_duration = fsync_start.elapsed();
-                total_fsync_duration += fsync_duration;
-                
-                flushed_count += 1;
-                total_bytes += buffer.len() as u64;
-                
-                debug!(
-                    topic = %tp.topic,
-                    partition = tp.partition,
-                    segment_id = active.id,
-                    bytes_flushed = buffer.len(),
-                    fsync_duration_ms = fsync_duration.as_millis() as u64,
-                    "WAL segment flushed to disk"
-                );
-            }
+            let fsync_start = Instant::now();
+            tokio::fs::write(&path, &buffer_data).await?;
+            let fsync_duration = fsync_start.elapsed();
+            total_fsync_duration += fsync_duration;
+            
+            flushed_count += 1;
+            total_bytes += buffer_data.len() as u64;
+            
+            debug!(
+                topic = %tp.topic,
+                partition = tp.partition,
+                segment_id = segment_id,
+                bytes_flushed = buffer_data.len(),
+                fsync_duration_ms = fsync_duration.as_millis() as u64,
+                "WAL segment flushed to disk"
+            );
         }
         
         let total_flush_duration = flush_start.elapsed();

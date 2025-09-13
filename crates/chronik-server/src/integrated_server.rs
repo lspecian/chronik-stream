@@ -214,6 +214,7 @@ impl IntegratedKafkaServer {
         
         // Create WAL configuration with default settings
         use chronik_wal::{CompressionType, CheckpointConfig, RecoveryConfig, RotationConfig, FsyncConfig};
+        use chronik_wal::config::AsyncIoConfig;
         use std::path::PathBuf;
         
         let wal_config = WalConfig {
@@ -235,6 +236,7 @@ impl IntegratedKafkaServer {
                 batch_size: 8,     // Batch up to 8 writes for efficiency
                 batch_timeout_ms: 50, // Max 50ms latency for fsync batching
             },
+            async_io: AsyncIoConfig::default(),
         };
         
         // Wrap the produce handler with WAL for durability
