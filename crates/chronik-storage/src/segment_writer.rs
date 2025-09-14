@@ -273,10 +273,38 @@ impl SegmentWriter {
                 ),
                 created_at: Utc::now(),
             };
-            
-            tracing::warn!("SEGMENT→METADATA: Created metadata for active segment {}-{}: offsets {}-{}, {} records (not rotated)",
+
+            // CRITICAL: Also write the segment data to object store immediately
+            // Clone the builder to create a segment without removing from active_segments
+            let segment_metadata = chronik_common::types::SegmentMetadata {
+                id: active.id,
+                topic_partition: TopicPartition {
+                    topic: active.topic.clone(),
+                    partition: active.partition,
+                },
+                base_offset: active.base_offset,
+                last_offset: active.last_offset,
+                timestamp_min: active.timestamp_min,
+                timestamp_max: active.timestamp_max,
+                size_bytes: active.current_size,
+                record_count: active.record_count,
+                object_key: format!("{}/{}/{}.segment",
+                    active.topic,
+                    active.partition,
+                    active.id.0
+                ),
+                created_at: Utc::now(),
+            };
+
+            // Build and upload segment (clone builder to keep it active)
+            let built_segment = active.builder.clone()
+                .with_metadata(segment_metadata)
+                .build()?;
+            self.upload_segment(built_segment).await?;
+
+            tracing::warn!("SEGMENT→WRITTEN: Wrote active segment {}-{} to object store: offsets {}-{}, {} records",
                 metadata.topic, metadata.partition, metadata.start_offset, metadata.end_offset, metadata.record_count);
-            
+
             return Ok(Some(metadata));
         }
         

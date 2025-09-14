@@ -1260,9 +1260,37 @@ impl GroupManager {
         Err(chronik_common::Error::Other(anyhow::anyhow!("OffsetCommit not implemented")))
     }
     
-    pub async fn handle_offset_fetch(&self, _request: chronik_protocol::types::OffsetFetchRequest) -> Result<chronik_protocol::types::OffsetFetchResponse> {
-        // For now, use the protocol handler's default handling which should delegate back
-        Err(chronik_common::Error::Other(anyhow::anyhow!("OffsetFetch not implemented")))
+    pub async fn handle_offset_fetch(&self, request: chronik_protocol::types::OffsetFetchRequest) -> Result<chronik_protocol::types::OffsetFetchResponse> {
+        // Return no committed offsets for now - this will cause consumers to use auto_offset_reset
+        // This is sufficient for the fetch handler to work with earliest/latest settings
+        let topics = if let Some(requested_topics) = request.topics {
+            // Return empty offsets for requested topics
+            // For simplicity, assume partition 0 for all topics
+            requested_topics.into_iter().map(|topic_name| {
+                chronik_protocol::types::OffsetFetchResponseTopic {
+                    name: topic_name,
+                    partitions: vec![
+                        chronik_protocol::types::OffsetFetchResponsePartition {
+                            partition_index: 0,  // Default to partition 0
+                            committed_offset: -1,  // No committed offset
+                            metadata: None,
+                            error_code: 0,
+                        }
+                    ],
+                }
+            }).collect()
+        } else {
+            // Return empty response if no topics specified
+            vec![]
+        };
+
+        Ok(chronik_protocol::types::OffsetFetchResponse {
+            header: chronik_protocol::ResponseHeader {
+                correlation_id: 0,  // Will be set by the handler
+            },
+            throttle_time_ms: 0,
+            topics,
+        })
     }
     
     pub fn handle_find_coordinator(&self, _request: chronik_protocol::find_coordinator_types::FindCoordinatorRequest, host: &str, port: i32) -> Result<chronik_protocol::find_coordinator_types::FindCoordinatorResponse> {

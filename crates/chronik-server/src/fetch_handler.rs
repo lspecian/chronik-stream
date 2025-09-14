@@ -705,11 +705,33 @@ impl FetchHandler {
         end_offset: i64,
         max_bytes: i32,
     ) -> Result<Vec<chronik_storage::Record>> {
-        tracing::info!("Fetching from segment {} (offsets {}-{}) with key: {}", 
+        tracing::info!("Fetching from segment {} (offsets {}-{}) with key: {}",
             segment_info.segment_id, start_offset, end_offset, segment_info.object_key);
-        
+
+        // Debug: Log the full path being accessed
+        tracing::warn!("SEGMENT→READ: Attempting to read segment from object store with key: {}",
+            segment_info.object_key);
+
         // Read segment from storage using the correct Segment format (CHRN magic bytes)
-        let segment_data = self.object_store.get(&segment_info.object_key).await?;
+        let segment_data = match self.object_store.get(&segment_info.object_key).await {
+            Ok(data) => {
+                tracing::info!("SEGMENT→READ: Successfully read segment {} ({} bytes)",
+                    segment_info.object_key, data.len());
+                data
+            }
+            Err(e) => {
+                tracing::error!("SEGMENT→READ: Failed to read segment {}: {:?}",
+                    segment_info.object_key, e);
+
+                // Try to understand where the file should be
+                tracing::error!("SEGMENT→DEBUG: The segment file was expected at key: {}",
+                    segment_info.object_key);
+                tracing::error!("SEGMENT→DEBUG: This typically maps to: ./data/segments/{}",
+                    segment_info.object_key);
+
+                return Err(e.into());
+            }
+        };
         
         // Parse using the Segment format - this is what SegmentWriter creates
         let segment = Segment::deserialize(segment_data)?;

@@ -43,7 +43,7 @@ pub struct Segment {
 }
 
 /// Builder for creating segments.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SegmentBuilder {
     metadata: Option<SegmentMetadata>,
     raw_kafka_batches: BytesMut,

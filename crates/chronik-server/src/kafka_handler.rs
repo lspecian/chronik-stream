@@ -253,6 +253,8 @@ impl KafkaProtocolHandler {
                 const LATEST_TIMESTAMP: i64 = -1;
                 const EARLIEST_TIMESTAMP: i64 = -2;
 
+                tracing::info!("ListOffsets request received, API version: {}", header.api_version);
+
                 let mut decoder = Decoder::new(&mut buf);
 
                 // Parse ListOffsets request
@@ -302,6 +304,9 @@ impl KafkaProtocolHandler {
                     let mut response_partitions = Vec::new();
 
                     for partition in topic.partitions {
+                        tracing::info!("ListOffsets: Processing topic {} partition {} with timestamp {}",
+                            topic.name, partition.partition_index, partition.timestamp);
+
                         let (offset, timestamp_found) = match partition.timestamp {
                             LATEST_TIMESTAMP => {
                                 // Get high watermark from ProduceHandler (includes in-memory messages)
@@ -333,6 +338,8 @@ impl KafkaProtocolHandler {
                             }
                             EARLIEST_TIMESTAMP => {
                                 // Return the earliest offset (always 0 for now)
+                                tracing::info!("ListOffsets: Returning earliest offset 0 for {}-{}",
+                                    topic.name, partition.partition_index);
                                 (0, std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap()
@@ -348,13 +355,20 @@ impl KafkaProtocolHandler {
                             }
                         };
 
-                        response_partitions.push(ListOffsetsResponsePartition {
+                        let response_part = ListOffsetsResponsePartition {
                             partition_index: partition.partition_index,
                             error_code: error_codes::NONE,
                             timestamp: if header.api_version >= 1 { timestamp_found } else { -1 },
                             offset,
                             leader_epoch: if header.api_version >= 4 { 0 } else { -1 },
-                        });
+                        };
+
+                        tracing::info!("ListOffsets: Response for {}-{}: offset={}, timestamp={}, error_code={}",
+                            topic.name, partition.partition_index, offset,
+                            if header.api_version >= 1 { timestamp_found } else { -1 },
+                            error_codes::NONE);
+
+                        response_partitions.push(response_part);
                     }
 
                     response_topics.push(ListOffsetsResponseTopic {

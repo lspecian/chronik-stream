@@ -2464,21 +2464,28 @@ impl ProtocolHandler {
             for partition in &topic.partitions {
                 // Partition index
                 encoder.write_i32(partition.partition_index);
-                
+
                 // Error code
                 encoder.write_i16(partition.error_code);
-                
-                // Timestamp (v1+)
-                if version >= 1 {
-                    encoder.write_i64(partition.timestamp);
-                }
-                
-                // Offset
-                encoder.write_i64(partition.offset);
-                
-                // Leader epoch (v4+)
-                if version >= 4 {
-                    encoder.write_i32(partition.leader_epoch);
+
+                // For v0, we need to write an array of offsets
+                if version == 0 {
+                    // Write offset array (for v0, we return a single offset in an array)
+                    encoder.write_i32(1); // Offset count = 1
+                    encoder.write_i64(partition.offset); // The single offset
+                } else {
+                    // Timestamp (v1+)
+                    if version >= 1 {
+                        encoder.write_i64(partition.timestamp);
+                    }
+
+                    // Offset (v1+)
+                    encoder.write_i64(partition.offset);
+
+                    // Leader epoch (v4+)
+                    if version >= 4 {
+                        encoder.write_i32(partition.leader_epoch);
+                    }
                 }
             }
         }
