@@ -268,7 +268,7 @@ impl WalCompactor {
     async fn create_temp_compacted_segment(&self, partition: &TopicPartition, records: &[WalRecord]) -> Result<PathBuf> {
         let temp_dir = self.base_path.join("tmp");
         tokio::fs::create_dir_all(&temp_dir).await
-            .map_err(|e| WalError::Io(format!("Failed to create temp directory: {}", e)))?;
+            .map_err(|e| WalError::Io(e))?;
 
         let temp_file = temp_dir.join(format!("compact_{}_{}.wal", partition.topic, partition.partition));
 
@@ -283,7 +283,7 @@ impl WalCompactor {
         }
 
         tokio::fs::write(&temp_file, data).await
-            .map_err(|e| WalError::Io(format!("Failed to write temp file: {}", e)))?;
+            .map_err(|e| WalError::Io(e))?;
 
         Ok(temp_file)
     }

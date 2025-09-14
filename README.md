@@ -186,6 +186,7 @@ Options:
   -b, --bind-addr <ADDR>       Bind address (default: 0.0.0.0)
   --advertised-addr <ADDR>     Address advertised to clients (REQUIRED for Docker/remote access)
   --advertised-port <PORT>     Port advertised to clients (default: kafka port)
+  --file-metadata              Use file-based metadata store instead of WAL-based (legacy mode)
   --enable-search              Enable search functionality
   --enable-backup              Enable backup functionality
 
@@ -195,6 +196,7 @@ Environment Variables:
   CHRONIK_ADVERTISED_ADDR      Address advertised to clients (CRITICAL for Docker)
   CHRONIK_ADVERTISED_PORT      Port advertised to clients
   CHRONIK_DATA_DIR             Data directory path
+  CHRONIK_FILE_METADATA        Set to "true" to use legacy file-based metadata store
   RUST_LOG                     Log level (error, warn, info, debug, trace)
 ```
 

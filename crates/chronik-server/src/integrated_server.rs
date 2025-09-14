@@ -75,7 +75,7 @@ impl Default for IntegratedServerConfig {
             num_partitions: 3,
             replication_factor: 1,
             enable_dual_storage: false, // Default to raw-only for better performance
-            use_wal_metadata: false, // Default to file-based for now
+            use_wal_metadata: true, // Default to WAL-based metadata
         }
     }
 }
@@ -160,13 +160,13 @@ impl IntegratedKafkaServer {
 
             metalog_store_arc
         } else {
-            info!("Initializing persistent file-based metadata store");
+            info!("Initializing file-based metadata store (legacy mode)");
             let metadata_dir = format!("{}/metadata", config.data_dir);
             std::fs::create_dir_all(&metadata_dir)?;
 
             match FileMetadataStore::new(&metadata_dir).await {
                 Ok(store) => {
-                    info!("Successfully initialized file-based metadata store at {}", metadata_dir);
+                    info!("Successfully initialized file-based metadata store (legacy) at {}", metadata_dir);
                     Arc::new(store)
                 },
                 Err(e) => {
