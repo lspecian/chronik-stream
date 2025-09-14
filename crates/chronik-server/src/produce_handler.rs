@@ -1578,6 +1578,21 @@ impl ProduceHandler {
         info!("Produce handler shutdown complete");
         Ok(())
     }
+    
+    /// Get the high watermark for a partition (includes in-memory messages)
+    pub async fn get_partition_high_watermark(&self, topic: &str, partition: i32) -> i64 {
+        let states = self.partition_states.read().await;
+        if let Some(state) = states.get(&(topic.to_string(), partition)) {
+            state.high_watermark.load(Ordering::SeqCst) as i64
+        } else {
+            // If no state exists yet, query metadata store for persisted offsets
+            if let Ok(Some((hw, _))) = self.metadata_store.get_partition_offset(topic, partition as u32).await {
+                hw
+            } else {
+                0
+            }
+        }
+    }
 }
 
 // Implement Clone for handler (needed for background tasks)

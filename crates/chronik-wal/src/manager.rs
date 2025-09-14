@@ -180,9 +180,57 @@ impl WalManager {
         let _partition_wal = self.partitions.get(&tp)
             .ok_or_else(|| WalError::SegmentNotFound(format!("{}-{}", topic, partition)))?;
         
-        // TODO: Implement actual reading from segments
-        // For now, return empty vec
-        Ok(Vec::new())
+        let partition_wal = self.partitions.get(&tp)
+            .ok_or_else(|| WalError::SegmentNotFound(format!("{}-{}", topic, partition)))?;
+        
+        let mut records = Vec::new();
+        
+        info!(
+            "Reading from WAL: topic={}, partition={}, offset={}, max_records={}", 
+            topic, partition, offset, max_records
+        );
+        
+        // First check active segment buffer
+        {
+            let active_segment = partition_wal.active_segment.read();
+            let buffer = active_segment.buffer.read();
+            
+            if !buffer.is_empty() && offset >= active_segment.base_offset {
+                debug!("Checking active segment buffer for offset {}", offset);
+                
+                // Parse records from active segment buffer
+                if let Ok(parsed_records) = self.parse_buffer_records(&buffer, active_segment.base_offset, offset, max_records) {
+                    records.extend(parsed_records);
+                    info!("Found {} records in active segment buffer", records.len());
+                }
+            }
+        }
+        
+        // If we still need more records and haven't hit the limit, check sealed segments
+        if records.len() < max_records && !partition_wal.sealed_segments.is_empty() {
+            for sealed_segment in &partition_wal.sealed_segments {
+                if sealed_segment.contains_offset(offset) {
+                    debug!("Reading from sealed segment {}", sealed_segment.id);
+                    
+                    // Read the sealed segment file
+                    if let Ok(segment_data) = tokio::fs::read(&sealed_segment.path).await {
+                        if let Ok(sealed_records) = self.parse_buffer_records(&segment_data, sealed_segment.base_offset, offset, max_records - records.len()) {
+                            let sealed_count = sealed_records.len();
+                            records.extend(sealed_records);
+                            info!("Found {} additional records in sealed segment {}", sealed_count, sealed_segment.id);
+                        }
+                    }
+                    
+                    // Stop if we have enough records
+                    if records.len() >= max_records {
+                        break;
+                    }
+                }
+            }
+        }
+        
+        info!("WAL read completed: found {} records starting from offset {}", records.len(), offset);
+        Ok(records)
     }
     
     /// Create a new partition WAL
@@ -389,5 +437,93 @@ impl WalManager {
         // TODO: Implement streaming read
         debug!("WAL read_next not yet implemented");
         Ok(None)
+    }
+    
+    /// Parse buffer records within offset range
+    fn parse_buffer_records(
+        &self,
+        buffer: &[u8],
+        base_offset: i64,
+        start_offset: i64,
+        max_records: usize,
+    ) -> Result<Vec<WalRecord>> {
+        let mut records = Vec::new();
+        let mut cursor = 0;
+        
+        debug!(
+            buffer_len = buffer.len(),
+            base_offset = base_offset,
+            start_offset = start_offset,
+            max_records = max_records,
+            "Parsing buffer records"
+        );
+        
+        while cursor < buffer.len() && records.len() < max_records {
+            // Try to read a record from current position
+            let remaining = &buffer[cursor..];
+            
+            // Need at least the minimum header size to proceed
+            if remaining.len() < 28 { // Fixed header size from record.rs:246
+                debug!("Insufficient buffer data for header at cursor {}", cursor);
+                break;
+            }
+            
+            // Parse the record length to determine full record size
+            let record_length = {
+                use byteorder::{LittleEndian, ReadBytesExt};
+                use std::io::Cursor;
+                
+                let mut length_cursor = Cursor::new(&remaining[4..8]); // Length is at offset 4
+                length_cursor.read_u32::<LittleEndian>()?
+            };
+            
+            // Check if we have the full record
+            if remaining.len() < record_length as usize {
+                debug!(
+                    "Incomplete record: need {} bytes, have {}",
+                    record_length,
+                    remaining.len()
+                );
+                break;
+            }
+            
+            // Try to parse the record
+            let record_bytes = &remaining[..record_length as usize];
+            match WalRecord::from_bytes(record_bytes) {
+                Ok(record) => {
+                    // Check if this record is within our offset range
+                    if record.offset >= start_offset {
+                        debug!(
+                            record_offset = record.offset,
+                            record_size = record_bytes.len(),
+                            "Found record in range"
+                        );
+                        records.push(record);
+                    } else {
+                        debug!(
+                            record_offset = record.offset,
+                            start_offset = start_offset,
+                            "Skipping record before start offset"
+                        );
+                    }
+                    
+                    // Move cursor to next record
+                    cursor += record_length as usize;
+                }
+                Err(e) => {
+                    // If we can't parse a record, it might be corruption or incomplete data
+                    debug!("Failed to parse record at cursor {}: {}", cursor, e);
+                    break;
+                }
+            }
+        }
+        
+        debug!(
+            "Parsed {} records from buffer (cursor final position: {})",
+            records.len(),
+            cursor
+        );
+        
+        Ok(records)
     }
 }

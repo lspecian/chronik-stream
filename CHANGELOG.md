@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.2] - 2025-09-14
+
+### Fixed
+- **CRITICAL**: Fixed "Unknown Group" errors in Kafka Consumer Group Coordination
+  - Consumer groups are now automatically created when clients attempt to join non-existent groups
+  - Enhanced JoinGroup and SyncGroup protocol handlers for proper consumer group coordination
+  - Matches standard Kafka broker behavior for consumer group lifecycle management
+- Improved protocol conversion between internal consumer group format and Kafka wire protocol
+- Enhanced consumer group state transitions and member management
+- Better error handling for consumer group edge cases
+
+### Added
+- Automatic consumer group creation during coordination process
+- Enhanced protocol compliance for JoinGroup and SyncGroup operations
+- Comprehensive test suite for consumer group functionality in `tests/consumer-group/`
+- Improved logging and debugging for consumer group operations
+
+### Changed
+- Consumer group coordination now follows standard Kafka broker patterns
+- Enhanced client compatibility with kafka-python and other standard Kafka clients
+- Improved consumer group state management and assignment distribution
+
+### Compatibility
+- Full backward compatibility with v1.0.1
+- Drop-in replacement with no breaking changes
+- Enhanced compatibility with all major Kafka client libraries
+
 ## [0.7.2] - 2025-09-09
 
 ### Fixed

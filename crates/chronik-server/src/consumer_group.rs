@@ -1158,26 +1158,84 @@ impl GroupManager {
     }
     
     // Protocol wrapper methods for kafka_handler compatibility
-    pub async fn handle_join_group(&self, _request: chronik_protocol::join_group_types::JoinGroupRequest) -> Result<chronik_protocol::join_group_types::JoinGroupResponse> {
-        // Return a minimal join group response for now
+    pub async fn handle_join_group(&self, request: chronik_protocol::join_group_types::JoinGroupRequest) -> Result<chronik_protocol::join_group_types::JoinGroupResponse> {
+        use std::time::Duration;
+
+        // Convert protocol request to internal format
+        let protocols = request.protocols.into_iter()
+            .map(|p| (p.name, p.metadata.to_vec()))
+            .collect();
+
+        // Call the real join_group implementation with proper parameters
+        let result = self.join_group(
+            request.group_id,
+            if request.member_id.is_empty() { None } else { Some(request.member_id) },
+            "kafka-python".to_string(), // TODO: Parse from request if available
+            "/127.0.0.1".to_string(),   // TODO: Parse from connection info
+            Duration::from_millis(request.session_timeout_ms as u64),
+            Duration::from_millis(if request.rebalance_timeout_ms > 0 {
+                request.rebalance_timeout_ms as u64
+            } else {
+                request.session_timeout_ms as u64
+            }),
+            request.protocol_type,
+            protocols,
+            request.group_instance_id,
+        ).await?;
+
+        // Convert internal response to protocol format
+        let is_leader = result.member_id == result.leader_id;
+        let members = if is_leader {
+            result.members.into_iter().map(|m| {
+                chronik_protocol::join_group_types::JoinGroupResponseMember {
+                    member_id: m.member_id,
+                    group_instance_id: None, // Not supported in MemberInfo struct
+                    metadata: bytes::Bytes::from(m.metadata),
+                }
+            }).collect()
+        } else {
+            vec![]
+        };
+
         Ok(chronik_protocol::join_group_types::JoinGroupResponse {
-            error_code: 0,
-            generation_id: 1,
-            protocol_type: Some("consumer".to_string()),
-            protocol_name: Some("range".to_string()),
-            leader: "member-1".to_string(),
-            member_id: "member-1".to_string(),
-            members: vec![],
+            error_code: result.error_code,
+            generation_id: result.generation_id,
+            protocol_type: Some("consumer".to_string()), // Use default since internal struct uses 'protocol'
+            protocol_name: Some(result.protocol),
+            leader: result.leader_id,
+            member_id: result.member_id,
+            members,
             throttle_time_ms: 0,
         })
     }
     
-    pub async fn handle_sync_group(&self, _request: chronik_protocol::sync_group_types::SyncGroupRequest) -> Result<chronik_protocol::sync_group_types::SyncGroupResponse> {
+    pub async fn handle_sync_group(&self, request: chronik_protocol::sync_group_types::SyncGroupRequest) -> Result<chronik_protocol::sync_group_types::SyncGroupResponse> {
+        // Convert assignments from protocol format to our internal format
+        let assignments = if !request.assignments.is_empty() {
+            let mut parsed_assignments = Vec::new();
+            for assignment in request.assignments {
+                parsed_assignments.push((assignment.member_id, assignment.assignment.to_vec()));
+            }
+            Some(parsed_assignments)
+        } else {
+            None
+        };
+
+        // Call the real sync group implementation
+        let sync_response = self.sync_group(
+            request.group_id,
+            request.generation_id,
+            request.member_id,
+            0, // member_epoch - protocol doesn't have this field yet
+            assignments,
+        ).await?;
+
+        // Convert back to protocol format
         Ok(chronik_protocol::sync_group_types::SyncGroupResponse {
-            error_code: 0,
-            protocol_name: Some("range".to_string()),
-            protocol_type: Some("consumer".to_string()),
-            assignment: bytes::Bytes::new(),
+            error_code: sync_response.error_code,
+            protocol_name: request.protocol_name,
+            protocol_type: request.protocol_type,
+            assignment: bytes::Bytes::from(sync_response.assignment),
             throttle_time_ms: 0,
         })
     }

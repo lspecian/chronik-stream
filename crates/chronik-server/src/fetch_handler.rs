@@ -5,12 +5,13 @@ use chronik_common::metadata::traits::MetadataStore;
 use chronik_protocol::{FetchRequest, FetchResponse, FetchResponseTopic, FetchResponsePartition};
 use chronik_storage::{SegmentReader, RecordBatch, Record, Segment, ObjectStoreTrait};
 use chronik_storage::kafka_records::{KafkaRecordBatch, KafkaRecord, RecordHeader as KafkaRecordHeader, CompressionType};
+use chronik_wal::{WalManager, WalRecord};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tokio::time::timeout;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// In-memory buffer for recent records
 #[derive(Debug)]
@@ -44,6 +45,7 @@ pub struct FetchHandler {
     segment_reader: Arc<SegmentReader>,
     metadata_store: Arc<dyn MetadataStore>,
     object_store: Arc<dyn ObjectStoreTrait>,
+    wal_manager: Option<Arc<RwLock<WalManager>>>,
     state: Arc<RwLock<FetchState>>,
 }
 
@@ -58,6 +60,26 @@ impl FetchHandler {
             segment_reader,
             metadata_store,
             object_store,
+            wal_manager: None,
+            state: Arc::new(RwLock::new(FetchState {
+                buffers: HashMap::new(),
+                segment_cache: HashMap::new(),
+            })),
+        }
+    }
+
+    /// Create a new fetch handler with WAL integration
+    pub fn new_with_wal(
+        segment_reader: Arc<SegmentReader>,
+        metadata_store: Arc<dyn MetadataStore>,
+        object_store: Arc<dyn ObjectStoreTrait>,
+        wal_manager: Arc<RwLock<WalManager>>,
+    ) -> Self {
+        Self {
+            segment_reader,
+            metadata_store,
+            object_store,
+            wal_manager: Some(wal_manager),
             state: Arc::new(RwLock::new(FetchState {
                 buffers: HashMap::new(),
                 segment_cache: HashMap::new(),
@@ -354,7 +376,7 @@ impl FetchHandler {
         unreachable!("Fetch handler logic error")
     }
     
-    /// Fetch records from memory or segments
+    /// Fetch records with proper priority: Buffer → WAL → Segments
     async fn fetch_records(
         &self,
         topic: &str,
@@ -363,8 +385,133 @@ impl FetchHandler {
         high_watermark: i64,
         max_bytes: i32,
     ) -> Result<Vec<chronik_storage::Record>> {
-        tracing::info!(
+        info!(
             "fetch_records called - topic: {}, partition: {}, fetch_offset: {}, high_watermark: {}",
+            topic, partition, fetch_offset, high_watermark
+        );
+        
+        let mut records = Vec::new();
+        let mut bytes_fetched = 0usize;
+        
+        // PHASE 1: Try in-memory buffer first (fastest path)
+        {
+            let state = self.state.read().await;
+            if let Some(buffer) = state.buffers.get(&(topic.to_string(), partition)) {
+                info!(
+                    "FETCH→BUFFER: Checking buffer for {}-{}, buffer has {} records",
+                    topic, partition, buffer.records.len()
+                );
+                
+                for record in &buffer.records {
+                    if record.offset >= fetch_offset && record.offset < high_watermark {
+                        let record_size = record.value.len() + 
+                            record.key.as_ref().map(|k| k.len()).unwrap_or(0) + 24;
+                        
+                        if bytes_fetched + record_size > max_bytes as usize && !records.is_empty() {
+                            break;
+                        }
+                        
+                        debug!(
+                            "FETCH→BUFFER: Found record at offset {} in buffer",
+                            record.offset
+                        );
+                        
+                        records.push(record.clone());
+                        bytes_fetched += record_size;
+                    }
+                }
+                
+                if !records.is_empty() {
+                    info!(
+                        "FETCH→BUFFER: Successfully fetched {} records from buffer for {}-{}",
+                        records.len(), topic, partition
+                    );
+                    return Ok(records);
+                }
+            }
+        }
+        
+        // PHASE 2: Try WAL if buffer was empty (handles flushed records)
+        if let Some(wal_manager) = &self.wal_manager {
+            match self.fetch_from_wal(wal_manager, topic, partition, fetch_offset, max_bytes).await {
+                Ok(wal_records) => {
+                    if !wal_records.is_empty() {
+                        info!(
+                            "FETCH→WAL: Successfully fetched {} records from WAL for {}-{}",
+                            wal_records.len(), topic, partition
+                        );
+                        return Ok(wal_records);
+                    } else {
+                        debug!(
+                            "FETCH→WAL: No records found in WAL for {}-{} at offset {}",
+                            topic, partition, fetch_offset
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "FETCH→WAL: Failed to fetch from WAL for {}-{}: {}",
+                        topic, partition, e
+                    );
+                }
+            }
+        }
+        
+        // PHASE 3: Fall back to segment-based storage (legacy path)
+        info!(
+            "FETCH→SEGMENTS: Falling back to segment reader for {}-{}",
+            topic, partition
+        );
+        self.fetch_records_legacy(topic, partition, fetch_offset, high_watermark, max_bytes).await
+    }
+    
+    /// Fetch records from WAL manager
+    async fn fetch_from_wal(
+        &self,
+        wal_manager: &Arc<RwLock<WalManager>>,
+        topic: &str,
+        partition: i32,
+        fetch_offset: i64,
+        max_bytes: i32,
+    ) -> Result<Vec<chronik_storage::Record>> {
+        let max_records = std::cmp::max(1, max_bytes as usize / 100); // Estimate ~100 bytes per record
+        
+        let wal_records = {
+            let manager = wal_manager.read().await;
+            manager.read_from(topic, partition, fetch_offset, max_records).await
+                .map_err(|e| Error::Internal(format!("WAL read failed: {}", e)))?
+        };
+        
+        // Convert WalRecord to chronik_storage::Record
+        let mut records = Vec::new();
+        for wal_record in wal_records {
+            let storage_record = chronik_storage::Record {
+                offset: wal_record.offset,
+                timestamp: wal_record.timestamp,
+                key: wal_record.key,
+                value: wal_record.value,
+                headers: wal_record.headers.into_iter().collect(),
+            };
+            records.push(storage_record);
+        }
+        
+        info!("WAL returned {} records starting from offset {} for {}-{}", 
+            records.len(), fetch_offset, topic, partition);
+        
+        Ok(records)
+    }
+    
+    /// Legacy method for fetching from segments and buffers (fallback)
+    async fn fetch_records_legacy(
+        &self,
+        topic: &str,
+        partition: i32,
+        fetch_offset: i64,
+        high_watermark: i64,
+        max_bytes: i32,
+    ) -> Result<Vec<chronik_storage::Record>> {
+        info!(
+            "fetch_records_legacy called - topic: {}, partition: {}, fetch_offset: {}, high_watermark: {}",
             topic, partition, fetch_offset, high_watermark
         );
         
@@ -703,6 +850,31 @@ impl FetchHandler {
         tracing::info!("Combined {} bytes of raw Kafka data from {} segments", 
             combined_bytes.len(), num_segments);
         Ok(combined_bytes)
+    }
+    
+    /// Get the high watermark and log start offset for a partition (used by ListOffsets)
+    pub async fn get_partition_offsets(&self, topic: &str, partition: i32) -> Result<(i64, i64)> {
+        // Calculate high watermark from segments
+        let segments = self.metadata_store.list_segments(topic, Some(partition as u32)).await?;
+        let segment_high_watermark = segments.iter()
+            .map(|s| s.end_offset + 1)
+            .max()
+            .unwrap_or(0);
+        
+        // Also check buffer for high watermark
+        let buffer_high_watermark = {
+            let state = self.state.read().await;
+            let key = (topic.to_string(), partition);
+            state.buffers.get(&key).map(|b| b.high_watermark).unwrap_or(0)
+        };
+        
+        // Use the maximum of segment and buffer high watermarks
+        let high_watermark = segment_high_watermark.max(buffer_high_watermark);
+        
+        // Log start offset is always 0 for now (we don't do deletion)
+        let log_start_offset = 0;
+        
+        Ok((high_watermark, log_start_offset))
     }
     
     /// Update in-memory buffer with new records  
