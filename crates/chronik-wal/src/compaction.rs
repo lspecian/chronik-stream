@@ -277,7 +277,7 @@ impl WalCompactor {
         let mut data = Vec::new();
         for record in records {
             let serialized = serde_json::to_vec(record)
-                .map_err(|e| WalError::Serialization(format!("Failed to serialize record: {}", e)))?;
+                .map_err(|e| WalError::IoError(format!("Failed to serialize record: {}", e)))?;
             data.extend_from_slice(&(serialized.len() as u32).to_le_bytes());
             data.extend_from_slice(&serialized);
         }
