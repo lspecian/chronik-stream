@@ -81,7 +81,6 @@ cargo test --package chronik-storage
 
 3. **Offset Management**
    - Offset commit/fetch fully working
-   - Persistence to TiKV metadata store
    - Consumers can resume from last position
    - Test: `test_offset_commit_fetch()`
 

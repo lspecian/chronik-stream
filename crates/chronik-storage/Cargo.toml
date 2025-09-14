@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 chronik-common = { path = "../chronik-common" }
 chronik-protocol = { path = "../chronik-protocol" }
+chronik-wal = { path = "../chronik-wal" }
 
 # Storage backends
 opendal = { workspace = true }

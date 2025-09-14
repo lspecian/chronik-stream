@@ -34,17 +34,17 @@ pub trait ProduceHandlerTrait: Send + Sync {
 }
 
 impl WalProduceHandler {
-    /// Create a new WAL-integrated produce handler
+    /// Create a new WAL-integrated produce handler with recovery
     pub async fn new(
         wal_config: WalConfig,
         inner_handler: Arc<ProduceHandler>,
     ) -> Result<Self> {
-        // Initialize WAL manager
-        let wal_manager = WalManager::new(wal_config).await
-            .map_err(|e| Error::Internal(format!("Failed to initialize WAL: {}", e)))?;
-        
-        info!("WAL-integrated produce handler initialized");
-        
+        // Initialize WAL manager with recovery
+        let wal_manager = WalManager::recover(&wal_config).await
+            .map_err(|e| Error::Internal(format!("Failed to recover WAL: {}", e)))?;
+
+        info!("WAL-integrated produce handler initialized with recovery");
+
         Ok(Self {
             wal_manager: Arc::new(RwLock::new(wal_manager)),
             inner_handler,

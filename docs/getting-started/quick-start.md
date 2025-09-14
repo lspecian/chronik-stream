@@ -19,7 +19,6 @@ This will start:
 - Chronik Stream server on port 9092 (Kafka protocol)
 - Search API on port 8080
 - Admin UI on port 8081
-- TiKV for metadata storage
 
 ## 3. Verify Installation
 

@@ -10,7 +10,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{RwLock, Mutex};
 use tracing::{debug, info, warn, error};
-// use crate::distributed_lock::{DistributedLockManager, with_lock_async};  // Removed - tikv dependency
 
 /// Consumer group state
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -372,7 +371,6 @@ pub struct GroupManager {
     groups: Arc<RwLock<HashMap<String, ConsumerGroup>>>,
     metadata_store: Arc<dyn MetadataStore>,
     assignor: Arc<Mutex<Box<dyn PartitionAssignor>>>,
-    // lock_manager: Option<Arc<DistributedLockManager>>,  // Removed - tikv dependency
 }
 
 impl GroupManager {
@@ -382,22 +380,8 @@ impl GroupManager {
             groups: Arc::new(RwLock::new(HashMap::new())),
             metadata_store,
             assignor: Arc::new(Mutex::new(Box::new(CooperativeStickyAssignor::new()))),
-            // lock_manager: None,  // Removed - tikv dependency
         }
     }
-    
-    // /// Create a new group manager with distributed locking
-    // pub fn with_lock_manager(
-    //     metadata_store: Arc<dyn MetadataStore>, 
-    //     lock_manager: Arc<DistributedLockManager>
-    // ) -> Self {
-    //     Self {
-    //         groups: Arc::new(RwLock::new(HashMap::new())),
-    //         metadata_store,
-    //         assignor: Arc::new(Mutex::new(Box::new(CooperativeStickyAssignor::new()))),
-    //         lock_manager: Some(lock_manager),
-    //     }
-    // }  // Removed - tikv dependency
     
     /// Set the partition assignment strategy
     pub async fn set_assignment_strategy(&self, strategy: AssignmentStrategy) {

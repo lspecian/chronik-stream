@@ -201,8 +201,15 @@ impl FsyncBatcher {
         pending_bytes: Arc<AtomicU64>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            let mut timer = interval(Duration::from_millis(config.batch_timeout_ms));
-            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // If timeout is 0, don't use timer-based flushing
+            let use_timer = config.batch_timeout_ms > 0;
+            let mut timer = if use_timer {
+                let mut t = interval(Duration::from_millis(config.batch_timeout_ms));
+                t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                Some(t)
+            } else {
+                None
+            };
             
             info!(
                 batch_timeout_ms = config.batch_timeout_ms,
@@ -211,8 +218,15 @@ impl FsyncBatcher {
             
             loop {
                 tokio::select! {
-                    // Timer-based flush
-                    _ = timer.tick() => {
+                    // Timer-based flush (only if timer is enabled)
+                    _ = async {
+                        if let Some(ref mut t) = timer {
+                            t.tick().await;
+                        } else {
+                            // If no timer, just wait forever
+                            futures::future::pending::<()>().await;
+                        }
+                    } => {
                         if pending_count.load(Ordering::Relaxed) > 0 {
                             debug!("Timer-based batch flush triggered");
                             Self::process_batch(

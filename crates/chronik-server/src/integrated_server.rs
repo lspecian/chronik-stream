@@ -18,7 +18,6 @@ use crate::produce_handler::{ProduceHandler, ProduceHandlerConfig};
 use crate::fetch_handler::FetchHandler;
 use crate::storage::{StorageConfig as IngestStorageConfig, StorageService};
 use crate::wal_integration::WalProduceHandler;
-use chronik_wal::{WalConfig, CompressionType, CheckpointConfig, RecoveryConfig, RotationConfig};
 
 // Storage components
 use chronik_storage::{
@@ -31,6 +30,7 @@ use chronik_storage::{
 use chronik_common::metadata::{
     file_store::FileMetadataStore,
     traits::MetadataStore,
+    ChronikMetaLogStore,
 };
 
 // Protocol types - BrokerMetadata is in chronik_common
@@ -58,6 +58,8 @@ pub struct IntegratedServerConfig {
     pub replication_factor: u32,
     /// Enable dual storage (raw Kafka + indexed records for search)
     pub enable_dual_storage: bool,
+    /// Use WAL-based metadata store instead of file-based
+    pub use_wal_metadata: bool,
 }
 
 impl Default for IntegratedServerConfig {
@@ -73,6 +75,7 @@ impl Default for IntegratedServerConfig {
             num_partitions: 3,
             replication_factor: 1,
             enable_dual_storage: false, // Default to raw-only for better performance
+            use_wal_metadata: false, // Default to file-based for now
         }
     }
 }
@@ -94,18 +97,81 @@ impl IntegratedKafkaServer {
         let segments_dir = format!("{}/segments", config.data_dir);
         std::fs::create_dir_all(&segments_dir)?;
         
-        // Always use persistent file-based metadata store
-        info!("Initializing persistent file-based metadata store");
-        let metadata_dir = format!("{}/metadata", config.data_dir);
-        std::fs::create_dir_all(&metadata_dir)?;
-        
-        let metadata_store: Arc<dyn MetadataStore> = match FileMetadataStore::new(&metadata_dir).await {
-            Ok(store) => {
-                info!("Successfully initialized file-based metadata store at {}", metadata_dir);
-                Arc::new(store)
-            },
-            Err(e) => {
-                return Err(anyhow::anyhow!("Failed to initialize file-based metadata store: {:?}. Please ensure the metadata directory {} is writable.", e, metadata_dir));
+        // Initialize metadata store based on configuration
+        let metadata_store: Arc<dyn MetadataStore> = if config.use_wal_metadata {
+            info!("Initializing WAL-based metadata store with real WAL adapter");
+
+            // Create WAL configuration for metadata
+            let wal_config = chronik_wal::config::WalConfig {
+                enabled: true,
+                data_dir: PathBuf::from(format!("{}/wal_metadata", config.data_dir)),
+                segment_size: 50 * 1024 * 1024, // 50MB segments for metadata
+                flush_interval_ms: 100, // Flush every 100ms
+                flush_threshold: 1024 * 1024, // 1MB buffer threshold
+                compression: chronik_wal::config::CompressionType::None,
+                checkpointing: chronik_wal::config::CheckpointConfig {
+                    enabled: true,
+                    interval_records: 1000,
+                    interval_bytes: 10 * 1024 * 1024,
+                },
+                rotation: chronik_wal::config::RotationConfig {
+                    max_segment_size: 50 * 1024 * 1024,
+                    max_segment_age_ms: 60 * 60 * 1000, // 1 hour
+                    coordinate_with_storage: false,
+                },
+                fsync: chronik_wal::config::FsyncConfig {
+                    enabled: true,
+                    batch_size: 1,
+                    batch_timeout_ms: 0,
+                },
+                ..Default::default()
+            };
+
+            // Create the real WAL adapter
+            use chronik_storage::WalMetadataAdapter;
+            let wal_adapter = Arc::new(WalMetadataAdapter::new(wal_config).await?);
+
+            let metalog_store = ChronikMetaLogStore::new(
+                wal_adapter,
+                PathBuf::from(format!("{}/metalog_snapshots", config.data_dir)),
+            ).await?;
+
+            info!("Successfully initialized WAL-based metadata store with real WAL adapter");
+
+            // Ensure __meta topic exists for metadata storage
+            let metalog_store_arc = Arc::new(metalog_store);
+            if metalog_store_arc.get_topic(chronik_common::metadata::METADATA_TOPIC).await?.is_none() {
+                info!("Creating internal metadata topic: {}", chronik_common::metadata::METADATA_TOPIC);
+                let meta_config = chronik_common::metadata::TopicConfig {
+                    partition_count: 1, // Metadata topic only needs 1 partition
+                    replication_factor: 1,
+                    retention_ms: None, // Never delete metadata
+                    segment_bytes: 50 * 1024 * 1024, // 50MB segments
+                    config: {
+                        let mut cfg = std::collections::HashMap::new();
+                        cfg.insert("compression.type".to_string(), "snappy".to_string());
+                        cfg.insert("cleanup.policy".to_string(), "compact".to_string());
+                        cfg
+                    },
+                };
+                metalog_store_arc.create_topic(chronik_common::metadata::METADATA_TOPIC, meta_config).await?;
+                info!("Successfully created internal metadata topic");
+            }
+
+            metalog_store_arc
+        } else {
+            info!("Initializing persistent file-based metadata store");
+            let metadata_dir = format!("{}/metadata", config.data_dir);
+            std::fs::create_dir_all(&metadata_dir)?;
+
+            match FileMetadataStore::new(&metadata_dir).await {
+                Ok(store) => {
+                    info!("Successfully initialized file-based metadata store at {}", metadata_dir);
+                    Arc::new(store)
+                },
+                Err(e) => {
+                    return Err(anyhow::anyhow!("Failed to initialize file-based metadata store: {:?}. Please ensure the metadata directory {} is writable.", e, metadata_dir));
+                }
             }
         };
         
@@ -213,10 +279,9 @@ impl IntegratedKafkaServer {
         let produce_handler_base = Arc::new(produce_handler_inner);
         
         // Create WAL configuration with default settings
-        use chronik_wal::{CompressionType, CheckpointConfig, RecoveryConfig, RotationConfig, FsyncConfig};
+        use chronik_wal::{CompressionType, CheckpointConfig, RecoveryConfig, RotationConfig, FsyncConfig, WalConfig};
         use chronik_wal::config::AsyncIoConfig;
-        use std::path::PathBuf;
-        
+
         let wal_config = WalConfig {
             enabled: true,  // WAL is always enabled now as the default durability mechanism
             data_dir: PathBuf::from(format!("{}/wal", config.data_dir)),

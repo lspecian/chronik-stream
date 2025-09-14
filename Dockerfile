@@ -14,17 +14,13 @@ RUN apt-get update && apt-get install -y \
 
 # Copy only Cargo files to cache dependencies
 COPY Cargo.toml Cargo.lock ./
-COPY crates/chronik-admin/Cargo.toml crates/chronik-admin/
 COPY crates/chronik-auth/Cargo.toml crates/chronik-auth/
 COPY crates/chronik-backup/Cargo.toml crates/chronik-backup/
 COPY crates/chronik-benchmarks/Cargo.toml crates/chronik-benchmarks/
 COPY crates/chronik-cli/Cargo.toml crates/chronik-cli/
 COPY crates/chronik-common/Cargo.toml crates/chronik-common/
 COPY crates/chronik-config/Cargo.toml crates/chronik-config/
-COPY crates/chronik-controller/Cargo.toml crates/chronik-controller/
-COPY crates/chronik-janitor/Cargo.toml crates/chronik-janitor/
 COPY crates/chronik-monitoring/Cargo.toml crates/chronik-monitoring/
-COPY crates/chronik-operator/Cargo.toml crates/chronik-operator/
 COPY crates/chronik-protocol/Cargo.toml crates/chronik-protocol/
 COPY crates/chronik-query/Cargo.toml crates/chronik-query/
 COPY crates/chronik-search/Cargo.toml crates/chronik-search/

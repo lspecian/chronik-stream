@@ -9,6 +9,7 @@ license.workspace = true
 chronik-common = { path = "../chronik-common" }
 chronik-protocol = { path = "../chronik-protocol" }
 chronik-storage = { path = "../chronik-storage" }
+chronik-wal = { path = "../chronik-wal" }
 # chronik-ingest removed - use chronik-server instead
 chronik-search = { path = "../chronik-search" }
 
@@ -16,6 +17,7 @@ chronik-search = { path = "../chronik-search" }
 tokio = { workspace = true, features = ["full"] }
 tokio-util = { workspace = true }
 futures = { workspace = true }
+async-trait = { workspace = true }
 
 # Serialization
 serde = { workspace = true }
@@ -62,6 +64,10 @@ harness = false
 
 [[bench]]
 name = "end_to_end"
+harness = false
+
+[[bench]]
+name = "metadata_performance"
 harness = false
 
 [[bin]]

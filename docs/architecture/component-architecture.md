@@ -324,34 +324,7 @@ impl QueryEngine {
 ```
 
 ## Metadata Management
-
-### TiKV Integration
-
-```rust
-pub struct MetadataStore {
-    client: TikvClient,
-    cache: Arc<RwLock<MetadataCache>>,
-}
-
-impl MetadataStore {
-    pub async fn get_topic_metadata(&self, topic: &str) -> Option<TopicMetadata> {
-        // Check cache first
-        if let Some(metadata) = self.cache.read().await.get(topic) {
-            return Some(metadata.clone());
-        }
-        
-        // Fetch from TiKV
-        let key = format!("/topics/{}/metadata", topic);
-        let value = self.client.get(key).await?;
-        let metadata: TopicMetadata = serde_json::from_slice(&value)?;
-        
-        // Update cache
-        self.cache.write().await.insert(topic.to_string(), metadata.clone());
-        
-        Some(metadata)
-    }
-}
-```
+With a topic WAL
 
 ### Metadata Types
 

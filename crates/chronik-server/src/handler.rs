@@ -101,7 +101,7 @@ impl RequestHandler {
             offset_storage_config,
         ));
         
-        // Start offset cleanup task - for now we don't pass TiKV endpoints
+        // Start offset cleanup task
         // as the metadata store already has the connection
         offset_storage.start_cleanup_task(None).await;
         
@@ -508,7 +508,7 @@ impl RequestHandler {
             }));
         }
         
-        // Store valid offsets in TiKV
+        // Store valid offsets
         let commit_results = if !storage_offsets.is_empty() {
             self.offset_storage.commit_offsets(
                 &request.group_id,

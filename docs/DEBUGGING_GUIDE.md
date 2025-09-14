@@ -57,7 +57,7 @@ cargo flamegraph --bin chronik
 #### Likely Locations of Busy Loops:
 - `crates/chronik-protocol/src/kafka_handler.rs` - Connection accept loop
 - `crates/chronik-protocol/src/handler.rs` - Request processing loop
-- `crates/chronik-controller/src/raft_transport.rs` - Message polling
+- `crates/chronik-wal/src/manager.rs` - WAL management and recovery
 
 #### Fix Pattern:
 ```rust

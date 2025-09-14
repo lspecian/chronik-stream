@@ -39,7 +39,7 @@ Chronik Stream is designed as a distributed, fault-tolerant streaming platform t
 │                      Storage Layer                                │
 │  ┌─────────────────┐  ┌──────────────────┐  ┌────────────────┐  │
 │  │   Log Storage   │  │  Index Storage    │  │ Metadata Store │  │
-│  │   (Segments)    │  │   (Tantivy)       │  │    (TiKV)      │  │
+│  │   (Segments)    │  │   (Tantivy)       │  │   (File-based) │  │
 │  └─────────────────┘  └──────────────────┘  └────────────────┘  │
 └──────────────────────────────────────────────────────────────────┘
 ```

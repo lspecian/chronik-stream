@@ -57,13 +57,6 @@ For a single-node setup:
 # Create network
 docker network create chronik
 
-# Start TiKV (metadata store)
-docker run -d \
-  --name tikv \
-  --network chronik \
-  -p 2379:2379 \
-  pingcap/tikv:latest
-
 # Start Chronik Stream
 docker run -d \
   --name chronik-stream \

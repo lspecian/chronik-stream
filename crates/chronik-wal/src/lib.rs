@@ -19,6 +19,7 @@ pub mod buffer_pool;
 pub mod io;
 pub mod checkpoint;
 pub mod rotation;
+pub mod compaction;
 
 // Future-ready modules
 pub mod replication;
@@ -35,6 +36,7 @@ pub use segment::{WalSegment, SealedSegment};
 pub use config::{WalConfig, CompressionType, CheckpointConfig, RecoveryConfig, RotationConfig, FsyncConfig};
 pub use checkpoint::{Checkpoint, CheckpointManager};
 pub use fsync::{FsyncBatcher, FsyncStats};
+pub use compaction::{WalCompactor, CompactionConfig, CompactionStats};
 
 use tracing::info;
 

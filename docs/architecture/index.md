@@ -87,7 +87,7 @@ Support for multiple storage backends allows optimization for different use case
                            ▼
                    ┌───────────────┐
                    │Metadata Store │
-                   │    (TiKV)     │
+                   │    (Metadata WAL)     │
                    └───────────────┘
 ```
 
@@ -97,7 +97,7 @@ Support for multiple storage backends allows optimization for different use case
 - **Protocol**: Apache Kafka wire protocol
 - **Storage**: Custom log-structured storage engine
 - **Search**: Tantivy (Rust-based search library)
-- **Metadata**: TiKV (distributed key-value store)
+- **Metadata**: Self store
 - **Networking**: Tokio (async runtime)
 - **Serialization**: Protocol Buffers, MessagePack
 

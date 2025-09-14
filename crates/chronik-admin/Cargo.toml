@@ -29,8 +29,6 @@ futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
-# Database - using TiKV via chronik-common
-
 # Error handling
 anyhow = { workspace = true }
 thiserror = { workspace = true }

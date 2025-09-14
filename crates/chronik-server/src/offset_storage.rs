@@ -1,11 +1,9 @@
 //! Offset storage management for consumer groups
 //! 
 //! This module provides functionality for storing and retrieving consumer group offsets
-//! in TiKV with proper retention policies and atomic operations.
 
 use chronik_common::Result;
 use chronik_common::metadata::{MetadataStore, ConsumerOffset, MetadataError};
-// use crate::offset_cleanup::OffsetCleanupManager;  // Removed - tikv dependency
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::collections::HashMap;
@@ -71,9 +69,9 @@ impl OffsetStorage {
             return;
         }
         
-        // TiKV cleanup removed - cleanup now handled by metadata store
+        //cleanup now handled by metadata store
         // TODO: Implement cleanup using metadata store if needed
-        info!("Offset cleanup task disabled - TiKV dependencies removed");
+        info!("Offset cleanup task disabled");
     }
     
     /// Commit a batch of offsets atomically

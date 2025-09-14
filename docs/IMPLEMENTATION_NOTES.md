@@ -42,8 +42,6 @@
 ### 5. Distributed Architecture
 - Stateless nodes (compute/storage separation)
 - Consistent hashing for work distribution
-- Distributed TiKV cluster for metadata storage
-- Raft consensus for controller coordination
 
 ## Implementation Order
 1. Foundation: Project structure, core types

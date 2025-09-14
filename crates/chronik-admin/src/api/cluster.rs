@@ -114,7 +114,7 @@ pub async fn health_check(
 ) -> AdminResult<Json<HealthStatus>> {
     let mut components = vec![];
     
-    // Check metadata store - TiKV connectivity is handled automatically
+    // Check metadata store - 
     components.push(ComponentHealth {
         name: "metadata".to_string(),
         status: "healthy".to_string(),

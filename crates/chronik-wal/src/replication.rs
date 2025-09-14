@@ -467,7 +467,7 @@ impl WALFollower {
     }
     
     /// Start follower background tasks
-    pub async fn start(mut self) -> Result<()> {
+    pub async fn start(self) -> Result<()> {
         info!("Starting WAL follower {}", self.replica_id);
         
         while !*self.shutdown.read() {
@@ -593,7 +593,7 @@ mod tests {
     
     #[tokio::test]
     async fn test_mock_transport() {
-        let (mut transport1, mut transport2) = MockTransport::new();
+        let (transport1, mut transport2) = MockTransport::new();
         
         let event = ReplicationEvent::Heartbeat {
             replica_id: ReplicaId(1),
@@ -621,8 +621,8 @@ mod tests {
         let (transport1, _) = MockTransport::new();
         let (transport2, _) = MockTransport::new();
         
-        replica_set.add_replica(ReplicaId(2), Box::new(transport1));
-        replica_set.add_replica(ReplicaId(3), Box::new(transport2));
+        replica_set.add_replica(ReplicaId(2), Arc::new(transport1));
+        replica_set.add_replica(ReplicaId(3), Arc::new(transport2));
         
         assert!(replica_set.has_quorum());
         
@@ -643,13 +643,13 @@ mod tests {
         
         // Setup leader
         let leader = WALLeader::new(Arc::clone(&replica_set));
-        replica_set.add_replica(ReplicaId(2), Box::new(leader_transport));
-        
+        replica_set.add_replica(ReplicaId(2), Arc::new(leader_transport));
+
         // Setup follower
         let follower = WALFollower::new(
             ReplicaId(2),
             Arc::clone(&replica_set),
-            Box::new(follower_transport),
+            Arc::new(Mutex::new(follower_transport)),
         );
         
         // Test sync request

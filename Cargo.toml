@@ -2,16 +2,12 @@
 resolver = "2"
 members = [
     "crates/chronik-common",
-    "crates/chronik-protocol", 
+    "crates/chronik-protocol",
     "crates/chronik-storage",
     "crates/chronik-search",
     "crates/chronik-query",
-    # "crates/chronik-controller",  # Removed - has raft dependency with protoc issues
-    "crates/chronik-janitor",
-    # "crates/chronik-operator",  # Removed - not needed
     "crates/chronik-monitoring",
     "crates/chronik-auth",
-    # "crates/chronik-admin",  # Removed - depends on chronik-controller
     "crates/chronik-cli",
     "crates/chronik-benchmarks",
     "crates/chronik-backup",
@@ -22,7 +18,7 @@ members = [
 exclude = ["tests"]
 
 [workspace.package]
-version = "1.0.3"
+version = "1.1.0"
 edition = "2021"
 authors = ["Chronik Stream Contributors"]
 license = "Apache-2.0"
@@ -63,8 +59,7 @@ snap = "1.1"
 lz4_flex = "0.11"
 
 # Database
-# sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono"] }  # Replaced with TiKV
-# tikv-client = "0.3"  # Removed - not needed
+# sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono"] }
 
 # Kubernetes (Apache 2.0)
 kube = { version = "0.87", features = ["runtime", "derive"] }

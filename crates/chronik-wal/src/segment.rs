@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
-use parking_lot::RwLock;
+use tokio::sync::RwLock;
 use bytes::BytesMut;
 use chrono::Utc;
 use tracing::{info, debug, instrument};
@@ -55,11 +55,11 @@ impl WalSegment {
         bytes_written = tracing::field::Empty,
         append_duration_us = tracing::field::Empty
     ))]
-    pub fn append(&mut self, record: WalRecord) -> Result<()> {
+    pub async fn append(&mut self, record: WalRecord) -> Result<()> {
         let append_start = Instant::now();
         let record_size = record.length;
-        
-        let mut buffer = self.buffer.write();
+
+        let mut buffer = self.buffer.write().await;
         record.write_to(&mut buffer)?;
         
         self.last_offset = record.offset;
@@ -123,7 +123,7 @@ impl WalSegment {
     pub async fn seal(self) -> Result<SealedSegment> {
         // Extract buffer data without holding lock across await
         let (buffer_data, buffer_len) = {
-            let buffer = self.buffer.read();
+            let buffer = self.buffer.read().await;
             (buffer.to_vec(), buffer.len())
         };
         

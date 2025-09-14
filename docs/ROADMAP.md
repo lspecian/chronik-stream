@@ -7,7 +7,7 @@ The project has a solid foundation with ~60% completion, but critical gaps preve
 ### What's Working ✅
 - Docker-compose infrastructure with all services
 - Basic Kafka wire protocol parsing/encoding
-- TiKV metadata store integration
+- File-based metadata store
 - Search service (Tantivy-based)
 - Kubernetes operator framework
 - Observability instrumentation

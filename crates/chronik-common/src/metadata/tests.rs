@@ -6,15 +6,11 @@ mod tests {
     use tempfile::TempDir;
     use std::collections::HashMap;
     
-    async fn create_test_store() -> TiKVMetadataStore {
-        // For tests, use a test TiKV instance or mock
-        // In a real test environment, you'd spin up a test TiKV cluster
-        let endpoints = if let Ok(endpoints_str) = std::env::var("TIKV_PD_ENDPOINTS") {
-            endpoints_str.split(',').map(|s| s.to_string()).collect()
-        } else {
-            vec!["localhost:2379".to_string()]
-        };
-        TiKVMetadataStore::new(endpoints).await.unwrap()
+    async fn create_test_store() -> FileMetadataStore {
+        // For tests, use a temporary directory
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().to_str().unwrap();
+        FileMetadataStore::new(path).await.unwrap()
     }
     
     #[tokio::test]
@@ -369,10 +365,10 @@ mod tests {
     #[tokio::test]
     async fn test_topic_deletion_cascades() {
         let store = create_test_store().await;
-        
+
         // Create topic with segments
         store.create_topic("cascade-topic", TopicConfig::default()).await.unwrap();
-        
+
         // Add segments
         for i in 0..3 {
             store.persist_segment_metadata(SegmentMetadata {
@@ -387,15 +383,197 @@ mod tests {
                 created_at: chrono::Utc::now(),
             }).await.unwrap();
         }
-        
+
         // Verify segments exist
         assert_eq!(store.list_segments("cascade-topic", None).await.unwrap().len(), 3);
-        
+
         // Delete topic
         store.delete_topic("cascade-topic").await.unwrap();
-        
+
         // Verify topic and segments are gone
         assert!(store.get_topic("cascade-topic").await.unwrap().is_none());
         assert_eq!(store.list_segments("cascade-topic", None).await.unwrap().len(), 0);
+    }
+
+    // Tests for ChronikMetaLogStore
+    mod metalog_tests {
+        use crate::metadata::{
+            ChronikMetaLogStore, MockWal, MetadataStore,
+            TopicConfig, TopicMetadata, SegmentMetadata,
+            BrokerMetadata, BrokerStatus, ConsumerOffset,
+            PartitionAssignment, ConsumerGroupMetadata
+        };
+        use std::sync::Arc;
+        use tempfile::TempDir;
+        use std::collections::HashMap;
+        use chrono;
+
+        async fn create_metalog_store() -> ChronikMetaLogStore {
+            let temp_dir = TempDir::new().unwrap();
+            let mock_wal = Arc::new(MockWal::new());
+            ChronikMetaLogStore::new(mock_wal, temp_dir.path()).await.unwrap()
+        }
+
+        #[tokio::test]
+        async fn test_metalog_topic_operations() {
+            let store = create_metalog_store().await;
+
+            // Create topic
+            let config = TopicConfig {
+                partition_count: 3,
+                replication_factor: 2,
+                retention_ms: Some(86400000),
+                segment_bytes: 1024 * 1024 * 100,
+                config: HashMap::new(),
+            };
+
+            let topic = store.create_topic("metalog-test", config.clone()).await.unwrap();
+            assert_eq!(topic.name, "metalog-test");
+            assert_eq!(topic.config.partition_count, 3);
+
+            // Get topic
+            let retrieved = store.get_topic("metalog-test").await.unwrap().unwrap();
+            assert_eq!(retrieved.name, "metalog-test");
+
+            // Update topic
+            let mut updated_config = config.clone();
+            updated_config.partition_count = 6;
+            let updated = store.update_topic("metalog-test", updated_config).await.unwrap();
+            assert_eq!(updated.config.partition_count, 6);
+
+            // List topics
+            let topics = store.list_topics().await.unwrap();
+            assert_eq!(topics.len(), 1);
+
+            // Delete topic
+            store.delete_topic("metalog-test").await.unwrap();
+            assert!(store.get_topic("metalog-test").await.unwrap().is_none());
+        }
+
+        #[tokio::test]
+        async fn test_metalog_event_sourcing() {
+            let store = create_metalog_store().await;
+
+            // Create multiple topics
+            for i in 0..3 {
+                store.create_topic(
+                    &format!("event-topic-{}", i),
+                    TopicConfig::default()
+                ).await.unwrap();
+            }
+
+            // Create segments
+            for i in 0..3 {
+                store.persist_segment_metadata(SegmentMetadata {
+                    segment_id: format!("seg-{}", i),
+                    topic: "event-topic-0".to_string(),
+                    partition: 0,
+                    start_offset: i * 100,
+                    end_offset: (i + 1) * 100 - 1,
+                    size: 1024,
+                    record_count: 100,
+                    path: format!("/data/seg-{}", i),
+                    created_at: chrono::Utc::now(),
+                }).await.unwrap();
+            }
+
+            // Verify state
+            assert_eq!(store.list_topics().await.unwrap().len(), 3);
+            assert_eq!(store.list_segments("event-topic-0", None).await.unwrap().len(), 3);
+        }
+
+        #[tokio::test]
+        async fn test_metalog_consumer_offsets() {
+            let store = create_metalog_store().await;
+
+            // Create topic first
+            store.create_topic("offset-topic", TopicConfig::default()).await.unwrap();
+
+            // Commit offsets
+            let offset = ConsumerOffset {
+                group_id: "test-group".to_string(),
+                topic: "offset-topic".to_string(),
+                partition: 0,
+                offset: 1234,
+                metadata: Some("checkpoint".to_string()),
+                commit_timestamp: chrono::Utc::now(),
+            };
+
+            store.commit_offset(offset.clone()).await.unwrap();
+
+            // Retrieve offset
+            let retrieved = store.get_consumer_offset("test-group", "offset-topic", 0)
+                .await.unwrap().unwrap();
+            assert_eq!(retrieved.offset, 1234);
+            assert_eq!(retrieved.metadata.as_ref().unwrap(), "checkpoint");
+        }
+
+        #[tokio::test]
+        async fn test_metalog_broker_registration() {
+            let store = create_metalog_store().await;
+
+            // Register broker
+            let broker = BrokerMetadata {
+                broker_id: 1,
+                host: "broker1.test".to_string(),
+                port: 9092,
+                rack: Some("rack-1".to_string()),
+                status: BrokerStatus::Online,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            };
+
+            store.register_broker(broker.clone()).await.unwrap();
+
+            // Get broker
+            let retrieved = store.get_broker(1).await.unwrap().unwrap();
+            assert_eq!(retrieved.host, "broker1.test");
+
+            // Update status
+            store.update_broker_status(1, BrokerStatus::Maintenance).await.unwrap();
+            let updated = store.get_broker(1).await.unwrap().unwrap();
+            assert!(matches!(updated.status, BrokerStatus::Maintenance));
+        }
+
+        #[tokio::test]
+        async fn test_metalog_recovery() {
+            let temp_dir = TempDir::new().unwrap();
+            let mock_wal = Arc::new(MockWal::new());
+
+            // Create store and add data
+            {
+                let store = ChronikMetaLogStore::new(
+                    mock_wal.clone(),
+                    temp_dir.path()
+                ).await.unwrap();
+
+                store.create_topic("recovery-test", TopicConfig::default()).await.unwrap();
+                store.register_broker(BrokerMetadata {
+                    broker_id: 1,
+                    host: "broker1".to_string(),
+                    port: 9092,
+                    rack: None,
+                    status: BrokerStatus::Online,
+                    created_at: chrono::Utc::now(),
+                    updated_at: chrono::Utc::now(),
+                }).await.unwrap();
+            }
+
+            // Create new store with same WAL - should recover state
+            {
+                let store = ChronikMetaLogStore::new(
+                    mock_wal.clone(),
+                    temp_dir.path()
+                ).await.unwrap();
+
+                // Verify state was recovered
+                let topics = store.list_topics().await.unwrap();
+                assert_eq!(topics.len(), 1);
+                assert_eq!(topics[0].name, "recovery-test");
+
+                let broker = store.get_broker(1).await.unwrap().unwrap();
+                assert_eq!(broker.host, "broker1");
+            }
+        }
     }
 }

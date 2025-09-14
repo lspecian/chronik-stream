@@ -84,6 +84,10 @@ struct Cli {
     #[cfg(feature = "dynamic-config")]
     #[arg(long, env = "CHRONIK_ENABLE_DYNAMIC_CONFIG", default_value = "false")]
     enable_dynamic_config: bool,
+
+    /// Use WAL-based metadata store (experimental)
+    #[arg(long, env = "CHRONIK_WAL_METADATA", default_value = "false")]
+    wal_metadata: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -295,6 +299,7 @@ async fn run_standalone_server(cli: &Cli, dual_storage: bool) -> Result<()> {
         num_partitions: 3,
         replication_factor: 1,
         enable_dual_storage: dual_storage,
+        use_wal_metadata: cli.wal_metadata,
     };
 
     // Create and start the integrated server
@@ -461,6 +466,7 @@ async fn run_all_components(cli: &Cli) -> Result<()> {
         num_partitions: 3,
         replication_factor: 1,
         enable_dual_storage: true,  // Enable dual storage for search
+        use_wal_metadata: cli.wal_metadata,
     };
     
     // Start Kafka protocol server

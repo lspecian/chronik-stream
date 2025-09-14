@@ -6,7 +6,7 @@ This guide covers best practices for deploying Chronik Stream in production envi
 
 ### Hardware Requirements
 
-#### Controller Nodes (3 minimum)
+#### Server Nodes (3 minimum)
 - CPU: 4+ cores
 - Memory: 8GB RAM
 - Storage: 50GB SSD
@@ -25,6 +25,7 @@ This guide covers best practices for deploying Chronik Stream in production envi
 ### Software Requirements
 - Kubernetes 1.25+
 - Object Storage (S3, GCS, or Azure Blob)
+- Local persistent storage for WAL metadata
 
 ## Pre-Production Checklist
 
@@ -38,13 +39,13 @@ This guide covers best practices for deploying Chronik Stream in production envi
 - [ ] Enable encryption at rest
 
 ### High Availability
-- [ ] Deploy 3+ controller nodes
+- [ ] Deploy 3+ server nodes
 - [ ] Configure replication factor ≥ 3
 - [ ] Configure pod disruption budgets
 - [ ] Enable leader election
 - [ ] Set up health checks
 - [ ] Configure automatic failover
-- [ ] Enable Raft consensus for metadata
+- [ ] Enable WAL-based metadata persistence
 
 ### Monitoring
 - [ ] Deploy Prometheus
@@ -134,9 +135,8 @@ metadata:
   name: production
   namespace: chronik-prod
 spec:
-  controllers: 3
-  ingestNodes: 10
-  
+  replicas: 3
+
   storage:
     backend:
       s3:
@@ -145,26 +145,18 @@ spec:
         endpoint: https://s3.amazonaws.com
     size: 1Ti
     storageClass: chronik-ssd
-  
+
   metadataStorage:
-    type: tikv
-    pdEndpoints: 
-      - tikv-pd-0.tikv-pd:2379
-      - tikv-pd-1.tikv-pd:2379
-      - tikv-pd-2.tikv-pd:2379
+    type: wal
+    walDataDir: /data/wal
     storageClass: chronik-ssd
   
   resources:
-    controller:
+    server:
       cpu: "4"
       memory: "8Gi"
       cpuLimit: "8"
       memoryLimit: "16Gi"
-    ingest:
-      cpu: "8"
-      memory: "16Gi"
-      cpuLimit: "16"
-      memoryLimit: "32Gi"
   
   monitoring:
     prometheus: true
@@ -338,7 +330,7 @@ groups:
 ### Backup Strategy
 
 1. **Metadata Backup**
-   - TiKV cluster: Daily snapshots using TiKV backup tool
+   - WAL segments: Daily snapshots of WAL data directory
    - Retention: 30 days
 
 2. **Data Backup**
@@ -356,9 +348,9 @@ groups:
    - No manual intervention required
 
 2. **Metadata Recovery**
-   - Restore TiKV cluster from backup
+   - Restore WAL segments from backup
    - Verify metadata consistency
-   - TiKV automatically handles failover
+   - WAL recovery automatically rebuilds metadata on startup
 
 3. **Data Recovery**
    - Restore segments from object storage
@@ -370,23 +362,15 @@ groups:
 ### Rolling Updates
 
 ```bash
-# Update controller nodes
-kubectl set image statefulset/chronik-controller controller=chronik/controller:v1.2.0 -n chronik-prod
-
-# Update ingest nodes (10% at a time)
-kubectl rollout pause deployment/chronik-ingest -n chronik-prod
-kubectl set image deployment/chronik-ingest ingest=chronik/ingest:v1.2.0 -n chronik-prod
-kubectl rollout resume deployment/chronik-ingest -n chronik-prod
+# Update server nodes
+kubectl set image statefulset/chronik-server server=chronik/server:v1.2.0 -n chronik-prod
 ```
 
 ### Scaling
 
 ```bash
-# Scale ingest nodes
-kubectl scale deployment/chronik-ingest --replicas=15 -n chronik-prod
-
-# Add controller node
-kubectl scale statefulset/chronik-controller --replicas=5 -n chronik-prod
+# Add server node
+kubectl scale statefulset/chronik-server --replicas=5 -n chronik-prod
 ```
 
 ## Troubleshooting
@@ -414,8 +398,8 @@ kubectl scale statefulset/chronik-controller --replicas=5 -n chronik-prod
 # Check cluster status
 chronik-ctl cluster info
 
-# View controller logs
-kubectl logs -n chronik-prod chronik-controller-0 -f
+# View server logs
+kubectl logs -n chronik-prod chronik-server-0 -f
 
 # Check consumer group status
 chronik-ctl group get my-group

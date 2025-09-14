@@ -28,8 +28,8 @@ async-trait = { workspace = true }
 prometheus = { workspace = true }
 
 # Metadata storage
-# tikv-client = { workspace = true }  # Removed - not needed
 bincode = "1.3"
+parking_lot = { workspace = true }
 
 [dev-dependencies]
 tokio-test = "0.4"

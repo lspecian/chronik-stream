@@ -140,7 +140,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Initial release of Chronik Stream
 - Kafka wire protocol v2 compatibility
-- Distributed storage with TiKV backend
 - Built-in full-text search capabilities
 - REST Admin API for management
 - Prometheus metrics support

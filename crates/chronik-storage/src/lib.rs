@@ -15,6 +15,7 @@ pub mod segment_cache;
 pub mod optimized_segment;
 pub mod vector_search;
 pub mod extended_segment;
+pub mod metadata_wal_adapter;
 
 pub use index::{IndexBuilder, Document, FieldType, FieldValue, SegmentSearcher, SearchHit};
 pub use object_store::{
@@ -41,3 +42,4 @@ pub use extended_segment::{
     ExtendedTansuSegment, ExtendedSegmentMetadata, ExtendedSegmentBuilder,
     VectorFieldConfig, HybridStats, SegmentMigration
 };
+pub use metadata_wal_adapter::WalMetadataAdapter;

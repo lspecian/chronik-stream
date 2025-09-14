@@ -1,4 +1,4 @@
-# Chronik Stream v1.0.2
+# Chronik Stream v1.1.0
 
 [![Build Status](https://github.com/lspecian/chronik-stream/workflows/CI/badge.svg)](https://github.com/lspecian/chronik-stream/actions)
 [![Release](https://img.shields.io/github/v/release/lspecian/chronik-stream)](https://github.com/lspecian/chronik-stream/releases)
@@ -8,38 +8,49 @@
 
 A high-performance streaming platform built in Rust that implements core Kafka wire protocol functionality with Write-Ahead Log (WAL) durability guarantees.
 
-## 🎉 What's New in v1.0.2
+## 🎉 What's New in v1.1.0
 
-- **🔧 Consumer Group Coordination**: Fixed "Unknown Group" errors in Kafka Consumer Group Coordination
-- **🛡️ Write-Ahead Log (WAL)**: Complete WAL system for zero message loss durability
-- **🔧 Send Trait Compliance**: Fixed all async Send trait violations for proper compilation
-- **🚀 Production Stability**: Resolved Box<dyn Trait> issues and added missing trait implementations
-- **📊 Enhanced Configuration**: Complete WAL configuration with async I/O support
-- **✅ Tested Core APIs**: Successfully handles basic produce/consume workflows with real Kafka clients
-- **🐳 Docker Ready**: Proper container deployment with advertised address configuration
+- **🏗️ Simplified Architecture**: Unified single-process server replacing multi-service architecture
+- **🗄️ WAL-based Metadata**: Production-ready ChronikMetaLog replacing TiKV dependency
+- **🧹 Codebase Cleanup**: Removed unused components (chronik-controller, chronik-operator, chronik-janitor)
+- **📚 Documentation Consolidation**: Unified release documentation structure
+- **⚡ Performance Improvements**: Streamlined codebase with reduced complexity
+- **🔧 Operational Simplicity**: Single binary deployment with integrated metadata management
+- **🛡️ Enhanced Reliability**: Event-sourced metadata store with WAL durability
 
 ## 🚀 Features
 
 - **Kafka Wire Protocol**: Implements core Kafka wire protocol for basic produce/consume operations
+- **WAL-based Metadata**: ChronikMetaLog provides event-sourced metadata persistence
 - **Write-Ahead Log**: Complete WAL system with segmentation, rotation, and durability guarantees
 - **Real Client Testing**: Successfully tested with kafka-python and other Python clients
 - **Zero Message Loss**: WAL ensures durability even during unexpected shutdowns
 - **High Performance**: Async architecture with zero-copy networking optimizations
 - **Multi-Architecture**: Native support for x86_64 and ARM64 (Apple Silicon, AWS Graviton)
 - **Container Ready**: Docker deployment with proper network configuration
+- **Simplified Operations**: Single-process architecture reduces operational complexity
 
 ## 🏗️ Architecture
 
 ```
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│   Kafka Client  │────▶│   Chronik       │────▶│ Object Storage  │
-│  (Any Language) │     │   (All-in-One)  │     │  (S3/GCS/Local) │
-└─────────────────┘     └─────────────────┘     └─────────────────┘
-                               │
-                               ├── Protocol Handler (Port 9092)
-                               ├── Metadata Store
-                               ├── Search Engine (Tantivy)
-                               └── Storage Manager
+┌─────────────────┐     ┌─────────────────────────────────────────┐
+│   Kafka Client  │────▶│            Chronik Server               │
+│  (Any Language) │     │  ┌─────────────┐  ┌─────────────────┐  │
+└─────────────────┘     │  │ Kafka Proto │  │  ChronikMetaLog │  │
+                        │  │ Handler     │  │  (WAL Metadata) │  │
+                        │  │ (Port 9092) │  │                 │  │
+                        │  └─────────────┘  └─────────────────┘  │
+                        │  ┌─────────────┐  ┌─────────────────┐  │
+                        │  │   Search    │  │  Storage Mgr    │  │
+                        │  │  (Tantivy)  │  │                 │  │
+                        │  └─────────────┘  └─────────────────┘  │
+                        └─────────────────────────────────────────┘
+                                            │
+                                            ▼
+                                ┌─────────────────────┐
+                                │   Object Storage    │
+                                │  (S3/GCS/Local)     │
+                                └─────────────────────┘
 ```
 
 ## ⚡ Quick Start
@@ -50,7 +61,7 @@ A high-performance streaming platform built in Rust that implements core Kafka w
 # Quick start - single command
 docker run -d -p 9092:9092 \
   -e CHRONIK_ADVERTISED_ADDR=localhost \
-  ghcr.io/lspecian/chronik-stream:v1.0.2
+  ghcr.io/lspecian/chronik-stream:v1.1.0
 
 # With persistent storage and custom configuration
 docker run -d --name chronik \
@@ -58,7 +69,7 @@ docker run -d --name chronik \
   -v chronik-data:/data \
   -e CHRONIK_ADVERTISED_ADDR=localhost \
   -e RUST_LOG=info \
-  ghcr.io/lspecian/chronik-stream:v1.0.2
+  ghcr.io/lspecian/chronik-stream:v1.1.0
 
 # Using docker-compose
 curl -O https://raw.githubusercontent.com/lspecian/chronik-stream/main/docker-compose.yml
@@ -73,7 +84,7 @@ docker-compose up -d
 # docker-compose.yml example
 services:
   chronik-stream:
-    image: ghcr.io/lspecian/chronik-stream:v1.0.2
+    image: ghcr.io/lspecian/chronik-stream:v1.1.0
     ports:
       - "9092:9092"
     environment:
@@ -193,7 +204,7 @@ All images support both **linux/amd64** and **linux/arm64** architectures:
 
 | Image | Tags | Size | Description |
 |-------|------|------|-------------|
-| `ghcr.io/lspecian/chronik-stream` | `v1.0.2`, `1.0`, `latest` | ~50MB | Chronik server with WAL |
+| `ghcr.io/lspecian/chronik-stream` | `v1.1.0`, `1.1`, `latest` | ~50MB | Chronik server with WAL metadata |
 
 ### Supported Platforms
 
@@ -304,17 +315,19 @@ cargo bench
 ```
 chronik-stream/
 ├── crates/
-│   ├── chronik-all-in-one/  # Main server binary
+│   ├── chronik-server/      # Main server binary (unified)
 │   ├── chronik-protocol/    # Kafka wire protocol implementation
 │   ├── chronik-storage/     # Storage abstraction layer
-│   ├── chronik-ingest/      # Message ingestion service
 │   ├── chronik-search/      # Search engine integration
 │   ├── chronik-query/       # Query processing
 │   ├── chronik-common/      # Shared utilities
 │   ├── chronik-auth/        # Authentication & authorization
 │   ├── chronik-monitoring/  # Metrics & observability
 │   ├── chronik-config/      # Configuration management
-│   └── chronik-janitor/     # Maintenance tasks
+│   ├── chronik-backup/      # Backup functionality
+│   ├── chronik-benchmarks/  # Performance benchmarks
+│   ├── chronik-cli/         # Command line interface
+│   └── chronik-wal/         # Write-Ahead Log & metadata store
 ├── tests/                   # Integration tests
 ├── Dockerfile              # Multi-arch Docker build
 ├── docker-compose.yml      # Local development setup
@@ -364,37 +377,37 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 Apache License 2.0. See [LICENSE](LICENSE) for details.
 
-## 🚀 Latest Release: v1.0.2
+## 🚀 Latest Release: v1.1.0
 
-### What's New in v1.0.2
-- ✅ **FIXED: Consumer Group Coordination** - Resolved "Unknown Group" errors in Kafka Consumer Group operations
-- ✅ **Auto Group Creation** - Consumer groups are now automatically created when clients attempt to join non-existent groups
-- ✅ **Write-Ahead Log (WAL)** - Complete WAL system for zero message loss durability
-- ✅ **Send Trait Compliance** - Fixed all async Send trait violations for proper compilation
-- ✅ **Production Stability** - Resolved trait object issues and added missing implementations
-- ✅ **Enhanced Configuration** - Complete WAL configuration with async I/O support
-- ✅ **Tested Core APIs** - Successfully handles basic produce/consume workflows
-- ✅ **Docker Ready** - Proper container deployment with network configuration
+### What's New in v1.1.0
+- ✅ **Unified Architecture** - Single-process server replacing multi-service distributed architecture
+- ✅ **WAL-based Metadata** - ChronikMetaLog provides production-ready event-sourced metadata storage
+- ✅ **Codebase Simplification** - Removed unused components (chronik-controller, chronik-operator, chronik-janitor)
+- ✅ **Documentation Consolidation** - Unified release notes and documentation structure
+- ✅ **Operational Simplicity** - Simplified deployment with integrated metadata management
+- ✅ **Performance Improvements** - Streamlined architecture reduces complexity and overhead
+- ✅ **Enhanced Reliability** - Event-sourced metadata with WAL persistence guarantees
 
-### Consumer Group Improvements
-- Fixed JoinGroup and SyncGroup protocol handlers to properly handle consumer group coordination
-- Automatic consumer group creation eliminates "Unknown Group" errors
-- Enhanced protocol compatibility with kafka-python and other standard Kafka clients
-- Improved consumer group state management and assignment distribution
+### Architecture Evolution
+- Migrated from distributed TiKV-based metadata store to integrated ChronikMetaLog
+- Simplified from multi-process (controller/ingest/search) to unified chronik-server
+- Removed external dependencies for easier deployment and operation
+- Enhanced testing infrastructure for streamlined architecture
 
-### Architecture Improvements
-- WAL segmentation with automatic rotation based on size and age
-- Proper async/await handling without Send trait violations
-- Arc-based trait objects for proper cloning in multi-threaded contexts
-- Comprehensive error handling and recovery mechanisms
+### ChronikMetaLog Features
+- Event-sourced metadata management with complete audit trail
+- WAL-based persistence with automatic recovery on restart
+- High-performance metadata operations optimized for Kafka workloads
+- Integrated compaction and cleanup for long-running deployments
 
 ### Compatibility Notes
-- Full consumer group support matching standard Kafka broker behavior
-- Successfully tested with kafka-python client and consumer groups
-- WAL provides durability guarantees for message persistence
-- Enhanced client compatibility with automatic group creation
+- Maintains full Kafka protocol compatibility
+- Simplified operational model reduces configuration complexity
+- Enhanced reliability through integrated metadata management
+- Backwards compatible with existing Kafka clients and workflows
 
 ### Fixed Issues
-- ✅ "Unknown Group" errors in consumer group coordination
-- ✅ Consumer group auto-creation now matches Kafka broker behavior
-- ✅ Enhanced JoinGroup and SyncGroup protocol implementations
+- ✅ Removed complex multi-service coordination overhead
+- ✅ Eliminated TiKV external dependency for simpler deployments
+- ✅ Unified codebase reduces maintenance burden
+- ✅ Improved metadata consistency through event sourcing
