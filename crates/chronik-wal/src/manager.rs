@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use dashmap::DashMap;
 use tokio::sync::RwLock;
-use tracing::{info, debug, instrument};
+use tracing::{info, debug, warn, instrument};
 use serde::{Serialize, Deserialize};
 
 use crate::{
@@ -494,11 +494,11 @@ impl WalManager {
     pub fn get_recovery_result(&self) -> RecoveryResult {
         let total_records = 0;
         let mut last_offsets = Vec::new();
-        
+
         for entry in self.partitions.iter() {
             let tp = entry.key();
             let _wal = entry.value();
-            
+
             // This would need async to read active_segment properly
             // For now, use placeholder values
             last_offsets.push((
@@ -507,13 +507,61 @@ impl WalManager {
                 0, // Would be active_segment.last_offset
             ));
         }
-        
+
         RecoveryResult {
             total_records,
             partitions: self.partitions.len(),
             corrupted_segments: 0,
             last_offsets,
         }
+    }
+
+    /// Get all partitions for recovery
+    pub fn get_partitions(&self) -> Vec<TopicPartition> {
+        self.partitions.iter()
+            .map(|entry| entry.key().clone())
+            .collect()
+    }
+
+    /// Truncate WAL segments before the given offset
+    /// Returns the number of segments truncated
+    pub async fn truncate_before(
+        &mut self,
+        topic: &str,
+        partition: i32,
+        offset: i64,
+    ) -> Result<usize> {
+        let tp = TopicPartition {
+            topic: topic.to_string(),
+            partition,
+        };
+
+        let mut partition_wal = self.partitions.get_mut(&tp)
+            .ok_or_else(|| WalError::SegmentNotFound(format!("{}-{}", topic, partition)))?;
+
+        let mut truncated_count = 0;
+
+        // Find and remove sealed segments that are completely before the offset
+        partition_wal.sealed_segments.retain(|segment| {
+            if segment.base_offset + segment.record_count as i64 <= offset {
+                // This segment is completely before the truncation point
+                if let Err(e) = std::fs::remove_file(&segment.path) {
+                    warn!("Failed to delete WAL segment file {:?}: {}", segment.path, e);
+                } else {
+                    info!("Truncated WAL segment {} (base_offset: {}, records: {})",
+                          segment.id, segment.base_offset, segment.record_count);
+                    truncated_count += 1;
+                }
+                false // Remove from list
+            } else {
+                true // Keep in list
+            }
+        });
+
+        info!("Truncated {} WAL segments for {}-{} before offset {}",
+              truncated_count, topic, partition, offset);
+
+        Ok(truncated_count)
     }
     
     /// Flush all partitions to disk
@@ -702,5 +750,186 @@ impl WalManager {
         );
         
         Ok(records)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+    use crate::config::{
+        CompressionType, CheckpointConfig, RecoveryConfig,
+        RotationConfig, FsyncConfig, AsyncIoConfig
+    };
+
+    async fn setup_test_manager() -> (WalManager, TempDir) {
+        let temp_dir = TempDir::new().unwrap();
+        let config = WalConfig {
+            enabled: true,
+            data_dir: temp_dir.path().to_path_buf(),
+            segment_size: 1024 * 1024, // 1MB
+            flush_interval_ms: 100,
+            flush_threshold: 1000,
+            compression: CompressionType::None,
+            checkpointing: CheckpointConfig::default(),
+            recovery: RecoveryConfig::default(),
+            rotation: RotationConfig::default(),
+            fsync: FsyncConfig::default(),
+            async_io: AsyncIoConfig::default(),
+        };
+
+        let manager = WalManager::new(config).await.unwrap();
+        (manager, temp_dir)
+    }
+
+    #[tokio::test]
+    async fn test_truncate_before() {
+        let (mut manager, _temp_dir) = setup_test_manager().await;
+
+        // Append some records
+        let topic = "test-topic";
+        let partition = 0;
+
+        // Create records with offsets 0-9
+        let mut records = Vec::new();
+        for i in 0..10 {
+            records.push(WalRecord::new(
+                i,
+                Some(format!("key-{}", i).into_bytes()),
+                format!("value-{}", i).into_bytes(),
+                1000 + i,
+            ));
+        }
+
+        // Append records
+        manager.append(topic.to_string(), partition, records.clone()).await.unwrap();
+
+        // Force segment rotation would happen automatically based on size
+        // manager.rotate_if_needed(topic, partition).await.unwrap();
+
+        // Append more records (10-19)
+        let mut more_records = Vec::new();
+        for i in 10..20 {
+            more_records.push(WalRecord::new(
+                i,
+                Some(format!("key-{}", i).into_bytes()),
+                format!("value-{}", i).into_bytes(),
+                1010 + i,
+            ));
+        }
+        manager.append(topic.to_string(), partition, more_records).await.unwrap();
+
+        // Truncate before offset 10
+        let truncated = manager.truncate_before(topic, partition, 10).await.unwrap();
+
+        // Should have truncated at least one segment
+        assert!(truncated > 0, "Should have truncated at least one segment");
+
+        // Read remaining records
+        let remaining = manager.read_from(topic, partition, 10, 100).await.unwrap();
+
+        // Should only have records with offset >= 10
+        for record in &remaining {
+            assert!(record.offset >= 10, "Record offset {} should be >= 10", record.offset);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_partitions() {
+        let (mut manager, _temp_dir) = setup_test_manager().await;
+
+        // Initially no partitions
+        let partitions = manager.get_partitions();
+        assert_eq!(partitions.len(), 0);
+
+        // Add some partitions
+        let topics = vec![
+            ("topic1", 0),
+            ("topic1", 1),
+            ("topic2", 0),
+        ];
+
+        for (topic, partition) in &topics {
+            let record = WalRecord::new(
+                0,
+                Some(b"key".to_vec()),
+                b"value".to_vec(),
+                1000,
+            );
+            manager.append(topic.to_string(), *partition, vec![record]).await.unwrap();
+        }
+
+        // Should now have 3 partitions
+        let partitions = manager.get_partitions();
+        assert_eq!(partitions.len(), 3);
+
+        // Verify partition keys
+        for tp in partitions {
+            let found = topics.iter().any(|(t, p)| {
+                tp.topic == *t && tp.partition == *p
+            });
+            assert!(found, "Unexpected partition: {}-{}", tp.topic, tp.partition);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_recovery() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = WalConfig {
+            enabled: true,
+            data_dir: temp_dir.path().to_path_buf(),
+            segment_size: 1024 * 1024,
+            flush_interval_ms: 100,
+            flush_threshold: 1000,
+            compression: CompressionType::None,
+            checkpointing: CheckpointConfig::default(),
+            recovery: RecoveryConfig::default(),
+            rotation: RotationConfig::default(),
+            fsync: FsyncConfig::default(),
+            async_io: AsyncIoConfig::default(),
+        };
+
+        // Create and write some data
+        {
+            let mut manager = WalManager::new(config.clone()).await.unwrap();
+
+            // Write records to multiple partitions
+            for partition in 0..3 {
+                let mut records = Vec::new();
+                for i in 0..5 {
+                    records.push(WalRecord::new(
+                        i,
+                        Some(format!("key-{}", i).into_bytes()),
+                        format!("value-p{}-{}", partition, i).into_bytes(),
+                        1000 + i,
+                    ));
+                }
+                manager.append("test-topic".to_string(), partition, records).await.unwrap();
+            }
+
+            // Flush to ensure data is persisted
+            manager.flush_all().await.unwrap();
+        }
+
+        // Recover from disk
+        let recovered_manager = WalManager::recover(&config).await.unwrap();
+
+        // Get recovery stats
+        let recovery_result = recovered_manager.get_recovery_result();
+        assert_eq!(recovery_result.partitions, 3, "Should recover 3 partitions");
+        assert_eq!(recovery_result.total_records, 15, "Should recover 15 total records");
+
+        // Verify we can read the recovered data
+        for partition in 0..3 {
+            let records = recovered_manager.read_from("test-topic", partition, 0, 100).await.unwrap();
+            assert_eq!(records.len(), 5, "Should have 5 records in partition {}", partition);
+
+            // Verify record content
+            for (i, record) in records.iter().enumerate() {
+                assert_eq!(record.offset, i as i64);
+                let expected_value = format!("value-p{}-{}", partition, i);
+                assert_eq!(record.value, expected_value.as_bytes());
+            }
+        }
     }
 }

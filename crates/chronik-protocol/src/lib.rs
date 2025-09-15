@@ -27,6 +27,21 @@ pub mod heartbeat_types;
 pub mod list_groups_types;
 pub mod leave_group_types;
 pub mod consumer_group_types;
+pub mod delete_topics_types;
+pub mod delete_groups_types;
+pub mod alter_configs_types;
+pub mod describe_configs_types;
+pub mod create_partitions_types;
+pub mod offset_delete_types;
+pub mod describe_groups_types;
+pub mod end_txn_types;
+pub mod init_producer_id_types;
+pub mod add_partitions_to_txn_types;
+pub mod add_offsets_to_txn_types;
+pub mod txn_offset_commit_types;
+pub mod metadata_types;
+pub mod fetch_types;
+pub mod produce_types;
 
 // Temporarily disabled due to kafka-protocol crate compatibility issues
 // pub mod handler_v2;

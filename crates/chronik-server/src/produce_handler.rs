@@ -239,6 +239,117 @@ impl ProduceHandler {
     pub fn get_metadata_store(&self) -> &Arc<dyn MetadataStore> {
         &self.metadata_store
     }
+
+    /// Ensure a partition exists with the specified starting offset (for WAL recovery)
+    pub async fn ensure_partition_exists(
+        &self,
+        topic: &str,
+        partition: i32,
+        next_offset: i64,
+    ) -> Result<()> {
+        let key = (topic.to_string(), partition);
+
+        // Check if partition already exists
+        {
+            let states = self.partition_states.read().await;
+            if states.contains_key(&key) {
+                // Update the offset if needed
+                if let Some(state) = states.get(&key) {
+                    let current_offset = state.next_offset.load(Ordering::SeqCst);
+                    if next_offset > current_offset as i64 {
+                        state.next_offset.store(next_offset as u64, Ordering::SeqCst);
+                        info!(
+                            "Updated partition {}-{} next offset from {} to {}",
+                            topic, partition, current_offset, next_offset
+                        );
+                    }
+                }
+                return Ok(());
+            }
+        }
+
+        // Create new partition state
+        let mut states = self.partition_states.write().await;
+        if !states.contains_key(&key) {
+            let state = self.create_partition_state_with_offset(topic, partition, next_offset).await?;
+            states.insert(key, Arc::new(state));
+            info!(
+                "Created partition {}-{} with starting offset {}",
+                topic, partition, next_offset
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Apply recovered batch to partition buffers (for WAL recovery)
+    pub async fn apply_recovered_batch(
+        &self,
+        topic: &str,
+        partition: i32,
+        batch_data: Bytes,
+    ) -> Result<()> {
+        let key = (topic.to_string(), partition);
+
+        let state = {
+            let states = self.partition_states.read().await;
+            states.get(&key).cloned()
+        };
+
+        if let Some(state) = state {
+            // Add to pending batches
+            let mut pending = state.pending_batches.lock().await;
+            pending.push(BufferedBatch {
+                data: batch_data,
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as i64,
+                producer_id: 0, // Recovery batch
+            });
+
+            info!(
+                "Applied recovered batch to partition {}-{} buffers",
+                topic, partition
+            );
+        } else {
+            warn!(
+                "Partition {}-{} not found when applying recovered batch",
+                topic, partition
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Create partition state with specific starting offset
+    async fn create_partition_state_with_offset(
+        &self,
+        topic: &str,
+        partition: i32,
+        next_offset: i64,
+    ) -> Result<PartitionState> {
+        let segment_path = self.config.data_dir
+            .join(topic)
+            .join(format!("{:010}", partition))
+            .join(format!("{:020}.log", next_offset));
+
+        tokio::fs::create_dir_all(segment_path.parent().unwrap()).await?;
+
+        let writer = SegmentWriter::new(segment_path, next_offset).await?;
+
+        Ok(PartitionState {
+            next_offset: AtomicU64::new(next_offset as u64),
+            high_watermark: AtomicU64::new(next_offset as u64),
+            log_start_offset: AtomicU64::new(0),
+            current_writer: Arc::new(Mutex::new(writer)),
+            segment_created: AtomicU64::new(0),
+            start_time: Instant::now(),
+            segment_size: AtomicU64::new(0),
+            pending_batches: Arc::new(Mutex::new(Vec::new())),
+            last_flush: Arc::new(Mutex::new(Instant::now())),
+        })
+    }
     /// Create a new produce handler
     pub async fn new(
         config: ProduceHandlerConfig,
@@ -527,10 +638,23 @@ impl ProduceHandler {
                 let assignments = self.metadata_store
                     .get_partition_assignments(&topic_data.name)
                     .await?;
-                
+
+                // Debug partition assignments and leadership
+                debug!(
+                    "Leadership check for {}-{}: node_id={}, assignments={:?}",
+                    topic_data.name, partition_data.index, self.config.node_id, assignments
+                );
+
                 let is_leader = assignments.iter()
                     .find(|a| a.partition == partition_data.index as u32)
-                    .map(|a| a.is_leader && a.broker_id == self.config.node_id)
+                    .map(|a| {
+                        let leader = a.is_leader && a.broker_id == self.config.node_id;
+                        debug!(
+                            "Partition {}-{}: assignment broker_id={}, is_leader={}, our_node_id={}, result={}",
+                            topic_data.name, partition_data.index, a.broker_id, a.is_leader, self.config.node_id, leader
+                        );
+                        leader
+                    })
                     .unwrap_or(false);
                 
                 if !is_leader {

@@ -712,6 +712,18 @@ pub fn supported_api_versions() -> HashMap<ApiKey, VersionRange> {
     versions
 }
 
+/// Trait for types that can be decoded from Kafka wire protocol
+pub trait KafkaDecodable: Sized {
+    /// Decode from a decoder
+    fn decode(decoder: &mut Decoder, version: i16) -> Result<Self>;
+}
+
+/// Trait for types that can be encoded to Kafka wire protocol
+pub trait KafkaEncodable {
+    /// Encode to an encoder
+    fn encode(&self, encoder: &mut Encoder, version: i16) -> Result<()>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

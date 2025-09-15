@@ -657,10 +657,25 @@ impl KafkaProtocolHandler {
                     config: config_map,
                 };
 
-                // Create the topic (broker assignment is handled by metadata store)
+                // Create the topic and partition assignments
                 match self.metadata_store.create_topic(topic_name, config).await {
                     Ok(_) => {
                         tracing::info!("Successfully auto-created topic '{}'", topic_name);
+
+                        // Create partition assignments for this broker (single-node setup)
+                        for partition in 0..default_num_partitions {
+                            let assignment = chronik_common::metadata::PartitionAssignment {
+                                topic: topic_name.to_string(),
+                                partition,
+                                broker_id: 1, // Using hardcoded node_id = 1
+                                is_leader: true, // Single node is always the leader
+                            };
+
+                            if let Err(e) = self.metadata_store.assign_partition(assignment).await {
+                                tracing::warn!("Failed to assign partition {} for topic '{}': {:?}",
+                                    partition, topic_name, e);
+                            }
+                        }
                     }
                     Err(e) => {
                         tracing::error!("Failed to auto-create topic '{}': {:?}", topic_name, e);

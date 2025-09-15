@@ -826,16 +826,24 @@ impl ProtocolHandler {
             ApiKey::FindCoordinator => self.handle_find_coordinator(header, &mut buf).await,
             ApiKey::JoinGroup => self.handle_join_group(header, &mut buf).await,
             ApiKey::Heartbeat => self.handle_heartbeat(header, &mut buf).await,
-            ApiKey::LeaveGroup => self.unimplemented_api_response(header.correlation_id, "LeaveGroup"),
+            ApiKey::LeaveGroup => self.handle_leave_group(header, &mut buf).await,
             ApiKey::SyncGroup => self.handle_sync_group(header, &mut buf).await,
             ApiKey::DescribeGroups => self.handle_describe_groups(header, &mut buf).await,
             ApiKey::ListGroups => self.handle_list_groups(header, &mut buf).await,
             
             // Administrative APIs - TODO: implement these
             ApiKey::CreateTopics => self.handle_create_topics(header, &mut buf).await,
-            ApiKey::DeleteTopics => self.unimplemented_api_response(header.correlation_id, "DeleteTopics"),
-            ApiKey::AlterConfigs => self.unimplemented_api_response(header.correlation_id, "AlterConfigs"),
-            
+            ApiKey::DeleteTopics => self.handle_delete_topics(header, &mut buf).await,
+            ApiKey::DeleteGroups => self.handle_delete_groups(header, &mut buf).await,
+            ApiKey::AlterConfigs => self.handle_alter_configs(header, &mut buf).await,
+            ApiKey::CreatePartitions => self.handle_create_partitions(header, &mut buf).await,
+            ApiKey::OffsetDelete => self.handle_offset_delete(header, &mut buf).await,
+            ApiKey::EndTxn => self.handle_end_txn(header, &mut buf).await,
+            ApiKey::InitProducerId => self.handle_init_producer_id(header, &mut buf).await,
+            ApiKey::AddPartitionsToTxn => self.handle_add_partitions_to_txn(header, &mut buf).await,
+            ApiKey::AddOffsetsToTxn => self.handle_add_offsets_to_txn(header, &mut buf).await,
+            ApiKey::TxnOffsetCommit => self.handle_txn_offset_commit(header, &mut buf).await,
+
             // Other APIs
             ApiKey::ListOffsets => self.handle_list_offsets(header, &mut buf).await,
             
@@ -852,12 +860,7 @@ impl ProtocolHandler {
             }
             
             // Transaction APIs
-            ApiKey::InitProducerId |
-            ApiKey::AddPartitionsToTxn |
-            ApiKey::AddOffsetsToTxn |
-            ApiKey::EndTxn |
-            ApiKey::WriteTxnMarkers |
-            ApiKey::TxnOffsetCommit => {
+            ApiKey::WriteTxnMarkers => {
                 tracing::warn!("Received transaction API request: {:?}", header.api_key);
                 self.error_response(header.correlation_id, error_codes::UNSUPPORTED_VERSION)  
             }
@@ -876,7 +879,6 @@ impl ProtocolHandler {
             ApiKey::AlterReplicaLogDirs |
             ApiKey::DescribeLogDirs |
             ApiKey::SaslAuthenticate |
-            ApiKey::CreatePartitions |
             ApiKey::CreateDelegationToken |
             ApiKey::RenewDelegationToken |
             ApiKey::ExpireDelegationToken |
@@ -2283,7 +2285,444 @@ impl ProtocolHandler {
         
         Ok(())
     }
-    
+
+    /// Handle DeleteTopics request
+    async fn handle_delete_topics(
+        &self,
+        header: RequestHeader,
+        body: &mut Bytes,
+    ) -> Result<Response> {
+        use crate::delete_topics_types::{
+            DeleteTopicsRequest, DeleteTopicsResponse, DeletableTopicResult,
+            error_codes
+        };
+        use crate::parser::{Decoder, Encoder, KafkaDecodable, KafkaEncodable};
+        use bytes::BytesMut;
+
+        // Decode request
+        let mut decoder = Decoder::new(body);
+        let request = DeleteTopicsRequest::decode(&mut decoder, header.api_version)?;
+
+        tracing::info!("DeleteTopics request: {:?}", request);
+
+        // Build response - for now, return NOT_CONTROLLER error for all topics
+        // since we don't actually implement topic deletion yet
+        let mut responses = Vec::new();
+        for topic_name in &request.topic_names {
+            responses.push(DeletableTopicResult {
+                name: topic_name.clone(),
+                error_code: error_codes::NOT_CONTROLLER,
+                error_message: if header.api_version >= 5 {
+                    Some("Topic deletion not implemented".to_string())
+                } else {
+                    None
+                },
+            });
+        }
+
+        let response = DeleteTopicsResponse {
+            throttle_time_ms: 0,
+            responses,
+        };
+
+        // Encode response
+        let mut body_buf = BytesMut::new();
+        let mut encoder = Encoder::new(&mut body_buf);
+        response.encode(&mut encoder, header.api_version)?;
+
+        Ok(Self::make_response(&header, ApiKey::DeleteTopics, body_buf.freeze()))
+    }
+
+    /// Handle DeleteGroups request
+    async fn handle_delete_groups(
+        &self,
+        header: RequestHeader,
+        body: &mut Bytes,
+    ) -> Result<Response> {
+        use crate::delete_groups_types::{
+            DeleteGroupsRequest, DeleteGroupsResponse, DeletableGroupResult,
+            error_codes
+        };
+        use crate::parser::{Decoder, Encoder, KafkaDecodable, KafkaEncodable};
+        use bytes::BytesMut;
+
+        // Decode request
+        let mut decoder = Decoder::new(body);
+        let request = DeleteGroupsRequest::decode(&mut decoder, header.api_version)?;
+
+        tracing::info!("DeleteGroups request: {:?}", request);
+
+        // Build response - for now, return GROUP_ID_NOT_FOUND for all groups
+        // since we don't actually implement group deletion yet
+        let mut results = Vec::new();
+        for group_id in &request.groups_names {
+            results.push(DeletableGroupResult {
+                group_id: group_id.clone(),
+                error_code: error_codes::GROUP_ID_NOT_FOUND,
+            });
+        }
+
+        let response = DeleteGroupsResponse {
+            throttle_time_ms: 0,
+            results,
+        };
+
+        // Encode response
+        let mut body_buf = BytesMut::new();
+        let mut encoder = Encoder::new(&mut body_buf);
+        response.encode(&mut encoder, header.api_version)?;
+
+        Ok(Self::make_response(&header, ApiKey::DeleteGroups, body_buf.freeze()))
+    }
+
+    /// Handle AlterConfigs request
+    async fn handle_alter_configs(
+        &self,
+        header: RequestHeader,
+        body: &mut Bytes,
+    ) -> Result<Response> {
+        use crate::alter_configs_types::{
+            AlterConfigsRequest, AlterConfigsResponse, AlterConfigsResourceResponse,
+            error_codes
+        };
+        use crate::parser::{Decoder, Encoder, KafkaDecodable, KafkaEncodable};
+        use bytes::BytesMut;
+
+        // Decode request
+        let mut decoder = Decoder::new(body);
+        let request = AlterConfigsRequest::decode(&mut decoder, header.api_version)?;
+
+        tracing::info!("AlterConfigs request: {:?}", request);
+
+        // Build response - for now, return INVALID_REQUEST for all resources
+        // since we don't actually implement configuration changes yet
+        let mut resources = Vec::new();
+        for resource in &request.resources {
+            resources.push(AlterConfigsResourceResponse {
+                error_code: error_codes::INVALID_REQUEST,
+                error_message: Some("Configuration changes not yet implemented".to_string()),
+                resource_type: resource.resource_type,
+                resource_name: resource.resource_name.clone(),
+            });
+        }
+
+        let response = AlterConfigsResponse {
+            throttle_time_ms: 0,
+            resources,
+        };
+
+        // Encode response
+        let mut body_buf = BytesMut::new();
+        let mut encoder = Encoder::new(&mut body_buf);
+        response.encode(&mut encoder, header.api_version)?;
+
+        Ok(Self::make_response(&header, ApiKey::AlterConfigs, body_buf.freeze()))
+    }
+
+    /// Handle CreatePartitions request
+    async fn handle_create_partitions(
+        &self,
+        header: RequestHeader,
+        body: &mut Bytes,
+    ) -> Result<Response> {
+        use crate::create_partitions_types::{
+            CreatePartitionsRequest, CreatePartitionsResponse, CreatePartitionsTopicResult,
+            error_codes
+        };
+        use crate::parser::{Decoder, Encoder, KafkaDecodable, KafkaEncodable};
+        use bytes::BytesMut;
+
+        // Decode request
+        let mut decoder = Decoder::new(body);
+        let request = CreatePartitionsRequest::decode(&mut decoder, header.api_version)?;
+
+        tracing::info!("CreatePartitions request: {:?}", request);
+
+        // Build response - for now, return INVALID_PARTITIONS for all topics
+        // since we don't actually implement partition creation yet
+        let mut results = Vec::new();
+        for topic in &request.topics {
+            results.push(CreatePartitionsTopicResult {
+                name: topic.name.clone(),
+                error_code: error_codes::INVALID_PARTITIONS,
+                error_message: if header.api_version >= 1 {
+                    Some("Partition creation not yet implemented".to_string())
+                } else {
+                    None
+                },
+            });
+        }
+
+        let response = CreatePartitionsResponse {
+            throttle_time_ms: 0,
+            results,
+        };
+
+        // Encode response
+        let mut body_buf = BytesMut::new();
+        let mut encoder = Encoder::new(&mut body_buf);
+        response.encode(&mut encoder, header.api_version)?;
+
+        Ok(Self::make_response(&header, ApiKey::CreatePartitions, body_buf.freeze()))
+    }
+
+    /// Handle OffsetDelete request
+    async fn handle_offset_delete(&self, header: RequestHeader, body: &mut Bytes) -> Result<Response> {
+        use crate::offset_delete_types::{
+            OffsetDeleteRequest, OffsetDeleteResponse, OffsetDeleteResponseTopic,
+            OffsetDeleteResponsePartition, error_codes,
+        };
+        use crate::parser::{Decoder, Encoder, KafkaDecodable, KafkaEncodable};
+        use bytes::BytesMut;
+
+        tracing::info!("Handling OffsetDelete request");
+
+        // Decode request
+        let mut decoder = Decoder::new(body);
+        let request = OffsetDeleteRequest::decode(&mut decoder, header.api_version)?;
+
+        tracing::info!("OffsetDelete for group: {}", request.group_id);
+
+        // For now, return error for all partitions (not implemented)
+        let topics = request.topics.iter().map(|topic| {
+            OffsetDeleteResponseTopic {
+                name: topic.name.clone(),
+                partitions: topic.partitions.iter().map(|partition| {
+                    OffsetDeleteResponsePartition {
+                        partition_index: partition.partition_index,
+                        error_code: error_codes::GROUP_SUBSCRIBED_TO_TOPIC, // Cannot delete active consumer group offsets
+                    }
+                }).collect(),
+            }
+        }).collect();
+
+        let response = OffsetDeleteResponse {
+            error_code: error_codes::NONE,
+            throttle_time_ms: 0,
+            topics,
+        };
+
+        // Encode response
+        let mut body_buf = BytesMut::new();
+        let mut encoder = Encoder::new(&mut body_buf);
+        response.encode(&mut encoder, header.api_version)?;
+
+        Ok(Self::make_response(&header, ApiKey::OffsetDelete, body_buf.freeze()))
+    }
+
+    /// Handle EndTxn request
+    async fn handle_end_txn(&self, header: RequestHeader, body: &mut Bytes) -> Result<Response> {
+        use crate::end_txn_types::{EndTxnRequest, EndTxnResponse, error_codes};
+        use crate::parser::{Decoder, Encoder, KafkaDecodable, KafkaEncodable};
+        use bytes::BytesMut;
+
+        tracing::info!("Handling EndTxn request");
+
+        // Decode request
+        let mut decoder = Decoder::new(body);
+        let request = EndTxnRequest::decode(&mut decoder, header.api_version)?;
+
+        tracing::info!(
+            "EndTxn for transaction: {}, producer_id: {}, committed: {}",
+            request.transactional_id,
+            request.producer_id,
+            request.committed
+        );
+
+        // For now, return NOT_COORDINATOR error since we don't support transactions
+        let response = EndTxnResponse {
+            throttle_time_ms: 0,
+            error_code: error_codes::NOT_COORDINATOR,
+        };
+
+        // Encode response
+        let mut body_buf = BytesMut::new();
+        let mut encoder = Encoder::new(&mut body_buf);
+        response.encode(&mut encoder, header.api_version)?;
+
+        Ok(Self::make_response(&header, ApiKey::EndTxn, body_buf.freeze()))
+    }
+
+    /// Handle InitProducerId request
+    async fn handle_init_producer_id(&self, header: RequestHeader, body: &mut Bytes) -> Result<Response> {
+        use crate::init_producer_id_types::{InitProducerIdRequest, InitProducerIdResponse, error_codes};
+        use crate::parser::{Decoder, Encoder, KafkaDecodable, KafkaEncodable};
+        use bytes::BytesMut;
+        use std::sync::atomic::{AtomicI64, Ordering};
+
+        tracing::info!("Handling InitProducerId request");
+
+        // Decode request
+        let mut decoder = Decoder::new(body);
+        let request = InitProducerIdRequest::decode(&mut decoder, header.api_version)?;
+
+        tracing::info!(
+            "InitProducerId for transaction: {:?}, timeout: {}ms",
+            request.transactional_id,
+            request.transaction_timeout_ms
+        );
+
+        // Generate a simple producer ID (in production, this would need proper coordination)
+        static PRODUCER_ID_COUNTER: AtomicI64 = AtomicI64::new(1000);
+        let producer_id = PRODUCER_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let producer_epoch = 0;
+
+        let response = InitProducerIdResponse {
+            throttle_time_ms: 0,
+            error_code: error_codes::NONE,
+            producer_id,
+            producer_epoch,
+        };
+
+        // Encode response
+        let mut body_buf = BytesMut::new();
+        let mut encoder = Encoder::new(&mut body_buf);
+        response.encode(&mut encoder, header.api_version)?;
+
+        Ok(Self::make_response(&header, ApiKey::InitProducerId, body_buf.freeze()))
+    }
+
+    /// Handle TxnOffsetCommit request
+    async fn handle_txn_offset_commit(&self, header: RequestHeader, body: &mut Bytes) -> Result<Response> {
+        use crate::txn_offset_commit_types::{
+            TxnOffsetCommitRequest, TxnOffsetCommitResponse,
+            TxnOffsetCommitTopicResponse, TxnOffsetCommitPartitionResponse,
+            error_codes
+        };
+        use crate::parser::{Decoder, Encoder, KafkaDecodable, KafkaEncodable};
+        use bytes::BytesMut;
+
+        tracing::info!("Handling TxnOffsetCommit request");
+
+        // Decode request
+        let mut decoder = Decoder::new(body);
+        let request = TxnOffsetCommitRequest::decode(&mut decoder, header.api_version)?;
+
+        tracing::info!(
+            "TxnOffsetCommit for transaction: {}, group: {}, producer_id: {}, epoch: {}, topics: {}",
+            request.transactional_id,
+            request.consumer_group_id,
+            request.producer_id,
+            request.producer_epoch,
+            request.topics.len()
+        );
+
+        // Build response - for now, all offsets are successfully committed
+        let mut topic_responses = Vec::new();
+        for topic in &request.topics {
+            let mut partition_responses = Vec::new();
+            for partition in &topic.partitions {
+                partition_responses.push(TxnOffsetCommitPartitionResponse {
+                    partition_index: partition.partition_index,
+                    error_code: error_codes::NONE,
+                });
+            }
+            topic_responses.push(TxnOffsetCommitTopicResponse {
+                name: topic.name.clone(),
+                partitions: partition_responses,
+            });
+        }
+
+        let response = TxnOffsetCommitResponse {
+            throttle_time_ms: 0,
+            topics: topic_responses,
+        };
+
+        // Encode response
+        let mut body_buf = BytesMut::new();
+        let mut encoder = Encoder::new(&mut body_buf);
+        response.encode(&mut encoder, header.api_version)?;
+
+        Ok(Self::make_response(&header, ApiKey::TxnOffsetCommit, body_buf.freeze()))
+    }
+
+    /// Handle AddOffsetsToTxn request
+    async fn handle_add_offsets_to_txn(&self, header: RequestHeader, body: &mut Bytes) -> Result<Response> {
+        use crate::add_offsets_to_txn_types::{AddOffsetsToTxnRequest, AddOffsetsToTxnResponse, error_codes};
+        use crate::parser::{Decoder, Encoder, KafkaDecodable, KafkaEncodable};
+        use bytes::BytesMut;
+
+        tracing::info!("Handling AddOffsetsToTxn request");
+
+        // Decode request
+        let mut decoder = Decoder::new(body);
+        let request = AddOffsetsToTxnRequest::decode(&mut decoder, header.api_version)?;
+
+        tracing::info!(
+            "AddOffsetsToTxn for transaction: {}, producer_id: {}, epoch: {}, group: {}",
+            request.transactional_id,
+            request.producer_id,
+            request.producer_epoch,
+            request.consumer_group_id
+        );
+
+        // Build response - for now, successfully add the consumer group offsets to the transaction
+        let response = AddOffsetsToTxnResponse {
+            throttle_time_ms: 0,
+            error_code: error_codes::NONE,
+        };
+
+        // Encode response
+        let mut body_buf = BytesMut::new();
+        let mut encoder = Encoder::new(&mut body_buf);
+        response.encode(&mut encoder, header.api_version)?;
+
+        Ok(Self::make_response(&header, ApiKey::AddOffsetsToTxn, body_buf.freeze()))
+    }
+
+    /// Handle AddPartitionsToTxn request
+    async fn handle_add_partitions_to_txn(&self, header: RequestHeader, body: &mut Bytes) -> Result<Response> {
+        use crate::add_partitions_to_txn_types::{
+            AddPartitionsToTxnRequest, AddPartitionsToTxnResponse,
+            AddPartitionsToTxnTopicResult, AddPartitionsToTxnPartitionResult,
+            error_codes
+        };
+        use crate::parser::{Decoder, Encoder, KafkaDecodable, KafkaEncodable};
+        use bytes::BytesMut;
+
+        tracing::info!("Handling AddPartitionsToTxn request");
+
+        // Decode request
+        let mut decoder = Decoder::new(body);
+        let request = AddPartitionsToTxnRequest::decode(&mut decoder, header.api_version)?;
+
+        tracing::info!(
+            "AddPartitionsToTxn for transaction: {}, producer_id: {}, epoch: {}, topics: {}",
+            request.transactional_id,
+            request.producer_id,
+            request.producer_epoch,
+            request.topics.len()
+        );
+
+        // Build response - for now, all partitions are successfully added
+        let mut results = Vec::new();
+        for topic in &request.topics {
+            let mut partition_results = Vec::new();
+            for partition in &topic.partitions {
+                partition_results.push(AddPartitionsToTxnPartitionResult {
+                    partition: partition.partition,
+                    error_code: error_codes::NONE,
+                });
+            }
+            results.push(AddPartitionsToTxnTopicResult {
+                name: topic.name.clone(),
+                results: partition_results,
+            });
+        }
+
+        let response = AddPartitionsToTxnResponse {
+            throttle_time_ms: 0,
+            results,
+        };
+
+        // Encode response
+        let mut body_buf = BytesMut::new();
+        let mut encoder = Encoder::new(&mut body_buf);
+        response.encode(&mut encoder, header.api_version)?;
+
+        Ok(Self::make_response(&header, ApiKey::AddPartitionsToTxn, body_buf.freeze()))
+    }
+
     /// Handle ListOffsets request
     async fn handle_list_offsets(
         &self,
@@ -3010,7 +3449,128 @@ impl ProtocolHandler {
         
         Ok(Self::make_response(&header, ApiKey::JoinGroup, body_buf.freeze()))
     }
-    
+
+    /// Handle LeaveGroup request
+    async fn handle_leave_group(
+        &self,
+        header: RequestHeader,
+        body: &mut Bytes,
+    ) -> Result<Response> {
+        use crate::leave_group_types::{
+            LeaveGroupRequest, LeaveGroupResponse, MemberResponse,
+            error_codes
+        };
+        use crate::parser::{Decoder, Encoder, KafkaDecodable, KafkaEncodable};
+        use bytes::BytesMut;
+
+        tracing::debug!("Handling LeaveGroup request v{}", header.api_version);
+
+        // Parse request
+        let mut decoder = Decoder::new(body);
+        let request = LeaveGroupRequest::decode(&mut decoder, header.api_version)?;
+
+        tracing::info!(
+            "LeaveGroup request for group '{}', {} members",
+            request.group_id, request.members.len()
+        );
+
+        // Process leave group
+        let mut group_state = self.consumer_groups.lock().await;
+        let mut member_responses = Vec::new();
+
+        if let Some(group) = group_state.groups.get_mut(&request.group_id) {
+            // Remove each member from the group
+            for member in &request.members {
+                let mut error_code = error_codes::NONE;
+
+                // Find and remove the member
+                let initial_count = group.members.len();
+                group.members.retain(|m| m.member_id != member.member_id);
+
+                if group.members.len() < initial_count {
+                    tracing::info!(
+                        "Removed member '{}' from group '{}'",
+                        member.member_id, request.group_id
+                    );
+                } else {
+                    // Member not found
+                    error_code = error_codes::UNKNOWN_MEMBER_ID;
+                    tracing::warn!(
+                        "Member '{}' not found in group '{}'",
+                        member.member_id, request.group_id
+                    );
+                }
+
+                // Add member response (v3+)
+                if header.api_version >= 3 {
+                    member_responses.push(MemberResponse {
+                        member_id: member.member_id.clone(),
+                        group_instance_id: member.group_instance_id.clone(),
+                        error_code,
+                    });
+                }
+            }
+
+            // If group is now empty, mark it as empty
+            if group.members.is_empty() {
+                group.state = "Empty".to_string();
+                tracing::info!("Group '{}' is now empty", request.group_id);
+            } else {
+                // Trigger rebalance for remaining members
+                group.state = "PreparingRebalance".to_string();
+                group.generation_id += 1;
+                tracing::info!(
+                    "Group '{}' entering rebalance after member removal, new generation: {}",
+                    request.group_id, group.generation_id
+                );
+            }
+        } else {
+            // Group not found
+            let error_code = error_codes::GROUP_ID_NOT_FOUND;
+            if header.api_version >= 3 {
+                for member in &request.members {
+                    member_responses.push(MemberResponse {
+                        member_id: member.member_id.clone(),
+                        group_instance_id: member.group_instance_id.clone(),
+                        error_code,
+                    });
+                }
+            } else {
+                // For v0-v2, return error at top level
+                let response = LeaveGroupResponse {
+                    throttle_time_ms: 0,
+                    error_code,
+                    members: vec![],
+                };
+                let mut body_buf = BytesMut::new();
+                let mut encoder = Encoder::new(&mut body_buf);
+                response.encode(&mut encoder, header.api_version)?;
+                return Ok(Self::make_response(&header, ApiKey::LeaveGroup, body_buf.freeze()));
+            }
+        }
+
+        // Build response
+        let response = if header.api_version >= 3 {
+            LeaveGroupResponse {
+                throttle_time_ms: 0,
+                error_code: error_codes::NONE,
+                members: member_responses,
+            }
+        } else {
+            LeaveGroupResponse {
+                throttle_time_ms: 0,
+                error_code: error_codes::NONE,
+                members: vec![],
+            }
+        };
+
+        let mut body_buf = BytesMut::new();
+        let mut encoder = Encoder::new(&mut body_buf);
+        response.encode(&mut encoder, header.api_version)?;
+
+        Ok(Self::make_response(&header, ApiKey::LeaveGroup, body_buf.freeze()))
+    }
+
     /// Handle SyncGroup request
     async fn handle_sync_group(
         &self,
@@ -3236,47 +3796,32 @@ impl ProtocolHandler {
         use crate::heartbeat_types::{
             HeartbeatRequest, HeartbeatResponse, error_codes
         };
-        use crate::parser::Decoder;
-        
+        use crate::parser::{Decoder, Encoder, KafkaDecodable, KafkaEncodable};
+        use bytes::BytesMut;
+
         tracing::debug!("Handling Heartbeat request v{}", header.api_version);
-        
+
+        // Parse request using trait-based decoding
         let mut decoder = Decoder::new(body);
-        
-        // Parse request
-        let group_id = decoder.read_string()?
-            .ok_or_else(|| Error::Protocol("Group ID cannot be null".into()))?;
-        let generation_id = decoder.read_i32()?;
-        let member_id = decoder.read_string()?
-            .ok_or_else(|| Error::Protocol("Member ID cannot be null".into()))?;
-        
-        let group_instance_id = if header.api_version >= 3 {
-            decoder.read_string()?
-        } else {
-            None
-        };
-        
-        let request = HeartbeatRequest {
-            group_id: group_id.clone(),
-            generation_id,
-            member_id: member_id.clone(),
-            group_instance_id,
-        };
-        
+        let request = HeartbeatRequest::decode(&mut decoder, header.api_version)?;
+
         tracing::debug!(
             "Heartbeat from member '{}' in group '{}', generation {}",
             request.member_id, request.group_id, request.generation_id
         );
-        
+
         // For now, always return success
         // In a real implementation, this would check member validity and group state
         let response = HeartbeatResponse {
             throttle_time_ms: 0,
             error_code: error_codes::NONE,
         };
-        
+
+        // Encode response using trait-based encoding
         let mut body_buf = BytesMut::new();
-        self.encode_heartbeat_response(&mut body_buf, &response, header.api_version)?;
-        
+        let mut encoder = Encoder::new(&mut body_buf);
+        response.encode(&mut encoder, header.api_version)?;
+
         Ok(Self::make_response(&header, ApiKey::Heartbeat, body_buf.freeze()))
     }
     
@@ -3735,7 +4280,7 @@ impl ProtocolHandler {
                         partitions.push(MetadataPartition {
                             error_code: 0,
                             partition_index: assignment.partition as i32,
-                            leader_id: if assignment.is_leader { assignment.broker_id } else { self.broker_id },
+                            leader_id: assignment.broker_id,
                             leader_epoch: 0,
                             replica_nodes: vec![assignment.broker_id],
                             isr_nodes: vec![assignment.broker_id], // For now, all replicas are in sync
