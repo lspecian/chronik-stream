@@ -1,4 +1,4 @@
-# Chronik Stream v1.2.3
+# Chronik Stream v1.2.4
 
 [![Build Status](https://github.com/lspecian/chronik-stream/workflows/CI/badge.svg)](https://github.com/lspecian/chronik-stream/actions)
 [![Release](https://img.shields.io/github/v/release/lspecian/chronik-stream)](https://github.com/lspecian/chronik-stream/releases)
@@ -8,7 +8,14 @@
 
 A high-performance streaming platform built in Rust that implements core Kafka wire protocol functionality with comprehensive Write-Ahead Log (WAL) durability and automatic recovery.
 
-## 🎉 What's New in v1.2.3
+## 🎉 What's New in v1.2.4
+
+### v1.2.4 - Full Kafka Compatibility & Consumer Groups
+- **🎯 Fixed ApiVersionsResponse v0**: Resolved kafka-python "IncompatibleBrokerVersion" errors
+- **👥 Consumer Group APIs**: All 9 consumer group APIs now fully functional
+- **✅ KSQLDB Compatible**: Full compatibility with KSQLDB via confluent-kafka
+- **🚀 Apache Flink Support**: Consumer group patterns work correctly
+- **🔧 Comprehensive Testing**: Added extensive test suite for all consumer group APIs
 
 ### v1.2.3 - Compilation Fix
 - **🔧 Fixed Compilation Errors**: Resolved struct field mismatches in produce_handler
@@ -26,12 +33,12 @@ A high-performance streaming platform built in Rust that implements core Kafka w
 
 ## 🚀 Features
 
-- **Kafka Wire Protocol**: Implements core Kafka wire protocol for basic produce/consume operations
+- **Kafka Wire Protocol**: Full Kafka wire protocol with consumer group support
 - **WAL-based Metadata**: ChronikMetaLog provides event-sourced metadata persistence
 - **Write-Ahead Log**: Complete WAL system with segmentation, rotation, recovery, and truncation
 - **Automatic Recovery**: WAL records are automatically replayed on startup to restore state
 - **WAL Truncation**: Old WAL segments are efficiently removed after successful persistence
-- **Real Client Testing**: Successfully tested with kafka-python and other Python clients
+- **Real Client Testing**: Tested with kafka-python, confluent-kafka, KSQLDB, and Apache Flink
 - **Zero Message Loss**: WAL ensures durability even during unexpected shutdowns
 - **Crash Recovery**: Full recovery of messages and offsets after server crashes
 - **High Performance**: Async architecture with zero-copy networking optimizations
@@ -70,7 +77,7 @@ A high-performance streaming platform built in Rust that implements core Kafka w
 # Quick start - single command
 docker run -d -p 9092:9092 \
   -e CHRONIK_ADVERTISED_ADDR=localhost \
-  ghcr.io/lspecian/chronik-stream:v1.2.3
+  ghcr.io/lspecian/chronik-stream:v1.2.4
 
 # With persistent storage and custom configuration
 docker run -d --name chronik \
@@ -78,7 +85,7 @@ docker run -d --name chronik \
   -v chronik-data:/data \
   -e CHRONIK_ADVERTISED_ADDR=localhost \
   -e RUST_LOG=info \
-  ghcr.io/lspecian/chronik-stream:v1.2.3
+  ghcr.io/lspecian/chronik-stream:v1.2.4
 
 # Using docker-compose
 curl -O https://raw.githubusercontent.com/lspecian/chronik-stream/main/docker-compose.yml
