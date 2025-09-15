@@ -300,12 +300,9 @@ impl ProduceHandler {
             // Add to pending batches
             let mut pending = state.pending_batches.lock().await;
             pending.push(BufferedBatch {
-                data: batch_data,
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as i64,
-                producer_id: 0, // Recovery batch
+                raw_bytes: batch_data.to_vec(),
+                records: Vec::new(), // Will be parsed when needed
+                base_offset: 0, // Will be assigned when written
             });
 
             info!(
@@ -329,14 +326,20 @@ impl ProduceHandler {
         partition: i32,
         next_offset: i64,
     ) -> Result<PartitionState> {
-        let segment_path = self.config.data_dir
+        // Create segment path
+        let segment_path = self.config.storage_config.segment_writer_config.data_dir
             .join(topic)
             .join(format!("{:010}", partition))
             .join(format!("{:020}.log", next_offset));
 
+        // Ensure directory exists
         tokio::fs::create_dir_all(segment_path.parent().unwrap()).await?;
 
-        let writer = SegmentWriter::new(segment_path, next_offset).await?;
+        // Configure the writer with the segment directory
+        let mut writer_config = self.config.storage_config.segment_writer_config.clone();
+        writer_config.data_dir = segment_path.parent().unwrap().to_path_buf();
+
+        let writer = SegmentWriter::new(writer_config).await?;
 
         Ok(PartitionState {
             next_offset: AtomicU64::new(next_offset as u64),
