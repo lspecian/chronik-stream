@@ -1,4 +1,4 @@
-# Chronik Stream v1.2.2
+# Chronik Stream v1.2.3
 
 [![Build Status](https://github.com/lspecian/chronik-stream/workflows/CI/badge.svg)](https://github.com/lspecian/chronik-stream/actions)
 [![Release](https://img.shields.io/github/v/release/lspecian/chronik-stream)](https://github.com/lspecian/chronik-stream/releases)
@@ -8,7 +8,13 @@
 
 A high-performance streaming platform built in Rust that implements core Kafka wire protocol functionality with comprehensive Write-Ahead Log (WAL) durability and automatic recovery.
 
-## 🎉 What's New in v1.2.2
+## 🎉 What's New in v1.2.3
+
+### v1.2.3 - Compilation Fix
+- **🔧 Fixed Compilation Errors**: Resolved struct field mismatches in produce_handler
+- **✅ Build Stability**: Fixed BufferedBatch and SegmentWriter initialization issues
+
+### v1.2.2 Features
 
 - **🔄 WAL Recovery on Startup**: Automatic recovery of in-memory state from persistent WAL records
 - **✂️ WAL Truncation**: Efficient cleanup of old WAL segments after successful persistence
@@ -64,7 +70,7 @@ A high-performance streaming platform built in Rust that implements core Kafka w
 # Quick start - single command
 docker run -d -p 9092:9092 \
   -e CHRONIK_ADVERTISED_ADDR=localhost \
-  ghcr.io/lspecian/chronik-stream:v1.2.2
+  ghcr.io/lspecian/chronik-stream:v1.2.3
 
 # With persistent storage and custom configuration
 docker run -d --name chronik \
@@ -72,7 +78,7 @@ docker run -d --name chronik \
   -v chronik-data:/data \
   -e CHRONIK_ADVERTISED_ADDR=localhost \
   -e RUST_LOG=info \
-  ghcr.io/lspecian/chronik-stream:v1.2.2
+  ghcr.io/lspecian/chronik-stream:v1.2.3
 
 # Using docker-compose
 curl -O https://raw.githubusercontent.com/lspecian/chronik-stream/main/docker-compose.yml
@@ -209,7 +215,7 @@ All images support both **linux/amd64** and **linux/arm64** architectures:
 
 | Image | Tags | Size | Description |
 |-------|------|------|-------------|
-| `ghcr.io/lspecian/chronik-stream` | `v1.2.2`, `1.2`, `latest` | ~50MB | Chronik server with WAL recovery |
+| `ghcr.io/lspecian/chronik-stream` | `v1.2.3`, `1.2`, `latest` | ~50MB | Chronik server with WAL recovery |
 
 ### Supported Platforms
 
@@ -382,9 +388,13 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 Apache License 2.0. See [LICENSE](LICENSE) for details.
 
-## 🚀 Latest Release: v1.2.2
+## 🚀 Latest Release: v1.2.3
 
-### What's New in v1.2.2
+### What's New in v1.2.3
+- ✅ **Compilation Fix** - Fixed struct field mismatches preventing successful builds
+- ✅ **Build Stability** - Resolved BufferedBatch and SegmentWriter initialization issues
+
+### Previous Release: v1.2.2
 - ✅ **WAL Recovery on Startup** - Automatic recovery of in-memory state from persistent WAL records
 - ✅ **WAL Truncation** - Efficient cleanup of old WAL segments after successful persistence to disk
 - ✅ **Crash Recovery** - Full message recovery after unexpected server shutdowns
