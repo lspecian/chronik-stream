@@ -106,7 +106,7 @@ impl ProtocolHandler {
             is_flexible_version(api_key, header.api_version)
         };
         
-        eprintln!("DEBUG: make_response - api_key={:?}, body.len()={}, header_has_tagged_fields={}", 
+        tracing::debug!("make_response - api_key={:?}, body.len()={}, header_has_tagged_fields={}",
                  api_key, body.len(), header_has_tagged_fields);
         
         Response {
@@ -772,10 +772,13 @@ impl ProtocolHandler {
     /// Handle a raw request and return a response
     pub async fn handle_request(&self, request_bytes: &[u8]) -> Result<Response> {
         let mut buf = Bytes::copy_from_slice(request_bytes);
-        
+
         // Use the new parsing function that preserves correlation ID
         let header = match parse_request_header_with_correlation(&mut buf) {
-            Ok((h, _)) => h,
+            Ok((h, _)) => {
+                tracing::info!("Protocol handler: Processing API {:?} v{}", h.api_key, h.api_version);
+                h
+            },
             Err(Error::ProtocolWithCorrelation { correlation_id, message }) => {
                 // Unknown API key but we have correlation ID
                 tracing::warn!("Unknown API key error: {}, correlation_id: {}", message, correlation_id);
@@ -945,11 +948,9 @@ impl ProtocolHandler {
             let mut body_buf = BytesMut::new();
             self.encode_api_versions_response(&mut body_buf, &response, header.api_version)?;
             
-            eprintln!("DEBUG: After encode, body_buf first 32 bytes: {:?}", &body_buf[..body_buf.len().min(32)]);
             let encoded_bytes = body_buf.freeze();
-            eprintln!("DEBUG: After freeze, encoded_bytes first 32 bytes: {:?}", &encoded_bytes[..encoded_bytes.len().min(32)]);
             let response = Self::make_response(&header, ApiKey::ApiVersions, encoded_bytes);
-            eprintln!("DEBUG: Response body first 32 bytes: {:?}", &response.body[..response.body.len().min(32)]);
+            tracing::debug!("ApiVersions response encoded, body size: {} bytes", response.body.len());
             return Ok(response);
         }
         
@@ -989,26 +990,27 @@ impl ProtocolHandler {
         response: &ApiVersionsResponse,
         version: i16,
     ) -> Result<()> {
-        eprintln!("DEBUG encode_api_versions_response: version={}, api_count={}", version, response.api_versions.len());
+        tracing::info!("Encoding ApiVersionsResponse v{} with {} APIs", version, response.api_versions.len());
         let mut encoder = Encoder::new(buf);
-        
+
         // CRITICAL: For v0 protocol, field order matters!
-        // v0: api_versions array comes BEFORE error_code
-        // v1+: error_code comes first (standard field ordering)
-        
+        // kafka-python expects error_code FIRST, then api_versions array
+        // This is different from the Kafka protocol spec, but needed for compatibility
+
         if version == 0 {
-            // v0 field order: api_versions array, then error_code
-            
-            // Write array of API versions first
+            // v0 field order: kafka-python compatibility requires error_code FIRST
+            tracing::info!("Using kafka-python compatible v0 encoding: error_code first, then api_versions array");
+
+            // Write error_code first (for kafka-python compatibility)
+            encoder.write_i16(response.error_code);
+
+            // Then write array of API versions
             encoder.write_i32(response.api_versions.len() as i32);
             for api in &response.api_versions {
                 encoder.write_i16(api.api_key);
                 encoder.write_i16(api.min_version);
                 encoder.write_i16(api.max_version);
             }
-            
-            // Then write error_code
-            encoder.write_i16(response.error_code);
         } else {
             // v1+ field order depends on version:
             // v1-2: throttle_time_ms, error_code, api_versions
@@ -1023,29 +1025,19 @@ impl ProtocolHandler {
             }
             
             // Then error_code
-            eprintln!("DEBUG: About to write error_code = {}", response.error_code);
-            eprintln!("DEBUG: Buffer before error_code: {:?}", encoder.debug_buffer());
             encoder.write_i16(response.error_code);
-            eprintln!("DEBUG: Buffer after error_code: {:?}", encoder.debug_buffer());
             
             // Write array of API versions
-            eprintln!("DEBUG: version = {}, will use compact = {}", version, version >= 3);
             if version >= 3 {
                 // Use compact array encoding
                 // Compact arrays use length+1 encoding
                 let array_len = (response.api_versions.len() + 1) as u32;
-                eprintln!("DEBUG: IN COMPACT PATH - Writing compact array for {} APIs, varint value = {}", response.api_versions.len(), array_len);
-                eprintln!("DEBUG: Buffer before varint: {:?}", encoder.debug_buffer());
                 encoder.write_unsigned_varint(array_len);
-                eprintln!("DEBUG: Buffer after varint: {:?}", encoder.debug_buffer());
                 
                 for (i, api) in response.api_versions.iter().enumerate() {
                     // CRITICAL: librdkafka compatibility issue
                     // Kafka spec says v3+ uses INT8 for min/max, but librdkafka v2.11.1
                     // seems to expect INT16. Let's try INT16 for compatibility.
-                    if i == 0 {
-                        eprintln!("DEBUG: First API - key={}, min={}, max={}", api.api_key, api.min_version, api.max_version);
-                    }
                     encoder.write_i16(api.api_key);
                     
                     // Try INT16 for librdkafka compatibility
@@ -1068,22 +1060,18 @@ impl ProtocolHandler {
             // CRITICAL FIX: librdkafka expects throttle_time_ms at the end for v3
             // The error shows it expects 4 bytes at position 423/424
             if version == 3 {
-                eprintln!("DEBUG: v3 - Writing throttle_time THEN tagged fields");
                 encoder.write_i32(response.throttle_time_ms);
                 encoder.write_unsigned_varint(0);
             }
             
             // v4+ has tagged fields at the end (and throttle_time is earlier)
             if version >= 4 {
-                eprintln!("DEBUG: Writing end tagged field for version {}", version);
                 // Write tagged fields at the end (empty for now)
                 encoder.write_unsigned_varint(0);
             }
         }
         
-        eprintln!("DEBUG: Final buffer in encode_api_versions_response: len={}, first 32 bytes: {:?}", 
-            encoder.debug_buffer().len(),
-            &encoder.debug_buffer()[..encoder.debug_buffer().len().min(32)]);
+        tracing::debug!("ApiVersions response encoded, buffer size: {} bytes", encoder.debug_buffer().len());
         Ok(())
     }
     
@@ -1096,25 +1084,25 @@ impl ProtocolHandler {
         use crate::types::{MetadataRequest, MetadataResponse, MetadataBroker};
         use crate::parser::Decoder;
         
-        eprintln!("DEBUG: handle_metadata called with v{}", header.api_version);
+        tracing::debug!("handle_metadata called with v{}", header.api_version);
         tracing::debug!("Handling metadata request v{}", header.api_version);
         
         let mut decoder = Decoder::new(body);
         let flexible = header.api_version >= 9;
         
         // Parse metadata request
-        eprintln!("DEBUG: Parsing metadata request, flexible={}", flexible);
+        tracing::debug!("Parsing metadata request, flexible={}", flexible);
         let topics = if header.api_version >= 1 {
             let topic_count = if flexible {
                 // Compact array
                 let count = match decoder.read_unsigned_varint() {
                     Ok(c) => c as i32,
                     Err(e) => {
-                        eprintln!("DEBUG: Failed to read topic count varint: {:?}", e);
+                        tracing::debug!("Failed to read topic count varint: {:?}", e);
                         return Err(e);
                     }
                 };
-                eprintln!("DEBUG: Topic count varint read: {}", count);
+                tracing::debug!("Topic count varint read: {}", count);
                 if count == 0 {
                     -1  // Null array
                 } else {
@@ -1124,13 +1112,13 @@ impl ProtocolHandler {
                 decoder.read_i32()?
             };
             
-            eprintln!("DEBUG: Topic count decoded: {}", topic_count);
+            tracing::debug!("Topic count decoded: {}", topic_count);
             if topic_count < 0 {
                 None // All topics
             } else {
                 let mut topic_names = Vec::with_capacity(topic_count as usize);
                 for i in 0..topic_count {
-                    eprintln!("DEBUG: Reading topic {}/{}", i+1, topic_count);
+                    tracing::trace!("Reading topic {}/{}", i+1, topic_count);
                     
                     // v10+ includes topic_id (UUID) before name
                     if header.api_version >= 10 {
@@ -1139,7 +1127,7 @@ impl ProtocolHandler {
                         for j in 0..16 {
                             topic_id[j] = decoder.read_i8()? as u8;
                         }
-                        eprintln!("DEBUG: Topic {} ID: {:02x?}", i, &topic_id);
+                        tracing::trace!("Topic {} ID: {:02x?}", i, &topic_id);
                     }
                     
                     let name = if flexible {

@@ -446,19 +446,20 @@ impl ProtocolCodec {
         // v1+: error_code comes first (standard field ordering)
         
         if version == 0 {
-            // v0 field order: api_versions array, then error_code
-            
-            // API versions array first
+            // v0 field order: kafka-python expects error_code FIRST, then api_versions
+            // This is different from the Kafka protocol spec, but needed for compatibility
+
+            // Error code first (for kafka-python compatibility)
+            buf.put_i16(ErrorCode::None.code());
+
+            // Then API versions array
             buf.put_i32(api_versions.len() as i32);
-            
+
             for api in api_versions {
                 buf.put_i16(api.api_key);
                 buf.put_i16(api.min_version);
                 buf.put_i16(api.max_version);
             }
-            
-            // Then error code
-            buf.put_i16(ErrorCode::None.code());
         } else {
             // v1+ field order: throttle_time, error_code, then api_versions array
             

@@ -2,7 +2,8 @@
 
 use crate::{BenchmarkConfig, BenchmarkResults, ResourceMonitor};
 use anyhow::Result;
-use chronik_ingest::{IngestServer, ServerConfig};
+// chronik_ingest crate doesn't exist, commenting out for now
+// use chronik_ingest::{IngestServer, ServerConfig};
 use chronik_search::api::{SearchRequest, SearchResponse};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -13,14 +14,14 @@ use tracing::{info, warn};
 /// Ingest throughput benchmark
 pub struct IngestThroughputBenchmark {
     config: BenchmarkConfig,
-    ingest_server: Option<Arc<IngestServer>>,
+    // ingest_server: Option<Arc<IngestServer>>,
 }
 
 impl IngestThroughputBenchmark {
     pub fn new(config: BenchmarkConfig) -> Self {
         Self {
             config,
-            ingest_server: None,
+            // ingest_server: None,
         }
     }
     

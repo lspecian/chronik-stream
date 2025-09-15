@@ -578,6 +578,7 @@ impl KafkaProtocolHandler {
             }
             _ => {
                 // For all other API calls, delegate to the protocol handler
+                tracing::info!("Delegating API {:?} v{} to protocol_handler", header.api_key, header.api_version);
                 self.protocol_handler.handle_request(request_bytes).await
             }
         }

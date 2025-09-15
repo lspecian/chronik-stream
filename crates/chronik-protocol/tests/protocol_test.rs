@@ -294,32 +294,30 @@ fn test_api_key_mapping() {
     assert_eq!(ApiKey::from_i16(999), None); // Invalid
 }
 
-/// Test ApiVersions v0 field ordering
+/// Test ApiVersions v0 field ordering (kafka-python compatibility)
 #[test]
 fn test_api_versions_v0_field_ordering() {
     let mut buf = BytesMut::new();
     let apis = get_supported_apis();
-    
-    // Encode with v0 - field order should be: api_versions array, then error_code
+
+    // Encode with v0 - for kafka-python compatibility: error_code FIRST, then api_versions array
     ProtocolCodec::encode_api_versions_response(&mut buf, 123, &apis, 0).unwrap();
-    
+
     // Skip correlation ID (4 bytes)
     let mut data = &buf[4..];
-    
-    // First should be array length (4 bytes)
-    let array_len = i32::from_be_bytes([data[0], data[1], data[2], data[3]]);
-    assert!(array_len > 0, "API versions array should not be empty");
-    
-    // Calculate where error_code should be
-    // Each API version entry is 6 bytes (api_key: 2, min_version: 2, max_version: 2)
-    let error_code_offset = 4 + (array_len as usize * 6);
-    
-    // Verify we have enough data
-    assert!(data.len() >= error_code_offset + 2, "Response too short");
-    
-    // Error code should be after the array
-    let error_code = i16::from_be_bytes([data[error_code_offset], data[error_code_offset + 1]]);
+
+    // First should be error_code (2 bytes) for kafka-python compatibility
+    let error_code = i16::from_be_bytes([data[0], data[1]]);
     assert_eq!(error_code, 0, "Error code should be 0");
+
+    // Then array length (4 bytes)
+    let array_len = i32::from_be_bytes([data[2], data[3], data[4], data[5]]);
+    assert!(array_len > 0, "API versions array should not be empty");
+
+    // Verify we have the right amount of data
+    // Each API version entry is 6 bytes (api_key: 2, min_version: 2, max_version: 2)
+    let expected_data_len = 2 + 4 + (array_len as usize * 6); // error_code + array_len + entries
+    assert!(data.len() >= expected_data_len, "Response too short");
 }
 
 /// Test ApiVersions v1+ field ordering
@@ -327,31 +325,28 @@ fn test_api_versions_v0_field_ordering() {
 fn test_api_versions_v1_field_ordering() {
     let mut buf = BytesMut::new();
     let apis = get_supported_apis();
-    
-    // Encode with v1 - field order should be: error_code, then api_versions array
+
+    // Encode with v1 - field order: throttle_time_ms, error_code, then api_versions array
     ProtocolCodec::encode_api_versions_response(&mut buf, 456, &apis, 1).unwrap();
-    
+
     // Skip correlation ID (4 bytes)
     let mut data = &buf[4..];
-    
-    // First should be error_code (2 bytes)
-    let error_code = i16::from_be_bytes([data[0], data[1]]);
-    assert_eq!(error_code, 0, "Error code should be 0");
-    
-    // Then array length (4 bytes)
-    let array_len = i32::from_be_bytes([data[2], data[3], data[4], data[5]]);
-    assert!(array_len > 0, "API versions array should not be empty");
-    
-    // Then throttle_time_ms (4 bytes) for v1+
-    let throttle_offset = 6 + (array_len as usize * 6);
-    assert!(data.len() >= throttle_offset + 4, "Response too short for throttle_time_ms");
-    let throttle_time = i32::from_be_bytes([
-        data[throttle_offset], 
-        data[throttle_offset + 1], 
-        data[throttle_offset + 2], 
-        data[throttle_offset + 3]
-    ]);
+
+    // First should be throttle_time_ms (4 bytes) for v1+
+    let throttle_time = i32::from_be_bytes([data[0], data[1], data[2], data[3]]);
     assert_eq!(throttle_time, 0, "Throttle time should be 0");
+
+    // Then error_code (2 bytes)
+    let error_code = i16::from_be_bytes([data[4], data[5]]);
+    assert_eq!(error_code, 0, "Error code should be 0");
+
+    // Then array length (4 bytes)
+    let array_len = i32::from_be_bytes([data[6], data[7], data[8], data[9]]);
+    assert!(array_len > 0, "API versions array should not be empty");
+
+    // Verify we have enough data for all API entries
+    let expected_data_len = 4 + 2 + 4 + (array_len as usize * 6); // throttle + error + array_len + entries
+    assert!(data.len() >= expected_data_len, "Response too short");
 }
 
 /// Test DescribeConfigs request/response
