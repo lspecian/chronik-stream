@@ -33,16 +33,17 @@ impl IngestThroughputBenchmark {
         let temp_dir = tempfile::tempdir()?;
         
         // Configure ingest server
-        let server_config = ServerConfig {
-            listen_addr: "127.0.0.1:19092".parse()?,
-            max_connections: 1000,
-            buffer_size: 100 * 1024 * 1024, // 100MB
-            ..Default::default()
-        };
-        
-        // Create ingest server
-        let server = IngestServer::new(server_config, temp_dir.path().to_path_buf()).await?;
-        self.ingest_server = Some(Arc::new(server));
+        // TODO: Update once integrated server API is stabilized
+        // let server_config = ServerConfig {
+        //     listen_addr: "127.0.0.1:19092".parse()?,
+        //     max_connections: 1000,
+        //     buffer_size: 100 * 1024 * 1024, // 100MB
+        //     ..Default::default()
+        // };
+
+        // // Create ingest server
+        // let server = IngestServer::new(server_config, temp_dir.path().to_path_buf()).await?;
+        // self.ingest_server = Some(Arc::new(server));
         
         Ok(())
     }
