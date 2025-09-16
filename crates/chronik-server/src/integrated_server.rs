@@ -404,8 +404,6 @@ impl IntegratedKafkaServer {
                     // Enable TCP_NODELAY to disable Nagle's algorithm for immediate sending
                     if let Err(e) = socket.set_nodelay(true) {
                         error!("Failed to set TCP_NODELAY for {}: {}", addr, e);
-                    } else {
-                        eprintln!("CRITICAL: TCP_NODELAY enabled for connection {}", addr);
                     }
                     
                     let kafka_handler = self.kafka_handler.clone();
@@ -521,20 +519,8 @@ impl IntegratedKafkaServer {
                                     tracing::trace!("Response bytes (first 64): {:?}", 
                                         &full_response[..std::cmp::min(64, full_response.len())]);
                                     
-                                    // CRITICAL FIX: Use vectored I/O and TCP coalescing for small responses
+                                    // Send the response
                                     let response_size = full_response.len();
-                                    eprintln!("CRITICAL: Response size: {} bytes", response_size);
-                                    
-                                    // For small responses (< 100 bytes), disable TCP_NODELAY temporarily
-                                    // to enable Nagle's algorithm for coalescing
-                                    let should_toggle_nodelay = response_size < 100;
-                                    
-                                    if should_toggle_nodelay {
-                                        eprintln!("CRITICAL: Small response detected ({} bytes), disabling TCP_NODELAY for coalescing", response_size);
-                                        if let Err(e) = socket.set_nodelay(false) {
-                                            eprintln!("WARNING: Failed to disable TCP_NODELAY: {}", e);
-                                        }
-                                    }
                                     
                                     // Option 1: Try vectored write first (most efficient)
                                     let size_slice = &full_response[..4];
@@ -608,18 +594,6 @@ impl IntegratedKafkaServer {
                                         Err(e) => {
                                             error!("Error flushing socket to {}: {}", addr, e);
                                             eprintln!("CRITICAL: Socket flush FAILED: {}", e);
-                                        }
-                                    }
-                                    
-                                    // For small responses, add a tiny delay to ensure TCP coalescing
-                                    if should_toggle_nodelay {
-                                        eprintln!("CRITICAL: Adding 1ms delay for TCP coalescing");
-                                        tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
-                                        
-                                        // Re-enable TCP_NODELAY for future requests
-                                        eprintln!("CRITICAL: Re-enabling TCP_NODELAY");
-                                        if let Err(e) = socket.set_nodelay(true) {
-                                            eprintln!("WARNING: Failed to re-enable TCP_NODELAY: {}", e);
                                         }
                                     }
                                     

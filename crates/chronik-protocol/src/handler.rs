@@ -849,6 +849,7 @@ impl ProtocolHandler {
 
             // Other APIs
             ApiKey::ListOffsets => self.handle_list_offsets(header, &mut buf).await,
+            ApiKey::DescribeCluster => self.handle_describe_cluster(header, &mut buf).await,
             
             // SASL authentication (partial support for compatibility)
             ApiKey::SaslHandshake => self.handle_sasl_handshake(header, &mut buf).await,
@@ -904,7 +905,6 @@ impl ProtocolHandler {
             ApiKey::UpdateFeatures |
             ApiKey::Envelope |
             // ApiKey::FetchSnapshot |  // API 59 - not in CP Kafka
-            ApiKey::DescribeCluster |
             ApiKey::DescribeProducers |
             // ApiKey::BrokerRegistration |  // API 62 - not in CP Kafka
             // ApiKey::BrokerHeartbeat |  // API 63 - not in CP Kafka
@@ -3076,8 +3076,78 @@ impl ProtocolHandler {
         
         Ok(())
     }
-    
-    
+
+    /// Handle DescribeCluster request (API key 60)
+    async fn handle_describe_cluster(&self, header: RequestHeader, body: &mut Bytes) -> Result<Response> {
+        use crate::parser::{Decoder, Encoder};
+        use bytes::BytesMut;
+
+        tracing::info!("Handling DescribeCluster request v{}", header.api_version);
+
+        // DescribeCluster request has these fields for v0:
+        // - include_cluster_authorized_operations: bool
+        // For now, we'll just skip parsing the request body since we don't use it
+
+        let mut body_buf = BytesMut::new();
+        let mut encoder = Encoder::new(&mut body_buf);
+
+        // DescribeCluster Response v0 structure:
+        // - throttle_time_ms: i32
+        // - error_code: i16
+        // - error_message: nullable string
+        // - cluster_id: string
+        // - controller_id: i32 (-1 if no controller)
+        // - brokers: array of broker
+        //   - broker_id: i32
+        //   - host: string
+        //   - port: i32
+        //   - rack: nullable string
+        // - cluster_authorized_operations: i32 (-2147483648 if not requested)
+
+        // Throttle time
+        encoder.write_i32(0); // throttle_time_ms
+
+        // Error code
+        encoder.write_i16(0); // NONE
+
+        // Error message (null)
+        encoder.write_i16(-1); // null string
+
+        // Cluster ID
+        let cluster_id = "chronik-stream-cluster";
+        encoder.write_i16(cluster_id.len() as i16);
+        encoder.write_raw_bytes(cluster_id.as_bytes());
+
+        // Controller ID (use our broker ID as controller)
+        encoder.write_i32(self.broker_id);
+
+        // Brokers array
+        encoder.write_i32(1); // 1 broker
+
+        // Broker entry
+        encoder.write_i32(self.broker_id); // broker_id
+
+        // Host
+        let host = "localhost"; // TODO: Get from config
+        encoder.write_i16(host.len() as i16);
+        encoder.write_raw_bytes(host.as_bytes());
+
+        // Port
+        encoder.write_i32(9092); // TODO: Get from config
+
+        // Rack (null)
+        encoder.write_i16(-1); // null string
+
+        // Cluster authorized operations (-2147483648 = not requested)
+        encoder.write_i32(-2147483648i32);
+
+        tracing::info!("DescribeCluster response: cluster_id={}, controller={}, broker={}:{}",
+                      cluster_id, self.broker_id, host, 9092);
+
+        Ok(Self::make_response(&header, ApiKey::DescribeCluster, body_buf.freeze()))
+    }
+
+
     /// Encode Metadata response
     fn encode_metadata_response(
         &self,
