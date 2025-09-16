@@ -887,12 +887,10 @@ impl ProtocolHandler {
             ApiKey::RenewDelegationToken |
             ApiKey::ExpireDelegationToken |
             ApiKey::DescribeDelegationToken |
-            ApiKey::DeleteGroups |
             ApiKey::ElectLeaders |
             ApiKey::IncrementalAlterConfigs |
             ApiKey::AlterPartitionReassignments |
             ApiKey::ListPartitionReassignments |
-            ApiKey::OffsetDelete |
             ApiKey::DescribeClientQuotas |
             ApiKey::AlterClientQuotas |
             ApiKey::DescribeUserScramCredentials |
@@ -3078,8 +3076,8 @@ impl ProtocolHandler {
     }
 
     /// Handle DescribeCluster request (API key 60)
-    async fn handle_describe_cluster(&self, header: RequestHeader, body: &mut Bytes) -> Result<Response> {
-        use crate::parser::{Decoder, Encoder};
+    async fn handle_describe_cluster(&self, header: RequestHeader, _body: &mut Bytes) -> Result<Response> {
+        use crate::parser::Encoder;
         use bytes::BytesMut;
 
         tracing::info!("Handling DescribeCluster request v{}", header.api_version);
