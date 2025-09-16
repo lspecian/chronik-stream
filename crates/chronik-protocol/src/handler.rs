@@ -90,6 +90,10 @@ pub struct ProtocolHandler {
     broker_id: i32,
     /// Consumer group state
     consumer_groups: Arc<Mutex<ConsumerGroupState>>,
+    /// Advertised host for this broker
+    advertised_host: String,
+    /// Advertised port for this broker
+    advertised_port: i32,
 }
 
 impl ProtocolHandler {
@@ -124,6 +128,8 @@ impl ProtocolHandler {
             metadata_store: None,
             broker_id: 1, // Default broker ID
             consumer_groups: Arc::new(Mutex::new(ConsumerGroupState::default())),
+            advertised_host: "localhost".to_string(),
+            advertised_port: 9092,
         }
     }
     
@@ -135,6 +141,8 @@ impl ProtocolHandler {
             metadata_store: Some(metadata_store),
             broker_id: 1, // Default broker ID
             consumer_groups: Arc::new(Mutex::new(ConsumerGroupState::default())),
+            advertised_host: "localhost".to_string(),
+            advertised_port: 9092,
         }
     }
     
@@ -149,6 +157,26 @@ impl ProtocolHandler {
             metadata_store: Some(metadata_store),
             broker_id,
             consumer_groups: Arc::new(Mutex::new(ConsumerGroupState::default())),
+            advertised_host: "localhost".to_string(),
+            advertised_port: 9092,
+        }
+    }
+
+    /// Create a new protocol handler with full configuration
+    pub fn with_full_config(
+        metadata_store: Arc<dyn chronik_common::metadata::traits::MetadataStore>,
+        broker_id: i32,
+        advertised_host: String,
+        advertised_port: i32,
+    ) -> Self {
+        let versions = supported_api_versions();
+        Self {
+            supported_versions: versions,
+            metadata_store: Some(metadata_store),
+            broker_id,
+            consumer_groups: Arc::new(Mutex::new(ConsumerGroupState::default())),
+            advertised_host,
+            advertised_port,
         }
     }
     
@@ -3126,12 +3154,12 @@ impl ProtocolHandler {
         encoder.write_i32(self.broker_id); // broker_id
 
         // Host
-        let host = "localhost"; // TODO: Get from config
+        let host = &self.advertised_host;
         encoder.write_i16(host.len() as i16);
         encoder.write_raw_bytes(host.as_bytes());
 
         // Port
-        encoder.write_i32(9092); // TODO: Get from config
+        encoder.write_i32(self.advertised_port);
 
         // Rack (null)
         encoder.write_i16(-1); // null string
@@ -3140,7 +3168,7 @@ impl ProtocolHandler {
         encoder.write_i32(-2147483648i32);
 
         tracing::info!("DescribeCluster response: cluster_id={}, controller={}, broker={}:{}",
-                      cluster_id, self.broker_id, host, 9092);
+                      cluster_id, self.broker_id, self.advertised_host, self.advertised_port);
 
         Ok(Self::make_response(&header, ApiKey::DescribeCluster, body_buf.freeze()))
     }

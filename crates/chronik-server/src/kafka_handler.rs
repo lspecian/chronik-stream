@@ -61,7 +61,12 @@ impl KafkaProtocolHandler {
         group_manager.clone().start_expiration_checker();
         
         Ok(Self {
-            protocol_handler: ProtocolHandler::with_metadata_and_broker(metadata_store.clone(), node_id),
+            protocol_handler: ProtocolHandler::with_full_config(
+                metadata_store.clone(),
+                node_id,
+                host.clone(),
+                port
+            ),
             produce_handler,
             wal_handler,
             segment_reader,
