@@ -100,7 +100,7 @@ impl KafkaProtocolHandler {
         let header = parse_request_header(&mut buf)?;
 
         // Save a copy of the buffer for metadata processing
-        let buf_copy = buf.clone();
+        let _buf_copy = buf.clone();
 
         // Route to specific handlers for certain API keys
         // produce and fetch are special-cased because they need access to our storage layer
@@ -263,8 +263,8 @@ impl KafkaProtocolHandler {
                 let mut decoder = Decoder::new(&mut buf);
 
                 // Parse ListOffsets request
-                let replica_id = decoder.read_i32()?;
-                let isolation_level = if header.api_version >= 2 {
+                let _replica_id = decoder.read_i32()?;
+                let _isolation_level = if header.api_version >= 2 {
                     decoder.read_i8()?
                 } else {
                     0

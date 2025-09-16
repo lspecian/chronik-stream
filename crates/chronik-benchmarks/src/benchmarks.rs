@@ -5,7 +5,7 @@ use anyhow::Result;
 // chronik_ingest crate doesn't exist, commenting out for now
 // use chronik_ingest::{IngestServer, ServerConfig};
 use chronik_search::api::{SearchRequest, SearchResponse};
-use std::sync::Arc;
+// use std::sync::Arc; // Will be used when IngestServer is implemented
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -30,7 +30,7 @@ impl IngestThroughputBenchmark {
         info!("Setting up ingest throughput benchmark");
         
         // Create temporary directory for test data
-        let temp_dir = tempfile::tempdir()?;
+        let _temp_dir = tempfile::tempdir()?;
         
         // Configure ingest server
         // TODO: Update once integrated server API is stabilized
@@ -72,14 +72,14 @@ impl IngestThroughputBenchmark {
         // Spawn producer tasks
         for task_id in 0..num_tasks {
             let tx = tx.clone();
-            let payload = message_payload.clone();
+            let _payload = message_payload.clone();
             let message_size = self.config.message_size;
             
             tokio::spawn(async move {
                 let start = Instant::now();
                 
                 // Simulate producing messages
-                for i in 0..messages_per_task {
+                for _i in 0..messages_per_task {
                     let msg_start = Instant::now();
                     
                     // Simulate message production (in real test, this would be actual Kafka produce)
@@ -122,12 +122,12 @@ impl IngestThroughputBenchmark {
 
 /// Search latency benchmark
 pub struct SearchLatencyBenchmark {
-    config: BenchmarkConfig,
+    _config: BenchmarkConfig,
 }
 
 impl SearchLatencyBenchmark {
     pub fn new(config: BenchmarkConfig) -> Self {
-        Self { config }
+        Self { _config: config }
     }
     
     /// Setup benchmark environment
@@ -156,7 +156,7 @@ impl SearchLatencyBenchmark {
             let query_start = Instant::now();
             
             // Create search request
-            let search_request = SearchRequest {
+            let _search_request = SearchRequest {
                 query: None,  // TODO: Fix query type - should be QueryDsl not serde_json::Value
                 size: 10,
                 from: 0,
