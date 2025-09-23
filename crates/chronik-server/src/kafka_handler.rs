@@ -245,6 +245,7 @@ impl KafkaProtocolHandler {
                     body: body_buf.freeze(),
                     is_flexible: header.api_version >= 9,  // v9+ uses flexible/compact encoding
                     api_key: ApiKey::Produce,
+                    throttle_time_ms: None,
                 })
             }
             ApiKey::ListOffsets => {
@@ -398,6 +399,7 @@ impl KafkaProtocolHandler {
                     body: body_buf.freeze(),
                     is_flexible: header.api_version >= 6,
                     api_key: ApiKey::ListOffsets,
+                    throttle_time_ms: None,
                 })
             }
             ApiKey::Fetch => {
@@ -432,6 +434,7 @@ impl KafkaProtocolHandler {
                     body: body_buf.freeze(),
                     is_flexible: header.api_version >= 11, // Fetch uses flexible from v11+
                     api_key: ApiKey::Fetch,
+                    throttle_time_ms: None,
                 })
             }
             ApiKey::JoinGroup => {
@@ -453,6 +456,7 @@ impl KafkaProtocolHandler {
                     body: body_buf.freeze(),
                     is_flexible: header.api_version >= 6, // JoinGroup uses flexible from v6+
                     api_key: ApiKey::JoinGroup,
+                    throttle_time_ms: None,
                 })
             }
             ApiKey::SyncGroup => {
@@ -474,6 +478,7 @@ impl KafkaProtocolHandler {
                     body: body_buf.freeze(),
                     is_flexible: header.api_version >= 4, // SyncGroup uses flexible from v4+
                     api_key: ApiKey::SyncGroup,
+                    throttle_time_ms: None,
                 })
             }
             ApiKey::Heartbeat => {
@@ -495,6 +500,7 @@ impl KafkaProtocolHandler {
                     body: body_buf.freeze(),
                     is_flexible: header.api_version >= 4, // Heartbeat uses flexible from v4+
                     api_key: ApiKey::Heartbeat,
+                    throttle_time_ms: None,
                 })
             }
             ApiKey::LeaveGroup => {
@@ -516,6 +522,7 @@ impl KafkaProtocolHandler {
                     body: body_buf.freeze(),
                     is_flexible: header.api_version >= 4, // LeaveGroup uses flexible from v4+
                     api_key: ApiKey::LeaveGroup,
+                    throttle_time_ms: None,
                 })
             }
             ApiKey::OffsetCommit => {
@@ -537,6 +544,7 @@ impl KafkaProtocolHandler {
                     body: body_buf.freeze(),
                     is_flexible: header.api_version >= 8, // OffsetCommit uses flexible from v8+
                     api_key: ApiKey::OffsetCommit,
+                    throttle_time_ms: None,
                 })
             }
             ApiKey::OffsetFetch => {
@@ -558,6 +566,7 @@ impl KafkaProtocolHandler {
                     body: body_buf.freeze(),
                     is_flexible: header.api_version >= 6, // OffsetFetch uses flexible from v6+
                     api_key: ApiKey::OffsetFetch,
+                    throttle_time_ms: None,
                 })
             }
             ApiKey::FindCoordinator => {
@@ -579,6 +588,7 @@ impl KafkaProtocolHandler {
                     body: body_buf.freeze(),
                     is_flexible: header.api_version >= 3, // FindCoordinator uses flexible from v3+
                     api_key: ApiKey::FindCoordinator,
+                    throttle_time_ms: None,
                 })
             }
             _ => {

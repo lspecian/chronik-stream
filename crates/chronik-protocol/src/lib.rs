@@ -31,6 +31,7 @@ pub mod delete_topics_types;
 pub mod delete_groups_types;
 pub mod alter_configs_types;
 pub mod describe_configs_types;
+pub mod incremental_alter_configs_types;
 pub mod create_partitions_types;
 pub mod offset_delete_types;
 pub mod describe_groups_types;
@@ -42,6 +43,7 @@ pub mod txn_offset_commit_types;
 pub mod metadata_types;
 pub mod fetch_types;
 pub mod produce_types;
+pub mod sasl;
 
 // Temporarily disabled due to kafka-protocol crate compatibility issues
 // pub mod handler_v2;

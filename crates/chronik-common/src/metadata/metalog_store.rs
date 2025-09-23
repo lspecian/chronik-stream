@@ -139,6 +139,28 @@ impl EventApplicator for MetadataState {
                 }
             }
 
+            MetadataEventPayload::TransactionalOffsetCommit {
+                transactional_id: _,
+                producer_id: _,
+                producer_epoch: _,
+                group_id,
+                offsets
+            } => {
+                // Atomically commit all offsets in the transaction
+                for txn_offset in offsets {
+                    let key = (group_id.clone(), txn_offset.topic.clone(), txn_offset.partition);
+                    let consumer_offset = ConsumerOffset {
+                        group_id: group_id.clone(),
+                        topic: txn_offset.topic.clone(),
+                        partition: txn_offset.partition,
+                        offset: txn_offset.offset,
+                        metadata: txn_offset.metadata.clone(),
+                        commit_timestamp: event.timestamp,
+                    };
+                    self.consumer_offsets.insert(key, consumer_offset);
+                }
+            }
+
             MetadataEventPayload::ConfigUpdated { scope, key, value } => {
                 let config_key = match scope {
                     ConfigScope::Cluster => format!("cluster:{}", key),
@@ -583,6 +605,174 @@ impl MetadataStore for ChronikMetaLogStore {
     async fn get_consumer_offset(&self, group_id: &str, topic: &str, partition: u32) -> Result<Option<ConsumerOffset>> {
         let key = (group_id.to_string(), topic.to_string(), partition);
         Ok(self.state.read().consumer_offsets.get(&key).cloned())
+    }
+
+    async fn commit_transactional_offsets(
+        &self,
+        transactional_id: String,
+        producer_id: i64,
+        producer_epoch: i16,
+        group_id: String,
+        offsets: Vec<(String, u32, i64, Option<String>)>,
+    ) -> Result<()> {
+        use super::events::TransactionalOffset;
+
+        let transactional_offsets: Vec<TransactionalOffset> = offsets
+            .into_iter()
+            .map(|(topic, partition, offset, metadata)| TransactionalOffset {
+                topic,
+                partition,
+                offset,
+                metadata,
+            })
+            .collect();
+
+        let payload = MetadataEventPayload::TransactionalOffsetCommit {
+            transactional_id,
+            producer_id,
+            producer_epoch,
+            group_id,
+            offsets: transactional_offsets,
+        };
+
+        self.append_event(payload).await
+    }
+
+    async fn begin_transaction(
+        &self,
+        transactional_id: String,
+        producer_id: i64,
+        producer_epoch: i16,
+        timeout_ms: i32,
+    ) -> Result<()> {
+        let payload = MetadataEventPayload::BeginTransaction {
+            transactional_id,
+            producer_id,
+            producer_epoch,
+            transaction_timeout_ms: timeout_ms,
+        };
+
+        self.append_event(payload).await
+    }
+
+    async fn add_partitions_to_transaction(
+        &self,
+        transactional_id: String,
+        producer_id: i64,
+        producer_epoch: i16,
+        partitions: Vec<(String, u32)>,
+    ) -> Result<()> {
+        use super::events::TransactionPartition;
+
+        let transaction_partitions: Vec<TransactionPartition> = partitions
+            .into_iter()
+            .map(|(topic, partition)| TransactionPartition { topic, partition })
+            .collect();
+
+        let payload = MetadataEventPayload::AddPartitionsToTransaction {
+            transactional_id,
+            producer_id,
+            producer_epoch,
+            partitions: transaction_partitions,
+        };
+
+        self.append_event(payload).await
+    }
+
+    async fn add_offsets_to_transaction(
+        &self,
+        transactional_id: String,
+        producer_id: i64,
+        producer_epoch: i16,
+        group_id: String,
+    ) -> Result<()> {
+        let payload = MetadataEventPayload::AddOffsetsToTransaction {
+            transactional_id,
+            producer_id,
+            producer_epoch,
+            group_id,
+        };
+
+        self.append_event(payload).await
+    }
+
+    async fn prepare_commit_transaction(
+        &self,
+        transactional_id: String,
+        producer_id: i64,
+        producer_epoch: i16,
+    ) -> Result<()> {
+        let payload = MetadataEventPayload::PrepareCommit {
+            transactional_id,
+            producer_id,
+            producer_epoch,
+        };
+
+        self.append_event(payload).await
+    }
+
+    async fn commit_transaction(
+        &self,
+        transactional_id: String,
+        producer_id: i64,
+        producer_epoch: i16,
+    ) -> Result<()> {
+        // Get transaction state from memory to get partitions and offsets
+        let state = self.state.read();
+
+        // For now, just record the commit event
+        // In a full implementation, we'd track partitions and offsets from the transaction
+        let payload = MetadataEventPayload::CommitTransaction {
+            transactional_id,
+            producer_id,
+            producer_epoch,
+            committed_partitions: Vec::new(), // Would be populated from transaction state
+            committed_offsets: Vec::new(),    // Would be populated from transaction state
+        };
+
+        drop(state);
+        self.append_event(payload).await
+    }
+
+    async fn abort_transaction(
+        &self,
+        transactional_id: String,
+        producer_id: i64,
+        producer_epoch: i16,
+    ) -> Result<()> {
+        // Get transaction state from memory to get partitions
+        let state = self.state.read();
+
+        // For now, just record the abort event
+        // In a full implementation, we'd track partitions from the transaction
+        let payload = MetadataEventPayload::AbortTransaction {
+            transactional_id,
+            producer_id,
+            producer_epoch,
+            aborted_partitions: Vec::new(), // Would be populated from transaction state
+        };
+
+        drop(state);
+        self.append_event(payload).await
+    }
+
+    async fn fence_producer(
+        &self,
+        transactional_id: String,
+        old_producer_id: i64,
+        old_producer_epoch: i16,
+        new_producer_id: i64,
+        new_producer_epoch: i16,
+    ) -> Result<()> {
+        let payload = MetadataEventPayload::ProducerFenced {
+            transactional_id,
+            old_producer_id,
+            old_producer_epoch,
+            new_producer_id,
+            new_producer_epoch,
+        };
+
+        self.append_event(payload).await
     }
 
     async fn update_partition_offset(&self, topic: &str, partition: u32, high_watermark: i64, log_start_offset: i64) -> Result<()> {

@@ -515,6 +515,8 @@ impl GroupManager {
                     protocol_type,
                     generation_id: 0,
                     leader_id: None,
+                    leader: String::new(),
+                    members: Vec::new(),
                     created_at: chrono::Utc::now(),
                     updated_at: chrono::Utc::now(),
                 };
@@ -536,6 +538,8 @@ impl GroupManager {
             protocol_type: group.protocol_type.clone(),
             generation_id: group.generation_id,
             leader_id: group.leader_id.clone(),
+            leader: group.leader_id.clone().unwrap_or_default(),
+            members: Vec::new(), // TODO: convert group.members to metadata format
             created_at: chrono::Utc::now(), // This should be preserved from initial creation
             updated_at: chrono::Utc::now(),
         };
@@ -916,6 +920,8 @@ impl GroupManager {
                     protocol_type: String::new(),
                     generation_id: 0,
                     leader_id: None,
+                    leader: String::new(),
+                    members: Vec::new(),
                     created_at: chrono::Utc::now(),
                     updated_at: chrono::Utc::now(),
                 }).await {

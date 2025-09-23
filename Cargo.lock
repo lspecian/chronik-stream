@@ -1258,6 +1258,7 @@ name = "chronik-protocol"
 version = "1.2.6"
 dependencies = [
  "anyhow",
+ "base64 0.21.7",
  "bytes",
  "chronik-common",
  "crc32fast",
@@ -1361,6 +1362,7 @@ dependencies = [
  "parking_lot",
  "serde",
  "serde_json",
+ "socket2 0.5.10",
  "thiserror 1.0.69",
  "tokio",
  "tokio-util",

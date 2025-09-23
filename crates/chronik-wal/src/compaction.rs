@@ -12,6 +12,19 @@ use crate::manager::{WalManager, TopicPartition};
 use crate::record::WalRecord;
 use crate::config::WalConfig;
 
+/// Compaction strategy type
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CompactionStrategy {
+    /// Keep only the latest value for each key
+    KeyBased,
+    /// Remove records older than retention period
+    TimeBased,
+    /// Hybrid: key-based within time window
+    Hybrid,
+    /// Custom strategy for specific topics
+    Custom,
+}
+
 /// Configuration for WAL compaction
 #[derive(Debug, Clone)]
 pub struct CompactionConfig {
@@ -35,6 +48,18 @@ pub struct CompactionConfig {
 
     /// Maximum compaction duration (seconds)
     pub max_duration_secs: u64,
+
+    /// Compaction strategy to use
+    pub strategy: CompactionStrategy,
+
+    /// Time retention period for time-based compaction (seconds)
+    pub retention_period_secs: u64,
+
+    /// Enable parallel compaction of multiple partitions
+    pub parallel_compaction: bool,
+
+    /// Maximum number of parallel compaction tasks
+    pub max_parallel_tasks: usize,
 }
 
 impl Default for CompactionConfig {
@@ -47,6 +72,10 @@ impl Default for CompactionConfig {
             min_segments: 5,
             retention_ratio: 0.8, // Keep 80% of recent records
             max_duration_secs: 300, // 5 minutes
+            strategy: CompactionStrategy::KeyBased,
+            retention_period_secs: 86400 * 7, // 7 days
+            parallel_compaction: true,
+            max_parallel_tasks: 4,
         }
     }
 }
@@ -104,30 +133,85 @@ impl WalCompactor {
         let start_time = std::time::Instant::now();
         let mut stats = CompactionStats::default();
 
-        debug!("Starting WAL compaction cycle");
+        debug!("Starting WAL compaction cycle with strategy: {:?}", self.config.strategy);
 
         // Get list of partitions to compact
         let partitions = self.get_partitions_for_compaction(wal_manager.clone()).await?;
 
-        for partition in partitions {
-            if start_time.elapsed().as_secs() > self.config.max_duration_secs {
-                warn!("Compaction timeout reached, stopping compaction cycle");
-                break;
-            }
-
-            match self.compact_partition(wal_manager.clone(), &partition).await {
-                Ok(partition_stats) => {
-                    stats.merge(partition_stats);
+        if self.config.parallel_compaction && partitions.len() > 1 {
+            // Parallel compaction
+            stats = self.run_parallel_compaction(wal_manager, partitions, start_time).await?;
+        } else {
+            // Sequential compaction
+            for partition in partitions {
+                if start_time.elapsed().as_secs() > self.config.max_duration_secs {
+                    warn!("Compaction timeout reached, stopping compaction cycle");
+                    break;
                 }
-                Err(e) => {
-                    error!("Failed to compact partition {:?}: {}", partition, e);
-                    stats.errors += 1;
+
+                match self.compact_partition(wal_manager.clone(), &partition).await {
+                    Ok(partition_stats) => {
+                        stats.merge(partition_stats);
+                    }
+                    Err(e) => {
+                        error!("Failed to compact partition {:?}: {}", partition, e);
+                        stats.errors += 1;
+                    }
                 }
             }
         }
 
         let duration = start_time.elapsed();
-        debug!("Compaction cycle completed in {:?}", duration);
+        info!("Compaction cycle completed in {:?} - {} segments compacted, {} bytes saved",
+              duration, stats.segments_compacted, stats.bytes_saved);
+
+        Ok(stats)
+    }
+
+    /// Run parallel compaction for multiple partitions
+    async fn run_parallel_compaction(
+        &self,
+        wal_manager: Arc<RwLock<WalManager>>,
+        partitions: Vec<TopicPartition>,
+        start_time: std::time::Instant,
+    ) -> Result<CompactionStats> {
+        use futures::future::join_all;
+
+        let mut stats = CompactionStats::default();
+        let max_parallel = self.config.max_parallel_tasks.min(partitions.len());
+
+        // Process partitions in batches
+        for chunk in partitions.chunks(max_parallel) {
+            if start_time.elapsed().as_secs() > self.config.max_duration_secs {
+                warn!("Compaction timeout reached during parallel processing");
+                break;
+            }
+
+            let futures: Vec<_> = chunk
+                .iter()
+                .map(|partition| {
+                    let wal_manager = wal_manager.clone();
+                    let partition = partition.clone();
+                    let compactor = self.clone();
+
+                    async move {
+                        compactor.compact_partition(wal_manager, &partition).await
+                    }
+                })
+                .collect();
+
+            let results = join_all(futures).await;
+
+            for result in results {
+                match result {
+                    Ok(partition_stats) => stats.merge(partition_stats),
+                    Err(e) => {
+                        error!("Parallel compaction error: {}", e);
+                        stats.errors += 1;
+                    }
+                }
+            }
+        }
 
         Ok(stats)
     }
@@ -226,42 +310,143 @@ impl WalCompactor {
 
     /// Apply compaction strategy to records
     fn apply_compaction_strategy(&self, records: Vec<WalRecord>) -> Result<Vec<WalRecord>> {
-        // For metadata WAL, we can implement key-based compaction
-        // Keep only the latest record for each unique key
+        match self.config.strategy {
+            CompactionStrategy::KeyBased => self.apply_key_based_compaction(records),
+            CompactionStrategy::TimeBased => self.apply_time_based_compaction(records),
+            CompactionStrategy::Hybrid => self.apply_hybrid_compaction(records),
+            CompactionStrategy::Custom => self.apply_custom_compaction(records),
+        }
+    }
 
+    /// Key-based compaction: keep only latest value per key
+    fn apply_key_based_compaction(&self, records: Vec<WalRecord>) -> Result<Vec<WalRecord>> {
         let mut key_to_record: HashMap<Vec<u8>, WalRecord> = HashMap::new();
+        let mut keyless_records = Vec::new();
 
         for record in records {
             if let Some(key) = &record.key {
                 // Keep the latest record for each key
                 key_to_record.insert(key.clone(), record);
             } else {
-                // Keep records without keys (shouldn't happen in metadata WAL)
-                // For now, keep them all
-                continue;
+                // Keep records without keys for transaction logs
+                keyless_records.push(record);
             }
         }
 
         let mut compacted_records: Vec<WalRecord> = key_to_record.into_values().collect();
+        compacted_records.extend(keyless_records);
 
         // Sort by offset to maintain order
         compacted_records.sort_by_key(|r| r.offset);
 
-        // Apply retention ratio if we still have too many records
-        let target_count = (compacted_records.len() as f64 * self.config.retention_ratio) as usize;
-        if target_count < compacted_records.len() {
-            // Keep the most recent records
-            compacted_records = compacted_records
-                .into_iter()
-                .rev()
-                .take(target_count)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect();
-        }
+        // Apply retention ratio if needed
+        self.apply_retention_ratio(compacted_records)
+    }
+
+    /// Time-based compaction: remove old records
+    fn apply_time_based_compaction(&self, records: Vec<WalRecord>) -> Result<Vec<WalRecord>> {
+        let current_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        let retention_cutoff = current_time - (self.config.retention_period_secs * 1000) as i64;
+
+        let mut compacted_records: Vec<WalRecord> = records
+            .into_iter()
+            .filter(|r| r.timestamp >= retention_cutoff)
+            .collect();
+
+        // Sort by offset to maintain order
+        compacted_records.sort_by_key(|r| r.offset);
 
         Ok(compacted_records)
+    }
+
+    /// Hybrid compaction: key-based within time window
+    fn apply_hybrid_compaction(&self, records: Vec<WalRecord>) -> Result<Vec<WalRecord>> {
+        let current_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        let retention_cutoff = current_time - (self.config.retention_period_secs * 1000) as i64;
+
+        // First filter by time
+        let recent_records: Vec<WalRecord> = records
+            .into_iter()
+            .filter(|r| r.timestamp >= retention_cutoff)
+            .collect();
+
+        // Then apply key-based compaction
+        self.apply_key_based_compaction(recent_records)
+    }
+
+    /// Custom compaction for specific use cases
+    fn apply_custom_compaction(&self, records: Vec<WalRecord>) -> Result<Vec<WalRecord>> {
+        // For transactional records, keep all transaction boundaries
+        // For metadata records, use key-based compaction
+        // For consumer offsets, keep only latest per partition
+
+        let mut transaction_records = Vec::new();
+        let mut metadata_records = Vec::new();
+        let mut offset_records = Vec::new();
+        let mut other_records = Vec::new();
+
+        for record in records {
+            // Identify record type based on key prefix or topic
+            if let Some(key) = &record.key {
+                if key.starts_with(b"__txn__") {
+                    transaction_records.push(record);
+                } else if key.starts_with(b"__offset__") {
+                    offset_records.push(record);
+                } else if key.starts_with(b"__meta__") {
+                    metadata_records.push(record);
+                } else {
+                    other_records.push(record);
+                }
+            } else {
+                other_records.push(record);
+            }
+        }
+
+        // Apply different strategies to each category
+        let mut result = Vec::new();
+
+        // Keep all transaction records (they're critical)
+        result.extend(transaction_records);
+
+        // Key-based compaction for metadata
+        if !metadata_records.is_empty() {
+            result.extend(self.apply_key_based_compaction(metadata_records)?);
+        }
+
+        // Key-based compaction for offsets
+        if !offset_records.is_empty() {
+            result.extend(self.apply_key_based_compaction(offset_records)?);
+        }
+
+        // Time-based for other records
+        if !other_records.is_empty() {
+            result.extend(self.apply_time_based_compaction(other_records)?);
+        }
+
+        // Sort by offset to maintain order
+        result.sort_by_key(|r| r.offset);
+
+        Ok(result)
+    }
+
+    /// Apply retention ratio to limit record count
+    fn apply_retention_ratio(&self, mut records: Vec<WalRecord>) -> Result<Vec<WalRecord>> {
+        let target_count = (records.len() as f64 * self.config.retention_ratio) as usize;
+
+        if target_count < records.len() {
+            // Keep the most recent records
+            records.truncate(target_count);
+        }
+
+        Ok(records)
     }
 
     /// Create temporary compacted segment file
@@ -316,13 +501,15 @@ impl Clone for WalCompactor {
 }
 
 /// Statistics from a compaction run
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct CompactionStats {
     pub segments_compacted: u32,
     pub records_before: usize,
     pub records_after: usize,
     pub bytes_saved: u64,
     pub errors: u32,
+    pub duration_ms: u64,
+    pub strategy_used: Option<CompactionStrategy>,
 }
 
 impl CompactionStats {
@@ -332,6 +519,28 @@ impl CompactionStats {
         self.records_after += other.records_after;
         self.bytes_saved += other.bytes_saved;
         self.errors += other.errors;
+        self.duration_ms = self.duration_ms.max(other.duration_ms);
+        if self.strategy_used.is_none() {
+            self.strategy_used = other.strategy_used;
+        }
+    }
+
+    /// Calculate compaction ratio
+    pub fn compaction_ratio(&self) -> f64 {
+        if self.records_before > 0 {
+            1.0 - (self.records_after as f64 / self.records_before as f64)
+        } else {
+            0.0
+        }
+    }
+
+    /// Get throughput in records/sec
+    pub fn throughput(&self) -> f64 {
+        if self.duration_ms > 0 {
+            (self.records_before as f64 / self.duration_ms as f64) * 1000.0
+        } else {
+            0.0
+        }
     }
 }
 

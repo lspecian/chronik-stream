@@ -56,6 +56,9 @@ dashmap = { workspace = true }
 parking_lot = { workspace = true }
 murmur2 = { workspace = true }
 
+# Socket configuration
+socket2 = "0.5"
+
 # Force vendored OpenSSL for musl builds
 openssl = { workspace = true }
 

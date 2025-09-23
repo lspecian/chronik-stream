@@ -257,13 +257,61 @@ impl ProduceResponse {
 
 impl KafkaEncodable for ProduceResponse {
     fn encode(&self, encoder: &mut Encoder, version: i16) -> Result<()> {
-        encoder.write_i32(self.topics.len() as i32);
-        for topic in &self.topics {
-            topic.encode(encoder, version)?;
-        }
-
-        if version >= 1 {
+        // ProduceResponse v9+ uses flexible/compact encoding with different field order
+        if version >= 9 {
+            // For v9+, throttle_time_ms comes FIRST
             encoder.write_i32(self.throttle_time_ms);
+
+            // Write topics as compact array
+            encoder.write_compact_array_len(self.topics.len());
+            for topic in &self.topics {
+                // Write topic name as compact string
+                encoder.write_compact_string(Some(&topic.name));
+
+                // Write partitions as compact array
+                encoder.write_compact_array_len(topic.partitions.len());
+                for partition in &topic.partitions {
+                    encoder.write_i32(partition.index);
+                    encoder.write_i16(partition.error_code);
+                    encoder.write_i64(partition.base_offset);
+                    encoder.write_i64(partition.log_append_time);
+                    encoder.write_i64(partition.log_start_offset);
+
+                    // Record errors and error message for v8+ (but we're v9+)
+                    if let Some(ref record_errors) = partition.record_errors {
+                        encoder.write_compact_array_len(record_errors.len());
+                        for error in record_errors {
+                            encoder.write_i32(error.batch_index);
+                            encoder.write_compact_string(error.batch_index_error_message.as_deref());
+                            // Tagged fields for record error
+                            encoder.write_tagged_fields();
+                        }
+                    } else {
+                        encoder.write_compact_array_len(0);
+                    }
+
+                    encoder.write_compact_string(partition.error_message.as_deref());
+
+                    // Tagged fields for partition
+                    encoder.write_tagged_fields();
+                }
+
+                // Tagged fields for topic
+                encoder.write_tagged_fields();
+            }
+
+            // Tagged fields for response
+            encoder.write_tagged_fields();
+        } else {
+            // For v0-8, use old non-flexible encoding
+            encoder.write_i32(self.topics.len() as i32);
+            for topic in &self.topics {
+                topic.encode(encoder, version)?;
+            }
+
+            if version >= 1 {
+                encoder.write_i32(self.throttle_time_ms);
+            }
         }
 
         Ok(())

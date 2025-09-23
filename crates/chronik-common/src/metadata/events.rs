@@ -12,6 +12,22 @@ use super::{
 /// Version for metadata event schema
 pub const METADATA_EVENT_VERSION: u32 = 1;
 
+/// A transactional offset for atomic commits
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransactionalOffset {
+    pub topic: String,
+    pub partition: u32,
+    pub offset: i64,
+    pub metadata: Option<String>,
+}
+
+/// A partition involved in a transaction
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransactionPartition {
+    pub topic: String,
+    pub partition: u32,
+}
+
 /// Metadata event that can be stored in the WAL
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetadataEvent {
@@ -117,6 +133,65 @@ pub enum MetadataEventPayload {
         topic: String,
         partition: u32,
         new_offset: i64,
+    },
+
+    // Transactional offset events
+    TransactionalOffsetCommit {
+        transactional_id: String,
+        producer_id: i64,
+        producer_epoch: i16,
+        group_id: String,
+        offsets: Vec<TransactionalOffset>,
+    },
+
+    // Transaction lifecycle events
+    BeginTransaction {
+        transactional_id: String,
+        producer_id: i64,
+        producer_epoch: i16,
+        transaction_timeout_ms: i32,
+    },
+    AddPartitionsToTransaction {
+        transactional_id: String,
+        producer_id: i64,
+        producer_epoch: i16,
+        partitions: Vec<TransactionPartition>,
+    },
+    AddOffsetsToTransaction {
+        transactional_id: String,
+        producer_id: i64,
+        producer_epoch: i16,
+        group_id: String,
+    },
+    PrepareCommit {
+        transactional_id: String,
+        producer_id: i64,
+        producer_epoch: i16,
+    },
+    PrepareAbort {
+        transactional_id: String,
+        producer_id: i64,
+        producer_epoch: i16,
+    },
+    CommitTransaction {
+        transactional_id: String,
+        producer_id: i64,
+        producer_epoch: i16,
+        committed_partitions: Vec<TransactionPartition>,
+        committed_offsets: Vec<TransactionalOffset>,
+    },
+    AbortTransaction {
+        transactional_id: String,
+        producer_id: i64,
+        producer_epoch: i16,
+        aborted_partitions: Vec<TransactionPartition>,
+    },
+    ProducerFenced {
+        transactional_id: String,
+        old_producer_id: i64,
+        old_producer_epoch: i16,
+        new_producer_id: i64,
+        new_producer_epoch: i16,
     },
 
     // Configuration events

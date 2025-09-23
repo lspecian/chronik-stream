@@ -98,6 +98,16 @@ pub struct PartitionAssignment {
     pub is_leader: bool,
 }
 
+/// Group member information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupMember {
+    pub member_id: String,
+    pub client_id: String,
+    pub client_host: String,
+    pub metadata: Vec<u8>,
+    pub assignment: Vec<u8>,
+}
+
 /// Consumer group metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConsumerGroupMetadata {
@@ -107,6 +117,8 @@ pub struct ConsumerGroupMetadata {
     pub protocol_type: String,
     pub generation_id: i32,
     pub leader_id: Option<String>,
+    pub leader: String,  // Leader member ID
+    pub members: Vec<GroupMember>,  // Group members
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -154,6 +166,69 @@ pub trait MetadataStore: Send + Sync {
     async fn update_consumer_group(&self, metadata: ConsumerGroupMetadata) -> Result<()>;
     async fn commit_offset(&self, offset: ConsumerOffset) -> Result<()>;
     async fn get_consumer_offset(&self, group_id: &str, topic: &str, partition: u32) -> Result<Option<ConsumerOffset>>;
+    async fn commit_transactional_offsets(
+        &self,
+        transactional_id: String,
+        producer_id: i64,
+        producer_epoch: i16,
+        group_id: String,
+        offsets: Vec<(String, u32, i64, Option<String>)>, // (topic, partition, offset, metadata)
+    ) -> Result<()>;
+
+    // Transaction lifecycle operations
+    async fn begin_transaction(
+        &self,
+        transactional_id: String,
+        producer_id: i64,
+        producer_epoch: i16,
+        timeout_ms: i32,
+    ) -> Result<()>;
+
+    async fn add_partitions_to_transaction(
+        &self,
+        transactional_id: String,
+        producer_id: i64,
+        producer_epoch: i16,
+        partitions: Vec<(String, u32)>, // (topic, partition)
+    ) -> Result<()>;
+
+    async fn add_offsets_to_transaction(
+        &self,
+        transactional_id: String,
+        producer_id: i64,
+        producer_epoch: i16,
+        group_id: String,
+    ) -> Result<()>;
+
+    async fn prepare_commit_transaction(
+        &self,
+        transactional_id: String,
+        producer_id: i64,
+        producer_epoch: i16,
+    ) -> Result<()>;
+
+    async fn commit_transaction(
+        &self,
+        transactional_id: String,
+        producer_id: i64,
+        producer_epoch: i16,
+    ) -> Result<()>;
+
+    async fn abort_transaction(
+        &self,
+        transactional_id: String,
+        producer_id: i64,
+        producer_epoch: i16,
+    ) -> Result<()>;
+
+    async fn fence_producer(
+        &self,
+        transactional_id: String,
+        old_producer_id: i64,
+        old_producer_epoch: i16,
+        new_producer_id: i64,
+        new_producer_epoch: i16,
+    ) -> Result<()>;
     
     // Partition offset operations
     async fn update_partition_offset(&self, topic: &str, partition: u32, high_watermark: i64, log_start_offset: i64) -> Result<()>;

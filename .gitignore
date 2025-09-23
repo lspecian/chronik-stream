@@ -87,4 +87,9 @@ benchmarks/results/
 data/
 *.segment
 *.db
-*.idx 
+*.idx
+
+# KSQL installation and test files
+ksql/
+*.jar
+*.class 

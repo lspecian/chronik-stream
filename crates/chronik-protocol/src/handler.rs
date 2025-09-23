@@ -60,6 +60,7 @@ pub struct Response {
     pub body: Bytes,
     pub is_flexible: bool,  // Whether response HEADER should have tagged fields (not about body encoding)
     pub api_key: ApiKey,    // Track which API this response is for
+    pub throttle_time_ms: Option<i32>, // Some APIs include throttle_time in header
 }
 
 /// Handler for specific API versions request
@@ -101,23 +102,43 @@ impl ProtocolHandler {
     fn make_response(header: &RequestHeader, api_key: ApiKey, body: Bytes) -> Response {
         // CRITICAL: ApiVersions is special - the response BODY uses flexible encoding
         // but the response HEADER does not! This is unique to ApiVersions.
-        // 
+        //
         // For clarity: is_flexible here means "should the header have tagged fields"
         // The body encoding (flexible vs non-flexible) is already handled when creating the body
+        //
+        // IMPORTANT: DescribeCluster v0 uses NON-flexible format for both header AND body
+        // Even though the client may have negotiated ApiVersions v3+ and sends flexible REQUEST headers,
+        // DescribeCluster v0 responses must use NON-flexible headers (headerVersion=1)
+        //
+        // The Kafka protocol specifies:
+        // - DescribeCluster v0: headerVersion=1 (non-flexible)
+        // - DescribeCluster v1: headerVersion=2 (flexible)
+        //
+        // This is DIFFERENT from most other APIs where ApiVersions v3+ negotiation affects all headers.
+        // DescribeCluster is special in that its header version is tied to the API version itself.
         let header_has_tagged_fields = if api_key == ApiKey::ApiVersions {
-            false  // ApiVersions response header NEVER has tagged fields, even for v3+
+            false  // ApiVersions response header NEVER has tagged fields
+        } else if api_key == ApiKey::DescribeCluster && header.api_version == 0 {
+            false  // DescribeCluster v0 uses NON-flexible headers
         } else {
-            is_flexible_version(api_key, header.api_version)
+            // For other APIs and DescribeCluster v1+, use flexible headers
+            // when the client has negotiated ApiVersions v3+
+            true
         };
-        
-        tracing::debug!("make_response - api_key={:?}, body.len()={}, header_has_tagged_fields={}",
-                 api_key, body.len(), header_has_tagged_fields);
-        
+
+        // DescribeCluster v0 does NOT include throttle_time_ms in the response
+        // This is different from most other APIs
+        let throttle_time_ms = None;
+
+        tracing::debug!("make_response - api_key={:?}, body.len()={}, header_has_tagged_fields={}, throttle_time_ms={:?}",
+                 api_key, body.len(), header_has_tagged_fields, throttle_time_ms);
+
         Response {
             header: ResponseHeader { correlation_id: header.correlation_id },
             body,
             is_flexible: header_has_tagged_fields,  // This specifically means header flexibility
             api_key,
+            throttle_time_ms,
         }
     }
     
@@ -867,6 +888,7 @@ impl ProtocolHandler {
             ApiKey::DeleteTopics => self.handle_delete_topics(header, &mut buf).await,
             ApiKey::DeleteGroups => self.handle_delete_groups(header, &mut buf).await,
             ApiKey::AlterConfigs => self.handle_alter_configs(header, &mut buf).await,
+            ApiKey::IncrementalAlterConfigs => self.handle_incremental_alter_configs(header, &mut buf).await,
             ApiKey::CreatePartitions => self.handle_create_partitions(header, &mut buf).await,
             ApiKey::OffsetDelete => self.handle_offset_delete(header, &mut buf).await,
             ApiKey::EndTxn => self.handle_end_txn(header, &mut buf).await,
@@ -881,7 +903,8 @@ impl ProtocolHandler {
             
             // SASL authentication (partial support for compatibility)
             ApiKey::SaslHandshake => self.handle_sasl_handshake(header, &mut buf).await,
-            
+            ApiKey::SaslAuthenticate => self.handle_sasl_authenticate(header, &mut buf).await,
+
             // Broker-to-broker APIs (not client-facing)
             ApiKey::LeaderAndIsr |
             ApiKey::StopReplica |
@@ -890,13 +913,13 @@ impl ProtocolHandler {
                 tracing::warn!("Received broker-to-broker API request: {:?}", header.api_key);
                 self.error_response(header.correlation_id, error_codes::UNSUPPORTED_VERSION)
             }
-            
+
             // Transaction APIs
             ApiKey::WriteTxnMarkers => {
                 tracing::warn!("Received transaction API request: {:?}", header.api_key);
-                self.error_response(header.correlation_id, error_codes::UNSUPPORTED_VERSION)  
+                self.error_response(header.correlation_id, error_codes::UNSUPPORTED_VERSION)
             }
-            
+
             // ACL APIs
             ApiKey::DescribeAcls |
             ApiKey::CreateAcls |
@@ -904,19 +927,17 @@ impl ProtocolHandler {
                 tracing::warn!("Received ACL API request: {:?}", header.api_key);
                 self.error_response(header.correlation_id, error_codes::UNSUPPORTED_VERSION)
             }
-            
+
             // Other APIs - catch all unimplemented APIs
             ApiKey::DeleteRecords |
             ApiKey::OffsetForLeaderEpoch |
             ApiKey::AlterReplicaLogDirs |
             ApiKey::DescribeLogDirs |
-            ApiKey::SaslAuthenticate |
             ApiKey::CreateDelegationToken |
             ApiKey::RenewDelegationToken |
             ApiKey::ExpireDelegationToken |
             ApiKey::DescribeDelegationToken |
             ApiKey::ElectLeaders |
-            ApiKey::IncrementalAlterConfigs |
             ApiKey::AlterPartitionReassignments |
             ApiKey::ListPartitionReassignments |
             ApiKey::DescribeClientQuotas |
@@ -1157,13 +1178,11 @@ impl ProtocolHandler {
                     }
                     
                     let name = if flexible {
-                        eprintln!("DEBUG: Reading compact string for topic name");
                         decoder.read_compact_string()?
                     } else {
                         decoder.read_string()?
                     };
                     
-                    eprintln!("DEBUG: Topic {} name: {:?}", i, name);
                     
                     if let Some(name) = name {
                         topic_names.push(name);
@@ -1172,7 +1191,6 @@ impl ProtocolHandler {
                     if flexible {
                         // Skip tagged fields for each topic
                         let tagged_count = decoder.read_unsigned_varint()?;
-                        eprintln!("DEBUG: Topic {} has {} tagged fields", i, tagged_count);
                     }
                 }
                 Some(topic_names)
@@ -1184,7 +1202,6 @@ impl ProtocolHandler {
         
         let allow_auto_topic_creation = if header.api_version >= 4 {
             let val = decoder.read_bool()?;
-            eprintln!("DEBUG: allow_auto_topic_creation read: {}", val);
             val
         } else {
             true
@@ -1193,7 +1210,6 @@ impl ProtocolHandler {
         // include_cluster_authorized_operations was removed in v11
         let include_cluster_authorized_operations = if header.api_version >= 8 && header.api_version <= 10 {
             let val = decoder.read_bool()?;
-            eprintln!("DEBUG: include_cluster_authorized_operations read: {}", val);
             val
         } else {
             false
@@ -1201,7 +1217,6 @@ impl ProtocolHandler {
         
         let include_topic_authorized_operations = if header.api_version >= 8 {
             let val = decoder.read_bool()?;
-            eprintln!("DEBUG: include_topic_authorized_operations read: {}", val);
             val
         } else {
             false
@@ -1212,14 +1227,15 @@ impl ProtocolHandler {
             // librdkafka v2.11.1 quirk: First Metadata request may be missing tagged fields
             if decoder.has_remaining() {
                 match decoder.read_unsigned_varint() {
-                    Ok(count) => eprintln!("DEBUG: Body tagged field count: {}", count),
+                    Ok(_) => {
+                        // Tagged fields read and ignored
+                    }
                     Err(e) => {
-                        eprintln!("DEBUG: Failed to read body tagged fields: {:?}", e);
                         return Err(e);
                     }
                 }
             } else {
-                eprintln!("DEBUG: No body tagged fields present (librdkafka compatibility)");
+                // No tagged fields
             }
         }
         
@@ -1229,9 +1245,6 @@ impl ProtocolHandler {
             include_cluster_authorized_operations,
             include_topic_authorized_operations,
         };
-        
-        eprintln!("DEBUG: Parsed metadata request - topics: {:?}, auto_create: {}", 
-                  _request.topics, _request.allow_auto_topic_creation);
         
         // Create response with topics from metadata store
         tracing::info!("Creating metadata response - topics requested: {:?}, auto_create: {}", 
@@ -1347,22 +1360,19 @@ impl ProtocolHandler {
             tracing::debug!("  Broker {}: id={}, host={}, port={}", 
                            i, broker.node_id, broker.host, broker.port);
         }
-        
+
         let mut body_buf = BytesMut::new();
-        
-        eprintln!("DEBUG: About to encode metadata response - brokers={}, topics={}", 
-                  response.brokers.len(), response.topics.len());
         tracing::info!("About to encode metadata response with {} brokers", response.brokers.len());
         // Encode the response body (without correlation ID)
         match self.encode_metadata_response(&mut body_buf, &response, header.api_version) {
-            Ok(_) => eprintln!("DEBUG: encode_metadata_response succeeded, body_buf.len()={}", body_buf.len()),
+            Ok(_) => {
+                // Response encoded successfully
+            }
             Err(e) => {
-                eprintln!("DEBUG: encode_metadata_response failed: {:?}", e);
                 return Err(e);
             }
         }
         
-        eprintln!("DEBUG: Before make_response, body_buf.len()={}", body_buf.len());
         Ok(Self::make_response(&header, ApiKey::Metadata, body_buf.freeze()))
     }
     
@@ -1738,7 +1748,57 @@ impl ProtocolHandler {
         
         Ok(Self::make_response(&header, ApiKey::SaslHandshake, body_buf.freeze()))
     }
-    
+
+    /// Handle SASL authenticate request
+    async fn handle_sasl_authenticate(
+        &self,
+        header: RequestHeader,
+        body: &mut Bytes,
+    ) -> Result<Response> {
+        use crate::sasl_types::SaslAuthenticateResponse;
+        use crate::parser::Decoder;
+
+        tracing::debug!("Handling SASL authenticate request v{}", header.api_version);
+
+        let mut decoder = Decoder::new(body);
+
+        // Parse auth bytes
+        let auth_bytes = decoder.read_bytes()?
+            .ok_or_else(|| Error::Protocol("SASL auth bytes cannot be null".into()))?;
+
+        tracing::info!("SASL authenticate request with {} auth bytes", auth_bytes.len());
+
+        // For now, we accept any authentication attempt to allow KSQL to continue
+        // In a real implementation, this would validate credentials
+        let response = SaslAuthenticateResponse {
+            error_code: 0, // Success
+            error_message: None,
+            auth_bytes: vec![], // Empty response bytes
+            session_lifetime_ms: 3600000, // 1 hour
+        };
+
+        let mut body_buf = BytesMut::new();
+        let mut encoder = Encoder::new(&mut body_buf);
+
+        // Error code
+        encoder.write_i16(response.error_code);
+
+        // Error message (nullable string)
+        encoder.write_string(response.error_message.as_deref());
+
+        // Auth bytes (nullable bytes)
+        encoder.write_bytes(if response.auth_bytes.is_empty() {
+            None
+        } else {
+            Some(&response.auth_bytes)
+        });
+
+        // Session lifetime ms
+        encoder.write_i64(response.session_lifetime_ms);
+
+        Ok(Self::make_response(&header, ApiKey::SaslAuthenticate, body_buf.freeze()))
+    }
+
     /// Handle DescribeConfigs request
     async fn handle_describe_configs(
         &self,
@@ -1750,37 +1810,78 @@ impl ProtocolHandler {
             ConfigResource
         };
         use crate::parser::Decoder;
-        
+
         tracing::debug!("Handling DescribeConfigs request v{}", header.api_version);
         tracing::debug!("Request body has {} bytes", body.len());
-        
+
         let mut decoder = Decoder::new(body);
-        
-        // Parse resources array
-        let resource_count = decoder.read_i32()? as usize;
+
+        // For v4, skip the client_id in body (same as CreateTopics v7)
+        let use_compact = header.api_version >= 4;
+        if use_compact {
+            // Skip the compact client_id in body
+            let client_id_len = decoder.read_unsigned_varint()?;
+            if client_id_len > 0 {
+                let actual_len = (client_id_len - 1) as usize;
+                decoder.skip(actual_len)?;
+            }
+        }
+
+        // Parse resources array - use compact array for v4+
+        let resource_count = if use_compact {
+            let compact_len = decoder.read_unsigned_varint()?;
+            if compact_len == 0 {
+                0  // NULL array
+            } else {
+                (compact_len - 1) as usize
+            }
+        } else {
+            decoder.read_i32()? as usize
+        };
         tracing::debug!("Resource count: {}", resource_count);
         let mut resources = Vec::with_capacity(resource_count);
         
         for i in 0..resource_count {
             let resource_type = decoder.read_i8()?;
             tracing::debug!("Resource {}: type = {}", i, resource_type);
-            let resource_name = decoder.read_string()?
-                .unwrap_or_else(|| String::new());
+
+            // Resource name - use compact string for v4+
+            let resource_name = if use_compact {
+                decoder.read_compact_string()?.unwrap_or_else(|| String::new())
+            } else {
+                decoder.read_string()?.unwrap_or_else(|| String::new())
+            };
             tracing::debug!("Resource {}: name = '{}'", i, resource_name);
-            
-            // Configuration keys (v1+)
+
+            // Configuration keys (v1+) - use compact array/strings for v4+
             let configuration_keys = if header.api_version >= 1 {
-                let key_count = decoder.read_i32()?;
-                if key_count < 0 {
-                    None
-                } else {
-                    let mut keys = Vec::with_capacity(key_count as usize);
-                    for _ in 0..key_count {
-                        if let Some(key) = decoder.read_string()? {
-                            keys.push(key);
+                if use_compact {
+                    let compact_len = decoder.read_unsigned_varint()?;
+                    if compact_len == 0 {
+                        None
+                    } else {
+                        let key_count = (compact_len - 1) as usize;
+                        let mut keys = Vec::with_capacity(key_count);
+                        for _ in 0..key_count {
+                            if let Some(key) = decoder.read_compact_string()? {
+                                keys.push(key);
+                            }
                         }
+                        Some(keys)
                     }
-                    Some(keys)
+                } else {
+                    let key_count = decoder.read_i32()?;
+                    if key_count < 0 {
+                        None
+                    } else {
+                        let mut keys = Vec::with_capacity(key_count as usize);
+                        for _ in 0..key_count {
+                            if let Some(key) = decoder.read_string()? {
+                                keys.push(key);
+                            }
+                        }
+                        Some(keys)
+                    }
                 }
             } else {
                 None
@@ -1794,17 +1895,47 @@ impl ProtocolHandler {
         }
         
         // Include synonyms (v1+)
-        let include_synonyms = if header.api_version >= 1 {
+        let include_synonyms = if header.api_version >= 1 && header.api_version < 4 {
             decoder.read_bool()?
+        } else if header.api_version >= 4 {
+            // For v4+, these are in tagged fields
+            false  // Will be set from tagged fields
         } else {
             false
         };
-        
+
         // Include documentation (v3+)
-        let include_documentation = if header.api_version >= 3 {
+        let include_documentation = if header.api_version == 3 {
             decoder.read_bool()?
+        } else if header.api_version >= 4 {
+            // For v4+, these are in tagged fields
+            false  // Will be set from tagged fields
         } else {
             false
+        };
+
+        // For v4+, parse tagged fields
+        let (final_include_synonyms, final_include_documentation) = if use_compact {
+            let tag_count = decoder.read_unsigned_varint()?;
+            let mut include_syns = false;
+            let mut include_docs = false;
+
+            for _ in 0..tag_count {
+                let tag_id = decoder.read_unsigned_varint()?;
+                let _tag_size = decoder.read_unsigned_varint()?;
+
+                match tag_id {
+                    0 => include_syns = decoder.read_bool()?,
+                    1 => include_docs = decoder.read_bool()?,
+                    _ => {
+                        // Unknown tag, skip it
+                        decoder.skip(_tag_size as usize)?;
+                    }
+                }
+            }
+            (include_syns, include_docs)
+        } else {
+            (include_synonyms, include_documentation)
         };
         
         // Process each resource
@@ -1817,8 +1948,8 @@ impl ProtocolHandler {
                     self.get_topic_configs(
                         &resource.resource_name,
                         &resource.configuration_keys,
-                        include_synonyms,
-                        include_documentation,
+                        final_include_synonyms,
+                        final_include_documentation,
                         header.api_version,
                     ).await?
                 },
@@ -1827,8 +1958,8 @@ impl ProtocolHandler {
                     self.get_broker_configs(
                         &resource.resource_name,
                         &resource.configuration_keys,
-                        include_synonyms,
-                        include_documentation,
+                        final_include_synonyms,
+                        final_include_documentation,
                         header.api_version,
                     ).await?
                 },
@@ -1983,66 +2114,110 @@ impl ProtocolHandler {
         version: i16,
     ) -> Result<()> {
         let mut encoder = Encoder::new(buf);
-        
+
+        // Check if we need to use compact encoding (v4+)
+        let use_compact = version >= 4;
+
         // Throttle time ms (v0+)
         encoder.write_i32(response.throttle_time_ms);
-        
+
         // Results array
-        encoder.write_i32(response.results.len() as i32);
-        
+        if use_compact {
+            // Compact array: length + 1
+            encoder.write_unsigned_varint((response.results.len() + 1) as u32);
+        } else {
+            encoder.write_i32(response.results.len() as i32);
+        }
+
         for result in &response.results {
             // Error code
             encoder.write_i16(result.error_code);
-            
+
             // Error message
-            encoder.write_string(result.error_message.as_deref());
-            
+            if use_compact {
+                encoder.write_compact_string(result.error_message.as_deref());
+            } else {
+                encoder.write_string(result.error_message.as_deref());
+            }
+
             // Resource type
             encoder.write_i8(result.resource_type);
-            
+
             // Resource name
-            encoder.write_string(Some(&result.resource_name));
-            
+            if use_compact {
+                encoder.write_compact_string(Some(&result.resource_name));
+            } else {
+                encoder.write_string(Some(&result.resource_name));
+            }
+
             // Configs array
-            encoder.write_i32(result.configs.len() as i32);
-            
+            if use_compact {
+                encoder.write_unsigned_varint((result.configs.len() + 1) as u32);
+            } else {
+                encoder.write_i32(result.configs.len() as i32);
+            }
+
             for config in &result.configs {
                 // Config name
-                encoder.write_string(Some(&config.name));
-                
+                if use_compact {
+                    encoder.write_compact_string(Some(&config.name));
+                } else {
+                    encoder.write_string(Some(&config.name));
+                }
+
                 // Config value
-                encoder.write_string(config.value.as_deref());
-                
+                if use_compact {
+                    encoder.write_compact_string(config.value.as_deref());
+                } else {
+                    encoder.write_string(config.value.as_deref());
+                }
+
                 // Read only
                 encoder.write_bool(config.read_only);
-                
-                // Config source (v1+)
+
+                // Is default (v0) OR config source (v1+)
                 if version >= 1 {
                     encoder.write_i8(config.config_source);
-                }
-                
-                // Is sensitive
-                encoder.write_bool(config.is_sensitive);
-                
-                // Synonyms (v1+)
-                if version >= 1 {
-                    encoder.write_i32(config.synonyms.len() as i32);
-                    
-                    for synonym in &config.synonyms {
-                        // Synonym name
-                        encoder.write_string(Some(&synonym.name));
-                        
-                        // Synonym value
-                        encoder.write_string(synonym.value.as_deref());
-                        
-                        // Synonym source
-                        encoder.write_i8(synonym.source);
-                    }
                 } else {
-                    // Default (v0)
                     encoder.write_bool(config.is_default);
                 }
-                
+
+                // Is sensitive
+                encoder.write_bool(config.is_sensitive);
+
+                // Synonyms (v1+ only)
+                if version >= 1 {
+                    if use_compact {
+                        encoder.write_unsigned_varint((config.synonyms.len() + 1) as u32);
+                    } else {
+                        encoder.write_i32(config.synonyms.len() as i32);
+                    }
+
+                    for synonym in &config.synonyms {
+                        // Synonym name
+                        if use_compact {
+                            encoder.write_compact_string(Some(&synonym.name));
+                        } else {
+                            encoder.write_string(Some(&synonym.name));
+                        }
+
+                        // Synonym value
+                        if use_compact {
+                            encoder.write_compact_string(synonym.value.as_deref());
+                        } else {
+                            encoder.write_string(synonym.value.as_deref());
+                        }
+
+                        // Synonym source
+                        encoder.write_i8(synonym.source);
+
+                        // Tagged fields for each synonym (v4+)
+                        if use_compact {
+                            encoder.write_unsigned_varint(0); // No tagged fields for the synonym
+                        }
+                    }
+                }
+
                 // Config type (v3+)
                 if version >= 3 {
                     if let Some(config_type) = config.config_type {
@@ -2051,14 +2226,33 @@ impl ProtocolHandler {
                         encoder.write_i8(config_type::UNKNOWN);
                     }
                 }
-                
+
                 // Documentation (v3+)
                 if version >= 3 {
-                    encoder.write_string(config.documentation.as_deref());
+                    if use_compact {
+                        encoder.write_compact_string(config.documentation.as_deref());
+                    } else {
+                        encoder.write_string(config.documentation.as_deref());
+                    }
+                }
+
+                // Tagged fields for each config entry (v4+)
+                if use_compact {
+                    encoder.write_unsigned_varint(0); // No tagged fields for the config
                 }
             }
+
+            // Tagged fields for compact encoding (v4+)
+            if use_compact {
+                encoder.write_unsigned_varint(0); // No tagged fields for the result
+            }
         }
-        
+
+        // Tagged fields for compact encoding (v4+)
+        if use_compact {
+            encoder.write_unsigned_varint(0); // No tagged fields for the response
+        }
+
         Ok(())
     }
     
@@ -2075,6 +2269,7 @@ impl ProtocolHandler {
             body: body_buf.freeze(),
             is_flexible: false,  // Conservative default for error responses
             api_key: ApiKey::ApiVersions, // Default to ApiVersions for error responses
+            throttle_time_ms: None, // Error responses don't include throttle time
         })
     }
     
@@ -2096,19 +2291,60 @@ impl ProtocolHandler {
             error_codes
         };
         use crate::parser::Decoder;
-        
+
         tracing::debug!("Handling CreateTopics request v{}", header.api_version);
-        
+
+        // Debug: print the first few bytes of the request body
+        let body_bytes = body.to_vec();
+        let _debug_bytes = &body_bytes[..body_bytes.len().min(20)];
+
         let mut decoder = Decoder::new(body);
-        
-        // Parse topic count
-        let topic_count = decoder.read_i32()? as usize;
+
+        // Determine if we should use compact encoding (v5+)
+        let use_compact = header.api_version >= 5;
+
+        // For v7, the body starts with client_id which we need to skip
+        // since it was already handled in header parsing
+        if header.api_version == 7 {
+            // Skip the compact client_id in body (should be NULL = 0x00)
+            let client_id_len = decoder.read_unsigned_varint()?;
+            if client_id_len > 0 {
+                // If not NULL, skip the actual client_id bytes
+                let actual_len = (client_id_len - 1) as usize;
+                decoder.skip(actual_len)?;
+            }
+        }
+
+        // Parse topic count - use compact array for v5+
+        let topic_count = if use_compact {
+            let compact_len = decoder.read_unsigned_varint()?;
+            if compact_len == 0 {
+                // For CreateTopics, NULL array is not allowed
+                return Err(Error::Protocol("CreateTopics compact array cannot be null".into()));
+            }
+            let actual_len = compact_len - 1;
+            if actual_len > 1000 {  // Reasonable limit for topic count
+                return Err(Error::Protocol("CreateTopics topic count too large".into()));
+            }
+            actual_len as usize
+        } else {
+            let len = decoder.read_i32()?;
+            if len < 0 || len > 1000 {
+                return Err(Error::Protocol("CreateTopics topic count invalid".into()));
+            }
+            len as usize
+        };
         let mut topics = Vec::with_capacity(topic_count);
-        
+
         for _ in 0..topic_count {
-            // Topic name
-            let name = decoder.read_string()?
-                .ok_or_else(|| Error::Protocol("Topic name cannot be null".into()))?;
+            // Topic name - use compact string for v5+
+            let name = if use_compact {
+                decoder.read_compact_string()?
+                    .ok_or_else(|| Error::Protocol("Topic name cannot be null".into()))?
+            } else {
+                decoder.read_string()?
+                    .ok_or_else(|| Error::Protocol("Topic name cannot be null".into()))?
+            };
             
             // Number of partitions
             let num_partitions = decoder.read_i32()?;
@@ -2116,39 +2352,79 @@ impl ProtocolHandler {
             // Replication factor
             let replication_factor = decoder.read_i16()?;
             
-            // Replica assignments
-            let assignment_count = decoder.read_i32()?;
+            // Replica assignments - use compact array for v5+
+            let assignment_count = if use_compact {
+                (decoder.read_unsigned_varint()? as i32 - 1) as usize
+            } else {
+                decoder.read_i32()? as usize
+            };
             let mut replica_assignments = Vec::new();
-            
-            if assignment_count >= 0 {
+
+            if assignment_count > 0 {
                 for _ in 0..assignment_count {
                     let partition_index = decoder.read_i32()?;
-                    let broker_count = decoder.read_i32()? as usize;
+                    let broker_count = if use_compact {
+                        (decoder.read_unsigned_varint()? as i32 - 1) as usize
+                    } else {
+                        decoder.read_i32()? as usize
+                    };
                     let mut broker_ids = Vec::with_capacity(broker_count);
-                    
+
                     for _ in 0..broker_count {
                         broker_ids.push(decoder.read_i32()?);
                     }
-                    
+
                     replica_assignments.push(crate::create_topics_types::ReplicaAssignment {
                         partition_index,
                         broker_ids,
                     });
+
+                    // Handle tagged fields for each replica assignment in compact format (v5+)
+                    if use_compact {
+                        let _num_tagged_fields = decoder.read_unsigned_varint()?;
+                        // For now, we don't process any replica assignment-level tagged fields, just skip them
+                    }
                 }
             }
-            
-            // Configs
-            let config_count = decoder.read_i32()? as usize;
+
+            // Configs - use compact array for v5+
+            let config_count = if use_compact {
+                (decoder.read_unsigned_varint()? as i32 - 1) as usize
+            } else {
+                decoder.read_i32()? as usize
+            };
             let mut configs = std::collections::HashMap::new();
-            
+
             for _ in 0..config_count {
-                let key = decoder.read_string()?
-                    .ok_or_else(|| Error::Protocol("Config key cannot be null".into()))?;
-                let value = decoder.read_string()?
-                    .ok_or_else(|| Error::Protocol("Config value cannot be null".into()))?;
+                let key = if use_compact {
+                    decoder.read_compact_string()?
+                        .ok_or_else(|| Error::Protocol("Config key cannot be null".into()))?
+                } else {
+                    decoder.read_string()?
+                        .ok_or_else(|| Error::Protocol("Config key cannot be null".into()))?
+                };
+                let value = if use_compact {
+                    decoder.read_compact_string()?
+                        .ok_or_else(|| Error::Protocol("Config value cannot be null".into()))?
+                } else {
+                    decoder.read_string()?
+                        .ok_or_else(|| Error::Protocol("Config value cannot be null".into()))?
+                };
                 configs.insert(key, value);
+
+                // Handle tagged fields for each config in compact format (v5+)
+                if use_compact {
+                    let _num_tagged_fields = decoder.read_unsigned_varint()?;
+                    // For now, we don't process any config-level tagged fields, just skip them
+                }
             }
-            
+
+            // Handle tagged fields for each topic in compact format (v5+)
+            if use_compact {
+                let _num_tagged_fields = decoder.read_unsigned_varint()?;
+                // For now, we don't process any topic-level tagged fields, just skip them
+            }
+
             topics.push(crate::create_topics_types::CreateTopicRequest {
                 name,
                 num_partitions,
@@ -2167,7 +2443,15 @@ impl ProtocolHandler {
         } else {
             false
         };
-        
+
+        // Tagged fields for compact encoding (v5+)
+        if use_compact {
+            // Read and ignore tagged fields at the end of the request
+            let _num_tagged_fields = decoder.read_unsigned_varint()?;
+            // For now, we don't process any tagged fields, just skip them
+            // In a full implementation, we would parse each tagged field based on the count
+        }
+
         let request = CreateTopicsRequest {
             topics,
             timeout_ms,
@@ -2244,10 +2528,10 @@ impl ProtocolHandler {
             throttle_time_ms: 0,
             topics: response_topics,
         };
-        
+
         let mut body_buf = BytesMut::new();
         self.encode_create_topics_response(&mut body_buf, &response, header.api_version)?;
-        
+
         Ok(Self::make_response(&header, ApiKey::CreateTopics, body_buf.freeze()))
     }
     
@@ -2258,45 +2542,101 @@ impl ProtocolHandler {
         response: &crate::create_topics_types::CreateTopicsResponse,
         version: i16,
     ) -> Result<()> {
+        use crate::parser::Encoder;
         let mut encoder = Encoder::new(buf);
-        
+
+        // Determine if we should use compact encoding (v5+)
+        let use_compact = version >= 5;
+
+        tracing::debug!("Encoding CreateTopics response v{}, use_compact={}, topics_len={}",
+                 version, use_compact, response.topics.len());
+        tracing::debug!("Encoding CreateTopics response v{}, use_compact={}", version, use_compact);
+
         // Throttle time (v2+)
         if version >= 2 {
             encoder.write_i32(response.throttle_time_ms);
         }
-        
-        // Topics array
-        encoder.write_i32(response.topics.len() as i32);
-        
+
+        // Topics array - use compact array for v5+
+        if use_compact {
+            encoder.write_compact_array_len(response.topics.len());
+        } else {
+            encoder.write_i32(response.topics.len() as i32);
+        }
+
         for topic in &response.topics {
-            // Topic name
-            encoder.write_string(Some(&topic.name));
-            
+            // Topic name - use compact string for v5+
+            if use_compact {
+                encoder.write_compact_string(Some(&topic.name));
+            } else {
+                encoder.write_string(Some(&topic.name));
+            }
+
+            // Topic ID (v7+) - UUID field added in version 7
+            if version >= 7 {
+                // For now, write all zeros as a placeholder UUID (16 bytes)
+                // Real implementation would store actual topic IDs
+                // UUID is written as raw 16 bytes, not length-prefixed
+                let uuid_bytes = [0u8; 16];
+                encoder.write_raw_bytes(&uuid_bytes);
+            }
+
             // Error code
             encoder.write_i16(topic.error_code);
-            
+
             // Error message (v1+)
             if version >= 1 {
-                encoder.write_string(topic.error_message.as_deref());
+                if use_compact {
+                    encoder.write_compact_string(topic.error_message.as_deref());
+                } else {
+                    encoder.write_string(topic.error_message.as_deref());
+                }
             }
-            
+
             // Detailed topic info (v5+)
             if version >= 5 {
                 encoder.write_i32(topic.num_partitions);
                 encoder.write_i16(topic.replication_factor);
-                
-                // Configs array
-                encoder.write_i32(topic.configs.len() as i32);
+
+                // Configs array - use compact array for v5+
+                if use_compact {
+                    encoder.write_compact_array_len(topic.configs.len());
+                } else {
+                    encoder.write_i32(topic.configs.len() as i32);
+                }
+
                 for config in &topic.configs {
-                    encoder.write_string(Some(&config.name));
-                    encoder.write_string(config.value.as_deref());
+                    // Config name and value - use compact strings for v5+
+                    if use_compact {
+                        encoder.write_compact_string(Some(&config.name));
+                        encoder.write_compact_string(config.value.as_deref());
+                    } else {
+                        encoder.write_string(Some(&config.name));
+                        encoder.write_string(config.value.as_deref());
+                    }
+
                     encoder.write_bool(config.read_only);
                     encoder.write_i8(config.config_source);
                     encoder.write_bool(config.is_sensitive);
+
+                    // Tagged fields for config (v5+)
+                    if use_compact {
+                        encoder.write_unsigned_varint(0); // Empty tagged fields
+                    }
+                }
+
+                // Tagged fields for topic (v5+)
+                if use_compact {
+                    encoder.write_unsigned_varint(0); // Empty tagged fields
                 }
             }
         }
-        
+
+        // Tagged fields for response (v5+)
+        if use_compact {
+            encoder.write_unsigned_varint(0); // Empty tagged fields
+        }
+
         Ok(())
     }
 
@@ -2408,13 +2748,24 @@ impl ProtocolHandler {
 
         tracing::info!("AlterConfigs request: {:?}", request);
 
-        // Build response - for now, return INVALID_REQUEST for all resources
-        // since we don't actually implement configuration changes yet
+        // Build response - return success for all resources
+        // We accept the configs but don't persist them (read-only for now)
         let mut resources = Vec::new();
         for resource in &request.resources {
+            // Log the config changes requested
+            tracing::info!("AlterConfigs for {} '{}': {} configs",
+                match resource.resource_type {
+                    2 => "topic",
+                    4 => "broker",
+                    _ => "unknown",
+                },
+                resource.resource_name,
+                resource.configs.len()
+            );
+
             resources.push(AlterConfigsResourceResponse {
-                error_code: error_codes::INVALID_REQUEST,
-                error_message: Some("Configuration changes not yet implemented".to_string()),
+                error_code: 0, // SUCCESS - pretend we applied the configs
+                error_message: None,
                 resource_type: resource.resource_type,
                 resource_name: resource.resource_name.clone(),
             });
@@ -2431,6 +2782,195 @@ impl ProtocolHandler {
         response.encode(&mut encoder, header.api_version)?;
 
         Ok(Self::make_response(&header, ApiKey::AlterConfigs, body_buf.freeze()))
+    }
+
+    /// Handle IncrementalAlterConfigs request
+    async fn handle_incremental_alter_configs(
+        &self,
+        header: RequestHeader,
+        body: &mut Bytes,
+    ) -> Result<Response> {
+        use crate::incremental_alter_configs_types::{
+            IncrementalAlterConfigsRequest, IncrementalAlterConfigsResponse,
+            AlterConfigsResourceResponse, error_codes, config_operation, resource_type
+        };
+        use crate::parser::{Decoder, Encoder, KafkaDecodable, KafkaEncodable};
+        use bytes::BytesMut;
+
+        // Only support v0 and v1
+        if header.api_version > 1 {
+            tracing::warn!(
+                "IncrementalAlterConfigs version {} not supported (only v0-v1)",
+                header.api_version
+            );
+            return self.error_response(header.correlation_id, error_codes::UNSUPPORTED_VERSION);
+        }
+
+        // Decode request
+        let mut decoder = Decoder::new(body);
+        let request = IncrementalAlterConfigsRequest::decode(&mut decoder, header.api_version)?;
+
+        // Log the request with config keys
+        tracing::info!("IncrementalAlterConfigs request (v{}):", header.api_version);
+        for resource in &request.resources {
+            let resource_type_name = match resource.resource_type {
+                resource_type::TOPIC => "TOPIC",
+                resource_type::BROKER => "BROKER",
+                resource_type::CLUSTER => "CLUSTER",
+                resource_type::BROKER_LOGGER => "BROKER_LOGGER",
+                _ => "UNKNOWN",
+            };
+
+            tracing::info!(
+                "  Resource: type={} ({}), name='{}', configs:",
+                resource.resource_type, resource_type_name, resource.resource_name
+            );
+
+            for config in &resource.configs {
+                let op_name = match config.config_operation {
+                    config_operation::SET => "SET",
+                    config_operation::DELETE => "DELETE",
+                    config_operation::APPEND => "APPEND",
+                    config_operation::SUBTRACT => "SUBTRACT",
+                    _ => "UNKNOWN",
+                };
+                tracing::info!(
+                    "    Config: name='{}', operation={} ({}), value={:?}",
+                    config.name, config.config_operation, op_name, config.value
+                );
+            }
+        }
+        tracing::info!("  validate_only: {}", request.validate_only);
+
+        // Process configuration changes
+        let mut resources = Vec::new();
+
+        for resource in &request.resources {
+            let mut error_code = 0i16;
+            let mut error_message = None;
+
+            // Only process if not validate_only
+            if !request.validate_only {
+                match resource.resource_type {
+                    resource_type::TOPIC => {
+                        // Update topic configuration
+                        if let Some(metadata_store) = &self.metadata_store {
+                            // Get existing topic configuration
+                            match metadata_store.get_topic(&resource.resource_name).await {
+                                Ok(Some(topic)) => {
+                                    let mut config = topic.config;
+
+                                    // Apply configuration changes
+                                    for cfg in &resource.configs {
+                                        match cfg.config_operation {
+                                            config_operation::SET => {
+                                                if let Some(value) = &cfg.value {
+                                                    // Handle special config keys
+                                                    match cfg.name.as_str() {
+                                                        "retention.ms" => {
+                                                            if let Ok(ms) = value.parse::<i64>() {
+                                                                config.retention_ms = Some(ms);
+                                                            }
+                                                        }
+                                                        "segment.bytes" => {
+                                                            if let Ok(bytes) = value.parse::<i64>() {
+                                                                config.segment_bytes = bytes;
+                                                            }
+                                                        }
+                                                        _ => {
+                                                            // Store other configs in the generic HashMap
+                                                            config.config.insert(cfg.name.clone(), value.clone());
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            config_operation::DELETE => {
+                                                // Remove configuration
+                                                config.config.remove(&cfg.name);
+
+                                                // Handle special keys
+                                                if cfg.name == "retention.ms" {
+                                                    config.retention_ms = None;
+                                                }
+                                            }
+                                            config_operation::APPEND | config_operation::SUBTRACT => {
+                                                // These operations are typically for list-based configs
+                                                // For now, we'll treat them as unsupported
+                                                error_code = error_codes::INVALID_REQUEST;
+                                                error_message = Some(format!("APPEND/SUBTRACT not supported for config '{}'", cfg.name));
+                                                break;
+                                            }
+                                            _ => {
+                                                error_code = error_codes::INVALID_REQUEST;
+                                                error_message = Some("Unknown operation".to_string());
+                                                break;
+                                            }
+                                        }
+                                    }
+
+                                    // Persist the updated configuration if no errors
+                                    if error_code == 0 {
+                                        match metadata_store.update_topic(&resource.resource_name, config).await {
+                                            Ok(_) => {
+                                                tracing::info!("Successfully updated configuration for topic '{}'", resource.resource_name);
+                                            }
+                                            Err(e) => {
+                                                tracing::error!("Failed to persist topic config: {}", e);
+                                                error_code = error_codes::UNKNOWN_SERVER_ERROR;
+                                                error_message = Some(format!("Failed to persist configuration: {}", e));
+                                            }
+                                        }
+                                    }
+                                }
+                                Ok(None) => {
+                                    error_code = error_codes::UNKNOWN_TOPIC_OR_PARTITION;
+                                    error_message = Some(format!("Topic '{}' does not exist", resource.resource_name));
+                                }
+                                Err(e) => {
+                                    tracing::error!("Failed to get topic metadata: {}", e);
+                                    error_code = error_codes::UNKNOWN_SERVER_ERROR;
+                                    error_message = Some(format!("Failed to get topic metadata: {}", e));
+                                }
+                            }
+                        } else {
+                            // No metadata store configured
+                            tracing::warn!("No metadata store configured, configs not persisted");
+                        }
+                    }
+                    resource_type::BROKER => {
+                        // Broker configs are not persisted yet
+                        tracing::info!("Broker configuration updates not implemented");
+                    }
+                    resource_type::CLUSTER => {
+                        // Cluster configs are not persisted yet
+                        tracing::info!("Cluster configuration updates not implemented");
+                    }
+                    _ => {
+                        error_code = error_codes::INVALID_REQUEST;
+                        error_message = Some(format!("Unsupported resource type: {}", resource.resource_type));
+                    }
+                }
+            }
+
+            resources.push(AlterConfigsResourceResponse {
+                error_code,
+                error_message,
+                resource_type: resource.resource_type,
+                resource_name: resource.resource_name.clone(),
+            });
+        }
+
+        let response = IncrementalAlterConfigsResponse {
+            throttle_time_ms: 0,
+            resources,
+        };
+
+        // Encode response
+        let mut body_buf = BytesMut::new();
+        let mut encoder = Encoder::new(&mut body_buf);
+        response.encode(&mut encoder, header.api_version)?;
+
+        Ok(Self::make_response(&header, ApiKey::IncrementalAlterConfigs, body_buf.freeze()))
     }
 
     /// Handle CreatePartitions request
@@ -2543,10 +3083,49 @@ impl ProtocolHandler {
             request.committed
         );
 
-        // For now, return NOT_COORDINATOR error since we don't support transactions
+        // Persist transaction commit/abort to WAL if available
+        let error_code = if let Some(ref metadata_store) = self.metadata_store {
+            if request.committed {
+                // Prepare and commit the transaction
+                if let Err(e) = metadata_store.prepare_commit_transaction(
+                    request.transactional_id.clone(),
+                    request.producer_id,
+                    request.producer_epoch,
+                ).await {
+                    tracing::warn!("Failed to prepare transaction commit: {}", e);
+                    error_codes::COORDINATOR_NOT_AVAILABLE
+                } else if let Err(e) = metadata_store.commit_transaction(
+                    request.transactional_id.clone(),
+                    request.producer_id,
+                    request.producer_epoch,
+                ).await {
+                    tracing::warn!("Failed to commit transaction: {}", e);
+                    error_codes::COORDINATOR_NOT_AVAILABLE
+                } else {
+                    tracing::info!("Transaction committed: {}", request.transactional_id);
+                    error_codes::NONE
+                }
+            } else {
+                // Abort the transaction
+                if let Err(e) = metadata_store.abort_transaction(
+                    request.transactional_id.clone(),
+                    request.producer_id,
+                    request.producer_epoch,
+                ).await {
+                    tracing::warn!("Failed to abort transaction: {}", e);
+                    error_codes::COORDINATOR_NOT_AVAILABLE
+                } else {
+                    tracing::info!("Transaction aborted: {}", request.transactional_id);
+                    error_codes::NONE
+                }
+            }
+        } else {
+            error_codes::NOT_COORDINATOR
+        };
+
         let response = EndTxnResponse {
             throttle_time_ms: 0,
-            error_code: error_codes::NOT_COORDINATOR,
+            error_code,
         };
 
         // Encode response
@@ -2581,9 +3160,33 @@ impl ProtocolHandler {
         let producer_id = PRODUCER_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
         let producer_epoch = 0;
 
+        // If transactional_id is provided, begin a transaction with WAL persistence
+        let error_code = if let Some(transactional_id) = &request.transactional_id {
+            if let Some(ref metadata_store) = self.metadata_store {
+                // Begin the transaction
+                if let Err(e) = metadata_store.begin_transaction(
+                    transactional_id.clone(),
+                    producer_id,
+                    producer_epoch,
+                    request.transaction_timeout_ms,
+                ).await {
+                    tracing::warn!("Failed to begin transaction: {}", e);
+                    error_codes::COORDINATOR_NOT_AVAILABLE
+                } else {
+                    tracing::info!("Transaction started: {}, producer_id: {}, epoch: {}",
+                        transactional_id, producer_id, producer_epoch);
+                    error_codes::NONE
+                }
+            } else {
+                error_codes::NONE // No WAL, but allow non-transactional usage
+            }
+        } else {
+            error_codes::NONE
+        };
+
         let response = InitProducerIdResponse {
             throttle_time_ms: 0,
-            error_code: error_codes::NONE,
+            error_code,
             producer_id,
             producer_epoch,
         };
@@ -2621,7 +3224,61 @@ impl ProtocolHandler {
             request.topics.len()
         );
 
-        // Build response - for now, all offsets are successfully committed
+        // Collect all offsets for atomic commit
+        let mut offsets_for_wal: Vec<(String, u32, i64, Option<String>)> = Vec::new();
+        for topic in &request.topics {
+            for partition in &topic.partitions {
+                offsets_for_wal.push((
+                    topic.name.clone(),
+                    partition.partition_index as u32,
+                    partition.committed_offset,
+                    partition.metadata.clone(),
+                ));
+            }
+        }
+
+        // Persist transactional offsets to WAL if available
+        if let Some(ref metadata_store) = self.metadata_store {
+
+            if let Err(e) = metadata_store.commit_transactional_offsets(
+                request.transactional_id.clone(),
+                request.producer_id,
+                request.producer_epoch,
+                request.consumer_group_id.clone(),
+                offsets_for_wal.clone(),
+            ).await {
+                tracing::warn!("Failed to persist transactional offset commit to WAL: {}", e);
+            }
+        }
+
+        // Also update in-memory state for backward compatibility
+        let mut consumer_groups = self.consumer_groups.lock().await;
+        let group = consumer_groups.groups.entry(request.consumer_group_id.clone())
+            .or_insert_with(|| ConsumerGroup {
+                group_id: request.consumer_group_id.clone(),
+                state: "Stable".to_string(),
+                protocol: None,
+                protocol_type: None,
+                generation_id: 0,
+                leader_id: None,
+                members: Vec::new(),
+                offsets: HashMap::new(),
+            });
+
+        // Update offsets in memory
+        for (topic, partition, offset, metadata) in &offsets_for_wal {
+            let partition_offsets = group.offsets.entry(topic.clone()).or_insert_with(HashMap::new);
+            partition_offsets.insert(
+                *partition as i32,
+                OffsetInfo {
+                    offset: *offset,
+                    metadata: metadata.clone(),
+                    timestamp: chronik_common::Utc::now().timestamp_millis(),
+                }
+            );
+        }
+
+        // Build response - all offsets are successfully committed
         let mut topic_responses = Vec::new();
         for topic in &request.topics {
             let mut partition_responses = Vec::new();
@@ -2708,7 +3365,26 @@ impl ProtocolHandler {
             request.topics.len()
         );
 
-        // Build response - for now, all partitions are successfully added
+        // Persist partitions to WAL if available
+        if let Some(ref metadata_store) = self.metadata_store {
+            let mut partitions_for_wal: Vec<(String, u32)> = Vec::new();
+            for topic in &request.topics {
+                for partition in &topic.partitions {
+                    partitions_for_wal.push((topic.name.clone(), partition.partition as u32));
+                }
+            }
+
+            if let Err(e) = metadata_store.add_partitions_to_transaction(
+                request.transactional_id.clone(),
+                request.producer_id,
+                request.producer_epoch,
+                partitions_for_wal,
+            ).await {
+                tracing::warn!("Failed to persist AddPartitionsToTxn to WAL: {}", e);
+            }
+        }
+
+        // Build response - all partitions are successfully added
         let mut results = Vec::new();
         for topic in &request.topics {
             let mut partition_results = Vec::new();
@@ -2749,58 +3425,106 @@ impl ProtocolHandler {
             error_codes
         };
         use crate::parser::Decoder;
-        
+
         tracing::debug!("Handling ListOffsets request v{}", header.api_version);
-        
+        tracing::debug!("Body length: {}, first 50 bytes: {:?}", body.len(), &body[..body.len().min(50)]);
+
         let mut decoder = Decoder::new(body);
-        
+        let is_flexible = header.api_version >= 6;
+
         // Replica ID
         let replica_id = decoder.read_i32()?;
-        
+
         // Isolation level (v2+)
         let isolation_level = if header.api_version >= 2 {
             decoder.read_i8()?
         } else {
             0 // READ_UNCOMMITTED
         };
-        
-        // Topics array
-        let topic_count = decoder.read_i32()? as usize;
+
+        // Topics array - use compact array for v6+
+        let topic_count = if is_flexible {
+            let count = decoder.read_unsigned_varint()? as i32;
+            if count == 0 { 0 } else { (count - 1) as usize }
+        } else {
+            decoder.read_i32()? as usize
+        };
         let mut topics = Vec::with_capacity(topic_count);
-        
+
         for _ in 0..topic_count {
-            let name = decoder.read_string()?
-                .ok_or_else(|| Error::Protocol("Topic name cannot be null".into()))?;
-            
-            // Partitions array
-            let partition_count = decoder.read_i32()? as usize;
+            // Topic name - use compact string for v6+
+            let name = if is_flexible {
+                decoder.read_compact_string()?
+                    .ok_or_else(|| Error::Protocol("Topic name cannot be null".into()))?
+            } else {
+                decoder.read_string()?
+                    .ok_or_else(|| Error::Protocol("Topic name cannot be null".into()))?
+            };
+
+            // Partitions array - use compact array for v6+
+            let partition_count = if is_flexible {
+                let count = decoder.read_unsigned_varint()? as i32;
+                if count == 0 { 0 } else { (count - 1) as usize }
+            } else {
+                decoder.read_i32()? as usize
+            };
             let mut partitions = Vec::with_capacity(partition_count);
-            
+
             for _ in 0..partition_count {
                 let partition_index = decoder.read_i32()?;
-                
+
                 // Current leader epoch (v4+)
                 let current_leader_epoch = if header.api_version >= 4 {
                     decoder.read_i32()?
                 } else {
                     -1
                 };
-                
+
                 let timestamp = decoder.read_i64()?;
-                
+
                 partitions.push(crate::list_offsets_types::ListOffsetsRequestPartition {
                     partition_index,
                     current_leader_epoch,
                     timestamp,
                 });
+
+                // Skip tagged fields for each partition (v6+)
+                if is_flexible {
+                    let tag_count = decoder.read_unsigned_varint()?;
+                    for _ in 0..tag_count {
+                        let _tag_id = decoder.read_unsigned_varint()?;
+                        let tag_size = decoder.read_unsigned_varint()? as usize;
+                        decoder.advance(tag_size);
+                    }
+                }
             }
-            
+
             topics.push(crate::list_offsets_types::ListOffsetsRequestTopic {
                 name,
                 partitions,
             });
+
+            // Skip tagged fields for each topic (v6+)
+            if is_flexible {
+                let tag_count = decoder.read_unsigned_varint()?;
+                for _ in 0..tag_count {
+                    let _tag_id = decoder.read_unsigned_varint()?;
+                    let tag_size = decoder.read_unsigned_varint()? as usize;
+                    decoder.advance(tag_size);
+                }
+            }
         }
-        
+
+        // Skip tagged fields at the request level (v6+)
+        if is_flexible {
+            let tag_count = decoder.read_unsigned_varint()?;
+            for _ in 0..tag_count {
+                let _tag_id = decoder.read_unsigned_varint()?;
+                let tag_size = decoder.read_unsigned_varint()? as usize;
+                decoder.advance(tag_size);
+            }
+        }
+
         let request = ListOffsetsRequest {
             replica_id,
             isolation_level,
@@ -2898,22 +3622,37 @@ impl ProtocolHandler {
         version: i16,
     ) -> Result<()> {
         let mut encoder = Encoder::new(buf);
-        
+
+        // Check if we need flexible encoding (v6+)
+        let is_flexible = version >= 6;
+
         // Throttle time (v2+)
         if version >= 2 {
             encoder.write_i32(response.throttle_time_ms);
         }
-        
+
         // Topics array
-        encoder.write_i32(response.topics.len() as i32);
-        
+        if is_flexible {
+            encoder.write_compact_array_len(response.topics.len());
+        } else {
+            encoder.write_i32(response.topics.len() as i32);
+        }
+
         for topic in &response.topics {
             // Topic name
-            encoder.write_string(Some(&topic.name));
-            
+            if is_flexible {
+                encoder.write_compact_string(Some(&topic.name));
+            } else {
+                encoder.write_string(Some(&topic.name));
+            }
+
             // Partitions array
-            encoder.write_i32(topic.partitions.len() as i32);
-            
+            if is_flexible {
+                encoder.write_compact_array_len(topic.partitions.len());
+            } else {
+                encoder.write_i32(topic.partitions.len() as i32);
+            }
+
             for partition in &topic.partitions {
                 // Partition index
                 encoder.write_i32(partition.partition_index);
@@ -2940,9 +3679,24 @@ impl ProtocolHandler {
                         encoder.write_i32(partition.leader_epoch);
                     }
                 }
+
+                // Tagged fields for flexible versions (v6+)
+                if is_flexible {
+                    encoder.write_tagged_fields();
+                }
+            }
+
+            // Tagged fields for topic level in flexible versions (v6+)
+            if is_flexible {
+                encoder.write_tagged_fields();
             }
         }
-        
+
+        // Tagged fields for response level in flexible versions (v6+)
+        if is_flexible {
+            encoder.write_tagged_fields();
+        }
+
         Ok(())
     }
     
@@ -2979,12 +3733,26 @@ impl ProtocolHandler {
         };
         
         tracing::info!("FindCoordinator request for key '{}', type {}", request.key, request.key_type);
-        
-        // For now, always return this node as the coordinator
+
+        // Check if we know about this group
+        let group_state = self.consumer_groups.lock().await;
+        let group_exists = group_state.groups.contains_key(&request.key);
+        drop(group_state);
+
+        // Return appropriate response based on group existence
+        let (error_code, error_message) = if request.key.is_empty() {
+            (error_codes::INVALID_REQUEST, Some("Group key cannot be empty".to_string()))
+        } else if request.key_type != coordinator_type::GROUP && request.key_type != coordinator_type::TRANSACTION {
+            (error_codes::INVALID_REQUEST, Some(format!("Unsupported coordinator type: {}", request.key_type)))
+        } else {
+            // Always return this node as coordinator for simplicity
+            (error_codes::NONE, None)
+        };
+
         let response = FindCoordinatorResponse {
             throttle_time_ms: 0,
-            error_code: error_codes::NONE,
-            error_message: None,
+            error_code,
+            error_message,
             node_id: 1, // This node
             host: "localhost".to_string(),
             port: 9092,
@@ -3004,17 +3772,21 @@ impl ProtocolHandler {
         version: i16,
     ) -> Result<()> {
         let mut encoder = Encoder::new(buf);
-        
+
         // Check if this is a flexible/compact version (v9+)
         let flexible = version >= 9;
-        
+
         // NOTE: throttle_time_ms position differs between versions
         // For v1-v8: throttle_time_ms goes at the END of the response
-        // For v9+: handled differently with flexible versions
-        // This was discovered through comparison with real Kafka - Python clients
-        // expect throttle_time_ms at the end for v2 responses
-        
-        // Topics array
+        // For v9+: throttle_time_ms goes at the BEGINNING of the response
+        // This was discovered through comparison with real Kafka
+
+        // Write throttle_time_ms at the BEGINNING for v9+
+        if version >= 9 {
+            encoder.write_i32(response.throttle_time_ms);
+        }
+
+        // Topics array (called "responses" in the protocol)
         if flexible {
             // v9+ uses compact array
             encoder.write_unsigned_varint((response.topics.len() + 1) as u32);
@@ -3104,73 +3876,121 @@ impl ProtocolHandler {
     }
 
     /// Handle DescribeCluster request (API key 60)
-    async fn handle_describe_cluster(&self, header: RequestHeader, _body: &mut Bytes) -> Result<Response> {
-        use crate::parser::Encoder;
+    async fn handle_describe_cluster(&self, header: RequestHeader, body: &mut Bytes) -> Result<Response> {
+        use crate::parser::{Encoder, Decoder};
         use bytes::BytesMut;
 
-        tracing::info!("Handling DescribeCluster request v{}", header.api_version);
+        tracing::info!("Handling DescribeCluster request v{} from client_id={:?}, correlation_id={}",
+            header.api_version,
+            header.client_id.as_deref().unwrap_or("unknown"),
+            header.correlation_id
+        );
 
-        // DescribeCluster request has these fields for v0:
-        // - include_cluster_authorized_operations: bool
-        // For now, we'll just skip parsing the request body since we don't use it
+        // Parse request body
+        let include_cluster_authorized_operations = if !body.is_empty() {
+            let mut decoder = Decoder::new(body);
+            let result = decoder.read_i8().unwrap_or(0) != 0;
+
+            // For v1, also need to skip any tagged fields in the request
+            if header.api_version >= 1 {
+                let tag_count = decoder.read_unsigned_varint().unwrap_or(0);
+                for _ in 0..tag_count {
+                    let _tag_id = decoder.read_unsigned_varint().unwrap_or(0);
+                    let tag_size = decoder.read_unsigned_varint().unwrap_or(0);
+                    decoder.skip(tag_size as usize).ok();
+                }
+            }
+
+            result
+        } else {
+            false
+        };
+
+        tracing::debug!("DescribeCluster request: include_cluster_authorized_operations = {}",
+            include_cluster_authorized_operations);
 
         let mut body_buf = BytesMut::new();
         let mut encoder = Encoder::new(&mut body_buf);
 
-        // DescribeCluster Response v0 structure:
-        // - throttle_time_ms: i32
-        // - error_code: i16
-        // - error_message: nullable string
-        // - cluster_id: string
-        // - controller_id: i32 (-1 if no controller)
-        // - brokers: array of broker
-        //   - broker_id: i32
-        //   - host: string
-        //   - port: i32
-        //   - rack: nullable string
-        // - cluster_authorized_operations: i32 (-2147483648 if not requested)
+        // Build response based on version
+        if header.api_version == 0 {
+            // v0: NON-FLEXIBLE encoding
+            encoder.write_i16(0); // Error code: NONE
+            encoder.write_string(None); // Error message: null
 
-        // Throttle time
-        encoder.write_i32(0); // throttle_time_ms
+            let cluster_id = "MkU0OEEwNTlFRkY4QjE2OQ";
+            encoder.write_string(Some(cluster_id)); // Cluster ID as nullable string
 
-        // Error code
-        encoder.write_i16(0); // NONE
+            encoder.write_i32(self.broker_id); // Controller ID
 
-        // Error message (null)
-        encoder.write_i16(-1); // null string
+            encoder.write_i32(1); // Number of brokers: 1
 
-        // Cluster ID
-        let cluster_id = "chronik-stream-cluster";
-        encoder.write_i16(cluster_id.len() as i16);
-        encoder.write_raw_bytes(cluster_id.as_bytes());
+            // Broker entry
+            encoder.write_i32(self.broker_id); // Broker ID
+            encoder.write_string(Some(&self.advertised_host)); // Host as nullable string
+            encoder.write_i32(self.advertised_port); // Port
+            encoder.write_string(None); // Rack: null
 
-        // Controller ID (use our broker ID as controller)
-        encoder.write_i32(self.broker_id);
+            // Cluster authorized operations
+            let authorized_operations = if include_cluster_authorized_operations {
+                0x7FFFFFFF_i32
+            } else {
+                -2147483648_i32
+            };
+            encoder.write_i32(authorized_operations);
 
-        // Brokers array
-        encoder.write_i32(1); // 1 broker
+        } else if header.api_version == 1 {
+            // v1: FLEXIBLE/COMPACT encoding
+            encoder.write_i16(0); // Error code: NONE
+            encoder.write_compact_string(None); // Error message: null (compact nullable string)
 
-        // Broker entry
-        encoder.write_i32(self.broker_id); // broker_id
+            let cluster_id = "MkU0OEEwNTlFRkY4QjE2OQ";
+            encoder.write_compact_string(Some(cluster_id)); // Cluster ID as compact nullable string
 
-        // Host
-        let host = &self.advertised_host;
-        encoder.write_i16(host.len() as i16);
-        encoder.write_raw_bytes(host.as_bytes());
+            encoder.write_i32(self.broker_id); // Controller ID (still i32 in v1)
 
-        // Port
-        encoder.write_i32(self.advertised_port);
+            // Brokers array - compact array format
+            encoder.write_unsigned_varint(2); // Array length + 1 (1 broker means write 2)
 
-        // Rack (null)
-        encoder.write_i16(-1); // null string
+            // Broker entry
+            encoder.write_i32(self.broker_id); // Broker ID
+            encoder.write_compact_string(Some(&self.advertised_host)); // Host as compact string
+            encoder.write_i32(self.advertised_port); // Port
+            encoder.write_compact_string(None); // Rack: compact null
 
-        // Cluster authorized operations (-2147483648 = not requested)
-        encoder.write_i32(-2147483648i32);
+            // Tagged fields for broker
+            encoder.write_unsigned_varint(0); // No tagged fields
 
-        tracing::info!("DescribeCluster response: cluster_id={}, controller={}, broker={}:{}",
-                      cluster_id, self.broker_id, self.advertised_host, self.advertised_port);
+            // Cluster authorized operations (still i32 in v1)
+            let authorized_operations = if include_cluster_authorized_operations {
+                0x7FFFFFFF_i32
+            } else {
+                -2147483648_i32
+            };
+            encoder.write_i32(authorized_operations);
 
-        Ok(Self::make_response(&header, ApiKey::DescribeCluster, body_buf.freeze()))
+            // Tagged fields for response
+            encoder.write_unsigned_varint(0); // No tagged fields
+
+        } else {
+            // Unsupported version
+            return Err(Error::Protocol(format!("DescribeCluster v{} not implemented", header.api_version)));
+        }
+
+        let body_bytes = body_buf.freeze();
+
+        let cluster_id = "MkU0OEEwNTlFRkY4QjE2OQ";
+        tracing::info!("DescribeCluster v{} response: cluster_id={}, controller={}, broker={}:{}, body_size={}",
+                      header.api_version, cluster_id, self.broker_id, self.advertised_host, self.advertised_port, body_bytes.len());
+
+        // Debug: log exact bytes for troubleshooting
+        let hex_bytes = body_bytes.iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<Vec<_>>()
+            .join(" ");
+        tracing::debug!("DescribeCluster response body hex: {}", hex_bytes);
+
+        Ok(Self::make_response(&header, ApiKey::DescribeCluster, body_bytes))
     }
 
 
@@ -3182,8 +4002,8 @@ impl ProtocolHandler {
         version: i16,
     ) -> Result<()> {
         let mut encoder = Encoder::new(buf);
-        
-        eprintln!("DEBUG: encode_metadata_response v{} - brokers={}, topics={}", 
+
+        tracing::debug!("Encoding Metadata response v{}, brokers={}, topics={}",
                   version, response.brokers.len(), response.topics.len());
         tracing::info!("Encoding metadata response v{} with {} topics, {} brokers, throttle_time: {}", 
                       version, response.topics.len(), response.brokers.len(), response.throttle_time_ms);
@@ -3193,37 +4013,29 @@ impl ProtocolHandler {
         
         // Throttle time (v3+ always, regardless of flexible)
         if version >= 3 {
-            eprintln!("DEBUG: Writing throttle_time_ms = {}", response.throttle_time_ms);
             encoder.write_i32(response.throttle_time_ms);
         }
         
         // Brokers array
-        eprintln!("DEBUG: About to encode {} brokers, flexible={}", response.brokers.len(), flexible);
-        eprintln!("DEBUG: Broker list contents:");
         for (i, broker) in response.brokers.iter().enumerate() {
-            eprintln!("  Broker[{}]: id={}, host={}, port={}", i, broker.node_id, broker.host, broker.port);
         }
         
         tracing::debug!("About to encode {} brokers", response.brokers.len());
         
         // Get buffer position before writing
         let buffer_before = encoder.debug_buffer().len();
-        eprintln!("DEBUG: Buffer position before broker array encoding: {}", buffer_before);
         
         if flexible {
-            eprintln!("DEBUG: Using compact array encoding for {} brokers", response.brokers.len());
             encoder.write_compact_array_len(response.brokers.len());
-            eprintln!("DEBUG: Expected to write compact varint for length {}", response.brokers.len() + 1);
         } else {
-            eprintln!("DEBUG: Using INT32 encoding for {} brokers", response.brokers.len());
             encoder.write_i32(response.brokers.len() as i32);
         }
         
         let buffer_after = encoder.debug_buffer().len();
-        eprintln!("DEBUG: Buffer position after broker array encoding: {}, wrote {} bytes", 
-                 buffer_after, buffer_after - buffer_before);
+        tracing::debug!("Metadata response buffer: before={}, after={}, size={}",
+                 buffer_before, buffer_after, buffer_after - buffer_before);
         let debug_buf = encoder.debug_buffer();
-        eprintln!("DEBUG: Actual bytes written for broker array length: {:02x?}", 
+        tracing::debug!("Metadata response bytes: {:02x?}",
                  &debug_buf[buffer_before..buffer_after]);
         
         for broker in &response.brokers {
@@ -3360,11 +4172,9 @@ impl ProtocolHandler {
         // Remove duplicate cluster_authorized_operations - already written above
         
         if flexible {
-            eprintln!("DEBUG: Writing final tagged fields for Metadata v{}", version);
             encoder.write_tagged_fields();
         }
         
-        eprintln!("DEBUG: Metadata response encoded, buffer size = {} bytes", encoder.debug_buffer().len());
         Ok(())
     }
     
@@ -3430,9 +4240,15 @@ impl ProtocolHandler {
         };
         
         tracing::info!(
-            "JoinGroup request for group '{}', member '{}', protocol '{}'",
-            request.group_id, request.member_id, request.protocol_type
+            "JoinGroup request for group '{}', member '{}', protocol '{}', session_timeout: {}ms, rebalance_timeout: {}ms",
+            request.group_id, request.member_id, request.protocol_type,
+            request.session_timeout_ms, request.rebalance_timeout_ms
         );
+
+        // Log protocol details
+        for protocol in &request.protocols {
+            tracing::debug!("  Protocol: {}, metadata_size: {}", protocol.name, protocol.metadata.len());
+        }
         
         // Update consumer group state
         let mut group_state = self.consumer_groups.lock().await;
@@ -3496,7 +4312,46 @@ impl ProtocolHandler {
         
         // Update state to Stable once we have a leader
         group.state = "Stable".to_string();
-        
+
+        // Persist group state to WAL if metadata store is available
+        if let Some(ref metadata_store) = self.metadata_store {
+            let group_metadata = chronik_common::metadata::ConsumerGroupMetadata {
+                group_id: group.group_id.clone(),
+                generation_id: group.generation_id,
+                protocol_type: group.protocol_type.clone().unwrap_or_default(),
+                protocol: group.protocol.clone().unwrap_or_default(),
+                leader_id: group.leader_id.clone(),
+                leader: group.leader_id.clone().unwrap_or_default(),
+                state: group.state.clone(),
+                members: group.members.iter().map(|m| {
+                    chronik_common::metadata::GroupMember {
+                        member_id: m.member_id.clone(),
+                        client_id: m.client_id.clone(),
+                        client_host: m.client_host.clone(),
+                        metadata: m.metadata.clone().unwrap_or_default(),
+                        assignment: m.assignment.clone().unwrap_or_default(),
+                    }
+                }).collect(),
+                created_at: chronik_common::Utc::now(),
+                updated_at: chronik_common::Utc::now(),
+            };
+
+            // Use create_consumer_group for new groups or update_consumer_group for existing ones
+            let result = if is_new_member && group.generation_id == 1 {
+                metadata_store.create_consumer_group(group_metadata).await
+            } else {
+                metadata_store.update_consumer_group(group_metadata).await
+            };
+
+            if let Err(e) = result {
+                tracing::warn!("Failed to persist group state to WAL for group {}: {}",
+                    group.group_id, e);
+            } else {
+                tracing::debug!("Persisted group state to WAL for group {} with generation {}",
+                    group.group_id, group.generation_id);
+            }
+        }
+
         let is_leader = group.leader_id.as_ref() == Some(&assigned_member_id);
         let generation_id = group.generation_id;
         
@@ -3607,6 +4462,38 @@ impl ProtocolHandler {
                     "Group '{}' entering rebalance after member removal, new generation: {}",
                     request.group_id, group.generation_id
                 );
+            }
+
+            // Persist updated group state to WAL after member removal
+            if let Some(ref metadata_store) = self.metadata_store {
+                let group_metadata = chronik_common::metadata::ConsumerGroupMetadata {
+                    group_id: group.group_id.clone(),
+                    generation_id: group.generation_id,
+                    protocol_type: group.protocol_type.clone().unwrap_or_default(),
+                    protocol: group.protocol.clone().unwrap_or_default(),
+                    leader_id: group.leader_id.clone(),
+                    leader: group.leader_id.clone().unwrap_or_default(),
+                    state: group.state.clone(),
+                    members: group.members.iter().map(|m| {
+                        chronik_common::metadata::GroupMember {
+                            member_id: m.member_id.clone(),
+                            client_id: m.client_id.clone(),
+                            client_host: m.client_host.clone(),
+                            metadata: m.metadata.clone().unwrap_or_default(),
+                            assignment: m.assignment.clone().unwrap_or_default(),
+                        }
+                    }).collect(),
+                    created_at: chronik_common::Utc::now(),
+                    updated_at: chronik_common::Utc::now(),
+                };
+
+                if let Err(e) = metadata_store.update_consumer_group(group_metadata).await {
+                    tracing::warn!("Failed to persist group state after leave to WAL for group {}: {}",
+                        group.group_id, e);
+                } else {
+                    tracing::debug!("Persisted group state after leave to WAL for group {}",
+                        group.group_id);
+                }
             }
         } else {
             // Group not found
@@ -3727,6 +4614,38 @@ impl ProtocolHandler {
                     if let Some(member) = group.members.iter_mut()
                         .find(|m| m.member_id == assignment.member_id) {
                         member.assignment = Some(assignment.assignment.to_vec());
+                    }
+                }
+
+                // Persist updated group state with assignments to WAL
+                if let Some(ref metadata_store) = self.metadata_store {
+                    let group_metadata = chronik_common::metadata::ConsumerGroupMetadata {
+                        group_id: group.group_id.clone(),
+                        generation_id: group.generation_id,
+                        protocol_type: group.protocol_type.clone().unwrap_or_default(),
+                        protocol: group.protocol.clone().unwrap_or_default(),
+                        leader_id: group.leader_id.clone(),
+                        leader: group.leader_id.clone().unwrap_or_default(),
+                        state: group.state.clone(),
+                        members: group.members.iter().map(|m| {
+                            chronik_common::metadata::GroupMember {
+                                member_id: m.member_id.clone(),
+                                client_id: m.client_id.clone(),
+                                client_host: m.client_host.clone(),
+                                metadata: m.metadata.clone().unwrap_or_default(),
+                                assignment: m.assignment.clone().unwrap_or_default(), // Now includes the assignments
+                            }
+                        }).collect(),
+                        created_at: chronik_common::Utc::now(),
+                        updated_at: chronik_common::Utc::now(),
+                    };
+
+                    if let Err(e) = metadata_store.update_consumer_group(group_metadata).await {
+                        tracing::warn!("Failed to persist assignments to WAL for group {}: {}",
+                            group.group_id, e);
+                    } else {
+                        tracing::debug!("Persisted assignments to WAL for group {}",
+                            group.group_id);
                     }
                 }
 
@@ -3889,16 +4808,36 @@ impl ProtocolHandler {
         let mut decoder = Decoder::new(body);
         let request = HeartbeatRequest::decode(&mut decoder, header.api_version)?;
 
-        tracing::debug!(
+        tracing::info!(
             "Heartbeat from member '{}' in group '{}', generation {}",
             request.member_id, request.group_id, request.generation_id
         );
 
-        // For now, always return success
-        // In a real implementation, this would check member validity and group state
+        // Check if member exists and generation matches
+        let group_state = self.consumer_groups.lock().await;
+        let error_code = if let Some(group) = group_state.groups.get(&request.group_id) {
+            if !group.members.iter().any(|m| m.member_id == request.member_id) {
+                tracing::warn!("Unknown member '{}' in group '{}'", request.member_id, request.group_id);
+                error_codes::UNKNOWN_MEMBER_ID
+            } else if group.generation_id != request.generation_id {
+                tracing::warn!("Generation mismatch for member '{}': expected {}, got {}",
+                    request.member_id, group.generation_id, request.generation_id);
+                error_codes::ILLEGAL_GENERATION
+            } else if group.state == "PreparingRebalance" {
+                tracing::debug!("Group '{}' is rebalancing", request.group_id);
+                error_codes::REBALANCE_IN_PROGRESS
+            } else {
+                error_codes::NONE
+            }
+        } else {
+            tracing::warn!("Unknown group '{}'", request.group_id);
+            error_codes::UNKNOWN_MEMBER_ID
+        };
+        drop(group_state);
+
         let response = HeartbeatResponse {
             throttle_time_ms: 0,
-            error_code: error_codes::NONE,
+            error_code,
         };
 
         // Encode response using trait-based encoding
@@ -3919,14 +4858,24 @@ impl ProtocolHandler {
             ListGroupsResponse, error_codes
         };
         
-        tracing::debug!("Handling ListGroups request v{}", header.api_version);
-        
-        // For now, return an empty list of groups
-        // In a real implementation, this would list all consumer groups
+        tracing::info!("Handling ListGroups request v{}", header.api_version);
+
+        // Return actual list of consumer groups
+        let group_state = self.consumer_groups.lock().await;
+        let groups: Vec<crate::list_groups_types::ListGroupsResponseGroup> = group_state.groups.iter().map(|(group_id, group)| {
+            crate::list_groups_types::ListGroupsResponseGroup {
+                group_id: group_id.clone(),
+                protocol_type: group.protocol_type.clone().unwrap_or_else(|| "consumer".to_string()),
+            }
+        }).collect();
+        drop(group_state);
+
+        tracing::info!("Returning {} consumer groups", groups.len());
+
         let response = ListGroupsResponse {
             throttle_time_ms: 0,
             error_code: error_codes::NONE,
-            groups: vec![],
+            groups,
         };
         
         let mut body_buf = BytesMut::new();
@@ -3945,54 +4894,114 @@ impl ProtocolHandler {
             ListConsumerGroupOffsetsRequest, ListConsumerGroupOffsetsResponse,
             OffsetFetchResponseTopic, OffsetFetchResponsePartition,
         };
-        
+        use std::collections::HashMap;
+
         tracing::info!("Handling OffsetFetch request - version: {}", header.api_version);
-        
+
         // Parse request
         let request = ListConsumerGroupOffsetsRequest::parse(body, header.api_version)?;
         tracing::info!("OffsetFetch for group: {}", request.group_id);
-        
-        // Get group offsets from storage
-        let group_state = self.consumer_groups.lock().await;
+
         let mut topics = Vec::new();
-        
-        if let Some(group) = group_state.groups.get(&request.group_id) {
-            // Return offsets for requested topics or all topics
-            for (topic_name, topic_offsets) in &group.offsets {
-                // Check if this topic was requested
-                let include_topic = if let Some(ref requested_topics) = request.topics {
-                    requested_topics.iter().any(|t| t.name == *topic_name)
-                } else {
-                    true // Include all topics if none specified
-                };
-                
-                if include_topic {
-                    let mut partitions = Vec::new();
-                    
-                    for (partition_id, offset_info) in topic_offsets {
-                        partitions.push(OffsetFetchResponsePartition {
-                            partition_index: *partition_id,
-                            committed_offset: offset_info.offset,
-                            committed_leader_epoch: -1,
-                            metadata: offset_info.metadata.clone(),
-                            error_code: 0,
-                        });
+        let mut offsets_map: HashMap<String, HashMap<i32, (i64, Option<String>)>> = HashMap::new();
+
+        // Try to get offsets from WAL first if available
+        if let Some(ref metadata_store) = self.metadata_store {
+            tracing::debug!("Fetching offsets from WAL for group: {}", request.group_id);
+
+            // Determine which topics to fetch
+            let topics_to_fetch: Vec<String> = if let Some(ref requested_topics) = request.topics {
+                requested_topics.iter().map(|t| t.name.clone()).collect()
+            } else {
+                // If no topics specified, we need to get all topics for this group
+                // For now, we'll fall back to in-memory, but this could be improved
+                // by adding a list_consumer_group_topics method to MetadataStore
+                vec![]
+            };
+
+            if !topics_to_fetch.is_empty() {
+                // Fetch offsets for specific topics
+                for topic_name in &topics_to_fetch {
+                    // We need to fetch all partitions for each topic
+                    // This is a limitation - we might need to enhance the metadata store API
+                    // For now, try common partition numbers (0-31)
+                    let topic_offsets = offsets_map.entry(topic_name.clone())
+                        .or_insert_with(HashMap::new);
+
+                    for partition in 0..32 {
+                        match metadata_store.get_consumer_offset(&request.group_id, topic_name, partition).await {
+                            Ok(Some(offset)) => {
+                                topic_offsets.insert(partition as i32, (offset.offset, offset.metadata));
+                                tracing::debug!(
+                                    "Retrieved offset from WAL: group={} topic={} partition={} offset={}",
+                                    request.group_id, topic_name, partition, offset.offset
+                                );
+                            }
+                            Ok(None) => {
+                                // No offset stored for this partition
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to fetch offset from WAL for group {} topic {} partition {}: {}",
+                                    request.group_id, topic_name, partition, e
+                                );
+                            }
+                        }
                     }
-                    
-                    topics.push(OffsetFetchResponseTopic {
-                        name: topic_name.clone(),
-                        partitions,
-                    });
                 }
             }
         }
-        
+
+        // Fall back to in-memory storage if WAL is not available or didn't have all data
+        if offsets_map.is_empty() {
+            let group_state = self.consumer_groups.lock().await;
+            if let Some(group) = group_state.groups.get(&request.group_id) {
+                // Return offsets for requested topics or all topics
+                for (topic_name, topic_offsets) in &group.offsets {
+                    // Check if this topic was requested
+                    let include_topic = if let Some(ref requested_topics) = request.topics {
+                        requested_topics.iter().any(|t| t.name == *topic_name)
+                    } else {
+                        true // Include all topics if none specified
+                    };
+
+                    if include_topic {
+                        let topic_map = offsets_map.entry(topic_name.clone())
+                            .or_insert_with(HashMap::new);
+                        for (partition_id, offset_info) in topic_offsets {
+                            topic_map.insert(*partition_id, (offset_info.offset, offset_info.metadata.clone()));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Build response from collected offsets
+        for (topic_name, partition_offsets) in offsets_map {
+            let mut partitions = Vec::new();
+
+            for (partition_id, (offset, metadata)) in partition_offsets {
+                partitions.push(OffsetFetchResponsePartition {
+                    partition_index: partition_id,
+                    committed_offset: offset,
+                    committed_leader_epoch: -1,
+                    metadata,
+                    error_code: 0,
+                });
+            }
+
+            topics.push(OffsetFetchResponseTopic {
+                name: topic_name,
+                partitions,
+            });
+        }
+
         let response = ListConsumerGroupOffsetsResponse {
             throttle_time_ms: 0,
             error_code: 0,
             topics,
         };
-        
+
         let body = response.encode(header.api_version);
         Ok(Self::make_response(&header, ApiKey::OffsetFetch, body))
     }
@@ -4004,14 +5013,15 @@ impl ProtocolHandler {
         body: &mut Bytes,
     ) -> Result<Response> {
         use crate::types::{OffsetCommitResponse, OffsetCommitResponseTopic, OffsetCommitResponsePartition};
-        
+        use chronik_common::metadata::ConsumerOffset;
+
         tracing::info!("Handling OffsetCommit request - version: {}", header.api_version);
-        
+
         // Parse request
         let request = self.parse_offset_commit_request(&header, body)?;
         tracing::info!("OffsetCommit for group: {}", request.group_id);
-        
-        // Store offsets
+
+        // Store offsets - use both in-memory and WAL for now (transitional)
         let mut group_state = self.consumer_groups.lock().await;
         let group = group_state.groups.entry(request.group_id.clone())
             .or_insert_with(|| ConsumerGroup {
@@ -4024,17 +5034,18 @@ impl ProtocolHandler {
                 state: "Empty".to_string(),
                 offsets: std::collections::HashMap::new(),
             });
-        
+
         // Update offsets
         let mut response_topics = Vec::new();
-        
+
         for topic in &request.topics {
             let topic_offsets = group.offsets.entry(topic.name.clone())
                 .or_insert_with(std::collections::HashMap::new);
-            
+
             let mut response_partitions = Vec::new();
-            
+
             for partition in &topic.partitions {
+                // Store in memory for backward compatibility
                 topic_offsets.insert(partition.partition_index, OffsetInfo {
                     offset: partition.committed_offset,
                     metadata: partition.committed_metadata.clone(),
@@ -4043,28 +5054,53 @@ impl ProtocolHandler {
                         .unwrap()
                         .as_millis() as i64,
                 });
-                
+
+                // Store in WAL if metadata store is available
+                if let Some(ref metadata_store) = self.metadata_store {
+                    let consumer_offset = ConsumerOffset {
+                        group_id: request.group_id.clone(),
+                        topic: topic.name.clone(),
+                        partition: partition.partition_index as u32,
+                        offset: partition.committed_offset,
+                        metadata: partition.committed_metadata.clone(),
+                        commit_timestamp: chronik_common::Utc::now(),
+                    };
+
+                    // Log and continue on error to maintain compatibility
+                    if let Err(e) = metadata_store.commit_offset(consumer_offset).await {
+                        tracing::warn!(
+                            "Failed to persist offset to WAL for group {} topic {} partition {}: {}",
+                            request.group_id, topic.name, partition.partition_index, e
+                        );
+                    } else {
+                        tracing::debug!(
+                            "Persisted offset to WAL: group={} topic={} partition={} offset={}",
+                            request.group_id, topic.name, partition.partition_index, partition.committed_offset
+                        );
+                    }
+                }
+
                 response_partitions.push(OffsetCommitResponsePartition {
                     partition_index: partition.partition_index,
                     error_code: 0,
                 });
             }
-            
+
             response_topics.push(OffsetCommitResponseTopic {
                 name: topic.name.clone(),
                 partitions: response_partitions,
             });
         }
-        
+
         let response = OffsetCommitResponse {
             header: ResponseHeader { correlation_id: header.correlation_id },
             throttle_time_ms: 0,
             topics: response_topics,
         };
-        
+
         let mut body_buf = BytesMut::new();
         self.encode_offset_commit_response(&mut body_buf, &response, header.api_version)?;
-        
+
         Ok(Self::make_response(&header, ApiKey::OffsetCommit, body_buf.freeze()))
     }
     

@@ -351,4 +351,108 @@ impl MetadataStore for FileMetadataStore {
         
         Ok(metadata)
     }
+
+    async fn commit_transactional_offsets(
+        &self,
+        _transactional_id: String,
+        _producer_id: i64,
+        _producer_epoch: i16,
+        group_id: String,
+        offsets: Vec<(String, u32, i64, Option<String>)>, // (topic, partition, offset, metadata)
+    ) -> Result<()> {
+        // For file store, we just commit the offsets like regular commits
+        // In a real implementation, we'd track transaction state
+        let mut state = self.state.write().await;
+
+        for (topic, partition, offset, metadata) in offsets {
+            let key = format!("{}:{}:{}", group_id, topic, partition);
+            state.consumer_offsets.insert(key, ConsumerOffset {
+                group_id: group_id.clone(),
+                topic,
+                partition,
+                offset,
+                metadata,
+                commit_timestamp: chrono::Utc::now(),
+            });
+        }
+
+        drop(state);
+        self.persist().await?;
+        Ok(())
+    }
+
+    async fn begin_transaction(
+        &self,
+        _transactional_id: String,
+        _producer_id: i64,
+        _producer_epoch: i16,
+        _timeout_ms: i32,
+    ) -> Result<()> {
+        // Stub implementation for file store
+        Ok(())
+    }
+
+    async fn add_partitions_to_transaction(
+        &self,
+        _transactional_id: String,
+        _producer_id: i64,
+        _producer_epoch: i16,
+        _partitions: Vec<(String, u32)>,
+    ) -> Result<()> {
+        // Stub implementation for file store
+        Ok(())
+    }
+
+    async fn add_offsets_to_transaction(
+        &self,
+        _transactional_id: String,
+        _producer_id: i64,
+        _producer_epoch: i16,
+        _group_id: String,
+    ) -> Result<()> {
+        // Stub implementation for file store
+        Ok(())
+    }
+
+    async fn prepare_commit_transaction(
+        &self,
+        _transactional_id: String,
+        _producer_id: i64,
+        _producer_epoch: i16,
+    ) -> Result<()> {
+        // Stub implementation for file store
+        Ok(())
+    }
+
+    async fn commit_transaction(
+        &self,
+        _transactional_id: String,
+        _producer_id: i64,
+        _producer_epoch: i16,
+    ) -> Result<()> {
+        // Stub implementation for file store
+        Ok(())
+    }
+
+    async fn abort_transaction(
+        &self,
+        _transactional_id: String,
+        _producer_id: i64,
+        _producer_epoch: i16,
+    ) -> Result<()> {
+        // Stub implementation for file store
+        Ok(())
+    }
+
+    async fn fence_producer(
+        &self,
+        _transactional_id: String,
+        _old_producer_id: i64,
+        _old_producer_epoch: i16,
+        _new_producer_id: i64,
+        _new_producer_epoch: i16,
+    ) -> Result<()> {
+        // Stub implementation for file store
+        Ok(())
+    }
 }

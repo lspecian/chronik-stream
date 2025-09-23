@@ -203,6 +203,15 @@ impl<'a> Decoder<'a> {
     pub fn remaining(&self) -> usize {
         self.buf.remaining()
     }
+
+    /// Skip n bytes
+    pub fn skip(&mut self, n: usize) -> Result<()> {
+        if self.buf.remaining() < n {
+            return Err(Error::Protocol(format!("Cannot skip {} bytes, only {} remaining", n, self.buf.remaining())));
+        }
+        self.buf.advance(n);
+        Ok(())
+    }
     
     /// Read a boolean
     pub fn read_bool(&mut self) -> Result<bool> {
@@ -385,7 +394,7 @@ impl<'a> Encoder<'a> {
         self.buf.put_i64(value);
     }
     
-    /// Write a string (null = None)
+    /// Write a nullable string (null = None)
     pub fn write_string(&mut self, value: Option<&str>) {
         match value {
             Some(s) => {
@@ -396,6 +405,13 @@ impl<'a> Encoder<'a> {
                 self.write_i16(-1);
             }
         }
+    }
+
+    /// Write a non-nullable string (must not be None)
+    /// This is used for fields that cannot be null in the Kafka protocol
+    pub fn write_non_nullable_string(&mut self, value: &str) {
+        self.write_i16(value.len() as i16);
+        self.buf.put_slice(value.as_bytes());
     }
     
     /// Write a byte array (null = None)
@@ -450,12 +466,11 @@ impl<'a> Encoder<'a> {
     
     /// Write a compact array length (uses varint with +1 offset)
     pub fn write_compact_array_len(&mut self, len: usize) {
-        eprintln!("DEBUG: write_compact_array_len called with len={}", len);
         let start_pos = self.buf.len();
         self.write_unsigned_varint((len + 1) as u32);
         let end_pos = self.buf.len();
-        eprintln!("DEBUG: Wrote {} bytes for compact array length: {:02x?}", 
-                 end_pos - start_pos, 
+        tracing::trace!("write_compact_array_len: wrote {} bytes: {:02x?}",
+                 end_pos - start_pos,
                  &self.buf.as_ref()[start_pos..end_pos]);
     }
     
@@ -505,14 +520,12 @@ pub fn parse_request_header_with_correlation(buf: &mut Bytes) -> Result<(Request
                 decoder.buf[0],
                 if decoder.remaining() > 0 { decoder.buf[1] } else { 0 }
             ];
-            eprintln!("DEBUG: Next 2 bytes after correlation_id: {:02x?}", peek_bytes);
             eprintln!("  As INT16: {}", i16::from_be_bytes(peek_bytes));
             eprintln!("  As UINT8: {}", peek_bytes[0]);
         }
         
         // Try compact string for flexible versions - this is what librdkafka actually sends
         let api_name = ApiKey::from_i16(api_key_raw).map(|k| format!("{:?}", k)).unwrap_or_else(|| format!("Unknown({})", api_key_raw));
-        eprintln!("DEBUG: Using COMPACT string for {} v{} client ID (librdkafka sends compact)", api_name, api_version);
         let client_id = decoder.read_compact_string()?;
         
         // WORKAROUND for librdkafka v2.11.1 bug:
@@ -521,12 +534,10 @@ pub fn parse_request_header_with_correlation(buf: &mut Bytes) -> Result<(Request
         if client_id.is_none() && decoder.remaining() > 0 {
             // Check if next byte looks like a string length (non-zero and reasonable)
             let next_byte = decoder.buf[0];
-            eprintln!("DEBUG: librdkafka bug detection - client_id is null but next byte is 0x{:02x}", next_byte);
             
             // If it looks like a compact string length (>0 and <128), it's probably the bug
             if next_byte > 0 && next_byte < 128 {
                 let string_len = (next_byte - 1) as usize;
-                eprintln!("DEBUG: Detected librdkafka v2.11.1 bug - skipping {} extra bytes", string_len + 1);
                 
                 // Skip the length byte and the string data
                 decoder.read_i8()?; // Skip length byte
@@ -543,7 +554,13 @@ pub fn parse_request_header_with_correlation(buf: &mut Bytes) -> Result<(Request
     
     // Skip tagged fields if flexible
     if flexible {
-        let _tagged_field_count = decoder.read_unsigned_varint()?;
+        let tagged_field_count = decoder.read_unsigned_varint()?;
+        // Actually skip the tagged field data
+        for _ in 0..tagged_field_count {
+            let _tag_id = decoder.read_unsigned_varint()?;
+            let tag_size = decoder.read_unsigned_varint()? as usize;
+            decoder.advance(tag_size);
+        }
     }
     
     let partial = PartialRequestHeader {
@@ -581,11 +598,17 @@ pub fn write_response_header(buf: &mut BytesMut, header: &ResponseHeader) {
     encoder.write_i32(header.correlation_id);
 }
 
-/// Write a response header to bytes with flexible version support
-pub fn write_response_header_flexible(buf: &mut BytesMut, header: &ResponseHeader, api_key: ApiKey, api_version: i16) {
+/// Write a response header to bytes with flexible version support and optional throttle time
+pub fn write_response_header_flexible(buf: &mut BytesMut, header: &ResponseHeader, api_key: ApiKey, api_version: i16, throttle_time_ms: Option<i32>) {
     let mut encoder = Encoder::new(buf);
     encoder.write_i32(header.correlation_id);
-    
+
+    // Only write throttle_time_ms if it's provided
+    // Note: DescribeCluster v0 does NOT include throttle_time_ms at all
+    if let Some(throttle_time) = throttle_time_ms {
+        encoder.write_i32(throttle_time);
+    }
+
     // Check if this API version uses flexible versions
     if is_flexible_version(api_key, api_version) {
         // Write empty tagged fields
@@ -614,6 +637,7 @@ pub fn is_flexible_version(api_key: ApiKey, api_version: i16) -> bool {
         ApiKey::CreateTopics => api_version >= 5,
         ApiKey::DeleteTopics => api_version >= 4,
         ApiKey::DescribeConfigs => api_version >= 4,
+        ApiKey::DescribeCluster => api_version >= 1,  // v1 uses flexible encoding
         // All new APIs default to non-flexible for v0
         _ => false,
     }
@@ -695,7 +719,7 @@ pub fn supported_api_versions() -> HashMap<ApiKey, VersionRange> {
     versions.insert(ApiKey::UpdateFeatures, VersionRange { min: 0, max: 0 });
     versions.insert(ApiKey::Envelope, VersionRange { min: 0, max: 0 });
     // versions.insert(ApiKey::FetchSnapshot, VersionRange { min: 0, max: 0 });  // API 59 - not in CP Kafka
-    versions.insert(ApiKey::DescribeCluster, VersionRange { min: 0, max: 0 });
+    versions.insert(ApiKey::DescribeCluster, VersionRange { min: 1, max: 1 });  // Only advertise v1 to force flexible encoding
     versions.insert(ApiKey::DescribeProducers, VersionRange { min: 0, max: 0 });
     // versions.insert(ApiKey::BrokerRegistration, VersionRange { min: 0, max: 0 });  // API 62 - not in CP Kafka
     // versions.insert(ApiKey::BrokerHeartbeat, VersionRange { min: 0, max: 0 });  // API 63 - not in CP Kafka
