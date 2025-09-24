@@ -4059,34 +4059,34 @@ impl ProtocolHandler {
 
         // Brokers array
         tracing::debug!("About to encode {} brokers", response.brokers.len());
-        
+
         // Get buffer position before writing
         let buffer_before = encoder.debug_buffer().len();
-        
+
         if flexible {
             encoder.write_compact_array_len(response.brokers.len());
         } else {
             encoder.write_i32(response.brokers.len() as i32);
         }
-        
+
         let buffer_after = encoder.debug_buffer().len();
         tracing::debug!("Metadata response buffer: before={}, after={}, size={}",
                  buffer_before, buffer_after, buffer_after - buffer_before);
         let debug_buf = encoder.debug_buffer();
         tracing::debug!("Metadata response bytes: {:02x?}",
                  &debug_buf[buffer_before..buffer_after]);
-        
+
         for broker in &response.brokers {
             encoder.write_i32(broker.node_id);
-            
+
             if flexible {
                 encoder.write_compact_string(Some(&broker.host));
             } else {
                 encoder.write_string(Some(&broker.host));
             }
-            
+
             encoder.write_i32(broker.port);
-            
+
             if version >= 1 {
                 if flexible {
                     encoder.write_compact_string(broker.rack.as_deref());
@@ -4094,13 +4094,13 @@ impl ProtocolHandler {
                     encoder.write_string(broker.rack.as_deref());
                 }
             }
-            
+
             if flexible {
                 encoder.write_tagged_fields();
             }
         }
-        
-        // Cluster ID comes BEFORE controller ID (librdkafka expects this order)
+
+        // Cluster ID comes before controller ID for v2+
         if version >= 2 {
             if flexible {
                 encoder.write_compact_string(response.cluster_id.as_deref());
@@ -4108,7 +4108,8 @@ impl ProtocolHandler {
                 encoder.write_string(response.cluster_id.as_deref());
             }
         }
-        
+
+        // Controller ID comes after brokers and cluster_id for v1+
         if version >= 1 {
             encoder.write_i32(response.controller_id);
         }
