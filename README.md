@@ -1,4 +1,4 @@
-# Chronik Stream v1.2.4
+# Chronik Stream v1.3.0
 
 [![Build Status](https://github.com/lspecian/chronik-stream/workflows/CI/badge.svg)](https://github.com/lspecian/chronik-stream/actions)
 [![Release](https://img.shields.io/github/v/release/lspecian/chronik-stream)](https://github.com/lspecian/chronik-stream/releases)
@@ -8,7 +8,14 @@
 
 A high-performance streaming platform built in Rust that implements core Kafka wire protocol functionality with comprehensive Write-Ahead Log (WAL) durability and automatic recovery.
 
-## 🎉 What's New in v1.2.4
+## 🎉 What's New in v1.3.0
+
+### v1.3.0 - Full KSQL Integration Support
+- **🎯 KSQL Compatibility**: Complete support for KSQL without workarounds or modifications
+- **🔧 Fixed ListOffsets v7**: Resolved "Failed to get topic offsets" error preventing KSQL startup
+- **🔐 SASL Authentication**: Added SaslAuthenticate API for stable AdminClient connections
+- **⚙️ IncrementalAlterConfigs**: Implemented dynamic configuration updates
+- **📚 Documentation**: Comprehensive KSQL integration guides and compatibility tracking
 
 ### v1.2.4 - Full Kafka Compatibility & Consumer Groups
 - **🎯 Fixed ApiVersionsResponse v0**: Resolved kafka-python "IncompatibleBrokerVersion" errors
@@ -33,12 +40,12 @@ A high-performance streaming platform built in Rust that implements core Kafka w
 
 ## 🚀 Features
 
-- **Kafka Wire Protocol**: Full Kafka wire protocol with consumer group support
+- **Kafka Wire Protocol**: Full Kafka wire protocol with consumer group and KSQL support
 - **WAL-based Metadata**: ChronikMetaLog provides event-sourced metadata persistence
 - **Write-Ahead Log**: Complete WAL system with segmentation, rotation, recovery, and truncation
 - **Automatic Recovery**: WAL records are automatically replayed on startup to restore state
 - **WAL Truncation**: Old WAL segments are efficiently removed after successful persistence
-- **Real Client Testing**: Tested with kafka-python, confluent-kafka, KSQLDB, and Apache Flink
+- **Real Client Testing**: Tested with kafka-python, confluent-kafka, KSQL, and Apache Flink
 - **Zero Message Loss**: WAL ensures durability even during unexpected shutdowns
 - **Crash Recovery**: Full recovery of messages and offsets after server crashes
 - **High Performance**: Async architecture with zero-copy networking optimizations
@@ -77,7 +84,7 @@ A high-performance streaming platform built in Rust that implements core Kafka w
 # Quick start - single command
 docker run -d -p 9092:9092 \
   -e CHRONIK_ADVERTISED_ADDR=localhost \
-  ghcr.io/lspecian/chronik-stream:v1.2.4
+  ghcr.io/lspecian/chronik-stream:v1.3.0
 
 # With persistent storage and custom configuration
 docker run -d --name chronik \
@@ -85,7 +92,7 @@ docker run -d --name chronik \
   -v chronik-data:/data \
   -e CHRONIK_ADVERTISED_ADDR=localhost \
   -e RUST_LOG=info \
-  ghcr.io/lspecian/chronik-stream:v1.2.4
+  ghcr.io/lspecian/chronik-stream:v1.3.0
 
 # Using docker-compose
 curl -O https://raw.githubusercontent.com/lspecian/chronik-stream/main/docker-compose.yml
@@ -163,6 +170,63 @@ cargo build --release --bin chronik-server
 # Run
 ./target/release/chronik-server standalone
 ```
+
+## 🌟 KSQL Integration
+
+Chronik Stream now provides **full compatibility** with KSQL (Confluent's SQL engine for Kafka) without any modifications or workarounds required:
+
+### Quick Start with KSQL
+
+```bash
+# 1. Start Chronik Stream
+chronik-server standalone
+
+# 2. Download and extract KSQL
+curl -O https://packages.confluent.io/archive/7.5/confluent-7.5.0.tar.gz
+tar xzf confluent-7.5.0.tar.gz
+
+# 3. Configure KSQL (ksql-server.properties)
+cat > ksql-server.properties <<EOF
+bootstrap.servers=localhost:9092
+ksql.service.id=ksql_service_1
+listeners=http://0.0.0.0:8088
+EOF
+
+# 4. Start KSQL Server
+confluent-7.5.0/bin/ksql-server-start ksql-server.properties
+
+# 5. Start KSQL CLI
+confluent-7.5.0/bin/ksql http://localhost:8088
+```
+
+### KSQL Operations Example
+
+```sql
+-- Create a stream
+CREATE STREAM pageviews (
+    viewtime BIGINT,
+    userid VARCHAR,
+    pageid VARCHAR
+) WITH (
+    KAFKA_TOPIC='pageviews',
+    VALUE_FORMAT='JSON'
+);
+
+-- Insert data
+INSERT INTO pageviews VALUES (1, 'User_1', 'Page_1');
+INSERT INTO pageviews VALUES (2, 'User_2', 'Page_2');
+
+-- Query data
+SELECT * FROM pageviews EMIT CHANGES;
+
+-- Create derived stream
+CREATE STREAM pageviews_female AS
+    SELECT * FROM pageviews
+    WHERE userid LIKE '%female%'
+    EMIT CHANGES;
+```
+
+For detailed KSQL integration instructions, see [docs/KSQL_INTEGRATION_GUIDE.md](docs/KSQL_INTEGRATION_GUIDE.md).
 
 ## 🎯 Operational Modes
 
