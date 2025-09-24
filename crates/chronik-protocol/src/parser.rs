@@ -390,6 +390,11 @@ impl<'a> Encoder<'a> {
     pub fn debug_buffer(&self) -> Vec<u8> {
         self.buf.to_vec()
     }
+
+    /// Get the current position in the buffer
+    pub fn position(&self) -> usize {
+        self.buf.len()
+    }
     
     /// Write a boolean
     pub fn write_bool(&mut self, value: bool) {

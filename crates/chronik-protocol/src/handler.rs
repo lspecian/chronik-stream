@@ -1378,6 +1378,9 @@ impl ProtocolHandler {
         match self.encode_metadata_response(&mut body_buf, &response, header.api_version) {
             Ok(_) => {
                 // Response encoded successfully
+                tracing::debug!("Metadata response body encoded, length={}, first 32 bytes: {:02x?}",
+                    body_buf.len(),
+                    &body_buf[..body_buf.len().min(32)]);
             }
             Err(e) => {
                 return Err(e);
@@ -4100,18 +4103,20 @@ impl ProtocolHandler {
             }
         }
 
-        // Cluster ID comes before controller ID for v2+
+        // Controller ID comes immediately after brokers for v1+
+        if version >= 1 {
+            tracing::debug!("Writing controller_id {} at position {}", response.controller_id, encoder.position());
+            encoder.write_i32(response.controller_id);
+        }
+
+        // Cluster ID comes after controller ID for v2+
         if version >= 2 {
+            tracing::debug!("Writing cluster_id {:?} at position {}", response.cluster_id, encoder.position());
             if flexible {
                 encoder.write_compact_string(response.cluster_id.as_deref());
             } else {
                 encoder.write_string(response.cluster_id.as_deref());
             }
-        }
-
-        // Controller ID comes after brokers and cluster_id for v1+
-        if version >= 1 {
-            encoder.write_i32(response.controller_id);
         }
         
         // Cluster authorized operations (v8-v10 only, librdkafka doesn't read for v11+)
@@ -4222,8 +4227,11 @@ impl ProtocolHandler {
         }
 
         // Log final encoded size for debugging
-        let final_size = encoder.debug_buffer().len();
+        let final_buffer = encoder.debug_buffer();
+        let final_size = final_buffer.len();
         tracing::info!("Metadata response v{} encoded successfully: {} bytes", version, final_size);
+        tracing::debug!("Final metadata response body: first 32 bytes: {:02x?}",
+            &final_buffer[..final_buffer.len().min(32)]);
 
         Ok(())
     }
