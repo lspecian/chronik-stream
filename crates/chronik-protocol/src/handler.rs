@@ -1492,11 +1492,11 @@ impl ProtocolHandler {
                 if flexible {
                     let tag_count = decoder.read_unsigned_varint()?;
                     tracing::debug!("Partition tagged fields: {}", tag_count);
-                    // Skip any tagged fields  
+                    // Skip any tagged fields
                     for _ in 0..tag_count {
                         let tag_id = decoder.read_unsigned_varint()?;
                         let tag_size = decoder.read_unsigned_varint()? as usize;
-                        decoder.advance(tag_size);
+                        decoder.advance(tag_size)?;
                     }
                 }
             }
@@ -1509,7 +1509,7 @@ impl ProtocolHandler {
                 for _ in 0..tag_count {
                     let tag_id = decoder.read_unsigned_varint()?;
                     let tag_size = decoder.read_unsigned_varint()? as usize;
-                    decoder.advance(tag_size);
+                    decoder.advance(tag_size)?;
                 }
             }
             
@@ -1527,7 +1527,7 @@ impl ProtocolHandler {
             for _ in 0..tag_count {
                 let tag_id = decoder.read_unsigned_varint()?;
                 let tag_size = decoder.read_unsigned_varint()? as usize;
-                decoder.advance(tag_size);
+                decoder.advance(tag_size)?;
             }
         }
         
@@ -3494,7 +3494,7 @@ impl ProtocolHandler {
                     for _ in 0..tag_count {
                         let _tag_id = decoder.read_unsigned_varint()?;
                         let tag_size = decoder.read_unsigned_varint()? as usize;
-                        decoder.advance(tag_size);
+                        decoder.advance(tag_size)?;
                     }
                 }
             }
@@ -3510,7 +3510,7 @@ impl ProtocolHandler {
                 for _ in 0..tag_count {
                     let _tag_id = decoder.read_unsigned_varint()?;
                     let tag_size = decoder.read_unsigned_varint()? as usize;
-                    decoder.advance(tag_size);
+                    decoder.advance(tag_size)?;
                 }
             }
         }
@@ -3521,7 +3521,7 @@ impl ProtocolHandler {
             for _ in 0..tag_count {
                 let _tag_id = decoder.read_unsigned_varint()?;
                 let tag_size = decoder.read_unsigned_varint()? as usize;
-                decoder.advance(tag_size);
+                decoder.advance(tag_size)?;
             }
         }
 

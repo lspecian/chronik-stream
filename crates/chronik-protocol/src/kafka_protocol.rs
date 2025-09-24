@@ -307,6 +307,14 @@ impl ProtocolUtils {
         for _ in 0..num_fields {
             let _tag = Self::read_unsigned_varint(buf)?;
             let size = Self::read_unsigned_varint(buf)?;
+
+            // Check we have enough bytes before advancing
+            if buf.remaining() < size as usize {
+                return Err(Error::Protocol(format!(
+                    "Cannot advance {} bytes in tagged field, only {} remaining",
+                    size, buf.remaining()
+                )));
+            }
             buf.advance(size as usize);
         }
         Ok(())

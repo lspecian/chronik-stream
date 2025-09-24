@@ -324,8 +324,15 @@ impl<'a> Decoder<'a> {
     }
     
     /// Advance the buffer by n bytes
-    pub fn advance(&mut self, n: usize) {
+    pub fn advance(&mut self, n: usize) -> Result<()> {
+        if self.buf.remaining() < n {
+            return Err(Error::Protocol(format!(
+                "Cannot advance {} bytes, only {} remaining",
+                n, self.buf.remaining()
+            )));
+        }
         self.buf.advance(n);
+        Ok(())
     }
     
     /// Read an unsigned varint
@@ -555,11 +562,23 @@ pub fn parse_request_header_with_correlation(buf: &mut Bytes) -> Result<(Request
     // Skip tagged fields if flexible
     if flexible {
         let tagged_field_count = decoder.read_unsigned_varint()?;
+        tracing::trace!("Skipping {} tagged fields in request header", tagged_field_count);
+
         // Actually skip the tagged field data
-        for _ in 0..tagged_field_count {
-            let _tag_id = decoder.read_unsigned_varint()?;
+        for i in 0..tagged_field_count {
+            let tag_id = decoder.read_unsigned_varint()?;
             let tag_size = decoder.read_unsigned_varint()? as usize;
-            decoder.advance(tag_size);
+
+            // Add safety check for unreasonable tag sizes
+            if tag_size > 1_000_000 {
+                return Err(Error::Protocol(format!(
+                    "Tagged field {} has unreasonable size: {} bytes",
+                    tag_id, tag_size
+                )));
+            }
+
+            tracing::trace!("Skipping tagged field {}: tag_id={}, size={}", i, tag_id, tag_size);
+            decoder.advance(tag_size)?;
         }
     }
     

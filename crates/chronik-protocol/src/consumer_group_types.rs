@@ -56,7 +56,7 @@ impl DescribeGroupsRequest {
         // Skip tagged fields for flexible versions
         if version >= 5 {
             let tag_section_size = decoder.read_unsigned_varint()? as usize;
-            decoder.advance(tag_section_size);
+            decoder.advance(tag_section_size)?;
         }
         
         Ok(Self {
@@ -273,7 +273,7 @@ impl ListConsumerGroupOffsetsRequest {
         // Skip tagged fields for flexible versions
         if version >= 8 {
             let tag_section_size = decoder.read_unsigned_varint()? as usize;
-            decoder.advance(tag_section_size);
+            decoder.advance(tag_section_size)?;
         }
         
         Ok(Self {
