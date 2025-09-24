@@ -1356,7 +1356,6 @@ impl ProtocolHandler {
         };
         
         let response = MetadataResponse {
-            correlation_id: header.correlation_id,
             throttle_time_ms: 0,
             brokers,
             cluster_id: Some("chronik-stream".to_string()),
@@ -4052,7 +4051,10 @@ impl ProtocolHandler {
         
         // Throttle time (v3+ always, regardless of flexible)
         if version >= 3 {
+            tracing::debug!("Writing throttle_time_ms={} for v{}", response.throttle_time_ms, version);
             encoder.write_i32(response.throttle_time_ms);
+        } else {
+            tracing::debug!("NOT writing throttle_time for v{} (only for v3+)", version);
         }
 
         // Brokers array

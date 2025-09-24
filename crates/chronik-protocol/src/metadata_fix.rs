@@ -15,8 +15,7 @@ pub fn encode_metadata_response_versioned(
     let mut buf = BytesMut::new();
     let mut encoder = Encoder::new(&mut buf);
     
-    // Correlation ID is always first
-    encoder.write_i32(response.correlation_id);
+    // Note: correlation_id is handled in the response header, not the body
     
     // Throttle time only for v3+
     if version >= 3 {

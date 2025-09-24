@@ -56,12 +56,16 @@ def test_metadata_v1(port=9094):
         # Parse response
         print("\n=== Response Analysis ===")
         print(f"Full response hex (first 64 bytes): {response[:64].hex()}")
+        print(f"Breaking down the response:")
+        print(f"  Bytes 0-3 (correlation_id): {response[0:4].hex()} = {struct.unpack('>i', response[0:4])[0]}")
+        print(f"  Bytes 4-7 (mystery field): {response[4:8].hex()} = {struct.unpack('>i', response[4:8])[0]}")
+        print(f"  Bytes 8-11 (broker count?): {response[8:12].hex()} = {struct.unpack('>i', response[8:12])[0]}")
 
         # Parse header
         offset = 0
         correlation_id = struct.unpack('>i', response[offset:offset+4])[0]
         offset += 4
-        print(f"Correlation ID: {correlation_id}")
+        print(f"\nParsed Correlation ID: {correlation_id}")
 
         # For v1, there should be NO throttle_time_ms field!
         # Next should be brokers array count

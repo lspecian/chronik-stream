@@ -174,7 +174,6 @@ pub struct MetadataRequest {
 /// Metadata response
 #[derive(Debug, Clone)]
 pub struct MetadataResponse {
-    pub correlation_id: i32,
     pub throttle_time_ms: i32,
     pub brokers: Vec<MetadataBroker>,
     pub cluster_id: Option<String>,
@@ -483,8 +482,7 @@ impl Response {
         
         match self {
             Response::Metadata(resp) => {
-                // Correlation ID
-                bytes.extend_from_slice(&resp.correlation_id.to_be_bytes());
+                // Note: correlation_id is handled in the response header, not here
                 
                 // Throttle time only for v3+
                 if api_version >= 3 {

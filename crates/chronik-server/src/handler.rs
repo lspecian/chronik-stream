@@ -291,7 +291,6 @@ impl RequestHandler {
         }
         
         Ok(Response::Metadata(MetadataResponse {
-            correlation_id,
             throttle_time_ms: 0,
             brokers,
             cluster_id: Some("chronik-stream".to_string()),
