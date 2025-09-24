@@ -820,6 +820,11 @@ impl ProtocolHandler {
     
     /// Handle a raw request and return a response
     pub async fn handle_request(&self, request_bytes: &[u8]) -> Result<Response> {
+        // Log request for debugging (first 64 bytes)
+        let preview_len = request_bytes.len().min(64);
+        tracing::debug!("Received {} byte request, first {} bytes: {:02x?}",
+                       request_bytes.len(), preview_len, &request_bytes[..preview_len]);
+
         let mut buf = Bytes::copy_from_slice(request_bytes);
 
         // Use the new parsing function that preserves correlation ID

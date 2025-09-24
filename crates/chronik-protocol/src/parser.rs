@@ -326,6 +326,13 @@ impl<'a> Decoder<'a> {
     /// Advance the buffer by n bytes
     pub fn advance(&mut self, n: usize) -> Result<()> {
         if self.buf.remaining() < n {
+            // Log the buffer contents for debugging
+            let preview_len = self.buf.remaining().min(100);
+            let preview_bytes: Vec<u8> = self.buf.chunk()[..preview_len].to_vec();
+            tracing::error!(
+                "Cannot advance {} bytes, only {} remaining. Buffer preview (first {} bytes): {:02x?}",
+                n, self.buf.remaining(), preview_len, preview_bytes
+            );
             return Err(Error::Protocol(format!(
                 "Cannot advance {} bytes, only {} remaining",
                 n, self.buf.remaining()
@@ -339,21 +346,29 @@ impl<'a> Decoder<'a> {
     pub fn read_unsigned_varint(&mut self) -> Result<u32> {
         let mut value = 0u32;
         let mut i = 0;
-        
+        let mut bytes_read = Vec::new();
+
         loop {
             if !self.buf.has_remaining() {
+                tracing::error!("Incomplete varint after {} bytes: {:02x?}", bytes_read.len(), bytes_read);
                 return Err(Error::Protocol("Incomplete varint".into()));
             }
-            
+
             let byte = self.buf.get_u8();
+            bytes_read.push(byte);
             value |= ((byte & 0x7F) as u32) << (i * 7);
-            
+
             if byte & 0x80 == 0 {
+                // Only log for suspiciously large values
+                if value > 10000 {
+                    tracing::warn!("Read varint value {} from bytes {:02x?}", value, bytes_read);
+                }
                 return Ok(value);
             }
-            
+
             i += 1;
             if i >= 5 {
+                tracing::error!("Varint too long, bytes read: {:02x?}, partial value: {}", bytes_read, value);
                 return Err(Error::Protocol("Varint too long".into()));
             }
         }

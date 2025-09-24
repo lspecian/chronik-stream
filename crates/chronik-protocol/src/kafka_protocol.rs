@@ -304,12 +304,43 @@ impl ProtocolUtils {
     /// Read tagged fields (skip for now)
     pub fn read_tagged_fields(buf: &mut dyn Buf) -> Result<()> {
         let num_fields = Self::read_unsigned_varint(buf)?;
-        for _ in 0..num_fields {
-            let _tag = Self::read_unsigned_varint(buf)?;
+        tracing::debug!("Reading {} tagged fields, buffer has {} bytes remaining",
+                       num_fields, buf.remaining());
+
+        for i in 0..num_fields {
+            let tag = Self::read_unsigned_varint(buf)?;
             let size = Self::read_unsigned_varint(buf)?;
+
+            tracing::debug!("Tagged field {}: tag={}, size={}, remaining={}",
+                          i, tag, size, buf.remaining());
+
+            // Safety check for unreasonable sizes (likely misparse)
+            if size > 1_000_000 {
+                tracing::error!("Tagged field size {} is unreasonably large (tag={}), likely protocol mismatch",
+                              size, tag);
+                // Log buffer contents for debugging
+                let preview_len = buf.remaining().min(100);
+                let mut preview = vec![0u8; preview_len];
+                buf.copy_to_slice(&mut preview[..preview_len]);
+                tracing::error!("Buffer preview when size too large: {:02x?}", preview);
+                return Err(Error::Protocol(format!(
+                    "Tagged field size {} is unreasonably large",
+                    size
+                )));
+            }
 
             // Check we have enough bytes before advancing
             if buf.remaining() < size as usize {
+                // Log detailed error information
+                let preview_len = buf.remaining().min(100);
+                let mut preview = vec![0u8; preview_len];
+                for (i, byte) in buf.chunk().iter().take(preview_len).enumerate() {
+                    preview[i] = *byte;
+                }
+                tracing::error!(
+                    "Cannot advance {} bytes in tagged field (tag={}, field_index={}), only {} remaining. Buffer: {:02x?}",
+                    size, tag, i, buf.remaining(), preview
+                );
                 return Err(Error::Protocol(format!(
                     "Cannot advance {} bytes in tagged field, only {} remaining",
                     size, buf.remaining()
