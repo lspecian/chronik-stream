@@ -303,7 +303,22 @@ impl ProtocolUtils {
     
     /// Read tagged fields (skip for now)
     pub fn read_tagged_fields(buf: &mut dyn Buf) -> Result<()> {
+        // First check if we have any data at all
+        if !buf.has_remaining() {
+            tracing::debug!("No data for tagged fields, assuming 0 fields");
+            return Ok(());
+        }
+
         let num_fields = Self::read_unsigned_varint(buf)?;
+
+        // Sanity check: if num_fields is unreasonably large, we're probably misaligned
+        if num_fields > 100 {
+            tracing::warn!("Suspicious number of tagged fields: {}. Buffer might be misaligned. First bytes: {:02x?}",
+                         num_fields, &buf.chunk()[..buf.remaining().min(10)]);
+            // Treat as 0 fields to avoid parsing garbage
+            return Ok(());
+        }
+
         tracing::debug!("Reading {} tagged fields, buffer has {} bytes remaining",
                        num_fields, buf.remaining());
 
@@ -318,10 +333,9 @@ impl ProtocolUtils {
             if size > 1_000_000 {
                 tracing::error!("Tagged field size {} is unreasonably large (tag={}), likely protocol mismatch",
                               size, tag);
-                // Log buffer contents for debugging
+                // Log buffer contents for debugging WITHOUT consuming it
                 let preview_len = buf.remaining().min(100);
-                let mut preview = vec![0u8; preview_len];
-                buf.copy_to_slice(&mut preview[..preview_len]);
+                let preview: Vec<u8> = buf.chunk()[..preview_len].to_vec();
                 tracing::error!("Buffer preview when size too large: {:02x?}", preview);
                 return Err(Error::Protocol(format!(
                     "Tagged field size {} is unreasonably large",

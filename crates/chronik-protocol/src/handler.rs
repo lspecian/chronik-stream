@@ -114,14 +114,20 @@ impl ProtocolHandler {
         // - DescribeCluster v0: headerVersion=1 (non-flexible)
         // - DescribeCluster v1: headerVersion=2 (flexible)
         //
+        // Metadata response header versions:
+        // - Metadata v0-v8: headerVersion=0 (non-flexible, no tagged fields)
+        // - Metadata v9+: headerVersion=1 (flexible, has tagged fields)
+        //
         // This is DIFFERENT from most other APIs where ApiVersions v3+ negotiation affects all headers.
-        // DescribeCluster is special in that its header version is tied to the API version itself.
+        // DescribeCluster and Metadata are special in that their header versions are tied to the API version itself.
         let header_has_tagged_fields = if api_key == ApiKey::ApiVersions {
             false  // ApiVersions response header NEVER has tagged fields
         } else if api_key == ApiKey::DescribeCluster && header.api_version == 0 {
             false  // DescribeCluster v0 uses NON-flexible headers
+        } else if api_key == ApiKey::Metadata && header.api_version < 9 {
+            false  // Metadata v0-v8 use NON-flexible headers
         } else {
-            // For other APIs and DescribeCluster v1+, use flexible headers
+            // For other APIs and DescribeCluster v1+/Metadata v9+, use flexible headers
             // when the client has negotiated ApiVersions v3+
             true
         };

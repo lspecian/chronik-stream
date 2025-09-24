@@ -429,16 +429,43 @@ impl IntegratedKafkaServer {
                             }
                             
                             let request_size = i32::from_be_bytes(size_buf) as usize;
-                            if request_size == 0 || request_size > 10_000_000 {
-                                error!("Invalid request size {} from {}", request_size, addr);
-                                break;
+
+                            // Check for suspicious size values that might indicate protocol mismatch
+                            // Common issue: "5.0\0" (0x35, 0x2e, 0x30, 0x00) = 892219392 bytes
+                            if request_size > 100_000_000 {
+                                // This is likely not a Kafka request - might be version string or other protocol
+                                let size_str = String::from_utf8_lossy(&size_buf);
+                                warn!("Suspicious request size {} ({} bytes) from {} - might be protocol mismatch. Bytes as string: '{}', hex: {:02x?}",
+                                      request_size, request_size, addr, size_str, size_buf);
+
+                                // Try to recover by consuming any remaining data and continuing
+                                // Read and discard up to 1KB of data to clear the buffer
+                                let mut discard_buf = vec![0u8; 1024];
+                                let _ = socket.try_read(&mut discard_buf);
+
+                                // Continue to next request instead of breaking connection
+                                continue;
                             }
-                            
+
+                            if request_size == 0 || request_size > 10_000_000 {
+                                error!("Invalid request size {} from {} (bytes: {:02x?})", request_size, addr, size_buf);
+
+                                // Try to recover instead of breaking connection
+                                // Clear the socket buffer and continue
+                                let mut discard_buf = vec![0u8; 1024];
+                                while let Ok(n) = socket.try_read(&mut discard_buf) {
+                                    if n == 0 { break; }
+                                }
+
+                                // Continue to next request
+                                continue;
+                            }
+
                             // Resize buffer if needed
                             if request_buffer.len() < request_size {
                                 request_buffer.resize(request_size, 0);
                             }
-                            
+
                             // Read the request body
                             match socket.read_exact(&mut request_buffer[..request_size]).await {
                                 Ok(_) => {},
