@@ -1,0 +1,46 @@
+version: '3.8'
+
+services:
+  chronik:
+    build:
+      context: ../..
+      dockerfile: tests/integration/Dockerfile.test
+    ports:
+      - "9092:9092"
+    environment:
+      - RUST_LOG=debug,chronik=trace
+      - CHRONIK_PORT=9092
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "9092"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - chronik-test
+
+  test-runner:
+    build:
+      context: .
+      dockerfile: Dockerfile.tests
+    depends_on:
+      chronik:
+        condition: service_healthy
+    environment:
+      - CHRONIK_HOST=chronik
+      - CHRONIK_PORT=9092
+    volumes:
+      - ./test_results:/test_results
+    networks:
+      - chronik-test
+    command: >
+      sh -c "
+        echo 'Waiting for Chronik to be ready...' &&
+        sleep 5 &&
+        echo 'Running integration tests...' &&
+        python3 -m pytest test_kafka_clients.py -v --junit-xml=/test_results/junit.xml &&
+        python3 test_regression.py
+      "
+
+networks:
+  chronik-test:
+    driver: bridge

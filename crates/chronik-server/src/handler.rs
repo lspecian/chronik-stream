@@ -297,6 +297,7 @@ impl RequestHandler {
             cluster_id: Some("chronik-stream".to_string()),
             controller_id: 1,
             topics,
+            cluster_authorized_operations: None,
         }))
     }
     

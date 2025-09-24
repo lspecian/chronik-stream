@@ -180,6 +180,7 @@ pub struct MetadataResponse {
     pub cluster_id: Option<String>,
     pub controller_id: i32,
     pub topics: Vec<MetadataTopic>,
+    pub cluster_authorized_operations: Option<i32>,
 }
 
 /// Metadata broker

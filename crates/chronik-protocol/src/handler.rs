@@ -1351,6 +1351,7 @@ impl ProtocolHandler {
             cluster_id: Some("chronik-stream".to_string()),
             controller_id: self.broker_id, // Use actual broker ID
             topics,
+            cluster_authorized_operations: if header.api_version >= 8 { Some(-2147483648) } else { None },
         };
         tracing::info!("Metadata response has {} topics and {} brokers", 
                       response.topics.len(), response.brokers.len());
@@ -4003,10 +4004,37 @@ impl ProtocolHandler {
     ) -> Result<()> {
         let mut encoder = Encoder::new(buf);
 
-        tracing::debug!("Encoding Metadata response v{}, brokers={}, topics={}",
-                  version, response.brokers.len(), response.topics.len());
-        tracing::info!("Encoding metadata response v{} with {} topics, {} brokers, throttle_time: {}", 
+        // Validate and log metadata response structure
+        tracing::info!("Encoding metadata response v{} with {} topics, {} brokers, throttle_time: {}",
                       version, response.topics.len(), response.brokers.len(), response.throttle_time_ms);
+
+        // Log broker details
+        for (i, broker) in response.brokers.iter().enumerate() {
+            tracing::debug!("  Broker[{}]: node_id={}, host={}, port={}, rack={:?}",
+                          i, broker.node_id, broker.host, broker.port, broker.rack);
+        }
+
+        // Log topic details
+        for (i, topic) in response.topics.iter().enumerate() {
+            tracing::debug!("  Topic[{}]: name={}, error_code={}, partitions={}, is_internal={}",
+                          i, &topic.name,
+                          topic.error_code, topic.partitions.len(), topic.is_internal);
+
+            // Sample first partition if exists
+            if let Some(partition) = topic.partitions.first() {
+                tracing::debug!("    Partition[0]: index={}, leader={}, replicas={:?}, isr={:?}, error_code={}",
+                              partition.partition_index, partition.leader_id,
+                              partition.replica_nodes, partition.isr_nodes, partition.error_code);
+            }
+        }
+
+        // Validate response has required fields
+        if response.brokers.is_empty() {
+            tracing::warn!("Metadata response has no brokers - this may cause client issues");
+        }
+        if response.cluster_id.is_none() && version >= 2 {
+            tracing::warn!("Metadata response missing cluster_id for v{} - clients may reject", version);
+        }
         
         // Check if this is a flexible/compact version (v9+)
         let flexible = version >= 9;
@@ -4015,11 +4043,8 @@ impl ProtocolHandler {
         if version >= 3 {
             encoder.write_i32(response.throttle_time_ms);
         }
-        
+
         // Brokers array
-        for (i, broker) in response.brokers.iter().enumerate() {
-        }
-        
         tracing::debug!("About to encode {} brokers", response.brokers.len());
         
         // Get buffer position before writing
@@ -4168,13 +4193,24 @@ impl ProtocolHandler {
                 encoder.write_tagged_fields();
             }
         }
-        
-        // Remove duplicate cluster_authorized_operations - already written above
-        
+
+        // Cluster authorized operations (v8+)
+        if version >= 8 {
+            if let Some(ops) = response.cluster_authorized_operations {
+                encoder.write_i32(ops);
+            } else {
+                encoder.write_i32(-2147483648); // INT32_MIN means "null"
+            }
+        }
+
         if flexible {
             encoder.write_tagged_fields();
         }
-        
+
+        // Log final encoded size for debugging
+        let final_size = encoder.debug_buffer().len();
+        tracing::info!("Metadata response v{} encoded successfully: {} bytes", version, final_size);
+
         Ok(())
     }
     

@@ -1,96 +1,80 @@
 #!/bin/bash
-#
-# Main test runner for Chronik Stream
-#
-
 set -e
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+echo "================================================"
+echo "Chronik Stream Integration Test Suite"
+echo "================================================"
 
 # Colors for output
-GREEN='\033[0;32m'
-BLUE='\033[0;34m'
 RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
-echo -e "${BLUE}=== Chronik Stream Test Suite ===${NC}"
+# Check if Chronik is already running
+if lsof -Pi :9092 -sTCP:LISTEN -t >/dev/null ; then
+    echo -e "${YELLOW}Chronik already running on port 9092${NC}"
+    CHRONIK_PID=""
+else
+    echo "Starting Chronik server..."
+    cargo build --release
+    ./target/release/chronik-server &
+    CHRONIK_PID=$!
+    echo "Chronik started with PID $CHRONIK_PID"
 
-# Function to run a test category
-run_test_category() {
-    local category=$1
-    local description=$2
-    
-    echo -e "\n${BLUE}Running ${description}...${NC}"
-    
-    if [ -d "tests/python/${category}" ]; then
-        cd tests/python
-        python -m pytest "${category}/" -v --tb=short
-        cd ../..
-    else
-        echo -e "${RED}Directory tests/python/${category} not found${NC}"
-        return 1
-    fi
-}
+    # Wait for Chronik to be ready
+    echo "Waiting for Chronik to be ready..."
+    for i in {1..30}; do
+        if nc -z localhost 9092 2>/dev/null; then
+            echo -e "${GREEN}Chronik is ready${NC}"
+            break
+        fi
+        sleep 1
+    done
+fi
 
-# Parse command line arguments
-TEST_TYPE=${1:-all}
+# Run regression tests
+echo ""
+echo "Running regression tests..."
+python3 tests/integration/test_regression.py
+REGRESSION_EXIT=$?
 
-case $TEST_TYPE in
-    all)
-        echo "Running all tests..."
-        
-        # Run Rust tests
-        echo -e "\n${BLUE}Running Rust tests...${NC}"
-        cargo test
-        
-        # Run Python tests
-        run_test_category "protocol" "Protocol Compatibility Tests"
-        run_test_category "integration" "Integration Tests"
-        run_test_category "performance" "Performance Tests"
-        ;;
-        
-    rust)
-        echo -e "\n${BLUE}Running Rust tests...${NC}"
-        cargo test
-        ;;
-        
-    protocol)
-        run_test_category "protocol" "Protocol Compatibility Tests"
-        ;;
-        
-    integration)
-        run_test_category "integration" "Integration Tests"
-        ;;
-        
-    performance)
-        run_test_category "performance" "Performance Tests"
-        ;;
-        
-    quick)
-        echo "Running quick smoke tests..."
-        
-        # Run a subset of fast tests
-        echo -e "\n${BLUE}Running Rust unit tests...${NC}"
-        cargo test --lib
-        
-        echo -e "\n${BLUE}Running basic integration tests...${NC}"
-        cd tests/python
-        python integration/simple_kafka_test.py
-        cd ../..
-        ;;
-        
-    *)
-        echo "Usage: $0 [all|rust|protocol|integration|performance|quick]"
-        echo ""
-        echo "  all         - Run all tests (default)"
-        echo "  rust        - Run only Rust tests"
-        echo "  protocol    - Run protocol compatibility tests"
-        echo "  integration - Run integration tests"
-        echo "  performance - Run performance tests"
-        echo "  quick       - Run quick smoke tests"
-        exit 1
-        ;;
-esac
+# Run integration tests
+echo ""
+echo "Running integration tests..."
+python3 tests/integration/test_kafka_clients.py
+INTEGRATION_EXIT=$?
 
-echo -e "\n${GREEN}✓ Test suite completed${NC}"
+# Clean up
+if [ ! -z "$CHRONIK_PID" ]; then
+    echo ""
+    echo "Stopping Chronik..."
+    kill $CHRONIK_PID 2>/dev/null || true
+    wait $CHRONIK_PID 2>/dev/null || true
+fi
+
+# Report results
+echo ""
+echo "================================================"
+echo "Test Results:"
+echo "================================================"
+
+if [ $REGRESSION_EXIT -eq 0 ]; then
+    echo -e "${GREEN}✓ Regression tests PASSED${NC}"
+else
+    echo -e "${RED}✗ Regression tests FAILED${NC}"
+fi
+
+if [ $INTEGRATION_EXIT -eq 0 ]; then
+    echo -e "${GREEN}✓ Integration tests PASSED${NC}"
+else
+    echo -e "${RED}✗ Integration tests FAILED${NC}"
+fi
+
+# Exit with failure if any tests failed
+if [ $REGRESSION_EXIT -ne 0 ] || [ $INTEGRATION_EXIT -ne 0 ]; then
+    exit 1
+fi
+
+echo -e "${GREEN}All tests passed!${NC}"
+exit 0
