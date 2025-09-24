@@ -427,70 +427,10 @@ impl IntegratedKafkaServer {
                                     break;
                                 }
                             }
-
-                            // Check for non-Kafka protocols
-                            // Common patterns:
-                            // - HTTP: "GET ", "POST", "PUT ", "HEAD", "HTTP"
-                            // - Version strings: "5.0\0" (0x35 0x2E 0x30 0x00) (seen from Kafka UI)
-                            // - TLS handshake: 0x16 (22) as first byte
-
-                            // Specifically check for "5.0\0" pattern from Kafka UI
-                            if size_buf == [0x35, 0x2e, 0x30, 0x00] { // "5.0\0"
-                                warn!("Kafka UI version string detected from {}: '5.0' (bytes: {:02x?})",
-                                      addr, size_buf);
-
-                                // Send a minimal HTTP response to inform the client
-                                let http_response = b"HTTP/1.1 400 Bad Request\r\n\
-                                                     Content-Type: text/plain\r\n\
-                                                     Content-Length: 115\r\n\
-                                                     \r\n\
-                                                     This is a Kafka protocol server. Kafka UI sent '5.0' version string instead of Kafka protocol. Check UI config.";
-
-                                let _ = socket.write_all(http_response).await;
-                                let _ = socket.flush().await;
-                                break;
-                            }
-
-                            // Check for HTTP methods - be specific to avoid false positives
-                            // HTTP methods: GET, POST, PUT, HEAD, DELETE, PATCH, OPTIONS
-                            let is_http = match &size_buf {
-                                [0x47, 0x45, 0x54, 0x20] => true, // "GET "
-                                [0x50, 0x4f, 0x53, 0x54] => true, // "POST"
-                                [0x50, 0x55, 0x54, 0x20] => true, // "PUT "
-                                [0x48, 0x45, 0x41, 0x44] => true, // "HEAD"
-                                [0x48, 0x54, 0x54, 0x50] => true, // "HTTP"
-                                _ => false,
-                            };
-
-                            if is_http {
-                                // This looks like HTTP or a version string
-                                let preview = String::from_utf8_lossy(&size_buf);
-                                warn!("Non-Kafka protocol detected from {}: '{}' (bytes: {:02x?})",
-                                      addr, preview, size_buf);
-
-                                // Send a minimal HTTP response to inform the client
-                                let http_response = b"HTTP/1.1 400 Bad Request\r\n\
-                                                     Content-Type: text/plain\r\n\
-                                                     Content-Length: 89\r\n\
-                                                     \r\n\
-                                                     This is a Kafka protocol server. Please use a Kafka client, not HTTP or version strings.";
-
-                                let _ = socket.write_all(http_response).await;
-                                let _ = socket.flush().await;
-                                break;
-                            }
-
-                            // Check for TLS handshake (client trying SSL on non-SSL port)
-                            if size_buf[0] == 0x16 {
-                                warn!("TLS handshake detected from {} on non-TLS port", addr);
-                                // Just close the connection, TLS negotiation won't work
-                                break;
-                            }
-
+                            
                             let request_size = i32::from_be_bytes(size_buf) as usize;
                             if request_size == 0 || request_size > 10_000_000 {
-                                error!("Invalid request size {} from {} (bytes: {:02x?})",
-                                       request_size, addr, size_buf);
+                                error!("Invalid request size {} from {}", request_size, addr);
                                 break;
                             }
                             
