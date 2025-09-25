@@ -185,7 +185,7 @@ impl ProtocolParser {
         versions.insert(ApiKey::Produce, VersionInfo { min_version: 0, max_version: 9 });
         versions.insert(ApiKey::Fetch, VersionInfo { min_version: 0, max_version: 13 });
         versions.insert(ApiKey::ListOffsets, VersionInfo { min_version: 0, max_version: 7 });
-        versions.insert(ApiKey::Metadata, VersionInfo { min_version: 0, max_version: 12 });
+        versions.insert(ApiKey::Metadata, VersionInfo { min_version: 0, max_version: 9 }); // Actually tested up to v9
         versions.insert(ApiKey::OffsetCommit, VersionInfo { min_version: 0, max_version: 8 });
         versions.insert(ApiKey::OffsetFetch, VersionInfo { min_version: 0, max_version: 8 });
         versions.insert(ApiKey::FindCoordinator, VersionInfo { min_version: 0, max_version: 4 });
