@@ -4103,13 +4103,7 @@ impl ProtocolHandler {
             }
         }
 
-        // Controller ID comes immediately after brokers for v1+
-        if version >= 1 {
-            tracing::debug!("Writing controller_id {} at position {}", response.controller_id, encoder.position());
-            encoder.write_i32(response.controller_id);
-        }
-
-        // Cluster ID comes after controller ID for v2+
+        // Cluster ID comes after brokers for v2+
         if version >= 2 {
             tracing::debug!("Writing cluster_id {:?} at position {}", response.cluster_id, encoder.position());
             if flexible {
@@ -4117,6 +4111,12 @@ impl ProtocolHandler {
             } else {
                 encoder.write_string(response.cluster_id.as_deref());
             }
+        }
+
+        // Controller ID comes after cluster_id for v2+, or directly after brokers for v1
+        if version >= 1 {
+            tracing::debug!("Writing controller_id {} at position {}", response.controller_id, encoder.position());
+            encoder.write_i32(response.controller_id);
         }
         
         // Cluster authorized operations (v8-v10 only, librdkafka doesn't read for v11+)
