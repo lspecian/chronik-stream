@@ -11,21 +11,44 @@ pub struct FindCoordinatorRequest {
     pub key_type: i8,
 }
 
-/// FindCoordinator response
+/// Single coordinator entry for v4+ batched response
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FindCoordinatorResponse {
-    /// Throttle time in milliseconds
-    pub throttle_time_ms: i32,
-    /// Error code
-    pub error_code: i16,
-    /// Error message
-    pub error_message: Option<String>,
+pub struct Coordinator {
+    /// Coordinator key
+    pub key: String,
     /// Coordinator node ID
     pub node_id: i32,
     /// Coordinator host
     pub host: String,
     /// Coordinator port
     pub port: i32,
+    /// Error code
+    pub error_code: i16,
+    /// Error message
+    pub error_message: Option<String>,
+}
+
+/// FindCoordinator response (supports both v0-v3 and v4+ formats)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FindCoordinatorResponse {
+    /// Throttle time in milliseconds
+    pub throttle_time_ms: i32,
+
+    // v0-v3 fields (for backward compatibility)
+    /// Error code (v0-v3 only)
+    pub error_code: i16,
+    /// Error message (v0-v3 only)
+    pub error_message: Option<String>,
+    /// Coordinator node ID (v0-v3 only)
+    pub node_id: i32,
+    /// Coordinator host (v0-v3 only)
+    pub host: String,
+    /// Coordinator port (v0-v3 only)
+    pub port: i32,
+
+    // v4+ fields
+    /// Coordinators array (v4+ only, for batched requests)
+    pub coordinators: Vec<Coordinator>,
 }
 
 /// Coordinator types

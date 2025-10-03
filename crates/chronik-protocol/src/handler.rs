@@ -3766,10 +3766,11 @@ impl ProtocolHandler {
         let response = FindCoordinatorResponse {
             throttle_time_ms: 0,
             error_code,
-            error_message,
+            error_message: error_message.clone(),
             node_id: 1, // This node
             host: "localhost".to_string(),
             port: 9092,
+            coordinators: vec![], // Empty for v0-v3
         };
         
         let mut body_buf = BytesMut::new();
