@@ -213,19 +213,49 @@ impl ProtocolHandler {
     pub fn parse_find_coordinator_request(&self, header: &RequestHeader, body: &mut Bytes) -> Result<crate::find_coordinator_types::FindCoordinatorRequest> {
         use crate::parser::Decoder;
         use crate::find_coordinator_types::FindCoordinatorRequest;
-        
+
         let mut decoder = Decoder::new(body);
-        
-        let key = decoder.read_string()?
-            .ok_or_else(|| Error::Protocol("Coordinator key cannot be null".into()))?;
-        
-        let key_type = if header.api_version >= 1 {
-            decoder.read_i8()?
+
+        // v4+ uses KIP-699 array format for coordinator_keys
+        if header.api_version >= 4 {
+            // Read compact array of coordinator keys
+            let array_length = decoder.read_unsigned_varint()? as usize;
+            if array_length == 0 {
+                return Err(Error::Protocol("FindCoordinator v4+ requires at least one coordinator key".into()));
+            }
+
+            let actual_length = array_length - 1; // Compact array encoding
+
+            // For now, we only support single coordinator lookup (KSQL uses one at a time)
+            // Read first coordinator key
+            let key = decoder.read_compact_string()?
+                .ok_or_else(|| Error::Protocol("Coordinator key cannot be null".into()))?;
+            let key_type = decoder.read_i8()?;
+
+            // Skip remaining coordinator keys if present (not used by KSQL)
+            for _ in 1..actual_length {
+                decoder.read_compact_string()?; // key
+                decoder.read_i8()?; // key_type
+            }
+
+            // Parse tagged fields for flexible version
+            let _tagged_fields_count = decoder.read_unsigned_varint()?;
+            // Skip tagged fields (we don't use them)
+
+            Ok(FindCoordinatorRequest { key, key_type })
         } else {
-            0 // GROUP type
-        };
-        
-        Ok(FindCoordinatorRequest { key, key_type })
+            // v0-v3: Single coordinator key
+            let key = decoder.read_string()?
+                .ok_or_else(|| Error::Protocol("Coordinator key cannot be null".into()))?;
+
+            let key_type = if header.api_version >= 1 {
+                decoder.read_i8()?
+            } else {
+                0 // GROUP type
+            };
+
+            Ok(FindCoordinatorRequest { key, key_type })
+        }
     }
     
     /// Parse JoinGroup request
@@ -484,21 +514,59 @@ impl ProtocolHandler {
     /// Encode FindCoordinator response
     pub fn encode_find_coordinator_response(&self, buf: &mut BytesMut, response: &crate::find_coordinator_types::FindCoordinatorResponse, version: i16) -> Result<()> {
         let mut encoder = Encoder::new(buf);
-        
+
         if version >= 1 {
             encoder.write_i32(response.throttle_time_ms);
         }
-        
-        encoder.write_i16(response.error_code);
-        
-        if version >= 1 {
-            encoder.write_string(response.error_message.as_deref());
+
+        if version >= 4 {
+            // v4+: KIP-699 array format
+            // Encode compact array of coordinators
+            let coordinators_count = if response.coordinators.is_empty() {
+                // If no coordinators array provided, create one from v0-v3 fields
+                1
+            } else {
+                response.coordinators.len()
+            };
+
+            encoder.write_unsigned_varint((coordinators_count + 1) as u32); // Compact array encoding
+
+            if response.coordinators.is_empty() {
+                // Use v0-v3 fields as single coordinator
+                encoder.write_compact_string(Some("")); // key (empty for response)
+                encoder.write_i32(response.node_id);
+                encoder.write_compact_string(Some(&response.host));
+                encoder.write_i32(response.port);
+                encoder.write_i16(response.error_code);
+                encoder.write_compact_string(response.error_message.as_deref());
+                encoder.write_unsigned_varint(0); // tagged fields
+            } else {
+                // Use coordinators array
+                for coord in &response.coordinators {
+                    encoder.write_compact_string(Some(&coord.key));
+                    encoder.write_i32(coord.node_id);
+                    encoder.write_compact_string(Some(&coord.host));
+                    encoder.write_i32(coord.port);
+                    encoder.write_i16(coord.error_code);
+                    encoder.write_compact_string(coord.error_message.as_deref());
+                    encoder.write_unsigned_varint(0); // tagged fields
+                }
+            }
+
+            encoder.write_unsigned_varint(0); // response-level tagged fields
+        } else {
+            // v0-v3: Single coordinator format
+            encoder.write_i16(response.error_code);
+
+            if version >= 1 {
+                encoder.write_string(response.error_message.as_deref());
+            }
+
+            encoder.write_i32(response.node_id);
+            encoder.write_string(Some(&response.host));
+            encoder.write_i32(response.port);
         }
-        
-        encoder.write_i32(response.node_id);
-        encoder.write_string(Some(&response.host));
-        encoder.write_i32(response.port);
-        
+
         Ok(())
     }
     

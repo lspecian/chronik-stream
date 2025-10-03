@@ -113,6 +113,16 @@ impl KafkaProtocolHandler {
                 let mut decoder = Decoder::new(&mut buf_for_parsing);
                 let flexible = header.api_version >= 9;
 
+                // CRITICAL: For flexible Metadata v9+, Java AdminClient sends 2 extra bytes before the body
+                // These bytes must be skipped before parsing the request
+                // Byte 1: Unknown (likely parsing artifact from client_id)
+                // Byte 2: Header tagged_fields count (0x00 = empty)
+                if flexible {
+                    decoder.read_i8()?; // Skip byte 1
+                    decoder.read_i8()?; // Skip byte 2 (header tagged_fields count)
+                    tracing::debug!("Skipped 2 extra bytes for flexible Metadata v{} in kafka_handler", header.api_version);
+                }
+
                 // Parse topics array
                 let topics = if header.api_version >= 1 {
                     let topic_count = if flexible {
@@ -261,7 +271,27 @@ impl KafkaProtocolHandler {
 
                 tracing::info!("ListOffsets request received, API version: {}", header.api_version);
 
+                let is_flexible = header.api_version >= 6;
+
+                // CRITICAL: For flexible ListOffsets v6+, Java AdminClient sends 2 extra bytes before the body
+                // Same issue as Metadata, ApiVersions, CreateTopics, and DescribeConfigs
+                // Byte 1: Unknown (likely parsing artifact from client_id)
+                // Byte 2: Header tagged_fields count (0x00 = empty)
+                if is_flexible {
+                    use bytes::Buf;
+                    let preview_len = buf.remaining().min(20);
+                    let preview: Vec<u8> = buf.chunk()[..preview_len].to_vec();
+                    tracing::debug!("ListOffsets v{} kafka_handler buffer ({} bytes total, showing first {}): {:02x?}",
+                        header.api_version, buf.remaining(), preview_len, preview);
+                }
+
                 let mut decoder = Decoder::new(&mut buf);
+
+                if is_flexible {
+                    decoder.read_i8()?; // Skip byte 1
+                    decoder.read_i8()?; // Skip byte 2 (header tagged_fields count)
+                    tracing::debug!("Skipped 2 extra bytes for flexible ListOffsets v{} in kafka_handler", header.api_version);
+                }
 
                 // Parse ListOffsets request
                 let _replica_id = decoder.read_i32()?;
@@ -271,14 +301,42 @@ impl KafkaProtocolHandler {
                     0
                 };
 
-                let topics_count = decoder.read_i32()?;
+                // Topics array - use compact array for v6+
+                let topics_count = if is_flexible {
+                    let count = decoder.read_unsigned_varint()? as i32;
+                    if count == 0 { 0 } else { count - 1 } // Compact array encoding
+                } else {
+                    decoder.read_i32()?
+                };
+
+                // Safety check to prevent capacity overflow panic
+                if topics_count < 0 || topics_count > 10000 {
+                    return Err(Error::Protocol(format!("Invalid topics count: {}", topics_count)));
+                }
                 let mut topics = Vec::with_capacity(topics_count as usize);
 
                 for _ in 0..topics_count {
-                    let topic_name = decoder.read_string()?
-                        .ok_or_else(|| Error::Protocol("Topic name cannot be null".into()))?;
+                    // Topic name - use compact string for v6+
+                    let topic_name = if is_flexible {
+                        decoder.read_compact_string()?
+                            .ok_or_else(|| Error::Protocol("Topic name cannot be null".into()))?
+                    } else {
+                        decoder.read_string()?
+                            .ok_or_else(|| Error::Protocol("Topic name cannot be null".into()))?
+                    };
 
-                    let partitions_count = decoder.read_i32()?;
+                    // Partitions array - use compact array for v6+
+                    let partitions_count = if is_flexible {
+                        let count = decoder.read_unsigned_varint()? as i32;
+                        if count == 0 { 0 } else { count - 1 }
+                    } else {
+                        decoder.read_i32()?
+                    };
+
+                    // Safety check
+                    if partitions_count < 0 || partitions_count > 10000 {
+                        return Err(Error::Protocol(format!("Invalid partitions count: {}", partitions_count)));
+                    }
                     let mut partitions = Vec::with_capacity(partitions_count as usize);
 
                     for _ in 0..partitions_count {
@@ -290,11 +348,21 @@ impl KafkaProtocolHandler {
                         };
                         let timestamp = decoder.read_i64()?;
 
+                        // Skip tagged fields for each partition in flexible versions
+                        if is_flexible {
+                            let _tagged_count = decoder.read_unsigned_varint()?;
+                        }
+
                         partitions.push(ListOffsetsRequestPartition {
                             partition_index,
                             current_leader_epoch,
                             timestamp,
                         });
+                    }
+
+                    // Skip tagged fields for each topic in flexible versions
+                    if is_flexible {
+                        let _tagged_count = decoder.read_unsigned_varint()?;
                     }
 
                     topics.push(ListOffsetsRequestTopic {

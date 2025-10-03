@@ -1283,14 +1283,27 @@ impl GroupManager {
         })
     }
     
-    pub fn handle_find_coordinator(&self, _request: chronik_protocol::find_coordinator_types::FindCoordinatorRequest, host: &str, port: i32) -> Result<chronik_protocol::find_coordinator_types::FindCoordinatorResponse> {
+    pub fn handle_find_coordinator(&self, request: chronik_protocol::find_coordinator_types::FindCoordinatorRequest, host: &str, port: i32) -> Result<chronik_protocol::find_coordinator_types::FindCoordinatorResponse> {
+        // Create coordinator entry for v4+
+        let coordinator = chronik_protocol::find_coordinator_types::Coordinator {
+            key: request.key,
+            node_id: 1,
+            host: host.to_string(),
+            port,
+            error_code: 0,
+            error_message: None,
+        };
+
         Ok(chronik_protocol::find_coordinator_types::FindCoordinatorResponse {
+            throttle_time_ms: 0,
+            // v0-v3 fields
             error_code: 0,
             error_message: None,
             node_id: 1,
             host: host.to_string(),
             port,
-            throttle_time_ms: 0,
+            // v4+ fields
+            coordinators: vec![coordinator],
         })
     }
 }
