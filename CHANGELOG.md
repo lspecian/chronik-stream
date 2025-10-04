@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.14] - 2025-10-04
+
+### Fixed
+- **CRITICAL**: InitProducerId v4 flexible format support - Enables full KSQLDB compatibility
+  - Fixed request decoding to use compact strings for v2+ (flexible format)
+  - Fixed response encoding to include tagged fields for v2+ (flexible format)
+  - Resolves `BufferUnderflowException` error when KSQLDB initializes producers
+  - Request now correctly parses transactional_id as COMPACT_NULLABLE_STRING for v2+
+  - Response now includes empty tagged fields (0x00) for v2+ per Kafka protocol spec
+
+### Changed
+- Enhanced InitProducerId handler with detailed debug logging
+  - Logs flexible format detection
+  - Logs producer ID and epoch generation
+  - Logs response encoding size for troubleshooting
+
+### Technical Details
+- InitProducerId v2+ uses flexible protocol format (KIP-482)
+- Request body: transactional_id (compact string), transaction_timeout_ms, producer_id (v3+), producer_epoch (v3+), tagged_fields
+- Response body: throttle_time_ms, error_code, producer_id, producer_epoch, tagged_fields (v2+)
+- Response header includes tagged fields for v2+ (handled by make_response)
+
+### Compatibility
+- **Full KSQLDB compatibility** - 100% functional with all KSQLDB features
+- **Kafka Streams ready** - Transaction initialization now works correctly
+- Drop-in replacement for v1.3.13 with no breaking changes
+- Backward compatible with InitProducerId v0-v1 (non-flexible format)
+
+### Migration from v1.3.13
+No changes required - this is a drop-in replacement that completes KSQLDB support.
+
 ## [1.3.13] - 2025-10-04
 
 ### Fixed

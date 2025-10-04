@@ -19,7 +19,15 @@ pub struct InitProducerIdRequest {
 
 impl KafkaDecodable for InitProducerIdRequest {
     fn decode(decoder: &mut Decoder, version: i16) -> Result<Self> {
-        let transactional_id = decoder.read_string()?;
+        let is_flexible = version >= 2;
+
+        // Read transactional_id with correct encoding based on version
+        let transactional_id = if is_flexible {
+            decoder.read_compact_string()?
+        } else {
+            decoder.read_string()?
+        };
+
         let transaction_timeout_ms = decoder.read_i32()?;
 
         // producer_id and producer_epoch are only in v3+
@@ -28,6 +36,16 @@ impl KafkaDecodable for InitProducerIdRequest {
         } else {
             (None, None)
         };
+
+        // Consume tagged fields for flexible versions (v2+)
+        if is_flexible {
+            let tag_count = decoder.read_unsigned_varint()?;
+            for _ in 0..tag_count {
+                let _tag_id = decoder.read_unsigned_varint()?;
+                let tag_size = decoder.read_unsigned_varint()? as usize;
+                decoder.advance(tag_size)?;
+            }
+        }
 
         Ok(InitProducerIdRequest {
             transactional_id,
@@ -66,11 +84,17 @@ pub struct InitProducerIdResponse {
 }
 
 impl KafkaEncodable for InitProducerIdResponse {
-    fn encode(&self, encoder: &mut Encoder, _version: i16) -> Result<()> {
+    fn encode(&self, encoder: &mut Encoder, version: i16) -> Result<()> {
         encoder.write_i32(self.throttle_time_ms);
         encoder.write_i16(self.error_code);
         encoder.write_i64(self.producer_id);
         encoder.write_i16(self.producer_epoch);
+
+        // Add tagged fields for flexible versions (v2+)
+        if version >= 2 {
+            encoder.write_unsigned_varint(0);  // Empty tagged fields
+        }
+
         Ok(())
     }
 }

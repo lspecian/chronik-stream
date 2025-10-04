@@ -3594,7 +3594,12 @@ impl ProtocolHandler {
         use bytes::BytesMut;
         use std::sync::atomic::{AtomicI64, Ordering};
 
-        tracing::info!("Handling InitProducerId request");
+        let is_flexible = header.api_version >= 2;
+        tracing::info!(
+            "Handling InitProducerId v{} request (is_flexible={})",
+            header.api_version,
+            is_flexible
+        );
 
         // Decode request
         let mut decoder = Decoder::new(body);
@@ -3642,10 +3647,25 @@ impl ProtocolHandler {
             producer_epoch,
         };
 
+        tracing::debug!(
+            "InitProducerId v{} response: producer_id={}, epoch={}, error_code={}",
+            header.api_version,
+            producer_id,
+            producer_epoch,
+            error_code
+        );
+
         // Encode response
         let mut body_buf = BytesMut::new();
         let mut encoder = Encoder::new(&mut body_buf);
         response.encode(&mut encoder, header.api_version)?;
+
+        tracing::debug!(
+            "Encoded InitProducerId v{} response: body_size={} bytes (flexible={})",
+            header.api_version,
+            body_buf.len(),
+            is_flexible
+        );
 
         Ok(Self::make_response(&header, ApiKey::InitProducerId, body_buf.freeze()))
     }
