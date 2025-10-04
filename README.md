@@ -1,4 +1,4 @@
-# Chronik Stream v1.3.0
+# Chronik Stream v1.3.11
 
 [![Build Status](https://github.com/lspecian/chronik-stream/workflows/CI/badge.svg)](https://github.com/lspecian/chronik-stream/actions)
 [![Release](https://img.shields.io/github/v/release/lspecian/chronik-stream)](https://github.com/lspecian/chronik-stream/releases)
@@ -8,7 +8,13 @@
 
 A high-performance streaming platform built in Rust that implements core Kafka wire protocol functionality with comprehensive Write-Ahead Log (WAL) durability and automatic recovery.
 
-## 🎉 What's New in v1.3.0
+## 🎉 What's New in v1.3.11
+
+### v1.3.11 - KSQL Compatibility Fix
+- **🔧 Fixed Produce v9+ Field Ordering**: Resolved "responses was serialized as null" error preventing KSQL CREATE STREAM commands
+- **🔍 Fixed Fetch v12 Parsing**: Added missing last_fetched_epoch field to prevent "Incomplete varint" errors
+- **✅ Complete Fetch Encoding**: Implemented full Fetch response encoding with flexible protocol support
+- **🎯 KSQL Restore Mode**: KSQL now successfully starts and enters restore mode without protocol errors
 
 ### v1.3.0 - Full KSQL Integration Support
 - **🎯 KSQL Compatibility**: Complete support for KSQL without workarounds or modifications
@@ -84,7 +90,7 @@ A high-performance streaming platform built in Rust that implements core Kafka w
 # Quick start - single command
 docker run -d -p 9092:9092 \
   -e CHRONIK_ADVERTISED_ADDR=localhost \
-  ghcr.io/lspecian/chronik-stream:v1.3.0
+  ghcr.io/lspecian/chronik-stream:v1.3.11
 
 # With persistent storage and custom configuration
 docker run -d --name chronik \
@@ -92,7 +98,7 @@ docker run -d --name chronik \
   -v chronik-data:/data \
   -e CHRONIK_ADVERTISED_ADDR=localhost \
   -e RUST_LOG=info \
-  ghcr.io/lspecian/chronik-stream:v1.3.0
+  ghcr.io/lspecian/chronik-stream:v1.3.11
 
 # Using docker-compose
 curl -O https://raw.githubusercontent.com/lspecian/chronik-stream/main/docker-compose.yml
@@ -286,7 +292,7 @@ All images support both **linux/amd64** and **linux/arm64** architectures:
 
 | Image | Tags | Size | Description |
 |-------|------|------|-------------|
-| `ghcr.io/lspecian/chronik-stream` | `v1.2.3`, `1.2`, `latest` | ~50MB | Chronik server with WAL recovery |
+| `ghcr.io/lspecian/chronik-stream` | `v1.3.11`, `1.3`, `latest` | ~50MB | Chronik server with KSQL support |
 
 ### Supported Platforms
 
@@ -459,13 +465,25 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 Apache License 2.0. See [LICENSE](LICENSE) for details.
 
-## 🚀 Latest Release: v1.2.3
+## 🚀 Latest Release: v1.3.11
 
-### What's New in v1.2.3
+### What's New in v1.3.11
+- ✅ **Produce v9+ Fix** - Fixed field ordering causing "responses was serialized as null" error
+- ✅ **Fetch v12 Fix** - Added missing last_fetched_epoch field to prevent parsing errors
+- ✅ **Complete Fetch Encoding** - Implemented full Fetch response with flexible protocol support
+- ✅ **KSQL Compatibility** - KSQL successfully starts and operates without protocol errors
+
+### Previous Release: v1.3.0
+- ✅ **KSQL Integration** - Full KSQL support without workarounds
+- ✅ **ListOffsets v7 Fix** - Resolved offset retrieval errors
+- ✅ **SASL Authentication** - Added SaslAuthenticate API
+- ✅ **IncrementalAlterConfigs** - Dynamic configuration support
+
+### v1.2.3
 - ✅ **Compilation Fix** - Fixed struct field mismatches preventing successful builds
 - ✅ **Build Stability** - Resolved BufferedBatch and SegmentWriter initialization issues
 
-### Previous Release: v1.2.2
+### v1.2.2
 - ✅ **WAL Recovery on Startup** - Automatic recovery of in-memory state from persistent WAL records
 - ✅ **WAL Truncation** - Efficient cleanup of old WAL segments after successful persistence to disk
 - ✅ **Crash Recovery** - Full message recovery after unexpected server shutdowns
