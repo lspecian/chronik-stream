@@ -65,7 +65,10 @@ pub struct Response {
 
 /// Handler for specific API versions request
 pub struct ApiVersionsRequest {
-    // Empty for v0-3
+    /// Client software name (v3+, KIP-511)
+    pub client_software_name: Option<String>,
+    /// Client software version (v3+, KIP-511)
+    pub client_software_version: Option<String>,
 }
 
 /// Response for API versions
@@ -126,6 +129,8 @@ impl ProtocolHandler {
             false  // DescribeCluster v0 uses NON-flexible headers
         } else if api_key == ApiKey::Metadata && header.api_version < 9 {
             false  // Metadata v0-v8 use NON-flexible headers
+        } else if api_key == ApiKey::AddPartitionsToTxn && header.api_version < 3 {
+            false  // AddPartitionsToTxn v0-v2 use NON-flexible headers
         } else {
             // For other APIs and DescribeCluster v1+/Metadata v9+, use flexible headers
             // when the client has negotiated ApiVersions v3+
@@ -415,56 +420,141 @@ impl ProtocolHandler {
     pub fn parse_offset_commit_request(&self, header: &RequestHeader, body: &mut Bytes) -> Result<crate::types::OffsetCommitRequest> {
         use crate::parser::Decoder;
         use crate::types::{OffsetCommitRequest, OffsetCommitTopic, OffsetCommitPartition};
-        
+
         let mut decoder = Decoder::new(body);
-        
-        let group_id = decoder.read_string()?
-            .ok_or_else(|| Error::Protocol("Group ID cannot be null".into()))?;
-        
+
+        // v8+ uses flexible/compact format
+        let flexible = header.api_version >= 8;
+
+        // Read group_id
+        let group_id = if flexible {
+            decoder.read_compact_string()?
+        } else {
+            decoder.read_string()?
+        }.ok_or_else(|| Error::Protocol("Group ID cannot be null".into()))?;
+
         let generation_id = decoder.read_i32()?;
-        let member_id = decoder.read_string()?
-            .ok_or_else(|| Error::Protocol("Member ID cannot be null".into()))?;
-        
-        // V2+ has retention_time field
+
+        // Read member_id
+        let member_id = if flexible {
+            decoder.read_compact_string()?
+        } else {
+            decoder.read_string()?
+        }.ok_or_else(|| Error::Protocol("Member ID cannot be null".into()))?;
+
+        // v6+ has group_instance_id
+        let _group_instance_id = if header.api_version >= 6 {
+            if flexible {
+                decoder.read_compact_string()?
+            } else {
+                decoder.read_string()?
+            }
+        } else {
+            None
+        };
+
+        // V2-4 has retention_time field (v5 removed it, v7 added it back)
         if header.api_version >= 2 && header.api_version <= 4 {
             let _retention_time = decoder.read_i64()?; // We ignore this for now
         }
-        
-        // Read topics array
-        let topic_count = decoder.read_i32()?;
-        if topic_count < 0 || topic_count > 10000 {
-            return Err(Error::Protocol(format!("Invalid topic count: {}", topic_count)));
+        if header.api_version == 7 || header.api_version >= 8 {
+            let _retention_time = decoder.read_i64()?; // We ignore this for now
         }
-        let mut topics = Vec::with_capacity(topic_count as usize);
-        
-        for _ in 0..topic_count {
-            let topic_name = decoder.read_string()?
-                .ok_or_else(|| Error::Protocol("Topic name cannot be null".into()))?;
-            
-            let partition_count = decoder.read_i32()?;
-            if partition_count < 0 || partition_count > 10000 {
-                return Err(Error::Protocol(format!("Invalid partition count: {}", partition_count)));
+
+        // Read topics array
+        let topic_count = if flexible {
+            let count = decoder.read_unsigned_varint()? as i32 - 1;
+            if count < 0 { 0 } else { count as usize }
+        } else {
+            let count = decoder.read_i32()?;
+            if count < 0 || count > 10000 {
+                return Err(Error::Protocol(format!("Invalid topic count: {}", count)));
             }
-            let mut partitions = Vec::with_capacity(partition_count as usize);
-            
+            count as usize
+        };
+
+        let mut topics = Vec::with_capacity(topic_count);
+
+        for _ in 0..topic_count {
+            let topic_name = if flexible {
+                decoder.read_compact_string()?
+            } else {
+                decoder.read_string()?
+            }.ok_or_else(|| Error::Protocol("Topic name cannot be null".into()))?;
+
+            let partition_count = if flexible {
+                let count = decoder.read_unsigned_varint()? as i32 - 1;
+                if count < 0 { 0 } else { count as usize }
+            } else {
+                let count = decoder.read_i32()?;
+                if count < 0 || count > 10000 {
+                    return Err(Error::Protocol(format!("Invalid partition count: {}", count)));
+                }
+                count as usize
+            };
+
+            let mut partitions = Vec::with_capacity(partition_count);
+
             for _ in 0..partition_count {
                 let partition_index = decoder.read_i32()?;
                 let committed_offset = decoder.read_i64()?;
-                let committed_metadata = decoder.read_string()?;
-                
+
+                // v6+ has committed_leader_epoch
+                let _committed_leader_epoch = if header.api_version >= 6 {
+                    decoder.read_i32()?
+                } else {
+                    -1
+                };
+
+                let committed_metadata = if flexible {
+                    decoder.read_compact_string()?
+                } else {
+                    decoder.read_string()?
+                };
+
+                // Skip tagged fields for flexible versions (partition level)
+                if flexible {
+                    let tag_count = decoder.read_unsigned_varint()?;
+                    for _ in 0..tag_count {
+                        let _tag_id = decoder.read_unsigned_varint()?;
+                        let tag_size = decoder.read_unsigned_varint()? as usize;
+                        decoder.advance(tag_size)?;
+                    }
+                }
+
                 partitions.push(OffsetCommitPartition {
                     partition_index,
                     committed_offset,
                     committed_metadata,
                 });
             }
-            
+
+            // Skip tagged fields for flexible versions (topic level)
+            if flexible {
+                let tag_count = decoder.read_unsigned_varint()?;
+                for _ in 0..tag_count {
+                    let _tag_id = decoder.read_unsigned_varint()?;
+                    let tag_size = decoder.read_unsigned_varint()? as usize;
+                    decoder.advance(tag_size)?;
+                }
+            }
+
             topics.push(OffsetCommitTopic {
                 name: topic_name,
                 partitions,
             });
         }
-        
+
+        // Skip tagged fields for flexible versions (request level)
+        if flexible {
+            let tag_count = decoder.read_unsigned_varint()?;
+            for _ in 0..tag_count {
+                let _tag_id = decoder.read_unsigned_varint()?;
+                let tag_size = decoder.read_unsigned_varint()? as usize;
+                decoder.advance(tag_size)?;
+            }
+        }
+
         Ok(OffsetCommitRequest {
             group_id,
             generation_id,
@@ -605,21 +695,10 @@ impl ProtocolHandler {
     
     /// Encode SyncGroup response
     pub fn encode_sync_group_response(&self, buf: &mut BytesMut, response: &crate::sync_group_types::SyncGroupResponse, version: i16) -> Result<()> {
+        use crate::parser::KafkaEncodable;
+
         let mut encoder = Encoder::new(buf);
-        
-        if version >= 1 {
-            encoder.write_i32(response.throttle_time_ms);
-        }
-        
-        encoder.write_i16(response.error_code);
-        
-        if version >= 5 {
-            encoder.write_string(response.protocol_type.as_deref());
-            encoder.write_string(response.protocol_name.as_deref());
-        }
-        
-        encoder.write_bytes(Some(&response.assignment));
-        
+        response.encode(&mut encoder, version)?;
         Ok(())
     }
     
@@ -661,50 +740,133 @@ impl ProtocolHandler {
     /// Encode OffsetCommit response
     pub fn encode_offset_commit_response(&self, buf: &mut BytesMut, response: &crate::types::OffsetCommitResponse, version: i16) -> Result<()> {
         let mut encoder = Encoder::new(buf);
-        
+
+        // v8+ uses flexible/compact format
+        let flexible = version >= 8;
+
         if version >= 3 {
             encoder.write_i32(response.throttle_time_ms);
         }
-        
-        encoder.write_i32(response.topics.len() as i32);
+
+        // Write topics array
+        if flexible {
+            encoder.write_compact_array_len(response.topics.len());
+        } else {
+            encoder.write_i32(response.topics.len() as i32);
+        }
+
         for topic in &response.topics {
-            encoder.write_string(Some(&topic.name));
-            
-            encoder.write_i32(topic.partitions.len() as i32);
+            // Write topic name
+            if flexible {
+                encoder.write_compact_string(Some(&topic.name));
+            } else {
+                encoder.write_string(Some(&topic.name));
+            }
+
+            // Write partitions array
+            if flexible {
+                encoder.write_compact_array_len(topic.partitions.len());
+            } else {
+                encoder.write_i32(topic.partitions.len() as i32);
+            }
+
             for partition in &topic.partitions {
                 encoder.write_i32(partition.partition_index);
                 encoder.write_i16(partition.error_code);
+
+                // Tagged fields at partition level
+                if flexible {
+                    encoder.write_tagged_fields();
+                }
+            }
+
+            // Tagged fields at topic level
+            if flexible {
+                encoder.write_tagged_fields();
             }
         }
-        
+
+        // Tagged fields at response level
+        if flexible {
+            encoder.write_tagged_fields();
+        }
+
         Ok(())
     }
     
     /// Encode OffsetFetch response
     pub fn encode_offset_fetch_response(&self, buf: &mut BytesMut, response: &crate::types::OffsetFetchResponse, version: i16) -> Result<()> {
         let mut encoder = Encoder::new(buf);
-        
+
+        // v6+ uses flexible/compact format (but v8 is standard for full support)
+        let flexible = version >= 6;
+
         if version >= 3 {
             encoder.write_i32(response.throttle_time_ms);
         }
-        
-        encoder.write_i32(response.topics.len() as i32);
+
+        // Write topics array
+        if flexible {
+            encoder.write_compact_array_len(response.topics.len());
+        } else {
+            encoder.write_i32(response.topics.len() as i32);
+        }
+
         for topic in &response.topics {
-            encoder.write_string(Some(&topic.name));
-            
-            encoder.write_i32(topic.partitions.len() as i32);
+            // Write topic name
+            if flexible {
+                encoder.write_compact_string(Some(&topic.name));
+            } else {
+                encoder.write_string(Some(&topic.name));
+            }
+
+            // Write partitions array
+            if flexible {
+                encoder.write_compact_array_len(topic.partitions.len());
+            } else {
+                encoder.write_i32(topic.partitions.len() as i32);
+            }
+
             for partition in &topic.partitions {
                 encoder.write_i32(partition.partition_index);
                 encoder.write_i64(partition.committed_offset);
-                encoder.write_string(partition.metadata.as_deref());
+
+                // v5+ has committed_leader_epoch
+                if version >= 5 {
+                    encoder.write_i32(-1); // -1 = unknown leader epoch
+                }
+
+                // Write metadata
+                if flexible {
+                    encoder.write_compact_string(partition.metadata.as_deref());
+                } else {
+                    encoder.write_string(partition.metadata.as_deref());
+                }
+
                 encoder.write_i16(partition.error_code);
+
+                // Tagged fields at partition level
+                if flexible {
+                    encoder.write_tagged_fields();
+                }
+            }
+
+            // Tagged fields at topic level
+            if flexible {
+                encoder.write_tagged_fields();
             }
         }
-        
-        if version >= 2 {
+
+        // Error code at response level (v2+, but moved for v8+)
+        if version >= 2 && version < 8 {
             encoder.write_i16(0); // error_code at response level
         }
-        
+
+        // Tagged fields at response level
+        if flexible {
+            encoder.write_tagged_fields();
+        }
+
         Ok(())
     }
     
@@ -1045,12 +1207,36 @@ impl ProtocolHandler {
         }
     }
     
+    /// Parse ApiVersions request
+    fn parse_api_versions_request(&self, header: &RequestHeader, body: &mut Bytes) -> Result<ApiVersionsRequest> {
+        use crate::parser::Decoder;
+
+        let (client_software_name, client_software_version) = if header.api_version >= 3 {
+            // For v3+, just ignore the body completely since fields are "ignorable"
+            // The schema marks them as ignorable: true, so we don't need to parse them
+            // This avoids encoding issues between different Kafka client implementations
+
+            tracing::debug!("ApiVersions v3 request received (body ignored - fields are ignorable)");
+
+            (None, None)
+        } else {
+            (None, None)
+        };
+
+        Ok(ApiVersionsRequest {
+            client_software_name,
+            client_software_version,
+        })
+    }
+
     /// Handle ApiVersions request
     async fn handle_api_versions(
         &self,
         header: RequestHeader,
         _body: &mut Bytes,
     ) -> Result<Response> {
+        // ApiVersions v0-3 have no request body (or ignorable fields in v3+)
+        // No need to parse the request body
         if self.supported_versions.is_empty() {
             // Use the directly fetched versions instead of minimal list
             let test_versions = supported_api_versions();
@@ -1202,7 +1388,7 @@ impl ProtocolHandler {
     }
     
     /// Handle Metadata request
-    async fn handle_metadata(
+    pub async fn handle_metadata(
         &self,
         header: RequestHeader,
         body: &mut Bytes,
@@ -1898,16 +2084,9 @@ impl ProtocolHandler {
 
         let mut decoder = Decoder::new(body);
 
-        // For v4, skip the client_id in body (same as CreateTopics v7)
+        // Determine encoding type (v4+ uses compact/flexible encoding)
         let use_compact = header.api_version >= 4;
-        if use_compact {
-            // Skip the compact client_id in body
-            let client_id_len = decoder.read_unsigned_varint()?;
-            if client_id_len > 0 {
-                let actual_len = (client_id_len - 1) as usize;
-                decoder.skip(actual_len)?;
-            }
-        }
+        // Note: DescribeConfigs does NOT have client_id in body (unlike CreateTopics)
 
         // Parse resources array - use compact array for v4+
         let resource_count = if use_compact {
@@ -1968,7 +2147,17 @@ impl ProtocolHandler {
             } else {
                 None
             };
-            
+
+            // CRITICAL: Skip per-resource tagged fields for v4+ (flexible protocol)
+            if use_compact {
+                let tag_count = decoder.read_unsigned_varint()?;
+                for _ in 0..tag_count {
+                    let _tag_id = decoder.read_unsigned_varint()?;
+                    let tag_size = decoder.read_unsigned_varint()? as usize;
+                    decoder.advance(tag_size)?;
+                }
+            }
+
             resources.push(ConfigResource {
                 resource_type,
                 resource_name,
@@ -2384,18 +2573,7 @@ impl ProtocolHandler {
 
         // Determine if we should use compact encoding (v5+)
         let use_compact = header.api_version >= 5;
-
-        // For v7, the body starts with client_id which we need to skip
-        // since it was already handled in header parsing
-        if header.api_version == 7 {
-            // Skip the compact client_id in body (should be NULL = 0x00)
-            let client_id_len = decoder.read_unsigned_varint()?;
-            if client_id_len > 0 {
-                // If not NULL, skip the actual client_id bytes
-                let actual_len = (client_id_len - 1) as usize;
-                decoder.skip(actual_len)?;
-            }
-        }
+        // Note: CreateTopics does NOT have client_id in body (it's only in the header)
 
         // Parse topic count - use compact array for v5+
         let topic_count = if use_compact {
@@ -2463,8 +2641,12 @@ impl ProtocolHandler {
 
                     // Handle tagged fields for each replica assignment in compact format (v5+)
                     if use_compact {
-                        let _num_tagged_fields = decoder.read_unsigned_varint()?;
-                        // For now, we don't process any replica assignment-level tagged fields, just skip them
+                        let num_tagged_fields = decoder.read_unsigned_varint()?;
+                        for _ in 0..num_tagged_fields {
+                            let _tag_id = decoder.read_unsigned_varint()?;
+                            let tag_size = decoder.read_unsigned_varint()? as usize;
+                            decoder.advance(tag_size)?;
+                        }
                     }
                 }
             }
@@ -2496,15 +2678,23 @@ impl ProtocolHandler {
 
                 // Handle tagged fields for each config in compact format (v5+)
                 if use_compact {
-                    let _num_tagged_fields = decoder.read_unsigned_varint()?;
-                    // For now, we don't process any config-level tagged fields, just skip them
+                    let num_tagged_fields = decoder.read_unsigned_varint()?;
+                    for _ in 0..num_tagged_fields {
+                        let _tag_id = decoder.read_unsigned_varint()?;
+                        let tag_size = decoder.read_unsigned_varint()? as usize;
+                        decoder.advance(tag_size)?;
+                    }
                 }
             }
 
             // Handle tagged fields for each topic in compact format (v5+)
             if use_compact {
-                let _num_tagged_fields = decoder.read_unsigned_varint()?;
-                // For now, we don't process any topic-level tagged fields, just skip them
+                let num_tagged_fields = decoder.read_unsigned_varint()?;
+                for _ in 0..num_tagged_fields {
+                    let _tag_id = decoder.read_unsigned_varint()?;
+                    let tag_size = decoder.read_unsigned_varint()? as usize;
+                    decoder.advance(tag_size)?;
+                }
             }
 
             topics.push(crate::create_topics_types::CreateTopicRequest {
@@ -2528,10 +2718,13 @@ impl ProtocolHandler {
 
         // Tagged fields for compact encoding (v5+)
         if use_compact {
-            // Read and ignore tagged fields at the end of the request
-            let _num_tagged_fields = decoder.read_unsigned_varint()?;
-            // For now, we don't process any tagged fields, just skip them
-            // In a full implementation, we would parse each tagged field based on the count
+            // Read and skip tagged fields at the end of the request
+            let num_tagged_fields = decoder.read_unsigned_varint()?;
+            for _ in 0..num_tagged_fields {
+                let _tag_id = decoder.read_unsigned_varint()?;
+                let tag_size = decoder.read_unsigned_varint()? as usize;
+                decoder.advance(tag_size)?;
+            }
         }
 
         let request = CreateTopicsRequest {
@@ -4676,56 +4869,16 @@ impl ProtocolHandler {
         body: &mut Bytes,
     ) -> Result<Response> {
         use crate::sync_group_types::{
-            SyncGroupRequest, SyncGroupResponse, SyncGroupRequestAssignment,
+            SyncGroupRequest, SyncGroupResponse,
             error_codes
         };
-        use crate::parser::Decoder;
-        
+        use crate::parser::{Decoder, KafkaDecodable};
+
         tracing::debug!("Handling SyncGroup request v{}", header.api_version);
-        
+
+        // Parse request using trait-based decoding
         let mut decoder = Decoder::new(body);
-        
-        // Parse request
-        let group_id = decoder.read_string()?
-            .ok_or_else(|| Error::Protocol("Group ID cannot be null".into()))?;
-        let generation_id = decoder.read_i32()?;
-        let member_id = decoder.read_string()?
-            .ok_or_else(|| Error::Protocol("Member ID cannot be null".into()))?;
-        
-        let group_instance_id = if header.api_version >= 3 {
-            decoder.read_string()?
-        } else {
-            None
-        };
-        
-        let (protocol_type, protocol_name) = if header.api_version >= 5 {
-            (decoder.read_string()?, decoder.read_string()?)
-        } else {
-            (None, None)
-        };
-        
-        // Read assignments array
-        let assignment_count = decoder.read_i32()? as usize;
-        let mut assignments = Vec::with_capacity(assignment_count);
-        
-        for _ in 0..assignment_count {
-            let member_id = decoder.read_string()?
-                .ok_or_else(|| Error::Protocol("Member ID in assignment cannot be null".into()))?;
-            let assignment = decoder.read_bytes()?
-                .ok_or_else(|| Error::Protocol("Assignment cannot be null".into()))?;
-            
-            assignments.push(SyncGroupRequestAssignment { member_id, assignment });
-        }
-        
-        let request = SyncGroupRequest {
-            group_id: group_id.clone(),
-            generation_id,
-            member_id: member_id.clone(),
-            group_instance_id,
-            protocol_type: protocol_type.clone(),
-            protocol_name: protocol_name.clone(),
-            assignments,
-        };
+        let request = SyncGroupRequest::decode(&mut decoder, header.api_version)?;
         
         tracing::info!(
             "SyncGroup request for group '{}', generation {}, member '{}'",
@@ -4792,8 +4945,8 @@ impl ProtocolHandler {
         let response = SyncGroupResponse {
             throttle_time_ms: 0,
             error_code: error_codes::NONE,
-            protocol_type: if header.api_version >= 5 { protocol_type } else { None },
-            protocol_name: if header.api_version >= 5 { protocol_name } else { None },
+            protocol_type: if header.api_version >= 5 { request.protocol_type.clone() } else { None },
+            protocol_name: if header.api_version >= 5 { request.protocol_name.clone() } else { None },
             assignment: member_assignment,
         };
         

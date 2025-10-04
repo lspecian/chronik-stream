@@ -19,17 +19,42 @@ pub struct HeartbeatRequest {
 
 impl KafkaDecodable for HeartbeatRequest {
     fn decode(decoder: &mut Decoder, version: i16) -> Result<Self> {
-        let group_id = decoder.read_string()?
-            .ok_or_else(|| Error::Protocol("group_id cannot be null".into()))?;
+        // v4+ uses flexible/compact format
+        let flexible = version >= 4;
+
+        let group_id = if flexible {
+            decoder.read_compact_string()?
+        } else {
+            decoder.read_string()?
+        }.ok_or_else(|| Error::Protocol("group_id cannot be null".into()))?;
+
         let generation_id = decoder.read_i32()?;
-        let member_id = decoder.read_string()?
-            .ok_or_else(|| Error::Protocol("member_id cannot be null".into()))?;
+
+        let member_id = if flexible {
+            decoder.read_compact_string()?
+        } else {
+            decoder.read_string()?
+        }.ok_or_else(|| Error::Protocol("member_id cannot be null".into()))?;
 
         let group_instance_id = if version >= 3 {
-            decoder.read_string()?
+            if flexible {
+                decoder.read_compact_string()?
+            } else {
+                decoder.read_string()?
+            }
         } else {
             None
         };
+
+        // Skip tagged fields for flexible versions
+        if flexible {
+            let tag_count = decoder.read_unsigned_varint()?;
+            for _ in 0..tag_count {
+                let _tag_id = decoder.read_unsigned_varint()?;
+                let tag_size = decoder.read_unsigned_varint()? as usize;
+                decoder.advance(tag_size)?;
+            }
+        }
 
         Ok(HeartbeatRequest {
             group_id,
@@ -65,10 +90,20 @@ pub struct HeartbeatResponse {
 
 impl KafkaEncodable for HeartbeatResponse {
     fn encode(&self, encoder: &mut Encoder, version: i16) -> Result<()> {
+        // v4+ uses flexible/compact format
+        let flexible = version >= 4;
+
         if version >= 1 {
             encoder.write_i32(self.throttle_time_ms);
         }
+
         encoder.write_i16(self.error_code);
+
+        // Tagged fields for flexible versions
+        if flexible {
+            encoder.write_tagged_fields();
+        }
+
         Ok(())
     }
 }

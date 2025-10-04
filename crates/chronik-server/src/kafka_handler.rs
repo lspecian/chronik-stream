@@ -107,21 +107,13 @@ impl KafkaProtocolHandler {
         // we should intercept and handle them directly
         match header.api_key {
             ApiKey::Metadata => {
-                // Parse the metadata request to get requested topics
+                // Parse the metadata request to get requested topics for auto-creation
                 use chronik_protocol::parser::Decoder;
-                let mut buf_for_parsing = buf.clone();
-                let mut decoder = Decoder::new(&mut buf_for_parsing);
                 let flexible = header.api_version >= 9;
 
-                // CRITICAL: For flexible Metadata v9+, Java AdminClient sends 2 extra bytes before the body
-                // These bytes must be skipped before parsing the request
-                // Byte 1: Unknown (likely parsing artifact from client_id)
-                // Byte 2: Header tagged_fields count (0x00 = empty)
-                if flexible {
-                    decoder.read_i8()?; // Skip byte 1
-                    decoder.read_i8()?; // Skip byte 2 (header tagged_fields count)
-                    tracing::debug!("Skipped 2 extra bytes for flexible Metadata v{} in kafka_handler", header.api_version);
-                }
+                // Clone the buffer for parsing (so original buf remains unchanged for handle_metadata)
+                let mut buf_for_parsing = buf.clone();
+                let mut decoder = Decoder::new(&mut buf_for_parsing);
 
                 // Parse topics array
                 let topics = if header.api_version >= 1 {
@@ -162,7 +154,12 @@ impl KafkaProtocolHandler {
 
                             if flexible {
                                 // Skip tagged fields for each topic
-                                let _tagged_count = decoder.read_unsigned_varint()?;
+                                let tagged_count = decoder.read_unsigned_varint()?;
+                                for _ in 0..tagged_count {
+                                    let _tag_id = decoder.read_unsigned_varint()?;
+                                    let tag_size = decoder.read_unsigned_varint()? as usize;
+                                    decoder.advance(tag_size)?;
+                                }
                             }
                         }
                         Some(topic_names)
@@ -203,8 +200,9 @@ impl KafkaProtocolHandler {
                 }
 
                 // Now delegate to protocol handler for the actual metadata response
-                // Pass the original request bytes unchanged
-                self.protocol_handler.handle_request(request_bytes).await
+                // Call handle_metadata directly with header and body buffer
+                // NOTE: No need to skip extra bytes - header parsing now correctly handles Java vs librdkafka differences
+                self.protocol_handler.handle_metadata(header, &mut buf).await
             }
             ApiKey::Produce => {
                 // Parse the produce request
@@ -272,26 +270,9 @@ impl KafkaProtocolHandler {
                 tracing::info!("ListOffsets request received, API version: {}", header.api_version);
 
                 let is_flexible = header.api_version >= 6;
-
-                // CRITICAL: For flexible ListOffsets v6+, Java AdminClient sends 2 extra bytes before the body
-                // Same issue as Metadata, ApiVersions, CreateTopics, and DescribeConfigs
-                // Byte 1: Unknown (likely parsing artifact from client_id)
-                // Byte 2: Header tagged_fields count (0x00 = empty)
-                if is_flexible {
-                    use bytes::Buf;
-                    let preview_len = buf.remaining().min(20);
-                    let preview: Vec<u8> = buf.chunk()[..preview_len].to_vec();
-                    tracing::debug!("ListOffsets v{} kafka_handler buffer ({} bytes total, showing first {}): {:02x?}",
-                        header.api_version, buf.remaining(), preview_len, preview);
-                }
+                // Note: No extra bytes to skip - header parsing now correctly handles Java client_id
 
                 let mut decoder = Decoder::new(&mut buf);
-
-                if is_flexible {
-                    decoder.read_i8()?; // Skip byte 1
-                    decoder.read_i8()?; // Skip byte 2 (header tagged_fields count)
-                    tracing::debug!("Skipped 2 extra bytes for flexible ListOffsets v{} in kafka_handler", header.api_version);
-                }
 
                 // Parse ListOffsets request
                 let _replica_id = decoder.read_i32()?;
@@ -350,7 +331,12 @@ impl KafkaProtocolHandler {
 
                         // Skip tagged fields for each partition in flexible versions
                         if is_flexible {
-                            let _tagged_count = decoder.read_unsigned_varint()?;
+                            let tagged_count = decoder.read_unsigned_varint()?;
+                            for _ in 0..tagged_count {
+                                let _tag_id = decoder.read_unsigned_varint()?;
+                                let tag_size = decoder.read_unsigned_varint()? as usize;
+                                decoder.advance(tag_size)?;
+                            }
                         }
 
                         partitions.push(ListOffsetsRequestPartition {
@@ -362,13 +348,28 @@ impl KafkaProtocolHandler {
 
                     // Skip tagged fields for each topic in flexible versions
                     if is_flexible {
-                        let _tagged_count = decoder.read_unsigned_varint()?;
+                        let tagged_count = decoder.read_unsigned_varint()?;
+                        for _ in 0..tagged_count {
+                            let _tag_id = decoder.read_unsigned_varint()?;
+                            let tag_size = decoder.read_unsigned_varint()? as usize;
+                            decoder.advance(tag_size)?;
+                        }
                     }
 
                     topics.push(ListOffsetsRequestTopic {
                         name: topic_name,
                         partitions,
                     });
+                }
+
+                // Skip request-level tagged fields for flexible versions
+                if is_flexible {
+                    let tagged_count = decoder.read_unsigned_varint()?;
+                    for _ in 0..tagged_count {
+                        let _tag_id = decoder.read_unsigned_varint()?;
+                        let tag_size = decoder.read_unsigned_varint()? as usize;
+                        decoder.advance(tag_size)?;
+                    }
                 }
 
                 // Build response with real offsets

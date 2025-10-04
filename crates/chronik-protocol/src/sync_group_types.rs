@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 use bytes::Bytes;
+use crate::parser::{Decoder, Encoder, KafkaDecodable, KafkaEncodable};
+use chronik_common::{Result, Error};
 
 /// SyncGroup request
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,6 +22,102 @@ pub struct SyncGroupRequest {
     pub protocol_name: Option<String>,
     /// Group assignments
     pub assignments: Vec<SyncGroupRequestAssignment>,
+}
+
+impl KafkaDecodable for SyncGroupRequest {
+    fn decode(decoder: &mut Decoder, version: i16) -> Result<Self> {
+        // v4+ uses flexible/compact format
+        let flexible = version >= 4;
+
+        let group_id = if flexible {
+            decoder.read_compact_string()?
+        } else {
+            decoder.read_string()?
+        }.ok_or_else(|| Error::Protocol("Group ID cannot be null".into()))?;
+
+        let generation_id = decoder.read_i32()?;
+
+        let member_id = if flexible {
+            decoder.read_compact_string()?
+        } else {
+            decoder.read_string()?
+        }.ok_or_else(|| Error::Protocol("Member ID cannot be null".into()))?;
+
+        let group_instance_id = if version >= 3 {
+            if flexible {
+                decoder.read_compact_string()?
+            } else {
+                decoder.read_string()?
+            }
+        } else {
+            None
+        };
+
+        let (protocol_type, protocol_name) = if version >= 5 {
+            (
+                if flexible { decoder.read_compact_string()? } else { decoder.read_string()? },
+                if flexible { decoder.read_compact_string()? } else { decoder.read_string()? }
+            )
+        } else {
+            (None, None)
+        };
+
+        // Read assignments array
+        let assignment_count = if flexible {
+            let count = decoder.read_unsigned_varint()? as i32 - 1;
+            if count < 0 { 0 } else { count as usize }
+        } else {
+            decoder.read_i32()? as usize
+        };
+
+        let mut assignments = Vec::with_capacity(assignment_count);
+
+        for _ in 0..assignment_count {
+            let member_id = if flexible {
+                decoder.read_compact_string()?
+            } else {
+                decoder.read_string()?
+            }.ok_or_else(|| Error::Protocol("Member ID in assignment cannot be null".into()))?;
+
+            let assignment = if flexible {
+                decoder.read_compact_bytes()?
+            } else {
+                decoder.read_bytes()?
+            }.ok_or_else(|| Error::Protocol("Assignment cannot be null".into()))?;
+
+            // Skip tagged fields for flexible versions (assignment level)
+            if flexible {
+                let tag_count = decoder.read_unsigned_varint()?;
+                for _ in 0..tag_count {
+                    let _tag_id = decoder.read_unsigned_varint()?;
+                    let tag_size = decoder.read_unsigned_varint()? as usize;
+                    decoder.advance(tag_size)?;
+                }
+            }
+
+            assignments.push(SyncGroupRequestAssignment { member_id, assignment });
+        }
+
+        // Skip tagged fields for flexible versions (request level)
+        if flexible {
+            let tag_count = decoder.read_unsigned_varint()?;
+            for _ in 0..tag_count {
+                let _tag_id = decoder.read_unsigned_varint()?;
+                let tag_size = decoder.read_unsigned_varint()? as usize;
+                decoder.advance(tag_size)?;
+            }
+        }
+
+        Ok(SyncGroupRequest {
+            group_id,
+            generation_id,
+            member_id,
+            group_instance_id,
+            protocol_type,
+            protocol_name,
+            assignments,
+        })
+    }
 }
 
 /// Assignment in SyncGroup request
@@ -44,6 +142,43 @@ pub struct SyncGroupResponse {
     pub protocol_name: Option<String>,
     /// Member assignment
     pub assignment: Bytes,
+}
+
+impl KafkaEncodable for SyncGroupResponse {
+    fn encode(&self, encoder: &mut Encoder, version: i16) -> Result<()> {
+        // v4+ uses flexible/compact format
+        let flexible = version >= 4;
+
+        if version >= 1 {
+            encoder.write_i32(self.throttle_time_ms);
+        }
+
+        encoder.write_i16(self.error_code);
+
+        if version >= 5 {
+            if flexible {
+                encoder.write_compact_string(self.protocol_type.as_deref());
+                encoder.write_compact_string(self.protocol_name.as_deref());
+            } else {
+                encoder.write_string(self.protocol_type.as_deref());
+                encoder.write_string(self.protocol_name.as_deref());
+            }
+        }
+
+        // Write assignment
+        if flexible {
+            encoder.write_compact_bytes(Some(&self.assignment));
+        } else {
+            encoder.write_bytes(Some(&self.assignment));
+        }
+
+        // Tagged fields for flexible versions
+        if flexible {
+            encoder.write_tagged_fields();
+        }
+
+        Ok(())
+    }
 }
 
 /// Error codes for SyncGroup

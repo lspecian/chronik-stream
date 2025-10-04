@@ -131,11 +131,25 @@ pub struct AddPartitionsToTxnResponse {
 
 impl KafkaEncodable for AddPartitionsToTxnResponse {
     fn encode(&self, encoder: &mut Encoder, version: i16) -> Result<()> {
+        let flexible = version >= 3;
+
         encoder.write_i32(self.throttle_time_ms);
-        encoder.write_i32(self.results.len() as i32);
+
+        if flexible {
+            encoder.write_compact_array_len(self.results.len());
+        } else {
+            encoder.write_i32(self.results.len() as i32);
+        }
+
         for result in &self.results {
             result.encode(encoder, version)?;
         }
+
+        // Tagged fields for v3+
+        if flexible {
+            encoder.write_tagged_fields();
+        }
+
         Ok(())
     }
 }
@@ -151,11 +165,25 @@ pub struct AddPartitionsToTxnTopicResult {
 
 impl KafkaEncodable for AddPartitionsToTxnTopicResult {
     fn encode(&self, encoder: &mut Encoder, version: i16) -> Result<()> {
-        encoder.write_string(Some(&self.name));
-        encoder.write_i32(self.results.len() as i32);
+        let flexible = version >= 3;
+
+        if flexible {
+            encoder.write_compact_string(Some(&self.name));
+            encoder.write_compact_array_len(self.results.len());
+        } else {
+            encoder.write_string(Some(&self.name));
+            encoder.write_i32(self.results.len() as i32);
+        }
+
         for result in &self.results {
             result.encode(encoder, version)?;
         }
+
+        // Tagged fields for v3+
+        if flexible {
+            encoder.write_tagged_fields();
+        }
+
         Ok(())
     }
 }
@@ -170,9 +198,17 @@ pub struct AddPartitionsToTxnPartitionResult {
 }
 
 impl KafkaEncodable for AddPartitionsToTxnPartitionResult {
-    fn encode(&self, encoder: &mut Encoder, _version: i16) -> Result<()> {
+    fn encode(&self, encoder: &mut Encoder, version: i16) -> Result<()> {
+        let flexible = version >= 3;
+
         encoder.write_i32(self.partition);
         encoder.write_i16(self.error_code);
+
+        // Tagged fields for v3+
+        if flexible {
+            encoder.write_tagged_fields();
+        }
+
         Ok(())
     }
 }

@@ -530,51 +530,47 @@ pub fn parse_request_header_with_correlation(buf: &mut Bytes) -> Result<(Request
     let correlation_id = decoder.read_i32()?;
     
     // Determine if this API+version uses flexible/compact encoding
+    // CRITICAL: ApiVersions is SPECIAL - request header is NEVER flexible (always v1)
+    // even though the request body IS flexible for v3+. This is for backward compatibility.
     let flexible = if let Some(api_key) = ApiKey::from_i16(api_key_raw) {
-        is_flexible_version(api_key, api_version)
+        if api_key == ApiKey::ApiVersions {
+            eprintln!("SPECIAL CASE: ApiVersions request header is NEVER flexible");
+            false  // ApiVersions NEVER has flexible request header
+        } else {
+            is_flexible_version(api_key, api_version)
+        }
     } else {
         false
     };
+
+    eprintln!("DEBUG: api_key={:?}, version={}, flexible={}", ApiKey::from_i16(api_key_raw), api_version, flexible);
     
     // Read client ID
-    // IMPORTANT: librdkafka quirk - it ACTUALLY sends compact strings for client ID in flexible versions!
-    // This is different from what the spec says - the spec says flexible versions should use compact strings
-    // But testing shows librdkafka v2.11.1 actually does send compact strings in Produce v9
+    // CRITICAL: Despite using flexible header v2, Java client sends client_id as regular STRING (INT16 length)
+    // NOT as COMPACT_STRING (varint length). This is inconsistent with the Kafka spec but matches Java behavior.
+    // librdkafka does send COMPACT_STRING for flexible versions.
+    // For maximum compatibility, we detect which encoding based on the bytes.
     let client_id = if flexible {
-        // Debug logging to understand what librdkafka sends
+        // Peek at first 2 bytes to detect encoding
         if decoder.remaining() >= 2 {
-            let peek_bytes = [
-                decoder.buf[0],
-                if decoder.remaining() > 0 { decoder.buf[1] } else { 0 }
-            ];
-            eprintln!("  As INT16: {}", i16::from_be_bytes(peek_bytes));
-            eprintln!("  As UINT8: {}", peek_bytes[0]);
-        }
-        
-        // Try compact string for flexible versions - this is what librdkafka actually sends
-        let api_name = ApiKey::from_i16(api_key_raw).map(|k| format!("{:?}", k)).unwrap_or_else(|| format!("Unknown({})", api_key_raw));
-        let client_id = decoder.read_compact_string()?;
-        
-        // WORKAROUND for librdkafka v2.11.1 bug:
-        // When client_id is null (None), librdkafka incorrectly sends the actual client_id string anyway
-        // We need to detect and skip this extra data
-        if client_id.is_none() && decoder.remaining() > 0 {
-            // Check if next byte looks like a string length (non-zero and reasonable)
-            let next_byte = decoder.buf[0];
-            
-            // If it looks like a compact string length (>0 and <128), it's probably the bug
-            if next_byte > 0 && next_byte < 128 {
-                let string_len = (next_byte - 1) as usize;
-                
-                // Skip the length byte and the string data
-                decoder.read_i8()?; // Skip length byte
-                for _ in 0..string_len {
-                    decoder.read_i8()?; // Skip string data
-                }
+            let first_byte = decoder.buf[0];
+            let second_byte = decoder.buf[1];
+
+            // If first byte is 0x00 and second byte >= 0x01, it's likely INT16 string length (Java style)
+            // If first byte >= 0x01 and is a reasonable varint, it's likely COMPACT_STRING (librdkafka style)
+            if first_byte == 0x00 {
+                // Probably Java INT16-length string
+                eprintln!("  Using STRING encoding for client_id (Java style)");
+                decoder.read_string()?
+            } else {
+                // Probably librdkafka COMPACT_STRING
+                eprintln!("  Using COMPACT_STRING encoding for client_id (librdkafka style)");
+                decoder.read_compact_string()?
             }
+        } else {
+            // Not enough bytes, try compact string
+            decoder.read_compact_string()?
         }
-        
-        client_id
     } else {
         decoder.read_string()?
     };

@@ -1245,37 +1245,121 @@ impl GroupManager {
         })
     }
     
-    pub async fn handle_offset_commit(&self, _request: chronik_protocol::types::OffsetCommitRequest) -> Result<chronik_protocol::types::OffsetCommitResponse> {
-        // For now, use the protocol handler's default handling which should delegate back
-        Err(chronik_common::Error::Other(anyhow::anyhow!("OffsetCommit not implemented")))
+    pub async fn handle_offset_commit(&self, request: chronik_protocol::types::OffsetCommitRequest) -> Result<chronik_protocol::types::OffsetCommitResponse> {
+        use chronik_protocol::types::{OffsetCommitResponseTopic, OffsetCommitResponsePartition};
+
+        info!("OffsetCommit for group: {}", request.group_id);
+
+        let mut response_topics = Vec::new();
+
+        for topic in &request.topics {
+            let mut response_partitions = Vec::new();
+
+            for partition in &topic.partitions {
+                // Store offset in metadata store
+                let consumer_offset = ConsumerOffset {
+                    group_id: request.group_id.clone(),
+                    topic: topic.name.clone(),
+                    partition: partition.partition_index as u32,
+                    offset: partition.committed_offset,
+                    metadata: partition.committed_metadata.clone(),
+                    commit_timestamp: chronik_common::Utc::now(),
+                };
+
+                // Commit to metadata store
+                if let Err(e) = self.metadata_store.commit_offset(consumer_offset).await {
+                    warn!(
+                        "Failed to persist offset to WAL for group {} topic {} partition {}: {}",
+                        request.group_id, topic.name, partition.partition_index, e
+                    );
+                    response_partitions.push(OffsetCommitResponsePartition {
+                        partition_index: partition.partition_index,
+                        error_code: 1, // Error
+                    });
+                } else {
+                    debug!(
+                        "Persisted offset to WAL: group={} topic={} partition={} offset={}",
+                        request.group_id, topic.name, partition.partition_index, partition.committed_offset
+                    );
+                    response_partitions.push(OffsetCommitResponsePartition {
+                        partition_index: partition.partition_index,
+                        error_code: 0, // Success
+                    });
+                }
+            }
+
+            response_topics.push(OffsetCommitResponseTopic {
+                name: topic.name.clone(),
+                partitions: response_partitions,
+            });
+        }
+
+        Ok(chronik_protocol::types::OffsetCommitResponse {
+            header: chronik_protocol::parser::ResponseHeader {
+                correlation_id: 0, // Will be overwritten by kafka_handler
+            },
+            throttle_time_ms: 0,
+            topics: response_topics,
+        })
     }
     
     pub async fn handle_offset_fetch(&self, request: chronik_protocol::types::OffsetFetchRequest) -> Result<chronik_protocol::types::OffsetFetchResponse> {
-        // Return no committed offsets for now - this will cause consumers to use auto_offset_reset
-        // This is sufficient for the fetch handler to work with earliest/latest settings
+        use chronik_protocol::types::{OffsetFetchResponseTopic, OffsetFetchResponsePartition};
+
+        info!("OffsetFetch for group: {}", request.group_id);
+
         let topics = if let Some(requested_topics) = request.topics {
-            // Return empty offsets for requested topics
-            // For simplicity, assume partition 0 for all topics
-            requested_topics.into_iter().map(|topic_name| {
-                chronik_protocol::types::OffsetFetchResponseTopic {
-                    name: topic_name,
-                    partitions: vec![
-                        chronik_protocol::types::OffsetFetchResponsePartition {
-                            partition_index: 0,  // Default to partition 0
-                            committed_offset: -1,  // No committed offset
-                            metadata: None,
-                            error_code: 0,
-                        }
-                    ],
+            let mut response_topics = Vec::new();
+
+            for topic_name in requested_topics {
+                // Try to get committed offset for partition 0 (default)
+                match self.metadata_store.get_consumer_offset(&request.group_id, &topic_name, 0).await {
+                    Ok(Some(offset_info)) => {
+                        debug!(
+                            "Retrieved offset from WAL: group={} topic={} partition=0 offset={}",
+                            request.group_id, topic_name, offset_info.offset
+                        );
+                        response_topics.push(OffsetFetchResponseTopic {
+                            name: topic_name,
+                            partitions: vec![
+                                OffsetFetchResponsePartition {
+                                    partition_index: 0,
+                                    committed_offset: offset_info.offset,
+                                    metadata: offset_info.metadata,
+                                    error_code: 0,
+                                }
+                            ],
+                        });
+                    }
+                    Ok(None) | Err(_) => {
+                        // No committed offset found, return -1
+                        debug!(
+                            "No committed offset found for group={} topic={} partition=0",
+                            request.group_id, topic_name
+                        );
+                        response_topics.push(OffsetFetchResponseTopic {
+                            name: topic_name,
+                            partitions: vec![
+                                OffsetFetchResponsePartition {
+                                    partition_index: 0,
+                                    committed_offset: -1,  // No committed offset
+                                    metadata: None,
+                                    error_code: 0,
+                                }
+                            ],
+                        });
+                    }
                 }
-            }).collect()
+            }
+
+            response_topics
         } else {
             // Return empty response if no topics specified
             vec![]
         };
 
         Ok(chronik_protocol::types::OffsetFetchResponse {
-            header: chronik_protocol::ResponseHeader {
+            header: chronik_protocol::parser::ResponseHeader {
                 correlation_id: 0,  // Will be set by the handler
             },
             throttle_time_ms: 0,
