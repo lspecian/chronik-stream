@@ -250,6 +250,8 @@ impl RequestHandler {
                 correlation_id,
             },
             throttle_time_ms: 0,
+            error_code: 0,
+            session_id: 0,
             topics: response_topics,
         }))
     }

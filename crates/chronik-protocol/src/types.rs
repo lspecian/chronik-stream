@@ -132,6 +132,8 @@ pub struct FetchRequestPartition {
 pub struct FetchResponse {
     pub header: ResponseHeader,
     pub throttle_time_ms: i32,
+    pub error_code: i16,      // v7+
+    pub session_id: i32,       // v7+
     pub topics: Vec<FetchResponseTopic>,
 }
 
@@ -550,36 +552,244 @@ impl Response {
             Response::Produce(resp) => {
                 // Correlation ID
                 bytes.extend_from_slice(&resp.header.correlation_id.to_be_bytes());
-                
-                // Topics array
-                bytes.extend_from_slice(&(resp.topics.len() as i32).to_be_bytes());
+
+                // Use comprehensive encoding with flexible protocol support
+                use crate::parser::Encoder;
+                use bytes::BytesMut;
+
+                let mut body_buf = BytesMut::new();
+                let mut encoder = Encoder::new(&mut body_buf);
+
+                // Check if this is a flexible/compact version (v9+)
+                let flexible = api_version >= 9;
+
+                // NOTE: throttle_time_ms position differs between versions
+                // For v1-v8: throttle_time_ms goes at the END of the response
+                // For v9+: throttle_time_ms goes at the BEGINNING of the response
+
+                // Write throttle_time_ms at the BEGINNING for v9+
+                if api_version >= 9 {
+                    encoder.write_i32(resp.throttle_time_ms);
+                }
+
+                // Topics array (called "responses" in the protocol spec)
+                if flexible {
+                    // v9+ uses compact array
+                    encoder.write_unsigned_varint((resp.topics.len() + 1) as u32);
+                } else {
+                    encoder.write_i32(resp.topics.len() as i32);
+                }
+
                 for topic in &resp.topics {
-                    bytes.extend_from_slice(&(topic.name.len() as i16).to_be_bytes());
-                    bytes.extend_from_slice(topic.name.as_bytes());
-                    
-                    // Partitions
-                    bytes.extend_from_slice(&(topic.partitions.len() as i32).to_be_bytes());
+                    // Topic name
+                    if flexible {
+                        encoder.write_compact_string(Some(&topic.name));
+                    } else {
+                        encoder.write_string(Some(&topic.name));
+                    }
+
+                    // Partitions array
+                    if flexible {
+                        encoder.write_unsigned_varint((topic.partitions.len() + 1) as u32);
+                    } else {
+                        encoder.write_i32(topic.partitions.len() as i32);
+                    }
+
                     for partition in &topic.partitions {
-                        bytes.extend_from_slice(&partition.index.to_be_bytes());
-                        bytes.extend_from_slice(&partition.error_code.to_be_bytes());
-                        bytes.extend_from_slice(&partition.base_offset.to_be_bytes());
-                        bytes.extend_from_slice(&partition.log_append_time.to_be_bytes());
-                        bytes.extend_from_slice(&partition.log_start_offset.to_be_bytes());
+                        encoder.write_i32(partition.index);
+                        encoder.write_i16(partition.error_code);
+                        encoder.write_i64(partition.base_offset);
+
+                        if api_version >= 2 {
+                            encoder.write_i64(partition.log_append_time);
+                        }
+
+                        if api_version >= 5 {
+                            encoder.write_i64(partition.log_start_offset);
+                        }
+
+                        // Record errors (COMPACT_ARRAY of RecordError) - v8+
+                        if api_version >= 8 {
+                            if flexible {
+                                encoder.write_unsigned_varint(1); // Empty array (0 + 1 for compact encoding)
+                            } else {
+                                encoder.write_i32(0); // Empty array
+                            }
+                        }
+
+                        // Error message (NULLABLE_COMPACT_STRING) - v8+
+                        if api_version >= 8 {
+                            if flexible {
+                                encoder.write_unsigned_varint(0); // Null string (compact encoding)
+                            } else {
+                                encoder.write_i16(-1); // Null string
+                            }
+                        }
+
+                        // Write tagged fields for partition in v9+
+                        if flexible {
+                            encoder.write_unsigned_varint(0); // No tagged fields
+                        }
+                    }
+
+                    // Write tagged fields for topic in v9+
+                    if flexible {
+                        encoder.write_unsigned_varint(0); // No tagged fields
                     }
                 }
-                
-                bytes.extend_from_slice(&resp.throttle_time_ms.to_be_bytes());
+
+                // Write tagged fields at response level in v9+
+                if flexible {
+                    encoder.write_unsigned_varint(0); // No tagged fields
+                }
+
+                // Write throttle_time_ms at the END for v1-v8
+                if api_version >= 1 && api_version < 9 {
+                    encoder.write_i32(resp.throttle_time_ms);
+                }
+
+                // Append the encoded body to bytes
+                bytes.extend_from_slice(&body_buf);
             }
             Response::Fetch(resp) => {
                 // Correlation ID
                 bytes.extend_from_slice(&resp.header.correlation_id.to_be_bytes());
-                
-                // Throttle time
-                bytes.extend_from_slice(&resp.throttle_time_ms.to_be_bytes());
-                
-                // Topics array
-                bytes.extend_from_slice(&(resp.topics.len() as i32).to_be_bytes());
-                // TODO: Implement full fetch response encoding
+
+                // Use comprehensive encoding with flexible protocol support
+                use crate::parser::Encoder;
+                use bytes::BytesMut;
+
+                let mut body_buf = BytesMut::new();
+                let mut encoder = Encoder::new(&mut body_buf);
+
+                // Check if this is a flexible/compact version (v12+)
+                let flexible = api_version >= 12;
+
+                // Throttle time (v1+)
+                if api_version >= 1 {
+                    encoder.write_i32(resp.throttle_time_ms);
+                }
+
+                // Error code (v7+, for session-level errors)
+                if api_version >= 7 {
+                    encoder.write_i16(resp.error_code);
+                }
+
+                // Session ID (v7+, for incremental fetch sessions)
+                if api_version >= 7 {
+                    encoder.write_i32(resp.session_id);
+                }
+
+                // Topics array (called "responses" in the protocol spec)
+                if flexible {
+                    // v12+ uses compact array
+                    encoder.write_unsigned_varint((resp.topics.len() + 1) as u32);
+                } else {
+                    encoder.write_i32(resp.topics.len() as i32);
+                }
+
+                for topic in &resp.topics {
+                    // Topic name
+                    if flexible {
+                        encoder.write_compact_string(Some(&topic.name));
+                    } else {
+                        encoder.write_string(Some(&topic.name));
+                    }
+
+                    // Partitions array
+                    if flexible {
+                        encoder.write_unsigned_varint((topic.partitions.len() + 1) as u32);
+                    } else {
+                        encoder.write_i32(topic.partitions.len() as i32);
+                    }
+
+                    for partition in &topic.partitions {
+                        // Partition index
+                        encoder.write_i32(partition.partition);
+
+                        // Error code
+                        encoder.write_i16(partition.error_code);
+
+                        // High watermark
+                        encoder.write_i64(partition.high_watermark);
+
+                        // Last stable offset (v4+)
+                        if api_version >= 4 {
+                            encoder.write_i64(partition.last_stable_offset);
+                        }
+
+                        // Log start offset (v5+)
+                        if api_version >= 5 {
+                            encoder.write_i64(partition.log_start_offset);
+                        }
+
+                        // Aborted transactions (v4+)
+                        if api_version >= 4 {
+                            if let Some(ref aborted_txns) = partition.aborted {
+                                if flexible {
+                                    encoder.write_unsigned_varint((aborted_txns.len() + 1) as u32);
+                                } else {
+                                    encoder.write_i32(aborted_txns.len() as i32);
+                                }
+                                for txn in aborted_txns {
+                                    encoder.write_i64(txn.producer_id);
+                                    encoder.write_i64(txn.first_offset);
+                                    if flexible {
+                                        encoder.write_unsigned_varint(0); // Tagged fields for aborted txn
+                                    }
+                                }
+                            } else {
+                                // Empty array
+                                if flexible {
+                                    encoder.write_unsigned_varint(1); // 0 + 1 for compact encoding
+                                } else {
+                                    encoder.write_i32(0);
+                                }
+                            }
+                        }
+
+                        // Preferred read replica (v11+)
+                        if api_version >= 11 {
+                            encoder.write_i32(partition.preferred_read_replica);
+                        }
+
+                        // Records (NULLABLE_BYTES for v0-v11, COMPACT_RECORDS for v12+)
+                        if partition.records.is_empty() {
+                            // Empty records
+                            if flexible {
+                                encoder.write_unsigned_varint(0); // Null in compact encoding
+                            } else {
+                                encoder.write_i32(0); // Empty byte array
+                            }
+                        } else {
+                            // Has records
+                            if flexible {
+                                encoder.write_unsigned_varint((partition.records.len() + 1) as u32);
+                            } else {
+                                encoder.write_i32(partition.records.len() as i32);
+                            }
+                            encoder.write_raw_bytes(&partition.records);
+                        }
+
+                        // Tagged fields for partition (v12+)
+                        if flexible {
+                            encoder.write_unsigned_varint(0); // No tagged fields
+                        }
+                    }
+
+                    // Tagged fields for topic (v12+)
+                    if flexible {
+                        encoder.write_unsigned_varint(0); // No tagged fields
+                    }
+                }
+
+                // Tagged fields at response level (v12+)
+                if flexible {
+                    encoder.write_unsigned_varint(0); // No tagged fields
+                }
+
+                // Append the encoded body to bytes
+                bytes.extend_from_slice(&body_buf);
             }
             Response::JoinGroup(resp) => {
                 // Correlation ID

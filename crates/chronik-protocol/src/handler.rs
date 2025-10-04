@@ -874,49 +874,63 @@ impl ProtocolHandler {
     pub fn parse_fetch_request(&self, header: &RequestHeader, body: &mut Bytes) -> Result<crate::types::FetchRequest> {
         use crate::parser::Decoder;
         use crate::types::{FetchRequest, FetchRequestTopic, FetchRequestPartition};
-        
+
         let mut decoder = Decoder::new(body);
-        
+        let flexible = header.api_version >= 12;
+
         let replica_id = decoder.read_i32()?;
         let max_wait_ms = decoder.read_i32()?;
         let min_bytes = decoder.read_i32()?;
-        
+
         let max_bytes = if header.api_version >= 3 {
             decoder.read_i32()?
         } else {
             i32::MAX
         };
-        
+
         let isolation_level = if header.api_version >= 4 {
             decoder.read_i8()?
         } else {
             0
         };
-        
+
         let session_id = if header.api_version >= 7 {
             decoder.read_i32()?
         } else {
             0
         };
-        
+
         let session_epoch = if header.api_version >= 7 {
             decoder.read_i32()?
         } else {
             -1
         };
-        
+
         // Topics array
-        let topic_count = decoder.read_i32()? as usize;
+        let topic_count = if flexible {
+            (decoder.read_unsigned_varint()? - 1) as usize
+        } else {
+            decoder.read_i32()? as usize
+        };
         let mut topics = Vec::with_capacity(topic_count);
-        
+
         for _ in 0..topic_count {
-            let name = decoder.read_string()?
-                .ok_or_else(|| Error::Protocol("Topic name cannot be null".into()))?;
-            
+            let name = if flexible {
+                decoder.read_compact_string()?
+                    .ok_or_else(|| Error::Protocol("Topic name cannot be null".into()))?
+            } else {
+                decoder.read_string()?
+                    .ok_or_else(|| Error::Protocol("Topic name cannot be null".into()))?
+            };
+
             // Partitions array
-            let partition_count = decoder.read_i32()? as usize;
+            let partition_count = if flexible {
+                (decoder.read_unsigned_varint()? - 1) as usize
+            } else {
+                decoder.read_i32()? as usize
+            };
             let mut partitions = Vec::with_capacity(partition_count);
-            
+
             for _ in 0..partition_count {
                 let partition = decoder.read_i32()?;
                 let current_leader_epoch = if header.api_version >= 9 {
@@ -925,13 +939,31 @@ impl ProtocolHandler {
                     -1
                 };
                 let fetch_offset = decoder.read_i64()?;
+
+                // last_fetched_epoch added in v12 (between fetch_offset and log_start_offset)
+                let _last_fetched_epoch = if header.api_version >= 12 {
+                    decoder.read_i32()?
+                } else {
+                    -1
+                };
+
                 let log_start_offset = if header.api_version >= 5 {
                     decoder.read_i64()?
                 } else {
                     -1
                 };
                 let partition_max_bytes = decoder.read_i32()?;
-                
+
+                // Tagged fields for partition (v12+)
+                if flexible {
+                    let tag_count = decoder.read_unsigned_varint()?;
+                    for _ in 0..tag_count {
+                        let _tag_id = decoder.read_unsigned_varint()?;
+                        let tag_size = decoder.read_unsigned_varint()? as usize;
+                        decoder.advance(tag_size)?;
+                    }
+                }
+
                 partitions.push(FetchRequestPartition {
                     partition,
                     current_leader_epoch,
@@ -940,28 +972,74 @@ impl ProtocolHandler {
                     partition_max_bytes,
                 });
             }
-            
+
+            // Tagged fields for topic (v12+)
+            if flexible {
+                let tag_count = decoder.read_unsigned_varint()?;
+                for _ in 0..tag_count {
+                    let _tag_id = decoder.read_unsigned_varint()?;
+                    let tag_size = decoder.read_unsigned_varint()? as usize;
+                    decoder.advance(tag_size)?;
+                }
+            }
+
             topics.push(FetchRequestTopic { name, partitions });
         }
-        
+
         // Read and ignore forgotten topics data for v7+
         if header.api_version >= 7 {
             // Read forgotten topics array
-            let count = decoder.read_i32()? as usize;
+            let count = if flexible {
+                (decoder.read_unsigned_varint()? - 1) as usize
+            } else {
+                decoder.read_i32()? as usize
+            };
             for _ in 0..count {
-                let _topic = decoder.read_string()?;
-                let partition_count = decoder.read_i32()? as usize;
+                let _topic = if flexible {
+                    decoder.read_compact_string()?
+                } else {
+                    decoder.read_string()?
+                };
+                let partition_count = if flexible {
+                    (decoder.read_unsigned_varint()? - 1) as usize
+                } else {
+                    decoder.read_i32()? as usize
+                };
                 for _ in 0..partition_count {
                     let _partition = decoder.read_i32()?;
                 }
+
+                // Tagged fields for forgotten topic (v12+)
+                if flexible {
+                    let tag_count = decoder.read_unsigned_varint()?;
+                    for _ in 0..tag_count {
+                        let _tag_id = decoder.read_unsigned_varint()?;
+                        let tag_size = decoder.read_unsigned_varint()? as usize;
+                        decoder.advance(tag_size)?;
+                    }
+                }
             }
         }
-        
+
         // Read and ignore rack_id for v11+
         if header.api_version >= 11 {
-            let _rack_id = decoder.read_string()?;
+            let _rack_id = if flexible {
+                decoder.read_compact_string()?
+            } else {
+                decoder.read_string()?
+            };
         }
-        
+
+        // Tagged fields at request level (v12+)
+        if flexible {
+            let tag_count = decoder.read_unsigned_varint()?;
+            for _ in 0..tag_count {
+                let _tag_id = decoder.read_unsigned_varint()?;
+                let tag_size = decoder.read_unsigned_varint()? as usize;
+                decoder.advance(tag_size)?;
+            }
+        }
+
         Ok(FetchRequest {
             replica_id,
             max_wait_ms,
@@ -978,79 +1056,133 @@ impl ProtocolHandler {
     pub fn encode_fetch_response(&self, buf: &mut BytesMut, response: &crate::types::FetchResponse, version: i16) -> Result<()> {
         let initial_len = buf.len();
         let mut encoder = Encoder::new(buf);
-        
-        tracing::debug!("Encoding Fetch response v{}", version);
-        
+        let flexible = version >= 12;
+
+        tracing::debug!("Encoding Fetch response v{} (flexible={})", version, flexible);
+
+        // Throttle time (v1+)
         if version >= 1 {
             encoder.write_i32(response.throttle_time_ms);
             tracing::trace!("  throttle_time_ms: {}", response.throttle_time_ms);
         }
-        
+
+        // Error code and session ID (v7+)
         if version >= 7 {
-            encoder.write_i16(0); // error_code
-            encoder.write_i32(0); // session_id
-            tracing::trace!("  error_code: 0, session_id: 0");
+            encoder.write_i16(response.error_code);
+            encoder.write_i32(response.session_id);
+            tracing::trace!("  error_code: {}, session_id: {}", response.error_code, response.session_id);
         }
-        
+
         // Topics array
-        encoder.write_i32(response.topics.len() as i32);
+        if flexible {
+            encoder.write_unsigned_varint((response.topics.len() + 1) as u32);
+        } else {
+            encoder.write_i32(response.topics.len() as i32);
+        }
         tracing::debug!("  Topics count: {}", response.topics.len());
-        
+
         for topic in &response.topics {
-            encoder.write_string(Some(&topic.name));
+            // Topic name
+            if flexible {
+                encoder.write_compact_string(Some(&topic.name));
+            } else {
+                encoder.write_string(Some(&topic.name));
+            }
             tracing::trace!("    Topic: {}", topic.name);
-            
+
             // Partitions array
-            encoder.write_i32(topic.partitions.len() as i32);
+            if flexible {
+                encoder.write_unsigned_varint((topic.partitions.len() + 1) as u32);
+            } else {
+                encoder.write_i32(topic.partitions.len() as i32);
+            }
             tracing::trace!("    Partitions count: {}", topic.partitions.len());
-            
+
             for partition in &topic.partitions {
                 encoder.write_i32(partition.partition);
                 encoder.write_i16(partition.error_code);
                 encoder.write_i64(partition.high_watermark);
-                
-                tracing::trace!("      Partition {}: error={}, hw={}", 
+
+                tracing::trace!("      Partition {}: error={}, hw={}",
                     partition.partition, partition.error_code, partition.high_watermark);
-                
+
                 if version >= 4 {
                     encoder.write_i64(partition.last_stable_offset);
-                    
+
                     if version >= 5 {
                         encoder.write_i64(partition.log_start_offset);
-                        tracing::trace!("        lso={}, log_start={}", 
+                        tracing::trace!("        lso={}, log_start={}",
                             partition.last_stable_offset, partition.log_start_offset);
                     }
-                    
-                    // Aborted transactions (empty for now)
-                    encoder.write_i32(0);
+
+                    // Aborted transactions
+                    if let Some(ref aborted) = partition.aborted {
+                        if flexible {
+                            encoder.write_unsigned_varint((aborted.len() + 1) as u32);
+                        } else {
+                            encoder.write_i32(aborted.len() as i32);
+                        }
+                        for txn in aborted {
+                            encoder.write_i64(txn.producer_id);
+                            encoder.write_i64(txn.first_offset);
+                            if flexible {
+                                encoder.write_unsigned_varint(0); // Tagged fields
+                            }
+                        }
+                    } else {
+                        if flexible {
+                            encoder.write_unsigned_varint(1); // 0 + 1 for compact encoding
+                        } else {
+                            encoder.write_i32(0);
+                        }
+                    }
                 }
-                
+
                 if version >= 11 {
                     encoder.write_i32(partition.preferred_read_replica);
                     tracing::trace!("        preferred_read_replica={}", partition.preferred_read_replica);
                 }
-                
+
                 // Records
-                // For the records field, write the actual bytes if we have them
-                // or write an empty byte array (length 0) for no records
                 let records_len = partition.records.len();
                 if records_len == 0 {
-                    // Write empty bytes (length 0) - not NULL
-                    // This tells the client there are no records without causing parsing errors
+                    // Empty records
                     tracing::trace!("        Records: empty (0 bytes)");
-                    encoder.write_bytes(Some(&[]));
+                    if flexible {
+                        encoder.write_unsigned_varint(0); // Null in compact encoding
+                    } else {
+                        encoder.write_i32(0); // Empty byte array
+                    }
                 } else {
                     tracing::debug!("        Records: {} bytes", records_len);
-                    tracing::trace!("        Records data (first 32 bytes): {:?}", 
-                        &partition.records[..std::cmp::min(32, records_len)]);
-                    encoder.write_bytes(Some(&partition.records));
+                    if flexible {
+                        encoder.write_unsigned_varint((records_len + 1) as u32);
+                    } else {
+                        encoder.write_i32(records_len as i32);
+                    }
+                    encoder.write_raw_bytes(&partition.records);
+                }
+
+                // Tagged fields for partition (v12+)
+                if flexible {
+                    encoder.write_unsigned_varint(0);
                 }
             }
+
+            // Tagged fields for topic (v12+)
+            if flexible {
+                encoder.write_unsigned_varint(0);
+            }
         }
-        
+
+        // Tagged fields at response level (v12+)
+        if flexible {
+            encoder.write_unsigned_varint(0);
+        }
+
         let total_encoded = buf.len() - initial_len;
-        tracing::info!("Encoded Fetch response: {} bytes total", total_encoded);
-        
+        tracing::info!("Encoded Fetch response v{}: {} bytes total", version, total_encoded);
+
         Ok(())
     }
     
@@ -1960,6 +2092,8 @@ impl ProtocolHandler {
         let response = FetchResponse {
             header: ResponseHeader { correlation_id: header.correlation_id },
             throttle_time_ms: 0,
+            error_code: 0,    // No error
+            session_id: 0,     // No incremental fetch session
             topics: response_topics,
         };
         
@@ -4052,17 +4186,12 @@ impl ProtocolHandler {
         // Check if this is a flexible/compact version (v9+)
         let flexible = version >= 9;
 
-        // NOTE: throttle_time_ms position differs between versions
-        // For v1-v8: throttle_time_ms goes at the END of the response
-        // For v9+: throttle_time_ms goes at the BEGINNING of the response
-        // This was discovered through comparison with real Kafka
+        // NOTE: According to Kafka protocol spec, field ordering is:
+        // For ALL versions v0+: responses/topics array comes FIRST
+        // For v1+: throttle_time_ms comes AFTER responses array (at the END)
+        // For v9+: uses flexible/compact encoding for arrays and strings
 
-        // Write throttle_time_ms at the BEGINNING for v9+
-        if version >= 9 {
-            encoder.write_i32(response.throttle_time_ms);
-        }
-
-        // Topics array (called "responses" in the protocol)
+        // Topics array (called "responses" in the protocol) - ALWAYS FIRST
         if flexible {
             // v9+ uses compact array
             encoder.write_unsigned_varint((response.topics.len() + 1) as u32);
@@ -4128,15 +4257,15 @@ impl ProtocolHandler {
             }
         }
         
-        // Write tagged fields at response level in v9+
+        // Write throttle_time_ms at the END for v1+ (INCLUDING v9+!)
+        // This comes AFTER the responses array for all versions
+        if version >= 1 {
+            encoder.write_i32(response.throttle_time_ms);
+        }
+
+        // Write tagged fields at response level in v9+ (AFTER throttle_time_ms)
         if flexible {
             encoder.write_unsigned_varint(0); // No tagged fields
-        }
-        
-        // Write throttle_time_ms at the END for v1-v8
-        // This is critical for client compatibility (especially Python kafka-python)
-        if version >= 1 && version < 9 {
-            encoder.write_i32(response.throttle_time_ms);
         }
         
         // Log the encoded response for debugging
