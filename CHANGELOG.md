@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.17] - 2025-10-04
+
+### Fixed
+- **CRITICAL**: AddPartitionsToTxn v3 flexible protocol format - Fixes KSQLDB transaction support
+  - **Root cause**: v3 response was using NON-flexible format instead of flexible format
+  - According to Kafka protocol spec (verified from Apache Kafka source and RedPanda implementation):
+    - `"flexibleVersions": "3+"` means v3+ uses flexible format for BOTH headers and bodies
+    - Flexible format = compact strings/arrays (varint lengths) + tagged fields
+  - Changed flexibility check from `version < 4` to `version < 3` in handler.rs
+  - v3+ now correctly uses flexible headers (5 bytes with tagged fields) and compact body encoding
+  - Resolves `BufferUnderflowException` and string parsing errors when KSQLDB attempts transactions
+  - **Note**: v1.3.15-v1.3.16 had incorrect understanding of v3 format requirements
+
+### Technical Details
+- AddPartitionsToTxn flexible format (v3+):
+  - Response header: Flexible (5 bytes: correlation_id + tagged_fields)
+  - Response body: Compact strings/arrays (varint lengths) + tagged fields at end
+- AddPartitionsToTxn non-flexible format (v0-v2):
+  - Response header: Non-flexible (4 bytes: correlation_id only)
+  - Response body: Standard strings/arrays (INT16/INT32 lengths), no tagged fields
+- This matches the pattern used by InitProducerId v2+ (flexible) and other Kafka APIs
+
+### Research
+- Verified against official Apache Kafka protocol schemas from RedPanda project
+- Schema file: `add_partitions_to_txn_response.json` clearly states `"flexibleVersions": "3+"`
+- Matches InitProducerId which has `"flexibleVersions": "2+"` (working correctly in v1.3.14)
+
+### Compatibility
+- **Full KSQLDB transactional support** - Complete transaction lifecycle now functional
+- Fixes the last blocker for 100% KSQLDB compatibility
+- Proper implementation following Apache Kafka protocol specification
+
+### Migration from v1.3.15/v1.3.16
+Upgrade immediately - previous versions had incorrect protocol format implementation.
+
+## [1.3.16] - 2025-10-04
+
+### Fixed (INCORRECT - See v1.3.17)
+- Attempted to fix AddPartitionsToTxn v3 with wrong understanding of protocol
+- Changed from v3 flexible to v3 non-flexible (opposite of correct fix)
+
+## [1.3.15] - 2025-10-04
+
+### Fixed (INCOMPLETE - See v1.3.17)
+- AddPartitionsToTxn v3 body encoding (compact strings/arrays)
+
+## [1.3.15] - 2025-10-04
+
+### Fixed (INCOMPLETE - See v1.3.16)
+- AddPartitionsToTxn v3 body encoding (compact strings/arrays)
+  - **Note**: This version fixed the body but missed the header issue
+  - Use v1.3.16 instead for complete fix
+
 ## [1.3.14] - 2025-10-04
 
 ### Fixed

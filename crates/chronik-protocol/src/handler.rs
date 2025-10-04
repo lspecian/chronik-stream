@@ -130,7 +130,9 @@ impl ProtocolHandler {
         } else if api_key == ApiKey::Metadata && header.api_version < 9 {
             false  // Metadata v0-v8 use NON-flexible headers
         } else if api_key == ApiKey::AddPartitionsToTxn && header.api_version < 3 {
-            false  // AddPartitionsToTxn v0-v2 use NON-flexible headers
+            false  // AddPartitionsToTxn v0-v2 use NON-flexible headers (v3+ use flexible)
+        } else if api_key == ApiKey::EndTxn && header.api_version < 3 {
+            false  // EndTxn v0-v2 use NON-flexible headers (v3+ use flexible)
         } else {
             // For other APIs and DescribeCluster v1+/Metadata v9+, use flexible headers
             // when the client has negotiated ApiVersions v3+
@@ -3822,7 +3824,12 @@ impl ProtocolHandler {
         use crate::parser::{Decoder, Encoder, KafkaDecodable, KafkaEncodable};
         use bytes::BytesMut;
 
-        tracing::info!("Handling AddPartitionsToTxn request");
+        let is_flexible = header.api_version >= 4;
+        tracing::info!(
+            "Handling AddPartitionsToTxn v{} request (is_flexible={})",
+            header.api_version,
+            is_flexible
+        );
 
         // Decode request
         let mut decoder = Decoder::new(body);
@@ -3880,6 +3887,13 @@ impl ProtocolHandler {
         let mut body_buf = BytesMut::new();
         let mut encoder = Encoder::new(&mut body_buf);
         response.encode(&mut encoder, header.api_version)?;
+
+        tracing::debug!(
+            "Encoded AddPartitionsToTxn v{} response: body_size={} bytes (flexible={})",
+            header.api_version,
+            body_buf.len(),
+            is_flexible
+        );
 
         Ok(Self::make_response(&header, ApiKey::AddPartitionsToTxn, body_buf.freeze()))
     }

@@ -18,12 +18,30 @@ pub struct EndTxnRequest {
 }
 
 impl KafkaDecodable for EndTxnRequest {
-    fn decode(decoder: &mut Decoder, _version: i16) -> Result<Self> {
-        let transactional_id = decoder.read_string()?
-            .ok_or_else(|| Error::Protocol("Transactional ID cannot be null".into()))?;
+    fn decode(decoder: &mut Decoder, version: i16) -> Result<Self> {
+        // v3+ uses flexible format: compact strings AND tagged fields
+        let uses_compact = version >= 3;
+        let has_tagged_fields = version >= 3;
+
+        let transactional_id = if uses_compact {
+            decoder.read_compact_string()?
+        } else {
+            decoder.read_string()?
+        }.ok_or_else(|| Error::Protocol("Transactional ID cannot be null".into()))?;
+
         let producer_id = decoder.read_i64()?;
         let producer_epoch = decoder.read_i16()?;
         let committed = decoder.read_i8()? != 0;
+
+        // Tagged fields for v3+
+        if has_tagged_fields {
+            let tag_count = decoder.read_unsigned_varint()?;
+            for _ in 0..tag_count {
+                let _tag_id = decoder.read_unsigned_varint()?;
+                let tag_size = decoder.read_unsigned_varint()? as usize;
+                decoder.advance(tag_size)?;
+            }
+        }
 
         Ok(EndTxnRequest {
             transactional_id,
@@ -54,9 +72,18 @@ pub struct EndTxnResponse {
 }
 
 impl KafkaEncodable for EndTxnResponse {
-    fn encode(&self, encoder: &mut Encoder, _version: i16) -> Result<()> {
+    fn encode(&self, encoder: &mut Encoder, version: i16) -> Result<()> {
+        // v3+ uses flexible format with tagged fields
+        let has_tagged_fields = version >= 3;
+
         encoder.write_i32(self.throttle_time_ms);
         encoder.write_i16(self.error_code);
+
+        // Tagged fields for v3+
+        if has_tagged_fields {
+            encoder.write_tagged_fields();
+        }
+
         Ok(())
     }
 }

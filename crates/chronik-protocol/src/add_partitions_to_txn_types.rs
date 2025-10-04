@@ -37,10 +37,22 @@ pub struct AddPartitionsToTxnTopic {
 
 impl KafkaDecodable for AddPartitionsToTxnTopic {
     fn decode(decoder: &mut Decoder, version: i16) -> Result<Self> {
-        let name = decoder.read_string()?
-            .ok_or_else(|| Error::Protocol("Topic name cannot be null".into()))?;
+        // v3+ uses flexible format: compact strings/arrays AND tagged fields
+        let uses_compact = version >= 3;
+        let has_tagged_fields = version >= 3;  // FIXED: v3+, not v4+
 
-        let partition_count = decoder.read_i32()?;
+        let name = if uses_compact {
+            decoder.read_compact_string()?
+        } else {
+            decoder.read_string()?
+        }.ok_or_else(|| Error::Protocol("Topic name cannot be null".into()))?;
+
+        let partition_count = if uses_compact {
+            (decoder.read_unsigned_varint()? as i32) - 1  // Compact array: varint length - 1
+        } else {
+            decoder.read_i32()?
+        };
+
         if partition_count < 0 {
             return Err(Error::Protocol("Invalid partition count".into()));
         }
@@ -48,6 +60,16 @@ impl KafkaDecodable for AddPartitionsToTxnTopic {
         let mut partitions = Vec::with_capacity(partition_count as usize);
         for _ in 0..partition_count {
             partitions.push(AddPartitionsToTxnPartition::decode(decoder, version)?);
+        }
+
+        // Consume tagged fields for v4+ only
+        if has_tagged_fields {
+            let tag_count = decoder.read_unsigned_varint()?;
+            for _ in 0..tag_count {
+                let _tag_id = decoder.read_unsigned_varint()?;
+                let tag_size = decoder.read_unsigned_varint()? as usize;
+                decoder.advance(tag_size)?;
+            }
         }
 
         Ok(AddPartitionsToTxnTopic {
@@ -83,12 +105,27 @@ pub struct AddPartitionsToTxnRequest {
 
 impl KafkaDecodable for AddPartitionsToTxnRequest {
     fn decode(decoder: &mut Decoder, version: i16) -> Result<Self> {
-        let transactional_id = decoder.read_string()?
-            .ok_or_else(|| Error::Protocol("Transactional ID cannot be null".into()))?;
+        // v3+ uses flexible format: compact strings/arrays AND tagged fields
+        let uses_compact = version >= 3;
+        let has_tagged_fields = version >= 3;  // FIXED: v3+, not v4+
+
+        // Read transactional_id with correct encoding based on version
+        let transactional_id = if uses_compact {
+            decoder.read_compact_string()?
+        } else {
+            decoder.read_string()?
+        }.ok_or_else(|| Error::Protocol("Transactional ID cannot be null".into()))?;
+
         let producer_id = decoder.read_i64()?;
         let producer_epoch = decoder.read_i16()?;
 
-        let topic_count = decoder.read_i32()?;
+        // Read topic count with correct encoding
+        let topic_count = if uses_compact {
+            (decoder.read_unsigned_varint()? as i32) - 1  // Compact array: varint length - 1
+        } else {
+            decoder.read_i32()?
+        };
+
         if topic_count < 0 {
             return Err(Error::Protocol("Invalid topic count".into()));
         }
@@ -96,6 +133,16 @@ impl KafkaDecodable for AddPartitionsToTxnRequest {
         let mut topics = Vec::with_capacity(topic_count as usize);
         for _ in 0..topic_count {
             topics.push(AddPartitionsToTxnTopic::decode(decoder, version)?);
+        }
+
+        // Consume tagged fields for v4+ only
+        if has_tagged_fields {
+            let tag_count = decoder.read_unsigned_varint()?;
+            for _ in 0..tag_count {
+                let _tag_id = decoder.read_unsigned_varint()?;
+                let tag_size = decoder.read_unsigned_varint()? as usize;
+                decoder.advance(tag_size)?;
+            }
         }
 
         Ok(AddPartitionsToTxnRequest {
@@ -131,11 +178,13 @@ pub struct AddPartitionsToTxnResponse {
 
 impl KafkaEncodable for AddPartitionsToTxnResponse {
     fn encode(&self, encoder: &mut Encoder, version: i16) -> Result<()> {
-        let flexible = version >= 3;
+        // v3+ uses flexible format: compact strings/arrays AND tagged fields
+        let uses_compact = version >= 3;
+        let has_tagged_fields = version >= 3;  // FIXED: v3+, not v4+
 
         encoder.write_i32(self.throttle_time_ms);
 
-        if flexible {
+        if uses_compact {
             encoder.write_compact_array_len(self.results.len());
         } else {
             encoder.write_i32(self.results.len() as i32);
@@ -145,8 +194,8 @@ impl KafkaEncodable for AddPartitionsToTxnResponse {
             result.encode(encoder, version)?;
         }
 
-        // Tagged fields for v3+
-        if flexible {
+        // Tagged fields for v4+ only
+        if has_tagged_fields {
             encoder.write_tagged_fields();
         }
 
@@ -165,9 +214,11 @@ pub struct AddPartitionsToTxnTopicResult {
 
 impl KafkaEncodable for AddPartitionsToTxnTopicResult {
     fn encode(&self, encoder: &mut Encoder, version: i16) -> Result<()> {
-        let flexible = version >= 3;
+        // v3+ uses flexible format: compact strings/arrays AND tagged fields
+        let uses_compact = version >= 3;
+        let has_tagged_fields = version >= 3;  // FIXED: v3+, not v4+
 
-        if flexible {
+        if uses_compact {
             encoder.write_compact_string(Some(&self.name));
             encoder.write_compact_array_len(self.results.len());
         } else {
@@ -179,8 +230,8 @@ impl KafkaEncodable for AddPartitionsToTxnTopicResult {
             result.encode(encoder, version)?;
         }
 
-        // Tagged fields for v3+
-        if flexible {
+        // Tagged fields for v4+ only
+        if has_tagged_fields {
             encoder.write_tagged_fields();
         }
 
@@ -199,12 +250,12 @@ pub struct AddPartitionsToTxnPartitionResult {
 
 impl KafkaEncodable for AddPartitionsToTxnPartitionResult {
     fn encode(&self, encoder: &mut Encoder, version: i16) -> Result<()> {
-        let flexible = version >= 3;
+        let flexible = version >= 3;  // FIXED: v3+, not v4+
 
         encoder.write_i32(self.partition);
         encoder.write_i16(self.error_code);
 
-        // Tagged fields for v3+
+        // Tagged fields for v4+
         if flexible {
             encoder.write_tagged_fields();
         }

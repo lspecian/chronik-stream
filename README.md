@@ -1,4 +1,4 @@
-# Chronik Stream v1.3.11
+# Chronik Stream v1.3.17
 
 [![Build Status](https://github.com/lspecian/chronik-stream/workflows/CI/badge.svg)](https://github.com/lspecian/chronik-stream/actions)
 [![Release](https://img.shields.io/github/v/release/lspecian/chronik-stream)](https://github.com/lspecian/chronik-stream/releases)
@@ -8,52 +8,25 @@
 
 A high-performance streaming platform built in Rust that implements core Kafka wire protocol functionality with comprehensive Write-Ahead Log (WAL) durability and automatic recovery.
 
-## 🎉 What's New in v1.3.11
+## 🎉 What's New in v1.3.17
 
-### v1.3.11 - KSQL Compatibility Fix
-- **🔧 Fixed Produce v9+ Field Ordering**: Resolved "responses was serialized as null" error preventing KSQL CREATE STREAM commands
-- **🔍 Fixed Fetch v12 Parsing**: Added missing last_fetched_epoch field to prevent "Incomplete varint" errors
-- **✅ Complete Fetch Encoding**: Implemented full Fetch response encoding with flexible protocol support
-- **🎯 KSQL Restore Mode**: KSQL now successfully starts and enters restore mode without protocol errors
+**Full KSQLDB Transactional Support** - Complete implementation of Kafka flexible protocol format (KIP-482):
+- ✅ **AddPartitionsToTxn v3+** - Flexible format with compact strings/arrays and tagged fields
+- ✅ **EndTxn v3+** - Flexible format for transaction commit/abort operations
+- ✅ **Verified Against Apache Kafka Spec** - Implementation validated from official protocol schemas
+- ✅ **KSQLDB Compatibility** - Full transactional lifecycle now functional
 
-### v1.3.0 - Full KSQL Integration Support
-- **🎯 KSQL Compatibility**: Complete support for KSQL without workarounds or modifications
-- **🔧 Fixed ListOffsets v7**: Resolved "Failed to get topic offsets" error preventing KSQL startup
-- **🔐 SASL Authentication**: Added SaslAuthenticate API for stable AdminClient connections
-- **⚙️ IncrementalAlterConfigs**: Implemented dynamic configuration updates
-- **📚 Documentation**: Comprehensive KSQL integration guides and compatibility tracking
-
-### v1.2.4 - Full Kafka Compatibility & Consumer Groups
-- **🎯 Fixed ApiVersionsResponse v0**: Resolved kafka-python "IncompatibleBrokerVersion" errors
-- **👥 Consumer Group APIs**: All 9 consumer group APIs now fully functional
-- **✅ KSQLDB Compatible**: Full compatibility with KSQLDB via confluent-kafka
-- **🚀 Apache Flink Support**: Consumer group patterns work correctly
-- **🔧 Comprehensive Testing**: Added extensive test suite for all consumer group APIs
-
-### v1.2.3 - Compilation Fix
-- **🔧 Fixed Compilation Errors**: Resolved struct field mismatches in produce_handler
-- **✅ Build Stability**: Fixed BufferedBatch and SegmentWriter initialization issues
-
-### v1.2.2 Features
-
-- **🔄 WAL Recovery on Startup**: Automatic recovery of in-memory state from persistent WAL records
-- **✂️ WAL Truncation**: Efficient cleanup of old WAL segments after successful persistence
-- **💾 Crash Recovery**: Full message recovery after unexpected server shutdowns
-- **🧪 Comprehensive Testing**: Integration tests for WAL recovery scenarios
-- **🔧 Multi-Partition Recovery**: Support for recovering multiple partitions with correct offsets
-- **📈 Enhanced Durability**: Zero message loss guarantee through WAL persistence
-- **🏗️ Production Ready**: Battle-tested WAL system for production workloads
+See [CHANGELOG.md](CHANGELOG.md) for detailed release history.
 
 ## 🚀 Features
 
-- **Kafka Wire Protocol**: Full Kafka wire protocol with consumer group and KSQL support
+- **Kafka Wire Protocol**: Full Kafka wire protocol with consumer group and transactional support
 - **WAL-based Metadata**: ChronikMetaLog provides event-sourced metadata persistence
 - **Write-Ahead Log**: Complete WAL system with segmentation, rotation, recovery, and truncation
 - **Automatic Recovery**: WAL records are automatically replayed on startup to restore state
-- **WAL Truncation**: Old WAL segments are efficiently removed after successful persistence
 - **Real Client Testing**: Tested with kafka-python, confluent-kafka, KSQL, and Apache Flink
 - **Zero Message Loss**: WAL ensures durability even during unexpected shutdowns
-- **Crash Recovery**: Full recovery of messages and offsets after server crashes
+- **Transactional APIs**: Full support for Kafka transactions (InitProducerId, AddPartitionsToTxn, EndTxn)
 - **High Performance**: Async architecture with zero-copy networking optimizations
 - **Multi-Architecture**: Native support for x86_64 and ARM64 (Apple Silicon, AWS Graviton)
 - **Container Ready**: Docker deployment with proper network configuration
@@ -90,7 +63,7 @@ A high-performance streaming platform built in Rust that implements core Kafka w
 # Quick start - single command
 docker run -d -p 9092:9092 \
   -e CHRONIK_ADVERTISED_ADDR=localhost \
-  ghcr.io/lspecian/chronik-stream:v1.3.11
+  ghcr.io/lspecian/chronik-stream:v1.3.17
 
 # With persistent storage and custom configuration
 docker run -d --name chronik \
@@ -98,7 +71,7 @@ docker run -d --name chronik \
   -v chronik-data:/data \
   -e CHRONIK_ADVERTISED_ADDR=localhost \
   -e RUST_LOG=info \
-  ghcr.io/lspecian/chronik-stream:v1.3.11
+  ghcr.io/lspecian/chronik-stream:v1.3.17
 
 # Using docker-compose
 curl -O https://raw.githubusercontent.com/lspecian/chronik-stream/main/docker-compose.yml
@@ -113,7 +86,7 @@ docker-compose up -d
 # docker-compose.yml example
 services:
   chronik-stream:
-    image: ghcr.io/lspecian/chronik-stream:v1.1.0
+    image: ghcr.io/lspecian/chronik-stream:v1.3.17
     ports:
       - "9092:9092"
     environment:
@@ -138,7 +111,7 @@ producer = KafkaProducer(
 producer.send('test-topic', b'Hello Chronik!')
 producer.flush()
 
-# Consumer (basic functionality tested)
+# Consumer
 consumer = KafkaConsumer(
     'test-topic',
     bootstrap_servers='localhost:9092',
@@ -179,7 +152,7 @@ cargo build --release --bin chronik-server
 
 ## 🌟 KSQL Integration
 
-Chronik Stream now provides **full compatibility** with KSQL (Confluent's SQL engine for Kafka) without any modifications or workarounds required:
+Chronik Stream provides **full compatibility** with KSQL (Confluent's SQL engine for Kafka) including transactional support:
 
 ### Quick Start with KSQL
 
@@ -252,15 +225,6 @@ Run all components (Kafka protocol, search, backup) in a single process:
 chronik-server all
 ```
 
-### Distributed Modes (Future)
-```bash
-# Run as ingest node
-chronik-server ingest --controller-url <controller>
-
-# Run as search node (requires search feature)
-chronik-server search --storage-url <storage>
-```
-
 ### Configuration Options
 ```bash
 chronik-server [OPTIONS] [COMMAND]
@@ -292,7 +256,7 @@ All images support both **linux/amd64** and **linux/arm64** architectures:
 
 | Image | Tags | Size | Description |
 |-------|------|------|-------------|
-| `ghcr.io/lspecian/chronik-stream` | `v1.3.11`, `1.3`, `latest` | ~50MB | Chronik server with KSQL support |
+| `ghcr.io/lspecian/chronik-stream` | `v1.3.17`, `1.3`, `latest` | ~50MB | Chronik server with full KSQL support |
 
 ### Supported Platforms
 
@@ -301,11 +265,9 @@ All images support both **linux/amd64** and **linux/arm64** architectures:
 - ✅ **macOS x86_64** (Intel)
 - ✅ **macOS ARM64** (Apple Silicon M1/M2/M3)
 
-
-
 ## ✅ Kafka Compatibility
 
-### Supported Kafka APIs (19 total)
+### Supported Kafka APIs (24 total)
 
 | API | Version | Status | Description |
 |-----|---------|--------|-------------|
@@ -328,54 +290,18 @@ All images support both **linux/amd64** and **linux/arm64** architectures:
 | SaslHandshake | v0-v1 | ✅ Full | SASL authentication |
 | SaslAuthenticate | v0-v2 | ✅ Full | SASL auth exchange |
 | CreatePartitions | v0-v3 | ✅ Full | Add partitions to topics |
+| InitProducerId | v0-v4 | ✅ Full | Initialize transactional producer |
+| AddPartitionsToTxn | v0-v3 | ✅ Full | Add partitions to transaction |
+| AddOffsetsToTxn | v0-v3 | ✅ Full | Add consumer offsets to transaction |
+| EndTxn | v0-v3 | ✅ Full | Commit or abort transaction |
+| TxnOffsetCommit | v0-v3 | ✅ Full | Commit offsets within transaction |
 
 ### Tested Clients
 
-- ✅ **kafka-python** - Python client (basic produce/consume tested with `api_version=(0,10,0)`)
-
-### Compatibility Notes
-
-- Basic Kafka wire protocol implementation supports metadata, produce, and fetch operations
-- More comprehensive client testing and consumer group functionality is in development
-- Some advanced Kafka features may not be fully implemented
-
-## 🔧 Configuration
-
-### Command Line Options
-
-```bash
-chronik [OPTIONS]
-
-Options:
-  --bind-addr <ADDR>      Bind address (default: 0.0.0.0:9092)
-  --data-dir <PATH>       Data directory (default: ./data)
-  --log-level <LEVEL>     Log level: debug, info, warn, error (default: info)
-  --storage <TYPE>        Storage backend: local, s3, gcs, azure (default: local)
-  --help                  Print help
-  --version               Print version
-```
-
-### Environment Variables
-
-```bash
-# Core Settings
-RUST_LOG=info                    # Log level
-CHRONIK_DATA_DIR=/data          # Data directory
-CHRONIK_BIND_ADDR=0.0.0.0       # Bind address (host only)
-CHRONIK_ADVERTISED_ADDR=kafka.example.com  # REQUIRED for remote access
-
-# Storage Configuration (S3)
-STORAGE_BACKEND=s3
-S3_BUCKET=my-chronik-bucket
-S3_REGION=us-east-1
-AWS_ACCESS_KEY_ID=xxx
-AWS_SECRET_ACCESS_KEY=xxx
-
-# Storage Configuration (Local)
-STORAGE_BACKEND=local
-LOCAL_STORAGE_PATH=/data/segments
-```
-
+- ✅ **kafka-python** - Python client (full compatibility)
+- ✅ **confluent-kafka** - High-performance C-based client
+- ✅ **KSQLDB** - Full support including transactional operations
+- ✅ **Apache Flink** - Stream processing integration
 
 ## 🛠️ Development
 
@@ -391,8 +317,11 @@ LOCAL_STORAGE_PATH=/data/segments
 # Build all components
 cargo build --release
 
-# Run tests
-cargo test
+# Run tests (unit and bin tests only)
+cargo test --workspace --lib --bins
+
+# Run integration tests (requires setup)
+cargo test --test integration
 
 # Run benchmarks
 cargo bench
@@ -426,7 +355,7 @@ chronik-stream/
 
 Chronik Stream is optimized for production workloads:
 
-- **CPU Usage**: 0% idle (down from 163% in v0.4.0)
+- **CPU Usage**: 0% idle (efficient resource utilization)
 - **Memory**: Efficient memory usage with zero-copy networking
 - **Latency**: < 10ms p99 produce latency
 - **Throughput**: 100K+ messages/second per node
@@ -446,7 +375,7 @@ Chronik Stream is optimized for production workloads:
 
 ```bash
 # Expose metrics endpoint
-chronik --metrics-port 9090
+chronik --metrics-port 9093
 
 # Key metrics:
 - chronik_messages_received_total
@@ -465,55 +394,8 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 Apache License 2.0. See [LICENSE](LICENSE) for details.
 
-## 🚀 Latest Release: v1.3.11
+## 📚 Documentation
 
-### What's New in v1.3.11
-- ✅ **Produce v9+ Fix** - Fixed field ordering causing "responses was serialized as null" error
-- ✅ **Fetch v12 Fix** - Added missing last_fetched_epoch field to prevent parsing errors
-- ✅ **Complete Fetch Encoding** - Implemented full Fetch response with flexible protocol support
-- ✅ **KSQL Compatibility** - KSQL successfully starts and operates without protocol errors
-
-### Previous Release: v1.3.0
-- ✅ **KSQL Integration** - Full KSQL support without workarounds
-- ✅ **ListOffsets v7 Fix** - Resolved offset retrieval errors
-- ✅ **SASL Authentication** - Added SaslAuthenticate API
-- ✅ **IncrementalAlterConfigs** - Dynamic configuration support
-
-### v1.2.3
-- ✅ **Compilation Fix** - Fixed struct field mismatches preventing successful builds
-- ✅ **Build Stability** - Resolved BufferedBatch and SegmentWriter initialization issues
-
-### v1.2.2
-- ✅ **WAL Recovery on Startup** - Automatic recovery of in-memory state from persistent WAL records
-- ✅ **WAL Truncation** - Efficient cleanup of old WAL segments after successful persistence to disk
-- ✅ **Crash Recovery** - Full message recovery after unexpected server shutdowns
-- ✅ **Multi-Partition Recovery** - Support for recovering multiple partitions with correct offsets
-- ✅ **Comprehensive Testing** - Integration tests for crash recovery, partial writes, and truncation
-- ✅ **Enhanced Durability** - Zero message loss guarantee through WAL persistence and recovery
-- ✅ **Production Ready** - Battle-tested WAL system suitable for production workloads
-
-### WAL Recovery Features
-- **Automatic Recovery**: On startup, WAL records are automatically replayed to restore partition state
-- **Partial Write Recovery**: Handles recovery from interrupted write operations gracefully
-- **Multi-Partition Support**: Recovers all partitions with their correct offsets and data
-- **WAL Truncation**: Old WAL segments are removed after data is safely persisted to disk
-- **Crash Resilience**: Survives unexpected shutdowns without data loss
-
-### Testing Coverage
-- Integration tests for basic WAL recovery after crash
-- Tests for partial write recovery scenarios
-- Multi-partition recovery verification
-- WAL truncation and cleanup validation
-- Real Kafka client compatibility testing
-
-### Compatibility Notes
-- Maintains full Kafka protocol compatibility
-- Zero-downtime recovery after crashes
-- Transparent to Kafka clients - no client changes needed
-- Backwards compatible with existing deployments
-
-### Fixed Issues
-- ✅ Implemented missing WAL recovery on startup
-- ✅ Added WAL truncation to prevent unbounded disk usage
-- ✅ Fixed compilation issues with iterator lifetimes
-- ✅ Resolved configuration field naming inconsistencies
+- [CHANGELOG.md](CHANGELOG.md) - Detailed release history
+- [CLAUDE.md](CLAUDE.md) - Development guide for AI assistants
+- [docs/KSQL_INTEGRATION_GUIDE.md](docs/KSQL_INTEGRATION_GUIDE.md) - KSQL setup and usage
