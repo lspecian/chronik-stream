@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.12] - 2025-10-04
+
+### Fixed
+- **CRITICAL**: Flexible protocol format support for Kafka v9+ (Produce) and v12+ (Fetch)
+  - Fixed response header encoding to include tagged fields for all flexible API versions
+  - Corrected Fetch flexible version threshold from v11 to v12 per Kafka protocol specification
+  - Resolves KSQLDB compatibility issues with Fetch v13
+  - Implements KIP-482 tagged fields correctly for all flexible APIs
+- Fixed API version advertising for flexible protocol support
+  - Produce v9+ now correctly advertised as supporting flexible format
+  - Fetch v12-v13 now correctly advertised with flexible format support
+
+### Added
+- **Transaction API Support** - Full support for transactional producers and exactly-once semantics
+  - InitProducerId API (v0-v4) - Initialize producer ID and epoch for transactions
+  - AddPartitionsToTxn API (v0-v3) - Add partitions to ongoing transaction
+  - AddOffsetsToTxn API (v0-v3) - Add consumer group offsets to transaction
+  - EndTxn API (v0-v3) - Commit or abort transactions
+  - TxnOffsetCommit API (v0-v3) - Commit offsets as part of transaction
+  - Flexible protocol format support for transaction APIs (v2+ for InitProducerId, v3+ for others)
+- Comprehensive debug logging for Producer request flow tracing
+- Test suite for validating flexible protocol format (`test_producer_fix.py`)
+- Detailed implementation documentation (`FIXES_v1.3.12.md`)
+
+### Changed
+- Updated ApiVersions response to advertise transaction API support (previously advertised as v0 only)
+- Enhanced request routing to properly handle all transaction APIs
+- Improved protocol compliance with Apache Kafka 2.5+ for flexible format APIs
+
+### Compatibility
+- **Full KSQLDB compatibility** - Fetch v13 with flexible format now works correctly
+- **Kafka Streams ready** - Transaction APIs enable exactly-once semantics
+- **Enhanced client compatibility** - Works with kafka-python, confluent-kafka, librdkafka using flexible formats
+- Drop-in replacement for v1.3.11 with no breaking changes
+- All existing clients continue to work with non-flexible API versions
+
+### Technical Details
+- Response headers for flexible APIs (except ApiVersions v3) now include empty tagged field (0x00)
+- Flexible version detection: Produce v9+, Fetch v12+, InitProducerId v2+, transaction APIs v3+
+- Protocol version negotiation properly handles both flexible and non-flexible formats
+- Transaction coordinator integrated with existing Kafka protocol handler
+
+### Migration from v1.3.11
+No changes required - this is a drop-in replacement that adds features without breaking compatibility.
+
 ## [1.0.2] - 2025-09-14
 
 ### Fixed

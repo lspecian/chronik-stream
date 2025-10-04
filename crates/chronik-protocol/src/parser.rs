@@ -673,6 +673,12 @@ pub fn is_flexible_version(api_key: ApiKey, api_version: i16) -> bool {
         ApiKey::DeleteTopics => api_version >= 4,
         ApiKey::DescribeConfigs => api_version >= 4,
         ApiKey::DescribeCluster => api_version >= 1,  // v1 uses flexible encoding
+        // Transaction APIs
+        ApiKey::InitProducerId => api_version >= 2,  // v2+ uses flexible encoding
+        ApiKey::AddPartitionsToTxn => api_version >= 3,  // v3+ uses flexible encoding
+        ApiKey::AddOffsetsToTxn => api_version >= 3,  // v3+ uses flexible encoding
+        ApiKey::EndTxn => api_version >= 3,  // v3+ uses flexible encoding
+        ApiKey::TxnOffsetCommit => api_version >= 3,  // v3+ uses flexible encoding
         // All new APIs default to non-flexible for v0
         _ => false,
     }
@@ -709,13 +715,13 @@ pub fn supported_api_versions() -> HashMap<ApiKey, VersionRange> {
     versions.insert(ApiKey::UpdateMetadata, VersionRange { min: 0, max: 0 });
     versions.insert(ApiKey::ControlledShutdown, VersionRange { min: 0, max: 0 });
     
-    // Transaction APIs (NOT IMPLEMENTED - placeholder for librdkafka compatibility)
-    versions.insert(ApiKey::InitProducerId, VersionRange { min: 0, max: 0 });
-    versions.insert(ApiKey::AddPartitionsToTxn, VersionRange { min: 0, max: 0 });
-    versions.insert(ApiKey::AddOffsetsToTxn, VersionRange { min: 0, max: 0 });
-    versions.insert(ApiKey::EndTxn, VersionRange { min: 0, max: 0 });
-    versions.insert(ApiKey::WriteTxnMarkers, VersionRange { min: 0, max: 0 });
-    versions.insert(ApiKey::TxnOffsetCommit, VersionRange { min: 0, max: 0 });
+    // Transaction APIs (IMPLEMENTED - full support for transactional producers)
+    versions.insert(ApiKey::InitProducerId, VersionRange { min: 0, max: 4 });  // v0-v4 supported
+    versions.insert(ApiKey::AddPartitionsToTxn, VersionRange { min: 0, max: 3 });  // v0-v3 supported
+    versions.insert(ApiKey::AddOffsetsToTxn, VersionRange { min: 0, max: 3 });  // v0-v3 supported
+    versions.insert(ApiKey::EndTxn, VersionRange { min: 0, max: 3 });  // v0-v3 supported
+    versions.insert(ApiKey::WriteTxnMarkers, VersionRange { min: 0, max: 0 });  // Broker-internal, not client-facing
+    versions.insert(ApiKey::TxnOffsetCommit, VersionRange { min: 0, max: 3 });  // v0-v3 supported
     
     // ACL APIs (NOT IMPLEMENTED - placeholder for librdkafka compatibility)
     versions.insert(ApiKey::DescribeAcls, VersionRange { min: 0, max: 0 });

@@ -205,8 +205,12 @@ impl KafkaProtocolHandler {
                 self.protocol_handler.handle_metadata(header, &mut buf).await
             }
             ApiKey::Produce => {
+                eprintln!("!!! PRODUCE HANDLER CALLED !!! version={}, correlation_id={}", header.api_version, header.correlation_id);
+
                 // Parse the produce request
                 let request = self.protocol_handler.parse_produce_request(&header, &mut buf)?;
+
+                eprintln!("!!! PRODUCE REQUEST PARSED !!! topics_count={}", request.topics.len());
 
                 // Auto-create topics if they don't exist
                 let topic_names: Vec<String> = request.topics.iter()
@@ -214,6 +218,7 @@ impl KafkaProtocolHandler {
                     .collect();
 
                 if !topic_names.is_empty() {
+                    eprintln!("!!! AUTO-CREATING TOPICS: {:?}", topic_names);
                     tracing::info!("Produce request for topics: {:?}", topic_names);
 
                     // Check which topics don't exist and create them
@@ -501,7 +506,7 @@ impl KafkaProtocolHandler {
                         correlation_id: header.correlation_id,
                     },
                     body: body_buf.freeze(),
-                    is_flexible: header.api_version >= 11, // Fetch uses flexible from v11+
+                    is_flexible: header.api_version >= 12, // Fetch uses flexible from v12+ (not v11)
                     api_key: ApiKey::Fetch,
                     throttle_time_ms: None,
                 })

@@ -474,14 +474,26 @@ impl IntegratedKafkaServer {
                                     break;
                                 }
                             }
-                            
+
+                            // CRITICAL DEBUG: Log the raw request bytes to identify API key
+                            if request_size >= 8 {
+                                let api_key = i16::from_be_bytes([request_buffer[0], request_buffer[1]]);
+                                let api_version = i16::from_be_bytes([request_buffer[2], request_buffer[3]]);
+                                eprintln!(">>> RAW REQUEST: api_key={}, api_version={}, size={}, first_16_bytes={:02x?}",
+                                    api_key, api_version, request_size, &request_buffer[..std::cmp::min(16, request_size)]);
+
+                                if api_key == 0 {
+                                    eprintln!("!!! PRODUCE REQUEST DETECTED !!! API key=0, version={}, size={}", api_version, request_size);
+                                }
+                            }
+
                             // Parse correlation ID from request for error handling
                             // Kafka protocol: API key (2), API version (2), correlation ID (4)
                             let correlation_id = if request_size >= 8 {
                                 i32::from_be_bytes([
-                                    request_buffer[4], 
-                                    request_buffer[5], 
-                                    request_buffer[6], 
+                                    request_buffer[4],
+                                    request_buffer[5],
+                                    request_buffer[6],
                                     request_buffer[7]
                                 ])
                             } else {
@@ -499,14 +511,13 @@ impl IntegratedKafkaServer {
                                     header_bytes.extend_from_slice(&response.header.correlation_id.to_be_bytes());
                                     
                                     // For flexible versions, add tagged fields after correlation ID
-                                    // BUT ApiVersions v3 and Produce v9+ are special - the response headers have NO tagged fields!
-                                    // The tagged fields are only in the response BODY for these APIs
+                                    // According to Kafka protocol spec, ALL flexible API versions need tagged fields in response header
+                                    // ApiVersions v3 is an exception - it has NO tagged fields anywhere (not in header, not in body)
                                     if response.is_flexible {
-                                        // ApiVersions v3 and Produce v9+ don't have header tagged fields
-                                        // All other flexible APIs do
-                                        if response.api_key != chronik_protocol::parser::ApiKey::ApiVersions && 
-                                           response.api_key != chronik_protocol::parser::ApiKey::Produce {
-                                            // Add empty tagged fields (varint 0) for other flexible APIs
+                                        // ApiVersions v3 is special - no tagged fields at all
+                                        // All other flexible APIs (including Produce v9+, Fetch v12+) need empty tagged fields in header
+                                        if response.api_key != chronik_protocol::parser::ApiKey::ApiVersions {
+                                            // Add empty tagged fields (varint 0) for all flexible APIs except ApiVersions
                                             header_bytes.push(0);
                                         }
                                     }

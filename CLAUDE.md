@@ -1,443 +1,381 @@
-# Task Master AI - Claude Code Integration Guide
+# CLAUDE.md
 
-## Essential Commands
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-### Core Workflow Commands
+## Project Overview
 
+Chronik Stream is a high-performance Kafka-compatible streaming platform written in Rust that implements the Kafka wire protocol with comprehensive Write-Ahead Log (WAL) durability and automatic recovery. Current version: v1.3.11.
+
+**Key Differentiators:**
+- Full Kafka protocol compatibility tested with real clients (kafka-python, confluent-kafka, KSQL, Apache Flink)
+- WAL-based metadata store (ChronikMetaLog) for event-sourced metadata persistence
+- Zero message loss guarantee through WAL persistence and automatic recovery
+- Single unified binary (`chronik-server`) with multiple operational modes
+
+## Build & Test Commands
+
+### Building
 ```bash
-# Project Setup
-task-master init                                    # Initialize Task Master in current project
-task-master parse-prd .taskmaster/docs/prd.txt      # Generate tasks from PRD document
-task-master models --setup                        # Configure AI models interactively
+# Build all components
+cargo build --release
 
-# Daily Development Workflow
-task-master list                                   # Show all tasks with status
-task-master next                                   # Get next available task to work on
-task-master show <id>                             # View detailed task information (e.g., task-master show 1.2)
-task-master set-status --id=<id> --status=done    # Mark task complete
+# Build specific binary
+cargo build --release --bin chronik-server
 
-# Task Management
-task-master add-task --prompt="description" --research        # Add new task with AI assistance
-task-master expand --id=<id> --research --force              # Break task into subtasks
-task-master update-task --id=<id> --prompt="changes"         # Update specific task
-task-master update --from=<id> --prompt="changes"            # Update multiple tasks from ID onwards
-task-master update-subtask --id=<id> --prompt="notes"        # Add implementation notes to subtask
-
-# Analysis & Planning
-task-master analyze-complexity --research          # Analyze task complexity
-task-master complexity-report                      # View complexity analysis
-task-master expand --all --research               # Expand all eligible tasks
-
-# Dependencies & Organization
-task-master add-dependency --id=<id> --depends-on=<id>       # Add task dependency
-task-master move --from=<id> --to=<id>                       # Reorganize task hierarchy
-task-master validate-dependencies                            # Check for dependency issues
-task-master generate                                         # Update task markdown files (usually auto-called)
+# Check without building
+cargo check --all-features --workspace
 ```
 
-## Key Files & Project Structure
+### Testing
+```bash
+# Run unit tests (lib and bins only - skip integration)
+cargo test --workspace --lib --bins
 
-### Core Files
+# Run specific test
+cargo test --test <test_name>
 
-- `.taskmaster/tasks/tasks.json` - Main task data file (auto-managed)
-- `.taskmaster/config.json` - AI model configuration (use `task-master models` to modify)
-- `.taskmaster/docs/prd.txt` - Product Requirements Document for parsing
-- `.taskmaster/tasks/*.txt` - Individual task files (auto-generated from tasks.json)
-- `.env` - API keys for CLI usage
+# Run test with output
+cargo test <test_name> -- --nocapture
 
-### Claude Code Integration Files
+# Run integration tests (requires Docker for some)
+cargo test --test integration
 
-- `CLAUDE.md` - Auto-loaded context for Claude Code (this file)
-- `.claude/settings.json` - Claude Code tool allowlist and preferences
-- `.claude/commands/` - Custom slash commands for repeated workflows
-- `.mcp.json` - MCP server configuration (project-specific)
-
-### Directory Structure
-
-```
-project/
-├── .taskmaster/
-│   ├── tasks/              # Task files directory
-│   │   ├── tasks.json      # Main task database
-│   │   ├── task-1.md      # Individual task files
-│   │   └── task-2.md
-│   ├── docs/              # Documentation directory
-│   │   ├── prd.txt        # Product requirements
-│   ├── reports/           # Analysis reports directory
-│   │   └── task-complexity-report.json
-│   ├── templates/         # Template files
-│   │   └── example_prd.txt  # Example PRD template
-│   └── config.json        # AI models & settings
-├── .claude/
-│   ├── settings.json      # Claude Code configuration
-│   └── commands/         # Custom slash commands
-├── .env                  # API keys
-├── .mcp.json            # MCP configuration
-└── CLAUDE.md            # This file - auto-loaded by Claude Code
+# Run benchmarks
+cargo bench
 ```
 
-## MCP Integration
+### Running the Server
+```bash
+# Development mode (default standalone)
+cargo run --bin chronik-server
 
-Task Master provides an MCP server that Claude Code can connect to. Configure in `.mcp.json`:
+# Standalone with options
+cargo run --bin chronik-server -- standalone --dual-storage
 
-```json
-{
-  "mcpServers": {
-    "task-master-ai": {
-      "command": "npx",
-      "args": ["-y", "--package=task-master-ai", "task-master-ai"],
-      "env": {
-        "ANTHROPIC_API_KEY": "your_key_here",
-        "PERPLEXITY_API_KEY": "your_key_here",
-        "OPENAI_API_KEY": "OPENAI_API_KEY_HERE",
-        "GOOGLE_API_KEY": "GOOGLE_API_KEY_HERE",
-        "XAI_API_KEY": "XAI_API_KEY_HERE",
-        "OPENROUTER_API_KEY": "OPENROUTER_API_KEY_HERE",
-        "MISTRAL_API_KEY": "MISTRAL_API_KEY_HERE",
-        "AZURE_OPENAI_API_KEY": "AZURE_OPENAI_API_KEY_HERE",
-        "OLLAMA_API_KEY": "OLLAMA_API_KEY_HERE"
-      }
-    }
-  }
+# With advertised address (required for Docker/remote clients)
+cargo run --bin chronik-server -- --advertised-addr localhost standalone
+
+# All components mode
+cargo run --bin chronik-server -- all
+
+# Check version and features
+cargo run --bin chronik-server -- version
+```
+
+### Docker
+```bash
+# Build Docker image
+docker build -t chronik-stream .
+
+# Run with Docker
+docker run -d -p 9092:9092 \
+  -e CHRONIK_ADVERTISED_ADDR=localhost \
+  chronik-stream
+
+# Using docker-compose
+docker-compose up -d
+```
+
+## Architecture Overview
+
+### Core Components
+
+**1. Kafka Protocol Layer** (`chronik-protocol`)
+- Implements Kafka wire protocol (19 APIs fully supported)
+- Frame-based codec with length-prefixed messages
+- Request/response handling for Produce (v0-v9), Fetch (v0-v13), Metadata, Consumer Groups, etc.
+- Protocol version negotiation and compatibility
+- Location: `crates/chronik-protocol/src/`
+
+**2. Write-Ahead Log (WAL)** (`chronik-wal`)
+- **Mandatory for all deployments** - provides zero message loss guarantee
+- Segments with rotation, compaction, and checkpointing
+- Automatic recovery on startup from WAL records
+- Truncation of old segments after persistence
+- Location: `crates/chronik-wal/src/`
+- Key modules:
+  - `manager.rs` - WalManager for lifecycle
+  - `segment.rs` - Segment handling
+  - `compaction.rs` - WalCompactor with strategies (key-based, time-based, hybrid)
+  - `checkpoint.rs` - CheckpointManager
+
+**3. Metadata Store** (`chronik-common/metadata`)
+- Trait-based abstraction (`MetadataStore`)
+- Two implementations:
+  - **ChronikMetaLog (WAL-based)** - Default, event-sourced metadata
+  - File-based (legacy) - Use `--file-metadata` flag
+- Stores topics, partitions, consumer groups, offsets
+- Location: `crates/chronik-common/src/metadata/`
+
+**4. Storage Layer** (`chronik-storage`)
+- Segment-based storage with writers and readers
+- Object store abstraction (local, S3, GCS, Azure)
+- `SegmentWriter` - Buffered writes with batching
+- `SegmentReader` - Efficient fetch with caching
+- Optional indexing for search (Tantivy integration)
+- Location: `crates/chronik-storage/src/`
+
+**5. Server** (`chronik-server`)
+- Unified binary supporting multiple modes
+- Integrated Kafka server with request routing
+- Handlers for Produce, Fetch, Consumer Groups
+- Main entry: `crates/chronik-server/src/main.rs`
+- Protocol handler: `crates/chronik-server/src/kafka_handler.rs`
+
+### Data Flow
+
+1. **Write Path (Produce)**:
+   - Kafka client → Protocol handler → WalProduceHandler (WAL write) → ProduceHandler → SegmentWriter → Object Store
+   - WAL record written FIRST for durability, then in-memory + disk
+
+2. **Read Path (Fetch)**:
+   - Kafka client → Protocol handler → FetchHandler → SegmentReader → Object Store
+   - Metadata consulted for partition offsets and segment locations
+
+3. **Recovery Path**:
+   - Server startup → WalManager.recover() → Replay WAL records → Restore in-memory state
+   - Automatic and transparent to clients
+
+### Key Architecture Patterns
+
+**Request Routing** (`crates/chronik-server/src/kafka_handler.rs`):
+```rust
+// Parse API key from request header
+let header = parse_request_header(&mut buf)?;
+match ApiKey::try_from(header.api_key)? {
+    ApiKey::Produce => self.wal_handler.handle_produce(...),
+    ApiKey::Fetch => self.fetch_handler.handle_fetch(...),
+    ApiKey::Metadata => self.protocol_handler.handle_metadata(...),
+    // ... consumer group APIs, etc.
 }
 ```
 
-### Essential MCP Tools
+**WAL Integration** (MANDATORY):
+- `WalProduceHandler` wraps `ProduceHandler`
+- All produce requests write to WAL before in-memory state
+- `IntegratedKafkaServer::new()` always creates WAL components
+- Config flag `use_wal_metadata` controls metadata store type (default: true)
 
-```javascript
-help; // = shows available taskmaster commands
-// Project setup
-initialize_project; // = task-master init
-parse_prd; // = task-master parse-prd
-
-// Daily workflow
-get_tasks; // = task-master list
-next_task; // = task-master next
-get_task; // = task-master show <id>
-set_task_status; // = task-master set-status
-
-// Task management
-add_task; // = task-master add-task
-expand_task; // = task-master expand
-update_task; // = task-master update-task
-update_subtask; // = task-master update-subtask
-update; // = task-master update
-
-// Analysis
-analyze_project_complexity; // = task-master analyze-complexity
-complexity_report; // = task-master complexity-report
-```
-
-## Claude Code Workflow Integration
-
-### Standard Development Workflow
-
-#### 1. Project Initialization
-
-```bash
-# Initialize Task Master
-task-master init
-
-# Create or obtain PRD, then parse it
-task-master parse-prd .taskmaster/docs/prd.txt
-
-# Analyze complexity and expand tasks
-task-master analyze-complexity --research
-task-master expand --all --research
-```
-
-If tasks already exist, another PRD can be parsed (with new information only!) using parse-prd with --append flag. This will add the generated tasks to the existing list of tasks..
-
-#### 2. Daily Development Loop
-
-```bash
-# Start each session
-task-master next                           # Find next available task
-task-master show <id>                     # Review task details
-
-# During implementation, check in code context into the tasks and subtasks
-task-master update-subtask --id=<id> --prompt="implementation notes..."
-
-# Complete tasks
-task-master set-status --id=<id> --status=done
-```
-
-#### 3. Multi-Claude Workflows
-
-For complex projects, use multiple Claude Code sessions:
-
-```bash
-# Terminal 1: Main implementation
-cd project && claude
-
-# Terminal 2: Testing and validation
-cd project-test-worktree && claude
-
-# Terminal 3: Documentation updates
-cd project-docs-worktree && claude
-```
-
-### Custom Slash Commands
-
-Create `.claude/commands/taskmaster-next.md`:
-
-```markdown
-Find the next available Task Master task and show its details.
-
-Steps:
-
-1. Run `task-master next` to get the next task
-2. If a task is available, run `task-master show <id>` for full details
-3. Provide a summary of what needs to be implemented
-4. Suggest the first implementation step
-```
-
-Create `.claude/commands/taskmaster-complete.md`:
-
-```markdown
-Complete a Task Master task: $ARGUMENTS
-
-Steps:
-
-1. Review the current task with `task-master show $ARGUMENTS`
-2. Verify all implementation is complete
-3. Run any tests related to this task
-4. Mark as complete: `task-master set-status --id=$ARGUMENTS --status=done`
-5. Show the next available task with `task-master next`
-```
-
-## Tool Allowlist Recommendations
-
-Add to `.claude/settings.json`:
-
-```json
-{
-  "allowedTools": [
-    "Edit",
-    "Bash(task-master *)",
-    "Bash(git commit:*)",
-    "Bash(git add:*)",
-    "Bash(npm run *)",
-    "mcp__task_master_ai__*"
-  ]
+**Metadata Store Abstraction**:
+```rust
+#[async_trait]
+pub trait MetadataStore: Send + Sync {
+    async fn create_topic(&self, topic: &str, config: TopicConfig) -> Result<TopicMetadata>;
+    async fn get_topic(&self, topic: &str) -> Result<Option<TopicMetadata>>;
+    async fn list_topics(&self) -> Result<Vec<TopicMetadata>>;
+    async fn get_partition_count(&self, topic: &str) -> Result<i32>;
+    async fn get_high_watermark(&self, topic: &str, partition: i32) -> Result<i64>;
+    async fn set_high_watermark(&self, topic: &str, partition: i32, offset: i64) -> Result<()>;
+    // ... consumer group methods
 }
 ```
 
-## Configuration & Setup
+## Testing Strategy
 
-### API Keys Required
+### Integration Tests
+Location: `tests/integration/`
 
-At least **one** of these API keys must be configured:
+**Key Test Files:**
+- `kafka_compatibility_test.rs` - Real Kafka client testing
+- `wal_recovery_test.rs` - Crash recovery scenarios
+- `consumer_groups.rs` - Consumer group functionality
+- `kafka_protocol_test.rs` - Protocol conformance
 
-- `ANTHROPIC_API_KEY` (Claude models) - **Recommended**
-- `PERPLEXITY_API_KEY` (Research features) - **Highly recommended**
-- `OPENAI_API_KEY` (GPT models)
-- `GOOGLE_API_KEY` (Gemini models)
-- `MISTRAL_API_KEY` (Mistral models)
-- `OPENROUTER_API_KEY` (Multiple models)
-- `XAI_API_KEY` (Grok models)
+**Running Integration Tests:**
+```bash
+# WAL recovery tests
+cargo test --test wal_recovery_test
 
-An API key is required for any provider used across any of the 3 roles defined in the `models` command.
+# Kafka compatibility (may need Docker)
+cargo test --test kafka_compatibility_test
 
-### Model Configuration
+# Specific test
+cargo test test_basic_produce_fetch -- --nocapture
+```
+
+### Protocol Conformance Tests
+Location: `crates/chronik-protocol/tests/`
+
+Tests wire format compliance, version negotiation, error handling
+
+### Testing with Real Clients
+
+**Python (kafka-python):**
+```python
+from kafka import KafkaProducer, KafkaConsumer
+
+producer = KafkaProducer(
+    bootstrap_servers='localhost:9092',
+    api_version=(0, 10, 0)  # Specify version
+)
+producer.send('test-topic', b'Hello Chronik!')
+```
+
+**KSQL Integration:**
+Full KSQL compatibility - see `docs/KSQL_INTEGRATION_GUIDE.md`
+
+## Critical Implementation Details
+
+### Advertised Address Configuration
+**CRITICAL**: When binding to `0.0.0.0` or running in Docker, `CHRONIK_ADVERTISED_ADDR` MUST be set, or clients will receive `0.0.0.0:9092` and fail to connect.
 
 ```bash
-# Interactive setup (recommended)
-task-master models --setup
+# Correct
+CHRONIK_ADVERTISED_ADDR=localhost cargo run --bin chronik-server
 
-# Set specific models
-task-master models --set-main claude-3-5-sonnet-20241022
-task-master models --set-research perplexity-llama-3.1-sonar-large-128k-online
-task-master models --set-fallback gpt-4o-mini
+# Docker
+docker run -e CHRONIK_ADVERTISED_ADDR=chronik-stream chronik-stream
 ```
 
-## Task Structure & IDs
+### WAL Recovery Flow
+1. Server starts → `WalManager::recover(config)`
+2. Scans WAL directory for segments
+3. Replays records in order to restore state
+4. Sets high watermarks for partitions
+5. Server ready to accept requests
 
-### Task ID Format
+After successful persistence, old WAL segments are truncated.
 
-- Main tasks: `1`, `2`, `3`, etc.
-- Subtasks: `1.1`, `1.2`, `2.1`, etc.
-- Sub-subtasks: `1.1.1`, `1.1.2`, etc.
+### Protocol Version Handling
+- `ApiVersions` (v0-v3) - Negotiate supported versions
+- Version-specific encoding/decoding in `chronik-protocol`
+- Flexible tag field support for newer protocol versions
+- Must handle kafka-python's v0 compatibility requirements
 
-### Task Status Values
+### Consumer Group Coordination
+- `GroupManager` tracks groups and members
+- `FindCoordinator` returns this node as coordinator
+- `JoinGroup` / `SyncGroup` / `Heartbeat` / `LeaveGroup` fully implemented
+- Offset commit/fetch stored in metadata store
 
-- `pending` - Ready to work on
-- `in-progress` - Currently being worked on
-- `done` - Completed and verified
-- `deferred` - Postponed
-- `cancelled` - No longer needed
-- `blocked` - Waiting on external factors
+## Common Development Tasks
 
-### Task Fields
+### Adding a New Kafka API
+1. Define request/response types in `chronik-protocol/src/` (follow existing patterns like `create_topics_types.rs`)
+2. Add ApiKey enum variant
+3. Implement handler in `chronik-server/src/` or `chronik-protocol/src/handler.rs`
+4. Add routing in `kafka_handler.rs`
+5. Write protocol conformance test in `chronik-protocol/tests/`
+6. Test with real Kafka client
 
-```json
-{
-  "id": "1.2",
-  "title": "Implement user authentication",
-  "description": "Set up JWT-based auth system",
-  "status": "pending",
-  "priority": "high",
-  "dependencies": ["1.1"],
-  "details": "Use bcrypt for hashing, JWT for tokens...",
-  "testStrategy": "Unit tests for auth functions, integration tests for login flow",
-  "subtasks": []
-}
-```
+### Modifying WAL Behavior
+1. Update `WalConfig` in `chronik-wal/src/config.rs`
+2. Modify `WalManager` or `WalSegment` logic
+3. **CRITICAL**: Ensure recovery logic (`WalManager::recover()`) handles changes
+4. Add integration test in `tests/integration/wal_recovery_test.rs`
+5. Test crash scenarios
 
-## Claude Code Best Practices with Task Master
+### Storage Backend Changes
+1. Implement `ObjectStoreTrait` for new backend
+2. Add to `ObjectStoreFactory` in `chronik-storage/src/object_store.rs`
+3. Update `ObjectStoreConfig` enum
+4. Test with `storage_test.rs`
 
-### Context Management
+## Operational Modes
 
-- Use `/clear` between different tasks to maintain focus
-- This CLAUDE.md file is automatically loaded for context
-- Use `task-master show <id>` to pull specific task context when needed
+The `chronik-server` binary supports:
+- **Standalone** (default) - Single-node Kafka server
+- **Ingest** - Data ingestion (future: distributed)
+- **Search** - Search node (requires `--features search`)
+- **All** - All components in one process
 
-### Iterative Implementation
-
-1. `task-master show <subtask-id>` - Understand requirements
-2. Explore codebase and plan implementation
-3. `task-master update-subtask --id=<id> --prompt="detailed plan"` - Log plan
-4. `task-master set-status --id=<id> --status=in-progress` - Start work
-5. Implement code following logged plan
-6. `task-master update-subtask --id=<id> --prompt="what worked/didn't work"` - Log progress
-7. `task-master set-status --id=<id> --status=done` - Complete task
-
-### Complex Workflows with Checklists
-
-For large migrations or multi-step processes:
-
-1. Create a markdown PRD file describing the new changes: `touch task-migration-checklist.md` (prds can be .txt or .md)
-2. Use Taskmaster to parse the new prd with `task-master parse-prd --append` (also available in MCP)
-3. Use Taskmaster to expand the newly generated tasks into subtasks. Consdier using `analyze-complexity` with the correct --to and --from IDs (the new ids) to identify the ideal subtask amounts for each task. Then expand them.
-4. Work through items systematically, checking them off as completed
-5. Use `task-master update-subtask` to log progress on each task/subtask and/or updating/researching them before/during implementation if getting stuck
-
-### Git Integration
-
-Task Master works well with `gh` CLI:
-
+WAL compaction CLI:
 ```bash
-# Create PR for completed task
-gh pr create --title "Complete task 1.2: User authentication" --body "Implements JWT auth system as specified in task 1.2"
+# Manual compaction
+chronik-server compact now --strategy key-based
 
-# Reference task in commits
-git commit -m "feat: implement JWT auth (task 1.2)"
+# Show status
+chronik-server compact status --detailed
+
+# Configure
+chronik-server compact config --enabled true --interval 3600
 ```
 
-### Parallel Development with Git Worktrees
+## Environment Variables
 
+Key environment variables:
+- `RUST_LOG` - Log level (debug, info, warn, error)
+- `CHRONIK_KAFKA_PORT` - Kafka port (default: 9092)
+- `CHRONIK_BIND_ADDR` - Bind address (default: 0.0.0.0)
+- `CHRONIK_ADVERTISED_ADDR` - **CRITICAL** for Docker/remote access
+- `CHRONIK_ADVERTISED_PORT` - Port advertised to clients
+- `CHRONIK_DATA_DIR` - Data directory (default: ./data)
+- `CHRONIK_FILE_METADATA` - Use file-based metadata (default: false, uses WAL)
+
+## Debugging Tips
+
+### Protocol Debugging
 ```bash
-# Create worktrees for parallel task development
-git worktree add ../project-auth feature/auth-system
-git worktree add ../project-api feature/api-refactor
-
-# Run Claude Code in each worktree
-cd ../project-auth && claude    # Terminal 1: Auth work
-cd ../project-api && claude     # Terminal 2: API work
+# Enable debug logging for protocol
+RUST_LOG=chronik_protocol=debug,chronik_server=debug cargo run --bin chronik-server
 ```
 
-## Troubleshooting
-
-### AI Commands Failing
-
+### WAL Debugging
 ```bash
-# Check API keys are configured
-cat .env                           # For CLI usage
+# WAL-specific logging
+RUST_LOG=chronik_wal=debug cargo run --bin chronik-server
 
-# Verify model configuration
-task-master models
-
-# Test with different model
-task-master models --set-fallback gpt-4o-mini
+# Check WAL recovery
+RUST_LOG=chronik_wal::manager=trace cargo run --bin chronik-server
 ```
 
-### MCP Connection Issues
+### Client Connection Issues
+1. Check advertised address is set correctly
+2. Verify client can resolve hostname
+3. Check firewall/network rules
+4. Enable protocol tracing: `RUST_LOG=chronik_protocol::frame=trace`
 
-- Check `.mcp.json` configuration
-- Verify Node.js installation
-- Use `--mcp-debug` flag when starting Claude Code
-- Use CLI as fallback if MCP unavailable
+## CI/CD
 
-### Task File Sync Issues
+GitHub Actions workflows (`.github/workflows/`):
+- **CI** (`ci.yml`) - Check, test (lib/bins only), build on PRs
+- **Release** (`release.yml`) - Multi-arch builds, Docker images, GitHub releases
 
-```bash
-# Regenerate task files from tasks.json
-task-master generate
+Runs on self-hosted runner. Tests skip integration by default (`--lib --bins`).
 
-# Fix dependency issues
-task-master fix-dependencies
+## Project Structure Summary
+
+```
+chronik-stream/
+├── crates/
+│   ├── chronik-server/      # Main binary - integrated Kafka server
+│   ├── chronik-protocol/    # Kafka wire protocol (19 APIs)
+│   ├── chronik-wal/          # WAL with recovery, compaction, checkpointing
+│   ├── chronik-storage/     # Storage layer, segment I/O, object store
+│   ├── chronik-common/      # Shared types, metadata traits
+│   ├── chronik-search/      # Optional Tantivy search integration
+│   ├── chronik-query/       # Query processing
+│   ├── chronik-monitoring/  # Prometheus metrics, tracing
+│   ├── chronik-auth/        # SASL, TLS, ACLs
+│   ├── chronik-backup/      # Backup functionality
+│   ├── chronik-config/      # Configuration management
+│   ├── chronik-cli/         # CLI tools
+│   └── chronik-benchmarks/  # Performance benchmarks
+├── tests/integration/       # Integration tests (WAL, Kafka clients, etc.)
+└── .github/workflows/       # CI/CD pipelines
 ```
 
-DO NOT RE-INITIALIZE. That will not do anything beyond re-adding the same Taskmaster core files.
+## Work Ethic and Quality Standards
 
-## Important Notes
-
-### AI-Powered Operations
-
-These commands make AI calls and may take up to a minute:
-
-- `parse_prd` / `task-master parse-prd`
-- `analyze_project_complexity` / `task-master analyze-complexity`
-- `expand_task` / `task-master expand`
-- `expand_all` / `task-master expand --all`
-- `add_task` / `task-master add-task`
-- `update` / `task-master update`
-- `update_task` / `task-master update-task`
-- `update_subtask` / `task-master update-subtask`
-
-### File Management
-
-- Never manually edit `tasks.json` - use commands instead
-- Never manually edit `.taskmaster/config.json` - use `task-master models`
-- Task markdown files in `tasks/` are auto-generated
-- Run `task-master generate` after manual changes to tasks.json
-
-### Claude Code Session Management
-
-- Use `/clear` frequently to maintain focused context
-- Create custom slash commands for repeated Task Master workflows
-- Configure tool allowlist to streamline permissions
-- Use headless mode for automation: `claude -p "task-master next"`
-
-### Multi-Task Updates
-
-- Use `update --from=<id>` to update multiple future tasks
-- Use `update-task --id=<id>` for single task updates
-- Use `update-subtask --id=<id>` for implementation logging
-
-### Research Mode
-
-- Add `--research` flag for research-based AI enhancement
-- Requires a research model API key like Perplexity (`PERPLEXITY_API_KEY`) in environment
-- Provides more informed task creation and updates
-- Recommended for complex technical tasks
-
----
-
-_This guide ensures Claude Code has immediate access to Task Master's essential functionality for agentic development workflows._
-
-
-# Work Ethic and Quality Standards
-
-## Core Principles
+**Core Principles:**
 1. **NO SHORTCUTS** - Always implement proper, production-ready solutions
-2. **CLEAN CODE** - Maintain a clean, organized codebase without experimental debris
-3. **OPERATIONAL EXCELLENCE** - Focus on reliability, performance, and maintainability
+2. **CLEAN CODE** - Maintain clean codebase without experimental debris
+3. **OPERATIONAL EXCELLENCE** - Focus on reliability, performance, maintainability
 4. **COMPLETE SOLUTIONS** - Finish what you start, test thoroughly, document properly
 5. **ARCHITECTURAL INTEGRITY** - One implementation, not multiple partial ones
-6. **PROFESSIONAL STANDARDS** - Write code as if it is going to production tomorrow
+6. **PROFESSIONAL STANDARDS** - Write code as if going to production tomorrow
 
-## Development Process
-1. **Understand First** - Fully evaluate existing code before making changes
-2. **Plan Properly** - Create comprehensive plans, not quick fixes
-3. **Implement Correctly** - Use the right approach, even if it takes longer
-4. **Test Thoroughly** - Verify all functionality with real clients
-5. **Clean As You Go** - Do not leave experimental files or dead code
-6. **Document Decisions** - Explain architectural choices and trade-offs
+**Development Process:**
+1. Understand existing code fully before changes
+2. Plan properly - comprehensive plans, not quick fixes
+3. Implement correctly - use the right approach even if it takes longer
+4. Test thoroughly - verify all functionality with real clients
+5. Clean as you go - no experimental files or dead code
+6. Document decisions - explain architectural choices and trade-offs
 
-## Quality Metrics
+**Quality Metrics:**
 - Code should be production-ready on first implementation
-- All features must be tested with real Kafka clients
+- All features MUST be tested with real Kafka clients
 - Error handling must be comprehensive
-- Performance should be considered in every decision
+- Performance considered in every decision
 - Security and reliability are non-negotiable
