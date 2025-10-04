@@ -475,15 +475,17 @@ impl IntegratedKafkaServer {
                                 }
                             }
 
-                            // CRITICAL DEBUG: Log the raw request bytes to identify API key
+                            // Debug logging for request identification
                             if request_size >= 8 {
                                 let api_key = i16::from_be_bytes([request_buffer[0], request_buffer[1]]);
                                 let api_version = i16::from_be_bytes([request_buffer[2], request_buffer[3]]);
-                                eprintln!(">>> RAW REQUEST: api_key={}, api_version={}, size={}, first_16_bytes={:02x?}",
-                                    api_key, api_version, request_size, &request_buffer[..std::cmp::min(16, request_size)]);
+                                tracing::debug!(
+                                    "Received request: api_key={}, api_version={}, size={} bytes",
+                                    api_key, api_version, request_size
+                                );
 
                                 if api_key == 0 {
-                                    eprintln!("!!! PRODUCE REQUEST DETECTED !!! API key=0, version={}, size={}", api_version, request_size);
+                                    tracing::debug!("Produce request detected: version={}, size={} bytes", api_version, request_size);
                                 }
                             }
 

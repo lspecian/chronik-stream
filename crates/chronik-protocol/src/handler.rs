@@ -1,16 +1,16 @@
 //! Kafka protocol request handler.
 
-use bytes::{Bytes, BytesMut};
+use bytes::{Bytes, BytesMut, Buf};
 use chronik_common::{Result, Error};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use crate::error_codes;
 use crate::parser::{
-    ApiKey, RequestHeader, ResponseHeader, VersionRange, 
+    ApiKey, RequestHeader, ResponseHeader, VersionRange,
     parse_request_header_with_correlation,
     supported_api_versions,
-    Encoder,
+    Encoder, Decoder,
     is_flexible_version
 };
 
@@ -1361,14 +1361,56 @@ impl ProtocolHandler {
         })
     }
 
+    /// Consume ApiVersions v3+ request body fields (ignorable but must be consumed)
+    fn try_consume_api_versions_body(&self, body: &mut Bytes) -> Result<()> {
+        if body.remaining() == 0 {
+            return Ok(());
+        }
+
+        let mut decoder = Decoder::new(body);
+
+        // client_software_name (COMPACT_STRING - varint length)
+        let _software_name = decoder.read_compact_string()?;
+        tracing::trace!("ApiVersions v3+ client_software_name: {:?}", _software_name);
+
+        // client_software_version (COMPACT_STRING - varint length)
+        let _software_version = decoder.read_compact_string()?;
+        tracing::trace!("ApiVersions v3+ client_software_version: {:?}", _software_version);
+
+        // Tagged fields (required for v3+)
+        let tag_count = decoder.read_unsigned_varint()?;
+        tracing::trace!("ApiVersions v3+ tagged fields count: {}", tag_count);
+
+        for _ in 0..tag_count {
+            let tag_id = decoder.read_unsigned_varint()?;
+            let tag_size = decoder.read_unsigned_varint()? as usize;
+            tracing::trace!("  Skipping tagged field: id={}, size={}", tag_id, tag_size);
+            decoder.advance(tag_size)?;
+        }
+
+        Ok(())
+    }
+
     /// Handle ApiVersions request
     async fn handle_api_versions(
         &self,
         header: RequestHeader,
-        _body: &mut Bytes,
+        body: &mut Bytes,
     ) -> Result<Response> {
-        // ApiVersions v0-3 have no request body (or ignorable fields in v3+)
-        // No need to parse the request body
+        // For v3+, consume the optional body fields to prevent buffer underrun
+        // These fields are marked as "ignorable" in the spec but must still be consumed
+        if header.api_version >= 3 && body.remaining() > 0 {
+            if let Err(e) = self.try_consume_api_versions_body(body) {
+                tracing::warn!(
+                    "Failed to parse ApiVersions v{} body (fields are ignorable): {}",
+                    header.api_version, e
+                );
+                // Clear remaining buffer to prevent issues with subsequent parsing
+                body.advance(body.remaining());
+            } else {
+                tracing::debug!("Successfully consumed ApiVersions v{} body fields", header.api_version);
+            }
+        }
         if self.supported_versions.is_empty() {
             // Use the directly fetched versions instead of minimal list
             let test_versions = supported_api_versions();

@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.13] - 2025-10-04
+
+### Fixed
+- **CRITICAL**: KSQLDB compatibility - Fixed ApiVersions v3+ request body parsing
+  - ApiVersions v3+ now correctly consumes client_software_name and client_software_version fields
+  - Prevents "Cannot advance N bytes" buffer underrun errors with KSQLDB and Confluent clients
+  - Request body fields are properly consumed even though marked as "ignorable" in protocol spec
+- Replaced debug `eprintln!()` statements with proper `tracing::debug!()` for production readiness
+  - Integrated server request logging now uses tracing framework
+  - Produce handler logging uses tracing framework
+  - Protocol parser logging uses tracing framework
+
+### Changed
+- Enhanced ApiVersions handler with robust error handling for body parsing
+- Added detailed trace logging for ApiVersions v3+ body field consumption
+- Improved client compatibility detection logging (Java vs librdkafka)
+
+### Technical Details
+- ApiVersions v3+ request body uses compact string encoding for client software fields
+- Body parsing errors are logged but don't fail the request (fields are ignorable)
+- Buffer is properly cleared on parsing failure to prevent downstream issues
+
+### Compatibility
+- **Full KSQLDB compatibility** - Resolves connection and query execution issues
+- **Confluent clients** - Full support for Confluent Platform clients
+- Drop-in replacement for v1.3.12 with no breaking changes
+- All existing clients continue to work without modification
+
+### Migration from v1.3.12
+No changes required - this is a drop-in replacement that fixes KSQLDB compatibility.
+
 ## [1.3.12] - 2025-10-04
 
 ### Fixed

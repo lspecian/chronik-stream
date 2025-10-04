@@ -106,7 +106,7 @@ jobs:
   docker:
     name: Build and Push Docker Images
     needs: build-binaries
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
@@ -179,7 +179,7 @@ jobs:
   release:
     name: Create Release
     needs: [build-binaries, docker]
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     permissions:
       contents: write
     

@@ -534,7 +534,7 @@ pub fn parse_request_header_with_correlation(buf: &mut Bytes) -> Result<(Request
     // even though the request body IS flexible for v3+. This is for backward compatibility.
     let flexible = if let Some(api_key) = ApiKey::from_i16(api_key_raw) {
         if api_key == ApiKey::ApiVersions {
-            eprintln!("SPECIAL CASE: ApiVersions request header is NEVER flexible");
+            tracing::trace!("ApiVersions request header uses non-flexible encoding (spec requirement)");
             false  // ApiVersions NEVER has flexible request header
         } else {
             is_flexible_version(api_key, api_version)
@@ -543,7 +543,7 @@ pub fn parse_request_header_with_correlation(buf: &mut Bytes) -> Result<(Request
         false
     };
 
-    eprintln!("DEBUG: api_key={:?}, version={}, flexible={}", ApiKey::from_i16(api_key_raw), api_version, flexible);
+    tracing::trace!("Request header: api_key={:?}, version={}, flexible={}", ApiKey::from_i16(api_key_raw), api_version, flexible);
     
     // Read client ID
     // CRITICAL: Despite using flexible header v2, Java client sends client_id as regular STRING (INT16 length)
@@ -560,11 +560,11 @@ pub fn parse_request_header_with_correlation(buf: &mut Bytes) -> Result<(Request
             // If first byte >= 0x01 and is a reasonable varint, it's likely COMPACT_STRING (librdkafka style)
             if first_byte == 0x00 {
                 // Probably Java INT16-length string
-                eprintln!("  Using STRING encoding for client_id (Java style)");
+                tracing::trace!("Using STRING encoding for client_id (Java client style)");
                 decoder.read_string()?
             } else {
                 // Probably librdkafka COMPACT_STRING
-                eprintln!("  Using COMPACT_STRING encoding for client_id (librdkafka style)");
+                tracing::trace!("Using COMPACT_STRING encoding for client_id (librdkafka client style)");
                 decoder.read_compact_string()?
             }
         } else {
