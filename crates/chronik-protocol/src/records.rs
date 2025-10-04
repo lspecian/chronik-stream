@@ -187,18 +187,31 @@ impl RecordBatch {
 
         // Calculate batch length (excluding first 12 bytes: 4 for padding + 8 for offset)
         let batch_length = (buf.len() - 12) as i32;
-        
+
         // Write batch length at position 12-16 (after padding and base_offset)
         buf[12..16].copy_from_slice(&batch_length.to_be_bytes());
 
-        // Calculate CRC (from magic byte to end)
-        // Magic byte is at position 20 (4 padding + 8 offset + 4 length + 4 epoch)
-        let crc_data = &buf[20..];
+        // Calculate CRC32C checksum per Kafka protocol spec
+        // CRC covers: attributes + last_offset_delta + timestamps + producer info + records
+        // CRC field itself (4 bytes after magic) must NOT be included in calculation
+        //
+        // Buffer layout: [4 padding][8 base_offset][4 batch_length][4 partition_leader_epoch]
+        //                [1 magic][4 CRC][2 attributes]...
+        // Position 20 = magic byte
+        // Position 21-24 = CRC field (to be filled)
+        // Position 25 = attributes (start of CRC calculation)
+        let crc_start = 25; // Start AFTER CRC field
+        let crc_data = &buf[crc_start..];
         let mut hasher = Hasher::new();
         hasher.update(crc_data);
         let crc = hasher.finalize();
-        
-        // Write CRC at position 21-25 (after magic byte)
+
+        tracing::debug!(
+            "RecordBatch CRC: crc={}, data_len={}, producer_id={}, records={}, is_txn={}",
+            crc, crc_data.len(), self.producer_id, self.records.len(), self.attributes.is_transactional
+        );
+
+        // Write CRC at position 21-24 (4 bytes after magic byte)
         buf[21..25].copy_from_slice(&crc.to_be_bytes());
 
         Ok(buf.freeze())
@@ -294,7 +307,11 @@ impl RecordBatch {
             return Err(Error::Protocol(format!("Unsupported magic byte: {}", magic)));
         }
 
-        let crc = data.get_u32();
+        let stored_crc = data.get_u32();
+
+        // Save position to calculate CRC over remaining data
+        let crc_verify_start = data.remaining();
+
         let attributes = RecordAttributes::from_byte(data.get_i16() as i8);
         let last_offset_delta = data.get_i32();
         let first_timestamp = data.get_i64();
@@ -304,7 +321,8 @@ impl RecordBatch {
         let base_sequence = data.get_i32();
         let record_count = data.get_i32();
 
-        // TODO: Verify CRC
+        // Clone data for CRC verification before decompression
+        let data_for_crc = data.clone();
 
         // Decompress records if needed
         let records_data = if attributes.compression.is_compressed() {
@@ -312,6 +330,27 @@ impl RecordBatch {
         } else {
             data
         };
+
+        // Verify CRC after parsing header but before processing records
+        // CRC covers: attributes + last_offset_delta + timestamps + producer info + records
+        let crc_data = &data_for_crc[data_for_crc.len() - crc_verify_start..];
+        let calculated_crc = crc32fast::hash(crc_data);
+
+        if calculated_crc != stored_crc {
+            tracing::warn!(
+                "CRC mismatch: stored={}, calculated={}, producer_id={}, is_txn={}",
+                stored_crc, calculated_crc, producer_id, attributes.is_transactional
+            );
+            return Err(Error::Protocol(format!(
+                "Record is corrupt (stored crc = {}, computed crc = {})",
+                stored_crc, calculated_crc
+            )));
+        }
+
+        tracing::debug!(
+            "CRC verified: crc={}, producer_id={}, records={}, is_txn={}",
+            calculated_crc, producer_id, record_count, attributes.is_transactional
+        );
 
         // Decode records
         let mut records = Vec::with_capacity(record_count as usize);
@@ -327,7 +366,7 @@ impl RecordBatch {
             batch_length,
             partition_leader_epoch,
             magic,
-            crc,
+            crc: stored_crc,
             attributes,
             last_offset_delta,
             first_timestamp,

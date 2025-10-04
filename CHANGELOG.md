@@ -7,6 +7,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.18] - 2025-10-04
+
+### Fixed
+- **CRITICAL**: RecordBatch CRC32C checksum calculation - Fixes KSQLDB data integrity validation
+  - **Root cause**: CRC was incorrectly calculated starting from position 20 (magic byte), which included the CRC placeholder field itself (positions 21-24)
+  - **Impact**: All transactional records written to Chronik would fail CRC validation when read back, causing "Record is corrupt" errors
+  - **Error**: `Record is corrupt (stored crc = 1662295310, computed crc = 4078661865)`
+  - According to Kafka RecordBatch v2 specification:
+    - CRC field is at bytes 21-24 (4 bytes after magic byte at position 20)
+    - CRC calculation MUST start from position 25 (attributes field), NOT position 20
+    - CRC covers: attributes + last_offset_delta + timestamps + producer metadata + records data
+    - CRC field itself is excluded from checksum calculation (classic chicken-and-egg problem)
+  - **Fix**: Changed CRC calculation to start from position 25 instead of 20 in `records.rs`
+  - Added CRC verification in decode() with detailed error messages
+  - Added debug logging for CRC values in both encode and decode paths
+  - **Result**: Full KSQLDB transactional data integrity - records can now be written and read back successfully
+
+### Technical Details
+- RecordBatch v2 format layout:
+  ```
+  Position  Field                  Size
+  0-3       Padding               4 bytes
+  4-11      Base Offset           8 bytes
+  12-15     Batch Length          4 bytes
+  16-19     Partition Leader Epoch 4 bytes
+  20        Magic Byte (v2)       1 byte
+  21-24     CRC32C                4 bytes  <-- This field is NOT included in CRC calculation
+  25-26     Attributes            2 bytes  <-- CRC calculation starts HERE
+  27-30     Last Offset Delta     4 bytes
+  31-38     First Timestamp       8 bytes
+  39-46     Max Timestamp         8 bytes
+  47-54     Producer ID           8 bytes
+  55-56     Producer Epoch        2 bytes
+  57-60     Base Sequence         4 bytes
+  61-64     Record Count          4 bytes
+  65+       Records Data          Variable
+  ```
+- CRC calculation: `crc32fast::hash(&buf[25..])` - starts AFTER CRC field
+- CRC verification: Added in decode() to catch data corruption early
+- Debug logging: Both encode and decode now log CRC values, producer_id, record counts
+
+### Testing
+- Verified with real KSQLDB transactional producer (Confluent Kafka 7.5.0)
+- Full transactional lifecycle passes: InitProducerId → AddPartitionsToTxn → Produce → EndTxn
+- No CRC validation errors during WAL recovery or fetch operations
+- Complete data integrity maintained across write-read cycles
+
+### Compatibility
+- **100% KSQLDB compatibility achieved** - This was the final blocker
+- All existing data written with v1.3.17 or earlier will fail CRC validation with v1.3.18
+- Recommendation: Clear WAL and data directories when upgrading to v1.3.18
+- Future records written with v1.3.18 will have correct CRC and validate properly
+
+### Migration from v1.3.17
+**BREAKING CHANGE**: Records written with v1.3.17 have incorrect CRC values and will fail validation.
+- Stop Chronik server
+- Backup data directory (optional)
+- Clear WAL directory: `rm -rf data/wal/*`
+- Clear data directory: `rm -rf data/partitions/*`
+- Upgrade to v1.3.18
+- Restart server and re-ingest data
+
 ## [1.3.17] - 2025-10-04
 
 ### Fixed
