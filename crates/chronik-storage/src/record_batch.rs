@@ -100,28 +100,28 @@ impl RecordBatch {
         Ok(buf)
     }
     
-    /// Decode a batch from bytes
-    pub fn decode(data: &[u8]) -> Result<Self> {
+    /// Decode a batch from bytes, returning the batch and number of bytes consumed
+    pub fn decode(data: &[u8]) -> Result<(Self, usize)> {
         use std::io::Cursor;
         use byteorder::{BigEndian, ReadBytesExt};
-        
+
         let mut cursor = Cursor::new(data);
         let mut records = Vec::new();
-        
+
         // Read record count
         let count = cursor.read_u32::<BigEndian>()
             .map_err(|e| chronik_common::Error::Internal(format!("Failed to read count: {}", e)))? as usize;
-        
+
         // Read records
         for _ in 0..count {
             // Offset
             let offset = cursor.read_i64::<BigEndian>()
                 .map_err(|e| chronik_common::Error::Internal(format!("Failed to read offset: {}", e)))?;
-            
+
             // Timestamp
             let timestamp = cursor.read_i64::<BigEndian>()
                 .map_err(|e| chronik_common::Error::Internal(format!("Failed to read timestamp: {}", e)))?;
-            
+
             // Key
             let key_len = cursor.read_u32::<BigEndian>()
                 .map_err(|e| chronik_common::Error::Internal(format!("Failed to read key len: {}", e)))? as usize;
@@ -133,18 +133,18 @@ impl RecordBatch {
             } else {
                 None
             };
-            
+
             // Value
             let value_len = cursor.read_u32::<BigEndian>()
                 .map_err(|e| chronik_common::Error::Internal(format!("Failed to read value len: {}", e)))? as usize;
             let mut value = vec![0u8; value_len];
             std::io::Read::read_exact(&mut cursor, &mut value)
                 .map_err(|e| chronik_common::Error::Internal(format!("Failed to read value: {}", e)))?;
-            
+
             // Headers
             let header_count = cursor.read_u32::<BigEndian>()
                 .map_err(|e| chronik_common::Error::Internal(format!("Failed to read header count: {}", e)))? as usize;
-            
+
             let mut headers = std::collections::HashMap::new();
             for _ in 0..header_count {
                 // Key
@@ -155,17 +155,17 @@ impl RecordBatch {
                     .map_err(|e| chronik_common::Error::Internal(format!("Failed to read header key: {}", e)))?;
                 let key = String::from_utf8(key_buf)
                     .map_err(|e| chronik_common::Error::Internal(format!("Invalid header key: {}", e)))?;
-                
+
                 // Value
                 let value_len = cursor.read_u32::<BigEndian>()
                     .map_err(|e| chronik_common::Error::Internal(format!("Failed to read header value len: {}", e)))? as usize;
                 let mut value_buf = vec![0u8; value_len];
                 std::io::Read::read_exact(&mut cursor, &mut value_buf)
                     .map_err(|e| chronik_common::Error::Internal(format!("Failed to read header value: {}", e)))?;
-                
+
                 headers.insert(key, value_buf);
             }
-            
+
             records.push(Record {
                 offset,
                 timestamp,
@@ -174,7 +174,8 @@ impl RecordBatch {
                 headers,
             });
         }
-        
-        Ok(Self { records })
+
+        let bytes_consumed = cursor.position() as usize;
+        Ok((Self { records }, bytes_consumed))
     }
 }

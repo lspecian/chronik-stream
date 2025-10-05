@@ -1,43 +1,87 @@
 #!/usr/bin/env python3
-import socket
-import struct
+"""Simple test to verify segment reader fix"""
+
+import sys
 import time
+from kafka import KafkaProducer, KafkaConsumer
+from kafka.errors import KafkaError
 
-# Create a simple ApiVersions request v0
-request = bytes.fromhex(
-    '00000012'  # Length: 18
-    '0012'      # API Key: 18 (ApiVersions)
-    '0000'      # API Version: 0
-    '00000001'  # Correlation ID: 1
-    '0006'      # Client ID length: 6
-    '746573746572'  # Client ID: "tester"
-)
+def test_batch_size(num_messages):
+    """Test with specific number of messages"""
+    topic = f'test-{num_messages}'
 
-sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-sock.connect(('localhost', 9095))
-sock.settimeout(2)
+    # Produce messages
+    producer = KafkaProducer(
+        bootstrap_servers='localhost:9092',
+        api_version=(0, 10, 0)
+    )
 
-print("Sending request...")
-sock.sendall(request)
+    print(f"\n{'='*60}")
+    print(f"TEST: {num_messages} messages")
+    print(f"{'='*60}")
 
-print("Waiting for response...")
-try:
-    # Read the response length
-    response_len_bytes = sock.recv(4)
-    print(f"Got response length bytes: {response_len_bytes.hex()}")
+    for i in range(num_messages):
+        key = f'key-{i}'.encode()
+        value = f'message-{i}'.encode()
+        producer.send(topic, key=key, value=value)
 
-    if len(response_len_bytes) == 4:
-        response_len = struct.unpack('>I', response_len_bytes)[0]
-        print(f"Response length: {response_len}")
+    producer.flush()
+    producer.close()
+    print(f"✓ Produced {num_messages} messages to topic '{topic}'")
 
-        # Read the response
-        response_data = sock.recv(response_len)
-        print(f"Response data ({len(response_data)} bytes): {response_data.hex()}")
+    # Wait for persistence
+    time.sleep(2)
+
+    # Consume messages
+    consumer = KafkaConsumer(
+        topic,
+        bootstrap_servers='localhost:9092',
+        auto_offset_reset='earliest',
+        consumer_timeout_ms=5000,
+        api_version=(0, 10, 0)
+    )
+
+    messages = []
+    for msg in consumer:
+        messages.append(msg)
+
+    consumer.close()
+
+    # Check results
+    expected = num_messages
+    received = len(messages)
+
+    print(f"Expected: {expected}")
+    print(f"Received: {received}")
+
+    if received == expected:
+        print(f"✅ PASS - All {expected} messages received")
+        return True
     else:
-        print(f"Failed to read full response length, got {len(response_len_bytes)} bytes")
-except socket.timeout:
-    print("Timeout waiting for response")
-except Exception as e:
-    print(f"Error: {e}")
+        print(f"❌ FAIL - Expected {expected}, got {received}")
+        print(f"   Data loss: {expected - received} messages ({100*(expected-received)/expected:.1f}%)")
+        return False
 
-sock.close()
+if __name__ == '__main__':
+    # Test with requested sizes
+    test_sizes = [20, 50, 200, 2000]
+
+    results = {}
+    for size in test_sizes:
+        try:
+            results[size] = test_batch_size(size)
+        except Exception as e:
+            print(f"❌ FAIL - Exception: {e}")
+            results[size] = False
+
+    # Summary
+    print(f"\n{'='*60}")
+    print("SUMMARY")
+    print(f"{'='*60}")
+    for size, passed in results.items():
+        status = "✅ PASS" if passed else "❌ FAIL"
+        print(f"{status} - {size} messages")
+
+    # Exit code
+    all_passed = all(results.values())
+    sys.exit(0 if all_passed else 1)

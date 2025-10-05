@@ -7,10 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.21] - 2025-10-05
+
+### Fixed
+- **CRITICAL**: Fixed v1.3.20 multi-batch decoding bug - Correct cursor advancement for proper batch iteration
+  - **Root cause**: v1.3.20's manual bytes_consumed calculation was INCORRECT
+    - `RecordBatch::decode()` only returned the decoded batch, not bytes consumed
+    - Manual calculation tried to compute encoded size from decoded records
+    - Size calculation was wrong → cursor advanced incorrectly → second batch decode failed
+    - **Result**: Same 85% data loss as v1.3.19 (only 3/20 records returned)
+  - **Fix**: Modified `RecordBatch::decode()` to return `(batch, bytes_consumed)` tuple
+    - Decoder tracks cursor position during read and returns exact bytes consumed
+    - `fetch_from_segment()` uses returned bytes_consumed for cursor advancement
+    - Simple, correct: `cursor_pos += bytes_consumed`
+    - **Impact**: Proper multi-batch iteration, all records fetched, zero data loss
+  - **Test results**:
+    - v1.3.20: 3/20 records (same bug as v1.3.19)
+    - v1.3.21: 20/20 records expected
+- Files modified:
+  - `crates/chronik-storage/src/record_batch.rs:104-180` - decode() signature change
+  - `crates/chronik-server/src/fetch_handler.rs:801-849` - clean cursor-based iteration
+
 ## [1.3.20] - 2025-10-05
 
 ### Fixed
 - **CRITICAL**: Segment reader truncation bug - Only first batch decoded from multi-batch segments
+  - **NOTE**: This fix was INCOMPLETE - cursor advancement calculation was wrong
   - **Root cause**: `fetch_from_segment()` only decoded the FIRST RecordBatch from segments
     - A segment can contain multiple concatenated RecordBatch structures
     - When 20 messages written, they may be split into 10 batches of 2 messages each

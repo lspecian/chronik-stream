@@ -798,77 +798,77 @@ impl FetchHandler {
             segment.raw_kafka_batches.len(),
             segment.indexed_records.len());
         
-        // CRITICAL FIX: Decode ALL batches from segment, not just the first one
-        // A segment can contain multiple concatenated RecordBatch structures
+        // CRITICAL FIX v1.3.21: Decode ALL batches from segment
+        // indexed_records contains multiple concatenated RecordBatch structures
+        // RecordBatch::decode() now returns (batch, bytes_consumed) for proper cursor advancement
         let mut all_records = Vec::new();
         let mut batch_count = 0;
+        let mut cursor_pos = 0;
+        let total_len = segment.indexed_records.len();
 
-        if !segment.indexed_records.is_empty() {
-            // Decode ALL batches from indexed_records
-            use std::io::Cursor;
-            let mut cursor = Cursor::new(&segment.indexed_records[..]);
-            let total_len = segment.indexed_records.len();
+        tracing::info!("SEGMENT→DECODE: Starting multi-batch decode from indexed_records ({} bytes)", total_len);
 
-            tracing::warn!("SEGMENT→DECODE: Starting to decode batches from indexed_records ({} bytes)", total_len);
+        while cursor_pos < total_len {
+            match RecordBatch::decode(&segment.indexed_records[cursor_pos..]) {
+                Ok((batch, bytes_consumed)) => {
+                    let batch_records = batch.records.len();
+                    tracing::info!(
+                        "SEGMENT→BATCH {}: Decoded {} records, consumed {} bytes at position {}",
+                        batch_count + 1,
+                        batch_records,
+                        bytes_consumed,
+                        cursor_pos
+                    );
 
-            while (cursor.position() as usize) < total_len {
-                let position_before = cursor.position();
+                    all_records.extend(batch.records);
+                    cursor_pos += bytes_consumed;
+                    batch_count += 1;
 
-                // Try to decode a batch
-                match RecordBatch::decode(&segment.indexed_records[(cursor.position() as usize)..]) {
-                    Ok(batch) => {
-                        let batch_records = batch.records.len();
-                        tracing::warn!(
-                            "SEGMENT→BATCH {}: Decoded {} records from position {}",
-                            batch_count + 1,
-                            batch_records,
-                            position_before
-                        );
-
-                        all_records.extend(batch.records);
-                        batch_count += 1;
-
-                        // Advance cursor by the size of this batch
-                        // RecordBatch format: 4 bytes count + records
-                        // We need to calculate how many bytes were consumed
-                        let bytes_consumed = 4 + all_records.iter()
-                            .skip(all_records.len() - batch_records)
-                            .map(|r| {
-                                16 + // offset (8) + timestamp (8)
-                                4 + r.key.as_ref().map(|k| k.len()).unwrap_or(0) + // key_len (4) + key
-                                4 + r.value.len() + // value_len (4) + value
-                                4 + // header_count (4)
-                                r.headers.iter().map(|(k, v)| 4 + k.len() + 4 + v.len()).sum::<usize>()
-                            })
-                            .sum::<usize>();
-
-                        cursor.set_position(position_before + bytes_consumed as u64);
-
-                        // Safety check: if we didn't advance, break to avoid infinite loop
-                        if cursor.position() == position_before {
-                            tracing::error!("SEGMENT→ERROR: Cursor didn't advance, breaking to avoid infinite loop");
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        // If we can't decode more batches, we're done
-                        tracing::warn!(
-                            "SEGMENT→DECODE: Finished decoding at position {} ({} bytes remaining): {}",
-                            cursor.position(),
-                            total_len - cursor.position() as usize,
-                            e
-                        );
+                    // Safety check: ensure we're making progress
+                    if bytes_consumed == 0 {
+                        tracing::error!("SEGMENT→ERROR: Zero bytes consumed, breaking to avoid infinite loop");
                         break;
                     }
                 }
+                Err(e) => {
+                    tracing::info!(
+                        "SEGMENT→DECODE: Finished at position {} ({} bytes remaining): {}",
+                        cursor_pos,
+                        total_len - cursor_pos,
+                        e
+                    );
+                    break;
+                }
             }
+        }
 
-            tracing::warn!(
-                "SEGMENT→COMPLETE: Decoded {} batches with {} total records from indexed_records",
-                batch_count,
-                all_records.len()
-            );
-        } else if !segment.raw_kafka_batches.is_empty() {
+        tracing::info!(
+            "SEGMENT→COMPLETE: Decoded {} batches with {} total records from indexed_records",
+            batch_count,
+            all_records.len()
+        );
+
+        // CRITICAL FIX: Adjust record offsets if they're stored as relative offsets
+        // Records in indexed_records may be stored with relative offsets (0, 1, 2...)
+        // Need to adjust them to absolute partition offsets by adding base_offset
+        let base_offset = segment.metadata.base_offset;
+        if base_offset > 0 && !all_records.is_empty() {
+            // Check if offsets need adjustment (if first record offset is small, likely relative)
+            let first_offset = all_records[0].offset;
+            if first_offset < base_offset {
+                tracing::info!(
+                    "SEGMENT→ADJUST: Adjusting {} record offsets by base_offset={} (first record offset was {})",
+                    all_records.len(),
+                    base_offset,
+                    first_offset
+                );
+                for record in &mut all_records {
+                    record.offset += base_offset;
+                }
+            }
+        }
+
+        if all_records.is_empty() && !segment.raw_kafka_batches.is_empty() {
             // Decode ALL batches from raw Kafka batches (preserves CRC)
             tracing::info!("Using raw Kafka batches for fetch (no indexed records)");
 
@@ -908,8 +908,11 @@ impl FetchHandler {
                     }
                 }
             }
-        } else {
-            tracing::warn!("SEGMENT→EMPTY: No indexed_records or raw_kafka_batches to decode");
+        }
+
+        // If still no records after trying both indexed and raw formats, return empty
+        if all_records.is_empty() {
+            tracing::warn!("SEGMENT→EMPTY: No records decoded from segment");
             return Ok(vec![]);
         }
 
