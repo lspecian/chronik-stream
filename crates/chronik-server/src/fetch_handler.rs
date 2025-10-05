@@ -945,74 +945,30 @@ impl FetchHandler {
 
         if all_records.is_empty() && !segment.raw_kafka_batches.is_empty() {
             // Decode ALL batches from raw Kafka batches (preserves CRC)
+            // Kafka batches are self-describing with batch_length in header
             tracing::info!("Using raw Kafka batches for fetch (no indexed records, {} bytes)", segment.raw_kafka_batches.len());
 
             let mut cursor_pos = 0;
             let total_len = segment.raw_kafka_batches.len();
-
-            // Check segment version to determine format
-            let is_v3_format = segment.header.version >= 3;
+            let mut batch_count = 0;
+            let mut current_absolute_offset = segment.metadata.base_offset;
 
             tracing::info!(
-                "SEGMENT→KAFKA: Starting multi-batch decode from raw_kafka_batches ({} bytes, v{} format)",
-                total_len, segment.header.version
+                "SEGMENT→KAFKA: Starting multi-batch decode from raw_kafka_batches ({} bytes, base_offset={})",
+                total_len,
+                current_absolute_offset
             );
 
             while cursor_pos < total_len {
-                // v3 format: Read length prefix first
-                let batch_data_start = if is_v3_format {
-                    // Need at least 4 bytes for length prefix
-                    if cursor_pos + 4 > total_len {
-                        tracing::info!("SEGMENT→KAFKA: Not enough bytes for length prefix at position {}", cursor_pos);
-                        break;
-                    }
-
-                    // Read u32 length prefix (big-endian)
-                    let batch_len = u32::from_be_bytes([
-                        segment.raw_kafka_batches[cursor_pos],
-                        segment.raw_kafka_batches[cursor_pos + 1],
-                        segment.raw_kafka_batches[cursor_pos + 2],
-                        segment.raw_kafka_batches[cursor_pos + 3],
-                    ]) as usize;
-
-                    tracing::debug!("SEGMENT→KAFKA: Batch {} has length prefix {} bytes", batch_count + 1, batch_len);
-
-                    // Move cursor past length prefix
-                    cursor_pos + 4
-                } else {
-                    // v2 format: No length prefix, try to decode from current position
-                    cursor_pos
-                };
-
-                // Calculate end position for this batch
-                let batch_data_end = if is_v3_format {
-                    let batch_len = u32::from_be_bytes([
-                        segment.raw_kafka_batches[cursor_pos],
-                        segment.raw_kafka_batches[cursor_pos + 1],
-                        segment.raw_kafka_batches[cursor_pos + 2],
-                        segment.raw_kafka_batches[cursor_pos + 3],
-                    ]) as usize;
-                    batch_data_start + batch_len
-                } else {
-                    total_len  // For v2, decode will determine the end
-                };
-
-                // Ensure we have enough data
-                if batch_data_end > total_len {
-                    tracing::error!(
-                        "SEGMENT→KAFKA: Batch extends beyond segment bounds (pos={}, end={}, total={})",
-                        batch_data_start, batch_data_end, total_len
-                    );
-                    break;
-                }
-
-                // Decode the Kafka batch
-                match KafkaRecordBatch::decode(&segment.raw_kafka_batches[batch_data_start..batch_data_end]) {
+                // Kafka batches are self-describing - decode will use batch_length from header
+                match KafkaRecordBatch::decode(&segment.raw_kafka_batches[cursor_pos..]) {
                     Ok((kafka_batch, bytes_consumed)) => {
-                        // Convert Kafka records to storage Records
+                        // CRITICAL: Use segment metadata's base_offset, NOT client's base_offset from Kafka batch header
+                        // The client's base_offset in the Kafka batch header is often incorrect (e.g., 1 instead of 0)
+                        // We must use the segment's actual offsets which are tracked server-side
                         let records: Vec<Record> = kafka_batch.records.into_iter().enumerate().map(|(i, kr)| {
                             Record {
-                                offset: kafka_batch.header.base_offset + i as i64,
+                                offset: current_absolute_offset + i as i64,
                                 timestamp: kafka_batch.header.base_timestamp + kr.timestamp_delta,
                                 key: kr.key.map(|k| k.to_vec()),
                                 value: kr.value.map(|v| v.to_vec()).unwrap_or_default(),
@@ -1023,51 +979,39 @@ impl FetchHandler {
                         }).collect();
 
                         let batch_records = records.len();
-                        tracing::info!(
-                            "SEGMENT→KAFKA {}: Decoded {} records, {} bytes at position {}",
+                        tracing::debug!(
+                            "Decoded batch {}: {} records (offsets {}-{})",
                             batch_count + 1,
                             batch_records,
-                            if is_v3_format { batch_data_end - batch_data_start } else { bytes_consumed },
-                            cursor_pos
+                            current_absolute_offset,
+                            current_absolute_offset + batch_records as i64 - 1
                         );
+
+                        // Increment absolute offset for next batch
+                        current_absolute_offset += batch_records as i64;
 
                         all_records.extend(records);
 
-                        // Advance cursor
-                        if is_v3_format {
-                            // v3: Move to next length prefix
-                            cursor_pos = batch_data_end;
-                        } else {
-                            // v2: Use bytes_consumed from decode
-                            cursor_pos += bytes_consumed;
+                        // Advance cursor using bytes_consumed from Kafka decode
+                        cursor_pos += bytes_consumed;
 
-                            // Safety check for v2 format
-                            if bytes_consumed == 0 {
-                                tracing::error!("SEGMENT→KAFKA: Zero bytes consumed in v2 format, breaking");
-                                break;
-                            }
+                        // Safety check
+                        if bytes_consumed == 0 {
+                            tracing::error!("SEGMENT→KAFKA: Zero bytes consumed, breaking to avoid infinite loop");
+                            break;
                         }
 
                         batch_count += 1;
                     }
                     Err(e) => {
-                        if is_v3_format {
-                            // v3: Length prefix told us exact size, decode should not fail
-                            tracing::error!(
-                                "SEGMENT→KAFKA: Failed to decode v3 batch {} at position {}: {}",
-                                batch_count + 1, cursor_pos, e
-                            );
-                            break;
-                        } else {
-                            // v2: Expected to fail after last batch (no length prefix to know when to stop)
-                            tracing::info!(
-                                "SEGMENT→KAFKA: Finished v2 format at position {} ({} bytes remaining): {}",
-                                cursor_pos,
-                                total_len - cursor_pos,
-                                e
-                            );
-                            break;
-                        }
+                        // Expected to fail when we run out of complete batches
+                        tracing::info!(
+                            "SEGMENT→KAFKA: Finished decoding at position {} ({} bytes remaining): {}",
+                            cursor_pos,
+                            total_len - cursor_pos,
+                            e
+                        );
+                        break;
                     }
                 }
             }
@@ -1086,20 +1030,20 @@ impl FetchHandler {
         }
 
         let record_batch = RecordBatch { records: all_records };
-        
+
         // Filter records by offset range
         let mut filtered_records = Vec::new();
         let mut bytes_fetched = 0;
-        
+
         for record in record_batch.records {
             if record.offset >= start_offset && record.offset < end_offset {
-                let record_size = record.value.len() + 
+                let record_size = record.value.len() +
                     record.key.as_ref().map(|k| k.len()).unwrap_or(0) + 24;
-                
+
                 if bytes_fetched + record_size > max_bytes as usize && !filtered_records.is_empty() {
                     break;
                 }
-                
+
                 filtered_records.push(record);
                 bytes_fetched += record_size;
             }

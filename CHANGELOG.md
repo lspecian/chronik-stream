@@ -7,7 +7,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.3.24] - 2025-10-05
+## [1.3.26] - 2025-10-05
+
+### Fixed
+- **CRITICAL**: Fixed offset 0 missing bug in multi-batch segment reading
+  - **Root cause**: When decoding raw Kafka batches from segments, code was using client's `base_offset` from Kafka batch header instead of segment's actual `base_offset`
+    - Kafka Python client sends `base_offset=1` in batch header (client implementation detail)
+    - Server was using this client value: `offset = kafka_batch.header.base_offset + i`
+    - Result: Records got offsets [1, 2, 3, ..., 20] instead of [0, 1, 2, ..., 19]
+    - Offset 0 was never created, offset 20 was filtered out (out of range), leaving 19/20 records
+  - **v1.3.26 fix**: Ignore client's `base_offset`, use segment metadata's authoritative offsets
+    - Track absolute offset starting from `segment.metadata.base_offset`
+    - Assign offsets: `offset = current_absolute_offset + i`
+    - Increment across batches: `current_absolute_offset += batch_records.len()`
+  - **Impact**: ALL records now readable, including offset 0
+  - **Test results**:
+    - v1.3.25: 19/20 records (missing offset 0)
+    - v1.3.26: 20/20 records (100% readable) ✅
+  - **All test scenarios pass**:
+    - Single batch: 20/20 ✅
+    - Multi-batch (explicit flushes): 20/20 ✅
+    - Realistic (confluent-kafka-go style): 20/20 ✅
+
+### Technical Details
+- Kafka batch header contains client's `base_offset` which should be IGNORED by server
+- Server must use its own authoritative offset tracking from segment metadata
+- Different Kafka clients send different `base_offset` values (0, 1, or calculated values)
+- Server's segment metadata contains the true `base_offset` and `last_offset` for the partition
+
+### Files Modified
+- `crates/chronik-server/src/fetch_handler.rs:951-1000` - Fixed offset assignment in raw_kafka_batches decode
+  - Added `current_absolute_offset` tracking starting from `segment.metadata.base_offset`
+  - Changed record offset from `kafka_batch.header.base_offset + i` to `current_absolute_offset + i`
+  - Increment offset across batches for proper multi-batch handling
+
+## [1.3.25] - 2025-10-05
+
+### Fixed
+- **CRITICAL**: v1.3.24 regression - Kafka batches are self-describing, don't need length prefixes
+  - **Root cause of v1.3.24 regression**: Added u32 length prefixes to `raw_kafka_batches`
+    - Kafka RecordBatch wire format ALREADY has `batch_length` field in the header
+    - Adding extra length prefixes created mismatch - read 4 bytes as "length" but they were actually start of Kafka batch header
+    - Result: Garbage values, early termination, only 2-3/20 records readable
+  - **v1.3.25 fix**: Remove length prefixes from `raw_kafka_batches`, keep them ONLY for `indexed_records`
+    - `raw_kafka_batches`: Uses Kafka wire format with self-describing `batch_length` in header
+    - `indexed_records`: Uses our custom RecordBatch format which DOES need u32 length prefixes (v3)
+    - `KafkaRecordBatch::decode()` reads `batch_length` from header - no additional prefix needed
+  - **Impact**: Restores full multi-batch reading for all Kafka clients
+  - **Test results**:
+    - v1.3.24: 2-3/20 records (10-15% readable) - MAJOR REGRESSION
+    - v1.3.25: 20/20 records (100% readable) ✅
+
+### Technical Details
+- Kafka RecordBatch wire format (self-describing):
+  ```
+  base_offset: i64 (8 bytes)
+  batch_length: i32 (4 bytes) ← SELF-DESCRIBING!
+  partition_leader_epoch: i32
+  magic: i8
+  crc: u32
+  ... rest of header and records
+  ```
+- Chronik's indexed_records format (needs prefixes):
+  ```
+  [u32 len1][RecordBatch1][u32 len2][RecordBatch2]...
+  ```
+- **Key insight**: Don't add length prefixes to self-describing formats!
+
+### Files Modified
+- `crates/chronik-storage/src/segment.rs` - Reverted add_raw_kafka_batch() to NOT add length prefix
+- `crates/chronik-server/src/fetch_handler.rs` - Simplified raw_kafka_batches decode loop
+- `crates/chronik-storage/tests/segment_test.rs` - Updated test to match Kafka's self-describing format
+
+## [1.3.24] - 2025-10-05 (BROKEN - DO NOT USE)
 
 ### Fixed
 - **CRITICAL**: v1.3.23 incomplete fix - raw_kafka_batches was missing length prefixes

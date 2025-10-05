@@ -238,14 +238,11 @@ impl SegmentBuilder {
     
     /// Add raw Kafka batch data (wire format)
     ///
-    /// In v3 format, each batch is prefixed with a u32 length to allow
-    /// proper multi-batch deserialization. This fixes the bug where only
-    /// the first batch in a segment could be read.
+    /// Kafka batches are self-describing with batch_length field in the header,
+    /// so we don't need additional length prefixes like we do for indexed_records.
+    /// The KafkaRecordBatch::decode() function uses batch_length to know boundaries.
     pub fn add_raw_kafka_batch(&mut self, data: &[u8]) {
-        // v3 format: Add 4-byte length prefix before each batch
-        // This allows the reader to know exactly where each batch ends
-        // and the next batch begins, fixing the multi-batch bug
-        self.raw_kafka_batches.put_u32(data.len() as u32);
+        // Kafka wire format already has batch_length in header - no prefix needed
         self.raw_kafka_batches.put_slice(data);
     }
     

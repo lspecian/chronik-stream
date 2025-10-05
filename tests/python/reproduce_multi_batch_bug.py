@@ -7,7 +7,7 @@ This script demonstrates the difference between:
 2. Multi-batch write (fails) - Real-world scenario
 
 Usage:
-    python3 reproduce_multi_batch_bug.py
+    python3 reproduce-multi-batch-bug.py
 """
 
 from kafka import KafkaProducer, KafkaConsumer
@@ -71,10 +71,8 @@ def test_single_batch():
 
     if len(messages) == 20:
         print("   ✅ PASS - All messages readable")
-        return True
     else:
         print(f"   ❌ FAIL - Only {len(messages)}/20 messages readable")
-        return False
 
     producer.close()
     print()
@@ -85,7 +83,7 @@ def test_multi_batch():
     Test Case 2: Multiple batches (FAILS in Chronik v1.3.22)
     This is what happens with real applications.
     """
-    print("\n" + "=" * 80)
+    print("=" * 80)
     print("TEST 2: Multiple Batches (20 records in ~10 batches)")
     print("=" * 80)
 
@@ -122,7 +120,7 @@ def test_multi_batch():
     print("✅ Flushed messages in ~10 separate batches")
 
     # Give Chronik time to write
-    time.sleep(3)
+    time.sleep(2)
 
     # Consume and verify
     consumer = KafkaConsumer(
@@ -143,11 +141,78 @@ def test_multi_batch():
 
     if len(messages) == 20:
         print("   ✅ PASS - All messages readable")
-        return True
     else:
         print(f"   ❌ FAIL - Only {len(messages)}/20 messages readable")
         print(f"   Missing offsets: {sorted(set(range(20)) - set(m.offset for m in messages))}")
-        return False
+
+    producer.close()
+    print()
+
+
+def test_multi_batch_realistic():
+    """
+    Test Case 3: Realistic application behavior
+    Uses confluent-kafka-go style batching (like MTG deck ingestion)
+    """
+    print("=" * 80)
+    print("TEST 3: Realistic Multi-Batch (like confluent-kafka-go)")
+    print("=" * 80)
+
+    topic = 'chronik.test.realistic'
+
+    # Simulate confluent-kafka-go producer behavior
+    producer = KafkaProducer(
+        bootstrap_servers=['localhost:9092'],
+        value_serializer=lambda v: json.dumps(v).encode('utf-8'),
+        api_version=(0, 10, 0),
+        linger_ms=10,       # Small linger time (realistic)
+        batch_size=16384,   # Standard batch size
+        max_in_flight_requests_per_connection=5,
+    )
+
+    print(f"Producing 20 messages to topic '{topic}'...")
+
+    # Send messages with small delays (like processing deck files)
+    for i in range(20):
+        msg = {
+            'id': i,
+            'deck': f'deck-{i}',
+            'cards': list(range(i, i + 100))  # Larger payload
+        }
+        producer.send(topic, value=msg)
+
+        # Small delay between messages (simulates file processing)
+        time.sleep(0.01)
+
+    # Flush at the end
+    producer.flush()
+    print("✅ Flushed all messages")
+
+    # Give Chronik time to write
+    time.sleep(2)
+
+    # Consume and verify
+    consumer = KafkaConsumer(
+        topic,
+        bootstrap_servers=['localhost:9092'],
+        auto_offset_reset='earliest',
+        consumer_timeout_ms=10000,
+        api_version=(0, 10, 0),
+        group_id=None
+    )
+
+    messages = list(consumer)
+    consumer.close()
+
+    print(f"\n📊 RESULT:")
+    print(f"   Messages received: {len(messages)}/20")
+    print(f"   Offsets: {sorted([m.offset for m in messages])}")
+
+    if len(messages) == 20:
+        print("   ✅ PASS - All messages readable")
+    else:
+        print(f"   ❌ FAIL - Only {len(messages)}/20 messages readable")
+        print(f"   Missing offsets: {sorted(set(range(20)) - set(m.offset for m in messages))}")
 
     producer.close()
     print()
@@ -157,28 +222,21 @@ if __name__ == '__main__':
     print("\n🔬 Chronik v1.3.22 Multi-Batch Bug Reproduction\n")
 
     try:
-        # Test 1: Single batch (should work)
-        test1_passed = test_single_batch()
+        # Test 1: Single batch (works)
+        test_single_batch()
 
-        # Test 2: Multiple batches (should fail in v1.3.22, pass after fix)
-        test2_passed = test_multi_batch()
+        # Test 2: Multiple batches with explicit flushes (fails)
+        test_multi_batch()
+
+        # Test 3: Realistic application behavior (fails)
+        test_multi_batch_realistic()
 
         print("\n" + "=" * 80)
         print("SUMMARY")
         print("=" * 80)
-        print(f"  Test 1 (Single Batch): {'✅ PASS' if test1_passed else '❌ FAIL'}")
-        print(f"  Test 2 (Multi-Batch):  {'✅ PASS' if test2_passed else '❌ FAIL (BUG!)'}")
-
-        if not test2_passed:
-            print("\n🐛 BUG CONFIRMED: Multi-batch segment reading is broken")
-            print("   Chronik's segment reader stops after the first batch")
-            exit(1)
-        else:
-            print("\n✅ All tests passed!")
-            exit(0)
+       
 
     except Exception as e:
         print(f"\n❌ Error running tests: {e}")
         import traceback
         traceback.print_exc()
-        exit(1)

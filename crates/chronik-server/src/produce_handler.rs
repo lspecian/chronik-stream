@@ -736,7 +736,7 @@ impl ProduceHandler {
         
         // Decode record batch
         let (kafka_batch, _bytes_consumed) = KafkaRecordBatch::decode(records_data)?;
-        
+
         // Validate producer info for idempotence
         if kafka_batch.header.producer_id >= 0 {
             self.validate_producer_sequence(
@@ -749,7 +749,7 @@ impl ProduceHandler {
         
         // Get or create partition state
         let partition_state = self.get_or_create_partition_state(topic, partition).await?;
-        
+
         // Assign offsets and prepare records
         let base_offset = partition_state.next_offset.load(Ordering::SeqCst);
         let mut records = Vec::with_capacity(kafka_batch.records.len());
