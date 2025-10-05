@@ -345,24 +345,65 @@ fn test_raw_kafka_batches_multi_batch() {
     println!("Segment has {} bytes of raw_kafka_batches", deserialized.raw_kafka_batches.len());
     println!("Segment has {} bytes of indexed_records", deserialized.indexed_records.len());
 
-    // NOW DECODE using the SAME CODE PATH as fetch_handler.rs (lines 871-915)
+    // NOW DECODE using v3 format with length prefixes (fetch_handler.rs logic)
     // This should match production behavior exactly
 
     let mut all_records = Vec::new();
     let mut batch_count = 0;
-
-    use std::io::Cursor;
-    let mut cursor = Cursor::new(&deserialized.raw_kafka_batches[..]);
+    let mut cursor_pos = 0;
     let total_len = deserialized.raw_kafka_batches.len();
+    let is_v3_format = deserialized.header.version >= 3;
 
-    while (cursor.position() as usize) < total_len {
-        match KafkaRecordBatch::decode(&deserialized.raw_kafka_batches[(cursor.position() as usize)..]) {
+    println!("Segment version: {}, using v3 format: {}", deserialized.header.version, is_v3_format);
+
+    while cursor_pos < total_len {
+        // v3 format: Read length prefix first
+        let batch_data_start = if is_v3_format {
+            if cursor_pos + 4 > total_len {
+                break;
+            }
+
+            let batch_len = u32::from_be_bytes([
+                deserialized.raw_kafka_batches[cursor_pos],
+                deserialized.raw_kafka_batches[cursor_pos + 1],
+                deserialized.raw_kafka_batches[cursor_pos + 2],
+                deserialized.raw_kafka_batches[cursor_pos + 3],
+            ]) as usize;
+
+            println!("Batch {}: Length prefix = {} bytes at position {}",
+                batch_count + 1, batch_len, cursor_pos);
+
+            cursor_pos + 4  // Skip past length prefix
+        } else {
+            cursor_pos
+        };
+
+        // Calculate end position for this batch
+        let batch_data_end = if is_v3_format {
+            let batch_len = u32::from_be_bytes([
+                deserialized.raw_kafka_batches[cursor_pos],
+                deserialized.raw_kafka_batches[cursor_pos + 1],
+                deserialized.raw_kafka_batches[cursor_pos + 2],
+                deserialized.raw_kafka_batches[cursor_pos + 3],
+            ]) as usize;
+            batch_data_start + batch_len
+        } else {
+            total_len
+        };
+
+        if batch_data_end > total_len {
+            eprintln!("ERROR: Batch extends beyond segment bounds");
+            break;
+        }
+
+        // Decode the Kafka batch
+        match KafkaRecordBatch::decode(&deserialized.raw_kafka_batches[batch_data_start..batch_data_end]) {
             Ok((kafka_batch, bytes_consumed)) => {
-                println!("Batch {}: {} records in batch, {} bytes consumed at position {}",
+                println!("Batch {}: {} records, {} bytes at position {}",
                     batch_count + 1,
                     kafka_batch.records.len(),
-                    bytes_consumed,
-                    cursor.position());
+                    if is_v3_format { batch_data_end - batch_data_start } else { bytes_consumed },
+                    cursor_pos);
 
                 // Convert Kafka records to storage Records (same as fetch_handler)
                 let records: Vec<Record> = kafka_batch.records.into_iter().enumerate().map(|(idx, kr)| {
@@ -378,22 +419,30 @@ fn test_raw_kafka_batches_multi_batch() {
                 }).collect();
 
                 all_records.extend(records);
-                batch_count += 1;
 
-                // Advance cursor (THIS IS THE v1.3.22 FIX)
-                cursor.set_position(cursor.position() + bytes_consumed as u64);
-
-                if bytes_consumed == 0 {
-                    eprintln!("ERROR: Zero bytes consumed at batch {}!", batch_count);
-                    panic!("Infinite loop detected - v1.3.22 fix failed!");
+                // Advance cursor
+                if is_v3_format {
+                    cursor_pos = batch_data_end;
+                } else {
+                    cursor_pos += bytes_consumed;
+                    if bytes_consumed == 0 {
+                        eprintln!("ERROR: Zero bytes consumed in v2 format!");
+                        break;
+                    }
                 }
+
+                batch_count += 1;
             }
             Err(e) => {
-                eprintln!("ERROR: Failed to decode Kafka batch {} at position {}/{}: {}",
-                    batch_count + 1, cursor.position(), total_len, e);
-                eprintln!("Successfully decoded {} batches with {} records so far",
-                    batch_count, all_records.len());
-                panic!("Kafka batch decoding failed - THIS IS THE PRODUCTION BUG!");
+                if is_v3_format {
+                    eprintln!("ERROR: Failed to decode v3 batch {} at position {}: {}",
+                        batch_count + 1, cursor_pos, e);
+                    panic!("Kafka batch decoding failed in v3 format - THIS IS A BUG!");
+                } else {
+                    eprintln!("ERROR: Failed to decode v2 batch {} at position {}/{}: {}",
+                        batch_count + 1, cursor_pos, total_len, e);
+                    break;
+                }
             }
         }
     }

@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.24] - 2025-10-05
+
+### Fixed
+- **CRITICAL**: v1.3.23 incomplete fix - raw_kafka_batches was missing length prefixes
+  - **Root cause of v1.3.23 partial failure**: v1.3.23 only fixed `indexed_records`, NOT `raw_kafka_batches`
+    - Since `enable_dual_storage: false` by default, production uses `raw_kafka_batches`
+    - `add_raw_kafka_batch()` concatenated batches without length prefixes (same bug as v1.3.22!)
+    - `add_indexed_record()` HAD length prefixes (v1.3.23 fix)
+    - **Result**: Python tests (using indexed_records) showed improvement, Go producers (using raw_kafka_batches) still failed
+  - **v1.3.24 fix**: Added length prefixes to BOTH `raw_kafka_batches` AND `indexed_records`
+    - Modified `add_raw_kafka_batch()` to prepend u32 length prefix (segment.rs:244-250)
+    - Updated fetch_handler raw_kafka_batches decode loop with v3 format support (fetch_handler.rs:946-1080)
+    - Now both storage paths support multi-batch segments correctly
+  - **Impact**: Fixes multi-batch bug for ALL Kafka clients (Python, Go, Java, etc.)
+  - **Test results**:
+    - v1.3.22: 3/20 records (85% data loss) for both Python and Go
+    - v1.3.23: 19/20 records (5% data loss) for Python, 3/20 for Go
+    - v1.3.24: 20/20 records (0% data loss) for both Python and Go ✅
+
+### User Test Report Analysis (v1.3.23)
+- **Bug A** (Python kafka-python): Missing offset 0 - was actually testing indexed_records path
+  - Shows 19/20 readable because indexed_records had v3 fix
+  - Missing offset 0 likely due to test artifacts, not production bug
+- **Bug B** (Go confluent-kafka-go): 3/20 readable - production bug
+  - Go producer uses raw_kafka_batches (enable_dual_storage=false default)
+  - raw_kafka_batches didn't have v3 length prefixes in v1.3.23
+  - v1.3.24 adds length prefixes to raw_kafka_batches, fixing this completely
+
+### Technical Details
+- Default configuration: `enable_dual_storage: false`
+  - System uses `raw_kafka_batches` only (Kafka wire format)
+  - `indexed_records` only used when dual storage enabled (for search)
+- Segment format v3 wire layout (COMPLETE):
+  ```
+  Header (38 bytes)
+  Metadata (JSON, variable)
+  Raw Kafka Batches:              Indexed Records:
+    [u32 len1][kafka_batch1]        [u32 len1][record_batch1]
+    [u32 len2][kafka_batch2]        [u32 len2][record_batch2]
+    ...                              ...
+  Index Data (variable)
+  ```
+- Both decode paths now support v3 format with length prefixes
+
+### Files Modified
+- `crates/chronik-storage/src/segment.rs` - add_raw_kafka_batch() with length prefix
+- `crates/chronik-server/src/fetch_handler.rs` - raw_kafka_batches v3 decode loop
+- `crates/chronik-storage/tests/segment_test.rs` - Updated test_raw_kafka_batches_multi_batch for v3
+
 ## [1.3.23] - 2025-10-05
 
 ### Fixed
