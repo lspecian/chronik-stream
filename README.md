@@ -1,4 +1,4 @@
-# Chronik Stream v1.3.18
+# Chronik Stream
 
 [![Build Status](https://github.com/lspecian/chronik-stream/workflows/CI/badge.svg)](https://github.com/lspecian/chronik-stream/actions)
 [![Release](https://img.shields.io/github/v/release/lspecian/chronik-stream)](https://github.com/lspecian/chronik-stream/releases)
@@ -8,16 +8,7 @@
 
 A high-performance streaming platform built in Rust that implements core Kafka wire protocol functionality with comprehensive Write-Ahead Log (WAL) durability and automatic recovery.
 
-## 🎉 What's New in v1.3.18
-
-**100% KSQLDB Compatibility Achieved** - Fixed critical CRC32C checksum validation issue:
-- ✅ **RecordBatch CRC Fix** - Corrected CRC calculation to exclude CRC field itself (Kafka v2 spec compliance)
-- ✅ **Data Integrity** - Full transactional record write/read cycle now works without corruption errors
-- ✅ **CRC Verification** - Added decode-time validation with detailed error messages
-- ✅ **Production Ready** - Complete KSQLDB transactional support with proper data integrity
-- ⚠️ **Breaking Change** - Existing data from v1.3.17 will fail CRC validation (migration required)
-
-See [CHANGELOG.md](CHANGELOG.md) for detailed release history.
+See [CHANGELOG.md](CHANGELOG.md) for release history and latest updates.
 
 ## 🚀 Features
 
@@ -64,7 +55,7 @@ See [CHANGELOG.md](CHANGELOG.md) for detailed release history.
 # Quick start - single command
 docker run -d -p 9092:9092 \
   -e CHRONIK_ADVERTISED_ADDR=localhost \
-  ghcr.io/lspecian/chronik-stream:v1.3.18
+  ghcr.io/lspecian/chronik-stream:latest
 
 # With persistent storage and custom configuration
 docker run -d --name chronik \
@@ -72,7 +63,7 @@ docker run -d --name chronik \
   -v chronik-data:/data \
   -e CHRONIK_ADVERTISED_ADDR=localhost \
   -e RUST_LOG=info \
-  ghcr.io/lspecian/chronik-stream:v1.3.18
+  ghcr.io/lspecian/chronik-stream:latest
 
 # Using docker-compose
 curl -O https://raw.githubusercontent.com/lspecian/chronik-stream/main/docker-compose.yml
@@ -87,7 +78,7 @@ docker-compose up -d
 # docker-compose.yml example
 services:
   chronik-stream:
-    image: ghcr.io/lspecian/chronik-stream:v1.3.17
+    image: ghcr.io/lspecian/chronik-stream:latest
     ports:
       - "9092:9092"
     environment:
@@ -153,60 +144,15 @@ cargo build --release --bin chronik-server
 
 ## 🌟 KSQL Integration
 
-Chronik Stream provides **full compatibility** with KSQL (Confluent's SQL engine for Kafka) including transactional support:
+Chronik Stream provides **full compatibility** with KSQLDB (Confluent's SQL engine for Kafka) including transactional support. Simply point KSQLDB at Chronik's Kafka endpoint:
 
-### Quick Start with KSQL
-
-```bash
-# 1. Start Chronik Stream
-chronik-server standalone
-
-# 2. Download and extract KSQL
-curl -O https://packages.confluent.io/archive/7.5/confluent-7.5.0.tar.gz
-tar xzf confluent-7.5.0.tar.gz
-
-# 3. Configure KSQL (ksql-server.properties)
-cat > ksql-server.properties <<EOF
+```properties
+# ksql-server.properties
 bootstrap.servers=localhost:9092
 ksql.service.id=ksql_service_1
-listeners=http://0.0.0.0:8088
-EOF
-
-# 4. Start KSQL Server
-confluent-7.5.0/bin/ksql-server-start ksql-server.properties
-
-# 5. Start KSQL CLI
-confluent-7.5.0/bin/ksql http://localhost:8088
 ```
 
-### KSQL Operations Example
-
-```sql
--- Create a stream
-CREATE STREAM pageviews (
-    viewtime BIGINT,
-    userid VARCHAR,
-    pageid VARCHAR
-) WITH (
-    KAFKA_TOPIC='pageviews',
-    VALUE_FORMAT='JSON'
-);
-
--- Insert data
-INSERT INTO pageviews VALUES (1, 'User_1', 'Page_1');
-INSERT INTO pageviews VALUES (2, 'User_2', 'Page_2');
-
--- Query data
-SELECT * FROM pageviews EMIT CHANGES;
-
--- Create derived stream
-CREATE STREAM pageviews_female AS
-    SELECT * FROM pageviews
-    WHERE userid LIKE '%female%'
-    EMIT CHANGES;
-```
-
-For detailed KSQL integration instructions, see [docs/KSQL_INTEGRATION_GUIDE.md](docs/KSQL_INTEGRATION_GUIDE.md).
+For detailed KSQL setup and usage examples, see [docs/KSQL_INTEGRATION_GUIDE.md](docs/KSQL_INTEGRATION_GUIDE.md).
 
 ## 🎯 Operational Modes
 
@@ -255,9 +201,9 @@ Environment Variables:
 
 All images support both **linux/amd64** and **linux/arm64** architectures:
 
-| Image | Tags | Size | Description |
-|-------|------|------|-------------|
-| `ghcr.io/lspecian/chronik-stream` | `v1.3.17`, `1.3`, `latest` | ~50MB | Chronik server with full KSQL support |
+| Image | Tags | Description |
+|-------|------|-------------|
+| `ghcr.io/lspecian/chronik-stream` | `latest`, `1.3`, `v1.3.x` | Chronik server with full KSQL support |
 
 ### Supported Platforms
 
