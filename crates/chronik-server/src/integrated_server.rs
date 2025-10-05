@@ -91,7 +91,7 @@ impl IntegratedKafkaServer {
     /// Create a new integrated Kafka server
     pub async fn new(config: IntegratedServerConfig) -> Result<Self> {
         info!("Initializing integrated Kafka server with chronik-ingest components");
-        
+
         // Create data directory
         std::fs::create_dir_all(&config.data_dir)?;
         let segments_dir = format!("{}/segments", config.data_dir);

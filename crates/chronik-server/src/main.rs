@@ -213,6 +213,14 @@ async fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
+    // Log version information on startup
+    info!("Chronik Server v{}", env!("CARGO_PKG_VERSION"));
+    info!("Build features: search={}, backup={}, dynamic-config={}",
+        cfg!(feature = "search"),
+        cfg!(feature = "backup"),
+        cfg!(feature = "dynamic-config")
+    );
+
     // Show deprecation warnings for old binaries
     if std::env::args().next().unwrap().contains("chronik-ingest") {
         warn!("chronik-ingest is deprecated. Please use chronik-server instead.");
