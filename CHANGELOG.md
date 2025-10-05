@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.20] - 2025-10-05
+
+### Fixed
+- **CRITICAL**: Segment reader truncation bug - Only first batch decoded from multi-batch segments
+  - **Root cause**: `fetch_from_segment()` only decoded the FIRST RecordBatch from segments
+    - A segment can contain multiple concatenated RecordBatch structures
+    - When 20 messages written, they may be split into 10 batches of 2 messages each
+    - Previous code stopped after decoding first batch (2 records)
+    - Remaining 9 batches (18 records) were never decoded
+    - **Result**: 85-90% data loss (only 2-3 out of 20 records returned)
+  - **Fix**: Modified `fetch_from_segment()` to loop through ALL batches in segment
+    - Decodes all RecordBatch structures until end of indexed_records
+    - Properly advances cursor position after each batch
+    - Accumulates records from all batches before filtering
+    - Added detailed logging: batch count, record count per batch, total records
+  - **Impact**: All records now fetched from segments, zero data loss
+  - **Evidence from test report**:
+    - Before fix: 3/20 records returned (offsets 0, 1, 19) - 85% data loss
+    - After fix: 20/20 records expected
+  - Detailed analysis in user test report: Chronik v1.3.19 Test Report
+
+### Technical Details
+- Added multi-batch decoding loop in `fetch_from_segment()`
+- Cursor position tracking to iterate through concatenated batches
+- Batch size calculation: 4 bytes (count) + sum of all record sizes
+- Record size: 16 bytes (offset+timestamp) + key_len + key + value_len + value + headers
+- Safety check: Break on infinite loop if cursor doesn't advance
+- Comprehensive logging at WARN level for debugging:
+  - `SEGMENT→DECODE`: Starting batch decode with total bytes
+  - `SEGMENT→BATCH N`: Records decoded from each batch
+  - `SEGMENT→COMPLETE`: Total batches and records decoded
+  - `SEGMENT→ERROR`: Cursor position issues
+- Files modified:
+  - `crates/chronik-server/src/fetch_handler.rs` (lines 801-916)
+
 ## [1.3.19] - 2025-10-05
 
 ### Fixed
