@@ -191,26 +191,44 @@ impl RecordBatch {
         buf[12..16].copy_from_slice(&batch_length.to_be_bytes());
 
         // Calculate CRC32C checksum per Kafka protocol spec
-        // CRC covers: attributes + last_offset_delta + timestamps + producer info + records
-        // CRC field itself (4 bytes after magic) must NOT be included in calculation
+        // Per Kafka spec: CRC covers from partition_leader_epoch to end of records
+        // CRC field itself must be ZEROED during calculation, then filled with result
         //
         // Buffer layout: [4 padding][8 base_offset][4 batch_length][4 partition_leader_epoch]
         //                [1 magic][4 CRC][2 attributes]...
+        // Position 16-19 = partition_leader_epoch (start of CRC input)
         // Position 20 = magic byte
-        // Position 21-24 = CRC field (to be filled)
-        // Position 25 = attributes (start of CRC calculation)
-        let crc_start = 25; // Start AFTER CRC field
+        // Position 21-24 = CRC field (must be zeroed during calculation)
+        // Position 25 = attributes
+
+        // CRC starts at partition_leader_epoch (offset 16 in buffer with padding)
+        let crc_start = 16;
+
+        // CRC field is at offset 21-24 - ensure it's zeroed before calculation
+        // (it should already be zero from line 162, but be explicit)
+        buf[21..25].copy_from_slice(&[0, 0, 0, 0]);
+
+        // Calculate CRC-32C over: partition_leader_epoch + magic + (zeroed CRC) + attributes + ... + records
         let crc_data = &buf[crc_start..];
+
         // Use CRC-32C (Castagnoli) as per Kafka protocol specification
         let crc = crc32c::crc32c(crc_data);
 
         tracing::debug!(
-            "RecordBatch CRC: crc={}, data_len={}, producer_id={}, records={}, is_txn={}",
-            crc, crc_data.len(), self.producer_id, self.records.len(), self.attributes.is_transactional
+            "RecordBatch CRC encode: crc=0x{:08X} ({}), data_len={}, crc_start={}, producer_id={}, records={}, is_txn={}",
+            crc, crc, crc_data.len(), crc_start, self.producer_id, self.records.len(), self.attributes.is_transactional
         );
 
-        // Write CRC at position 21-24 (4 bytes after magic byte)
-        buf[21..25].copy_from_slice(&crc.to_be_bytes());
+        // Log first 64 bytes of CRC input for debugging
+        if crc_data.len() >= 64 {
+            tracing::trace!(
+                "CRC input (first 64 bytes): {:02X?}",
+                &crc_data[..64]
+            );
+        }
+
+        // Write CRC at position 21-24 as LITTLE-ENDIAN (Kafka requirement)
+        buf[21..25].copy_from_slice(&crc.to_le_bytes());
 
         Ok(buf.freeze())
     }
@@ -300,14 +318,15 @@ impl RecordBatch {
         let batch_length = data.get_i32();
         let partition_leader_epoch = data.get_i32();
         let magic = data.get_i8();
-        
+
         if magic != MAGIC_V2 {
             return Err(Error::Protocol(format!("Unsupported magic byte: {}", magic)));
         }
 
-        let stored_crc = data.get_u32();
+        // Read CRC as LITTLE-ENDIAN (Kafka requirement)
+        let stored_crc = data.get_u32_le();
 
-        // Save position to calculate CRC over remaining data
+        // Save position after CRC to calculate CRC over remaining data
         let crc_verify_start = data.remaining();
 
         let attributes = RecordAttributes::from_byte(data.get_i16() as i8);
@@ -330,16 +349,43 @@ impl RecordBatch {
         };
 
         // Verify CRC after parsing header but before processing records
-        // CRC covers: attributes + last_offset_delta + timestamps + producer info + records
-        let crc_data = &data_for_crc[data_for_crc.len() - crc_verify_start..];
+        // Per Kafka spec: CRC covers from partition_leader_epoch to end of records
+        // We need to reconstruct the bytes that were included in the CRC calculation
+
+        // Build the CRC input buffer with the same fields as encoding
+        let mut crc_input = BytesMut::new();
+        crc_input.put_i32(partition_leader_epoch);
+        crc_input.put_i8(magic);
+        crc_input.put_u32(0); // CRC field must be zero during calculation
+        crc_input.put_i16(attributes.to_byte() as i16);
+        crc_input.put_i32(last_offset_delta);
+        crc_input.put_i64(first_timestamp);
+        crc_input.put_i64(max_timestamp);
+        crc_input.put_i64(producer_id);
+        crc_input.put_i16(producer_epoch);
+        crc_input.put_i32(base_sequence);
+        crc_input.put_i32(record_count);
+
+        // Append the (possibly compressed) records data
+        crc_input.extend_from_slice(&data_for_crc);
+
         // Use CRC-32C (Castagnoli) as per Kafka protocol specification
-        let calculated_crc = crc32c::crc32c(crc_data);
+        let calculated_crc = crc32c::crc32c(&crc_input);
 
         if calculated_crc != stored_crc {
             tracing::warn!(
-                "CRC mismatch: stored={}, calculated={}, producer_id={}, is_txn={}",
-                stored_crc, calculated_crc, producer_id, attributes.is_transactional
+                "CRC mismatch: stored=0x{:08X} ({}), calculated=0x{:08X} ({}), producer_id={}, is_txn={}",
+                stored_crc, stored_crc, calculated_crc, calculated_crc, producer_id, attributes.is_transactional
             );
+
+            // Log first 64 bytes of CRC input for debugging
+            if crc_input.len() >= 64 {
+                tracing::trace!(
+                    "CRC input (first 64 bytes): {:02X?}",
+                    &crc_input[..64]
+                );
+            }
+
             return Err(Error::Protocol(format!(
                 "Record is corrupt (stored crc = {}, computed crc = {})",
                 stored_crc, calculated_crc
@@ -347,8 +393,8 @@ impl RecordBatch {
         }
 
         tracing::debug!(
-            "CRC verified: crc={}, producer_id={}, records={}, is_txn={}",
-            calculated_crc, producer_id, record_count, attributes.is_transactional
+            "CRC verified: crc=0x{:08X} ({}), producer_id={}, records={}, is_txn={}",
+            calculated_crc, calculated_crc, producer_id, record_count, attributes.is_transactional
         );
 
         // Decode records
