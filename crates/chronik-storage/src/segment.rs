@@ -8,8 +8,11 @@ use serde::{Deserialize, Serialize};
 
 /// Magic bytes for segment file format
 const SEGMENT_MAGIC: &[u8] = b"CHRN";
-/// Current segment format version (v2 adds dual storage)
-const SEGMENT_VERSION: u16 = 2;
+/// Current segment format version
+/// v1: Original format with kafka_data and index
+/// v2: Dual storage (raw_kafka_batches + indexed_records)
+/// v3: v2 + length prefixes for indexed_records batches (fixes multi-batch bug)
+const SEGMENT_VERSION: u16 = 3;
 
 /// Header for segment files
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,23 +116,25 @@ impl Segment {
             // Version 1: kafka_data_size, index_size
             cursor.read_exact(&mut buf8)?;
             let kafka_data_size = u64::from_be_bytes(buf8);
-            
+
             cursor.read_exact(&mut buf8)?;
             let index_size = u64::from_be_bytes(buf8);
-            
+
             // In v1, kafka_data is our indexed records, no raw batches
             (0u64, kafka_data_size, index_size)
         } else {
-            // Version 2: raw_kafka_size, indexed_data_size, index_size
+            // Version 2 & 3: raw_kafka_size, indexed_data_size, index_size
+            // v2: indexed_records without length prefixes (multi-batch bug)
+            // v3: indexed_records with u32 length prefixes (fixed)
             cursor.read_exact(&mut buf8)?;
             let raw_kafka_size = u64::from_be_bytes(buf8);
-            
+
             cursor.read_exact(&mut buf8)?;
             let indexed_data_size = u64::from_be_bytes(buf8);
-            
+
             cursor.read_exact(&mut buf8)?;
             let index_size = u64::from_be_bytes(buf8);
-            
+
             (raw_kafka_size, indexed_data_size, index_size)
         };
         
@@ -237,7 +242,15 @@ impl SegmentBuilder {
     }
     
     /// Add indexed record data (for search)
+    ///
+    /// In v3 format, each batch is prefixed with a u32 length to allow
+    /// proper multi-batch deserialization. This fixes the bug where only
+    /// the first batch in a segment could be read.
     pub fn add_indexed_record(&mut self, data: &[u8]) {
+        // v3 format: Add 4-byte length prefix before each batch
+        // This allows the reader to know exactly where each batch ends
+        // and the next batch begins, fixing the multi-batch bug
+        self.indexed_records.put_u32(data.len() as u32);
         self.indexed_records.put_slice(data);
     }
     

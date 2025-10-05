@@ -7,6 +7,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.23] - 2025-10-05
+
+### Fixed
+- **CRITICAL**: Multi-batch segment deserialization bug - Segment format v3 with length prefixes
+  - **Root cause**: When multiple separate batches written to same segment file, only first 1-2 batches were readable
+    - Production scenario: Go producer creates 20 separate batches (1 record each) via 20 separate produce requests
+    - SegmentBuilder.add_indexed_record() called 20 times, concatenating batches without delimiters
+    - RecordBatch::decode() can only read first batch - doesn't know where it ends and next begins
+    - **Result**: 85% data loss (3/20 records readable - offsets 0, 1, 19)
+  - **v2 format bug**: indexed_records = [batch1_bytes][batch2_bytes][batch3_bytes]... (no boundaries)
+  - **v3 format fix**: indexed_records = [u32_len1][batch1_bytes][u32_len2][batch2_bytes][u32_len3][batch3_bytes]...
+    - Each batch prefixed with 4-byte big-endian u32 length
+    - Reader knows exact batch boundaries for proper deserialization
+    - Fixes multi-batch decoding completely
+  - **Impact**: All batches in segment now readable - zero data loss
+  - **Test results**:
+    - v1.3.22: 3/20 records readable (85% data loss)
+    - v1.3.23: 20/20 records readable (0% data loss)
+
+### Changed
+- **Breaking Change**: Bumped SEGMENT_VERSION from 2 to 3
+  - v3 segments are NOT backward compatible with v1.3.22 and earlier
+  - Users must wipe data and re-ingest after upgrading to v1.3.23
+  - No migration path - acceptable due to low user adoption
+- **Code Quality**: Refactored `fetch_records_legacy` → `fetch_records_from_segments` for clarity
+  - Method name now accurately reflects its purpose: fetching from persistent segment storage
+  - This is NOT a legacy method - it's the primary segment reader for persistent data
+  - Updated documentation to clarify this is called after checking WAL and in-memory buffers
+
+### Added
+- **v3 Format Implementation**:
+  - Modified `SegmentBuilder::add_indexed_record()` to prepend u32 length prefix (segment.rs:249-255)
+  - Updated fetch_handler indexed_records decode loop to read length prefixes (fetch_handler.rs:802-918)
+  - Added version detection: v2 (no prefix) vs v3 (with prefix) for backward read compatibility
+  - Comprehensive test: `test_multiple_separate_batch_writes` - Verifies 20 separate batches encode/decode correctly
+
+### Technical Details
+- Segment format v3 wire layout:
+  ```
+  Header (38 bytes)
+  Metadata (JSON, variable)
+  Raw Kafka Batches (variable)
+  Indexed Records:
+    [u32 batch1_len][batch1_data]  // 4 bytes + batch1_len bytes
+    [u32 batch2_len][batch2_data]  // 4 bytes + batch2_len bytes
+    ...
+  Index Data (variable)
+  ```
+- Decode loop logic:
+  - Read u32 length prefix (big-endian)
+  - Extract exactly `length` bytes for batch data
+  - Call RecordBatch::decode() on bounded slice
+  - Advance cursor past length prefix + batch data
+  - Repeat until all indexed_records consumed
+
+### Migration from v1.3.22
+**BREAKING CHANGE**: v3 format requires data re-ingestion
+1. Stop Chronik server
+2. Backup data directory (optional)
+3. Clear segments: `rm -rf data/segments/*`
+4. Clear WAL: `rm -rf data/wal/*`
+5. Upgrade to v1.3.23
+6. Restart server and re-ingest data
+
+### Files Modified
+- `crates/chronik-storage/src/segment.rs` - SEGMENT_VERSION = 3, add_indexed_record() with length prefix
+- `crates/chronik-server/src/fetch_handler.rs` - Decode loop with v3 format support, method rename
+- `crates/chronik-storage/tests/segment_test.rs` - New test for multi-batch scenario
+
 ## [1.3.22] - 2025-10-05
 
 ### Fixed

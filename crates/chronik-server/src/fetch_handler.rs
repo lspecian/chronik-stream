@@ -499,7 +499,7 @@ impl FetchHandler {
                 topic, partition, records.len()
             );
 
-            let segment_records = self.fetch_records_legacy(
+            let segment_records = self.fetch_records_from_segments(
                 topic,
                 partition,
                 fetch_offset,
@@ -557,8 +557,9 @@ impl FetchHandler {
         Ok(records)
     }
     
-    /// Legacy method for fetching from segments and buffers (fallback)
-    async fn fetch_records_legacy(
+    /// Fetch records from segment files (persistent storage)
+    /// This is called after checking WAL and in-memory buffers
+    async fn fetch_records_from_segments(
         &self,
         topic: &str,
         partition: i32,
@@ -567,7 +568,7 @@ impl FetchHandler {
         max_bytes: i32,
     ) -> Result<Vec<chronik_storage::Record>> {
         info!(
-            "fetch_records_legacy called - topic: {}, partition: {}, fetch_offset: {}, high_watermark: {}",
+            "fetch_records_from_segments called - topic: {}, partition: {}, fetch_offset: {}, high_watermark: {}",
             topic, partition, fetch_offset, high_watermark
         );
         
@@ -798,46 +799,120 @@ impl FetchHandler {
             segment.raw_kafka_batches.len(),
             segment.indexed_records.len());
         
-        // CRITICAL FIX v1.3.21: Decode ALL batches from segment
-        // indexed_records contains multiple concatenated RecordBatch structures
-        // RecordBatch::decode() now returns (batch, bytes_consumed) for proper cursor advancement
+        // CRITICAL FIX v1.3.23: Multi-batch decode with v3 length prefixes
+        // v3 format: Each batch is prefixed with u32 length
+        // v2 format: Batches concatenated without length (only first batch readable - BUG!)
+        // This fixes the multi-batch bug where only first batch was deserialized
         let mut all_records = Vec::new();
         let mut batch_count = 0;
         let mut cursor_pos = 0;
         let total_len = segment.indexed_records.len();
 
-        tracing::info!("SEGMENT→DECODE: Starting multi-batch decode from indexed_records ({} bytes)", total_len);
+        // Check segment version to determine format
+        let is_v3_format = segment.header.version >= 3;
+
+        tracing::info!(
+            "SEGMENT→DECODE: Starting multi-batch decode from indexed_records ({} bytes, v{} format)",
+            total_len, segment.header.version
+        );
 
         while cursor_pos < total_len {
-            match RecordBatch::decode(&segment.indexed_records[cursor_pos..]) {
+            // v3 format: Read length prefix first
+            let batch_data_start = if is_v3_format {
+                // Need at least 4 bytes for length prefix
+                if cursor_pos + 4 > total_len {
+                    tracing::info!("SEGMENT→DECODE: Not enough bytes for length prefix at position {}", cursor_pos);
+                    break;
+                }
+
+                // Read u32 length prefix (big-endian)
+                let batch_len = u32::from_be_bytes([
+                    segment.indexed_records[cursor_pos],
+                    segment.indexed_records[cursor_pos + 1],
+                    segment.indexed_records[cursor_pos + 2],
+                    segment.indexed_records[cursor_pos + 3],
+                ]) as usize;
+
+                tracing::debug!("SEGMENT→V3: Batch {} has length prefix {} bytes", batch_count + 1, batch_len);
+
+                // Move cursor past length prefix
+                cursor_pos + 4
+            } else {
+                // v2 format: No length prefix, try to decode from current position
+                cursor_pos
+            };
+
+            // Calculate end position for this batch
+            let batch_data_end = if is_v3_format {
+                let batch_len = u32::from_be_bytes([
+                    segment.indexed_records[cursor_pos],
+                    segment.indexed_records[cursor_pos + 1],
+                    segment.indexed_records[cursor_pos + 2],
+                    segment.indexed_records[cursor_pos + 3],
+                ]) as usize;
+                batch_data_start + batch_len
+            } else {
+                total_len  // For v2, decode will determine the end
+            };
+
+            // Ensure we have enough data
+            if batch_data_end > total_len {
+                tracing::error!(
+                    "SEGMENT→ERROR: Batch extends beyond segment bounds (pos={}, end={}, total={})",
+                    batch_data_start, batch_data_end, total_len
+                );
+                break;
+            }
+
+            // Decode the batch
+            match RecordBatch::decode(&segment.indexed_records[batch_data_start..batch_data_end]) {
                 Ok((batch, bytes_consumed)) => {
                     let batch_records = batch.records.len();
                     tracing::info!(
-                        "SEGMENT→BATCH {}: Decoded {} records, consumed {} bytes at position {}",
+                        "SEGMENT→BATCH {}: Decoded {} records, {} bytes at position {}",
                         batch_count + 1,
                         batch_records,
-                        bytes_consumed,
+                        if is_v3_format { batch_data_end - batch_data_start } else { bytes_consumed },
                         cursor_pos
                     );
 
                     all_records.extend(batch.records);
-                    cursor_pos += bytes_consumed;
-                    batch_count += 1;
 
-                    // Safety check: ensure we're making progress
-                    if bytes_consumed == 0 {
-                        tracing::error!("SEGMENT→ERROR: Zero bytes consumed, breaking to avoid infinite loop");
-                        break;
+                    // Advance cursor
+                    if is_v3_format {
+                        // v3: Move to next length prefix
+                        cursor_pos = batch_data_end;
+                    } else {
+                        // v2: Use bytes_consumed from decode
+                        cursor_pos += bytes_consumed;
+
+                        // Safety check for v2 format
+                        if bytes_consumed == 0 {
+                            tracing::error!("SEGMENT→ERROR: Zero bytes consumed in v2 format, breaking");
+                            break;
+                        }
                     }
+
+                    batch_count += 1;
                 }
                 Err(e) => {
-                    tracing::info!(
-                        "SEGMENT→DECODE: Finished at position {} ({} bytes remaining): {}",
-                        cursor_pos,
-                        total_len - cursor_pos,
-                        e
-                    );
-                    break;
+                    if is_v3_format {
+                        // v3: Length prefix told us exact size, decode should not fail
+                        tracing::error!(
+                            "SEGMENT→ERROR: Failed to decode v3 batch {} at position {}: {}",
+                            batch_count + 1, cursor_pos, e
+                        );
+                        break;
+                    } else {
+                        // v2: Expected to fail after last batch (no length prefix to know when to stop)
+                        tracing::info!(
+                            "SEGMENT→DECODE: Finished v2 format at position {} ({} bytes remaining): {}",
+                            cursor_pos,
+                            total_len - cursor_pos,
+                            e
+                        );
+                        break;
+                    }
                 }
             }
         }
