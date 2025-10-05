@@ -22,6 +22,7 @@ serde = { workspace = true }
 # Compression
 flate2 = { workspace = true }
 crc32fast = { workspace = true }
+crc32c = "0.6" # CRC-32C (Castagnoli) for Kafka protocol compatibility
 snap = { workspace = true }
 lz4_flex = { workspace = true }
 

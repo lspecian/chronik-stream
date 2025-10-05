@@ -1261,6 +1261,7 @@ dependencies = [
  "base64 0.21.7",
  "bytes",
  "chronik-common",
+ "crc32c",
  "crc32fast",
  "criterion",
  "flate2",
@@ -1710,6 +1711,15 @@ dependencies = [
  "libc",
  "rand 0.9.1",
  "regex",
+]
+
+[[package]]
+name = "crc32c"
+version = "0.6.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a47af21622d091a8f0fb295b88bc886ac74efcc613efc19f5d0b21de5c89e47"
+dependencies = [
+ "rustc_version",
 ]
 
 [[package]]

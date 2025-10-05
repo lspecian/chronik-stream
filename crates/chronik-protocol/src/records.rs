@@ -3,7 +3,6 @@
 //! Supports both legacy message format (v0-v1) and new record batch format (v2+).
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use crc32fast::Hasher;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chronik_common::{Result, Error};
@@ -202,9 +201,8 @@ impl RecordBatch {
         // Position 25 = attributes (start of CRC calculation)
         let crc_start = 25; // Start AFTER CRC field
         let crc_data = &buf[crc_start..];
-        let mut hasher = Hasher::new();
-        hasher.update(crc_data);
-        let crc = hasher.finalize();
+        // Use CRC-32C (Castagnoli) as per Kafka protocol specification
+        let crc = crc32c::crc32c(crc_data);
 
         tracing::debug!(
             "RecordBatch CRC: crc={}, data_len={}, producer_id={}, records={}, is_txn={}",
@@ -334,7 +332,8 @@ impl RecordBatch {
         // Verify CRC after parsing header but before processing records
         // CRC covers: attributes + last_offset_delta + timestamps + producer info + records
         let crc_data = &data_for_crc[data_for_crc.len() - crc_verify_start..];
-        let calculated_crc = crc32fast::hash(crc_data);
+        // Use CRC-32C (Castagnoli) as per Kafka protocol specification
+        let calculated_crc = crc32c::crc32c(crc_data);
 
         if calculated_crc != stored_crc {
             tracing::warn!(
