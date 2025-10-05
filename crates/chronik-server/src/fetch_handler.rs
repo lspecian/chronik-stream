@@ -396,75 +396,129 @@ impl FetchHandler {
         let mut bytes_fetched = 0usize;
         
         // PHASE 1: Try in-memory buffer first (fastest path)
-        {
+        // NOTE: Buffer contains ONLY unflushed records. We need to also check WAL/segments.
+        let buffer_highest_offset = {
             let state = self.state.read().await;
             if let Some(buffer) = state.buffers.get(&(topic.to_string(), partition)) {
                 info!(
                     "FETCH→BUFFER: Checking buffer for {}-{}, buffer has {} records",
                     topic, partition, buffer.records.len()
                 );
-                
+
+                let mut buffer_max_offset = -1i64;
                 for record in &buffer.records {
                     if record.offset >= fetch_offset && record.offset < high_watermark {
-                        let record_size = record.value.len() + 
+                        let record_size = record.value.len() +
                             record.key.as_ref().map(|k| k.len()).unwrap_or(0) + 24;
-                        
+
                         if bytes_fetched + record_size > max_bytes as usize && !records.is_empty() {
                             break;
                         }
-                        
+
                         debug!(
                             "FETCH→BUFFER: Found record at offset {} in buffer",
                             record.offset
                         );
-                        
+
                         records.push(record.clone());
                         bytes_fetched += record_size;
+                        buffer_max_offset = buffer_max_offset.max(record.offset);
                     }
                 }
-                
+
                 if !records.is_empty() {
                     info!(
-                        "FETCH→BUFFER: Successfully fetched {} records from buffer for {}-{}",
-                        records.len(), topic, partition
+                        "FETCH→BUFFER: Fetched {} records from buffer for {}-{}, highest offset: {}",
+                        records.len(), topic, partition, buffer_max_offset
                     );
-                    return Ok(records);
                 }
+                buffer_max_offset
+            } else {
+                -1i64
             }
+        };
+
+        // If we got records from buffer, check if we need more from WAL/segments
+        if !records.is_empty() && bytes_fetched >= max_bytes as usize {
+            // We have enough data from buffer alone
+            return Ok(records);
         }
+
+        // If buffer only had partial data (or was empty), we need to check if there are
+        // earlier records in WAL/segments that we missed
+        let need_earlier_records = records.is_empty() ||
+            (buffer_highest_offset >= 0 && fetch_offset < buffer_highest_offset);
         
-        // PHASE 2: Try WAL if buffer was empty (handles flushed records)
+        // PHASE 2: Try WAL for any missing records or to continue the fetch
+        // WAL should have flushed records that are no longer in buffer
         if let Some(wal_manager) = &self.wal_manager {
-            match self.fetch_from_wal(wal_manager, topic, partition, fetch_offset, max_bytes).await {
-                Ok(wal_records) => {
-                    if !wal_records.is_empty() {
-                        info!(
-                            "FETCH→WAL: Successfully fetched {} records from WAL for {}-{}",
-                            wal_records.len(), topic, partition
-                        );
-                        return Ok(wal_records);
-                    } else {
-                        debug!(
-                            "FETCH→WAL: No records found in WAL for {}-{} at offset {}",
-                            topic, partition, fetch_offset
+            // Only try WAL if we don't already have all needed records from buffer
+            if records.is_empty() || need_earlier_records {
+                match self.fetch_from_wal(wal_manager, topic, partition, fetch_offset, max_bytes).await {
+                    Ok(wal_records) => {
+                        if !wal_records.is_empty() {
+                            info!(
+                                "FETCH→WAL: Successfully fetched {} records from WAL for {}-{}",
+                                wal_records.len(), topic, partition
+                            );
+                            // Merge WAL records with buffer records
+                            for wal_rec in wal_records {
+                                if !records.iter().any(|r| r.offset == wal_rec.offset) {
+                                    records.push(wal_rec);
+                                }
+                            }
+                            // Sort by offset to maintain order
+                            records.sort_by_key(|r| r.offset);
+
+                            // If we now have enough data, return
+                            if records.len() > 0 && bytes_fetched >= max_bytes as usize {
+                                return Ok(records);
+                            }
+                        } else {
+                            debug!(
+                                "FETCH→WAL: No records found in WAL for {}-{} at offset {}",
+                                topic, partition, fetch_offset
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "FETCH→WAL: Failed to fetch from WAL for {}-{}: {} - will try segments",
+                            topic, partition, e
                         );
                     }
                 }
-                Err(e) => {
-                    warn!(
-                        "FETCH→WAL: Failed to fetch from WAL for {}-{}: {}",
-                        topic, partition, e
-                    );
-                }
             }
         }
         
-        // PHASE 3: Fall back to segment-based storage (legacy path)
-        info!(
-            "FETCH→SEGMENTS: Falling back to segment reader for {}-{}",
-            topic, partition
-        );
-        self.fetch_records_legacy(topic, partition, fetch_offset, high_watermark, max_bytes).await
+        // PHASE 3: Fall back to segment-based storage if we still need more records
+        // This ensures we fetch from segments if WAL/buffer didn't have all the data
+        if records.is_empty() || need_earlier_records {
+            info!(
+                "FETCH→SEGMENTS: Fetching from segments for {}-{} (have {} records so far)",
+                topic, partition, records.len()
+            );
+
+            let segment_records = self.fetch_records_legacy(
+                topic,
+                partition,
+                fetch_offset,
+                high_watermark,
+                max_bytes
+            ).await?;
+
+            // Merge segment records with existing records (from buffer/WAL)
+            for seg_rec in segment_records {
+                if !records.iter().any(|r| r.offset == seg_rec.offset) {
+                    records.push(seg_rec);
+                }
+            }
+
+            // Sort by offset to maintain order
+            records.sort_by_key(|r| r.offset);
+        }
+
+        Ok(records)
     }
     
     /// Fetch records from WAL manager

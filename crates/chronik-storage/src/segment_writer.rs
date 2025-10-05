@@ -413,7 +413,93 @@ impl SegmentWriter {
         
         Ok(None)
     }
-    
+
+    /// Flush active segment to disk WITHOUT removing it from active segments
+    /// This ensures data persistence while keeping the segment active for appends
+    /// CRITICAL FIX: Prevents data loss when flush happens without rotation
+    pub async fn flush_active_to_disk(
+        &self,
+        topic: &str,
+        partition: i32,
+    ) -> Result<Option<SegmentMetadata>> {
+        let key = (topic.to_string(), partition);
+        let segments = self.active_segments.read().await;
+
+        // Get active segment (read-only, we don't remove it)
+        let active = match segments.get(&key) {
+            Some(seg) => seg,
+            None => {
+                tracing::debug!("No active segment for {}-{}, nothing to flush", topic, partition);
+                return Ok(None);
+            }
+        };
+
+        // Skip if segment is empty
+        if active.record_count == 0 {
+            tracing::debug!("Active segment for {}-{} is empty, skipping flush", topic, partition);
+            return Ok(None);
+        }
+
+        tracing::info!(
+            "FLUSH→ACTIVE: Flushing active segment for {}-{} (offsets {}-{}, {} records, {} bytes)",
+            topic, partition, active.base_offset, active.last_offset,
+            active.record_count, active.current_size
+        );
+
+        // Create metadata for segment builder (using types::SegmentMetadata)
+        let segment_metadata = chronik_common::types::SegmentMetadata {
+            id: active.id,
+            topic_partition: TopicPartition {
+                topic: active.topic.clone(),
+                partition: active.partition,
+            },
+            base_offset: active.base_offset,
+            last_offset: active.last_offset,
+            timestamp_min: active.timestamp_min,
+            timestamp_max: active.timestamp_max,
+            size_bytes: active.current_size,
+            record_count: active.record_count,
+            object_key: format!("{}/{}/{}.segment",
+                active.topic,
+                active.partition,
+                active.id.0
+            ),
+            created_at: Utc::now(),
+        };
+
+        // Clone the builder to preserve the active segment
+        let built_segment = active.builder.clone()
+            .with_metadata(segment_metadata)
+            .build()?;
+
+        // Upload segment to object store
+        self.upload_segment(built_segment).await?;
+
+        // Create metadata for metadata store (using traits::SegmentMetadata)
+        let metadata = SegmentMetadata {
+            segment_id: active.id.0.to_string(),
+            topic: active.topic.clone(),
+            partition: active.partition as u32,
+            start_offset: active.base_offset,
+            end_offset: active.last_offset,
+            size: active.current_size as i64,
+            record_count: active.record_count as i64,
+            path: format!("{}/{}/{}.segment",
+                active.topic,
+                active.partition,
+                active.id.0
+            ),
+            created_at: Utc::now(),
+        };
+
+        tracing::warn!(
+            "FLUSH→ACTIVE→SUCCESS: Uploaded active segment {}-{} to object store (offsets {}-{}, {} records)",
+            metadata.topic, metadata.partition, metadata.start_offset, metadata.end_offset, metadata.record_count
+        );
+
+        Ok(Some(metadata))
+    }
+
     /// Flush all active segments
     /// Returns metadata for all flushed segments
     pub async fn flush_all(&self) -> Result<Vec<SegmentMetadata>> {

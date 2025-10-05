@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.19] - 2025-10-05
+
+### Fixed
+- **CRITICAL**: Segment fetch bug - Data written to segments was unreachable after flush
+  - **Root cause 1**: Active segments were not uploaded to disk until rotation triggered
+    - Data was written to in-memory active segment
+    - Removed from buffer via `mark_flushed()`
+    - Segment NOT uploaded unless rotation threshold reached
+    - Result: Data loss on restart if server stopped before rotation
+  - **Root cause 2**: Fetch handler had early return when buffer had records
+    - If buffer had ANY records, returned immediately without checking WAL/segments
+    - Historical data in WAL and segments was unreachable
+    - Result: Write-only system for historical data
+  - **Fix 1**: Added `flush_active_to_disk()` method to `segment_writer.rs`
+    - Uploads active segment WITHOUT removing it from active segments
+    - Clones builder to preserve segment for continued writes
+    - Called after `mark_flushed()` in `flush_partition()`
+    - Ensures immediate persistence while keeping segment active
+  - **Fix 2**: Modified fetch handler to merge records from buffer+WAL+segments
+    - Removed early return from buffer phase
+    - Added logic to check if earlier records needed
+    - WAL and segments phases now merge records instead of replace
+    - All records sorted by offset before returning
+  - **Impact**: Zero message loss guarantee now maintained even without rotation
+  - **Result**: All data written to Chronik is immediately queryable from buffer, WAL, and segments
+  - **Test**: `tests/test_segment_fetch.py` - Verified 50 messages produced and consumed correctly
+  - Detailed test results in `tests/SEGMENT_FETCH_FIX_RESULTS.md`
+
+### Technical Details
+- Segment flush logging added: `FLUSH→PERSISTED` when active segment uploaded
+- Metadata store registration: Segment metadata persisted after flush
+- Fetch phases now work cooperatively:
+  1. Buffer phase: Collect records and track highest offset
+  2. WAL phase: Merge earlier records if needed
+  3. Segments phase: Merge historical records if needed
+  4. Sort all records by offset and return
+- Files modified:
+  - `crates/chronik-storage/src/segment_writer.rs` - Added flush_active_to_disk()
+  - `crates/chronik-server/src/produce_handler.rs` - Call flush after mark_flushed
+  - `crates/chronik-server/src/fetch_handler.rs` - Fixed merge logic
+
 ## [1.3.18] - 2025-10-04
 
 ### Fixed

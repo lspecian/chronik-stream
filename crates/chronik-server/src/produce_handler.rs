@@ -1373,15 +1373,41 @@ impl ProduceHandler {
                     warn!("Failed to mark records as flushed in fetch handler: {:?}", e);
                     // Continue anyway - this is not critical for correctness
                 } else {
-                    debug!("Marked records up to offset {} as flushed for {}-{}", 
+                    debug!("Marked records up to offset {} as flushed for {}-{}",
                         highest_flushed_offset, topic, partition);
                 }
             }
         }
-        
-        debug!("Flushed {} batches with {} total records to {}-{}", 
+
+        // CRITICAL FIX: Force upload active segment to disk after flush
+        // This ensures data persistence even if rotation threshold not reached
+        // Previously, data was removed from buffer but remained only in memory!
+        {
+            let mut writer = state.current_writer.lock().await;
+            match writer.flush_active_to_disk(topic, partition).await {
+                Ok(Some(metadata)) => {
+                    tracing::info!(
+                        "FLUSH→PERSISTED: Uploaded active segment for {}-{} (offsets {}-{}, {} records)",
+                        topic, partition, metadata.start_offset, metadata.end_offset, metadata.record_count
+                    );
+                    // Register segment metadata with metadata store
+                    if let Err(e) = self.metadata_store.persist_segment_metadata(metadata).await {
+                        tracing::error!("FLUSH→ERROR: Failed to register segment metadata: {:?}", e);
+                    }
+                }
+                Ok(None) => {
+                    tracing::debug!("FLUSH→SKIP: No active segment to persist for {}-{}", topic, partition);
+                }
+                Err(e) => {
+                    tracing::error!("FLUSH→ERROR: Failed to flush active segment for {}-{}: {:?}", topic, partition, e);
+                    // Don't fail the entire flush, data is still in WAL
+                }
+            }
+        }
+
+        debug!("Flushed {} batches with {} total records to {}-{}",
             batches.len(), total_records, topic, partition);
-        
+
         Ok(())
     }
     
