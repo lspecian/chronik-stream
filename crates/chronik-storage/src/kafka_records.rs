@@ -297,10 +297,11 @@ impl KafkaRecordBatch {
     }
     
     /// Decode a RecordBatch from bytes
-    pub fn decode(data: &[u8]) -> Result<Self> {
+    /// Decode a RecordBatch from bytes, returning the batch and number of bytes consumed
+    pub fn decode(data: &[u8]) -> Result<(Self, usize)> {
         // Handle empty record batches (common during flush operations)
         if data.is_empty() {
-            return Ok(KafkaRecordBatch {
+            let batch = KafkaRecordBatch {
                 header: RecordBatchHeader {
                     base_offset: 0,
                     batch_length: 0,
@@ -317,9 +318,10 @@ impl KafkaRecordBatch {
                     records_count: 0,
                 },
                 records: vec![],
-            });
+            };
+            return Ok((batch, 0));
         }
-        
+
         // First check the magic byte to determine format
         // For v0/v1, the magic byte is at offset 16 (after offset and size)
         // For v2, it's at offset 17 (after offset, size, and partition_leader_epoch)
@@ -327,7 +329,7 @@ impl KafkaRecordBatch {
         if data.len() < 17 {
             // For very short batches, return an empty batch instead of erroring
             // This can happen with flush operations or connectivity checks
-            return Ok(KafkaRecordBatch {
+            let batch = KafkaRecordBatch {
                 header: RecordBatchHeader {
                     base_offset: 0,
                     batch_length: 0,
@@ -344,7 +346,8 @@ impl KafkaRecordBatch {
                     records_count: 0,
                 },
                 records: vec![],
-            });
+            };
+            return Ok((batch, 0));
         }
         
         // Try to detect the format by looking at the magic byte position
@@ -448,12 +451,15 @@ impl KafkaRecordBatch {
         
         // Decode records
         let records = Self::decode_records(&records_data, records_count)?;
-        
-        Ok(Self { header, records })
+
+        // Calculate bytes consumed: 8 bytes (offset) + 4 bytes (length field) + batch_length
+        let bytes_consumed = 12 + batch_length as usize;
+
+        Ok((Self { header, records }, bytes_consumed))
     }
     
     /// Decode legacy message set (v0/v1 format) and convert to v2 RecordBatch
-    fn decode_legacy_message_set(data: &[u8]) -> Result<Self> {
+    fn decode_legacy_message_set(data: &[u8]) -> Result<(Self, usize)> {
         let mut cursor = Cursor::new(data);
         let mut records = Vec::new();
         let mut base_offset = 0i64;
@@ -559,8 +565,11 @@ impl KafkaRecordBatch {
             base_sequence: -1, // Not available in legacy format
             records_count: records.len() as i32,
         };
-        
-        Ok(Self { header, records })
+
+        // Calculate bytes consumed (position where cursor stopped)
+        let bytes_consumed = cursor.position() as usize;
+
+        Ok((Self { header, records }, bytes_consumed))
     }
     
     /// Decode records from bytes
@@ -841,14 +850,15 @@ mod tests {
         
         // Encode
         let encoded = batch.encode().unwrap();
-        
+
         // Decode
-        let decoded = KafkaRecordBatch::decode(&encoded).unwrap();
-        
+        let (decoded, bytes_consumed) = KafkaRecordBatch::decode(&encoded).unwrap();
+
         // Verify
         assert_eq!(decoded.header.base_offset, 100);
         assert_eq!(decoded.header.records_count, 2);
         assert_eq!(decoded.records.len(), 2);
+        assert_eq!(bytes_consumed, encoded.len());
         
         assert_eq!(decoded.records[0].key.as_ref().map(|b| b.as_ref()), Some(&b"key1"[..]));
         assert_eq!(decoded.records[0].value.as_ref().map(|b| b.as_ref()), Some(&b"value1"[..]));
@@ -884,13 +894,14 @@ mod tests {
         
         // Encode with compression
         let encoded = batch.encode().unwrap();
-        
+
         // Decode
-        let decoded = KafkaRecordBatch::decode(&encoded).unwrap();
-        
+        let (decoded, bytes_consumed) = KafkaRecordBatch::decode(&encoded).unwrap();
+
         // Verify
         assert_eq!(decoded.header.records_count, 10);
         assert_eq!(decoded.records.len(), 10);
+        assert_eq!(bytes_consumed, encoded.len());
         
         for i in 0..10 {
             assert_eq!(

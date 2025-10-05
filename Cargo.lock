@@ -1067,7 +1067,7 @@ checksum = "9555578bc9e57714c812a1f84e4fc5b4d21fcb063490c624de019f7464c91268"
 
 [[package]]
 name = "chronik-auth"
-version = "1.3.21"
+version = "1.3.22"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1098,7 +1098,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-backup"
-version = "1.3.21"
+version = "1.3.22"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1135,7 +1135,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-benchmarks"
-version = "1.3.21"
+version = "1.3.22"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1167,7 +1167,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-cli"
-version = "1.3.21"
+version = "1.3.22"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1186,7 +1186,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-common"
-version = "1.3.21"
+version = "1.3.22"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1207,7 +1207,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-config"
-version = "1.3.21"
+version = "1.3.22"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1232,7 +1232,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-monitoring"
-version = "1.3.21"
+version = "1.3.22"
 dependencies = [
  "anyhow",
  "axum 0.7.9",
@@ -1255,7 +1255,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-protocol"
-version = "1.3.21"
+version = "1.3.22"
 dependencies = [
  "anyhow",
  "base64 0.21.7",
@@ -1278,7 +1278,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-query"
-version = "1.3.21"
+version = "1.3.22"
 dependencies = [
  "anyhow",
  "axum 0.7.9",
@@ -1302,7 +1302,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-search"
-version = "1.3.21"
+version = "1.3.22"
 dependencies = [
  "anyhow",
  "axum 0.7.9",
@@ -1336,7 +1336,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-server"
-version = "1.3.21"
+version = "1.3.22"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1373,7 +1373,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-storage"
-version = "1.3.21"
+version = "1.3.22"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1413,7 +1413,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-wal"
-version = "1.3.21"
+version = "1.3.22"
 dependencies = [
  "anyhow",
  "async-trait",

@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.22] - 2025-10-05
+
+### Fixed
+- **CRITICAL**: Fixed raw Kafka batch decoding bug - v1.3.21 only fixed `indexed_records` format, NOT `raw_kafka_batches`
+  - **Root cause**: User report revealed batched Kafka producers (confluent-kafka-go) store data in `raw_kafka_batches` format
+    - Segments have TWO storage formats: `indexed_records` (Chronik format) AND `raw_kafka_batches` (native Kafka format)
+    - v1.3.21 fixed indexed_records multi-batch decoding
+    - BUT raw_kafka_batches path still had FIXME comment and `break` after first batch
+    - Real-world Kafka clients use raw_kafka_batches format → 85% data loss
+  - **Fix**: Modified `KafkaRecordBatch::decode()` to return `(batch, bytes_consumed)` tuple
+    - Updated fetch_handler.rs lines 880-907 to properly iterate through ALL Kafka batches
+    - Removed `break` statement and FIXME comment
+    - Uses `bytes_consumed = 12 + batch_length` (8 bytes offset + 4 bytes length + batch data)
+    - Proper cursor advancement: `cursor.set_position(cursor.position() + bytes_consumed as u64)`
+  - **Impact**: Fixes batched production from confluent-kafka-go, Java clients, and all real Kafka producers
+- Files modified:
+  - `crates/chronik-storage/src/kafka_records.rs:300-568` - KafkaRecordBatch::decode() signature
+  - `crates/chronik-server/src/fetch_handler.rs:871-945` - raw_kafka_batches multi-batch iteration
+  - `crates/chronik-server/src/produce_handler.rs:738` - Updated callsite
+  - `crates/chronik-server/src/wal_integration.rs:277` - Updated callsite
+
 ## [1.3.21] - 2025-10-05
 
 ### Fixed

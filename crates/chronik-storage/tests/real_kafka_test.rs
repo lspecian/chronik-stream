@@ -52,10 +52,11 @@ fn test_real_kafkactl_produce_data() {
 
     // Try to decode
     match KafkaRecordBatch::decode(&real_data) {
-        Ok(batch) => {
+        Ok((batch, bytes_consumed)) => {
             println!("Successfully decoded batch:");
             println!("  Base offset: {}", batch.header.base_offset);
             println!("  Records count: {}", batch.header.records_count);
+            println!("  Bytes consumed: {}", bytes_consumed);
             println!("  Records: {:?}", batch.records);
         }
         Err(e) => {
@@ -98,8 +99,9 @@ fn test_minimal_record_batch() {
     ];
 
     match KafkaRecordBatch::decode(&minimal_data) {
-        Ok(batch) => {
+        Ok((batch, bytes_consumed)) => {
             println!("Successfully decoded minimal batch");
+            println!("  Bytes consumed: {}", bytes_consumed);
             assert_eq!(batch.header.records_count, 0);
         }
         Err(e) => {

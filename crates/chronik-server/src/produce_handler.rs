@@ -735,7 +735,7 @@ impl ProduceHandler {
             .map_err(|_| Error::Internal("Memory limit exceeded".into()))?;
         
         // Decode record batch
-        let kafka_batch = KafkaRecordBatch::decode(records_data)?;
+        let (kafka_batch, _bytes_consumed) = KafkaRecordBatch::decode(records_data)?;
         
         // Validate producer info for idempotence
         if kafka_batch.header.producer_id >= 0 {

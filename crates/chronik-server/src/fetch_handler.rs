@@ -878,7 +878,7 @@ impl FetchHandler {
 
             while (cursor.position() as usize) < total_len {
                 match KafkaRecordBatch::decode(&segment.raw_kafka_batches[(cursor.position() as usize)..]) {
-                    Ok(kafka_batch) => {
+                    Ok((kafka_batch, bytes_consumed)) => {
                         // Convert Kafka records to storage Records
                         let records: Vec<Record> = kafka_batch.records.into_iter().enumerate().map(|(i, kr)| {
                             Record {
@@ -896,11 +896,15 @@ impl FetchHandler {
                         all_records.extend(records);
                         batch_count += 1;
 
-                        // Advance cursor (Kafka batch has known size)
-                        // This needs proper implementation based on Kafka batch format
-                        // For now, break after first batch to avoid infinite loop
-                        tracing::warn!("SEGMENT→KAFKA: Decoded batch {} with {} records (FIXME: multi-batch not implemented for raw Kafka)", batch_count, batch_records);
-                        break;
+                        // Advance cursor using bytes consumed from decode
+                        cursor.set_position(cursor.position() + bytes_consumed as u64);
+                        tracing::debug!("SEGMENT→KAFKA: Decoded batch {} with {} records, consumed {} bytes", batch_count, batch_records, bytes_consumed);
+
+                        // Continue to next batch if available
+                        if bytes_consumed == 0 {
+                            tracing::warn!("SEGMENT→KAFKA: Decoded batch returned 0 bytes consumed, stopping to avoid infinite loop");
+                            break;
+                        }
                     }
                     Err(e) => {
                         tracing::warn!("SEGMENT→KAFKA: Finished decoding raw batches: {}", e);

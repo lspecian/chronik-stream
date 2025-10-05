@@ -274,7 +274,7 @@ fn parse_record_batch(data: &[u8]) -> Result<Vec<ParsedRecord>> {
     use chronik_storage::kafka_records::KafkaRecordBatch;
 
     // Parse using the existing Kafka record batch decoder
-    let batch = KafkaRecordBatch::decode(data)?;
+    let (batch, _bytes_consumed) = KafkaRecordBatch::decode(data)?;
 
     let mut parsed_records = Vec::new();
     let base_offset = batch.header.base_offset;
