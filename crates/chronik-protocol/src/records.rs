@@ -194,18 +194,21 @@ impl RecordBatch {
         // Per Kafka spec: CRC covers from partition_leader_epoch to end of records
         // CRC field itself must be ZEROED during calculation, then filled with result
         //
-        // Buffer layout: [4 padding][8 base_offset][4 batch_length][4 partition_leader_epoch]
-        //                [1 magic][4 CRC][2 attributes]...
+        // Buffer layout (with temporary 4-byte padding that will be removed):
+        // [4 padding][8 base_offset][4 batch_length][4 partition_leader_epoch]
+        //            [1 magic][4 CRC][2 attributes]...
+        // Position 0-3 = padding (removed before return)
+        // Position 4-11 = base_offset
+        // Position 12-15 = batch_length
         // Position 16-19 = partition_leader_epoch (start of CRC input)
         // Position 20 = magic byte
         // Position 21-24 = CRC field (must be zeroed during calculation)
-        // Position 25 = attributes
+        // Position 25+ = attributes and beyond
 
-        // CRC starts at partition_leader_epoch (offset 16 in buffer with padding)
+        // CRC starts at partition_leader_epoch (offset 16 in buffer WITH padding)
         let crc_start = 16;
 
         // CRC field is at offset 21-24 - ensure it's zeroed before calculation
-        // (it should already be zero from line 162, but be explicit)
         buf[21..25].copy_from_slice(&[0, 0, 0, 0]);
 
         // Calculate CRC-32C over: partition_leader_epoch + magic + (zeroed CRC) + attributes + ... + records
@@ -230,7 +233,11 @@ impl RecordBatch {
         // Write CRC at position 21-24 as LITTLE-ENDIAN (Kafka requirement)
         buf[21..25].copy_from_slice(&crc.to_le_bytes());
 
-        Ok(buf.freeze())
+        // Remove the 4-byte padding from the beginning
+        // Kafka RecordBatch format starts directly with base_offset, not with padding
+        let final_buf = buf.split_off(4);
+
+        Ok(final_buf.freeze())
     }
 
     /// Encode a single record

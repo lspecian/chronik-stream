@@ -277,6 +277,8 @@ mod tests {
             protocol_type: "consumer".to_string(),
             generation_id: 1,
             leader_id: Some("consumer-1".to_string()),
+            leader: "consumer-1".to_string(),
+            members: vec![],
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
