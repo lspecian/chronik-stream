@@ -206,9 +206,16 @@ impl KafkaRecordBatch {
         buf[batch_length_pos..batch_length_pos + 4].copy_from_slice(&batch_length.to_be_bytes());
         
         // Calculate and write CRC
-        let crc_data = &buf[crc_start + 4 + 1 + 4..]; // Skip to after CRC field
+        // CRITICAL FIX v1.3.31: Zero out CRC field before calculation
+        buf[crc_pos..crc_pos + 4].copy_from_slice(&[0, 0, 0, 0]);
+
+        // Calculate CRC over EVERYTHING from partition_leader_epoch onwards (including zeroed CRC)
+        // Kafka CRC-32C calculation must include: partition_leader_epoch, magic, CRC (zeroed), attributes, and all remaining fields
+        let crc_data = &buf[crc_start..];
         let crc = calculate_crc32(crc_data);
-        buf[crc_pos..crc_pos + 4].copy_from_slice(&crc.to_be_bytes());
+
+        // Write CRC as LITTLE-ENDIAN (Kafka protocol requirement)
+        buf[crc_pos..crc_pos + 4].copy_from_slice(&crc.to_le_bytes());
         
         Ok(buf.freeze())
     }
@@ -787,9 +794,9 @@ fn decode_varlong(cursor: &mut Cursor<&[u8]>) -> Result<i64> {
 }
 
 fn calculate_crc32(data: &[u8]) -> u32 {
-    let mut hasher = Crc32::new();
-    hasher.update(data);
-    hasher.finalize()
+    // CRITICAL FIX v1.3.31: Use CRC-32C (Castagnoli) as required by Kafka protocol
+    // Previous version used regular CRC-32 which produced wrong checksums
+    crc32c::crc32c(data)
 }
 
 #[cfg(test)]

@@ -217,14 +217,14 @@ impl RecordBatch {
         // Use CRC-32C (Castagnoli) as per Kafka protocol specification
         let crc = crc32c::crc32c(crc_data);
 
-        tracing::debug!(
+        tracing::info!(
             "RecordBatch CRC encode: crc=0x{:08X} ({}), data_len={}, crc_start={}, producer_id={}, records={}, is_txn={}",
             crc, crc, crc_data.len(), crc_start, self.producer_id, self.records.len(), self.attributes.is_transactional
         );
 
         // Log first 64 bytes of CRC input for debugging
         if crc_data.len() >= 64 {
-            tracing::trace!(
+            tracing::info!(
                 "CRC input (first 64 bytes): {:02X?}",
                 &crc_data[..64]
             );
@@ -233,9 +233,14 @@ impl RecordBatch {
         // Write CRC at position 21-24 as LITTLE-ENDIAN (Kafka requirement)
         buf[21..25].copy_from_slice(&crc.to_le_bytes());
 
+        tracing::info!("CRC bytes written to buffer[21..25]: {:02X?}", &buf[21..25]);
+
         // Remove the 4-byte padding from the beginning
         // Kafka RecordBatch format starts directly with base_offset, not with padding
         let final_buf = buf.split_off(4);
+
+        tracing::info!("Final RecordBatch (after removing padding): {} bytes, first 64: {:02X?}",
+            final_buf.len(), &final_buf[..std::cmp::min(64, final_buf.len())]);
 
         Ok(final_buf.freeze())
     }

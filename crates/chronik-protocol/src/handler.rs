@@ -225,6 +225,14 @@ impl ProtocolHandler {
 
         // v4+ uses KIP-699 array format for coordinator_keys
         if header.api_version >= 4 {
+            // v4+ format (fields serialized in JSON schema order):
+            // Field 1: KeyType (int8)
+            // Field 2: CoordinatorKeys (compact array)
+            // Field 3: Tagged fields
+
+            // Read KeyType first (appears before CoordinatorKeys in schema)
+            let key_type = decoder.read_i8()?;
+
             // Read compact array of coordinator keys
             let array_length = decoder.read_unsigned_varint()? as usize;
             if array_length == 0 {
@@ -233,21 +241,17 @@ impl ProtocolHandler {
 
             let actual_length = array_length - 1; // Compact array encoding
 
-            // For now, we only support single coordinator lookup (KSQL uses one at a time)
-            // Read first coordinator key
+            // Read first coordinator key (KSQL typically sends one at a time)
             let key = decoder.read_compact_string()?
                 .ok_or_else(|| Error::Protocol("Coordinator key cannot be null".into()))?;
-            let key_type = decoder.read_i8()?;
 
-            // Skip remaining coordinator keys if present (not used by KSQL)
+            // Skip remaining coordinator keys if present (batched lookup not commonly used)
             for _ in 1..actual_length {
-                decoder.read_compact_string()?; // key
-                decoder.read_i8()?; // key_type
+                decoder.read_compact_string()?; // skip additional keys
             }
 
-            // Parse tagged fields for flexible version
+            // Read tagged fields (flexible version 3+)
             let _tagged_fields_count = decoder.read_unsigned_varint()?;
-            // Skip tagged fields (we don't use them)
 
             Ok(FindCoordinatorRequest { key, key_type })
         } else {
@@ -612,37 +616,19 @@ impl ProtocolHandler {
         }
 
         if version >= 4 {
-            // v4+: KIP-699 array format
-            // Encode compact array of coordinators
-            let coordinators_count = if response.coordinators.is_empty() {
-                // If no coordinators array provided, create one from v0-v3 fields
-                1
-            } else {
-                response.coordinators.len()
-            };
+            // v4+: KIP-699 array format with compact encoding
+            // Compact array length = actual_length + 1
+            encoder.write_unsigned_varint((response.coordinators.len() + 1) as u32);
 
-            encoder.write_unsigned_varint((coordinators_count + 1) as u32); // Compact array encoding
-
-            if response.coordinators.is_empty() {
-                // Use v0-v3 fields as single coordinator
-                encoder.write_compact_string(Some("")); // key (empty for response)
-                encoder.write_i32(response.node_id);
-                encoder.write_compact_string(Some(&response.host));
-                encoder.write_i32(response.port);
-                encoder.write_i16(response.error_code);
-                encoder.write_compact_string(response.error_message.as_deref());
-                encoder.write_unsigned_varint(0); // tagged fields
-            } else {
-                // Use coordinators array
-                for coord in &response.coordinators {
-                    encoder.write_compact_string(Some(&coord.key));
-                    encoder.write_i32(coord.node_id);
-                    encoder.write_compact_string(Some(&coord.host));
-                    encoder.write_i32(coord.port);
-                    encoder.write_i16(coord.error_code);
-                    encoder.write_compact_string(coord.error_message.as_deref());
-                    encoder.write_unsigned_varint(0); // tagged fields
-                }
+            // Write each coordinator in the array
+            for coord in &response.coordinators {
+                encoder.write_compact_string(Some(&coord.key));
+                encoder.write_i32(coord.node_id);
+                encoder.write_compact_string(Some(&coord.host));
+                encoder.write_i32(coord.port);
+                encoder.write_i16(coord.error_code);
+                encoder.write_compact_string(coord.error_message.as_deref());
+                encoder.write_unsigned_varint(0); // tagged fields for coordinator
             }
 
             encoder.write_unsigned_varint(0); // response-level tagged fields
@@ -4424,20 +4410,61 @@ impl ProtocolHandler {
         use crate::parser::Decoder;
         
         tracing::debug!("Handling FindCoordinator request v{}", header.api_version);
-        
+        tracing::debug!("FindCoordinator request body has {} bytes: {:?}", body.len(), &body[..std::cmp::min(body.len(), 64)]);
+
         let mut decoder = Decoder::new(body);
-        
-        // Coordinator key (group ID)
-        let key = decoder.read_string()?
-            .ok_or_else(|| Error::Protocol("Coordinator key cannot be null".into()))?;
-        
-        // Coordinator type (v1+)
-        let key_type = if header.api_version >= 1 {
-            decoder.read_i8()?
+
+        // Parse request based on version
+        let (key, key_type) = if header.api_version >= 4 {
+            // v4+: KIP-699 batched format (fields serialized in JSON schema order)
+            // Field 1: KeyType (int8)
+            // Field 2: CoordinatorKeys (compact array)
+            // Field 3: Tagged fields
+
+            // Read KeyType first
+            let key_type = decoder.read_i8()?;
+            tracing::debug!("FindCoordinator v4: Read KeyType = {}", key_type);
+
+            // Read CoordinatorKeys array
+            let array_length = decoder.read_unsigned_varint()? as usize;
+            tracing::debug!("FindCoordinator v4: Read CoordinatorKeys array_length (compact) = {}", array_length);
+
+            if array_length == 0 {
+                return Err(Error::Protocol("FindCoordinator v4+ requires at least one coordinator key".into()));
+            }
+
+            let actual_length = array_length - 1; // Compact array encoding
+
+            // Read first coordinator key (KSQL typically sends one at a time)
+            let key = decoder.read_compact_string()?
+                .ok_or_else(|| Error::Protocol("Coordinator key cannot be null".into()))?;
+            tracing::debug!("FindCoordinator v4: Read key = '{}'", key);
+
+            // Skip remaining coordinator keys if present (batched lookup not supported yet)
+            for _ in 1..actual_length {
+                decoder.read_compact_string()?; // skip additional keys
+            }
+
+            // Read tagged fields
+            let _tagged_fields = decoder.read_unsigned_varint()?;
+
+            (key, key_type)
         } else {
-            coordinator_type::GROUP // Default to group coordinator
+            // v0-v3: Single coordinator lookup
+            // Field 1: Key (string)
+            let key = decoder.read_string()?
+                .ok_or_else(|| Error::Protocol("Coordinator key cannot be null".into()))?;
+
+            // Field 2: KeyType (int8, versions 1+)
+            let key_type = if header.api_version >= 1 {
+                decoder.read_i8()?
+            } else {
+                coordinator_type::GROUP
+            };
+
+            (key, key_type)
         };
-        
+
         let request = FindCoordinatorRequest {
             key,
             key_type,
@@ -4460,6 +4487,20 @@ impl ProtocolHandler {
             (error_codes::NONE, None)
         };
 
+        // For v4+, need to populate coordinators array
+        let coordinators = if header.api_version >= 4 {
+            vec![crate::find_coordinator_types::Coordinator {
+                key: request.key.clone(),
+                node_id: 1,
+                host: "localhost".to_string(),
+                port: 9092,
+                error_code,
+                error_message: error_message.clone(),
+            }]
+        } else {
+            vec![] // Empty for v0-v3
+        };
+
         let response = FindCoordinatorResponse {
             throttle_time_ms: 0,
             error_code,
@@ -4467,7 +4508,7 @@ impl ProtocolHandler {
             node_id: 1, // This node
             host: "localhost".to_string(),
             port: 9092,
-            coordinators: vec![], // Empty for v0-v3
+            coordinators,
         };
         
         let mut body_buf = BytesMut::new();

@@ -643,16 +643,22 @@ impl KafkaProtocolHandler {
                 })
             }
             ApiKey::FindCoordinator => {
-                debug!("Processing FindCoordinator request");
+                tracing::info!("Processing FindCoordinator v{} request", header.api_version);
+                tracing::info!("FindCoordinator request buffer: {} bytes: {:?}", buf.len(), &buf[..std::cmp::min(buf.len(), 64)]);
+
                 // Parse the find coordinator request
                 let request = self.protocol_handler.parse_find_coordinator_request(&header, &mut buf)?;
-                
+                tracing::info!("FindCoordinator parsed: key='{}', key_type={}", request.key, request.key_type);
+
                 // Handle the find coordinator request
                 let response = self.group_manager.handle_find_coordinator(request, &self.host, self.port)?;
-                
+                tracing::info!("FindCoordinator response: node_id={}, host={}:{}, coordinators.len()={}",
+                    response.node_id, response.host, response.port, response.coordinators.len());
+
                 // Encode the response
                 let mut body_buf = BytesMut::new();
                 self.protocol_handler.encode_find_coordinator_response(&mut body_buf, &response, header.api_version)?;
+                tracing::debug!("FindCoordinator response encoded: {} bytes: {:?}", body_buf.len(), &body_buf[..std::cmp::min(body_buf.len(), 64)]);
                 
                 Ok(Response {
                     header: ResponseHeader {
