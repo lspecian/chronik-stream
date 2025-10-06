@@ -752,7 +752,7 @@ pub fn get_supported_apis() -> Vec<ApiVersion> {
         ApiVersion { api_key: 2, min_version: 0, max_version: 7 },   // ListOffsets
         ApiVersion { api_key: 3, min_version: 0, max_version: 12 },  // Metadata
         ApiVersion { api_key: 8, min_version: 0, max_version: 8 },   // OffsetCommit
-        ApiVersion { api_key: 9, min_version: 0, max_version: 8 },   // OffsetFetch
+        ApiVersion { api_key: 9, min_version: 0, max_version: 8 },   // OffsetFetch - v8+ Groups array now supported
         ApiVersion { api_key: 10, min_version: 0, max_version: 4 },  // FindCoordinator
         ApiVersion { api_key: 11, min_version: 0, max_version: 9 },  // JoinGroup
         ApiVersion { api_key: 12, min_version: 0, max_version: 4 },  // Heartbeat

@@ -366,6 +366,7 @@ chronik-stream/
 6. **PROFESSIONAL STANDARDS** - Write code as if going to production tomorrow
 7. **NEVER RELEASE WITHOUT TESTING** - CRITICAL: Do NOT commit, tag, or push releases without actual testing
 8. **NEVER CLAIM PRODUCTION-READY WITHOUT TESTING** - Do NOT claim anything is ready, fixed, or production-ready without verification
+9. **FIX FORWARD, NEVER REVERT** - CRITICAL: In this house, we NEVER revert commits, delete tags, or rollback releases. We ALWAYS fix forward with the next version. Every bug is an opportunity to learn and improve. Reverting hides problems; fixing forward solves them permanently.
 
 **Development Process:**
 1. Understand existing code fully before changes

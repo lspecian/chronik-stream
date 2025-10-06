@@ -367,6 +367,7 @@ pub struct OffsetFetchResponse {
     pub header: ResponseHeader,
     pub throttle_time_ms: i32,
     pub topics: Vec<OffsetFetchResponseTopic>,
+    pub group_id: Option<String>,  // v8+ requires group_id for Groups array
 }
 
 /// Offset fetch response topic

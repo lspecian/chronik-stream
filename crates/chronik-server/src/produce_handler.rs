@@ -903,33 +903,27 @@ impl ProduceHandler {
         // Drop memory permit
         drop(memory_permit);
         
-        // Update fetch handler buffer with these unflushed messages so they're immediately available
+        // Update fetch handler buffer with RAW batch bytes (v1.3.32 CRC FIX)
+        // CRITICAL: Store original wire-format bytes to preserve CRC
         if let Some(ref fetch_handler) = self.fetch_handler {
-            let mut records_for_buffer = Vec::new();
-            for record in &records {
-                records_for_buffer.push(Record {
-                    offset: record.offset,
-                    timestamp: record.timestamp,
-                    key: record.key.clone(),
-                    value: record.value.clone(),
-                    headers: record.headers.clone(),
-                });
-            }
-            
-            if !records_for_buffer.is_empty() {
-                let high_watermark = partition_state.high_watermark.load(Ordering::Relaxed) as i64;
-                // Log what we're sending to the buffer
-                let first_offset = records_for_buffer.first().unwrap().offset;
-                let last_offset = records_for_buffer.last().unwrap().offset;
-                tracing::warn!("PRODUCE→BUFFER: Sending {} records to buffer for {}-{}, offset_range=[{}-{}], high_watermark={}", 
-                    records_for_buffer.len(), topic, partition, first_offset, last_offset, high_watermark);
-                
-                debug!("Updating fetch handler buffer with {} unflushed records", records_for_buffer.len());
-                if let Err(e) = fetch_handler.update_buffer(topic, partition, records_for_buffer, high_watermark).await {
-                    warn!("Failed to update fetch handler buffer: {:?}", e);
-                } else {
-                    tracing::info!("PRODUCE→BUFFER: Successfully updated buffer for {}-{}", topic, partition);
-                }
+            let high_watermark = partition_state.high_watermark.load(Ordering::Relaxed) as i64;
+            let record_count = records.len() as i32;
+
+            tracing::info!("PRODUCE→BUFFER: Storing raw batch for {}-{}, base_offset={}, last_offset={}, record_count={}, high_watermark={}",
+                topic, partition, base_offset, last_offset, record_count, high_watermark);
+
+            if let Err(e) = fetch_handler.update_buffer_with_raw_batch(
+                topic,
+                partition,
+                records_data,  // Original wire-format bytes with correct CRC!
+                base_offset as i64,
+                last_offset,
+                record_count,
+                high_watermark
+            ).await {
+                warn!("Failed to update fetch handler buffer: {:?}", e);
+            } else {
+                tracing::info!("PRODUCE→BUFFER: Successfully stored raw batch for {}-{}", topic, partition);
             }
         }
         

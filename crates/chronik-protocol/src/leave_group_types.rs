@@ -118,19 +118,32 @@ pub struct LeaveGroupResponse {
 
 impl KafkaEncodable for LeaveGroupResponse {
     fn encode(&self, encoder: &mut Encoder, version: i16) -> Result<()> {
+        // v4+ uses flexible/compact format
+        let flexible = version >= 4;
+
         if version >= 1 {
             encoder.write_i32(self.throttle_time_ms);
         }
 
-        if version <= 2 {
-            // Version 0-2: single error code
-            encoder.write_i16(self.error_code);
-        } else {
+        // Top-level error code (all versions)
+        encoder.write_i16(self.error_code);
+
+        if version >= 3 {
             // Version 3+: per-member responses
-            encoder.write_i32(self.members.len() as i32);
+            if flexible {
+                encoder.write_compact_array_len(self.members.len());
+            } else {
+                encoder.write_i32(self.members.len() as i32);
+            }
+
             for member in &self.members {
                 member.encode(encoder, version)?;
             }
+        }
+
+        // Tagged fields for flexible versions
+        if flexible {
+            encoder.write_tagged_fields();
         }
 
         Ok(())
@@ -150,13 +163,29 @@ pub struct MemberResponse {
 
 impl KafkaEncodable for MemberResponse {
     fn encode(&self, encoder: &mut Encoder, version: i16) -> Result<()> {
-        encoder.write_string(Some(&self.member_id));
+        // v4+ uses flexible/compact format
+        let flexible = version >= 4;
+
+        if flexible {
+            encoder.write_compact_string(Some(&self.member_id));
+        } else {
+            encoder.write_string(Some(&self.member_id));
+        }
 
         if version >= 3 {
-            encoder.write_string(self.group_instance_id.as_deref());
+            if flexible {
+                encoder.write_compact_string(self.group_instance_id.as_deref());
+            } else {
+                encoder.write_string(self.group_instance_id.as_deref());
+            }
         }
 
         encoder.write_i16(self.error_code);
+
+        // Tagged fields for flexible versions
+        if flexible {
+            encoder.write_tagged_fields();
+        }
 
         Ok(())
     }

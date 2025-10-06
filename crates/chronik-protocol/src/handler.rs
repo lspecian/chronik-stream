@@ -273,36 +273,84 @@ impl ProtocolHandler {
     pub fn parse_join_group_request(&self, header: &RequestHeader, body: &mut Bytes) -> Result<crate::join_group_types::JoinGroupRequest> {
         use crate::parser::Decoder;
         use crate::join_group_types::{JoinGroupRequest, JoinGroupRequestProtocol};
-        
+
         let mut decoder = Decoder::new(body);
-        
-        let group_id = decoder.read_string()?
-            .ok_or_else(|| Error::Protocol("Group ID cannot be null".into()))?;
+
+        // v6+ uses flexible/compact format
+        let flexible = header.api_version >= 6;
+
+        let group_id = if flexible {
+            decoder.read_compact_string()?.ok_or_else(|| Error::Protocol("Group ID cannot be null".into()))?
+        } else {
+            decoder.read_string()?.ok_or_else(|| Error::Protocol("Group ID cannot be null".into()))?
+        };
+
         let session_timeout_ms = decoder.read_i32()?;
         let rebalance_timeout_ms = if header.api_version >= 1 {
             decoder.read_i32()?
         } else {
             session_timeout_ms
         };
-        let member_id = decoder.read_string()?.unwrap_or_default();
+
+        let member_id = if flexible {
+            decoder.read_compact_string()?.unwrap_or_default()
+        } else {
+            decoder.read_string()?.unwrap_or_default()
+        };
+
         let group_instance_id = if header.api_version >= 5 {
-            decoder.read_string()?
+            if flexible {
+                decoder.read_compact_string()?
+            } else {
+                decoder.read_string()?
+            }
         } else {
             None
         };
-        let protocol_type = decoder.read_string()?
-            .ok_or_else(|| Error::Protocol("Protocol type cannot be null".into()))?;
-        
-        let protocol_count = decoder.read_i32()? as usize;
+
+        let protocol_type = if flexible {
+            decoder.read_compact_string()?.ok_or_else(|| Error::Protocol("Protocol type cannot be null".into()))?
+        } else {
+            decoder.read_string()?.ok_or_else(|| Error::Protocol("Protocol type cannot be null".into()))?
+        };
+
+        let protocol_count = if flexible {
+            let len = decoder.read_unsigned_varint()? as usize;
+            if len == 0 {
+                return Err(Error::Protocol("JoinGroup protocols array cannot be empty".into()));
+            }
+            len - 1 // Compact array encoding: actual_length = encoded_length - 1
+        } else {
+            decoder.read_i32()? as usize
+        };
+
         let mut protocols = Vec::with_capacity(protocol_count);
         for _ in 0..protocol_count {
-            let name = decoder.read_string()?
-                .ok_or_else(|| Error::Protocol("Protocol name cannot be null".into()))?;
-            let metadata = decoder.read_bytes()?
-                .ok_or_else(|| Error::Protocol("Protocol metadata cannot be null".into()))?;
+            let name = if flexible {
+                decoder.read_compact_string()?.ok_or_else(|| Error::Protocol("Protocol name cannot be null".into()))?
+            } else {
+                decoder.read_string()?.ok_or_else(|| Error::Protocol("Protocol name cannot be null".into()))?
+            };
+
+            let metadata = if flexible {
+                decoder.read_compact_bytes()?.ok_or_else(|| Error::Protocol("Protocol metadata cannot be null".into()))?
+            } else {
+                decoder.read_bytes()?.ok_or_else(|| Error::Protocol("Protocol metadata cannot be null".into()))?
+            };
+
             protocols.push(JoinGroupRequestProtocol { name, metadata });
+
+            // Tagged fields at protocol level (flexible only)
+            if flexible {
+                let _tag_count = decoder.read_unsigned_varint()?;
+            }
         }
-        
+
+        // Tagged fields at request level (flexible only)
+        if flexible {
+            let _tag_count = decoder.read_unsigned_varint()?;
+        }
+
         Ok(JoinGroupRequest {
             group_id,
             session_timeout_ms,
@@ -318,42 +366,90 @@ impl ProtocolHandler {
     pub fn parse_sync_group_request(&self, header: &RequestHeader, body: &mut Bytes) -> Result<crate::sync_group_types::SyncGroupRequest> {
         use crate::parser::Decoder;
         use crate::sync_group_types::{SyncGroupRequest, SyncGroupRequestAssignment};
-        
+
         let mut decoder = Decoder::new(body);
-        
-        let group_id = decoder.read_string()?
-            .ok_or_else(|| Error::Protocol("Group ID cannot be null".into()))?;
+
+        // v4+ uses flexible/compact format
+        let flexible = header.api_version >= 4;
+
+        let group_id = if flexible {
+            decoder.read_compact_string()?.ok_or_else(|| Error::Protocol("Group ID cannot be null".into()))?
+        } else {
+            decoder.read_string()?.ok_or_else(|| Error::Protocol("Group ID cannot be null".into()))?
+        };
+
         let generation_id = decoder.read_i32()?;
-        let member_id = decoder.read_string()?
-            .ok_or_else(|| Error::Protocol("Member ID cannot be null".into()))?;
+
+        let member_id = if flexible {
+            decoder.read_compact_string()?.ok_or_else(|| Error::Protocol("Member ID cannot be null".into()))?
+        } else {
+            decoder.read_string()?.ok_or_else(|| Error::Protocol("Member ID cannot be null".into()))?
+        };
+
         let group_instance_id = if header.api_version >= 3 {
-            decoder.read_string()?
+            if flexible {
+                decoder.read_compact_string()?
+            } else {
+                decoder.read_string()?
+            }
         } else {
             None
         };
-        
+
         let protocol_type = if header.api_version >= 5 {
-            decoder.read_string()?
+            if flexible {
+                decoder.read_compact_string()?
+            } else {
+                decoder.read_string()?
+            }
         } else {
             None
         };
-        
+
         let protocol_name = if header.api_version >= 5 {
-            decoder.read_string()?
+            if flexible {
+                decoder.read_compact_string()?
+            } else {
+                decoder.read_string()?
+            }
         } else {
             None
         };
-        
-        let assignment_count = decoder.read_i32()? as usize;
+
+        let assignment_count = if flexible {
+            let len = decoder.read_unsigned_varint()? as usize;
+            if len > 0 { len - 1 } else { 0 }
+        } else {
+            decoder.read_i32()? as usize
+        };
+
         let mut assignments = Vec::with_capacity(assignment_count);
         for _ in 0..assignment_count {
-            let member_id = decoder.read_string()?
-                .ok_or_else(|| Error::Protocol("Assignment member ID cannot be null".into()))?;
-            let assignment = decoder.read_bytes()?
-                .ok_or_else(|| Error::Protocol("Assignment cannot be null".into()))?;
+            let member_id = if flexible {
+                decoder.read_compact_string()?.ok_or_else(|| Error::Protocol("Assignment member ID cannot be null".into()))?
+            } else {
+                decoder.read_string()?.ok_or_else(|| Error::Protocol("Assignment member ID cannot be null".into()))?
+            };
+
+            let assignment = if flexible {
+                decoder.read_compact_bytes()?.ok_or_else(|| Error::Protocol("Assignment cannot be null".into()))?
+            } else {
+                decoder.read_bytes()?.ok_or_else(|| Error::Protocol("Assignment cannot be null".into()))?
+            };
+
             assignments.push(SyncGroupRequestAssignment { member_id, assignment });
+
+            // Tagged fields at assignment level (flexible only)
+            if flexible {
+                let _tag_count = decoder.read_unsigned_varint()?;
+            }
         }
-        
+
+        // Tagged fields at request level (flexible only)
+        if flexible {
+            let _tag_count = decoder.read_unsigned_varint()?;
+        }
+
         Ok(SyncGroupRequest {
             group_id,
             generation_id,
@@ -369,20 +465,39 @@ impl ProtocolHandler {
     pub fn parse_heartbeat_request(&self, header: &RequestHeader, body: &mut Bytes) -> Result<crate::heartbeat_types::HeartbeatRequest> {
         use crate::parser::Decoder;
         use crate::heartbeat_types::HeartbeatRequest;
-        
+
         let mut decoder = Decoder::new(body);
-        
-        let group_id = decoder.read_string()?
-            .ok_or_else(|| Error::Protocol("Group ID cannot be null".into()))?;
+        let flexible = header.api_version >= 4;
+
+        let group_id = if flexible {
+            decoder.read_compact_string()?.ok_or_else(|| Error::Protocol("Group ID cannot be null".into()))?
+        } else {
+            decoder.read_string()?.ok_or_else(|| Error::Protocol("Group ID cannot be null".into()))?
+        };
+
         let generation_id = decoder.read_i32()?;
-        let member_id = decoder.read_string()?
-            .ok_or_else(|| Error::Protocol("Member ID cannot be null".into()))?;
+
+        let member_id = if flexible {
+            decoder.read_compact_string()?.ok_or_else(|| Error::Protocol("Member ID cannot be null".into()))?
+        } else {
+            decoder.read_string()?.ok_or_else(|| Error::Protocol("Member ID cannot be null".into()))?
+        };
+
         let group_instance_id = if header.api_version >= 3 {
-            decoder.read_string()?
+            if flexible {
+                decoder.read_compact_string()?
+            } else {
+                decoder.read_string()?
+            }
         } else {
             None
         };
-        
+
+        // Tagged fields for flexible versions
+        if flexible {
+            let _tag_count = decoder.read_unsigned_varint()?;
+        }
+
         Ok(HeartbeatRequest {
             group_id,
             generation_id,
@@ -395,30 +510,64 @@ impl ProtocolHandler {
     pub fn parse_leave_group_request(&self, header: &RequestHeader, body: &mut Bytes) -> Result<crate::leave_group_types::LeaveGroupRequest> {
         use crate::parser::Decoder;
         use crate::leave_group_types::{LeaveGroupRequest, MemberIdentity};
-        
+
         let mut decoder = Decoder::new(body);
-        
-        let group_id = decoder.read_string()?
-            .ok_or_else(|| Error::Protocol("Group ID cannot be null".into()))?;
-        
+
+        // v4+ uses flexible/compact format
+        let flexible = header.api_version >= 4;
+
+        let group_id = if flexible {
+            decoder.read_compact_string()?.ok_or_else(|| Error::Protocol("Group ID cannot be null".into()))?
+        } else {
+            decoder.read_string()?.ok_or_else(|| Error::Protocol("Group ID cannot be null".into()))?
+        };
+
         let members = if header.api_version >= 3 {
             // V3+ has array of members
-            let member_count = decoder.read_i32()? as usize;
+            let member_count = if flexible {
+                let len = decoder.read_unsigned_varint()? as usize;
+                if len > 0 { len - 1 } else { 0 }
+            } else {
+                decoder.read_i32()? as usize
+            };
+
             let mut members = Vec::with_capacity(member_count);
             for _ in 0..member_count {
-                let member_id = decoder.read_string()?
-                    .ok_or_else(|| Error::Protocol("Member ID cannot be null".into()))?;
-                let group_instance_id = decoder.read_string()?;
+                let member_id = if flexible {
+                    decoder.read_compact_string()?.ok_or_else(|| Error::Protocol("Member ID cannot be null".into()))?
+                } else {
+                    decoder.read_string()?.ok_or_else(|| Error::Protocol("Member ID cannot be null".into()))?
+                };
+
+                let group_instance_id = if flexible {
+                    decoder.read_compact_string()?
+                } else {
+                    decoder.read_string()?
+                };
+
                 members.push(MemberIdentity { member_id, group_instance_id });
+
+                // Tagged fields at member level (flexible only)
+                if flexible {
+                    let _tag_count = decoder.read_unsigned_varint()?;
+                }
             }
             members
         } else {
             // V0-2 has single member_id
-            let member_id = decoder.read_string()?
-                .ok_or_else(|| Error::Protocol("Member ID cannot be null".into()))?;
+            let member_id = if flexible {
+                decoder.read_compact_string()?.ok_or_else(|| Error::Protocol("Member ID cannot be null".into()))?
+            } else {
+                decoder.read_string()?.ok_or_else(|| Error::Protocol("Member ID cannot be null".into()))?
+            };
             vec![MemberIdentity { member_id, group_instance_id: None }]
         };
-        
+
+        // Tagged fields at request level (flexible only)
+        if flexible {
+            let _tag_count = decoder.read_unsigned_varint()?;
+        }
+
         Ok(LeaveGroupRequest { group_id, members })
     }
     
@@ -573,36 +722,183 @@ impl ProtocolHandler {
     pub fn parse_offset_fetch_request(&self, header: &RequestHeader, body: &mut Bytes) -> Result<crate::types::OffsetFetchRequest> {
         use crate::parser::Decoder;
         use crate::types::OffsetFetchRequest;
-        
+
         let mut decoder = Decoder::new(body);
-        
-        let group_id = decoder.read_string()?
-            .ok_or_else(|| Error::Protocol("Group ID cannot be null".into()))?;
-        
-        // Read topics array (null means all topics)
-        let topics = if header.api_version >= 1 {
-            let topic_count = decoder.read_i32()?;
-            if topic_count < 0 {
-                // Null array means fetch all topics
-                None
+
+        // v6+ uses flexible/compact format
+        let flexible = header.api_version >= 6;
+
+        if header.api_version >= 8 {
+            // V8+ has completely different structure: Groups array instead of single group_id
+            let group_count = if flexible {
+                let len = decoder.read_unsigned_varint()? as usize;
+                if len > 0 { len - 1 } else { 0 }
             } else {
-                let mut topics = Vec::with_capacity(topic_count as usize);
-                for _ in 0..topic_count {
-                    let topic_name = decoder.read_string()?
-                        .ok_or_else(|| Error::Protocol("Topic name cannot be null".into()))?;
-                    topics.push(topic_name);
-                }
-                Some(topics)
+                decoder.read_i32()? as usize
+            };
+
+            if group_count == 0 {
+                return Err(Error::Protocol("OffsetFetch v8+ requires at least one group".into()));
             }
+
+            // Read first group only (we only support single group for now)
+            let group_id = if flexible {
+                decoder.read_compact_string()?.ok_or_else(|| Error::Protocol("Group ID cannot be null".into()))?
+            } else {
+                decoder.read_string()?.ok_or_else(|| Error::Protocol("Group ID cannot be null".into()))?
+            };
+
+            // Read topics array (null means all topics)
+            let topics = if flexible {
+                let topic_count = decoder.read_unsigned_varint()? as usize;
+                if topic_count == 0 {
+                    None // Null means fetch all topics
+                } else {
+                    let actual_count = topic_count - 1;
+                    let mut topic_names = Vec::with_capacity(actual_count);
+                    for _ in 0..actual_count {
+                        let topic_name = decoder.read_compact_string()?
+                            .ok_or_else(|| Error::Protocol("Topic name cannot be null".into()))?;
+
+                        // Skip PartitionIndexes array
+                        let partition_count = decoder.read_unsigned_varint()? as usize;
+                        if partition_count > 0 {
+                            for _ in 0..(partition_count - 1) {
+                                let _partition_index = decoder.read_i32()?;
+                            }
+                        }
+
+                        // Tagged fields at topic level
+                        let _tag_count = decoder.read_unsigned_varint()?;
+
+                        topic_names.push(topic_name);
+                    }
+                    Some(topic_names)
+                }
+            } else {
+                let topic_count = decoder.read_i32()?;
+                if topic_count < 0 {
+                    None
+                } else {
+                    let mut topic_names = Vec::with_capacity(topic_count as usize);
+                    for _ in 0..topic_count {
+                        let topic_name = decoder.read_string()?
+                            .ok_or_else(|| Error::Protocol("Topic name cannot be null".into()))?;
+
+                        let partition_count = decoder.read_i32()? as usize;
+                        for _ in 0..partition_count {
+                            let _partition_index = decoder.read_i32()?;
+                        }
+
+                        topic_names.push(topic_name);
+                    }
+                    Some(topic_names)
+                }
+            };
+
+            // Tagged fields at group level (flexible only)
+            if flexible {
+                let _tag_count = decoder.read_unsigned_varint()?;
+            }
+
+            // Skip remaining groups if any
+            for _ in 1..group_count {
+                if flexible {
+                    let _ = decoder.read_compact_string()?;
+                    let topic_count = decoder.read_unsigned_varint()? as usize;
+                    for _ in 0..(if topic_count > 0 { topic_count - 1 } else { 0 }) {
+                        let _ = decoder.read_compact_string()?;
+                        let partition_count = decoder.read_unsigned_varint()? as usize;
+                        for _ in 0..(if partition_count > 0 { partition_count - 1 } else { 0 }) {
+                            let _ = decoder.read_i32()?;
+                        }
+                        let _ = decoder.read_unsigned_varint()?; // topic tags
+                    }
+                    let _ = decoder.read_unsigned_varint()?; // group tags
+                } else {
+                    let _ = decoder.read_string()?;
+                    let topic_count = decoder.read_i32()? as usize;
+                    for _ in 0..topic_count {
+                        let _ = decoder.read_string()?;
+                        let partition_count = decoder.read_i32()? as usize;
+                        for _ in 0..partition_count {
+                            let _ = decoder.read_i32()?;
+                        }
+                    }
+                }
+            }
+
+            // RequireStable field (v7+)
+            if header.api_version >= 7 {
+                let _require_stable = decoder.read_bool()?;
+            }
+
+            // Tagged fields at request level (flexible only)
+            if flexible {
+                let _tag_count = decoder.read_unsigned_varint()?;
+            }
+
+            Ok(OffsetFetchRequest {
+                group_id,
+                topics,
+            })
         } else {
-            // V0 doesn't have topics array, fetches all
-            None
-        };
-        
-        Ok(OffsetFetchRequest {
-            group_id,
-            topics,
-        })
+            // V0-7: Original structure with group_id and topics
+            let group_id = if flexible {
+                decoder.read_compact_string()?.ok_or_else(|| Error::Protocol("Group ID cannot be null".into()))?
+            } else {
+                decoder.read_string()?.ok_or_else(|| Error::Protocol("Group ID cannot be null".into()))?
+            };
+
+            // Read topics array (null means all topics)
+            let topics = if header.api_version >= 1 {
+                if flexible {
+                    let topic_count = decoder.read_unsigned_varint()? as usize;
+                    if topic_count == 0 {
+                        None
+                    } else {
+                        let actual_count = topic_count - 1;
+                        let mut topics = Vec::with_capacity(actual_count);
+                        for _ in 0..actual_count {
+                            let topic_name = decoder.read_compact_string()?
+                                .ok_or_else(|| Error::Protocol("Topic name cannot be null".into()))?;
+                            topics.push(topic_name);
+                        }
+                        Some(topics)
+                    }
+                } else {
+                    let topic_count = decoder.read_i32()?;
+                    if topic_count < 0 {
+                        None
+                    } else {
+                        let mut topics = Vec::with_capacity(topic_count as usize);
+                        for _ in 0..topic_count {
+                            let topic_name = decoder.read_string()?
+                                .ok_or_else(|| Error::Protocol("Topic name cannot be null".into()))?;
+                            topics.push(topic_name);
+                        }
+                        Some(topics)
+                    }
+                }
+            } else {
+                None
+            };
+
+            // RequireStable field (v7+)
+            if header.api_version >= 7 {
+                let _require_stable = decoder.read_bool()?;
+            }
+
+            // Tagged fields at request level (flexible only)
+            if flexible {
+                let _tag_count = decoder.read_unsigned_varint()?;
+            }
+
+            Ok(OffsetFetchRequest {
+                group_id,
+                topics,
+            })
+        }
     }
     
     // Public encode methods for use by KafkaProtocolHandler
@@ -650,34 +946,117 @@ impl ProtocolHandler {
     
     /// Encode JoinGroup response
     pub fn encode_join_group_response(&self, buf: &mut BytesMut, response: &crate::join_group_types::JoinGroupResponse, version: i16) -> Result<()> {
+        let start_len = buf.len();
         let mut encoder = Encoder::new(buf);
-        
+
+        // v6+ uses flexible/compact format
+        let flexible = version >= 6;
+
+        tracing::debug!("JoinGroup v{} response encoding START: error={}, gen={}, protocol={:?}, leader={}, member_id={}, members={}",
+            version, response.error_code, response.generation_id, response.protocol_name, response.leader, response.member_id, response.members.len());
+
+        // Field 1: ThrottleTimeMs (v2+)
         if version >= 2 {
             encoder.write_i32(response.throttle_time_ms);
+            tracing::debug!("  [1] ThrottleTimeMs: {}", response.throttle_time_ms);
         }
-        
+
+        // Field 2: ErrorCode (v0+)
         encoder.write_i16(response.error_code);
+        tracing::debug!("  [2] ErrorCode: {}", response.error_code);
+
+        // Field 3: GenerationId (v0+)
         encoder.write_i32(response.generation_id);
-        
+        tracing::debug!("  [3] GenerationId: {}", response.generation_id);
+
+        // Field 4: ProtocolType (v7+)
         if version >= 7 {
-            encoder.write_string(response.protocol_type.as_deref());
-        }
-        
-        encoder.write_string(response.protocol_name.as_deref());
-        encoder.write_string(Some(&response.leader));
-        encoder.write_string(Some(&response.member_id));
-        
-        encoder.write_i32(response.members.len() as i32);
-        for member in &response.members {
-            encoder.write_string(Some(&member.member_id));
-            
-            if version >= 5 {
-                encoder.write_string(member.group_instance_id.as_deref());
+            if flexible {
+                encoder.write_compact_string(response.protocol_type.as_deref());
+                tracing::debug!("  [4] ProtocolType (compact): {:?}", response.protocol_type);
+            } else {
+                encoder.write_string(response.protocol_type.as_deref());
+                tracing::debug!("  [4] ProtocolType: {:?}", response.protocol_type);
             }
-            
-            encoder.write_bytes(Some(&member.metadata));
         }
-        
+
+        // Field 5: ProtocolName (v0+)
+        if flexible {
+            encoder.write_compact_string(response.protocol_name.as_deref());
+            tracing::debug!("  [5] ProtocolName (compact): {:?}", response.protocol_name);
+        } else {
+            encoder.write_string(response.protocol_name.as_deref());
+            tracing::debug!("  [5] ProtocolName: {:?}", response.protocol_name);
+        }
+
+        // Field 6: Leader (v0+)
+        if flexible {
+            encoder.write_compact_string(Some(&response.leader));
+            tracing::debug!("  [6] Leader (compact): {}", response.leader);
+        } else {
+            encoder.write_string(Some(&response.leader));
+            tracing::debug!("  [6] Leader: {}", response.leader);
+        }
+
+        // Field 7: SkipAssignment (v9+)
+        if version >= 9 {
+            encoder.write_bool(false);
+            tracing::debug!("  [7] SkipAssignment: false");
+        }
+
+        // Field 8: MemberId (v0+)
+        if flexible {
+            encoder.write_compact_string(Some(&response.member_id));
+            tracing::debug!("  [8] MemberId (compact): {}", response.member_id);
+        } else {
+            encoder.write_string(Some(&response.member_id));
+            tracing::debug!("  [8] MemberId: {}", response.member_id);
+        }
+
+        // Field 9: Members array (v0+)
+        if flexible {
+            encoder.write_compact_array_len(response.members.len());
+            tracing::debug!("  [9] Members array (compact): {} members", response.members.len());
+        } else {
+            encoder.write_i32(response.members.len() as i32);
+            tracing::debug!("  [9] Members array: {} members", response.members.len());
+        }
+
+        for (idx, member) in response.members.iter().enumerate() {
+            tracing::debug!("    Member[{}]: id={}, instance_id={:?}", idx, member.member_id, member.group_instance_id);
+
+            if flexible {
+                encoder.write_compact_string(Some(&member.member_id));
+            } else {
+                encoder.write_string(Some(&member.member_id));
+            }
+
+            if version >= 5 {
+                if flexible {
+                    encoder.write_compact_string(member.group_instance_id.as_deref());
+                } else {
+                    encoder.write_string(member.group_instance_id.as_deref());
+                }
+            }
+
+            if flexible {
+                encoder.write_compact_bytes(Some(&member.metadata));
+                // Tagged fields at member level
+                encoder.write_tagged_fields();
+            } else {
+                encoder.write_bytes(Some(&member.metadata));
+            }
+        }
+
+        // Tagged fields at response level (flexible versions only)
+        if flexible {
+            encoder.write_tagged_fields();
+            tracing::debug!("  Tagged fields (response level): 0");
+        }
+
+        let response_bytes = &buf[start_len..];
+        tracing::debug!("JoinGroup v{} response encoded {} bytes: {:02x?}", version, response_bytes.len(), response_bytes);
+
         Ok(())
     }
     
@@ -693,26 +1072,41 @@ impl ProtocolHandler {
     /// Encode Heartbeat response
     pub fn encode_heartbeat_response(&self, buf: &mut BytesMut, response: &crate::heartbeat_types::HeartbeatResponse, version: i16) -> Result<()> {
         let mut encoder = Encoder::new(buf);
-        
+        let flexible = version >= 4;
+
         if version >= 1 {
             encoder.write_i32(response.throttle_time_ms);
         }
-        
+
         encoder.write_i16(response.error_code);
-        
+
+        // Tagged fields for flexible versions
+        if flexible {
+            encoder.write_tagged_fields();
+        }
+
         Ok(())
     }
     
     /// Encode LeaveGroup response
     pub fn encode_leave_group_response(&self, buf: &mut BytesMut, response: &crate::leave_group_types::LeaveGroupResponse, version: i16) -> Result<()> {
+        use crate::parser::KafkaEncodable;
+
         let mut encoder = Encoder::new(buf);
-        
+        response.encode(&mut encoder, version)?;
+        Ok(())
+    }
+
+    /// OLD MANUAL ENCODER - REPLACED WITH KAFKAENCODABLE TRAIT
+    pub fn _encode_leave_group_response_manual(&self, buf: &mut BytesMut, response: &crate::leave_group_types::LeaveGroupResponse, version: i16) -> Result<()> {
+        let mut encoder = Encoder::new(buf);
+
         if version >= 1 {
             encoder.write_i32(response.throttle_time_ms);
         }
-        
+
         encoder.write_i16(response.error_code);
-        
+
         if version >= 3 {
             encoder.write_i32(response.members.len() as i32);
             for member in &response.members {
@@ -793,66 +1187,149 @@ impl ProtocolHandler {
             encoder.write_i32(response.throttle_time_ms);
         }
 
-        // Write topics array
-        if flexible {
-            encoder.write_compact_array_len(response.topics.len());
-        } else {
-            encoder.write_i32(response.topics.len() as i32);
-        }
-
-        for topic in &response.topics {
-            // Write topic name
+        // V8+ uses Groups array wrapper
+        if version >= 8 {
+            // Write Groups array (length 1 - we only support single group)
             if flexible {
-                encoder.write_compact_string(Some(&topic.name));
+                encoder.write_compact_array_len(1); // 1 group
             } else {
-                encoder.write_string(Some(&topic.name));
+                encoder.write_i32(1);
             }
 
-            // Write partitions array
+            // Write GroupId (get from response, fallback to empty string)
             if flexible {
-                encoder.write_compact_array_len(topic.partitions.len());
+                encoder.write_compact_string(response.group_id.as_deref());
             } else {
-                encoder.write_i32(topic.partitions.len() as i32);
+                encoder.write_string(response.group_id.as_deref());
             }
 
-            for partition in &topic.partitions {
-                encoder.write_i32(partition.partition_index);
-                encoder.write_i64(partition.committed_offset);
+            // Write Topics array inside group
+            if flexible {
+                encoder.write_compact_array_len(response.topics.len());
+            } else {
+                encoder.write_i32(response.topics.len() as i32);
+            }
 
-                // v5+ has committed_leader_epoch
-                if version >= 5 {
-                    encoder.write_i32(-1); // -1 = unknown leader epoch
-                }
-
-                // Write metadata
+            for topic in &response.topics {
+                // Write topic name
                 if flexible {
-                    encoder.write_compact_string(partition.metadata.as_deref());
+                    encoder.write_compact_string(Some(&topic.name));
                 } else {
-                    encoder.write_string(partition.metadata.as_deref());
+                    encoder.write_string(Some(&topic.name));
                 }
 
-                encoder.write_i16(partition.error_code);
+                // Write partitions array
+                if flexible {
+                    encoder.write_compact_array_len(topic.partitions.len());
+                } else {
+                    encoder.write_i32(topic.partitions.len() as i32);
+                }
 
-                // Tagged fields at partition level
+                for partition in &topic.partitions {
+                    encoder.write_i32(partition.partition_index);
+                    encoder.write_i64(partition.committed_offset);
+
+                    // v5+ has committed_leader_epoch
+                    if version >= 5 {
+                        encoder.write_i32(-1); // -1 = unknown leader epoch
+                    }
+
+                    // Write metadata
+                    if flexible {
+                        encoder.write_compact_string(partition.metadata.as_deref());
+                    } else {
+                        encoder.write_string(partition.metadata.as_deref());
+                    }
+
+                    encoder.write_i16(partition.error_code);
+
+                    // Tagged fields at partition level
+                    if flexible {
+                        encoder.write_tagged_fields();
+                    }
+                }
+
+                // Tagged fields at topic level
                 if flexible {
                     encoder.write_tagged_fields();
                 }
             }
 
-            // Tagged fields at topic level
+            // Error code at group level (v8+)
+            encoder.write_i16(0); // error_code
+
+            // Tagged fields at group level
             if flexible {
                 encoder.write_tagged_fields();
             }
-        }
 
-        // Error code at response level (v2+, but moved for v8+)
-        if version >= 2 && version < 8 {
-            encoder.write_i16(0); // error_code at response level
-        }
+            // Tagged fields at response level
+            if flexible {
+                encoder.write_tagged_fields();
+            }
+        } else {
+            // V0-7: Original flat structure
+            // Write topics array
+            if flexible {
+                encoder.write_compact_array_len(response.topics.len());
+            } else {
+                encoder.write_i32(response.topics.len() as i32);
+            }
 
-        // Tagged fields at response level
-        if flexible {
-            encoder.write_tagged_fields();
+            for topic in &response.topics {
+                // Write topic name
+                if flexible {
+                    encoder.write_compact_string(Some(&topic.name));
+                } else {
+                    encoder.write_string(Some(&topic.name));
+                }
+
+                // Write partitions array
+                if flexible {
+                    encoder.write_compact_array_len(topic.partitions.len());
+                } else {
+                    encoder.write_i32(topic.partitions.len() as i32);
+                }
+
+                for partition in &topic.partitions {
+                    encoder.write_i32(partition.partition_index);
+                    encoder.write_i64(partition.committed_offset);
+
+                    // v5+ has committed_leader_epoch
+                    if version >= 5 {
+                        encoder.write_i32(-1); // -1 = unknown leader epoch
+                    }
+
+                    // Write metadata
+                    if flexible {
+                        encoder.write_compact_string(partition.metadata.as_deref());
+                    } else {
+                        encoder.write_string(partition.metadata.as_deref());
+                    }
+
+                    encoder.write_i16(partition.error_code);
+
+                    // Tagged fields at partition level
+                    if flexible {
+                        encoder.write_tagged_fields();
+                    }
+                }
+
+                // Tagged fields at topic level
+                if flexible {
+                    encoder.write_tagged_fields();
+                }
+            }
+
+            // Error code at response level (v2-7)
+            if version >= 2 {
+                encoder.write_i16(0); // error_code at response level
+            }
+
+            // Tagged fields at response level
+            if flexible {
+                encoder.write_tagged_fields();
+            }
         }
 
         Ok(())
@@ -4983,42 +5460,86 @@ impl ProtocolHandler {
         use crate::parser::Decoder;
         
         tracing::debug!("Handling JoinGroup request v{}", header.api_version);
-        
+
         let mut decoder = Decoder::new(body);
-        
+
+        // v6+ uses flexible/compact format
+        let flexible = header.api_version >= 6;
+
         // Parse request
-        let group_id = decoder.read_string()?
-            .ok_or_else(|| Error::Protocol("Group ID cannot be null".into()))?;
+        let group_id = if flexible {
+            decoder.read_compact_string()?.ok_or_else(|| Error::Protocol("Group ID cannot be null".into()))?
+        } else {
+            decoder.read_string()?.ok_or_else(|| Error::Protocol("Group ID cannot be null".into()))?
+        };
+
         let session_timeout_ms = decoder.read_i32()?;
-        
+
         let rebalance_timeout_ms = if header.api_version >= 1 {
             decoder.read_i32()?
         } else {
             session_timeout_ms // Default to session timeout
         };
-        
-        let member_id = decoder.read_string()?.unwrap_or_default();
-        
+
+        let member_id = if flexible {
+            decoder.read_compact_string()?.unwrap_or_default()
+        } else {
+            decoder.read_string()?.unwrap_or_default()
+        };
+
         let group_instance_id = if header.api_version >= 5 {
-            decoder.read_string()?
+            if flexible {
+                decoder.read_compact_string()?
+            } else {
+                decoder.read_string()?
+            }
         } else {
             None
         };
-        
-        let protocol_type = decoder.read_string()?
-            .ok_or_else(|| Error::Protocol("Protocol type cannot be null".into()))?;
-        
+
+        let protocol_type = if flexible {
+            decoder.read_compact_string()?.ok_or_else(|| Error::Protocol("Protocol type cannot be null".into()))?
+        } else {
+            decoder.read_string()?.ok_or_else(|| Error::Protocol("Protocol type cannot be null".into()))?
+        };
+
         // Read protocols array
-        let protocol_count = decoder.read_i32()? as usize;
+        let protocol_count = if flexible {
+            let len = decoder.read_unsigned_varint()? as usize;
+            if len == 0 {
+                return Err(Error::Protocol("JoinGroup protocols array cannot be empty".into()));
+            }
+            len - 1 // Compact array encoding
+        } else {
+            decoder.read_i32()? as usize
+        };
+
         let mut protocols = Vec::with_capacity(protocol_count);
-        
+
         for _ in 0..protocol_count {
-            let name = decoder.read_string()?
-                .ok_or_else(|| Error::Protocol("Protocol name cannot be null".into()))?;
-            let metadata = decoder.read_bytes()?
-                .ok_or_else(|| Error::Protocol("Protocol metadata cannot be null".into()))?;
-            
+            let name = if flexible {
+                decoder.read_compact_string()?.ok_or_else(|| Error::Protocol("Protocol name cannot be null".into()))?
+            } else {
+                decoder.read_string()?.ok_or_else(|| Error::Protocol("Protocol name cannot be null".into()))?
+            };
+
+            let metadata = if flexible {
+                decoder.read_compact_bytes()?.ok_or_else(|| Error::Protocol("Protocol metadata cannot be null".into()))?
+            } else {
+                decoder.read_bytes()?.ok_or_else(|| Error::Protocol("Protocol metadata cannot be null".into()))?
+            };
+
             protocols.push(JoinGroupRequestProtocol { name, metadata });
+
+            // Tagged fields at protocol level (flexible only)
+            if flexible {
+                let _tag_count = decoder.read_unsigned_varint()?;
+            }
+        }
+
+        // Tagged fields at request level (flexible only)
+        if flexible {
+            let _tag_count = decoder.read_unsigned_varint()?;
         }
         
         let request = JoinGroupRequest {

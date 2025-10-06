@@ -1237,10 +1237,21 @@ impl GroupManager {
         })
     }
     
-    pub async fn handle_leave_group(&self, _request: chronik_protocol::leave_group_types::LeaveGroupRequest) -> Result<chronik_protocol::leave_group_types::LeaveGroupResponse> {
+    pub async fn handle_leave_group(&self, request: chronik_protocol::leave_group_types::LeaveGroupRequest) -> Result<chronik_protocol::leave_group_types::LeaveGroupResponse> {
+        use chronik_protocol::leave_group_types::MemberResponse;
+
+        // V3+ requires per-member responses
+        let member_responses: Vec<MemberResponse> = request.members.iter().map(|member| {
+            MemberResponse {
+                member_id: member.member_id.clone(),
+                group_instance_id: member.group_instance_id.clone(),
+                error_code: 0, // SUCCESS
+            }
+        }).collect();
+
         Ok(chronik_protocol::leave_group_types::LeaveGroupResponse {
             error_code: 0,
-            members: vec![],
+            members: member_responses,
             throttle_time_ms: 0,
         })
     }
@@ -1364,6 +1375,7 @@ impl GroupManager {
             },
             throttle_time_ms: 0,
             topics,
+            group_id: Some(request.group_id.clone()),  // v8+ requires group_id
         })
     }
     
@@ -1707,8 +1719,13 @@ fn parse_subscription_metadata(bytes: &[u8]) -> Result<Vec<String>> {
     // Read version
     let version = cursor.read_i16::<BigEndian>()
         .map_err(|e| Error::Serialization(format!("Failed to read subscription version: {}", e)))?;
-    
-    if version != 0 && version != 1 {
+
+    // Support versions 0-3 (Kafka 0.9-3.x)
+    // Version 0: topics only
+    // Version 1: topics + user_data
+    // Version 2: topics + user_data + owned_partitions (we can skip this)
+    // Version 3: topics + user_data + owned_partitions + generation_id + rack_id (we can skip these)
+    if version < 0 || version > 3 {
         return Err(Error::Protocol(format!("Unsupported subscription version: {}", version)));
     }
     

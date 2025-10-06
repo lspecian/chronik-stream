@@ -7,6 +7,7 @@ use chronik_storage::{SegmentReader, RecordBatch, Record, Segment, ObjectStoreTr
 use chronik_storage::kafka_records::{KafkaRecordBatch, KafkaRecord, RecordHeader as KafkaRecordHeader, CompressionType};
 use chronik_wal::{WalManager, WalRecord};
 use std::collections::HashMap;
+use std::io::Cursor;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -14,13 +15,26 @@ use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
 /// In-memory buffer for recent records
+/// CRITICAL v1.3.32: Store RAW Kafka batch bytes to preserve CRC
 #[derive(Debug)]
 struct PartitionBuffer {
-    records: Vec<chronik_storage::Record>,
+    /// Raw Kafka RecordBatch bytes in wire format (preserves original CRC)
+    raw_batches: Vec<bytes::Bytes>,
+    /// Metadata about batches for offset tracking
+    batch_metadata: Vec<BatchMetadata>,
     base_offset: i64,
     high_watermark: i64,
     /// Highest offset that has been flushed to segments
     flushed_offset: i64,
+}
+
+/// Metadata about a batch in the buffer
+#[derive(Debug, Clone)]
+struct BatchMetadata {
+    base_offset: i64,
+    last_offset: i64,
+    record_count: i32,
+    size_bytes: usize,
 }
 
 /// Fetch handler state
@@ -234,8 +248,10 @@ impl FetchHandler {
                 Duration::from_secs(30) // Default timeout
             };
             
-            let fetch_result = timeout(fetch_timeout, async {
-                self.fetch_records(
+            // CRITICAL CRC FIX v1.3.32: Try to fetch raw Kafka bytes first to preserve CRC
+            tracing::info!("Trying to fetch raw bytes (CRC-preserving) for {}-{}", topic, partition);
+            let raw_bytes_result = timeout(fetch_timeout, async {
+                self.fetch_raw_bytes(
                     topic,
                     partition,
                     fetch_offset,
@@ -243,24 +259,47 @@ impl FetchHandler {
                     max_bytes,
                 ).await
             }).await;
-            
-            let records = match fetch_result {
-                Ok(Ok(recs)) => {
-                    tracing::info!("Fetched {} records from {}-{}", recs.len(), topic, partition);
-                    recs
-                },
-                Ok(Err(e)) => {
-                    tracing::warn!("Error fetching records from {}-{}: {:?}", topic, partition, e);
-                    vec![]
+
+            let records_bytes = match raw_bytes_result {
+                Ok(Ok(Some(raw_bytes))) => {
+                    tracing::info!("✓ CRC-PRESERVED: Fetched {} bytes of raw Kafka data for {}-{}",
+                        raw_bytes.len(), topic, partition);
+                    raw_bytes
                 }
-                Err(_) => {
-                    tracing::warn!("Fetch timeout after {}ms for {}-{}", max_wait_ms, topic, partition);
-                    vec![]
+                Ok(Ok(None)) | Ok(Err(_)) | Err(_) => {
+                    // Fall back to parsed records (will recompute CRC)
+                    tracing::warn!("⚠ CRC-RECOMPUTED: No raw bytes available, falling back to parsed records for {}-{}",
+                        topic, partition);
+
+                    let fetch_result = timeout(fetch_timeout, async {
+                        self.fetch_records(
+                            topic,
+                            partition,
+                            fetch_offset,
+                            high_watermark,
+                            max_bytes,
+                        ).await
+                    }).await;
+
+                    let records = match fetch_result {
+                        Ok(Ok(recs)) => {
+                            tracing::info!("Fetched {} records from {}-{}", recs.len(), topic, partition);
+                            recs
+                        },
+                        Ok(Err(e)) => {
+                            tracing::warn!("Error fetching records from {}-{}: {:?}", topic, partition, e);
+                            vec![]
+                        }
+                        Err(_) => {
+                            tracing::warn!("Fetch timeout after {}ms for {}-{}", max_wait_ms, topic, partition);
+                            vec![]
+                        }
+                    };
+
+                    // Encode the records - will recompute CRC
+                    self.encode_kafka_records(&records, 0)?
                 }
             };
-            
-            // Encode the records - always use encode_kafka_records to get proper format
-            let records_bytes = self.encode_kafka_records(&records, 0)?;
             
             return Ok(FetchResponsePartition {
                 partition,
@@ -396,33 +435,45 @@ impl FetchHandler {
         let mut bytes_fetched = 0usize;
         
         // PHASE 1: Try in-memory buffer first (fastest path)
-        // NOTE: Buffer contains ONLY unflushed records. We need to also check WAL/segments.
+        // CRITICAL v1.3.32: Decode records from raw batches to preserve CRC
         let buffer_highest_offset = {
             let state = self.state.read().await;
             if let Some(buffer) = state.buffers.get(&(topic.to_string(), partition)) {
                 info!(
-                    "FETCH→BUFFER: Checking buffer for {}-{}, buffer has {} records",
-                    topic, partition, buffer.records.len()
+                    "FETCH→BUFFER: Checking buffer for {}-{}, buffer has {} batches",
+                    topic, partition, buffer.batch_metadata.len()
                 );
 
                 let mut buffer_max_offset = -1i64;
-                for record in &buffer.records {
-                    if record.offset >= fetch_offset && record.offset < high_watermark {
-                        let record_size = record.value.len() +
-                            record.key.as_ref().map(|k| k.len()).unwrap_or(0) + 24;
+                for (batch_idx, metadata) in buffer.batch_metadata.iter().enumerate() {
+                    if metadata.last_offset >= fetch_offset && metadata.base_offset < high_watermark {
+                        // Decode records from raw batch
+                        let raw_batch = &buffer.raw_batches[batch_idx];
+                        match self.decode_records_from_raw_batch(raw_batch, fetch_offset, high_watermark) {
+                            Ok(batch_records) => {
+                                for record in batch_records {
+                                    let record_size = record.value.len() +
+                                        record.key.as_ref().map(|k| k.len()).unwrap_or(0) + 24;
 
-                        if bytes_fetched + record_size > max_bytes as usize && !records.is_empty() {
-                            break;
+                                    if bytes_fetched + record_size > max_bytes as usize && !records.is_empty() {
+                                        break;
+                                    }
+
+                                    debug!(
+                                        "FETCH→BUFFER: Found record at offset {} in buffer",
+                                        record.offset
+                                    );
+
+                                    records.push(record.clone());
+                                    bytes_fetched += record_size;
+                                    buffer_max_offset = buffer_max_offset.max(record.offset);
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to decode batch from buffer: {}", e);
+                                continue;
+                            }
                         }
-
-                        debug!(
-                            "FETCH→BUFFER: Found record at offset {} in buffer",
-                            record.offset
-                        );
-
-                        records.push(record.clone());
-                        bytes_fetched += record_size;
-                        buffer_max_offset = buffer_max_offset.max(record.offset);
                     }
                 }
 
@@ -629,54 +680,158 @@ impl FetchHandler {
         }
         
         // PHASE 2: Fetch from buffer ONLY for offsets > max_segment_offset
+        // CRITICAL v1.3.32 FIX: Return raw batches from buffer, not re-encoded records
         if current_offset < high_watermark && bytes_fetched < max_bytes as usize {
             let state = self.state.read().await;
             if let Some(buffer) = state.buffers.get(&(topic.to_string(), partition)) {
-                tracing::warn!("FETCH→BUFFER: Checking buffer for {}-{}, buffer has {} records, current_offset={}, max_segment_offset={}, high_watermark={}", 
-                    topic, partition, buffer.records.len(), current_offset, max_segment_offset, high_watermark);
-                
-                // Only fetch from buffer for offsets that are NOT in segments
-                for record in &buffer.records {
-                    // Only include records that are:
-                    // 1. At or after current_offset (which is now > max_segment_offset)
-                    // 2. Before high_watermark
-                    // 3. NOT already in segments (offset > max_segment_offset)
-                    if record.offset >= current_offset && 
-                       record.offset < high_watermark &&
-                       record.offset > max_segment_offset {
-                        let record_size = record.value.len() + 
-                            record.key.as_ref().map(|k| k.len()).unwrap_or(0) + 24;
-                        
-                        if bytes_fetched + record_size > max_bytes as usize && !records.is_empty() {
+                tracing::info!("FETCH→BUFFER: Checking buffer for {}-{}, buffer has {} batches, current_offset={}, max_segment_offset={}, high_watermark={}",
+                    topic, partition, buffer.batch_metadata.len(), current_offset, max_segment_offset, high_watermark);
+
+                // Iterate through batches and decode records from raw bytes
+                for (batch_idx, metadata) in buffer.batch_metadata.iter().enumerate() {
+                    // Only include batches that overlap with our range and are not in segments
+                    if metadata.last_offset >= current_offset &&
+                       metadata.base_offset < high_watermark &&
+                       metadata.base_offset > max_segment_offset {
+
+                        if bytes_fetched + metadata.size_bytes > max_bytes as usize && !records.is_empty() {
                             break;
                         }
-                        
-                        tracing::debug!(
-                            "FETCH from buffer: partition={} offset={} value_len={}",
-                            partition, record.offset, record.value.len()
-                        );
-                        
-                        records.push(record.clone());
-                        current_offset = record.offset + 1;
-                        bytes_fetched += record_size;
-                    } else {
-                        tracing::warn!("FETCH→SKIP: Skipping record offset={} (current={}, max_seg={}, hw={})", 
-                            record.offset, current_offset, max_segment_offset, high_watermark);
+
+                        // Decode records from raw batch bytes
+                        let raw_batch = &buffer.raw_batches[batch_idx];
+                        match self.decode_records_from_raw_batch(raw_batch, current_offset, high_watermark) {
+                            Ok(batch_records) => {
+                                tracing::info!(
+                                    "FETCH from buffer: partition={} batch_base={} decoded {} records",
+                                    partition, metadata.base_offset, batch_records.len()
+                                );
+
+                                for record in batch_records {
+                                    records.push(record.clone());
+                                    current_offset = record.offset + 1;
+                                    bytes_fetched += record.value.len() +
+                                        record.key.as_ref().map(|k| k.len()).unwrap_or(0) + 24;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to decode batch from buffer: {}", e);
+                                continue;
+                            }
+                        }
                     }
                 }
             } else {
-                tracing::warn!("FETCH→NO_BUFFER: No buffer found for {}-{}", topic, partition);
+                tracing::info!("FETCH→NO_BUFFER: No buffer found for {}-{}", topic, partition);
             }
         }
         
         tracing::info!(
-            "fetch_records complete - fetched {} records from {}-{} starting at offset {} (current_offset: {})", 
+            "fetch_records complete - fetched {} records from {}-{} starting at offset {} (current_offset: {})",
             records.len(), topic, partition, fetch_offset, current_offset
         );
-        
+
         Ok(records)
     }
-    
+
+    /// Fetch raw Kafka batch bytes directly (preserves CRC) - try buffer first, then segments
+    async fn fetch_raw_bytes(
+        &self,
+        topic: &str,
+        partition: i32,
+        fetch_offset: i64,
+        high_watermark: i64,
+        max_bytes: i32,
+    ) -> Result<Option<Vec<u8>>> {
+        tracing::info!(
+            "fetch_raw_bytes - topic: {}, partition: {}, fetch_offset: {}, high_watermark: {}",
+            topic, partition, fetch_offset, high_watermark
+        );
+
+        // PHASE 1: Try buffer first (raw bytes already available)
+        {
+            let state = self.state.read().await;
+            if let Some(buffer) = state.buffers.get(&(topic.to_string(), partition)) {
+                tracing::info!(
+                    "RAW→BUFFER: Checking buffer for {}-{}, buffer has {} batches",
+                    topic, partition, buffer.batch_metadata.len()
+                );
+
+                let mut combined_bytes = Vec::new();
+                for (batch_idx, metadata) in buffer.batch_metadata.iter().enumerate() {
+                    // Check if this batch overlaps with requested range
+                    if metadata.last_offset >= fetch_offset && metadata.base_offset < high_watermark {
+                        let raw_batch = &buffer.raw_batches[batch_idx];
+
+                        if combined_bytes.len() + raw_batch.len() > max_bytes as usize && !combined_bytes.is_empty() {
+                            break;
+                        }
+
+                        tracing::info!(
+                            "RAW→BUFFER: Adding {} bytes from batch at offsets {}-{}",
+                            raw_batch.len(), metadata.base_offset, metadata.last_offset
+                        );
+                        combined_bytes.extend_from_slice(raw_batch);
+                    }
+                }
+
+                if !combined_bytes.is_empty() {
+                    tracing::info!(
+                        "RAW→BUFFER: Returning {} bytes of raw Kafka data from buffer",
+                        combined_bytes.len()
+                    );
+                    return Ok(Some(combined_bytes));
+                }
+            }
+        }
+
+        // PHASE 2: Try segments (read raw_kafka_batches section)
+        tracing::info!("RAW→SEGMENTS: Buffer empty or no match, trying segments");
+        let segments = self.get_segments_for_range(topic, partition, fetch_offset, high_watermark).await?;
+
+        if segments.is_empty() {
+            tracing::info!("RAW→SEGMENTS: No segments found for range");
+            return Ok(None);
+        }
+
+        let mut combined_bytes = Vec::new();
+        for segment_info in &segments {
+            // Read segment and extract raw_kafka_batches
+            let segment_data = self.object_store.get(&segment_info.object_key).await?;
+            let segment = Segment::deserialize(segment_data)?;
+
+            tracing::info!(
+                "RAW→SEGMENT: Segment {} has {} bytes of raw_kafka_batches",
+                segment_info.segment_id, segment.raw_kafka_batches.len()
+            );
+
+            if !segment.raw_kafka_batches.is_empty() {
+                if combined_bytes.len() + segment.raw_kafka_batches.len() > max_bytes as usize && !combined_bytes.is_empty() {
+                    break;
+                }
+                combined_bytes.extend_from_slice(&segment.raw_kafka_batches);
+            } else {
+                // Segment doesn't have raw bytes (v1 format or indexed-only)
+                // Cannot preserve CRC, need to fall back to parsed records
+                tracing::warn!(
+                    "RAW→SEGMENT: Segment {} has no raw_kafka_batches, cannot preserve CRC",
+                    segment_info.segment_id
+                );
+                return Ok(None);
+            }
+        }
+
+        if !combined_bytes.is_empty() {
+            tracing::info!(
+                "RAW→SEGMENTS: Returning {} bytes of raw Kafka data from {} segments",
+                combined_bytes.len(), segments.len()
+            );
+            Ok(Some(combined_bytes))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Get segments that contain data in the given offset range
     async fn get_segments_for_range(
         &self,
@@ -943,10 +1098,11 @@ impl FetchHandler {
             }
         }
 
-        if all_records.is_empty() && !segment.raw_kafka_batches.is_empty() {
-            // Decode ALL batches from raw Kafka batches (preserves CRC)
-            // Kafka batches are self-describing with batch_length in header
-            tracing::info!("Using raw Kafka batches for fetch (no indexed records, {} bytes)", segment.raw_kafka_batches.len());
+        if !segment.raw_kafka_batches.is_empty() {
+            // ALWAYS prefer raw Kafka batches when available (preserves CRC from original produce request)
+            // Dual storage (v2) has both indexed + raw, but raw has correct CRC
+            tracing::info!("Using raw Kafka batches for fetch (CRC-preserving format, {} bytes)", segment.raw_kafka_batches.len());
+            all_records.clear();  // Clear any indexed records, use raw instead
 
             let mut cursor_pos = 0;
             let total_len = segment.raw_kafka_batches.len();
@@ -1159,93 +1315,281 @@ impl FetchHandler {
         Ok((high_watermark, log_start_offset))
     }
     
-    /// Update in-memory buffer with new records  
-    /// This replaces the buffer with only the new unflushed records
-    pub async fn update_buffer(
+    /// Update in-memory buffer with raw Kafka batch bytes (v1.3.32 FIX)
+    /// CRITICAL: Stores original wire-format bytes to preserve CRC
+    pub async fn update_buffer_with_raw_batch(
         &self,
         topic: &str,
         partition: i32,
-        records: Vec<chronik_storage::Record>,
+        raw_bytes: &[u8],
+        base_offset: i64,
+        last_offset: i64,
+        record_count: i32,
         high_watermark: i64,
     ) -> Result<()> {
-        if records.is_empty() {
+        if raw_bytes.is_empty() {
             return Ok(());
         }
-        
-        let base_offset = records.first().unwrap().offset;
-        let last_offset = records.last().unwrap().offset;
-        
-        // Log the offset range of records being added
-        tracing::warn!("BUFFER→UPDATE: Called for {}-{}, num_records={}, high_watermark={}, offset_range=[{}-{}]", 
-            topic, partition, records.len(), high_watermark, base_offset, last_offset);
-        
+
+        tracing::warn!(
+            "BUFFER→RAW_UPDATE: Storing {} bytes for {}-{}, offset_range=[{}-{}], count={}, high_watermark={}",
+            raw_bytes.len(), topic, partition, base_offset, last_offset, record_count, high_watermark
+        );
+
         let mut state = self.state.write().await;
         let key = (topic.to_string(), partition);
-        
-        // Create or get buffer - we'll REPLACE its contents, not append
+
         let buffer = state.buffers.entry(key.clone()).or_insert(PartitionBuffer {
-            records: Vec::new(),
+            raw_batches: Vec::new(),
+            batch_metadata: Vec::new(),
             base_offset,
             high_watermark,
-            flushed_offset: -1,  // Nothing flushed initially
+            flushed_offset: -1,
         });
-        
-        // CRITICAL FIX: Use a HashSet to track existing offsets for proper deduplication
-        // This handles non-sequential offsets from multiple partitions correctly
-        use std::collections::HashSet;
-        
-        tracing::warn!("BUFFER→STATE: Buffer for {}-{} currently has {} records before update", 
-            topic, partition, buffer.records.len());
-        
-        let existing_offsets: HashSet<i64> = buffer.records.iter()
-            .map(|r| r.offset)
-            .collect();
-        
-        // Only add records that don't already exist in the buffer
-        let mut added_count = 0;
-        let records_len = records.len();
-        for record in records {
-            if !existing_offsets.contains(&record.offset) {
-                tracing::warn!("BUFFER→ADD: Adding record offset={} to {}-{} buffer", 
-                    record.offset, topic, partition);
-                buffer.records.push(record);
-                added_count += 1;
-            } else {
-                tracing::warn!("BUFFER→SKIP: Skipping duplicate offset={} for {}-{} (already in buffer)", 
-                    record.offset, topic, partition);
-            }
+
+        // Check for duplicate batches (same base_offset)
+        if !buffer.batch_metadata.iter().any(|m| m.base_offset == base_offset) {
+            // Store raw bytes
+            buffer.raw_batches.push(bytes::Bytes::copy_from_slice(raw_bytes));
+
+            // Store metadata
+            buffer.batch_metadata.push(BatchMetadata {
+                base_offset,
+                last_offset,
+                record_count,
+                size_bytes: raw_bytes.len(),
+            });
+
+            tracing::info!(
+                "BUFFER→RAW_STORED: Added batch to {}-{}, now has {} batches",
+                topic, partition, buffer.raw_batches.len()
+            );
+        } else {
+            tracing::warn!(
+                "BUFFER→RAW_SKIP: Skipping duplicate batch at offset {} for {}-{}",
+                base_offset, topic, partition
+            );
         }
-        
-        if added_count > 0 {
-            tracing::debug!("Added {} new records to buffer (deduplicated)", added_count);
-            
-            // Sort records by offset to maintain order
-            buffer.records.sort_by_key(|r| r.offset);
-            
-            // Update base_offset to the lowest offset in buffer
-            if let Some(first) = buffer.records.first() {
-                buffer.base_offset = first.offset;
-            }
-        }
-        
-        // Always update the high watermark to the latest
+
+        // Update high watermark
         buffer.high_watermark = high_watermark;
-        
-        tracing::debug!("Buffer updated: now contains {} records total", buffer.records.len());
-        
-        tracing::info!("Buffer updated: key={:?}, total_records={}, high_watermark={}", 
-            key, buffer.records.len(), buffer.high_watermark);
-        
-        // Trim old records if buffer is too large (keep last 1000 records)
-        if buffer.records.len() > 1000 {
-            let trim_count = buffer.records.len() - 1000;
-            buffer.records.drain(0..trim_count);
-            if !buffer.records.is_empty() {
-                buffer.base_offset = buffer.records[0].offset;
-            }
+
+        // Update base_offset if this is the first batch or earlier
+        if buffer.batch_metadata.is_empty() || base_offset < buffer.base_offset {
+            buffer.base_offset = base_offset;
         }
-        
+
+        // Trim old batches if buffer too large (keep last 100 batches)
+        if buffer.raw_batches.len() > 100 {
+            let trim_count = buffer.raw_batches.len() - 100;
+            buffer.raw_batches.drain(0..trim_count);
+            buffer.batch_metadata.drain(0..trim_count);
+
+            if let Some(first_meta) = buffer.batch_metadata.first() {
+                buffer.base_offset = first_meta.base_offset;
+            }
+
+            tracing::debug!(
+                "BUFFER→TRIM: Trimmed {} old batches from {}-{}, {} remain",
+                trim_count, topic, partition, buffer.raw_batches.len()
+            );
+        }
+
         Ok(())
+    }
+
+    /// Decode records from raw Kafka RecordBatch bytes
+    /// CRITICAL v1.3.32: Decode original bytes instead of re-encoding
+    fn decode_records_from_raw_batch(
+        &self,
+        raw_bytes: &[u8],
+        min_offset: i64,
+        max_offset: i64,
+    ) -> Result<Vec<chronik_storage::Record>> {
+        use bytes::Buf;
+
+        let mut cursor = raw_bytes;
+        let mut records = Vec::new();
+
+        // Skip RecordBatch header to get to records
+        // RecordBatch format v2:
+        // - base_offset (8 bytes)
+        // - batch_length (4 bytes)
+        // - partition_leader_epoch (4 bytes)
+        // - magic (1 byte)
+        // - crc (4 bytes)
+        // - attributes (2 bytes)
+        // - last_offset_delta (4 bytes)
+        // - base_timestamp (8 bytes)
+        // - max_timestamp (8 bytes)
+        // - producer_id (8 bytes)
+        // - producer_epoch (2 bytes)
+        // - base_sequence (4 bytes)
+        // - record_count (4 bytes)
+        // Total header: 61 bytes
+
+        if raw_bytes.len() < 61 {
+            return Err(Error::Protocol("RecordBatch too small".into()));
+        }
+
+        let base_offset = cursor.get_i64();
+        cursor.advance(4); // batch_length
+        cursor.advance(4); // partition_leader_epoch
+        cursor.advance(1); // magic
+        cursor.advance(4); // crc
+        cursor.advance(2); // attributes
+        cursor.advance(4); // last_offset_delta
+        let base_timestamp = cursor.get_i64();
+        cursor.advance(8); // max_timestamp
+        cursor.advance(8); // producer_id
+        cursor.advance(2); // producer_epoch
+        cursor.advance(4); // base_sequence
+        let record_count = cursor.get_i32();
+
+        // Parse individual records
+        for _ in 0..record_count {
+            if cursor.remaining() == 0 {
+                break;
+            }
+
+            // Read record length (varint)
+            let length = self.read_varint(&mut cursor)?;
+            if cursor.remaining() < length as usize {
+                break;
+            }
+
+            // Read attributes (1 byte)
+            cursor.advance(1);
+
+            // Read timestamp delta (varint)
+            let timestamp_delta = self.read_varlong(&mut cursor)?;
+
+            // Read offset delta (varint)
+            let offset_delta = self.read_varint(&mut cursor)?;
+            let record_offset = base_offset + offset_delta as i64;
+
+            // Check if record is in requested range
+            if record_offset < min_offset || record_offset >= max_offset {
+                // Skip this record
+                let key_len = self.read_varint(&mut cursor)?;
+                if key_len >= 0 {
+                    cursor.advance(key_len as usize);
+                }
+                let value_len = self.read_varint(&mut cursor)?;
+                if value_len >= 0 {
+                    cursor.advance(value_len as usize);
+                }
+                let header_count = self.read_varint(&mut cursor)?;
+                for _ in 0..header_count {
+                    let key_len = self.read_varint(&mut cursor)?;
+                    cursor.advance(key_len as usize);
+                    let val_len = self.read_varint(&mut cursor)?;
+                    cursor.advance(val_len as usize);
+                }
+                continue;
+            }
+
+            // Read key (varint length + bytes)
+            let key_len = self.read_varint(&mut cursor)?;
+            let key = if key_len >= 0 {
+                let mut key_bytes = vec![0u8; key_len as usize];
+                cursor.copy_to_slice(&mut key_bytes);
+                Some(key_bytes)
+            } else {
+                None
+            };
+
+            // Read value (varint length + bytes)
+            let value_len = self.read_varint(&mut cursor)?;
+            let value = if value_len >= 0 {
+                let mut value_bytes = vec![0u8; value_len as usize];
+                cursor.copy_to_slice(&mut value_bytes);
+                value_bytes
+            } else {
+                vec![]
+            };
+
+            // Read headers (varint count, then key-value pairs)
+            let header_count = self.read_varint(&mut cursor)?;
+            let mut headers = std::collections::HashMap::new();
+            for _ in 0..header_count {
+                let key_len = self.read_varint(&mut cursor)?;
+                let mut key_bytes = vec![0u8; key_len as usize];
+                cursor.copy_to_slice(&mut key_bytes);
+                let key_str = String::from_utf8_lossy(&key_bytes).to_string();
+
+                let val_len = self.read_varint(&mut cursor)?;
+                let mut val_bytes = vec![0u8; val_len as usize];
+                cursor.copy_to_slice(&mut val_bytes);
+
+                headers.insert(key_str, val_bytes);
+            }
+
+            records.push(chronik_storage::Record {
+                offset: record_offset,
+                timestamp: base_timestamp + timestamp_delta,
+                key,
+                value,
+                headers,
+            });
+        }
+
+        Ok(records)
+    }
+
+    /// Read varint from byte slice (zigzag encoded)
+    fn read_varint(&self, cursor: &mut &[u8]) -> Result<i32> {
+        use bytes::Buf;
+        let mut result: i32 = 0;
+        let mut shift = 0;
+        loop {
+            if cursor.remaining() == 0 {
+                return Err(Error::Protocol("Unexpected end of varint".into()));
+            }
+            let byte = cursor.get_u8();
+            result |= ((byte & 0x7F) as i32) << shift;
+            if byte & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+        }
+        // Zigzag decode
+        Ok((result >> 1) ^ -(result & 1))
+    }
+
+    /// Read varlong from byte slice (zigzag encoded)
+    fn read_varlong(&self, cursor: &mut &[u8]) -> Result<i64> {
+        use bytes::Buf;
+        let mut result: i64 = 0;
+        let mut shift = 0;
+        loop {
+            if cursor.remaining() == 0 {
+                return Err(Error::Protocol("Unexpected end of varlong".into()));
+            }
+            let byte = cursor.get_u8();
+            result |= ((byte & 0x7F) as i64) << shift;
+            if byte & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+        }
+        // Zigzag decode
+        Ok((result >> 1) ^ -(result & 1))
+    }
+
+    /// Update in-memory buffer with new records (DEPRECATED - DO NOT USE)
+    /// DEPRECATED v1.3.32: This function re-encodes records and corrupts CRC
+    /// Use update_buffer_with_raw_batch instead to preserve wire-format bytes
+    #[deprecated(since = "1.3.32", note = "Use update_buffer_with_raw_batch to preserve CRC")]
+    pub async fn update_buffer(
+        &self,
+        _topic: &str,
+        _partition: i32,
+        _records: Vec<chronik_storage::Record>,
+        _high_watermark: i64,
+    ) -> Result<()> {
+        tracing::error!("DEPRECATED: update_buffer() was called but should not be used. Use update_buffer_with_raw_batch() instead.");
+        Err(Error::Internal("update_buffer is deprecated - use update_buffer_with_raw_batch".into()))
     }
     
     /// Clear buffers for a topic
@@ -1256,55 +1600,63 @@ impl FetchHandler {
         Ok(())
     }
     
-    /// Mark records as flushed to segment (removes only flushed records from buffer)
-    /// CRITICAL FIX: Only remove records that were actually flushed, not all records
+    /// Mark batches as flushed to segment (removes only flushed batches from buffer)
+    /// CRITICAL v1.3.32 FIX: Use batch_metadata instead of records to track flushed data
     pub async fn mark_flushed(
         &self,
         topic: &str,
         partition: i32,
         up_to_offset: i64,
     ) -> Result<()> {
-        tracing::warn!("FLUSH→MARK: Marking records as flushed for {}-{}, up_to_offset={}",
+        tracing::info!("FLUSH→MARK: Marking batches as flushed for {}-{}, up_to_offset={}",
             topic, partition, up_to_offset);
-        
+
         let mut state = self.state.write().await;
         let key = (topic.to_string(), partition);
-        
+
         if let Some(buffer) = state.buffers.get_mut(&key) {
-            let initial_count = buffer.records.len();
-            
-            tracing::warn!("FLUSH→BEFORE: Buffer for {}-{} has {} records before flush",
+            let initial_count = buffer.raw_batches.len();
+
+            tracing::info!("FLUSH→BEFORE: Buffer for {}-{} has {} batches before flush",
                 topic, partition, initial_count);
-            
-            // Log which records will be removed
-            for record in &buffer.records {
-                if record.offset <= up_to_offset {
-                    tracing::warn!("FLUSH→REMOVE: Will remove record offset={} from {}-{} (offset <= {})",
-                        record.offset, topic, partition, up_to_offset);
+
+            // Log which batches will be removed
+            for metadata in &buffer.batch_metadata {
+                if metadata.last_offset <= up_to_offset {
+                    tracing::info!("FLUSH→REMOVE: Will remove batch base_offset={}, last_offset={} from {}-{} (last_offset <= {})",
+                        metadata.base_offset, metadata.last_offset, topic, partition, up_to_offset);
                 }
             }
-            
-            // CRITICAL FIX: Only remove records with offset <= up_to_offset
-            // Keep all records with offset > up_to_offset (they haven't been flushed yet)
-            let before_count = buffer.records.len();
-            buffer.records.retain(|record| record.offset > up_to_offset);
-            let removed_count = before_count - buffer.records.len();
-            
-            // Update base_offset if we removed records from the beginning
-            if !buffer.records.is_empty() && removed_count > 0 {
-                buffer.base_offset = buffer.records[0].offset;
-            } else if buffer.records.is_empty() {
+
+            // CRITICAL FIX: Remove batches where last_offset <= up_to_offset
+            // Keep batches where last_offset > up_to_offset (not fully flushed yet)
+            let mut i = 0;
+            let mut removed_count = 0;
+            while i < buffer.batch_metadata.len() {
+                if buffer.batch_metadata[i].last_offset <= up_to_offset {
+                    buffer.raw_batches.remove(i);
+                    buffer.batch_metadata.remove(i);
+                    removed_count += 1;
+                } else {
+                    i += 1;
+                }
+            }
+
+            // Update base_offset if we removed batches
+            if !buffer.batch_metadata.is_empty() && removed_count > 0 {
+                buffer.base_offset = buffer.batch_metadata[0].base_offset;
+            } else if buffer.batch_metadata.is_empty() {
                 // If buffer is now empty, set base_offset to continue from where we left off
                 buffer.base_offset = up_to_offset + 1;
             }
-            
+
             // Always update flushed_offset to track progress
             buffer.flushed_offset = up_to_offset;
-            
-            tracing::warn!("FLUSH→COMPLETE: Removed {} flushed records (up to offset {}) from buffer for {}-{}, {} records remain",
-                removed_count, up_to_offset, topic, partition, buffer.records.len());
+
+            tracing::info!("FLUSH→COMPLETE: Removed {} flushed batches (up to offset {}) from buffer for {}-{}, {} batches remain",
+                removed_count, up_to_offset, topic, partition, buffer.raw_batches.len());
         }
-        
+
         Ok(())
     }
     

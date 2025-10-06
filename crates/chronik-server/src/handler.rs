@@ -570,6 +570,7 @@ impl RequestHandler {
                 header: ResponseHeader { correlation_id },
                 throttle_time_ms: 0,
                 topics: vec![],
+                group_id: Some(request.group_id.clone()),  // v8+ requires group_id
             }));
         }
         
@@ -667,6 +668,7 @@ impl RequestHandler {
             header: ResponseHeader { correlation_id },
             throttle_time_ms: 0,
             topics: response_topics,
+            group_id: Some(request.group_id.clone()),  // v8+ requires group_id
         }))
     }
     
