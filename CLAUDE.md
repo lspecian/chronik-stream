@@ -386,5 +386,14 @@ chronik-stream/
 - **CRITICAL**: On macOS development, NEVER use Docker for testing Chronik
 - Docker builds take too long on macOS and Docker networking doesn't work well on macOS
 - Always test Chronik natively with `cargo run --bin chronik-server`
-- Use real Kafka clients (kafka-python, KSQLDB, etc.) for integration testing
+- **CRITICAL**: Test with THE ACTUAL CLIENT that reported the bug
+  - If Java clients report issues, test with Java clients (KSQLDB, kafka-console-consumer, Java producer/consumer)
+  - If Python clients report issues, test with Python clients (kafka-python)
+  - Testing with a different client than the one that failed is NOT testing
+- **CRITICAL**: Test the EXACT failure scenario reported by the user
+  - If user reports CRC errors, verify CRC validation passes
+  - If user reports connection failures, verify connections succeed
+  - Reproducing success with a different scenario is NOT testing the fix
+- Java client testing location: `ksql/confluent-7.5.0/` contains KSQLDB and Java Kafka libraries
 - Test BEFORE committing, tagging, or pushing any release
+- **DO THINGS PROPERLY** - There is no point in doing things halfway or incorrectly. Properly is the normal, it's how you do things.
