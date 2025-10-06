@@ -364,18 +364,27 @@ chronik-stream/
 4. **COMPLETE SOLUTIONS** - Finish what you start, test thoroughly, document properly
 5. **ARCHITECTURAL INTEGRITY** - One implementation, not multiple partial ones
 6. **PROFESSIONAL STANDARDS** - Write code as if going to production tomorrow
+7. **NEVER RELEASE WITHOUT TESTING** - CRITICAL: Do NOT commit, tag, or push releases without actual testing
+8. **NEVER CLAIM PRODUCTION-READY WITHOUT TESTING** - Do NOT claim anything is ready, fixed, or production-ready without verification
 
 **Development Process:**
 1. Understand existing code fully before changes
 2. Plan properly - comprehensive plans, not quick fixes
 3. Implement correctly - use the right approach even if it takes longer
-4. Test thoroughly - verify all functionality with real clients
+4. **TEST FIRST, RELEASE SECOND** - ALWAYS test changes with real clients BEFORE committing/tagging
 5. Clean as you go - no experimental files or dead code
 6. Document decisions - explain architectural choices and trade-offs
 
 **Quality Metrics:**
 - Code should be production-ready on first implementation
-- All features MUST be tested with real Kafka clients
+- All features MUST be tested with real Kafka clients BEFORE release
 - Error handling must be comprehensive
 - Performance considered in every decision
 - Security and reliability are non-negotiable
+
+**Testing Requirements:**
+- **CRITICAL**: On macOS development, NEVER use Docker for testing Chronik
+- Docker builds take too long on macOS and Docker networking doesn't work well on macOS
+- Always test Chronik natively with `cargo run --bin chronik-server`
+- Use real Kafka clients (kafka-python, KSQLDB, etc.) for integration testing
+- Test BEFORE committing, tagging, or pushing any release
