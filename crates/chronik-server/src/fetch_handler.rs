@@ -805,12 +805,7 @@ impl FetchHandler {
                 segment_info.segment_id, segment.raw_kafka_batches.len()
             );
 
-            if !segment.raw_kafka_batches.is_empty() {
-                if combined_bytes.len() + segment.raw_kafka_batches.len() > max_bytes as usize && !combined_bytes.is_empty() {
-                    break;
-                }
-                combined_bytes.extend_from_slice(&segment.raw_kafka_batches);
-            } else {
+            if segment.raw_kafka_batches.is_empty() {
                 // Segment doesn't have raw bytes (v1 format or indexed-only)
                 // Cannot preserve CRC, need to fall back to parsed records
                 tracing::warn!(
@@ -818,6 +813,64 @@ impl FetchHandler {
                     segment_info.segment_id
                 );
                 return Ok(None);
+            }
+
+            // CRITICAL FIX: Parse batch headers to filter by offset range
+            // We must ONLY include batches that overlap [fetch_offset, high_watermark)
+            // Otherwise we return wrong batches and clients see CRC errors!
+            let mut cursor = std::io::Cursor::new(&segment.raw_kafka_batches[..]);
+            use std::io::Read;
+            use bytes::Buf;
+
+            while cursor.position() < segment.raw_kafka_batches.len() as u64 {
+                let batch_start = cursor.position() as usize;
+
+                // Read batch header (minimum 61 bytes for v2 format)
+                if (segment.raw_kafka_batches.len() - batch_start) < 61 {
+                    // Not enough bytes for a valid batch
+                    break;
+                }
+
+                // Parse JUST the header to get offsets (without decoding records)
+                let base_offset = (&segment.raw_kafka_batches[batch_start..]).get_i64();
+                let batch_length = (&segment.raw_kafka_batches[batch_start + 8..]).get_i32();
+
+                // Read last_offset_delta at offset 23 (after base_offset, batch_length, partition_leader_epoch, magic, crc, attributes)
+                let last_offset_delta = (&segment.raw_kafka_batches[batch_start + 23..]).get_i32();
+                let last_offset = base_offset + last_offset_delta as i64;
+
+                // Total batch size is: 12 bytes (base_offset + batch_length) + batch_length
+                let total_batch_size = 12 + batch_length as usize;
+
+                tracing::debug!(
+                    "RAW→BATCH: Found batch at offset {}, base_offset={}, last_offset={}, size={}",
+                    batch_start, base_offset, last_offset, total_batch_size
+                );
+
+                // Check if this batch overlaps with requested range [fetch_offset, high_watermark)
+                if last_offset >= fetch_offset && base_offset < high_watermark {
+                    // This batch is in range, include it
+                    if combined_bytes.len() + total_batch_size > max_bytes as usize && !combined_bytes.is_empty() {
+                        // Would exceed max_bytes, stop here
+                        break;
+                    }
+
+                    let batch_bytes = &segment.raw_kafka_batches[batch_start..batch_start + total_batch_size];
+                    combined_bytes.extend_from_slice(batch_bytes);
+
+                    tracing::info!(
+                        "RAW→BATCH: Including {} bytes from batch {}-{}",
+                        total_batch_size, base_offset, last_offset
+                    );
+                } else {
+                    tracing::debug!(
+                        "RAW→BATCH: Skipping batch {}-{} (outside range {}-{})",
+                        base_offset, last_offset, fetch_offset, high_watermark
+                    );
+                }
+
+                // Move to next batch
+                cursor.set_position((batch_start + total_batch_size) as u64);
             }
         }
 
