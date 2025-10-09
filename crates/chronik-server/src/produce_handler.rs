@@ -98,7 +98,7 @@ impl Default for ProduceHandlerConfig {
             batch_size: 16384,
             linger_ms: 10,
             compression_type: CompressionType::Gzip,
-            request_timeout_ms: 30000,
+            request_timeout_ms: 120000,  // 120 seconds (increased from 30s to handle slow topic auto-creation)
             buffer_memory: 32 * 1024 * 1024, // 32MB
             auto_create_topics_enable: true,
             num_partitions: 3,
@@ -314,6 +314,85 @@ impl ProduceHandler {
                 "Partition {}-{} not found when applying recovered batch",
                 topic, partition
             );
+        }
+
+        Ok(())
+    }
+
+    /// Get high watermark for a partition (NEW architecture v1.3.39+)
+    ///
+    /// Returns the next offset that will be assigned = the high watermark.
+    /// This is the SOURCE OF TRUTH for FetchHandler - no need to query metadata store.
+    pub async fn get_high_watermark(&self, topic: &str, partition: i32) -> Result<i64> {
+        let key = (topic.to_string(), partition);
+        let states = self.partition_states.read().await;
+
+        if let Some(state) = states.get(&key) {
+            let high_watermark = state.next_offset.load(Ordering::SeqCst) as i64;
+            Ok(high_watermark)
+        } else {
+            // Partition doesn't exist yet, high watermark is 0
+            Ok(0)
+        }
+    }
+
+    /// Update high watermark in metadata store (for WAL recovery)
+    ///
+    /// NOTE: This is only used during WAL recovery to update the metadata store.
+    /// In normal operation, FetchHandler should call get_high_watermark() instead.
+    pub async fn update_high_watermark(
+        &self,
+        topic: &str,
+        partition: i32,
+        high_watermark: i64,
+    ) -> Result<()> {
+        // Get current log_start_offset or default to 0
+        let log_start_offset = self.metadata_store
+            .get_partition_offset(topic, partition as u32)
+            .await?
+            .map(|(_, lso)| lso)
+            .unwrap_or(0);
+
+        self.metadata_store.update_partition_offset(topic, partition as u32, high_watermark, log_start_offset).await
+            .map_err(|e| Error::Internal(format!("Failed to update partition offset: {}", e)))
+    }
+
+    /// Extract pending batches for WAL writing (v1.3.37)
+    ///
+    /// This method retrieves the batches that were just written to the partition buffer
+    /// so they can be persisted to the WAL. The batches are NOT cleared, as they're still
+    /// needed for serving fetch requests.
+    pub async fn get_pending_batches(&self, topic: &str, partition: i32) -> Result<Vec<Vec<u8>>> {
+        let key = (topic.to_string(), partition);
+
+        let state = {
+            let states = self.partition_states.read().await;
+            states.get(&key).cloned()
+        };
+
+        if let Some(state) = state {
+            let pending = state.pending_batches.lock().await;
+            // Return cloned raw_bytes from all pending batches
+            Ok(pending.iter().map(|b| b.raw_bytes.clone()).collect())
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Clear pending batches after they've been written to WAL (v1.3.43)
+    pub async fn clear_pending_batches(&self, topic: &str, partition: i32) -> Result<()> {
+        let key = (topic.to_string(), partition);
+
+        let state = {
+            let states = self.partition_states.read().await;
+            states.get(&key).cloned()
+        };
+
+        if let Some(state) = state {
+            let mut pending = state.pending_batches.lock().await;
+            let count = pending.len();
+            pending.clear();
+            debug!("Cleared {} pending batches for {}-{} after WAL write", count, topic, partition);
         }
 
         Ok(())
@@ -734,8 +813,87 @@ impl ProduceHandler {
             .await
             .map_err(|_| Error::Internal("Memory limit exceeded".into()))?;
         
-        // Decode record batch
-        let (kafka_batch, _bytes_consumed) = KafkaRecordBatch::decode(records_data)?;
+        // Get or create partition state FIRST to determine base_offset
+        let partition_state = self.get_or_create_partition_state(topic, partition).await?;
+        let base_offset = partition_state.next_offset.load(Ordering::SeqCst);
+
+        // CRITICAL FIX (v1.3.46): Skip modification when offsets match to preserve CRC perfectly
+        // Java Kafka client requires byte-perfect CRC validation. Even header-only updates
+        // can cause CRC recalculation issues. When base_offset matches, store AS-IS.
+        use chronik_storage::canonical_record::CanonicalRecord;
+
+        // Parse incoming base_offset from records_data
+        let incoming_base_offset = if records_data.len() >= 8 {
+            i64::from_be_bytes([
+                records_data[0], records_data[1], records_data[2], records_data[3],
+                records_data[4], records_data[5], records_data[6], records_data[7],
+            ])
+        } else {
+            return Err(Error::Protocol("Invalid record batch: too short".into()));
+        };
+
+        // Check if we need to modify the batch at all
+        let re_encoded_bytes = if incoming_base_offset == base_offset as i64 {
+            // Perfect match - store original bytes AS-IS (preserves CRC perfectly)
+            debug!(
+                "Base offset match ({}) - storing original bytes without modification (byte-perfect CRC preservation)",
+                base_offset
+            );
+            Bytes::copy_from_slice(records_data)
+        } else {
+            // Offset mismatch - need to update header and recalculate CRC
+            debug!(
+                "Base offset mismatch (incoming={}, assigned={}) - updating header and recalculating CRC",
+                incoming_base_offset, base_offset
+            );
+
+            // HEX DUMP: Incoming records_data from producer (only when modifying)
+            if records_data.len() >= 61 {
+                let hex_first_64: String = records_data.iter().take(64).map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
+                debug!("PRODUCE INCOMING (first 64 bytes): {}", hex_first_64);
+            }
+
+            // Update ONLY the header with new base_offset, keep compressed records UNCHANGED
+            let updated = CanonicalRecord::update_header_preserve_records(
+                records_data,
+                base_offset as i64,
+            ).map_err(|e| Error::Protocol(format!("Failed to update batch header: {}", e)))?;
+
+            // HEX DUMP: Re-encoded bytes to be stored (only when modifying)
+            if updated.len() >= 61 {
+                let hex_first_64: String = updated.iter().take(64).map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
+                debug!("PRODUCE STORED (first 64 bytes): {}", hex_first_64);
+            }
+
+            // Log CRC before/after for debugging (only when modifying)
+            if records_data.len() >= 25 && updated.len() >= 25 {
+                let original_crc = u32::from_le_bytes([
+                    records_data[21], records_data[22], records_data[23], records_data[24]
+                ]);
+                let new_crc = u32::from_le_bytes([
+                    updated[21], updated[22], updated[23], updated[24]
+                ]);
+                debug!(
+                    "Header-only update: original_crc=0x{:08x}, new_crc=0x{:08x} (compressed records preserved)",
+                    original_crc, new_crc
+                );
+            }
+
+            updated
+        };
+
+        // Decode the batch (either original or updated)
+        let (kafka_batch, _bytes_consumed) = KafkaRecordBatch::decode(&re_encoded_bytes)?;
+
+        // TODO (Phase 3): Write CanonicalRecord to WAL as V2 record
+        // This will enable layered storage: WAL (hot) → Tantivy segments (warm) → Object store (cold)
+        // Requires adding wal_manager field to ProduceHandler struct
+        //
+        // Example code:
+        // if let Some(ref mut wal_manager) = self.wal_manager {
+        //     let canonical_data = bincode::serialize(&canonical_record)?;
+        //     wal_manager.append_canonical(topic.to_string(), partition, canonical_data).await?;
+        // }
 
         // Validate producer info for idempotence
         if kafka_batch.header.producer_id >= 0 {
@@ -747,11 +905,9 @@ impl ProduceHandler {
             ).await?;
         }
         
-        // Get or create partition state
-        let partition_state = self.get_or_create_partition_state(topic, partition).await?;
+        // partition_state and base_offset already loaded above (before re-encoding)
 
         // Assign offsets and prepare records
-        let base_offset = partition_state.next_offset.load(Ordering::SeqCst);
         let mut records = Vec::with_capacity(kafka_batch.records.len());
         let mut current_offset = base_offset;
         let mut total_bytes = 0u64;
@@ -808,11 +964,11 @@ impl ProduceHandler {
             warn!("Failed to persist partition offset to metadata store: {:?}", e);
         }
         
-        // Buffer the batch with original wire format preserved
+        // Buffer the batch with re-encoded wire format (correct CRC)
         {
             let mut pending = partition_state.pending_batches.lock().await;
             pending.push(BufferedBatch {
-                raw_bytes: records_data.to_vec(),  // Preserve the original wire bytes!
+                raw_bytes: re_encoded_bytes.to_vec(),  // Store re-encoded bytes with correct CRC!
                 records: records.clone(),
                 base_offset: base_offset as i64,
             });
@@ -856,7 +1012,7 @@ impl ProduceHandler {
                         topic: topic.to_string(),
                         partition,
                         offset: last_offset,
-                        data: Bytes::copy_from_slice(records_data),
+                        data: Bytes::copy_from_slice(&re_encoded_bytes),
                         acks_required: -1,
                         response_sender: resp_tx,
                     };
@@ -915,7 +1071,7 @@ impl ProduceHandler {
             if let Err(e) = fetch_handler.update_buffer_with_raw_batch(
                 topic,
                 partition,
-                records_data,  // Original wire-format bytes with correct CRC!
+                &re_encoded_bytes,  // Re-encoded bytes with correct CRC!
                 base_offset as i64,
                 last_offset,
                 record_count,
@@ -1243,164 +1399,31 @@ impl ProduceHandler {
     }
     
     /// Flush pending records to storage
+    ///
+    /// POST-REFACTOR (v1.3.39+): This is now a NO-OP because data persistence happens via:
+    /// 1. WAL writes (handled by WalProduceHandler - ALREADY DONE during produce)
+    /// 2. Background indexing (WalIndexer → Tantivy → Object Store)
+    ///
+    /// The OLD dual-storage path (write_dual_format) has been REMOVED.
+    /// Data is served from: WAL (recent) + Tantivy (older) by FetchHandler.
     async fn flush_partition(
         &self,
         topic: &str,
         partition: i32,
         state: &Arc<PartitionState>,
     ) -> Result<()> {
-        tracing::warn!("FLUSH→START: Starting flush for {}-{}", topic, partition);
-        
-        let batches = {
-            let mut pending = state.pending_batches.lock().await;
-            if pending.is_empty() {
-                return Ok(());
-            }
-            let count = pending.len();
-            tracing::warn!("FLUSH→BATCHES: Flushing {} batches for {}-{}", count, topic, partition);
-            std::mem::take(&mut *pending)
-        };
-        
-        if batches.is_empty() {
-            return Ok(());
-        }
-        
-        // DON'T update buffer here - records should already be in buffer from handle_partition_produce
-        // and we're about to flush them to segments. The buffer should only contain unflushed messages.
-        // After writing to segments, mark_flushed will clear them from the buffer.
-        
-        // Track the highest offset being flushed
-        let mut highest_flushed_offset = -1i64;
-        
-        // Process each batch while preserving original wire format
-        for batch in &batches {
-            // Convert ProduceRecords to Records for storage (indexed format)
-            let storage_records: Vec<Record> = batch.records.iter().map(|r| {
-                // Track the highest offset
-                if r.offset > highest_flushed_offset {
-                    highest_flushed_offset = r.offset;
-                }
-                Record {
-                    offset: r.offset,
-                    timestamp: r.timestamp,
-                    key: r.key.clone(),
-                    value: r.value.clone(),
-                    headers: r.headers.clone(),
-                }
-            }).collect();
-            
-            // Convert to RecordBatch for indexed storage
-            let record_batch = RecordBatch {
-                records: storage_records,
-            };
-        
-            // Write batch with retry logic
-            let mut writer = state.current_writer.lock().await;
-            
-            // Retry up to 3 times with exponential backoff
-            let mut retry_count = 0;
-            let max_retries = 3;
-            let mut backoff = Duration::from_millis(100);
-            
-            loop {
-                // Write both the ORIGINAL raw Kafka batch (preserves CRC) and indexed records
-                match writer.write_dual_format(
-                    topic, 
-                    partition, 
-                    &batch.raw_bytes,  // Use original wire format bytes!
-                    record_batch.clone()
-                ).await {
-                Ok(segment_metadata) => {
-                    // If a segment was created, register it with metadata store
-                    if let Some(metadata) = segment_metadata {
-                        tracing::warn!("SEGMENT→REGISTER: Attempting to register segment {} for {}-{}, path: {}", 
-                            metadata.segment_id, topic, partition, metadata.path);
-                        if let Err(e) = self.metadata_store.persist_segment_metadata(metadata).await {
-                            tracing::error!("SEGMENT→REGISTER: FAILED to persist segment metadata: {:?}", e);
-                        } else {
-                            tracing::warn!("SEGMENT→REGISTER: Successfully registered segment for {}-{}", topic, partition);
-                        }
-                    } else {
-                        tracing::warn!("SEGMENT→REGISTER: No segment metadata returned for {}-{}", topic, partition);
-                    }
-                    
-                    // DO NOT call flush_all here - it drains all segments!
-                    // The segments will be flushed when they reach size/time thresholds
-                    // or when explicitly needed for acks=-1
-                    debug!("Batch written to segment writer");
-                    break;
-                },
-                Err(e) => {
-                    retry_count += 1;
-                    if retry_count > max_retries {
-                        error!("Failed to write batch after {} retries: {:?}", max_retries, e);
-                        return Err(Error::Internal(format!("Storage write failed after retries: {}", e)));
-                    }
-                    
-                    warn!("Storage write failed (attempt {}/{}): {:?}", retry_count, max_retries, e);
-                    
-                    // Update metrics
-                    self.metrics.storage_write_errors.fetch_add(1, Ordering::Relaxed);
-                    self.metrics.storage_write_retries.fetch_add(1, Ordering::Relaxed);
-                    
-                    // Exponential backoff
-                    tokio::time::sleep(backoff).await;
-                    backoff *= 2;
-                }
-            }
-        }  // End of retry loop for current batch
-        }  // End of batch processing loop
-        
-        // Update state
-        let total_records: usize = batches.iter().map(|b| b.records.len()).sum();
-        state.segment_size.fetch_add(total_records as u64 * 100, Ordering::Relaxed); // Approximate size
-        *state.last_flush.lock().await = Instant::now();
-        
-        // NOTE: We no longer update the fetch handler buffer here because
-        // messages are already added to the buffer in handle_partition_produce.
-        // This was causing duplication - messages were being added to the buffer twice!
-        
-        // After successful flush, notify fetch handler to remove flushed records from buffer
-        if highest_flushed_offset >= 0 {
-            if let Some(ref fetch_handler) = self.fetch_handler {
-                if let Err(e) = fetch_handler.mark_flushed(topic, partition, highest_flushed_offset).await {
-                    warn!("Failed to mark records as flushed in fetch handler: {:?}", e);
-                    // Continue anyway - this is not critical for correctness
-                } else {
-                    debug!("Marked records up to offset {} as flushed for {}-{}",
-                        highest_flushed_offset, topic, partition);
-                }
-            }
-        }
+        tracing::debug!("FLUSH→NOOP: Flush called for {}-{} (data already in WAL, will be indexed by WalIndexer)", topic, partition);
 
-        // CRITICAL FIX: Force upload active segment to disk after flush
-        // This ensures data persistence even if rotation threshold not reached
-        // Previously, data was removed from buffer but remained only in memory!
+        // CRITICAL (v1.3.43): Do NOT clear pending_batches here!
+        // Reason: WalProduceHandler reads pending_batches AFTER handle_produce returns.
+        // If background flush task clears them before WAL write, data is lost.
+        // WalProduceHandler will clear them after successfully writing to WAL.
+
+        // Update last flush time
         {
-            let mut writer = state.current_writer.lock().await;
-            match writer.flush_active_to_disk(topic, partition).await {
-                Ok(Some(metadata)) => {
-                    tracing::info!(
-                        "FLUSH→PERSISTED: Uploaded active segment for {}-{} (offsets {}-{}, {} records)",
-                        topic, partition, metadata.start_offset, metadata.end_offset, metadata.record_count
-                    );
-                    // Register segment metadata with metadata store
-                    if let Err(e) = self.metadata_store.persist_segment_metadata(metadata).await {
-                        tracing::error!("FLUSH→ERROR: Failed to register segment metadata: {:?}", e);
-                    }
-                }
-                Ok(None) => {
-                    tracing::debug!("FLUSH→SKIP: No active segment to persist for {}-{}", topic, partition);
-                }
-                Err(e) => {
-                    tracing::error!("FLUSH→ERROR: Failed to flush active segment for {}-{}: {:?}", topic, partition, e);
-                    // Don't fail the entire flush, data is still in WAL
-                }
-            }
+            let mut last_flush = state.last_flush.lock().await;
+            *last_flush = Instant::now();
         }
-
-        debug!("Flushed {} batches with {} total records to {}-{}",
-            batches.len(), total_records, topic, partition);
 
         Ok(())
     }

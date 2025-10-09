@@ -64,71 +64,106 @@ mod wal_record_tests {
     #[test]
     fn test_record_creation_with_key() {
         let record = create_test_record(1, Some("test-key"), "test-value");
-        
-        assert_eq!(record.offset, 1);
-        assert_eq!(record.key, Some(b"test-key".to_vec()));
-        assert_eq!(record.value, b"test-value".to_vec());
-        assert_eq!(record.magic, 0xCA7E);
-        assert_eq!(record.version, 1);
-        assert!(record.crc32 > 0);
-        assert!(record.length > 0);
+
+        // Extract V1 fields
+        let WalRecord::V1 { offset, key, value, magic, version, crc32, length, .. } = record else {
+            panic!("Expected V1 record");
+        };
+
+        assert_eq!(offset, 1);
+        assert_eq!(key, Some(b"test-key".to_vec()));
+        assert_eq!(value, b"test-value".to_vec());
+        assert_eq!(magic, 0xCA7E);
+        assert_eq!(version, 1);
+        assert!(crc32 > 0);
+        assert!(length > 0);
     }
 
     #[test]
     fn test_record_creation_without_key() {
         let record = create_test_record(2, None, "keyless-value");
-        
-        assert_eq!(record.offset, 2);
-        assert_eq!(record.key, None);
-        assert_eq!(record.value, b"keyless-value".to_vec());
-        assert!(record.crc32 > 0);
+
+        let WalRecord::V1 { offset, key, value, crc32, .. } = record else {
+            panic!("Expected V1 record");
+        };
+
+        assert_eq!(offset, 2);
+        assert_eq!(key, None);
+        assert_eq!(value, b"keyless-value".to_vec());
+        assert!(crc32 > 0);
     }
 
     #[test]
     fn test_record_serialization_roundtrip() {
         let original = create_test_record(3, Some("round-trip"), "test-data");
-        
+
         let bytes = original.to_bytes().expect("Serialization should succeed");
         let deserialized = WalRecord::from_bytes(&bytes).expect("Deserialization should succeed");
-        
-        assert_eq!(original.offset, deserialized.offset);
-        assert_eq!(original.key, deserialized.key);
-        assert_eq!(original.value, deserialized.value);
-        assert_eq!(original.crc32, deserialized.crc32);
-        assert_eq!(original.length, deserialized.length);
+
+        // Extract fields from both records for comparison
+        let WalRecord::V1 { offset: orig_offset, key: orig_key, value: orig_value, crc32: orig_crc32, length: orig_length, .. } = original else {
+            panic!("Expected V1 record");
+        };
+        let WalRecord::V1 { offset: deser_offset, key: deser_key, value: deser_value, crc32: deser_crc32, length: deser_length, .. } = deserialized else {
+            panic!("Expected V1 record");
+        };
+
+        assert_eq!(orig_offset, deser_offset);
+        assert_eq!(orig_key, deser_key);
+        assert_eq!(orig_value, deser_value);
+        assert_eq!(orig_crc32, deser_crc32);
+        assert_eq!(orig_length, deser_length);
     }
 
     #[test]
     fn test_record_with_headers() {
         let mut record = create_test_record(4, Some("header-test"), "header-value");
-        record.headers.push(("content-type".to_string(), b"application/json".to_vec()));
-        record.headers.push(("source".to_string(), b"test-producer".to_vec()));
-        
+
+        // Add headers to V1 record
+        if let WalRecord::V1 { ref mut headers, .. } = record {
+            headers.push(("content-type".to_string(), b"application/json".to_vec()));
+            headers.push(("source".to_string(), b"test-producer".to_vec()));
+        } else {
+            panic!("Expected V1 record");
+        }
+
         // Recalculate length and checksum after adding headers
-        record.length = record.calculate_length();
-        record.crc32 = record.calculate_checksum();
-        
+        let new_length = record.calculate_length();
+        let new_crc32 = record.calculate_checksum();
+
+        if let WalRecord::V1 { ref mut length, ref mut crc32, .. } = record {
+            *length = new_length;
+            *crc32 = new_crc32;
+        }
+
         let bytes = record.to_bytes().expect("Serialization should succeed");
         let deserialized = WalRecord::from_bytes(&bytes).expect("Deserialization should succeed");
-        
-        assert_eq!(deserialized.headers.len(), 2);
-        assert_eq!(deserialized.headers[0].0, "content-type");
-        assert_eq!(deserialized.headers[0].1, b"application/json".to_vec());
-        assert_eq!(deserialized.headers[1].0, "source");
-        assert_eq!(deserialized.headers[1].1, b"test-producer".to_vec());
+
+        // Verify headers
+        if let WalRecord::V1 { headers, .. } = deserialized {
+            assert_eq!(headers.len(), 2);
+            assert_eq!(headers[0].0, "content-type");
+            assert_eq!(headers[0].1, b"application/json".to_vec());
+            assert_eq!(headers[1].0, "source");
+            assert_eq!(headers[1].1, b"test-producer".to_vec());
+        } else {
+            panic!("Expected V1 record");
+        }
     }
 
     #[test]
     fn test_record_checksum_verification() {
         let record = create_test_record(5, Some("checksum-test"), "verify-me");
-        
+
         // Valid checksum should pass
         assert!(record.verify_checksum().is_ok());
-        
+
         // Create record with invalid checksum
         let mut invalid_record = record.clone();
-        invalid_record.crc32 = 0xDEADBEEF;
-        
+        if let WalRecord::V1 { ref mut crc32, .. } = invalid_record {
+            *crc32 = 0xDEADBEEF;
+        }
+
         match invalid_record.verify_checksum() {
             Err(WalError::ChecksumMismatch { offset, expected, actual }) => {
                 assert_eq!(offset, 5);
@@ -174,46 +209,71 @@ mod wal_record_tests {
     fn test_record_large_payload() {
         let large_value = "x".repeat(1024 * 1024); // 1MB
         let record = create_test_record(8, Some("large-key"), &large_value);
-        
-        assert_eq!(record.value.len(), 1024 * 1024);
-        assert!(record.length > 1024 * 1024);
-        
+
+        // Extract value from record
+        let WalRecord::V1 { value, length, .. } = &record else {
+            panic!("Expected V1 record");
+        };
+
+        assert_eq!(value.len(), 1024 * 1024);
+        assert!(length > &(1024 * 1024));
+
         // Test serialization/deserialization of large record
         let bytes = record.to_bytes().expect("Large record serialization should succeed");
         let deserialized = WalRecord::from_bytes(&bytes).expect("Large record deserialization should succeed");
-        
-        assert_eq!(deserialized.value.len(), 1024 * 1024);
-        assert_eq!(deserialized.value, record.value);
+
+        let WalRecord::V1 { value: deser_value, .. } = deserialized else {
+            panic!("Expected V1 record");
+        };
+
+        assert_eq!(deser_value.len(), 1024 * 1024);
+        assert_eq!(deser_value, *value);
     }
 
     #[test]
     fn test_record_empty_value() {
         let record = create_test_record(9, Some("empty-value"), "");
-        
-        assert!(record.value.is_empty());
-        assert!(record.length > 0); // Header still has size
-        
+
+        let WalRecord::V1 { value, key, length, .. } = &record else {
+            panic!("Expected V1 record");
+        };
+
+        assert!(value.is_empty());
+        assert!(length > &0); // Header still has size
+
         let bytes = record.to_bytes().expect("Empty value serialization should succeed");
         let deserialized = WalRecord::from_bytes(&bytes).expect("Empty value deserialization should succeed");
-        
-        assert!(deserialized.value.is_empty());
-        assert_eq!(deserialized.key, record.key);
+
+        let WalRecord::V1 { value: deser_value, key: deser_key, .. } = deserialized else {
+            panic!("Expected V1 record");
+        };
+
+        assert!(deser_value.is_empty());
+        assert_eq!(deser_key, *key);
     }
 
     #[test]
     fn test_record_write_to_buffer() {
         let record = create_test_record(10, Some("buffer-test"), "buffer-data");
         let mut buffer = BytesMut::new();
-        
+
         record.write_to(&mut buffer).expect("Write to buffer should succeed");
-        
+
         assert!(!buffer.is_empty());
-        assert_eq!(buffer.len(), record.length as usize);
-        
+        assert_eq!(buffer.len(), record.get_length() as usize);
+
         // Verify we can deserialize from the buffer
         let deserialized = WalRecord::from_bytes(&buffer).expect("Deserialization from buffer should succeed");
-        assert_eq!(deserialized.offset, record.offset);
-        assert_eq!(deserialized.value, record.value);
+
+        let WalRecord::V1 { offset: orig_offset, value: orig_value, .. } = record else {
+            panic!("Expected V1 record");
+        };
+        let WalRecord::V1 { offset: deser_offset, value: deser_value, .. } = deserialized else {
+            panic!("Expected V1 record");
+        };
+
+        assert_eq!(deser_offset, orig_offset);
+        assert_eq!(deser_value, orig_value);
     }
 }
 
@@ -240,12 +300,12 @@ mod wal_segment_tests {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let segment_path = temp_dir.path().join("append_test.log");
         let mut segment = WalSegment::new(1, 0, segment_path);
-        
+
         let record = create_test_record(0, Some("key1"), "value1");
-        let expected_size = record.length;
-        
+        let expected_size = record.get_length();
+
         segment.append(record).await.expect("Append should succeed");
-        
+
         assert_eq!(segment.last_offset, 0);
         assert_eq!(segment.size, expected_size as u64);
         assert_eq!(segment.record_count, 1);
@@ -256,19 +316,19 @@ mod wal_segment_tests {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let segment_path = temp_dir.path().join("multi_append_test.log");
         let mut segment = WalSegment::new(2, 100, segment_path);
-        
+
         let records = vec![
             create_test_record(100, Some("key1"), "value1"),
             create_test_record(101, Some("key2"), "value2"),
             create_test_record(102, None, "value3"),
         ];
-        
+
         let mut total_size = 0;
         for record in records {
-            total_size += record.length as u64;
+            total_size += record.get_length() as u64;
             segment.append(record).await.expect("Append should succeed");
         }
-        
+
         assert_eq!(segment.last_offset, 102);
         assert_eq!(segment.size, total_size);
         assert_eq!(segment.record_count, 3);
@@ -299,21 +359,21 @@ mod wal_segment_tests {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let segment_path = temp_dir.path().join("seal_test.log");
         let mut segment = WalSegment::new(4, 200, segment_path.clone());
-        
+
         // Add some records
         let records = vec![
             create_test_record(200, Some("seal1"), "data1"),
             create_test_record(201, Some("seal2"), "data2"),
         ];
-        
+
         let mut total_size = 0;
         for record in records {
-            total_size += record.length as u64;
+            total_size += record.get_length() as u64;
             segment.append(record).await.expect("Append should succeed");
         }
-        
+
         let sealed = segment.seal().await.expect("Sealing should succeed");
-        
+
         assert_eq!(sealed.id, 4);
         assert_eq!(sealed.base_offset, 200);
         assert_eq!(sealed.last_offset, 201);
@@ -321,7 +381,7 @@ mod wal_segment_tests {
         assert_eq!(sealed.record_count, 2);
         assert_eq!(sealed.path, segment_path);
         assert!(sealed.sealed_at > sealed.created_at);
-        
+
         // Verify file was written
         assert!(segment_path.exists());
         assert!(std::fs::metadata(&segment_path).unwrap().len() > 0);
@@ -781,38 +841,54 @@ mod integration_edge_cases {
         let unicode_key = "测试键🔑";
         let unicode_value = "测试值📝🌍";
         let record = create_test_record(1, Some(unicode_key), unicode_value);
-        
-        assert_eq!(record.key, Some(unicode_key.as_bytes().to_vec()));
-        assert_eq!(record.value, unicode_value.as_bytes().to_vec());
-        
+
+        let WalRecord::V1 { key, value, .. } = &record else {
+            panic!("Expected V1 record");
+        };
+
+        assert_eq!(key, &Some(unicode_key.as_bytes().to_vec()));
+        assert_eq!(value, &unicode_value.as_bytes().to_vec());
+
         // Test serialization roundtrip with Unicode
         let bytes = record.to_bytes().expect("Unicode serialization should succeed");
         let deserialized = WalRecord::from_bytes(&bytes).expect("Unicode deserialization should succeed");
-        
-        assert_eq!(deserialized.key, record.key);
-        assert_eq!(deserialized.value, record.value);
-        
+
+        let WalRecord::V1 { key: deser_key, value: deser_value, .. } = deserialized else {
+            panic!("Expected V1 record");
+        };
+
+        assert_eq!(deser_key, *key);
+        assert_eq!(deser_value, *value);
+
         // Verify Unicode strings are preserved
-        assert_eq!(String::from_utf8(deserialized.key.unwrap()).unwrap(), unicode_key);
-        assert_eq!(String::from_utf8(deserialized.value).unwrap(), unicode_value);
+        assert_eq!(String::from_utf8(deser_key.clone().unwrap()).unwrap(), unicode_key);
+        assert_eq!(String::from_utf8(deser_value.clone()).unwrap(), unicode_value);
     }
 
     #[test]
     fn test_record_with_binary_data() {
         let binary_key = vec![0x00, 0xFF, 0x7F, 0x80, 0xAA, 0x55];
         let binary_value = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01, 0x02, 0x03];
-        
+
         let timestamp = Utc::now().timestamp_millis();
         let record = WalRecord::new(42, Some(binary_key.clone()), binary_value.clone(), timestamp);
-        
-        assert_eq!(record.key, Some(binary_key));
-        assert_eq!(record.value, binary_value);
-        
+
+        let WalRecord::V1 { key, value, .. } = &record else {
+            panic!("Expected V1 record");
+        };
+
+        assert_eq!(key, &Some(binary_key.clone()));
+        assert_eq!(value, &binary_value);
+
         // Test serialization roundtrip with binary data
         let bytes = record.to_bytes().expect("Binary serialization should succeed");
         let deserialized = WalRecord::from_bytes(&bytes).expect("Binary deserialization should succeed");
-        
-        assert_eq!(deserialized.key, record.key);
-        assert_eq!(deserialized.value, record.value);
+
+        let WalRecord::V1 { key: deser_key, value: deser_value, .. } = deserialized else {
+            panic!("Expected V1 record");
+        };
+
+        assert_eq!(deser_key, *key);
+        assert_eq!(deser_value, *value);
     }
 }

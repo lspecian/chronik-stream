@@ -9,7 +9,7 @@ use chronik_common::{Result, Error};
 use chronik_protocol::{ProduceRequest, ProduceResponse};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{info, warn, error, instrument};
+use tracing::{debug, info, warn, error, instrument};
 use bytes::{Bytes, BytesMut, BufMut};
 
 /// WAL-integrated produce handler wrapper
@@ -51,7 +51,12 @@ impl WalProduceHandler {
             inner_handler,
         })
     }
-    
+
+    /// Get reference to the WAL manager for external use (e.g., WAL Indexer)
+    pub fn wal_manager(&self) -> &Arc<RwLock<WalManager>> {
+        &self.wal_manager
+    }
+
     /// Recover from WAL on startup
     pub async fn recover(&self) -> Result<()> {
         info!("Starting WAL recovery...");
@@ -126,112 +131,170 @@ impl WalProduceHandler {
             return Ok(());
         }
 
-        // Get the last offset from recovered records
-        let last_offset = records
-            .iter()
-            .map(|r| r.offset)
-            .max()
-            .unwrap_or(0);
+        use chronik_storage::canonical_record::CanonicalRecord;
+
+        // Process WAL V2 records (CanonicalRecord batches)
+        // V1 records are legacy and we'll skip them during recovery
+        let mut recovered_batches = 0;
+        let mut total_records = 0i64;
+
+        for record in records {
+            if let chronik_wal::record::WalRecord::V2 { canonical_data, .. } = record {
+                // Deserialize CanonicalRecord from WAL
+                match bincode::deserialize::<CanonicalRecord>(canonical_data) {
+                    Ok(canonical_record) => {
+                        // Count records in this batch
+                        total_records += canonical_record.records.len() as i64;
+
+                        // Convert back to Kafka wire format
+                        match canonical_record.to_kafka_batch() {
+                            Ok(kafka_batch) => {
+                                // Apply to produce handler's buffer
+                                self.inner_handler
+                                    .apply_recovered_batch(topic, partition, kafka_batch)
+                                    .await?;
+                                recovered_batches += 1;
+                            }
+                            Err(e) => {
+                                warn!("Failed to encode CanonicalRecord to Kafka batch: {}", e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to deserialize CanonicalRecord from WAL V2: {}", e);
+                    }
+                }
+            }
+            // V1 records are skipped - they're from old format
+        }
 
         info!(
-            "Restoring partition {}-{} state up to offset {}",
-            topic, partition, last_offset
+            "Restoring partition {}-{} state: {} batches, {} records (offsets 0-{})",
+            topic, partition, recovered_batches, total_records, total_records - 1
         );
 
         // Ensure the partition exists in the produce handler
         self.inner_handler
-            .ensure_partition_exists(topic, partition, last_offset + 1)
+            .ensure_partition_exists(topic, partition, total_records)
             .await?;
 
-        // Convert WAL records to buffered batches for the produce handler
-        // This maintains the original wire format for consumers
-        let mut batch_builder = RecordBatchBuilder::new(topic, partition);
-
-        for record in records {
-            batch_builder.add_record(
-                record.offset,
-                record.timestamp,
-                record.key.as_deref(),
-                &record.value,
-            );
-        }
-
-        // Apply the batch to the produce handler's buffers
-        if let Some(batch) = batch_builder.build() {
-            self.inner_handler
-                .apply_recovered_batch(topic, partition, batch)
-                .await?;
-        }
-
         info!(
-            "Successfully restored {} records for partition {}-{}",
-            records.len(), topic, partition
+            "Successfully recovered {} batches for partition {}-{} (V2 format)",
+            recovered_batches, topic, partition
+        );
+
+        // CRITICAL: Update metadata store high watermark after recovery
+        // This ensures FetchHandler knows data is available for consumption
+        // High watermark = next offset to be written = total_records
+        let high_watermark = total_records;
+        self.inner_handler.update_high_watermark(topic, partition, high_watermark).await
+            .map_err(|e| {
+                warn!("Failed to update high watermark after recovery for {}-{}: {}", topic, partition, e);
+                e
+            })?;
+        info!(
+            "Updated metadata store high watermark for {}-{} to {}",
+            topic, partition, high_watermark
         );
 
         Ok(())
     }
     
     /// Handle produce request with WAL durability
+    ///
+    /// CORRECT APPROACH (v1.3.41): POST-produce WAL writing
+    /// 1. Let ProduceHandler process request (assigns offsets, re-encodes batch)
+    /// 2. Extract the RE-ENCODED batches with assigned offsets from pending_batches
+    /// 3. Convert to CanonicalRecord and write to WAL
+    /// 4. Return response
+    ///
+    /// This ensures we write batches WITH assigned offsets, not raw client batches.
     #[instrument(skip(self, request))]
     pub async fn handle_produce(
         &self,
         request: ProduceRequest,
         correlation_id: i32,
     ) -> Result<ProduceResponse> {
-        // CRITICAL: Write to WAL BEFORE any other processing
-        // This ensures durability even if we crash after WAL write
-        
-        let mut wal_records = Vec::new();
-        
-        // Convert produce request to WAL records
-        for topic_data in &request.topics {
-            for partition_data in &topic_data.partitions {
-                // Parse the raw record batch data
-                let records = parse_record_batch(&partition_data.records)?;
-                
-                for record in records {
-                    let wal_record = WalRecord::new(
-                        record.offset,
-                        record.key.clone(),
-                        record.value.clone(),
-                        record.timestamp,
-                    );
-                    
-                    wal_records.push((
-                        topic_data.name.clone(),
-                        partition_data.index,
-                        wal_record,
-                    ));
-                }
-            }
-        }
-        
-        // Write all records to WAL with fsync
+        use chronik_storage::canonical_record::CanonicalRecord;
+
+        // Store topic-partition info for WAL writing
+        let topic_partitions: Vec<(String, i32)> = request.topics.iter()
+            .flat_map(|t| t.partitions.iter().map(move |p| (t.name.clone(), p.index)))
+            .collect();
+
+        // Step 1: Let ProduceHandler process the request
+        // This assigns offsets, re-encodes batch with correct base_offset and CRC
+        let response = self.inner_handler.handle_produce(request, correlation_id).await?;
+
+        // Step 2: Extract RE-ENCODED batches and write to WAL
         {
             let mut manager = self.wal_manager.write().await;
-            
-            for (topic, partition, record) in wal_records {
-                // This will fsync before returning
-                manager.append(topic, partition, vec![record]).await
-                    .map_err(|e| {
-                        error!("Failed to write to WAL: {}", e);
-                        Error::Internal(format!("WAL write failed: {}", e))
-                    })?;
+
+            for (topic, partition) in &topic_partitions {
+                // Get the re-encoded batches ProduceHandler just created
+                match self.inner_handler.get_pending_batches(topic, *partition).await {
+                    Ok(batches) if !batches.is_empty() => {
+                        debug!("Writing {} re-encoded batches to WAL for {}-{}", batches.len(), topic, partition);
+
+                        for batch_bytes in batches {
+                            // Convert Kafka v2 batch → CanonicalRecord
+                            // These bytes have CORRECT base_offset (assigned by ProduceHandler)
+                            match CanonicalRecord::from_kafka_batch(&batch_bytes) {
+                                Ok(mut canonical_record) => {
+                                    // CRITICAL FIX (v1.3.46): Preserve original compressed bytes
+                                    // for byte-perfect CRC validation by Java Kafka clients.
+                                    // Store the ENTIRE RecordBatch wire format (all fields intact).
+                                    canonical_record.compressed_records_wire_bytes = Some(batch_bytes.clone());
+                                    debug!(
+                                        "Stored {} bytes of original wire format for CRC preservation",
+                                        batch_bytes.len()
+                                    );
+
+                                    // Serialize with bincode for WAL V2
+                                    match bincode::serialize(&canonical_record) {
+                                        Ok(serialized) => {
+                                            // Write to WAL V2
+                                            if let Err(e) = manager.append_canonical(topic.clone(), *partition, serialized).await {
+                                                error!("Failed to write CanonicalRecord to WAL: {}", e);
+                                            } else {
+                                                debug!("Successfully wrote batch to WAL V2 for {}-{}", topic, partition);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            error!("Failed to serialize CanonicalRecord: {}", e);
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    debug!("Batch not in v2 format (size: {}), skipping WAL V2: {}", batch_bytes.len(), e);
+                                }
+                            }
+                        }
+                    }
+                    Ok(_) => {
+                        // No batches for this partition (could be error response)
+                    }
+                    Err(e) => {
+                        warn!("Failed to get pending batches for {}-{}: {}", topic, partition, e);
+                    }
+                }
             }
-            
-            // Force flush to ensure durability
-            manager.flush_all().await
-                .map_err(|e| {
-                    error!("Failed to flush WAL: {}", e);
-                    Error::Internal(format!("WAL flush failed: {}", e))
-                })?;
+
+            // Flush WAL immediately for durability
+            if let Err(e) = manager.flush_all().await {
+                error!("Failed to flush WAL: {}", e);
+            }
         }
-        
-        info!("WAL write complete, proceeding with produce handling");
-        
-        // Now that WAL write is complete, proceed with normal handling
-        // This updates in-memory buffers and may write to segments
-        self.inner_handler.handle_produce(request, correlation_id).await
+
+        // CRITICAL (v1.3.43): Clear pending_batches AFTER writing to WAL
+        // This prevents duplicate WAL writes and memory leaks
+        for (topic, partition) in &topic_partitions {
+            if let Err(e) = self.inner_handler.clear_pending_batches(topic, *partition).await {
+                warn!("Failed to clear pending batches for {}-{}: {}", topic, partition, e);
+            }
+        }
+
+        Ok(response)
     }
     
     /// Truncate WAL after successful flush to segments
@@ -269,113 +332,14 @@ impl WalProduceHandler {
     }
 }
 
-/// Parse raw record batch bytes into structured records
-fn parse_record_batch(data: &[u8]) -> Result<Vec<ParsedRecord>> {
-    use chronik_storage::kafka_records::KafkaRecordBatch;
-
-    // Parse using the existing Kafka record batch decoder
-    let (batch, _bytes_consumed) = KafkaRecordBatch::decode(data)?;
-
-    let mut parsed_records = Vec::new();
-    let base_offset = batch.header.base_offset;
-    let base_timestamp = batch.header.base_timestamp;
-
-    for record in batch.records {
-        let offset = base_offset + record.offset_delta as i64;
-        let timestamp = base_timestamp + record.timestamp_delta;
-
-        parsed_records.push(ParsedRecord {
-            offset,
-            timestamp,
-            key: record.key.map(|k| k.to_vec()),
-            value: record.value.map(|v| v.to_vec()).unwrap_or_default(),
-        });
-    }
-
-    info!("Parsed {} records from record batch", parsed_records.len());
-    Ok(parsed_records)
-}
-
-#[derive(Debug)]
-struct ParsedRecord {
-    offset: i64,
-    timestamp: i64,
-    key: Option<Vec<u8>>,
-    value: Vec<u8>,
-}
-
-/// Helper to build record batches from WAL records
-struct RecordBatchBuilder {
-    topic: String,
-    partition: i32,
-    records: Vec<WalRecord>,
-}
-
-impl RecordBatchBuilder {
-    fn new(topic: &str, partition: i32) -> Self {
-        Self {
-            topic: topic.to_string(),
-            partition,
-            records: Vec::new(),
-        }
-    }
-
-    fn add_record(
-        &mut self,
-        offset: i64,
-        timestamp: i64,
-        key: Option<&[u8]>,
-        value: &[u8],
-    ) {
-        self.records.push(WalRecord::new(
-            offset,
-            key.map(|k| k.to_vec()),
-            value.to_vec(),
-            timestamp,
-        ));
-    }
-
-    fn build(self) -> Option<Bytes> {
-        if self.records.is_empty() {
-            return None;
-        }
-
-        // Build a simple Kafka record batch format
-        // This is a simplified version - in production you'd use the full Kafka protocol
-        let mut buf = BytesMut::new();
-
-        // Write batch header (simplified)
-        buf.put_i64(self.records.first()?.offset); // base offset
-        buf.put_i32(self.records.len() as i32); // batch length
-        buf.put_i64(self.records.first()?.timestamp); // base timestamp
-
-        // Write records
-        for record in &self.records {
-            // Record length
-            let record_size = 8 + 8 + // offset + timestamp
-                4 + record.key.as_ref().map_or(0, |k| k.len()) + // key length + key
-                4 + record.value.len(); // value length + value
-
-            buf.put_i32(record_size as i32);
-            buf.put_i64(record.offset);
-            buf.put_i64(record.timestamp);
-
-            // Key
-            if let Some(key) = &record.key {
-                buf.put_i32(key.len() as i32);
-                buf.put_slice(key);
-            } else {
-                buf.put_i32(-1); // null key
-            }
-
-            // Value
-            buf.put_i32(record.value.len() as i32);
-            buf.put_slice(&record.value);
-        }
-
-        Some(buf.freeze())
-    }
-}
+// REMOVED v1.3.36: Legacy V1 parsing code
+// The following were part of the old approach that parsed individual records:
+// - parse_record_batch() - parsed RecordBatch into individual ParsedRecord structs
+// - ParsedRecord - temporary struct for individual records
+// - RecordBatchBuilder - helper to rebuild batches from V1 records (with add_record/build methods)
+//
+// NEW APPROACH (v1.3.36): We now use CanonicalRecord which preserves the entire
+// Kafka batch structure for exact round-trip and CRC preservation
 
 #[cfg(test)]
 mod tests {

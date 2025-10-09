@@ -208,7 +208,7 @@ async fn test_rotation_load_single_partition() {
                 &format!("batch-{}-msg-{}", batch, i),
                 MESSAGE_SIZE
             );
-            metrics.total_bytes += record.length as u64;
+            metrics.total_bytes += record.get_length() as u64;
             batch_records.push(record);
             current_offset += 1;
         }
@@ -316,7 +316,7 @@ async fn test_rotation_load_multiple_partitions() {
                         &format!("p{}-batch{}-msg{}", partition, batch, i),
                         MESSAGE_SIZE
                     );
-                    partition_metrics.total_bytes += record.length as u64;
+                    partition_metrics.total_bytes += record.get_length() as u64;
                     batch_records.push(record);
                     current_offset += 1;
                 }
@@ -435,7 +435,7 @@ async fn test_rotation_under_memory_pressure() {
             Utc::now().timestamp_millis()
         );
         
-        metrics.total_bytes += record.length as u64;
+        metrics.total_bytes += record.get_length() as u64;
         
         manager.append("pressure-test-topic".to_string(), 0, vec![record]).await
             .expect("Append under pressure should succeed");
@@ -545,8 +545,8 @@ async fn test_rotation_data_integrity() {
         
         // Verify record checksum before writing
         record.verify_checksum().expect("Record checksum should be valid before writing");
-        
-        written_records.push((current_offset, key.clone(), value.clone(), record.crc32));
+
+        written_records.push((current_offset, key.clone(), value.clone(), record.get_crc32()));
         
         manager.append("integrity-test-topic".to_string(), 0, vec![record]).await
             .expect("Append should succeed");
@@ -613,7 +613,7 @@ async fn test_rotation_performance_benchmarks() {
             MESSAGE_SIZE
         );
         
-        metrics.total_bytes += record.length as u64;
+        metrics.total_bytes += record.get_length() as u64;
         
         manager.append("benchmark-topic".to_string(), 0, vec![record]).await
             .expect("Append should succeed");

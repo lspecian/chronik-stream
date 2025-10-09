@@ -24,7 +24,7 @@ use tantivy::{
     schema::{FieldType, Value},
     Term,
 };
-use tracing::error;
+use tracing::{error, debug};
 use uuid::Uuid;
 
 /// Health check response
@@ -58,43 +58,72 @@ pub async fn search_all(
     Json(request): Json<SearchRequest>,
 ) -> impl IntoResponse {
     let start = SystemTime::now();
-    
+
     // Generate cache key
     let cache_key = crate::cache::QueryCache::generate_key(None, &request);
-    
+
     // Check cache first
     if let Some(cached_response) = api.cache.get(&cache_key) {
         return Json(cached_response);
     }
-    
+
     // Search across all indices
     let mut all_hits = Vec::new();
     let indices = api.indices.clone();
-    
+
+    // Search in-memory indices (created via REST API)
     for entry in indices.iter() {
         let index_name = entry.key().clone();
         let state = entry.value();
-        
+
         match search_in_index(&index_name, &state, &request).await {
             Ok(mut hits) => all_hits.append(&mut hits),
             Err(e) => {
-                error!("Error searching index {}: {}", index_name, e);
+                error!("Error searching in-memory index {}: {}", index_name, e);
             }
         }
     }
-    
+
+    // Also search WAL-created indices from disk
+    if let Some(base_path) = api.get_index_base_path() {
+        // Search WAL indices (data/tantivy_indexes/)
+        match search_wal_indices(base_path, &request).await {
+            Ok(mut hits) => {
+                debug!("Found {} hits from WAL-created indices", hits.len());
+                all_hits.append(&mut hits);
+            }
+            Err(e) => {
+                error!("Error searching WAL-created indices: {}", e);
+            }
+        }
+
+        // Also search real-time indices (data/index/) - they're in a sibling directory
+        let realtime_path = base_path.replace("tantivy_indexes", "index");
+        match search_wal_indices(&realtime_path, &request).await {
+            Ok(mut hits) => {
+                debug!("Found {} hits from real-time indices", hits.len());
+                all_hits.append(&mut hits);
+            }
+            Err(e) => {
+                debug!("No real-time indices found (this is normal): {}", e);
+            }
+        }
+    }
+
     // Sort and limit results
     all_hits.sort_by(|a, b| b._score.partial_cmp(&a._score).unwrap());
     all_hits.truncate(request.size);
-    
+
     let took = start.elapsed().unwrap_or_default().as_millis() as u64;
-    
+
+    let total_shards = indices.len() as u32 + if api.get_index_base_path().is_some() { 1 } else { 0 };
+
     let response = SearchResponse {
         took,
         timed_out: false,
         _shards: ShardInfo {
-            total: indices.len() as u32,
-            successful: indices.len() as u32,
+            total: total_shards,
+            successful: total_shards,
             skipped: 0,
             failed: 0,
         },
@@ -108,10 +137,10 @@ pub async fn search_all(
         },
         aggregations: None,
     };
-    
+
     // Cache the response
     api.cache.put(cache_key, response.clone());
-    
+
     Json(response)
 }
 
@@ -173,6 +202,143 @@ pub async fn search_index(
     };
     
     Ok(Json(response))
+}
+
+/// Search WAL-created Tantivy indices from disk
+async fn search_wal_indices(base_path: &str, request: &SearchRequest) -> Result<Vec<Hit>> {
+    use std::fs;
+    use std::path::Path;
+    use tantivy::Index;
+
+    let mut all_hits = Vec::new();
+    let base = Path::new(base_path);
+
+    if !base.exists() {
+        debug!("WAL index base path does not exist: {}", base_path);
+        return Ok(all_hits);
+    }
+
+    // Discover all index directories (format: topic-partition)
+    let entries = fs::read_dir(base)
+        .map_err(|e| Error::Internal(format!("Failed to read index directory: {}", e)))?;
+
+    for entry in entries {
+        let entry = entry
+            .map_err(|e| Error::Internal(format!("Failed to read directory entry: {}", e)))?;
+        let path = entry.path();
+
+        if path.is_dir() {
+            let index_name = path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown")
+                .to_string();
+
+            debug!("Attempting to open WAL-created index at: {}", path.display());
+
+            // Try to open the Tantivy index
+            match Index::open_in_dir(&path) {
+                Ok(index) => {
+                    debug!("Successfully opened index: {}", index_name);
+
+                    // Search this index
+                    match search_tantivy_index(&index_name, &index, request).await {
+                        Ok(mut hits) => {
+                            debug!("Found {} hits in index {}", hits.len(), index_name);
+                            all_hits.append(&mut hits);
+                        }
+                        Err(e) => {
+                            error!("Error searching WAL index {}: {}", index_name, e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    debug!("Could not open index at {}: {}", path.display(), e);
+                }
+            }
+        }
+    }
+
+    debug!("Total hits from WAL indices: {}", all_hits.len());
+    Ok(all_hits)
+}
+
+/// Search a Tantivy index directly (for WAL-created indices)
+async fn search_tantivy_index(
+    index_name: &str,
+    index: &tantivy::Index,
+    request: &SearchRequest,
+) -> Result<Vec<Hit>> {
+    let reader = index.reader()
+        .map_err(|e| Error::Internal(format!("Failed to create index reader: {}", e)))?;
+    let searcher = reader.searcher();
+
+    // Build query - for WAL indices, we'll do a match_all by default
+    // since we don't have the schema mapping readily available
+    let schema = index.schema();
+    let query: Box<dyn TantivyQuery> = if let Some(query_dsl) = &request.query {
+        // Try to build query, fall back to match_all if schema mismatch
+        match build_tantivy_query(query_dsl, &schema) {
+            Ok(q) => q,
+            Err(e) => {
+                debug!("Could not build query for index {}: {}, using match_all", index_name, e);
+                Box::new(AllQuery)
+            }
+        }
+    } else {
+        Box::new(AllQuery)
+    };
+
+    // Execute search
+    let top_docs = searcher.search(&*query, &TopDocs::with_limit(request.size).and_offset(request.from))
+        .map_err(|e| Error::Internal(format!("Search failed: {}", e)))?;
+
+    // Collect results
+    let mut hits = Vec::new();
+    for (score, doc_address) in top_docs {
+        let doc: tantivy::TantivyDocument = searcher.doc(doc_address)
+            .map_err(|e| Error::Internal(format!("Failed to retrieve document: {}", e)))?;
+
+        // Convert Tantivy document to JSON
+        let mut source = serde_json::Map::new();
+        for field in schema.fields() {
+            let field_name = schema.get_field_name(field.0);
+            {
+                let field_values: Vec<_> = doc.get_all(field.0).collect();
+                if !field_values.is_empty() {
+                    let json_values: Vec<serde_json::Value> = field_values.into_iter().filter_map(|v| {
+                        // Convert Tantivy values to JSON
+                        v.as_str().map(|s| serde_json::Value::String(s.to_string()))
+                            .or_else(|| v.as_u64().map(|n| serde_json::Value::Number(n.into())))
+                            .or_else(|| v.as_i64().map(|n| serde_json::Value::Number(n.into())))
+                            .or_else(|| v.as_f64().and_then(|f| serde_json::Number::from_f64(f).map(serde_json::Value::Number)))
+                            .or_else(|| v.as_bytes().map(|b| serde_json::Value::String(format!("{:?}", b))))
+                    }).collect();
+
+                    if json_values.len() == 1 {
+                        source.insert(field_name.to_string(), json_values.into_iter().next().unwrap());
+                    } else if !json_values.is_empty() {
+                        source.insert(field_name.to_string(), serde_json::Value::Array(json_values));
+                    }
+                }
+            }
+        }
+
+        // Generate document ID
+        let doc_id = source.get("offset")
+            .and_then(|v| v.as_i64())
+            .map(|o| o.to_string())
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+        hits.push(Hit {
+            _index: index_name.to_string(),
+            _id: doc_id,
+            _score: Some(score),
+            _source: serde_json::Value::Object(source),
+            highlight: None,
+        });
+    }
+
+    Ok(hits)
 }
 
 /// Helper function to search within a single index

@@ -50,20 +50,20 @@ impl WalSegment {
     /// Append a record to the segment
     #[instrument(skip(self, record), fields(
         segment_id = self.id,
-        record_offset = record.offset,
-        record_length = record.length,
+        record_offset = record.get_offset().unwrap_or(-1),
+        record_length = record.get_length(),
         bytes_written = tracing::field::Empty,
         append_duration_us = tracing::field::Empty
     ))]
     pub async fn append(&mut self, record: WalRecord) -> Result<()> {
         let append_start = Instant::now();
-        let record_size = record.length;
+        let record_size = record.get_length();
 
         let mut buffer = self.buffer.write().await;
         record.write_to(&mut buffer)?;
-        
-        self.last_offset = record.offset;
-        self.size += record.length as u64;
+
+        self.last_offset = record.get_offset().unwrap_or(self.last_offset);
+        self.size += record.get_length() as u64;
         self.record_count += 1;
         
         let append_duration = append_start.elapsed();

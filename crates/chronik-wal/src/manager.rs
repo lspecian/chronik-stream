@@ -310,7 +310,31 @@ impl WalManager {
         
         Ok(())
     }
-    
+
+    /// Append a CanonicalRecord batch as a V2 WAL record
+    /// Takes pre-serialized canonical data to avoid circular dependencies
+    #[instrument(skip(self, canonical_data), fields(
+        topic = %topic,
+        partition = partition,
+        data_size = canonical_data.len()
+    ))]
+    pub async fn append_canonical(
+        &mut self,
+        topic: String,
+        partition: i32,
+        canonical_data: Vec<u8>,
+    ) -> Result<()> {
+        // Create V2 WAL record
+        let wal_record = WalRecord::new_v2(
+            topic.clone(),
+            partition,
+            canonical_data,
+        );
+
+        // Append as a single record
+        self.append(topic, partition, vec![wal_record]).await
+    }
+
     /// Read records from a specific offset
     #[instrument(skip(self), fields(
         topic = topic,
@@ -344,17 +368,108 @@ impl WalManager {
         );
         
         // First check active segment buffer
-        {
+        let (active_base_offset, active_path) = {
             let active_segment = partition_wal.active_segment.read().await;
             let buffer = active_segment.buffer.read().await;
-            
+
             if !buffer.is_empty() && offset >= active_segment.base_offset {
                 debug!("Checking active segment buffer for offset {}", offset);
-                
+
                 // Parse records from active segment buffer
                 if let Ok(parsed_records) = self.parse_buffer_records(&buffer, active_segment.base_offset, offset, max_records) {
                     records.extend(parsed_records);
                     info!("Found {} records in active segment buffer", records.len());
+                }
+            }
+
+            (active_segment.base_offset, active_segment.path.clone())
+        };
+
+        // If buffer was empty but we still need records, check active segment FILE
+        if records.is_empty() && offset >= active_base_offset {
+            debug!("Active buffer empty, checking active segment file: {:?}", active_path);
+
+            if let Ok(file_data) = tokio::fs::read(&active_path).await {
+                if !file_data.is_empty() {
+                    debug!("Reading {} bytes from active segment file", file_data.len());
+
+                    // Parse V2 WAL records from file
+                    // V2 format: magic(2) + version(1) + flags(1) + length(4) + crc32(4) + topic_len(2) + topic + partition(4) + canonical_data_len(4) + canonical_data
+                    let mut cursor = 0;
+                    let mut file_records = Vec::new();
+
+                    while cursor < file_data.len() && file_records.len() < max_records {
+                        use byteorder::{LittleEndian, ReadBytesExt};
+                        use std::io::Cursor as IoCursor;
+
+                        debug!("=== Parsing record at cursor {} (file_data.len={}, file_records.len={}) ===", cursor, file_data.len(), file_records.len());
+
+                        // Need at least 12 bytes for V2 header (magic+version+flags+length+crc32)
+                        if cursor + 12 > file_data.len() {
+                            debug!("Not enough data for header at cursor {}: need 12 bytes, have {}", cursor, file_data.len() - cursor);
+                            break;
+                        }
+
+                        let record_start = cursor;
+                        let mut rdr = IoCursor::new(&file_data[cursor..]);
+
+                        let magic = rdr.read_u16::<LittleEndian>().unwrap();
+                        let version = rdr.read_u8().unwrap();
+                        let _flags = rdr.read_u8().unwrap();
+                        let length = rdr.read_u32::<LittleEndian>().unwrap() as usize;
+                        let _crc32 = rdr.read_u32::<LittleEndian>().unwrap();
+
+                        debug!("Header: magic={:x}, version={}, length={}, crc32={:x}", magic, version, length, _crc32);
+
+                        // Validate magic and version
+                        if magic != 0xCA7E || version != 2 {
+                            debug!("Invalid WAL record at cursor {}: magic={:x}, version={}", cursor, magic, version);
+                            break;
+                        }
+
+                        // Parse V2 record body
+                        let topic_len = rdr.read_u16::<LittleEndian>().unwrap() as usize;
+                        let mut topic_bytes = vec![0u8; topic_len];
+                        std::io::Read::read_exact(&mut rdr, &mut topic_bytes).unwrap();
+                        let topic = String::from_utf8(topic_bytes).unwrap();
+
+                        let partition = rdr.read_i32::<LittleEndian>().unwrap();
+
+                        let canonical_data_len = rdr.read_u32::<LittleEndian>().unwrap() as usize;
+                        let mut canonical_data = vec![0u8; canonical_data_len];
+                        std::io::Read::read_exact(&mut rdr, &mut canonical_data).unwrap();
+
+                        // Calculate actual bytes consumed by checking cursor position
+                        // Create WalRecord::V2
+                        let record = WalRecord::V2 {
+                            magic,
+                            version,
+                            flags: _flags,
+                            length: length as u32,
+                            crc32: _crc32,
+                            topic,
+                            partition,
+                            canonical_data,
+                        };
+
+                        // V2 records don't have offset in WAL record - it's in CanonicalRecord
+                        // For recovery, we need ALL V2 records for this partition
+                        file_records.push(record);
+
+                        // CRITICAL FIX: Advance cursor by FULL record size (header + body)
+                        // V2 format: 12-byte header (magic[2] + version[1] + flags[1] + length[4] + crc32[4]) + variable body
+                        // The `length` field contains the size of everything AFTER the header
+                        let bytes_consumed = rdr.position() as usize; // Body bytes read
+                        let total_record_size = 12 + bytes_consumed; // Header + body
+
+                        debug!("Advancing cursor from {} by {} bytes (header[12] + body[{}], stored length was {})",
+                            record_start, total_record_size, bytes_consumed, length);
+                        cursor = record_start + total_record_size;
+                    }
+
+                    let count = file_records.len();
+                    records.extend(file_records);
+                    info!("Found {} V2 records in active segment file", count);
                 }
             }
         }
@@ -590,22 +705,39 @@ impl WalManager {
                 (active.path.clone(), buffer.to_vec(), active.id)
             };
             
-            // Force flush buffer to disk
+            // Force flush buffer to disk (APPEND mode, not overwrite)
             let fsync_start = Instant::now();
-            tokio::fs::write(&path, &buffer_data).await?;
+            use tokio::fs::OpenOptions;
+            use tokio::io::AsyncWriteExt;
+
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)  // CRITICAL: APPEND, not overwrite
+                .open(&path)
+                .await?;
+            file.write_all(&buffer_data).await?;
+            file.sync_all().await?;  // Ensure data is on disk
+
             let fsync_duration = fsync_start.elapsed();
             total_fsync_duration += fsync_duration;
-            
+
             flushed_count += 1;
             total_bytes += buffer_data.len() as u64;
-            
+
+            // Clear buffer after successful flush (data is now on disk)
+            {
+                let active = wal.active_segment.read().await;
+                let mut buffer = active.buffer.write().await;
+                buffer.clear();
+            }
+
             debug!(
                 topic = %tp.topic,
                 partition = tp.partition,
                 segment_id = segment_id,
                 bytes_flushed = buffer_data.len(),
                 fsync_duration_ms = fsync_duration.as_millis() as u64,
-                "WAL segment flushed to disk"
+                "WAL segment flushed to disk and buffer cleared"
             );
         }
         
@@ -717,16 +849,18 @@ impl WalManager {
             match WalRecord::from_bytes(record_bytes) {
                 Ok(record) => {
                     // Check if this record is within our offset range
-                    if record.offset >= start_offset {
+                    // Note: Only V1 records have offset, V2 records are accepted always
+                    let record_offset = record.get_offset().unwrap_or(start_offset);
+                    if record_offset >= start_offset {
                         debug!(
-                            record_offset = record.offset,
+                            record_offset = record_offset,
                             record_size = record_bytes.len(),
                             "Found record in range"
                         );
                         records.push(record);
                     } else {
                         debug!(
-                            record_offset = record.offset,
+                            record_offset = record_offset,
                             start_offset = start_offset,
                             "Skipping record before start offset"
                         );
@@ -750,6 +884,167 @@ impl WalManager {
         );
         
         Ok(records)
+    }
+
+    /// Get list of sealed segment IDs across all partitions
+    /// Returns segment identifiers like "topic-0-segment-123"
+    pub fn get_sealed_segments(&self) -> Vec<String> {
+        let mut sealed = Vec::new();
+
+        for entry in self.partitions.iter() {
+            let partition_wal = entry.value();
+            for sealed_segment in &partition_wal.sealed_segments {
+                let segment_id = format!(
+                    "{}-{}-segment-{}",
+                    partition_wal.topic,
+                    partition_wal.partition,
+                    sealed_segment.id
+                );
+                sealed.push(segment_id);
+            }
+        }
+
+        debug!(count = sealed.len(), "Found sealed segments");
+        sealed
+    }
+
+    /// Read all records from a specific sealed segment
+    /// segment_id format: "topic-partition-segment-id"
+    pub async fn read_segment(&self, segment_id: &str) -> Result<Vec<WalRecord>> {
+        // Parse segment_id
+        let parts: Vec<&str> = segment_id.split('-').collect();
+        if parts.len() < 4 || parts[parts.len() - 2] != "segment" {
+            return Err(WalError::InvalidFormat(format!(
+                "Invalid segment ID format: {}",
+                segment_id
+            )));
+        }
+
+        let topic = parts[0..parts.len() - 3].join("-");
+        let partition: i32 = parts[parts.len() - 3]
+            .parse()
+            .map_err(|e| WalError::InvalidFormat(format!("Invalid partition number: {}", e)))?;
+        let segment_num: u64 = parts[parts.len() - 1]
+            .parse()
+            .map_err(|e| WalError::InvalidFormat(format!("Invalid segment number: {}", e)))?;
+
+        let tp = TopicPartition {
+            topic: topic.clone(),
+            partition,
+        };
+
+        // Find the sealed segment
+        let partition_wal = self
+            .partitions
+            .get(&tp)
+            .ok_or_else(|| WalError::SegmentNotFound(format!("Partition not found: {}-{}", topic, partition)))?;
+
+        let sealed_segment = partition_wal
+            .sealed_segments
+            .iter()
+            .find(|s| s.id == segment_num)
+            .ok_or_else(|| WalError::SegmentNotFound(format!("Segment not found: {}", segment_id)))?;
+
+        // Read all records from the segment file
+        let segment_data = tokio::fs::read(&sealed_segment.path).await?;
+
+        // Parse records from the segment data
+        let mut records = Vec::new();
+        let mut cursor = 0;
+
+        while cursor < segment_data.len() {
+            let remaining = &segment_data[cursor..];
+
+            // Need at least minimum header size
+            if remaining.len() < 28 {
+                break;
+            }
+
+            // Read record length
+            let record_length = {
+                use byteorder::{LittleEndian, ReadBytesExt};
+                use std::io::Cursor;
+
+                let mut length_cursor = Cursor::new(&remaining[4..8]);
+                length_cursor.read_u32::<LittleEndian>()?
+            };
+
+            // Check if we have the full record
+            if remaining.len() < record_length as usize {
+                break;
+            }
+
+            // Parse record
+            let record_bytes = &remaining[..record_length as usize];
+            match WalRecord::from_bytes(record_bytes) {
+                Ok(record) => {
+                    records.push(record);
+                    cursor += record_length as usize;
+                }
+                Err(e) => {
+                    warn!(
+                        segment = %segment_id,
+                        cursor = cursor,
+                        error = %e,
+                        "Failed to parse record, stopping"
+                    );
+                    break;
+                }
+            }
+        }
+
+        info!(
+            segment = %segment_id,
+            record_count = records.len(),
+            "Read records from sealed segment"
+        );
+
+        Ok(records)
+    }
+
+    /// Delete a sealed segment after it has been indexed
+    pub async fn delete_segment(&mut self, segment_id: &str) -> Result<()> {
+        // Parse segment_id
+        let parts: Vec<&str> = segment_id.split('-').collect();
+        if parts.len() < 4 || parts[parts.len() - 2] != "segment" {
+            return Err(WalError::InvalidFormat(format!(
+                "Invalid segment ID format: {}",
+                segment_id
+            )));
+        }
+
+        let topic = parts[0..parts.len() - 3].join("-");
+        let partition: i32 = parts[parts.len() - 3]
+            .parse()
+            .map_err(|e| WalError::InvalidFormat(format!("Invalid partition number: {}", e)))?;
+        let segment_num: u64 = parts[parts.len() - 1]
+            .parse()
+            .map_err(|e| WalError::InvalidFormat(format!("Invalid segment number: {}", e)))?;
+
+        let tp = TopicPartition {
+            topic: topic.clone(),
+            partition,
+        };
+
+        // Find and remove the sealed segment
+        if let Some(mut partition_wal) = self.partitions.get_mut(&tp) {
+            if let Some(pos) = partition_wal.sealed_segments.iter().position(|s| s.id == segment_num) {
+                let sealed_segment = partition_wal.sealed_segments.remove(pos);
+
+                // Delete the file
+                tokio::fs::remove_file(&sealed_segment.path).await?;
+
+                info!(
+                    segment = %segment_id,
+                    path = %sealed_segment.path.display(),
+                    "Deleted sealed segment"
+                );
+
+                return Ok(());
+            }
+        }
+
+        Err(WalError::SegmentNotFound(format!("Segment not found: {}", segment_id)))
     }
 }
 
@@ -830,7 +1125,8 @@ mod tests {
 
         // Should only have records with offset >= 10
         for record in &remaining {
-            assert!(record.offset >= 10, "Record offset {} should be >= 10", record.offset);
+            let offset = record.get_offset().unwrap();
+            assert!(offset >= 10, "Record offset {} should be >= 10", offset);
         }
     }
 
@@ -926,9 +1222,9 @@ mod tests {
 
             // Verify record content
             for (i, record) in records.iter().enumerate() {
-                assert_eq!(record.offset, i as i64);
+                assert_eq!(record.get_offset().unwrap(), i as i64);
                 let expected_value = format!("value-p{}-{}", partition, i);
-                assert_eq!(record.value, expected_value.as_bytes());
+                assert_eq!(record.get_value().unwrap(), expected_value.as_bytes());
             }
         }
     }

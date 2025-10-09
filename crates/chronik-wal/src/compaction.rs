@@ -322,9 +322,17 @@ impl WalCompactor {
     fn apply_key_based_compaction(&self, records: Vec<WalRecord>) -> Result<Vec<WalRecord>> {
         let mut key_to_record: HashMap<Vec<u8>, WalRecord> = HashMap::new();
         let mut keyless_records = Vec::new();
+        let mut v2_records = Vec::new();
 
         for record in records {
-            if let Some(key) = &record.key {
+            // V2 records are already compacted batches, keep them as-is
+            if record.is_v2() {
+                v2_records.push(record);
+                continue;
+            }
+
+            // Handle V1 records
+            if let Some(key) = record.get_key() {
                 // Keep the latest record for each key
                 key_to_record.insert(key.clone(), record);
             } else {
@@ -335,9 +343,10 @@ impl WalCompactor {
 
         let mut compacted_records: Vec<WalRecord> = key_to_record.into_values().collect();
         compacted_records.extend(keyless_records);
+        compacted_records.extend(v2_records);
 
-        // Sort by offset to maintain order
-        compacted_records.sort_by_key(|r| r.offset);
+        // Sort by offset to maintain order (V1 only, V2 doesn't have offset)
+        compacted_records.sort_by_key(|r| r.get_offset().unwrap_or(i64::MAX));
 
         // Apply retention ratio if needed
         self.apply_retention_ratio(compacted_records)
@@ -354,11 +363,18 @@ impl WalCompactor {
 
         let mut compacted_records: Vec<WalRecord> = records
             .into_iter()
-            .filter(|r| r.timestamp >= retention_cutoff)
+            .filter(|r| {
+                // V2 records always kept (they're already optimized batches)
+                if r.is_v2() {
+                    return true;
+                }
+                // V1 records filtered by timestamp
+                r.get_timestamp().unwrap_or(current_time) >= retention_cutoff
+            })
             .collect();
 
-        // Sort by offset to maintain order
-        compacted_records.sort_by_key(|r| r.offset);
+        // Sort by offset to maintain order (V1 only)
+        compacted_records.sort_by_key(|r| r.get_offset().unwrap_or(i64::MAX));
 
         Ok(compacted_records)
     }
@@ -372,10 +388,15 @@ impl WalCompactor {
 
         let retention_cutoff = current_time - (self.config.retention_period_secs * 1000) as i64;
 
-        // First filter by time
+        // First filter by time (V1 only, V2 always kept)
         let recent_records: Vec<WalRecord> = records
             .into_iter()
-            .filter(|r| r.timestamp >= retention_cutoff)
+            .filter(|r| {
+                if r.is_v2() {
+                    return true;
+                }
+                r.get_timestamp().unwrap_or(current_time) >= retention_cutoff
+            })
             .collect();
 
         // Then apply key-based compaction
@@ -392,10 +413,17 @@ impl WalCompactor {
         let mut metadata_records = Vec::new();
         let mut offset_records = Vec::new();
         let mut other_records = Vec::new();
+        let mut v2_records = Vec::new();
 
         for record in records {
-            // Identify record type based on key prefix or topic
-            if let Some(key) = &record.key {
+            // V2 records always kept (already optimized batches)
+            if record.is_v2() {
+                v2_records.push(record);
+                continue;
+            }
+
+            // Identify V1 record type based on key prefix
+            if let Some(key) = record.get_key() {
                 if key.starts_with(b"__txn__") {
                     transaction_records.push(record);
                 } else if key.starts_with(b"__offset__") {
@@ -431,8 +459,11 @@ impl WalCompactor {
             result.extend(self.apply_time_based_compaction(other_records)?);
         }
 
-        // Sort by offset to maintain order
-        result.sort_by_key(|r| r.offset);
+        // Keep all V2 records
+        result.extend(v2_records);
+
+        // Sort by offset to maintain order (V1 only)
+        result.sort_by_key(|r| r.get_offset().unwrap_or(i64::MAX));
 
         Ok(result)
     }
@@ -583,12 +614,14 @@ mod tests {
 
         // Should be sorted by offset
         for i in 1..compacted.len() {
-            assert!(compacted[i].offset >= compacted[i-1].offset);
+            let curr_offset = compacted[i].get_offset().unwrap();
+            let prev_offset = compacted[i-1].get_offset().unwrap();
+            assert!(curr_offset >= prev_offset);
         }
 
         // Should have the updated value for key1
-        let key1_record = compacted.iter().find(|r| r.key.as_ref() == Some(&b"key1".to_vec())).unwrap();
-        assert_eq!(key1_record.value, b"value1_updated".to_vec());
+        let key1_record = compacted.iter().find(|r| r.get_key() == Some(&b"key1".to_vec())).unwrap();
+        assert_eq!(key1_record.get_value().unwrap(), b"value1_updated");
     }
 
     #[tokio::test]
@@ -599,6 +632,8 @@ mod tests {
             records_after: 800,
             bytes_saved: 50000,
             errors: 1,
+            duration_ms: 0,
+            strategy_used: None,
         };
 
         let stats2 = CompactionStats {
@@ -607,6 +642,8 @@ mod tests {
             records_after: 400,
             bytes_saved: 25000,
             errors: 0,
+            duration_ms: 0,
+            strategy_used: None,
         };
 
         stats1.merge(stats2);

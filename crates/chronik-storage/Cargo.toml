@@ -32,6 +32,7 @@ bincode = { workspace = true }
 # Compression
 flate2 = { workspace = true }
 zstd = "0.13"
+tar = "0.4"
 
 # Checksum
 crc32fast = { workspace = true }

@@ -288,7 +288,7 @@ fn test_segment_round_trip_multi_batch() {
 #[test]
 fn test_raw_kafka_batches_multi_batch() {
     // Test using ACTUAL Kafka RecordBatch format (what real producers send)
-    // This tests the raw_kafka_batches path used in production (when enable_dual_storage=false)
+    // This tests the raw_kafka_batches path used in production (when WAL-only architecture)
 
     let mut builder = SegmentBuilder::new();
 

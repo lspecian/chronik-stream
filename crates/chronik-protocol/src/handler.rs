@@ -6650,10 +6650,34 @@ impl ProtocolHandler {
                     }
                 };
                 
-                // Create partition metadata from assignments
-                if assignments.is_empty() {
-                    // Fallback: create default partition metadata if no assignments found
-                    for partition_id in 0..topic_meta.config.partition_count {
+                // CRITICAL FIX (v1.3.41): Always create ALL partitions based on partition_count
+                // Even if assignments exist, we need to fill in missing partitions
+                // Otherwise clients won't be able to produce to partition 1, 2, etc.
+
+                let mut sorted_assignments = assignments;
+                sorted_assignments.sort_by_key(|a| a.partition);
+
+                tracing::info!("METADATA→PARTITIONS: topic={} partition_count={} assignments_count={}",
+                              topic_meta.name, topic_meta.config.partition_count, sorted_assignments.len());
+
+                // Create partitions for ALL partition_count, using assignments where available
+                for partition_id in 0..topic_meta.config.partition_count {
+                    // Try to find an assignment for this partition
+                    let assignment = sorted_assignments.iter().find(|a| a.partition == partition_id);
+
+                    if let Some(assignment) = assignment {
+                        // Use the actual assignment
+                        partitions.push(MetadataPartition {
+                            error_code: 0,
+                            partition_index: assignment.partition as i32,
+                            leader_id: assignment.broker_id,
+                            leader_epoch: 0,
+                            replica_nodes: vec![assignment.broker_id],
+                            isr_nodes: vec![assignment.broker_id],
+                            offline_replicas: vec![],
+                        });
+                    } else {
+                        // No assignment found, use default (current broker)
                         partitions.push(MetadataPartition {
                             error_code: 0,
                             partition_index: partition_id as i32,
@@ -6661,22 +6685,6 @@ impl ProtocolHandler {
                             leader_epoch: 0,
                             replica_nodes: vec![self.broker_id],
                             isr_nodes: vec![self.broker_id],
-                            offline_replicas: vec![],
-                        });
-                    }
-                } else {
-                    // Use actual partition assignments
-                    let mut sorted_assignments = assignments;
-                    sorted_assignments.sort_by_key(|a| a.partition);
-                    
-                    for assignment in sorted_assignments {
-                        partitions.push(MetadataPartition {
-                            error_code: 0,
-                            partition_index: assignment.partition as i32,
-                            leader_id: assignment.broker_id,
-                            leader_epoch: 0,
-                            replica_nodes: vec![assignment.broker_id],
-                            isr_nodes: vec![assignment.broker_id], // For now, all replicas are in sync
                             offline_replicas: vec![],
                         });
                     }

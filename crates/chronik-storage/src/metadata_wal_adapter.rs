@@ -86,8 +86,14 @@ impl WalMetadataAdapter {
 
     /// Convert WAL record to metadata event
     fn wal_record_to_event(&self, record: &WalRecord) -> Result<MetadataEvent> {
-        serde_json::from_slice(&record.value)
-            .map_err(|e| MetadataError::SerializationError(format!("Failed to deserialize event: {}", e)))
+        // Metadata events use V1 records (individual events, not batches)
+        match record {
+            chronik_wal::record::WalRecord::V1 { value, .. } => {
+                serde_json::from_slice(value)
+                    .map_err(|e| MetadataError::SerializationError(format!("Failed to deserialize event: {}", e)))
+            }
+            _ => Err(MetadataError::SerializationError("Expected V1 record for metadata events".into()))
+        }
     }
 }
 
@@ -102,11 +108,12 @@ impl MetaLogWalInterface for WalMetadataAdapter {
 
         // Append to WAL
         let mut wal_manager = self.wal_manager.write().await;
+        let record_offset = wal_record.get_offset().unwrap_or(0);
         wal_manager.append(tp.topic.clone(), tp.partition, vec![wal_record.clone()]).await
             .map_err(|e| MetadataError::StorageError(format!("Failed to append to WAL: {}", e)))?;
 
-        debug!("Wrote metadata event {} at offset {}", event.event_id, wal_record.offset);
-        Ok(wal_record.offset as u64)
+        debug!("Wrote metadata event {} at offset {}", event.event_id, record_offset);
+        Ok(record_offset as u64)
     }
 
     async fn read_metadata_events(&self, from_offset: u64) -> Result<Vec<MetadataEvent>> {
@@ -137,10 +144,11 @@ impl MetaLogWalInterface for WalMetadataAdapter {
         // Convert WAL records back to events
         let mut events = Vec::new();
         for record in records {
+            let record_offset = record.get_offset().unwrap_or(-1);
             match self.wal_record_to_event(&record) {
                 Ok(event) => events.push(event),
                 Err(e) => {
-                    error!("Failed to deserialize event at offset {}: {}", record.offset, e);
+                    error!("Failed to deserialize event at offset {}: {}", record_offset, e);
                     // Skip corrupted events
                 }
             }

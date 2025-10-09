@@ -102,6 +102,9 @@ pub struct RecordHeader {
 pub struct KafkaRecordBatch {
     pub header: RecordBatchHeader,
     pub records: Vec<KafkaRecord>,
+    /// Original compressed records bytes (if batch was compressed).
+    /// Preserved during decode() to enable byte-perfect round-trip encoding.
+    pub compressed_records_data: Option<Bytes>,
 }
 
 impl KafkaRecordBatch {
@@ -137,6 +140,7 @@ impl KafkaRecordBatch {
                 records_count: 0,
             },
             records: Vec::new(),
+            compressed_records_data: None, // Created new, no original bytes
         }
     }
     
@@ -325,6 +329,7 @@ impl KafkaRecordBatch {
                     records_count: 0,
                 },
                 records: vec![],
+                compressed_records_data: None,
             };
             return Ok((batch, 0));
         }
@@ -353,6 +358,7 @@ impl KafkaRecordBatch {
                     records_count: 0,
                 },
                 records: vec![],
+                compressed_records_data: None,
             };
             return Ok((batch, 0));
         }
@@ -428,41 +434,50 @@ impl KafkaRecordBatch {
             records_count,
         };
         
-        // Read and decompress records if needed
-        let records_data = {
-            let mut buf = vec![0u8; cursor.get_ref().len() - cursor.position() as usize];
-            cursor.read_exact(&mut buf)
-                .map_err(|e| Error::Internal(format!("Failed to read records data: {}", e)))?;
-            
-            let compression = CompressionType::from_attributes(attributes);
-            match compression {
-                CompressionType::None => buf,
-                CompressionType::Gzip => {
-                    let mut decoder = GzDecoder::new(&buf[..]);
-                    let mut decompressed = Vec::new();
-                    decoder.read_to_end(&mut decompressed)
-                        .map_err(|e| Error::Internal(format!("Gzip decompression failed: {}", e)))?;
-                    decompressed
-                }
-                CompressionType::Zstd => {
-                    // For now, try zlib since we used it as fallback
-                    let mut decoder = ZlibDecoder::new(&buf[..]);
-                    let mut decompressed = Vec::new();
-                    decoder.read_to_end(&mut decompressed)
-                        .map_err(|e| Error::Internal(format!("Zlib decompression failed: {}", e)))?;
-                    decompressed
-                }
-                _ => buf,
-            }
+        // Read records section (potentially compressed)
+        let mut compressed_buf = vec![0u8; cursor.get_ref().len() - cursor.position() as usize];
+        cursor.read_exact(&mut compressed_buf)
+            .map_err(|e| Error::Internal(format!("Failed to read records data: {}", e)))?;
+
+        let compression = CompressionType::from_attributes(attributes);
+
+        // CRITICAL: Preserve original compressed bytes for byte-perfect round-trip
+        // Compression is non-deterministic (gzip includes timestamps) so we MUST
+        // keep the original bytes to maintain CRC validity
+        let compressed_records_data = if compression != CompressionType::None {
+            Some(Bytes::from(compressed_buf.clone()))
+        } else {
+            None
         };
-        
+
+        // Decompress if needed
+        let records_data = match compression {
+            CompressionType::None => compressed_buf,
+            CompressionType::Gzip => {
+                let mut decoder = GzDecoder::new(&compressed_buf[..]);
+                let mut decompressed = Vec::new();
+                decoder.read_to_end(&mut decompressed)
+                    .map_err(|e| Error::Internal(format!("Gzip decompression failed: {}", e)))?;
+                decompressed
+            }
+            CompressionType::Zstd => {
+                // For now, try zlib since we used it as fallback
+                let mut decoder = ZlibDecoder::new(&compressed_buf[..]);
+                let mut decompressed = Vec::new();
+                decoder.read_to_end(&mut decompressed)
+                    .map_err(|e| Error::Internal(format!("Zlib decompression failed: {}", e)))?;
+                decompressed
+            }
+            _ => compressed_buf,
+        };
+
         // Decode records
         let records = Self::decode_records(&records_data, records_count)?;
 
         // Calculate bytes consumed: 8 bytes (offset) + 4 bytes (length field) + batch_length
         let bytes_consumed = 12 + batch_length as usize;
 
-        Ok((Self { header, records }, bytes_consumed))
+        Ok((Self { header, records, compressed_records_data }, bytes_consumed))
     }
     
     /// Decode legacy message set (v0/v1 format) and convert to v2 RecordBatch
@@ -576,7 +591,7 @@ impl KafkaRecordBatch {
         // Calculate bytes consumed (position where cursor stopped)
         let bytes_consumed = cursor.position() as usize;
 
-        Ok((Self { header, records }, bytes_consumed))
+        Ok((Self { header, records, compressed_records_data: None }, bytes_consumed))
     }
     
     /// Decode records from bytes

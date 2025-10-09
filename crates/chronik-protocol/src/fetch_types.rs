@@ -266,12 +266,25 @@ impl KafkaEncodable for FetchResponsePartition {
 
         if version >= 4 {
             if let Some(ref aborted) = self.aborted {
-                encoder.write_i32(aborted.len() as i32);
+                if version >= 12 {
+                    // v12+: compact array (varint length + 1)
+                    encoder.write_unsigned_varint(aborted.len() as u32 + 1);
+                } else {
+                    encoder.write_i32(aborted.len() as i32);
+                }
                 for transaction in aborted {
                     transaction.encode(encoder, version)?;
+                    // v12+: tag buffer for each transaction
+                    if version >= 12 {
+                        encoder.write_unsigned_varint(0); // empty tag buffer
+                    }
                 }
             } else {
-                encoder.write_i32(-1);
+                if version >= 12 {
+                    encoder.write_unsigned_varint(0); // null compact array
+                } else {
+                    encoder.write_i32(-1); // null array
+                }
             }
         }
 
@@ -279,9 +292,23 @@ impl KafkaEncodable for FetchResponsePartition {
             encoder.write_i32(self.preferred_read_replica);
         }
 
-        // Write records length and data
-        encoder.write_i32(self.records.len() as i32);
-        encoder.write_raw_bytes(&self.records);
+        // CRITICAL FIX (v1.3.44): Fetch v12+ uses compact encoding (KIP-482)
+        if version >= 12 {
+            // COMPACT_RECORDS: unsigned varint length + 1
+            // 0 = null, 1 = empty, n = (n-1) bytes
+            if self.records.is_empty() {
+                encoder.write_unsigned_varint(1); // Empty (0 bytes), not null
+            } else {
+                encoder.write_unsigned_varint(self.records.len() as u32 + 1);
+                encoder.write_raw_bytes(&self.records);
+            }
+            // Tag buffer (empty)
+            encoder.write_unsigned_varint(0);
+        } else {
+            // v0-v11: traditional int32 length encoding
+            encoder.write_i32(self.records.len() as i32);
+            encoder.write_raw_bytes(&self.records);
+        }
 
         Ok(())
     }
@@ -298,11 +325,29 @@ pub struct FetchResponseTopic {
 
 impl KafkaEncodable for FetchResponseTopic {
     fn encode(&self, encoder: &mut Encoder, version: i16) -> Result<()> {
-        encoder.write_string(Some(&self.name));
-        encoder.write_i32(self.partitions.len() as i32);
+        // v12+: compact string (varint length + 1)
+        if version >= 12 {
+            encoder.write_compact_string(Some(&self.name));
+        } else {
+            encoder.write_string(Some(&self.name));
+        }
+
+        // v12+: compact array (varint length + 1)
+        if version >= 12 {
+            encoder.write_unsigned_varint(self.partitions.len() as u32 + 1);
+        } else {
+            encoder.write_i32(self.partitions.len() as i32);
+        }
+
         for partition in &self.partitions {
             partition.encode(encoder, version)?;
         }
+
+        // v12+: tag buffer
+        if version >= 12 {
+            encoder.write_unsigned_varint(0); // empty tag buffer
+        }
+
         Ok(())
     }
 }
@@ -347,9 +392,20 @@ impl KafkaEncodable for FetchResponse {
             encoder.write_i32(self.session_id);
         }
 
-        encoder.write_i32(self.topics.len() as i32);
+        // v12+: compact array (varint length + 1)
+        if version >= 12 {
+            encoder.write_unsigned_varint(self.topics.len() as u32 + 1);
+        } else {
+            encoder.write_i32(self.topics.len() as i32);
+        }
+
         for topic in &self.topics {
             topic.encode(encoder, version)?;
+        }
+
+        // v12+: tag buffer
+        if version >= 12 {
+            encoder.write_unsigned_varint(0); // empty tag buffer
         }
 
         Ok(())

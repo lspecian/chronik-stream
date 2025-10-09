@@ -31,6 +31,10 @@ pub struct SearchApi {
     metrics: ApiMetrics,
     /// Query cache
     pub cache: Arc<crate::cache::QueryCache>,
+    /// WAL Indexer for querying WAL-created indices (optional for backwards compatibility)
+    wal_indexer: Option<Arc<chronik_storage::WalIndexer>>,
+    /// Base path for WAL-created Tantivy indices
+    index_base_path: Option<String>,
 }
 
 /// State for a single index
@@ -386,14 +390,34 @@ pub struct ErrorInfo {
 }
 
 impl SearchApi {
-    /// Create a new search API.
+    /// Create a new search API (without WAL indexer integration).
     pub fn new() -> Result<Self> {
         let cache_config = crate::cache::CacheConfig::default();
         Ok(Self {
             indices: Arc::new(DashMap::new()),
             metrics: ApiMetrics::new()?,
             cache: Arc::new(crate::cache::QueryCache::new(cache_config)),
+            wal_indexer: None,
+            index_base_path: None,
         })
+    }
+
+    /// Create a new search API with WAL indexer integration.
+    /// The index_base_path parameter specifies where to find WAL-created Tantivy indices.
+    pub fn new_with_wal_indexer(wal_indexer: Arc<chronik_storage::WalIndexer>, index_base_path: String) -> Result<Self> {
+        let cache_config = crate::cache::CacheConfig::default();
+        Ok(Self {
+            indices: Arc::new(DashMap::new()),
+            metrics: ApiMetrics::new()?,
+            cache: Arc::new(crate::cache::QueryCache::new(cache_config)),
+            wal_indexer: Some(wal_indexer),
+            index_base_path: Some(index_base_path),
+        })
+    }
+
+    /// Get the WAL indexer's index base path for querying WAL-created indices
+    pub fn get_index_base_path(&self) -> Option<&str> {
+        self.index_base_path.as_deref()
     }
 
     /// Create router for the API

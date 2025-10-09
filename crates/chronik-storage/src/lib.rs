@@ -1,5 +1,10 @@
 //! Storage layer for Chronik Stream.
 
+pub mod canonical_record;
+pub mod tantivy_segment;
+pub mod wal_indexer;
+pub mod segment_index;
+pub mod segment_compaction;
 pub mod index;
 pub mod object_store;
 pub mod record_batch;
@@ -17,6 +22,14 @@ pub mod vector_search;
 pub mod extended_segment;
 pub mod metadata_wal_adapter;
 
+pub use canonical_record::{
+    CanonicalRecord, CanonicalRecordEntry, RecordHeader as CanonicalRecordHeader,
+    CompressionType as CanonicalCompressionType, TimestampType,
+};
+pub use tantivy_segment::{
+    TantivySegmentWriter, TantivySegmentReader, SegmentMetadata as TantivySegmentMetadata,
+    SchemaFields as TantivySchemaFields,
+};
 pub use index::{IndexBuilder, Document, FieldType, FieldValue, SegmentSearcher, SearchHit};
 pub use object_store::{
     ObjectStore as ObjectStoreTrait, ObjectStoreConfig, ObjectStoreFactory, ObjectMetadata,
@@ -43,3 +56,12 @@ pub use extended_segment::{
     VectorFieldConfig, HybridStats, SegmentMigration
 };
 pub use metadata_wal_adapter::WalMetadataAdapter;
+pub use wal_indexer::{
+    WalIndexer, WalIndexerConfig, IndexingStats, TopicPartition as WalIndexerTopicPartition,
+};
+pub use segment_index::{
+    SegmentIndex, SegmentMetadata as SegmentIndexMetadata, TopicPartition as SegmentIndexTopicPartition, IndexStats,
+};
+pub use segment_compaction::{
+    SegmentCompactor, CompactionConfig, CompactionStrategy, CompactionStats,
+};

@@ -63,17 +63,35 @@ cargo run --bin chronik-server -- version
 ```
 
 ### Docker
+
+**IMPORTANT: DO NOT use Docker for testing during development on macOS.**
+- Docker Desktop on macOS is slow and resource-intensive
+- Native binary testing is much faster and more reliable
+- Use Docker only for CI/CD or final integration testing, not for iterative development
+
 ```bash
-# Build Docker image
+# Build Docker image (CI/CD only)
 docker build -t chronik-stream .
 
-# Run with Docker
+# Run with Docker (CI/CD only)
 docker run -d -p 9092:9092 \
   -e CHRONIK_ADVERTISED_ADDR=localhost \
   chronik-stream
 
-# Using docker-compose
+# Using docker-compose (CI/CD only)
 docker-compose up -d
+```
+
+**For development testing on macOS:**
+```bash
+# Test with native binary instead
+./target/release/chronik-server --advertised-addr localhost standalone --dual-storage
+
+# Test with Python Kafka clients
+python3 test_script.py
+
+# Test with kafka-console-producer/consumer (if installed via brew)
+kafka-console-producer --bootstrap-server localhost:9092 --topic test
 ```
 
 ## Architecture Overview
@@ -364,6 +382,8 @@ chronik-stream/
 4. **COMPLETE SOLUTIONS** - Finish what you start, test thoroughly, document properly
 5. **ARCHITECTURAL INTEGRITY** - One implementation, not multiple partial ones
 6. **PROFESSIONAL STANDARDS** - Write code as if going to production tomorrow
+7. **ABSOLUTE OWNERSHIP** - NEVER say "beyond scope", "not my responsibility", or "separate issue". If you discover a problem while working, YOU OWN IT. Fix it completely.
+8. **END-TO-END VERIFICATION** - A fix is NOT complete until verified with real client testing (produce → crash → recover → consume). No excuses.
 7. **NEVER RELEASE WITHOUT TESTING** - CRITICAL: Do NOT commit, tag, or push releases without actual testing
 8. **NEVER CLAIM PRODUCTION-READY WITHOUT TESTING** - Do NOT claim anything is ready, fixed, or production-ready without verification
 9. **FIX FORWARD, NEVER REVERT** - CRITICAL: In this house, we NEVER revert commits, delete tags, or rollback releases. We ALWAYS fix forward with the next version. Every bug is an opportunity to learn and improve. Reverting hides problems; fixing forward solves them permanently.

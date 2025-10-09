@@ -41,6 +41,8 @@ pub struct KafkaProtocolHandler {
     port: i32,
     /// Expected topics tracker for v0 metadata compatibility
     expected_topics: Arc<RwLock<HashSet<String>>>,
+    /// Default number of partitions for auto-created topics
+    default_num_partitions: u32,
 }
 
 impl KafkaProtocolHandler {
@@ -56,6 +58,7 @@ impl KafkaProtocolHandler {
         node_id: i32,
         host: String,
         port: i32,
+        default_num_partitions: u32,
     ) -> Result<Self> {
         let group_manager = Arc::new(GroupManager::new(metadata_store.clone()));
         group_manager.clone().start_expiration_checker();
@@ -77,6 +80,7 @@ impl KafkaProtocolHandler {
             host: host.clone(),
             port,
             expected_topics: Arc::new(RwLock::new(HashSet::new())),
+            default_num_partitions,
         })
     }
     
@@ -731,8 +735,8 @@ impl KafkaProtocolHandler {
         if !topics_to_create.is_empty() {
             tracing::info!("Auto-creating {} topics: {:?}", topics_to_create.len(), topics_to_create);
 
-            // Get default configuration values
-            let default_num_partitions = 1;  // Use 1 partition for simplicity in testing
+            // Get default configuration values from config
+            let default_num_partitions = self.default_num_partitions;
             let default_replication_factor = 1;
             let default_retention_ms = 604800000; // 7 days
             let default_segment_bytes = 1073741824; // 1GB

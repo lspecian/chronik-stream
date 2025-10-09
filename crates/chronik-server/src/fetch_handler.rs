@@ -3,8 +3,10 @@
 use chronik_common::{Result, Error};
 use chronik_common::metadata::traits::MetadataStore;
 use chronik_protocol::{FetchRequest, FetchResponse, FetchResponseTopic, FetchResponsePartition};
-use chronik_storage::{SegmentReader, RecordBatch, Record, Segment, ObjectStoreTrait};
+use chronik_storage::{SegmentReader, RecordBatch, Record, Segment, ObjectStoreTrait, SegmentIndex};
 use chronik_storage::kafka_records::{KafkaRecordBatch, KafkaRecord, RecordHeader as KafkaRecordHeader, CompressionType};
+use chronik_storage::tantivy_segment::TantivySegmentReader;
+use chronik_storage::canonical_record::CanonicalRecord;
 use chronik_wal::{WalManager, WalRecord};
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -60,6 +62,8 @@ pub struct FetchHandler {
     metadata_store: Arc<dyn MetadataStore>,
     object_store: Arc<dyn ObjectStoreTrait>,
     wal_manager: Option<Arc<RwLock<WalManager>>>,
+    segment_index: Option<Arc<SegmentIndex>>,
+    produce_handler: Option<Arc<crate::produce_handler::ProduceHandler>>,
     state: Arc<RwLock<FetchState>>,
 }
 
@@ -75,6 +79,8 @@ impl FetchHandler {
             metadata_store,
             object_store,
             wal_manager: None,
+            segment_index: None,
+            produce_handler: None,
             state: Arc::new(RwLock::new(FetchState {
                 buffers: HashMap::new(),
                 segment_cache: HashMap::new(),
@@ -82,18 +88,43 @@ impl FetchHandler {
         }
     }
 
-    /// Create a new fetch handler with WAL integration
+    /// Create a new fetch handler with WAL and ProduceHandler integration (v1.3.39+)
     pub fn new_with_wal(
         segment_reader: Arc<SegmentReader>,
         metadata_store: Arc<dyn MetadataStore>,
         object_store: Arc<dyn ObjectStoreTrait>,
         wal_manager: Arc<RwLock<WalManager>>,
+        produce_handler: Arc<crate::produce_handler::ProduceHandler>,
     ) -> Self {
         Self {
             segment_reader,
             metadata_store,
             object_store,
             wal_manager: Some(wal_manager),
+            segment_index: None,
+            produce_handler: Some(produce_handler),
+            state: Arc::new(RwLock::new(FetchState {
+                buffers: HashMap::new(),
+                segment_cache: HashMap::new(),
+            })),
+        }
+    }
+
+    /// Create a new fetch handler with WAL and segment index
+    pub fn new_with_wal_and_index(
+        segment_reader: Arc<SegmentReader>,
+        metadata_store: Arc<dyn MetadataStore>,
+        object_store: Arc<dyn ObjectStoreTrait>,
+        wal_manager: Arc<RwLock<WalManager>>,
+        segment_index: Arc<SegmentIndex>,
+    ) -> Self {
+        Self {
+            segment_reader,
+            metadata_store,
+            object_store,
+            wal_manager: Some(wal_manager),
+            segment_index: Some(segment_index),
+            produce_handler: None, // Not provided in this constructor
             state: Arc::new(RwLock::new(FetchState {
                 buffers: HashMap::new(),
                 segment_cache: HashMap::new(),
@@ -185,40 +216,31 @@ impl FetchHandler {
             });
         }
         
-        // Get partition segments to determine watermarks
-        let segments = self.metadata_store.list_segments(topic, Some(partition as u32)).await?;
-        
-        tracing::info!("Found {} segments for {}-{}", segments.len(), topic, partition);
-        for seg in &segments {
-            tracing::info!("  Segment: {} offsets {}-{} path: {}", 
-                seg.segment_id, seg.start_offset, seg.end_offset, seg.path);
-        }
-        
-        // Calculate high watermark from segments
-        let segment_high_watermark = segments.iter()
-            .map(|s| s.end_offset + 1)
-            .max()
-            .unwrap_or(0);
-        
-        // Also check buffer for high watermark
-        let buffer_high_watermark = {
-            let state = self.state.read().await;
-            let key = (topic.to_string(), partition);
-            state.buffers.get(&key).map(|b| b.high_watermark).unwrap_or(0)
+        // NEW ARCHITECTURE (v1.3.39+): Get high watermark from ProduceHandler (source of truth)
+        // This is the next offset that will be assigned = current high watermark
+        let high_watermark = if let Some(ref produce_handler) = self.produce_handler {
+            produce_handler.get_high_watermark(topic, partition).await
+                .unwrap_or_else(|e| {
+                    tracing::warn!("Failed to get high watermark from ProduceHandler for {}-{}: {}, defaulting to 0", topic, partition, e);
+                    0
+                })
+        } else {
+            // Fallback: try segments (OLD architecture path)
+            let segments = self.metadata_store.list_segments(topic, Some(partition as u32)).await?;
+            tracing::info!("Found {} segments for {}-{}", segments.len(), topic, partition);
+            segments.iter()
+                .map(|s| s.end_offset + 1)
+                .max()
+                .unwrap_or(0)
         };
         
-        // Use the maximum of segment and buffer high watermarks
-        let high_watermark = segment_high_watermark.max(buffer_high_watermark);
-        
         tracing::info!(
-            "High watermark for {}-{}: segment={}, buffer={}, final={}",
-            topic, partition, segment_high_watermark, buffer_high_watermark, high_watermark
+            "High watermark for {}-{}: {} (from ProduceHandler)",
+            topic, partition, high_watermark
         );
-        
-        let log_start_offset = segments.iter()
-            .map(|s| s.start_offset)
-            .min()
-            .unwrap_or(0);
+
+        // Log start offset is always 0 in NEW architecture (WAL-based)
+        let log_start_offset = 0;
         
         // Check if offset is out of range
         if fetch_offset < log_start_offset {
@@ -264,6 +286,13 @@ impl FetchHandler {
                 Ok(Ok(Some(raw_bytes))) => {
                     tracing::info!("✓ CRC-PRESERVED: Fetched {} bytes of raw Kafka data for {}-{}",
                         raw_bytes.len(), topic, partition);
+
+                    // HEX DUMP: Outgoing raw bytes to consumer
+                    if raw_bytes.len() >= 61 {
+                        let hex_first_64: String = raw_bytes.iter().take(64).map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
+                        tracing::debug!("FETCH OUTGOING (first 64 bytes): {}", hex_first_64);
+                    }
+
                     raw_bytes
                 }
                 Ok(Ok(None)) | Ok(Err(_)) | Err(_) => {
@@ -573,6 +602,8 @@ impl FetchHandler {
     }
     
     /// Fetch records from WAL manager
+    ///
+    /// NEW (v1.3.36): Handle WAL V2 CanonicalRecord format
     async fn fetch_from_wal(
         &self,
         wal_manager: &Arc<RwLock<WalManager>>,
@@ -581,33 +612,149 @@ impl FetchHandler {
         fetch_offset: i64,
         max_bytes: i32,
     ) -> Result<Vec<chronik_storage::Record>> {
+        use chronik_storage::canonical_record::CanonicalRecord;
+
         let max_records = std::cmp::max(1, max_bytes as usize / 100); // Estimate ~100 bytes per record
-        
+
         let wal_records = {
             let manager = wal_manager.read().await;
             manager.read_from(topic, partition, fetch_offset, max_records).await
                 .map_err(|e| Error::Internal(format!("WAL read failed: {}", e)))?
         };
-        
+
         // Convert WalRecord to chronik_storage::Record
         let mut records = Vec::new();
         for wal_record in wal_records {
-            let storage_record = chronik_storage::Record {
-                offset: wal_record.offset,
-                timestamp: wal_record.timestamp,
-                key: wal_record.key,
-                value: wal_record.value,
-                headers: wal_record.headers.into_iter().collect(),
-            };
-            records.push(storage_record);
+            // Process WAL V2 records (CanonicalRecord batches)
+            if let chronik_wal::record::WalRecord::V2 { canonical_data, .. } = wal_record {
+                // Deserialize CanonicalRecord from WAL
+                match bincode::deserialize::<CanonicalRecord>(&canonical_data) {
+                    Ok(canonical_record) => {
+                        // Extract individual records from the batch
+                        for entry in &canonical_record.records {
+                            // Filter by offset range
+                            if entry.offset >= fetch_offset {
+                                let storage_record = chronik_storage::Record {
+                                    offset: entry.offset,
+                                    timestamp: entry.timestamp,
+                                    key: entry.key.clone(),
+                                    value: entry.value.clone().unwrap_or_default(),
+                                    headers: entry.headers.iter()
+                                        .filter_map(|h| h.value.as_ref().map(|v| (h.key.clone(), v.clone())))
+                                        .collect(),
+                                };
+                                records.push(storage_record);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to deserialize CanonicalRecord from WAL V2: {}", e);
+                    }
+                }
+            }
+            // V1 records are skipped (legacy format from pre-v1.3.36)
         }
-        
-        info!("WAL returned {} records starting from offset {} for {}-{}", 
+
+        info!("WAL returned {} records starting from offset {} for {}-{}",
             records.len(), fetch_offset, topic, partition);
-        
+
         Ok(records)
     }
-    
+
+    /// Fetch raw RecordBatch bytes from WAL (compressed_records_wire_bytes)
+    ///
+    /// NEW (v1.3.46): Fetch the original compressed bytes from CanonicalRecord
+    /// to preserve CRC validation for Java Kafka clients.
+    async fn fetch_raw_bytes_from_wal(
+        &self,
+        wal_manager: &Arc<RwLock<WalManager>>,
+        topic: &str,
+        partition: i32,
+        fetch_offset: i64,
+        high_watermark: i64,
+        max_bytes: i32,
+    ) -> Result<Option<Vec<u8>>> {
+        use chronik_storage::canonical_record::CanonicalRecord;
+
+        let max_records = std::cmp::max(1, max_bytes as usize / 100);
+
+        let wal_records = {
+            let manager = wal_manager.read().await;
+            manager.read_from(topic, partition, fetch_offset, max_records).await
+                .map_err(|e| Error::Internal(format!("WAL read failed: {}", e)))?
+        };
+
+        if wal_records.is_empty() {
+            return Ok(None);
+        }
+
+        let wal_records_count = wal_records.len();
+        let mut combined_bytes = Vec::new();
+
+        for wal_record in wal_records {
+            if let chronik_wal::record::WalRecord::V2 { canonical_data, .. } = wal_record {
+                match bincode::deserialize::<CanonicalRecord>(&canonical_data) {
+                    Ok(canonical_record) => {
+                        // Check if this batch has compressed_records_wire_bytes
+                        if let Some(raw_bytes) = canonical_record.compressed_records_wire_bytes {
+                            // Parse batch header to check offset range (same logic as segments)
+                            if raw_bytes.len() < 61 {
+                                warn!("RAW→WAL: Batch too small ({} bytes), skipping", raw_bytes.len());
+                                continue;
+                            }
+
+                            let base_offset = i64::from_be_bytes([
+                                raw_bytes[0], raw_bytes[1], raw_bytes[2], raw_bytes[3],
+                                raw_bytes[4], raw_bytes[5], raw_bytes[6], raw_bytes[7],
+                            ]);
+
+                            let last_offset_delta = i32::from_be_bytes([
+                                raw_bytes[23], raw_bytes[24], raw_bytes[25], raw_bytes[26],
+                            ]);
+                            let last_offset = base_offset + last_offset_delta as i64;
+
+                            // Check if this batch overlaps with requested range
+                            if last_offset >= fetch_offset && base_offset < high_watermark {
+                                if combined_bytes.len() + raw_bytes.len() > max_bytes as usize && !combined_bytes.is_empty() {
+                                    break;
+                                }
+
+                                info!(
+                                    "RAW→WAL: Adding {} bytes from batch {}-{}",
+                                    raw_bytes.len(), base_offset, last_offset
+                                );
+                                combined_bytes.extend_from_slice(&raw_bytes);
+                            } else {
+                                tracing::debug!(
+                                    "RAW→WAL: Skipping batch {}-{} (outside range {}-{})",
+                                    base_offset, last_offset, fetch_offset, high_watermark
+                                );
+                            }
+                        } else {
+                            // No raw bytes in this record (uncompressed or old format)
+                            warn!("RAW→WAL: CanonicalRecord has no compressed_records_wire_bytes");
+                            return Ok(None);
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to deserialize CanonicalRecord from WAL V2: {}", e);
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+
+        if combined_bytes.is_empty() {
+            Ok(None)
+        } else {
+            info!(
+                "RAW→WAL: Returning {} bytes from {} WAL records for {}-{}",
+                combined_bytes.len(), wal_records_count, topic, partition
+            );
+            Ok(Some(combined_bytes))
+        }
+    }
+
     /// Fetch records from segment files (persistent storage)
     /// This is called after checking WAL and in-memory buffers
     async fn fetch_records_from_segments(
@@ -785,8 +932,30 @@ impl FetchHandler {
             }
         }
 
-        // PHASE 2: Try segments (read raw_kafka_batches section)
-        tracing::info!("RAW→SEGMENTS: Buffer empty or no match, trying segments");
+        // PHASE 2: Try WAL (NEW: fetch compressed_records_wire_bytes from CanonicalRecord)
+        tracing::info!("RAW→WAL: Buffer empty or no match, trying WAL");
+        if let Some(wal_manager) = self.wal_manager.as_ref() {
+            let raw_bytes_from_wal = self.fetch_raw_bytes_from_wal(
+                wal_manager,
+                topic,
+                partition,
+                fetch_offset,
+                high_watermark,
+                max_bytes,
+            ).await?;
+
+            if let Some(bytes) = raw_bytes_from_wal {
+                tracing::info!(
+                    "RAW→WAL: Returning {} bytes of raw Kafka data from WAL",
+                    bytes.len()
+                );
+                return Ok(Some(bytes));
+            }
+            tracing::info!("RAW→WAL: No raw bytes found in WAL");
+        }
+
+        // PHASE 3: Try segments (read raw_kafka_batches section)
+        tracing::info!("RAW→SEGMENTS: Buffer and WAL empty or no match, trying segments");
         let segments = self.get_segments_for_range(topic, partition, fetch_offset, high_watermark).await?;
 
         if segments.is_empty() {
@@ -818,12 +987,10 @@ impl FetchHandler {
             // CRITICAL FIX: Parse batch headers to filter by offset range
             // We must ONLY include batches that overlap [fetch_offset, high_watermark)
             // Otherwise we return wrong batches and clients see CRC errors!
-            let mut cursor = std::io::Cursor::new(&segment.raw_kafka_batches[..]);
-            use std::io::Read;
-            use bytes::Buf;
+            let mut cursor_pos = 0;
 
-            while cursor.position() < segment.raw_kafka_batches.len() as u64 {
-                let batch_start = cursor.position() as usize;
+            while cursor_pos < segment.raw_kafka_batches.len() {
+                let batch_start = cursor_pos;
 
                 // Read batch header (minimum 61 bytes for v2 format)
                 if (segment.raw_kafka_batches.len() - batch_start) < 61 {
@@ -832,11 +999,32 @@ impl FetchHandler {
                 }
 
                 // Parse JUST the header to get offsets (without decoding records)
-                let base_offset = (&segment.raw_kafka_batches[batch_start..]).get_i64();
-                let batch_length = (&segment.raw_kafka_batches[batch_start + 8..]).get_i32();
+                // Use manual big-endian byte parsing to avoid any trait complications
+                let base_offset = i64::from_be_bytes([
+                    segment.raw_kafka_batches[batch_start],
+                    segment.raw_kafka_batches[batch_start + 1],
+                    segment.raw_kafka_batches[batch_start + 2],
+                    segment.raw_kafka_batches[batch_start + 3],
+                    segment.raw_kafka_batches[batch_start + 4],
+                    segment.raw_kafka_batches[batch_start + 5],
+                    segment.raw_kafka_batches[batch_start + 6],
+                    segment.raw_kafka_batches[batch_start + 7],
+                ]);
+
+                let batch_length = i32::from_be_bytes([
+                    segment.raw_kafka_batches[batch_start + 8],
+                    segment.raw_kafka_batches[batch_start + 9],
+                    segment.raw_kafka_batches[batch_start + 10],
+                    segment.raw_kafka_batches[batch_start + 11],
+                ]);
 
                 // Read last_offset_delta at offset 23 (after base_offset, batch_length, partition_leader_epoch, magic, crc, attributes)
-                let last_offset_delta = (&segment.raw_kafka_batches[batch_start + 23..]).get_i32();
+                let last_offset_delta = i32::from_be_bytes([
+                    segment.raw_kafka_batches[batch_start + 23],
+                    segment.raw_kafka_batches[batch_start + 24],
+                    segment.raw_kafka_batches[batch_start + 25],
+                    segment.raw_kafka_batches[batch_start + 26],
+                ]);
                 let last_offset = base_offset + last_offset_delta as i64;
 
                 // Total batch size is: 12 bytes (base_offset + batch_length) + batch_length
@@ -870,7 +1058,7 @@ impl FetchHandler {
                 }
 
                 // Move to next batch
-                cursor.set_position((batch_start + total_batch_size) as u64);
+                cursor_pos = batch_start + total_batch_size;
             }
         }
 
@@ -879,10 +1067,145 @@ impl FetchHandler {
                 "RAW→SEGMENTS: Returning {} bytes of raw Kafka data from {} segments",
                 combined_bytes.len(), segments.len()
             );
-            Ok(Some(combined_bytes))
-        } else {
-            Ok(None)
+            return Ok(Some(combined_bytes));
         }
+
+        // PHASE 3: Try Tantivy segments (warm storage)
+        if let Some(ref segment_index) = self.segment_index {
+            tracing::info!("RAW→TANTIVY: Checking Tantivy segment index for {}-{}", topic, partition);
+
+            match self.fetch_from_tantivy(
+                segment_index,
+                topic,
+                partition,
+                fetch_offset,
+                high_watermark,
+                max_bytes,
+            ).await {
+                Ok(Some(bytes)) => {
+                    tracing::info!(
+                        "RAW→TANTIVY: Returning {} bytes from Tantivy segments",
+                        bytes.len()
+                    );
+                    return Ok(Some(bytes));
+                }
+                Ok(None) => {
+                    tracing::info!("RAW→TANTIVY: No matching Tantivy segments found");
+                }
+                Err(e) => {
+                    tracing::warn!("RAW→TANTIVY: Error fetching from Tantivy: {}", e);
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Fetch data from Tantivy segments (warm storage)
+    async fn fetch_from_tantivy(
+        &self,
+        segment_index: &Arc<SegmentIndex>,
+        topic: &str,
+        partition: i32,
+        fetch_offset: i64,
+        high_watermark: i64,
+        _max_bytes: i32,
+    ) -> Result<Option<Vec<u8>>> {
+        use chronik_storage::canonical_record::{CanonicalRecord, CompressionType, TimestampType};
+
+        // Query segment index for matching Tantivy segments
+        let tantivy_segments = segment_index.find_segments_by_offset_range(
+            topic,
+            partition,
+            fetch_offset,
+            high_watermark,
+        ).await?;
+
+        if tantivy_segments.is_empty() {
+            tracing::debug!("No Tantivy segments found for {}-{} range {}-{}",
+                topic, partition, fetch_offset, high_watermark);
+            return Ok(None);
+        }
+
+        tracing::info!(
+            "Found {} Tantivy segments for {}-{} range {}-{}, downloading and reading",
+            tantivy_segments.len(), topic, partition, fetch_offset, high_watermark
+        );
+
+        // Collect all entries from all matching segments
+        let mut all_entries = Vec::new();
+
+        for segment_metadata in tantivy_segments {
+            // Download segment from object store
+            let segment_data = match self.object_store.get(&segment_metadata.object_store_path).await {
+                Ok(data) => data,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to download Tantivy segment {}: {}",
+                        segment_metadata.segment_id, e
+                    );
+                    continue; // Skip this segment, try others
+                }
+            };
+
+            // Deserialize Tantivy segment
+            let reader = match TantivySegmentReader::from_tar_gz_bytes(segment_data.as_ref()) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to deserialize Tantivy segment {}: {}",
+                        segment_metadata.segment_id, e
+                    );
+                    continue;
+                }
+            };
+
+            // Query for records in the offset range
+            let entries = match reader.query_by_offset_range(fetch_offset, high_watermark) {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to query Tantivy segment {}: {}",
+                        segment_metadata.segment_id, e
+                    );
+                    continue;
+                }
+            };
+
+            tracing::debug!(
+                "Read {} entries from Tantivy segment {}",
+                entries.len(), segment_metadata.segment_id
+            );
+
+            all_entries.extend(entries);
+        }
+
+        if all_entries.is_empty() {
+            tracing::info!("No entries found in Tantivy segments for {}-{} range {}-{}",
+                topic, partition, fetch_offset, high_watermark);
+            return Ok(None);
+        }
+
+        // Sort entries by offset (should already be sorted, but ensure correctness)
+        all_entries.sort_by_key(|e| e.offset);
+
+        // Reconstruct CanonicalRecord from entries
+        // Note: We use default compression (None) since we're serving the data uncompressed
+        let canonical_record = CanonicalRecord::from_entries(
+            all_entries,
+            CompressionType::None,
+            TimestampType::CreateTime,
+        )?;
+
+        // Convert to Kafka wire format
+        let kafka_batch = canonical_record.to_kafka_batch()?;
+
+        tracing::info!(
+            "Returning {} bytes from Tantivy segments for {}-{} range {}-{}",
+            kafka_batch.len(), topic, partition, fetch_offset, high_watermark
+        );
+
+        Ok(Some(kafka_batch.to_vec()))
     }
 
     /// Get segments that contain data in the given offset range

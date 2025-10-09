@@ -3,6 +3,7 @@
 mod test_setup;
 mod common;
 mod basic_components_test;
+mod canonical_crc_test;
 
 // Tests that require full cluster setup
 // mod cluster;

@@ -27,7 +27,6 @@ impl Default for StorageConfig {
                 data_dir: std::path::PathBuf::from("/tmp/chronik/segments"),
                 compression_codec: "none".to_string(),
                 max_segment_size: 1024 * 1024 * 128, // 128MB
-                enable_dual_storage: false, // Default to raw-only for better performance
                 max_segment_age_secs: 3600, // 1 hour
                 retention_period_secs: 7 * 24 * 3600, // 7 days
                 enable_cleanup: true,

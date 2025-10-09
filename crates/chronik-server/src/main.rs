@@ -73,11 +73,6 @@ struct Cli {
     #[arg(long, env = "CHRONIK_ADVERTISED_PORT")]
     advertised_port: Option<u16>,
 
-    /// Enable search functionality
-    #[cfg(feature = "search")]
-    #[arg(long, env = "CHRONIK_ENABLE_SEARCH", default_value = "false")]
-    enable_search: bool,
-
     /// Enable backup functionality
     #[cfg(feature = "backup")]
     #[arg(long, env = "CHRONIK_ENABLE_BACKUP", default_value = "false")]
@@ -160,11 +155,7 @@ enum CompactAction {
 enum Commands {
     /// Run in standalone mode (default)
     #[command(about = "Run as a standalone Kafka-compatible server")]
-    Standalone {
-        /// Enable dual storage (raw Kafka + indexed for search)
-        #[arg(long, default_value = "false")]
-        dual_storage: bool,
-    },
+    Standalone,
     
     /// Run as ingest node (future: for distributed mode)
     #[command(about = "Run as an ingest node in a distributed cluster")]
@@ -242,10 +233,9 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         
-        Some(Commands::Standalone { dual_storage }) => {
+        Some(Commands::Standalone) => {
             info!("Starting Chronik Server in standalone mode");
-            info!("Dual storage: {}", dual_storage);
-            run_standalone_server(&cli, dual_storage).await?;
+            run_standalone_server(&cli).await?;
         }
         
         Some(Commands::Ingest { ref controller_url }) => {
@@ -261,9 +251,9 @@ async fn main() -> Result<()> {
             info!("Starting Chronik Server as search node");
             info!("Storage URL: {}", storage_url);
             warn!("Search-only mode not yet implemented - running in standalone mode");
-            run_standalone_server(&cli, true).await?;
+            run_standalone_server(&cli).await?;
         }
-        
+
         Some(Commands::All { experimental }) => {
             info!("Starting Chronik Server with all components");
             if experimental {
@@ -275,18 +265,18 @@ async fn main() -> Result<()> {
         Some(Commands::Compact { ref action }) => {
             handle_compaction_command(&cli, action.clone()).await?;
         }
-        
+
         None => {
             // Default to standalone mode
             info!("Starting Chronik Server in standalone mode (default)");
-            run_standalone_server(&cli, false).await?;
+            run_standalone_server(&cli).await?;
         }
     }
 
     Ok(())
 }
 
-async fn run_standalone_server(cli: &Cli, dual_storage: bool) -> Result<()> {
+async fn run_standalone_server(cli: &Cli) -> Result<()> {
     // Parse bind address to handle "host:port" format
     let bind_host = if cli.bind_addr.contains(':') {
         cli.bind_addr.split(':').next().unwrap_or("0.0.0.0").to_string()
@@ -378,13 +368,14 @@ async fn run_standalone_server(cli: &Cli, dual_storage: bool) -> Result<()> {
         advertised_host,
         advertised_port,
         data_dir: cli.data_dir.to_string_lossy().to_string(),
-        enable_indexing: false,
+        enable_indexing: cfg!(feature = "search"),  // Enable when search feature is compiled
         enable_compression: true,
         auto_create_topics: true,
         num_partitions: 3,
         replication_factor: 1,
-        enable_dual_storage: dual_storage,
         use_wal_metadata: !cli.file_metadata,  // Use WAL by default, file-based if flag is set
+        enable_wal_indexing: true,  // Enable WAL→Tantivy indexing
+        wal_indexing_interval_secs: 30,  // Index every 30 seconds
     };
 
     // Create and start the integrated server
@@ -400,37 +391,40 @@ async fn run_standalone_server(cli: &Cli, dual_storage: bool) -> Result<()> {
     let kafka_addr = format!("{}:{}", cli.bind_addr, cli.kafka_port);
     info!("Kafka protocol listening on {}", kafka_addr);
     info!("Metrics endpoint available at http://{}:{}/metrics", cli.bind_addr, cli.metrics_port);
-    
-    // Start search API if enabled
+
+    // Start search API if search feature is compiled
     #[cfg(feature = "search")]
-    if cli.enable_search {
+    {
         info!("Starting Search API on port 8080");
-        
+
         let search_bind = cli.bind_addr.clone();
+        let wal_indexer = server.get_wal_indexer();
+        let index_base_path = format!("{}/tantivy_indexes", cli.data_dir.to_string_lossy());
+
         tokio::spawn(async move {
             use chronik_search::api::SearchApi;
             use std::sync::Arc;
-            
-            // Create search API instance
-            let search_api = Arc::new(SearchApi::new().unwrap());
-            
+
+            // Create search API instance with WAL indexer integration
+            let search_api = Arc::new(SearchApi::new_with_wal_indexer(wal_indexer, index_base_path).unwrap());
+
             // Create router
             let app = search_api.router();
-            
+
             // Start server
             let addr = format!("{}:8080", search_bind);
             info!("Search API listening on http://{}", addr);
-            
+
             let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
             chronik_search::serve_app(listener, app).await.unwrap()
         });
-        
+
         info!("Search API available at http://{}:8080", cli.bind_addr);
         info!("  - Search: POST http://{}:8080/_search", cli.bind_addr);
         info!("  - Index: PUT http://{}:8080/{{index}}", cli.bind_addr);
         info!("  - Document: POST http://{}:8080/{{index}}/_doc/{{id}}", cli.bind_addr);
     }
-    
+
     server.run(&kafka_addr).await?;
     
     Ok(())
@@ -439,7 +433,7 @@ async fn run_standalone_server(cli: &Cli, dual_storage: bool) -> Result<()> {
 async fn run_ingest_server(cli: &Cli) -> Result<()> {
     // For now, just run standalone
     // In the future, this would connect to a controller for coordination
-    run_standalone_server(cli, false).await
+    run_standalone_server(cli).await
 }
 
 async fn run_all_components(cli: &Cli) -> Result<()> {
@@ -550,8 +544,9 @@ async fn run_all_components(cli: &Cli) -> Result<()> {
         auto_create_topics: true,
         num_partitions: 3,
         replication_factor: 1,
-        enable_dual_storage: true,  // Enable dual storage for search
         use_wal_metadata: !cli.file_metadata,  // Use WAL by default, file-based if flag is set
+        enable_wal_indexing: true,  // Enable WAL→Tantivy indexing
+        wal_indexing_interval_secs: 30,  // Index every 30 seconds
     };
     
     // Start Kafka protocol server

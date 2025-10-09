@@ -1278,18 +1278,21 @@ impl GroupManager {
                 };
 
                 // Commit to metadata store
+                info!("DEBUG: Committing offset for group={} topic={} partition={} offset={}",
+                      request.group_id, topic.name, partition.partition_index, partition.committed_offset);
+
                 if let Err(e) = self.metadata_store.commit_offset(consumer_offset).await {
                     warn!(
-                        "Failed to persist offset to WAL for group {} topic {} partition {}: {}",
-                        request.group_id, topic.name, partition.partition_index, e
+                        "✗ Failed to persist offset to metadata: group={} topic={} partition={} offset={} error={}",
+                        request.group_id, topic.name, partition.partition_index, partition.committed_offset, e
                     );
                     response_partitions.push(OffsetCommitResponsePartition {
                         partition_index: partition.partition_index,
                         error_code: 1, // Error
                     });
                 } else {
-                    debug!(
-                        "Persisted offset to WAL: group={} topic={} partition={} offset={}",
+                    info!(
+                        "✓ Persisted offset to metadata: group={} topic={} partition={} offset={}",
                         request.group_id, topic.name, partition.partition_index, partition.committed_offset
                     );
                     response_partitions.push(OffsetCommitResponsePartition {
@@ -1324,10 +1327,11 @@ impl GroupManager {
 
             for topic_name in requested_topics {
                 // Try to get committed offset for partition 0 (default)
+                info!("DEBUG: Fetching offset for group={} topic={} partition=0", request.group_id, topic_name);
                 match self.metadata_store.get_consumer_offset(&request.group_id, &topic_name, 0).await {
                     Ok(Some(offset_info)) => {
-                        debug!(
-                            "Retrieved offset from WAL: group={} topic={} partition=0 offset={}",
+                        info!(
+                            "✓ Retrieved offset from metadata: group={} topic={} partition=0 offset={}",
                             request.group_id, topic_name, offset_info.offset
                         );
                         response_topics.push(OffsetFetchResponseTopic {
@@ -1342,11 +1346,29 @@ impl GroupManager {
                             ],
                         });
                     }
-                    Ok(None) | Err(_) => {
+                    Ok(None) => {
                         // No committed offset found, return -1
-                        debug!(
-                            "No committed offset found for group={} topic={} partition=0",
+                        info!(
+                            "✗ No committed offset found for group={} topic={} partition=0 (returning -1)",
                             request.group_id, topic_name
+                        );
+                        response_topics.push(OffsetFetchResponseTopic {
+                            name: topic_name,
+                            partitions: vec![
+                                OffsetFetchResponsePartition {
+                                    partition_index: 0,
+                                    committed_offset: -1,  // No committed offset
+                                    metadata: None,
+                                    error_code: 0,
+                                }
+                            ],
+                        });
+                    }
+                    Err(e) => {
+                        // Error retrieving offset
+                        warn!(
+                            "✗ ERROR retrieving offset for group={} topic={} partition=0: {}",
+                            request.group_id, topic_name, e
                         );
                         response_topics.push(OffsetFetchResponseTopic {
                             name: topic_name,

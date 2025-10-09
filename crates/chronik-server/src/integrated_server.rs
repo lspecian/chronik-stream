@@ -24,6 +24,7 @@ use chronik_storage::{
     ObjectStoreTrait, ObjectStoreConfig, ObjectStoreFactory,
     SegmentReader, SegmentReaderConfig,
     SegmentWriter, SegmentWriterConfig,
+    WalIndexer, WalIndexerConfig,
 };
 
 // Metadata store
@@ -56,10 +57,12 @@ pub struct IntegratedServerConfig {
     pub num_partitions: u32,
     /// Default replication factor
     pub replication_factor: u32,
-    /// Enable dual storage (raw Kafka + indexed records for search)
-    pub enable_dual_storage: bool,
     /// Use WAL-based metadata store instead of file-based
     pub use_wal_metadata: bool,
+    /// Enable background WAL indexing (WAL → Tantivy → Object Store)
+    pub enable_wal_indexing: bool,
+    /// WAL indexing interval in seconds
+    pub wal_indexing_interval_secs: u64,
 }
 
 impl Default for IntegratedServerConfig {
@@ -69,13 +72,14 @@ impl Default for IntegratedServerConfig {
             advertised_host: "localhost".to_string(),
             advertised_port: 9092,
             data_dir: "./data".to_string(),
-            enable_indexing: false, // Disabled for now to avoid Tantivy complexity
+            enable_indexing: cfg!(feature = "search"), // Enable when search feature is compiled
             enable_compression: true,
             auto_create_topics: true,
             num_partitions: 3,
             replication_factor: 1,
-            enable_dual_storage: false, // Default to raw-only for better performance
             use_wal_metadata: true, // Default to WAL-based metadata
+            enable_wal_indexing: true, // Enable WAL→Tantivy indexing by default
+            wal_indexing_interval_secs: 30, // Index every 30 seconds
         }
     }
 }
@@ -85,6 +89,7 @@ pub struct IntegratedKafkaServer {
     config: IntegratedServerConfig,
     kafka_handler: Arc<KafkaProtocolHandler>,
     metadata_store: Arc<dyn MetadataStore>,
+    wal_indexer: Arc<WalIndexer>,
 }
 
 impl IntegratedKafkaServer {
@@ -216,7 +221,6 @@ impl IntegratedKafkaServer {
                     "none".to_string() 
                 },
                 max_segment_size: 256 * 1024 * 1024, // 256MB
-                enable_dual_storage: config.enable_dual_storage,
                 max_segment_age_secs: 30, // 30 seconds - flush on produce for immediate availability
                 retention_period_secs: 7 * 24 * 3600, // 7 days  
                 enable_cleanup: true,
@@ -253,31 +257,22 @@ impl IntegratedKafkaServer {
             } else {
                 chronik_storage::kafka_records::CompressionType::None
             },
-            request_timeout_ms: 30000,
+            request_timeout_ms: 120000,  // 120 seconds (increased from 30s to handle slow topic auto-creation)
             buffer_memory: 32 * 1024 * 1024, // 32MB
             auto_create_topics_enable: config.auto_create_topics,
             num_partitions: config.num_partitions,
             default_replication_factor: config.replication_factor,
         };
-        
-        // Create FetchHandler first
-        let fetch_handler = Arc::new(FetchHandler::new(
-            segment_reader.clone(),
-            metadata_store.clone(),
-            object_store_arc.clone(),
-        ));
-        
+
         // Initialize produce handler with object store directly
         let mut produce_handler_inner = ProduceHandler::new(
             produce_config,
             object_store_arc.clone(),
             metadata_store.clone(),
         ).await?;
-        
-        // Connect the fetch handler to the produce handler
-        produce_handler_inner.set_fetch_handler(fetch_handler.clone());
+
         let produce_handler_base = Arc::new(produce_handler_inner);
-        
+
         // Create WAL configuration with default settings
         use chronik_wal::{CompressionType, CheckpointConfig, RecoveryConfig, RotationConfig, FsyncConfig, WalConfig};
         use chronik_wal::config::AsyncIoConfig;
@@ -312,11 +307,20 @@ impl IntegratedKafkaServer {
         info!("Recovering from WAL...");
         wal_handler.recover().await
             .map_err(|e| anyhow::anyhow!("Failed to recover from WAL: {}", e))?;
-        
-        // Store the WAL handler for later use (will be used in kafka_handler)
-        // For now, we pass the base handler to KafkaProtocolHandler
-        // and we'll integrate WAL at the kafka_handler level
-        
+
+        // Extract WAL manager reference for FetchHandler
+        let wal_manager_ref = wal_handler.wal_manager().clone();
+
+        // Create FetchHandler with WAL and ProduceHandler integration (v1.3.39+)
+        // FetchHandler needs ProduceHandler to get the real-time high watermark
+        let fetch_handler = Arc::new(FetchHandler::new_with_wal(
+            segment_reader.clone(),
+            metadata_store.clone(),
+            object_store_arc.clone(),
+            wal_manager_ref,
+            produce_handler_base.clone(),
+        ));
+
         // Start background tasks for segment rotation on the base handler
         produce_handler_base.start_background_tasks().await;
         
@@ -327,13 +331,46 @@ impl IntegratedKafkaServer {
             segment_reader,
             metadata_store.clone(),
             object_store_arc.clone(),
-            fetch_handler,
+            fetch_handler.clone(),
             wal_handler.clone(),  // WAL is mandatory, not optional
             config.node_id,
             config.advertised_host.clone(),
             config.advertised_port,
+            config.num_partitions,  // Pass default partition count from config
         ).await?);
-        
+
+        // Initialize WAL Indexer (always enabled for search integration)
+        info!("Initializing WAL Indexer for background indexing (WAL → Tantivy → Object Store)");
+
+        let indexer_config = WalIndexerConfig {
+            interval_secs: config.wal_indexing_interval_secs,
+            min_segment_age_secs: 10,
+            max_segments_per_run: 100,
+            delete_after_index: true,
+            object_store: object_store_config.clone(),
+            index_base_path: format!("{}/tantivy_indexes", config.data_dir),
+            parallel_indexing: false, // Start with serial processing
+            max_concurrent_tasks: 4,
+            segment_index_path: Some(std::path::PathBuf::from(format!("{}/segment_index.json", config.data_dir))),
+            segment_index_auto_save: true,
+        };
+
+        // Get WAL manager from wal_handler
+        let wal_manager_ref = wal_handler.wal_manager().clone();
+
+        let wal_indexer = Arc::new(WalIndexer::new(
+            indexer_config,
+            wal_manager_ref,
+            object_store_arc.clone(),
+        ));
+
+        // Start the background indexing task
+        wal_indexer.start().await
+            .map_err(|e| anyhow::anyhow!("Failed to start WAL indexer: {}", e))?;
+
+        info!("WAL Indexer started successfully (interval: {}s)", config.wal_indexing_interval_secs);
+        info!("  Segment index will track Tantivy segments for future query optimization");
+
         info!("Integrated Kafka server initialized successfully");
         info!("  Node ID: {}", config.node_id);
         info!("  Advertised: {}:{}", config.advertised_host, config.advertised_port);
@@ -341,8 +378,8 @@ impl IntegratedKafkaServer {
         info!("  Auto-create topics: {}", config.auto_create_topics);
         info!("  Compression: {}", config.enable_compression);
         info!("  Indexing: {}", config.enable_indexing);
-        info!("  Dual storage: {}", config.enable_dual_storage);
-        
+        info!("  WAL Indexing: {}", config.enable_wal_indexing);
+
         // Create default topic on startup to ensure clients can connect
         // This solves the chicken-and-egg problem where clients need at least one topic
         // in metadata responses before they can produce messages
@@ -350,6 +387,7 @@ impl IntegratedKafkaServer {
             config,
             kafka_handler,
             metadata_store: metadata_store.clone(),
+            wal_indexer,
         };
         
         // Create default topic
@@ -357,8 +395,13 @@ impl IntegratedKafkaServer {
         if let Err(e) = server.ensure_default_topic().await {
             warn!("Failed to create default topic on startup: {:?}", e);
         }
-        
+
         Ok(server)
+    }
+
+    /// Get reference to the WAL indexer for search integration
+    pub fn get_wal_indexer(&self) -> Arc<WalIndexer> {
+        self.wal_indexer.clone()
     }
     
     /// Ensure a default topic exists for client connectivity
