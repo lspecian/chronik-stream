@@ -203,7 +203,7 @@ All images support both **linux/amd64** and **linux/arm64** architectures:
 
 | Image | Tags | Description |
 |-------|------|-------------|
-| `ghcr.io/lspecian/chronik-stream` | `latest`, `1.3`, `v1.3.x` | Chronik server with full KSQL support |
+| `ghcr.io/lspecian/chronik-stream` | `latest`, `1.3`, `v1.3.46` | Chronik server with full KSQL support |
 
 ### Supported Platforms
 

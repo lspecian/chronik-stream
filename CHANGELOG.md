@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.46] - 2025-10-09
+
+### Fixed
+- **CRITICAL**: Increase produce request timeout from 30s to 120s to handle slow topic auto-creation
+  - **Root cause**: Topic auto-creation with WAL-based metadata store takes significant time:
+    - Creating topic metadata (1 WAL write + fsync)
+    - Creating 3 partition assignments (3 WAL writes + fsyncs)
+    - Each fsync: 5-20ms on slow disks
+    - Total: ~200ms normally, but can exceed 30s under load
+  - **Impact**:
+    - kafka-python clients experiencing connection failures
+    - "Broken pipe (os error 32)" errors on server side
+    - Messages not persisting to WAL despite client reporting success
+    - Timeouts occurring exactly every 30 seconds
+  - **Solution**:
+    - Increased `request_timeout_ms` from 30000ms to 120000ms (120 seconds)
+    - Updated in TWO locations:
+      - `produce_handler.rs:101` - Default ProduceHandlerConfig
+      - `integrated_server.rs:260` - IntegratedKafkaServer config
+  - **Result**:
+    - ✅ kafka-python client timeouts resolved
+    - ✅ Message persistence to WAL now succeeds
+    - ✅ "Broken pipe" errors eliminated
+    - ✅ Enables WAL rotation testing
+  - **Performance**: Timeout increased from 30s to 120s (4x) - allows sufficient time for topic creation and large batch processing
+
+### Technical Details
+- **Files modified**:
+  - `crates/chronik-server/src/produce_handler.rs:101` - Increased default timeout
+  - `crates/chronik-server/src/integrated_server.rs:260` - Increased server config timeout
+- **Deployment**: Drop-in replacement, no configuration changes required
+- **Compatibility**: Fully backward compatible, no breaking changes
+
+See [docs/releases/RELEASE_NOTES_v1.3.46.md](docs/releases/RELEASE_NOTES_v1.3.46.md) for detailed release notes.
+
 ## [1.3.28] - 2025-10-05
 
 ### Fixed
