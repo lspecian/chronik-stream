@@ -396,9 +396,13 @@ impl WalRecord {
             }
 
             WalRecord::V2 { topic, canonical_data, .. } => {
-                let mut len = 15; // Fixed header: magic(2) + version(1) + flags(1) + length(4) + crc32(4) + topic_len(2) + partition(4) + data_len(4) = 19
+                // V2 format body (AFTER 12-byte header):
+                // topic_len(2) + topic + partition(4) + data_len(4) + data
+                // The length field stores the size of everything AFTER the 12-byte header
+                let mut len = 0;
+                len += 2; // topic_len field
                 len += topic.len() as u32;
-                len += 4; // partition
+                len += 4; // partition field
                 len += 4; // canonical_data length field
                 len += canonical_data.len() as u32;
                 len

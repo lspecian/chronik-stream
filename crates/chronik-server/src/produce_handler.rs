@@ -751,6 +751,10 @@ impl ProduceHandler {
                 }
                 
                 // Process the partition data
+                debug!(
+                    "PARTITION_DATA: topic={}, partition={}, records_len={} bytes",
+                    topic_data.name, partition_data.index, partition_data.records.len()
+                );
                 match self.produce_to_partition(
                     &topic_data.name,
                     partition_data.index,
@@ -841,45 +845,22 @@ impl ProduceHandler {
             );
             Bytes::copy_from_slice(records_data)
         } else {
-            // Offset mismatch - need to update header and recalculate CRC
+            // Offset mismatch - need to decode, update offset, and re-encode
             debug!(
-                "Base offset mismatch (incoming={}, assigned={}) - updating header and recalculating CRC",
+                "Base offset mismatch (incoming={}, assigned={}) - decoding, updating offset, and re-encoding",
                 incoming_base_offset, base_offset
             );
 
-            // HEX DUMP: Incoming records_data from producer (only when modifying)
-            if records_data.len() >= 61 {
-                let hex_first_64: String = records_data.iter().take(64).map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
-                debug!("PRODUCE INCOMING (first 64 bytes): {}", hex_first_64);
-            }
+            // Decode the batch (handles both legacy and v2 formats)
+            let (mut kafka_batch, _) = KafkaRecordBatch::decode(records_data)
+                .map_err(|e| Error::Protocol(format!("Failed to decode record batch: {}", e)))?;
 
-            // Update ONLY the header with new base_offset, keep compressed records UNCHANGED
-            let updated = CanonicalRecord::update_header_preserve_records(
-                records_data,
-                base_offset as i64,
-            ).map_err(|e| Error::Protocol(format!("Failed to update batch header: {}", e)))?;
+            // Update the base offset
+            kafka_batch.header.base_offset = base_offset as i64;
 
-            // HEX DUMP: Re-encoded bytes to be stored (only when modifying)
-            if updated.len() >= 61 {
-                let hex_first_64: String = updated.iter().take(64).map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
-                debug!("PRODUCE STORED (first 64 bytes): {}", hex_first_64);
-            }
-
-            // Log CRC before/after for debugging (only when modifying)
-            if records_data.len() >= 25 && updated.len() >= 25 {
-                let original_crc = u32::from_le_bytes([
-                    records_data[21], records_data[22], records_data[23], records_data[24]
-                ]);
-                let new_crc = u32::from_le_bytes([
-                    updated[21], updated[22], updated[23], updated[24]
-                ]);
-                debug!(
-                    "Header-only update: original_crc=0x{:08x}, new_crc=0x{:08x} (compressed records preserved)",
-                    original_crc, new_crc
-                );
-            }
-
-            updated
+            // Re-encode the batch (always to v2 format)
+            kafka_batch.encode()
+                .map_err(|e| Error::Protocol(format!("Failed to re-encode record batch: {}", e)))?
         };
 
         // Decode the batch (either original or updated)

@@ -10,6 +10,8 @@ use std::io::{Cursor, Read, Write};
 use flate2::write::{GzEncoder, ZlibEncoder};
 use flate2::read::{GzDecoder, ZlibDecoder};
 use flate2::Compression;
+use snap::raw::Decoder as SnappyDecoder;
+use lz4_flex::decompress_size_prepended as lz4_decompress;
 
 /// Magic byte for RecordBatch format v2
 const MAGIC_V2: i8 = 2;
@@ -243,15 +245,20 @@ impl KafkaRecordBatch {
                 encoder.finish()
                     .map_err(|e| Error::Internal(format!("Gzip finish failed: {}", e)))
             }
-            CompressionType::Zstd => {
-                // For now, fallback to zlib since zstd requires additional dependencies
-                let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-                encoder.write_all(&buf)
-                    .map_err(|e| Error::Internal(format!("Zlib compression failed: {}", e)))?;
-                encoder.finish()
-                    .map_err(|e| Error::Internal(format!("Zlib finish failed: {}", e)))
+            CompressionType::Snappy => {
+                let mut encoder = snap::raw::Encoder::new();
+                encoder.compress_vec(&buf)
+                    .map_err(|e| Error::Internal(format!("Snappy compression failed: {}", e)))
             }
-            _ => Ok(buf), // Other compression types not implemented yet
+            CompressionType::Lz4 => {
+                // Kafka uses LZ4 block format with size prefix
+                Ok(lz4_flex::compress_prepend_size(&buf))
+            }
+            CompressionType::Zstd => {
+                // Use actual zstd compression
+                zstd::encode_all(&buf[..], 3) // compression level 3
+                    .map_err(|e| Error::Internal(format!("Zstd compression failed: {}", e)))
+            }
         }
     }
     
@@ -460,15 +467,21 @@ impl KafkaRecordBatch {
                     .map_err(|e| Error::Internal(format!("Gzip decompression failed: {}", e)))?;
                 decompressed
             }
-            CompressionType::Zstd => {
-                // For now, try zlib since we used it as fallback
-                let mut decoder = ZlibDecoder::new(&compressed_buf[..]);
-                let mut decompressed = Vec::new();
-                decoder.read_to_end(&mut decompressed)
-                    .map_err(|e| Error::Internal(format!("Zlib decompression failed: {}", e)))?;
-                decompressed
+            CompressionType::Snappy => {
+                let mut decoder = SnappyDecoder::new();
+                decoder.decompress_vec(&compressed_buf)
+                    .map_err(|e| Error::Internal(format!("Snappy decompression failed: {}", e)))?
             }
-            _ => compressed_buf,
+            CompressionType::Lz4 => {
+                // Kafka uses LZ4 block format with size prefix
+                lz4_decompress(&compressed_buf)
+                    .map_err(|e| Error::Internal(format!("LZ4 decompression failed: {}", e)))?
+            }
+            CompressionType::Zstd => {
+                // Use actual zstd decompression
+                zstd::decode_all(&compressed_buf[..])
+                    .map_err(|e| Error::Internal(format!("Zstd decompression failed: {}", e)))?
+            }
         };
 
         // Decode records

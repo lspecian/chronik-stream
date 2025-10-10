@@ -697,21 +697,24 @@ impl FetchHandler {
                     Ok(canonical_record) => {
                         // Check if this batch has compressed_records_wire_bytes
                         if let Some(raw_bytes) = canonical_record.compressed_records_wire_bytes {
-                            // Parse batch header to check offset range (same logic as segments)
-                            if raw_bytes.len() < 61 {
-                                warn!("RAW→WAL: Batch too small ({} bytes), skipping", raw_bytes.len());
-                                continue;
-                            }
+                            // Use CanonicalRecord's base_offset (authoritative) rather than parsing from wire bytes
+                            // This handles cases where wire bytes were preserved AS-IS for CRC validation
+                            let base_offset = canonical_record.base_offset;
 
-                            let base_offset = i64::from_be_bytes([
-                                raw_bytes[0], raw_bytes[1], raw_bytes[2], raw_bytes[3],
-                                raw_bytes[4], raw_bytes[5], raw_bytes[6], raw_bytes[7],
-                            ]);
-
-                            let last_offset_delta = i32::from_be_bytes([
-                                raw_bytes[23], raw_bytes[24], raw_bytes[25], raw_bytes[26],
-                            ]);
-                            let last_offset = base_offset + last_offset_delta as i64;
+                            // Calculate last_offset: use records.len() - 1 if available, otherwise parse from wire bytes
+                            let last_offset = if !canonical_record.records.is_empty() {
+                                // Use the last record's offset from CanonicalRecord (most reliable)
+                                canonical_record.records.last().unwrap().offset
+                            } else if raw_bytes.len() >= 27 {
+                                // Fallback: parse last_offset_delta from v2 header at offset 23
+                                let last_offset_delta = i32::from_be_bytes([
+                                    raw_bytes[23], raw_bytes[24], raw_bytes[25], raw_bytes[26],
+                                ]);
+                                base_offset + last_offset_delta as i64
+                            } else {
+                                // Small batch or empty - assume single record at base_offset
+                                base_offset
+                            };
 
                             // Check if this batch overlaps with requested range
                             if last_offset >= fetch_offset && base_offset < high_watermark {
@@ -720,8 +723,8 @@ impl FetchHandler {
                                 }
 
                                 info!(
-                                    "RAW→WAL: Adding {} bytes from batch {}-{}",
-                                    raw_bytes.len(), base_offset, last_offset
+                                    "RAW→WAL: Adding {} bytes from batch {}-{} ({} records)",
+                                    raw_bytes.len(), base_offset, last_offset, canonical_record.records.len()
                                 );
                                 combined_bytes.extend_from_slice(&raw_bytes);
                             } else {

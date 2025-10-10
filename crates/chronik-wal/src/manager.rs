@@ -456,14 +456,15 @@ impl WalManager {
                         // For recovery, we need ALL V2 records for this partition
                         file_records.push(record);
 
-                        // CRITICAL FIX: Advance cursor by FULL record size (header + body)
-                        // V2 format: 12-byte header (magic[2] + version[1] + flags[1] + length[4] + crc32[4]) + variable body
-                        // The `length` field contains the size of everything AFTER the header
-                        let bytes_consumed = rdr.position() as usize; // Body bytes read
-                        let total_record_size = 12 + bytes_consumed; // Header + body
+                        // CRITICAL FIX: Advance cursor by FULL record size
+                        // V2 format: 12-byte header + body (where body size is stored in `length` field)
+                        // rdr.position() gives us the total bytes read from rdr, which includes BOTH header and body
+                        // since rdr was created from &file_data[cursor..] and we read the header from it too
+                        let total_bytes_read = rdr.position() as usize; // Total bytes consumed (header + body)
+                        let total_record_size = total_bytes_read;
 
-                        debug!("Advancing cursor from {} by {} bytes (header[12] + body[{}], stored length was {})",
-                            record_start, total_record_size, bytes_consumed, length);
+                        debug!("Advancing cursor from {} by {} bytes (total_bytes_read={}, stored length was {})",
+                            record_start, total_record_size, total_bytes_read, length);
                         cursor = record_start + total_record_size;
                     }
 

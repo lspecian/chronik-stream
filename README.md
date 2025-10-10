@@ -13,6 +13,7 @@ See [CHANGELOG.md](CHANGELOG.md) for release history and latest updates.
 ## 🚀 Features
 
 - **Kafka Wire Protocol**: Full Kafka wire protocol with consumer group and transactional support
+- **Full Compression Support**: All Kafka compression codecs (Gzip, Snappy, LZ4, Zstd) - see [COMPRESSION_SUPPORT.md](COMPRESSION_SUPPORT.md)
 - **WAL-based Metadata**: ChronikMetaLog provides event-sourced metadata persistence
 - **Write-Ahead Log**: Complete WAL system with segmentation, rotation, recovery, and truncation
 - **Automatic Recovery**: WAL records are automatically replayed on startup to restore state
