@@ -723,10 +723,10 @@ pub fn supported_api_versions() -> HashMap<ApiKey, VersionRange> {
     versions.insert(ApiKey::WriteTxnMarkers, VersionRange { min: 0, max: 0 });  // Broker-internal, not client-facing
     versions.insert(ApiKey::TxnOffsetCommit, VersionRange { min: 0, max: 3 });  // v0-v3 supported
     
-    // ACL APIs (NOT IMPLEMENTED - placeholder for librdkafka compatibility)
-    versions.insert(ApiKey::DescribeAcls, VersionRange { min: 0, max: 0 });
-    versions.insert(ApiKey::CreateAcls, VersionRange { min: 0, max: 0 });
-    versions.insert(ApiKey::DeleteAcls, VersionRange { min: 0, max: 0 });
+    // ACL APIs (v0-v3 supported, flexible encoding from v2+)
+    versions.insert(ApiKey::DescribeAcls, VersionRange { min: 0, max: 3 });
+    versions.insert(ApiKey::CreateAcls, VersionRange { min: 0, max: 3 });
+    versions.insert(ApiKey::DeleteAcls, VersionRange { min: 0, max: 3 });
     
     // Additional APIs (NOT IMPLEMENTED - placeholder for librdkafka compatibility)
     versions.insert(ApiKey::DeleteRecords, VersionRange { min: 0, max: 0 });

@@ -155,55 +155,113 @@ pub struct DescribeAclsResponse {
 
 /// Encode DescribeAcls response
 pub fn encode_describe_acls_response(response: &DescribeAclsResponse, version: i16) -> BytesMut {
+    use crate::parser::Encoder;
+
     let mut buf = BytesMut::new();
+    let is_flexible = version >= 2;  // Flexible encoding from v2+
 
-    // Throttle time
-    buf.put_i32(response.throttle_time_ms);
+    if is_flexible {
+        // CRITICAL: Create a SINGLE Encoder instance and use it throughout the entire response.
+        // Do NOT create new Encoder instances for each field - that pattern doesn't work because
+        // each new instance creates its own buffer and the data gets lost when it goes out of scope.
+        // This single-instance pattern ensures all writes accumulate in the same buffer.
+        let mut encoder = Encoder::new(&mut buf);
 
-    // Error code
-    buf.put_i16(response.error_code);
+        // Throttle time
+        encoder.write_i32(response.throttle_time_ms);
 
-    // Error message (nullable)
-    if let Some(ref msg) = response.error_message {
-        buf.put_i16(msg.len() as i16);
-        buf.put_slice(msg.as_bytes());
-    } else {
-        buf.put_i16(-1);  // null
-    }
+        // Error code
+        encoder.write_i16(response.error_code);
 
-    // Resources array
-    buf.put_i32(response.resources.len() as i32);
+        // Error message (compact nullable string)
+        encoder.write_compact_string(response.error_message.as_deref());
 
-    for resource in &response.resources {
-        // Resource type
-        buf.put_i8(resource.resource_type as i8);
+        // Resources array (compact array)
+        encoder.write_unsigned_varint((response.resources.len() as u32) + 1);
 
-        // Resource name
-        buf.put_i16(resource.resource_name.len() as i16);
-        buf.put_slice(resource.resource_name.as_bytes());
+        for resource in &response.resources {
+            // Resource type
+            encoder.write_i8(resource.resource_type as i8);
 
-        // Resource pattern type (v1+)
-        if version >= 1 {
-            buf.put_i8(resource.resource_pattern_type as i8);
+            // Resource name (compact string)
+            encoder.write_compact_string(Some(&resource.resource_name));
+
+            // Resource pattern type (v1+)
+            encoder.write_i8(resource.resource_pattern_type as i8);
+
+            // ACLs array (compact array)
+            encoder.write_unsigned_varint((resource.acls.len() as u32) + 1);
+
+            for acl in &resource.acls {
+                // Principal (compact string)
+                encoder.write_compact_string(Some(&acl.principal));
+
+                // Host (compact string)
+                encoder.write_compact_string(Some(&acl.host));
+
+                // Operation
+                encoder.write_i8(acl.operation as i8);
+
+                // Permission type
+                encoder.write_i8(acl.permission_type as i8);
+
+                // Tagged fields for each ACL
+                encoder.write_unsigned_varint(0);
+            }
+
+            // Tagged fields for each resource
+            encoder.write_unsigned_varint(0);
         }
 
-        // ACLs array
-        buf.put_i32(resource.acls.len() as i32);
+        // Tagged fields at response level
+        encoder.write_unsigned_varint(0);
+    } else {
+        // Standard encoding for v0-v1
+        buf.put_i32(response.throttle_time_ms);
+        buf.put_i16(response.error_code);
 
-        for acl in &resource.acls {
-            // Principal
-            buf.put_i16(acl.principal.len() as i16);
-            buf.put_slice(acl.principal.as_bytes());
+        // Error message (nullable string)
+        if let Some(ref msg) = response.error_message {
+            buf.put_i16(msg.len() as i16);
+            buf.put_slice(msg.as_bytes());
+        } else {
+            buf.put_i16(-1);  // null
+        }
 
-            // Host
-            buf.put_i16(acl.host.len() as i16);
-            buf.put_slice(acl.host.as_bytes());
+        // Resources array
+        buf.put_i32(response.resources.len() as i32);
 
-            // Operation
-            buf.put_i8(acl.operation as i8);
+        for resource in &response.resources {
+            // Resource type
+            buf.put_i8(resource.resource_type as i8);
 
-            // Permission type
-            buf.put_i8(acl.permission_type as i8);
+            // Resource name
+            buf.put_i16(resource.resource_name.len() as i16);
+            buf.put_slice(resource.resource_name.as_bytes());
+
+            // Resource pattern type (v1 only)
+            if version >= 1 {
+                buf.put_i8(resource.resource_pattern_type as i8);
+            }
+
+            // ACLs array
+            buf.put_i32(resource.acls.len() as i32);
+
+            for acl in &resource.acls {
+                // Principal
+                buf.put_i16(acl.principal.len() as i16);
+                buf.put_slice(acl.principal.as_bytes());
+
+                // Host
+                buf.put_i16(acl.host.len() as i16);
+                buf.put_slice(acl.host.as_bytes());
+
+                // Operation
+                buf.put_i8(acl.operation as i8);
+
+                // Permission type
+                buf.put_i8(acl.permission_type as i8);
+            }
         }
     }
 
