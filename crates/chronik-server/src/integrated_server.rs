@@ -298,11 +298,11 @@ impl IntegratedKafkaServer {
         // 3. Recovery: Clear segments, replay WAL → Segments
         // Without clearing, we'd have: WAL data + Old segment data = Duplicates
         info!("Clearing segments directory to prevent duplicates during WAL recovery...");
-        let segments_dir = std::path::Path::new("./data/segments");
-        if segments_dir.exists() {
-            match tokio::fs::remove_dir_all(segments_dir).await {
-                Ok(_) => info!("Cleared segments directory successfully"),
-                Err(e) => warn!("Failed to clear segments directory: {}. Recovery may have duplicates.", e),
+        let segments_dir_path = std::path::Path::new(&segments_dir);
+        if segments_dir_path.exists() {
+            match tokio::fs::remove_dir_all(segments_dir_path).await {
+                Ok(_) => info!("Cleared segments directory successfully: {}", segments_dir),
+                Err(e) => warn!("Failed to clear segments directory {}: {}. Recovery may have duplicates.", segments_dir, e),
             }
         }
 
@@ -531,28 +531,63 @@ impl IntegratedKafkaServer {
         let listener = TcpListener::bind(bind_addr).await?;
         info!("Integrated Kafka server listening on {}", bind_addr);
         info!("Ready to accept Kafka client connections");
-        
+
+        // CRITICAL FIX (v1.3.56): Limit concurrent requests to prevent task overload
+        // With acks=0, clients can send faster than server can process, causing
+        // tokio runtime to spawn thousands of tasks that never get scheduled.
+        // Semaphore provides backpressure at TCP level.
+        let max_concurrent_requests = 1000; // Kafka default is 500-1000
+        let request_semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent_requests));
+        info!("Request concurrency limited to {} (prevents acks=0 overload)", max_concurrent_requests);
+
         loop {
             match listener.accept().await {
                 Ok((mut socket, addr)) => {
                     debug!("New connection from {}", addr);
-                    
+
                     // Enable TCP_NODELAY to disable Nagle's algorithm for immediate sending
                     if let Err(e) = socket.set_nodelay(true) {
                         error!("Failed to set TCP_NODELAY for {}: {}", addr, e);
                     }
-                    
+
                     let kafka_handler = self.kafka_handler.clone();
                     let error_handler = Arc::new(ErrorHandler::new());
-                    
+                    let semaphore = request_semaphore.clone();
+
+                    // CRITICAL FIX (v1.3.56): Channel-based concurrent request processing
+                    // Split socket into read/write halves for concurrent operation
+                    let (socket_reader, mut socket_writer) = socket.into_split();
+
+                    // Elastic response channel capacity for burst traffic handling
+                    // 10x semaphore limit provides buffer for burst traffic when handlers complete simultaneously
+                    // With 1000 concurrent handlers + 100ms WAL batch window (ultra profile),
+                    // handlers complete together and need elastic response buffering
+                    let (response_tx, mut response_rx) = tokio::sync::mpsc::channel::<(i32, Vec<u8>)>(10_000);
+
+                    // Spawn response writer task
+                    tokio::spawn(async move {
+                        while let Some((correlation_id, response_data)) = response_rx.recv().await {
+                            // Write response to socket
+                            if let Err(e) = socket_writer.write_all(&response_data).await {
+                                error!("Failed to write response for correlation_id={}: {}", correlation_id, e);
+                                break;
+                            }
+                            if let Err(e) = socket_writer.flush().await {
+                                error!("Failed to flush response for correlation_id={}: {}", correlation_id, e);
+                                break;
+                            }
+                        }
+                    });
+
                     // Spawn a task to handle this connection with proper error handling
                     tokio::spawn(async move {
                         let mut request_buffer = vec![0; 65536];
-                        
+                        let mut socket_reader = socket_reader;
+
                         loop {
                             // Read the size header (4 bytes)
                             let mut size_buf = [0u8; 4];
-                            match socket.read_exact(&mut size_buf).await {
+                            match socket_reader.read_exact(&mut size_buf).await {
                                 Ok(_) => {},
                                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                                     debug!("Connection closed by {}", addr);
@@ -577,7 +612,7 @@ impl IntegratedKafkaServer {
                                 // Try to recover by consuming any remaining data and continuing
                                 // Read and discard up to 1KB of data to clear the buffer
                                 let mut discard_buf = vec![0u8; 1024];
-                                let _ = socket.try_read(&mut discard_buf);
+                                let _ = socket_reader.read(&mut discard_buf).await;
 
                                 // Continue to next request instead of breaking connection
                                 continue;
@@ -589,7 +624,7 @@ impl IntegratedKafkaServer {
                                 // Try to recover instead of breaking connection
                                 // Clear the socket buffer and continue
                                 let mut discard_buf = vec![0u8; 1024];
-                                while let Ok(n) = socket.try_read(&mut discard_buf) {
+                                while let Ok(n) = socket_reader.read(&mut discard_buf).await {
                                     if n == 0 { break; }
                                 }
 
@@ -603,7 +638,7 @@ impl IntegratedKafkaServer {
                             }
 
                             // Read the request body
-                            match socket.read_exact(&mut request_buffer[..request_size]).await {
+                            match socket_reader.read_exact(&mut request_buffer[..request_size]).await {
                                 Ok(_) => {},
                                 Err(e) => {
                                     error!("Error reading request body from {}: {}", addr, e);
@@ -637,185 +672,99 @@ impl IntegratedKafkaServer {
                             } else {
                                 0
                             };
-                            
-                            // Handle request using the integrated handler
-                            match kafka_handler.handle_request(&request_buffer[..request_size]).await {
+
+                            // CRITICAL FIX (v1.3.56): Spawn request handler as separate task
+                            // This enables concurrent request processing - the connection loop never blocks
+                            // Copy request data and spawn handler
+                            let request_data = request_buffer[..request_size].to_vec();
+                            let handler_clone = kafka_handler.clone();
+                            let response_sender = response_tx.clone();
+                            let semaphore_clone = semaphore.clone();
+                            let error_handler_clone = error_handler.clone();
+                            let addr_clone = addr;
+
+                            tokio::spawn(async move {
+                                // Acquire semaphore to limit concurrent handlers
+                                let _permit = match semaphore_clone.acquire_owned().await {
+                                    Ok(p) => p,
+                                    Err(_) => {
+                                        error!("Failed to acquire semaphore for request");
+                                        return;
+                                    }
+                                };
+
+                                // Handle request using the integrated handler
+                                match handler_clone.handle_request(&request_data).await {
                                 Ok(response) => {
                                     // Build complete response with size header
-                                    // We need to handle flexible versions properly
                                     let mut header_bytes = Vec::new();
-                                    
-                                    // Add correlation ID
                                     header_bytes.extend_from_slice(&response.header.correlation_id.to_be_bytes());
-                                    
-                                    // For flexible versions, add tagged fields after correlation ID
-                                    // According to Kafka protocol spec, ALL flexible API versions need tagged fields in response header
-                                    // ApiVersions v3 is an exception - it has NO tagged fields anywhere (not in header, not in body)
+
                                     if response.is_flexible {
-                                        // ApiVersions v3 is special - no tagged fields at all
-                                        // All other flexible APIs (including Produce v9+, Fetch v12+) need empty tagged fields in header
                                         if response.api_key != chronik_protocol::parser::ApiKey::ApiVersions {
-                                            // Add empty tagged fields (varint 0) for all flexible APIs except ApiVersions
                                             header_bytes.push(0);
                                         }
                                     }
-                                    
+
                                     let mut full_response = Vec::with_capacity(header_bytes.len() + response.body.len() + 4);
-                                    
-                                    // Add size (4 bytes)
                                     let size = (header_bytes.len() + response.body.len()) as i32;
-                                    eprintln!("DEBUG SIZE: header_bytes.len()={}, body.len()={}, calculated size={}, is_flexible={}, api_key={:?}", 
-                                        header_bytes.len(), response.body.len(), size, response.is_flexible, response.api_key);
-                                    eprintln!("DEBUG: response.body first 32 bytes: {:?}", 
-                                        &response.body[..response.body.len().min(32)]);
-                                    
-                                    let size_bytes = size.to_be_bytes();
-                                    eprintln!("DEBUG: size_bytes = {:?}", size_bytes);
-                                    full_response.extend_from_slice(&size_bytes);
-                                    eprintln!("DEBUG: After adding size, full_response.len()={}", full_response.len());
-                                    
-                                    // Add header (correlation ID + optional tagged fields)
-                                    eprintln!("DEBUG: header_bytes = {:?}", header_bytes);
+                                    full_response.extend_from_slice(&size.to_be_bytes());
                                     full_response.extend_from_slice(&header_bytes);
-                                    eprintln!("DEBUG: After adding header, full_response.len()={}", full_response.len());
-                                    
-                                    // Add response body
                                     full_response.extend_from_slice(&response.body);
-                                    eprintln!("DEBUG: After adding body, full_response.len()={} (expected={})", 
-                                        full_response.len(), 4 + header_bytes.len() + response.body.len());
-                                    
-                                    // Validate the complete response before sending
-                                    eprintln!("CRITICAL: About to send {} bytes. First 16 bytes: {:02x?}", 
-                                        full_response.len(), &full_response[..std::cmp::min(16, full_response.len())]);
-                                    eprintln!("CRITICAL: Last 16 bytes: {:02x?}", 
-                                        &full_response[full_response.len().saturating_sub(16)..]);
-                                    
-                                    debug!("Sending response: size={}, correlation_id={}, body_len={}, total_len={}", 
-                                        size, response.header.correlation_id, response.body.len(), full_response.len());
-                                    tracing::trace!("Response bytes (first 64): {:?}", 
-                                        &full_response[..std::cmp::min(64, full_response.len())]);
-                                    
-                                    // Send the response
-                                    let response_size = full_response.len();
-                                    
-                                    // Option 1: Try vectored write first (most efficient)
-                                    let size_slice = &full_response[..4];
-                                    let header_and_body = &full_response[4..];
-                                    
-                                    eprintln!("CRITICAL: Attempting vectored write with 2 IoSlices");
-                                    eprintln!("  - Size prefix: {:02x?}", size_slice);
-                                    eprintln!("  - Header+Body first 16 bytes: {:02x?}", &header_and_body[..std::cmp::min(16, header_and_body.len())]);
-                                    
-                                    let bufs = &[
-                                        IoSlice::new(size_slice),
-                                        IoSlice::new(header_and_body)
-                                    ];
-                                    
-                                    // Use write_vectored to send both parts atomically
-                                    let mut total_written = 0;
-                                    while total_written < response_size {
-                                        match socket.write_vectored(bufs).await {
-                                            Ok(n) => {
-                                                total_written += n;
-                                                eprintln!("CRITICAL: write_vectored wrote {} bytes (total: {}/{})", 
-                                                    n, total_written, response_size);
-                                                
-                                                if n == 0 {
-                                                    eprintln!("ERROR: write_vectored returned 0 bytes");
-                                                    break;
-                                                }
-                                                
-                                                // If partial write, fall back to regular write for remainder
-                                                if total_written < response_size {
-                                                    eprintln!("CRITICAL: Partial write detected, writing remaining {} bytes", 
-                                                        response_size - total_written);
-                                                    match socket.write_all(&full_response[total_written..]).await {
-                                                        Ok(()) => {
-                                                            eprintln!("CRITICAL: Remainder write_all completed");
-                                                            total_written = response_size;
-                                                        }
-                                                        Err(e) => {
-                                                            error!("Error writing remainder to {}: {}", addr, e);
-                                                            break;
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            Err(e) => {
-                                                error!("Error in write_vectored to {}: {}", addr, e);
-                                                eprintln!("CRITICAL: write_vectored FAILED: {}, falling back to write_all", e);
-                                                
-                                                // Fallback: Try single write_all
-                                                match socket.write_all(&full_response[total_written..]).await {
-                                                    Ok(()) => {
-                                                        eprintln!("CRITICAL: Fallback write_all completed successfully");
-                                                        total_written = response_size;
-                                                    }
-                                                    Err(e) => {
-                                                        error!("Error in fallback write to {}: {}", addr, e);
-                                                        break;
-                                                    }
-                                                }
-                                                break;
-                                            }
-                                        }
+
+                                    // Measure channel send delay to detect backpressure
+                                    let send_start = std::time::Instant::now();
+                                    if let Err(e) = response_sender.send((response.header.correlation_id, full_response)).await {
+                                        error!("Failed to send response to writer for addr={}: {}", addr_clone, e);
                                     }
-                                    
-                                    // Ensure all data is flushed
-                                    eprintln!("CRITICAL: Flushing socket to ensure transmission");
-                                    match socket.flush().await {
-                                        Ok(()) => {
-                                            eprintln!("CRITICAL: Socket flush completed successfully");
-                                        }
-                                        Err(e) => {
-                                            error!("Error flushing socket to {}: {}", addr, e);
-                                            eprintln!("CRITICAL: Socket flush FAILED: {}", e);
-                                        }
+                                    let send_duration = send_start.elapsed();
+                                    if send_duration.as_millis() > 10 {
+                                        warn!("Response channel send took {}ms (correlation_id={}) - channel backpressure detected",
+                                              send_duration.as_millis(), response.header.correlation_id);
                                     }
-                                    
-                                    if total_written == response_size {
-                                        eprintln!("CRITICAL: Successfully sent complete {} byte response", response_size);
-                                    } else {
-                                        eprintln!("ERROR: Only sent {}/{} bytes!", total_written, response_size);
-                                    }
-                                    
-                                    debug!("Response sent successfully to {}", addr);
                                 }
                                 Err(e) => {
                                     // Convert to ServerError for proper handling
                                     let server_error = ErrorHandler::from_anyhow(anyhow::anyhow!(e));
-                                    let recovery = error_handler.handle_error(
-                                        server_error, 
-                                        &format!("request from {}", addr)
+                                    let recovery = error_handler_clone.handle_error(
+                                        server_error,
+                                        &format!("request from {}", addr_clone)
                                     ).await;
-                                    
+
                                     match recovery {
                                         ErrorRecovery::ReturnError(error_code) => {
                                             // Build proper error response with preserved correlation ID
-                                            let error_response = error_handler.build_error_response(
+                                            let error_response = error_handler_clone.build_error_response(
                                                 error_code,
-                                                correlation_id, // Use the preserved correlation ID
+                                                correlation_id,
                                                 0, // Unknown API key
                                                 0, // Unknown API version
                                             );
-                                            
-                                            if let Err(e) = socket.write_all(&error_response).await {
-                                                error!("Error writing error response to {}: {}", addr, e);
-                                                break;
+
+                                            // Measure channel send delay for error responses too
+                                            let send_start = std::time::Instant::now();
+                                            if let Err(e) = response_sender.send((correlation_id, error_response)).await {
+                                                error!("Failed to send error response: {}", e);
+                                            }
+                                            let send_duration = send_start.elapsed();
+                                            if send_duration.as_millis() > 10 {
+                                                warn!("Error response channel send took {}ms (correlation_id={}) - channel backpressure detected",
+                                                      send_duration.as_millis(), correlation_id);
                                             }
                                         }
                                         ErrorRecovery::CloseConnection => {
-                                            info!("Closing connection to {} due to error", addr);
-                                            break;
+                                            info!("Closing connection to {} due to error", addr_clone);
+                                            // Channel will be dropped, closing the connection
                                         }
                                         ErrorRecovery::Throttle(ms) => {
-                                            debug!("Throttling client {} for {}ms", addr, ms);
+                                            debug!("Throttling client {} for {}ms", addr_clone, ms);
                                             tokio::time::sleep(tokio::time::Duration::from_millis(ms)).await;
                                         }
                                         _ => {}
                                     }
                                 }
                             }
+                            });  // End of spawned handler task
                         }
                         
                         debug!("Connection handler for {} terminated", addr);

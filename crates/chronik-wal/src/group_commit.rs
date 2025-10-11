@@ -378,20 +378,34 @@ impl GroupCommitWal {
     }
 
     /// Enqueue without waiting (acks=0 mode)
+    ///
+    /// Elastic buffer for acks=0 with high threshold
+    /// - Monitor queue size but DON'T block/error for acks=0 (fire-and-forget semantics)
+    /// - Queue grows elastically during bursts, background committer drains at its own pace
+    /// - Warn only if queue exceeds 10x batch size (very large accumulation)
+    /// - Ultra profile: 10MB batch size × 10 = 100MB warning threshold
+    /// - This prevents false "message loss" from backpressure errors
     async fn enqueue_nowait(
         &self,
         queue: Arc<PartitionCommitQueue>,
         data: Bytes,
     ) -> Result<()> {
-        // Check backpressure
-        let queued_bytes = *queue.total_queued_bytes.lock().await;
-        if queued_bytes >= self.config.max_batch_bytes * 2 {
-            queue.metrics.backpressure_events.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return Err(WalError::Backpressure("Queue too full for acks=0".into()));
+        let data_len = data.len();
+
+        // Monitor backpressure but don't block - elastic buffer with high threshold
+        {
+            let queued_bytes = *queue.total_queued_bytes.lock().await;
+            if queued_bytes >= self.config.max_batch_bytes * 10 {
+                queue.metrics.backpressure_events.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                warn!(
+                    "acks=0 queue growing large: {} MB (elastic threshold {} MB), continuing",
+                    queued_bytes / 1_000_000,
+                    (self.config.max_batch_bytes * 10) / 1_000_000
+                );
+            }
         }
 
         // Enqueue without response channel
-        let data_len = data.len();
         let mut pending = queue.pending.lock().await;
         pending.push_back(PendingWrite {
             data,
