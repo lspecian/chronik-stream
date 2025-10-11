@@ -196,6 +196,7 @@ Environment Variables:
   CHRONIK_ADVERTISED_PORT      Port advertised to clients
   CHRONIK_DATA_DIR             Data directory path
   CHRONIK_FILE_METADATA        Set to "true" to use legacy file-based metadata store
+  CHRONIK_WAL_PROFILE          WAL performance profile: low/medium/high (auto-detects if not set)
   RUST_LOG                     Log level (error, warn, info, debug, trace)
 ```
 
@@ -355,3 +356,4 @@ Apache License 2.0. See [LICENSE](LICENSE) for details.
 - [CHANGELOG.md](CHANGELOG.md) - Detailed release history
 - [CLAUDE.md](CLAUDE.md) - Development guide for AI assistants
 - [docs/KSQL_INTEGRATION_GUIDE.md](docs/KSQL_INTEGRATION_GUIDE.md) - KSQL setup and usage
+- [docs/WAL_AUTO_TUNING.md](docs/WAL_AUTO_TUNING.md) - WAL performance auto-tuning guide
