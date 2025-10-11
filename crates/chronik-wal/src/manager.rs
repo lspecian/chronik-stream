@@ -48,14 +48,17 @@ impl WalManager {
 
         let fsync_batcher = FsyncBatcher::new(config.fsync.clone());
 
-        // Initialize GroupCommitWal for zero-loss durability (v1.3.52+)
-        let group_commit_config = GroupCommitConfig {
-            max_batch_size: 1000,           // 1000 writes per batch
-            max_batch_bytes: 10_000_000,    // 10MB per batch
-            max_wait_time_ms: 10,           // 10ms max latency
-            max_queue_depth: 5000,          // 5000 pending writes max
-            enable_metrics: true,
-        };
+        // Initialize GroupCommitWal for zero-loss durability (v1.3.54+)
+        // Auto-tunes based on CPU count: 1-2 CPUs (conservative), 3-8 CPUs (balanced), 9+ CPUs (aggressive)
+        let group_commit_config = GroupCommitConfig::auto_tune();
+        info!(
+            "GroupCommitWal auto-tuned: batch_size={}, batch_bytes={}MB, wait_ms={}ms, queue_depth={}",
+            group_commit_config.max_batch_size,
+            group_commit_config.max_batch_bytes / 1_000_000,
+            group_commit_config.max_wait_time_ms,
+            group_commit_config.max_queue_depth
+        );
+
         let group_commit_wal = Arc::new(GroupCommitWal::new(
             config.data_dir.clone(),
             group_commit_config,

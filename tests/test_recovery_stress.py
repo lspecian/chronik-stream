@@ -169,11 +169,11 @@ def test_recovery_at_scale(message_count):
 
 def main():
     """Run stress tests at multiple scales"""
-    test_sizes = [5000, 10000, 50000]
+    test_sizes = [5000, 10000, 50000, 100000, 500000]
     results = {}
 
     print("🚀 WAL Recovery Stress Testing")
-    print("Testing scales: 5K, 10K, 50K messages")
+    print("Testing scales: 5K, 10K, 50K, 100K, 500K messages")
     print("=" * 60)
 
     for size in test_sizes:

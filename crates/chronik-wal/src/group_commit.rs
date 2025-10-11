@@ -46,11 +46,67 @@ pub struct GroupCommitConfig {
 
 impl Default for GroupCommitConfig {
     fn default() -> Self {
+        Self::auto_tune()
+    }
+}
+
+impl GroupCommitConfig {
+    /// Auto-tune configuration based on system resources
+    pub fn auto_tune() -> Self {
+        use std::thread;
+
+        // Detect CPU count
+        let cpu_count = thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+
+        // Scale configuration based on CPU count
+        // Low-end (1-2 CPUs): Conservative config for containers/VMs
+        // Mid-range (3-8 CPUs): Balanced config for typical servers
+        // High-end (9+ CPUs): Aggressive config for big iron
+
+        let (batch_size, batch_bytes, wait_ms, queue_depth) = match cpu_count {
+            1..=2 => (
+                1_000,          // 1K writes per batch
+                10_000_000,     // 10MB per batch
+                10,             // 10ms latency
+                5_000,          // 5K queue depth
+            ),
+            3..=8 => (
+                5_000,          // 5K writes per batch (sweet spot)
+                25_000_000,     // 25MB per batch
+                5,              // 5ms latency (low-latency optimized)
+                25_000,         // 25K queue depth
+            ),
+            _ => (
+                10_000,         // 10K writes per batch
+                50_000_000,     // 50MB per batch
+                2,              // 2ms latency (ultra low-latency)
+                50_000,         // 50K queue depth
+            ),
+        };
+
         Self {
-            max_batch_size: 1000,           // 1000 writes per batch
-            max_batch_bytes: 10_000_000,    // 10MB per batch
-            max_wait_time_ms: 10,           // 10ms max latency
-            max_queue_depth: 5000,          // 5000 pending writes max
+            max_batch_size: batch_size,
+            max_batch_bytes: batch_bytes,
+            max_wait_time_ms: wait_ms,
+            max_queue_depth: queue_depth,
+            enable_metrics: true,
+        }
+    }
+
+    /// Create custom configuration
+    pub fn custom(
+        max_batch_size: usize,
+        max_batch_bytes: usize,
+        max_wait_time_ms: u64,
+        max_queue_depth: usize,
+    ) -> Self {
+        Self {
+            max_batch_size,
+            max_batch_bytes,
+            max_wait_time_ms,
+            max_queue_depth,
             enable_metrics: true,
         }
     }
