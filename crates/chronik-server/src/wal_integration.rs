@@ -13,9 +13,10 @@ use tracing::{debug, info, warn, error, instrument};
 use bytes::{Bytes, BytesMut, BufMut};
 
 /// WAL-integrated produce handler wrapper
+/// v1.3.47+: Uses Arc<WalManager> directly for lock-free concurrent access
 pub struct WalProduceHandler {
-    /// WAL manager for durability
-    wal_manager: Arc<RwLock<WalManager>>,
+    /// WAL manager for durability (no RwLock - WalManager uses DashMap internally)
+    wal_manager: Arc<WalManager>,
     /// Original produce handler (will be removed after full integration)
     inner_handler: Arc<ProduceHandler>,
 }
@@ -44,16 +45,44 @@ impl WalProduceHandler {
         let wal_manager = WalManager::recover(&wal_config).await
             .map_err(|e| Error::Internal(format!("Failed to recover WAL: {}", e)))?;
 
-        info!("WAL-integrated produce handler initialized with recovery");
+        let wal_manager_arc = Arc::new(wal_manager);
+
+        // Start periodic background flusher (flushes WAL every 50ms)
+        // This eliminates fsync bottleneck in produce path while maintaining durability
+        use chronik_wal::{PeriodicFlusherConfig, spawn_periodic_flusher};
+        let flusher_config = PeriodicFlusherConfig::default();
+        spawn_periodic_flusher(wal_manager_arc.clone(), flusher_config);
+
+        info!("WAL-integrated produce handler initialized with recovery and periodic flusher");
 
         Ok(Self {
-            wal_manager: Arc::new(RwLock::new(wal_manager)),
+            wal_manager: wal_manager_arc,
             inner_handler,
         })
     }
 
+    /// Create a passthrough wrapper for backward compatibility (v1.3.47+)
+    /// WAL writes are now handled inline in ProduceHandler
+    pub fn new_passthrough(
+        wal_manager: Arc<WalManager>,
+        inner_handler: Arc<ProduceHandler>,
+    ) -> Self {
+        // Start periodic background flusher (flushes WAL every 50ms)
+        use chronik_wal::{PeriodicFlusherConfig, spawn_periodic_flusher};
+        let flusher_config = PeriodicFlusherConfig::default();
+        spawn_periodic_flusher(wal_manager.clone(), flusher_config);
+
+        info!("WAL passthrough handler initialized (inline WAL architecture v1.3.47)");
+
+        Self {
+            wal_manager,
+            inner_handler,
+        }
+    }
+
     /// Get reference to the WAL manager for external use (e.g., WAL Indexer)
-    pub fn wal_manager(&self) -> &Arc<RwLock<WalManager>> {
+    /// v1.3.47+: Returns Arc<WalManager> directly (no RwLock - WalManager uses DashMap internally)
+    pub fn wal_manager(&self) -> &Arc<WalManager> {
         &self.wal_manager
     }
 
@@ -61,11 +90,8 @@ impl WalProduceHandler {
     pub async fn recover(&self) -> Result<()> {
         info!("Starting WAL recovery...");
 
-        // Get recovery result from WAL
-        let recovery_result = {
-            let manager = self.wal_manager.read().await;
-            manager.get_recovery_result()
-        };
+        // Get recovery result from WAL (v1.3.47+: direct call, no lock needed)
+        let recovery_result = self.wal_manager.get_recovery_result();
 
         info!(
             "WAL recovery complete: {} partitions, {} total records recovered",
@@ -85,17 +111,16 @@ impl WalProduceHandler {
     async fn apply_recovered_records(&self) -> Result<()> {
         info!("Applying recovered WAL records to in-memory state...");
 
-        let manager = self.wal_manager.read().await;
-
+        // v1.3.47+: Direct call to WalManager (no lock - uses DashMap internally)
         // Iterate through all recovered partitions
-        for tp in manager.get_partitions() {
+        for tp in self.wal_manager.get_partitions() {
             let topic = &tp.topic;
             let partition = tp.partition;
 
             info!("Recovering partition {}-{}", topic, partition);
 
-            // Read all records from WAL for this partition
-            match manager.read_from(topic, partition, 0, usize::MAX).await {
+            // Read all records from WAL for this partition (v1.3.47+: direct call)
+            match self.wal_manager.read_from(topic, partition, 0, usize::MAX).await {
                 Ok(records) => {
                     if !records.is_empty() {
                         info!(
@@ -200,101 +225,19 @@ impl WalProduceHandler {
         Ok(())
     }
     
-    /// Handle produce request with WAL durability
+    /// Handle produce request (v1.3.47: passthrough, WAL now handled inline)
     ///
-    /// CORRECT APPROACH (v1.3.41): POST-produce WAL writing
-    /// 1. Let ProduceHandler process request (assigns offsets, re-encodes batch)
-    /// 2. Extract the RE-ENCODED batches with assigned offsets from pending_batches
-    /// 3. Convert to CanonicalRecord and write to WAL
-    /// 4. Return response
-    ///
-    /// This ensures we write batches WITH assigned offsets, not raw client batches.
+    /// This is now a simple passthrough since WAL writes happen inline in ProduceHandler.
+    /// Kept for backward compatibility with code that expects WalProduceHandler.
     #[instrument(skip(self, request))]
     pub async fn handle_produce(
         &self,
         request: ProduceRequest,
         correlation_id: i32,
     ) -> Result<ProduceResponse> {
-        use chronik_storage::canonical_record::CanonicalRecord;
-
-        // Store topic-partition info for WAL writing
-        let topic_partitions: Vec<(String, i32)> = request.topics.iter()
-            .flat_map(|t| t.partitions.iter().map(move |p| (t.name.clone(), p.index)))
-            .collect();
-
-        // Step 1: Let ProduceHandler process the request
-        // This assigns offsets, re-encodes batch with correct base_offset and CRC
-        let response = self.inner_handler.handle_produce(request, correlation_id).await?;
-
-        // Step 2: Extract RE-ENCODED batches and write to WAL
-        {
-            let mut manager = self.wal_manager.write().await;
-
-            for (topic, partition) in &topic_partitions {
-                // Get the re-encoded batches ProduceHandler just created
-                match self.inner_handler.get_pending_batches(topic, *partition).await {
-                    Ok(batches) if !batches.is_empty() => {
-                        debug!("Writing {} re-encoded batches to WAL for {}-{}", batches.len(), topic, partition);
-
-                        for batch_bytes in batches {
-                            // Convert Kafka v2 batch → CanonicalRecord
-                            // These bytes have CORRECT base_offset (assigned by ProduceHandler)
-                            match CanonicalRecord::from_kafka_batch(&batch_bytes) {
-                                Ok(mut canonical_record) => {
-                                    // CRITICAL FIX (v1.3.46): Preserve original compressed bytes
-                                    // for byte-perfect CRC validation by Java Kafka clients.
-                                    // Store the ENTIRE RecordBatch wire format (all fields intact).
-                                    canonical_record.compressed_records_wire_bytes = Some(batch_bytes.clone());
-                                    debug!(
-                                        "Stored {} bytes of original wire format for CRC preservation",
-                                        batch_bytes.len()
-                                    );
-
-                                    // Serialize with bincode for WAL V2
-                                    match bincode::serialize(&canonical_record) {
-                                        Ok(serialized) => {
-                                            // Write to WAL V2
-                                            if let Err(e) = manager.append_canonical(topic.clone(), *partition, serialized).await {
-                                                error!("Failed to write CanonicalRecord to WAL: {}", e);
-                                            } else {
-                                                debug!("Successfully wrote batch to WAL V2 for {}-{}", topic, partition);
-                                            }
-                                        }
-                                        Err(e) => {
-                                            error!("Failed to serialize CanonicalRecord: {}", e);
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    debug!("Batch not in v2 format (size: {}), skipping WAL V2: {}", batch_bytes.len(), e);
-                                }
-                            }
-                        }
-                    }
-                    Ok(_) => {
-                        // No batches for this partition (could be error response)
-                    }
-                    Err(e) => {
-                        warn!("Failed to get pending batches for {}-{}: {}", topic, partition, e);
-                    }
-                }
-            }
-
-            // Flush WAL immediately for durability
-            if let Err(e) = manager.flush_all().await {
-                error!("Failed to flush WAL: {}", e);
-            }
-        }
-
-        // CRITICAL (v1.3.43): Clear pending_batches AFTER writing to WAL
-        // This prevents duplicate WAL writes and memory leaks
-        for (topic, partition) in &topic_partitions {
-            if let Err(e) = self.inner_handler.clear_pending_batches(topic, *partition).await {
-                warn!("Failed to clear pending batches for {}-{}: {}", topic, partition, e);
-            }
-        }
-
-        Ok(response)
+        // WAL is now written inline in ProduceHandler before high watermark update
+        // This eliminates race conditions and guarantees durability
+        self.inner_handler.handle_produce(request, correlation_id).await
     }
     
     /// Truncate WAL after successful flush to segments
@@ -309,10 +252,9 @@ impl WalProduceHandler {
             topic, partition, up_to_offset
         );
 
-        let mut manager = self.wal_manager.write().await;
-
+        // v1.3.47+: Direct call to WalManager (no lock - uses DashMap internally)
         // Truncate the WAL segments that have been persisted
-        match manager.truncate_before(topic, partition, up_to_offset).await {
+        match self.wal_manager.truncate_before(topic, partition, up_to_offset).await {
             Ok(truncated_segments) => {
                 info!(
                     "Successfully truncated {} WAL segments for {}-{} up to offset {}",

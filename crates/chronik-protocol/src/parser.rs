@@ -679,6 +679,10 @@ pub fn is_flexible_version(api_key: ApiKey, api_version: i16) -> bool {
         ApiKey::AddOffsetsToTxn => api_version >= 3,  // v3+ uses flexible encoding
         ApiKey::EndTxn => api_version >= 3,  // v3+ uses flexible encoding
         ApiKey::TxnOffsetCommit => api_version >= 3,  // v3+ uses flexible encoding
+        // ACL APIs
+        ApiKey::DescribeAcls => api_version >= 2,  // v2+ uses flexible encoding
+        ApiKey::CreateAcls => api_version >= 2,  // v2+ uses flexible encoding
+        ApiKey::DeleteAcls => api_version >= 2,  // v2+ uses flexible encoding
         // All new APIs default to non-flexible for v0
         _ => false,
     }

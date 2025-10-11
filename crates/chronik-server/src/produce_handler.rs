@@ -28,13 +28,14 @@ use chronik_storage::{
     object_store::storage::ObjectStore,
 };
 use chronik_common::metadata::traits::MetadataStore;
+use chronik_wal::WalManager;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{RwLock, Mutex, mpsc, Semaphore};
 use tokio::time::timeout;
-use tracing::{debug, error, info, warn, instrument};
+use tracing::{debug, error, info, warn, trace, instrument};
 use bytes::Bytes;
 
 /// Maximum segment size before rotation (256MB)
@@ -221,6 +222,9 @@ pub struct ProduceHandler {
     fetch_handler: Option<Arc<FetchHandler>>,
     /// Track in-flight topic creation requests to prevent duplicates
     topic_creation_cache: Arc<RwLock<HashMap<String, Arc<Mutex<Option<chronik_common::metadata::TopicMetadata>>>>>>,
+    /// WAL manager for inline durability writes (v1.3.47+)
+    /// Uses Arc<WalManager> directly - no RwLock needed since WalManager uses DashMap internally
+    wal_manager: Option<Arc<WalManager>>,
 }
 
 /// Replication request for ISR management
@@ -238,6 +242,11 @@ impl ProduceHandler {
     /// Get reference to metadata store
     pub fn get_metadata_store(&self) -> &Arc<dyn MetadataStore> {
         &self.metadata_store
+    }
+
+    /// Get request timeout in milliseconds
+    pub fn get_request_timeout_ms(&self) -> u64 {
+        self.config.request_timeout_ms
     }
 
     /// Ensure a partition exists with the specified starting offset (for WAL recovery)
@@ -398,6 +407,29 @@ impl ProduceHandler {
         Ok(())
     }
 
+    /// Restore partition state from WAL recovery (v1.3.48)
+    ///
+    /// Called during server startup to restore partition state after crash.
+    /// Sets the next_offset based on recovered high watermark from WAL.
+    pub async fn restore_partition_state(
+        &self,
+        topic: &str,
+        partition: i32,
+        high_watermark: u64,
+    ) -> Result<()> {
+        let key = (topic.to_string(), partition);
+        let mut states = self.partition_states.write().await;
+
+        if !states.contains_key(&key) {
+            // Create new partition state with recovered offset
+            let state = self.create_partition_state_with_offset(topic, partition, high_watermark as i64).await?;
+            states.insert(key, Arc::new(state));
+            info!("Restored partition state: {}-{} with high watermark {}", topic, partition, high_watermark);
+        }
+
+        Ok(())
+    }
+
     /// Create partition state with specific starting offset
     async fn create_partition_state_with_offset(
         &self,
@@ -477,7 +509,23 @@ impl ProduceHandler {
             replication_sender: None,
             fetch_handler: None,
             topic_creation_cache: Arc::new(RwLock::new(HashMap::new())),
+            wal_manager: None,
         })
+    }
+
+    /// Create a new ProduceHandler with WAL support for inline durability (v1.3.47+)
+    /// WalManager uses DashMap internally so no external RwLock needed
+    pub async fn new_with_wal(
+        config: ProduceHandlerConfig,
+        storage: Arc<dyn ObjectStore>,
+        metadata_store: Arc<dyn MetadataStore>,
+        wal_manager: Arc<WalManager>,
+    ) -> Result<Self> {
+        info!("CRITICAL_DEBUG: ProduceHandler::new_with_wal() called - setting wal_manager");
+        let mut handler = Self::new(config, storage, metadata_store).await?;
+        handler.wal_manager = Some(wal_manager);
+        info!("CRITICAL_DEBUG: wal_manager set to Some - inline WAL writes ENABLED");
+        Ok(handler)
     }
     
     /// Start the produce handler with replication support
@@ -556,7 +604,7 @@ impl ProduceHandler {
         let mut response_topics = Vec::new();
         let acks = request.acks;
         let timeout_ms = request.timeout_ms as u64;
-        
+
         // Clone topic names for error handling
         let topic_names: Vec<(String, Vec<i32>)> = request.topics.iter()
             .map(|t| (t.name.clone(), t.partitions.iter().map(|p| p.index).collect()))
@@ -599,8 +647,10 @@ impl ProduceHandler {
                 });
             }
             Err(_) => {
-                warn!("Produce request timed out after {}ms", timeout_ms);
-                
+                let actual_timeout = timeout_ms.max(self.config.request_timeout_ms);
+                warn!("Produce request timed out after {}ms (client requested {}ms, server config {}ms)",
+                    actual_timeout, timeout_ms, self.config.request_timeout_ms);
+
                 // Return timeout error for all topics
                 let timeout_topics = topic_names.iter().map(|(topic_name, partitions)| {
                     ProduceResponseTopic {
@@ -811,6 +861,9 @@ impl ProduceHandler {
         transactional_id: Option<&str>,
         acks: i16,
     ) -> Result<ProduceResponsePartition> {
+        // ENTRY POINT LOGGING (v1.3.47 debugging)
+        info!("→ produce_to_partition({}-{}) bytes={} acks={}", topic, partition, records_data.len(), acks);
+
         // Acquire memory permit
         let memory_permit = self.memory_limiter
             .acquire_many(records_data.len() as u32)
@@ -909,17 +962,16 @@ impl ProduceHandler {
                 is_transactional: (kafka_batch.header.attributes & 0x10) != 0,
                 is_control: (kafka_batch.header.attributes & 0x20) != 0,
             };
-            
-            // Log what we're producing for debugging
-            info!(
-                "PRODUCE: topic={} partition={} offset={} value_len={} value_preview={}",
+
+            // Trace-level logging only (removed from hot path for performance)
+            trace!(
+                "Record: topic={} partition={} offset={} value_len={}",
                 topic,
                 partition,
                 record.offset,
-                record.value.len(),
-                String::from_utf8_lossy(&record.value[..std::cmp::min(50, record.value.len())])
+                record.value.len()
             );
-            
+
             total_bytes += record.value.len() as u64;
             if let Some(ref key) = record.key {
                 total_bytes += key.len() as u64;
@@ -945,6 +997,60 @@ impl ProduceHandler {
             warn!("Failed to persist partition offset to metadata store: {:?}", e);
         }
         
+        // Log batch-level summary (performance-optimized)
+        info!(
+            "Batch: topic={} partition={} base_offset={} records={} bytes={}",
+            topic, partition, base_offset, records.len(), total_bytes
+        );
+
+        // CRITICAL (v1.3.47+): Write to WAL BEFORE updating high watermark
+        // This ensures durability guarantee - data is persisted before acknowledgment
+        // WalManager uses DashMap internally for lock-free concurrent access
+        if self.wal_manager.is_none() {
+            warn!("WAL manager is None - WAL writes DISABLED! Data will NOT be durable!");
+        }
+        if let Some(ref wal_mgr) = self.wal_manager {
+            use chronik_storage::canonical_record::CanonicalRecord;
+
+            // Convert to CanonicalRecord and serialize
+            match CanonicalRecord::from_kafka_batch(&re_encoded_bytes) {
+                Ok(mut canonical_record) => {
+                    // Preserve original wire bytes for byte-perfect CRC
+                    canonical_record.compressed_records_wire_bytes = Some(re_encoded_bytes.to_vec());
+
+                    match bincode::serialize(&canonical_record) {
+                        Ok(serialized) => {
+                            // Direct call - no global lock! DashMap handles per-partition locking
+                            // v1.3.51+: Pass offset metadata to enable WAL filtering
+                            if let Err(e) = wal_mgr.append_canonical(
+                                topic.to_string(),
+                                partition,
+                                serialized,
+                                base_offset as i64,
+                                last_offset as i64,
+                                records.len() as i32
+                            ).await {
+                                error!("WAL WRITE FAILED: topic={} partition={} error={}", topic, partition, e);
+                                return Err(Error::Internal(format!("WAL write failed: {}", e)));
+                            }
+                            // Changed to warn! for visibility in production logs
+                            warn!("WAL✓ {}-{}: {} bytes, {} records (offsets {}-{})",
+                                topic, partition, re_encoded_bytes.len(), records.len(),
+                                base_offset, last_offset);
+                        }
+                        Err(e) => {
+                            error!("WAL SERIALIZATION FAILED: topic={} partition={} error={}", topic, partition, e);
+                            return Err(Error::Internal(format!("Serialization failed: {}", e)));
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("WAL PARSE FAILED: topic={} partition={} error={}", topic, partition, e);
+                    return Err(Error::Protocol(format!("Invalid Kafka batch: {}", e)));
+                }
+            }
+        }
+
         // Buffer the batch with re-encoded wire format (correct CRC)
         {
             let mut pending = partition_state.pending_batches.lock().await;
@@ -954,7 +1060,7 @@ impl ProduceHandler {
                 base_offset: base_offset as i64,
             });
         }
-        
+
         // Update metrics
         self.metrics.records_produced.fetch_add(records.len() as u64, Ordering::Relaxed);
         self.metrics.bytes_produced.fetch_add(total_bytes, Ordering::Relaxed);
@@ -1764,6 +1870,7 @@ impl Clone for ProduceHandler {
             replication_sender: self.replication_sender.clone(),
             fetch_handler: self.fetch_handler.clone(),
             topic_creation_cache: Arc::clone(&self.topic_creation_cache),
+            wal_manager: self.wal_manager.clone(),
         }
     }
 }

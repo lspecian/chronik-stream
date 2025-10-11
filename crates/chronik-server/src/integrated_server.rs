@@ -5,6 +5,7 @@
 
 use anyhow::Result;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use std::path::PathBuf;
 use tokio::net::TcpListener;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -264,17 +265,8 @@ impl IntegratedKafkaServer {
             default_replication_factor: config.replication_factor,
         };
 
-        // Initialize produce handler with object store directly
-        let mut produce_handler_inner = ProduceHandler::new(
-            produce_config,
-            object_store_arc.clone(),
-            metadata_store.clone(),
-        ).await?;
-
-        let produce_handler_base = Arc::new(produce_handler_inner);
-
-        // Create WAL configuration with default settings
-        use chronik_wal::{CompressionType, CheckpointConfig, RecoveryConfig, RotationConfig, FsyncConfig, WalConfig};
+        // Create WAL configuration with default settings (v1.3.47: moved before ProduceHandler)
+        use chronik_wal::{CompressionType, CheckpointConfig, RecoveryConfig, RotationConfig, FsyncConfig, WalConfig, WalManager};
         use chronik_wal::config::AsyncIoConfig;
 
         let wal_config = WalConfig {
@@ -298,18 +290,95 @@ impl IntegratedKafkaServer {
             },
             async_io: AsyncIoConfig::default(),
         };
-        
-        // Wrap the produce handler with WAL for durability
-        let wal_handler = Arc::new(WalProduceHandler::new(wal_config, produce_handler_base.clone()).await
-            .map_err(|e| anyhow::anyhow!("Failed to initialize WAL handler: {}", e))?);
-        
-        // Recover from WAL on startup
-        info!("Recovering from WAL...");
-        wal_handler.recover().await
-            .map_err(|e| anyhow::anyhow!("Failed to recover from WAL: {}", e))?;
 
-        // Extract WAL manager reference for FetchHandler
-        let wal_manager_ref = wal_handler.wal_manager().clone();
+        // Initialize WAL manager with recovery (v1.3.47+: lock-free WAL architecture)
+        // WalManager uses DashMap internally - no external RwLock needed
+        info!("Initializing WAL manager with recovery...");
+        let wal_manager_recovered = WalManager::recover(&wal_config)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to recover WAL: {}", e))?;
+        let wal_manager = Arc::new(wal_manager_recovered);
+
+        info!("WAL recovery complete - {} partitions loaded", wal_manager.get_partitions().len());
+
+        // Initialize produce handler with inline WAL support (v1.3.47)
+        let mut produce_handler_inner = ProduceHandler::new_with_wal(
+            produce_config,
+            object_store_arc.clone(),
+            metadata_store.clone(),
+            wal_manager.clone(),
+        ).await?;
+
+        let produce_handler_base = Arc::new(produce_handler_inner);
+
+        // CRITICAL (v1.3.48): Replay WAL to restore high watermarks after crash
+        // Without this, all partitions have high_watermark=0 and consumers get no data
+        let recovered_partitions = wal_manager.get_partitions();
+        if !recovered_partitions.is_empty() {
+            info!("Replaying WAL to restore high watermarks for {} partitions...", recovered_partitions.len());
+
+            for tp in recovered_partitions {
+                // Read all WAL records to find highest offset
+                match wal_manager.read_from(&tp.topic, tp.partition, 0, usize::MAX).await {
+                    Ok(records) if !records.is_empty() => {
+                        use chronik_wal::record::WalRecord;
+                        use chronik_storage::CanonicalRecord;
+
+                        let mut max_offset: i64 = -1;
+
+                        // Find max offset across all records (handle both V1 and V2 formats)
+                        for record in &records {
+                            match record {
+                                WalRecord::V1 { offset, .. } => {
+                                    if *offset > max_offset {
+                                        max_offset = *offset;
+                                    }
+                                },
+                                WalRecord::V2 { canonical_data, .. } => {
+                                    // Deserialize CanonicalRecord to get offsets
+                                    if let Ok(canonical) = bincode::deserialize::<CanonicalRecord>(canonical_data) {
+                                        let last_offset = canonical.last_offset();
+                                        if last_offset > max_offset {
+                                            max_offset = last_offset;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if max_offset >= 0 {
+                            // High watermark is max_offset + 1 (next offset to be written)
+                            let high_watermark = (max_offset + 1) as u64;
+
+                            // Restore partition state
+                            if let Err(e) = produce_handler_base.restore_partition_state(&tp.topic, tp.partition, high_watermark).await {
+                                warn!("Failed to restore partition state for {}-{}: {}", tp.topic, tp.partition, e);
+                            } else {
+                                info!("Restored {}-{}: {} records, high watermark = {}",
+                                      tp.topic, tp.partition, records.len(), high_watermark);
+                            }
+                        }
+                    },
+                    Ok(_) => {
+                        // No records, nothing to restore
+                    },
+                    Err(e) => {
+                        warn!("Failed to read WAL for {}-{}: {}", tp.topic, tp.partition, e);
+                    }
+                }
+            }
+
+            info!("WAL replay complete");
+        }
+
+        // Wrap with WalProduceHandler for backward compatibility (will be removed in future)
+        let wal_handler = Arc::new(WalProduceHandler::new_passthrough(
+            wal_manager.clone(),
+            produce_handler_base.clone()
+        ));
+
+        // WAL manager reference for FetchHandler
+        let wal_manager_ref = wal_manager.clone();
 
         // Create FetchHandler with WAL and ProduceHandler integration (v1.3.39+)
         // FetchHandler needs ProduceHandler to get the real-time high watermark

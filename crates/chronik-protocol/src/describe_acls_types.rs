@@ -177,7 +177,10 @@ pub fn encode_describe_acls_response(response: &DescribeAclsResponse, version: i
         encoder.write_compact_string(response.error_message.as_deref());
 
         // Resources array (compact array)
-        encoder.write_unsigned_varint((response.resources.len() as u32) + 1);
+        let resources_len = response.resources.len();
+        tracing::debug!("DescribeAcls v2: encoding resources array, len={}, writing varint={}",
+                       resources_len, (resources_len as u32) + 1);
+        encoder.write_unsigned_varint((resources_len as u32) + 1);
 
         for resource in &response.resources {
             // Resource type

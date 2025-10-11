@@ -92,20 +92,32 @@ def test_describe_acls_v2():
         print("❌ FAILED: No response")
         return False
 
+    print(f"Response size: {len(response)} bytes")
+    print(f"Response hex: {response.hex()}")
+
+    if len(response) < 10:
+        print(f"❌ FAILED: Response too short ({len(response)} bytes)")
+        return False
+
     # Parse response
     corr_id = struct.unpack('>i', response[0:4])[0]
-    throttle = struct.unpack('>i', response[4:8])[0]
-    error_code = struct.unpack('>h', response[8:10])[0]
+    # For flexible versions, header has tagged fields after correlation ID
+    # Check if there's a tagged fields byte
+    offset = 4
+    if len(response) > 4 and response[4] == 0:  # Empty tagged fields in header
+        print("Found tagged fields in header (flexible)")
+        offset = 5
 
-    print(f"Response size: {len(response)} bytes")
+    throttle = struct.unpack('>i', response[offset:offset+4])[0]
+    error_code = struct.unpack('>h', response[offset+4:offset+6])[0]
+
     print(f"Correlation ID: {corr_id}")
     print(f"Throttle time: {throttle}ms")
     print(f"Error code: {error_code}")
-    print(f"Response hex: {response.hex()}")
 
     # Check flexible encoding
-    error_msg_byte = response[10]  # Should be 0 for null compact string
-    resources_byte = response[11]  # Should be 1 for empty compact array
+    error_msg_byte = response[offset+6]  # Should be 0 for null compact string
+    resources_byte = response[offset+7]  # Should be 1 for empty compact array
 
     print(f"Error message byte: 0x{error_msg_byte:02x} (should be 0x00 for null)")
     print(f"Resources array byte: 0x{resources_byte:02x} (should be 0x01 for empty)")

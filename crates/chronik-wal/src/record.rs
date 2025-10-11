@@ -38,6 +38,7 @@ pub enum WalRecord {
     },
 
     /// V2 format: CanonicalRecord batch (new format for layered storage)
+    /// v1.3.51+: Added offset metadata to enable WAL filtering without deserialization
     V2 {
         magic: u16,
         version: u8,
@@ -47,6 +48,12 @@ pub enum WalRecord {
         topic: String,
         partition: i32,
         canonical_data: Vec<u8>,  // Bincode-serialized CanonicalRecord
+        /// First offset in this batch (v1.3.51+)
+        base_offset: i64,
+        /// Last offset in this batch (v1.3.51+)
+        last_offset: i64,
+        /// Number of records in this batch (v1.3.51+)
+        record_count: i32,
     },
 }
 
@@ -76,10 +83,14 @@ impl WalRecord {
     }
 
     /// Create a new V2 WAL record from serialized CanonicalRecord
+    /// v1.3.51+: Added offset metadata to enable WAL filtering without deserialization
     pub fn new_v2(
         topic: String,
         partition: i32,
         canonical_data: Vec<u8>,
+        base_offset: i64,
+        last_offset: i64,
+        record_count: i32,
     ) -> Self {
         let mut record = WalRecord::V2 {
             magic: WAL_MAGIC,
@@ -90,6 +101,9 @@ impl WalRecord {
             topic,
             partition,
             canonical_data,
+            base_offset,
+            last_offset,
+            record_count,
         };
 
         record.update_length_and_checksum();
@@ -155,7 +169,7 @@ impl WalRecord {
                 Ok(buf)
             }
 
-            WalRecord::V2 { magic, version, flags, length, crc32, topic, partition, canonical_data } => {
+            WalRecord::V2 { magic, version, flags, length, crc32, topic, partition, canonical_data, base_offset, last_offset, record_count } => {
                 let mut buf = Vec::with_capacity(*length as usize);
 
                 // Write header
@@ -175,6 +189,11 @@ impl WalRecord {
                 // Write canonical data
                 buf.write_u32::<LittleEndian>(canonical_data.len() as u32)?;
                 buf.extend_from_slice(canonical_data);
+
+                // v1.3.51+: Write offset metadata
+                buf.write_i64::<LittleEndian>(*base_offset)?;
+                buf.write_i64::<LittleEndian>(*last_offset)?;
+                buf.write_i32::<LittleEndian>(*record_count)?;
 
                 Ok(buf)
             }
@@ -275,6 +294,11 @@ impl WalRecord {
                 let mut canonical_data = vec![0u8; data_len as usize];
                 std::io::Read::read_exact(&mut cursor, &mut canonical_data)?;
 
+                // v1.3.51+: Read offset metadata
+                let base_offset = cursor.read_i64::<LittleEndian>()?;
+                let last_offset = cursor.read_i64::<LittleEndian>()?;
+                let record_count = cursor.read_i32::<LittleEndian>()?;
+
                 let record = WalRecord::V2 {
                     magic,
                     version,
@@ -284,6 +308,9 @@ impl WalRecord {
                     topic,
                     partition,
                     canonical_data,
+                    base_offset,
+                    last_offset,
+                    record_count,
                 };
 
                 // Verify checksum
@@ -338,7 +365,7 @@ impl WalRecord {
                 }
             }
 
-            WalRecord::V2 { magic, version, flags, length, crc32, topic, partition, canonical_data } => {
+            WalRecord::V2 { magic, version, flags, length, crc32, topic, partition, canonical_data, base_offset, last_offset, record_count } => {
                 buf.put_u16(*magic);
                 buf.put_u8(*version);
                 buf.put_u8(*flags);
@@ -349,6 +376,10 @@ impl WalRecord {
                 buf.put_i32(*partition);
                 buf.put_u32(canonical_data.len() as u32);
                 buf.put_slice(canonical_data);
+                // v1.3.51+: Write offset metadata
+                buf.put_i64(*base_offset);
+                buf.put_i64(*last_offset);
+                buf.put_i32(*record_count);
             }
         }
 
@@ -398,6 +429,7 @@ impl WalRecord {
             WalRecord::V2 { topic, canonical_data, .. } => {
                 // V2 format body (AFTER 12-byte header):
                 // topic_len(2) + topic + partition(4) + data_len(4) + data
+                // v1.3.51+: + base_offset(8) + last_offset(8) + record_count(4)
                 // The length field stores the size of everything AFTER the 12-byte header
                 let mut len = 0;
                 len += 2; // topic_len field
@@ -405,6 +437,9 @@ impl WalRecord {
                 len += 4; // partition field
                 len += 4; // canonical_data length field
                 len += canonical_data.len() as u32;
+                len += 8; // base_offset (v1.3.51+)
+                len += 8; // last_offset (v1.3.51+)
+                len += 4; // record_count (v1.3.51+)
                 len
             }
         }
@@ -448,7 +483,7 @@ impl WalRecord {
                 }
             }
 
-            WalRecord::V2 { magic, version, flags, length, topic, partition, canonical_data, .. } => {
+            WalRecord::V2 { magic, version, flags, length, topic, partition, canonical_data, base_offset, last_offset, record_count, .. } => {
                 hasher.update(&magic.to_le_bytes());
                 hasher.update(&[*version, *flags]);
                 hasher.update(&length.to_le_bytes());
@@ -457,6 +492,10 @@ impl WalRecord {
                 hasher.update(&partition.to_le_bytes());
                 hasher.update(&(canonical_data.len() as u32).to_le_bytes());
                 hasher.update(canonical_data);
+                // v1.3.51+: Include offset metadata in checksum
+                hasher.update(&base_offset.to_le_bytes());
+                hasher.update(&last_offset.to_le_bytes());
+                hasher.update(&record_count.to_le_bytes());
             }
         }
 
@@ -572,16 +611,22 @@ mod tests {
             "test-topic".to_string(),
             5,
             canonical_data.clone(),
+            100,  // base_offset
+            110,  // last_offset
+            11,   // record_count
         );
 
         let bytes = record.to_bytes().unwrap();
         let decoded = WalRecord::from_bytes(&bytes).unwrap();
 
         match decoded {
-            WalRecord::V2 { topic, partition, canonical_data: data, .. } => {
+            WalRecord::V2 { topic, partition, canonical_data: data, base_offset, last_offset, record_count, .. } => {
                 assert_eq!(topic, "test-topic");
                 assert_eq!(partition, 5);
                 assert_eq!(data, canonical_data);
+                assert_eq!(base_offset, 100);
+                assert_eq!(last_offset, 110);
+                assert_eq!(record_count, 11);
             }
             _ => panic!("Expected V2 record"),
         }
@@ -590,7 +635,7 @@ mod tests {
     #[test]
     fn test_wal_version_detection() {
         let v1 = WalRecord::new(0, None, b"test".to_vec(), 0);
-        let v2 = WalRecord::new_v2("topic".to_string(), 0, b"data".to_vec());
+        let v2 = WalRecord::new_v2("topic".to_string(), 0, b"data".to_vec(), 0, 0, 1);
 
         let v1_bytes = v1.to_bytes().unwrap();
         let v2_bytes = v2.to_bytes().unwrap();

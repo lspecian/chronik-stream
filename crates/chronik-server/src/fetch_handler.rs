@@ -28,6 +28,9 @@ struct PartitionBuffer {
     high_watermark: i64,
     /// Highest offset that has been flushed to segments
     flushed_offset: i64,
+    /// Minimum offset actually present in buffer after trimming (v1.3.48)
+    /// Used to detect gaps and trigger WAL fallback when old batches are trimmed
+    min_offset_in_buffer: i64,
 }
 
 /// Metadata about a batch in the buffer
@@ -57,11 +60,12 @@ struct SegmentInfo {
 }
 
 /// Fetch request handler
+/// v1.3.47+: Uses Arc<WalManager> directly (no RwLock - WalManager uses DashMap internally)
 pub struct FetchHandler {
     segment_reader: Arc<SegmentReader>,
     metadata_store: Arc<dyn MetadataStore>,
     object_store: Arc<dyn ObjectStoreTrait>,
-    wal_manager: Option<Arc<RwLock<WalManager>>>,
+    wal_manager: Option<Arc<WalManager>>,
     segment_index: Option<Arc<SegmentIndex>>,
     produce_handler: Option<Arc<crate::produce_handler::ProduceHandler>>,
     state: Arc<RwLock<FetchState>>,
@@ -89,11 +93,12 @@ impl FetchHandler {
     }
 
     /// Create a new fetch handler with WAL and ProduceHandler integration (v1.3.39+)
+    /// v1.3.47+: Accepts Arc<WalManager> directly (no RwLock - WalManager uses DashMap internally)
     pub fn new_with_wal(
         segment_reader: Arc<SegmentReader>,
         metadata_store: Arc<dyn MetadataStore>,
         object_store: Arc<dyn ObjectStoreTrait>,
-        wal_manager: Arc<RwLock<WalManager>>,
+        wal_manager: Arc<WalManager>,
         produce_handler: Arc<crate::produce_handler::ProduceHandler>,
     ) -> Self {
         Self {
@@ -111,11 +116,12 @@ impl FetchHandler {
     }
 
     /// Create a new fetch handler with WAL and segment index
+    /// v1.3.47+: Accepts Arc<WalManager> directly (no RwLock - WalManager uses DashMap internally)
     pub fn new_with_wal_and_index(
         segment_reader: Arc<SegmentReader>,
         metadata_store: Arc<dyn MetadataStore>,
         object_store: Arc<dyn ObjectStoreTrait>,
-        wal_manager: Arc<RwLock<WalManager>>,
+        wal_manager: Arc<WalManager>,
         segment_index: Arc<SegmentIndex>,
     ) -> Self {
         Self {
@@ -465,15 +471,18 @@ impl FetchHandler {
         
         // PHASE 1: Try in-memory buffer first (fastest path)
         // CRITICAL v1.3.32: Decode records from raw batches to preserve CRC
-        let buffer_highest_offset = {
+        // v1.3.48: Also track buffer min_offset to detect gaps from trimming
+        let (buffer_highest_offset, buffer_min_offset) = {
             let state = self.state.read().await;
             if let Some(buffer) = state.buffers.get(&(topic.to_string(), partition)) {
                 info!(
-                    "FETCH→BUFFER: Checking buffer for {}-{}, buffer has {} batches",
-                    topic, partition, buffer.batch_metadata.len()
+                    "FETCH→BUFFER: Checking buffer for {}-{}, buffer has {} batches, min_offset={}",
+                    topic, partition, buffer.batch_metadata.len(), buffer.min_offset_in_buffer
                 );
 
                 let mut buffer_max_offset = -1i64;
+                let buffer_min = buffer.min_offset_in_buffer;
+
                 for (batch_idx, metadata) in buffer.batch_metadata.iter().enumerate() {
                     if metadata.last_offset >= fetch_offset && metadata.base_offset < high_watermark {
                         // Decode records from raw batch
@@ -512,9 +521,9 @@ impl FetchHandler {
                         records.len(), topic, partition, buffer_max_offset
                     );
                 }
-                buffer_max_offset
+                (buffer_max_offset, buffer_min)
             } else {
-                -1i64
+                (-1i64, -1i64)
             }
         };
 
@@ -524,16 +533,30 @@ impl FetchHandler {
             return Ok(records);
         }
 
-        // If buffer only had partial data (or was empty), we need to check if there are
-        // earlier records in WAL/segments that we missed
+        // v1.3.48: Improved WAL fallback logic to detect buffer gaps from trimming
+        // Check if we need to read from WAL for missing data
         let need_earlier_records = records.is_empty() ||
             (buffer_highest_offset >= 0 && fetch_offset < buffer_highest_offset);
-        
+
+        // NEW (v1.3.48): Detect if fetch_offset is before buffer's min_offset (trimmed region)
+        let fetch_in_trimmed_region = buffer_min_offset >= 0 && fetch_offset < buffer_min_offset;
+
         // PHASE 2: Try WAL for any missing records or to continue the fetch
-        // WAL should have flushed records that are no longer in buffer
+        // WAL should have records that were trimmed from buffer
         if let Some(wal_manager) = &self.wal_manager {
-            // Only try WAL if we don't already have all needed records from buffer
-            if records.is_empty() || need_earlier_records {
+            // Try WAL if:
+            // 1. Buffer is empty, OR
+            // 2. Need earlier records than buffer has, OR
+            // 3. Fetch offset is in trimmed region (gap in buffer)
+            let should_try_wal = records.is_empty() || need_earlier_records || fetch_in_trimmed_region;
+
+            if should_try_wal {
+                if fetch_in_trimmed_region {
+                    info!(
+                        "FETCH→WAL_FALLBACK: fetch_offset={} is before buffer min_offset={} (trimmed), reading from WAL",
+                        fetch_offset, buffer_min_offset
+                    );
+                }
                 match self.fetch_from_wal(wal_manager, topic, partition, fetch_offset, max_bytes).await {
                     Ok(wal_records) => {
                         if !wal_records.is_empty() {
@@ -604,9 +627,10 @@ impl FetchHandler {
     /// Fetch records from WAL manager
     ///
     /// NEW (v1.3.36): Handle WAL V2 CanonicalRecord format
+    /// v1.3.47+: Direct call to WalManager (no RwLock - uses DashMap internally)
     async fn fetch_from_wal(
         &self,
-        wal_manager: &Arc<RwLock<WalManager>>,
+        wal_manager: &Arc<WalManager>,
         topic: &str,
         partition: i32,
         fetch_offset: i64,
@@ -616,11 +640,8 @@ impl FetchHandler {
 
         let max_records = std::cmp::max(1, max_bytes as usize / 100); // Estimate ~100 bytes per record
 
-        let wal_records = {
-            let manager = wal_manager.read().await;
-            manager.read_from(topic, partition, fetch_offset, max_records).await
-                .map_err(|e| Error::Internal(format!("WAL read failed: {}", e)))?
-        };
+        let wal_records = wal_manager.read_from(topic, partition, fetch_offset, max_records).await
+            .map_err(|e| Error::Internal(format!("WAL read failed: {}", e)))?;
 
         // Convert WalRecord to chronik_storage::Record
         let mut records = Vec::new();
@@ -665,9 +686,10 @@ impl FetchHandler {
     ///
     /// NEW (v1.3.46): Fetch the original compressed bytes from CanonicalRecord
     /// to preserve CRC validation for Java Kafka clients.
+    /// v1.3.47+: Direct call to WalManager (no RwLock - uses DashMap internally)
     async fn fetch_raw_bytes_from_wal(
         &self,
-        wal_manager: &Arc<RwLock<WalManager>>,
+        wal_manager: &Arc<WalManager>,
         topic: &str,
         partition: i32,
         fetch_offset: i64,
@@ -678,11 +700,8 @@ impl FetchHandler {
 
         let max_records = std::cmp::max(1, max_bytes as usize / 100);
 
-        let wal_records = {
-            let manager = wal_manager.read().await;
-            manager.read_from(topic, partition, fetch_offset, max_records).await
-                .map_err(|e| Error::Internal(format!("WAL read failed: {}", e)))?
-        };
+        let wal_records = wal_manager.read_from(topic, partition, fetch_offset, max_records).await
+            .map_err(|e| Error::Internal(format!("WAL read failed: {}", e)))?;
 
         if wal_records.is_empty() {
             return Ok(None);
@@ -1724,6 +1743,7 @@ impl FetchHandler {
             base_offset,
             high_watermark,
             flushed_offset: -1,
+            min_offset_in_buffer: base_offset,  // v1.3.48: Track actual minimum offset in buffer
         });
 
         // Check for duplicate batches (same base_offset)
@@ -1759,18 +1779,26 @@ impl FetchHandler {
         }
 
         // Trim old batches if buffer too large (keep last 100 batches)
+        // v1.3.48: Track min_offset_in_buffer to detect gaps and trigger WAL fallback
         if buffer.raw_batches.len() > 100 {
             let trim_count = buffer.raw_batches.len() - 100;
+
+            // Track what we're trimming for logging
+            let first_trimmed = buffer.batch_metadata[0].base_offset;
+            let last_trimmed = buffer.batch_metadata[trim_count - 1].last_offset;
+
             buffer.raw_batches.drain(0..trim_count);
             buffer.batch_metadata.drain(0..trim_count);
 
             if let Some(first_meta) = buffer.batch_metadata.first() {
                 buffer.base_offset = first_meta.base_offset;
+                buffer.min_offset_in_buffer = first_meta.base_offset;  // v1.3.48: Update min after trim
             }
 
-            tracing::debug!(
-                "BUFFER→TRIM: Trimmed {} old batches from {}-{}, {} remain",
-                trim_count, topic, partition, buffer.raw_batches.len()
+            warn!(
+                "BUFFER→TRIM: Trimmed {} old batches from {}-{} (offsets {}-{}), {} batches remain, min_offset_in_buffer={}, data still in WAL",
+                trim_count, topic, partition, first_trimmed, last_trimmed,
+                buffer.raw_batches.len(), buffer.min_offset_in_buffer
             );
         }
 

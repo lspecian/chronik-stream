@@ -26,10 +26,12 @@ pub struct TopicPartition {
 }
 
 /// WAL manager coordinating all partitions
+/// v1.3.47+: Uses Arc<DashMap> for lock-free partition access
+/// CheckpointManager wrapped in Mutex for interior mutability (rarely accessed)
 pub struct WalManager {
     config: WalConfig,
     partitions: Arc<DashMap<TopicPartition, PartitionWal>>,
-    checkpoint_manager: CheckpointManager,
+    checkpoint_manager: tokio::sync::Mutex<CheckpointManager>,
     fsync_batcher: FsyncBatcher,
 }
 
@@ -62,7 +64,7 @@ impl WalManager {
         Ok(Self {
             config,
             partitions: Arc::new(DashMap::new()),
-            checkpoint_manager,
+            checkpoint_manager: tokio::sync::Mutex::new(checkpoint_manager),
             fsync_batcher,
         })
     }
@@ -240,7 +242,7 @@ impl WalManager {
         record_count = records.len()
     ))]
     pub async fn append(
-        &mut self,
+        &self,
         topic: String,
         partition: i32,
         records: Vec<WalRecord>,
@@ -294,7 +296,7 @@ impl WalManager {
         };
         
         if self.config.checkpointing.enabled {
-            self.checkpoint_manager.maybe_checkpoint(
+            self.checkpoint_manager.lock().await.maybe_checkpoint(
                 &topic,
                 partition,
                 last_offset,
@@ -313,22 +315,31 @@ impl WalManager {
 
     /// Append a CanonicalRecord batch as a V2 WAL record
     /// Takes pre-serialized canonical data to avoid circular dependencies
+    /// v1.3.51+: Added offset metadata parameters
     #[instrument(skip(self, canonical_data), fields(
         topic = %topic,
         partition = partition,
-        data_size = canonical_data.len()
+        data_size = canonical_data.len(),
+        base_offset = base_offset,
+        last_offset = last_offset
     ))]
     pub async fn append_canonical(
-        &mut self,
+        &self,
         topic: String,
         partition: i32,
         canonical_data: Vec<u8>,
+        base_offset: i64,
+        last_offset: i64,
+        record_count: i32,
     ) -> Result<()> {
-        // Create V2 WAL record
+        // Create V2 WAL record with offset metadata
         let wal_record = WalRecord::new_v2(
             topic.clone(),
             partition,
             canonical_data,
+            base_offset,
+            last_offset,
+            record_count,
         );
 
         // Append as a single record
@@ -386,23 +397,25 @@ impl WalManager {
         };
 
         // If buffer was empty but we still need records, check active segment FILE
-        if records.is_empty() && offset >= active_base_offset {
+        // v1.3.48 FIX: Remove offset >= active_base_offset check because active segment
+        // contains ALL data when segments don't rotate (which is normal for WAL)
+        // v1.3.49 FIX: Skip batches until we find ones containing requested offset
+        if records.is_empty() {
             debug!("Active buffer empty, checking active segment file: {:?}", active_path);
 
             if let Ok(file_data) = tokio::fs::read(&active_path).await {
                 if !file_data.is_empty() {
-                    debug!("Reading {} bytes from active segment file", file_data.len());
+                    debug!("Reading {} bytes from active segment file, seeking offset {}", file_data.len(), offset);
 
                     // Parse V2 WAL records from file
                     // V2 format: magic(2) + version(1) + flags(1) + length(4) + crc32(4) + topic_len(2) + topic + partition(4) + canonical_data_len(4) + canonical_data
                     let mut cursor = 0;
                     let mut file_records = Vec::new();
+                    let mut skipped_batches = 0;
 
                     while cursor < file_data.len() && file_records.len() < max_records {
                         use byteorder::{LittleEndian, ReadBytesExt};
                         use std::io::Cursor as IoCursor;
-
-                        debug!("=== Parsing record at cursor {} (file_data.len={}, file_records.len={}) ===", cursor, file_data.len(), file_records.len());
 
                         // Need at least 12 bytes for V2 header (magic+version+flags+length+crc32)
                         if cursor + 12 > file_data.len() {
@@ -419,8 +432,6 @@ impl WalManager {
                         let length = rdr.read_u32::<LittleEndian>().unwrap() as usize;
                         let _crc32 = rdr.read_u32::<LittleEndian>().unwrap();
 
-                        debug!("Header: magic={:x}, version={}, length={}, crc32={:x}", magic, version, length, _crc32);
-
                         // Validate magic and version
                         if magic != 0xCA7E || version != 2 {
                             debug!("Invalid WAL record at cursor {}: magic={:x}, version={}", cursor, magic, version);
@@ -431,30 +442,46 @@ impl WalManager {
                         let topic_len = rdr.read_u16::<LittleEndian>().unwrap() as usize;
                         let mut topic_bytes = vec![0u8; topic_len];
                         std::io::Read::read_exact(&mut rdr, &mut topic_bytes).unwrap();
-                        let topic = String::from_utf8(topic_bytes).unwrap();
+                        let _topic = String::from_utf8(topic_bytes).unwrap();
 
-                        let partition = rdr.read_i32::<LittleEndian>().unwrap();
+                        let _partition = rdr.read_i32::<LittleEndian>().unwrap();
 
                         let canonical_data_len = rdr.read_u32::<LittleEndian>().unwrap() as usize;
                         let mut canonical_data = vec![0u8; canonical_data_len];
                         std::io::Read::read_exact(&mut rdr, &mut canonical_data).unwrap();
 
-                        // Calculate actual bytes consumed by checking cursor position
-                        // Create WalRecord::V2
-                        let record = WalRecord::V2 {
-                            magic,
-                            version,
-                            flags: _flags,
-                            length: length as u32,
-                            crc32: _crc32,
-                            topic,
-                            partition,
-                            canonical_data,
-                        };
+                        // v1.3.51: Read offset metadata from WAL V2 record
+                        let base_offset = rdr.read_i64::<LittleEndian>().unwrap();
+                        let last_offset = rdr.read_i64::<LittleEndian>().unwrap();
+                        let record_count = rdr.read_i32::<LittleEndian>().unwrap();
 
-                        // V2 records don't have offset in WAL record - it's in CanonicalRecord
-                        // For recovery, we need ALL V2 records for this partition
-                        file_records.push(record);
+                        // Filter batch by offset range - skip batches that end before requested offset
+                        let should_include = last_offset >= offset;
+
+                        if !should_include {
+                            skipped_batches += 1;
+                            debug!("SKIP batch: offsets {}-{} (seeking {})", base_offset, last_offset, offset);
+                        } else {
+                            debug!("INCLUDE batch: offsets {}-{}, {} records (seeking {})",
+                                   base_offset, last_offset, record_count, offset);
+
+                            // Create WalRecord::V2 with offset metadata
+                            let record = WalRecord::V2 {
+                                magic,
+                                version,
+                                flags: _flags,
+                                length: length as u32,
+                                crc32: _crc32,
+                                topic: _topic,
+                                partition: _partition,
+                                canonical_data,
+                                base_offset,
+                                last_offset,
+                                record_count,
+                            };
+
+                            file_records.push(record);
+                        }
 
                         // CRITICAL FIX: Advance cursor by FULL record size
                         // V2 format: 12-byte header + body (where body size is stored in `length` field)
@@ -463,14 +490,13 @@ impl WalManager {
                         let total_bytes_read = rdr.position() as usize; // Total bytes consumed (header + body)
                         let total_record_size = total_bytes_read;
 
-                        debug!("Advancing cursor from {} by {} bytes (total_bytes_read={}, stored length was {})",
-                            record_start, total_record_size, total_bytes_read, length);
                         cursor = record_start + total_record_size;
                     }
 
                     let count = file_records.len();
                     records.extend(file_records);
-                    info!("Found {} V2 records in active segment file", count);
+                    info!("Found {} V2 records in active segment file (skipped {} batches before offset {})",
+                          count, skipped_batches, offset);
                 }
             }
         }
@@ -639,10 +665,33 @@ impl WalManager {
             .collect()
     }
 
+    /// Get the record count for a partition from WAL (v1.3.48)
+    ///
+    /// Returns the total number of records in the WAL for this partition.
+    /// This is a conservative estimate used during recovery - the actual high watermark
+    /// calculation happens at a higher level with access to CanonicalRecord.
+    pub async fn get_partition_record_count(&self, topic: &str, partition: i32) -> Result<usize> {
+        let tp = TopicPartition {
+            topic: topic.to_string(),
+            partition,
+        };
+
+        // Check if partition exists
+        if !self.partitions.contains_key(&tp) {
+            return Ok(0); // Partition doesn't exist
+        }
+
+        // Read all records from this partition
+        let records = self.read_from(topic, partition, 0, usize::MAX).await?;
+
+        Ok(records.len())
+    }
+
     /// Truncate WAL segments before the given offset
     /// Returns the number of segments truncated
+    /// v1.3.47+: Changed to &self (DashMap provides interior mutability)
     pub async fn truncate_before(
-        &mut self,
+        &self,
         topic: &str,
         partition: i32,
         offset: i64,
@@ -1004,7 +1053,8 @@ impl WalManager {
     }
 
     /// Delete a sealed segment after it has been indexed
-    pub async fn delete_segment(&mut self, segment_id: &str) -> Result<()> {
+    /// v1.3.47+: Changed to &self (DashMap provides interior mutability)
+    pub async fn delete_segment(&self, segment_id: &str) -> Result<()> {
         // Parse segment_id
         let parts: Vec<&str> = segment_id.split('-').collect();
         if parts.len() < 4 || parts[parts.len() - 2] != "segment" {
@@ -1229,4 +1279,91 @@ mod tests {
             }
         }
     }
+}
+
+/// Extract offset range (base_offset, last_offset) from CanonicalRecord bincode data.
+///
+/// v1.3.49: We can't depend on chronik-storage due to circular dependency,
+/// so we manually deserialize just the fields we need using a minimal struct.
+///
+/// CanonicalRecord format (bincode serialized):
+/// - base_offset: i64
+/// - partition_leader_epoch: i32
+/// - producer_id: i64
+/// - producer_epoch: i16
+/// - base_sequence: i32
+/// - is_transactional: bool
+/// - is_control: bool
+/// - compression: u8 (enum)
+/// - timestamp_type: u8 (enum)
+/// - records: Vec<CanonicalRecordEntry> where each has { offset: i64, ... }
+///
+/// We only need base_offset and the last record's offset.
+fn extract_offset_range(canonical_data: &[u8]) -> Result<(i64, i64)> {
+    use serde::Deserialize;
+
+    // Minimal struct that matches CanonicalRecord field order for bincode deserialization
+    // CRITICAL: Must match EXACT field order and types from chronik-storage/src/canonical_record.rs
+    #[derive(Deserialize)]
+    struct MinimalCanonicalRecord {
+        base_offset: i64,
+        #[allow(dead_code)]
+        partition_leader_epoch: i32,
+        #[allow(dead_code)]
+        producer_id: i64,
+        #[allow(dead_code)]
+        producer_epoch: i16,
+        #[allow(dead_code)]
+        base_sequence: i32,
+        #[allow(dead_code)]
+        is_transactional: bool,
+        #[allow(dead_code)]
+        is_control: bool,
+        #[allow(dead_code)]
+        compression: MinimalCompressionType,
+        #[allow(dead_code)]
+        timestamp_type: MinimalTimestampType,
+        #[allow(dead_code)]
+        base_timestamp: i64,
+        #[allow(dead_code)]
+        max_timestamp: i64,
+        records: Vec<MinimalRecordEntry>,
+        // compressed_records_wire_bytes is Option<Vec<u8>> with skip_serializing_if
+        // We don't need to declare it because serde will stop reading after records
+    }
+
+    #[derive(Deserialize)]
+    #[allow(dead_code)]
+    enum MinimalCompressionType {
+        None,
+        Gzip,
+        Snappy,
+        Lz4,
+        Zstd,
+    }
+
+    #[derive(Deserialize)]
+    #[allow(dead_code)]
+    enum MinimalTimestampType {
+        CreateTime,
+        LogAppendTime,
+    }
+
+    #[derive(Deserialize)]
+    struct MinimalRecordEntry {
+        offset: i64,
+    }
+
+    let canonical: MinimalCanonicalRecord = bincode::deserialize(canonical_data)
+        .map_err(|e| WalError::CorruptRecord {
+            offset: 0,
+            reason: format!("Failed to deserialize CanonicalRecord for offset extraction: {}", e)
+        })?;
+
+    let base_offset = canonical.base_offset;
+    let last_offset = canonical.records.last()
+        .map(|r| r.offset)
+        .unwrap_or(base_offset);
+
+    Ok((base_offset, last_offset))
 }

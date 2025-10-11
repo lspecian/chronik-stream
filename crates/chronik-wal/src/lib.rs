@@ -20,6 +20,7 @@ pub mod io;
 pub mod checkpoint;
 pub mod rotation;
 pub mod compaction;
+pub mod periodic_flusher;
 
 // Future-ready modules
 pub mod replication;
@@ -37,6 +38,7 @@ pub use config::{WalConfig, CompressionType, CheckpointConfig, RecoveryConfig, R
 pub use checkpoint::{Checkpoint, CheckpointManager};
 pub use fsync::{FsyncBatcher, FsyncStats};
 pub use compaction::{WalCompactor, CompactionConfig, CompactionStats};
+pub use periodic_flusher::{PeriodicFlusherConfig, spawn_periodic_flusher};
 
 use tracing::info;
 

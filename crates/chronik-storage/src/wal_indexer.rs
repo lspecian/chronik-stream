@@ -124,7 +124,7 @@ pub struct WalIndexer {
     config: WalIndexerConfig,
 
     /// WAL manager for reading sealed segments
-    wal_manager: Arc<RwLock<WalManager>>,
+    wal_manager: Arc<WalManager>,
 
     /// Object store for uploading indexes
     object_store: Arc<dyn ObjectStore>,
@@ -146,7 +146,7 @@ impl WalIndexer {
     /// Create a new WAL indexer
     pub fn new(
         config: WalIndexerConfig,
-        wal_manager: Arc<RwLock<WalManager>>,
+        wal_manager: Arc<WalManager>,
         object_store: Arc<dyn ObjectStore>,
     ) -> Self {
         // Create segment index with persistence
@@ -270,7 +270,7 @@ impl WalIndexer {
     #[instrument(skip(config, wal_manager, object_store, segment_index, indexing_in_progress))]
     async fn index_sealed_segments_internal(
         config: &WalIndexerConfig,
-        wal_manager: &Arc<RwLock<WalManager>>,
+        wal_manager: &Arc<WalManager>,
         object_store: &Arc<dyn ObjectStore>,
         segment_index: &Arc<SegmentIndex>,
         indexing_in_progress: &Arc<RwLock<HashSet<String>>>,
@@ -278,11 +278,8 @@ impl WalIndexer {
         let start_time = std::time::Instant::now();
         let mut stats = IndexingStats::default();
 
-        // Get list of sealed segments from WAL manager
-        let sealed_segments = {
-            let manager = wal_manager.read().await;
-            manager.get_sealed_segments()
-        };
+        // Get list of sealed segments from WAL manager (v1.3.47+: direct call)
+        let sealed_segments = wal_manager.get_sealed_segments();
 
         if sealed_segments.is_empty() {
             debug!("No sealed segments to index");
@@ -354,7 +351,7 @@ impl WalIndexer {
     #[instrument(skip(config, wal_manager, object_store, segment_index, stats))]
     async fn index_segment(
         config: &WalIndexerConfig,
-        wal_manager: &Arc<RwLock<WalManager>>,
+        wal_manager: &Arc<WalManager>,
         object_store: &Arc<dyn ObjectStore>,
         segment_index: &Arc<SegmentIndex>,
         segment_id: &str,
@@ -362,12 +359,9 @@ impl WalIndexer {
     ) -> Result<()> {
         info!(segment = %segment_id, "Indexing WAL segment");
 
-        // Read all records from the segment
-        let records = {
-            let manager = wal_manager.read().await;
-            manager.read_segment(segment_id).await
-                .map_err(|e| Error::Internal(format!("Failed to read segment {}: {}", segment_id, e)))?
-        };
+        // Read all records from the segment (v1.3.47+: direct call)
+        let records = wal_manager.read_segment(segment_id).await
+            .map_err(|e| Error::Internal(format!("Failed to read segment {}: {}", segment_id, e)))?;
 
         if records.is_empty() {
             info!(segment = %segment_id, "Segment is empty, skipping");
@@ -432,10 +426,9 @@ impl WalIndexer {
             }
         }
 
-        // Delete WAL segment if configured
+        // Delete WAL segment if configured (v1.3.47+: direct call)
         if config.delete_after_index {
-            let mut manager = wal_manager.write().await;
-            manager.delete_segment(segment_id).await
+            wal_manager.delete_segment(segment_id).await
                 .map_err(|e| Error::Internal(format!("Failed to delete segment {}: {}", segment_id, e)))?;
             info!(segment = %segment_id, "Deleted WAL segment after indexing");
         }

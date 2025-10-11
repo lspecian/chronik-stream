@@ -42,10 +42,10 @@ pub struct WalConfig {
     #[serde(default)]
     pub rotation: RotationConfig,
     
-    /// Fsync configuration  
+    /// Fsync configuration
     #[serde(default)]
     pub fsync: FsyncConfig,
-    
+
     /// Async I/O configuration
     #[serde(default)]
     pub async_io: AsyncIoConfig,
