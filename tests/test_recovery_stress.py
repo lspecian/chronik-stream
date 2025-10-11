@@ -12,10 +12,17 @@ from kafka.errors import KafkaError
 
 def start_server():
     """Start chronik-server"""
+    import os
+    env = os.environ.copy()
+    # Use CHRONIK_WAL_PROFILE from environment if set, otherwise use high
+    if 'CHRONIK_WAL_PROFILE' not in env:
+        env['CHRONIK_WAL_PROFILE'] = 'high'
+
     proc = subprocess.Popen(
-        ['./target/debug/chronik-server'],
+        ['./target/release/chronik-server', '--advertised-addr', 'localhost', 'standalone'],
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL
+        stderr=subprocess.DEVNULL,
+        env=env
     )
     time.sleep(3)  # Wait for server to start
     return proc
@@ -34,6 +41,11 @@ def test_recovery_at_scale(message_count):
     print(f"\n{'='*60}")
     print(f"🧪 Testing WAL Recovery with {message_count:,} messages")
     print(f"{'='*60}")
+
+    # Step 0: Clean data directory
+    print("0️⃣  Cleaning data directory...")
+    subprocess.run(['rm', '-rf', 'data/'], check=False)
+    time.sleep(1)
 
     # Step 1: Start server
     print("1️⃣  Starting server...")

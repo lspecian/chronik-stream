@@ -51,20 +51,42 @@ Based on these constraints, it selects the optimal performance profile.
 
 ### High Resource Profile
 **Target:** Dedicated servers, high-performance deployments
-**Constraints:** 4+ CPUs, 4GB+ RAM
+**Constraints:** 4-16 CPUs, 4-16GB RAM
 
 | Parameter | Value | Description |
 |-----------|-------|-------------|
 | `max_batch_size` | 5,000 | Writes per batch |
 | `max_batch_bytes` | 25 MB | Maximum batch size |
-| `max_wait_time_ms` | 5 ms | Batching window |
-| `max_wait_time_ms` | 25,000 | Pending writes limit |
+| `max_wait_time_ms` | 5 ms | Batching window (low-latency) |
+| `max_queue_depth` | 25,000 | Pending writes limit |
 
 **Use Cases:**
 - Bare metal servers
 - Large Kubernetes pods with generous limits
 - High-throughput production workloads
 - Real-time streaming applications
+
+### Ultra Resource Profile
+**Target:** Maximum throughput deployments (latency-tolerant)
+**Constraints:** 16+ CPUs, 16GB+ RAM
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| `max_batch_size` | 20,000 | Writes per batch (4x high) |
+| `max_batch_bytes` | 100 MB | Maximum batch size (4x high) |
+| `max_wait_time_ms` | 100 ms | Batching window (maximum batching) |
+| `max_queue_depth` | 100,000 | Pending writes limit (4x high) |
+
+**Use Cases:**
+- High-throughput batch processing (where 100ms latency is acceptable)
+- Data ingestion pipelines with bulk writes
+- Analytics workloads with large batches
+- Scenarios where throughput >> latency
+
+**Trade-offs:**
+- ✅ Potentially 2-3x higher throughput vs high profile
+- ❌ ~100ms p99 produce latency (vs 5ms in high profile)
+- ⚠️ Requires significant memory (100MB+ per partition)
 
 ## Environment Variable Override
 
@@ -82,12 +104,17 @@ export CHRONIK_WAL_PROFILE=medium
 # Force high-resource profile (aggressive)
 export CHRONIK_WAL_PROFILE=high
 ./chronik-server
+
+# Force ultra-resource profile (maximum throughput)
+export CHRONIK_WAL_PROFILE=ultra
+./chronik-server
 ```
 
 **Aliases:**
 - `low` = `small` = `container`
 - `medium` = `balanced`
 - `high` = `aggressive` = `dedicated`
+- `ultra` = `maximum` = `throughput`
 
 ## Kubernetes Configuration Examples
 
@@ -151,6 +178,27 @@ spec:
     # Auto-detects: High profile (5K batch, 25MB, 5ms)
 ```
 
+### Ultra-Large Pod (Ultra Profile)
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: chronik-ultra
+spec:
+  containers:
+  - name: chronik
+    image: ghcr.io/lspecian/chronik-stream:latest
+    resources:
+      requests:
+        cpu: "16"
+        memory: "16Gi"
+      limits:
+        cpu: "32"
+        memory: "32Gi"
+    # Auto-detects: Ultra profile (20K batch, 100MB, 100ms)
+    # Best for: High-throughput batch ingestion where latency is acceptable
+```
+
 ### Override Auto-Detection
 ```yaml
 apiVersion: v1
@@ -201,6 +249,17 @@ docker run -d \
   --memory="8g" \
   ghcr.io/lspecian/chronik-stream:latest
 # Forces: High profile
+```
+
+### Ultra-Large Container (Maximum Throughput)
+```bash
+docker run -d \
+  -e CHRONIK_ADVERTISED_ADDR=localhost \
+  --cpus="32" \
+  --memory="32g" \
+  ghcr.io/lspecian/chronik-stream:latest
+# Auto-detects: Ultra profile (20K batch, 100MB, 100ms)
+# Best for batch ingestion where latency tolerance is high
 ```
 
 ## How Detection Works

@@ -64,6 +64,7 @@ impl GroupCommitConfig {
                 "low" | "small" | "container" => Self::low_resource(),
                 "medium" | "balanced" => Self::medium_resource(),
                 "high" | "aggressive" | "dedicated" => Self::high_resource(),
+                "ultra" | "maximum" | "throughput" => Self::ultra_resource(),
                 _ => Self::detect_resources(),
             };
         }
@@ -85,16 +86,20 @@ impl GroupCommitConfig {
             0 // low
         } else if cpu_limit <= 4.0 {
             1 // medium
-        } else {
+        } else if cpu_limit <= 16.0 {
             2 // high
+        } else {
+            3 // ultra (16+ CPUs)
         };
 
         let memory_profile = if memory_gb < 0.5 {
             0 // low (< 512MB)
         } else if memory_gb < 4.0 {
             1 // medium (< 4GB)
+        } else if memory_gb < 16.0 {
+            2 // high (< 16GB)
         } else {
-            2 // high (>= 4GB)
+            3 // ultra (>= 16GB)
         };
 
         // Use the more conservative profile
@@ -103,7 +108,8 @@ impl GroupCommitConfig {
         match profile {
             0 => Self::low_resource(),
             1 => Self::medium_resource(),
-            _ => Self::high_resource(),
+            2 => Self::high_resource(),
+            _ => Self::ultra_resource(),
         }
     }
 
@@ -238,6 +244,19 @@ impl GroupCommitConfig {
             max_batch_bytes: 25_000_000,    // 25MB per batch
             max_wait_time_ms: 5,            // 5ms latency (low-latency optimized)
             max_queue_depth: 25_000,        // 25K queue depth
+            enable_metrics: true,
+        }
+    }
+
+    /// Ultra resource profile (maximum throughput: 16+ CPUs, 16GB+ RAM)
+    /// Uses 100ms batching window for massive throughput at cost of higher latency
+    /// Trade-off: ~100ms p99 latency for potentially 2-3x higher throughput
+    fn ultra_resource() -> Self {
+        Self {
+            max_batch_size: 20_000,         // 20K writes per batch (4x high profile)
+            max_batch_bytes: 100_000_000,   // 100MB per batch (4x high profile)
+            max_wait_time_ms: 100,          // 100ms latency (20x high profile - maximum batching)
+            max_queue_depth: 100_000,       // 100K queue depth (4x high profile)
             enable_metrics: true,
         }
     }
