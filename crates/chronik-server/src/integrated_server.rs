@@ -291,6 +291,21 @@ impl IntegratedKafkaServer {
             async_io: AsyncIoConfig::default(),
         };
 
+        // CRITICAL FIX (v1.3.52): Clear segments directory before WAL recovery
+        // This prevents duplicate messages during recovery. The flow is:
+        // 1. Normal operation: Data → WAL (fsync) → Segments (async)
+        // 2. Crash: Segments may have partial data
+        // 3. Recovery: Clear segments, replay WAL → Segments
+        // Without clearing, we'd have: WAL data + Old segment data = Duplicates
+        info!("Clearing segments directory to prevent duplicates during WAL recovery...");
+        let segments_dir = std::path::Path::new("./data/segments");
+        if segments_dir.exists() {
+            match tokio::fs::remove_dir_all(segments_dir).await {
+                Ok(_) => info!("Cleared segments directory successfully"),
+                Err(e) => warn!("Failed to clear segments directory: {}. Recovery may have duplicates.", e),
+            }
+        }
+
         // Initialize WAL manager with recovery (v1.3.47+: lock-free WAL architecture)
         // WalManager uses DashMap internally - no external RwLock needed
         info!("Initializing WAL manager with recovery...");
@@ -310,6 +325,15 @@ impl IntegratedKafkaServer {
         ).await?;
 
         let produce_handler_base = Arc::new(produce_handler_inner);
+
+        // CRITICAL FIX (v1.3.52): Clear all partition buffers before WAL recovery
+        // This prevents duplicate messages by ensuring we start with clean in-memory state.
+        // Without this, WAL replay adds recovered data on top of any existing buffers,
+        // causing 140%+ message recovery (e.g., 7000/5000 messages).
+        info!("Clearing all partition buffers before WAL recovery...");
+        if let Err(e) = produce_handler_base.clear_all_buffers().await {
+            warn!("Failed to clear partition buffers: {}. Recovery may have duplicates.", e);
+        }
 
         // CRITICAL (v1.3.48): Replay WAL to restore high watermarks after crash
         // Without this, all partitions have high_watermark=0 and consumers get no data

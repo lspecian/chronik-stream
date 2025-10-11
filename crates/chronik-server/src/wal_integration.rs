@@ -47,13 +47,10 @@ impl WalProduceHandler {
 
         let wal_manager_arc = Arc::new(wal_manager);
 
-        // Start periodic background flusher (flushes WAL every 50ms)
-        // This eliminates fsync bottleneck in produce path while maintaining durability
-        use chronik_wal::{PeriodicFlusherConfig, spawn_periodic_flusher};
-        let flusher_config = PeriodicFlusherConfig::default();
-        spawn_periodic_flusher(wal_manager_arc.clone(), flusher_config);
+        // v1.3.53+: GroupCommitWal handles flushing internally via background workers
+        // No need for periodic flusher anymore
 
-        info!("WAL-integrated produce handler initialized with recovery and periodic flusher");
+        info!("WAL-integrated produce handler initialized with recovery (v1.3.53: GroupCommitWal)");
 
         Ok(Self {
             wal_manager: wal_manager_arc,
@@ -67,12 +64,10 @@ impl WalProduceHandler {
         wal_manager: Arc<WalManager>,
         inner_handler: Arc<ProduceHandler>,
     ) -> Self {
-        // Start periodic background flusher (flushes WAL every 50ms)
-        use chronik_wal::{PeriodicFlusherConfig, spawn_periodic_flusher};
-        let flusher_config = PeriodicFlusherConfig::default();
-        spawn_periodic_flusher(wal_manager.clone(), flusher_config);
+        // v1.3.53+: GroupCommitWal handles flushing internally via background workers
+        // No need for periodic flusher anymore
 
-        info!("WAL passthrough handler initialized (inline WAL architecture v1.3.47)");
+        info!("WAL passthrough handler initialized (v1.3.53: GroupCommitWal)");
 
         Self {
             wal_manager,
@@ -164,21 +159,29 @@ impl WalProduceHandler {
         let mut total_records = 0i64;
 
         for record in records {
-            if let chronik_wal::record::WalRecord::V2 { canonical_data, .. } = record {
+            if let chronik_wal::record::WalRecord::V2 { canonical_data, base_offset, last_offset, record_count, .. } = record {
                 // Deserialize CanonicalRecord from WAL
                 match bincode::deserialize::<CanonicalRecord>(canonical_data) {
                     Ok(canonical_record) => {
                         // Count records in this batch
-                        total_records += canonical_record.records.len() as i64;
+                        let batch_record_count = canonical_record.records.len() as i64;
+                        total_records += batch_record_count;
 
                         // Convert back to Kafka wire format
                         match canonical_record.to_kafka_batch() {
                             Ok(kafka_batch) => {
-                                // Apply to produce handler's buffer
+                                // CRITICAL FIX (v1.3.52): Write to pending_batches for background flush
+                                // This ensures segments are rebuilt from WAL during recovery.
+                                // Segments directory should be cleared on startup before recovery.
                                 self.inner_handler
                                     .apply_recovered_batch(topic, partition, kafka_batch)
                                     .await?;
                                 recovered_batches += 1;
+
+                                debug!(
+                                    "Recovered WAL batch for {}-{}: offsets {}-{}, {} records",
+                                    topic, partition, base_offset, last_offset, batch_record_count
+                                );
                             }
                             Err(e) => {
                                 warn!("Failed to encode CanonicalRecord to Kafka batch: {}", e);

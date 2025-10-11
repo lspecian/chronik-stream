@@ -407,6 +407,29 @@ impl ProduceHandler {
         Ok(())
     }
 
+    /// Clear all partition buffers (used before WAL recovery to prevent duplicates - v1.3.52+)
+    ///
+    /// This is called during server startup BEFORE WAL recovery to ensure we start with
+    /// a clean slate. Without this, WAL replay would add recovered data on top of any
+    /// existing in-memory state, causing duplicate messages.
+    pub async fn clear_all_buffers(&self) -> Result<()> {
+        let states = self.partition_states.read().await;
+        let mut total_cleared = 0;
+
+        for (key, state) in states.iter() {
+            let mut pending = state.pending_batches.lock().await;
+            let count = pending.len();
+            total_cleared += count;
+            pending.clear();
+            if count > 0 {
+                debug!("Cleared {} pending batches for {}-{}", count, key.0, key.1);
+            }
+        }
+
+        info!("Cleared all partition buffers before WAL recovery: {} total batches", total_cleared);
+        Ok(())
+    }
+
     /// Restore partition state from WAL recovery (v1.3.48)
     ///
     /// Called during server startup to restore partition state after crash.
@@ -1020,23 +1043,26 @@ impl ProduceHandler {
 
                     match bincode::serialize(&canonical_record) {
                         Ok(serialized) => {
-                            // Direct call - no global lock! DashMap handles per-partition locking
-                            // v1.3.51+: Pass offset metadata to enable WAL filtering
-                            if let Err(e) = wal_mgr.append_canonical(
+                            // v1.3.52+: Group commit with acks parameter (Option 4 + Option 2)
+                            // - acks=0: Fire-and-forget (buffered, ~50ms flush window)
+                            // - acks=1/−1: Immediate fsync (zero data loss guarantee)
+                            if let Err(e) = wal_mgr.append_canonical_with_acks(
                                 topic.to_string(),
                                 partition,
                                 serialized,
                                 base_offset as i64,
                                 last_offset as i64,
-                                records.len() as i32
+                                records.len() as i32,
+                                acks  // Pass acks parameter for durability control
                             ).await {
-                                error!("WAL WRITE FAILED: topic={} partition={} error={}", topic, partition, e);
+                                error!("WAL WRITE FAILED: topic={} partition={} acks={} error={}",
+                                       topic, partition, acks, e);
                                 return Err(Error::Internal(format!("WAL write failed: {}", e)));
                             }
-                            // Changed to warn! for visibility in production logs
-                            warn!("WAL✓ {}-{}: {} bytes, {} records (offsets {}-{})",
+                            // Log with acks mode for visibility
+                            warn!("WAL✓ {}-{}: {} bytes, {} records (offsets {}-{}), acks={}",
                                 topic, partition, re_encoded_bytes.len(), records.len(),
-                                base_offset, last_offset);
+                                base_offset, last_offset, acks);
                         }
                         Err(e) => {
                             error!("WAL SERIALIZATION FAILED: topic={} partition={} error={}", topic, partition, e);

@@ -55,4 +55,10 @@ pub enum WalError {
     
     #[error("Replication error: {0}")]
     ReplicationError(String),
+
+    #[error("Backpressure: {0}")]
+    Backpressure(String),
+
+    #[error("Commit failed: {0}")]
+    CommitFailed(String),
 }

@@ -21,6 +21,7 @@ pub mod checkpoint;
 pub mod rotation;
 pub mod compaction;
 pub mod periodic_flusher;
+pub mod group_commit;
 
 // Future-ready modules
 pub mod replication;
@@ -39,6 +40,7 @@ pub use checkpoint::{Checkpoint, CheckpointManager};
 pub use fsync::{FsyncBatcher, FsyncStats};
 pub use compaction::{WalCompactor, CompactionConfig, CompactionStats};
 pub use periodic_flusher::{PeriodicFlusherConfig, spawn_periodic_flusher};
+pub use group_commit::{GroupCommitWal, GroupCommitConfig, PartitionMetrics};
 
 use tracing::info;
 
