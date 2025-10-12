@@ -686,8 +686,13 @@ impl FetchHandler {
 
     /// Fetch raw RecordBatch bytes from WAL (compressed_records_wire_bytes)
     ///
-    /// NEW (v1.3.46): Fetch the original compressed bytes from CanonicalRecord
-    /// to preserve CRC validation for Java Kafka clients.
+    /// CRITICAL FIX (v1.3.59): Return ORIGINAL batches AS-IS by concatenation!
+    /// Each batch has its ORIGINAL CRC which is only valid for that specific batch.
+    /// Java Kafka clients validate CRC and will reject batches with modified CRCs.
+    ///
+    /// The Kafka protocol ALLOWS concatenating multiple RecordBatches in a Fetch response.
+    /// This is the CORRECT approach - return the original batches exactly as stored.
+    ///
     /// v1.3.47+: Direct call to WalManager (no RwLock - uses DashMap internally)
     async fn fetch_raw_bytes_from_wal(
         &self,
@@ -700,9 +705,6 @@ impl FetchHandler {
     ) -> Result<Option<Vec<u8>>> {
         use chronik_storage::canonical_record::CanonicalRecord;
 
-        // CRITICAL FIX (v1.3.55): Don't artificially limit WAL reads
-        // Old calculation (max_bytes / 100) was too conservative and caused consumer timeouts
-        // Allow reading many more records - let max_bytes limit total bytes instead
         let max_records = std::cmp::max(10000, max_bytes as usize / 10);
 
         let wal_records = wal_manager.read_from(topic, partition, fetch_offset, max_records).await
@@ -712,74 +714,50 @@ impl FetchHandler {
             return Ok(None);
         }
 
-        let wal_records_count = wal_records.len();
-        let mut combined_bytes = Vec::new();
+        // CRITICAL FIX (v1.3.59): Concatenate ORIGINAL batch bytes without modification
+        // Each batch's CRC is valid for its own bytes - we cannot re-encode or combine
+        let mut concatenated_bytes = Vec::new();
+        let mut batches_concatenated = 0;
 
         for wal_record in wal_records {
             if let chronik_wal::record::WalRecord::V2 { canonical_data, .. } = wal_record {
                 match bincode::deserialize::<CanonicalRecord>(&canonical_data) {
                     Ok(canonical_record) => {
-                        // Check if this batch has compressed_records_wire_bytes
-                        if let Some(raw_bytes) = canonical_record.compressed_records_wire_bytes {
-                            // Use CanonicalRecord's base_offset (authoritative) rather than parsing from wire bytes
-                            // This handles cases where wire bytes were preserved AS-IS for CRC validation
+                        // Use the ORIGINAL compressed_records_wire_bytes preserved during produce
+                        if let Some(ref raw_bytes) = canonical_record.compressed_records_wire_bytes {
+                            // Verify this batch's records are in the requested range
                             let base_offset = canonical_record.base_offset;
+                            let last_offset = canonical_record.last_offset();
 
-                            // Calculate last_offset: use records.len() - 1 if available, otherwise parse from wire bytes
-                            let last_offset = if !canonical_record.records.is_empty() {
-                                // Use the last record's offset from CanonicalRecord (most reliable)
-                                canonical_record.records.last().unwrap().offset
-                            } else if raw_bytes.len() >= 27 {
-                                // Fallback: parse last_offset_delta from v2 header at offset 23
-                                let last_offset_delta = i32::from_be_bytes([
-                                    raw_bytes[23], raw_bytes[24], raw_bytes[25], raw_bytes[26],
-                                ]);
-                                base_offset + last_offset_delta as i64
-                            } else {
-                                // Small batch or empty - assume single record at base_offset
-                                base_offset
-                            };
-
-                            // Check if this batch overlaps with requested range
                             if last_offset >= fetch_offset && base_offset < high_watermark {
-                                if combined_bytes.len() + raw_bytes.len() > max_bytes as usize && !combined_bytes.is_empty() {
-                                    break;
-                                }
+                                concatenated_bytes.extend_from_slice(raw_bytes);
+                                batches_concatenated += 1;
 
-                                info!(
-                                    "RAW→WAL: Adding {} bytes from batch {}-{} ({} records)",
-                                    raw_bytes.len(), base_offset, last_offset, canonical_record.records.len()
-                                );
-                                combined_bytes.extend_from_slice(&raw_bytes);
-                            } else {
-                                tracing::debug!(
-                                    "RAW→WAL: Skipping batch {}-{} (outside range {}-{})",
-                                    base_offset, last_offset, fetch_offset, high_watermark
+                                debug!(
+                                    "RAW→WAL: Appended original batch offsets {}-{} ({} bytes)",
+                                    base_offset, last_offset, raw_bytes.len()
                                 );
                             }
-                        } else {
-                            // No raw bytes in this record (uncompressed or old format)
-                            warn!("RAW→WAL: CanonicalRecord has no compressed_records_wire_bytes");
-                            return Ok(None);
                         }
                     }
                     Err(e) => {
                         warn!("Failed to deserialize CanonicalRecord from WAL V2: {}", e);
-                        return Ok(None);
+                        continue;
                     }
                 }
             }
         }
 
-        if combined_bytes.is_empty() {
-            Ok(None)
-        } else {
-            info!(
-                "RAW→WAL: Returning {} bytes from {} WAL records for {}-{}",
-                combined_bytes.len(), wal_records_count, topic, partition
-            );
-            Ok(Some(combined_bytes))
+        if concatenated_bytes.is_empty() {
+            return Ok(None);
         }
+
+        info!(
+            "RAW→WAL: Concatenated {} original batches, total {} bytes for {}-{}",
+            batches_concatenated, concatenated_bytes.len(), topic, partition
+        );
+
+        Ok(Some(concatenated_bytes))
     }
 
     /// Fetch records from segment files (persistent storage)

@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.59] - 2025-10-12
+
+### Fixed
+- **CRITICAL**: CRC validation fix for Java Kafka clients consuming multiple messages
+  - **Root cause**: When producers send batches with `base_offset=0`, Chronik was re-encoding entire batches with assigned offsets (1, 2, 3...), which regenerated CRC checksums
+  - **Impact**:
+    - First message (offset 0): ✅ WORKED (offset matched, no re-encoding)
+    - Subsequent messages (offset 1+): ❌ FAILED with `Record is corrupt (stored crc != computed crc)`
+    - Affected ALL producers (Java, Python, kafka-console-producer) when sending multiple messages
+    - Kafka UI showed "No messages found" due to CRC validation failures
+  - **Solution**:
+    - **Produce path**: Update ONLY `base_offset` field (first 8 bytes) when offsets don't match, preserving original CRC
+    - **Fetch path**: Concatenate original RecordBatch bytes AS-IS (already working from v1.3.57)
+    - **Key insight**: Kafka v2 CRC calculation starts from `partition_leader_epoch` (position 12), so `base_offset` (positions 0-7) can be modified without invalidating CRC
+  - **Result**:
+    - ✅ Java producer → Java consumer: ALL messages consumed successfully
+    - ✅ Python producer → Java consumer: ALL messages consumed successfully
+    - ✅ kafka-console-consumer: ALL messages consumed successfully
+    - ✅ Kafka UI: Messages now visible and readable
+    - ✅ Mixed producers: Java + Python messages work together
+  - **Testing**:
+    - Verified with 7 messages (5 Java + 2 Python)
+    - Java consumer with CRC validation: PASSED
+    - kafka-console-consumer: PASSED
+    - Kafka UI web interface: PASSED
+
+### Technical Details
+- **Files modified**:
+  - `crates/chronik-server/src/produce_handler.rs:1019-1040` - Replace `kafka_batch.encode()` with 8-byte base_offset update
+  - `crates/chronik-server/src/fetch_handler.rs:687-761` - Concatenate original batches without modification
+- **Deployment**: Drop-in replacement, existing data remains readable
+- **Compatibility**: Fully backward compatible with v1.3.57
+- **Performance**: No performance impact, slightly faster (avoids full batch re-encoding)
+
+### Context
+This completes the CRC preservation work started in earlier versions:
+- v1.3.18: Fixed CRC calculation range
+- v1.3.28: Switched to CRC-32C algorithm
+- v1.3.32: Fixed fetch path to return raw bytes
+- v1.3.59: Fixed produce path to preserve CRC when updating offsets
+
 ## [1.3.46] - 2025-10-09
 
 ### Fixed

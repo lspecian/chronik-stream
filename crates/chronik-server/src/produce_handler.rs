@@ -1017,25 +1017,26 @@ impl ProduceHandler {
 
             (bytes, batch)
         } else {
-            // Offset mismatch - need to decode, update offset, and re-encode
+            // Offset mismatch - update ONLY base_offset field to preserve CRC
             debug!(
-                "Base offset mismatch (incoming={}, assigned={}) - decoding, updating offset, and re-encoding",
+                "Base offset mismatch (incoming={}, assigned={}) - updating base_offset WITHOUT changing CRC",
                 incoming_base_offset, base_offset
             );
 
-            // Decode the batch (handles both legacy and v2 formats)
-            let (mut kafka_batch, _) = KafkaRecordBatch::decode(records_data)
-                .map_err(|e| Error::Protocol(format!("Failed to decode record batch: {}", e)))?;
+            // CRITICAL FIX (v1.3.59): Kafka v2 CRC is calculated from partition_leader_epoch onwards.
+            // The base_offset field (first 8 bytes) is NOT included in CRC calculation.
+            // Therefore, we can update ONLY base_offset and keep everything else byte-identical.
 
-            // Update the base offset
-            kafka_batch.header.base_offset = base_offset as i64;
+            // Create a copy and update ONLY the first 8 bytes
+            let mut updated_bytes = records_data.to_vec();
+            updated_bytes[0..8].copy_from_slice(&(base_offset as i64).to_be_bytes());
+            let bytes = Bytes::from(updated_bytes);
 
-            // Re-encode the batch (always to v2 format)
-            let re_encoded = kafka_batch.encode()
-                .map_err(|e| Error::Protocol(format!("Failed to re-encode record batch: {}", e)))?;
+            // Decode to get batch metadata (needed for records count, etc.)
+            let (kafka_batch, _) = KafkaRecordBatch::decode(&bytes)
+                .map_err(|e| Error::Protocol(format!("Failed to decode updated batch: {}", e)))?;
 
-            // OPTIMIZATION: Return the already-decoded batch to avoid double decode
-            (re_encoded, kafka_batch)
+            (bytes, kafka_batch)
         };
 
         // TODO (Phase 3): Write CanonicalRecord to WAL as V2 record

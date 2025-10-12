@@ -2228,25 +2228,52 @@ impl ProtocolHandler {
                 Err(e) => {
                     tracing::error!("Failed to get brokers from metadata: {:?}", e);
                     // Fallback to current broker if we can't get from metadata store
+                    tracing::warn!("Using fallback broker: {}:{} (node_id={})",
+                        self.advertised_host, self.advertised_port, self.broker_id);
                     vec![MetadataBroker {
                         node_id: self.broker_id,
-                        host: "localhost".to_string(),
-                        port: 9092,
+                        host: self.advertised_host.clone(),
+                        port: self.advertised_port,
                         rack: None,
                     }]
                 }
             }
         } else {
             tracing::warn!("No metadata store available, using default broker");
+            tracing::warn!("Using default broker: {}:{} (node_id={})",
+                self.advertised_host, self.advertised_port, self.broker_id);
             // No metadata store, use current broker
             vec![MetadataBroker {
                 node_id: self.broker_id,
-                host: "localhost".to_string(),
-                port: 9092,
+                host: self.advertised_host.clone(),
+                port: self.advertised_port,
                 rack: None,
             }]
         };
         
+        // CRITICAL VALIDATION: Ensure broker list is not empty and hosts are valid
+        // This prevents the AdminClient "No resolvable bootstrap urls" error
+        if brokers.is_empty() {
+            tracing::error!("CRITICAL: Metadata response has NO brokers - AdminClient will fail!");
+            tracing::error!("This will cause 'No resolvable bootstrap urls' error in Java clients");
+            return Err(Error::Internal("Metadata response must include at least one broker".into()));
+        }
+
+        for broker in &brokers {
+            if broker.host.is_empty() {
+                tracing::error!("CRITICAL: Broker {} has EMPTY host - AdminClient will fail!", broker.node_id);
+                return Err(Error::Internal(format!("Broker {} has empty host field", broker.node_id)));
+            }
+            if broker.host == "0.0.0.0" {
+                tracing::error!("CRITICAL: Broker {} has 0.0.0.0 host - clients cannot connect!", broker.node_id);
+                return Err(Error::Internal(format!("Broker {} has invalid host 0.0.0.0", broker.node_id)));
+            }
+            if broker.node_id < 0 {
+                tracing::error!("CRITICAL: Broker has invalid node_id {} - clients will reject!", broker.node_id);
+                return Err(Error::Internal(format!("Broker has invalid node_id {}", broker.node_id)));
+            }
+        }
+
         let response = MetadataResponse {
             throttle_time_ms: 0,
             brokers,
@@ -2255,7 +2282,7 @@ impl ProtocolHandler {
             topics,
             cluster_authorized_operations: if header.api_version >= 8 { Some(-2147483648) } else { None },
         };
-        tracing::info!("Metadata response has {} topics and {} brokers", 
+        tracing::info!("Metadata response has {} topics and {} brokers",
                       response.topics.len(), response.brokers.len());
         
         // Debug: Log broker details
@@ -2805,57 +2832,53 @@ impl ProtocolHandler {
             });
         }
         
-        // Include synonyms (v1+)
-        let include_synonyms = if header.api_version >= 1 && header.api_version < 4 {
+        // Include synonyms (v1+) - ALWAYS in main body, even for v4+
+        let include_synonyms = if header.api_version >= 1 {
             decoder.read_bool()?
-        } else if header.api_version >= 4 {
-            // For v4+, these are in tagged fields
-            false  // Will be set from tagged fields
         } else {
             false
         };
 
-        // Include documentation (v3+)
-        let include_documentation = if header.api_version == 3 {
+        // Include documentation (v3+) - ALWAYS in main body, even for v4+
+        let include_documentation = if header.api_version >= 3 {
             decoder.read_bool()?
-        } else if header.api_version >= 4 {
-            // For v4+, these are in tagged fields
-            false  // Will be set from tagged fields
         } else {
             false
         };
 
-        // For v4+, parse tagged fields
-        let (final_include_synonyms, final_include_documentation) = if use_compact {
+        tracing::debug!("DescribeConfigs v{}: include_synonyms={}, include_documentation={}",
+            header.api_version, include_synonyms, include_documentation);
+
+        // For v4+, parse tagged fields at request level (after all main body fields)
+        if use_compact {
             let tag_count = decoder.read_unsigned_varint()?;
-            let mut include_syns = false;
-            let mut include_docs = false;
+            tracing::debug!("DescribeConfigs v{}: parsing {} request-level tagged fields", header.api_version, tag_count);
 
             for _ in 0..tag_count {
                 let tag_id = decoder.read_unsigned_varint()?;
-                let _tag_size = decoder.read_unsigned_varint()?;
-
-                match tag_id {
-                    0 => include_syns = decoder.read_bool()?,
-                    1 => include_docs = decoder.read_bool()?,
-                    _ => {
-                        // Unknown tag, skip it
-                        decoder.skip(_tag_size as usize)?;
-                    }
-                }
+                let tag_size = decoder.read_unsigned_varint()? as usize;
+                tracing::debug!("DescribeConfigs v{}: skipping tagged field {} ({} bytes)",
+                    header.api_version, tag_id, tag_size);
+                decoder.skip(tag_size)?;
             }
-            (include_syns, include_docs)
-        } else {
-            (include_synonyms, include_documentation)
-        };
-        
+        }
+
+        let (final_include_synonyms, final_include_documentation) = (include_synonyms, include_documentation);
+
+        tracing::info!("DescribeConfigs v{}: processing {} resources (include_synonyms={}, include_documentation={})",
+            header.api_version, resources.len(), final_include_synonyms, final_include_documentation);
+
         // Process each resource
         let mut results = Vec::new();
-        
+
         for resource in resources {
+            tracing::debug!("DescribeConfigs: processing resource_type={}, resource_name={}",
+                resource.resource_type, resource.resource_name);
+
             let configs = match resource.resource_type {
                 2 => {
                     // Topic configs
+                    tracing::debug!("DescribeConfigs: fetching topic configs for '{}'", resource.resource_name);
                     self.get_topic_configs(
                         &resource.resource_name,
                         &resource.configuration_keys,
@@ -2866,6 +2889,7 @@ impl ProtocolHandler {
                 },
                 4 => {
                     // Broker configs
+                    tracing::debug!("DescribeConfigs: fetching broker configs for '{}'", resource.resource_name);
                     self.get_broker_configs(
                         &resource.resource_name,
                         &resource.configuration_keys,
@@ -2887,25 +2911,40 @@ impl ProtocolHandler {
                 }
             };
             
+            tracing::debug!("DescribeConfigs: resource {} returned {} config entries",
+                resource.resource_name, configs.len());
+
             results.push(DescribeConfigsResult {
                 error_code: 0,
                 error_message: None,
                 resource_type: resource.resource_type,
-                resource_name: resource.resource_name,
+                resource_name: resource.resource_name.clone(),
                 configs,
             });
         }
-        
+
+        tracing::info!("DescribeConfigs v{}: returning {} results", header.api_version, results.len());
+
         let response = DescribeConfigsResponse {
             throttle_time_ms: 0,
             results,
         };
-        
+
         let mut body_buf = BytesMut::new();
-        
+
         // Encode the response body (without correlation ID)
         self.encode_describe_configs_response(&mut body_buf, &response, header.api_version)?;
-        
+
+        tracing::info!("DescribeConfigs v{}: encoded response size = {} bytes",
+            header.api_version, body_buf.len());
+        if body_buf.len() <= 100 {
+            tracing::debug!("DescribeConfigs v{}: response bytes: {:02x?}",
+                header.api_version, &body_buf[..]);
+        } else {
+            tracing::debug!("DescribeConfigs v{}: first 100 bytes: {:02x?}",
+                header.api_version, &body_buf[..100]);
+        }
+
         Ok(Self::make_response(&header, ApiKey::DescribeConfigs, body_buf.freeze()))
     }
     
@@ -2973,12 +3012,12 @@ impl ProtocolHandler {
         &self,
         _broker_id: &str,
         configuration_keys: &Option<Vec<String>>,
-        _include_synonyms: bool,
+        include_synonyms: bool,
         include_documentation: bool,
         api_version: i16,
     ) -> Result<Vec<ConfigEntry>> {
         let mut configs = Vec::new();
-        
+
         // Default broker configurations
         let all_configs = vec![
             ("default.replication.factor", "1", "Default replication factor for automatically created topics", config_type::INT),
@@ -2989,7 +3028,7 @@ impl ProtocolHandler {
             ("socket.send.buffer.bytes", "102400", "The SO_SNDBUF buffer size", config_type::INT),
             ("socket.receive.buffer.bytes", "102400", "The SO_RCVBUF buffer size", config_type::INT),
         ];
-        
+
         for (name, default_value, doc, config_type_val) in all_configs {
             // Check if we should include this config
             if let Some(keys) = configuration_keys {
@@ -2997,7 +3036,17 @@ impl ProtocolHandler {
                     continue;
                 }
             }
-            
+
+            // Build synonyms if requested (v1+)
+            let mut synonyms = Vec::new();
+            if include_synonyms {
+                synonyms.push(ConfigSynonym {
+                    name: name.to_string(),
+                    value: Some(default_value.to_string()),
+                    source: config_source::STATIC_BROKER_CONFIG,
+                });
+            }
+
             configs.push(ConfigEntry {
                 name: name.to_string(),
                 value: Some(default_value.to_string()),
@@ -3005,7 +3054,7 @@ impl ProtocolHandler {
                 is_default: true,
                 config_source: config_source::STATIC_BROKER_CONFIG,
                 is_sensitive: false,
-                synonyms: vec![],
+                synonyms,
                 config_type: if api_version >= 3 { Some(config_type_val) } else { None },
                 documentation: if include_documentation && api_version >= 3 {
                     Some(doc.to_string())
@@ -3014,7 +3063,7 @@ impl ProtocolHandler {
                 },
             });
         }
-        
+
         Ok(configs)
     }
     
@@ -6385,22 +6434,44 @@ impl ProtocolHandler {
         version: i16,
     ) -> Result<()> {
         let mut encoder = Encoder::new(buf);
-        
+        let use_compact = version >= 3; // v3+ uses flexible/compact encoding
+
         // Throttle time (v1+)
         if version >= 1 {
             encoder.write_i32(response.throttle_time_ms);
         }
-        
+
         // Error code
         encoder.write_i16(response.error_code);
-        
-        // Groups array
-        encoder.write_i32(response.groups.len() as i32);
-        for group in &response.groups {
-            encoder.write_string(Some(&group.group_id));
-            encoder.write_string(Some(&group.protocol_type));
+
+        // Groups array - use compact array for v3+
+        if use_compact {
+            encoder.write_unsigned_varint((response.groups.len() + 1) as u32); // Compact arrays use +1 encoding
+        } else {
+            encoder.write_i32(response.groups.len() as i32);
         }
-        
+
+        for group in &response.groups {
+            if use_compact {
+                encoder.write_compact_string(Some(&group.group_id));
+                encoder.write_compact_string(Some(&group.protocol_type));
+                // Group state (v4+) - empty string for now
+                if version >= 4 {
+                    encoder.write_compact_string(Some("Stable")); // Default state
+                }
+                // Tagged fields for each group (v3+)
+                encoder.write_unsigned_varint(0); // No tagged fields
+            } else {
+                encoder.write_string(Some(&group.group_id));
+                encoder.write_string(Some(&group.protocol_type));
+            }
+        }
+
+        // Tagged fields at response level (v3+)
+        if use_compact {
+            encoder.write_unsigned_varint(0); // No tagged fields
+        }
+
         Ok(())
     }
     
