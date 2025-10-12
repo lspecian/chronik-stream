@@ -84,10 +84,16 @@ pub struct ProduceHandlerConfig {
     pub num_partitions: u32,
     /// Default replication factor for auto-created topics
     pub default_replication_factor: u32,
+    /// Flush profile for pending_batches management
+    pub flush_profile: ProduceFlushProfile,
 }
 
 impl Default for ProduceHandlerConfig {
     fn default() -> Self {
+        let profile = ProduceFlushProfile::auto_select();
+        info!("ProduceHandler using flush profile: {} (min_batches={}, linger_ms={}, buffer_memory={}MB)",
+              profile.name(), profile.min_batches(), profile.linger_ms(), profile.buffer_memory() / (1024 * 1024));
+
         Self {
             node_id: 0,
             storage_config: StorageConfig::default(),
@@ -97,13 +103,94 @@ impl Default for ProduceHandlerConfig {
             enable_transactions: true,
             max_in_flight_requests: 5,
             batch_size: 16384,
-            linger_ms: 10,
+            linger_ms: profile.linger_ms(),
             compression_type: CompressionType::Gzip,
             request_timeout_ms: 120000,  // 120 seconds (increased from 30s to handle slow topic auto-creation)
-            buffer_memory: 32 * 1024 * 1024, // 32MB
+            buffer_memory: profile.buffer_memory(),
             auto_create_topics_enable: true,
             num_partitions: 3,
             default_replication_factor: 1,
+            flush_profile: profile,
+        }
+    }
+}
+
+/// ProduceHandler flush performance profiles
+///
+/// Controls when buffered messages in `pending_batches` become visible to consumers.
+/// Similar to WAL profiles, but optimizes the in-memory flush layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProduceFlushProfile {
+    /// Low-latency profile: Optimize for minimal latency (<20ms p99)
+    /// Use case: Real-time analytics, instant messaging, live dashboards
+    LowLatency,
+
+    /// Balanced profile: Good throughput with reasonable latency (100-150ms p99)
+    /// Use case: General-purpose streaming, typical microservices (DEFAULT)
+    Balanced,
+
+    /// High-throughput profile: Maximum throughput at cost of higher latency
+    /// Use case: Log aggregation, data pipelines, ETL, batch processing
+    HighThroughput,
+}
+
+impl Default for ProduceFlushProfile {
+    fn default() -> Self {
+        Self::Balanced
+    }
+}
+
+impl ProduceFlushProfile {
+    /// Auto-select profile based on environment variable or default to Balanced
+    pub fn auto_select() -> Self {
+        if let Ok(profile) = std::env::var("CHRONIK_PRODUCE_PROFILE") {
+            match profile.to_lowercase().as_str() {
+                "low" | "low-latency" | "realtime" => Self::LowLatency,
+                "balanced" | "medium" | "default" => Self::Balanced,
+                "high" | "high-throughput" | "bulk" => Self::HighThroughput,
+                _ => {
+                    warn!("Unknown CHRONIK_PRODUCE_PROFILE '{}', using Balanced", profile);
+                    Self::Balanced
+                }
+            }
+        } else {
+            Self::Balanced
+        }
+    }
+
+    /// Get minimum batches before flush
+    pub fn min_batches(&self) -> usize {
+        match self {
+            Self::LowLatency => 1,      // Flush immediately
+            Self::Balanced => 10,        // Wait for 10 batches
+            Self::HighThroughput => 100, // Wait for 100 batches
+        }
+    }
+
+    /// Get linger time (max time before forced flush)
+    pub fn linger_ms(&self) -> u64 {
+        match self {
+            Self::LowLatency => 10,      // 10ms max wait
+            Self::Balanced => 100,       // 100ms max wait
+            Self::HighThroughput => 500, // 500ms max wait
+        }
+    }
+
+    /// Get buffer memory size
+    pub fn buffer_memory(&self) -> usize {
+        match self {
+            Self::LowLatency => 16 * 1024 * 1024,  // 16MB
+            Self::Balanced => 32 * 1024 * 1024,     // 32MB
+            Self::HighThroughput => 128 * 1024 * 1024, // 128MB
+        }
+    }
+
+    /// Get profile name for logging
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::LowLatency => "LowLatency",
+            Self::Balanced => "Balanced",
+            Self::HighThroughput => "HighThroughput",
         }
     }
 }
@@ -884,6 +971,9 @@ impl ProduceHandler {
         transactional_id: Option<&str>,
         acks: i16,
     ) -> Result<ProduceResponsePartition> {
+        use std::time::Instant;
+        let start_time = Instant::now();
+
         // ENTRY POINT LOGGING (v1.3.47 debugging)
         info!("→ produce_to_partition({}-{}) bytes={} acks={}", topic, partition, records_data.len(), acks);
 
@@ -913,13 +1003,19 @@ impl ProduceHandler {
         };
 
         // Check if we need to modify the batch at all
-        let re_encoded_bytes = if incoming_base_offset == base_offset as i64 {
+        let (re_encoded_bytes, kafka_batch) = if incoming_base_offset == base_offset as i64 {
             // Perfect match - store original bytes AS-IS (preserves CRC perfectly)
             debug!(
                 "Base offset match ({}) - storing original bytes without modification (byte-perfect CRC preservation)",
                 base_offset
             );
-            Bytes::copy_from_slice(records_data)
+            let bytes = Bytes::copy_from_slice(records_data);
+
+            // OPTIMIZATION: Decode once when offset matches
+            let (batch, _) = KafkaRecordBatch::decode(records_data)
+                .map_err(|e| Error::Protocol(format!("Failed to decode record batch: {}", e)))?;
+
+            (bytes, batch)
         } else {
             // Offset mismatch - need to decode, update offset, and re-encode
             debug!(
@@ -935,12 +1031,12 @@ impl ProduceHandler {
             kafka_batch.header.base_offset = base_offset as i64;
 
             // Re-encode the batch (always to v2 format)
-            kafka_batch.encode()
-                .map_err(|e| Error::Protocol(format!("Failed to re-encode record batch: {}", e)))?
-        };
+            let re_encoded = kafka_batch.encode()
+                .map_err(|e| Error::Protocol(format!("Failed to re-encode record batch: {}", e)))?;
 
-        // Decode the batch (either original or updated)
-        let (kafka_batch, _bytes_consumed) = KafkaRecordBatch::decode(&re_encoded_bytes)?;
+            // OPTIMIZATION: Return the already-decoded batch to avoid double decode
+            (re_encoded, kafka_batch)
+        };
 
         // TODO (Phase 3): Write CanonicalRecord to WAL as V2 record
         // This will enable layered storage: WAL (hot) → Tantivy segments (warm) → Object store (cold)
@@ -1205,7 +1301,7 @@ impl ProduceHandler {
         
         // Get partition state for response
         let log_start_offset = partition_state.log_start_offset.load(Ordering::Relaxed) as i64;
-        
+
         Ok(ProduceResponsePartition {
             index: partition,
             error_code: ErrorCode::None.code(),
@@ -1480,6 +1576,11 @@ impl ProduceHandler {
     }
     
     /// Flush partition if needed based on size or time
+    ///
+    /// v1.3.56+: Uses ProduceFlushProfile for configurable flush behavior:
+    /// - LowLatency: 1 batch / 10ms (real-time)
+    /// - Balanced: 10 batches / 100ms (default)
+    /// - HighThroughput: 100 batches / 500ms (bulk)
     async fn flush_partition_if_needed(
         &self,
         topic: &str,
@@ -1489,25 +1590,29 @@ impl ProduceHandler {
         let should_flush = {
             let pending = state.pending_batches.lock().await;
             let last_flush = state.last_flush.lock().await;
-            
-            // Use reasonable thresholds even in debug mode
-            // Batch at least 100 records or wait 1 second before flushing
-            let min_batches = if cfg!(debug_assertions) { 10 } else { 100 };
-            let linger_time = if cfg!(debug_assertions) { 
-                Duration::from_millis(1000) 
-            } else { 
-                Duration::from_millis(self.config.linger_ms) 
+
+            // Use profile settings for flush thresholds
+            let min_batches = if cfg!(debug_assertions) {
+                1  // Always flush immediately in debug
+            } else {
+                self.config.flush_profile.min_batches()
             };
-            
+
+            let linger_time = if cfg!(debug_assertions) {
+                Duration::from_millis(10)  // Fast flush in debug
+            } else {
+                Duration::from_millis(self.config.flush_profile.linger_ms())
+            };
+
             pending.len() >= min_batches ||
             state.segment_size.load(Ordering::Relaxed) >= MAX_SEGMENT_SIZE ||
             last_flush.elapsed() >= linger_time
         };
-        
+
         if should_flush {
             self.flush_partition(topic, partition, state).await?;
         }
-        
+
         Ok(())
     }
     

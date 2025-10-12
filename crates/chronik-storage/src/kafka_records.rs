@@ -377,9 +377,11 @@ impl KafkaRecordBatch {
         let magic_byte_v2_position = 16;
         if data.len() > magic_byte_v2_position {
             let possible_magic = data[magic_byte_v2_position];
-            
+
             // Check if this could be a legacy format
             if possible_magic == MAGIC_V0 as u8 || possible_magic == MAGIC_V1 as u8 {
+                use tracing::warn as warn2;
+                warn2!("🔴 LEGACY FORMAT DETECTED: magic={} (v0={}, v1={})", possible_magic, MAGIC_V0, MAGIC_V1);
                 // This is a legacy message set, convert it to v2 format
                 return Self::decode_legacy_message_set(data);
             }
@@ -468,9 +470,46 @@ impl KafkaRecordBatch {
                 decompressed
             }
             CompressionType::Snappy => {
-                let mut decoder = SnappyDecoder::new();
-                decoder.decompress_vec(&compressed_buf)
-                    .map_err(|e| Error::Internal(format!("Snappy decompression failed: {}", e)))?
+                // Fast path: Try Xerial format first (most common for Kafka producers)
+                const XERIAL_HEADER: &[u8] = &[0x82, b'S', b'N', b'A', b'P', b'P', b'Y', 0];
+                if compressed_buf.len() > 16 && compressed_buf.starts_with(XERIAL_HEADER) {
+                    // Xerial Snappy - optimized decompression
+                    let mut pos = 16;
+
+                    // Pre-allocate output buffer (estimate 3x compression ratio)
+                    let mut output = Vec::with_capacity(compressed_buf.len() * 3);
+
+                    // Reuse single decoder for all blocks
+                    let mut decoder = SnappyDecoder::new();
+
+                    while pos + 4 <= compressed_buf.len() {
+                        let block_size = u32::from_be_bytes([
+                            compressed_buf[pos],
+                            compressed_buf[pos + 1],
+                            compressed_buf[pos + 2],
+                            compressed_buf[pos + 3],
+                        ]) as usize;
+                        pos += 4;
+
+                        if block_size == 0 || pos + block_size > compressed_buf.len() {
+                            return Err(Error::Internal(format!("Invalid Xerial block size: {}", block_size)));
+                        }
+
+                        let block_data = &compressed_buf[pos..pos + block_size];
+                        let decompressed_block = decoder.decompress_vec(block_data)
+                            .map_err(|e| Error::Internal(format!("Xerial block decompression failed: {}", e)))?;
+
+                        output.extend_from_slice(&decompressed_block);
+                        pos += block_size;
+                    }
+
+                    output
+                } else {
+                    // Fallback: Try raw Snappy
+                    let mut decoder = SnappyDecoder::new();
+                    decoder.decompress_vec(&compressed_buf)
+                        .map_err(|e| Error::Internal(format!("Snappy decompression failed: {}", e)))?
+                }
             }
             CompressionType::Lz4 => {
                 // Kafka uses LZ4 block format with size prefix
@@ -495,12 +534,13 @@ impl KafkaRecordBatch {
     
     /// Decode legacy message set (v0/v1 format) and convert to v2 RecordBatch
     fn decode_legacy_message_set(data: &[u8]) -> Result<(Self, usize)> {
+        use tracing::warn as legacy_warn;
         let mut cursor = Cursor::new(data);
         let mut records = Vec::new();
         let mut base_offset = 0i64;
         let mut base_timestamp = 0i64;
         let mut max_timestamp = 0i64;
-        
+
         // Parse MessageSet format (series of offset + message_size + message)
         while cursor.position() < data.len() as u64 {
             // Check if we have at least 12 bytes for offset + size
@@ -508,31 +548,34 @@ impl KafkaRecordBatch {
             if remaining < 12 {
                 break;
             }
-            
+
             // Read offset
             let offset = read_i64(&mut cursor)?;
             if base_offset == 0 {
                 base_offset = offset;
             }
-            
+
             // Read message size
             let message_size = read_i32(&mut cursor)?;
-            
+
             // Check if we have enough data for the message
             let remaining = cursor.get_ref().len() - cursor.position() as usize;
             if remaining < message_size as usize {
                 break;
             }
-            
+
             // Read CRC
             let _crc = read_u32(&mut cursor)?;
-            
+
             // Read magic byte
             let magic = read_i8(&mut cursor)?;
-            
+
             // Read attributes
             let attributes = read_i8(&mut cursor)?;
-            
+
+            // Check for compression (lower 3 bits of attributes)
+            let compression = CompressionType::from_attributes(attributes as u16);
+
             // For v1, read timestamp
             let timestamp = if magic == MAGIC_V1 {
                 let ts = read_i64(&mut cursor)?;
@@ -561,27 +604,114 @@ impl KafkaRecordBatch {
             
             // Read value
             let value_len = read_i32(&mut cursor)?;
-            let value = if value_len >= 0 {
+            let value_bytes = if value_len >= 0 {
                 let mut buf = vec![0u8; value_len as usize];
                 cursor.read_exact(&mut buf)
                     .map_err(|e| Error::Internal(format!("Failed to read value: {}", e)))?;
-                Some(Bytes::from(buf))
+                buf
             } else {
-                None
+                Vec::new()
             };
-            
-            // Convert to v2 Record
-            let record = KafkaRecord {
-                length: 0, // Will be calculated when encoding
-                attributes: 0,
-                timestamp_delta: timestamp - base_timestamp,
-                offset_delta: (offset - base_offset) as i32,
-                key,
-                value,
-                headers: Vec::new(), // Legacy formats don't have headers
-            };
-            
-            records.push(record);
+
+            // CRITICAL FIX: Handle compressed MessageSets in legacy format
+            // In v0/v1, when a message has compression, its value is a nested compressed MessageSet
+            if compression != CompressionType::None && !value_bytes.is_empty() {
+                // Decompress the value (optimized path - removed excessive logging)
+                let decompressed = match compression {
+                    CompressionType::Gzip => {
+                        let mut decoder = GzDecoder::new(&value_bytes[..]);
+                        let mut decompressed = Vec::new();
+                        decoder.read_to_end(&mut decompressed)
+                            .map_err(|e| Error::Internal(format!("Legacy Gzip decompression failed: {}", e)))?;
+                        decompressed
+                    }
+                    CompressionType::Snappy => {
+                        // Fast path: Try Xerial format first (most common for Kafka producers)
+                        const XERIAL_HEADER: &[u8] = &[0x82, b'S', b'N', b'A', b'P', b'P', b'Y', 0];
+                        if value_bytes.len() > 16 && value_bytes.starts_with(XERIAL_HEADER) {
+                            // Xerial Snappy - optimized decompression
+                            let mut pos = 16;
+
+                            // Pre-allocate output buffer (estimate 3x compression ratio)
+                            let mut output = Vec::with_capacity(value_bytes.len() * 3);
+
+                            // Reuse single decoder for all blocks
+                            let mut decoder = SnappyDecoder::new();
+
+                            while pos + 4 <= value_bytes.len() {
+                                let block_size = u32::from_be_bytes([
+                                    value_bytes[pos],
+                                    value_bytes[pos + 1],
+                                    value_bytes[pos + 2],
+                                    value_bytes[pos + 3],
+                                ]) as usize;
+                                pos += 4;
+
+                                if block_size == 0 || pos + block_size > value_bytes.len() {
+                                    return Err(Error::Internal(format!("Invalid Xerial block size: {}", block_size)));
+                                }
+
+                                let block_data = &value_bytes[pos..pos + block_size];
+                                let decompressed_block = decoder.decompress_vec(block_data)
+                                    .map_err(|e| Error::Internal(format!("Xerial block decompression failed: {}", e)))?;
+
+                                output.extend_from_slice(&decompressed_block);
+                                pos += block_size;
+                            }
+
+                            output
+                        } else {
+                            // Fallback: Try raw Snappy
+                            let mut decoder = SnappyDecoder::new();
+                            decoder.decompress_vec(&value_bytes)
+                                .map_err(|e| Error::Internal(format!("Legacy Snappy decompression failed: {}", e)))?
+                        }
+                    }
+                    CompressionType::Lz4 => {
+                        lz4_decompress(&value_bytes)
+                            .map_err(|e| Error::Internal(format!("Legacy LZ4 decompression failed: {}", e)))?
+                    }
+                    CompressionType::Zstd => {
+                        zstd::decode_all(&value_bytes[..])
+                            .map_err(|e| Error::Internal(format!("Legacy Zstd decompression failed: {}", e)))?
+                    }
+                    _ => value_bytes.clone(),
+                };
+
+                // Recursively parse the decompressed MessageSet
+                let (nested_batch, _) = Self::decode_legacy_message_set(&decompressed)?;
+
+                // Update offsets and timestamps from nested messages BEFORE extending
+                for record in &nested_batch.records {
+                    let record_offset = base_offset + record.offset_delta as i64;
+                    let record_timestamp = base_timestamp + record.timestamp_delta;
+                    if record_timestamp > max_timestamp {
+                        max_timestamp = record_timestamp;
+                    }
+                }
+
+                // Extend records after iteration
+                records.extend(nested_batch.records);
+            } else {
+                // Uncompressed message - add directly
+                let value = if value_len >= 0 {
+                    Some(Bytes::from(value_bytes))
+                } else {
+                    None
+                };
+
+                let record = KafkaRecord {
+                    length: 0, // Will be calculated when encoding
+                    attributes: 0,
+                    timestamp_delta: timestamp - base_timestamp,
+                    offset_delta: (offset - base_offset) as i32,
+                    key,
+                    value,
+                    headers: Vec::new(), // Legacy formats don't have headers
+                };
+
+                records.push(record);
+            }
         }
         
         // Create a v2 RecordBatch header with converted data

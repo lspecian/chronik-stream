@@ -243,6 +243,7 @@ impl IntegratedKafkaServer {
             ..Default::default()
         };
         
+        let flush_profile = crate::produce_handler::ProduceFlushProfile::auto_select();
         let produce_config = ProduceHandlerConfig {
             node_id: config.node_id,
             storage_config: storage_config.clone(),
@@ -252,17 +253,18 @@ impl IntegratedKafkaServer {
             enable_transactions: false, // Start without transactions
             max_in_flight_requests: 5,
             batch_size: 16384,
-            linger_ms: 10,
+            linger_ms: flush_profile.linger_ms(),
             compression_type: if config.enable_compression {
                 chronik_storage::kafka_records::CompressionType::Snappy
             } else {
                 chronik_storage::kafka_records::CompressionType::None
             },
             request_timeout_ms: 120000,  // 120 seconds (increased from 30s to handle slow topic auto-creation)
-            buffer_memory: 32 * 1024 * 1024, // 32MB
+            buffer_memory: flush_profile.buffer_memory(),
             auto_create_topics_enable: config.auto_create_topics,
             num_partitions: config.num_partitions,
             default_replication_factor: config.replication_factor,
+            flush_profile,
         };
 
         // Create WAL configuration with default settings (v1.3.47: moved before ProduceHandler)

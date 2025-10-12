@@ -309,6 +309,69 @@ chronik-server compact status --detailed
 chronik-server compact config --enabled true --interval 3600
 ```
 
+## Performance Tuning
+
+### ProduceHandler Flush Profiles (v1.3.56+)
+
+The ProduceHandler has configurable flush profiles that control when buffered messages become visible to consumers. Choose the profile that matches your workload:
+
+#### Available Profiles
+
+**1. Low-Latency** (`CHRONIK_PRODUCE_PROFILE=low-latency`)
+- **Use case**: Real-time analytics, instant messaging, live dashboards
+- **Settings**: 1 batch / 10ms flush
+- **Expected latency**: < 20ms p99
+- **Buffer memory**: 16MB
+- **Trade-off**: More CPU usage for minimal latency
+
+**2. Balanced** (default)
+- **Use case**: General-purpose streaming, typical microservices
+- **Settings**: 10 batches / 100ms flush
+- **Expected latency**: 100-150ms p99
+- **Buffer memory**: 32MB
+- **Trade-off**: Good balance of throughput and latency
+
+**3. High-Throughput** (`CHRONIK_PRODUCE_PROFILE=high-throughput`)
+- **Use case**: Log aggregation, data pipelines, ETL, batch processing
+- **Settings**: 100 batches / 500ms flush
+- **Expected latency**: < 500ms p99
+- **Buffer memory**: 128MB
+- **Trade-off**: Maximum throughput at cost of higher latency
+
+#### Usage Examples
+
+```bash
+# Low-latency for real-time applications
+CHRONIK_PRODUCE_PROFILE=low-latency ./target/release/chronik-server --advertised-addr localhost standalone
+
+# High-throughput for bulk ingestion
+CHRONIK_PRODUCE_PROFILE=high-throughput ./target/release/chronik-server --advertised-addr localhost standalone
+
+# Balanced (default, no env var needed)
+./target/release/chronik-server --advertised-addr localhost standalone
+```
+
+#### Benchmarking Profiles
+
+Test all profiles with comprehensive workloads:
+```bash
+# Build server first
+cargo build --release --bin chronik-server
+
+# Run profile benchmark (tests all 3 profiles with 1K/10K/50K/100K messages)
+python3 tests/test_produce_profiles.py
+```
+
+The benchmark measures:
+- Produce rate (msg/s)
+- Consume rate (msg/s)
+- Success rate (%)
+- End-to-end latency (p50, p95, p99)
+
+### WAL Performance Profiles
+
+See GroupCommitWal configuration in `chronik-wal/src/group_commit.rs` for WAL-level tuning via `CHRONIK_WAL_PROFILE`.
+
 ## Environment Variables
 
 Key environment variables:
@@ -319,6 +382,8 @@ Key environment variables:
 - `CHRONIK_ADVERTISED_PORT` - Port advertised to clients
 - `CHRONIK_DATA_DIR` - Data directory (default: ./data)
 - `CHRONIK_FILE_METADATA` - Use file-based metadata (default: false, uses WAL)
+- `CHRONIK_PRODUCE_PROFILE` - ProduceHandler flush profile: `low-latency`, `balanced` (default), `high-throughput`
+- `CHRONIK_WAL_PROFILE` - WAL commit profile: `low`, `medium`, `high`, `ultra` (auto-detected by default)
 
 ## Debugging Tips
 

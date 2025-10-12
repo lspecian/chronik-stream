@@ -638,7 +638,9 @@ impl FetchHandler {
     ) -> Result<Vec<chronik_storage::Record>> {
         use chronik_storage::canonical_record::CanonicalRecord;
 
-        let max_records = std::cmp::max(1, max_bytes as usize / 100); // Estimate ~100 bytes per record
+        // CRITICAL FIX (v1.3.55): Match fetch_raw_bytes_from_wal limit increase
+        // Old limit (max_bytes / 100) caused consumer timeouts at ~75K messages
+        let max_records = std::cmp::max(10000, max_bytes as usize / 10);
 
         let wal_records = wal_manager.read_from(topic, partition, fetch_offset, max_records).await
             .map_err(|e| Error::Internal(format!("WAL read failed: {}", e)))?;
@@ -698,7 +700,10 @@ impl FetchHandler {
     ) -> Result<Option<Vec<u8>>> {
         use chronik_storage::canonical_record::CanonicalRecord;
 
-        let max_records = std::cmp::max(1, max_bytes as usize / 100);
+        // CRITICAL FIX (v1.3.55): Don't artificially limit WAL reads
+        // Old calculation (max_bytes / 100) was too conservative and caused consumer timeouts
+        // Allow reading many more records - let max_bytes limit total bytes instead
+        let max_records = std::cmp::max(10000, max_bytes as usize / 10);
 
         let wal_records = wal_manager.read_from(topic, partition, fetch_offset, max_records).await
             .map_err(|e| Error::Internal(format!("WAL read failed: {}", e)))?;
