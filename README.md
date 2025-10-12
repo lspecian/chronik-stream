@@ -196,8 +196,61 @@ Environment Variables:
   CHRONIK_ADVERTISED_PORT      Port advertised to clients
   CHRONIK_DATA_DIR             Data directory path
   CHRONIK_FILE_METADATA        Set to "true" to use legacy file-based metadata store
-  CHRONIK_WAL_PROFILE          WAL performance profile: low/medium/high (auto-detects if not set)
+  CHRONIK_WAL_PROFILE          WAL performance profile: low/medium/high/ultra (auto-detects if not set)
+  CHRONIK_PRODUCE_PROFILE      Producer flush profile: low-latency/balanced/high-throughput (default: balanced)
   RUST_LOG                     Log level (error, warn, info, debug, trace)
+```
+
+## ⚡ Performance Tuning
+
+Chronik Stream provides two layers of performance tuning for different workloads:
+
+### Producer Flush Profiles
+
+Control when buffered messages become visible to consumers:
+
+**Low-Latency** - Real-time applications
+```bash
+CHRONIK_PRODUCE_PROFILE=low-latency ./chronik-server ...
+```
+- Settings: 1 batch / 10ms flush / 16MB buffer
+- Target: < 20ms p99 latency
+- Use for: Real-time analytics, instant messaging, live dashboards
+
+**Balanced** - General-purpose (default)
+```bash
+./chronik-server ...  # No env var needed
+```
+- Settings: 10 batches / 100ms flush / 32MB buffer
+- Target: 100-150ms p99 latency
+- Use for: General streaming, typical microservices
+
+**High-Throughput** - Bulk ingestion
+```bash
+CHRONIK_PRODUCE_PROFILE=high-throughput ./chronik-server ...
+```
+- Settings: 100 batches / 500ms flush / 128MB buffer
+- Target: < 500ms p99 latency
+- Use for: Log aggregation, data pipelines, ETL, batch processing
+
+### WAL Performance Profiles
+
+The Write-Ahead Log automatically detects system resources (CPU, memory, Docker/K8s limits) and selects an appropriate profile. Override with:
+
+```bash
+CHRONIK_WAL_PROFILE=low        # Containers, small VMs (≤1 CPU, <512MB)
+CHRONIK_WAL_PROFILE=medium     # Typical servers (2-4 CPUs, 512MB-4GB)
+CHRONIK_WAL_PROFILE=high       # Dedicated servers (4-16 CPUs, 4-16GB)
+CHRONIK_WAL_PROFILE=ultra      # Maximum throughput (16+ CPUs, 16GB+)
+```
+
+### Benchmarking
+
+Test performance profiles with your workload:
+```bash
+cargo build --release
+python3 tests/test_profiles_quick.py  # Quick 10K message test
+python3 tests/test_produce_profiles.py  # Comprehensive benchmark
 ```
 
 ## 📦 Docker Images
