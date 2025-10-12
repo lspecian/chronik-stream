@@ -46,174 +46,26 @@ pub struct GroupCommitConfig {
 
 impl Default for GroupCommitConfig {
     fn default() -> Self {
-        Self::auto_tune()
-    }
-}
-
-impl GroupCommitConfig {
-    /// Auto-tune configuration based on system resources
-    ///
-    /// Detects CPU and memory constraints, including:
-    /// - K8s/Docker CPU limits (cgroup v1 and v2)
-    /// - Available memory
-    /// - Environment variable overrides
-    pub fn auto_tune() -> Self {
-        // Check for manual override via environment
+        // Check for profile override via environment
         if let Ok(profile) = std::env::var("CHRONIK_WAL_PROFILE") {
             return match profile.to_lowercase().as_str() {
                 "low" | "small" | "container" => Self::low_resource(),
                 "medium" | "balanced" => Self::medium_resource(),
                 "high" | "aggressive" | "dedicated" => Self::high_resource(),
                 "ultra" | "maximum" | "throughput" => Self::ultra_resource(),
-                _ => Self::detect_resources(),
+                _ => {
+                    warn!("Unknown CHRONIK_WAL_PROFILE '{}', using high profile", profile);
+                    Self::high_resource()
+                }
             };
         }
 
-        Self::detect_resources()
+        // Default to high profile: good balance of throughput and latency
+        Self::high_resource()
     }
+}
 
-    /// Detect actual available resources (handles K8s/Docker limits)
-    fn detect_resources() -> Self {
-        let cpu_limit = Self::detect_cpu_limit();
-        let memory_bytes = Self::detect_memory_limit();
-
-        // Convert memory to GB for easier comparison
-        let memory_gb = memory_bytes as f64 / 1_073_741_824.0;
-
-        // Choose profile based on BOTH CPU and memory
-        // Use the more conservative constraint
-        let cpu_profile = if cpu_limit <= 1.0 {
-            0 // low
-        } else if cpu_limit <= 4.0 {
-            1 // medium
-        } else if cpu_limit <= 16.0 {
-            2 // high
-        } else {
-            3 // ultra (16+ CPUs)
-        };
-
-        let memory_profile = if memory_gb < 0.5 {
-            0 // low (< 512MB)
-        } else if memory_gb < 4.0 {
-            1 // medium (< 4GB)
-        } else if memory_gb < 16.0 {
-            2 // high (< 16GB)
-        } else {
-            3 // ultra (>= 16GB)
-        };
-
-        // Use the more conservative profile
-        let profile = cpu_profile.min(memory_profile);
-
-        match profile {
-            0 => Self::low_resource(),
-            1 => Self::medium_resource(),
-            2 => Self::high_resource(),
-            _ => Self::ultra_resource(),
-        }
-    }
-
-    /// Detect CPU limit (handles cgroups v1/v2 for K8s/Docker)
-    fn detect_cpu_limit() -> f64 {
-        // Try cgroup v2 first (newer K8s, Docker)
-        if let Ok(cpu) = Self::read_cgroup_v2_cpu() {
-            return cpu;
-        }
-
-        // Fall back to cgroup v1
-        if let Ok(cpu) = Self::read_cgroup_v1_cpu() {
-            return cpu;
-        }
-
-        // Fall back to thread::available_parallelism (bare metal)
-        std::thread::available_parallelism()
-            .map(|n| n.get() as f64)
-            .unwrap_or(4.0)
-    }
-
-    /// Read cgroup v2 CPU limit (K8s 1.25+, modern Docker)
-    fn read_cgroup_v2_cpu() -> std::result::Result<f64, std::io::Error> {
-        use std::fs;
-
-        // Read CPU max: "100000 100000" means 1 CPU (quota/period)
-        let cpu_max = fs::read_to_string("/sys/fs/cgroup/cpu.max")?;
-        let parts: Vec<&str> = cpu_max.trim().split_whitespace().collect();
-
-        if parts.len() == 2 && parts[0] != "max" {
-            let quota: f64 = parts[0].parse().unwrap_or(100_000.0);
-            let period: f64 = parts[1].parse().unwrap_or(100_000.0);
-            return Ok(quota / period);
-        }
-
-        Err(std::io::Error::new(std::io::ErrorKind::NotFound, "No CPU limit"))
-    }
-
-    /// Read cgroup v1 CPU limit (older K8s, Docker)
-    fn read_cgroup_v1_cpu() -> std::result::Result<f64, std::io::Error> {
-        use std::fs;
-
-        let quota = fs::read_to_string("/sys/fs/cgroup/cpu/cpu.cfs_quota_us")?
-            .trim()
-            .parse::<i64>()
-            .unwrap_or(-1);
-
-        if quota > 0 {
-            let period = fs::read_to_string("/sys/fs/cgroup/cpu/cpu.cfs_period_us")?
-                .trim()
-                .parse::<f64>()
-                .unwrap_or(100_000.0);
-
-            return Ok(quota as f64 / period);
-        }
-
-        Err(std::io::Error::new(std::io::ErrorKind::NotFound, "No CPU limit"))
-    }
-
-    /// Detect memory limit (handles cgroups v1/v2)
-    fn detect_memory_limit() -> usize {
-        // Try cgroup v2 first
-        if let Ok(mem) = Self::read_cgroup_v2_memory() {
-            return mem;
-        }
-
-        // Fall back to cgroup v1
-        if let Ok(mem) = Self::read_cgroup_v1_memory() {
-            return mem;
-        }
-
-        // Fall back to system memory (bare metal)
-        #[cfg(target_os = "linux")]
-        {
-            if let Ok(info) = sys_info::mem_info() {
-                return (info.total * 1024) as usize; // Convert KB to bytes
-            }
-        }
-
-        // Conservative default: 2GB
-        2_147_483_648
-    }
-
-    /// Read cgroup v2 memory limit
-    fn read_cgroup_v2_memory() -> std::result::Result<usize, std::io::Error> {
-        use std::fs;
-
-        let mem_max = fs::read_to_string("/sys/fs/cgroup/memory.max")?;
-        let mem_max = mem_max.trim();
-
-        if mem_max != "max" {
-            return Ok(mem_max.parse().unwrap_or(2_147_483_648));
-        }
-
-        Err(std::io::Error::new(std::io::ErrorKind::NotFound, "No memory limit"))
-    }
-
-    /// Read cgroup v1 memory limit
-    fn read_cgroup_v1_memory() -> std::result::Result<usize, std::io::Error> {
-        use std::fs;
-
-        let mem_limit = fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes")?;
-        Ok(mem_limit.trim().parse().unwrap_or(2_147_483_648))
-    }
+impl GroupCommitConfig {
 
     /// Low resource profile (containers, small VMs: <= 1 CPU, < 512MB RAM)
     fn low_resource() -> Self {
@@ -238,12 +90,13 @@ impl GroupCommitConfig {
     }
 
     /// High resource profile (dedicated servers: 4+ CPUs, 4GB+ RAM)
+    /// Default profile: balanced throughput and reduced disk I/O with 100ms batching
     fn high_resource() -> Self {
         Self {
-            max_batch_size: 5_000,          // 5K writes per batch
-            max_batch_bytes: 25_000_000,    // 25MB per batch
-            max_wait_time_ms: 5,            // 5ms latency (low-latency optimized)
-            max_queue_depth: 25_000,        // 25K queue depth
+            max_batch_size: 10_000,         // 10K writes per batch
+            max_batch_bytes: 50_000_000,    // 50MB per batch
+            max_wait_time_ms: 100,          // 100ms latency (reduce disk I/O)
+            max_queue_depth: 50_000,        // 50K queue depth
             enable_metrics: true,
         }
     }

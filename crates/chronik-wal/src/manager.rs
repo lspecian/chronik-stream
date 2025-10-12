@@ -49,10 +49,10 @@ impl WalManager {
         let fsync_batcher = FsyncBatcher::new(config.fsync.clone());
 
         // Initialize GroupCommitWal for zero-loss durability (v1.3.54+)
-        // Auto-tunes based on CPU and memory (handles K8s/Docker cgroup limits)
-        let group_commit_config = GroupCommitConfig::auto_tune();
+        // Default profile: high (good balance). Override with CHRONIK_WAL_PROFILE env var
+        let group_commit_config = GroupCommitConfig::default();
         info!(
-            "GroupCommitWal configured: batch_size={}, batch_MB={}, wait_ms={}, queue_depth={} (use CHRONIK_WAL_PROFILE=low/medium/high to override)",
+            "GroupCommitWal configured: batch_size={}, batch_MB={}, wait_ms={}, queue_depth={} (profile: high, override with CHRONIK_WAL_PROFILE=low/medium/high/ultra)",
             group_commit_config.max_batch_size,
             group_commit_config.max_batch_bytes / 1_000_000,
             group_commit_config.max_wait_time_ms,
