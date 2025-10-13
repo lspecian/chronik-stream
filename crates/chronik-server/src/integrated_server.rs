@@ -64,6 +64,8 @@ pub struct IntegratedServerConfig {
     pub enable_wal_indexing: bool,
     /// WAL indexing interval in seconds
     pub wal_indexing_interval_secs: u64,
+    /// Optional object store configuration (overrides default local storage)
+    pub object_store_config: Option<ObjectStoreConfig>,
 }
 
 impl Default for IntegratedServerConfig {
@@ -81,6 +83,7 @@ impl Default for IntegratedServerConfig {
             use_wal_metadata: true, // Default to WAL-based metadata
             enable_wal_indexing: true, // Enable WAL→Tantivy indexing by default
             wal_indexing_interval_secs: 30, // Index every 30 seconds
+            object_store_config: None, // Use default local storage unless specified
         }
     }
 }
@@ -191,22 +194,28 @@ impl IntegratedKafkaServer {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }).await?;
-        
-        // Create object store configuration for local filesystem
-        let object_store_config = ObjectStoreConfig {
-            backend: chronik_storage::object_store::StorageBackend::Local {
-                path: segments_dir.clone(),
-            },
-            bucket: "chronik".to_string(),
-            prefix: None,
-            connection: Default::default(),
-            performance: Default::default(),
-            retry: Default::default(),
-            auth: chronik_storage::object_store::AuthConfig::None,
-            default_metadata: None,
-            encryption: None,
+
+        // Create object store configuration (use custom config if provided, otherwise default to local)
+        let object_store_config = if let Some(custom_config) = config.object_store_config.clone() {
+            info!("Using custom object store configuration from environment/config");
+            custom_config
+        } else {
+            info!("Using default local filesystem object store at {}", segments_dir);
+            ObjectStoreConfig {
+                backend: chronik_storage::object_store::StorageBackend::Local {
+                    path: segments_dir.clone(),
+                },
+                bucket: "chronik".to_string(),
+                prefix: None,
+                connection: Default::default(),
+                performance: Default::default(),
+                retry: Default::default(),
+                auth: chronik_storage::object_store::AuthConfig::None,
+                default_metadata: None,
+                encryption: None,
+            }
         };
-        
+
         // Create object store
         let object_store = ObjectStoreFactory::create(object_store_config.clone()).await?;
         let object_store_arc: Arc<dyn ObjectStoreTrait> = Arc::from(object_store);

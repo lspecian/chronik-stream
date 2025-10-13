@@ -27,6 +27,7 @@ mod wal_integration;
 use integrated_server::{IntegratedKafkaServer, IntegratedServerConfig};
 use chronik_wal::compaction::{WalCompactor, CompactionConfig, CompactionStrategy};
 use chronik_wal::config::{WalConfig, CompressionType};
+use chronik_storage::object_store::{ObjectStoreConfig, StorageBackend, AuthConfig, S3Credentials};
 use serde_json;
 
 #[derive(Parser, Debug)]
@@ -192,6 +193,154 @@ enum Commands {
         #[command(subcommand)]
         action: CompactAction,
     },
+}
+
+/// Parse object store configuration from environment variables
+fn parse_object_store_config_from_env() -> Option<ObjectStoreConfig> {
+    let backend_type = std::env::var("OBJECT_STORE_BACKEND").ok()?;
+
+    match backend_type.to_lowercase().as_str() {
+        "s3" => {
+            info!("Configuring S3-compatible object store from environment variables");
+
+            let endpoint = std::env::var("S3_ENDPOINT").ok();
+            let region = std::env::var("S3_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+            let bucket = std::env::var("S3_BUCKET").unwrap_or_else(|_| "chronik-storage".to_string());
+            let access_key = std::env::var("S3_ACCESS_KEY").ok();
+            let secret_key = std::env::var("S3_SECRET_KEY").ok();
+            let path_style = std::env::var("S3_PATH_STYLE")
+                .ok()
+                .and_then(|v| v.parse::<bool>().ok())
+                .unwrap_or(true); // Default to path-style for MinIO compatibility
+            let disable_ssl = std::env::var("S3_DISABLE_SSL")
+                .ok()
+                .and_then(|v| v.parse::<bool>().ok())
+                .unwrap_or(false);
+
+            let auth = match (access_key, secret_key) {
+                (Some(key), Some(secret)) => {
+                    info!("Using S3 access key authentication");
+                    AuthConfig::S3(S3Credentials::AccessKey {
+                        access_key_id: key,
+                        secret_access_key: secret,
+                        session_token: std::env::var("S3_SESSION_TOKEN").ok(),
+                    })
+                }
+                _ => {
+                    info!("Using S3 environment-based authentication");
+                    AuthConfig::S3(S3Credentials::FromEnvironment)
+                }
+            };
+
+            let config = ObjectStoreConfig {
+                backend: StorageBackend::S3 {
+                    region,
+                    endpoint,
+                    force_path_style: path_style,
+                    use_virtual_hosted_style: !path_style,
+                    signing_region: None,
+                    disable_ssl,
+                },
+                bucket,
+                prefix: std::env::var("S3_PREFIX").ok(),
+                auth,
+                connection: Default::default(),
+                performance: Default::default(),
+                retry: Default::default(),
+                default_metadata: None,
+                encryption: None,
+            };
+
+            info!("S3 object store configured: bucket={}, endpoint={:?}",
+                  config.bucket,
+                  if let StorageBackend::S3 { endpoint, .. } = &config.backend { endpoint } else { &None });
+
+            Some(config)
+        }
+        "gcs" => {
+            info!("Configuring Google Cloud Storage object store from environment variables");
+
+            let bucket = std::env::var("GCS_BUCKET").unwrap_or_else(|_| "chronik-storage".to_string());
+            let project_id = std::env::var("GCS_PROJECT_ID").ok();
+            let endpoint = std::env::var("GCS_ENDPOINT").ok();
+
+            let config = ObjectStoreConfig {
+                backend: StorageBackend::Gcs {
+                    project_id,
+                    endpoint,
+                },
+                bucket,
+                prefix: std::env::var("GCS_PREFIX").ok(),
+                auth: AuthConfig::Gcs(chronik_storage::object_store::GcsCredentials::Default),
+                connection: Default::default(),
+                performance: Default::default(),
+                retry: Default::default(),
+                default_metadata: None,
+                encryption: None,
+            };
+
+            info!("GCS object store configured: bucket={}", config.bucket);
+
+            Some(config)
+        }
+        "azure" => {
+            info!("Configuring Azure Blob Storage object store from environment variables");
+
+            let account_name = std::env::var("AZURE_ACCOUNT_NAME").ok()?;
+            let bucket = std::env::var("AZURE_CONTAINER").unwrap_or_else(|_| "chronik-storage".to_string());
+            let endpoint = std::env::var("AZURE_ENDPOINT").ok();
+            let use_emulator = std::env::var("AZURE_USE_EMULATOR")
+                .ok()
+                .and_then(|v| v.parse::<bool>().ok())
+                .unwrap_or(false);
+
+            let config = ObjectStoreConfig {
+                backend: StorageBackend::Azure {
+                    account_name,
+                    endpoint,
+                    use_emulator,
+                },
+                bucket,
+                prefix: std::env::var("AZURE_PREFIX").ok(),
+                auth: AuthConfig::Azure(chronik_storage::object_store::AzureCredentials::DefaultChain),
+                connection: Default::default(),
+                performance: Default::default(),
+                retry: Default::default(),
+                default_metadata: None,
+                encryption: None,
+            };
+
+            info!("Azure object store configured: container={}", config.bucket);
+
+            Some(config)
+        }
+        "local" => {
+            info!("Configuring local filesystem object store from environment variables");
+
+            let path = std::env::var("LOCAL_STORAGE_PATH").unwrap_or_else(|_| "./data/segments".to_string());
+
+            let config = ObjectStoreConfig {
+                backend: StorageBackend::Local { path: path.clone() },
+                bucket: "local".to_string(),
+                prefix: None,
+                auth: AuthConfig::None,
+                connection: Default::default(),
+                performance: Default::default(),
+                retry: Default::default(),
+                default_metadata: None,
+                encryption: None,
+            };
+
+            info!("Local object store configured: path={}", path);
+
+            Some(config)
+        }
+        other => {
+            warn!("Unknown OBJECT_STORE_BACKEND value: {}", other);
+            warn!("Valid values: s3, gcs, azure, local");
+            None
+        }
+    }
 }
 
 #[tokio::main]
@@ -362,6 +511,9 @@ async fn run_standalone_server(cli: &Cli) -> Result<()> {
         (bind_host.clone(), port)
     };
     
+    // Parse object store configuration from environment (for Tier 3: Tantivy archives)
+    let object_store_config = parse_object_store_config_from_env();
+
     // Create server configuration
     let config = IntegratedServerConfig {
         node_id: 1,
@@ -376,6 +528,7 @@ async fn run_standalone_server(cli: &Cli) -> Result<()> {
         use_wal_metadata: !cli.file_metadata,  // Use WAL by default, file-based if flag is set
         enable_wal_indexing: true,  // Enable WAL→Tantivy indexing
         wal_indexing_interval_secs: 30,  // Index every 30 seconds
+        object_store_config,  // Pass custom object store config if provided
     };
 
     // Create and start the integrated server
@@ -532,7 +685,10 @@ async fn run_all_components(cli: &Cli) -> Result<()> {
         let port = cli.advertised_port.unwrap_or(cli.kafka_port) as i32;
         (bind_host.clone(), port)
     };
-    
+
+    // Parse object store configuration from environment (for Tier 3: Tantivy archives)
+    let object_store_config = parse_object_store_config_from_env();
+
     // Create server configuration with all features
     let config = IntegratedServerConfig {
         node_id: 1,
@@ -547,6 +703,7 @@ async fn run_all_components(cli: &Cli) -> Result<()> {
         use_wal_metadata: !cli.file_metadata,  // Use WAL by default, file-based if flag is set
         enable_wal_indexing: true,  // Enable WAL→Tantivy indexing
         wal_indexing_interval_secs: 30,  // Index every 30 seconds
+        object_store_config,  // Pass custom object store config if provided
     };
     
     // Start Kafka protocol server
