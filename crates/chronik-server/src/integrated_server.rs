@@ -556,7 +556,7 @@ impl IntegratedKafkaServer {
                     let error_handler = Arc::new(ErrorHandler::new());
                     let semaphore = request_semaphore.clone();
 
-                    // CRITICAL FIX (v1.3.56): Channel-based concurrent request processing
+                    // CRITICAL FIX (v1.3.60): Channel-based concurrent request processing with response ordering
                     // Split socket into read/write halves for concurrent operation
                     let (socket_reader, mut socket_writer) = socket.into_split();
 
@@ -564,19 +564,38 @@ impl IntegratedKafkaServer {
                     // 10x semaphore limit provides buffer for burst traffic when handlers complete simultaneously
                     // With 1000 concurrent handlers + 100ms WAL batch window (ultra profile),
                     // handlers complete together and need elastic response buffering
-                    let (response_tx, mut response_rx) = tokio::sync::mpsc::channel::<(i32, Vec<u8>)>(10_000);
+                    // Channel now carries (sequence_number, correlation_id, response_data)
+                    let (response_tx, mut response_rx) = tokio::sync::mpsc::channel::<(u64, i32, Vec<u8>)>(10_000);
 
-                    // Spawn response writer task
+                    // Spawn response writer task with ordering guarantee
+                    // CRITICAL: Responses MUST be sent in request order (Kafka protocol requirement)
                     tokio::spawn(async move {
-                        while let Some((correlation_id, response_data)) = response_rx.recv().await {
-                            // Write response to socket
-                            if let Err(e) = socket_writer.write_all(&response_data).await {
-                                error!("Failed to write response for correlation_id={}: {}", correlation_id, e);
-                                break;
-                            }
-                            if let Err(e) = socket_writer.flush().await {
-                                error!("Failed to flush response for correlation_id={}: {}", correlation_id, e);
-                                break;
+                        use std::collections::BTreeMap;
+
+                        // Buffer for out-of-order responses
+                        let mut pending_responses: BTreeMap<u64, (i32, Vec<u8>)> = BTreeMap::new();
+                        let mut next_sequence: u64 = 0;
+
+                        while let Some((sequence, correlation_id, response_data)) = response_rx.recv().await {
+                            // Add response to buffer
+                            pending_responses.insert(sequence, (correlation_id, response_data));
+
+                            // Send all consecutive responses starting from next_sequence
+                            while let Some((corr_id, resp_data)) = pending_responses.remove(&next_sequence) {
+                                // Write response to socket
+                                if let Err(e) = socket_writer.write_all(&resp_data).await {
+                                    error!("Failed to write response for sequence={}, correlation_id={}: {}",
+                                           next_sequence, corr_id, e);
+                                    return;
+                                }
+                                if let Err(e) = socket_writer.flush().await {
+                                    error!("Failed to flush response for sequence={}, correlation_id={}: {}",
+                                           next_sequence, corr_id, e);
+                                    return;
+                                }
+
+                                tracing::debug!("Sent response: sequence={}, correlation_id={}", next_sequence, corr_id);
+                                next_sequence += 1;
                             }
                         }
                     });
@@ -585,6 +604,7 @@ impl IntegratedKafkaServer {
                     tokio::spawn(async move {
                         let mut request_buffer = vec![0; 65536];
                         let mut socket_reader = socket_reader;
+                        let mut request_sequence: u64 = 0; // Sequence number for request ordering
 
                         loop {
                             // Read the size header (4 bytes)
@@ -675,15 +695,19 @@ impl IntegratedKafkaServer {
                                 0
                             };
 
-                            // CRITICAL FIX (v1.3.56): Spawn request handler as separate task
-                            // This enables concurrent request processing - the connection loop never blocks
-                            // Copy request data and spawn handler
+                            // CRITICAL FIX (v1.3.60): Spawn request handler as separate task with sequence number
+                            // This enables concurrent request processing while preserving response order
+                            // Copy request data and sequence number, then spawn handler
                             let request_data = request_buffer[..request_size].to_vec();
                             let handler_clone = kafka_handler.clone();
                             let response_sender = response_tx.clone();
                             let semaphore_clone = semaphore.clone();
                             let error_handler_clone = error_handler.clone();
                             let addr_clone = addr;
+                            let sequence = request_sequence; // Capture sequence number for this request
+
+                            // Increment sequence for next request
+                            request_sequence += 1;
 
                             tokio::spawn(async move {
                                 // Acquire semaphore to limit concurrent handlers
@@ -716,13 +740,14 @@ impl IntegratedKafkaServer {
 
                                     // Measure channel send delay to detect backpressure
                                     let send_start = std::time::Instant::now();
-                                    if let Err(e) = response_sender.send((response.header.correlation_id, full_response)).await {
+                                    // Send response with sequence number for ordering
+                                    if let Err(e) = response_sender.send((sequence, response.header.correlation_id, full_response)).await {
                                         error!("Failed to send response to writer for addr={}: {}", addr_clone, e);
                                     }
                                     let send_duration = send_start.elapsed();
                                     if send_duration.as_millis() > 10 {
-                                        warn!("Response channel send took {}ms (correlation_id={}) - channel backpressure detected",
-                                              send_duration.as_millis(), response.header.correlation_id);
+                                        warn!("Response channel send took {}ms (sequence={}, correlation_id={}) - channel backpressure detected",
+                                              send_duration.as_millis(), sequence, response.header.correlation_id);
                                     }
                                 }
                                 Err(e) => {
@@ -745,7 +770,8 @@ impl IntegratedKafkaServer {
 
                                             // Measure channel send delay for error responses too
                                             let send_start = std::time::Instant::now();
-                                            if let Err(e) = response_sender.send((correlation_id, error_response)).await {
+                                            // Send error response with sequence number for ordering
+                                            if let Err(e) = response_sender.send((sequence, correlation_id, error_response)).await {
                                                 error!("Failed to send error response: {}", e);
                                             }
                                             let send_duration = send_start.elapsed();

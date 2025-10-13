@@ -3657,8 +3657,12 @@ impl ProtocolHandler {
             let error_code = if !Self::is_valid_topic_name(&topic.name) {
                 error_codes::INVALID_TOPIC_EXCEPTION
             } else if topic.num_partitions <= 0 {
+                tracing::warn!("CreateTopics: Invalid partition count {} for topic '{}'",
+                    topic.num_partitions, topic.name);
                 error_codes::INVALID_PARTITIONS
             } else if topic.num_partitions > 10000 {
+                tracing::warn!("CreateTopics: Partition count {} exceeds limit 10000 for topic '{}'",
+                    topic.num_partitions, topic.name);
                 error_codes::INVALID_PARTITIONS
             } else if topic.replication_factor <= 0 {
                 error_codes::INVALID_REPLICATION_FACTOR
@@ -3714,7 +3718,7 @@ impl ProtocolHandler {
                 configs: Vec::new(), // TODO: Return actual configs
             });
         }
-        
+
         let response = CreateTopicsResponse {
             throttle_time_ms: 0,
             topics: response_topics,
