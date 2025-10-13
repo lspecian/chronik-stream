@@ -72,6 +72,31 @@ curl -O https://raw.githubusercontent.com/lspecian/chronik-stream/main/docker-co
 docker-compose up -d
 ```
 
+### With S3/MinIO Object Storage
+
+```bash
+# MinIO for development
+docker run -d --name chronik \
+  -p 9092:9092 \
+  -e CHRONIK_ADVERTISED_ADDR=localhost \
+  -e OBJECT_STORE_BACKEND=s3 \
+  -e S3_ENDPOINT=http://minio:9000 \
+  -e S3_BUCKET=chronik-storage \
+  -e S3_ACCESS_KEY=minioadmin \
+  -e S3_SECRET_KEY=minioadmin \
+  -e S3_PATH_STYLE=true \
+  ghcr.io/lspecian/chronik-stream:latest
+
+# AWS S3 for production (uses IAM role)
+docker run -d --name chronik \
+  -p 9092:9092 \
+  -e CHRONIK_ADVERTISED_ADDR=localhost \
+  -e OBJECT_STORE_BACKEND=s3 \
+  -e S3_REGION=us-west-2 \
+  -e S3_BUCKET=chronik-prod-archives \
+  ghcr.io/lspecian/chronik-stream:latest
+```
+
 ### ⚠️ Critical Docker Configuration
 
 **IMPORTANT**: When running Chronik Stream in Docker or binding to `0.0.0.0`, you **MUST** set `CHRONIK_ADVERTISED_ADDR`:
@@ -199,6 +224,29 @@ Environment Variables:
   CHRONIK_WAL_PROFILE          WAL performance profile: low/medium/high/ultra (auto-detects if not set)
   CHRONIK_PRODUCE_PROFILE      Producer flush profile: low-latency/balanced/high-throughput (default: balanced)
   RUST_LOG                     Log level (error, warn, info, debug, trace)
+
+Object Store (Tier 3 - Tantivy Archives):
+  OBJECT_STORE_BACKEND         Backend type: s3/gcs/azure/local (default: local)
+
+  S3 Configuration:
+    S3_ENDPOINT                S3-compatible endpoint (for MinIO, Wasabi, etc.)
+    S3_REGION                  AWS region (default: us-east-1)
+    S3_BUCKET                  Bucket name (default: chronik-storage)
+    S3_ACCESS_KEY              Access key ID (optional, uses IAM if not set)
+    S3_SECRET_KEY              Secret access key (optional)
+    S3_PATH_STYLE              Use path-style URLs (default: true, required for MinIO)
+    S3_DISABLE_SSL             Disable SSL (default: false)
+    S3_PREFIX                  Key prefix for all objects (optional)
+
+  GCS Configuration:
+    GCS_BUCKET                 GCS bucket name (default: chronik-storage)
+    GCS_PROJECT_ID             GCP project ID (optional)
+    GCS_PREFIX                 Key prefix for all objects (optional)
+
+  Azure Configuration:
+    AZURE_ACCOUNT_NAME         Storage account name (required)
+    AZURE_CONTAINER            Container name (default: chronik-storage)
+    AZURE_USE_EMULATOR         Use Azurite emulator (default: false)
 ```
 
 ## ⚡ Performance Tuning

@@ -94,6 +94,216 @@ python3 test_script.py
 kafka-console-producer --bootstrap-server localhost:9092 --topic test
 ```
 
+## Layered Storage Architecture
+
+**CRITICAL**: Chronik implements a unique 3-tier layered storage system that's DIFFERENT from traditional Kafka S3 tiering.
+
+### The 3 Tiers (Always Active by Default)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                 Chronik Layered Storage                          │
+├─────────────────────────────────────────────────────────────────┤
+│  Tier 1: WAL (Hot)           Tier 2: Segments (Warm)            │
+│  ┌──────────────┐            ┌──────────────┐                   │
+│  │ Recent data  │            │ Recent-ish   │                   │
+│  │ Seconds old  │────────▶   │ Minutes old  │                   │
+│  │ In-memory    │ Background │ On disk      │                   │
+│  │ buffer       │ indexing   │ Local files  │                   │
+│  └──────────────┘            └──────────────┘                   │
+│        ↓                            ↓                            │
+│   Phase 1 Fetch              Phase 2 Fetch                      │
+│   (μs latency)               (ms latency)                       │
+│                                                                   │
+│  Tier 3: Tantivy Archives (Cold)                                │
+│  ┌──────────────────────────────────┐                           │
+│  │ Archived data (hours+ old)       │                           │
+│  │ Compressed tar.gz in object      │                           │
+│  │ store (S3/GCS/Azure/Local)       │                           │
+│  │ Searchable via Tantivy           │                           │
+│  └──────────────────────────────────┘                           │
+│                ↓                                                 │
+│         Phase 3 Fetch                                            │
+│         (100-500ms latency)                                      │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Object Store Configuration (Tier 3)
+
+Configure where Tantivy archives are stored via environment variables:
+
+**S3-Compatible (MinIO, Wasabi, DigitalOcean Spaces, etc.)**:
+```bash
+OBJECT_STORE_BACKEND=s3
+S3_ENDPOINT=http://minio:9000           # Custom endpoint (MinIO, etc.)
+S3_REGION=us-east-1                     # AWS region
+S3_BUCKET=chronik-storage               # Bucket name
+S3_ACCESS_KEY=minioadmin                # Access key
+S3_SECRET_KEY=minioadmin                # Secret key
+S3_PATH_STYLE=true                      # Required for MinIO (path-style URLs)
+S3_DISABLE_SSL=false                    # Set true for local HTTP MinIO
+S3_PREFIX=chronik/                      # Optional prefix for all keys
+```
+
+**Local Filesystem** (default if no env vars set):
+```bash
+OBJECT_STORE_BACKEND=local
+LOCAL_STORAGE_PATH=/data/segments       # Path for Tantivy archives
+```
+
+**Google Cloud Storage**:
+```bash
+OBJECT_STORE_BACKEND=gcs
+GCS_BUCKET=chronik-storage              # GCS bucket name
+GCS_PROJECT_ID=my-project               # GCP project ID
+GCS_PREFIX=chronik/                     # Optional prefix
+```
+
+**Azure Blob Storage**:
+```bash
+OBJECT_STORE_BACKEND=azure
+AZURE_ACCOUNT_NAME=myaccount            # Storage account name
+AZURE_CONTAINER=chronik-storage         # Container name
+AZURE_USE_EMULATOR=false                # Use Azurite emulator for local dev
+```
+
+### How Layered Storage Works
+
+**Write Path** (Automatic):
+```
+Producer → WAL (Tier 1, immediate) → Segments (Tier 2, seconds) → Tantivy Archives (Tier 3, minutes)
+            ↓                           ↓                              ↓
+        Durable fsync          Background flush              WalIndexer background thread
+                                                             (uploads to object store)
+```
+
+**Read Path** (3-Phase Fetch with Automatic Fallback):
+```
+Consumer Request
+    ↓
+Phase 1: Try WAL buffer (hot, in-memory)
+    ↓ MISS
+Phase 2: Try segment files (warm, local disk)
+    ↓ MISS
+Phase 3: Try Tantivy archives (cold, object store - S3/GCS/Azure/Local)
+    ↓ MISS
+Fallback: Reconstruct from metadata
+```
+
+**Performance Characteristics**:
+- **Tier 1 (WAL)**: < 1ms latency, seconds retention
+- **Tier 2 (Segments)**: 1-10ms latency, minutes-hours retention
+- **Tier 3 (Tantivy)**: 100-500ms latency, unlimited retention (configurable)
+
+### Key Differentiators vs Kafka Tiered Storage
+
+| Feature | Kafka Tiered Storage | Chronik Layered Storage |
+|---------|---------------------|-------------------------|
+| **Hot Storage** | Local disk | WAL + Segments (local) |
+| **Cold Storage** | S3 (raw data) | Tantivy archives (S3/GCS/Azure) |
+| **Auto-archival** | ✅ Yes | ✅ Yes (WalIndexer) |
+| **Query by Offset** | ✅ Yes | ✅ Yes |
+| **Full-text Search** | ❌ NO | ✅ **YES** (Tantivy) |
+| **Query by Content** | ❌ NO | ✅ **YES** (search API) |
+| **Compression** | Minimal | High (tar.gz archives) |
+| **Read Archived Data** | Slow (S3 fetch) | Fast (indexed search) |
+
+**Unique Advantage**: Chronik's Tier 3 isn't just "cold storage" - it's a **searchable indexed archive**. You can query old data by content without scanning!
+
+### Data Lifecycle Example
+
+```bash
+# Minute 0: Producer sends message
+# → Immediately written to WAL (Tier 1)
+# → Available for consumption in < 1ms
+
+# Minute 1: Background flush
+# → Data moved to local segments (Tier 2)
+# → Still available for consumption in ~5ms
+
+# Minute 2: WalIndexer runs (every 30s by default)
+# → Data indexed by Tantivy
+# → Compressed tar.gz uploaded to S3/GCS/Azure
+# → Now in Tier 3 (searchable archive)
+# → Consumption from archive: ~200ms (includes S3 download + decompress + search)
+
+# Days later: Data still accessible
+# → Consumer requests old offset
+# → Phase 3 fetch: Download from S3, search index, return results
+# → Full-text search also available via Search API
+```
+
+### Configuration Examples
+
+**Example 1: MinIO for Development**
+```bash
+# Docker Compose setup
+OBJECT_STORE_BACKEND=s3
+S3_ENDPOINT=http://minio:9000
+S3_BUCKET=chronik-dev
+S3_ACCESS_KEY=minioadmin
+S3_SECRET_KEY=minioadmin
+S3_PATH_STYLE=true
+S3_DISABLE_SSL=true  # Local HTTP MinIO
+
+cargo run --bin chronik-server -- standalone
+```
+
+**Example 2: AWS S3 for Production**
+```bash
+# Production with real S3
+OBJECT_STORE_BACKEND=s3
+S3_REGION=us-west-2
+S3_BUCKET=chronik-prod-archives
+# Credentials from IAM role or ~/.aws/credentials
+
+cargo run --bin chronik-server -- standalone
+```
+
+**Example 3: Default Local Storage**
+```bash
+# No env vars = local filesystem for all tiers
+cargo run --bin chronik-server -- standalone
+# Tantivy archives stored in ./data/segments/
+```
+
+### Monitoring Layered Storage
+
+**Key Metrics**:
+- `fetch_wal_hit_rate` - % served from Tier 1 (should be high for recent data)
+- `fetch_segment_hit_rate` - % served from Tier 2
+- `fetch_tantivy_hit_rate` - % served from Tier 3
+- `wal_indexer_lag_seconds` - How far behind WalIndexer is
+- `tantivy_archive_size_bytes` - Total size in object store
+
+**Logs to Watch**:
+```bash
+# Check which tier is serving fetches
+RUST_LOG=chronik_server::fetch_handler=debug cargo run --bin chronik-server
+
+# Look for:
+# - "Serving from WAL buffer" (Tier 1)
+# - "Serving from local segment" (Tier 2)
+# - "Fetching from Tantivy archive" (Tier 3)
+```
+
+### Troubleshooting
+
+**Issue**: Tantivy archives not uploading to S3
+- Check `OBJECT_STORE_BACKEND` is set correctly
+- Verify S3 credentials and bucket access
+- Check logs: `RUST_LOG=chronik_storage::wal_indexer=debug`
+
+**Issue**: Slow Tier 3 fetches (> 1 second)
+- Check network latency to S3/GCS/Azure
+- Consider increasing `wal_indexing_interval_secs` for larger segments
+- Use local caching (WalIndexer supports local cache)
+
+**Issue**: Running out of local disk space
+- Tier 2 segments are automatically cleaned up after indexing
+- Configure retention: `segment_writer_config.retention_period_secs`
+- Tier 3 archives can be stored on unlimited object storage
+
 ## Architecture Overview
 
 ### Core Components
