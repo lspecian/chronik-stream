@@ -447,21 +447,93 @@ impl WalManager {
     }
     
 
-    /// Get list of sealed segment IDs (v1.3.53+: Not applicable for GroupCommitWal)
+    /// Get list of sealed segment IDs ready for archival (v1.3.62+: Now implemented!)
     pub fn get_sealed_segments(&self) -> Vec<String> {
-        // GroupCommitWal uses active segment only, no sealed segments tracking
-        debug!("get_sealed_segments: Not applicable for GroupCommitWal");
-        Vec::new()
+        let sealed = self.group_commit_wal.get_sealed_segments();
+        debug!("get_sealed_segments: Found {} sealed segments", sealed.len());
+
+        // Convert SealedSegmentInfo to segment ID strings (topic:partition:segment_id)
+        sealed
+            .iter()
+            .map(|info| format!("{}:{}:{}", info.topic, info.partition, info.segment_id))
+            .collect()
     }
 
-    /// Read all records from a specific sealed segment (v1.3.53+: Not applicable for GroupCommitWal)
+    /// Read all records from a specific sealed segment (v1.3.62+: Now reads from sealed file)
     pub async fn read_segment(&self, segment_id: &str) -> Result<Vec<WalRecord>> {
-        Err(WalError::SegmentNotFound(format!("GroupCommitWal does not track sealed segments: {}", segment_id)))
+        // Parse segment_id format: "topic:partition:segment_id"
+        let parts: Vec<&str> = segment_id.split(':').collect();
+        if parts.len() != 3 {
+            return Err(WalError::SegmentNotFound(format!("Invalid segment ID format: {}", segment_id)));
+        }
+
+        let topic = parts[0];
+        let partition: i32 = parts[1].parse()
+            .map_err(|_| WalError::SegmentNotFound(format!("Invalid partition in segment ID: {}", segment_id)))?;
+        let seg_id: u64 = parts[2].parse()
+            .map_err(|_| WalError::SegmentNotFound(format!("Invalid segment_id in segment ID: {}", segment_id)))?;
+
+        // Get sealed segment info
+        let sealed = self.group_commit_wal.get_sealed_segments();
+        let segment_info = sealed.iter().find(|s|
+            s.topic == topic && s.partition == partition && s.segment_id == seg_id
+        ).ok_or_else(|| WalError::SegmentNotFound(format!("Sealed segment not found: {}", segment_id)))?;
+
+        // Read the file
+        let data = tokio::fs::read(&segment_info.file_path).await
+            .map_err(|e| WalError::Io(std::io::Error::new(
+                e.kind(),
+                format!("Failed to read segment file {:?}: {}", segment_info.file_path, e)
+            )))?;
+
+        // Parse records from file
+        let mut records = Vec::new();
+        let mut offset = 0;
+
+        while offset < data.len() {
+            // Try to parse a record
+            match WalRecord::from_bytes(&data[offset..]) {
+                Ok(record) => {
+                    let record_size = record.get_length() as usize;
+                    records.push(record);
+                    offset += record_size;
+                }
+                Err(e) => {
+                    warn!("Failed to parse record at offset {} in segment {}: {}", offset, segment_id, e);
+                    break;
+                }
+            }
+        }
+
+        info!("Read {} records from sealed segment {}", records.len(), segment_id);
+        Ok(records)
     }
 
-    /// Delete a sealed segment (v1.3.53+: Not applicable for GroupCommitWal)
+    /// Delete a sealed segment after archival (v1.3.62+: Now removes sealed segment)
     pub async fn delete_segment(&self, segment_id: &str) -> Result<()> {
-        Err(WalError::SegmentNotFound(format!("GroupCommitWal does not track sealed segments: {}", segment_id)))
+        // Parse segment_id format: "topic:partition:segment_id"
+        let parts: Vec<&str> = segment_id.split(':').collect();
+        if parts.len() != 3 {
+            return Err(WalError::SegmentNotFound(format!("Invalid segment ID format: {}", segment_id)));
+        }
+
+        let topic = parts[0];
+        let partition: i32 = parts[1].parse()
+            .map_err(|_| WalError::SegmentNotFound(format!("Invalid partition in segment ID: {}", segment_id)))?;
+        let seg_id: u64 = parts[2].parse()
+            .map_err(|_| WalError::SegmentNotFound(format!("Invalid segment_id in segment ID: {}", segment_id)))?;
+
+        self.remove_segment(topic, partition, seg_id)
+    }
+
+    /// Mark segment as archived after successful S3 upload (v1.3.62+)
+    pub fn mark_segment_archived(&self, topic: &str, partition: i32, segment_id: u64) {
+        self.group_commit_wal.mark_segment_archived(topic, partition, segment_id);
+    }
+
+    /// Remove archived segment after S3 upload (v1.3.62+)
+    pub fn remove_segment(&self, topic: &str, partition: i32, segment_id: u64) -> Result<()> {
+        self.group_commit_wal.remove_segment(topic, partition, segment_id)
     }
 }
 

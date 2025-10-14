@@ -12,8 +12,9 @@
 //! - Per-partition commit queues
 
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -42,6 +43,48 @@ pub struct GroupCommitConfig {
 
     /// Enable metrics collection
     pub enable_metrics: bool,
+
+    /// Enable segment rotation (for S3 archival)
+    pub enable_rotation: bool,
+
+    /// Maximum segment size before rotation (bytes)
+    pub rotation_size_bytes: u64,
+
+    /// Maximum segment age before rotation (seconds)
+    pub rotation_age_secs: u64,
+}
+
+/// State of a WAL segment in its lifecycle
+#[derive(Debug, Clone, PartialEq)]
+pub enum SegmentState {
+    /// Currently accepting writes
+    Active,
+    /// Immutable, ready for indexing/archival (Quickwit's "Staged")
+    Sealed,
+    /// Uploaded to S3, local copy can be deleted (Quickwit's "Published")
+    Archived,
+}
+
+/// Metadata about a WAL segment
+#[derive(Debug, Clone)]
+pub struct SegmentMetadata {
+    pub segment_id: u64,
+    pub created_at: Instant,
+    pub size_bytes: u64,
+    pub file_path: PathBuf,
+    pub state: SegmentState,
+}
+
+/// Sealed segment info for archival (public API)
+#[derive(Debug, Clone)]
+pub struct SealedSegmentInfo {
+    pub topic: String,
+    pub partition: i32,
+    pub segment_id: u64,
+    pub file_path: PathBuf,
+    pub size_bytes: u64,
+    pub state: SegmentState,
+    pub sealed_at: Instant,
 }
 
 impl Default for GroupCommitConfig {
@@ -75,6 +118,9 @@ impl GroupCommitConfig {
             max_wait_time_ms: 20,           // 20ms latency
             max_queue_depth: 2_500,         // 2.5K queue depth
             enable_metrics: true,
+            enable_rotation: true,          // Enable S3 archival
+            rotation_size_bytes: 128 * 1024 * 1024,  // 128MB
+            rotation_age_secs: 30 * 60,     // 30 minutes
         }
     }
 
@@ -86,6 +132,9 @@ impl GroupCommitConfig {
             max_wait_time_ms: 10,           // 10ms latency
             max_queue_depth: 10_000,        // 10K queue depth
             enable_metrics: true,
+            enable_rotation: true,          // Enable S3 archival
+            rotation_size_bytes: 256 * 1024 * 1024,  // 256MB
+            rotation_age_secs: 30 * 60,     // 30 minutes
         }
     }
 
@@ -98,6 +147,9 @@ impl GroupCommitConfig {
             max_wait_time_ms: 100,          // 100ms latency (reduce disk I/O)
             max_queue_depth: 50_000,        // 50K queue depth
             enable_metrics: true,
+            enable_rotation: true,          // Enable S3 archival
+            rotation_size_bytes: 256 * 1024 * 1024,  // 256MB
+            rotation_age_secs: 30 * 60,     // 30 minutes
         }
     }
 
@@ -111,6 +163,9 @@ impl GroupCommitConfig {
             max_wait_time_ms: 100,          // 100ms latency (20x high profile - maximum batching)
             max_queue_depth: 100_000,       // 100K queue depth (4x high profile)
             enable_metrics: true,
+            enable_rotation: true,          // Enable S3 archival
+            rotation_size_bytes: 512 * 1024 * 1024,  // 512MB (larger for ultra)
+            rotation_age_secs: 30 * 60,     // 30 minutes
         }
     }
 
@@ -127,6 +182,9 @@ impl GroupCommitConfig {
             max_wait_time_ms,
             max_queue_depth,
             enable_metrics: true,
+            enable_rotation: true,
+            rotation_size_bytes: 256 * 1024 * 1024,
+            rotation_age_secs: 30 * 60,
         }
     }
 }
@@ -159,6 +217,21 @@ struct PartitionCommitQueue {
 
     /// Metrics
     metrics: Arc<CommitMetrics>,
+
+    /// Current segment ID
+    segment_id: Arc<AtomicU64>,
+
+    /// Current segment creation time
+    segment_created_at: Arc<Mutex<Instant>>,
+
+    /// Current segment size in bytes
+    segment_size_bytes: Arc<AtomicU64>,
+
+    /// Topic name (for rotation)
+    topic: String,
+
+    /// Partition number (for rotation)
+    partition: i32,
 }
 
 /// Commit metrics for observability
@@ -176,6 +249,9 @@ pub struct GroupCommitWal {
     /// Per-partition commit queues
     partition_queues: Arc<DashMap<(String, i32), Arc<PartitionCommitQueue>>>,
 
+    /// Sealed segments ready for archival (topic:partition:segment_id → info)
+    sealed_segments: Arc<DashMap<String, SealedSegmentInfo>>,
+
     /// Configuration
     config: GroupCommitConfig,
 
@@ -191,6 +267,7 @@ impl GroupCommitWal {
     pub fn new(base_dir: PathBuf, config: GroupCommitConfig) -> Self {
         let wal = Self {
             partition_queues: Arc::new(DashMap::new()),
+            sealed_segments: Arc::new(DashMap::new()),
             config,
             base_dir,
             shutdown: Arc::new(Notify::new()),
@@ -199,8 +276,9 @@ impl GroupCommitWal {
         // Start background commit thread
         wal.start_background_committer();
 
-        info!("Group commit WAL initialized: max_batch={}, max_wait={}ms, max_queue={}",
-              wal.config.max_batch_size, wal.config.max_wait_time_ms, wal.config.max_queue_depth);
+        info!("Group commit WAL initialized: max_batch={}, max_wait={}ms, max_queue={}, rotation={}",
+              wal.config.max_batch_size, wal.config.max_wait_time_ms, wal.config.max_queue_depth,
+              if wal.config.enable_rotation { "enabled" } else { "disabled" });
 
         wal
     }
@@ -377,6 +455,11 @@ impl GroupCommitWal {
             last_fsync: Mutex::new(Instant::now()),
             write_notify: Arc::new(Notify::new()),
             metrics: Arc::new(CommitMetrics::default()),
+            segment_id: Arc::new(AtomicU64::new(0)),
+            segment_created_at: Arc::new(Mutex::new(Instant::now())),
+            segment_size_bytes: Arc::new(AtomicU64::new(0)),
+            topic: topic.to_string(),
+            partition,
         });
 
         // Start per-partition commit worker
@@ -393,6 +476,8 @@ impl GroupCommitWal {
     fn start_partition_committer(&self, queue: Arc<PartitionCommitQueue>) {
         let config = self.config.clone();
         let shutdown = self.shutdown.clone();
+        let sealed_segments = self.sealed_segments.clone();
+        let base_dir = self.base_dir.clone();
 
         info!("🚀 WORKER_SPAWN: Starting partition committer background task");
 
@@ -421,7 +506,7 @@ impl GroupCommitWal {
 
                 // Commit if there are pending writes
                 debug!("📝 WORKER_COMMIT: About to call commit_batch");
-                if let Err(e) = Self::commit_batch(&queue, &config).await {
+                if let Err(e) = Self::commit_batch(&queue, &config, &sealed_segments, &base_dir).await {
                     error!("❌ WORKER_ERROR: Commit batch failed: {}", e);
                 } else {
                     debug!("✅ WORKER_SUCCESS: commit_batch completed successfully");
@@ -437,6 +522,8 @@ impl GroupCommitWal {
         let queues = self.partition_queues.clone();
         let config = self.config.clone();
         let shutdown = self.shutdown.clone();
+        let sealed_segments = self.sealed_segments.clone();
+        let base_dir = self.base_dir.clone();
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_millis(config.max_wait_time_ms));
@@ -458,7 +545,7 @@ impl GroupCommitWal {
                     let pending_count = queue.pending.lock().await.len();
 
                     if pending_count > 0 {
-                        if let Err(e) = Self::commit_batch(queue, &config).await {
+                        if let Err(e) = Self::commit_batch(queue, &config, &sealed_segments, &base_dir).await {
                             error!("Background commit failed: {}", e);
                         }
                     }
@@ -468,10 +555,12 @@ impl GroupCommitWal {
     }
 
     /// Commit a batch of writes with single fsync
-    #[instrument(skip(queue, config), fields(batch_size, bytes, fsync_us))]
+    #[instrument(skip(queue, config, sealed_segments, base_dir), fields(batch_size, bytes, fsync_us))]
     async fn commit_batch(
         queue: &PartitionCommitQueue,
         config: &GroupCommitConfig,
+        sealed_segments: &Arc<DashMap<String, SealedSegmentInfo>>,
+        base_dir: &Path,
     ) -> Result<()> {
         debug!("🔵 COMMIT_START: Entering commit_batch");
         let start = Instant::now();
@@ -532,6 +621,9 @@ impl GroupCommitWal {
 
         let fsync_duration = start.elapsed();
 
+        // Update segment size
+        queue.segment_size_bytes.fetch_add(total_bytes as u64, Ordering::Relaxed);
+
         // Update metrics
         if config.enable_metrics {
             queue.metrics.total_commits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -560,6 +652,101 @@ impl GroupCommitWal {
         }
         debug!("All {} waiters notified successfully", batch_count);
 
+        // Check if we should seal and rotate segment
+        if let Err(e) = Self::check_and_seal_segment(queue, config, sealed_segments, base_dir).await {
+            error!("Failed to check/seal segment: {}", e);
+            // Don't fail the commit, just log the error
+        }
+
+        Ok(())
+    }
+
+    /// Check if current segment should be sealed and rotate if needed
+    async fn check_and_seal_segment(
+        queue: &PartitionCommitQueue,
+        config: &GroupCommitConfig,
+        sealed_segments: &Arc<DashMap<String, SealedSegmentInfo>>,
+        base_dir: &Path,
+    ) -> Result<()> {
+        // Skip if rotation disabled
+        if !config.enable_rotation {
+            return Ok(());
+        }
+
+        let current_size = queue.segment_size_bytes.load(Ordering::Relaxed);
+        let segment_age = {
+            let created_at = queue.segment_created_at.lock().await;
+            created_at.elapsed()
+        };
+
+        let should_seal = current_size >= config.rotation_size_bytes
+            || segment_age.as_secs() >= config.rotation_age_secs;
+
+        if !should_seal {
+            return Ok(());
+        }
+
+        // Seal current segment
+        let old_segment_id = queue.segment_id.load(Ordering::Relaxed);
+        let old_file_path = base_dir
+            .join(&queue.topic)
+            .join(queue.partition.to_string())
+            .join(format!("wal_{}_{}.log", queue.partition, old_segment_id));
+
+        info!(
+            "🔒 Sealing segment {}/{} segment_id={} (size={} bytes, age={:?})",
+            queue.topic, queue.partition, old_segment_id, current_size, segment_age
+        );
+
+        // Close old file
+        {
+            let file = queue.file.lock().await;
+            file.sync_all().await?;
+            drop(file); // Explicitly drop to close
+        }
+
+        // Record sealed segment info
+        let sealed_key = format!("{}:{}:{}", queue.topic, queue.partition, old_segment_id);
+        sealed_segments.insert(
+            sealed_key,
+            SealedSegmentInfo {
+                topic: queue.topic.clone(),
+                partition: queue.partition,
+                segment_id: old_segment_id,
+                file_path: old_file_path.clone(),
+                size_bytes: current_size,
+                state: SegmentState::Sealed,
+                sealed_at: Instant::now(),
+            },
+        );
+
+        // Rotate to new segment
+        let new_segment_id = old_segment_id + 1;
+        queue.segment_id.store(new_segment_id, Ordering::Relaxed);
+
+        let new_file_path = base_dir
+            .join(&queue.topic)
+            .join(queue.partition.to_string())
+            .join(format!("wal_{}_{}.log", queue.partition, new_segment_id));
+
+        // Open new file
+        let new_file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&new_file_path)
+            .await?;
+
+        *queue.file.lock().await = new_file;
+
+        // Reset segment tracking
+        *queue.segment_created_at.lock().await = Instant::now();
+        queue.segment_size_bytes.store(0, Ordering::Relaxed);
+
+        info!(
+            "✅ Rotated to new segment {}/{} segment_id={}",
+            queue.topic, queue.partition, new_segment_id
+        );
+
         Ok(())
     }
 
@@ -581,6 +768,42 @@ impl GroupCommitWal {
                 backpressure_events: metrics.backpressure_events.load(std::sync::atomic::Ordering::Relaxed),
             }
         })
+    }
+
+    /// Get list of sealed segments ready for archival
+    pub fn get_sealed_segments(&self) -> Vec<SealedSegmentInfo> {
+        self.sealed_segments
+            .iter()
+            .filter(|entry| entry.value().state == SegmentState::Sealed)
+            .map(|entry| entry.value().clone())
+            .collect()
+    }
+
+    /// Mark segment as archived after successful S3 upload
+    pub fn mark_segment_archived(&self, topic: &str, partition: i32, segment_id: u64) {
+        let key = format!("{}:{}:{}", topic, partition, segment_id);
+        if let Some(mut entry) = self.sealed_segments.get_mut(&key) {
+            entry.state = SegmentState::Archived;
+            info!("Marked segment {}/{} segment_id={} as Archived", topic, partition, segment_id);
+        }
+    }
+
+    /// Remove archived segment (called after S3 upload and local cleanup)
+    pub fn remove_segment(&self, topic: &str, partition: i32, segment_id: u64) -> Result<()> {
+        let key = format!("{}:{}:{}", topic, partition, segment_id);
+
+        if let Some((_, segment_info)) = self.sealed_segments.remove(&key) {
+            // Delete local file if configured
+            if segment_info.state == SegmentState::Archived {
+                if let Err(e) = std::fs::remove_file(&segment_info.file_path) {
+                    warn!("Failed to delete archived segment file {:?}: {}", segment_info.file_path, e);
+                } else {
+                    info!("Deleted archived segment file {:?}", segment_info.file_path);
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Shutdown the group commit WAL
