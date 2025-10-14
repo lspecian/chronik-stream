@@ -480,32 +480,57 @@ impl WalManager {
         ).ok_or_else(|| WalError::SegmentNotFound(format!("Sealed segment not found: {}", segment_id)))?;
 
         // Read the file
+        debug!("Reading sealed segment file: {:?}", segment_info.file_path);
         let data = tokio::fs::read(&segment_info.file_path).await
             .map_err(|e| WalError::Io(std::io::Error::new(
                 e.kind(),
                 format!("Failed to read segment file {:?}: {}", segment_info.file_path, e)
             )))?;
 
+        info!("Read {} bytes from segment file {:?}", data.len(), segment_info.file_path);
+
         // Parse records from file
         let mut records = Vec::new();
         let mut offset = 0;
+        let mut parse_errors = 0;
 
         while offset < data.len() {
-            // Try to parse a record
+            // Need at least 12 bytes for V2 header or 28 bytes for V1 header
+            if offset + 12 > data.len() {
+                debug!("Reached end of file at offset {} (remaining {} bytes)", offset, data.len() - offset);
+                break;
+            }
+
             match WalRecord::from_bytes(&data[offset..]) {
                 Ok(record) => {
-                    let record_size = record.get_length() as usize;
+                    // Calculate TOTAL record size (header + body)
+                    // V1: 28 bytes fixed header + body
+                    // V2: 12 bytes fixed header + body (length field contains body size)
+                    let total_size = if record.is_v2() {
+                        12 + record.get_length() as usize  // V2: 12-byte header + body
+                    } else {
+                        record.get_length() as usize  // V1: length includes full record
+                    };
+
+                    debug!("Parsed record at offset {} (total_size={}, is_v2={})", offset, total_size, record.is_v2());
                     records.push(record);
-                    offset += record_size;
+                    offset += total_size;
                 }
                 Err(e) => {
-                    warn!("Failed to parse record at offset {} in segment {}: {}", offset, segment_id, e);
-                    break;
+                    parse_errors += 1;
+                    warn!("Failed to parse record {} at offset {} in segment {}: {}", parse_errors, offset, segment_id, e);
+                    if parse_errors > 3 {
+                        warn!("Too many parse errors, stopping at offset {}/{}", offset, data.len());
+                        break;
+                    }
+                    // Try skipping ahead
+                    offset += 1;
                 }
             }
         }
 
-        info!("Read {} records from sealed segment {}", records.len(), segment_id);
+        info!("Read {} records from sealed segment {} ({} bytes, {} parse errors)",
+              records.len(), segment_id, data.len(), parse_errors);
         Ok(records)
     }
 

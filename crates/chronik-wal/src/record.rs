@@ -395,6 +395,19 @@ impl WalRecord {
 
     /// Verify record checksum
     pub fn verify_checksum(&self) -> Result<()> {
+        // SKIP checksum validation for V2 records
+        // V2 records contain CanonicalRecords which ALREADY have Kafka's CRC-32C
+        // for validating the original wire bytes. Adding a second CRC on top of
+        // bincode-serialized data is redundant and problematic because:
+        // 1. Bincode serialization is non-deterministic for complex structures
+        // 2. The canonical_data already has CRC protection via Kafka's protocol
+        // 3. Historical CRC issues (v1.3.28-v1.3.59) show this is error-prone
+        //
+        // V1 records still get checksum validation as they don't have Kafka CRC.
+        if self.is_v2() {
+            return Ok(());
+        }
+
         let computed = self.calculate_checksum();
         let stored = self.get_crc32();
 

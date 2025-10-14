@@ -269,9 +269,12 @@ impl GroupCommitWal {
             partition_queues: Arc::new(DashMap::new()),
             sealed_segments: Arc::new(DashMap::new()),
             config,
-            base_dir,
+            base_dir: base_dir.clone(),
             shutdown: Arc::new(Notify::new()),
         };
+
+        // Discover existing sealed segments from filesystem
+        wal.discover_sealed_segments();
 
         // Start background commit thread
         wal.start_background_committer();
@@ -281,6 +284,85 @@ impl GroupCommitWal {
               if wal.config.enable_rotation { "enabled" } else { "disabled" });
 
         wal
+    }
+
+    /// Discover sealed segments from filesystem (called on startup)
+    fn discover_sealed_segments(&self) {
+        use std::fs;
+
+        if !self.config.enable_rotation {
+            return;
+        }
+
+        let mut discovered = 0;
+
+        // Scan data/wal/topic/partition/ directories
+        if let Ok(topic_dirs) = fs::read_dir(&self.base_dir) {
+            for topic_entry in topic_dirs.flatten() {
+                if let Ok(topic_name) = topic_entry.file_name().into_string() {
+                    // Skip non-directories or __meta
+                    if topic_name.starts_with("__") || !topic_entry.path().is_dir() {
+                        continue;
+                    }
+
+                    // Scan partition directories
+                    if let Ok(partition_dirs) = fs::read_dir(topic_entry.path()) {
+                        for partition_entry in partition_dirs.flatten() {
+                            if let Ok(partition_str) = partition_entry.file_name().into_string() {
+                                if let Ok(partition) = partition_str.parse::<i32>() {
+                                    // Scan WAL files in this partition
+                                    if let Ok(files) = fs::read_dir(partition_entry.path()) {
+                                        for file_entry in files.flatten() {
+                                            let file_name = file_entry.file_name();
+                                            let file_name_str = file_name.to_string_lossy();
+
+                                            // Match pattern: wal_PARTITION_SEGMENT.log
+                                            if file_name_str.starts_with("wal_") && file_name_str.ends_with(".log") {
+                                                // Extract segment_id from filename
+                                                if let Some(segment_str) = file_name_str.strip_prefix("wal_").and_then(|s| s.strip_suffix(".log")) {
+                                                    let parts: Vec<&str> = segment_str.split('_').collect();
+                                                    if parts.len() == 2 {
+                                                        if let Ok(segment_id) = parts[1].parse::<u64>() {
+                                                            // Get file metadata
+                                                            if let Ok(metadata) = file_entry.metadata() {
+                                                                let size_bytes = metadata.len();
+
+                                                                // Only consider sealed segments (>= rotation size or not the highest segment_id)
+                                                                // For now, consider all segments except segment_0 as potentially sealed
+                                                                if segment_id > 0 || size_bytes >= self.config.rotation_size_bytes {
+                                                                    let sealed_key = format!("{}:{}:{}", topic_name, partition, segment_id);
+                                                                    self.sealed_segments.insert(
+                                                                        sealed_key,
+                                                                        SealedSegmentInfo {
+                                                                            topic: topic_name.clone(),
+                                                                            partition,
+                                                                            segment_id,
+                                                                            file_path: file_entry.path(),
+                                                                            size_bytes,
+                                                                            state: SegmentState::Sealed,
+                                                                            sealed_at: Instant::now(),
+                                                                        },
+                                                                    );
+                                                                    discovered += 1;
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if discovered > 0 {
+            info!("Discovered {} sealed segments from filesystem", discovered);
+        }
     }
 
     /// Append a record with specified acknowledgment mode
