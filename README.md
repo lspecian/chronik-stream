@@ -284,8 +284,10 @@ Environment Variables:
   CHRONIK_WAL_ROTATION_SIZE    Segment seal threshold: 100KB/250MB (default)/1GB/bytes (controls when WAL segments are sealed and uploaded to S3)
   RUST_LOG                     Log level (error, warn, info, debug, trace)
 
-Object Store (Tier 3 - Tantivy Archives):
+Object Store Configuration (Tier 2 + Tier 3):
   OBJECT_STORE_BACKEND         Backend type: s3/gcs/azure/local (default: local)
+                               • local: All data stays on local disk, no S3 upload
+                               • s3/gcs/azure: Enable 3-tier storage with cloud archival
 
   S3 Configuration:
     S3_ENDPOINT                S3-compatible endpoint (for MinIO, Wasabi, etc.)

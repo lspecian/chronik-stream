@@ -645,31 +645,52 @@ impl FetchHandler {
             }
         }
 
-        // PHASE 4: Fall back to legacy segment-based storage if we still need more records
-        // This ensures we fetch from segments if WAL/S3 didn't have all the data
-        if records.is_empty() || need_earlier_records {
+        // PHASE 4: Try Tantivy archives (cold storage) as final fallback
+        // This provides searchable indexed archives for very old data
+        if (records.is_empty() || need_earlier_records) && self.segment_index.is_some() {
             info!(
-                "FETCH→SEGMENTS: Fetching from segments for {}-{} (have {} records so far)",
+                "FETCH→TANTIVY: Trying Tantivy archives for {}-{} (have {} records so far)",
                 topic, partition, records.len()
             );
 
-            let segment_records = self.fetch_records_from_segments(
+            // Try to get records via Tantivy fetch (will download tar.gz, search index, return results)
+            // This is a fallback for very old archived data
+            match self.fetch_from_tantivy_for_records(
                 topic,
                 partition,
                 fetch_offset,
                 high_watermark,
                 max_bytes
-            ).await?;
+            ).await {
+                Ok(tantivy_records) if !tantivy_records.is_empty() => {
+                    info!(
+                        "FETCH→TANTIVY: Successfully fetched {} records from Tantivy archives for {}-{}",
+                        tantivy_records.len(), topic, partition
+                    );
 
-            // Merge segment records with existing records (from buffer/WAL)
-            for seg_rec in segment_records {
-                if !records.iter().any(|r| r.offset == seg_rec.offset) {
-                    records.push(seg_rec);
+                    // Merge Tantivy records with existing records
+                    for t_rec in tantivy_records {
+                        if !records.iter().any(|r| r.offset == t_rec.offset) {
+                            records.push(t_rec);
+                        }
+                    }
+
+                    // Sort by offset to maintain order
+                    records.sort_by_key(|r| r.offset);
+                }
+                Ok(_) => {
+                    debug!(
+                        "FETCH→TANTIVY: No records found in Tantivy archives for {}-{} at offset {}",
+                        topic, partition, fetch_offset
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "FETCH→TANTIVY: Failed to fetch from Tantivy archives for {}-{}: {}",
+                        topic, partition, e
+                    );
                 }
             }
-
-            // Sort by offset to maintain order
-            records.sort_by_key(|r| r.offset);
         }
 
         Ok(records)
@@ -1319,7 +1340,119 @@ impl FetchHandler {
         Ok(None)
     }
 
-    /// Fetch data from Tantivy segments (warm storage)
+    /// Fetch records from Tantivy archives (cold storage) - for consumption
+    /// This is similar to fetch_from_tantivy but returns parsed Record objects instead of raw bytes
+    async fn fetch_from_tantivy_for_records(
+        &self,
+        topic: &str,
+        partition: i32,
+        fetch_offset: i64,
+        high_watermark: i64,
+        _max_bytes: i32,
+    ) -> Result<Vec<chronik_storage::Record>> {
+        let segment_index = match &self.segment_index {
+            Some(idx) => idx,
+            None => return Ok(vec![]),
+        };
+
+        // Query segment index for matching Tantivy segments
+        let tantivy_segments = segment_index.find_segments_by_offset_range(
+            topic,
+            partition,
+            fetch_offset,
+            high_watermark,
+        ).await?;
+
+        if tantivy_segments.is_empty() {
+            debug!("No Tantivy segments found for {}-{} range {}-{}",
+                topic, partition, fetch_offset, high_watermark);
+            return Ok(vec![]);
+        }
+
+        info!(
+            "Found {} Tantivy segments for {}-{} range {}-{}, downloading and reading",
+            tantivy_segments.len(), topic, partition, fetch_offset, high_watermark
+        );
+
+        // Collect all entries from all matching segments
+        let mut all_entries = Vec::new();
+
+        for segment_metadata in tantivy_segments {
+            // Download segment from object store
+            let segment_data = match self.object_store.get(&segment_metadata.object_store_path).await {
+                Ok(data) => data,
+                Err(e) => {
+                    warn!(
+                        "Failed to download Tantivy segment {}: {}",
+                        segment_metadata.segment_id, e
+                    );
+                    continue; // Skip this segment, try others
+                }
+            };
+
+            // Deserialize Tantivy segment
+            let reader = match TantivySegmentReader::from_tar_gz_bytes(segment_data.as_ref()) {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(
+                        "Failed to deserialize Tantivy segment {}: {}",
+                        segment_metadata.segment_id, e
+                    );
+                    continue;
+                }
+            };
+
+            // Query for records in the offset range
+            let entries = match reader.query_by_offset_range(fetch_offset, high_watermark) {
+                Ok(e) => e,
+                Err(e) => {
+                    warn!(
+                        "Failed to query Tantivy segment {}: {}",
+                        segment_metadata.segment_id, e
+                    );
+                    continue;
+                }
+            };
+
+            debug!(
+                "Read {} entries from Tantivy segment {}",
+                entries.len(), segment_metadata.segment_id
+            );
+
+            all_entries.extend(entries);
+        }
+
+        if all_entries.is_empty() {
+            info!("No entries found in Tantivy segments for {}-{} range {}-{}",
+                topic, partition, fetch_offset, high_watermark);
+            return Ok(vec![]);
+        }
+
+        // Sort entries by offset
+        all_entries.sort_by_key(|e| e.offset);
+
+        // Convert entries to chronik_storage::Record
+        let records: Vec<chronik_storage::Record> = all_entries.into_iter()
+            .map(|entry| chronik_storage::Record {
+                offset: entry.offset,
+                timestamp: entry.timestamp,
+                key: entry.key,
+                value: entry.value.unwrap_or_default(),
+                headers: entry.headers.iter()
+                    .filter_map(|h| h.value.as_ref().map(|v| (h.key.clone(), v.clone())))
+                    .collect(),
+            })
+            .collect();
+
+        info!(
+            "Returning {} records from Tantivy segments for {}-{} range {}-{}",
+            records.len(), topic, partition, fetch_offset, high_watermark
+        );
+
+        Ok(records)
+    }
+
+    /// Fetch data from Tantivy segments (warm storage) - returns raw bytes
     async fn fetch_from_tantivy(
         &self,
         segment_index: &Arc<SegmentIndex>,
