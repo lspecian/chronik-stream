@@ -109,6 +109,30 @@ impl Default for GroupCommitConfig {
 }
 
 impl GroupCommitConfig {
+    /// Parse rotation size from environment variable or use default
+    /// Supports: "100KB", "250MB", "1GB", or raw bytes "268435456"
+    ///
+    /// Example: CHRONIK_WAL_ROTATION_SIZE=100MB
+    fn parse_rotation_size() -> u64 {
+        match std::env::var("CHRONIK_WAL_ROTATION_SIZE") {
+            Ok(val) => {
+                let val = val.trim().to_uppercase();
+
+                // Try to parse with unit suffix
+                if val.ends_with("KB") {
+                    val.trim_end_matches("KB").trim().parse::<u64>().unwrap_or(250) * 1024
+                } else if val.ends_with("MB") {
+                    val.trim_end_matches("MB").trim().parse::<u64>().unwrap_or(250) * 1024 * 1024
+                } else if val.ends_with("GB") {
+                    val.trim_end_matches("GB").trim().parse::<u64>().unwrap_or(1) * 1024 * 1024 * 1024
+                } else {
+                    // Try parsing as raw bytes
+                    val.parse::<u64>().unwrap_or(250 * 1024 * 1024)
+                }
+            }
+            Err(_) => 250 * 1024 * 1024,  // Default: 250MB
+        }
+    }
 
     /// Low resource profile (containers, small VMs: <= 1 CPU, < 512MB RAM)
     fn low_resource() -> Self {
@@ -119,7 +143,7 @@ impl GroupCommitConfig {
             max_queue_depth: 2_500,         // 2.5K queue depth
             enable_metrics: true,
             enable_rotation: true,          // Enable S3 archival
-            rotation_size_bytes: 128 * 1024 * 1024,  // 128MB
+            rotation_size_bytes: Self::parse_rotation_size(),
             rotation_age_secs: 30 * 60,     // 30 minutes
         }
     }
@@ -133,7 +157,7 @@ impl GroupCommitConfig {
             max_queue_depth: 10_000,        // 10K queue depth
             enable_metrics: true,
             enable_rotation: true,          // Enable S3 archival
-            rotation_size_bytes: 256 * 1024 * 1024,  // 256MB
+            rotation_size_bytes: Self::parse_rotation_size(),
             rotation_age_secs: 30 * 60,     // 30 minutes
         }
     }
@@ -148,7 +172,7 @@ impl GroupCommitConfig {
             max_queue_depth: 50_000,        // 50K queue depth
             enable_metrics: true,
             enable_rotation: true,          // Enable S3 archival
-            rotation_size_bytes: 256 * 1024 * 1024,  // 256MB
+            rotation_size_bytes: Self::parse_rotation_size(),
             rotation_age_secs: 30 * 60,     // 30 minutes
         }
     }

@@ -26,28 +26,86 @@ See [CHANGELOG.md](CHANGELOG.md) for release history and latest updates.
 - **Container Ready**: Docker deployment with proper network configuration
 - **Simplified Operations**: Single-process architecture reduces operational complexity
 
-## 🏗️ Architecture
+## 🏗️ Architecture - 3-Tier Seamless Storage
+
+Chronik implements a unique 3-tier storage system with automatic failover that provides **infinite retention** without requiring infinite local disk:
 
 ```
-┌─────────────────┐     ┌─────────────────────────────────────────┐
-│   Kafka Client  │────▶│            Chronik Server               │
-│  (Any Language) │     │  ┌─────────────┐  ┌─────────────────┐  │
-└─────────────────┘     │  │ Kafka Proto │  │  ChronikMetaLog │  │
-                        │  │ Handler     │  │  (WAL Metadata) │  │
-                        │  │ (Port 9092) │  │                 │  │
-                        │  └─────────────┘  └─────────────────┘  │
-                        │  ┌─────────────┐  ┌─────────────────┐  │
-                        │  │   Search    │  │  Storage Mgr    │  │
-                        │  │  (Tantivy)  │  │                 │  │
-                        │  └─────────────┘  └─────────────────┘  │
-                        └─────────────────────────────────────────┘
-                                            │
-                                            ▼
-                                ┌─────────────────────┐
-                                │   Object Storage    │
-                                │  (S3/GCS/Local)     │
-                                └─────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│              Chronik 3-Tier Seamless Storage                     │
+│                   (Infinite Retention Design)                    │
+├─────────────────────────────────────────────────────────────────┤
+│  Tier 1: WAL (Hot - Local Disk)                                 │
+│  ├─ Location: ./data/wal/{topic}/{partition}/                   │
+│  ├─ Latency: <1ms (in-memory buffer)                            │
+│  └─ Retention: Until sealed (250MB or 30min by default)         │
+│        ↓ Background WalIndexer (every 30s)                       │
+│                                                                   │
+│  Tier 2: Raw Segments in S3 (Warm - Object Storage)             │
+│  ├─ Location: s3://bucket/segments/{topic}/{partition}/{range}  │
+│  ├─ Latency: 50-200ms (download + deserialize)                  │
+│  ├─ Retention: Unlimited (cheap object storage)                 │
+│  └─ Purpose: Message consumption after local WAL deletion        │
+│        ↓ PLUS ↓                                                  │
+│                                                                   │
+│  Tier 3: Tantivy Indexes in S3 (Cold - Searchable)              │
+│  ├─ Location: s3://bucket/indexes/{topic}/partition-{p}/...     │
+│  ├─ Latency: 100-500ms (download + decompress + search)         │
+│  ├─ Retention: Unlimited                                         │
+│  └─ Purpose: Full-text search WITHOUT downloading raw data       │
+│                                                                   │
+│  Consumer Fetch Flow (Automatic Fallback):                      │
+│    Phase 1: Try WAL buffer (hot, in-memory) → μs latency        │
+│    Phase 2: Try local WAL (warm, local disk) → ms latency       │
+│    Phase 3: Download raw segment from S3 → 50-200ms latency     │
+│    Phase 4: Search Tantivy index → 100-500ms latency            │
+│                                                                   │
+│  Local Disk Cleanup:                                             │
+│    - WAL files DELETED after successful upload to S3             │
+│    - Old messages still accessible from S3 indefinitely          │
+│    - No infinite local disk space required!                      │
+└─────────────────────────────────────────────────────────────────┘
+
+    ┌─────────────────┐
+    │   Kafka Client  │  (kafka-python, Java clients, KSQL, etc.)
+    │  (Any Language) │
+    └────────┬────────┘
+             │
+             ▼
+    ┌────────────────────────────────────────┐
+    │         Chronik Server                  │
+    │  ┌──────────────┐  ┌─────────────────┐ │
+    │  │ Kafka Proto  │  │ ChronikMetaLog  │ │
+    │  │ Handler      │  │ (WAL Metadata)  │ │
+    │  │ (Port 9092)  │  │                 │ │
+    │  └──────────────┘  └─────────────────┘ │
+    │  ┌──────────────┐  ┌─────────────────┐ │
+    │  │   Search     │  │  Storage Mgr    │ │
+    │  │  (Tantivy)   │  │  (3-Tier)       │ │
+    │  └──────────────┘  └─────────────────┘ │
+    └───────────┬────────────────────────────┘
+                │
+                ▼
+    ┌───────────────────────────┐
+    │    Object Storage         │
+    │  (S3/GCS/Azure/Local)     │
+    │  • Raw segments (Tier 2)  │
+    │  • Tantivy indexes (Tier 3)│
+    └───────────────────────────┘
 ```
+
+### Key Differentiators vs Kafka Tiered Storage
+
+| Feature | Kafka Tiered Storage | Chronik Layered Storage |
+|---------|---------------------|-------------------------|
+| **Hot Storage** | Local disk | WAL + Segments (local) |
+| **Cold Storage** | S3 (raw data) | S3 raw segments + Tantivy indexes |
+| **Auto-archival** | ✅ Yes | ✅ Yes (WalIndexer background task) |
+| **Query by Offset** | ✅ Yes | ✅ Yes (download from S3 as needed) |
+| **Full-text Search** | ❌ NO | ✅ **YES** (Tantivy indexes, no download!) |
+| **Local Disk** | Grows forever | Bounded (old WAL deleted after S3 upload) |
+
+**Unique Advantage**: Chronik's Tier 3 isn't just "cold storage" - it's a **searchable indexed archive**. You can query old data by content or timestamp range without downloading or scanning raw data!
 
 ## ⚡ Quick Start
 
@@ -223,6 +281,7 @@ Environment Variables:
   CHRONIK_FILE_METADATA        Set to "true" to use legacy file-based metadata store
   CHRONIK_WAL_PROFILE          WAL performance profile: low/medium/high/ultra (auto-detects if not set)
   CHRONIK_PRODUCE_PROFILE      Producer flush profile: low-latency/balanced/high-throughput (default: balanced)
+  CHRONIK_WAL_ROTATION_SIZE    Segment seal threshold: 100KB/250MB (default)/1GB/bytes (controls when WAL segments are sealed and uploaded to S3)
   RUST_LOG                     Log level (error, warn, info, debug, trace)
 
 Object Store (Tier 3 - Tantivy Archives):

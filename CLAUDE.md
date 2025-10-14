@@ -605,6 +605,7 @@ Key environment variables:
 - `CHRONIK_FILE_METADATA` - Use file-based metadata (default: false, uses WAL)
 - `CHRONIK_PRODUCE_PROFILE` - ProduceHandler flush profile: `low-latency`, `balanced` (default), `high-throughput`
 - `CHRONIK_WAL_PROFILE` - WAL commit profile: `low`, `medium`, `high`, `ultra` (auto-detected by default)
+- `CHRONIK_WAL_ROTATION_SIZE` - Segment seal threshold: `100KB`, `250MB` (default), `1GB`, or raw bytes `268435456`
 
 ## CRC and Checksum Architecture
 

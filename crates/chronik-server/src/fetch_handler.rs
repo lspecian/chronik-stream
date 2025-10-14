@@ -594,8 +594,59 @@ impl FetchHandler {
             }
         }
         
-        // PHASE 3: Fall back to segment-based storage if we still need more records
-        // This ensures we fetch from segments if WAL/buffer didn't have all the data
+        // PHASE 3: Try downloading raw segments from S3 (Tier 2: warm storage)
+        // This is the NEW v1.3.64 flow where sealed WAL segments are uploaded to S3
+        if records.is_empty() || need_earlier_records {
+            info!(
+                "FETCH→S3_RAW_SEGMENTS: Trying to download raw segment from S3 for {}-{} (have {} records so far)",
+                topic, partition, records.len()
+            );
+
+            match self.fetch_from_s3_raw_segments(
+                topic,
+                partition,
+                fetch_offset,
+                high_watermark,
+                max_bytes
+            ).await {
+                Ok(s3_records) if !s3_records.is_empty() => {
+                    info!(
+                        "FETCH→S3_RAW_SEGMENTS: Successfully fetched {} records from S3 for {}-{}",
+                        s3_records.len(), topic, partition
+                    );
+
+                    // Merge S3 records with existing records
+                    for s3_rec in s3_records {
+                        if !records.iter().any(|r| r.offset == s3_rec.offset) {
+                            records.push(s3_rec);
+                        }
+                    }
+
+                    // Sort by offset to maintain order
+                    records.sort_by_key(|r| r.offset);
+
+                    // If we now have enough data, return
+                    if !records.is_empty() {
+                        return Ok(records);
+                    }
+                }
+                Ok(_) => {
+                    debug!(
+                        "FETCH→S3_RAW_SEGMENTS: No records found in S3 raw segments for {}-{} at offset {}",
+                        topic, partition, fetch_offset
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "FETCH→S3_RAW_SEGMENTS: Failed to fetch from S3 for {}-{}: {} - will try legacy segments",
+                        topic, partition, e
+                    );
+                }
+            }
+        }
+
+        // PHASE 4: Fall back to legacy segment-based storage if we still need more records
+        // This ensures we fetch from segments if WAL/S3 didn't have all the data
         if records.is_empty() || need_earlier_records {
             info!(
                 "FETCH→SEGMENTS: Fetching from segments for {}-{} (have {} records so far)",
@@ -682,6 +733,168 @@ impl FetchHandler {
             records.len(), fetch_offset, topic, partition);
 
         Ok(records)
+    }
+
+    /// Fetch records from S3 raw segments (Tier 2: warm storage)
+    ///
+    /// NEW (v1.3.64): Download and deserialize bincode Vec<CanonicalRecord> from S3
+    /// Path: segments/{topic}/{partition}/{min_offset}-{max_offset}.segment
+    async fn fetch_from_s3_raw_segments(
+        &self,
+        topic: &str,
+        partition: i32,
+        fetch_offset: i64,
+        high_watermark: i64,
+        max_bytes: i32,
+    ) -> Result<Vec<chronik_storage::Record>> {
+        use chronik_storage::canonical_record::CanonicalRecord;
+
+        // List all segment files in S3 for this topic/partition
+        // Path pattern: segments/{topic}/{partition}/*.segment
+        let prefix = format!("segments/{}/{}/", topic, partition);
+
+        info!(
+            "S3→LIST: Looking for raw segments with prefix: {}",
+            prefix
+        );
+
+        // List objects with the prefix
+        let objects = match self.object_store.list(&prefix).await {
+            Ok(objs) => objs,
+            Err(e) => {
+                warn!("S3→LIST: Failed to list objects with prefix {}: {}", prefix, e);
+                return Ok(vec![]);
+            }
+        };
+
+        if objects.is_empty() {
+            info!("S3→LIST: No raw segments found for {}-{}", topic, partition);
+            return Ok(vec![]);
+        }
+
+        info!(
+            "S3→LIST: Found {} raw segment files for {}-{}",
+            objects.len(), topic, partition
+        );
+
+        // Parse segment filenames to find ones that overlap with [fetch_offset, high_watermark)
+        let mut matching_segments = Vec::new();
+        for obj_meta in objects {
+            let object_key = &obj_meta.key;
+            // Parse filename: {min_offset}-{max_offset}.segment
+            if let Some(filename) = object_key.strip_prefix(&prefix) {
+                if let Some(range_part) = filename.strip_suffix(".segment") {
+                    let parts: Vec<&str> = range_part.split('-').collect();
+                    if parts.len() == 2 {
+                        if let (Ok(min_offset), Ok(max_offset)) = (parts[0].parse::<i64>(), parts[1].parse::<i64>()) {
+                            // Check if this segment overlaps with [fetch_offset, high_watermark)
+                            if max_offset >= fetch_offset && min_offset < high_watermark {
+                                info!(
+                                    "S3→MATCH: Segment {} covers offsets {}-{}, overlaps with fetch range {}-{}",
+                                    object_key, min_offset, max_offset, fetch_offset, high_watermark
+                                );
+                                matching_segments.push((object_key.clone(), min_offset, max_offset));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if matching_segments.is_empty() {
+            info!(
+                "S3→NO_MATCH: No segments overlap with fetch range {}-{} for {}-{}",
+                fetch_offset, high_watermark, topic, partition
+            );
+            return Ok(vec![]);
+        }
+
+        // Sort by min_offset to process in order
+        matching_segments.sort_by_key(|(_, min, _)| *min);
+
+        let mut all_records = Vec::new();
+        let mut bytes_fetched = 0usize;
+
+        for (object_key, segment_min, segment_max) in matching_segments {
+            if bytes_fetched >= max_bytes as usize && !all_records.is_empty() {
+                break;
+            }
+
+            info!(
+                "S3→DOWNLOAD: Downloading raw segment {} (offsets {}-{})",
+                object_key, segment_min, segment_max
+            );
+
+            // Download segment from S3
+            let segment_data = match self.object_store.get(&object_key).await {
+                Ok(data) => data,
+                Err(e) => {
+                    warn!(
+                        "S3→DOWNLOAD: Failed to download segment {}: {}",
+                        object_key, e
+                    );
+                    continue; // Skip this segment, try others
+                }
+            };
+
+            info!(
+                "S3→DOWNLOAD: Downloaded {} bytes from {}",
+                segment_data.len(), object_key
+            );
+
+            // Deserialize Vec<CanonicalRecord> using bincode
+            let canonical_records: Vec<CanonicalRecord> = match bincode::deserialize(&segment_data) {
+                Ok(records) => records,
+                Err(e) => {
+                    error!(
+                        "S3→DESERIALIZE: Failed to deserialize segment {}: {}",
+                        object_key, e
+                    );
+                    continue;
+                }
+            };
+
+            info!(
+                "S3→DESERIALIZE: Segment {} contains {} canonical records",
+                object_key, canonical_records.len()
+            );
+
+            // Extract individual records from CanonicalRecords
+            for canonical_record in canonical_records {
+                for entry in &canonical_record.records {
+                    // Filter by offset range
+                    if entry.offset >= fetch_offset && entry.offset < high_watermark {
+                        let record_size = entry.value.as_ref().map(|v| v.len()).unwrap_or(0)
+                            + entry.key.as_ref().map(|k| k.len()).unwrap_or(0)
+                            + 24; // Estimated overhead
+
+                        if bytes_fetched + record_size > max_bytes as usize && !all_records.is_empty() {
+                            break;
+                        }
+
+                        let storage_record = chronik_storage::Record {
+                            offset: entry.offset,
+                            timestamp: entry.timestamp,
+                            key: entry.key.clone(),
+                            value: entry.value.clone().unwrap_or_default(),
+                            headers: entry.headers.iter()
+                                .filter_map(|h| h.value.as_ref().map(|v| (h.key.clone(), v.clone())))
+                                .collect(),
+                        };
+
+                        all_records.push(storage_record);
+                        bytes_fetched += record_size;
+                    }
+                }
+            }
+        }
+
+        info!(
+            "S3→COMPLETE: Fetched {} records ({} bytes) from S3 raw segments for {}-{}",
+            all_records.len(), bytes_fetched, topic, partition
+        );
+
+        Ok(all_records)
     }
 
     /// Fetch raw RecordBatch bytes from WAL (compressed_records_wire_bytes)
