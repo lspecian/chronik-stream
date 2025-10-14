@@ -66,6 +66,10 @@ pub struct IntegratedServerConfig {
     pub wal_indexing_interval_secs: u64,
     /// Optional object store configuration (overrides default local storage)
     pub object_store_config: Option<ObjectStoreConfig>,
+    /// Enable metadata disaster recovery (upload metadata WAL to S3)
+    pub enable_metadata_dr: bool,
+    /// Metadata upload interval in seconds
+    pub metadata_upload_interval_secs: u64,
 }
 
 impl Default for IntegratedServerConfig {
@@ -84,6 +88,8 @@ impl Default for IntegratedServerConfig {
             enable_wal_indexing: true, // Enable WAL→Tantivy indexing by default
             wal_indexing_interval_secs: 30, // Index every 30 seconds
             object_store_config: None, // Use default local storage unless specified
+            enable_metadata_dr: true, // Enable metadata DR by default
+            metadata_upload_interval_secs: 60, // Upload metadata every minute
         }
     }
 }
@@ -94,6 +100,7 @@ pub struct IntegratedKafkaServer {
     kafka_handler: Arc<KafkaProtocolHandler>,
     metadata_store: Arc<dyn MetadataStore>,
     wal_indexer: Arc<WalIndexer>,
+    metadata_uploader: Option<Arc<chronik_common::metadata::MetadataUploader>>,
 }
 
 impl IntegratedKafkaServer {
@@ -475,6 +482,56 @@ impl IntegratedKafkaServer {
         info!("WAL Indexer started successfully (interval: {}s)", config.wal_indexing_interval_secs);
         info!("  Segment index will track Tantivy segments for future query optimization");
 
+        // Initialize Metadata Uploader for disaster recovery
+        // IMPORTANT: Only enable for remote object stores (S3/GCS/Azure)
+        // Local filesystem backend provides no DR benefit (same disk)
+        let is_remote_object_store = matches!(
+            object_store_config.backend,
+            chronik_storage::object_store::StorageBackend::S3 { .. } |
+            chronik_storage::object_store::StorageBackend::Gcs { .. } |
+            chronik_storage::object_store::StorageBackend::Azure { .. }
+        );
+
+        let metadata_uploader = if config.enable_metadata_dr && config.use_wal_metadata && is_remote_object_store {
+            info!("Initializing Metadata Uploader for disaster recovery (metadata WAL → Object Store)");
+
+            let uploader_config = chronik_common::metadata::MetadataUploaderConfig {
+                upload_interval_secs: config.metadata_upload_interval_secs,
+                wal_base_path: "metadata-wal".to_string(),
+                snapshot_base_path: "metadata-snapshots".to_string(),
+                delete_after_upload: false, // Keep local WAL for redundancy
+                delete_old_snapshots: true,
+                keep_local_snapshot_count: 2,
+                enabled: true,
+            };
+
+            let uploader = Arc::new(crate::metadata_dr::create_metadata_uploader(
+                object_store_arc.clone(),
+                &config.data_dir,
+                uploader_config,
+            ));
+
+            // Start the background upload task
+            uploader.start().await
+                .map_err(|e| anyhow::anyhow!("Failed to start metadata uploader: {}", e))?;
+
+            info!("Metadata Uploader started successfully (interval: {}s)", config.metadata_upload_interval_secs);
+            info!("  Metadata WAL and snapshots will be uploaded to object store for disaster recovery");
+
+            Some(uploader)
+        } else {
+            if !config.use_wal_metadata {
+                info!("Metadata Uploader disabled (file-based metadata store in use)");
+            } else if !is_remote_object_store {
+                info!("Metadata Uploader disabled (local filesystem backend - no DR benefit)");
+                info!("  Local metadata already persists to disk and survives restarts");
+                info!("  For true DR, configure S3/GCS/Azure object store");
+            } else {
+                info!("Metadata Uploader disabled by configuration");
+            }
+            None
+        };
+
         info!("Integrated Kafka server initialized successfully");
         info!("  Node ID: {}", config.node_id);
         info!("  Advertised: {}:{}", config.advertised_host, config.advertised_port);
@@ -492,6 +549,7 @@ impl IntegratedKafkaServer {
             kafka_handler,
             metadata_store: metadata_store.clone(),
             wal_indexer,
+            metadata_uploader,
         };
         
         // Create default topic

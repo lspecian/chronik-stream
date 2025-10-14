@@ -94,9 +94,9 @@ python3 test_script.py
 kafka-console-producer --bootstrap-server localhost:9092 --topic test
 ```
 
-## Layered Storage Architecture
+## Layered Storage Architecture with Full Disaster Recovery
 
-**CRITICAL**: Chronik implements a unique 3-tier layered storage system that stores BOTH raw message data AND search indexes in object storage (S3/GCS/Azure).
+**CRITICAL**: Chronik implements a unique 3-tier layered storage system that stores BOTH raw message data AND search indexes in object storage (S3/GCS/Azure). **NEW in v1.3.65**: Metadata (topics, partitions, offsets) is also backed up to object storage for complete disaster recovery.
 
 ### The 3 Tiers (Always Active by Default)
 
@@ -205,6 +205,72 @@ Fallback: Reconstruct from metadata
 - **Tier 1 (WAL)**: < 1ms latency, seconds retention
 - **Tier 2 (Segments)**: 1-10ms latency, minutes-hours retention
 - **Tier 3 (Tantivy)**: 100-500ms latency, unlimited retention (configurable)
+
+### Disaster Recovery (v1.3.65+)
+
+**CRITICAL NEW FEATURE**: Chronik now backs up **both data AND metadata** to remote object storage, enabling complete disaster recovery.
+
+**How It Works:**
+- **Local filesystem (default)**: Metadata already persists locally to `./data/wal/__meta/` and survives restarts. **No additional backup needed.**
+- **S3/GCS/Azure**: Metadata uploader **automatically activates** to copy metadata to remote storage every 60s. Provides protection against complete node loss.
+
+**Object Store Backends:**
+- ✅ **S3** (AWS, MinIO, Wasabi, etc.) - Automatic metadata DR
+- ✅ **Google Cloud Storage** - Automatic metadata DR
+- ✅ **Azure Blob Storage** - Automatic metadata DR
+- ✅ **Local filesystem** (default) - Metadata persists locally, survives restarts
+
+**What Gets Backed Up:**
+1. **Message Data** (Already in v1.3.64):
+   - Tier 2: Raw segments → `s3://.../segments/`
+   - Tier 3: Tantivy indexes → `s3://.../indexes/`
+
+2. **Metadata** (NEW in v1.3.65):
+   - Metadata WAL → `s3://.../metadata-wal/`
+   - Metadata snapshots → `s3://.../metadata-snapshots/`
+   - Includes: topics, partitions, high watermarks, consumer offsets, consumer groups
+
+**Automatic Recovery on Cold Start (with S3):**
+```bash
+# Scenario: Complete node loss (EC2 terminated, disk gone)
+
+# Step 1: Provision new node with same S3 bucket
+export OBJECT_STORE_BACKEND=s3
+export S3_BUCKET=chronik-prod  # Same bucket as before
+export S3_REGION=us-west-2
+
+# Step 2: Start Chronik (automatic recovery happens)
+cargo run --bin chronik-server -- standalone
+
+# What happens automatically:
+# 1. Detects empty local WAL
+# 2. Downloads latest metadata snapshot from S3
+# 3. Downloads metadata WAL segments from S3
+# 4. Replays events to restore:
+#    - ✅ All topics and partitions
+#    - ✅ High watermarks
+#    - ✅ Consumer offsets
+#    - ✅ Consumer group state
+# 5. Server starts normally
+
+# Step 3: Verify (everything should be restored)
+kafka-topics --list --bootstrap-server localhost:9092
+kafka-console-consumer --topic my-topic --from-beginning --bootstrap-server localhost:9092
+```
+
+**Configuration:**
+```bash
+# Enable metadata DR (default: enabled)
+CHRONIK_METADATA_DR=true  # Already enabled by default
+
+# Change upload interval (default: 60s)
+CHRONIK_METADATA_UPLOAD_INTERVAL=120 cargo run --bin chronik-server
+
+# Disable if using file-based metadata
+CHRONIK_FILE_METADATA=true cargo run --bin chronik-server  # DR disabled
+```
+
+**See [docs/DISASTER_RECOVERY.md](docs/DISASTER_RECOVERY.md) for complete DR guide.**
 
 ### Key Differentiators vs Kafka Tiered Storage
 

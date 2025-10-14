@@ -23,6 +23,7 @@ mod handler;
 mod offset_storage;
 mod coordinator_manager;
 mod wal_integration;
+mod metadata_dr;
 
 use integrated_server::{IntegratedKafkaServer, IntegratedServerConfig};
 use chronik_wal::compaction::{WalCompactor, CompactionConfig, CompactionStrategy};
@@ -529,6 +530,8 @@ async fn run_standalone_server(cli: &Cli) -> Result<()> {
         enable_wal_indexing: true,  // Enable WAL→Tantivy indexing
         wal_indexing_interval_secs: 30,  // Index every 30 seconds
         object_store_config,  // Pass custom object store config if provided
+        enable_metadata_dr: true,  // Enable metadata DR by default
+        metadata_upload_interval_secs: 60,  // Upload metadata every minute
     };
 
     // Create and start the integrated server
@@ -704,6 +707,8 @@ async fn run_all_components(cli: &Cli) -> Result<()> {
         enable_wal_indexing: true,  // Enable WAL→Tantivy indexing
         wal_indexing_interval_secs: 30,  // Index every 30 seconds
         object_store_config,  // Pass custom object store config if provided
+        enable_metadata_dr: true,  // Enable metadata DR by default
+        metadata_upload_interval_secs: 60,  // Upload metadata every minute
     };
     
     // Start Kafka protocol server
