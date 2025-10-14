@@ -395,8 +395,39 @@ impl WalIndexer {
             }
         }
 
-        // Create Tantivy index for each topic-partition
+        // Process each topic-partition: upload raw segments + create Tantivy indexes
         for (tp, canonical_records) in tp_records {
+            // STEP 1: Upload raw segment data to S3 (Tier 2: warm storage)
+            // This preserves the actual message data for consumption
+            match Self::upload_raw_segment(
+                object_store,
+                &tp,
+                &canonical_records,
+            ).await {
+                Ok(segment_bytes) => {
+                    info!(
+                        topic = %tp.topic,
+                        partition = tp.partition,
+                        bytes = segment_bytes,
+                        records = canonical_records.len(),
+                        "Uploaded raw segment to S3"
+                    );
+                    stats.bytes_written += segment_bytes;
+                }
+                Err(e) => {
+                    error!(
+                        topic = %tp.topic,
+                        partition = tp.partition,
+                        error = %e,
+                        "Failed to upload raw segment - CRITICAL DATA LOSS RISK!"
+                    );
+                    stats.errors += 1;
+                    // Continue to Tantivy indexing even if raw upload fails
+                    // (at least we'll have searchable index)
+                }
+            }
+
+            // STEP 2: Create Tantivy index (Tier 3: cold storage with search)
             match Self::create_tantivy_index(
                 config,
                 object_store,
@@ -435,6 +466,63 @@ impl WalIndexer {
 
         stats.segments_processed += 1;
         Ok(())
+    }
+
+    /// Upload raw segment data to S3 for message consumption (Tier 2: warm storage)
+    ///
+    /// This stores the actual CanonicalRecords (bincode-serialized) so consumers can
+    /// fetch messages from S3 when they're no longer in local WAL/segments.
+    #[instrument(skip(object_store, canonical_records))]
+    async fn upload_raw_segment(
+        object_store: &Arc<dyn ObjectStore>,
+        tp: &TopicPartition,
+        canonical_records: &[CanonicalRecord],
+    ) -> Result<u64> {
+        if canonical_records.is_empty() {
+            return Ok(0);
+        }
+
+        // Calculate offset range for this segment
+        let min_offset = canonical_records.iter()
+            .map(|r| r.min_offset())
+            .min()
+            .unwrap_or(0);
+        let max_offset = canonical_records.iter()
+            .map(|r| r.last_offset())
+            .max()
+            .unwrap_or(0);
+
+        // Serialize all CanonicalRecords using bincode
+        // This preserves the exact data including compressed_records_wire_bytes
+        let serialized_data = bincode::serialize(canonical_records)
+            .map_err(|e| Error::Internal(format!("Failed to serialize canonical records: {}", e)))?;
+
+        let data_size = serialized_data.len() as u64;
+
+        // Upload to S3 with path: segments/{topic}/{partition}/{min_offset}-{max_offset}.segment
+        let object_key = format!(
+            "segments/{}/{}/{}-{}.segment",
+            tp.topic,
+            tp.partition,
+            min_offset,
+            max_offset
+        );
+
+        let data_bytes = bytes::Bytes::from(serialized_data);
+        object_store.put(&object_key, data_bytes).await
+            .map_err(|e| Error::Internal(format!("Failed to upload raw segment to S3: {}", e)))?;
+
+        info!(
+            topic = %tp.topic,
+            partition = tp.partition,
+            min_offset = min_offset,
+            max_offset = max_offset,
+            object_key = %object_key,
+            bytes = data_size,
+            "Uploaded raw segment data to S3"
+        );
+
+        Ok(data_size)
     }
 
     /// Create Tantivy index from CanonicalRecords

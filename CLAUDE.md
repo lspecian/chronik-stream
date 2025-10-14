@@ -96,35 +96,46 @@ kafka-console-producer --bootstrap-server localhost:9092 --topic test
 
 ## Layered Storage Architecture
 
-**CRITICAL**: Chronik implements a unique 3-tier layered storage system that's DIFFERENT from traditional Kafka S3 tiering.
+**CRITICAL**: Chronik implements a unique 3-tier layered storage system that stores BOTH raw message data AND search indexes in object storage (S3/GCS/Azure).
 
 ### The 3 Tiers (Always Active by Default)
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                 Chronik Layered Storage                          │
+│              Chronik 3-Tier Seamless Storage                     │
+│                   (Infinite Retention Design)                    │
 ├─────────────────────────────────────────────────────────────────┤
-│  Tier 1: WAL (Hot)           Tier 2: Segments (Warm)            │
-│  ┌──────────────┐            ┌──────────────┐                   │
-│  │ Recent data  │            │ Recent-ish   │                   │
-│  │ Seconds old  │────────▶   │ Minutes old  │                   │
-│  │ In-memory    │ Background │ On disk      │                   │
-│  │ buffer       │ indexing   │ Local files  │                   │
-│  └──────────────┘            └──────────────┘                   │
-│        ↓                            ↓                            │
-│   Phase 1 Fetch              Phase 2 Fetch                      │
-│   (μs latency)               (ms latency)                       │
+│  Tier 1: WAL (Hot - Local Disk)                                 │
+│  ├─ Location: ./data/wal/{topic}/{partition}/wal_{p}_{id}.log   │
+│  ├─ Data: GroupCommitWal (bincode CanonicalRecords)             │
+│  ├─ Latency: <1ms (in-memory buffer)                            │
+│  └─ Retention: Until sealed (256MB or 30min threshold)          │
+│        ↓ Background WalIndexer (every 30s)                       │
 │                                                                   │
-│  Tier 3: Tantivy Archives (Cold)                                │
-│  ┌──────────────────────────────────┐                           │
-│  │ Archived data (hours+ old)       │                           │
-│  │ Compressed tar.gz in object      │                           │
-│  │ store (S3/GCS/Azure/Local)       │                           │
-│  │ Searchable via Tantivy           │                           │
-│  └──────────────────────────────────┘                           │
-│                ↓                                                 │
-│         Phase 3 Fetch                                            │
-│         (100-500ms latency)                                      │
+│  Tier 2: Raw Segments in S3 (Warm - Object Storage)             │
+│  ├─ Location: s3://.../segments/{topic}/{partition}/{min}-{max} │
+│  ├─ Data: Bincode Vec<CanonicalRecord> (with wire bytes)        │
+│  ├─ Latency: 50-200ms (S3 download + LRU cache)                 │
+│  ├─ Retention: Unlimited (cheap object storage)                 │
+│  └─ Purpose: Message consumption after local WAL deletion        │
+│        ↓ PLUS ↓                                                  │
+│                                                                   │
+│  Tier 3: Tantivy Indexes in S3 (Cold - Searchable)              │
+│  ├─ Location: s3://.../indexes/{topic}/partition-{p}/segment... │
+│  ├─ Data: Compressed tar.gz Tantivy search indexes              │
+│  ├─ Latency: 100-500ms (S3 + decompress + search)               │
+│  ├─ Retention: Unlimited                                         │
+│  └─ Purpose: Full-text search, timestamp range queries          │
+│                                                                   │
+│  Consumer Fetch Flow (Automatic Fallback):                      │
+│    Phase 1: Try WAL buffer (hot, in-memory) → μs latency        │
+│    Phase 2 MISS: Download raw segment from S3 → cache → serve   │
+│    Phase 3 MISS: Search Tantivy index → fetch → serve           │
+│                                                                   │
+│  Local Disk Cleanup:                                             │
+│    - WAL files DELETED after upload to S3 (both raw + index)    │
+│    - Tier 2 uses SegmentCache (LRU) to avoid repeated downloads │
+│    - Old messages still accessible from S3 indefinitely          │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -594,6 +605,74 @@ Key environment variables:
 - `CHRONIK_FILE_METADATA` - Use file-based metadata (default: false, uses WAL)
 - `CHRONIK_PRODUCE_PROFILE` - ProduceHandler flush profile: `low-latency`, `balanced` (default), `high-throughput`
 - `CHRONIK_WAL_PROFILE` - WAL commit profile: `low`, `medium`, `high`, `ultra` (auto-detected by default)
+
+## CRC and Checksum Architecture
+
+**CRITICAL Understanding** (to prevent future debugging loops):
+
+Chronik has **THREE SEPARATE CRC/CHECKSUM SYSTEMS** for different purposes:
+
+### 1. Kafka RecordBatch CRC-32C (Wire Protocol)
+**Location**: Inside each RecordBatch sent by producers
+**Purpose**: Validate batch integrity from producer to consumer
+**Algorithm**: CRC-32C (Castagnoli polynomial)
+**Calculated Over**: partition_leader_epoch through end of batch (position 12+)
+**Preservation Strategy**:
+- `CanonicalRecord.compressed_records_wire_bytes` stores ORIGINAL compressed bytes
+- Compression (gzip/snappy/zstd) is NON-DETERMINISTIC (timestamps, OS flags)
+- Re-compressing produces DIFFERENT bytes → DIFFERENT CRC → Java clients reject
+- **Solution**: Preserve original wire bytes, never re-compress (v1.3.18, v1.3.28-v1.3.59)
+
+### 2. WalRecord V2 CRC32 (Internal WAL Integrity)
+**Location**: WalRecord V2 header (offset 0x08-0x0B)
+**Purpose**: Detect corruption in WAL files
+**Algorithm**: CRC32 (IEEE 802.3)
+**Problem**: Bincode serialization + preserved wire bytes = non-deterministic
+**Solution (v1.3.63)**: **SKIP** checksum validation for V2 records entirely
+- V2 records already have Kafka's CRC-32C for data integrity
+- Adding second CRC on bincode-serialized data is redundant and error-prone
+- V1 records still get full checksum validation (no Kafka CRC)
+
+**Why V2 Checksum Fails**:
+```rust
+// At write time:
+let record = WalRecord::new_v2(...);  // Calculates CRC over struct fields
+record.to_bytes();  // Serializes with that CRC
+
+// At read time:
+let record = WalRecord::from_bytes(data);  // Deserializes struct
+record.verify_checksum();  // Recalculates CRC → DIFFERENT VALUE!
+// Because: canonical_data contains compressed_records_wire_bytes which are
+// non-deterministic, plus bincode serialization variations
+```
+
+**The Fix (v1.3.63)**:
+```rust
+pub fn verify_checksum(&self) -> Result<()> {
+    if self.is_v2() {
+        return Ok(());  // Skip - rely on Kafka's CRC-32C
+    }
+    // V1 records still validated normally
+}
+```
+
+### 3. Segment File Checksum (Chronik Segment Format)
+**Location**: SegmentHeader.checksum (offset 0x22-0x25)
+**Purpose**: Validate entire .segment file integrity
+**Algorithm**: CRC32 (IEEE 802.3)
+**Calculated Over**: Entire file from magic to end
+**Used For**: Tier 2 raw segments uploaded to S3
+
+**Historical CRC Issues** (Learn from these!):
+- **v1.3.28**: Switched from CRC-32 to CRC-32C for Kafka protocol compatibility
+- **v1.3.29**: Fixed CRC-32C endianness and byte range bugs
+- **v1.3.30**: Removed incorrect 4-byte padding from RecordBatch
+- **v1.3.31-v1.3.32**: Fixed CRC-32C bugs for Java client compatibility
+- **v1.3.33**: Fixed CRC corruption by filtering batches in segment fetch
+- **v1.3.59**: **MAJOR**: Preserve CRC when updating base_offset during produce
+- **v1.3.63**: **MAJOR**: Skip WalRecord V2 checksum validation (redundant with Kafka CRC)
+
+**Key Lesson**: Don't add redundant CRC layers! Each adds complexity and failure modes.
 
 ## Debugging Tips
 
