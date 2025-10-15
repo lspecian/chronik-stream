@@ -218,7 +218,7 @@ impl WalManager {
         max_records = max_records
     ))]
     /// Read records from WAL
-    /// v1.3.53+: Reads directly from GroupCommitWal files (old PartitionWal removed)
+    /// v1.3.65+: Reads from all WAL segments (both sealed and active) with rotation support
     pub async fn read_from(
         &self,
         topic: &str,
@@ -231,95 +231,136 @@ impl WalManager {
             topic, partition, offset, max_records
         );
 
-        // Read directly from GroupCommitWal file
-        // GroupCommitWal uses: {base_dir}/{topic}/{partition}/wal_0_0.log
-        let wal_file_path = self.config.data_dir
-            .join(topic)
-            .join(partition.to_string())
-            .join("wal_0_0.log");
-
         let mut records = Vec::new();
 
-        if !wal_file_path.exists() {
-            debug!("WAL file does not exist: {:?}", wal_file_path);
+        // Read from partition directory to find all WAL segment files
+        // Format: wal_{partition}_{segment_id}.log (e.g., wal_1_0.log, wal_1_1.log, wal_1_2.log)
+        let partition_dir = self.config.data_dir
+            .join(topic)
+            .join(partition.to_string());
+
+        if !partition_dir.exists() {
+            debug!("Partition directory does not exist: {:?}", partition_dir);
             return Ok(records);
         }
 
-        let file_data = tokio::fs::read(&wal_file_path).await?;
-        if file_data.is_empty() {
+        // Find all WAL segment files for this partition
+        let mut wal_files = Vec::new();
+        let mut entries = tokio::fs::read_dir(&partition_dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
+                // Match pattern: wal_{partition}_{segment_id}.log
+                if filename.starts_with(&format!("wal_{}_", partition)) && filename.ends_with(".log") {
+                    wal_files.push(path);
+                }
+            }
+        }
+
+        if wal_files.is_empty() {
+            debug!("No WAL files found in partition directory: {:?}", partition_dir);
             return Ok(records);
         }
 
-        debug!("Reading {} bytes from GroupCommitWal file: {:?}", file_data.len(), wal_file_path);
+        // Sort by segment ID (extract from filename)
+        wal_files.sort_by_key(|path| {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|s| {
+                    // Extract segment_id from wal_{partition}_{segment_id}.log
+                    s.strip_prefix(&format!("wal_{}_", partition))
+                        .and_then(|rest| rest.strip_suffix(".log"))
+                        .and_then(|seg_id| seg_id.parse::<u64>().ok())
+                })
+                .unwrap_or(0)
+        });
 
-        // Parse V2 WAL records from file
-        let mut cursor = 0;
-        let mut skipped_batches = 0;
+        debug!("Found {} WAL segment files for {}/{}: {:?}", wal_files.len(), topic, partition, wal_files);
 
-        while cursor < file_data.len() && records.len() < max_records {
-            use byteorder::{LittleEndian, ReadBytesExt};
-            use std::io::Cursor as IoCursor;
-
-            if cursor + 12 > file_data.len() {
+        // Read from all segment files until we have enough records
+        for wal_file_path in &wal_files {
+            if records.len() >= max_records {
                 break;
             }
 
-            let record_start = cursor;
-            let mut rdr = IoCursor::new(&file_data[cursor..]);
-
-            let magic = rdr.read_u16::<LittleEndian>().unwrap();
-            let version = rdr.read_u8().unwrap();
-            let flags = rdr.read_u8().unwrap();
-            let length = rdr.read_u32::<LittleEndian>().unwrap() as usize;
-            let crc32 = rdr.read_u32::<LittleEndian>().unwrap();
-
-            if magic != 0xCA7E || version != 2 || length == 0 {
-                debug!("Invalid WAL record at cursor {}: magic={:x}, version={}, length={}", cursor, magic, version, length);
-                break;
+            let file_data = tokio::fs::read(&wal_file_path).await?;
+            if file_data.is_empty() {
+                continue;
             }
 
-            // Parse V2 record body
-            let topic_len = rdr.read_u16::<LittleEndian>().unwrap() as usize;
-            let mut topic_bytes = vec![0u8; topic_len];
-            std::io::Read::read_exact(&mut rdr, &mut topic_bytes).unwrap();
-            let record_topic = String::from_utf8(topic_bytes).unwrap();
+            debug!("Reading {} bytes from GroupCommitWal file: {:?}", file_data.len(), wal_file_path);
 
-            let record_partition = rdr.read_i32::<LittleEndian>().unwrap();
+            // Parse V2 WAL records from file
+            let mut cursor = 0;
+            let mut skipped_batches = 0;
 
-            let canonical_data_len = rdr.read_u32::<LittleEndian>().unwrap() as usize;
-            let mut canonical_data = vec![0u8; canonical_data_len];
-            std::io::Read::read_exact(&mut rdr, &mut canonical_data).unwrap();
+            while cursor < file_data.len() && records.len() < max_records {
+                use byteorder::{LittleEndian, ReadBytesExt};
+                use std::io::Cursor as IoCursor;
 
-            let base_offset = rdr.read_i64::<LittleEndian>().unwrap();
-            let last_offset = rdr.read_i64::<LittleEndian>().unwrap();
-            let record_count = rdr.read_i32::<LittleEndian>().unwrap();
+                if cursor + 12 > file_data.len() {
+                    break;
+                }
 
-            // Filter by offset range
-            let should_include = last_offset >= offset;
+                let record_start = cursor;
+                let mut rdr = IoCursor::new(&file_data[cursor..]);
 
-            if !should_include {
-                skipped_batches += 1;
-            } else {
-                let record = WalRecord::V2 {
-                    magic,
-                    version,
-                    flags,
-                    length: length as u32,
-                    crc32,
-                    topic: record_topic,
-                    partition: record_partition,
-                    canonical_data,
-                    base_offset,
-                    last_offset,
-                    record_count,
-                };
-                records.push(record);
+                let magic = rdr.read_u16::<LittleEndian>().unwrap();
+                let version = rdr.read_u8().unwrap();
+                let flags = rdr.read_u8().unwrap();
+                let length = rdr.read_u32::<LittleEndian>().unwrap() as usize;
+                let crc32 = rdr.read_u32::<LittleEndian>().unwrap();
+
+                if magic != 0xCA7E || version != 2 || length == 0 {
+                    debug!("Invalid WAL record at cursor {}: magic={:x}, version={}, length={}", cursor, magic, version, length);
+                    break;
+                }
+
+                // Parse V2 record body
+                let topic_len = rdr.read_u16::<LittleEndian>().unwrap() as usize;
+                let mut topic_bytes = vec![0u8; topic_len];
+                std::io::Read::read_exact(&mut rdr, &mut topic_bytes).unwrap();
+                let record_topic = String::from_utf8(topic_bytes).unwrap();
+
+                let record_partition = rdr.read_i32::<LittleEndian>().unwrap();
+
+                let canonical_data_len = rdr.read_u32::<LittleEndian>().unwrap() as usize;
+                let mut canonical_data = vec![0u8; canonical_data_len];
+                std::io::Read::read_exact(&mut rdr, &mut canonical_data).unwrap();
+
+                let base_offset = rdr.read_i64::<LittleEndian>().unwrap();
+                let last_offset = rdr.read_i64::<LittleEndian>().unwrap();
+                let record_count = rdr.read_i32::<LittleEndian>().unwrap();
+
+                // Filter by offset range
+                let should_include = last_offset >= offset;
+
+                if !should_include {
+                    skipped_batches += 1;
+                } else {
+                    let record = WalRecord::V2 {
+                        magic,
+                        version,
+                        flags,
+                        length: length as u32,
+                        crc32,
+                        topic: record_topic,
+                        partition: record_partition,
+                        canonical_data,
+                        base_offset,
+                        last_offset,
+                        record_count,
+                    };
+                    records.push(record);
+                }
+
+                cursor = record_start + rdr.position() as usize;
             }
 
-            cursor = record_start + rdr.position() as usize;
+            debug!("Completed reading segment {:?}: {} records (skipped {} batches)", wal_file_path, records.len(), skipped_batches);
         }
 
-        info!("WAL read completed: found {} records (skipped {} batches)", records.len(), skipped_batches);
+        info!("WAL read completed: found {} total records from {} segment files", records.len(), wal_files.len());
         Ok(records)
     }
     
@@ -354,13 +395,23 @@ impl WalManager {
                             for partition_entry in partition_entries.flatten() {
                                 if let Ok(partition_name) = partition_entry.file_name().into_string() {
                                     if let Ok(partition) = partition_name.parse::<i32>() {
-                                        // Check if WAL file exists for this partition
-                                        let wal_file = topic_path.join(&partition_name).join("wal_0_0.log");
-                                        if wal_file.exists() {
-                                            partitions.push(TopicPartition {
-                                                topic: topic_name.clone(),
-                                                partition,
+                                        // Check if any WAL file exists for this partition
+                                        // Pattern: wal_{partition}_{segment_id}.log (v1.3.66+: supports rotation)
+                                        let partition_dir = topic_path.join(&partition_name);
+                                        if let Ok(wal_files) = fs::read_dir(&partition_dir) {
+                                            let has_wal_file = wal_files.flatten().any(|entry| {
+                                                entry.file_name()
+                                                    .to_str()
+                                                    .map(|name| name.starts_with(&format!("wal_{}_", partition)) && name.ends_with(".log"))
+                                                    .unwrap_or(false)
                                             });
+
+                                            if has_wal_file {
+                                                partitions.push(TopicPartition {
+                                                    topic: topic_name.clone(),
+                                                    partition,
+                                                });
+                                            }
                                         }
                                     }
                                 }

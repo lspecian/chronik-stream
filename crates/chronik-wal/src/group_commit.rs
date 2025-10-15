@@ -546,7 +546,9 @@ impl GroupCommitWal {
         let partition_dir = self.base_dir.join(topic).join(partition.to_string());
         tokio::fs::create_dir_all(&partition_dir).await?;
 
-        let wal_path = partition_dir.join("wal_0_0.log");
+        // Use partition-specific naming for consistency with rotation
+        // Format: wal_{partition}_{segment_id}.log
+        let wal_path = partition_dir.join(format!("wal_{}_0.log", partition));
 
         let file = OpenOptions::new()
             .create(true)
