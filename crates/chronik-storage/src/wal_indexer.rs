@@ -20,6 +20,7 @@ use crate::{
 };
 use chronik_wal::{WalManager, WalRecord};
 use chronik_common::{Result, Error};
+use chronik_common::metadata::traits::{MetadataStore, SegmentMetadata as MetadataSegmentMetadata};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time::{interval, Duration};
@@ -132,6 +133,9 @@ pub struct WalIndexer {
     /// Segment index registry
     segment_index: Arc<SegmentIndex>,
 
+    /// Metadata store for registering segment metadata
+    metadata_store: Arc<dyn MetadataStore>,
+
     /// Set of segments currently being indexed (to avoid duplicate work)
     indexing_in_progress: Arc<RwLock<HashSet<String>>>,
 
@@ -148,6 +152,7 @@ impl WalIndexer {
         config: WalIndexerConfig,
         wal_manager: Arc<WalManager>,
         object_store: Arc<dyn ObjectStore>,
+        metadata_store: Arc<dyn MetadataStore>,
     ) -> Self {
         // Create segment index with persistence
         let segment_index = if let Some(ref path) = config.segment_index_path {
@@ -164,6 +169,7 @@ impl WalIndexer {
             wal_manager,
             object_store,
             segment_index,
+            metadata_store,
             indexing_in_progress: Arc::new(RwLock::new(HashSet::new())),
             last_stats: Arc::new(RwLock::new(IndexingStats::default())),
             running: Arc::new(RwLock::new(false)),
@@ -200,6 +206,7 @@ impl WalIndexer {
         let wal_manager = Arc::clone(&self.wal_manager);
         let object_store = Arc::clone(&self.object_store);
         let segment_index = Arc::clone(&self.segment_index);
+        let metadata_store = Arc::clone(&self.metadata_store);
         let indexing_in_progress = Arc::clone(&self.indexing_in_progress);
         let last_stats = Arc::clone(&self.last_stats);
         let running = Arc::clone(&self.running);
@@ -225,6 +232,7 @@ impl WalIndexer {
                     &wal_manager,
                     &object_store,
                     &segment_index,
+                    &metadata_store,
                     &indexing_in_progress,
                 ).await {
                     Ok(stats) => {
@@ -266,13 +274,27 @@ impl WalIndexer {
         *self.running.read().await
     }
 
+    /// Run one indexing cycle immediately (used during shutdown)
+    pub async fn run_once(&self) -> Result<IndexingStats> {
+        info!("Running WAL indexer once (on-demand)");
+        Self::index_sealed_segments_internal(
+            &self.config,
+            &self.wal_manager,
+            &self.object_store,
+            &self.segment_index,
+            &self.metadata_store,
+            &self.indexing_in_progress,
+        ).await
+    }
+
     /// Index sealed segments (internal implementation)
-    #[instrument(skip(config, wal_manager, object_store, segment_index, indexing_in_progress))]
+    #[instrument(skip(config, wal_manager, object_store, segment_index, metadata_store, indexing_in_progress))]
     async fn index_sealed_segments_internal(
         config: &WalIndexerConfig,
         wal_manager: &Arc<WalManager>,
         object_store: &Arc<dyn ObjectStore>,
         segment_index: &Arc<SegmentIndex>,
+        metadata_store: &Arc<dyn MetadataStore>,
         indexing_in_progress: &Arc<RwLock<HashSet<String>>>,
     ) -> Result<IndexingStats> {
         let start_time = std::time::Instant::now();
@@ -322,6 +344,7 @@ impl WalIndexer {
                 wal_manager,
                 object_store,
                 segment_index,
+                metadata_store,
                 segment_id,
                 &mut stats,
             ).await {
@@ -348,12 +371,13 @@ impl WalIndexer {
     }
 
     /// Index a single sealed WAL segment
-    #[instrument(skip(config, wal_manager, object_store, segment_index, stats))]
+    #[instrument(skip(config, wal_manager, object_store, segment_index, metadata_store, stats))]
     async fn index_segment(
         config: &WalIndexerConfig,
         wal_manager: &Arc<WalManager>,
         object_store: &Arc<dyn ObjectStore>,
         segment_index: &Arc<SegmentIndex>,
+        metadata_store: &Arc<dyn MetadataStore>,
         segment_id: &str,
         stats: &mut IndexingStats,
     ) -> Result<()> {
@@ -401,6 +425,7 @@ impl WalIndexer {
             // This preserves the actual message data for consumption
             match Self::upload_raw_segment(
                 object_store,
+                metadata_store,
                 &tp,
                 &canonical_records,
             ).await {
@@ -472,9 +497,10 @@ impl WalIndexer {
     ///
     /// This stores the actual CanonicalRecords (bincode-serialized) so consumers can
     /// fetch messages from S3 when they're no longer in local WAL/segments.
-    #[instrument(skip(object_store, canonical_records))]
+    #[instrument(skip(object_store, metadata_store, canonical_records))]
     async fn upload_raw_segment(
         object_store: &Arc<dyn ObjectStore>,
+        metadata_store: &Arc<dyn MetadataStore>,
         tp: &TopicPartition,
         canonical_records: &[CanonicalRecord],
     ) -> Result<u64> {
@@ -520,6 +546,32 @@ impl WalIndexer {
             object_key = %object_key,
             bytes = data_size,
             "Uploaded raw segment data to S3"
+        );
+
+        // Register segment metadata in the metadata store
+        // This allows high watermarks to be restored on startup
+        let segment_id = format!("{}-{}", min_offset, max_offset);
+        let segment_metadata = MetadataSegmentMetadata {
+            segment_id,
+            topic: tp.topic.clone(),
+            partition: tp.partition as u32,
+            start_offset: min_offset,
+            end_offset: max_offset,
+            size: data_size as i64,
+            record_count: canonical_records.iter().map(|r| r.records.len() as i64).sum(),
+            path: object_key.clone(),
+            created_at: chrono::Utc::now(),
+        };
+
+        metadata_store.persist_segment_metadata(segment_metadata).await
+            .map_err(|e| Error::Internal(format!("Failed to register segment metadata: {}", e)))?;
+
+        info!(
+            topic = %tp.topic,
+            partition = tp.partition,
+            min_offset = min_offset,
+            max_offset = max_offset,
+            "Registered segment metadata"
         );
 
         Ok(data_size)

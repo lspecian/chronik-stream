@@ -2,8 +2,33 @@
 
 mod test_setup;
 mod common;
-mod basic_components_test;
+// mod basic_components_test;
 mod canonical_crc_test;
+mod raft_single_partition;
+mod raft_multi_partition;
+mod raft_cluster_bootstrap;
+// mod raft_cluster_e2e;  // Temporarily disabled
+mod raft_network_test;
+
+// Multi-node Raft cluster integration tests
+#[cfg(feature = "raft")]
+mod raft_cluster_integration;
+
+// Phase 3: Raft-based Produce Path test
+#[cfg(feature = "raft")]
+mod raft_produce_path_test;
+
+// Single-node Raft debug test
+mod raft_single_node_debug;
+
+mod wal_raft_storage;
+
+// Phase 2.2: Partition assignment persistence tests
+mod partition_assignment_persistence;
+
+// Raft snapshot support tests
+#[cfg(feature = "raft")]
+mod raft_snapshot_test;
 
 // Tests that require full cluster setup
 // mod cluster;

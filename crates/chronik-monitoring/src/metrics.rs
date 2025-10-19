@@ -220,6 +220,11 @@ impl MetricsRegistry {
     pub fn wal(&self) -> WalMetrics {
         WalMetrics::new()
     }
+
+    /// Get Raft metrics
+    pub fn raft(&self) -> crate::raft_metrics::RaftMetrics {
+        crate::raft_metrics::RaftMetrics::new()
+    }
 }
 
 /// Controller metrics

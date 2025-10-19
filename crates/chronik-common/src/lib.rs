@@ -4,6 +4,7 @@ pub mod error;
 pub mod metrics;
 pub mod types;
 pub mod metadata;
+pub mod partition_assignment;
 
 pub use error::{Error, Result};
 

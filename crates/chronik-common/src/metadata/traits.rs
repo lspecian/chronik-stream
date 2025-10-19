@@ -159,6 +159,10 @@ pub trait MetadataStore: Send + Sync {
     // Partition assignment operations
     async fn assign_partition(&self, assignment: PartitionAssignment) -> Result<()>;
     async fn get_partition_assignments(&self, topic: &str) -> Result<Vec<PartitionAssignment>>;
+
+    // Partition leader query operations (for Kafka Metadata API)
+    async fn get_partition_leader(&self, topic: &str, partition: u32) -> Result<Option<i32>>;
+    async fn get_partition_replicas(&self, topic: &str, partition: u32) -> Result<Option<Vec<i32>>>;
     
     // Consumer group operations
     async fn create_consumer_group(&self, metadata: ConsumerGroupMetadata) -> Result<()>;

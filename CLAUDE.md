@@ -579,10 +579,67 @@ After successful persistence, old WAL segments are truncated.
 ## Operational Modes
 
 The `chronik-server` binary supports:
-- **Standalone** (default) - Single-node Kafka server
+- **Standalone** (default) - Single-node Kafka server with WAL-only (no Raft)
+- **Raft Cluster** - Multi-node Kafka cluster with Raft consensus (requires `--raft` flag and 3+ nodes)
 - **Ingest** - Data ingestion (future: distributed)
 - **Search** - Search node (requires `--features search`)
 - **All** - All components in one process
+
+### Raft Clustering (Multi-Node Replication)
+
+**CRITICAL**: Raft is ONLY for multi-node clusters (3+ nodes for quorum). Single-node deployments should use standalone mode.
+
+#### Why Single-Node Raft is Rejected
+
+Raft provides **zero benefit** for single-node deployments:
+- ❌ No fault tolerance (1 node dies = cluster down)
+- ❌ No replication (data only exists on 1 node)
+- ❌ Adds latency (Raft state machine overhead)
+- ✅ WAL already provides durability for single-node
+
+**Use standalone mode for single-node:**
+```bash
+# Correct: Single-node with WAL-only (fast path)
+cargo run --bin chronik-server -- standalone
+
+# REJECTED: Single-node with Raft (will error)
+cargo run --bin chronik-server -- --raft standalone  # Error: "Raft requires 3+ nodes"
+```
+
+#### Multi-Node Raft Cluster Setup
+
+**Minimum 3 nodes required for quorum:**
+```bash
+# Node 1 (port 9092)
+cargo run --bin chronik-server -- \
+  --advertised-addr node1:9092 \
+  --raft \
+  standalone
+
+# Node 2 (port 9093)
+cargo run --bin chronik-server -- \
+  --advertised-addr node2:9092 \
+  --raft \
+  standalone
+
+# Node 3 (port 9094)
+cargo run --bin chronik-server -- \
+  --advertised-addr node3:9092 \
+  --raft \
+  standalone
+```
+
+**Raft Configuration:**
+- `chronik-cluster.toml` defines cluster topology
+- Each node gets a unique `node_id` (1, 2, 3, etc.)
+- Raft gRPC port = Kafka port + 100 (e.g., 9192 for node on 9092)
+- Requires peer connectivity on both Kafka and Raft ports
+
+**Benefits of Raft Cluster:**
+- ✅ Quorum-based replication (survives minority failures)
+- ✅ Automatic leader election
+- ✅ Strong consistency (linearizable reads/writes)
+- ✅ Fault tolerance (can lose minority of nodes)
 
 WAL compaction CLI:
 ```bash

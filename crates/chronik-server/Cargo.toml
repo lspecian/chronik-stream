@@ -20,12 +20,14 @@ chronik-wal = { path = "../chronik-wal" }
 # chronik-ingest removed - code moved directly into chronik-server
 chronik-monitoring = { path = "../chronik-monitoring" }
 chronik-auth = { path = "../chronik-auth" }
+chronik-config = { path = "../chronik-config" }  # Required for cluster configuration
 
 # Optional components (feature-gated)
 chronik-search = { path = "../chronik-search", optional = true }
 chronik-query = { path = "../chronik-query", optional = true }
 chronik-backup = { path = "../chronik-backup", optional = true }
-chronik-config = { path = "../chronik-config", optional = true }
+chronik-raft = { path = "../chronik-raft", optional = true }
+raft = { workspace = true, optional = true }
 
 # Core dependencies
 tokio = { workspace = true }
@@ -44,9 +46,11 @@ tracing-subscriber = { workspace = true }
 # Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = "0.9"  # For YAML output in CLI
 bincode = { workspace = true }
 byteorder = { workspace = true }
 base64 = "0.22"
+toml = "0.8"  # For cluster config parsing
 
 # Utils
 uuid = { workspace = true }
@@ -63,6 +67,9 @@ socket2 = "0.5"
 # Force vendored OpenSSL for musl builds
 openssl = { workspace = true }
 
+# CLI table formatting
+tabled = "0.15"
+
 # Metrics handled by chronik-monitoring dependency
 
 
@@ -70,8 +77,8 @@ openssl = { workspace = true }
 default = ["search", "backup"]
 search = ["dep:chronik-search", "dep:chronik-query"]
 backup = ["dep:chronik-backup"]
-dynamic-config = ["dep:chronik-config"]
-full = ["search", "backup", "dynamic-config"]
+raft = ["dep:chronik-raft", "dep:raft", "chronik-wal/raft-storage"]
+full = ["search", "backup", "raft"]
 
 # Minimal build without optional features
 minimal = []

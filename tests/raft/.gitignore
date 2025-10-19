@@ -1,0 +1,13 @@
+# Rust
+target/
+Cargo.lock
+
+# Test artifacts
+*.log
+test-data/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo

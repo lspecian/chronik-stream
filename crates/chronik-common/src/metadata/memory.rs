@@ -179,6 +179,34 @@ impl MetadataStore for InMemoryMetadataStore {
             .cloned()
             .collect())
     }
+
+    async fn get_partition_leader(&self, topic: &str, partition: u32) -> Result<Option<i32>> {
+        let assignments = self.partition_assignments.read().await;
+        let key = (topic.to_string(), partition);
+        Ok(assignments.get(&key).and_then(|a| {
+            if a.is_leader {
+                Some(a.broker_id)
+            } else {
+                None
+            }
+        }))
+    }
+
+    async fn get_partition_replicas(&self, topic: &str, partition: u32) -> Result<Option<Vec<i32>>> {
+        let assignments = self.partition_assignments.read().await;
+
+        // Get all assignments for this partition
+        let replicas: Vec<i32> = assignments.values()
+            .filter(|a| a.topic == topic && a.partition == partition)
+            .map(|a| a.broker_id)
+            .collect();
+
+        if replicas.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(replicas))
+        }
+    }
     
     async fn create_consumer_group(&self, group: ConsumerGroupMetadata) -> Result<()> {
         let mut groups = self.consumer_groups.write().await;

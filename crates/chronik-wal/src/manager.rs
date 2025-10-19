@@ -797,3 +797,13 @@ fn extract_offset_range(canonical_data: &[u8]) -> Result<(i64, i64)> {
 
     Ok((base_offset, last_offset))
 }
+
+impl WalManager {
+    /// Shutdown the WAL manager and flush all pending data
+    /// This seals all active WAL segments to disk so they can be indexed
+    pub async fn shutdown(&self) {
+        info!("Shutting down WAL manager...");
+        self.group_commit_wal.shutdown().await;
+        info!("WAL manager shutdown complete");
+    }
+}

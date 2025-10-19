@@ -59,8 +59,43 @@ struct SegmentInfo {
     object_key: String,
 }
 
+/// Configuration for FetchHandler behavior
+#[derive(Debug, Clone)]
+pub struct FetchHandlerConfig {
+    /// Enable follower reads (default: true)
+    /// If false, only leaders can serve fetches
+    pub allow_follower_reads: bool,
+
+    /// Maximum wait time for commit in follower reads (ms)
+    pub follower_read_max_wait_ms: u64,
+
+    /// Node ID (for preferred_read_replica)
+    pub node_id: i32,
+}
+
+impl Default for FetchHandlerConfig {
+    fn default() -> Self {
+        let allow_follower_reads = std::env::var("CHRONIK_FETCH_FROM_FOLLOWERS")
+            .unwrap_or_else(|_| "true".to_string())
+            .parse()
+            .unwrap_or(true);
+
+        let follower_read_max_wait_ms = std::env::var("CHRONIK_FETCH_FOLLOWER_MAX_WAIT_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1000); // 1 second default
+
+        Self {
+            allow_follower_reads,
+            follower_read_max_wait_ms,
+            node_id: 0,
+        }
+    }
+}
+
 /// Fetch request handler
 /// v1.3.47+: Uses Arc<WalManager> directly (no RwLock - WalManager uses DashMap internally)
+/// v1.3.66+: Raft-aware with follower read support using RaftReplicaManager
 pub struct FetchHandler {
     segment_reader: Arc<SegmentReader>,
     metadata_store: Arc<dyn MetadataStore>,
@@ -69,6 +104,11 @@ pub struct FetchHandler {
     segment_index: Option<Arc<SegmentIndex>>,
     produce_handler: Option<Arc<crate::produce_handler::ProduceHandler>>,
     state: Arc<RwLock<FetchState>>,
+    /// Raft replica manager for multi-partition replication (v1.3.66+)
+    #[cfg(feature = "raft")]
+    raft_manager: Option<Arc<crate::raft_integration::RaftReplicaManager>>,
+    /// Configuration for fetch behavior
+    config: FetchHandlerConfig,
 }
 
 impl FetchHandler {
@@ -89,6 +129,9 @@ impl FetchHandler {
                 buffers: HashMap::new(),
                 segment_cache: HashMap::new(),
             })),
+            #[cfg(feature = "raft")]
+            raft_manager: None,
+            config: FetchHandlerConfig::default(),
         }
     }
 
@@ -112,6 +155,9 @@ impl FetchHandler {
                 buffers: HashMap::new(),
                 segment_cache: HashMap::new(),
             })),
+            #[cfg(feature = "raft")]
+            raft_manager: None,
+            config: FetchHandlerConfig::default(),
         }
     }
 
@@ -135,9 +181,45 @@ impl FetchHandler {
                 buffers: HashMap::new(),
                 segment_cache: HashMap::new(),
             })),
+            #[cfg(feature = "raft")]
+            raft_manager: None,
+            config: FetchHandlerConfig::default(),
         }
     }
-    
+
+    /// Create a new fetch handler with WAL, ProduceHandler, and Raft integration (v1.3.66+)
+    #[cfg(feature = "raft")]
+    pub fn new_with_wal_and_raft(
+        segment_reader: Arc<SegmentReader>,
+        metadata_store: Arc<dyn MetadataStore>,
+        object_store: Arc<dyn ObjectStoreTrait>,
+        wal_manager: Arc<WalManager>,
+        produce_handler: Arc<crate::produce_handler::ProduceHandler>,
+        raft_manager: Arc<crate::raft_integration::RaftReplicaManager>,
+        config: FetchHandlerConfig,
+    ) -> Self {
+        info!(
+            "FetchHandler initialized with Raft: allow_follower_reads={}, follower_read_max_wait_ms={}, node_id={}",
+            config.allow_follower_reads, config.follower_read_max_wait_ms, config.node_id
+        );
+
+        Self {
+            segment_reader,
+            metadata_store,
+            object_store,
+            wal_manager: Some(wal_manager),
+            segment_index: None,
+            produce_handler: Some(produce_handler),
+            state: Arc::new(RwLock::new(FetchState {
+                buffers: HashMap::new(),
+                segment_cache: HashMap::new(),
+            })),
+            raft_manager: Some(raft_manager),
+            config,
+        }
+    }
+
+
     /// Handle a fetch request
     pub async fn handle_fetch(
         &self,
@@ -191,6 +273,97 @@ impl FetchHandler {
             "fetch_partition called - topic: {}, partition: {}, fetch_offset: {}, max_bytes: {}",
             topic, partition, fetch_offset, max_bytes
         );
+
+        // PHASE 0: Raft-aware leadership and commit checking (v1.3.66+)
+        // Check if we need to enforce leader-only reads or check commit offset
+        #[cfg(feature = "raft")]
+        if let Some(ref raft_manager) = self.raft_manager {
+            if raft_manager.is_enabled() {
+                // Check if replica exists for this partition
+                let replica = match raft_manager.get_replica(topic, partition) {
+                    Some(r) => r,
+                    None => {
+                        // No replica - either not yet created or not part of this node's partitions
+                        warn!(
+                            "No Raft replica found for {}-{} on node {}, returning NOT_LEADER",
+                            topic, partition, self.config.node_id
+                        );
+                        return Ok(FetchResponsePartition {
+                            partition,
+                            error_code: 6, // NOT_LEADER_FOR_PARTITION
+                            high_watermark: -1,
+                            last_stable_offset: -1,
+                            log_start_offset: -1,
+                            aborted: None,
+                            preferred_read_replica: -1,
+                            records: vec![],
+                        });
+                    }
+                };
+
+                // Option B: Leader-only reads (if configured)
+                if !self.config.allow_follower_reads {
+                    if !replica.is_leader() {
+                        let leader_id = replica.leader_id();
+                        info!(
+                            "Leader-only mode: Node {} is not leader for {}-{} (leader={}), returning NOT_LEADER",
+                            self.config.node_id, topic, partition, leader_id
+                        );
+                        return Ok(FetchResponsePartition {
+                            partition,
+                            error_code: 6, // NOT_LEADER_FOR_PARTITION
+                            high_watermark: -1,
+                            last_stable_offset: -1,
+                            log_start_offset: -1,
+                            aborted: None,
+                            preferred_read_replica: leader_id as i32,
+                            records: vec![],
+                        });
+                    }
+                }
+
+                // Option A: Follower reads (default)
+                // Get committed offset from Raft - this is the highest offset safe to serve
+                let committed_offset = replica.commit_index() as i64;
+
+                info!(
+                    "Raft-aware fetch for {}-{}: fetch_offset={}, committed_offset={}, is_leader={}",
+                    topic, partition, fetch_offset, committed_offset, replica.is_leader()
+                );
+
+                // If requesting data beyond committed offset, either wait or return empty
+                if fetch_offset >= committed_offset {
+                    info!(
+                        "Fetch for {}-{} at offset {} waiting for commit (committed_offset={})",
+                        topic, partition, fetch_offset, committed_offset
+                    );
+
+                    // TODO: Implement wait for commit with polling
+                    // For now, return empty response with committed offset as high watermark
+                    let empty_records = self.encode_kafka_records(&[], 0)?;
+
+                    return Ok(FetchResponsePartition {
+                        partition,
+                        error_code: 0,
+                        high_watermark: committed_offset, // Advertise committed offset
+                        last_stable_offset: committed_offset,
+                        log_start_offset: 0,
+                        aborted: None,
+                        preferred_read_replica: if replica.is_leader() {
+                            self.config.node_id
+                        } else {
+                            -1 // Let client decide
+                        },
+                        records: empty_records,
+                    });
+                }
+
+                // Data is committed and available, cap fetch at committed_offset
+                // This ensures we never serve uncommitted data from followers
+                debug!("Capping high_watermark to committed_offset={} for follower read", committed_offset);
+            }
+        }
+
         // First check if topic exists
         let topic_metadata = match self.metadata_store.get_topic(topic).await? {
             Some(meta) => meta,
@@ -770,55 +943,44 @@ impl FetchHandler {
     ) -> Result<Vec<chronik_storage::Record>> {
         use chronik_storage::canonical_record::CanonicalRecord;
 
-        // List all segment files in S3 for this topic/partition
-        // Path pattern: segments/{topic}/{partition}/*.segment
-        let prefix = format!("segments/{}/{}/", topic, partition);
-
+        // Use metadata store to find segments instead of parsing filenames
         info!(
-            "S3→LIST: Looking for raw segments with prefix: {}",
-            prefix
+            "METADATA→LIST: Looking for segments for {}-{}",
+            topic, partition
         );
 
-        // List objects with the prefix
-        let objects = match self.object_store.list(&prefix).await {
-            Ok(objs) => objs,
+        // List segments from metadata store
+        let all_segments = match self.metadata_store.list_segments(topic, Some(partition as u32)).await {
+            Ok(segs) => segs,
             Err(e) => {
-                warn!("S3→LIST: Failed to list objects with prefix {}: {}", prefix, e);
+                warn!("METADATA→LIST: Failed to list segments for {}-{}: {}", topic, partition, e);
                 return Ok(vec![]);
             }
         };
 
-        if objects.is_empty() {
-            info!("S3→LIST: No raw segments found for {}-{}", topic, partition);
+        if all_segments.is_empty() {
+            info!("METADATA→LIST: No segments found for {}-{}", topic, partition);
             return Ok(vec![]);
         }
 
         info!(
-            "S3→LIST: Found {} raw segment files for {}-{}",
-            objects.len(), topic, partition
+            "METADATA→LIST: Found {} segment(s) for {}-{}",
+            all_segments.len(), topic, partition
         );
 
-        // Parse segment filenames to find ones that overlap with [fetch_offset, high_watermark)
+        // Find segments that overlap with [fetch_offset, high_watermark)
         let mut matching_segments = Vec::new();
-        for obj_meta in objects {
-            let object_key = &obj_meta.key;
-            // Parse filename: {min_offset}-{max_offset}.segment
-            if let Some(filename) = object_key.strip_prefix(&prefix) {
-                if let Some(range_part) = filename.strip_suffix(".segment") {
-                    let parts: Vec<&str> = range_part.split('-').collect();
-                    if parts.len() == 2 {
-                        if let (Ok(min_offset), Ok(max_offset)) = (parts[0].parse::<i64>(), parts[1].parse::<i64>()) {
-                            // Check if this segment overlaps with [fetch_offset, high_watermark)
-                            if max_offset >= fetch_offset && min_offset < high_watermark {
-                                info!(
-                                    "S3→MATCH: Segment {} covers offsets {}-{}, overlaps with fetch range {}-{}",
-                                    object_key, min_offset, max_offset, fetch_offset, high_watermark
-                                );
-                                matching_segments.push((object_key.clone(), min_offset, max_offset));
-                            }
-                        }
-                    }
-                }
+        for seg_meta in all_segments {
+            let min_offset = seg_meta.start_offset;
+            let max_offset = seg_meta.end_offset;
+
+            // Check if this segment overlaps with [fetch_offset, high_watermark)
+            if max_offset >= fetch_offset && min_offset < high_watermark {
+                info!(
+                    "METADATA→MATCH: Segment {} covers offsets {}-{}, overlaps with fetch range {}-{}",
+                    seg_meta.path, min_offset, max_offset, fetch_offset, high_watermark
+                );
+                matching_segments.push((seg_meta.path.clone(), min_offset, max_offset));
             }
         }
 
@@ -863,12 +1025,13 @@ impl FetchHandler {
                 segment_data.len(), object_key
             );
 
-            // Deserialize Vec<CanonicalRecord> using bincode
+            // Deserialize as Vec<CanonicalRecord> (WalIndexer format)
+            // This is bincode-serialized CanonicalRecords from WAL
             let canonical_records: Vec<CanonicalRecord> = match bincode::deserialize(&segment_data) {
                 Ok(records) => records,
                 Err(e) => {
                     error!(
-                        "S3→DESERIALIZE: Failed to deserialize segment {}: {}",
+                        "S3→DESERIALIZE: Failed to deserialize canonical records from {}: {}",
                         object_key, e
                     );
                     continue;
@@ -876,7 +1039,7 @@ impl FetchHandler {
             };
 
             info!(
-                "S3→DESERIALIZE: Segment {} contains {} canonical records",
+                "S3→DESERIALIZE: Segment {} contains {} canonical record batches",
                 object_key, canonical_records.len()
             );
 

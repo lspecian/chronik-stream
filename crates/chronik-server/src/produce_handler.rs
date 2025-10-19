@@ -312,6 +312,11 @@ pub struct ProduceHandler {
     /// WAL manager for inline durability writes (v1.3.47+)
     /// Uses Arc<WalManager> directly - no RwLock needed since WalManager uses DashMap internally
     wal_manager: Option<Arc<WalManager>>,
+    /// Raft replica manager for multi-partition replication (optional, for Raft-enabled partitions)
+    /// If Some, produce requests will use Raft consensus for those partitions
+    /// If None, all produce requests use existing direct-write path (backward compatible)
+    #[cfg(feature = "raft")]
+    raft_manager: Option<Arc<crate::raft_integration::RaftReplicaManager>>,
 }
 
 /// Replication request for ISR management
@@ -620,6 +625,8 @@ impl ProduceHandler {
             fetch_handler: None,
             topic_creation_cache: Arc::new(RwLock::new(HashMap::new())),
             wal_manager: None,
+            #[cfg(feature = "raft")]
+            raft_manager: None,
         })
     }
 
@@ -652,6 +659,13 @@ impl ProduceHandler {
     /// Set the fetch handler for updating buffers
     pub fn set_fetch_handler(&mut self, fetch_handler: Arc<FetchHandler>) {
         self.fetch_handler = Some(fetch_handler);
+    }
+
+    /// Set the Raft replica manager for Raft-enabled partitions (optional)
+    #[cfg(feature = "raft")]
+    pub fn set_raft_manager(&mut self, raft_manager: Arc<crate::raft_integration::RaftReplicaManager>) {
+        info!("Setting RaftReplicaManager for ProduceHandler");
+        self.raft_manager = Some(raft_manager);
     }
     
     /// Create a new produce handler with fetch handler connected
@@ -703,6 +717,41 @@ impl ProduceHandler {
         });
     }
     
+    /// Check leadership using metadata store (fallback when Raft is not enabled)
+    ///
+    /// # Returns
+    /// (is_leader, leader_hint) where leader_hint is the current leader node ID if known
+    async fn check_metadata_leadership(&self, topic: &str, partition: i32) -> Result<(bool, Option<u64>)> {
+        let assignments = self.metadata_store
+            .get_partition_assignments(topic)
+            .await?;
+
+        // Debug partition assignments and leadership
+        debug!(
+            "Metadata leadership check for {}-{}: node_id={}, assignments={:?}",
+            topic, partition, self.config.node_id, assignments
+        );
+
+        let (is_leader, leader_id) = assignments.iter()
+            .find(|a| a.partition == partition as u32)
+            .map(|a| {
+                let leader = a.is_leader && a.broker_id == self.config.node_id;
+                let leader_node = if a.is_leader {
+                    Some(a.broker_id as u64)
+                } else {
+                    None
+                };
+                debug!(
+                    "Partition {}-{}: assignment broker_id={}, is_leader={}, our_node_id={}, result={}",
+                    topic, partition, a.broker_id, a.is_leader, self.config.node_id, leader
+                );
+                (leader, leader_node)
+            })
+            .unwrap_or((false, None));
+
+        Ok((is_leader, leader_id))
+    }
+
     /// Handle a produce request
     #[instrument(skip(self, request), fields(correlation_id, acks = request.acks))]
     pub async fn handle_produce(
@@ -876,38 +925,51 @@ impl ProduceHandler {
                     continue;
                 }
                 
-                // Check if we're the leader for this partition
-                let assignments = self.metadata_store
-                    .get_partition_assignments(&topic_data.name)
-                    .await?;
+                // Check leadership: Raft takes precedence over metadata store
+                #[cfg(feature = "raft")]
+                let (is_leader, leader_hint) = {
+                    if let Some(ref raft_manager) = self.raft_manager {
+                        // Check if this partition is managed by Raft
+                        if raft_manager.has_replica(&topic_data.name, partition_data.index) {
+                            let is_raft_leader = raft_manager.is_leader(&topic_data.name, partition_data.index);
+                            let leader_id = raft_manager.get_leader(&topic_data.name, partition_data.index);
 
-                // Debug partition assignments and leadership
-                debug!(
-                    "Leadership check for {}-{}: node_id={}, assignments={:?}",
-                    topic_data.name, partition_data.index, self.config.node_id, assignments
-                );
+                            debug!(
+                                "Raft leadership check for {}-{}: is_leader={}, leader_id={:?}",
+                                topic_data.name, partition_data.index, is_raft_leader, leader_id
+                            );
 
-                let is_leader = assignments.iter()
-                    .find(|a| a.partition == partition_data.index as u32)
-                    .map(|a| {
-                        let leader = a.is_leader && a.broker_id == self.config.node_id;
-                        debug!(
-                            "Partition {}-{}: assignment broker_id={}, is_leader={}, our_node_id={}, result={}",
-                            topic_data.name, partition_data.index, a.broker_id, a.is_leader, self.config.node_id, leader
-                        );
-                        leader
-                    })
-                    .unwrap_or(false);
-                
+                            (is_raft_leader, leader_id)
+                        } else {
+                            // Partition not managed by Raft, fall back to metadata store
+                            debug!(
+                                "Partition {}-{} not managed by Raft, using metadata store for leadership",
+                                topic_data.name, partition_data.index
+                            );
+                            self.check_metadata_leadership(&topic_data.name, partition_data.index).await?
+                        }
+                    } else {
+                        // No Raft manager, use metadata store
+                        self.check_metadata_leadership(&topic_data.name, partition_data.index).await?
+                    }
+                };
+
+                #[cfg(not(feature = "raft"))]
+                let (is_leader, leader_hint) = self.check_metadata_leadership(&topic_data.name, partition_data.index).await?;
+
                 if !is_leader {
-                        response_partitions.push(ProduceResponsePartition {
-                            index: partition_data.index,
-                            error_code: ErrorCode::NotLeaderForPartition.code(),
-                            base_offset: -1,
-                            log_append_time: -1,
-                            log_start_offset: 0,
-                        });
-                        continue;
+                    debug!(
+                        "Not leader for {}-{}, returning NOT_LEADER_FOR_PARTITION (leader_hint={:?})",
+                        topic_data.name, partition_data.index, leader_hint
+                    );
+                    response_partitions.push(ProduceResponsePartition {
+                        index: partition_data.index,
+                        error_code: ErrorCode::NotLeaderForPartition.code(),
+                        base_offset: -1,
+                        log_append_time: -1,
+                        log_start_offset: 0,
+                    });
+                    continue;
                 }
                 
                 // Process the partition data
@@ -1039,16 +1101,6 @@ impl ProduceHandler {
             (bytes, kafka_batch)
         };
 
-        // TODO (Phase 3): Write CanonicalRecord to WAL as V2 record
-        // This will enable layered storage: WAL (hot) → Tantivy segments (warm) → Object store (cold)
-        // Requires adding wal_manager field to ProduceHandler struct
-        //
-        // Example code:
-        // if let Some(ref mut wal_manager) = self.wal_manager {
-        //     let canonical_data = bincode::serialize(&canonical_record)?;
-        //     wal_manager.append_canonical(topic.to_string(), partition, canonical_data).await?;
-        // }
-
         // Validate producer info for idempotence
         if kafka_batch.header.producer_id >= 0 {
             self.validate_producer_sequence(
@@ -1123,9 +1175,120 @@ impl ProduceHandler {
             topic, partition, base_offset, records.len(), total_bytes
         );
 
+        // PHASE 3: Raft-based Produce Path
+        // Check if this partition is Raft-enabled FIRST, before writing to WAL directly
+        #[cfg(feature = "raft")]
+        {
+            if let Some(ref raft_manager) = self.raft_manager {
+                if raft_manager.has_replica(topic, partition) {
+                    // LEADER CHECK: Only the leader can accept produce requests
+                    if !raft_manager.is_leader(topic, partition) {
+                        // This node is not the leader - return error with leader info
+                        let leader_id = raft_manager.get_leader(topic, partition);
+                        warn!(
+                            "NOT_LEADER: {}-{} leader_id={:?}, this node cannot accept produce requests",
+                            topic, partition, leader_id
+                        );
+
+                        // Drop memory permit before returning error
+                        drop(memory_permit);
+
+                        // Return LEADER_NOT_AVAILABLE error (Kafka standard for non-leader)
+                        return Ok(ProduceResponsePartition {
+                            index: partition,
+                            error_code: chronik_protocol::error_codes::LEADER_NOT_AVAILABLE,
+                            base_offset: -1,
+                            log_append_time: -1,
+                            log_start_offset: -1,
+                        });
+                    }
+
+                    info!("Raft-enabled partition {}-{}: Proposing write to Raft consensus (leader)", topic, partition);
+
+                    // Serialize the canonical record for Raft proposal
+                    use chronik_storage::canonical_record::CanonicalRecord;
+                    match CanonicalRecord::from_kafka_batch(&re_encoded_bytes) {
+                        Ok(mut canonical_record) => {
+                            // Preserve original wire bytes for CRC validation
+                            canonical_record.compressed_records_wire_bytes = Some(re_encoded_bytes.to_vec());
+
+                            match bincode::serialize(&canonical_record) {
+                                Ok(serialized) => {
+                                    // Propose to Raft (will block until committed by quorum)
+                                    // The state machine will handle WAL writes and storage
+                                    match raft_manager.propose(topic, partition, serialized).await {
+                                        Ok(raft_index) => {
+                                            info!("Raft✓ {}-{}: Committed at index={}, offsets={}-{}",
+                                                topic, partition, raft_index, base_offset, last_offset);
+
+                                            // Update metrics
+                                            self.metrics.records_produced.fetch_add(records.len() as u64, Ordering::Relaxed);
+                                            self.metrics.bytes_produced.fetch_add(total_bytes, Ordering::Relaxed);
+
+                                            // Update high watermark after successful Raft commit
+                                            partition_state.high_watermark.store((last_offset + 1) as u64, Ordering::SeqCst);
+
+                                            // Send to indexing pipeline if enabled
+                                            if self.config.enable_indexing {
+                                                self.send_to_indexer(topic, partition, &records).await;
+                                            }
+
+                                            // Update producer sequence for idempotence
+                                            if kafka_batch.header.producer_id >= 0 {
+                                                self.update_producer_sequence(
+                                                    kafka_batch.header.producer_id,
+                                                    topic,
+                                                    partition,
+                                                    kafka_batch.header.base_sequence + records.len() as i32 - 1,
+                                                ).await;
+                                            }
+
+                                            // Drop memory permit
+                                            drop(memory_permit);
+
+                                            // Get partition state for response
+                                            let log_start_offset = partition_state.log_start_offset.load(Ordering::Relaxed) as i64;
+
+                                            // Return success immediately - Raft has replicated the data
+                                            return Ok(ProduceResponsePartition {
+                                                index: partition,
+                                                error_code: ErrorCode::None.code(),
+                                                base_offset: base_offset as i64,
+                                                log_append_time: if (kafka_batch.header.attributes >> 3) & 0b111 == TimestampType::LogAppendTime as u16 {
+                                                    kafka_batch.header.max_timestamp
+                                                } else {
+                                                    -1
+                                                },
+                                                log_start_offset,
+                                            });
+                                        }
+                                        Err(e) => {
+                                            error!("Raft proposal failed for {}-{}: {}", topic, partition, e);
+                                            return Err(Error::Internal(format!("Raft consensus failed: {}", e)));
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("Failed to serialize for Raft {}-{}: {}", topic, partition, e);
+                                    return Err(Error::Internal(format!("Raft serialization failed: {}", e)));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to parse batch for Raft {}-{}: {}", topic, partition, e);
+                            return Err(Error::Protocol(format!("Invalid batch for Raft: {}", e)));
+                        }
+                    }
+                }
+            }
+        }
+
+        // NON-RAFT PATH: Direct WAL write for partitions not managed by Raft
+        // This is the fallback for standalone mode or non-Raft partitions
+        warn!("DEBUG_TRACE: Using non-Raft path for {}-{}", topic, partition);
+
         // CRITICAL (v1.3.47+): Write to WAL BEFORE updating high watermark
         // This ensures durability guarantee - data is persisted before acknowledgment
-        // WalManager uses DashMap internally for lock-free concurrent access
         if self.wal_manager.is_none() {
             warn!("WAL manager is None - WAL writes DISABLED! Data will NOT be durable!");
         }
@@ -1140,7 +1303,7 @@ impl ProduceHandler {
 
                     match bincode::serialize(&canonical_record) {
                         Ok(serialized) => {
-                            // v1.3.52+: Group commit with acks parameter (Option 4 + Option 2)
+                            // v1.3.52+: Group commit with acks parameter
                             // - acks=0: Fire-and-forget (buffered, ~50ms flush window)
                             // - acks=1/−1: Immediate fsync (zero data loss guarantee)
                             if let Err(e) = wal_mgr.append_canonical_with_acks(
@@ -1150,13 +1313,12 @@ impl ProduceHandler {
                                 base_offset as i64,
                                 last_offset as i64,
                                 records.len() as i32,
-                                acks  // Pass acks parameter for durability control
+                                acks
                             ).await {
                                 error!("WAL WRITE FAILED: topic={} partition={} acks={} error={}",
                                        topic, partition, acks, e);
                                 return Err(Error::Internal(format!("WAL write failed: {}", e)));
                             }
-                            // Log with acks mode for visibility
                             warn!("WAL✓ {}-{}: {} bytes, {} records (offsets {}-{}), acks={}",
                                 topic, partition, re_encoded_bytes.len(), records.len(),
                                 base_offset, last_offset, acks);
@@ -1174,11 +1336,36 @@ impl ProduceHandler {
             }
         }
 
-        // Buffer the batch with re-encoded wire format (correct CRC)
+        // Buffer the batch for non-Raft partitions
+        #[cfg(feature = "raft")]
         {
+            if let Some(ref raft_manager) = self.raft_manager {
+                if !raft_manager.has_replica(topic, partition) {
+                    debug!("Partition {}-{} not Raft-enabled, using normal buffering", topic, partition);
+                    let mut pending = partition_state.pending_batches.lock().await;
+                    pending.push(BufferedBatch {
+                        raw_bytes: re_encoded_bytes.to_vec(),
+                        records: records.clone(),
+                        base_offset: base_offset as i64,
+                    });
+                }
+            } else {
+                // No Raft manager, use normal buffering
+                let mut pending = partition_state.pending_batches.lock().await;
+                pending.push(BufferedBatch {
+                    raw_bytes: re_encoded_bytes.to_vec(),
+                    records: records.clone(),
+                    base_offset: base_offset as i64,
+                });
+            }
+        }
+
+        #[cfg(not(feature = "raft"))]
+        {
+            // Buffer the batch with re-encoded wire format (correct CRC)
             let mut pending = partition_state.pending_batches.lock().await;
             pending.push(BufferedBatch {
-                raw_bytes: re_encoded_bytes.to_vec(),  // Store re-encoded bytes with correct CRC!
+                raw_bytes: re_encoded_bytes.to_vec(),
                 records: records.clone(),
                 base_offset: base_offset as i64,
             });
@@ -1617,26 +1804,63 @@ impl ProduceHandler {
         Ok(())
     }
     
-    /// Flush pending records to storage
+    /// Flush pending records to storage (v1.3.66 - PROPER UNDERSTANDING)
     ///
-    /// POST-REFACTOR (v1.3.39+): This is now a NO-OP because data persistence happens via:
-    /// 1. WAL writes (handled by WalProduceHandler - ALREADY DONE during produce)
+    /// POST-REFACTOR (v1.3.39+): This is intentionally a NO-OP because data persistence happens via:
+    /// 1. Inline WAL writes (handled during handle_produce at line ~1208) - MANDATORY, acks-based
     /// 2. Background indexing (WalIndexer → Tantivy → Object Store)
     ///
-    /// The OLD dual-storage path (write_dual_format) has been REMOVED.
-    /// Data is served from: WAL (recent) + Tantivy (older) by FetchHandler.
+    /// pending_batches is for in-memory serving to consumers, NOT for durability.
+    /// Durability is guaranteed by inline WAL writes that happen BEFORE this method.
+    ///
+    /// The data flow is:
+    /// - Producer sends batch
+    /// - handle_produce() writes to WAL inline (line ~1208, with acks parameter)
+    /// - handle_produce() buffers to pending_batches for fast consumer reads
+    /// - Consumer reads from pending_batches (fast path) or WAL (slower path)
+    /// - WalIndexer periodically indexes WAL to Tantivy
+    ///
+    /// During shutdown:
+    /// - Inline WAL writes have already persisted all data
+    /// - pending_batches can be safely discarded (data is in WAL)
+    /// - No additional flush needed
     async fn flush_partition(
         &self,
         topic: &str,
         partition: i32,
         state: &Arc<PartitionState>,
     ) -> Result<()> {
-        tracing::debug!("FLUSH→NOOP: Flush called for {}-{} (data already in WAL, will be indexed by WalIndexer)", topic, partition);
+        // ARCHITECTURAL NOTE (v1.3.64):
+        // Data flow: Produce → WAL (GroupCommitWal V2) → WalIndexer → S3 raw segments
+        //
+        // The inline WAL writes (in WalProduceHandler) have ALREADY persisted all data.
+        // pending_batches are only for in-memory serving (Phase 1 buffer fetch).
+        //
+        // WalIndexer runs periodically (every 30s) to:
+        // 1. Read sealed WAL segments
+        // 2. Upload bincode Vec<CanonicalRecord> to S3 as raw segments
+        // 3. Create Tantivy indexes for searchability
+        //
+        // Therefore, flush_partition() should simply clear pending_batches since:
+        // - Data is already durable (in WAL)
+        // - Segment creation is WalIndexer's responsibility
+        // - No need to write to SegmentWriter (wrong format anyway)
 
-        // CRITICAL (v1.3.43): Do NOT clear pending_batches here!
-        // Reason: WalProduceHandler reads pending_batches AFTER handle_produce returns.
-        // If background flush task clears them before WAL write, data is lost.
-        // WalProduceHandler will clear them after successfully writing to WAL.
+        // Take all pending batches (discard them, data is in WAL)
+        let batches = {
+            let mut pending = state.pending_batches.lock().await;
+            std::mem::take(&mut *pending)
+        };
+
+        if batches.is_empty() {
+            trace!("No pending batches to flush for {}-{}", topic, partition);
+            return Ok(());
+        }
+
+        info!(
+            "Flushed {} batches from memory for {}-{} (data already in WAL, WalIndexer will upload to S3)",
+            batches.len(), topic, partition
+        );
 
         // Update last flush time
         {
@@ -1736,7 +1960,10 @@ impl ProduceHandler {
     }
     
     /// Auto-create a topic with default settings
-    async fn auto_create_topic(&self, topic_name: &str) -> Result<chronik_common::metadata::TopicMetadata> {
+    ///
+    /// This method creates a topic and automatically creates Raft replicas if Raft is enabled.
+    /// Should be called by both ProduceHandler internally and by KafkaProtocolHandler.
+    pub async fn auto_create_topic(&self, topic_name: &str) -> Result<chronik_common::metadata::TopicMetadata> {
         let start_time = Instant::now();
         
         // Validate topic name according to Kafka rules
@@ -1799,21 +2026,177 @@ impl ProduceHandler {
         // Attempt to create the topic
         let result = match self.metadata_store.create_topic(topic_name, topic_config).await {
             Ok(metadata) => {
-                // Create partition assignments for this broker (single-node setup)
-                for partition in 0..self.config.num_partitions {
-                    let assignment = chronik_common::metadata::PartitionAssignment {
-                        topic: topic_name.to_string(),
-                        partition,
-                        broker_id: self.config.node_id,
-                        is_leader: true, // Single node is always the leader
-                    };
-                    
-                    if let Err(e) = self.metadata_store.assign_partition(assignment).await {
-                        warn!("Failed to assign partition {} for topic '{}': {:?}", 
-                            partition, topic_name, e);
+                // Create partition assignments
+                // For clustered mode, use round-robin assignment across nodes
+                // For standalone mode, assign all partitions to this node
+                #[cfg(feature = "raft")]
+                if let Some(ref raft_manager) = self.raft_manager {
+                    if raft_manager.is_enabled() {
+                        // Clustered mode: Use round-robin assignment
+                        use chronik_common::partition_assignment::PartitionAssignment as AssignmentManager;
+
+                        let peers = raft_manager.get_peers().await;
+                        info!("Auto-creating topic '{}' in cluster mode with {} peers", topic_name, peers.len());
+
+                        // Convert peer IDs from u64 to u32 for partition_assignment module
+                        let peer_ids: Vec<u32> = peers.iter().map(|&id| id as u32).collect();
+
+                        let mut assignment_mgr = AssignmentManager::new();
+                        if let Err(e) = assignment_mgr.add_topic(
+                            topic_name,
+                            self.config.num_partitions as i32,
+                            self.config.default_replication_factor.min(peers.len() as u32) as i32,
+                            &peer_ids,
+                        ) {
+                            warn!("Failed to create partition assignment plan for topic '{}': {:?}", topic_name, e);
+                        } else {
+                            // Persist assignments via metadata store
+                            let topic_assignments = assignment_mgr.get_topic_assignments(topic_name);
+                            for (partition_id, partition_info) in topic_assignments {
+                                for (replica_idx, &node_id) in partition_info.replicas.iter().enumerate() {
+                                    let is_leader = node_id == partition_info.leader;
+                                    let assignment = chronik_common::metadata::PartitionAssignment {
+                                        topic: topic_name.to_string(),
+                                        partition: partition_id as u32,
+                                        broker_id: node_id as i32,
+                                        is_leader,
+                                    };
+
+                                    if let Err(e) = self.metadata_store.assign_partition(assignment).await {
+                                        warn!("Failed to assign partition {} for topic '{}' to node {}: {:?}",
+                                            partition_id, topic_name, node_id, e);
+                                    } else if is_leader {
+                                        info!("Assigned partition {}/{} to node {} (leader)",
+                                            topic_name, partition_id, node_id);
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        // Standalone mode with Raft disabled
+                        for partition in 0..self.config.num_partitions {
+                            let assignment = chronik_common::metadata::PartitionAssignment {
+                                topic: topic_name.to_string(),
+                                partition,
+                                broker_id: self.config.node_id,
+                                is_leader: true,
+                            };
+
+                            if let Err(e) = self.metadata_store.assign_partition(assignment).await {
+                                warn!("Failed to assign partition {} for topic '{}': {:?}",
+                                    partition, topic_name, e);
+                            }
+                        }
+                    }
+                } else {
+                    // No Raft feature or no manager: standalone mode
+                    for partition in 0..self.config.num_partitions {
+                        let assignment = chronik_common::metadata::PartitionAssignment {
+                            topic: topic_name.to_string(),
+                            partition,
+                            broker_id: self.config.node_id,
+                            is_leader: true,
+                        };
+
+                        if let Err(e) = self.metadata_store.assign_partition(assignment).await {
+                            warn!("Failed to assign partition {} for topic '{}': {:?}",
+                                partition, topic_name, e);
+                        }
                     }
                 }
-                
+
+                // Non-Raft builds always use standalone assignment
+                #[cfg(not(feature = "raft"))]
+                {
+                    for partition in 0..self.config.num_partitions {
+                        let assignment = chronik_common::metadata::PartitionAssignment {
+                            topic: topic_name.to_string(),
+                            partition,
+                            broker_id: self.config.node_id,
+                            is_leader: true,
+                        };
+
+                        if let Err(e) = self.metadata_store.assign_partition(assignment).await {
+                            warn!("Failed to assign partition {} for topic '{}': {:?}",
+                                partition, topic_name, e);
+                        }
+                    }
+                }
+
+                // Create Raft replicas for each partition if Raft is enabled
+                #[cfg(feature = "raft")]
+                if let Some(ref raft_manager) = self.raft_manager {
+                    if raft_manager.is_enabled() {
+                        use chronik_storage::SegmentWriterConfig;
+
+                        // Get peer list from RaftReplicaManager
+                        let peers = raft_manager.get_peers().await;
+                        info!("Creating Raft replicas for topic '{}' with {} partitions, peer list: {:?}",
+                            topic_name, self.config.num_partitions, peers);
+
+                        for partition in 0..self.config.num_partitions {
+                            // Create Raft log storage for this partition
+                            let log_storage = match crate::raft_integration::create_raft_log_storage(
+                                &self.config.storage_config.segment_writer_config.data_dir,
+                                topic_name,
+                                partition as i32,
+                            ).await {
+                                Ok(storage) => storage,
+                                Err(e) => {
+                                    warn!("Failed to create Raft log storage for {}-{}: {:?}",
+                                        topic_name, partition, e);
+                                    continue;
+                                }
+                            };
+
+                            // Create the Raft replica with cluster peers
+                            // Note: ChronikStateMachine now writes directly to WAL (shared with ProduceHandler)
+                            if let Err(e) = raft_manager.create_replica(
+                                topic_name.to_string(),
+                                partition as i32,
+                                log_storage,
+                                peers.clone(),
+                            ).await {
+                                warn!("Failed to create Raft replica for {}-{}: {:?}",
+                                    topic_name, partition, e);
+                            } else {
+                                info!("✅ Created Raft replica for {}-{} with {} peers",
+                                    topic_name, partition, peers.len());
+
+                                // CRITICAL: Add each peer via ConfChange to initialize Raft's Progress tracker
+                                // Wait a bit for the replica to become leader first
+                                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+                                // Include all peers (including self) - Raft will handle the cluster setup
+                                for &peer_id in &peers {
+                                    match raft_manager.add_peer_to_replica(
+                                        topic_name,
+                                        partition as i32,
+                                        peer_id,
+                                    ).await {
+                                        Ok(_) => {
+                                            info!("✅ Added peer {} to replica {}-{} via ConfChange",
+                                                peer_id, topic_name, partition);
+                                        }
+                                        Err(e) => {
+                                            // Log as debug if not leader yet (expected during startup)
+                                            if e.to_string().contains("not leader") {
+                                                debug!("Not leader for {}-{} yet, will retry peer addition later: {:?}",
+                                                    topic_name, partition, e);
+                                            } else {
+                                                warn!("Failed to add peer {} to replica {}-{}: {:?}",
+                                                    peer_id, topic_name, partition, e);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        debug!("Raft is disabled, skipping replica creation for topic '{}'", topic_name);
+                    }
+                }
+
                 let elapsed = start_time.elapsed();
                 self.metrics.topics_auto_created.fetch_add(1, Ordering::Relaxed);
                 
@@ -2003,6 +2386,8 @@ impl Clone for ProduceHandler {
             fetch_handler: self.fetch_handler.clone(),
             topic_creation_cache: Arc::clone(&self.topic_creation_cache),
             wal_manager: self.wal_manager.clone(),
+            #[cfg(feature = "raft")]
+            raft_manager: self.raft_manager.clone(),
         }
     }
 }

@@ -3,16 +3,18 @@
 pub mod metrics;
 pub mod tracing;
 pub mod server;
+pub mod raft_metrics;
 
 pub use metrics::{
-    MetricsRegistry, 
-    ControllerMetrics, 
-    IngestMetrics, 
+    MetricsRegistry,
+    ControllerMetrics,
+    IngestMetrics,
     QueryMetrics,
     JanitorMetrics,
 };
 pub use tracing::{init_tracing, TracingConfig};
 pub use server::{MetricsServer, ServerMetrics, ConnectionMetrics};
+pub use raft_metrics::RaftMetrics;
 
 use anyhow::Result;
 

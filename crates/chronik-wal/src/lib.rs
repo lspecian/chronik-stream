@@ -28,6 +28,10 @@ pub mod replication;
 pub mod audit;
 pub mod streaming;
 
+// Raft integration (optional)
+#[cfg(feature = "raft-storage")]
+pub mod raft_storage_impl;
+
 #[cfg(test)]
 mod tests;
 
@@ -41,6 +45,12 @@ pub use fsync::{FsyncBatcher, FsyncStats};
 pub use compaction::{WalCompactor, CompactionConfig, CompactionStats};
 pub use periodic_flusher::{PeriodicFlusherConfig, spawn_periodic_flusher};
 pub use group_commit::{GroupCommitWal, GroupCommitConfig, PartitionMetrics};
+
+#[cfg(feature = "raft-storage")]
+pub use raft_storage_impl::RaftWalStorage;
+
+// Re-export WalError as Error for compatibility
+pub use WalError as Error;
 
 use tracing::info;
 

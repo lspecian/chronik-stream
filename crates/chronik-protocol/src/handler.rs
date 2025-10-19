@@ -2210,6 +2210,12 @@ impl ProtocolHandler {
         let brokers = if let Some(metadata_store) = &self.metadata_store {
             match metadata_store.list_brokers().await {
                 Ok(broker_metas) => {
+                    tracing::info!("Got {} brokers from metadata store (before filter)", broker_metas.len());
+                    for b in &broker_metas {
+                        tracing::info!("  BEFORE FILTER - Broker {}: {}:{} (status: {:?})",
+                            b.broker_id, b.host, b.port, b.status);
+                    }
+
                     // Filter out broker 0 with 0.0.0.0 - this is a phantom broker
                     let brokers: Vec<MetadataBroker> = broker_metas.into_iter()
                         .filter(|b| !(b.broker_id == 0 && b.host == "0.0.0.0"))
@@ -2219,9 +2225,9 @@ impl ProtocolHandler {
                             port: b.port,
                             rack: b.rack,
                         }).collect();
-                    tracing::info!("Got {} brokers from metadata store (filtered)", brokers.len());
+                    tracing::info!("Got {} brokers from metadata store (after filter)", brokers.len());
                     for b in &brokers {
-                        tracing::info!("  Broker {}: {}:{}", b.node_id, b.host, b.port);
+                        tracing::info!("  AFTER FILTER - Broker {}: {}:{}", b.node_id, b.host, b.port);
                     }
                     brokers
                 }
@@ -6737,32 +6743,45 @@ impl ProtocolHandler {
 
                 // Create partitions for ALL partition_count, using assignments where available
                 for partition_id in 0..topic_meta.config.partition_count {
-                    // Try to find an assignment for this partition
-                    let assignment = sorted_assignments.iter().find(|a| a.partition == partition_id);
+                    // Get leader for this partition (queries the leader-flagged assignment)
+                    let leader_id = match metadata_store.get_partition_leader(&topic_meta.name, partition_id).await {
+                        Ok(Some(leader)) => leader,
+                        Ok(None) => {
+                            tracing::warn!("No leader found for partition {}/{}, using default broker",
+                                         topic_meta.name, partition_id);
+                            self.broker_id
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to get leader for partition {}/{}: {:?}",
+                                          topic_meta.name, partition_id, e);
+                            self.broker_id
+                        }
+                    };
 
-                    if let Some(assignment) = assignment {
-                        // Use the actual assignment
-                        partitions.push(MetadataPartition {
-                            error_code: 0,
-                            partition_index: assignment.partition as i32,
-                            leader_id: assignment.broker_id,
-                            leader_epoch: 0,
-                            replica_nodes: vec![assignment.broker_id],
-                            isr_nodes: vec![assignment.broker_id],
-                            offline_replicas: vec![],
-                        });
-                    } else {
-                        // No assignment found, use default (current broker)
-                        partitions.push(MetadataPartition {
-                            error_code: 0,
-                            partition_index: partition_id as i32,
-                            leader_id: self.broker_id,
-                            leader_epoch: 0,
-                            replica_nodes: vec![self.broker_id],
-                            isr_nodes: vec![self.broker_id],
-                            offline_replicas: vec![],
-                        });
-                    }
+                    // Get replicas for this partition
+                    let replica_nodes = match metadata_store.get_partition_replicas(&topic_meta.name, partition_id).await {
+                        Ok(Some(replicas)) => replicas,
+                        Ok(None) => {
+                            tracing::warn!("No replicas found for partition {}/{}, using leader as sole replica",
+                                         topic_meta.name, partition_id);
+                            vec![leader_id]
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to get replicas for partition {}/{}: {:?}",
+                                          topic_meta.name, partition_id, e);
+                            vec![leader_id]
+                        }
+                    };
+
+                    partitions.push(MetadataPartition {
+                        error_code: 0,
+                        partition_index: partition_id as i32,
+                        leader_id,
+                        leader_epoch: 0,
+                        replica_nodes: replica_nodes.clone(),
+                        isr_nodes: replica_nodes, // For now, all replicas are in-sync
+                        offline_replicas: vec![],
+                    });
                 }
                 
                 result.push(MetadataTopic {

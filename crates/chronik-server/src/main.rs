@@ -9,6 +9,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use std::sync::Arc;
 use tracing::{error, info, warn};
 use chronik_monitoring::{init_monitoring, TracingConfig};
 
@@ -24,14 +25,20 @@ mod offset_storage;
 mod coordinator_manager;
 mod wal_integration;
 mod metadata_dr;
+#[cfg(feature = "raft")]
+mod raft_integration;
+#[cfg(feature = "raft")]
+mod raft_cluster;
+mod cli;
 
 use integrated_server::{IntegratedKafkaServer, IntegratedServerConfig};
 use chronik_wal::compaction::{WalCompactor, CompactionConfig, CompactionStrategy};
 use chronik_wal::config::{WalConfig, CompressionType};
 use chronik_storage::object_store::{ObjectStoreConfig, StorageBackend, AuthConfig, S3Credentials};
+use chronik_config::{ClusterConfig, NodeConfig};
 use serde_json;
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(
     name = "chronik-server",
     about = "Chronik Stream - Unified Kafka-compatible streaming platform",
@@ -88,6 +95,22 @@ struct Cli {
     /// Use file-based metadata store instead of WAL-based (legacy mode)
     #[arg(long, env = "CHRONIK_FILE_METADATA", default_value = "false")]
     file_metadata: bool,
+
+    /// Path to cluster configuration file (TOML)
+    #[arg(long, env = "CHRONIK_CLUSTER_CONFIG")]
+    cluster_config: Option<PathBuf>,
+
+    /// Node ID for cluster mode (overrides config file)
+    #[arg(long, env = "CHRONIK_NODE_ID")]
+    node_id: Option<u64>,
+
+    /// Port for Search API (default: 6080, only used if search feature is enabled)
+    #[arg(long, env = "CHRONIK_SEARCH_PORT", default_value = "6080")]
+    search_port: u16,
+
+    /// Disable Search API (default: false, search API enabled if search feature compiled)
+    #[arg(long, env = "CHRONIK_DISABLE_SEARCH", default_value = "false")]
+    disable_search: bool,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -153,12 +176,30 @@ enum CompactAction {
     },
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand, Debug, Clone)]
 enum Commands {
     /// Run in standalone mode (default)
     #[command(about = "Run as a standalone Kafka-compatible server")]
     Standalone,
-    
+
+    /// Run in Raft cluster mode
+    #[cfg(feature = "raft")]
+    #[command(about = "Run as a node in a Raft-replicated cluster")]
+    RaftCluster {
+        /// Raft listen address (gRPC)
+        #[arg(long, env = "CHRONIK_RAFT_ADDR", default_value = "0.0.0.0:5001")]
+        raft_addr: String,
+
+        /// Comma-separated list of peer nodes (format: id@host:port)
+        /// Example: 2@node2:5001,3@node3:5001
+        #[arg(long, env = "CHRONIK_RAFT_PEERS")]
+        peers: Option<String>,
+
+        /// Bootstrap the cluster (only run on initial cluster creation)
+        #[arg(long, default_value = "false")]
+        bootstrap: bool,
+    },
+
     /// Run as ingest node (future: for distributed mode)
     #[command(about = "Run as an ingest node in a distributed cluster")]
     Ingest {
@@ -166,7 +207,7 @@ enum Commands {
         #[arg(long, env = "CHRONIK_CONTROLLER_URL")]
         controller_url: Option<String>,
     },
-    
+
     /// Run as search node (future: for distributed mode)
     #[cfg(feature = "search")]
     #[command(about = "Run as a search node in a distributed cluster")]
@@ -175,7 +216,7 @@ enum Commands {
         #[arg(long, env = "CHRONIK_STORAGE_URL")]
         storage_url: String,
     },
-    
+
     /// Run with all components enabled
     #[command(about = "Run with all components in a single process")]
     All {
@@ -194,6 +235,10 @@ enum Commands {
         #[command(subcommand)]
         action: CompactAction,
     },
+
+    /// Cluster management commands
+    #[command(about = "Manage Raft cluster operations")]
+    Cluster(cli::ClusterCommand),
 }
 
 /// Parse object store configuration from environment variables
@@ -344,6 +389,49 @@ fn parse_object_store_config_from_env() -> Option<ObjectStoreConfig> {
     }
 }
 
+/// Load cluster configuration from file or environment variables
+fn load_cluster_config(cli: &Cli) -> Result<Option<ClusterConfig>> {
+    // Priority 1: Try environment variables
+    if let Ok(Some(config)) = ClusterConfig::from_env() {
+        info!("Loaded cluster configuration from environment variables");
+        info!("  Node ID: {}", config.node_id);
+        info!("  Replication Factor: {}", config.replication_factor);
+        info!("  Min In-Sync Replicas: {}", config.min_insync_replicas);
+        info!("  Peers: {}", config.peers.len());
+        return Ok(Some(config));
+    }
+
+    // Priority 2: Try config file
+    if let Some(config_path) = &cli.cluster_config {
+        info!("Loading cluster configuration from file: {}", config_path.display());
+
+        let contents = std::fs::read_to_string(config_path)?;
+        let mut config: ClusterConfig = toml::from_str(&contents)?;
+
+        // Override node_id from CLI if provided
+        if let Some(node_id) = cli.node_id {
+            info!("Overriding node_id from CLI: {}", node_id);
+            config.node_id = node_id;
+        }
+
+        // Validate configuration
+        config.validate_config().map_err(|e| {
+            anyhow::anyhow!("Invalid cluster configuration: {}", e)
+        })?;
+
+        info!("Loaded cluster configuration from file");
+        info!("  Node ID: {}", config.node_id);
+        info!("  Replication Factor: {}", config.replication_factor);
+        info!("  Min In-Sync Replicas: {}", config.min_insync_replicas);
+        info!("  Peers: {}", config.peers.len());
+
+        return Ok(Some(config));
+    }
+
+    // No clustering configured
+    Ok(None)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -387,7 +475,81 @@ async fn main() -> Result<()> {
             info!("Starting Chronik Server in standalone mode");
             run_standalone_server(&cli).await?;
         }
-        
+
+        #[cfg(feature = "raft")]
+        Some(Commands::RaftCluster { ref raft_addr, ref peers, bootstrap }) => {
+            use raft_cluster::{run_raft_cluster, RaftClusterConfig};
+
+            info!("Starting Chronik Server in Raft cluster mode");
+
+            // Parse node ID
+            let node_id = cli.node_id.unwrap_or(1);
+
+            // Parse peers (format: "2@node2:5001,3@node3:5001")
+            let parsed_peers: Vec<(u64, String)> = if let Some(peers_str) = peers {
+                peers_str
+                    .split(',')
+                    .filter_map(|s| {
+                        let parts: Vec<&str> = s.split('@').collect();
+                        if parts.len() == 2 {
+                            if let Ok(id) = parts[0].parse::<u64>() {
+                                return Some((id, parts[1].to_string()));
+                            }
+                        }
+                        warn!("Invalid peer format: {} (expected id@host:port)", s);
+                        None
+                    })
+                    .collect()
+            } else {
+                vec![]
+            };
+
+            // Parse advertised address (similar to standalone mode)
+            let (advertised_host, advertised_port) = if let Some(ref addr) = cli.advertised_addr {
+                if let Some(colon_pos) = addr.rfind(':') {
+                    let potential_port = &addr[colon_pos + 1..];
+                    if potential_port.chars().all(|c| c.is_ascii_digit()) && !potential_port.is_empty() {
+                        let host = addr[..colon_pos].to_string();
+                        let port = potential_port.parse::<u16>().unwrap_or(cli.kafka_port);
+                        (host, port)
+                    } else {
+                        (addr.clone(), cli.advertised_port.unwrap_or(cli.kafka_port))
+                    }
+                } else {
+                    (addr.clone(), cli.advertised_port.unwrap_or(cli.kafka_port))
+                }
+            } else {
+                ("localhost".to_string(), cli.kafka_port)
+            };
+
+            // Auto-derive metrics port for cluster mode (same logic as standalone)
+            let metrics_port = if cli.metrics_port == 9093 {
+                // Metrics port = kafka_port + 2 (avoid conflict with Raft gRPC on kafka_port + 1)
+                let derived = cli.kafka_port + 2;
+                info!("Auto-derived metrics port: {} (kafka_port + 2)", derived);
+                derived
+            } else {
+                cli.metrics_port
+            };
+
+            let config = RaftClusterConfig {
+                node_id,
+                raft_addr: raft_addr.clone(),
+                peers: parsed_peers,
+                bootstrap,
+                data_dir: cli.data_dir.clone(),
+                file_metadata: cli.file_metadata,
+                kafka_port: cli.kafka_port,
+                metrics_port,
+                bind_addr: cli.bind_addr.clone(),
+                advertised_host,
+                advertised_port,
+                gossip_config: None, // Old RaftCluster command doesn't support gossip config
+            };
+
+            run_raft_cluster(config).await?;
+        }
+
         Some(Commands::Ingest { ref controller_url }) => {
             info!("Starting Chronik Server as ingest node");
             if controller_url.is_some() {
@@ -416,6 +578,10 @@ async fn main() -> Result<()> {
             handle_compaction_command(&cli, action.clone()).await?;
         }
 
+        Some(Commands::Cluster(ref cluster_cmd)) => {
+            cluster_cmd.execute().await?;
+        }
+
         None => {
             // Default to standalone mode
             info!("Starting Chronik Server in standalone mode (default)");
@@ -427,6 +593,37 @@ async fn main() -> Result<()> {
 }
 
 async fn run_standalone_server(cli: &Cli) -> Result<()> {
+    // CRITICAL FIX: Auto-derive metrics and search API ports to avoid conflicts in multi-node clusters
+    // If metrics_port or search_port are at their default values and we're in cluster mode,
+    // derive them from kafka_port to allow multiple nodes on the same machine
+    let mut cli = cli.clone();
+
+    // Check if clustering is enabled
+    let is_cluster_mode = std::env::var("CHRONIK_CLUSTER_ENABLED").unwrap_or_default() == "true"
+        || cli.cluster_config.is_some()
+        || cli.node_id.is_some()
+        || std::env::var("CHRONIK_CLUSTER_PEERS").is_ok();
+
+    // Auto-derive metrics port if at default value (9093) and in cluster mode
+    if cli.metrics_port == 9093 && is_cluster_mode {
+        // Metrics port = kafka_port + 2 (avoid conflict with Raft gRPC on kafka_port + 1)
+        // This ensures Node 1 (9092) gets 9094, Node 2 (9192) gets 9194, etc.
+        cli.metrics_port = cli.kafka_port + 2;
+        info!("Auto-derived metrics port: {} (kafka_port + 2)", cli.metrics_port);
+    }
+
+    // Auto-derive search API port if at default value (6080) and in cluster mode
+    if cli.search_port == 6080 && is_cluster_mode {
+        // Search port = kafka_port - 3000
+        // This ensures Node 1 (9092) gets 6092, Node 2 (9192) gets 6192, etc.
+        cli.search_port = if cli.kafka_port >= 3000 {
+            cli.kafka_port - 3000
+        } else {
+            cli.kafka_port + 3000  // Fallback for low ports
+        };
+        info!("Auto-derived search API port: {} (kafka_port - 3000)", cli.search_port);
+    }
+
     // Parse bind address to handle "host:port" format
     let bind_host = if cli.bind_addr.contains(':') {
         cli.bind_addr.split(':').next().unwrap_or("0.0.0.0").to_string()
@@ -515,9 +712,26 @@ async fn run_standalone_server(cli: &Cli) -> Result<()> {
     // Parse object store configuration from environment (for Tier 3: Tantivy archives)
     let object_store_config = parse_object_store_config_from_env();
 
+    // Load cluster configuration
+    let cluster_config = load_cluster_config(&cli)?;
+
+    // Determine node_id from cluster config or default to 1
+    let node_id = if let Some(ref cluster) = cluster_config {
+        cluster.node_id as i32
+    } else {
+        1
+    };
+
+    // Determine replication factor from cluster config or default
+    let replication_factor = if let Some(ref cluster) = cluster_config {
+        cluster.replication_factor as u32
+    } else {
+        1
+    };
+
     // Create server configuration
     let config = IntegratedServerConfig {
-        node_id: 1,
+        node_id,
         advertised_host,
         advertised_port,
         data_dir: cli.data_dir.to_string_lossy().to_string(),
@@ -525,18 +739,223 @@ async fn run_standalone_server(cli: &Cli) -> Result<()> {
         enable_compression: true,
         auto_create_topics: true,
         num_partitions: 3,
-        replication_factor: 1,
+        replication_factor,
         use_wal_metadata: !cli.file_metadata,  // Use WAL by default, file-based if flag is set
         enable_wal_indexing: true,  // Enable WAL→Tantivy indexing
         wal_indexing_interval_secs: 30,  // Index every 30 seconds
         object_store_config,  // Pass custom object store config if provided
         enable_metadata_dr: true,  // Enable metadata DR by default
         metadata_upload_interval_secs: 60,  // Upload metadata every minute
+        cluster_config: cluster_config.clone(),  // Pass cluster configuration
     };
 
-    // Create and start the integrated server
+    // Create Raft manager if clustering is enabled
+    #[cfg(feature = "raft")]
+    let (raft_manager, raft_server_params, peer_list) = if let Some(ref cluster) = cluster_config {
+        info!("Clustering enabled with {} peers, creating RaftReplicaManager", cluster.peers.len());
+
+        use crate::raft_integration::{RaftReplicaManager, RaftManagerConfig};
+        use chronik_raft::RaftConfig;
+        use chronik_common::metadata::MetadataStore;
+
+        // Find this node's Raft port from cluster config
+        let raft_port = cluster.peers.iter()
+            .find(|p| p.id == cluster.node_id)
+            .map(|p| p.raft_port)
+            .unwrap_or(9093);  // Default to 9093 if not found
+
+        let raft_addr = format!("{}:{}", bind_host, raft_port);
+
+        let raft_config = RaftConfig {
+            node_id: cluster.node_id,
+            listen_addr: raft_addr.clone(),
+            election_timeout_ms: 300,
+            heartbeat_interval_ms: 30,
+            max_entries_per_batch: 100,
+            snapshot_threshold: 10_000,
+        };
+
+        // Extract ALL peer node IDs INCLUDING self (required for Raft bootstrap)
+        let initial_peers: Vec<u64> = cluster.peers.iter()
+            .map(|p| p.id)
+            .collect();
+
+        info!("Pre-populating Raft peer list with {} peers (INCLUDING self): {:?}", initial_peers.len(), initial_peers);
+
+        let manager_config = RaftManagerConfig {
+            raft_config,
+            enabled: true,  // Enable Raft when cluster config present
+            tick_interval_ms: 10,
+            initial_peers,
+        };
+
+        // Create metadata store for Raft manager
+        // Note: This will be the same metadata store used by IntegratedServer
+        let metadata_store: Arc<dyn MetadataStore> = if config.use_wal_metadata {
+            use chronik_common::metadata::ChronikMetaLogStore;
+            use chronik_storage::WalMetadataAdapter;
+
+            let wal_config = chronik_wal::config::WalConfig {
+                enabled: true,
+                data_dir: PathBuf::from(format!("{}/wal_metadata", config.data_dir)),
+                ..Default::default()
+            };
+
+            let wal_adapter = Arc::new(WalMetadataAdapter::new(wal_config).await?);
+            let metalog_store = ChronikMetaLogStore::new(
+                wal_adapter,
+                PathBuf::from(format!("{}/metalog_snapshots", config.data_dir)),
+            ).await?;
+
+            Arc::new(metalog_store)
+        } else {
+            use chronik_common::metadata::file_store::FileMetadataStore;
+            let metadata_path = PathBuf::from(format!("{}/metadata", config.data_dir));
+            std::fs::create_dir_all(&metadata_path)?;
+            Arc::new(FileMetadataStore::new(metadata_path).await?)
+        };
+
+        // Create WAL manager (needed by both Raft and IntegratedServer)
+        use chronik_wal::{config::WalConfig as WalCfg, WalManager};
+
+        let wal_config = WalCfg {
+            enabled: true,
+            data_dir: PathBuf::from(format!("{}/wal", config.data_dir)),
+            ..Default::default()
+        };
+
+        info!("Starting WAL recovery (may take a few seconds)...");
+        let wal_manager = Arc::new(WalManager::recover(&wal_config).await?);
+        info!("WAL recovery complete - {} partitions loaded", wal_manager.get_partitions().len());
+
+        let raft_mgr = Arc::new(RaftReplicaManager::new(
+            manager_config,
+            metadata_store,
+            wal_manager.clone(),
+        ));
+
+        // Start Raft gRPC server
+        info!("Starting Raft gRPC server on {}", raft_addr);
+        use chronik_raft::rpc::{RaftServiceImpl, start_raft_server};
+        let raft_service = RaftServiceImpl::new();
+        raft_mgr.set_raft_service(Arc::new(raft_service.clone())).await;
+
+        // NOTE: gRPC server will be started AFTER __meta replica creation
+        // to avoid race condition where peers send messages before replica exists
+
+        // CRITICAL FIX: Collect peer addresses but DON'T connect yet
+        // We'll connect AFTER all gRPC servers have started
+        let peer_list: Vec<(u64, String)> = cluster.peers.iter()
+            .filter(|p| p.id != cluster.node_id)  // Exclude self
+            .map(|p| (p.id, format!("{}:{}", p.addr.split(':').next().unwrap_or("localhost"), p.raft_port)))
+            .collect();
+
+        info!("Collected {} peer addresses (will connect after gRPC server is ready)", peer_list.len());
+
+        (Some(raft_mgr), Some((raft_addr, raft_service)), Some(peer_list))
+    } else {
+        info!("No cluster configuration, Raft disabled");
+        (None, None, None)
+    };
+
+    // CRITICAL FIX: Start Raft gRPC server and connect to peers BEFORE creating IntegratedKafkaServer
+    // This ensures peers are connected before __meta replica is created (which starts Raft election)
+    #[cfg(feature = "raft")]
+    if let Some((raft_addr, raft_service)) = raft_server_params {
+        info!("Starting Raft gRPC server on {} (BEFORE replica creation)", raft_addr);
+        let raft_addr_spawn = raft_addr.clone();
+        let raft_service_spawn = raft_service.clone();
+        tokio::spawn(async move {
+            if let Err(e) = chronik_raft::rpc::start_raft_server(raft_addr_spawn, raft_service_spawn).await {
+                error!("Raft gRPC server error: {:?}", e);
+            }
+        });
+
+        // Wait for gRPC server to be ready
+        info!("Waiting for Raft gRPC server to be ready...");
+
+        // Extract host and port for health check
+        let raft_addr_parts: Vec<&str> = raft_addr.split(':').collect();
+        let raft_host = raft_addr_parts.get(0).unwrap_or(&"127.0.0.1");
+        let raft_port = raft_addr_parts.get(1).and_then(|s| s.parse::<u16>().ok()).unwrap_or(5001);
+
+        // Wait until the port is listening (max 5 seconds)
+        let mut ready = false;
+        for attempt in 1..=50 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+            // Try to connect to the local gRPC server
+            if let Ok(stream) = tokio::net::TcpStream::connect((*raft_host, raft_port)).await {
+                drop(stream);
+                ready = true;
+                info!("Raft gRPC server is ready after {} ms", attempt * 100);
+                break;
+            }
+        }
+
+        if !ready {
+            warn!("Raft gRPC server readiness check timed out, but continuing anyway");
+        }
+
+        info!("Raft gRPC server started successfully");
+
+        // NOW connect to peers SYNCHRONOUSLY (wait for all to complete)
+        if let Some(peers) = peer_list {
+            // Initial delay to allow ALL peer gRPC servers to start
+            info!("Waiting 2 seconds for all peer gRPC servers to be ready...");
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            info!("Starting peer connections (synchronous, will wait for completion)");
+
+            let raft_mgr = raft_manager.as_ref().unwrap();
+            for (peer_id, peer_addr) in peers {
+                let peer_url = format!("http://{}", peer_addr);
+
+                // Connect synchronously with retry logic
+                let mut success = false;
+                for retry in 0..10 {
+                    match raft_mgr.add_peer(peer_id, peer_url.clone()).await {
+                        Ok(_) => {
+                            info!("Successfully connected to Raft peer {} at {}", peer_id, peer_url);
+                            success = true;
+                            break;
+                        }
+                        Err(e) => {
+                            if retry < 9 {
+                                // Start with 1 second delay, double each retry (1s, 2s, 4s, 8s, ...)
+                                let delay = std::time::Duration::from_secs(1_u64 << retry.min(5));
+                                warn!("Failed to connect to Raft peer {}: {:?}, retrying in {:?}...", peer_id, e, delay);
+                                tokio::time::sleep(delay).await;
+                            } else {
+                                error!("Failed to connect to Raft peer {} after {} retries: {:?}", peer_id, retry + 1, e);
+                            }
+                        }
+                    }
+                }
+
+                if !success {
+                    warn!("Could not connect to peer {} at {} - continuing anyway, Raft will retry", peer_id, peer_url);
+                }
+            }
+
+            info!("All peer connection attempts completed");
+
+            // CRITICAL FIX: Add delay to allow ALL peer nodes to create and register their replicas
+            // Without this, messages can arrive before the receiving node has registered its replica
+            // Use 5 seconds to account for staggered startup (nodes start 1-2 seconds apart)
+            info!("Waiting 5 seconds for all peer nodes to complete replica registration...");
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            info!("Proceeding with server creation");
+        }
+    }
+
+    // Create and start the integrated server (with optional Raft manager)
+    // At this point, gRPC server is running, peers are connected, and replicas should be registered
+    #[cfg(feature = "raft")]
+    let server = IntegratedKafkaServer::new_with_raft(config, raft_manager.clone()).await?;
+
+    #[cfg(not(feature = "raft"))]
     let server = IntegratedKafkaServer::new(config).await?;
-    
+
     // Initialize monitoring (metrics + optional tracing)
     let _metrics_registry = init_monitoring(
         "chronik-server",
@@ -548,12 +967,13 @@ async fn run_standalone_server(cli: &Cli) -> Result<()> {
     info!("Kafka protocol listening on {}", kafka_addr);
     info!("Metrics endpoint available at http://{}:{}/metrics", cli.bind_addr, cli.metrics_port);
 
-    // Start search API if search feature is compiled
+    // Start search API if search feature is compiled and not disabled
     #[cfg(feature = "search")]
-    {
-        info!("Starting Search API on port 8080");
+    if !cli.disable_search {
+        info!("Starting Search API on port {}", cli.search_port);
 
         let search_bind = cli.bind_addr.clone();
+        let search_port = cli.search_port;
         let wal_indexer = server.get_wal_indexer();
         let index_base_path = format!("{}/tantivy_indexes", cli.data_dir.to_string_lossy());
 
@@ -568,21 +988,66 @@ async fn run_standalone_server(cli: &Cli) -> Result<()> {
             let app = search_api.router();
 
             // Start server
-            let addr = format!("{}:8080", search_bind);
+            let addr = format!("{}:{}", search_bind, search_port);
             info!("Search API listening on http://{}", addr);
 
             let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
             chronik_search::serve_app(listener, app).await.unwrap()
         });
 
-        info!("Search API available at http://{}:8080", cli.bind_addr);
-        info!("  - Search: POST http://{}:8080/_search", cli.bind_addr);
-        info!("  - Index: PUT http://{}:8080/{{index}}", cli.bind_addr);
-        info!("  - Document: POST http://{}:8080/{{index}}/_doc/{{id}}", cli.bind_addr);
+        info!("Search API available at http://{}:{}", cli.bind_addr, cli.search_port);
+        info!("  - Search: POST http://{}:{}/_search", cli.bind_addr, cli.search_port);
+        info!("  - Index: PUT http://{}:{}/{{index}}", cli.bind_addr, cli.search_port);
+        info!("  - Document: POST http://{}:{}/{{index}}/_doc/{{id}}", cli.bind_addr, cli.search_port);
+    } else {
+        #[cfg(feature = "search")]
+        info!("Search API disabled via --disable-search flag");
     }
 
-    server.run(&kafka_addr).await?;
-    
+    // CRITICAL FIX (v1.3.66): Add signal handling for graceful shutdown
+    // Spawn server task
+    let server_clone = server.clone();
+    let kafka_addr_clone = kafka_addr.clone();
+    let server_task = tokio::spawn(async move {
+        server_clone.run(&kafka_addr_clone).await
+    });
+
+    // Wait for shutdown signal (SIGINT or SIGTERM)
+    tokio::select! {
+        result = server_task => {
+            match result {
+                Ok(Ok(_)) => info!("Server task completed normally"),
+                Ok(Err(e)) => error!("Server task failed: {}", e),
+                Err(e) => error!("Server task panicked: {}", e),
+            }
+        }
+        _ = tokio::signal::ctrl_c() => {
+            info!("Received SIGINT, gracefully shutting down...");
+        }
+        _ = async {
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{signal, SignalKind};
+                let mut sigterm = signal(SignalKind::terminate()).unwrap();
+                sigterm.recv().await
+            }
+            #[cfg(not(unix))]
+            {
+                std::future::pending::<()>().await
+            }
+        } => {
+            info!("Received SIGTERM, gracefully shutting down...");
+        }
+    }
+
+    // Graceful shutdown: flush all partitions
+    info!("Flushing all partitions before shutdown...");
+    if let Err(e) = server.shutdown().await {
+        error!("Failed to shutdown server gracefully: {}", e);
+    } else {
+        info!("Server shutdown complete");
+    }
+
     Ok(())
 }
 
@@ -692,9 +1157,26 @@ async fn run_all_components(cli: &Cli) -> Result<()> {
     // Parse object store configuration from environment (for Tier 3: Tantivy archives)
     let object_store_config = parse_object_store_config_from_env();
 
+    // Load cluster configuration
+    let cluster_config = load_cluster_config(&cli)?;
+
+    // Determine node_id from cluster config or default to 1
+    let node_id = if let Some(ref cluster) = cluster_config {
+        cluster.node_id as i32
+    } else {
+        1
+    };
+
+    // Determine replication factor from cluster config or default
+    let replication_factor = if let Some(ref cluster) = cluster_config {
+        cluster.replication_factor as u32
+    } else {
+        1
+    };
+
     // Create server configuration with all features
     let config = IntegratedServerConfig {
-        node_id: 1,
+        node_id,
         advertised_host,
         advertised_port,
         data_dir: cli.data_dir.to_string_lossy().to_string(),
@@ -702,13 +1184,14 @@ async fn run_all_components(cli: &Cli) -> Result<()> {
         enable_compression: true,
         auto_create_topics: true,
         num_partitions: 3,
-        replication_factor: 1,
+        replication_factor,
         use_wal_metadata: !cli.file_metadata,  // Use WAL by default, file-based if flag is set
         enable_wal_indexing: true,  // Enable WAL→Tantivy indexing
         wal_indexing_interval_secs: 30,  // Index every 30 seconds
         object_store_config,  // Pass custom object store config if provided
         enable_metadata_dr: true,  // Enable metadata DR by default
         metadata_upload_interval_secs: 60,  // Upload metadata every minute
+        cluster_config,  // Pass cluster configuration
     };
     
     // Start Kafka protocol server
@@ -722,38 +1205,41 @@ async fn run_all_components(cli: &Cli) -> Result<()> {
     info!("Kafka protocol listening on {}:{}", cli.bind_addr, cli.kafka_port);
     
     #[cfg(feature = "search")]
-    {
-        info!("Search API enabled, starting on port 8080");
-        
+    if !cli.disable_search {
+        info!("Search API enabled, starting on port {}", cli.search_port);
+
         // Start the search API server
         let search_bind = cli.bind_addr.clone();
-        let search_port = 8080u16; // Search API port
+        let search_port = cli.search_port;
         let search_task = tokio::spawn(async move {
             use chronik_search::api::SearchApi;
             use std::sync::Arc;
-            
+
             // Create search API instance
             let search_api = Arc::new(SearchApi::new().map_err(|e| anyhow::anyhow!("Failed to create search API: {}", e))?);
-            
+
             // Create router
             let app = search_api.router();
-            
+
             // Start server
             let addr = format!("{}:{}", search_bind, search_port);
             info!("Search API listening on http://{}", addr);
-            
+
             let listener = tokio::net::TcpListener::bind(&addr).await
                 .map_err(|e| anyhow::anyhow!("Failed to bind search API port: {}", e))?;
-            
+
             chronik_search::serve_app(listener, app).await
                 .map_err(|e| anyhow::anyhow!("Search API server error: {}", e))
         });
         tasks.push(search_task);
-        
-        info!("Search API available at http://{}:8080", cli.bind_addr);
-        info!("  - Search: POST http://{}:8080/_search", cli.bind_addr);
-        info!("  - Index: PUT http://{}:8080/{{index}}", cli.bind_addr);
-        info!("  - Document: POST http://{}:8080/{{index}}/_doc/{{id}}", cli.bind_addr);
+
+        info!("Search API available at http://{}:{}", cli.bind_addr, cli.search_port);
+        info!("  - Search: POST http://{}:{}/_search", cli.bind_addr, cli.search_port);
+        info!("  - Index: PUT http://{}:{}/{{index}}", cli.bind_addr, cli.search_port);
+        info!("  - Document: POST http://{}:{}/{{index}}/_doc/{{id}}", cli.bind_addr, cli.search_port);
+    } else {
+        #[cfg(feature = "search")]
+        info!("Search API disabled via --disable-search flag");
     }
     
     #[cfg(feature = "backup")]

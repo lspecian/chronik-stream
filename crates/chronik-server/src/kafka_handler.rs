@@ -83,7 +83,17 @@ impl KafkaProtocolHandler {
             default_num_partitions,
         })
     }
-    
+
+    /// Get reference to the produce handler for shutdown
+    pub fn get_produce_handler(&self) -> &Arc<ProduceHandler> {
+        &self.produce_handler
+    }
+
+    /// Get reference to the WAL produce handler for shutdown
+    pub fn get_wal_handler(&self) -> &Arc<WalProduceHandler> {
+        &self.wal_handler
+    }
+
     /// Handle a Kafka protocol request
     #[instrument(skip(self, request_bytes))]
     pub async fn handle_request(&self, request_bytes: &[u8]) -> Result<Response> {
@@ -715,10 +725,13 @@ impl KafkaProtocolHandler {
     }
 
     /// Auto-create topics that don't exist
+    ///
+    /// Delegates to ProduceHandler::auto_create_topic() which handles:
+    /// - Topic metadata creation
+    /// - Partition assignments
+    /// - Raft replica creation (if Raft is enabled)
+    /// - Validation and deduplication
     async fn auto_create_topics(&self, topic_names: &[String]) -> Result<()> {
-        use chronik_common::metadata::TopicConfig;
-        use std::collections::HashMap;
-
         // Get list of existing topics
         let existing_topics = self.metadata_store.list_topics().await
             .map_err(|e| Error::Internal(format!("Failed to list topics: {:?}", e)))?;
@@ -733,48 +746,18 @@ impl KafkaProtocolHandler {
             .collect();
 
         if !topics_to_create.is_empty() {
-            tracing::info!("Auto-creating {} topics: {:?}", topics_to_create.len(), topics_to_create);
-
-            // Get default configuration values from config
-            let default_num_partitions = self.default_num_partitions;
-            let default_replication_factor = 1;
-            let default_retention_ms = 604800000; // 7 days
-            let default_segment_bytes = 1073741824; // 1GB
+            tracing::info!("Auto-creating {} topics via ProduceHandler (ensures Raft replica creation): {:?}",
+                topics_to_create.len(), topics_to_create);
 
             for topic_name in topics_to_create {
-                // Create topic configuration
-                let mut config_map = HashMap::new();
-                config_map.insert("compression.type".to_string(), "none".to_string());
-                config_map.insert("cleanup.policy".to_string(), "delete".to_string());
-                config_map.insert("min.insync.replicas".to_string(), "1".to_string());
-
-                let config = TopicConfig {
-                    partition_count: default_num_partitions,
-                    replication_factor: default_replication_factor,
-                    retention_ms: Some(default_retention_ms),
-                    segment_bytes: default_segment_bytes,
-                    config: config_map,
-                };
-
-                // Create the topic and partition assignments
-                match self.metadata_store.create_topic(topic_name, config).await {
-                    Ok(_) => {
-                        tracing::info!("Successfully auto-created topic '{}'", topic_name);
-
-                        // Create partition assignments for this broker (single-node setup)
-                        for partition in 0..default_num_partitions {
-                            let assignment = chronik_common::metadata::PartitionAssignment {
-                                topic: topic_name.to_string(),
-                                partition,
-                                broker_id: 1, // Using hardcoded node_id = 1
-                                is_leader: true, // Single node is always the leader
-                            };
-
-                            if let Err(e) = self.metadata_store.assign_partition(assignment).await {
-                                tracing::warn!("Failed to assign partition {} for topic '{}': {:?}",
-                                    partition, topic_name, e);
-                            }
-                        }
+                // Delegate to ProduceHandler which handles:
+                // - Topic creation with default config
+                // - Partition assignments
+                // - Raft replica creation (if enabled)
+                // - Proper error handling and retries
+                match self.produce_handler.auto_create_topic(topic_name).await {
+                    Ok(_metadata) => {
+                        tracing::info!("Successfully auto-created topic '{}' with Raft integration", topic_name);
                     }
                     Err(e) => {
                         tracing::error!("Failed to auto-create topic '{}': {:?}", topic_name, e);
@@ -785,6 +768,11 @@ impl KafkaProtocolHandler {
         }
 
         Ok(())
+    }
+
+    /// Flush all partition buffers to storage
+    pub async fn flush_all_partitions(&self) -> Result<()> {
+        self.produce_handler.flush_all_partitions().await
     }
 }
 

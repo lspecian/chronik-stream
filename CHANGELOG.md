@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **chronik-raft**: Complete Raft consensus implementation (Phases 1-3)
+  - Phase 1: gRPC/Protobuf RPC protocol definitions ✅
+  - Phase 2: WAL-backed log storage with crash recovery ✅
+  - Phase 3: StateMachine trait for applying committed entries ✅
+  - MemoryStateMachine reference implementation for testing
+  - WalRaftStorage implementation (tests/integration/)
+  - PartitionReplica with full raft-rs RawNode integration
+  - 11 comprehensive tests across all components
+
+### Changed
+- **chronik-raft**: Use `prost-codec` feature for raft v0.7 to eliminate protoc dependency
+  - Build no longer requires Protocol Buffer compiler installation
+  - Pure Rust toolchain sufficient for all builds
+  - Improves developer experience and CI/CD simplicity
+
+### Documentation
+- Add comprehensive Raft library comparison matrix (RAFT_LIBRARY_COMPARISON.md)
+- Document decision to continue with tikv/raft-rs vs alternatives (openraft, raftify)
+- Update chronik-raft README with simplified build requirements
+- Update PHASE1_SUMMARY.md to reflect removal of protoc requirement
+- Add PHASE2_COMPLETE.md - WAL integration and architectural decisions
+- Add PHASE3_COMPLETE.md - State machine implementation summary
+- Production integration guide for Chronik clustering
+
 ## [1.3.59] - 2025-10-12
 
 ### Fixed

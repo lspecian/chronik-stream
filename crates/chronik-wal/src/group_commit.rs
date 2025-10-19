@@ -769,6 +769,68 @@ impl GroupCommitWal {
         Ok(())
     }
 
+    /// Force seal a segment (used during shutdown)
+    async fn force_seal_segment(
+        queue: &PartitionCommitQueue,
+        sealed_segments: &Arc<DashMap<String, SealedSegmentInfo>>,
+        base_dir: &Path,
+    ) -> Result<()> {
+        // Seal current segment
+        let old_segment_id = queue.segment_id.load(Ordering::Relaxed);
+        let old_file_path = base_dir
+            .join(&queue.topic)
+            .join(queue.partition.to_string())
+            .join(format!("wal_{}_{}.log", queue.partition, old_segment_id));
+
+        // Get actual file size from disk
+        let file_size = if old_file_path.exists() {
+            tokio::fs::metadata(&old_file_path).await
+                .map(|m| m.len())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        if file_size == 0 {
+            // No data in file, skip sealing
+            return Ok(());
+        }
+
+        info!(
+            "🔒 Force sealing segment {}/{} segment_id={} (file_size={} bytes)",
+            queue.topic, queue.partition, old_segment_id, file_size
+        );
+
+        // Close current file
+        {
+            let file = queue.file.lock().await;
+            file.sync_all().await?;
+            drop(file); // Explicitly drop to close
+        }
+
+        // Record sealed segment info
+        let sealed_key = format!("{}:{}:{}", queue.topic, queue.partition, old_segment_id);
+        sealed_segments.insert(
+            sealed_key,
+            SealedSegmentInfo {
+                topic: queue.topic.clone(),
+                partition: queue.partition,
+                segment_id: old_segment_id,
+                file_path: old_file_path.clone(),
+                size_bytes: file_size,
+                state: SegmentState::Sealed,
+                sealed_at: Instant::now(),
+            },
+        );
+
+        info!(
+            "✅ Sealed segment {}/{} segment_id={} (file_size={} bytes)",
+            queue.topic, queue.partition, old_segment_id, file_size
+        );
+
+        Ok(())
+    }
+
     /// Check if current segment should be sealed and rotate if needed
     async fn check_and_seal_segment(
         queue: &PartitionCommitQueue,
@@ -922,7 +984,38 @@ impl GroupCommitWal {
         // Give workers time to finish pending commits
         tokio::time::sleep(Duration::from_millis(100)).await;
 
+        // Force seal all active segments (CRITICAL for segment flush test)
+        // This ensures all data is written to disk before shutdown
+        info!("Force sealing all active WAL segments...");
+        let queue_count = self.partition_queues.len();
+        info!("Found {} partition queues to seal", queue_count);
+
+        for entry in self.partition_queues.iter() {
+            let ((topic, partition), queue) = entry.pair();
+
+            // Get current segment size (note: this is unflushed buffer size, not file size)
+            let current_size = queue.segment_size_bytes.load(std::sync::atomic::Ordering::Relaxed);
+            let segment_id = queue.segment_id.load(std::sync::atomic::Ordering::Relaxed);
+
+            info!("Processing {}-{} segment {} (buffer_size={} bytes)",
+                  topic, partition, segment_id, current_size);
+
+            // Force seal current segment regardless of size
+            // (files may have data from previous fsyncs even if buffer is empty)
+            if let Err(e) = Self::force_seal_segment(queue, &self.sealed_segments, &self.base_dir).await {
+                error!("Failed to seal segment {}-{}: {}", topic, partition, e);
+            } else {
+                info!("Successfully processed seal for {}-{}", topic, partition);
+            }
+        }
+        info!("Finished sealing {} partitions", queue_count);
+
         info!("Group commit WAL shutdown complete");
+    }
+
+    /// Get the base directory for WAL files
+    pub fn base_dir(&self) -> &Path {
+        &self.base_dir
     }
 }
 

@@ -14,6 +14,7 @@ members = [
     "crates/chronik-config",
     "crates/chronik-server",
     "crates/chronik-wal",
+    "crates/chronik-raft",
 ]
 exclude = ["tests"]
 
@@ -66,7 +67,8 @@ kube = { version = "0.87", features = ["runtime", "derive"] }
 k8s-openapi = { version = "0.20", features = ["v1_28"] }
 
 # Consensus (Apache 2.0)
-raft = "0.7"
+# Use prost-codec to avoid protoc dependency (pure Rust toolchain)
+raft = { version = "0.7", default-features = false, features = ["prost-codec"] }
 
 # Observability
 tracing = "0.1"

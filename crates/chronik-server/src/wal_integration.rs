@@ -275,6 +275,19 @@ impl WalProduceHandler {
 
         Ok(())
     }
+
+    /// Shutdown the WAL and flush all pending segments to disk
+    pub async fn shutdown(&self) {
+        info!("Shutting down WAL produce handler...");
+
+        // Shutdown the WAL manager (flushes pending commits and seals active segments)
+        self.wal_manager.shutdown().await;
+
+        // Also shutdown the inner ProduceHandler
+        self.inner_handler.shutdown().await;
+
+        info!("WAL produce handler shutdown complete");
+    }
 }
 
 // REMOVED v1.3.36: Legacy V1 parsing code
@@ -289,7 +302,7 @@ impl WalProduceHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[tokio::test]
     async fn test_wal_integration() {
         // TODO: Add integration tests

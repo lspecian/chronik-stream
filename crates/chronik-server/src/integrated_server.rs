@@ -39,6 +39,7 @@ use chronik_common::metadata::{
 use chronik_common::metadata::traits::BrokerMetadata;
 
 /// Configuration for the integrated Kafka server
+#[derive(Clone)]
 pub struct IntegratedServerConfig {
     /// Node ID for this broker
     pub node_id: i32,
@@ -70,6 +71,8 @@ pub struct IntegratedServerConfig {
     pub enable_metadata_dr: bool,
     /// Metadata upload interval in seconds
     pub metadata_upload_interval_secs: u64,
+    /// Optional cluster configuration for Raft clustering
+    pub cluster_config: Option<chronik_config::ClusterConfig>,
 }
 
 impl Default for IntegratedServerConfig {
@@ -90,6 +93,7 @@ impl Default for IntegratedServerConfig {
             object_store_config: None, // Use default local storage unless specified
             enable_metadata_dr: true, // Enable metadata DR by default
             metadata_upload_interval_secs: 60, // Upload metadata every minute
+            cluster_config: None, // No clustering by default (standalone mode)
         }
     }
 }
@@ -103,10 +107,55 @@ pub struct IntegratedKafkaServer {
     metadata_uploader: Option<Arc<chronik_common::metadata::MetadataUploader>>,
 }
 
+impl Clone for IntegratedKafkaServer {
+    fn clone(&self) -> Self {
+        Self {
+            config: self.config.clone(),
+            kafka_handler: self.kafka_handler.clone(),
+            metadata_store: self.metadata_store.clone(),
+            wal_indexer: self.wal_indexer.clone(),
+            metadata_uploader: self.metadata_uploader.clone(),
+        }
+    }
+}
+
 impl IntegratedKafkaServer {
     /// Create a new integrated Kafka server
     pub async fn new(config: IntegratedServerConfig) -> Result<Self> {
+        Self::new_with_raft(config, None).await
+    }
+
+    /// Create a new integrated Kafka server with optional Raft manager
+    #[cfg(feature = "raft")]
+    pub async fn new_with_raft(
+        config: IntegratedServerConfig,
+        raft_manager: Option<Arc<crate::raft_integration::RaftReplicaManager>>,
+    ) -> Result<Self> {
         info!("Initializing integrated Kafka server with chronik-ingest components");
+        if raft_manager.is_some() {
+            info!("Raft integration enabled");
+        }
+
+        Self::new_internal(config, raft_manager).await
+    }
+
+    /// Create a new integrated Kafka server (without raft feature)
+    #[cfg(not(feature = "raft"))]
+    pub async fn new_with_raft(
+        config: IntegratedServerConfig,
+        _raft_manager: Option<()>,
+    ) -> Result<Self> {
+        info!("Initializing integrated Kafka server with chronik-ingest components");
+        Self::new_internal(config, None).await
+    }
+
+    /// Internal server initialization
+    async fn new_internal(
+        config: IntegratedServerConfig,
+        #[cfg(feature = "raft")] raft_manager: Option<Arc<crate::raft_integration::RaftReplicaManager>>,
+        #[cfg(not(feature = "raft"))] _raft_manager: Option<()>,
+    ) -> Result<Self> {
+        info!("Starting internal server initialization");
 
         // Create data directory
         std::fs::create_dir_all(&config.data_dir)?;
@@ -114,7 +163,100 @@ impl IntegratedKafkaServer {
         std::fs::create_dir_all(&segments_dir)?;
         
         // Initialize metadata store based on configuration
-        let metadata_store: Arc<dyn MetadataStore> = if config.use_wal_metadata {
+        let metadata_store: Arc<dyn MetadataStore> = if let Some(ref cluster_config) = config.cluster_config {
+            // Cluster mode: Use Raft-replicated metadata store
+            #[cfg(feature = "raft")]
+            {
+                info!("Initializing Raft-replicated metadata store for cluster mode");
+
+                use chronik_raft::{RaftMetaLog, MemoryLogStorage};
+
+                // Raft manager must be provided in cluster mode
+                let raft_mgr = raft_manager.as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("Raft manager required in cluster mode"))?;
+
+                // Extract ALL peer IDs from cluster config (INCLUDING self)
+                // CRITICAL: For Raft bootstrap, all nodes must have identical peer lists
+                let peer_ids: Vec<u64> = cluster_config.peers.iter()
+                    .map(|p| p.id)
+                    .collect();
+
+                // Create Raft log storage for __meta partition
+                let meta_log_storage = Arc::new(MemoryLogStorage::new());
+
+                // CRITICAL FIX: Check if __meta partition replica already exists (created by raft_cluster.rs)
+                // If it does, retrieve the SHARED metadata state from RaftReplicaManager
+                // If not, create our own state (for standalone --raft mode)
+                let (local_state, applied_index, meta_replica) = if let Some(replica) = raft_mgr.get_replica("__meta", 0) {
+                    info!("Using existing __meta partition replica (created by raft_cluster.rs)");
+
+                    // Retrieve the shared state from RaftReplicaManager
+                    let shared_state = raft_mgr.get_meta_partition_state().await
+                        .ok_or_else(|| anyhow::anyhow!("__meta replica exists but shared state not found in RaftReplicaManager"))?;
+
+                    info!("Retrieved shared metadata state from RaftReplicaManager (state will be shared between MetadataStateMachine and RaftMetaLog)");
+
+                    (shared_state.0, shared_state.1, replica)
+                } else {
+                    // No existing replica - create our own state (standalone --raft mode)
+                    info!("No existing __meta replica found, creating new one with fresh state");
+                    let local_state = Arc::new(parking_lot::RwLock::new(chronik_raft::MetadataState::default()));
+                    let applied_index = Arc::new(std::sync::atomic::AtomicU64::new(0));
+                    // Create MetadataStateMachine with the shared state
+                    let metadata_sm = chronik_raft::MetadataStateMachine::new(
+                        local_state.clone(),
+                        applied_index.clone(),
+                    );
+                    let state_machine: Arc<tokio::sync::RwLock<dyn chronik_raft::StateMachine>> =
+                        Arc::new(tokio::sync::RwLock::new(metadata_sm));
+
+                    // Create __meta partition replica with MetadataStateMachine
+                    // All nodes start with SAME peer configuration for proper Raft bootstrap
+                    // This allows distributed consensus once all nodes are online
+                    info!("Creating __meta partition replica with MetadataStateMachine and {} peers", peer_ids.len());
+                    raft_mgr.create_meta_replica(
+                        "__meta".to_string(),
+                        0,
+                        meta_log_storage,
+                        peer_ids.clone(),  // All peers from cluster config
+                        state_machine,
+                    ).await?;
+
+                    // Get the replica we just created
+                    let replica = raft_mgr.get_replica("__meta", 0)
+                        .ok_or_else(|| anyhow::anyhow!("Failed to get __meta replica after creation"))?;
+
+                    // Return the tuple
+                    (local_state, applied_index, replica)
+                };
+
+                // Create RaftMetaLog using the shared replica and RaftClient
+                // CRITICAL: Pass the SAME local_state and applied_index that we gave to MetadataStateMachine
+                let raft_meta_log = RaftMetaLog::from_replica(
+                    cluster_config.node_id,
+                    meta_replica.clone(),
+                    Some(raft_mgr.raft_client()),
+                    local_state,
+                    applied_index,
+                ).await?;
+
+                info!("RaftMetaLog initialized for node {} with {} peers", cluster_config.node_id, peer_ids.len());
+
+                // No need to manually add peers via ConfChange for new cluster bootstrap
+                // All peers are already in ConfState (initialized in replica.rs)
+                // TiKV Raft will elect leader naturally via pre-vote and election
+                info!(
+                    "New cluster bootstrap: all {} peers initialized in ConfState, natural leader election will occur",
+                    cluster_config.peers.len()
+                );
+
+                Arc::new(raft_meta_log) as Arc<dyn MetadataStore>
+            }
+            #[cfg(not(feature = "raft"))]
+            {
+                return Err(anyhow::anyhow!("Cluster mode requires the 'raft' feature to be enabled. Please rebuild with --features raft"));
+            }
+        } else if config.use_wal_metadata {
             info!("Initializing WAL-based metadata store with real WAL adapter");
 
             // Create WAL configuration for metadata
@@ -192,7 +334,9 @@ impl IntegratedKafkaServer {
         };
         
         // Register this broker in metadata
-        metadata_store.register_broker(BrokerMetadata {
+        // CRITICAL FIX (v1.3.66): Wait for broker registration BEFORE accepting connections
+        // to prevent "no brokers available" errors from clients during cluster startup
+        let broker_metadata = BrokerMetadata {
             broker_id: config.node_id,
             host: config.advertised_host.clone(),
             port: config.advertised_port,
@@ -200,7 +344,55 @@ impl IntegratedKafkaServer {
             status: chronik_common::metadata::traits::BrokerStatus::Online,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
-        }).await?;
+        };
+
+        if config.cluster_config.is_some() {
+            // Cluster mode: register broker with retry, but BLOCK until successful
+            // This ensures metadata is consistent before clients can connect
+            info!("Registering broker {} ({}:{}) in Raft metadata (waiting for quorum)...",
+                  config.node_id, config.advertised_host, config.advertised_port);
+
+            let mut retry_count = 0;
+            let max_retries = 30; // 30 attempts * 2s = 60 seconds max wait
+            loop {
+                match metadata_store.register_broker(broker_metadata.clone()).await {
+                    Ok(_) => {
+                        info!("✓ Successfully registered broker {} in Raft metadata", config.node_id);
+                        break;
+                    }
+                    Err(e) => {
+                        retry_count += 1;
+                        if retry_count <= max_retries {
+                            warn!("Failed to register broker {} (attempt {}/{}): {:?}, retrying in 2s...",
+                                  config.node_id, retry_count, max_retries, e);
+                            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                        } else {
+                            error!("FATAL: Failed to register broker {} after {} attempts: {:?}",
+                                   config.node_id, retry_count, e);
+                            return Err(anyhow::anyhow!(
+                                "Broker registration failed after {} attempts - cluster may not have quorum",
+                                max_retries
+                            ));
+                        }
+                    }
+                }
+            }
+        } else {
+            // Standalone mode: register broker synchronously
+            info!("Registering broker {} ({}:{}) in metadata store...",
+                  config.node_id, config.advertised_host, config.advertised_port);
+            metadata_store.register_broker(broker_metadata).await?;
+            info!("✓ Successfully registered broker {} in metadata store", config.node_id);
+        }
+
+        // Restore high watermarks from segment metadata on startup
+        // This ensures that after WAL deletion, we can still serve data from segments
+        info!("Restoring high watermarks from segment metadata...");
+        if let Err(e) = Self::restore_high_watermarks_from_segments(&metadata_store).await {
+            warn!(error = %e, "Failed to restore high watermarks from segments (continuing anyway)");
+        } else {
+            info!("Successfully restored high watermarks from segment metadata");
+        }
 
         // Create object store configuration (use custom config if provided, otherwise default to local)
         let object_store_config = if let Some(custom_config) = config.object_store_config.clone() {
@@ -309,20 +501,23 @@ impl IntegratedKafkaServer {
             async_io: AsyncIoConfig::default(),
         };
 
-        // CRITICAL FIX (v1.3.52): Clear segments directory before WAL recovery
-        // This prevents duplicate messages during recovery. The flow is:
-        // 1. Normal operation: Data → WAL (fsync) → Segments (async)
-        // 2. Crash: Segments may have partial data
-        // 3. Recovery: Clear segments, replay WAL → Segments
-        // Without clearing, we'd have: WAL data + Old segment data = Duplicates
-        info!("Clearing segments directory to prevent duplicates during WAL recovery...");
-        let segments_dir_path = std::path::Path::new(&segments_dir);
-        if segments_dir_path.exists() {
-            match tokio::fs::remove_dir_all(segments_dir_path).await {
-                Ok(_) => info!("Cleared segments directory successfully: {}", segments_dir),
-                Err(e) => warn!("Failed to clear segments directory {}: {}. Recovery may have duplicates.", segments_dir, e),
-            }
-        }
+        // NOTE: Segments are NOW reliable (flush writes to segments on shutdown)
+        // Previous logic cleared segments to prevent duplicates, but this also deleted
+        // valid flushed data! With flush_partition() now writing to SegmentWriter,
+        // segments contain committed data that should NOT be deleted.
+        //
+        // Recovery strategy:
+        // 1. Segments have data from previous flush operations (reliable)
+        // 2. WAL has data from produce operations (reliable)
+        // 3. Both are needed for complete recovery
+        //
+        // We DO NOT clear segments on recovery. Consumers will fetch from:
+        // - WAL for recent writes (fast)
+        // - Segments for older data (persistent)
+        //
+        // Duplicate prevention is handled by offset tracking in metadata store.
+        info!("Skipping segment clearing - segments contain valid flushed data");
+        info!("Segments directory will be preserved for recovery: {}", segments_dir);
 
         // Initialize WAL manager with recovery (v1.3.47+: lock-free WAL architecture)
         // WalManager uses DashMap internally - no external RwLock needed
@@ -342,7 +537,19 @@ impl IntegratedKafkaServer {
             wal_manager.clone(),
         ).await?;
 
-        let produce_handler_base = Arc::new(produce_handler_inner);
+        let mut produce_handler_base = Arc::new(produce_handler_inner);
+
+        // Set Raft manager if provided (v2.0+)
+        #[cfg(feature = "raft")]
+        if let Some(raft_mgr) = raft_manager {
+            info!("Attaching Raft manager to ProduceHandler");
+            // Need to get mutable reference to set raft_manager
+            if let Some(handler_mut) = Arc::get_mut(&mut produce_handler_base) {
+                handler_mut.set_raft_manager(raft_mgr);
+            } else {
+                warn!("Could not attach Raft manager: ProduceHandler already has multiple references");
+            }
+        }
 
         // CRITICAL FIX (v1.3.52): Clear all partition buffers before WAL recovery
         // This prevents duplicate messages by ensuring we start with clean in-memory state.
@@ -411,6 +618,42 @@ impl IntegratedKafkaServer {
             }
 
             info!("WAL replay complete");
+        } else {
+            // CRITICAL FIX: WAL is empty (e.g., after deletion or fresh start with persisted segments)
+            // Restore partition states from metadata store instead
+            info!("WAL is empty, attempting to restore partition states from metadata store...");
+
+            // List all topics from metadata
+            match metadata_store.list_topics().await {
+                Ok(topics) => {
+                    for topic_meta in topics {
+                        let partition_count = topic_meta.config.partition_count as i32;
+                        for partition_id in 0..partition_count {
+                            // Get high watermark from metadata store
+                            match metadata_store.get_partition_offset(&topic_meta.name, partition_id as u32).await {
+                                Ok(Some((high_watermark, _log_start_offset))) if high_watermark > 0 => {
+                                    // Restore partition state
+                                    if let Err(e) = produce_handler_base.restore_partition_state(&topic_meta.name, partition_id, high_watermark as u64).await {
+                                        warn!("Failed to restore partition state from metadata for {}-{}: {}", topic_meta.name, partition_id, e);
+                                    } else {
+                                        info!("Restored {}-{} from metadata store: high watermark = {}", topic_meta.name, partition_id, high_watermark);
+                                    }
+                                }
+                                Ok(_) => {
+                                    // No offset data or hwm=0, nothing to restore
+                                }
+                                Err(e) => {
+                                    warn!("Failed to get partition offset from metadata for {}-{}: {}", topic_meta.name, partition_id, e);
+                                }
+                            }
+                        }
+                    }
+                    info!("Metadata store recovery complete");
+                }
+                Err(e) => {
+                    warn!("Failed to list topics from metadata store: {}", e);
+                }
+            }
         }
 
         // Wrap with WalProduceHandler for backward compatibility (will be removed in future)
@@ -473,6 +716,7 @@ impl IntegratedKafkaServer {
             indexer_config,
             wal_manager_ref,
             object_store_arc.clone(),
+            metadata_store.clone(),
         ));
 
         // Start the background indexing task
@@ -541,6 +785,10 @@ impl IntegratedKafkaServer {
         info!("  Indexing: {}", config.enable_indexing);
         info!("  WAL Indexing: {}", config.enable_wal_indexing);
 
+        // Clone cluster config before moving config into server
+        #[cfg(feature = "raft")]
+        let cluster_config_clone = config.cluster_config.clone();
+
         // Create default topic on startup to ensure clients can connect
         // This solves the chicken-and-egg problem where clients need at least one topic
         // in metadata responses before they can produce messages
@@ -551,11 +799,60 @@ impl IntegratedKafkaServer {
             wal_indexer,
             metadata_uploader,
         };
-        
+
         // Create default topic
         info!("Creating default topic 'chronik-default' for client compatibility");
         if let Err(e) = server.ensure_default_topic().await {
             warn!("Failed to create default topic on startup: {:?}", e);
+        }
+
+        // If clustering is enabled, perform initial partition assignment
+        #[cfg(feature = "raft")]
+        if let Some(ref cluster_config) = cluster_config_clone {
+            if cluster_config.enabled {
+                info!("Cluster mode enabled - performing initial partition assignment");
+                if let Err(e) = server.assign_existing_partitions(cluster_config).await {
+                    warn!("Failed to assign existing partitions: {:?}", e);
+                }
+
+                // CRITICAL FIX (v1.3.66): Verify broker is visible in metadata before accepting connections
+                // In Raft cluster mode, allow extra time for consensus and replication
+                info!("Verifying broker {} is visible in metadata store (Raft cluster mode)...", server.config.node_id);
+                let mut verify_retry = 0;
+                let max_verify_retries = 60; // 60 seconds for Raft cluster to stabilize
+                loop {
+                    match metadata_store.list_brokers().await {
+                        Ok(brokers) if !brokers.is_empty() => {
+                            let broker_ids: Vec<i32> = brokers.iter().map(|b| b.broker_id).collect();
+                            info!("✓ Metadata store has {} broker(s): {:?}", brokers.len(), broker_ids);
+
+                            // Verify THIS broker is in the list
+                            if brokers.iter().any(|b| b.broker_id == server.config.node_id) {
+                                info!("✓ Broker {} confirmed visible in metadata", server.config.node_id);
+                                break;
+                            } else {
+                                warn!("Broker {} not yet visible in metadata (found: {:?}), retrying...",
+                                      server.config.node_id, broker_ids);
+                            }
+                        }
+                        Ok(_) => {
+                            warn!("Metadata store has no brokers yet (attempt {}/{}), retrying in 1s...", verify_retry + 1, max_verify_retries);
+                        }
+                        Err(e) => {
+                            warn!("Failed to list brokers (attempt {}/{}): {:?}, retrying in 1s...", verify_retry + 1, max_verify_retries, e);
+                        }
+                    }
+
+                    verify_retry += 1;
+                    if verify_retry >= max_verify_retries {
+                        return Err(anyhow::anyhow!(
+                            "Broker {} not visible in metadata after {} attempts ({} seconds) - cluster metadata inconsistent",
+                            server.config.node_id, verify_retry, verify_retry
+                        ));
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                }
+            }
         }
 
         Ok(server)
@@ -566,6 +863,102 @@ impl IntegratedKafkaServer {
         self.wal_indexer.clone()
     }
     
+    /// Assign existing partitions to cluster nodes (Phase 3.4)
+    ///
+    /// This method is called on cluster startup to ensure all partitions have assignments.
+    /// It uses the round-robin strategy from `crates/chronik-common/src/partition_assignment.rs`.
+    #[cfg(feature = "raft")]
+    async fn assign_existing_partitions(&self, cluster_config: &chronik_config::ClusterConfig) -> Result<()> {
+        use chronik_common::partition_assignment::PartitionAssignment as AssignmentManager;
+        use chronik_common::metadata::PartitionAssignment;
+
+        info!("Starting partition assignment for existing topics");
+
+        // Get list of all cluster node IDs (convert from u64 to u32 for partition_assignment module)
+        let node_ids: Vec<u32> = cluster_config.peers.iter().map(|p| p.id as u32).collect();
+        if node_ids.is_empty() {
+            warn!("No cluster nodes found, skipping partition assignment");
+            return Ok(());
+        }
+
+        info!("Cluster nodes: {:?}", node_ids);
+
+        // Get all topics
+        let topics = self.metadata_store.list_topics().await?;
+        if topics.is_empty() {
+            info!("No topics found, skipping partition assignment");
+            return Ok(());
+        }
+
+        info!("Found {} topics to assign", topics.len());
+
+        // For each topic, assign partitions using round-robin
+        for topic in topics {
+            let topic_name = &topic.name;
+            let partition_count = topic.config.partition_count;
+            let replication_factor = topic.config.replication_factor.min(node_ids.len() as u32);
+
+            info!(
+                "Assigning topic '{}': {} partitions, RF={}",
+                topic_name, partition_count, replication_factor
+            );
+
+            // Check if partitions are already assigned
+            let existing_assignments = self.metadata_store.get_partition_assignments(topic_name).await?;
+            if !existing_assignments.is_empty() {
+                info!("Topic '{}' already has {} assignments, skipping", topic_name, existing_assignments.len());
+                continue;
+            }
+
+            // Create assignment manager and assign partitions
+            let mut assignment_mgr = AssignmentManager::new();
+            assignment_mgr.add_topic(
+                topic_name,
+                partition_count as i32,
+                replication_factor as i32,
+                &node_ids,
+            )?;
+
+            // Convert to metadata PartitionAssignment and persist
+            let topic_assignments = assignment_mgr.get_topic_assignments(topic_name);
+            for (partition_id, partition_info) in topic_assignments {
+                // For each replica, create a PartitionAssignment
+                for (replica_idx, &node_id) in partition_info.replicas.iter().enumerate() {
+                    let is_leader = node_id == partition_info.leader;
+                    let assignment = PartitionAssignment {
+                        topic: topic_name.clone(),
+                        partition: partition_id as u32,
+                        broker_id: node_id as i32,
+                        is_leader,
+                    };
+
+                    // Persist assignment via metadata store (will replicate via Raft)
+                    self.metadata_store.assign_partition(assignment).await?;
+
+                    if is_leader {
+                        info!(
+                            "Assigned partition {}/{} to node {} (leader)",
+                            topic_name, partition_id, node_id
+                        );
+                    } else {
+                        debug!(
+                            "Assigned partition {}/{} to node {} (replica #{})",
+                            topic_name, partition_id, node_id, replica_idx
+                        );
+                    }
+                }
+            }
+
+            info!(
+                "Successfully assigned {} partitions for topic '{}'",
+                partition_count, topic_name
+            );
+        }
+
+        info!("Partition assignment complete");
+        Ok(())
+    }
+
     /// Ensure a default topic exists for client connectivity
     async fn ensure_default_topic(&self) -> Result<()> {
         use chronik_common::metadata::TopicConfig;
@@ -594,8 +987,35 @@ impl IntegratedKafkaServer {
         
         Ok(())
     }
-    
-    /// Run the Kafka server
+
+    /// Gracefully shutdown the server, flushing all pending data
+    pub async fn shutdown(&self) -> Result<()> {
+        info!("Shutting down IntegratedKafkaServer...");
+
+        // Step 1: Shutdown WAL handler first to seal all WAL segments to disk
+        self.kafka_handler.get_wal_handler().shutdown().await;
+        info!("WAL segments sealed to disk");
+
+        // Step 2: Run WalIndexer once to upload sealed segments to object store
+        // This ensures data is available for consumption even after WAL deletion
+        info!("Running WalIndexer to upload sealed segments...");
+        match self.get_wal_indexer().run_once().await {
+            Ok(stats) => {
+                info!(
+                    "WalIndexer run complete: {} segments processed, {} records indexed",
+                    stats.segments_processed, stats.records_indexed
+                );
+            }
+            Err(e) => {
+                error!("WalIndexer run failed: {}", e);
+            }
+        }
+
+        info!("IntegratedKafkaServer shutdown complete");
+        Ok(())
+    }
+
+    /// Run the Kafka server (with optional shutdown signal)
     pub async fn run(&self, bind_addr: &str) -> Result<()> {
         let listener = TcpListener::bind(bind_addr).await?;
         info!("Integrated Kafka server listening on {}", bind_addr);
@@ -871,7 +1291,15 @@ impl IntegratedKafkaServer {
             }
         }
     }
-    
+
+    /// Flush all partition buffers to ensure data durability before shutdown
+    pub async fn flush_all_partitions(&self) -> Result<()> {
+        info!("Flushing all partition buffers to storage...");
+        self.kafka_handler.flush_all_partitions().await?;
+        info!("All partitions flushed successfully");
+        Ok(())
+    }
+
     /// Get server statistics
     pub async fn get_stats(&self) -> Result<ServerStats> {
         let topics = self.metadata_store.list_topics().await?;
@@ -882,10 +1310,93 @@ impl IntegratedKafkaServer {
             topics_count: topics.len(),
             brokers_count: brokers.len(),
             advertised_address: format!("{}:{}", 
-                self.config.advertised_host, 
+                self.config.advertised_host,
                 self.config.advertised_port
             ),
         })
+    }
+
+    /// Restore high watermarks from segment metadata on startup
+    ///
+    /// This is critical for recovery after WAL deletion. Without this, the server
+    /// would not know what offsets exist in segments and would report empty partitions.
+    async fn restore_high_watermarks_from_segments(
+        metadata_store: &Arc<dyn MetadataStore>,
+    ) -> Result<()> {
+        use std::collections::HashMap;
+
+        // Get all topics
+        let topics = metadata_store.list_topics().await
+            .map_err(|e| anyhow::anyhow!("Failed to list topics: {}", e))?;
+
+        if topics.is_empty() {
+            info!("No topics found, skipping high watermark restoration");
+            return Ok(());
+        }
+
+        // For each topic, find the maximum offset from segments
+        let mut high_watermarks: HashMap<(String, u32), i64> = HashMap::new();
+
+        for topic in topics {
+            // List all segments for this topic
+            let segments = metadata_store.list_segments(&topic.name, None).await
+                .map_err(|e| anyhow::anyhow!("Failed to list segments for topic {}: {}", topic.name, e))?;
+
+            if segments.is_empty() {
+                continue;
+            }
+
+            // Find maximum end_offset for each partition
+            for segment in segments {
+                let key = (segment.topic.clone(), segment.partition);
+                let current_max = high_watermarks.get(&key).copied().unwrap_or(-1);
+
+                // High watermark should be one past the last offset in the segment
+                let segment_high_watermark = segment.end_offset + 1;
+
+                if segment_high_watermark > current_max {
+                    high_watermarks.insert(key, segment_high_watermark);
+                }
+            }
+        }
+
+        // Update high watermarks in metadata store
+        let mut restored_count = 0;
+        for ((topic, partition), high_watermark) in high_watermarks {
+            // Check if we already have a high watermark set (from WAL recovery)
+            if let Ok(Some((existing_hwm, _))) = metadata_store.get_partition_offset(&topic, partition).await {
+                if existing_hwm >= high_watermark {
+                    // Already have a higher or equal watermark from WAL, don't overwrite
+                    debug!(
+                        topic = %topic,
+                        partition = partition,
+                        existing_hwm = existing_hwm,
+                        segment_hwm = high_watermark,
+                        "Skipping watermark restore (existing is higher)"
+                    );
+                    continue;
+                }
+            }
+
+            // Set the high watermark (log_start_offset = 0 for now)
+            metadata_store.update_partition_offset(&topic, partition, high_watermark, 0).await
+                .map_err(|e| anyhow::anyhow!("Failed to update high watermark for {}:{}: {}", topic, partition, e))?;
+
+            info!(
+                topic = %topic,
+                partition = partition,
+                high_watermark = high_watermark,
+                "Restored high watermark from segments"
+            );
+            restored_count += 1;
+        }
+
+        info!(
+            restored_count = restored_count,
+            "High watermark restoration complete"
+        );
+
+        Ok(())
     }
 }
 

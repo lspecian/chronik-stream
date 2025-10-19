@@ -76,23 +76,34 @@ impl WalMetadataAdapter {
             }
         };
 
-        Ok(WalRecord::new(
-            next_offset,
-            Some(event.event_id.as_bytes().to_vec()),
-            data,
-            event.timestamp.timestamp_millis(),
+        // CRITICAL FIX (v1.3.66): Use V2 records for metadata events
+        // WalManager::read_from() ONLY reads V2 records (see manager.rs line 314)
+        // V1 records are silently skipped by the V2 reader!
+        // We wrap the JSON metadata event in V2 format so recovery can read it back
+        Ok(WalRecord::new_v2(
+            METADATA_TOPIC.to_string(),
+            self.partition,
+            data,            // Canonical data = JSON-serialized metadata event
+            next_offset,     // base_offset = next_offset (single event)
+            next_offset,     // last_offset = next_offset (single event)
+            1,               // record_count = 1 (single event per record)
         ))
     }
 
     /// Convert WAL record to metadata event
     fn wal_record_to_event(&self, record: &WalRecord) -> Result<MetadataEvent> {
-        // Metadata events use V1 records (individual events, not batches)
+        // CRITICAL FIX (v1.3.66): Accept V2 records for metadata events
+        // Previously this expected V1 records, but WalManager::read_from() only returns V2
         match record {
+            chronik_wal::record::WalRecord::V2 { canonical_data, .. } => {
+                serde_json::from_slice(canonical_data)
+                    .map_err(|e| MetadataError::SerializationError(format!("Failed to deserialize event: {}", e)))
+            }
             chronik_wal::record::WalRecord::V1 { value, .. } => {
+                // Legacy V1 support (should not happen, but keep for backward compatibility)
                 serde_json::from_slice(value)
                     .map_err(|e| MetadataError::SerializationError(format!("Failed to deserialize event: {}", e)))
             }
-            _ => Err(MetadataError::SerializationError("Expected V1 record for metadata events".into()))
         }
     }
 }

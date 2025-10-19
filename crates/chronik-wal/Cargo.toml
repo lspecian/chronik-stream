@@ -12,6 +12,7 @@ wal = ["dep:memmap2"]
 wal-encryption = ["wal", "dep:ring"]
 wal-compression = ["wal", "dep:zstd"]
 async-io = ["dep:tokio-uring"]
+raft-storage = ["dep:chronik-raft"]
 
 [dependencies]
 # Workspace dependencies
@@ -43,6 +44,7 @@ tokio-uring = { version = "0.4", optional = true }
 
 # Local dependencies
 chronik-common = { path = "../chronik-common" }
+chronik-raft = { path = "../chronik-raft", optional = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

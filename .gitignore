@@ -84,7 +84,7 @@ tests/python/*.out
 benchmarks/results/
 
 # Data directories - runtime data should not be committed
-data/
+data*
 *.segment
 *.db
 *.idx
@@ -92,4 +92,21 @@ data/
 # KSQL installation and test files
 ksql/
 *.jar
-*.class 
+*.class
+
+# Editor backup files (vim, emacs, etc.)
+*.bak
+*.bak[0-9]
+*.bak[0-9][0-9]
+*~
+*.swp
+*.swo
+.#*
+\#*#
+
+# Runtime log files (development/testing)
+*.log
+node*.log
+server*.log
+test*.log
+*_lifecycle.log 

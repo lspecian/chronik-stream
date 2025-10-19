@@ -1,0 +1,54 @@
+[workspace]
+# This is a standalone test package, not part of main workspace
+
+[package]
+name = "chronik-raft-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "chronik_raft_tests"
+path = "common/mod.rs"
+
+[[test]]
+name = "test_leader_election"
+path = "test_leader_election.rs"
+harness = true
+
+[[test]]
+name = "test_single_partition_replication"
+path = "test_single_partition_replication.rs"
+harness = true
+
+[[test]]
+name = "test_network_partition"
+path = "test_network_partition.rs"
+harness = true
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error handling
+anyhow = "1.0"
+
+# Testing
+testcontainers = "0.15"
+tempfile = "3.8"
+reqwest = { version = "0.11", features = ["json"] }
+proptest = "1.4"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Kafka clients (for testing)
+# rdkafka = { version = "0.36", features = ["cmake-build"], optional = true }
+
+[dev-dependencies]
+tokio-test = "0.4"
