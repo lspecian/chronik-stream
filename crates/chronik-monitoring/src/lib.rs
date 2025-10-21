@@ -1,20 +1,17 @@
 //! Monitoring and observability for Chronik Stream.
 
-pub mod metrics;
+pub mod unified_metrics;  // New unified lock-free atomic metrics
 pub mod tracing;
 pub mod server;
-pub mod raft_metrics;
 
-pub use metrics::{
-    MetricsRegistry,
-    ControllerMetrics,
-    IngestMetrics,
-    QueryMetrics,
-    JanitorMetrics,
-};
+// Re-export for compatibility
+pub use unified_metrics::{UnifiedMetrics, MetricsRecorder, global_metrics};
 pub use tracing::{init_tracing, TracingConfig};
 pub use server::{MetricsServer, ServerMetrics, ConnectionMetrics};
-pub use raft_metrics::RaftMetrics;
+
+// Keep MetricsRegistry as a placeholder for compatibility
+#[derive(Clone)]
+pub struct MetricsRegistry {}
 
 use anyhow::Result;
 
@@ -29,8 +26,8 @@ pub async fn init_monitoring(
         init_tracing(service_name, config)?;
     }
     
-    // Create metrics registry
-    let registry = MetricsRegistry::new();
+    // Create metrics registry (placeholder for compatibility)
+    let registry = MetricsRegistry {};
     
     // Start metrics server
     let server = MetricsServer::new(registry.clone(), metrics_port);

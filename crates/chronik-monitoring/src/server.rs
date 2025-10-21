@@ -9,57 +9,18 @@ use axum::{
     routing::get,
     Router,
 };
-use prometheus::{Encoder, TextEncoder, Counter, Gauge, Histogram, HistogramOpts};
 use std::net::SocketAddr;
 use tower_http::trace::TraceLayer;
 
-/// Server metrics for monitoring TCP server performance
-pub struct ServerMetrics {
-    // Connection metrics
-    pub connections_total: Counter,
-    pub connections_active: Gauge,
-    pub connections_rejected: Counter,
-    
-    // Request metrics
-    pub requests_total: Counter,
-    pub request_errors: Counter,
-    pub request_timeouts: Counter,
-    pub request_duration: Histogram,
-    
-    // Data transfer metrics
-    pub bytes_received: Counter,
-    pub bytes_sent: Counter,
-    
-    // Backpressure metrics
-    pub pending_requests: Gauge,
-    pub backpressure_events: Counter,
-    
-    // Protocol metrics
-    pub frame_errors: Counter,
-    pub tls_handshake_failures: Counter,
-}
+/// Server metrics placeholder - actual metrics are in UnifiedMetrics
+///
+/// These structs are kept for backward compatibility but actual metric
+/// recording now happens through the unified atomic metrics system.
+pub struct ServerMetrics {}
 
 impl ServerMetrics {
-    /// Create new server metrics
     pub fn new() -> Self {
-        let histogram_opts = HistogramOpts::new("request_duration", "Request duration in seconds")
-            .buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]);
-        
-        Self {
-            connections_total: Counter::new("connections_total", "Total connections").unwrap(),
-            connections_active: Gauge::new("connections_active", "Active connections").unwrap(),
-            connections_rejected: Counter::new("connections_rejected", "Rejected connections").unwrap(),
-            requests_total: Counter::new("requests_total", "Total requests").unwrap(),
-            request_errors: Counter::new("request_errors", "Request errors").unwrap(),
-            request_timeouts: Counter::new("request_timeouts", "Request timeouts").unwrap(),
-            request_duration: Histogram::with_opts(histogram_opts).unwrap(),
-            bytes_received: Counter::new("bytes_received", "Bytes received").unwrap(),
-            bytes_sent: Counter::new("bytes_sent", "Bytes sent").unwrap(),
-            pending_requests: Gauge::new("pending_requests", "Pending requests").unwrap(),
-            backpressure_events: Counter::new("backpressure_events", "Backpressure events").unwrap(),
-            frame_errors: Counter::new("frame_errors", "Frame errors").unwrap(),
-            tls_handshake_failures: Counter::new("tls_handshake_failures", "TLS handshake failures").unwrap(),
-        }
+        Self {}
     }
 }
 
@@ -69,23 +30,12 @@ impl Default for ServerMetrics {
     }
 }
 
-/// Connection-specific metrics
-pub struct ConnectionMetrics {
-    pub requests: Counter,
-    pub errors: Counter,
-    pub bytes_sent: Counter,
-    pub bytes_received: Counter,
-}
+/// Connection metrics placeholder - actual metrics are in UnifiedMetrics
+pub struct ConnectionMetrics {}
 
 impl ConnectionMetrics {
-    /// Create new connection metrics
     pub fn new() -> Self {
-        Self {
-            requests: Counter::new("connection_requests", "Requests per connection").unwrap(),
-            errors: Counter::new("connection_errors", "Errors per connection").unwrap(),
-            bytes_sent: Counter::new("connection_bytes_sent", "Bytes sent per connection").unwrap(),
-            bytes_received: Counter::new("connection_bytes_received", "Bytes received per connection").unwrap(),
-        }
+        Self {}
     }
 }
 
@@ -128,20 +78,27 @@ impl MetricsServer {
 }
 
 /// Metrics endpoint handler
+///
+/// Uses lock-free atomic counters from UnifiedMetrics to avoid deadlocks.
+/// This is fast, reliable, and deadlock-proof.
 async fn metrics_handler(
-    State(registry): State<MetricsRegistry>,
+    State(_registry): State<MetricsRegistry>,
 ) -> impl IntoResponse {
-    let encoder = TextEncoder::new();
-    let metric_families = registry.registry().gather();
-    
-    let mut buffer = Vec::new();
-    match encoder.encode(&metric_families, &mut buffer) {
-        Ok(_) => (StatusCode::OK, buffer),
-        Err(e) => {
-            tracing::error!("Failed to encode metrics: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, Vec::new())
-        }
-    }
+    use crate::unified_metrics::global_metrics;
+
+    tracing::debug!("Metrics endpoint called");
+
+    // Get Prometheus-formatted metrics from atomic counters (lock-free, instant)
+    let prometheus_output = global_metrics().format_prometheus();
+
+    tracing::debug!("Successfully generated {} bytes of metrics", prometheus_output.len());
+
+    // Return as Prometheus text format
+    (
+        StatusCode::OK,
+        [("content-type", "text/plain; version=0.0.4")],
+        prometheus_output
+    )
 }
 
 /// Health check handler

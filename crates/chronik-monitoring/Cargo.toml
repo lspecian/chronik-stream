@@ -8,10 +8,6 @@ license.workspace = true
 [dependencies]
 chronik-common = { path = "../chronik-common" }
 
-# Metrics
-prometheus = "0.13"
-lazy_static = "1.4"
-
 # Tracing
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
