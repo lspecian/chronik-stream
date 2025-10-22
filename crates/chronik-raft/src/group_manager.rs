@@ -4,7 +4,7 @@
 //! in a Chronik node. It handles replica lifecycle, routing, and provides
 //! a unified interface for produce/fetch operations.
 
-use crate::{MemoryStateMachine, PartitionReplica, RaftClient, RaftConfig, RaftError, RaftLogStorage, Result, StateMachine};
+use crate::{MemoryStateMachine, PartitionReplica, RaftClient, RaftConfig, RaftError, RaftLogStorage, Result, StateMachine, Transport, GrpcTransport};
 use chronik_monitoring::RaftMetrics;
 use parking_lot::RwLock;
 use raft::{prelude::Message, StateRole};
@@ -68,8 +68,8 @@ pub struct RaftGroupManager {
     /// State machine factory for creating new replicas
     state_machine_factory: Arc<dyn Fn() -> Arc<TokioRwLock<dyn StateMachine>> + Send + Sync>,
 
-    /// gRPC client for sending messages to peers
-    raft_client: Arc<RaftClient>,
+    /// Raft transport layer for sending messages to peers (gRPC or in-memory)
+    raft_transport: Arc<dyn Transport>,
 
     /// Background tick task handle
     tick_task: RwLock<Option<JoinHandle<()>>>,
@@ -175,7 +175,42 @@ impl RaftGroupManager {
             replicas: Arc::new(RwLock::new(HashMap::new())),
             log_storage_factory: Arc::new(log_storage_factory),
             state_machine_factory: Arc::new(state_machine_factory),
-            raft_client: Arc::new(RaftClient::new()),
+            raft_transport: Arc::new(GrpcTransport::new()),  // Default to gRPC for production
+            tick_task: RwLock::new(None),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            tick_interval,
+            metrics: RaftMetrics::new(),
+        }
+    }
+
+    /// Create a new RaftGroupManager with custom transport (for testing).
+    ///
+    /// This allows injecting an InMemoryTransport for tests or other transport implementations.
+    pub fn with_transport<F, S, T>(
+        node_id: u64,
+        config: RaftConfig,
+        log_storage_factory: F,
+        state_machine_factory: S,
+        tick_interval: Duration,
+        transport: T,
+    ) -> Self
+    where
+        F: Fn() -> Arc<dyn RaftLogStorage> + Send + Sync + 'static,
+        S: Fn() -> Arc<TokioRwLock<dyn StateMachine>> + Send + Sync + 'static,
+        T: Transport + 'static,
+    {
+        info!(
+            "Creating RaftGroupManager for node {} with custom transport, tick_interval: {:?}",
+            node_id, tick_interval
+        );
+
+        Self {
+            node_id,
+            config,
+            replicas: Arc::new(RwLock::new(HashMap::new())),
+            log_storage_factory: Arc::new(log_storage_factory),
+            state_machine_factory: Arc::new(state_machine_factory),
+            raft_transport: Arc::new(transport),
             tick_task: RwLock::new(None),
             shutdown: Arc::new(AtomicBool::new(false)),
             tick_interval,
@@ -187,15 +222,15 @@ impl RaftGroupManager {
     ///
     /// # Arguments
     /// * `node_id` - Node ID of the peer
-    /// * `addr` - gRPC address of the peer (e.g., "http://192.168.1.10:5001")
+    /// * `addr` - Address of the peer (gRPC URL or identifier for in-memory transport)
     pub async fn add_peer(&self, node_id: u64, addr: String) -> Result<()> {
         info!("Adding peer {} at {}", node_id, addr);
-        self.raft_client.add_peer(node_id, addr).await
+        self.raft_transport.add_peer(node_id, addr).await
     }
 
-    /// Get reference to the Raft client
-    pub fn raft_client(&self) -> &Arc<RaftClient> {
-        &self.raft_client
+    /// Get reference to the Raft transport layer
+    pub fn raft_transport(&self) -> &Arc<dyn Transport> {
+        &self.raft_transport
     }
 
     /// Get or create a partition replica
@@ -479,6 +514,29 @@ impl RaftGroupManager {
         replica.propose(data).await
     }
 
+    /// Receive and process an incoming Raft message
+    ///
+    /// This method is used to deliver messages from the transport layer to the appropriate
+    /// partition replica. In production, this is called by the gRPC server. In tests with
+    /// InMemoryTransport, this is called by a message routing loop.
+    ///
+    /// # Arguments
+    /// * `topic` - Topic name
+    /// * `partition` - Partition ID
+    /// * `msg` - Raft message to process
+    ///
+    /// # Returns
+    /// Ok(()) if message was processed, Err if replica doesn't exist
+    pub async fn receive_message(&self, topic: &str, partition: i32, msg: raft::prelude::Message) -> Result<()> {
+        let replica = self.get_replica(topic, partition)
+            .ok_or_else(|| RaftError::Config(format!(
+                "Partition {}-{} is not managed by Raft",
+                topic, partition
+            )))?;
+
+        replica.step(msg).await
+    }
+
     /// Spawn background tick loop
     ///
     /// This creates a tokio task that continuously ticks all Raft groups
@@ -488,7 +546,7 @@ impl RaftGroupManager {
         let replicas = self.replicas.clone();
         let shutdown = self.shutdown.clone();
         let tick_interval = self.tick_interval;
-        let raft_client = Arc::clone(&self.raft_client);
+        let raft_transport = Arc::clone(&self.raft_transport);
         let node_id = self.node_id;
         let metrics = RaftMetrics::new(); // Create metrics for tick loop
 
@@ -537,13 +595,13 @@ impl RaftGroupManager {
                                             continue;
                                         }
 
-                                        let raft_client_clone = Arc::clone(&raft_client);
+                                        let raft_transport_clone = Arc::clone(&raft_transport);
                                         let topic_clone = topic.clone();
                                         let partition_clone = *partition;
 
                                         // Send message asynchronously (don't block tick loop)
                                         tokio::spawn(async move {
-                                            if let Err(e) = raft_client_clone.send_message(
+                                            if let Err(e) = raft_transport_clone.send_message(
                                                 &topic_clone,
                                                 partition_clone,
                                                 to,
@@ -680,13 +738,13 @@ impl RaftGroupManager {
                     continue;
                 }
 
-                let raft_client = Arc::clone(&self.raft_client);
+                let raft_transport = Arc::clone(&self.raft_transport);
                 let topic_clone = topic.to_string();
                 let partition_clone = partition;
 
                 // Send message asynchronously
                 tokio::spawn(async move {
-                    if let Err(e) = raft_client.send_message(
+                    if let Err(e) = raft_transport.send_message(
                         &topic_clone,
                         partition_clone,
                         to,

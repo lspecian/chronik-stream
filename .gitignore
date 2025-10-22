@@ -110,3 +110,6 @@ node*.log
 server*.log
 test*.log
 *_lifecycle.log 
+.env.hetzner
+test-cluster*
+.env*

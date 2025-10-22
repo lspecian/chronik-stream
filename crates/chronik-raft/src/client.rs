@@ -1,4 +1,4 @@
-//! gRPC client for Raft peer communication.
+//! gRPC client for Raft peer communication with connection pooling.
 
 use crate::error::{Result, RaftError};
 use crate::rpc::proto;
@@ -9,26 +9,50 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
 use tonic::transport::{Channel, Endpoint};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
-/// Raft client for sending messages to peer nodes.
+/// Connection pool entry with last access tracking for LRU eviction
+struct PooledClient {
+    client: proto::raft_service_client::RaftServiceClient<Channel>,
+    last_used: Instant,
+}
+
+/// Raft client for sending messages to peer nodes with connection pooling.
+///
+/// OPTIMIZATION (v1.3.66): Implements bounded connection pool with LRU eviction
+/// to prevent unbounded memory growth and improve cluster scalability.
 pub struct RaftClient {
-    /// Map of node_id -> gRPC client
-    clients: Arc<RwLock<HashMap<u64, proto::raft_service_client::RaftServiceClient<Channel>>>>,
+    /// Map of node_id -> pooled gRPC client with access tracking
+    clients: Arc<RwLock<HashMap<u64, PooledClient>>>,
 
     /// Map of node_id -> address
     peer_addrs: Arc<RwLock<HashMap<u64, String>>>,
+
+    /// Maximum number of concurrent connections (default: 1000)
+    max_pool_size: usize,
 
     /// Raft metrics collector
     metrics: RaftMetrics,
 }
 
 impl RaftClient {
-    /// Create a new Raft client.
+    /// Create a new Raft client with default connection pool size (1000).
     pub fn new() -> Self {
+        Self::with_pool_size(1000)
+    }
+
+    /// Create a new Raft client with custom connection pool size.
+    ///
+    /// OPTIMIZATION (v1.3.66): Configurable pool size for different deployment scales.
+    /// Recommended values:
+    /// - Small clusters (3-10 nodes): 100-500
+    /// - Medium clusters (10-100 nodes): 500-1000
+    /// - Large clusters (100+ nodes): 1000-5000
+    pub fn with_pool_size(max_pool_size: usize) -> Self {
         Self {
             clients: Arc::new(RwLock::new(HashMap::new())),
             peer_addrs: Arc::new(RwLock::new(HashMap::new())),
+            max_pool_size,
             metrics: RaftMetrics::new(),
         }
     }
@@ -236,6 +260,117 @@ impl RaftClient {
         result
     }
 
+    /// Send multiple Raft messages to a single peer in one RPC call.
+    ///
+    /// OPTIMIZATION (v1.3.66): Batch sending reduces HTTP/2 frame overhead
+    /// and improves throughput by sending multiple messages in a single gRPC call.
+    ///
+    /// # Arguments
+    /// * `to` - Target node ID
+    /// * `messages` - Vec of (topic, partition, RaftMessage) tuples
+    pub async fn send_message_batch(
+        &self,
+        to: u64,
+        messages: Vec<(&str, i32, RaftMessage_)>,
+    ) -> Result<Vec<Result<()>>> {
+        if messages.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let start = Instant::now();
+        debug!("Sending batch of {} messages to peer {}", messages.len(), to);
+
+        // Get or create client for the peer
+        let mut client = self.get_or_connect(to).await?;
+
+        // Convert messages to protobuf format
+        let mut proto_messages = Vec::with_capacity(messages.len());
+        for (topic, partition, msg) in &messages {
+            let msg_bytes = crate::prost_bridge::encode_raft_message(msg)
+                .map_err(|e| RaftError::Config(e))?;
+
+            proto_messages.push(proto::RaftMessage {
+                topic: topic.to_string(),
+                partition: *partition,
+                message: msg_bytes,
+            });
+        }
+
+        // Send batch via gRPC
+        let batch_request = proto::RaftMessageBatch {
+            messages: proto_messages,
+        };
+
+        let response = match client.step_batch(batch_request).await {
+            Ok(resp) => resp.into_inner(),
+            Err(e) => {
+                // Connection error - remove client and retry
+                if matches!(
+                    e.code(),
+                    tonic::Code::Unavailable | tonic::Code::DeadlineExceeded | tonic::Code::Cancelled
+                ) {
+                    warn!("Batch RPC connection error to peer {}, reconnecting...", to);
+                    self.clients.write().await.remove(&to);
+
+                    // Retry once
+                    if let Ok(mut new_client) = self.get_or_connect(to).await {
+                        // Recreate batch request
+                        let retry_messages: Vec<proto::RaftMessage> = messages.iter()
+                            .map(|(topic, partition, msg)| {
+                                let msg_bytes = crate::prost_bridge::encode_raft_message(msg)
+                                    .unwrap_or_default();
+                                proto::RaftMessage {
+                                    topic: topic.to_string(),
+                                    partition: *partition,
+                                    message: msg_bytes,
+                                }
+                            })
+                            .collect();
+
+                        let retry_batch = proto::RaftMessageBatch { messages: retry_messages };
+                        match new_client.step_batch(retry_batch).await {
+                            Ok(resp) => resp.into_inner(),
+                            Err(retry_err) => {
+                                warn!("Batch RPC failed after reconnect to peer {}: {}", to, retry_err);
+                                return Err(RaftError::Grpc(retry_err));
+                            }
+                        }
+                    } else {
+                        return Err(RaftError::Grpc(e));
+                    }
+                } else {
+                    return Err(RaftError::Grpc(e));
+                }
+            }
+        };
+
+        // Convert responses
+        let mut results = Vec::with_capacity(response.responses.len());
+        for step_resp in response.responses {
+            if step_resp.success {
+                results.push(Ok(()));
+            } else {
+                results.push(Err(RaftError::Config(step_resp.error)));
+            }
+        }
+
+        // Record metrics
+        let latency_ms = start.elapsed().as_millis() as f64;
+        let target_node = to.to_string();
+        let success_count = results.iter().filter(|r| r.is_ok()).count();
+        let success_rate = success_count as f64 / results.len() as f64;
+
+        // Record as a single "Batch" RPC with success rate
+        self.metrics.record_rpc_call("Batch", &target_node, success_rate > 0.5, latency_ms);
+
+        debug!(
+            "Batch of {} messages to peer {} completed: {}/{} successful, latency: {:.2}ms",
+            messages.len(), to, success_count, results.len(), latency_ms
+        );
+
+        Ok(results)
+    }
+
     /// Send messages to multiple peers in parallel.
     pub async fn broadcast_messages(
         &self,
@@ -298,12 +433,15 @@ impl RaftClient {
     }
 
     /// Get an existing client or connect to the peer.
+    ///
+    /// OPTIMIZATION (v1.3.66): Updates last_used timestamp for LRU tracking.
     async fn get_or_connect(&self, node_id: u64) -> Result<proto::raft_service_client::RaftServiceClient<Channel>> {
-        // Check if we already have a client
+        // Check if we already have a client and update its last_used timestamp
         {
-            let clients = self.clients.read().await;
-            if let Some(client) = clients.get(&node_id) {
-                return Ok(client.clone());
+            let mut clients = self.clients.write().await;
+            if let Some(pooled) = clients.get_mut(&node_id) {
+                pooled.last_used = Instant::now();
+                return Ok(pooled.client.clone());
             }
         }
 
@@ -316,6 +454,9 @@ impl RaftClient {
                 .ok_or_else(|| RaftError::Config(format!("No address for peer {}", node_id)))?
         };
 
+        // Check if we need to evict connections to stay within pool size limit
+        self.evict_if_needed().await;
+
         // Connect
         self.connect(node_id, &addr).await?;
 
@@ -323,11 +464,35 @@ impl RaftClient {
         let clients = self.clients.read().await;
         clients
             .get(&node_id)
-            .cloned()
+            .map(|pooled| pooled.client.clone())
             .ok_or_else(|| RaftError::Config(format!("Failed to connect to peer {}", node_id)))
     }
 
-    /// Connect to a peer and store the client.
+    /// Evict least recently used connections if pool is at capacity.
+    ///
+    /// OPTIMIZATION (v1.3.66): LRU eviction to prevent unbounded connection growth.
+    async fn evict_if_needed(&self) {
+        let mut clients = self.clients.write().await;
+
+        if clients.len() >= self.max_pool_size {
+            // Find the least recently used connection
+            if let Some((&lru_node_id, _)) = clients.iter()
+                .min_by_key(|(_, pooled)| pooled.last_used) {
+
+                info!(
+                    "Connection pool at capacity ({}/{}), evicting LRU connection to peer {}",
+                    clients.len(),
+                    self.max_pool_size,
+                    lru_node_id
+                );
+                clients.remove(&lru_node_id);
+            }
+        }
+    }
+
+    /// Connect to a peer and store the client with pooling.
+    ///
+    /// OPTIMIZATION (v1.3.66): Wraps client in PooledClient with last_used tracking.
     async fn connect(&self, node_id: u64, addr: &str) -> Result<()> {
         debug!("Connecting to peer {} at {}", node_id, addr);
 
@@ -351,18 +516,29 @@ impl RaftClient {
 
         let client = proto::raft_service_client::RaftServiceClient::new(channel);
 
-        self.clients.write().await.insert(node_id, client);
+        let pooled = PooledClient {
+            client,
+            last_used: Instant::now(),
+        };
 
-        info!("Connected to peer {} at {}", node_id, addr);
+        self.clients.write().await.insert(node_id, pooled);
+
+        info!("Connected to peer {} at {} (pool: {}/{})",
+              node_id, addr,
+              self.clients.read().await.len(),
+              self.max_pool_size);
 
         Ok(())
     }
 
     /// Clone the client (shares the same connection pool).
+    ///
+    /// OPTIMIZATION (v1.3.66): Preserves max_pool_size from original instance.
     pub fn clone(&self) -> Self {
         Self {
             clients: self.clients.clone(),
             peer_addrs: self.peer_addrs.clone(),
+            max_pool_size: self.max_pool_size,
             metrics: RaftMetrics::new(), // Create new metrics instance
         }
     }

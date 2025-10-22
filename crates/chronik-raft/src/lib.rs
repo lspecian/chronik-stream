@@ -68,6 +68,7 @@ pub mod snapshot;
 pub mod snapshot_bootstrap;
 pub mod state_machine;
 pub mod storage;
+pub mod transport;
 // Note: wal_storage moved to tests/integration to avoid circular dependency with chronik-wal
 
 pub use client::RaftClient;
@@ -97,7 +98,8 @@ pub use rebalancer::{
     RebalancePlan,
 };
 pub use replica::PartitionReplica;
-pub use snapshot::{SnapshotCompression, SnapshotConfig, SnapshotManager, SnapshotMetadata};
+pub use snapshot::{RaftReplicaProvider, SnapshotCompression, SnapshotConfig, SnapshotManager, SnapshotMetadata};
 pub use snapshot_bootstrap::{BootstrapConfig, SnapshotBootstrap};
 pub use state_machine::{MemoryStateMachine, SnapshotData, StateMachine};
 pub use storage::{MemoryLogStorage, RaftEntry, RaftLogStorage, RAFT_PARTITION, RAFT_TOPIC};
+pub use transport::{Transport, GrpcTransport, InMemoryTransport, InMemoryRouter};

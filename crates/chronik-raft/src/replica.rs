@@ -115,10 +115,35 @@ impl PartitionReplica {
             topic, partition, config.node_id, peers
         );
 
+        // CRITICAL FIX: Randomize election timeout per partition to prevent split votes
+        // When multiple partitions are created simultaneously, they would all use the same
+        // election_tick and timeout at the same time, causing election storms.
+        //
+        // Solution: Add randomization based on partition ID + topic hash
+        // This ensures different partitions have staggered election timeouts.
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = DefaultHasher::new();
+        topic.hash(&mut hasher);
+        partition.hash(&mut hasher);
+        let hash = hasher.finish();
+
+        // Randomize election_tick between base and base*2 (standard Raft practice)
+        // Using hash for deterministic but varied values across partitions
+        let base_election_tick = (config.election_timeout_ms / config.heartbeat_interval_ms) as usize;
+        let randomized_election_tick = base_election_tick + ((hash as usize) % base_election_tick);
+
+        info!(
+            "Election timeout for {}-{}: base={} ticks, randomized={} ticks (~{}ms)",
+            topic, partition, base_election_tick, randomized_election_tick,
+            randomized_election_tick * config.heartbeat_interval_ms as usize
+        );
+
         // Configure Raft core
         let raft_config = RaftCoreConfig {
             id: config.node_id,
-            election_tick: (config.election_timeout_ms / config.heartbeat_interval_ms) as usize,
+            election_tick: randomized_election_tick,
             heartbeat_tick: 1,
             max_size_per_msg: (config.max_entries_per_batch * 1024) as u64,
             max_inflight_msgs: 256,

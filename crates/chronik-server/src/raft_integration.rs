@@ -12,6 +12,7 @@ use chronik_raft::{
     MemoryStateMachine, PartitionReplica, RaftClient, RaftConfig, RaftEntry, RaftLogStorage,
     Result as RaftResult, SnapshotData, StateMachine,
 };
+use chronik_wal::{GroupCommitWal, GroupCommitConfig, RaftWalStorage};
 use raft::prelude::{ConfChange, ConfChangeType};
 use chronik_storage::{CanonicalRecord, SegmentWriter};
 use dashmap::DashMap;
@@ -633,10 +634,26 @@ impl RaftReplicaManager {
         self.replicas.get(&key).map(|r| r.clone())
     }
 
+    /// Get the WalManager instance (v1.3.66+: For sharing with IntegratedKafkaServer)
+    ///
+    /// This allows IntegratedKafkaServer to reuse the same WalManager instance
+    /// that RaftReplicaManager uses, ensuring sealed_segments DashMap is shared.
+    pub fn wal_manager(&self) -> Arc<chronik_wal::WalManager> {
+        self.wal_manager.clone()
+    }
+
     /// Check if a partition has a replica
     pub fn has_replica(&self, topic: &str, partition: i32) -> bool {
         let key = (topic.to_string(), partition);
         self.replicas.contains_key(&key)
+    }
+
+    /// List all partition replicas (topic, partition_id)
+    pub fn list_replicas(&self) -> Vec<(String, i32)> {
+        self.replicas
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect()
     }
 
     /// Get the leader for a partition
@@ -739,9 +756,31 @@ pub async fn create_raft_log_storage(
 
     #[cfg(not(feature = "raft-storage"))]
     {
-        // Fallback to in-memory storage if raft-storage feature not enabled
-        use chronik_raft::MemoryLogStorage;
-        Ok(Arc::new(MemoryLogStorage::new()) as Arc<dyn chronik_raft::RaftLogStorage>)
+        // Fallback: Create WAL-backed storage even without raft-storage feature
+        let wal_config = GroupCommitConfig::default();
+        let wal_dir = data_dir.join(format!("raft_log_{topic}_{partition}"));
+
+        tokio::fs::create_dir_all(&wal_dir).await
+            .map_err(|e| chronik_raft::RaftError::StorageError(e.to_string()))?;
+
+        let wal = Arc::new(GroupCommitWal::new(wal_dir.clone(), wal_config));
+        let storage = RaftWalStorage::new(wal);
+
+        // Recover existing state if any
+        storage.recover(&wal_dir).await?;
+
+        Ok(Arc::new(storage) as Arc<dyn chronik_raft::RaftLogStorage>)
+    }
+}
+
+// Implement RaftReplicaProvider trait for SnapshotManager integration
+impl chronik_raft::RaftReplicaProvider for RaftReplicaManager {
+    fn get_replica(&self, topic: &str, partition: i32) -> Option<Arc<PartitionReplica>> {
+        self.get_replica(topic, partition)
+    }
+
+    fn list_partitions(&self) -> Vec<(String, i32)> {
+        self.list_replicas()
     }
 }
 

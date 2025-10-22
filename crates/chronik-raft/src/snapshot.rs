@@ -41,7 +41,7 @@
 //! # }
 //! ```
 
-use crate::{RaftError, RaftGroupManager, Result};
+use crate::{RaftError, RaftGroupManager, Result, PartitionReplica};
 use async_trait::async_trait;
 use chrono::Utc;
 use chronik_common::metadata::MetadataStore;
@@ -57,6 +57,28 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
+
+/// Trait for providing access to Raft replicas for snapshot operations
+///
+/// This trait allows SnapshotManager to work with different Raft manager implementations
+/// (RaftGroupManager in tests, RaftReplicaManager in production server)
+pub trait RaftReplicaProvider: Send + Sync {
+    /// Get a replica for a partition
+    ///
+    /// # Arguments
+    /// * `topic` - Topic name
+    /// * `partition` - Partition ID
+    ///
+    /// # Returns
+    /// Some(Arc<PartitionReplica>) if replica exists, None otherwise
+    fn get_replica(&self, topic: &str, partition: i32) -> Option<Arc<PartitionReplica>>;
+
+    /// List all topic-partition keys that have replicas
+    ///
+    /// # Returns
+    /// Vector of (topic, partition) tuples
+    fn list_partitions(&self) -> Vec<(String, i32)>;
+}
 
 // Re-export ObjectStore trait from chronik-storage
 // Note: In production, this would be imported from chronik-storage crate
@@ -204,8 +226,8 @@ pub struct SnapshotManager {
     /// Node ID
     node_id: u64,
 
-    /// Raft group manager
-    raft_group_manager: Arc<RaftGroupManager>,
+    /// Raft replica provider (abstraction over RaftGroupManager/RaftReplicaManager)
+    replica_provider: Arc<dyn RaftReplicaProvider>,
 
     /// Metadata store
     metadata_store: Arc<dyn MetadataStore>,
@@ -231,13 +253,13 @@ impl SnapshotManager {
     ///
     /// # Arguments
     /// * `node_id` - Node ID
-    /// * `raft_group_manager` - Raft group manager
+    /// * `replica_provider` - Raft replica provider (RaftGroupManager or RaftReplicaManager)
     /// * `metadata_store` - Metadata store
     /// * `snapshot_config` - Snapshot configuration
     /// * `object_store` - Object store backend
     pub fn new(
         node_id: u64,
-        raft_group_manager: Arc<RaftGroupManager>,
+        replica_provider: Arc<dyn RaftReplicaProvider>,
         metadata_store: Arc<dyn MetadataStore>,
         snapshot_config: SnapshotConfig,
         object_store: Arc<dyn ObjectStoreTrait>,
@@ -249,7 +271,7 @@ impl SnapshotManager {
 
         Self {
             node_id,
-            raft_group_manager,
+            replica_provider,
             metadata_store,
             snapshot_config,
             object_store,
@@ -287,7 +309,7 @@ impl SnapshotManager {
 
         // Check log size threshold
         // Get current log size from Raft replica
-        if let Some(replica) = self.raft_group_manager.get_replica(topic, partition) {
+        if let Some(replica) = self.replica_provider.get_replica(topic, partition) {
             let commit_index = replica.commit_index();
             let applied_index = replica.applied_index();
 
@@ -389,7 +411,7 @@ impl SnapshotManager {
     /// Internal snapshot creation logic
     async fn create_snapshot_internal(&self, topic: &str, partition: i32) -> Result<SnapshotMetadata> {
         // Get Raft replica
-        let replica = self.raft_group_manager
+        let replica = self.replica_provider
             .get_replica(topic, partition)
             .ok_or_else(|| RaftError::Config(format!(
                 "No Raft replica found for {}-{}",
@@ -576,7 +598,7 @@ impl SnapshotManager {
         );
 
         // Get Raft replica and update applied index
-        if let Some(replica) = self.raft_group_manager.get_replica(topic, partition) {
+        if let Some(replica) = self.replica_provider.get_replica(topic, partition) {
             replica.set_applied_index(snapshot_data.last_included_index);
         }
 
@@ -693,7 +715,7 @@ impl SnapshotManager {
 
             while !shutdown.load(Ordering::Relaxed) {
                 // Get all active replicas
-                let replicas = manager.raft_group_manager.list_replicas();
+                let replicas = manager.replica_provider.list_partitions();
 
                 debug!("Checking {} partitions for snapshot creation", replicas.len());
 
@@ -726,7 +748,7 @@ impl SnapshotManager {
                 }
 
                 // Cleanup old snapshots
-                for (topic, partition) in manager.raft_group_manager.list_replicas() {
+                for (topic, partition) in manager.replica_provider.list_partitions() {
                     if let Err(e) = manager.cleanup_old_snapshots(&topic, partition).await {
                         warn!(
                             "Failed to cleanup snapshots for {}-{}: {}",
@@ -793,7 +815,7 @@ impl SnapshotManager {
     fn clone_for_background(&self) -> Self {
         Self {
             node_id: self.node_id,
-            raft_group_manager: self.raft_group_manager.clone(),
+            replica_provider: self.replica_provider.clone(),
             metadata_store: self.metadata_store.clone(),
             snapshot_config: self.snapshot_config.clone(),
             object_store: self.object_store.clone(),
@@ -801,6 +823,17 @@ impl SnapshotManager {
             shutdown: self.shutdown.clone(),
             concurrent_snapshots: self.concurrent_snapshots.clone(),
         }
+    }
+}
+
+// Implement RaftReplicaProvider for RaftGroupManager
+impl RaftReplicaProvider for RaftGroupManager {
+    fn get_replica(&self, topic: &str, partition: i32) -> Option<Arc<PartitionReplica>> {
+        self.get_replica(topic, partition)
+    }
+
+    fn list_partitions(&self) -> Vec<(String, i32)> {
+        self.list_replicas()
     }
 }
 

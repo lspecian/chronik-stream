@@ -12,39 +12,53 @@
 //! 6. No message loss: All committed messages survive failover
 
 use anyhow::{Context, Result};
-use chronik_raft::state_machine::{StateMachine, StateMachineSnapshot};
-use chronik_raft::{PartitionReplica, RaftConfig, MemoryLogStorage};
+use chronik_raft::{PartitionReplica, RaftConfig, MemoryLogStorage, RaftEntry, StateMachine, SnapshotData};
+use bytes::Bytes;
 use raft::prelude::Message;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock as TokioRwLock;
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
 /// No-op state machine for testing
-struct NoOpStateMachine;
+struct NoOpStateMachine {
+    last_applied: AtomicU64,
+}
+
+impl NoOpStateMachine {
+    fn new() -> Self {
+        Self {
+            last_applied: AtomicU64::new(0),
+        }
+    }
+}
 
 #[async_trait::async_trait]
 impl StateMachine for NoOpStateMachine {
-    async fn apply(&mut self, _index: u64, _data: Vec<u8>) -> std::result::Result<Vec<u8>, String> {
-        Ok(vec![])
+    async fn apply(&mut self, entry: &RaftEntry) -> chronik_raft::Result<Bytes> {
+        self.last_applied.store(entry.index, Ordering::SeqCst);
+        Ok(Bytes::from("ok"))
     }
 
-    async fn snapshot(&self) -> std::result::Result<StateMachineSnapshot, String> {
-        Ok(StateMachineSnapshot {
-            last_included_index: 0,
-            last_included_term: 0,
+    async fn snapshot(&self, last_index: u64, last_term: u64) -> chronik_raft::Result<SnapshotData> {
+        Ok(SnapshotData {
+            last_index,
+            last_term,
+            conf_state: vec![],
             data: vec![],
         })
     }
 
-    async fn restore(&mut self, _snapshot: StateMachineSnapshot) -> std::result::Result<(), String> {
+    async fn restore(&mut self, snapshot: &SnapshotData) -> chronik_raft::Result<()> {
+        self.last_applied.store(snapshot.last_index, Ordering::SeqCst);
         Ok(())
     }
 
     fn last_applied(&self) -> u64 {
-        0
+        self.last_applied.load(Ordering::SeqCst)
     }
 }
 
@@ -97,7 +111,7 @@ fn create_test_cluster(topic: &str, partition: i32) -> Result<HashMap<u64, Arc<P
         };
 
         let storage = Arc::new(MemoryLogStorage::new());
-        let state_machine = Arc::new(TokioRwLock::new(NoOpStateMachine));
+        let state_machine = Arc::new(TokioRwLock::new(NoOpStateMachine::new()));
 
         // Peers are all other nodes
         let peers: Vec<u64> = node_ids.iter()

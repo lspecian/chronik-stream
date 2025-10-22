@@ -11,20 +11,25 @@
 //! 5. No message loss: All messages survive leader failover per partition
 //! 6. Concurrent operations: Multiple partitions process messages simultaneously
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chronik_common::partition_assignment::{PartitionAssignment, round_robin};
-use chronik_raft::{RaftGroupManager, RaftConfig, MemoryLogStorage};
+use chronik_raft::{RaftGroupManager, RaftConfig, MemoryLogStorage, InMemoryTransport, InMemoryRouter, MemoryStateMachine};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::RwLock as TokioRwLock;
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
-/// Create a 3-node cluster with RaftGroupManagers
-fn create_cluster_managers() -> Vec<(u64, Arc<RaftGroupManager>)> {
-    let node_ids = vec![1, 2, 3];
+/// Create a 3-node cluster with RaftGroupManagers using InMemoryTransport
+async fn create_cluster_managers() -> Result<Vec<(u64, Arc<RaftGroupManager>)>> {
+    let node_ids: Vec<u64> = vec![1, 2, 3];
     let mut managers = Vec::new();
 
+    // Step 1: Create shared in-memory router for all nodes
+    let router = InMemoryRouter::new();
+
+    // Step 2: Create all managers with InMemoryTransport
     for &node_id in &node_ids {
         let config = RaftConfig {
             node_id,
@@ -35,16 +40,145 @@ fn create_cluster_managers() -> Vec<(u64, Arc<RaftGroupManager>)> {
             snapshot_threshold: 10_000,
         };
 
-        let manager = Arc::new(RaftGroupManager::new(
+        // Create in-memory transport for this node
+        let transport = InMemoryTransport::new(node_id, router.clone());
+
+        let manager = Arc::new(RaftGroupManager::with_transport(
             node_id,
             config,
             || Arc::new(MemoryLogStorage::new()),
+            || Arc::new(TokioRwLock::new(MemoryStateMachine::new())),
+            Duration::from_millis(100), // tick_interval
+            transport,
         ));
 
         managers.push((node_id, manager));
     }
 
-    managers
+    // Step 3: Connect all managers to each other as peers
+    for (node_id, manager) in &managers {
+        for (peer_id, _) in &managers {
+            if node_id != peer_id {
+                // Use dummy addresses for in-memory transport (not actually used for routing)
+                let peer_addr = format!("mem://node-{}", peer_id);
+                manager.add_peer(*peer_id, peer_addr).await?;
+            }
+        }
+    }
+
+    // Step 4: Start background tick loops AFTER peer setup
+    for (_, manager) in &managers {
+        manager.spawn_tick_loop();
+    }
+
+    Ok(managers)
+}
+
+/// Cluster with message routing for InMemoryTransport
+struct TestCluster {
+    managers: Vec<(u64, Arc<RaftGroupManager>)>,
+    router: InMemoryRouter,
+    routing_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl TestCluster {
+    async fn new() -> Result<Self> {
+        let node_ids: Vec<u64> = vec![1, 2, 3];
+        let mut managers = Vec::new();
+
+        // Step 1: Create shared in-memory router for all nodes
+        let router = InMemoryRouter::new();
+
+        // Step 2: Create all managers with InMemoryTransport
+        for &node_id in &node_ids {
+            let config = RaftConfig {
+                node_id,
+                listen_addr: format!("127.0.0.1:{}", 5000 + node_id),
+                election_timeout_ms: 1000,
+                heartbeat_interval_ms: 100,
+                max_entries_per_batch: 100,
+                snapshot_threshold: 10_000,
+            };
+
+            // Create in-memory transport for this node
+            let transport = InMemoryTransport::new(node_id, router.clone());
+
+            let manager = Arc::new(RaftGroupManager::with_transport(
+                node_id,
+                config,
+                || Arc::new(MemoryLogStorage::new()),
+                || Arc::new(TokioRwLock::new(MemoryStateMachine::new())),
+                Duration::from_millis(100), // tick_interval
+                transport,
+            ));
+
+            managers.push((node_id, manager));
+        }
+
+        // Step 3: Connect all managers to each other as peers
+        for (node_id, manager) in &managers {
+            for (peer_id, _) in &managers {
+                if node_id != peer_id {
+                    // Use dummy addresses for in-memory transport (not actually used for routing)
+                    let peer_addr = format!("mem://node-{}", peer_id);
+                    manager.add_peer(*peer_id, peer_addr).await?;
+                }
+            }
+        }
+
+        // Step 4: Start background tick loops AFTER peer setup
+        for (_, manager) in &managers {
+            manager.spawn_tick_loop();
+        }
+
+        Ok(Self {
+            managers,
+            router,
+            routing_task: None,
+        })
+    }
+
+    /// Start message routing task that polls router and delivers messages
+    fn spawn_message_routing(&mut self) {
+        let router = self.router.clone();
+        let managers = self.managers.clone();
+
+        let handle = tokio::spawn(async move {
+            loop {
+                // Poll each node's message queue
+                for (node_id, manager) in &managers {
+                    let messages = router.receive(*node_id).await;
+
+                    for (topic, partition, msg) in messages {
+                        // Deliver message to the appropriate replica
+                        if let Err(e) = manager.receive_message(&topic, partition, msg).await {
+                            warn!(
+                                "Failed to deliver message to {}-{} on node {}: {}",
+                                topic, partition, node_id, e
+                            );
+                        }
+                    }
+                }
+
+                // Small delay to avoid busy-waiting
+                sleep(Duration::from_millis(5)).await;
+            }
+        });
+
+        self.routing_task = Some(handle);
+    }
+
+    fn managers(&self) -> &[(u64, Arc<RaftGroupManager>)] {
+        &self.managers
+    }
+}
+
+impl Drop for TestCluster {
+    fn drop(&mut self) {
+        if let Some(handle) = self.routing_task.take() {
+            handle.abort();
+        }
+    }
 }
 
 /// Setup partition assignment for a topic
@@ -55,7 +189,9 @@ fn setup_partition_assignment(
     nodes: &[u64],
 ) -> Result<PartitionAssignment> {
     let mut assignment = PartitionAssignment::new();
-    assignment.add_topic(topic, num_partitions, replication_factor, nodes)?;
+    // Convert u64 to u32 for PartitionAssignment API
+    let nodes_u32: Vec<u32> = nodes.iter().map(|&id| id as u32).collect();
+    assignment.add_topic(topic, num_partitions, replication_factor, &nodes_u32)?;
     Ok(assignment)
 }
 
@@ -70,54 +206,25 @@ fn create_partition_replicas(
     for (partition, info) in topic_assignments {
         // Create replica on each node in the replica list
         for &replica_node_id in &info.replicas {
+            let replica_node_id_u64 = replica_node_id as u64;
             let manager = managers
                 .iter()
-                .find(|(node_id, _)| *node_id == replica_node_id)
+                .find(|(node_id, _)| *node_id == replica_node_id_u64)
                 .map(|(_, mgr)| mgr)
                 .ok_or_else(|| anyhow::anyhow!("Node {} not found", replica_node_id))?;
 
-            // Peers are all other replicas (excluding self)
+            // Peers are all other replicas (excluding self) - convert u32 to u64
             let peers: Vec<u64> = info.replicas
                 .iter()
                 .filter(|&&id| id != replica_node_id)
-                .copied()
+                .map(|&id| id as u64)
                 .collect();
 
-            manager.get_or_create_replica(topic, partition, peers)?;
+            manager.get_or_create_replica(topic, partition, peers.clone())?;
             debug!(
                 "Created replica for {}-{} on node {} with peers {:?}",
                 topic, partition, replica_node_id, peers
             );
-        }
-    }
-
-    Ok(())
-}
-
-/// Process one tick cycle for all managers
-async fn tick_all_managers(managers: &[(u64, Arc<RaftGroupManager>)]) -> Result<()> {
-    // Collect all messages from all managers
-    let mut all_messages = Vec::new();
-
-    for (_node_id, manager) in managers {
-        manager.tick_all()?;
-        let ready_results = manager.ready_all().await?;
-
-        for ((topic, partition), (messages, _committed)) in ready_results {
-            for msg in messages {
-                // Tag message with source partition
-                all_messages.push((topic.clone(), partition, msg));
-            }
-        }
-    }
-
-    // Route messages to appropriate replicas
-    for (topic, partition, msg) in all_messages {
-        let to = msg.to;
-
-        // Find the manager for the destination node
-        if let Some((_node_id, manager)) = managers.iter().find(|(node_id, _)| *node_id == to) {
-            manager.route_message(&topic, partition, msg).await?;
         }
     }
 
@@ -157,8 +264,7 @@ async fn wait_for_partition_leader(
             );
         }
 
-        // Tick all managers
-        tick_all_managers(managers).await?;
+        // Background tick loop handles automatic Raft processing
 
         // Log state every 20 iterations
         if iter % 20 == 0 {
@@ -227,7 +333,7 @@ async fn wait_for_partition_commit(
             );
         }
 
-        tick_all_managers(managers).await?;
+        // Background tick loop handles automatic Raft processing
 
         // Check if all replicas have committed
         let mut all_committed = true;
@@ -290,8 +396,10 @@ async fn test_multi_partition_produce_consume() -> Result<()> {
 
     info!("TEST: Multi-partition produce and consume");
 
-    // 1. Create 3-node cluster
-    let managers = create_cluster_managers();
+    // 1. Create 3-node cluster with message routing
+    let mut cluster = TestCluster::new().await?;
+    cluster.spawn_message_routing();
+    let managers = cluster.managers();
     let nodes: Vec<u64> = managers.iter().map(|(id, _)| *id).collect();
 
     // 2. Create partition assignment (3 partitions, RF=3)
@@ -299,10 +407,10 @@ async fn test_multi_partition_produce_consume() -> Result<()> {
     let assignment = setup_partition_assignment(topic, 3, 3, &nodes)?;
 
     // 3. Create replicas on all nodes
-    create_partition_replicas(&managers, &assignment, topic)?;
+    create_partition_replicas(managers, &assignment, topic)?;
 
     // 4. Wait for leaders on all partitions
-    let leaders = wait_for_all_partition_leaders(&managers, topic, 3, Duration::from_secs(10)).await?;
+    let leaders = wait_for_all_partition_leaders(managers, topic, 3, Duration::from_secs(10)).await?;
 
     info!("Partition leaders elected: {:?}", leaders);
 
@@ -338,7 +446,7 @@ async fn test_multi_partition_produce_consume() -> Result<()> {
 
     // 8. Verify all replicas have committed
     for (partition, expected_index) in &proposed_indices {
-        for (node_id, manager) in &managers {
+        for (node_id, manager) in managers {
             if let Some(replica) = manager.get_replica(topic, *partition) {
                 assert!(
                     replica.commit_index() >= *expected_index,
@@ -363,7 +471,9 @@ async fn test_multi_partition_independence() -> Result<()> {
     info!("TEST: Multi-partition independence (partition 0 failure doesn't affect others)");
 
     // 1. Setup: 3 nodes, 3 partitions, RF=3
-    let managers = create_cluster_managers();
+    let mut cluster = TestCluster::new().await?;
+    cluster.spawn_message_routing();
+    let managers = cluster.managers();
     let nodes: Vec<u64> = managers.iter().map(|(id, _)| *id).collect();
 
     let topic = "test-independence";
@@ -397,8 +507,9 @@ async fn test_multi_partition_independence() -> Result<()> {
 
     // 4. Kill leader of partition 0
     let managers_after_kill: Vec<_> = managers
-        .into_iter()
+        .iter()
         .filter(|(node_id, _)| *node_id != partition0_leader)
+        .cloned()
         .collect();
 
     info!("Killed partition 0 leader (node {})", partition0_leader);
@@ -504,7 +615,9 @@ async fn test_follower_reads_all_partitions() -> Result<()> {
     info!("TEST: Follower reads from all partitions");
 
     // 1. Setup cluster
-    let managers = create_cluster_managers();
+    let mut cluster = TestCluster::new().await?;
+    cluster.spawn_message_routing();
+    let managers = cluster.managers();
     let nodes: Vec<u64> = managers.iter().map(|(id, _)| *id).collect();
 
     let topic = "test-follower-reads";
@@ -576,7 +689,9 @@ async fn test_concurrent_partition_operations() -> Result<()> {
     info!("TEST: Concurrent operations on multiple partitions");
 
     // 1. Setup cluster with 3 partitions
-    let managers = create_cluster_managers();
+    let mut cluster = TestCluster::new().await?;
+    cluster.spawn_message_routing();
+    let managers = cluster.managers();
     let nodes: Vec<u64> = managers.iter().map(|(id, _)| *id).collect();
 
     let topic = "test-concurrent";
@@ -617,7 +732,7 @@ async fn test_concurrent_partition_operations() -> Result<()> {
     }
 
     // 5. Verify all nodes have all messages on all partitions
-    for (node_id, manager) in &managers {
+    for (node_id, manager) in managers {
         for partition in 0..3 {
             if let Some(replica) = manager.get_replica(topic, partition) {
                 let expected_index = all_indices.get(&partition).unwrap().last().unwrap();
@@ -647,7 +762,9 @@ async fn test_partition_leader_distribution() -> Result<()> {
     info!("TEST: Leader distribution across nodes");
 
     // 1. Setup cluster with 9 partitions (each node should lead 3)
-    let managers = create_cluster_managers();
+    let mut cluster = TestCluster::new().await?;
+    cluster.spawn_message_routing();
+    let managers = cluster.managers();
     let nodes: Vec<u64> = managers.iter().map(|(id, _)| *id).collect();
 
     let topic = "test-distribution";

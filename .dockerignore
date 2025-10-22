@@ -59,3 +59,5 @@ node_modules/
 data/
 .taskmaster/
 .claude/
+test-cluster*
+.env*

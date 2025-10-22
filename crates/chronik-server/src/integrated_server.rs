@@ -169,7 +169,8 @@ impl IntegratedKafkaServer {
             {
                 info!("Initializing Raft-replicated metadata store for cluster mode");
 
-                use chronik_raft::{RaftMetaLog, MemoryLogStorage};
+                use chronik_raft::RaftMetaLog;
+                use chronik_wal::{GroupCommitWal, GroupCommitConfig, RaftWalStorage};
 
                 // Raft manager must be provided in cluster mode
                 let raft_mgr = raft_manager.as_ref()
@@ -181,8 +182,17 @@ impl IntegratedKafkaServer {
                     .map(|p| p.id)
                     .collect();
 
-                // Create Raft log storage for __meta partition
-                let meta_log_storage = Arc::new(MemoryLogStorage::new());
+                // Create WAL-backed storage for __meta partition (standalone --raft mode)
+                // NOTE: In raft-cluster mode, this is already created in raft_cluster.rs
+                let meta_wal_config = GroupCommitConfig::default();
+                let meta_wal_dir = PathBuf::from(&config.data_dir).join("wal/__meta/0");
+                tokio::fs::create_dir_all(&meta_wal_dir).await?;
+                let meta_wal = Arc::new(GroupCommitWal::new(meta_wal_dir.clone(), meta_wal_config));
+                let meta_log_storage = Arc::new(RaftWalStorage::new(meta_wal));
+
+                // Recover any existing Raft log entries from WAL
+                meta_log_storage.recover(&PathBuf::from(&config.data_dir)).await?;
+                info!("Metadata Raft log storage initialized (WAL-backed with persistence)");
 
                 // CRITICAL FIX: Check if __meta partition replica already exists (created by raft_cluster.rs)
                 // If it does, retrieve the SHARED metadata state from RaftReplicaManager
@@ -232,6 +242,7 @@ impl IntegratedKafkaServer {
 
                 // Create RaftMetaLog using the shared replica and RaftClient
                 // CRITICAL: Pass the SAME local_state and applied_index that we gave to MetadataStateMachine
+                // NOTE: Topic creation callback is now set in MetadataStateMachine (in raft_cluster.rs)
                 let raft_meta_log = RaftMetaLog::from_replica(
                     cluster_config.node_id,
                     meta_replica.clone(),
@@ -240,7 +251,7 @@ impl IntegratedKafkaServer {
                     applied_index,
                 ).await?;
 
-                info!("RaftMetaLog initialized for node {} with {} peers", cluster_config.node_id, peer_ids.len());
+                info!("RaftMetaLog initialized for node {} with {} peers (callback set in MetadataStateMachine)", cluster_config.node_id, peer_ids.len());
 
                 // No need to manually add peers via ConfChange for new cluster bootstrap
                 // All peers are already in ConfState (initialized in replica.rs)
@@ -520,12 +531,28 @@ impl IntegratedKafkaServer {
         info!("Segments directory will be preserved for recovery: {}", segments_dir);
 
         // Initialize WAL manager with recovery (v1.3.47+: lock-free WAL architecture)
+        // v1.3.66+: Reuse Raft manager's WAL if available (ensures shared sealed_segments DashMap)
         // WalManager uses DashMap internally - no external RwLock needed
         info!("Initializing WAL manager with recovery...");
-        let wal_manager_recovered = WalManager::recover(&wal_config)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to recover WAL: {}", e))?;
-        let wal_manager = Arc::new(wal_manager_recovered);
+
+        #[cfg(feature = "raft")]
+        let wal_manager = if let Some(ref raft_mgr) = raft_manager {
+            info!("Reusing WalManager from RaftReplicaManager (ensures shared sealed_segments tracking)");
+            raft_mgr.wal_manager()
+        } else {
+            let wal_manager_recovered = WalManager::recover(&wal_config)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to recover WAL: {}", e))?;
+            Arc::new(wal_manager_recovered)
+        };
+
+        #[cfg(not(feature = "raft"))]
+        let wal_manager = {
+            let wal_manager_recovered = WalManager::recover(&wal_config)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to recover WAL: {}", e))?;
+            Arc::new(wal_manager_recovered)
+        };
 
         info!("WAL recovery complete - {} partitions loaded", wal_manager.get_partitions().len());
 
@@ -537,19 +564,14 @@ impl IntegratedKafkaServer {
             wal_manager.clone(),
         ).await?;
 
-        let mut produce_handler_base = Arc::new(produce_handler_inner);
-
-        // Set Raft manager if provided (v2.0+)
+        // Set Raft manager BEFORE wrapping in Arc (v1.3.66+)
         #[cfg(feature = "raft")]
         if let Some(raft_mgr) = raft_manager {
             info!("Attaching Raft manager to ProduceHandler");
-            // Need to get mutable reference to set raft_manager
-            if let Some(handler_mut) = Arc::get_mut(&mut produce_handler_base) {
-                handler_mut.set_raft_manager(raft_mgr);
-            } else {
-                warn!("Could not attach Raft manager: ProduceHandler already has multiple references");
-            }
+            produce_handler_inner.set_raft_manager(raft_mgr);
         }
+
+        let produce_handler_base = Arc::new(produce_handler_inner);
 
         // CRITICAL FIX (v1.3.52): Clear all partition buffers before WAL recovery
         // This prevents duplicate messages by ensuring we start with clean in-memory state.

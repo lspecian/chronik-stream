@@ -48,7 +48,8 @@ fn create_cluster_config(node_id: u64, peer_count: usize) -> ClusterConfig {
 
 #[tokio::test]
 async fn test_single_node_bootstrap() -> Result<()> {
-    // Single node cluster (no peers)
+    // Single node cluster (no peers) - should be REJECTED by design
+    // Raft requires 3+ nodes for quorum-based replication
     let cluster_config = ClusterConfig {
         node_id: 1,
         peers: vec![],
@@ -64,23 +65,25 @@ async fn test_single_node_bootstrap() -> Result<()> {
         || Arc::new(MemoryLogStorage::new()),
     ));
 
-    let coordinator = ClusterCoordinator::new(
+    // Creating ClusterCoordinator should FAIL for single-node clusters
+    // because RaftGroupManager rejects single-node Raft
+    let result = ClusterCoordinator::new(
         cluster_config,
         raft_config,
         manager.clone(),
-    )?;
+    );
 
-    // Bootstrap should succeed immediately (quorum of 1)
-    coordinator.bootstrap().await?;
-
-    // Verify bootstrap complete
-    assert!(coordinator.is_bootstrap_complete());
-
-    // Verify metadata partition exists
-    assert!(manager.has_replica("__meta", 0));
-
-    // Shutdown
-    coordinator.shutdown().await;
+    // Expect error containing "Single-node Raft cluster rejected"
+    assert!(result.is_err(), "Single-node Raft should be rejected");
+    if let Err(err) = result {
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("Single-node Raft cluster rejected") ||
+            err_msg.contains("3+ nodes"),
+            "Expected single-node rejection error, got: {}",
+            err_msg
+        );
+    }
 
     Ok(())
 }

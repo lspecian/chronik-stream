@@ -298,11 +298,34 @@ type ProposeResult<T> = oneshot::Sender<Result<T>>;
 pub struct MetadataStateMachine {
     local_state: Arc<RwLock<MetadataState>>,
     applied_index: Arc<AtomicU64>,
+    on_topic_created: Option<TopicCreatedCallback>,
 }
 
 impl MetadataStateMachine {
     pub fn new(local_state: Arc<RwLock<MetadataState>>, applied_index: Arc<AtomicU64>) -> Self {
-        Self { local_state, applied_index }
+        Self {
+            local_state,
+            applied_index,
+            on_topic_created: None,
+        }
+    }
+
+    /// Create with optional topic creation callback
+    pub fn with_callback(
+        local_state: Arc<RwLock<MetadataState>>,
+        applied_index: Arc<AtomicU64>,
+        callback: Option<TopicCreatedCallback>,
+    ) -> Self {
+        Self {
+            local_state,
+            applied_index,
+            on_topic_created: callback,
+        }
+    }
+
+    /// Set callback to be invoked when CreateTopicWithAssignments is applied
+    pub fn set_topic_created_callback(&mut self, callback: TopicCreatedCallback) {
+        self.on_topic_created = Some(callback);
     }
 }
 
@@ -319,9 +342,37 @@ impl StateMachine for MetadataStateMachine {
         match bincode::deserialize::<MetadataOp>(&entry.data) {
             Ok(op) => {
                 debug!("Applying metadata operation at index {}: {:?}", entry.index, op);
-                let mut state = self.local_state.write();
-                if let Err(e) = state.apply_operation(&op) {
-                    error!("Failed to apply operation: {}", e);
+
+                // Check if this is a CreateTopicWithAssignments operation (before applying)
+                let is_topic_creation = matches!(op, MetadataOp::CreateTopicWithAssignments { .. });
+                let topic_name = if let MetadataOp::CreateTopicWithAssignments { ref topic_name, .. } = op {
+                    Some(topic_name.clone())
+                } else {
+                    None
+                };
+
+                // Apply the operation
+                {
+                    let mut state = self.local_state.write();
+                    if let Err(e) = state.apply_operation(&op) {
+                        error!("Failed to apply operation: {}", e);
+                    }
+                }
+
+                // CRITICAL: Fire callback AFTER successful application (on ALL nodes)
+                if is_topic_creation {
+                    if let Some(ref topic_name) = topic_name {
+                        if let Some(ref callback) = self.on_topic_created {
+                            // Get the topic metadata from state (after application)
+                            let state = self.local_state.read();
+                            if let Some(topic_meta) = state.topics.get(topic_name) {
+                                info!("MetadataStateMachine: Firing topic creation callback for '{}'", topic_name);
+                                callback(topic_name, topic_meta);
+                            } else {
+                                error!("MetadataStateMachine: Topic '{}' not found after CreateTopicWithAssignments", topic_name);
+                            }
+                        }
+                    }
                 }
             }
             Err(e) => {
@@ -366,6 +417,9 @@ impl StateMachine for MetadataStateMachine {
 }
 
 /// Raft-backed metadata store with linearizable writes
+/// Callback type for topic creation events
+pub type TopicCreatedCallback = Arc<dyn Fn(&str, &TopicMetadata) + Send + Sync>;
+
 pub struct RaftMetaLog {
     /// Node ID in the Raft cluster
     node_id: u64,
@@ -384,6 +438,9 @@ pub struct RaftMetaLog {
 
     /// Channel for propose requests
     propose_tx: mpsc::UnboundedSender<(Vec<u8>, oneshot::Sender<Result<u64>>)>,
+
+    /// Optional callback fired after a topic is successfully created (for Raft replica creation)
+    on_topic_created: Option<TopicCreatedCallback>,
 }
 
 impl RaftMetaLog {
@@ -419,6 +476,7 @@ impl RaftMetaLog {
             applied_index: applied_index.clone(),
             processor_handle: Mutex::new(None),
             propose_tx,
+            on_topic_created: None,  // Callback will be set via set_topic_created_callback()
         };
 
         // Start background processor
@@ -488,6 +546,7 @@ impl RaftMetaLog {
             applied_index: applied_index.clone(),
             processor_handle: Mutex::new(None),
             propose_tx,
+            on_topic_created: None,  // Callback will be set via set_topic_created_callback()
         };
 
         // Start background processor (no RaftClient for standalone test mode)
@@ -508,6 +567,12 @@ impl RaftMetaLog {
         info!("RaftMetaLog created for node {} (test mode, no RaftClient)", node_id);
 
         Ok(store)
+    }
+
+    /// Set callback to be invoked after successful topic creation
+    /// This is used to trigger Raft replica creation for new topics
+    pub fn set_topic_created_callback(&mut self, callback: TopicCreatedCallback) {
+        self.on_topic_created = Some(callback);
     }
 
     /// Propose an operation to Raft and wait for commit with timeout
@@ -1051,6 +1116,8 @@ impl MetadataStore for RaftMetaLog {
             offsets,
         };
 
+        // Propose and wait for commit
+        // NOTE: Callback will fire in MetadataStateMachine.apply() on ALL nodes
         self.propose_and_wait(op, |state| {
             state.topics.get(topic_name)
                 .cloned()

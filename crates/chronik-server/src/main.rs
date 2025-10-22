@@ -769,8 +769,14 @@ async fn run_standalone_server(cli: &Cli) -> Result<()> {
         let raft_config = RaftConfig {
             node_id: cluster.node_id,
             listen_addr: raft_addr.clone(),
+            // OPTIMIZATION (v1.3.66): Kept at 300ms (3 ticks) for reliable leader election
+            // election_tick = election_timeout_ms / heartbeat_interval_ms MUST be > 1
+            // 300ms / 100ms = 3 ticks ✅ (was 300ms / 30ms = 10 ticks before)
             election_timeout_ms: 300,
-            heartbeat_interval_ms: 30,
+            // OPTIMIZATION (v1.3.66): Increased from 30ms to 100ms for cluster scalability
+            // Reduces heartbeat traffic by 70% (30k → 10k msg/sec for 1000 Raft groups)
+            // This prevents gRPC connection pool exhaustion in large clusters
+            heartbeat_interval_ms: 100,
             max_entries_per_batch: 100,
             snapshot_threshold: 10_000,
         };

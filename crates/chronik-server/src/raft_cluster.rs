@@ -9,8 +9,10 @@ use chronik_common::metadata::MetadataStore;
 use chronik_config::GossipConfig;
 use chronik_raft::{
     BootstrapDecision, BootstrapEvent, HealthCheckBootstrap, HealthCheckConfig, NodeMetadata,
-    RaftConfig, RaftMetaLog, MemoryLogStorage,
+    RaftConfig, RaftMetaLog,
+    SnapshotManager, SnapshotConfig, SnapshotCompression,
 };
+use chronik_wal::RaftWalStorage;  // WAL-backed Raft log storage
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -47,8 +49,15 @@ pub async fn run_raft_cluster(config: RaftClusterConfig) -> Result<()> {
     let raft_config = RaftConfig {
         node_id: config.node_id,
         listen_addr: config.raft_addr.clone(),
-        election_timeout_ms: 300,
-        heartbeat_interval_ms: 30,
+        // CRITICAL (v1.3.66): Election timeout MUST provide enough ticks for randomization
+        // With heartbeat_interval_ms = 100ms, election_timeout_ms = 500ms gives us:
+        // base_election_tick = 5 ticks, randomization range = 5-10 ticks (500-1000ms)
+        // This balances quick leader election with preventing split votes.
+        election_timeout_ms: 500,
+        // OPTIMIZATION (v1.3.66): Increased from 30ms to 100ms for cluster scalability
+        // Reduces heartbeat traffic by 70% (30k → 10k msg/sec for 1000 Raft groups)
+        // This prevents gRPC connection pool exhaustion in large clusters
+        heartbeat_interval_ms: 100,
         max_entries_per_batch: 100,
         snapshot_threshold: 10_000,
     };
@@ -76,6 +85,50 @@ pub async fn run_raft_cluster(config: RaftClusterConfig) -> Result<()> {
     info!("Starting WAL recovery...");
     let wal_manager = Arc::new(WalManager::recover(&wal_config).await?);
     info!("WAL recovery complete - {} partitions loaded", wal_manager.get_partitions().len());
+
+    // Create object store for snapshots and data storage
+    // v1.3.66+: Read configuration from environment variables (S3/GCS/Azure/Local)
+    use chronik_storage::object_store::{ObjectStoreConfig, StorageBackend, AuthConfig};
+    use chronik_storage::ObjectStoreFactory;
+
+    let object_store_config = crate::parse_object_store_config_from_env().unwrap_or_else(|| {
+        info!("No OBJECT_STORE_BACKEND environment variable found, using default local storage");
+        ObjectStoreConfig {
+            backend: StorageBackend::Local {
+                path: config.data_dir.join("object_store").to_string_lossy().to_string(),
+            },
+            bucket: "chronik-snapshots".to_string(),
+            prefix: None,
+            connection: Default::default(),
+            performance: Default::default(),
+            retry: Default::default(),
+            auth: AuthConfig::None,
+            default_metadata: None,
+            encryption: None,
+        }
+    });
+
+    let object_store = ObjectStoreFactory::create(object_store_config.clone()).await?;
+    let _object_store_arc: Arc<Box<dyn chronik_storage::object_store::ObjectStore>> = Arc::new(object_store); // Reserved for snapshot integration (Task 3.1)
+
+    // Log the configured backend
+    match &object_store_config.backend {
+        StorageBackend::S3 { endpoint, .. } => {
+            info!("Object store initialized: S3 (bucket: {}, endpoint: {:?})",
+                  object_store_config.bucket, endpoint);
+        }
+        StorageBackend::Gcs { .. } => {
+            info!("Object store initialized: Google Cloud Storage (bucket: {})",
+                  object_store_config.bucket);
+        }
+        StorageBackend::Azure { .. } => {
+            info!("Object store initialized: Azure Blob Storage (container: {})",
+                  object_store_config.bucket);
+        }
+        StorageBackend::Local { path } => {
+            info!("Object store initialized: Local filesystem (path: {})", path);
+        }
+    }
 
     // Create a temporary metadata store for bootstrapping the Raft manager
     // We'll replace this with RaftMetaLog after creating the __meta replica
@@ -242,7 +295,18 @@ pub async fn run_raft_cluster(config: RaftClusterConfig) -> Result<()> {
     // CRITICAL: Create MetadataStateMachine for __meta partition
     // This will apply committed metadata operations to RaftMetaLog's local state
     info!("Creating __meta partition replica with {} peers: {:?}", bootstrap_peer_ids.len(), bootstrap_peer_ids);
-    let meta_log_storage = Arc::new(MemoryLogStorage::new());
+
+    // Create WAL-backed storage for metadata Raft log (enables persistence + S3 upload)
+    use chronik_wal::{GroupCommitWal, GroupCommitConfig};
+    let meta_wal_config = GroupCommitConfig::default();
+    let meta_wal_dir = config.data_dir.join("wal/__meta/0");
+    tokio::fs::create_dir_all(&meta_wal_dir).await?;
+    let meta_wal = Arc::new(GroupCommitWal::new(meta_wal_dir.clone(), meta_wal_config));
+    let meta_log_storage = Arc::new(RaftWalStorage::new(meta_wal));
+
+    // Recover any existing Raft log entries from WAL
+    meta_log_storage.recover(&config.data_dir).await?;
+    info!("Metadata Raft log storage initialized (WAL-backed with persistence)");
 
     // Create shared state for metadata (will be used by both MetadataStateMachine and RaftMetaLog)
     use parking_lot::RwLock;
@@ -250,12 +314,67 @@ pub async fn run_raft_cluster(config: RaftClusterConfig) -> Result<()> {
     let local_state = Arc::new(RwLock::new(chronik_raft::MetadataState::default()));
     let applied_index = Arc::new(AtomicU64::new(0));
 
-    // Create MetadataStateMachine
+    // Create callback for automatic Raft replica creation when topics are created
+    let raft_mgr_for_callback = raft_manager.clone();
+    let peer_ids_for_callback = bootstrap_peer_ids.clone();
+    let data_dir_for_callback = config.data_dir.clone();
+    let callback = Arc::new(move |topic_name: &str, topic_meta: &chronik_common::metadata::TopicMetadata| {
+        info!("MetadataStateMachine callback: Topic '{}' created with {} partitions", topic_name, topic_meta.config.partition_count);
+
+        // Create Raft replicas for each partition
+        let raft_mgr_clone = raft_mgr_for_callback.clone();
+        let topic_name_clone = topic_name.to_string();
+        let partition_count = topic_meta.config.partition_count;
+        let peers_clone = peer_ids_for_callback.clone();
+        let data_dir_clone = data_dir_for_callback.clone();
+
+        tokio::spawn(async move {
+            use chronik_wal::{GroupCommitWal, GroupCommitConfig};
+
+            for partition_id in 0..partition_count {
+                // Create WAL-backed storage for this partition replica (enables persistence + S3 upload)
+                let partition_wal_config = GroupCommitConfig::default();
+                let partition_wal_dir = data_dir_clone.join(format!("wal/{}/{}", topic_name_clone, partition_id));
+
+                if let Err(e) = tokio::fs::create_dir_all(&partition_wal_dir).await {
+                    error!("Failed to create WAL directory for {}-{}: {:?}", topic_name_clone, partition_id, e);
+                    continue;
+                }
+
+                let partition_wal = Arc::new(GroupCommitWal::new(partition_wal_dir.clone(), partition_wal_config));
+                let log_storage = Arc::new(RaftWalStorage::new(partition_wal));
+
+                // Recover any existing Raft log entries from WAL
+                if let Err(e) = log_storage.recover(&data_dir_clone).await {
+                    error!("Failed to recover Raft log for {}-{}: {:?}", topic_name_clone, partition_id, e);
+                    continue;
+                }
+
+                match raft_mgr_clone.create_replica(
+                    topic_name_clone.clone(),
+                    partition_id as i32,
+                    log_storage,
+                    peers_clone.clone(),
+                ).await {
+                    Ok(_) => {
+                        info!("Created Raft replica for {}-{} on all nodes via callback", topic_name_clone, partition_id);
+                    }
+                    Err(e) => {
+                        error!("Failed to create Raft replica for {}-{}: {:?}", topic_name_clone, partition_id, e);
+                    }
+                }
+            }
+            info!("Completed Raft replica creation for all {} partitions of '{}'", partition_count, topic_name_clone);
+        });
+    });
+
+    // Create MetadataStateMachine with callback
     use chronik_raft::MetadataStateMachine;
     let state_machine: Arc<tokio::sync::RwLock<dyn chronik_raft::StateMachine>> =
-        Arc::new(tokio::sync::RwLock::new(MetadataStateMachine::new(
+        Arc::new(tokio::sync::RwLock::new(MetadataStateMachine::with_callback(
             local_state.clone(),
             applied_index.clone(),
+            Some(callback),
         )));
 
     raft_manager.create_meta_replica(
@@ -272,6 +391,121 @@ pub async fn run_raft_cluster(config: RaftClusterConfig) -> Result<()> {
     // This allows integrated_server.rs to retrieve the SAME state used by MetadataStateMachine
     raft_manager.set_meta_partition_state(local_state.clone(), applied_index.clone()).await;
     info!("Registered metadata state with RaftReplicaManager for sharing with RaftMetaLog");
+
+    // Create SnapshotManager for automatic log compaction
+    // Parse snapshot configuration from environment variables
+    use chronik_raft::{SnapshotManager, SnapshotConfig, SnapshotCompression};
+
+    let snapshot_enabled = std::env::var("CHRONIK_SNAPSHOT_ENABLED")
+        .unwrap_or_else(|_| "true".to_string())
+        .parse::<bool>()
+        .unwrap_or(true);
+
+    let log_threshold = std::env::var("CHRONIK_SNAPSHOT_LOG_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10_000);
+
+    let time_threshold_secs = std::env::var("CHRONIK_SNAPSHOT_TIME_THRESHOLD_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3600);
+
+    let max_concurrent = std::env::var("CHRONIK_SNAPSHOT_MAX_CONCURRENT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2);
+
+    let compression_str = std::env::var("CHRONIK_SNAPSHOT_COMPRESSION")
+        .unwrap_or_else(|_| "gzip".to_string());
+
+    let compression = match compression_str.to_lowercase().as_str() {
+        "none" => SnapshotCompression::None,
+        "zstd" => SnapshotCompression::Zstd,
+        _ => SnapshotCompression::Gzip,
+    };
+
+    let retention_count = std::env::var("CHRONIK_SNAPSHOT_RETENTION_COUNT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
+
+    let snapshot_config = SnapshotConfig {
+        enabled: snapshot_enabled,
+        log_size_threshold: log_threshold,
+        time_threshold: Duration::from_secs(time_threshold_secs),
+        max_concurrent_snapshots: max_concurrent,
+        compression,
+        retention_count,
+    };
+
+    info!("Snapshot configuration: {:?}", snapshot_config);
+
+    // Create object store adapter for SnapshotManager
+    // The SnapshotManager uses chronik_raft::ObjectStoreTrait which is simpler than chronik_storage::ObjectStore
+    use chronik_raft::snapshot::ObjectStoreTrait;
+
+    struct ObjectStoreAdapter {
+        inner: Arc<Box<dyn chronik_storage::object_store::ObjectStore>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreTrait for ObjectStoreAdapter {
+        async fn put(&self, key: &str, data: bytes::Bytes) -> anyhow::Result<()> {
+            self.inner.put(key, data).await.map_err(|e| anyhow::anyhow!("ObjectStore put error: {}", e))
+        }
+
+        async fn get(&self, key: &str) -> anyhow::Result<bytes::Bytes> {
+            self.inner.get(key).await.map_err(|e| anyhow::anyhow!("ObjectStore get error: {}", e))
+        }
+
+        async fn delete(&self, key: &str) -> anyhow::Result<()> {
+            self.inner.delete(key).await.map_err(|e| anyhow::anyhow!("ObjectStore delete error: {}", e))
+        }
+
+        async fn list(&self, prefix: &str) -> anyhow::Result<Vec<chronik_raft::snapshot::ObjectMetadata>> {
+            let list_result = self.inner.list(prefix).await.map_err(|e| anyhow::anyhow!("ObjectStore list error: {}", e))?;
+
+            Ok(list_result.into_iter().map(|obj| chronik_raft::snapshot::ObjectMetadata {
+                key: obj.key,
+                size: obj.size,
+                last_modified: obj.last_modified as u64,
+            }).collect())
+        }
+
+        async fn exists(&self, key: &str) -> anyhow::Result<bool> {
+            self.inner.exists(key).await.map_err(|e| anyhow::anyhow!("ObjectStore exists error: {}", e))
+        }
+    }
+
+    let object_store_adapter = Arc::new(ObjectStoreAdapter {
+        inner: _object_store_arc.clone(),
+    });
+
+    // Create RaftMetaLog as the metadata store for SnapshotManager
+    // This is a placeholder - in production we'd use the actual RaftMetaLog
+    let snapshot_metadata = temp_metadata.clone();
+
+    // Create SnapshotManager
+    let snapshot_manager = Arc::new(SnapshotManager::new(
+        config.node_id,
+        raft_manager.clone() as Arc<dyn chronik_raft::RaftReplicaProvider>,
+        snapshot_metadata,
+        snapshot_config,
+        object_store_adapter,
+    ));
+
+    // Spawn snapshot background loop if enabled
+    let _snapshot_loop_handle = if snapshot_enabled {
+        info!("Starting snapshot background loop");
+        let handle = snapshot_manager.spawn_snapshot_loop();
+        Some(handle)
+    } else {
+        info!("Snapshot creation disabled via CHRONIK_SNAPSHOT_ENABLED=false");
+        None
+    };
+
+    info!("SnapshotManager initialized successfully");
 
     // REMOVED: Background peer addition task
     // Peers are now added synchronously before replica creation (see lines 218-246)
@@ -377,7 +611,7 @@ pub async fn run_raft_cluster(config: RaftClusterConfig) -> Result<()> {
         use_wal_metadata: !config.file_metadata,
         enable_wal_indexing: true,
         wal_indexing_interval_secs: 30,
-        object_store_config: None,
+        object_store_config: Some(object_store_config.clone()), // v1.3.66+: Use S3/GCS/Azure from env vars
         enable_metadata_dr: true,
         metadata_upload_interval_secs: 60,
         cluster_config: Some(cluster_cfg),

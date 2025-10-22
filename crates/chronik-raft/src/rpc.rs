@@ -240,6 +240,67 @@ impl raft_service_server::RaftService for RaftServiceImpl {
         }
     }
 
+    /// Process multiple Raft messages in a single RPC call.
+    ///
+    /// OPTIMIZATION (v1.3.66): Batch message processing reduces HTTP/2 frame overhead
+    /// and improves throughput for high-volume Raft traffic.
+    async fn step_batch(
+        &self,
+        request: Request<proto::RaftMessageBatch>,
+    ) -> std::result::Result<Response<StepBatchResponse>, Status> {
+        let req = request.into_inner();
+
+        debug!("StepBatch: processing {} messages", req.messages.len());
+
+        let mut responses = Vec::with_capacity(req.messages.len());
+
+        // Process each message sequentially (maintains order)
+        for raft_msg in req.messages {
+            // Get replica for the partition
+            let replica = match self.get_replica(&raft_msg.topic, raft_msg.partition) {
+                Ok(r) => r,
+                Err(e) => {
+                    error!("StepBatch: replica not found for {}-{}: {}", raft_msg.topic, raft_msg.partition, e);
+                    responses.push(StepResponse {
+                        success: false,
+                        error: format!("Replica not found: {}", e),
+                    });
+                    continue;
+                }
+            };
+
+            // Deserialize raft::Message
+            let decoded_msg = match crate::prost_bridge::decode_raft_message(&raft_msg.message) {
+                Ok(msg) => msg,
+                Err(e) => {
+                    error!("StepBatch: failed to decode message for {}-{}: {}", raft_msg.topic, raft_msg.partition, e);
+                    responses.push(StepResponse {
+                        success: false,
+                        error: format!("Failed to decode message: {}", e),
+                    });
+                    continue;
+                }
+            };
+
+            // Step the message through Raft
+            match replica.step(decoded_msg).await {
+                Ok(_) => responses.push(StepResponse {
+                    success: true,
+                    error: String::new(),
+                }),
+                Err(e) => {
+                    error!("StepBatch: failed to process message for {}-{}: {}", raft_msg.topic, raft_msg.partition, e);
+                    responses.push(StepResponse {
+                        success: false,
+                        error: format!("Failed to step: {}", e),
+                    });
+                }
+            }
+        }
+
+        Ok(Response::new(StepBatchResponse { responses }))
+    }
+
     async fn propose_metadata(
         &self,
         request: Request<proto::ProposeMetadataRequest>,

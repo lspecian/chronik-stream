@@ -1322,6 +1322,7 @@ dependencies = [
  "prost 0.13.5",
  "prost-types 0.13.5",
  "raft",
+ "rand 0.8.5",
  "serde",
  "serde_json",
  "slog",

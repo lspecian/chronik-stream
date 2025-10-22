@@ -19,6 +19,10 @@ service RaftService {
   // Step processes a Raft message (generic message passing)
   rpc Step(RaftMessage) returns (StepResponse);
 
+  // StepBatch processes multiple Raft messages in a single call
+  // OPTIMIZATION (v1.3.66): Reduces HTTP/2 frame overhead for batch operations
+  rpc StepBatch(RaftMessageBatch) returns (StepBatchResponse);
+
   // ProposeMetadata proposes a metadata operation to the leader
   // Followers can use this to forward proposals to the leader
   rpc ProposeMetadata(ProposeMetadataRequest) returns (ProposeMetadataResponse);
@@ -27,6 +31,15 @@ service RaftService {
 message StepResponse {
   bool success = 1;
   string error = 2;
+}
+
+// OPTIMIZATION (v1.3.66): Batch message sending
+message RaftMessageBatch {
+  repeated RaftMessage messages = 1;
+}
+
+message StepBatchResponse {
+  repeated StepResponse responses = 1;
 }
 
 // ProposeMetadata RPC (for metadata operations like broker registration)
