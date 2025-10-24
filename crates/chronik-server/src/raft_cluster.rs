@@ -145,6 +145,10 @@ pub async fn run_raft_cluster(config: RaftClusterConfig) -> Result<()> {
         wal_manager.clone(),
     ));
 
+    // Spawn event handler to process Raft state changes (leader elections, etc.)
+    info!("Spawning Raft event handler loop");
+    tokio::spawn(raft_manager.clone().run_event_handler());
+
     // Bootstrap __meta partition - either via health-check or static configuration
     let bootstrap_peer_ids = if let Some(gossip_cfg) = &config.gossip_config {
         // Health-check-based automatic bootstrap
@@ -618,6 +622,13 @@ pub async fn run_raft_cluster(config: RaftClusterConfig) -> Result<()> {
     };
 
     let server = Arc::new(IntegratedKafkaServer::new_with_raft(server_config, Some(raft_manager.clone())).await?);
+
+    // CRITICAL FIX: Replace RaftReplicaManager's temporary FileMetadataStore with the RaftMetaLog
+    // The server created a RaftMetaLog internally, but the event handler still uses the temp metadata
+    // We need to update the manager's metadata reference so events update the Raft-replicated state
+    let raft_metadata = server.metadata_store();
+    raft_manager.set_metadata_store(raft_metadata).await;
+    info!("RaftReplicaManager metadata store updated with RaftMetaLog");
 
     // Initialize monitoring (metrics + optional tracing)
     use chronik_monitoring::init_monitoring;

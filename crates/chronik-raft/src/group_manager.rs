@@ -282,6 +282,7 @@ impl RaftGroupManager {
             log_storage,
             state_machine,
             peers,
+            None,  // GroupManager doesn't use event channel (legacy code)
         )?;
 
         let replica_arc = Arc::new(replica);

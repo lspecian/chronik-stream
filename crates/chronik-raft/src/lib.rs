@@ -48,6 +48,7 @@
 pub mod client;
 pub mod cluster_coordinator;
 pub mod config;
+pub mod events;
 pub mod error;
 pub mod gossip;
 pub mod graceful_shutdown;
@@ -72,6 +73,7 @@ pub mod transport;
 // Note: wal_storage moved to tests/integration to avoid circular dependency with chronik-wal
 
 pub use client::RaftClient;
+pub use events::RaftEvent;
 // Re-export raft types needed by users
 pub use raft::prelude::{ConfChange, ConfChangeType};
 pub use cluster_coordinator::{ClusterConfig, ClusterCoordinator, PeerConfig, PeerHealth};
@@ -91,7 +93,7 @@ pub use multi_dc::{
     RaftConfig as MultiDCRaftConfig, ReplicaPlacement, ReplicationMode,
 };
 pub use partition_assigner::{AssignmentConfig, PartitionAssigner};
-pub use raft_meta_log::{MetadataOp, MetadataState, MetadataStateMachine, RaftMetaLog};
+pub use raft_meta_log::{MetadataOp, MetadataState, MetadataStateMachine, RaftMetaLog, TopicCreatedCallback};
 pub use read_index::{ReadIndexManager, ReadIndexRequest, ReadIndexResponse};
 pub use rebalancer::{
     ImbalanceReport, MigrationStatus, PartitionMove, PartitionRebalancer, RebalanceConfig,

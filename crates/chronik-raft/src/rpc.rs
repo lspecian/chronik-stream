@@ -4,8 +4,9 @@ use crate::error::{Result, RaftError};
 use crate::replica::PartitionReplica;
 use raft::prelude::Message as RaftMessage; // Struct from raft (with prost-codec)
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tonic::{Request, Response, Status};
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 // NOTE: We cannot import prost::Message trait because raft uses prost 0.11 and we use prost 0.13
 // The trait implementations are incompatible even though the wire format is the same
@@ -29,6 +30,8 @@ pub use proto::{ReadIndexRequest as ProtoReadIndexRequest, ReadIndexResponse as 
 pub struct RaftServiceImpl {
     /// Map of (topic, partition) -> PartitionReplica
     replicas: Arc<dashmap::DashMap<(String, i32), Arc<PartitionReplica>>>,
+    /// Startup time for grace period handling
+    startup_time: Arc<Instant>,
 }
 
 impl RaftServiceImpl {
@@ -36,7 +39,14 @@ impl RaftServiceImpl {
     pub fn new() -> Self {
         Self {
             replicas: Arc::new(dashmap::DashMap::new()),
+            startup_time: Arc::new(Instant::now()),
         }
+    }
+
+    /// Check if we're within the startup grace period (first 10 seconds).
+    /// During this period, "replica not found" errors are logged as debug instead of error.
+    fn within_startup_grace_period(&self) -> bool {
+        self.startup_time.elapsed() < Duration::from_secs(10)
     }
 
     /// Register a partition replica with the service.
@@ -163,7 +173,12 @@ impl raft_service_server::RaftService for RaftServiceImpl {
         let replica = match self.get_replica(&req.topic, req.partition) {
             Ok(r) => r,
             Err(e) => {
-                error!("ReadIndex: replica not found: {}", e);
+                // During startup, replicas may not be registered yet - log as debug to reduce noise
+                if self.within_startup_grace_period() {
+                    debug!("ReadIndex: replica not yet registered (startup grace period): {}", e);
+                } else {
+                    error!("ReadIndex: replica not found: {}", e);
+                }
                 return Err(Status::not_found(format!(
                     "Replica not found for {}-{}",
                     req.topic, req.partition
@@ -201,7 +216,12 @@ impl raft_service_server::RaftService for RaftServiceImpl {
         let replica = match self.get_replica(&req.topic, req.partition) {
             Ok(r) => r,
             Err(e) => {
-                error!("Step: replica not found: {}", e);
+                // During startup, replicas may not be registered yet - log as debug to reduce noise
+                if self.within_startup_grace_period() {
+                    debug!("Step: replica not yet registered (startup grace period): {}", e);
+                } else {
+                    error!("Step: replica not found: {}", e);
+                }
                 return Ok(Response::new(StepResponse {
                     success: false,
                     error: format!("Replica not found: {}", e),
@@ -260,7 +280,12 @@ impl raft_service_server::RaftService for RaftServiceImpl {
             let replica = match self.get_replica(&raft_msg.topic, raft_msg.partition) {
                 Ok(r) => r,
                 Err(e) => {
-                    error!("StepBatch: replica not found for {}-{}: {}", raft_msg.topic, raft_msg.partition, e);
+                    // During startup, replicas may not be registered yet - log as debug to reduce noise
+                    if self.within_startup_grace_period() {
+                        debug!("StepBatch: replica not yet registered for {}-{} (startup grace period): {}", raft_msg.topic, raft_msg.partition, e);
+                    } else {
+                        error!("StepBatch: replica not found for {}-{}: {}", raft_msg.topic, raft_msg.partition, e);
+                    }
                     responses.push(StepResponse {
                         success: false,
                         error: format!("Replica not found: {}", e),
@@ -313,7 +338,12 @@ impl raft_service_server::RaftService for RaftServiceImpl {
         let replica = match self.get_replica("__meta", 0) {
             Ok(r) => r,
             Err(e) => {
-                error!("ProposeMetadata: __meta replica not found: {}", e);
+                // During startup, replicas may not be registered yet - log as debug to reduce noise
+                if self.within_startup_grace_period() {
+                    debug!("ProposeMetadata: __meta replica not yet registered (startup grace period): {}", e);
+                } else {
+                    error!("ProposeMetadata: __meta replica not found: {}", e);
+                }
                 return Ok(Response::new(proto::ProposeMetadataResponse {
                     success: false,
                     error: format!("__meta replica not found: {}", e),

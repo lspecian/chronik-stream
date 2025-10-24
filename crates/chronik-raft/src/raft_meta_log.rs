@@ -343,12 +343,13 @@ impl StateMachine for MetadataStateMachine {
             Ok(op) => {
                 debug!("Applying metadata operation at index {}: {:?}", entry.index, op);
 
-                // Check if this is a CreateTopicWithAssignments operation (before applying)
-                let is_topic_creation = matches!(op, MetadataOp::CreateTopicWithAssignments { .. });
-                let topic_name = if let MetadataOp::CreateTopicWithAssignments { ref topic_name, .. } = op {
-                    Some(topic_name.clone())
-                } else {
-                    None
+                // CRITICAL FIX: Check if this is ANY topic creation operation (before applying)
+                // Callback must fire for both CreateTopic and CreateTopicWithAssignments
+                let is_topic_creation = matches!(op, MetadataOp::CreateTopic { .. } | MetadataOp::CreateTopicWithAssignments { .. });
+                let topic_name = match &op {
+                    MetadataOp::CreateTopic { ref name, .. } => Some(name.clone()),
+                    MetadataOp::CreateTopicWithAssignments { ref topic_name, .. } => Some(topic_name.clone()),
+                    _ => None,
                 };
 
                 // Apply the operation
@@ -530,6 +531,7 @@ impl RaftMetaLog {
             log_storage,
             state_machine,
             peers,
+            None,  // No event channel for __meta partition (uses external RaftMetaLog wrapper)
         ).map_err(|e| MetadataError::StorageError(format!("Failed to create Raft replica: {}", e)))?;
 
         let raft_replica = Arc::new(raft_replica);
@@ -686,23 +688,30 @@ impl BackgroundProcessor {
                 Err(ref e) if e.to_string().contains("Not leader") => {
                     // Extract leader ID from error message
                     if let Some(leader_id) = self.extract_leader_id(&e.to_string()) {
-                        debug!("Not leader, forwarding proposal to leader {}", leader_id);
-
-                        // Forward to leader via RaftClient
-                        if let Some(ref client) = self.raft_client {
-                            match client.propose_metadata_to_leader(leader_id, data).await {
-                                Ok(index) => {
-                                    debug!("Proposal forwarded successfully to leader {}, index {}", leader_id, index);
-                                    Ok(index)
-                                }
-                                Err(e) => {
-                                    error!("Failed to forward proposal to leader {}: {}", leader_id, e);
-                                    Err(MetadataError::StorageError(format!("Forward to leader failed: {}", e)))
-                                }
-                            }
+                        // CRITICAL FIX: leader_id = 0 means "no leader elected yet" in Raft
+                        // Don't try to forward to peer 0, instead return error asking client to retry
+                        if leader_id == 0 {
+                            debug!("No leader elected yet (leader_id=0), cannot forward proposal");
+                            Err(MetadataError::StorageError("No leader elected yet. Please retry in a few moments.".to_string()))
                         } else {
-                            error!("Cannot forward to leader: RaftClient not available");
-                            Err(MetadataError::StorageError("Cannot forward to leader: RaftClient not available".to_string()))
+                            debug!("Not leader, forwarding proposal to leader {}", leader_id);
+
+                            // Forward to leader via RaftClient
+                            if let Some(ref client) = self.raft_client {
+                                match client.propose_metadata_to_leader(leader_id, data).await {
+                                    Ok(index) => {
+                                        debug!("Proposal forwarded successfully to leader {}, index {}", leader_id, index);
+                                        Ok(index)
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to forward proposal to leader {}: {}", leader_id, e);
+                                        Err(MetadataError::StorageError(format!("Forward to leader failed: {}", e)))
+                                    }
+                                }
+                            } else {
+                                error!("Cannot forward to leader: RaftClient not available");
+                                Err(MetadataError::StorageError("Cannot forward to leader: RaftClient not available".to_string()))
+                            }
                         }
                     } else {
                         error!("Could not extract leader ID from error: {}", e);

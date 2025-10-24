@@ -524,9 +524,10 @@ async fn main() -> Result<()> {
 
             // Auto-derive metrics port for cluster mode (same logic as standalone)
             let metrics_port = if cli.metrics_port == 9093 {
-                // Metrics port = kafka_port + 2 (avoid conflict with Raft gRPC on kafka_port + 1)
-                let derived = cli.kafka_port + 2;
-                info!("Auto-derived metrics port: {} (kafka_port + 2)", derived);
+                // Metrics port = kafka_port + 4000 (separate range from Kafka/Raft ports)
+                // This ensures Node 1 (9092) gets 13092, Node 2 (9093) gets 13093, Node 3 (9094) gets 13094
+                let derived = cli.kafka_port + 4000;
+                info!("Auto-derived metrics port: {} (kafka_port + 4000)", derived);
                 derived
             } else {
                 cli.metrics_port
@@ -606,10 +607,10 @@ async fn run_standalone_server(cli: &Cli) -> Result<()> {
 
     // Auto-derive metrics port if at default value (9093) and in cluster mode
     if cli.metrics_port == 9093 && is_cluster_mode {
-        // Metrics port = kafka_port + 2 (avoid conflict with Raft gRPC on kafka_port + 1)
-        // This ensures Node 1 (9092) gets 9094, Node 2 (9192) gets 9194, etc.
-        cli.metrics_port = cli.kafka_port + 2;
-        info!("Auto-derived metrics port: {} (kafka_port + 2)", cli.metrics_port);
+        // Metrics port = kafka_port + 4000 (separate range from Kafka/Raft ports)
+        // This ensures Node 1 (9092) gets 13092, Node 2 (9093) gets 13093, Node 3 (9094) gets 13094
+        cli.metrics_port = cli.kafka_port + 4000;
+        info!("Auto-derived metrics port: {} (kafka_port + 4000)", cli.metrics_port);
     }
 
     // Auto-derive search API port if at default value (6080) and in cluster mode

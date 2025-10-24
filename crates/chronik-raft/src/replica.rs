@@ -4,7 +4,7 @@
 //! the tikv/raft RawNode API. Each partition replica runs its own Raft state
 //! machine to ensure consistent replication across the cluster.
 
-use crate::{RaftConfig, RaftError, RaftLogStorage, Result, StateMachine};
+use crate::{RaftConfig, RaftError, RaftEvent, RaftLogStorage, Result, StateMachine};
 use chronik_monitoring::RaftMetrics;
 use parking_lot::RwLock as ParkingRwLock;
 use raft::{
@@ -17,7 +17,7 @@ use raft::{
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{oneshot, RwLock as TokioRwLock};
+use tokio::sync::{mpsc, oneshot, RwLock as TokioRwLock};
 use tracing::{debug, error, info, trace, warn};
 
 /// Manages Raft consensus for a single partition
@@ -56,6 +56,10 @@ pub struct PartitionReplica {
 
     /// Proposal timestamps for commit latency tracking (index -> proposal_time)
     proposal_times: Arc<ParkingRwLock<HashMap<u64, Instant>>>,
+
+    /// Event channel for notifying server layer of state changes (optional)
+    /// If None, no events are sent (useful for testing or standalone mode)
+    event_tx: Option<mpsc::UnboundedSender<RaftEvent>>,
 }
 
 /// Replica state tracking
@@ -99,6 +103,7 @@ impl PartitionReplica {
     /// * `log_storage` - Log storage backend
     /// * `state_machine` - State machine for applying committed entries
     /// * `peers` - List of peer node IDs in the cluster
+    /// * `event_tx` - Optional event channel for notifying server layer of state changes
     ///
     /// # Returns
     /// A new PartitionReplica instance
@@ -109,6 +114,7 @@ impl PartitionReplica {
         log_storage: Arc<dyn RaftLogStorage>,
         state_machine: Arc<TokioRwLock<dyn StateMachine>>,
         peers: Vec<u64>,
+        event_tx: Option<mpsc::UnboundedSender<RaftEvent>>,
     ) -> Result<Self> {
         info!(
             "Creating PartitionReplica for {}-{} with node_id={} peers={:?}",
@@ -258,6 +264,7 @@ impl PartitionReplica {
             last_tick: Arc::new(ParkingRwLock::new(Instant::now())),
             metrics: RaftMetrics::new(),
             proposal_times: Arc::new(ParkingRwLock::new(HashMap::new())),
+            event_tx,
         };
 
         // Update state to reflect initial role after campaign()
@@ -656,6 +663,28 @@ impl PartitionReplica {
                             term = state.term,
                             "Became Raft leader"
                         );
+
+                        // Send event to notify server layer of leadership change
+                        if let Some(ref event_tx) = self.event_tx {
+                            let event = RaftEvent::BecameLeader {
+                                topic: self.topic.clone(),
+                                partition: self.partition as u32,
+                                node_id: self.config.node_id,
+                                term: state.term,
+                            };
+
+                            if let Err(e) = event_tx.send(event) {
+                                warn!(
+                                    "Failed to send BecameLeader event for {}/{}: {:?}",
+                                    self.topic, self.partition, e
+                                );
+                            } else {
+                                debug!(
+                                    "Sent BecameLeader event for {}/{} (node={}, term={})",
+                                    self.topic, self.partition, self.config.node_id, state.term
+                                );
+                            }
+                        }
                     }
                 }
 

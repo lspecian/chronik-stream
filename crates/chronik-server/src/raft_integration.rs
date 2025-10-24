@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use chronik_common::metadata::MetadataStore;
 use chronik_raft::{
-    MemoryStateMachine, PartitionReplica, RaftClient, RaftConfig, RaftEntry, RaftLogStorage,
+    MemoryStateMachine, PartitionReplica, RaftClient, RaftConfig, RaftEntry, RaftEvent, RaftLogStorage,
     Result as RaftResult, SnapshotData, StateMachine,
 };
 use chronik_wal::{GroupCommitWal, GroupCommitConfig, RaftWalStorage};
@@ -17,7 +17,7 @@ use raft::prelude::{ConfChange, ConfChangeType};
 use chronik_storage::{CanonicalRecord, SegmentWriter};
 use dashmap::DashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 
 /// Partition identifier (topic, partition)
@@ -238,8 +238,8 @@ pub struct RaftReplicaManager {
     /// Map of partition -> state machine
     state_machines: Arc<DashMap<PartitionKey, Arc<tokio::sync::RwLock<dyn StateMachine>>>>,
 
-    /// Metadata store
-    metadata: Arc<dyn MetadataStore>,
+    /// Metadata store (wrapped in RwLock to allow replacement with RaftMetaLog)
+    metadata: Arc<RwLock<Arc<dyn MetadataStore>>>,
 
     /// WAL manager for writing committed entries
     wal_manager: Arc<chronik_wal::WalManager>,
@@ -259,6 +259,10 @@ pub struct RaftReplicaManager {
         Arc<parking_lot::RwLock<chronik_raft::MetadataState>>,
         Arc<std::sync::atomic::AtomicU64>,
     )>>>,
+
+    /// Event channel for receiving Raft state changes
+    event_tx: mpsc::UnboundedSender<RaftEvent>,
+    event_rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<RaftEvent>>>,
 }
 
 impl RaftReplicaManager {
@@ -287,16 +291,21 @@ impl RaftReplicaManager {
         // Pre-populate peer_nodes from config for immediate availability
         let initial_peers = config.initial_peers.clone();
 
+        // Create event channel for Raft state changes
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+
         Self {
             config,
             replicas: Arc::new(DashMap::new()),
             state_machines: Arc::new(DashMap::new()),
-            metadata,
+            metadata: Arc::new(RwLock::new(metadata)),
             wal_manager,
             raft_client: Arc::new(RaftClient::new()),
             raft_service: Arc::new(tokio::sync::RwLock::new(None)),
             peer_nodes: Arc::new(RwLock::new(initial_peers)),
             meta_partition_state: Arc::new(RwLock::new(None)),
+            event_tx,
+            event_rx: Arc::new(tokio::sync::Mutex::new(event_rx)),
         }
     }
 
@@ -318,6 +327,14 @@ impl RaftReplicaManager {
         let mut state = self.meta_partition_state.write().await;
         *state = Some((local_state, applied_index));
         info!("Meta partition state registered with RaftReplicaManager");
+    }
+
+    /// Replace the metadata store with a Raft-replicated one
+    /// This is called after initializing RaftMetaLog to replace the temporary FileMetadataStore
+    pub async fn set_metadata_store(&self, metadata: Arc<dyn MetadataStore>) {
+        let mut store = self.metadata.write().await;
+        *store = metadata;
+        info!("Metadata store replaced with Raft-replicated version");
     }
 
     /// Get the shared metadata state for __meta partition
@@ -395,14 +412,15 @@ impl RaftReplicaManager {
         );
 
         // Create state machine (directly as dyn StateMachine)
+        let metadata_store = self.metadata.read().await.clone();
         let state_machine: Arc<tokio::sync::RwLock<dyn StateMachine>> = Arc::new(tokio::sync::RwLock::new(ChronikStateMachine::new(
             topic.clone(),
             partition,
             self.wal_manager.clone(),
-            self.metadata.clone(),
+            metadata_store,
         )));
 
-        // Create replica
+        // Create replica with event channel
         let replica = Arc::new(PartitionReplica::new(
             topic.clone(),
             partition,
@@ -410,6 +428,7 @@ impl RaftReplicaManager {
             log_storage,
             state_machine.clone(),
             peers,
+            Some(self.event_tx.clone()),
         )?);
 
         // Store replica and state machine
@@ -466,7 +485,7 @@ impl RaftReplicaManager {
         );
 
         // Use provided state machine (MetadataStateMachine from RaftMetaLog)
-        // Create replica
+        // Create replica with event channel
         let replica = Arc::new(PartitionReplica::new(
             topic.clone(),
             partition,
@@ -474,6 +493,7 @@ impl RaftReplicaManager {
             log_storage,
             state_machine.clone(),
             peers,
+            Some(self.event_tx.clone()),
         )?);
 
         // Store replica and state machine
@@ -606,19 +626,20 @@ impl RaftReplicaManager {
                 );
 
                 // Send messages to peers via gRPC
+                // CRITICAL FIX (v1.3.67): Send messages SEQUENTIALLY to preserve Raft message ordering!
+                // Using tokio::spawn() creates unordered async tasks that violate Raft's ordering requirements,
+                // causing vote responses to arrive out-of-term and triggering endless leader election churn.
+                // See: docs/fixes/RAFT_MESSAGE_ORDERING_BUG.md
                 if !messages.is_empty() {
                     info!("Sending {} messages to peers for {}-{}", messages.len(), topic, partition);
 
                     for msg in messages {
                         let to = msg.to;
-                        let topic = topic.clone();
-                        let client = raft_client.clone();
 
-                        tokio::spawn(async move {
-                            if let Err(e) = client.send_message(&topic, partition, to, msg).await {
-                                error!("Failed to send message to peer {}: {}", to, e);
-                            }
-                        });
+                        // Send synchronously to guarantee ordering (await before next message)
+                        if let Err(e) = raft_client.send_message(&topic, partition, to, msg).await {
+                            error!("Failed to send message to peer {}: {}", to, e);
+                        }
                     }
                 }
 
@@ -705,6 +726,74 @@ impl RaftReplicaManager {
     /// List all partition keys
     pub fn list_partitions(&self) -> Vec<PartitionKey> {
         self.replicas.iter().map(|entry| entry.key().clone()).collect()
+    }
+
+    /// Start the event handler loop to process Raft state changes
+    ///
+    /// This should be spawned as a background task when the server starts.
+    /// It listens for RaftEvent::BecameLeader events and updates partition
+    /// assignments in the metadata store to keep them synchronized with
+    /// actual Raft leaders.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let manager = Arc::new(RaftReplicaManager::new(...));
+    /// tokio::spawn(manager.clone().run_event_handler());
+    /// ```
+    pub async fn run_event_handler(self: Arc<Self>) {
+        let mut rx = self.event_rx.lock().await;
+        info!("Starting Raft event handler loop");
+
+        while let Some(event) = rx.recv().await {
+            match event {
+                RaftEvent::BecameLeader { topic, partition, node_id, term } => {
+                    info!(
+                        "EVENT HANDLER: Node {} became leader for {}/{} at term {}",
+                        node_id, topic, partition, term
+                    );
+
+                    // Update partition assignment to reflect new leader
+                    let assignment = chronik_common::metadata::PartitionAssignment {
+                        topic: topic.clone(),
+                        partition,
+                        broker_id: node_id as i32,
+                        is_leader: true,
+                    };
+
+                    // Acquire read lock to access metadata store
+                    let metadata = self.metadata.read().await;
+                    if let Err(e) = metadata.assign_partition(assignment).await {
+                        error!(
+                            "Failed to update partition assignment for {}/{} leader {}: {:?}",
+                            topic, partition, node_id, e
+                        );
+                    } else {
+                        info!(
+                            "Updated partition assignment: {}/{} leader is now node {}",
+                            topic, partition, node_id
+                        );
+                    }
+                }
+
+                RaftEvent::BecameFollower { topic, partition, node_id, new_leader, term } => {
+                    debug!(
+                        "EVENT HANDLER: Node {} became follower for {}/{} (new leader: {:?}) at term {}",
+                        node_id, topic, partition, new_leader, term
+                    );
+                    // No action needed - leader event will update the assignment
+                }
+
+                RaftEvent::LeaderChanged { topic, partition, node_id, new_leader, term } => {
+                    debug!(
+                        "EVENT HANDLER: Node {} detected leader change to {} for {}/{} at term {}",
+                        node_id, new_leader, topic, partition, term
+                    );
+                    // No action needed - the new leader will send BecameLeader event
+                }
+            }
+        }
+
+        warn!("Raft event handler loop exited");
     }
 
     /// Get the committed offset for a partition (v1.3.66+)

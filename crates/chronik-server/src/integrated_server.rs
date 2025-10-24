@@ -167,7 +167,43 @@ impl IntegratedKafkaServer {
             // Cluster mode: Use Raft-replicated metadata store
             #[cfg(feature = "raft")]
             {
-                info!("Initializing Raft-replicated metadata store for cluster mode");
+                // CRITICAL VALIDATION: Multi-node Raft clustering requires raft-cluster mode, not standalone
+                // The standalone mode lacks distributed bootstrap coordination needed for multi-node clusters
+                // ONLY enforce this when raft_manager is None (standalone mode)
+                // When raft_manager is Some, we're in raft-cluster mode which properly handles multi-node
+                let total_nodes = cluster_config.peers.len();
+
+                if total_nodes > 1 && raft_manager.is_none() {
+                    return Err(anyhow::anyhow!(
+                        "Multi-node Raft clustering ({} nodes total) is not supported in 'standalone' mode.\n\
+                         \n\
+                         The standalone mode lacks distributed bootstrap coordination required for multi-node clusters.\n\
+                         Each node would create its __meta partition replica independently without quorum agreement,\n\
+                         leading to cluster formation failures.\n\
+                         \n\
+                         Please use one of the following instead:\n\
+                         \n\
+                         Option 1 (Recommended): Use raft-cluster mode with health-check bootstrap\n\
+                         ========================================================================\n\
+                         cargo run --features raft --bin chronik-server -- raft-cluster \\\n\
+                           --node-id 1 \\\n\
+                           --raft-addr 0.0.0.0:9192 \\\n\
+                           --peers \"2@node2:9292,3@node3:9392\"\n\
+                         \n\
+                         Option 2: Use raft-cluster mode (requires manual startup coordination)\n\
+                         =========================================================================\n\
+                         See docs/CLUSTERING_GUIDE.md for detailed multi-node setup instructions.\n\
+                         \n\
+                         Note: Single-node Raft is supported in standalone mode for development/testing.",
+                        total_nodes
+                    ));
+                }
+
+                if total_nodes > 1 {
+                    info!("Initializing Raft-replicated metadata store for {}-node cluster mode", total_nodes);
+                } else {
+                    info!("Initializing Raft-replicated metadata store for single-node cluster mode");
+                }
 
                 use chronik_raft::RaftMetaLog;
                 use chronik_wal::{GroupCommitWal, GroupCommitConfig, RaftWalStorage};
@@ -212,10 +248,75 @@ impl IntegratedKafkaServer {
                     info!("No existing __meta replica found, creating new one with fresh state");
                     let local_state = Arc::new(parking_lot::RwLock::new(chronik_raft::MetadataState::default()));
                     let applied_index = Arc::new(std::sync::atomic::AtomicU64::new(0));
-                    // Create MetadataStateMachine with the shared state
-                    let metadata_sm = chronik_raft::MetadataStateMachine::new(
+
+                    // CRITICAL FIX: Create topic creation callback to enable Raft replication for data partitions
+                    // When a topic is created via metadata, we need to create Raft replicas for each partition
+                    let raft_mgr_for_callback = raft_mgr.clone();
+                    let peer_ids_for_callback = peer_ids.clone();
+                    let data_dir_for_callback = PathBuf::from(&config.data_dir);
+
+                    let topic_created_callback: chronik_raft::TopicCreatedCallback = Arc::new(move |topic_name: &str, topic_meta: &chronik_common::metadata::TopicMetadata| {
+                        info!("Topic creation callback fired for '{}'", topic_name);
+
+                        // Skip __meta partition (already created)
+                        if topic_name == "__meta" {
+                            return;
+                        }
+
+                        // Create Raft replicas for each partition asynchronously
+                        let topic = topic_name.to_string();
+                        let partition_count = topic_meta.config.partition_count;
+                        let raft_mgr = raft_mgr_for_callback.clone();
+                        let peers = peer_ids_for_callback.clone();
+                        let data_dir = data_dir_for_callback.clone();
+
+                        tokio::spawn(async move {
+                            info!("Creating Raft replicas for topic '{}' with {} partitions", topic, partition_count);
+
+                            for partition_id in 0..partition_count {
+                                // Create WAL-backed storage for this partition
+                                let partition_wal_config = chronik_wal::GroupCommitConfig::default();
+                                let partition_wal_dir = data_dir.join(format!("wal/{}/{}", topic, partition_id));
+
+                                if let Err(e) = tokio::fs::create_dir_all(&partition_wal_dir).await {
+                                    error!("Failed to create WAL directory for {}-{}: {}", topic, partition_id, e);
+                                    continue;
+                                }
+
+                                let partition_wal = Arc::new(chronik_wal::GroupCommitWal::new(partition_wal_dir.clone(), partition_wal_config));
+                                let log_storage = Arc::new(chronik_wal::RaftWalStorage::new(partition_wal));
+
+                                // Recover any existing Raft log entries
+                                if let Err(e) = log_storage.recover(&data_dir).await {
+                                    error!("Failed to recover Raft log for {}-{}: {}", topic, partition_id, e);
+                                    continue;
+                                }
+
+                                // Create Raft replica for this partition
+                                match raft_mgr.create_replica(
+                                    topic.clone(),
+                                    partition_id as i32,
+                                    log_storage,
+                                    peers.clone(),
+                                ).await {
+                                    Ok(()) => {
+                                        info!("Successfully created Raft replica for {}-{} with {} peers", topic, partition_id, peers.len());
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to create Raft replica for {}-{}: {}", topic, partition_id, e);
+                                    }
+                                }
+                            }
+
+                            info!("Completed Raft replica creation for topic '{}'", topic);
+                        });
+                    });
+
+                    // Create MetadataStateMachine with the topic creation callback
+                    let metadata_sm = chronik_raft::MetadataStateMachine::with_callback(
                         local_state.clone(),
                         applied_index.clone(),
+                        Some(topic_created_callback),
                     );
                     let state_machine: Arc<tokio::sync::RwLock<dyn chronik_raft::StateMachine>> =
                         Arc::new(tokio::sync::RwLock::new(metadata_sm));
@@ -242,7 +343,7 @@ impl IntegratedKafkaServer {
 
                 // Create RaftMetaLog using the shared replica and RaftClient
                 // CRITICAL: Pass the SAME local_state and applied_index that we gave to MetadataStateMachine
-                // NOTE: Topic creation callback is now set in MetadataStateMachine (in raft_cluster.rs)
+                // Topic creation callback is set above in MetadataStateMachine::with_callback()
                 let raft_meta_log = RaftMetaLog::from_replica(
                     cluster_config.node_id,
                     meta_replica.clone(),
@@ -1035,6 +1136,11 @@ impl IntegratedKafkaServer {
 
         info!("IntegratedKafkaServer shutdown complete");
         Ok(())
+    }
+
+    /// Get the metadata store (for updating RaftReplicaManager after initialization)
+    pub fn metadata_store(&self) -> Arc<dyn MetadataStore> {
+        self.metadata_store.clone()
     }
 
     /// Run the Kafka server (with optional shutdown signal)

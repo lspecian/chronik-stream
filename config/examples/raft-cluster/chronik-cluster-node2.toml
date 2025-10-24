@@ -1,0 +1,19 @@
+enabled = true
+node_id = 2
+replication_factor = 3
+min_insync_replicas = 2
+
+[[peers]]
+id = 1
+addr = "localhost:9092"
+raft_port = 9192
+
+[[peers]]
+id = 2
+addr = "localhost:9093"
+raft_port = 9193
+
+[[peers]]
+id = 3
+addr = "localhost:9094"
+raft_port = 9194
