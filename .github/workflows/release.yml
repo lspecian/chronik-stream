@@ -64,7 +64,18 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-      
+
+      - name: Install protoc (Linux)
+        if: matrix.use_cross
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Install protoc (macOS)
+        if: "!matrix.use_cross"
+        run: |
+          brew install protobuf
+
       - name: Install cross (Linux builds)
         if: matrix.use_cross
         run: |
