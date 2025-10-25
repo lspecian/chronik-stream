@@ -1,5 +1,12 @@
 # Cross compilation configuration
 
+[build]
+# Install protoc in all cross containers (required by raft-proto build script)
+pre-build = [
+    "dpkg --add-architecture $CROSS_DEB_ARCH",
+    "apt-get update && apt-get install --assume-yes protobuf-compiler"
+]
+
 [build.env]
 # Don't pass RUSTC_WRAPPER as sccache isn't available in the container
 passthrough = [
@@ -13,5 +20,5 @@ passthrough = [
 image = "ghcr.io/cross-rs/x86_64-unknown-linux-musl:main"
 
 [target.aarch64-unknown-linux-musl]
-# Build in the container  
+# Build in the container
 image = "ghcr.io/cross-rs/aarch64-unknown-linux-musl:main"
