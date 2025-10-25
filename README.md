@@ -251,6 +251,60 @@ chronik-server standalone
 chronik-server
 ```
 
+### Raft Cluster Mode (Multi-Node Replication)
+**NEW in v2.0.0**: Production-ready multi-node cluster with automatic replication, leader election, and fault tolerance.
+
+**Minimum 3 nodes required** for quorum-based replication:
+
+```bash
+# Node 1 (port 9092, Raft port 9192)
+cargo run --release --features raft --bin chronik-server -- \
+  --kafka-port 9092 \
+  --advertised-addr node1.example.com \
+  --data-dir /data/node1 \
+  --node-id 1 \
+  raft-cluster \
+  --raft-addr 0.0.0.0:9192 \
+  --peers "2@node2.example.com:9193,3@node3.example.com:9194" \
+  --bootstrap
+
+# Node 2 (port 9092, Raft port 9193)
+cargo run --release --features raft --bin chronik-server -- \
+  --kafka-port 9092 \
+  --advertised-addr node2.example.com \
+  --data-dir /data/node2 \
+  --node-id 2 \
+  raft-cluster \
+  --raft-addr 0.0.0.0:9193 \
+  --peers "1@node1.example.com:9192,3@node3.example.com:9194"
+
+# Node 3 (port 9092, Raft port 9194)
+cargo run --release --features raft --bin chronik-server -- \
+  --kafka-port 9092 \
+  --advertised-addr node3.example.com \
+  --data-dir /data/node3 \
+  --node-id 3 \
+  raft-cluster \
+  --raft-addr 0.0.0.0:9194 \
+  --peers "1@node1.example.com:9192,2@node2.example.com:9193"
+```
+
+**Key Features:**
+- ✅ Quorum-based replication (survives minority node failures)
+- ✅ Automatic leader election via Raft consensus
+- ✅ Strong consistency (linearizable reads/writes)
+- ✅ Automatic log compaction with S3-backed snapshots
+- ✅ Zero-downtime rolling restarts
+- ✅ Comprehensive monitoring via Prometheus metrics
+
+**Important Notes:**
+- Raft port = Kafka port + 100 (e.g., 9092 → 9192)
+- Each node MUST have a unique `--node-id` (1, 2, 3, ...)
+- Only ONE node should use `--bootstrap` flag (creates initial cluster)
+- Requires connectivity on both Kafka AND Raft ports between all nodes
+
+See [docs/raft/README.md](docs/raft/README.md) for complete setup guide and [docs/RAFT_DEPLOYMENT_GUIDE.md](docs/RAFT_DEPLOYMENT_GUIDE.md) for production deployment.
+
 ### All Mode
 Run all components (Kafka protocol, search, backup) in a single process:
 ```bash
@@ -519,3 +573,12 @@ Apache License 2.0. See [LICENSE](LICENSE) for details.
 - [CLAUDE.md](CLAUDE.md) - Development guide for AI assistants
 - [docs/KSQL_INTEGRATION_GUIDE.md](docs/KSQL_INTEGRATION_GUIDE.md) - KSQL setup and usage
 - [docs/WAL_AUTO_TUNING.md](docs/WAL_AUTO_TUNING.md) - WAL performance auto-tuning guide
+
+### Raft Clustering (Multi-Node Replication)
+- [docs/raft/README.md](docs/raft/README.md) - Raft cluster overview and quick start
+- [docs/RAFT_DEPLOYMENT_GUIDE.md](docs/RAFT_DEPLOYMENT_GUIDE.md) - Production deployment guide
+- [docs/raft/CONFIGURATION.md](docs/raft/CONFIGURATION.md) - Detailed configuration reference
+- [docs/RAFT_TESTING_GUIDE.md](docs/RAFT_TESTING_GUIDE.md) - Testing and debugging Raft clusters
+- [docs/DISASTER_RECOVERY.md](docs/DISASTER_RECOVERY.md) - Disaster recovery and backup strategies
+- [docs/raft/TROUBLESHOOTING.md](docs/raft/TROUBLESHOOTING.md) - Common issues and solutions
+- [docs/RAFT_METRICS_GUIDE.md](docs/RAFT_METRICS_GUIDE.md) - Monitoring Raft clusters with Prometheus
