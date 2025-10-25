@@ -1214,9 +1214,19 @@ impl ProduceHandler {
 
                             match bincode::serialize(&canonical_record) {
                                 Ok(serialized) => {
+                                    // CRITICAL (v2.0.0 Phase 3): Log before proposing to Raft
+                                    info!(
+                                        "PRODUCE: Proposing {} bytes to Raft for {}-{}, base_offset={}, num_records={}",
+                                        serialized.len(), topic, partition, canonical_record.base_offset, canonical_record.records.len()
+                                    );
+
+                                    if serialized.is_empty() {
+                                        error!("PRODUCE: ❌ EMPTY serialized bytes before propose! This is a BUG in {}-{}", topic, partition);
+                                    }
+
                                     // Propose to Raft (will block until committed by quorum)
                                     // The state machine will handle WAL writes and storage
-                                    match raft_manager.propose(topic, partition, serialized).await {
+                                    match raft_manager.propose(topic, partition, serialized.clone()).await {
                                         Ok(raft_index) => {
                                             info!("Raft✓ {}-{}: Committed at index={}, offsets={}-{}",
                                                 topic, partition, raft_index, base_offset, last_offset);

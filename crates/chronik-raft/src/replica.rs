@@ -311,10 +311,24 @@ impl PartitionReplica {
     /// # Returns
     /// The proposed entry index on success
     pub async fn propose(&self, data: Vec<u8>) -> Result<u64> {
+        // CRITICAL (v2.0.0 Phase 3): Log proposal to track deserialization errors
+        info!(
+            "REPLICA: propose() called for {}-{}, data.len()={}",
+            self.topic, self.partition, data.len()
+        );
+
+        if data.is_empty() {
+            error!(
+                "REPLICA: ❌ EMPTY data in propose()! Caller sent empty bytes to {}-{}",
+                self.topic, self.partition
+            );
+            return Err(RaftError::Config("Cannot propose empty data".to_string()));
+        }
+
         let mut node = self.raw_node.write();
 
-        trace!(
-            "Proposing entry of {} bytes to {}-{}",
+        debug!(
+            "REPLICA: Proposing entry of {} bytes to {}-{}",
             data.len(),
             self.topic,
             self.partition
@@ -330,7 +344,7 @@ impl PartitionReplica {
         }
 
         // Propose the entry
-        node.propose(vec![], data)?;
+        node.propose(vec![], data.clone())?;  // Clone to verify data isn't corrupted
 
         // Get the proposed index (last index in the log)
         let index = node.raft.raft_log.last_index();
@@ -338,11 +352,12 @@ impl PartitionReplica {
         // Track proposal time for commit latency metrics
         self.proposal_times.write().insert(index, Instant::now());
 
-        debug!(
-            "Proposed entry at index {} to {}-{}, will commit via background loop",
+        info!(
+            "REPLICA: ✅ Proposed entry at index {} to {}-{}, data.len()={}, will commit via background loop",
             index,
             self.topic,
-            self.partition
+            self.partition,
+            data.len()
         );
 
         Ok(index)
@@ -944,6 +959,311 @@ impl PartitionReplica {
         }
 
         Ok((messages, committed_entries))
+    }
+
+    /// Non-blocking ready that separates message extraction from entry application
+    ///
+    /// **CRITICAL (v2.0.0 Phase 2)**: This method extracts messages and committed entries
+    /// WITHOUT applying them, allowing the caller to send heartbeats immediately while
+    /// applying entries in a background task. This prevents state machine blocking from
+    /// causing election churn.
+    ///
+    /// # Returns
+    /// `(messages, committed_entries)` - Messages should be sent immediately,
+    /// committed entries should be applied via `apply_committed_entries()` in background
+    ///
+    /// # Usage Pattern
+    /// ```rust,ignore
+    /// // In tick loop (every 10ms)
+    /// let (messages, entries) = replica.ready_non_blocking().await?;
+    ///
+    /// // Send messages IMMEDIATELY (heartbeats go out even if entries pending)
+    /// send_messages(messages);
+    ///
+    /// // Apply entries in BACKGROUND (doesn't block tick loop)
+    /// tokio::spawn(async move {
+    ///     replica.apply_committed_entries(entries).await;
+    /// });
+    /// ```
+    pub async fn ready_non_blocking(&self) -> Result<(Vec<Message>, Vec<Entry>)> {
+        // Step 1: Extract ready and update state (must hold locks briefly)
+        let (mut messages, persisted_messages, entries_to_persist, committed_entries, snapshot_to_install) = {
+            let mut node = self.raw_node.write();
+
+            let has_ready = node.has_ready();
+
+            if has_ready {
+                debug!(
+                    "ready_non_blocking() for {}-{}: raft_state={:?}, term={}, commit={}",
+                    self.topic,
+                    self.partition,
+                    node.raft.state,
+                    node.raft.term,
+                    node.raft.raft_log.committed,
+                );
+            }
+
+            if !has_ready {
+                return Ok((Vec::new(), Vec::new()));
+            }
+
+            let mut ready = node.ready();
+
+            debug!(
+                "ready_non_blocking() EXTRACTING for {}-{}: msgs={}, entries={}, committed={}",
+                self.topic,
+                self.partition,
+                ready.messages().len() + ready.persisted_messages().len(),
+                ready.entries().len(),
+                ready.committed_entries().len(),
+            );
+
+            // Check for snapshot to install (BEFORE persisting anything)
+            let snapshot_to_install = if !ready.snapshot().is_empty() {
+                let snap_meta = ready.snapshot().get_metadata();
+                info!(
+                    "Received snapshot for {}-{}: index={}, term={}",
+                    self.topic,
+                    self.partition,
+                    snap_meta.get_index(),
+                    snap_meta.get_term()
+                );
+                Some(ready.snapshot().clone())
+            } else {
+                None
+            };
+
+            // Update state from soft/hard state changes
+            {
+                let mut state = self.state.write();
+
+                if let Some(ss) = ready.ss() {
+                    let old_role = state.role;
+                    state.leader_id = ss.leader_id;
+                    state.role = ss.raft_state;
+
+                    // Log state transitions
+                    if old_role != state.role {
+                        info!(
+                            "Raft state transition for {}-{}: {:?} -> {:?} (leader={})",
+                            self.topic, self.partition, old_role, state.role, state.leader_id
+                        );
+
+                        // Update metrics
+                        let node_id_str = self.config.node_id.to_string();
+                        let state_value = match state.role {
+                            StateRole::Leader => 1,
+                            StateRole::Candidate => 2,
+                            StateRole::Follower => 3,
+                            StateRole::PreCandidate => 2,
+                        };
+                        self.metrics.set_node_state(&self.topic, self.partition, &node_id_str, state_value);
+
+                        // Send event if became leader
+                        if old_role != StateRole::Leader && state.role == StateRole::Leader {
+                            if let Some(ref event_tx) = self.event_tx {
+                                let event = RaftEvent::BecameLeader {
+                                    topic: self.topic.clone(),
+                                    partition: self.partition as u32,
+                                    node_id: self.config.node_id,
+                                    term: state.term,
+                                };
+                                let _ = event_tx.send(event);
+                            }
+                        }
+                    }
+                }
+
+                if let Some(hs) = ready.hs() {
+                    state.term = hs.term;
+                    state.commit_index = hs.commit;
+                    self.metrics.set_current_term(&self.topic, self.partition, state.term);
+                    self.metrics.set_commit_index(&self.topic, self.partition, state.commit_index);
+                }
+            }
+
+            // Collect data before persisting
+            let immediate_messages = ready.take_messages();
+            let persisted_messages = ready.take_persisted_messages();
+            let entries_to_persist: Vec<Entry> = ready.entries().iter().cloned().collect();
+            let committed_entries = ready.take_committed_entries();
+            let hard_state_to_persist = ready.hs().cloned();
+
+            // Persist hard state and entries to tikv/raft's MemStorage
+            if let Some(hs) = hard_state_to_persist.as_ref() {
+                let storage = node.mut_store();
+                storage.wl().set_hardstate(hs.clone());
+            }
+
+            if !entries_to_persist.is_empty() {
+                let storage = node.mut_store();
+                storage.wl().append(&entries_to_persist)?;
+            }
+
+            // Advance and collect all messages
+            let mut light_rd = node.advance(ready);
+            let mut all_messages = immediate_messages;
+            all_messages.extend(light_rd.take_messages());
+
+            let mut all_committed = committed_entries;
+            all_committed.extend(light_rd.take_committed_entries());
+
+            (all_messages, persisted_messages, entries_to_persist, all_committed, snapshot_to_install)
+        }; // Drop node lock here
+
+        // Step 1.5: Install snapshot if present
+        if let Some(snapshot) = snapshot_to_install {
+            match self.install_snapshot(&snapshot).await {
+                Ok(_) => {
+                    info!("Successfully installed snapshot for {}-{}", self.topic, self.partition);
+                }
+                Err(e) => {
+                    error!("Failed to install snapshot for {}-{}: {}", self.topic, self.partition, e);
+                    let mut node = self.raw_node.write();
+                    use raft::SnapshotStatus;
+                    node.report_snapshot(self.config.node_id, SnapshotStatus::Failure);
+                }
+            }
+        }
+
+        // Step 2: Persist entries to our custom log storage (async)
+        if !entries_to_persist.is_empty() {
+            self.persist_entries_to_custom_storage(&entries_to_persist).await?;
+        }
+
+        // Add persisted messages after persistence
+        if !persisted_messages.is_empty() {
+            debug!(
+                "Adding {} persisted messages for {}-{}",
+                persisted_messages.len(),
+                self.topic,
+                self.partition
+            );
+
+            // DIAGNOSTIC: Log each persisted message destination
+            for (idx, msg) in persisted_messages.iter().enumerate() {
+                info!(
+                    "Persisted message {}/{} for {}-{}: type={}, from={}, to={}, term={}",
+                    idx + 1,
+                    persisted_messages.len(),
+                    self.topic,
+                    self.partition,
+                    msg.get_msg_type() as i32,
+                    msg.from,
+                    msg.to,
+                    msg.term
+                );
+            }
+
+            messages.extend(persisted_messages);
+        }
+
+        // Return messages immediately + committed entries for background processing
+        // CRITICAL: We do NOT apply entries here - caller must do that in background!
+        Ok((messages, committed_entries))
+    }
+
+    /// Apply committed entries to state machine (for use with ready_non_blocking)
+    ///
+    /// **CRITICAL (v2.0.0 Phase 2)**: This method should be called in a background task
+    /// after `ready_non_blocking()` returns committed entries. This allows heartbeats
+    /// to be sent immediately while entries are applied asynchronously.
+    ///
+    /// # Arguments
+    /// * `entries` - Committed entries returned from `ready_non_blocking()`
+    pub async fn apply_committed_entries(&self, entries: Vec<Entry>) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        debug!(
+            "Applying {} committed entries for {}-{} (background task)",
+            entries.len(),
+            self.topic,
+            self.partition
+        );
+
+        for entry in &entries {
+            // Check if this is a configuration change
+            if entry.get_entry_type() == EntryType::EntryConfChange {
+                match crate::prost_bridge::decode_conf_change(&entry.data) {
+                    Ok(conf_change) => {
+                        info!(
+                            "Applying conf change at index {}: type={:?}, node_id={}",
+                            entry.index,
+                            conf_change.get_change_type(),
+                            conf_change.node_id
+                        );
+
+                        let mut node = self.raw_node.write();
+                        let conf_state = node.apply_conf_change(&conf_change)?;
+
+                        info!(
+                            "Conf change applied for {}-{}: voters={:?}",
+                            self.topic,
+                            self.partition,
+                            conf_state.voters
+                        );
+                    }
+                    Err(e) => {
+                        error!(
+                            "Failed to decode ConfChange at index {} for {}-{}: {}",
+                            entry.index,
+                            self.topic,
+                            self.partition,
+                            e
+                        );
+                    }
+                }
+            } else {
+                // Regular data entry - apply to state machine
+                let raft_entry = crate::RaftEntry {
+                    index: entry.index,
+                    term: entry.term,
+                    data: entry.data.clone(),
+                };
+
+                let mut sm = self.state_machine.write().await;
+                match sm.apply(&raft_entry).await {
+                    Ok(_) => {
+                        trace!("Applied entry {} to state machine", entry.index);
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to apply entry {} to state machine for {}-{}: {}",
+                            entry.index,
+                            self.topic,
+                            self.partition,
+                            e
+                        );
+                    }
+                }
+            }
+        }
+
+        // Update applied index after all entries are processed
+        if let Some(last_entry) = entries.last() {
+            let mut state = self.state.write();
+            state.applied_index = last_entry.index;
+            self.metrics.set_last_applied(&self.topic, self.partition, state.applied_index);
+        }
+
+        // Notify pending proposals and record commit latency
+        let mut pending = self.pending_proposals.write();
+        let mut proposal_times = self.proposal_times.write();
+
+        for entry in &entries {
+            if let Some(proposed_at) = proposal_times.remove(&entry.index) {
+                let latency_ms = proposed_at.elapsed().as_millis() as f64;
+                self.metrics.record_commit_latency(&self.topic, self.partition, latency_ms, 1);
+            }
+
+            if let Some(sender) = pending.remove(&entry.index) {
+                let _ = sender.send(Ok(()));
+            }
+        }
+
+        Ok(())
     }
 
     /// Check if this node is the Raft leader

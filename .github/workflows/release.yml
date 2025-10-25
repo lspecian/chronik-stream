@@ -75,12 +75,12 @@ jobs:
         env:
           RUSTC_WRAPPER: ""
         run: |
-          cross build --release --target ${{ matrix.target }} --bin chronik-server
-      
+          cross build --release --target ${{ matrix.target }} --bin chronik-server --features raft
+
       - name: Build native (macOS)
         if: "!matrix.use_cross"
         run: |
-          cargo build --release --target ${{ matrix.target }} --bin chronik-server
+          cargo build --release --target ${{ matrix.target }} --bin chronik-server --features raft
           
       - name: Package binary
         run: |

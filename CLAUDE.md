@@ -16,15 +16,21 @@ Chronik Stream is a high-performance Kafka-compatible streaming platform written
 
 ### Building
 ```bash
-# Build all components
+# Build all components (default: standalone, ingest, search, all modes)
 cargo build --release
 
-# Build specific binary
+# Build with Raft support (adds raft-cluster subcommand)
+# NOTE: This is the RECOMMENDED build - standalone mode still works!
+cargo build --release --bin chronik-server --features raft
+
+# Build specific binary (without Raft)
 cargo build --release --bin chronik-server
 
 # Check without building
 cargo check --all-features --workspace
 ```
+
+**IMPORTANT**: Building with `--features raft` does NOT break standalone mode. It only adds the `raft-cluster` subcommand for multi-node deployments. All other modes (`standalone`, `ingest`, `search`, `all`) work identically.
 
 ### Testing
 ```bash
@@ -608,31 +614,55 @@ cargo run --bin chronik-server -- --raft standalone  # Error: "Raft requires 3+ 
 
 #### Multi-Node Raft Cluster Setup
 
+**CRITICAL**: Must build with `--features raft` and specify `--node-id` for each node!
+
 **Minimum 3 nodes required for quorum:**
 ```bash
+# Build with raft feature FIRST
+cargo build --release --bin chronik-server --features raft
+
 # Node 1 (port 9092)
-cargo run --bin chronik-server -- \
-  --advertised-addr node1:9092 \
-  --raft \
-  standalone
+./target/release/chronik-server \
+  --kafka-port 9092 \
+  --advertised-addr localhost \
+  --node-id 1 \                    # ← CRITICAL: Must specify unique node ID!
+  raft-cluster \
+  --raft-addr 0.0.0.0:9192 \
+  --peers "2@localhost:9193,3@localhost:9194" \
+  --bootstrap
 
 # Node 2 (port 9093)
-cargo run --bin chronik-server -- \
-  --advertised-addr node2:9092 \
-  --raft \
-  standalone
+./target/release/chronik-server \
+  --kafka-port 9093 \
+  --advertised-addr localhost \
+  --node-id 2 \                    # ← CRITICAL: Must specify unique node ID!
+  raft-cluster \
+  --raft-addr 0.0.0.0:9193 \
+  --peers "1@localhost:9192,3@localhost:9194" \
+  --bootstrap
 
 # Node 3 (port 9094)
-cargo run --bin chronik-server -- \
-  --advertised-addr node3:9092 \
-  --raft \
-  standalone
+./target/release/chronik-server \
+  --kafka-port 9094 \
+  --advertised-addr localhost \
+  --node-id 3 \                    # ← CRITICAL: Must specify unique node ID!
+  raft-cluster \
+  --raft-addr 0.0.0.0:9194 \
+  --peers "1@localhost:9192,2@localhost:9193" \
+  --bootstrap
 ```
 
+**Common Mistakes (See [docs/RAFT_TESTING_GUIDE.md](docs/RAFT_TESTING_GUIDE.md) for details):**
+- ❌ Forgetting `--features raft` when building → "unrecognized subcommand 'raft-cluster'"
+- ❌ Forgetting `--node-id N` → All nodes default to node_id=1, leader election fails
+- ❌ Using `all` or `standalone` mode → Multi-node Raft rejected
+- ❌ Using `cluster` subcommand → That's the mock CLI, not for starting clusters
+
 **Raft Configuration:**
-- `chronik-cluster.toml` defines cluster topology
-- Each node gets a unique `node_id` (1, 2, 3, etc.)
-- Raft gRPC port = Kafka port + 100 (e.g., 9192 for node on 9092)
+- Each node MUST have unique `--node-id` (1, 2, 3, etc.)
+- Each node MUST have unique `--kafka-port`
+- Each node MUST have unique `--raft-addr`
+- Each node MUST have unique `--data-dir`
 - Requires peer connectivity on both Kafka and Raft ports
 
 **Benefits of Raft Cluster:**

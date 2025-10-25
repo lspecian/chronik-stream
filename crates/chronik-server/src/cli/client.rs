@@ -21,8 +21,24 @@ pub struct ClusterClient {
 impl ClusterClient {
     /// Connect to a Chronik cluster node
     pub async fn connect(addr: &str) -> Result<Self> {
+        // IMPORTANT: This is a mock implementation for development/testing only
+        eprintln!("╔═══════════════════════════════════════════════════════════════════════╗");
+        eprintln!("║  ⚠️  WARNING: Cluster CLI Returns MOCK DATA Only                      ║");
+        eprintln!("╠═══════════════════════════════════════════════════════════════════════╣");
+        eprintln!("║  This cluster management CLI is a stub implementation that returns    ║");
+        eprintln!("║  hardcoded mock data. It does NOT connect to a real cluster.         ║");
+        eprintln!("║                                                                       ║");
+        eprintln!("║  For actual cluster management, use Kafka protocol tools:            ║");
+        eprintln!("║    • kafka-topics --bootstrap-server localhost:9092 --list           ║");
+        eprintln!("║    • kafka-topics --describe --topic <name>                          ║");
+        eprintln!("║    • kafka-consumer-groups --list                                    ║");
+        eprintln!("║                                                                       ║");
+        eprintln!("║  This feature is planned for implementation in a future release.    ║");
+        eprintln!("╚═══════════════════════════════════════════════════════════════════════╝");
+        eprintln!();
+
         // For now, just store the address
-        // In Phase 5, this will establish a gRPC connection
+        // TODO: Phase 5 - Implement actual gRPC connection and admin API
         Ok(Self {
             addr: addr.to_string(),
             timeout: Duration::from_secs(10),

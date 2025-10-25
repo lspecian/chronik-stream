@@ -49,15 +49,18 @@ pub async fn run_raft_cluster(config: RaftClusterConfig) -> Result<()> {
     let raft_config = RaftConfig {
         node_id: config.node_id,
         listen_addr: config.raft_addr.clone(),
-        // CRITICAL (v1.3.66): Election timeout MUST provide enough ticks for randomization
-        // With heartbeat_interval_ms = 100ms, election_timeout_ms = 500ms gives us:
-        // base_election_tick = 5 ticks, randomization range = 5-10 ticks (500-1000ms)
-        // This balances quick leader election with preventing split votes.
-        election_timeout_ms: 500,
-        // OPTIMIZATION (v1.3.66): Increased from 30ms to 100ms for cluster scalability
-        // Reduces heartbeat traffic by 70% (30k → 10k msg/sec for 1000 Raft groups)
-        // This prevents gRPC connection pool exhaustion in large clusters
-        heartbeat_interval_ms: 100,
+        // CRITICAL (v2.0.0): Production-safe timeouts to prevent election churn
+        // With heartbeat_interval_ms = 150ms, election_timeout_ms = 3000ms gives us:
+        // election_tick = 3000/150 = 20 ticks (meets tikv/raft recommendation of 10-20)
+        // This provides ample margin for:
+        // - Network delays: 100-200ms
+        // - State machine blocking: 50-200ms
+        // - gRPC queuing: 50-100ms
+        // - Safety margin: 2500ms
+        election_timeout_ms: 3000,
+        // OPTIMIZATION (v2.0.0): 150ms heartbeat = 6-7 heartbeats per election timeout
+        // Provides redundancy while keeping heartbeat traffic reasonable
+        heartbeat_interval_ms: 150,
         max_entries_per_batch: 100,
         snapshot_threshold: 10_000,
     };

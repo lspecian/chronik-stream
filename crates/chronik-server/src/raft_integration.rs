@@ -72,9 +72,55 @@ impl ChronikStateMachine {
 #[async_trait]
 impl StateMachine for ChronikStateMachine {
     async fn apply(&mut self, entry: &RaftEntry) -> RaftResult<Bytes> {
+        // CRITICAL (v2.0.0 Phase 3): Comprehensive logging to diagnose 13,489 deserialization errors
+        info!(
+            "STATE_MACHINE: apply() called for {}-{}, entry.index={}, entry.term={}, entry.data.len()={}",
+            self.topic, self.partition, entry.index, entry.term, entry.data.len()
+        );
+
+        // Check for empty data (configuration changes or corrupted entries)
+        if entry.data.is_empty() {
+            warn!(
+                "STATE_MACHINE: Entry {} has EMPTY data! Skipping deserialization (likely conf change).",
+                entry.index
+            );
+            self.last_applied = entry.index;
+            return Ok(Bytes::from(format!("skipped:{}", entry.index)));
+        }
+
         // Deserialize as CanonicalRecord
-        let record: CanonicalRecord = bincode::deserialize(&entry.data)
-            .map_err(|e| chronik_raft::RaftError::SerializationError(e.to_string()))?;
+        let record: CanonicalRecord = match bincode::deserialize::<CanonicalRecord>(&entry.data) {
+            Ok(r) => {
+                info!(
+                    "STATE_MACHINE: ✅ Deserialized entry {} successfully: base_offset={}, num_records={}",
+                    entry.index, r.base_offset, r.records.len()
+                );
+                r
+            }
+            Err(e) => {
+                error!(
+                    "STATE_MACHINE: ❌ Deserialization FAILED for entry {}, data.len()={}, error: {}",
+                    entry.index, entry.data.len(), e
+                );
+
+                // Log hex dump of first 100 bytes for debugging
+                let hex_preview = entry.data.iter()
+                    .take(100)
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                error!("STATE_MACHINE: Data hex preview (first 100 bytes): {}", hex_preview);
+
+                // Log first 50 bytes as ASCII (replacing non-printable with '.')
+                let ascii_preview: String = entry.data.iter()
+                    .take(50)
+                    .map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '.' })
+                    .collect();
+                error!("STATE_MACHINE: Data ASCII preview (first 50 bytes): {}", ascii_preview);
+
+                return Err(chronik_raft::RaftError::SerializationError(e.to_string()));
+            }
+        };
 
         info!(
             "STATE_MACHINE: Applying Raft entry {} to {}-{}: base_offset={}, num_records={}",
@@ -599,7 +645,7 @@ impl RaftReplicaManager {
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(tokio::time::Duration::from_millis(tick_interval_ms));
 
-            info!("Started Raft processing loop for {}-{}", topic, partition);
+            info!("Started Raft processing loop (non-blocking) for {}-{}", topic, partition);
 
             loop {
                 ticker.tick().await;
@@ -610,28 +656,27 @@ impl RaftReplicaManager {
                     continue;
                 }
 
-                // Process ready - this applies committed entries and sends notifications
-                let (messages, committed) = match replica.ready().await {
+                // CRITICAL (v2.0.0 Phase 2): Use ready_non_blocking() to extract messages
+                // WITHOUT applying entries, preventing state machine blocking from delaying heartbeats
+                let (messages, committed_entries) = match replica.ready_non_blocking().await {
                     Ok(result) => result,
                     Err(e) => {
-                        error!("Ready failed for {}-{}: {}", topic, partition, e);
+                        error!("Ready (non-blocking) failed for {}-{}: {}", topic, partition, e);
                         continue;
                     }
                 };
 
-                // ALWAYS log to see activity
                 debug!(
                     "Tick loop for {}-{}: messages={}, committed={}",
-                    topic, partition, messages.len(), committed.len()
+                    topic, partition, messages.len(), committed_entries.len()
                 );
 
-                // Send messages to peers via gRPC
+                // Send messages to peers IMMEDIATELY (heartbeats go out even if entries pending)
                 // CRITICAL FIX (v1.3.67): Send messages SEQUENTIALLY to preserve Raft message ordering!
                 // Using tokio::spawn() creates unordered async tasks that violate Raft's ordering requirements,
                 // causing vote responses to arrive out-of-term and triggering endless leader election churn.
-                // See: docs/fixes/RAFT_MESSAGE_ORDERING_BUG.md
                 if !messages.is_empty() {
-                    info!("Sending {} messages to peers for {}-{}", messages.len(), topic, partition);
+                    debug!("Sending {} messages to peers for {}-{}", messages.len(), topic, partition);
 
                     for msg in messages {
                         let to = msg.to;
@@ -643,8 +688,22 @@ impl RaftReplicaManager {
                     }
                 }
 
-                // Note: replica.ready() already applied committed entries and sent
-                // commit notifications to pending proposals. No need to duplicate that work.
+                // Apply committed entries in BACKGROUND (doesn't block next tick)
+                // CRITICAL (v2.0.0 Phase 2): This allows heartbeats to be sent in the next tick
+                // even if entry application is still in progress, preventing election timeout
+                if !committed_entries.is_empty() {
+                    let replica_clone = replica.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = replica_clone.apply_committed_entries(committed_entries).await {
+                            error!(
+                                "Failed to apply committed entries for {}-{}: {}",
+                                replica_clone.topic(),
+                                replica_clone.partition(),
+                                e
+                            );
+                        }
+                    });
+                }
             }
         });
     }
@@ -760,17 +819,50 @@ impl RaftReplicaManager {
                         is_leader: true,
                     };
 
-                    // Acquire read lock to access metadata store
+                    // CRITICAL (v2.0.0 Phase 4): Retry with exponential backoff
+                    // __meta Raft group may still be electing leader, causing transient failures.
+                    // Retry up to 5 times with exponential backoff: 100ms, 200ms, 400ms, 800ms, 1600ms
+                    // Total retry window: 3.1 seconds (within 3s election timeout from Phase 1)
                     let metadata = self.metadata.read().await;
-                    if let Err(e) = metadata.assign_partition(assignment).await {
+                    let mut retry_delay_ms = 100;
+                    let mut success = false;
+
+                    for attempt in 1..=5 {
+                        match metadata.assign_partition(assignment.clone()).await {
+                            Ok(_) => {
+                                info!(
+                                    "✅ Updated partition assignment: {}/{} leader is now node {} (attempt {})",
+                                    topic, partition, node_id, attempt
+                                );
+                                success = true;
+                                break;
+                            }
+                            Err(e) => {
+                                if attempt < 5 {
+                                    warn!(
+                                        "⚠️ Failed to update partition assignment (attempt {}): {:?}. Retrying in {}ms...",
+                                        attempt, e, retry_delay_ms
+                                    );
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(retry_delay_ms)).await;
+                                    retry_delay_ms *= 2;  // Exponential backoff
+                                } else {
+                                    error!(
+                                        "❌ Failed to update partition assignment after 5 attempts: {:?}",
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    if !success {
+                        // Log critical error but don't crash - metadata will eventually sync
                         error!(
-                            "Failed to update partition assignment for {}/{} leader {}: {:?}",
-                            topic, partition, node_id, e
-                        );
-                    } else {
-                        info!(
-                            "Updated partition assignment: {}/{} leader is now node {}",
+                            "CRITICAL: Partition assignment for {}/{} leader {} could not be replicated after 5 attempts!",
                             topic, partition, node_id
+                        );
+                        error!(
+                            "This may cause clients to connect to wrong broker. Metadata sync will retry on next leader election."
                         );
                     }
                 }
