@@ -29,6 +29,8 @@ mod metadata_dr;
 mod raft_integration;
 #[cfg(feature = "raft")]
 mod raft_cluster;
+#[cfg(feature = "raft")]
+mod raft_batch_proposer;
 mod cli;
 
 use integrated_server::{IntegratedKafkaServer, IntegratedServerConfig};
