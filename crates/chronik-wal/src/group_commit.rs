@@ -221,6 +221,11 @@ struct PendingWrite {
 
     /// Channel to notify caller when commit completes
     response_tx: Option<oneshot::Sender<Result<()>>>,
+
+    /// Offset metadata for Raft batch notifications (V2 records only)
+    base_offset: Option<i64>,
+    last_offset: Option<i64>,
+    record_count: Option<i32>,
 }
 
 /// Per-partition commit queue
@@ -257,6 +262,9 @@ struct PartitionCommitQueue {
 
     /// Partition number (for rotation)
     partition: i32,
+
+    /// Optional channel for notifying Raft batch proposer (Raft mode only)
+    batch_notifier: Option<Arc<tokio::sync::mpsc::UnboundedSender<crate::BatchMetadata>>>,
 }
 
 /// Commit metrics for observability
@@ -285,17 +293,32 @@ pub struct GroupCommitWal {
 
     /// Shutdown signal
     shutdown: Arc<Notify>,
+
+    /// Optional batch notifier for Raft integration
+    batch_notifier: Option<Arc<tokio::sync::mpsc::UnboundedSender<crate::BatchMetadata>>>,
 }
 
 impl GroupCommitWal {
-    /// Create a new group commit WAL manager
+    /// Create a new group commit WAL manager (standalone mode)
     pub fn new(base_dir: PathBuf, config: GroupCommitConfig) -> Self {
+        Self::with_batch_notifier(base_dir, config, None)
+    }
+
+    /// Create a new group commit WAL manager with optional Raft batch notifier
+    pub fn with_batch_notifier(
+        base_dir: PathBuf,
+        config: GroupCommitConfig,
+        batch_notifier: Option<tokio::sync::mpsc::UnboundedSender<crate::BatchMetadata>>,
+    ) -> Self {
+        let batch_notifier_arc = batch_notifier.map(Arc::new);
+
         let wal = Self {
             partition_queues: Arc::new(DashMap::new()),
             sealed_segments: Arc::new(DashMap::new()),
             config,
             base_dir: base_dir.clone(),
             shutdown: Arc::new(Notify::new()),
+            batch_notifier: batch_notifier_arc,
         };
 
         // Discover existing sealed segments from filesystem
@@ -304,9 +327,10 @@ impl GroupCommitWal {
         // Start background commit thread
         wal.start_background_committer();
 
-        info!("Group commit WAL initialized: max_batch={}, max_wait={}ms, max_queue={}, rotation={}",
+        info!("Group commit WAL initialized: max_batch={}, max_wait={}ms, max_queue={}, rotation={}, raft_batching={}",
               wal.config.max_batch_size, wal.config.max_wait_time_ms, wal.config.max_queue_depth,
-              if wal.config.enable_rotation { "enabled" } else { "disabled" });
+              if wal.config.enable_rotation { "enabled" } else { "disabled" },
+              if wal.batch_notifier.is_some() { "enabled" } else { "disabled" });
 
         wal
     }
@@ -399,6 +423,14 @@ impl GroupCommitWal {
         record: WalRecord,
         acks: i16,
     ) -> Result<()> {
+        // Extract offset metadata from V2 records (for Raft batch notifications)
+        let (base_offset, last_offset, record_count) = match &record {
+            WalRecord::V2 { base_offset, last_offset, record_count, .. } => {
+                (Some(*base_offset), Some(*last_offset), Some(*record_count))
+            }
+            _ => (None, None, None),
+        };
+
         // Serialize record
         let data = record.to_bytes()?;
         let data_len = data.len();
@@ -408,11 +440,11 @@ impl GroupCommitWal {
 
         // Handle acks=0 (fire-and-forget)
         if acks == 0 {
-            return self.enqueue_nowait(queue, data.into()).await;
+            return self.enqueue_nowait(queue, data.into(), base_offset, last_offset, record_count).await;
         }
 
         // Handle acks=1 or acks=-1 (wait for commit)
-        self.enqueue_and_wait(queue, data.into(), data_len).await
+        self.enqueue_and_wait(queue, data.into(), data_len, base_offset, last_offset, record_count).await
     }
 
     /// Enqueue without waiting (acks=0 mode)
@@ -427,6 +459,9 @@ impl GroupCommitWal {
         &self,
         queue: Arc<PartitionCommitQueue>,
         data: Bytes,
+        base_offset: Option<i64>,
+        last_offset: Option<i64>,
+        record_count: Option<i32>,
     ) -> Result<()> {
         let data_len = data.len();
 
@@ -448,6 +483,9 @@ impl GroupCommitWal {
         pending.push_back(PendingWrite {
             data,
             response_tx: None,
+            base_offset,
+            last_offset,
+            record_count,
         });
         drop(pending);
 
@@ -468,6 +506,9 @@ impl GroupCommitWal {
         queue: Arc<PartitionCommitQueue>,
         data: Bytes,
         data_len: usize,
+        base_offset: Option<i64>,
+        last_offset: Option<i64>,
+        record_count: Option<i32>,
     ) -> Result<()> {
         debug!("🟢 ENQUEUE_START: Enqueuing write with {} bytes", data_len);
 
@@ -491,6 +532,9 @@ impl GroupCommitWal {
             pending.push_back(PendingWrite {
                 data,
                 response_tx: Some(tx),
+                base_offset,
+                last_offset,
+                record_count,
             });
             info!("📥 ENQUEUE_ADDED: Enqueued write (with wait), queue depth now: {}", pending.len());
         }
@@ -569,6 +613,7 @@ impl GroupCommitWal {
             segment_size_bytes: Arc::new(AtomicU64::new(0)),
             topic: topic.to_string(),
             partition,
+            batch_notifier: self.batch_notifier.clone(),
         });
 
         // Start per-partition commit worker
@@ -701,6 +746,21 @@ impl GroupCommitWal {
         let batch_count = batch.len();
         let mut total_bytes = 0;
 
+        // Track batch offsets for Raft notification
+        let mut batch_base_offset: Option<i64> = None;
+        let mut batch_last_offset: Option<i64> = None;
+        let mut batch_record_count: usize = 0;
+
+        // Collect offset metadata from writes
+        for write in &batch {
+            if let (Some(base), Some(last), Some(count)) = (write.base_offset, write.last_offset, write.record_count) {
+                // Track overall batch range
+                batch_base_offset = Some(batch_base_offset.map_or(base, |min_off| min_off.min(base)));
+                batch_last_offset = Some(batch_last_offset.map_or(last, |max_off| max_off.max(last)));
+                batch_record_count += count as usize;
+            }
+        }
+
         debug!("💾 COMMIT_WRITE: Writing {} records to file", batch_count);
 
         // Write all to file
@@ -763,6 +823,33 @@ impl GroupCommitWal {
             }
         }
         debug!("All {} waiters notified successfully", batch_count);
+
+        // NEW: Send batch notification to Raft proposer (if configured)
+        if let (Some(ref notifier), Some(base_offset), Some(last_offset)) =
+            (&queue.batch_notifier, batch_base_offset, batch_last_offset)
+        {
+            if batch_record_count > 0 {
+                let batch_metadata = crate::BatchMetadata::new(
+                    queue.topic.clone(),
+                    queue.partition,
+                    base_offset,
+                    last_offset,
+                    batch_record_count,
+                    queue.segment_id.load(Ordering::Relaxed),
+                );
+
+                info!(
+                    "📦 RAFT_BATCH_NOTIFY: Sending batch to Raft proposer: {}-{} offsets={}-{} records={}",
+                    queue.topic, queue.partition, base_offset, last_offset, batch_record_count
+                );
+
+                // Fire-and-forget (don't block WAL commit!)
+                if let Err(e) = notifier.send(batch_metadata) {
+                    error!("Failed to send batch notification to Raft proposer: {}", e);
+                    // Don't fail the commit, just log the error
+                }
+            }
+        }
 
         // Check if we should seal and rotate segment
         if let Err(e) = Self::check_and_seal_segment(queue, config, sealed_segments, base_dir).await {

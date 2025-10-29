@@ -22,6 +22,7 @@ pub mod rotation;
 pub mod compaction;
 pub mod periodic_flusher;
 pub mod group_commit;
+pub mod batch_metadata;
 
 // Future-ready modules
 pub mod replication;
@@ -45,6 +46,7 @@ pub use fsync::{FsyncBatcher, FsyncStats};
 pub use compaction::{WalCompactor, CompactionConfig, CompactionStats};
 pub use periodic_flusher::{PeriodicFlusherConfig, spawn_periodic_flusher};
 pub use group_commit::{GroupCommitWal, GroupCommitConfig, PartitionMetrics};
+pub use batch_metadata::BatchMetadata;
 
 #[cfg(feature = "raft-storage")]
 pub use raft_storage_impl::RaftWalStorage;
