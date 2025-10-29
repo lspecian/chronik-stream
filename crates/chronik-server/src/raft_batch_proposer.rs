@@ -43,7 +43,7 @@ pub struct RaftBatchProposer {
 
     /// Track pending batches for acks=-1 support
     /// Key: (topic, partition, offset), Value: Vec of oneshot senders
-    pending_batches: Arc<DashMap<(String, i32, i64), Vec<tokio::sync::oneshot::Sender<Result<(), String>>>>>,
+    pending_batches: Arc<DashMap<(String, i32, i64), Vec<tokio::sync::oneshot::Sender<std::result::Result<(), String>>>>>,
 }
 
 #[cfg(feature = "raft")]
@@ -61,7 +61,7 @@ impl RaftBatchProposer {
     }
 
     /// Get a shared reference to pending_batches (for ProduceHandler to register waiters)
-    pub fn pending_batches(&self) -> Arc<DashMap<(String, i32, i64), Vec<tokio::sync::oneshot::Sender<Result<(), String>>>>> {
+    pub fn pending_batches(&self) -> Arc<DashMap<(String, i32, i64), Vec<tokio::sync::oneshot::Sender<std::result::Result<(), String>>>>> {
         self.pending_batches.clone()
     }
 
@@ -168,11 +168,11 @@ impl RaftBatchProposer {
     /// This is called by ProduceHandler when handling acks=-1 requests.
     /// The waiter will be notified when the batch containing this offset is committed.
     pub fn register_offset_waiter(
-        pending_batches: Arc<DashMap<(String, i32, i64), Vec<tokio::sync::oneshot::Sender<Result<(), String>>>>>,
+        pending_batches: Arc<DashMap<(String, i32, i64), Vec<tokio::sync::oneshot::Sender<std::result::Result<(), String>>>>>,
         topic: String,
         partition: i32,
         offset: i64,
-    ) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
+    ) -> tokio::sync::oneshot::Receiver<std::result::Result<(), String>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
 
         pending_batches

@@ -329,6 +329,9 @@ pub struct ProduceHandler {
     /// If None, all produce requests use existing direct-write path (backward compatible)
     #[cfg(feature = "raft")]
     raft_manager: Option<Arc<crate::raft_integration::RaftReplicaManager>>,
+    /// Shared pending batches map for acks=-1 support (Raft batched mode)
+    #[cfg(feature = "raft")]
+    raft_batch_pending: Option<Arc<dashmap::DashMap<(String, i32, i64), Vec<tokio::sync::oneshot::Sender<std::result::Result<(), String>>>>>>,
 }
 
 /// Replication request for ISR management
@@ -649,6 +652,8 @@ impl ProduceHandler {
             wal_manager: None,
             #[cfg(feature = "raft")]
             raft_manager: None,
+            #[cfg(feature = "raft")]
+            raft_batch_pending: None,
         })
     }
 
@@ -688,6 +693,16 @@ impl ProduceHandler {
     pub fn set_raft_manager(&mut self, raft_manager: Arc<crate::raft_integration::RaftReplicaManager>) {
         info!("Setting RaftReplicaManager for ProduceHandler");
         self.raft_manager = Some(raft_manager);
+    }
+
+    /// Set the Raft batch pending map for acks=-1 support (batched Raft mode)
+    #[cfg(feature = "raft")]
+    pub fn set_raft_batch_pending(
+        &mut self,
+        pending: Arc<dashmap::DashMap<(String, i32, i64), Vec<tokio::sync::oneshot::Sender<std::result::Result<(), String>>>>>,
+    ) {
+        info!("Setting RaftBatchPending map for ProduceHandler (batched Raft mode)");
+        self.raft_batch_pending = Some(pending);
     }
     
     /// Create a new produce handler with fetch handler connected
@@ -1197,8 +1212,8 @@ impl ProduceHandler {
             topic, partition, base_offset, records.len(), total_bytes
         );
 
-        // PHASE 3: Raft-based Produce Path
-        // Check if this partition is Raft-enabled FIRST, before writing to WAL directly
+        // PHASE 3: Raft-based Produce Path (NEW: Batched Mode)
+        // Write to WAL immediately, then optionally wait for Raft based on acks level
         #[cfg(feature = "raft")]
         {
             if let Some(ref raft_manager) = self.raft_manager {
@@ -1225,94 +1240,176 @@ impl ProduceHandler {
                         });
                     }
 
-                    info!("Raft-enabled partition {}-{}: Proposing write to Raft consensus (leader)", topic, partition);
+                    info!("Raft-enabled partition {}-{}: Writing to WAL (batched mode), acks={}", topic, partition, acks);
 
-                    // Serialize the canonical record for Raft proposal
+                    // NEW APPROACH: Write to WAL immediately (no Raft blocking!)
+                    // WAL will batch and notify RaftBatchProposer asynchronously
+
+                    // Serialize canonical record for WAL
                     use chronik_storage::canonical_record::CanonicalRecord;
-                    match CanonicalRecord::from_kafka_batch(&re_encoded_bytes) {
+                    let canonical_record = match CanonicalRecord::from_kafka_batch(&re_encoded_bytes) {
                         Ok(mut canonical_record) => {
                             // Preserve original wire bytes for CRC validation
                             canonical_record.compressed_records_wire_bytes = Some(re_encoded_bytes.to_vec());
-
-                            match bincode::serialize(&canonical_record) {
-                                Ok(serialized) => {
-                                    // CRITICAL (v2.0.0 Phase 3): Log before proposing to Raft
-                                    info!(
-                                        "PRODUCE: Proposing {} bytes to Raft for {}-{}, base_offset={}, num_records={}",
-                                        serialized.len(), topic, partition, canonical_record.base_offset, canonical_record.records.len()
-                                    );
-
-                                    if serialized.is_empty() {
-                                        error!("PRODUCE: ❌ EMPTY serialized bytes before propose! This is a BUG in {}-{}", topic, partition);
-                                    }
-
-                                    // INSTRUMENTATION: Measure end-to-end Raft latency
-                                    let raft_start = std::time::Instant::now();
-
-                                    // Propose to Raft (will block until committed by quorum)
-                                    // The state machine will handle WAL writes and storage
-                                    match raft_manager.propose(topic, partition, serialized.clone()).await {
-                                        Ok(raft_index) => {
-                                            let raft_latency_ms = raft_start.elapsed().as_millis();
-                                            warn!("🔍 RAFT_LATENCY {}-{}: {}ms total (propose_and_wait), index={}, offsets={}-{}",
-                                                topic, partition, raft_latency_ms, raft_index, base_offset, last_offset);
-
-                                            // Update metrics
-                                            self.metrics.records_produced.fetch_add(records.len() as u64, Ordering::Relaxed);
-                                            self.metrics.bytes_produced.fetch_add(total_bytes, Ordering::Relaxed);
-
-                                            // Update high watermark after successful Raft commit
-                                            partition_state.high_watermark.store((last_offset + 1) as u64, Ordering::SeqCst);
-
-                                            // Send to indexing pipeline if enabled
-                                            if self.config.enable_indexing {
-                                                self.send_to_indexer(topic, partition, &records).await;
-                                            }
-
-                                            // Update producer sequence for idempotence
-                                            if kafka_batch.header.producer_id >= 0 {
-                                                self.update_producer_sequence(
-                                                    kafka_batch.header.producer_id,
-                                                    topic,
-                                                    partition,
-                                                    kafka_batch.header.base_sequence + records.len() as i32 - 1,
-                                                ).await;
-                                            }
-
-                                            // Drop memory permit
-                                            drop(memory_permit);
-
-                                            // Get partition state for response
-                                            let log_start_offset = partition_state.log_start_offset.load(Ordering::Relaxed) as i64;
-
-                                            // Return success immediately - Raft has replicated the data
-                                            return Ok(ProduceResponsePartition {
-                                                index: partition,
-                                                error_code: ErrorCode::None.code(),
-                                                base_offset: base_offset as i64,
-                                                log_append_time: if (kafka_batch.header.attributes >> 3) & 0b111 == TimestampType::LogAppendTime as u16 {
-                                                    kafka_batch.header.max_timestamp
-                                                } else {
-                                                    -1
-                                                },
-                                                log_start_offset,
-                                            });
-                                        }
-                                        Err(e) => {
-                                            error!("Raft proposal failed for {}-{}: {}", topic, partition, e);
-                                            return Err(Error::Internal(format!("Raft consensus failed: {}", e)));
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    error!("Failed to serialize for Raft {}-{}: {}", topic, partition, e);
-                                    return Err(Error::Internal(format!("Raft serialization failed: {}", e)));
-                                }
-                            }
+                            canonical_record
                         }
                         Err(e) => {
-                            error!("Failed to parse batch for Raft {}-{}: {}", topic, partition, e);
+                            error!("Failed to parse batch for Raft WAL {}-{}: {}", topic, partition, e);
                             return Err(Error::Protocol(format!("Invalid batch for Raft: {}", e)));
+                        }
+                    };
+
+                    let serialized = match bincode::serialize(&canonical_record) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            error!("Failed to serialize for Raft WAL {}-{}: {}", topic, partition, e);
+                            return Err(Error::Internal(format!("Raft serialization failed: {}", e)));
+                        }
+                    };
+
+                    // Write to WAL with acks parameter (GroupCommitWal handles batching)
+                    if let Some(ref wal_mgr) = self.wal_manager {
+                        let wal_start = std::time::Instant::now();
+
+                        if let Err(e) = wal_mgr.append_canonical_with_acks(
+                            topic.to_string(),
+                            partition,
+                            serialized,
+                            base_offset as i64,
+                            last_offset as i64,
+                            records.len() as i32,
+                            acks,
+                        ).await {
+                            error!("Raft WAL append failed for {}-{}: {}", topic, partition, e);
+                            return Err(Error::Internal(format!("Raft WAL write failed: {}", e)));
+                        }
+
+                        let wal_latency_ms = wal_start.elapsed().as_millis();
+                        info!("✅ RAFT_WAL_WRITTEN: {}-{} offsets={}-{} wal_latency={}ms acks={}",
+                            topic, partition, base_offset, last_offset, wal_latency_ms, acks);
+                    } else {
+                        error!("Raft mode requires WAL manager!");
+                        return Err(Error::Internal("WAL not configured for Raft mode".to_string()));
+                    }
+
+                    // Handle different acks levels
+                    match acks {
+                        0 | 1 => {
+                            // acks=0,1: Return immediately after WAL write (fire-and-forget or local fsync)
+                            info!("RAFT_IMMEDIATE_RETURN: {}-{} acks={} returning after WAL", topic, partition, acks);
+
+                            // Update metrics
+                            self.metrics.records_produced.fetch_add(records.len() as u64, Ordering::Relaxed);
+                            self.metrics.bytes_produced.fetch_add(total_bytes, Ordering::Relaxed);
+
+                            // Send to indexing pipeline if enabled
+                            if self.config.enable_indexing {
+                                self.send_to_indexer(topic, partition, &records).await;
+                            }
+
+                            // Update producer sequence for idempotence
+                            if kafka_batch.header.producer_id >= 0 {
+                                self.update_producer_sequence(
+                                    kafka_batch.header.producer_id,
+                                    topic,
+                                    partition,
+                                    kafka_batch.header.base_sequence + records.len() as i32 - 1,
+                                ).await;
+                            }
+
+                            // Drop memory permit
+                            drop(memory_permit);
+
+                            let log_start_offset = partition_state.log_start_offset.load(Ordering::Relaxed) as i64;
+
+                            return Ok(ProduceResponsePartition {
+                                index: partition,
+                                error_code: ErrorCode::None.code(),
+                                base_offset: base_offset as i64,
+                                log_append_time: if (kafka_batch.header.attributes >> 3) & 0b111 == TimestampType::LogAppendTime as u16 {
+                                    kafka_batch.header.max_timestamp
+                                } else {
+                                    -1
+                                },
+                                log_start_offset,
+                            });
+                        }
+                        -1 | _ => {
+                            // acks=-1 (all): Wait for Raft quorum commit
+                            info!("RAFT_WAIT_FOR_COMMIT: {}-{} acks=-1 waiting for Raft, offset={}",
+                                topic, partition, base_offset);
+
+                            // Register waiter with RaftBatchProposer
+                            let commit_rx = if let Some(ref pending_batches) = self.raft_batch_pending {
+                                crate::raft_batch_proposer::RaftBatchProposer::register_offset_waiter(
+                                    pending_batches.clone(),
+                                    topic.to_string(),
+                                    partition,
+                                    base_offset as i64,
+                                )
+                            } else {
+                                error!("Raft batch proposer not initialized for acks=-1!");
+                                return Err(Error::Internal("Raft batch proposer not initialized".to_string()));
+                            };
+
+                            // Wait for Raft commit (with timeout)
+                            let raft_start = std::time::Instant::now();
+                            match tokio::time::timeout(std::time::Duration::from_secs(30), commit_rx).await {
+                                Ok(Ok(Ok(()))) => {
+                                    let raft_latency_ms = raft_start.elapsed().as_millis();
+                                    info!("✅ RAFT_COMMITTED: {}-{} offset={} raft_latency={}ms",
+                                        topic, partition, base_offset, raft_latency_ms);
+
+                                    // Update metrics
+                                    self.metrics.records_produced.fetch_add(records.len() as u64, Ordering::Relaxed);
+                                    self.metrics.bytes_produced.fetch_add(total_bytes, Ordering::Relaxed);
+
+                                    // Send to indexing pipeline if enabled
+                                    if self.config.enable_indexing {
+                                        self.send_to_indexer(topic, partition, &records).await;
+                                    }
+
+                                    // Update producer sequence for idempotence
+                                    if kafka_batch.header.producer_id >= 0 {
+                                        self.update_producer_sequence(
+                                            kafka_batch.header.producer_id,
+                                            topic,
+                                            partition,
+                                            kafka_batch.header.base_sequence + records.len() as i32 - 1,
+                                        ).await;
+                                    }
+
+                                    // Drop memory permit
+                                    drop(memory_permit);
+
+                                    let log_start_offset = partition_state.log_start_offset.load(Ordering::Relaxed) as i64;
+
+                                    return Ok(ProduceResponsePartition {
+                                        index: partition,
+                                        error_code: ErrorCode::None.code(),
+                                        base_offset: base_offset as i64,
+                                        log_append_time: if (kafka_batch.header.attributes >> 3) & 0b111 == TimestampType::LogAppendTime as u16 {
+                                            kafka_batch.header.max_timestamp
+                                        } else {
+                                            -1
+                                        },
+                                        log_start_offset,
+                                    });
+                                }
+                                Ok(Ok(Err(e))) => {
+                                    error!("❌ RAFT_COMMIT_FAILED: {}-{} offset={} error={}",
+                                        topic, partition, base_offset, e);
+                                    return Err(Error::Internal(format!("Raft commit failed: {}", e)));
+                                }
+                                Ok(Err(_)) => {
+                                    error!("❌ RAFT_CHANNEL_CLOSED: {}-{} offset={}", topic, partition, base_offset);
+                                    return Err(Error::Internal("Raft notification channel closed".to_string()));
+                                }
+                                Err(_) => {
+                                    error!("❌ RAFT_TIMEOUT: {}-{} offset={} timeout=30s", topic, partition, base_offset);
+                                    return Err(Error::Internal("Timeout waiting for Raft commit".to_string()));
+                                }
+                            }
                         }
                     }
                 }
@@ -2427,6 +2524,8 @@ impl Clone for ProduceHandler {
             wal_manager: self.wal_manager.clone(),
             #[cfg(feature = "raft")]
             raft_manager: self.raft_manager.clone(),
+            #[cfg(feature = "raft")]
+            raft_batch_pending: self.raft_batch_pending.clone(),
         }
     }
 }
