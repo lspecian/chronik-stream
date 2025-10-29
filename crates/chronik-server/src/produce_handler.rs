@@ -1246,12 +1246,16 @@ impl ProduceHandler {
                                         error!("PRODUCE: ❌ EMPTY serialized bytes before propose! This is a BUG in {}-{}", topic, partition);
                                     }
 
+                                    // INSTRUMENTATION: Measure end-to-end Raft latency
+                                    let raft_start = std::time::Instant::now();
+
                                     // Propose to Raft (will block until committed by quorum)
                                     // The state machine will handle WAL writes and storage
                                     match raft_manager.propose(topic, partition, serialized.clone()).await {
                                         Ok(raft_index) => {
-                                            info!("Raft✓ {}-{}: Committed at index={}, offsets={}-{}",
-                                                topic, partition, raft_index, base_offset, last_offset);
+                                            let raft_latency_ms = raft_start.elapsed().as_millis();
+                                            warn!("🔍 RAFT_LATENCY {}-{}: {}ms total (propose_and_wait), index={}, offsets={}-{}",
+                                                topic, partition, raft_latency_ms, raft_index, base_offset, last_offset);
 
                                             // Update metrics
                                             self.metrics.records_produced.fetch_add(records.len() as u64, Ordering::Relaxed);

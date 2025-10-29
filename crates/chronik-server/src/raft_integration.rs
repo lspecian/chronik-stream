@@ -127,10 +127,15 @@ impl StateMachine for ChronikStateMachine {
             entry.index, self.topic, self.partition, record.base_offset, record.records.len()
         );
 
+        // INSTRUMENTATION: Track state machine apply timing
+        let t_apply_start = std::time::Instant::now();
+
         // Write directly to WAL (same path as ProduceHandler)
         // Re-serialize the CanonicalRecord to Vec<u8>
         let canonical_bytes = bincode::serialize(&record)
             .map_err(|e| chronik_raft::RaftError::SerializationError(format!("Failed to serialize: {}", e)))?;
+
+        let t_serialize_done = std::time::Instant::now();
 
         let last_offset = record.records.last()
             .map(|r| r.offset)
@@ -155,6 +160,8 @@ impl StateMachine for ChronikStateMachine {
             .await
             .map_err(|e| chronik_raft::RaftError::StorageError(format!("WAL write failed: {}", e)))?;
 
+        let t_wal_done = std::time::Instant::now();
+
         // Update high watermark in metadata (async)
         let last_offset = record.records.last()
             .map(|r| r.offset + 1)
@@ -170,8 +177,20 @@ impl StateMachine for ChronikStateMachine {
             .await
             .map_err(|e| chronik_raft::RaftError::StorageError(e.to_string()))?;
 
+        let t_metadata_done = std::time::Instant::now();
+
         // Update last applied
         self.last_applied = entry.index;
+
+        let serialize_ms = t_serialize_done.duration_since(t_apply_start).as_millis();
+        let wal_ms = t_wal_done.duration_since(t_serialize_done).as_millis();
+        let metadata_ms = t_metadata_done.duration_since(t_wal_done).as_millis();
+        let total_ms = t_metadata_done.duration_since(t_apply_start).as_millis();
+
+        warn!(
+            "🔍 STATE_MACHINE_TIMING {}-{} entry={}: serialize={}ms, wal={}ms, metadata={}ms, total={}ms",
+            self.topic, self.partition, entry.index, serialize_ms, wal_ms, metadata_ms, total_ms
+        );
 
         info!(
             "STATE_MACHINE: Applied entry {} to {}-{}: new HWM={}, wrote to WAL",

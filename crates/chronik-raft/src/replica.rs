@@ -374,6 +374,9 @@ impl PartitionReplica {
     /// # Returns
     /// The committed entry index on success
     pub async fn propose_and_wait(&self, data: Vec<u8>) -> Result<u64> {
+        // INSTRUMENTATION: Track detailed timing
+        let t_start = Instant::now();
+
         // Propose the entry
         let index = {
             let mut node = self.raw_node.write();
@@ -410,6 +413,9 @@ impl PartitionReplica {
             index
         };
 
+        let t_propose_done = Instant::now();
+        let propose_time_ms = t_propose_done.duration_since(t_start).as_millis();
+
         // Track proposal time for commit latency metrics
         self.proposal_times.write().insert(index, Instant::now());
 
@@ -420,6 +426,9 @@ impl PartitionReplica {
         // This ensures the notification channel is ready when commit happens
         self.pending_proposals.write().insert(index, tx);
 
+        let t_setup_done = Instant::now();
+        let setup_time_ms = t_setup_done.duration_since(t_propose_done).as_millis();
+
         debug!(
             "Waiting for entry {} to commit on {}-{}",
             index, self.topic, self.partition
@@ -429,9 +438,15 @@ impl PartitionReplica {
         // which will eventually commit this entry and send notification via the channel.
 
         // Wait for commit (with timeout)
-        match tokio::time::timeout(Duration::from_secs(30), rx).await {
+        let result = match tokio::time::timeout(Duration::from_secs(30), rx).await {
             Ok(Ok(Ok(()))) => {
-                debug!("Entry {} committed on {}-{}", index, self.topic, self.partition);
+                let t_commit_done = Instant::now();
+                let wait_time_ms = t_commit_done.duration_since(t_setup_done).as_millis();
+                let total_time_ms = t_commit_done.duration_since(t_start).as_millis();
+
+                warn!("🔍 RAFT_BREAKDOWN {}-{} index={}: propose={}ms, setup={}ms, wait={}ms, total={}ms",
+                    self.topic, self.partition, index, propose_time_ms, setup_time_ms, wait_time_ms, total_time_ms);
+
                 Ok(index)
             }
             Ok(Ok(Err(e))) => Err(e),
@@ -441,7 +456,9 @@ impl PartitionReplica {
             Err(_) => Err(RaftError::StorageError(
                 "Timeout waiting for commit".to_string()
             )),
-        }
+        };
+
+        result
     }
 
     /// Propose a configuration change (add/remove node)
