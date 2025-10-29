@@ -1,112 +1,127 @@
 #!/bin/bash
-# Start 3-node Chronik Raft cluster in background
-# Usage: ./scripts/start_3node_cluster.sh [--clean]
-
 set -e
 
-# Navigate to repo root
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
-cd "$REPO_ROOT"
-
-# Parse arguments
-CLEAN_DATA=false
-if [[ "$1" == "--clean" ]]; then
-    CLEAN_DATA=true
-fi
-
-# Clean data directories if requested
-if $CLEAN_DATA; then
-    echo "Cleaning data directories..."
-    rm -rf data/node1 data/node2 data/node3
-    rm -f /tmp/chronik-node*.pid
-fi
-
-# Build the server binary
-echo "Building chronik-server..."
-cargo build --release --bin chronik-server
-
-# Check if config files exist
-CONFIG_DIR=".conductor/lahore"
-if [[ ! -f "$CONFIG_DIR/chronik-cluster-node1.toml" ]]; then
-    echo "ERROR: Config files not found in $CONFIG_DIR/"
-    echo "Expected: chronik-cluster-node1.toml, chronik-cluster-node2.toml, chronik-cluster-node3.toml"
-    exit 1
-fi
-
-# Start Node 1 (port 9092)
-echo "Starting Node 1 (port 9092)..."
-CHRONIK_DATA_DIR=data/node1 \
-CHRONIK_KAFKA_PORT=9092 \
-CHRONIK_ADVERTISED_ADDR=localhost \
-./target/release/chronik-server \
-    --config "$CONFIG_DIR/chronik-cluster-node1.toml" \
-    standalone \
-    > /tmp/chronik-node1.log 2>&1 &
-echo $! > /tmp/chronik-node1.pid
-echo "Node 1 PID: $(cat /tmp/chronik-node1.pid)"
-
-# Start Node 2 (port 9093)
-echo "Starting Node 2 (port 9093)..."
-CHRONIK_DATA_DIR=data/node2 \
-CHRONIK_KAFKA_PORT=9093 \
-CHRONIK_ADVERTISED_ADDR=localhost \
-./target/release/chronik-server \
-    --config "$CONFIG_DIR/chronik-cluster-node2.toml" \
-    standalone \
-    > /tmp/chronik-node2.log 2>&1 &
-echo $! > /tmp/chronik-node2.pid
-echo "Node 2 PID: $(cat /tmp/chronik-node2.pid)"
-
-# Start Node 3 (port 9094)
-echo "Starting Node 3 (port 9094)..."
-CHRONIK_DATA_DIR=data/node3 \
-CHRONIK_KAFKA_PORT=9094 \
-CHRONIK_ADVERTISED_ADDR=localhost \
-./target/release/chronik-server \
-    --config "$CONFIG_DIR/chronik-cluster-node3.toml" \
-    standalone \
-    > /tmp/chronik-node3.log 2>&1 &
-echo $! > /tmp/chronik-node3.pid
-echo "Node 3 PID: $(cat /tmp/chronik-node3.pid)"
-
+echo "=== Starting Chronik 3-Node Raft Cluster ==="
 echo ""
-echo "Waiting 10 seconds for cluster formation..."
-sleep 10
 
-# Check if all nodes are still running
-FAILED=false
-for node_id in 1 2 3; do
-    if [[ -f "/tmp/chronik-node${node_id}.pid" ]]; then
-        pid=$(cat /tmp/chronik-node${node_id}.pid)
-        if ! ps -p $pid > /dev/null 2>&1; then
-            echo "ERROR: Node $node_id (PID $pid) failed to start!"
-            echo "Check logs at /tmp/chronik-node${node_id}.log"
-            FAILED=true
-        else
-            echo "Node $node_id (PID $pid) is running"
-        fi
-    fi
+# Clean up
+echo "1. Cleaning up old processes and data..."
+killall -9 chronik-server 2>/dev/null || true
+rm -rf ./data-node1 ./data-node2 ./data-node3
+mkdir -p ./data-node1 ./data-node2 ./data-node3
+sleep 2
+
+# Start Node 1
+echo ""
+echo "2. Starting Node 1 (port 9092, raft 9192)..."
+./target/release/chronik-server \
+  --kafka-port 9092 \
+  --advertised-addr localhost \
+  --node-id 1 \
+  --data-dir ./data-node1 \
+  raft-cluster \
+  --raft-addr 0.0.0.0:9192 \
+  --peers "2@localhost:9193,3@localhost:9194" \
+  --bootstrap \
+  > /tmp/node1.log 2>&1 &
+NODE1_PID=$!
+echo "   Node 1 PID: $NODE1_PID"
+
+# Wait for Node 1 gRPC server to be ready
+echo "   Waiting for Node 1 gRPC server..."
+for i in {1..30}; do
+  if grep -q "Raft gRPC server started successfully" /tmp/node1.log 2>/dev/null; then
+    echo "   ✅ Node 1 gRPC server ready"
+    break
+  fi
+  sleep 1
+  if [ $i -eq 30 ]; then
+    echo "   ❌ Node 1 gRPC server failed to start"
+    exit 1
+  fi
 done
 
-if $FAILED; then
-    echo ""
-    echo "Cluster startup FAILED. Shutting down..."
-    "$SCRIPT_DIR/stop_cluster.sh"
+# Start Node 2
+echo ""
+echo "3. Starting Node 2 (port 9093, raft 9193)..."
+./target/release/chronik-server \
+  --kafka-port 9093 \
+  --advertised-addr localhost \
+  --node-id 2 \
+  --data-dir ./data-node2 \
+  raft-cluster \
+  --raft-addr 0.0.0.0:9193 \
+  --peers "1@localhost:9192,3@localhost:9194" \
+  --bootstrap \
+  > /tmp/node2.log 2>&1 &
+NODE2_PID=$!
+echo "   Node 2 PID: $NODE2_PID"
+
+# Wait for Node 2 gRPC server to be ready
+echo "   Waiting for Node 2 gRPC server..."
+for i in {1..30}; do
+  if grep -q "Raft gRPC server started successfully" /tmp/node2.log 2>/dev/null; then
+    echo "   ✅ Node 2 gRPC server ready"
+    break
+  fi
+  sleep 1
+  if [ $i -eq 30 ]; then
+    echo "   ❌ Node 2 gRPC server failed to start"
     exit 1
-fi
+  fi
+done
+
+# Start Node 3
+echo ""
+echo "4. Starting Node 3 (port 9094, raft 9194)..."
+./target/release/chronik-server \
+  --kafka-port 9094 \
+  --advertised-addr localhost \
+  --node-id 3 \
+  --data-dir ./data-node3 \
+  raft-cluster \
+  --raft-addr 0.0.0.0:9194 \
+  --peers "1@localhost:9192,2@localhost:9193" \
+  --bootstrap \
+  > /tmp/node3.log 2>&1 &
+NODE3_PID=$!
+echo "   Node 3 PID: $NODE3_PID"
+
+# Wait for Node 3 gRPC server to be ready
+echo "   Waiting for Node 3 gRPC server..."
+for i in {1..30}; do
+  if grep -q "Raft gRPC server started successfully" /tmp/node3.log 2>/dev/null; then
+    echo "   ✅ Node 3 gRPC server ready"
+    break
+  fi
+  sleep 1
+  if [ $i -eq 30 ]; then
+    echo "   ❌ Node 3 gRPC server failed to start"
+    exit 1
+  fi
+done
+
+# Wait for leader election
+echo ""
+echo "5. Waiting for leader election (30s max)..."
+for i in {1..30}; do
+  if grep -q "became leader at term" /tmp/node*.log 2>/dev/null; then
+    LEADER=$(grep "became leader at term" /tmp/node*.log | head -1 | grep -oP "raft_id: \K\d+")
+    echo "   ✅ Leader elected: Node $LEADER"
+    break
+  fi
+  sleep 1
+  if [ $i -eq 30 ]; then
+    echo "   ⚠️  No leader elected yet (this may be normal, check logs)"
+  fi
+done
 
 echo ""
-echo "3-node cluster started successfully!"
-echo "Nodes:"
-echo "  - Node 1: localhost:9092 (PID $(cat /tmp/chronik-node1.pid))"
-echo "  - Node 2: localhost:9093 (PID $(cat /tmp/chronik-node2.pid))"
-echo "  - Node 3: localhost:9094 (PID $(cat /tmp/chronik-node3.pid))"
+echo "=== Cluster Status ==="
+echo "Node 1 (leader candidate): PID $NODE1_PID, Kafka port 9092"
+echo "Node 2 (follower):         PID $NODE2_PID, Kafka port 9093"
+echo "Node 3 (follower):         PID $NODE3_PID, Kafka port 9094"
 echo ""
-echo "Logs:"
-echo "  - tail -f /tmp/chronik-node1.log"
-echo "  - tail -f /tmp/chronik-node2.log"
-echo "  - tail -f /tmp/chronik-node3.log"
+echo "Logs: /tmp/node1.log, /tmp/node2.log, /tmp/node3.log"
 echo ""
-echo "Stop cluster: $SCRIPT_DIR/stop_cluster.sh"
-echo "Check health: $SCRIPT_DIR/check_cluster_health.sh"
+echo "To test: ./target/release/chronik-bench --bootstrap-servers localhost:9092 --topic test --mode produce --concurrency 64 --duration 20s"

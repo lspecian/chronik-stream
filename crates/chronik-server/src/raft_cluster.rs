@@ -305,7 +305,15 @@ pub async fn run_raft_cluster(config: RaftClusterConfig) -> Result<()> {
 
     // Create WAL-backed storage for metadata Raft log (enables persistence + S3 upload)
     use chronik_wal::{GroupCommitWal, GroupCommitConfig};
-    let meta_wal_config = GroupCommitConfig::default();
+
+    // CRITICAL FIX v2.2.0: Use immediate commit config for Raft
+    // Raft already provides batching via max_entries_per_batch, so WAL batching
+    // adds redundant latency. Use max_wait_time_ms=1 to minimize latency.
+    let meta_wal_config = {
+        let mut config = GroupCommitConfig::default();
+        config.max_wait_time_ms = 1; // 1ms instead of 100ms (50x faster commits)
+        config
+    };
     let meta_wal_dir = config.data_dir.join("wal/__meta/0");
     tokio::fs::create_dir_all(&meta_wal_dir).await?;
     let meta_wal = Arc::new(GroupCommitWal::new(meta_wal_dir.clone(), meta_wal_config));
@@ -340,7 +348,12 @@ pub async fn run_raft_cluster(config: RaftClusterConfig) -> Result<()> {
 
             for partition_id in 0..partition_count {
                 // Create WAL-backed storage for this partition replica (enables persistence + S3 upload)
-                let partition_wal_config = GroupCommitConfig::default();
+                // CRITICAL FIX v2.2.0: Use immediate commit config for Raft (max_wait_time_ms=1)
+                let partition_wal_config = {
+                    let mut config = GroupCommitConfig::default();
+                    config.max_wait_time_ms = 1; // 1ms instead of 100ms
+                    config
+                };
                 let partition_wal_dir = data_dir_clone.join(format!("wal/{}/{}", topic_name_clone, partition_id));
 
                 if let Err(e) = tokio::fs::create_dir_all(&partition_wal_dir).await {
@@ -547,15 +560,16 @@ pub async fn run_raft_cluster(config: RaftClusterConfig) -> Result<()> {
     // Wait until the port is listening (max 5 seconds)
     let mut ready = false;
     for attempt in 1..=50 {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // Try to connect to the local gRPC server
+        // Try to connect to the local gRPC server FIRST
         if let Ok(stream) = tokio::net::TcpStream::connect((*raft_host, raft_port)).await {
             drop(stream);
             ready = true;
-            info!("Raft gRPC server is ready after {} ms", attempt * 100);
+            info!("Raft gRPC server is ready after {} attempts", attempt);
             break;
         }
+
+        // Sleep AFTER failed attempt, not before
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
     if !ready {

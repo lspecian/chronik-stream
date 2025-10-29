@@ -74,7 +74,7 @@ tabled = "0.15"
 
 
 [features]
-default = ["search", "backup"]
+default = ["search", "backup", "raft"]
 search = ["dep:chronik-search", "dep:chronik-query"]
 backup = ["dep:chronik-backup"]
 raft = ["dep:chronik-raft", "dep:raft", "chronik-wal/raft-storage"]
