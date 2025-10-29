@@ -25,6 +25,7 @@ use tracing::{debug, info, warn, error, instrument};
 
 use crate::error::{Result, WalError};
 use crate::record::WalRecord;
+use chronik_monitoring::MetricsRecorder;
 
 /// Configuration for group commit behavior
 #[derive(Debug, Clone)]
@@ -738,6 +739,9 @@ impl GroupCommitWal {
             queue.metrics.total_writes.fetch_add(batch_count as u64, std::sync::atomic::Ordering::Relaxed);
             queue.metrics.total_bytes.fetch_add(total_bytes as u64, std::sync::atomic::Ordering::Relaxed);
             queue.metrics.total_fsync_time_us.fetch_add(fsync_duration.as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+
+            // Record to unified metrics for Prometheus (v2.1.0)
+            MetricsRecorder::record_wal_batch(batch_count as u64);
         }
 
         // Record metrics in span

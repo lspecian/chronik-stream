@@ -370,7 +370,16 @@ Chronik Stream provides two layers of performance tuning for different workloads
 
 ### Producer Flush Profiles
 
-Control when buffered messages become visible to consumers:
+Control when buffered messages become visible to consumers. **Default changed to HighThroughput in v2.1.0** based on benchmark results.
+
+**High-Throughput** - Production deployments (DEFAULT as of v2.1.0)
+```bash
+./chronik-server ...  # No env var needed - optimal for most workloads
+```
+- Settings: 100 batches / 500ms flush / 128MB buffer
+- Performance: **27,700 msg/s** throughput, **3.94ms p99 latency**
+- Use for: Production deployments, data pipelines, ETL, batch processing
+- **Why default**: 93% faster than previous Balanced profile with better latency!
 
 **Low-Latency** - Real-time applications
 ```bash
@@ -378,23 +387,23 @@ CHRONIK_PRODUCE_PROFILE=low-latency ./chronik-server ...
 ```
 - Settings: 1 batch / 10ms flush / 16MB buffer
 - Target: < 20ms p99 latency
-- Use for: Real-time analytics, instant messaging, live dashboards
+- Use for: Real-time analytics, instant messaging, live dashboards (when sub-20ms critical)
 
-**Balanced** - General-purpose (default)
+**Balanced** - Legacy compatibility
 ```bash
-./chronik-server ...  # No env var needed
+CHRONIK_PRODUCE_PROFILE=balanced ./chronik-server ...
 ```
 - Settings: 10 batches / 100ms flush / 32MB buffer
-- Target: 100-150ms p99 latency
-- Use for: General streaming, typical microservices
+- Performance: 14,300 msg/s, 7.72ms p99 latency
+- Use for: Compatibility with older configurations (not recommended for new deployments)
 
-**High-Throughput** - Bulk ingestion
+**Extreme** - Experimental maximum batching
 ```bash
-CHRONIK_PRODUCE_PROFILE=high-throughput ./chronik-server ...
+CHRONIK_PRODUCE_PROFILE=extreme ./chronik-server ...
 ```
-- Settings: 100 batches / 500ms flush / 128MB buffer
-- Target: < 500ms p99 latency
-- Use for: Log aggregation, data pipelines, ETL, batch processing
+- Settings: 500 batches / 2000ms flush / 512MB buffer
+- Performance: ~27,700 msg/s (same as HighThroughput - hits fsync hardware limit)
+- Use for: Bulk ingestion experiments, data migrations
 
 ### WAL Performance Profiles
 

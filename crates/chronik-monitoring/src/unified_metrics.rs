@@ -53,6 +53,13 @@ pub struct UnifiedMetrics {
     pub wal_segment_rotations: AtomicU64,
     pub wal_recovery_events: AtomicU64,
     pub wal_recovery_time_ms: AtomicU64,
+    pub wal_batch_size_sum: AtomicU64,      // Sum of all batch sizes for histogram
+    pub wal_batch_count: AtomicU64,         // Number of batches for average calculation
+
+    // ========== ProduceHandler Flush Metrics (v2.1.0) ==========
+    pub produce_flush_total: AtomicU64,           // Total number of flushes
+    pub produce_batches_flushed_sum: AtomicU64,   // Sum of batches per flush
+    pub produce_profile_active: AtomicU64,        // Current profile: 0=Low, 1=Balanced, 2=High, 3=Extreme
 
     // ========== Raft Metrics ==========
     pub raft_leader_count: AtomicU64,
@@ -139,6 +146,13 @@ impl UnifiedMetrics {
             wal_segment_rotations: AtomicU64::new(0),
             wal_recovery_events: AtomicU64::new(0),
             wal_recovery_time_ms: AtomicU64::new(0),
+            wal_batch_size_sum: AtomicU64::new(0),
+            wal_batch_count: AtomicU64::new(0),
+
+            // ProduceHandler Flush
+            produce_flush_total: AtomicU64::new(0),
+            produce_batches_flushed_sum: AtomicU64::new(0),
+            produce_profile_active: AtomicU64::new(2), // Default: HighThroughput (v2.1.0)
 
             // Raft
             raft_leader_count: AtomicU64::new(0),
@@ -289,6 +303,42 @@ impl UnifiedMetrics {
         output.push_str("# TYPE chronik_wal_recovery_time_ms gauge\n");
         output.push_str(&format!("chronik_wal_recovery_time_ms {}\n",
             self.wal_recovery_time_ms.load(Ordering::Relaxed)));
+
+        // ========== WAL Batch Size Histogram ==========
+        let wal_batch_count = self.wal_batch_count.load(Ordering::Relaxed);
+        let avg_batch_size = if wal_batch_count > 0 {
+            self.wal_batch_size_sum.load(Ordering::Relaxed) / wal_batch_count
+        } else {
+            0
+        };
+        output.push_str("# HELP chronik_wal_batch_size_avg Average WAL batch size (messages per fsync)\n");
+        output.push_str("# TYPE chronik_wal_batch_size_avg gauge\n");
+        output.push_str(&format!("chronik_wal_batch_size_avg {}\n", avg_batch_size));
+
+        output.push_str("# HELP chronik_wal_batch_count_total Total number of WAL batches processed\n");
+        output.push_str("# TYPE chronik_wal_batch_count_total counter\n");
+        output.push_str(&format!("chronik_wal_batch_count_total {}\n", wal_batch_count));
+
+        // ========== ProduceHandler Flush Metrics ==========
+        output.push_str("# HELP chronik_produce_flush_total Total number of produce flushes\n");
+        output.push_str("# TYPE chronik_produce_flush_total counter\n");
+        output.push_str(&format!("chronik_produce_flush_total {}\n",
+            self.produce_flush_total.load(Ordering::Relaxed)));
+
+        let produce_flush_count = self.produce_flush_total.load(Ordering::Relaxed);
+        let avg_batches_per_flush = if produce_flush_count > 0 {
+            self.produce_batches_flushed_sum.load(Ordering::Relaxed) / produce_flush_count
+        } else {
+            0
+        };
+        output.push_str("# HELP chronik_produce_batches_per_flush_avg Average batches per flush\n");
+        output.push_str("# TYPE chronik_produce_batches_per_flush_avg gauge\n");
+        output.push_str(&format!("chronik_produce_batches_per_flush_avg {}\n", avg_batches_per_flush));
+
+        let profile = self.produce_profile_active.load(Ordering::Relaxed);
+        output.push_str("# HELP chronik_produce_profile_active Current active ProduceFlushProfile (0=Low, 1=Balanced, 2=High, 3=Extreme)\n");
+        output.push_str("# TYPE chronik_produce_profile_active gauge\n");
+        output.push_str(&format!("chronik_produce_profile_active {}\n", profile));
 
         // ========== Raft Metrics ==========
         output.push_str("# HELP chronik_raft_leader_count Number of partitions where this node is leader\n");
@@ -500,5 +550,28 @@ impl MetricsRecorder {
         metrics.total_partitions.store(partitions, Ordering::Relaxed);
         metrics.total_consumer_groups.store(groups, Ordering::Relaxed);
         metrics.active_connections.store(connections, Ordering::Relaxed);
+    }
+
+    /// Record a ProduceHandler flush
+    /// Call this each time ProduceHandler flushes batches to the WAL
+    pub fn record_produce_flush(batches_count: u64) {
+        let metrics = global_metrics();
+        metrics.produce_flush_total.fetch_add(1, Ordering::Relaxed);
+        metrics.produce_batches_flushed_sum.fetch_add(batches_count, Ordering::Relaxed);
+    }
+
+    /// Set the active ProduceFlushProfile
+    /// Call this once during startup or profile change
+    /// profile_id: 0=LowLatency, 1=Balanced, 2=HighThroughput, 3=Extreme
+    pub fn set_produce_profile(profile_id: u64) {
+        global_metrics().produce_profile_active.store(profile_id, Ordering::Relaxed);
+    }
+
+    /// Record a WAL batch commit
+    /// Call this each time GroupCommitWal commits a batch
+    pub fn record_wal_batch(batch_size: u64) {
+        let metrics = global_metrics();
+        metrics.wal_batch_size_sum.fetch_add(batch_size, Ordering::Relaxed);
+        metrics.wal_batch_count.fetch_add(1, Ordering::Relaxed);
     }
 }

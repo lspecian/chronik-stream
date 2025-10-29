@@ -44,6 +44,7 @@ tokio-uring = { version = "0.4", optional = true }
 
 # Local dependencies
 chronik-common = { path = "../chronik-common" }
+chronik-monitoring = { path = "../chronik-monitoring" }
 chronik-raft = { path = "../chronik-raft", optional = true }
 
 [dev-dependencies]
