@@ -4,108 +4,170 @@
 
 This checklist provides step-by-step instructions for implementing the WAL-batch-to-Raft architecture to improve Raft cluster performance from 37 msg/s to 10,000+ msg/s.
 
-**Current Status:** Instrumentation complete, architecture designed, ready for implementation.
+**Current Status:** ✅ Phases 1-4 COMPLETED (Foundation, WAL, RaftBatchProposer, ProduceHandler)
+**Next Session:** Phase 5-6 (State Machine + Wiring), then Testing
 
 ---
 
-## Phase 1: Foundation - Batch Metadata & Communication
+## Phase 1: Foundation - Batch Metadata & Communication ✅ COMPLETED
 
 ### ☑ 1.1 Create BatchMetadata Type
-**Status:** ✅ COMPLETED
+**Status:** ✅ COMPLETED (Session 1)
 **File:** `crates/chronik-wal/src/batch_metadata.rs`
-**Commit:** Created with all necessary fields
+**Commit:** cc2459a
 
-**What was done:**
-```rust
-pub struct BatchMetadata {
-    pub topic: String,
-    pub partition: i32,
-    pub base_offset: i64,
-    pub last_offset: i64,
-    pub record_count: usize,
-    pub segment_id: u64,
-    pub created_at_ms: u64,
-}
-```
-
-### ☐ 1.2 Export BatchMetadata from WAL Crate
-**Status:** TODO
+### ☑ 1.2 Export BatchMetadata from WAL Crate
+**Status:** ✅ COMPLETED (Session 1)
 **File:** `crates/chronik-wal/src/lib.rs`
+**Commit:** cc2459a
 
-**Action:**
-```rust
-// Add to lib.rs
-pub mod batch_metadata;
-pub use batch_metadata::BatchMetadata;
-```
+### ☑ 1.3 Add Batch Notification Channel to PartitionCommitQueue
+**Status:** ✅ COMPLETED (Session 1)
+**File:** `crates/chronik-wal/src/group_commit.rs` (line 262)
+**Commit:** cc2459a
 
-**Test:**
-```bash
-# Should compile without errors
-cargo check --lib -p chronik-wal
-```
-
-### ☐ 1.3 Add Batch Notification Channel to PartitionCommitQueue
-**Status:** TODO
-**File:** `crates/chronik-wal/src/group_commit.rs`
-
-**Action:** Add optional channel to struct (around line 200):
-```rust
-struct PartitionCommitQueue {
-    // ... existing fields ...
-
-    /// Optional channel for notifying Raft batch proposer (Raft mode only)
-    batch_notifier: Option<Arc<tokio::sync::mpsc::UnboundedSender<BatchMetadata>>>,
-}
-```
-
-**Test:**
-```bash
-cargo check --lib -p chronik-wal
-```
-
-### ☐ 1.4 Add Batch Notifier to GroupCommitWal Constructor
-**Status:** TODO
-**File:** `crates/chronik-wal/src/group_commit.rs`
-
-**Action:** Modify `GroupCommitWal::new()` (around line 300):
-```rust
-impl GroupCommitWal {
-    pub fn new(base_dir: PathBuf, config: GroupCommitConfig) -> Self {
-        Self::with_batch_notifier(base_dir, config, None)
-    }
-
-    pub fn with_batch_notifier(
-        base_dir: PathBuf,
-        config: GroupCommitConfig,
-        batch_notifier: Option<tokio::sync::mpsc::UnboundedSender<BatchMetadata>>,
-    ) -> Self {
-        // ... existing code ...
-        // Pass batch_notifier to PartitionCommitQueue when creating it
-    }
-}
-```
-
-**Test:**
-```bash
-cargo check --lib -p chronik-wal
-```
+### ☑ 1.4 Add Batch Notifier to GroupCommitWal Constructor
+**Status:** ✅ COMPLETED (Session 1)
+**File:** `crates/chronik-wal/src/group_commit.rs` (line 297-331)
+**Commit:** cc2459a
 
 ---
 
-## Phase 2: WAL Integration - Batch Notifications
+## Phase 2: WAL Integration - Batch Notifications ✅ COMPLETED
 
-### ☐ 2.1 Send Batch Notification After Fsync
+### ☑ 2.1 Send Batch Notification After Fsync
+**Status:** ✅ COMPLETED (Session 1)
+**File:** `crates/chronik-wal/src/group_commit.rs` (line 827-852)
+
+**Commit:** cc2459a
+
+**What was done:**
+- Modified PendingWrite struct to include offset metadata (base_offset, last_offset, record_count)
+- Extract metadata from V2 WalRecords before serialization in append()
+- Track batch offset ranges in commit_batch()
+- Send BatchMetadata notification after fsync (fire-and-forget, non-blocking)
+
+---
+
+## Phase 3: Raft Integration - Batch Proposer Worker ✅ COMPLETED
+
+### ☑ 3.1 Create RaftBatchProposer Struct
+**Status:** ✅ COMPLETED (Session 1)
+**File:** `crates/chronik-server/src/raft_batch_proposer.rs` (NEW FILE)
+**Commit:** e1de672
+
+### ☑ 3.2 Implement Batch Proposal Loop
+**Status:** ✅ COMPLETED (Session 1)
+**File:** `crates/chronik-server/src/raft_batch_proposer.rs` (line 68-120)
+**Commit:** e1de672
+
+### ☑ 3.3 Implement Batch Commit Notification
+**Status:** ✅ COMPLETED (Session 1)
+**File:** `crates/chronik-server/src/raft_batch_proposer.rs` (line 122-164)
+**Commit:** e1de672
+
+### ☑ 3.4 Add Offset Waiter Registration
+**Status:** ✅ COMPLETED (Session 1)
+**File:** `crates/chronik-server/src/raft_batch_proposer.rs` (line 166-183)
+**Commit:** e1de672
+
+### ☑ 3.5 Export RaftBatchProposer
+**Status:** ✅ COMPLETED (Session 1)
+**File:** `crates/chronik-server/src/main.rs` (line 32-33)
+**Commit:** e1de672
+
+---
+
+## Phase 4: Produce Handler - Dual Mode Support ✅ COMPLETED
+
+### ☑ 4.1 Refactor Raft Produce Path
+**Status:** ✅ COMPLETED (Session 1)
+**File:** `crates/chronik-server/src/produce_handler.rs` (line 1215-1418)
+**Commit:** f43f0ea
+
+**What was done:**
+- Removed blocking Raft propose() call
+- Write to WAL immediately with append_canonical_with_acks()
+- Implement acks=0,1,-1 semantics correctly
+- No blocking on Raft for acks=0,1
+- Wait for Raft commit notification for acks=-1
+
+### ☑ 4.2 Implement Acks Semantics for Raft
+**Status:** ✅ COMPLETED (Session 1)
+**File:** `crates/chronik-server/src/produce_handler.rs` (line 1295-1414)
+**Commit:** f43f0ea
+
+**What was done:**
+- acks=0,1: Return immediately after WAL write
+- acks=-1: Register waiter with RaftBatchProposer
+- 30s timeout for Raft commits
+- Full error handling (commit failed, channel closed, timeout)
+
+### ☑ 4.3 Add RaftBatchProposer Reference to ProduceHandler
+**Status:** ✅ COMPLETED (Session 1)
+**File:** `crates/chronik-server/src/produce_handler.rs` (line 332-334, 698-706)
+**Commit:** f43f0ea
+
+**What was done:**
+- Added raft_batch_pending field to ProduceHandler
+- Created set_raft_batch_pending() setter method
+- Initialize in constructors and clone()
+
+---
+
+## Phase 5: State Machine - Batch Validation ⚠️ TODO (NEXT SESSION)
+
+### ☐ 5.1 Update State Machine to Handle BatchMetadata
 **Status:** TODO
-**File:** `crates/chronik-wal/src/group_commit.rs`
+**File:** `crates/chronik-server/src/raft_integration.rs`
 
-**Action:** Modify `commit_batch()` function (around line 668-750):
+**Action:** Modify `ChronikStateMachine::apply()` (around line 85-200):
+
+**OLD CODE (delete):**
 ```rust
-async fn commit_batch(
-    queue: &PartitionCommitQueue,
-    config: &GroupCommitConfig,
-    sealed_segments: &Arc<DashMap<String, SealedSegmentInfo>>,
-    base_dir: &Path,
+// Current: Deserialize CanonicalRecord and write to WAL
+let record: CanonicalRecord = bincode::deserialize(&entry.data)?;
+// ... write to WAL ...
+```
+
+**NEW CODE:**
+```rust
+async fn apply(&mut self, entry: RaftEntry) -> Result<()> {
+    // Try to deserialize as BatchMetadata (new batch mode)
+    if let Ok(batch) = bincode::deserialize::<chronik_wal::BatchMetadata>(&entry.data) {
+        info!(
+            "STATE_MACHINE: Applying batch {}-{}: offsets={}-{} records={}",
+            batch.topic, batch.partition, batch.base_offset,
+            batch.last_offset, batch.record_count
+        );
+
+        // Validate batch exists in local WAL
+        // Leader: Already in WAL (written before Raft proposal)
+        // Followers: Need to fetch from leader (future work)
+
+        // Update high watermark
+        self.metadata
+            .update_partition_offset(
+                &batch.topic,
+                batch.partition as u32,
+                batch.last_offset + 1,
+                0
+            )
+            .await
+            .map_err(|e| chronik_raft::RaftError::StorageError(e.to_string()))?;
+
+        self.last_applied = entry.index;
+        return Ok(());
+    }
+
+    // FALLBACK: Old CanonicalRecord format (backward compatibility)
+    if let Ok(record) = bincode::deserialize::<CanonicalRecord>(&entry.data) {
+        warn!("STATE_MACHINE: Legacy CanonicalRecord mode");
+        // ... keep existing handling ...
+    }
+
+    Err(chronik_raft::RaftError::SerializationError("Unknown format".to_string()))
+}
 ) -> Result<()> {
     // ... existing fsync logic ...
 
