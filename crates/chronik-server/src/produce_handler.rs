@@ -56,6 +56,15 @@ impl WalReplicationManager {
             _placeholder: (),
         }
     }
+
+    /// Replicate a WAL record to followers (Phase 2: stub implementation)
+    ///
+    /// This is fire-and-forget - spawns a task that returns immediately
+    /// Errors are logged but don't block the produce path
+    pub async fn replicate_async(&self, _topic: String, _partition: i32, _offset: i64) {
+        // Phase 2: No-op stub - just return immediately
+        // Phase 3 will implement actual replication logic
+    }
 }
 
 /// Maximum segment size before rotation (256MB)
@@ -1542,7 +1551,18 @@ impl ProduceHandler {
         if let Err(e) = self.flush_partition_if_needed(topic, partition, &partition_state).await {
             warn!("Failed to flush partition {}-{}: {:?}", topic, partition, e);
         }
-        
+
+        // v2.2.0 Phase 2: WAL Replication Hook (fire-and-forget)
+        // This is called AFTER all v2.1.0 logic completes
+        // CRITICAL: Non-blocking! Spawns async task, never blocks produce path
+        if let Some(ref repl_mgr) = self.wal_replication_manager {
+            let repl_mgr_clone = Arc::clone(repl_mgr);
+            let topic_owned = topic.to_string();
+            tokio::spawn(async move {
+                repl_mgr_clone.replicate_async(topic_owned, partition, base_offset as i64).await;
+            });
+        }
+
         // Get partition state for response
         let log_start_offset = partition_state.log_start_offset.load(Ordering::Relaxed) as i64;
 
