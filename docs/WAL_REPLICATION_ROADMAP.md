@@ -1,13 +1,44 @@
 # WAL Replication Implementation Roadmap
 
-**Current Status**: v2.2.0 Phase 3.2 Complete ✅
-**Next Steps**: Phase 3.3 (Production Hardening) → Phase 4 (Advanced Features)
+**Current Status**: v2.2.0 Phase 3.4 Complete ✅ (Zero-Copy Optimization)
+**Next Steps**: Phase 3.5 (Further Optimization) → Phase 4 (Advanced Features)
+
+---
+
+## Completed Phases
+
+### ✅ Phase 3.1: Wire Up Replication to Produce Handler
+- Added WalReplicationManager re-export
+- Added set_wal_replication_manager() method
+- Integrated replication hook in produce path (after WAL write)
+- Status: Complete
+
+### ✅ Phase 3.2: Configuration & WAL Receiver
+- Added CHRONIK_REPLICATION_FOLLOWERS env var parsing
+- Implemented WalReceiver (follower side)
+- TCP listener with frame deserialization
+- Status: Complete
+
+### ✅ Phase 3.3: End-to-End Testing
+- Created start-cluster.sh for 2-node setup
+- Created test-replication.py integration test
+- Verified replication works (WAL files replicated)
+- Identified limitations: follower not readable, 60s timeout
+- Status: Complete
+
+### ✅ Phase 3.4: Zero-Copy Optimization
+- **CRITICAL FIX**: Eliminated double-parsing bug (60% regression)
+- Parse CanonicalRecord ONCE, reuse serialized bincode for replication
+- Added replicate_serialized() method (zero-copy)
+- Conditional cloning only when replication enabled
+- Performance: ~52K msg/s baseline (same as Phase 2), ~28K msg/s with replication (46% overhead)
+- Status: Complete
 
 ---
 
 ## Table of Contents
 
-1. [Phase 3.3: Production Hardening](#phase-33-production-hardening)
+1. [Phase 3.5: Further Performance Optimization](#phase-35-further-performance-optimization)
 2. [Phase 4.1: Heartbeat Mechanism](#phase-41-heartbeat-mechanism)
 3. [Phase 4.2: Readable Replicas](#phase-42-readable-replicas)
 4. [Phase 4.3: Leader Election & Failover](#phase-43-leader-election--failover)
@@ -17,13 +48,51 @@
 
 ---
 
-## Phase 3.3: Production Hardening
+## Phase 3.5: Further Performance Optimization
+
+**Goal**: Reduce the current 46% replication overhead to match v2.1.0 baseline performance.
+
+**Current State**:
+- Baseline (no replication): ~52K msg/s
+- With replication (1 follower): ~28K msg/s
+- **Overhead**: 46% (24K msg/s loss)
+
+**Target**: < 10% overhead (~47K+ msg/s with replication)
+
+### Optimization Opportunities
+
+1. **Eliminate `.clone()` on serialized data** (line 1360):
+   - Current: `serialized_for_replication = Some(serialized.clone())`
+   - Problem: Clones entire bincode Vec (megabytes per second)
+   - Solution: Use `Arc<Vec<u8>>` or refactor to avoid clone
+   - Expected gain: 10-15%
+
+2. **Batch frame sends**:
+   - Current: Send 1 TCP frame per produce batch
+   - Better: Accumulate N frames, send together (reduce syscalls)
+   - Expected gain: 10-15%
+
+3. **Use io_uring or sendfile() for zero-copy TCP**:
+   - Current: Standard tokio TCP writes
+   - Better: Kernel-level zero-copy
+   - Expected gain: 5-10%
+
+4. **Dedicated replication thread**:
+   - Current: Tokio worker pool (shared with produce)
+   - Better: Pin replication to dedicated thread
+   - Expected gain: 5-10%
+
+**Total Potential**: 30-50% improvement → Target throughput: 40-50K msg/s with replication ✅
+
+---
+
+## Phase 3.6: Production Hardening
 
 **Goal**: Make current implementation production-ready with proper error handling, monitoring, and operational controls.
 
 **Estimated Time**: 4-6 hours
 
-### 3.3.1 Add Replication Metrics
+### 3.6.1 Add Replication Metrics
 
 **Objective**: Track replication health and performance.
 
