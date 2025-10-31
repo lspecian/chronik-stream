@@ -105,10 +105,6 @@ pub struct IntegratedKafkaServer {
     metadata_store: Arc<dyn MetadataStore>,
     wal_indexer: Arc<WalIndexer>,
     metadata_uploader: Option<Arc<chronik_common::metadata::MetadataUploader>>,
-    /// Optional Raft cluster for metadata coordination (v2.5.0 Phase 2)
-    /// Only initialized when cluster mode is requested
-    #[cfg(feature = "raft")]
-    raft_cluster: Option<Arc<crate::raft_cluster::RaftCluster>>,
 }
 
 impl Clone for IntegratedKafkaServer {
@@ -119,49 +115,21 @@ impl Clone for IntegratedKafkaServer {
             metadata_store: self.metadata_store.clone(),
             wal_indexer: self.wal_indexer.clone(),
             metadata_uploader: self.metadata_uploader.clone(),
-            #[cfg(feature = "raft")]
-            raft_cluster: self.raft_cluster.clone(),
         }
     }
 }
 
 impl IntegratedKafkaServer {
     /// Create a new integrated Kafka server
-    pub async fn new(config: IntegratedServerConfig) -> Result<Self> {
-        Self::new_with_raft(config, None).await
-    }
-
-    /// Create a new integrated Kafka server with optional Raft manager
-    #[cfg(feature = "raft")]
-    pub async fn new_with_raft(
+    ///
+    /// # Arguments
+    /// - `config`: Server configuration
+    /// - `raft_cluster`: Optional Raft cluster for metadata coordination (v2.5.0 Phase 3)
+    pub async fn new(
         config: IntegratedServerConfig,
-        raft_manager: Option<Arc<crate::raft_integration::RaftReplicaManager>>,
+        raft_cluster: Option<Arc<crate::raft_cluster::RaftCluster>>,
     ) -> Result<Self> {
-        info!("Initializing integrated Kafka server with chronik-ingest components");
-        if raft_manager.is_some() {
-            info!("Raft integration enabled");
-        }
-
-        Self::new_internal(config, raft_manager).await
-    }
-
-    /// Create a new integrated Kafka server (without raft feature)
-    #[cfg(not(feature = "raft"))]
-    pub async fn new_with_raft(
-        config: IntegratedServerConfig,
-        _raft_manager: Option<()>,
-    ) -> Result<Self> {
-        info!("Initializing integrated Kafka server with chronik-ingest components");
-        Self::new_internal(config, None).await
-    }
-
-    /// Internal server initialization
-    async fn new_internal(
-        config: IntegratedServerConfig,
-        #[cfg(feature = "raft")] raft_manager: Option<Arc<crate::raft_integration::RaftReplicaManager>>,
-        #[cfg(not(feature = "raft"))] _raft_manager: Option<()>,
-    ) -> Result<Self> {
-        info!("Starting internal server initialization");
+        info!("Starting internal server initialization with Raft: {}", raft_cluster.is_some());
 
         // Create data directory
         std::fs::create_dir_all(&config.data_dir)?;
@@ -169,212 +137,7 @@ impl IntegratedKafkaServer {
         std::fs::create_dir_all(&segments_dir)?;
         
         // Initialize metadata store based on configuration
-        let metadata_store: Arc<dyn MetadataStore> = if let Some(ref cluster_config) = config.cluster_config {
-            // Cluster mode: Use Raft-replicated metadata store
-            #[cfg(feature = "raft")]
-            {
-                // CRITICAL VALIDATION: Multi-node Raft clustering requires raft-cluster mode, not standalone
-                // The standalone mode lacks distributed bootstrap coordination needed for multi-node clusters
-                // ONLY enforce this when raft_manager is None (standalone mode)
-                // When raft_manager is Some, we're in raft-cluster mode which properly handles multi-node
-                let total_nodes = cluster_config.peers.len();
-
-                if total_nodes > 1 && raft_manager.is_none() {
-                    return Err(anyhow::anyhow!(
-                        "Multi-node Raft clustering ({} nodes total) is not supported in 'standalone' mode.\n\
-                         \n\
-                         The standalone mode lacks distributed bootstrap coordination required for multi-node clusters.\n\
-                         Each node would create its __meta partition replica independently without quorum agreement,\n\
-                         leading to cluster formation failures.\n\
-                         \n\
-                         Please use one of the following instead:\n\
-                         \n\
-                         Option 1 (Recommended): Use raft-cluster mode with health-check bootstrap\n\
-                         ========================================================================\n\
-                         cargo run --features raft --bin chronik-server -- raft-cluster \\\n\
-                           --node-id 1 \\\n\
-                           --raft-addr 0.0.0.0:9192 \\\n\
-                           --peers \"2@node2:9292,3@node3:9392\"\n\
-                         \n\
-                         Option 2: Use raft-cluster mode (requires manual startup coordination)\n\
-                         =========================================================================\n\
-                         See docs/CLUSTERING_GUIDE.md for detailed multi-node setup instructions.\n\
-                         \n\
-                         Note: Single-node Raft is supported in standalone mode for development/testing.",
-                        total_nodes
-                    ));
-                }
-
-                if total_nodes > 1 {
-                    info!("Initializing Raft-replicated metadata store for {}-node cluster mode", total_nodes);
-                } else {
-                    info!("Initializing Raft-replicated metadata store for single-node cluster mode");
-                }
-
-                use chronik_raft::RaftMetaLog;
-                use chronik_wal::{GroupCommitWal, GroupCommitConfig, RaftWalStorage};
-
-                // Raft manager must be provided in cluster mode
-                let raft_mgr = raft_manager.as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("Raft manager required in cluster mode"))?;
-
-                // Extract ALL peer IDs from cluster config (INCLUDING self)
-                // CRITICAL: For Raft bootstrap, all nodes must have identical peer lists
-                let peer_ids: Vec<u64> = cluster_config.peers.iter()
-                    .map(|p| p.id)
-                    .collect();
-
-                // Create WAL-backed storage for __meta partition (standalone --raft mode)
-                // NOTE: In raft-cluster mode, this is already created in raft_cluster.rs
-                let meta_wal_config = GroupCommitConfig::default();
-                let meta_wal_dir = PathBuf::from(&config.data_dir).join("wal/__meta/0");
-                tokio::fs::create_dir_all(&meta_wal_dir).await?;
-                let meta_wal = Arc::new(GroupCommitWal::new(meta_wal_dir.clone(), meta_wal_config));
-                let meta_log_storage = Arc::new(RaftWalStorage::new(meta_wal));
-
-                // Recover any existing Raft log entries from WAL
-                meta_log_storage.recover(&PathBuf::from(&config.data_dir)).await?;
-                info!("Metadata Raft log storage initialized (WAL-backed with persistence)");
-
-                // CRITICAL FIX: Check if __meta partition replica already exists (created by raft_cluster.rs)
-                // If it does, retrieve the SHARED metadata state from RaftReplicaManager
-                // If not, create our own state (for standalone --raft mode)
-                let (local_state, applied_index, meta_replica) = if let Some(replica) = raft_mgr.get_replica("__meta", 0) {
-                    info!("Using existing __meta partition replica (created by raft_cluster.rs)");
-
-                    // Retrieve the shared state from RaftReplicaManager
-                    let shared_state = raft_mgr.get_meta_partition_state().await
-                        .ok_or_else(|| anyhow::anyhow!("__meta replica exists but shared state not found in RaftReplicaManager"))?;
-
-                    info!("Retrieved shared metadata state from RaftReplicaManager (state will be shared between MetadataStateMachine and RaftMetaLog)");
-
-                    (shared_state.0, shared_state.1, replica)
-                } else {
-                    // No existing replica - create our own state (standalone --raft mode)
-                    info!("No existing __meta replica found, creating new one with fresh state");
-                    let local_state = Arc::new(parking_lot::RwLock::new(chronik_raft::MetadataState::default()));
-                    let applied_index = Arc::new(std::sync::atomic::AtomicU64::new(0));
-
-                    // CRITICAL FIX: Create topic creation callback to enable Raft replication for data partitions
-                    // When a topic is created via metadata, we need to create Raft replicas for each partition
-                    let raft_mgr_for_callback = raft_mgr.clone();
-                    let peer_ids_for_callback = peer_ids.clone();
-                    let data_dir_for_callback = PathBuf::from(&config.data_dir);
-
-                    let topic_created_callback: chronik_raft::TopicCreatedCallback = Arc::new(move |topic_name: &str, topic_meta: &chronik_common::metadata::TopicMetadata| {
-                        info!("Topic creation callback fired for '{}'", topic_name);
-
-                        // Skip __meta partition (already created)
-                        if topic_name == "__meta" {
-                            return;
-                        }
-
-                        // Create Raft replicas for each partition asynchronously
-                        let topic = topic_name.to_string();
-                        let partition_count = topic_meta.config.partition_count;
-                        let raft_mgr = raft_mgr_for_callback.clone();
-                        let peers = peer_ids_for_callback.clone();
-                        let data_dir = data_dir_for_callback.clone();
-
-                        tokio::spawn(async move {
-                            info!("Creating Raft replicas for topic '{}' with {} partitions", topic, partition_count);
-
-                            for partition_id in 0..partition_count {
-                                // Create WAL-backed storage for this partition
-                                let partition_wal_config = chronik_wal::GroupCommitConfig::default();
-                                let partition_wal_dir = data_dir.join(format!("wal/{}/{}", topic, partition_id));
-
-                                if let Err(e) = tokio::fs::create_dir_all(&partition_wal_dir).await {
-                                    error!("Failed to create WAL directory for {}-{}: {}", topic, partition_id, e);
-                                    continue;
-                                }
-
-                                let partition_wal = Arc::new(chronik_wal::GroupCommitWal::new(partition_wal_dir.clone(), partition_wal_config));
-                                let log_storage = Arc::new(chronik_wal::RaftWalStorage::new(partition_wal));
-
-                                // Recover any existing Raft log entries
-                                if let Err(e) = log_storage.recover(&data_dir).await {
-                                    error!("Failed to recover Raft log for {}-{}: {}", topic, partition_id, e);
-                                    continue;
-                                }
-
-                                // Create Raft replica for this partition
-                                match raft_mgr.create_replica(
-                                    topic.clone(),
-                                    partition_id as i32,
-                                    log_storage,
-                                    peers.clone(),
-                                ).await {
-                                    Ok(()) => {
-                                        info!("Successfully created Raft replica for {}-{} with {} peers", topic, partition_id, peers.len());
-                                    }
-                                    Err(e) => {
-                                        error!("Failed to create Raft replica for {}-{}: {}", topic, partition_id, e);
-                                    }
-                                }
-                            }
-
-                            info!("Completed Raft replica creation for topic '{}'", topic);
-                        });
-                    });
-
-                    // Create MetadataStateMachine with the topic creation callback
-                    let metadata_sm = chronik_raft::MetadataStateMachine::with_callback(
-                        local_state.clone(),
-                        applied_index.clone(),
-                        Some(topic_created_callback),
-                    );
-                    let state_machine: Arc<tokio::sync::RwLock<dyn chronik_raft::StateMachine>> =
-                        Arc::new(tokio::sync::RwLock::new(metadata_sm));
-
-                    // Create __meta partition replica with MetadataStateMachine
-                    // All nodes start with SAME peer configuration for proper Raft bootstrap
-                    // This allows distributed consensus once all nodes are online
-                    info!("Creating __meta partition replica with MetadataStateMachine and {} peers", peer_ids.len());
-                    raft_mgr.create_meta_replica(
-                        "__meta".to_string(),
-                        0,
-                        meta_log_storage,
-                        peer_ids.clone(),  // All peers from cluster config
-                        state_machine,
-                    ).await?;
-
-                    // Get the replica we just created
-                    let replica = raft_mgr.get_replica("__meta", 0)
-                        .ok_or_else(|| anyhow::anyhow!("Failed to get __meta replica after creation"))?;
-
-                    // Return the tuple
-                    (local_state, applied_index, replica)
-                };
-
-                // Create RaftMetaLog using the shared replica and RaftClient
-                // CRITICAL: Pass the SAME local_state and applied_index that we gave to MetadataStateMachine
-                // Topic creation callback is set above in MetadataStateMachine::with_callback()
-                let raft_meta_log = RaftMetaLog::from_replica(
-                    cluster_config.node_id,
-                    meta_replica.clone(),
-                    Some(raft_mgr.raft_client()),
-                    local_state,
-                    applied_index,
-                ).await?;
-
-                info!("RaftMetaLog initialized for node {} with {} peers (callback set in MetadataStateMachine)", cluster_config.node_id, peer_ids.len());
-
-                // No need to manually add peers via ConfChange for new cluster bootstrap
-                // All peers are already in ConfState (initialized in replica.rs)
-                // TiKV Raft will elect leader naturally via pre-vote and election
-                info!(
-                    "New cluster bootstrap: all {} peers initialized in ConfState, natural leader election will occur",
-                    cluster_config.peers.len()
-                );
-
-                Arc::new(raft_meta_log) as Arc<dyn MetadataStore>
-            }
-            #[cfg(not(feature = "raft"))]
-            {
-                return Err(anyhow::anyhow!("Cluster mode requires the 'raft' feature to be enabled. Please rebuild with --features raft"));
-            }
-        } else if config.use_wal_metadata {
+        let metadata_store: Arc<dyn MetadataStore> = if config.use_wal_metadata {
             info!("Initializing WAL-based metadata store with real WAL adapter");
 
             // Create WAL configuration for metadata
@@ -642,24 +405,11 @@ impl IntegratedKafkaServer {
         // WalManager uses DashMap internally - no external RwLock needed
         info!("Initializing WAL manager with recovery...");
 
-        #[cfg(feature = "raft")]
-        let wal_manager = if let Some(ref raft_mgr) = raft_manager {
-            info!("Reusing WalManager from RaftReplicaManager (ensures shared sealed_segments tracking)");
-            raft_mgr.wal_manager()
-        } else {
-            let wal_manager_recovered = WalManager::recover(&wal_config)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to recover WAL: {}", e))?;
-            Arc::new(wal_manager_recovered)
-        };
-
-        #[cfg(not(feature = "raft"))]
-        let wal_manager = {
-            let wal_manager_recovered = WalManager::recover(&wal_config)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to recover WAL: {}", e))?;
-            Arc::new(wal_manager_recovered)
-        };
+        // v2.5.0: Always use direct WAL recovery
+        let wal_manager_recovered = WalManager::recover(&wal_config)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to recover WAL: {}", e))?;
+        let wal_manager = Arc::new(wal_manager_recovered);
 
         info!("WAL recovery complete - {} partitions loaded", wal_manager.get_partitions().len());
 
@@ -671,11 +421,10 @@ impl IntegratedKafkaServer {
             wal_manager.clone(),
         ).await?;
 
-        // Set Raft manager BEFORE wrapping in Arc (v1.3.66+)
-        #[cfg(feature = "raft")]
-        if let Some(raft_mgr) = raft_manager {
-            info!("Attaching Raft manager to ProduceHandler");
-            produce_handler_inner.set_raft_manager(raft_mgr);
+        // v2.5.0 Phase 3: Wire RaftCluster to ProduceHandler for partition metadata
+        if let Some(ref cluster) = raft_cluster {
+            info!("Setting RaftCluster for ProduceHandler");
+            produce_handler_inner.set_raft_cluster(Arc::clone(cluster));
         }
 
         // v2.2.0: Initialize WAL replication manager if followers configured
@@ -689,7 +438,22 @@ impl IntegratedKafkaServer {
 
                 if !followers.is_empty() {
                     info!("WAL replication enabled with {} followers: {}", followers.len(), followers.join(", "));
-                    let replication_manager = crate::wal_replication::WalReplicationManager::new(followers);
+
+                    // v2.5.0 Phase 3: Create ISR tracker
+                    let isr_tracker = Arc::new(crate::isr_tracker::IsrTracker::new(
+                        10_000,  // max_lag_entries: 10K messages
+                        10_000,  // max_lag_ms: 10 seconds
+                    ));
+                    info!("Created ISR tracker (max_lag: 10K entries / 10s)");
+
+                    // v2.5.0 Phase 3: Create replication manager with dependencies
+                    let replication_manager = crate::wal_replication::WalReplicationManager::new_with_dependencies(
+                        followers,
+                        raft_cluster.clone(),  // Pass RaftCluster for partition metadata
+                        Some(isr_tracker),     // Pass ISR tracker for replica filtering
+                    );
+                    info!("Created WalReplicationManager with Raft and ISR support");
+
                     produce_handler_inner.set_wal_replication_manager(replication_manager);
                 } else {
                     info!("CHRONIK_REPLICATION_FOLLOWERS is empty, WAL replication disabled");
@@ -936,40 +700,7 @@ impl IntegratedKafkaServer {
         info!("  WAL Indexing: {}", config.enable_wal_indexing);
 
         // Clone cluster config before moving config into server
-        #[cfg(feature = "raft")]
         let cluster_config_clone = config.cluster_config.clone();
-
-        // Initialize Raft cluster if clustering is enabled (v2.5.0 Phase 2)
-        #[cfg(feature = "raft")]
-        let raft_cluster = if let Some(ref cluster_config) = config.cluster_config {
-            if cluster_config.enabled {
-                info!("Initializing Raft cluster for metadata coordination (v2.5.0 Phase 2)");
-
-                // Extract peer information
-                let peers: Vec<(u64, String)> = cluster_config.peers.iter()
-                    .filter(|p| p.id != cluster_config.node_id) // Exclude self
-                    .map(|p| (p.id, format!("{}:{}", p.host, p.port)))
-                    .collect();
-
-                match crate::raft_cluster::RaftCluster::bootstrap(cluster_config.node_id, peers).await {
-                    Ok(cluster) => {
-                        info!("✓ Raft cluster initialized successfully (node_id={})", cluster_config.node_id);
-                        Some(Arc::new(cluster))
-                    }
-                    Err(e) => {
-                        warn!("Failed to initialize Raft cluster: {:?}", e);
-                        warn!("Server will run in standalone mode (no Raft metadata coordination)");
-                        None
-                    }
-                }
-            } else {
-                info!("Clustering disabled in config, running in standalone mode");
-                None
-            }
-        } else {
-            info!("No cluster config provided, running in standalone mode");
-            None
-        };
 
         // Create default topic on startup to ensure clients can connect
         // This solves the chicken-and-egg problem where clients need at least one topic
@@ -980,8 +711,6 @@ impl IntegratedKafkaServer {
             metadata_store: metadata_store.clone(),
             wal_indexer,
             metadata_uploader,
-            #[cfg(feature = "raft")]
-            raft_cluster,
         };
 
         // Create default topic
@@ -991,7 +720,6 @@ impl IntegratedKafkaServer {
         }
 
         // If clustering is enabled, perform initial partition assignment
-        #[cfg(feature = "raft")]
         if let Some(ref cluster_config) = cluster_config_clone {
             if cluster_config.enabled {
                 info!("Cluster mode enabled - performing initial partition assignment");
@@ -1067,19 +795,11 @@ impl IntegratedKafkaServer {
         self.wal_indexer.clone()
     }
 
-    /// Get Raft cluster (v2.5.0 Phase 2)
-    ///
-    /// Returns None if clustering is disabled or Raft feature is not enabled.
-    #[cfg(feature = "raft")]
-    pub fn get_raft_cluster(&self) -> Option<Arc<crate::raft_cluster::RaftCluster>> {
-        self.raft_cluster.clone()
-    }
 
     /// Assign existing partitions to cluster nodes (Phase 3.4)
     ///
     /// This method is called on cluster startup to ensure all partitions have assignments.
     /// It uses the round-robin strategy from `crates/chronik-common/src/partition_assignment.rs`.
-    #[cfg(feature = "raft")]
     async fn assign_existing_partitions(&self, cluster_config: &chronik_config::ClusterConfig) -> Result<()> {
         use chronik_common::partition_assignment::PartitionAssignment as AssignmentManager;
         use chronik_common::metadata::PartitionAssignment;
@@ -1637,7 +1357,7 @@ mod tests {
             ..Default::default()
         };
         
-        let server = IntegratedKafkaServer::new(config).await.unwrap();
+        let server = IntegratedKafkaServer::new(config, None).await.unwrap();
         let stats = server.get_stats().await.unwrap();
         
         assert_eq!(stats.node_id, 1);

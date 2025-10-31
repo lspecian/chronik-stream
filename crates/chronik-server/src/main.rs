@@ -26,18 +26,11 @@ mod coordinator_manager;
 mod wal_integration;
 mod metadata_dr;
 mod wal_replication;  // v2.2.0: PostgreSQL-style WAL streaming
-// Removed raft_integration and raft_cluster modules (v2.2.0 - Raft removed)
-
 // v2.5.0 Phase 2: Raft for metadata coordination only (NOT data replication)
-#[cfg(feature = "raft")]
 mod raft_metadata;
-#[cfg(feature = "raft")]
 mod raft_cluster;
-
-// Compatibility shim for old chronik_raft references (temporary until full migration)
-mod chronik_raft_compat;
-// Re-export as chronik_raft for compatibility with old code
-use chronik_raft_compat as chronik_raft;
+// v2.5.0 Phase 3: ISR tracking for partition replication
+mod isr_tracker;
 
 mod cli;
 
@@ -193,7 +186,6 @@ enum Commands {
     Standalone,
 
     /// Run in Raft cluster mode
-    #[cfg(feature = "raft")]
     #[command(about = "Run as a node in a Raft-replicated cluster")]
     RaftCluster {
         /// Raft listen address (gRPC)
@@ -246,7 +238,7 @@ enum Commands {
         action: CompactAction,
     },
 
-    // Removed Cluster command (v2.2.0 - Raft removed)
+    // Cluster command replaced with raft-cluster subcommand (v2.5.0 Phase 2)
 }
 
 /// Parse object store configuration from environment variables
@@ -484,7 +476,6 @@ async fn main() -> Result<()> {
             run_standalone_server(&cli).await?;
         }
 
-        #[cfg(feature = "raft")]
         Some(Commands::RaftCluster { ref raft_addr, ref peers, bootstrap }) => {
             use raft_cluster::{run_raft_cluster, RaftClusterConfig};
 
@@ -546,14 +537,9 @@ async fn main() -> Result<()> {
                 raft_addr: raft_addr.clone(),
                 peers: parsed_peers,
                 bootstrap,
-                data_dir: cli.data_dir.clone(),
-                file_metadata: cli.file_metadata,
+                data_dir: cli.data_dir.to_string_lossy().to_string(),
                 kafka_port: cli.kafka_port,
-                metrics_port,
-                bind_addr: cli.bind_addr.clone(),
-                advertised_host,
-                advertised_port,
-                gossip_config: None, // Old RaftCluster command doesn't support gossip config
+                advertised_addr: advertised_host,
             };
 
             run_raft_cluster(config).await?;
@@ -587,7 +573,7 @@ async fn main() -> Result<()> {
             handle_compaction_command(&cli, action.clone()).await?;
         }
 
-        // Removed Cluster command (v2.2.0 - Raft removed)
+        // Cluster command replaced with raft-cluster subcommand (v2.5.0 Phase 2)
 
         None => {
             // Default to standalone mode
@@ -756,218 +742,8 @@ async fn run_standalone_server(cli: &Cli) -> Result<()> {
         cluster_config: cluster_config.clone(),  // Pass cluster configuration
     };
 
-    // Create Raft manager if clustering is enabled
-    #[cfg(feature = "raft")]
-    let (raft_manager, raft_server_params, peer_list) = if let Some(ref cluster) = cluster_config {
-        info!("Clustering enabled with {} peers, creating RaftReplicaManager", cluster.peers.len());
-
-        use crate::raft_integration::{RaftReplicaManager, RaftManagerConfig};
-        use chronik_raft::RaftConfig;
-        use chronik_common::metadata::MetadataStore;
-
-        // Find this node's Raft port from cluster config
-        let raft_port = cluster.peers.iter()
-            .find(|p| p.id == cluster.node_id)
-            .map(|p| p.raft_port)
-            .unwrap_or(9093);  // Default to 9093 if not found
-
-        let raft_addr = format!("{}:{}", bind_host, raft_port);
-
-        let raft_config = RaftConfig {
-            node_id: cluster.node_id,
-            listen_addr: raft_addr.clone(),
-            // OPTIMIZATION (v1.3.66): Kept at 300ms (3 ticks) for reliable leader election
-            // election_tick = election_timeout_ms / heartbeat_interval_ms MUST be > 1
-            // 300ms / 100ms = 3 ticks ✅ (was 300ms / 30ms = 10 ticks before)
-            election_timeout_ms: 300,
-            // OPTIMIZATION (v1.3.66): Increased from 30ms to 100ms for cluster scalability
-            // Reduces heartbeat traffic by 70% (30k → 10k msg/sec for 1000 Raft groups)
-            // This prevents gRPC connection pool exhaustion in large clusters
-            heartbeat_interval_ms: 100,
-            max_entries_per_batch: 100,
-            snapshot_threshold: 10_000,
-        };
-
-        // Extract ALL peer node IDs INCLUDING self (required for Raft bootstrap)
-        let initial_peers: Vec<u64> = cluster.peers.iter()
-            .map(|p| p.id)
-            .collect();
-
-        info!("Pre-populating Raft peer list with {} peers (INCLUDING self): {:?}", initial_peers.len(), initial_peers);
-
-        let manager_config = RaftManagerConfig {
-            raft_config,
-            enabled: true,  // Enable Raft when cluster config present
-            tick_interval_ms: 10,
-            initial_peers,
-        };
-
-        // Create metadata store for Raft manager
-        // Note: This will be the same metadata store used by IntegratedServer
-        let metadata_store: Arc<dyn MetadataStore> = if config.use_wal_metadata {
-            use chronik_common::metadata::ChronikMetaLogStore;
-            use chronik_storage::WalMetadataAdapter;
-
-            let wal_config = chronik_wal::config::WalConfig {
-                enabled: true,
-                data_dir: PathBuf::from(format!("{}/wal_metadata", config.data_dir)),
-                ..Default::default()
-            };
-
-            let wal_adapter = Arc::new(WalMetadataAdapter::new(wal_config).await?);
-            let metalog_store = ChronikMetaLogStore::new(
-                wal_adapter,
-                PathBuf::from(format!("{}/metalog_snapshots", config.data_dir)),
-            ).await?;
-
-            Arc::new(metalog_store)
-        } else {
-            use chronik_common::metadata::file_store::FileMetadataStore;
-            let metadata_path = PathBuf::from(format!("{}/metadata", config.data_dir));
-            std::fs::create_dir_all(&metadata_path)?;
-            Arc::new(FileMetadataStore::new(metadata_path).await?)
-        };
-
-        // Create WAL manager (needed by both Raft and IntegratedServer)
-        use chronik_wal::{config::WalConfig as WalCfg, WalManager};
-
-        let wal_config = WalCfg {
-            enabled: true,
-            data_dir: PathBuf::from(format!("{}/wal", config.data_dir)),
-            ..Default::default()
-        };
-
-        info!("Starting WAL recovery (may take a few seconds)...");
-        let wal_manager = Arc::new(WalManager::recover(&wal_config).await?);
-        info!("WAL recovery complete - {} partitions loaded", wal_manager.get_partitions().len());
-
-        let raft_mgr = Arc::new(RaftReplicaManager::new(
-            manager_config,
-            metadata_store,
-            wal_manager.clone(),
-        ));
-
-        // Start Raft gRPC server
-        info!("Starting Raft gRPC server on {}", raft_addr);
-        use chronik_raft::rpc::{RaftServiceImpl, start_raft_server};
-        let raft_service = RaftServiceImpl::new();
-        raft_mgr.set_raft_service(Arc::new(raft_service.clone())).await;
-
-        // NOTE: gRPC server will be started AFTER __meta replica creation
-        // to avoid race condition where peers send messages before replica exists
-
-        // CRITICAL FIX: Collect peer addresses but DON'T connect yet
-        // We'll connect AFTER all gRPC servers have started
-        let peer_list: Vec<(u64, String)> = cluster.peers.iter()
-            .filter(|p| p.id != cluster.node_id)  // Exclude self
-            .map(|p| (p.id, format!("{}:{}", p.addr.split(':').next().unwrap_or("localhost"), p.raft_port)))
-            .collect();
-
-        info!("Collected {} peer addresses (will connect after gRPC server is ready)", peer_list.len());
-
-        (Some(raft_mgr), Some((raft_addr, raft_service)), Some(peer_list))
-    } else {
-        info!("No cluster configuration, Raft disabled");
-        (None, None, None)
-    };
-
-    // CRITICAL FIX: Start Raft gRPC server and connect to peers BEFORE creating IntegratedKafkaServer
-    // This ensures peers are connected before __meta replica is created (which starts Raft election)
-    #[cfg(feature = "raft")]
-    if let Some((raft_addr, raft_service)) = raft_server_params {
-        info!("Starting Raft gRPC server on {} (BEFORE replica creation)", raft_addr);
-        let raft_addr_spawn = raft_addr.clone();
-        let raft_service_spawn = raft_service.clone();
-        tokio::spawn(async move {
-            if let Err(e) = chronik_raft::rpc::start_raft_server(raft_addr_spawn, raft_service_spawn).await {
-                error!("Raft gRPC server error: {:?}", e);
-            }
-        });
-
-        // Wait for gRPC server to be ready
-        info!("Waiting for Raft gRPC server to be ready...");
-
-        // Extract host and port for health check
-        let raft_addr_parts: Vec<&str> = raft_addr.split(':').collect();
-        let raft_host = raft_addr_parts.get(0).unwrap_or(&"127.0.0.1");
-        let raft_port = raft_addr_parts.get(1).and_then(|s| s.parse::<u16>().ok()).unwrap_or(5001);
-
-        // Wait until the port is listening (max 5 seconds)
-        let mut ready = false;
-        for attempt in 1..=50 {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-            // Try to connect to the local gRPC server
-            if let Ok(stream) = tokio::net::TcpStream::connect((*raft_host, raft_port)).await {
-                drop(stream);
-                ready = true;
-                info!("Raft gRPC server is ready after {} ms", attempt * 100);
-                break;
-            }
-        }
-
-        if !ready {
-            warn!("Raft gRPC server readiness check timed out, but continuing anyway");
-        }
-
-        info!("Raft gRPC server started successfully");
-
-        // NOW connect to peers SYNCHRONOUSLY (wait for all to complete)
-        if let Some(peers) = peer_list {
-            // Initial delay to allow ALL peer gRPC servers to start
-            info!("Waiting 2 seconds for all peer gRPC servers to be ready...");
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            info!("Starting peer connections (synchronous, will wait for completion)");
-
-            let raft_mgr = raft_manager.as_ref().unwrap();
-            for (peer_id, peer_addr) in peers {
-                let peer_url = format!("http://{}", peer_addr);
-
-                // Connect synchronously with retry logic
-                let mut success = false;
-                for retry in 0..10 {
-                    match raft_mgr.add_peer(peer_id, peer_url.clone()).await {
-                        Ok(_) => {
-                            info!("Successfully connected to Raft peer {} at {}", peer_id, peer_url);
-                            success = true;
-                            break;
-                        }
-                        Err(e) => {
-                            if retry < 9 {
-                                // Start with 1 second delay, double each retry (1s, 2s, 4s, 8s, ...)
-                                let delay = std::time::Duration::from_secs(1_u64 << retry.min(5));
-                                warn!("Failed to connect to Raft peer {}: {:?}, retrying in {:?}...", peer_id, e, delay);
-                                tokio::time::sleep(delay).await;
-                            } else {
-                                error!("Failed to connect to Raft peer {} after {} retries: {:?}", peer_id, retry + 1, e);
-                            }
-                        }
-                    }
-                }
-
-                if !success {
-                    warn!("Could not connect to peer {} at {} - continuing anyway, Raft will retry", peer_id, peer_url);
-                }
-            }
-
-            info!("All peer connection attempts completed");
-
-            // CRITICAL FIX: Add delay to allow ALL peer nodes to create and register their replicas
-            // Without this, messages can arrive before the receiving node has registered its replica
-            // Use 5 seconds to account for staggered startup (nodes start 1-2 seconds apart)
-            info!("Waiting 5 seconds for all peer nodes to complete replica registration...");
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            info!("Proceeding with server creation");
-        }
-    }
-
-    // Create and start the integrated server (with optional Raft manager)
-    // At this point, gRPC server is running, peers are connected, and replicas should be registered
-    #[cfg(feature = "raft")]
-    let server = IntegratedKafkaServer::new_with_raft(config, raft_manager.clone()).await?;
-
-    #[cfg(not(feature = "raft"))]
-    let server = IntegratedKafkaServer::new(config).await?;
+    // Create and start the integrated server
+    let server = IntegratedKafkaServer::new(config, None).await?;
 
     // Initialize monitoring (metrics + optional tracing)
     let _metrics_registry = init_monitoring(
@@ -1210,7 +986,7 @@ async fn run_all_components(cli: &Cli) -> Result<()> {
     // Start Kafka protocol server
     let kafka_addr = format!("{}:{}", cli.bind_addr, cli.kafka_port);
     let kafka_task = tokio::spawn(async move {
-        let server = IntegratedKafkaServer::new(config).await?;
+        let server = IntegratedKafkaServer::new(config, None).await?;
         server.run(&kafka_addr).await
     });
     tasks.push(kafka_task);

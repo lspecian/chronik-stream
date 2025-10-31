@@ -10,6 +10,7 @@
 
 use crate::storage::{StorageConfig, StorageService};
 use crate::fetch_handler::FetchHandler;
+use crate::raft_cluster::RaftCluster;  // NEW: v2.5.0 Phase 3
 use chronik_common::{Result, Error};
 use chronik_monitoring::MetricsRecorder;
 use chronik_protocol::{
@@ -327,11 +328,10 @@ pub struct ProduceHandler {
     /// WAL manager for inline durability writes (v1.3.47+)
     /// Uses Arc<WalManager> directly - no RwLock needed since WalManager uses DashMap internally
     wal_manager: Option<Arc<WalManager>>,
-    /// Raft replica manager for multi-partition replication (optional, for Raft-enabled partitions)
-    /// If Some, produce requests will use Raft consensus for those partitions
-    /// If None, all produce requests use existing direct-write path (backward compatible)
-    #[cfg(feature = "raft")]
-    raft_manager: Option<Arc<crate::raft_integration::RaftReplicaManager>>,
+    /// Raft cluster for metadata coordination (v2.5.0 Phase 3)
+    /// CRITICAL: Option<Arc<>> NOT Arc<RwLock<>> to avoid hot path locks!
+    /// Used to query partition replicas and ISR for replication decisions
+    raft_cluster: Option<Arc<RaftCluster>>,
     /// WAL replication manager for PostgreSQL-style streaming (v2.2.0+)
     /// CRITICAL: Option<Arc<>> NOT Arc<RwLock<>> to avoid hot path locks!
     /// Fire-and-forget async replication, never blocks produce path
@@ -654,8 +654,7 @@ impl ProduceHandler {
             fetch_handler: None,
             topic_creation_cache: Arc::new(RwLock::new(HashMap::new())),
             wal_manager: None,
-            #[cfg(feature = "raft")]
-            raft_manager: None,
+            raft_cluster: None,  // v2.5.0 Phase 3: Initialize as None (set via set_raft_cluster)
             wal_replication_manager: None,  // v2.2.0 Phase 1: Initialize as None
         })
     }
@@ -691,11 +690,10 @@ impl ProduceHandler {
         self.fetch_handler = Some(fetch_handler);
     }
 
-    /// Set the Raft replica manager for Raft-enabled partitions (optional)
-    #[cfg(feature = "raft")]
-    pub fn set_raft_manager(&mut self, raft_manager: Arc<crate::raft_integration::RaftReplicaManager>) {
-        info!("Setting RaftReplicaManager for ProduceHandler");
-        self.raft_manager = Some(raft_manager);
+    /// Set the Raft cluster for metadata coordination (v2.5.0 Phase 3)
+    pub fn set_raft_cluster(&mut self, raft_cluster: Arc<RaftCluster>) {
+        info!("Setting RaftCluster for ProduceHandler - enables partition replication routing");
+        self.raft_cluster = Some(raft_cluster);
     }
 
     /// Set the WAL replication manager for PostgreSQL-style streaming (v2.2.0+)
@@ -1397,7 +1395,7 @@ impl ProduceHandler {
             serialized_for_replication = None;
         }
 
-        // v2.2.0: WAL Replication Hook (PostgreSQL-style streaming)
+        // v2.5.0 Phase 3: WAL Replication Hook with ISR-aware routing
         // Zero-copy optimization: Reuse serialized WAL data from above (no re-parsing!)
         // This is called AFTER WAL write completes, so data is durable locally
         if let Some(ref wal_repl_mgr) = self.wal_replication_manager {
@@ -1408,16 +1406,20 @@ impl ProduceHandler {
                 let base_offset_clone = base_offset as i64;
                 let repl_mgr_clone = Arc::clone(wal_repl_mgr);
 
+                // Get current high watermark for ISR filtering
+                let high_watermark = partition_state.high_watermark.load(Ordering::SeqCst) as i64;
+
                 // Spawn background task (fire-and-forget, never blocks)
-                // Send pre-serialized bincode bytes (no re-parsing, no re-serialization)
+                // v2.5.0: Use replicate_partition for ISR-aware routing
                 tokio::spawn(async move {
-                    repl_mgr_clone.replicate_serialized(
+                    repl_mgr_clone.replicate_partition(
                         topic_clone,
                         partition_clone,
                         base_offset_clone,
+                        high_watermark,  // For ISR filtering
                         serialized_data,
                     ).await;
-                    // Errors are logged inside replicate_serialized, we don't block produce
+                    // Errors are logged inside replicate_partition, we don't block produce
                 });
             } else {
                 // WAL manager was None, nothing to replicate
@@ -2481,8 +2483,7 @@ impl Clone for ProduceHandler {
             fetch_handler: self.fetch_handler.clone(),
             topic_creation_cache: Arc::clone(&self.topic_creation_cache),
             wal_manager: self.wal_manager.clone(),
-            #[cfg(feature = "raft")]
-            raft_manager: self.raft_manager.clone(),
+            raft_cluster: self.raft_cluster.clone(),  // v2.5.0 Phase 3
             wal_replication_manager: self.wal_replication_manager.clone(),  // v2.2.0 Phase 1
         }
     }

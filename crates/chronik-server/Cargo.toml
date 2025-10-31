@@ -28,9 +28,9 @@ chronik-query = { path = "../chronik-query", optional = true }
 chronik-backup = { path = "../chronik-backup", optional = true }
 
 # Raft consensus (v2.5.0 - metadata coordination only, NOT data replication)
-raft = { version = "0.7", optional = true }
-raft-proto = { version = "0.7", optional = true }
-prost = { version = "0.12", optional = true }
+raft = "0.7"
+raft-proto = "0.7"
+prost = "0.12"
 
 # Core dependencies
 tokio = { workspace = true }
@@ -82,10 +82,9 @@ tabled = "0.15"
 default = ["search", "backup"]
 search = ["dep:chronik-search", "dep:chronik-query"]
 backup = ["dep:chronik-backup"]
-raft = ["dep:raft", "dep:raft-proto", "dep:prost"]  # v2.5.0: Metadata coordination (NOT data replication)
-full = ["search", "backup", "raft"]
+full = ["search", "backup"]
 
-# Minimal build without optional features
+# Minimal build without optional features (Raft is always included)
 minimal = []
 
 [lints]

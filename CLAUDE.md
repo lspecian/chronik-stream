@@ -19,18 +19,14 @@ Chronik Stream is a high-performance Kafka-compatible streaming platform written
 # Build all components (default: standalone, ingest, search, all modes)
 cargo build --release
 
-# Build with Raft support (adds raft-cluster subcommand)
-# NOTE: This is the RECOMMENDED build - standalone mode still works!
-cargo build --release --bin chronik-server --features raft
-
-# Build specific binary (without Raft)
+# Build specific binary
 cargo build --release --bin chronik-server
 
 # Check without building
 cargo check --all-features --workspace
 ```
 
-**IMPORTANT**: Building with `--features raft` does NOT break standalone mode. It only adds the `raft-cluster` subcommand for multi-node deployments. All other modes (`standalone`, `ingest`, `search`, `all`) work identically.
+**IMPORTANT**: The chronik-server binary includes both standalone and multi-node Raft cluster modes. All modes (`standalone`, `ingest`, `search`, `all`, `raft-cluster`) are available in a single binary.
 
 ### Testing
 ```bash
@@ -614,12 +610,12 @@ cargo run --bin chronik-server -- --raft standalone  # Error: "Raft requires 3+ 
 
 #### Multi-Node Raft Cluster Setup
 
-**CRITICAL**: Must build with `--features raft` and specify `--node-id` for each node!
+**CRITICAL**: Must specify unique `--node-id` for each node!
 
 **Minimum 3 nodes required for quorum:**
 ```bash
-# Build with raft feature FIRST
-cargo build --release --bin chronik-server --features raft
+# Build server binary
+cargo build --release --bin chronik-server
 
 # Node 1 (port 9092)
 ./target/release/chronik-server \
@@ -653,7 +649,6 @@ cargo build --release --bin chronik-server --features raft
 ```
 
 **Common Mistakes (See [docs/RAFT_TESTING_GUIDE.md](docs/RAFT_TESTING_GUIDE.md) for details):**
-- ❌ Forgetting `--features raft` when building → "unrecognized subcommand 'raft-cluster'"
 - ❌ Forgetting `--node-id N` → All nodes default to node_id=1, leader election fails
 - ❌ Using `all` or `standalone` mode → Multi-node Raft rejected
 - ❌ Using `cluster` subcommand → That's the mock CLI, not for starting clusters
@@ -755,26 +750,38 @@ s3://{bucket}/{prefix}/snapshots/{topic}/{partition}/{snapshot_id}.snap
 
 ```bash
 # Start Raft cluster with snapshots enabled (default)
-cargo run --features raft --bin chronik-server -- \
+cargo run --bin chronik-server -- \
   --node-id 1 \
-  --advertised-addr localhost:9092 \
-  standalone --raft
+  --advertised-addr localhost \
+  --kafka-port 9092 \
+  raft-cluster \
+  --raft-addr 0.0.0.0:9192 \
+  --peers "2@localhost:9193,3@localhost:9194" \
+  --bootstrap
 
 # Disable snapshots for testing
-CHRONIK_SNAPSHOT_ENABLED=false cargo run --features raft --bin chronik-server -- \
+CHRONIK_SNAPSHOT_ENABLED=false cargo run --bin chronik-server -- \
   --node-id 1 \
-  --advertised-addr localhost:9092 \
-  standalone --raft
+  --advertised-addr localhost \
+  --kafka-port 9092 \
+  raft-cluster \
+  --raft-addr 0.0.0.0:9192 \
+  --peers "2@localhost:9193,3@localhost:9194" \
+  --bootstrap
 
 # Custom snapshot configuration
 CHRONIK_SNAPSHOT_LOG_THRESHOLD=50000 \
 CHRONIK_SNAPSHOT_TIME_THRESHOLD_SECS=7200 \
 CHRONIK_SNAPSHOT_COMPRESSION=zstd \
 CHRONIK_SNAPSHOT_RETENTION_COUNT=5 \
-cargo run --features raft --bin chronik-server -- \
+cargo run --bin chronik-server -- \
   --node-id 1 \
-  --advertised-addr localhost:9092 \
-  standalone --raft
+  --advertised-addr localhost \
+  --kafka-port 9092 \
+  raft-cluster \
+  --raft-addr 0.0.0.0:9192 \
+  --peers "2@localhost:9193,3@localhost:9194" \
+  --bootstrap
 ```
 
 #### Monitoring
