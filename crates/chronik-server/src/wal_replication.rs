@@ -192,26 +192,20 @@ impl WalReplicationManager {
             }
         };
 
-        // Send to each follower (parallel)
-        let mut send_tasks = vec![];
+        // Send to each follower sequentially (DashMap doesn't allow moving RefMut into tasks)
         for follower_addr in &self.followers {
             if let Some(mut conn) = self.connections.get_mut(follower_addr) {
-                let frame_clone = frame.clone();
-                let follower_addr_clone = follower_addr.clone();
-
-                send_tasks.push(tokio::spawn(async move {
-                    if let Err(e) = conn.write_all(&frame_clone).await {
-                        error!("Failed to send WAL record to {}: {}", follower_addr_clone, e);
-                        return Err(e);
-                    }
-                    Ok(())
-                }));
+                // Write frame to TCP stream
+                // Note: This is fast (~1ms) so sequential is fine
+                if let Err(e) = conn.write_all(&frame).await {
+                    error!("Failed to send WAL record to {}: {}", follower_addr, e);
+                    // Remove dead connection (connection manager will reconnect)
+                    drop(conn); // Drop RefMut before removing
+                    self.connections.remove(follower_addr);
+                } else {
+                    debug!("Sent WAL record to follower: {}", follower_addr);
+                }
             }
-        }
-
-        // Await all sends (don't block on failures)
-        for task in send_tasks {
-            let _ = task.await;
         }
     }
 

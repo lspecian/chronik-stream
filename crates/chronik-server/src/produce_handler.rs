@@ -39,33 +39,8 @@ use tokio::time::timeout;
 use tracing::{debug, error, info, warn, trace, instrument};
 use bytes::Bytes;
 
-/// WAL Replication Manager for PostgreSQL-style streaming (v2.2.0+)
-///
-/// Stub implementation - Phase 1: Structure only, no functionality yet
-/// This allows us to add the field without changing behavior
-#[derive(Debug, Clone)]
-pub struct WalReplicationManager {
-    // Placeholder - will be populated in Phase 3
-    _placeholder: (),
-}
-
-impl WalReplicationManager {
-    /// Create a new WAL replication manager (stub for Phase 1)
-    pub fn new() -> Self {
-        Self {
-            _placeholder: (),
-        }
-    }
-
-    /// Replicate a WAL record to followers (Phase 2: stub implementation)
-    ///
-    /// This is fire-and-forget - spawns a task that returns immediately
-    /// Errors are logged but don't block the produce path
-    pub async fn replicate_async(&self, _topic: String, _partition: i32, _offset: i64) {
-        // Phase 2: No-op stub - just return immediately
-        // Phase 3 will implement actual replication logic
-    }
-}
+/// Re-export WalReplicationManager from wal_replication module (v2.2.0 Phase 3.1)
+pub use crate::wal_replication::WalReplicationManager;
 
 /// Maximum segment size before rotation (256MB)
 const MAX_SEGMENT_SIZE: u64 = 256 * 1024 * 1024;
@@ -722,7 +697,13 @@ impl ProduceHandler {
         info!("Setting RaftReplicaManager for ProduceHandler");
         self.raft_manager = Some(raft_manager);
     }
-    
+
+    /// Set the WAL replication manager for PostgreSQL-style streaming (v2.2.0+)
+    pub fn set_wal_replication_manager(&mut self, replication_manager: Arc<WalReplicationManager>) {
+        info!("Setting WalReplicationManager for ProduceHandler");
+        self.wal_replication_manager = Some(replication_manager);
+    }
+
     /// Create a new produce handler with fetch handler connected
     pub async fn new_with_fetch_handler(
         config: ProduceHandlerConfig,
@@ -1401,6 +1382,39 @@ impl ProduceHandler {
             }
         }
 
+        // v2.2.0: WAL Replication Hook (PostgreSQL-style streaming)
+        // Fire-and-forget async replication to followers - NEVER blocks produce path
+        // This is called AFTER WAL write completes, so data is durable locally
+        if let Some(ref wal_repl_mgr) = self.wal_replication_manager {
+            // Clone necessary data to avoid lifetime issues in spawned task
+            let topic_clone = topic.to_string();
+            let partition_clone = partition;
+            let base_offset_clone = base_offset as i64;
+            let repl_mgr_clone = Arc::clone(wal_repl_mgr);
+
+            // Parse CanonicalRecord for replication (need to send to followers)
+            use chronik_storage::canonical_record::CanonicalRecord;
+            if let Ok(mut canonical_record) = CanonicalRecord::from_kafka_batch(&re_encoded_bytes) {
+                // Preserve wire bytes for CRC validation on follower
+                canonical_record.compressed_records_wire_bytes = Some(re_encoded_bytes.to_vec());
+
+                // Spawn background task (fire-and-forget, never blocks)
+                tokio::spawn(async move {
+                    repl_mgr_clone.replicate_async(
+                        topic_clone,
+                        partition_clone,
+                        base_offset_clone,
+                        canonical_record,
+                    ).await;
+                    // Errors are logged inside replicate_async, we don't block produce
+                });
+            } else {
+                // Log parse error but don't fail produce (local write already succeeded)
+                warn!("Failed to parse CanonicalRecord for replication on {}-{}, skipping replication",
+                      topic, partition);
+            }
+        }
+
         // Buffer the batch for non-Raft partitions
         #[cfg(feature = "raft")]
         {
@@ -1552,16 +1566,8 @@ impl ProduceHandler {
             warn!("Failed to flush partition {}-{}: {:?}", topic, partition, e);
         }
 
-        // v2.2.0 Phase 2: WAL Replication Hook (fire-and-forget)
-        // This is called AFTER all v2.1.0 logic completes
-        // CRITICAL: Non-blocking! Spawns async task, never blocks produce path
-        if let Some(ref repl_mgr) = self.wal_replication_manager {
-            let repl_mgr_clone = Arc::clone(repl_mgr);
-            let topic_owned = topic.to_string();
-            tokio::spawn(async move {
-                repl_mgr_clone.replicate_async(topic_owned, partition, base_offset as i64).await;
-            });
-        }
+        // v2.2.0: WAL replication hook already called earlier (after WAL write, before buffering)
+        // No need to duplicate the call here
 
         // Get partition state for response
         let log_start_offset = partition_state.log_start_offset.load(Ordering::Relaxed) as i64;

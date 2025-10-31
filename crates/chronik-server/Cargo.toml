@@ -60,6 +60,7 @@ dashmap = { workspace = true }
 parking_lot = { workspace = true }
 murmur2 = { workspace = true }
 crossbeam = "0.8"  # Lock-free queues for WAL replication
+crc32fast = "1.4"  # CRC32 checksums for WAL replication frames
 
 # Socket configuration
 socket2 = "0.5"
