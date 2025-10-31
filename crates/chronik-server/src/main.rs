@@ -25,6 +25,7 @@ mod offset_storage;
 mod coordinator_manager;
 mod wal_integration;
 mod metadata_dr;
+mod wal_replication;  // v2.2.0: PostgreSQL-style WAL streaming
 // Removed raft_integration and raft_cluster modules (v2.2.0 - Raft removed)
 mod cli;
 

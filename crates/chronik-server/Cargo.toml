@@ -59,6 +59,7 @@ async-trait = { workspace = true }
 dashmap = { workspace = true }
 parking_lot = { workspace = true }
 murmur2 = { workspace = true }
+crossbeam = "0.8"  # Lock-free queues for WAL replication
 
 # Socket configuration
 socket2 = "0.5"

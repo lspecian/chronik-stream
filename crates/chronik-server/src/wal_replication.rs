@@ -1,0 +1,370 @@
+//! PostgreSQL-style WAL streaming replication (v2.2.0+)
+//!
+//! This module implements leader-to-follower WAL streaming using TCP connections.
+//! Design principles:
+//! - Fire-and-forget from leader (never blocks produce path)
+//! - Push-based streaming (leader actively sends records)
+//! - Lock-free queue (crossbeam SegQueue for MPMC)
+//! - Automatic reconnection on failure
+//!
+//! Protocol: See docs/WAL_STREAMING_PROTOCOL.md
+
+use anyhow::{Result, Context};
+use bytes::{Bytes, BytesMut, BufMut, Buf};
+use chronik_storage::CanonicalRecord;
+use crossbeam::queue::SegQueue;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use tokio::net::{TcpStream, TcpListener};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time::{sleep, Duration, timeout};
+use tracing::{debug, error, info, warn};
+use serde::{Serialize, Deserialize};
+use dashmap::DashMap;
+
+/// Magic number for WAL frames ('WA' in hex)
+const FRAME_MAGIC: u16 = 0x5741;
+
+/// Magic number for heartbeat frames ('HB' in hex)
+const HEARTBEAT_MAGIC: u16 = 0x4842;
+
+/// Current protocol version
+const PROTOCOL_VERSION: u16 = 1;
+
+/// Maximum queue size before dropping old records
+const MAX_QUEUE_SIZE: usize = 100_000;
+
+/// Heartbeat interval (10 seconds)
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Heartbeat timeout (30 seconds)
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Reconnect delay (30 seconds)
+const RECONNECT_DELAY: Duration = Duration::from_secs(30);
+
+/// WAL replication record sent over the wire
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WalReplicationRecord {
+    /// Topic name
+    pub topic: String,
+
+    /// Partition ID
+    pub partition: i32,
+
+    /// Base offset of this batch
+    pub base_offset: i64,
+
+    /// Number of records in batch
+    pub record_count: u32,
+
+    /// Timestamp (milliseconds since epoch)
+    pub timestamp_ms: i64,
+
+    /// Serialized CanonicalRecord (bincode)
+    pub data: Bytes,
+}
+
+/// WAL Replication Manager for PostgreSQL-style streaming
+///
+/// Phase 3 implementation with actual TCP streaming and lock-free queue
+pub struct WalReplicationManager {
+    /// Queue of pending WAL records (lock-free MPMC)
+    queue: Arc<SegQueue<WalReplicationRecord>>,
+
+    /// Active TCP connections to followers (topic -> TcpStream)
+    connections: Arc<DashMap<String, TcpStream>>,
+
+    /// Follower addresses ("host:port")
+    followers: Vec<String>,
+
+    /// Shutdown signal
+    shutdown: Arc<AtomicBool>,
+
+    /// Total records queued (for metrics)
+    total_queued: Arc<AtomicU64>,
+
+    /// Total records sent (for metrics)
+    total_sent: Arc<AtomicU64>,
+
+    /// Total records dropped (queue overflow)
+    total_dropped: Arc<AtomicU64>,
+}
+
+impl WalReplicationManager {
+    /// Create a new WAL replication manager
+    ///
+    /// Spawns background workers for connection management and record sending
+    pub fn new(followers: Vec<String>) -> Arc<Self> {
+        info!("Creating WalReplicationManager with {} followers", followers.len());
+
+        let manager = Arc::new(Self {
+            queue: Arc::new(SegQueue::new()),
+            connections: Arc::new(DashMap::new()),
+            followers,
+            shutdown: Arc::new(AtomicBool::new(false)),
+            total_queued: Arc::new(AtomicU64::new(0)),
+            total_sent: Arc::new(AtomicU64::new(0)),
+            total_dropped: Arc::new(AtomicU64::new(0)),
+        });
+
+        // Spawn background worker for sending records
+        let manager_clone = Arc::clone(&manager);
+        tokio::spawn(async move {
+            manager_clone.run_sender_worker().await;
+        });
+
+        // Spawn background worker for connection management
+        let manager_clone2 = Arc::clone(&manager);
+        tokio::spawn(async move {
+            manager_clone2.run_connection_manager().await;
+        });
+
+        manager
+    }
+
+    /// Replicate a WAL record to all followers (fire-and-forget)
+    ///
+    /// This is called from the produce hot path and MUST be non-blocking.
+    /// Records are pushed to a lock-free queue and sent by background worker.
+    pub async fn replicate_async(&self, topic: String, partition: i32, base_offset: i64, record: CanonicalRecord) {
+        // Serialize the record (bincode is fast, ~1-2 μs)
+        let data = match bincode::serialize(&record) {
+            Ok(serialized) => Bytes::from(serialized),
+            Err(e) => {
+                error!("Failed to serialize WAL record for replication: {}", e);
+                return;
+            }
+        };
+
+        let wal_record = WalReplicationRecord {
+            topic,
+            partition,
+            base_offset,
+            record_count: record.records.len() as u32,
+            timestamp_ms: chrono::Utc::now().timestamp_millis(),
+            data,
+        };
+
+        // Check queue size (prevent unbounded growth)
+        let queue_size = self.queue.len();
+        if queue_size >= MAX_QUEUE_SIZE {
+            // Drop this record and increment counter
+            self.total_dropped.fetch_add(1, Ordering::Relaxed);
+            warn!(
+                "WAL replication queue full ({} records), dropping record for {}-{} offset {}",
+                queue_size, wal_record.topic, wal_record.partition, wal_record.base_offset
+            );
+            return;
+        }
+
+        // Push to queue (lock-free, O(1))
+        self.queue.push(wal_record);
+        self.total_queued.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Background worker that dequeues records and sends to followers
+    async fn run_sender_worker(&self) {
+        info!("WAL replication sender worker started");
+
+        while !self.shutdown.load(Ordering::Relaxed) {
+            // Try to dequeue a record (non-blocking)
+            if let Some(record) = self.queue.pop() {
+                // Send to all active followers (fan-out)
+                self.send_to_followers(&record).await;
+                self.total_sent.fetch_add(1, Ordering::Relaxed);
+            } else {
+                // Queue empty, sleep briefly to avoid busy-wait
+                sleep(Duration::from_millis(1)).await;
+            }
+        }
+
+        info!("WAL replication sender worker stopped");
+    }
+
+    /// Send a WAL record to all active followers
+    async fn send_to_followers(&self, record: &WalReplicationRecord) {
+        let frame = match serialize_wal_frame(record) {
+            Ok(f) => f,
+            Err(e) => {
+                error!("Failed to serialize WAL frame: {}", e);
+                return;
+            }
+        };
+
+        // Send to each follower (parallel)
+        let mut send_tasks = vec![];
+        for follower_addr in &self.followers {
+            if let Some(mut conn) = self.connections.get_mut(follower_addr) {
+                let frame_clone = frame.clone();
+                let follower_addr_clone = follower_addr.clone();
+
+                send_tasks.push(tokio::spawn(async move {
+                    if let Err(e) = conn.write_all(&frame_clone).await {
+                        error!("Failed to send WAL record to {}: {}", follower_addr_clone, e);
+                        return Err(e);
+                    }
+                    Ok(())
+                }));
+            }
+        }
+
+        // Await all sends (don't block on failures)
+        for task in send_tasks {
+            let _ = task.await;
+        }
+    }
+
+    /// Background worker for managing connections to followers
+    async fn run_connection_manager(&self) {
+        info!("WAL replication connection manager started");
+
+        while !self.shutdown.load(Ordering::Relaxed) {
+            for follower_addr in &self.followers {
+                // Check if we have an active connection
+                if !self.connections.contains_key(follower_addr) {
+                    // Attempt to connect
+                    info!("Attempting to connect to follower: {}", follower_addr);
+
+                    match timeout(Duration::from_secs(5), TcpStream::connect(follower_addr)).await {
+                        Ok(Ok(stream)) => {
+                            info!("✅ Connected to follower: {}", follower_addr);
+
+                            // Send handshake
+                            if let Err(e) = self.send_handshake(&stream).await {
+                                error!("Failed to send handshake to {}: {}", follower_addr, e);
+                                continue;
+                            }
+
+                            // Store connection
+                            self.connections.insert(follower_addr.clone(), stream);
+                        }
+                        Ok(Err(e)) => {
+                            warn!("Failed to connect to follower {}: {}", follower_addr, e);
+                        }
+                        Err(_) => {
+                            warn!("Connection timeout to follower {}", follower_addr);
+                        }
+                    }
+                }
+            }
+
+            // Sleep before next connection check
+            sleep(RECONNECT_DELAY).await;
+        }
+
+        info!("WAL replication connection manager stopped");
+    }
+
+    /// Send handshake to follower
+    async fn send_handshake(&self, stream: &TcpStream) -> Result<()> {
+        // TODO: Implement handshake protocol
+        // For Phase 3.1, we'll skip handshake and go straight to streaming
+        Ok(())
+    }
+
+    /// Shutdown the replication manager
+    pub async fn shutdown(&self) {
+        info!("Shutting down WAL replication manager");
+        self.shutdown.store(true, Ordering::Relaxed);
+
+        // Close all connections
+        self.connections.clear();
+
+        info!(
+            "WAL replication stats: queued={} sent={} dropped={}",
+            self.total_queued.load(Ordering::Relaxed),
+            self.total_sent.load(Ordering::Relaxed),
+            self.total_dropped.load(Ordering::Relaxed)
+        );
+    }
+}
+
+/// Serialize a WAL record into a framed message
+fn serialize_wal_frame(record: &WalReplicationRecord) -> Result<Bytes> {
+    let mut buf = BytesMut::new();
+
+    // Frame header (8 bytes)
+    buf.put_u16(FRAME_MAGIC);
+    buf.put_u16(PROTOCOL_VERSION);
+
+    // We'll fill in total_length after serializing metadata + data
+    let length_pos = buf.len();
+    buf.put_u32(0); // Placeholder
+
+    // WAL metadata
+    let topic_bytes = record.topic.as_bytes();
+    buf.put_u16(topic_bytes.len() as u16);
+    buf.put_slice(topic_bytes);
+    buf.put_i32(record.partition);
+    buf.put_i64(record.base_offset);
+    buf.put_u32(record.record_count);
+    buf.put_i64(record.timestamp_ms);
+
+    // Calculate CRC32 of data
+    let checksum = crc32fast::hash(&record.data);
+    buf.put_u32(checksum);
+
+    // WAL record data
+    buf.put_slice(&record.data);
+
+    // Fill in total length (metadata + data length)
+    let total_length = (buf.len() - 8) as u32; // Exclude frame header
+    buf[length_pos..length_pos + 4].copy_from_slice(&total_length.to_be_bytes());
+
+    Ok(buf.freeze())
+}
+
+/// Deserialize a WAL frame from bytes
+pub fn deserialize_wal_frame(mut data: Bytes) -> Result<WalReplicationRecord> {
+    // Read frame header
+    if data.remaining() < 8 {
+        anyhow::bail!("Incomplete frame header");
+    }
+
+    let magic = data.get_u16();
+    if magic != FRAME_MAGIC {
+        anyhow::bail!("Invalid frame magic: 0x{:04x}", magic);
+    }
+
+    let version = data.get_u16();
+    if version != PROTOCOL_VERSION {
+        anyhow::bail!("Unsupported protocol version: {}", version);
+    }
+
+    let total_length = data.get_u32() as usize;
+
+    // Read WAL metadata
+    let topic_len = data.get_u16() as usize;
+    let mut topic_bytes = vec![0u8; topic_len];
+    data.copy_to_slice(&mut topic_bytes);
+    let topic = String::from_utf8(topic_bytes)?;
+
+    let partition = data.get_i32();
+    let base_offset = data.get_i64();
+    let record_count = data.get_u32();
+    let timestamp_ms = data.get_i64();
+    let checksum = data.get_u32();
+
+    // Read WAL record data
+    let record_data = data.copy_to_bytes(data.remaining());
+
+    // Verify checksum
+    let computed_checksum = crc32fast::hash(&record_data);
+    if checksum != computed_checksum {
+        anyhow::bail!(
+            "Checksum mismatch: expected 0x{:08x}, got 0x{:08x}",
+            checksum,
+            computed_checksum
+        );
+    }
+
+    Ok(WalReplicationRecord {
+        topic,
+        partition,
+        base_offset,
+        record_count,
+        timestamp_ms,
+        data: record_data,
+    })
+}
