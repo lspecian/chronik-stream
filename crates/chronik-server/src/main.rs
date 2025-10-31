@@ -25,10 +25,7 @@ mod offset_storage;
 mod coordinator_manager;
 mod wal_integration;
 mod metadata_dr;
-#[cfg(feature = "raft")]
-mod raft_integration;
-#[cfg(feature = "raft")]
-mod raft_cluster;
+// Removed raft_integration and raft_cluster modules (v2.2.0 - Raft removed)
 mod cli;
 
 use integrated_server::{IntegratedKafkaServer, IntegratedServerConfig};
@@ -236,9 +233,7 @@ enum Commands {
         action: CompactAction,
     },
 
-    /// Cluster management commands
-    #[command(about = "Manage Raft cluster operations")]
-    Cluster(cli::ClusterCommand),
+    // Removed Cluster command (v2.2.0 - Raft removed)
 }
 
 /// Parse object store configuration from environment variables
@@ -579,9 +574,7 @@ async fn main() -> Result<()> {
             handle_compaction_command(&cli, action.clone()).await?;
         }
 
-        Some(Commands::Cluster(ref cluster_cmd)) => {
-            cluster_cmd.execute().await?;
-        }
+        // Removed Cluster command (v2.2.0 - Raft removed)
 
         None => {
             // Default to standalone mode
