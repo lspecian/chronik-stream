@@ -31,6 +31,8 @@ mod wal_replication;  // v2.2.0: PostgreSQL-style WAL streaming
 // v2.5.0 Phase 2: Raft for metadata coordination only (NOT data replication)
 #[cfg(feature = "raft")]
 mod raft_metadata;
+#[cfg(feature = "raft")]
+mod raft_cluster;
 
 // Compatibility shim for old chronik_raft references (temporary until full migration)
 mod chronik_raft_compat;

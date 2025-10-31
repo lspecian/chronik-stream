@@ -105,6 +105,10 @@ pub struct IntegratedKafkaServer {
     metadata_store: Arc<dyn MetadataStore>,
     wal_indexer: Arc<WalIndexer>,
     metadata_uploader: Option<Arc<chronik_common::metadata::MetadataUploader>>,
+    /// Optional Raft cluster for metadata coordination (v2.5.0 Phase 2)
+    /// Only initialized when cluster mode is requested
+    #[cfg(feature = "raft")]
+    raft_cluster: Option<Arc<crate::raft_cluster::RaftCluster>>,
 }
 
 impl Clone for IntegratedKafkaServer {
@@ -115,6 +119,8 @@ impl Clone for IntegratedKafkaServer {
             metadata_store: self.metadata_store.clone(),
             wal_indexer: self.wal_indexer.clone(),
             metadata_uploader: self.metadata_uploader.clone(),
+            #[cfg(feature = "raft")]
+            raft_cluster: self.raft_cluster.clone(),
         }
     }
 }
@@ -933,6 +939,38 @@ impl IntegratedKafkaServer {
         #[cfg(feature = "raft")]
         let cluster_config_clone = config.cluster_config.clone();
 
+        // Initialize Raft cluster if clustering is enabled (v2.5.0 Phase 2)
+        #[cfg(feature = "raft")]
+        let raft_cluster = if let Some(ref cluster_config) = config.cluster_config {
+            if cluster_config.enabled {
+                info!("Initializing Raft cluster for metadata coordination (v2.5.0 Phase 2)");
+
+                // Extract peer information
+                let peers: Vec<(u64, String)> = cluster_config.peers.iter()
+                    .filter(|p| p.id != cluster_config.node_id) // Exclude self
+                    .map(|p| (p.id, format!("{}:{}", p.host, p.port)))
+                    .collect();
+
+                match crate::raft_cluster::RaftCluster::bootstrap(cluster_config.node_id, peers).await {
+                    Ok(cluster) => {
+                        info!("✓ Raft cluster initialized successfully (node_id={})", cluster_config.node_id);
+                        Some(Arc::new(cluster))
+                    }
+                    Err(e) => {
+                        warn!("Failed to initialize Raft cluster: {:?}", e);
+                        warn!("Server will run in standalone mode (no Raft metadata coordination)");
+                        None
+                    }
+                }
+            } else {
+                info!("Clustering disabled in config, running in standalone mode");
+                None
+            }
+        } else {
+            info!("No cluster config provided, running in standalone mode");
+            None
+        };
+
         // Create default topic on startup to ensure clients can connect
         // This solves the chicken-and-egg problem where clients need at least one topic
         // in metadata responses before they can produce messages
@@ -942,6 +980,8 @@ impl IntegratedKafkaServer {
             metadata_store: metadata_store.clone(),
             wal_indexer,
             metadata_uploader,
+            #[cfg(feature = "raft")]
+            raft_cluster,
         };
 
         // Create default topic
@@ -1026,7 +1066,15 @@ impl IntegratedKafkaServer {
     pub fn get_wal_indexer(&self) -> Arc<WalIndexer> {
         self.wal_indexer.clone()
     }
-    
+
+    /// Get Raft cluster (v2.5.0 Phase 2)
+    ///
+    /// Returns None if clustering is disabled or Raft feature is not enabled.
+    #[cfg(feature = "raft")]
+    pub fn get_raft_cluster(&self) -> Option<Arc<crate::raft_cluster::RaftCluster>> {
+        self.raft_cluster.clone()
+    }
+
     /// Assign existing partitions to cluster nodes (Phase 3.4)
     ///
     /// This method is called on cluster startup to ensure all partitions have assignments.
