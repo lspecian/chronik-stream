@@ -123,7 +123,47 @@ impl WalReplicationManager {
         manager
     }
 
+    /// Replicate pre-serialized WAL data to all followers (fire-and-forget, zero-copy)
+    ///
+    /// v2.2.0 OPTIMIZATION: Takes pre-serialized bincode bytes from WAL write.
+    /// This avoids redundant parsing and serialization in the hot path.
+    ///
+    /// This is called from the produce hot path and MUST be non-blocking.
+    /// Records are pushed to a lock-free queue and sent by background worker.
+    pub async fn replicate_serialized(&self, topic: String, partition: i32, base_offset: i64, serialized_data: Vec<u8>) {
+        // Data is already bincode-serialized CanonicalRecord from WAL write
+        // Zero-copy: Just wrap in Bytes (cheap Arc clone)
+        let data = Bytes::from(serialized_data);
+
+        // We don't know record_count from serialized data, but it's just for metrics
+        // Set to 0 (or we could deserialize just to count, but that defeats optimization)
+        let wal_record = WalReplicationRecord {
+            topic,
+            partition,
+            base_offset,
+            record_count: 0, // Unknown from serialized data (metrics only)
+            timestamp_ms: chrono::Utc::now().timestamp_millis(),
+            data,
+        };
+
+        // Check queue size (prevent unbounded growth)
+        let queue_size = self.queue.len();
+        if queue_size > MAX_QUEUE_SIZE {
+            // Drop oldest records to prevent memory exhaustion
+            self.total_dropped.fetch_add(1, Ordering::Relaxed);
+            warn!("WAL replication queue overflow ({} records), dropping record", queue_size);
+            return;
+        }
+
+        // Push to queue (lock-free, ~10 ns)
+        self.queue.push(wal_record);
+        self.total_queued.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Replicate a WAL record to all followers (fire-and-forget)
+    ///
+    /// DEPRECATED: Use replicate_serialized() for zero-copy replication.
+    /// This method is kept for backwards compatibility only.
     ///
     /// This is called from the produce hot path and MUST be non-blocking.
     /// Records are pushed to a lock-free queue and sent by background worker.

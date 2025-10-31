@@ -1335,13 +1335,18 @@ impl ProduceHandler {
 
         // CRITICAL (v1.3.47+): Write to WAL BEFORE updating high watermark
         // This ensures durability guarantee - data is persisted before acknowledgment
+        // v2.2.0: Parse and serialize ONCE, reuse for both local WAL and replication
         if self.wal_manager.is_none() {
             warn!("WAL manager is None - WAL writes DISABLED! Data will NOT be durable!");
         }
+
+        // v2.2.0: Store serialized WAL data for replication (zero-copy optimization)
+        let serialized_for_replication: Option<Vec<u8>>;
+
         if let Some(ref wal_mgr) = self.wal_manager {
             use chronik_storage::canonical_record::CanonicalRecord;
 
-            // Convert to CanonicalRecord and serialize
+            // Convert to CanonicalRecord and serialize (ONCE - reused for replication)
             match CanonicalRecord::from_kafka_batch(&re_encoded_bytes) {
                 Ok(mut canonical_record) => {
                     // Preserve original wire bytes for byte-perfect CRC
@@ -1349,6 +1354,14 @@ impl ProduceHandler {
 
                     match bincode::serialize(&canonical_record) {
                         Ok(serialized) => {
+                            // v2.2.0: Clone serialized data for replication ONLY if replication is enabled
+                            // Avoids unnecessary allocation when replication is disabled
+                            serialized_for_replication = if self.wal_replication_manager.is_some() {
+                                Some(serialized.clone())
+                            } else {
+                                None
+                            };
+
                             // v1.3.52+: Group commit with acks parameter
                             // - acks=0: Fire-and-forget (buffered, ~50ms flush window)
                             // - acks=1/−1: Immediate fsync (zero data loss guarantee)
@@ -1380,38 +1393,35 @@ impl ProduceHandler {
                     return Err(Error::Protocol(format!("Invalid Kafka batch: {}", e)));
                 }
             }
+        } else {
+            serialized_for_replication = None;
         }
 
         // v2.2.0: WAL Replication Hook (PostgreSQL-style streaming)
-        // Fire-and-forget async replication to followers - NEVER blocks produce path
+        // Zero-copy optimization: Reuse serialized WAL data from above (no re-parsing!)
         // This is called AFTER WAL write completes, so data is durable locally
         if let Some(ref wal_repl_mgr) = self.wal_replication_manager {
-            // Clone necessary data to avoid lifetime issues in spawned task
-            let topic_clone = topic.to_string();
-            let partition_clone = partition;
-            let base_offset_clone = base_offset as i64;
-            let repl_mgr_clone = Arc::clone(wal_repl_mgr);
-
-            // Parse CanonicalRecord for replication (need to send to followers)
-            use chronik_storage::canonical_record::CanonicalRecord;
-            if let Ok(mut canonical_record) = CanonicalRecord::from_kafka_batch(&re_encoded_bytes) {
-                // Preserve wire bytes for CRC validation on follower
-                canonical_record.compressed_records_wire_bytes = Some(re_encoded_bytes.to_vec());
+            if let Some(serialized_data) = serialized_for_replication {
+                // Clone necessary metadata (cheap - just strings and ints)
+                let topic_clone = topic.to_string();
+                let partition_clone = partition;
+                let base_offset_clone = base_offset as i64;
+                let repl_mgr_clone = Arc::clone(wal_repl_mgr);
 
                 // Spawn background task (fire-and-forget, never blocks)
+                // Send pre-serialized bincode bytes (no re-parsing, no re-serialization)
                 tokio::spawn(async move {
-                    repl_mgr_clone.replicate_async(
+                    repl_mgr_clone.replicate_serialized(
                         topic_clone,
                         partition_clone,
                         base_offset_clone,
-                        canonical_record,
+                        serialized_data,
                     ).await;
-                    // Errors are logged inside replicate_async, we don't block produce
+                    // Errors are logged inside replicate_serialized, we don't block produce
                 });
             } else {
-                // Log parse error but don't fail produce (local write already succeeded)
-                warn!("Failed to parse CanonicalRecord for replication on {}-{}, skipping replication",
-                      topic, partition);
+                // WAL manager was None, nothing to replicate
+                warn!("Skipping replication for {}-{}: no WAL data serialized", topic, partition);
             }
         }
 
