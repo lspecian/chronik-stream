@@ -336,6 +336,9 @@ pub struct ProduceHandler {
     /// CRITICAL: Option<Arc<>> NOT Arc<RwLock<>> to avoid hot path locks!
     /// Fire-and-forget async replication, never blocks produce path
     wal_replication_manager: Option<Arc<WalReplicationManager>>,
+    /// ISR ACK tracker for acks=-1 quorum support (v2.5.0 Phase 4)
+    /// Tracks pending acks=-1 requests and notifies when ISR quorum reached
+    isr_ack_tracker: Option<Arc<crate::isr_ack_tracker::IsrAckTracker>>,
 }
 
 /// Replication request for ISR management
@@ -656,6 +659,7 @@ impl ProduceHandler {
             wal_manager: None,
             raft_cluster: None,  // v2.5.0 Phase 3: Initialize as None (set via set_raft_cluster)
             wal_replication_manager: None,  // v2.2.0 Phase 1: Initialize as None
+            isr_ack_tracker: None,  // v2.5.0 Phase 4: Initialize as None (set via set_isr_ack_tracker)
         })
     }
 
@@ -700,6 +704,12 @@ impl ProduceHandler {
     pub fn set_wal_replication_manager(&mut self, replication_manager: Arc<WalReplicationManager>) {
         info!("Setting WalReplicationManager for ProduceHandler");
         self.wal_replication_manager = Some(replication_manager);
+    }
+
+    /// Set the ISR ACK tracker for acks=-1 quorum support (v2.5.0 Phase 4)
+    pub fn set_isr_ack_tracker(&mut self, tracker: Arc<crate::isr_ack_tracker::IsrAckTracker>) {
+        info!("Setting IsrAckTracker for ProduceHandler - enables acks=-1 quorum");
+        self.isr_ack_tracker = Some(tracker);
     }
 
     /// Create a new produce handler with fetch handler connected
@@ -2485,6 +2495,7 @@ impl Clone for ProduceHandler {
             wal_manager: self.wal_manager.clone(),
             raft_cluster: self.raft_cluster.clone(),  // v2.5.0 Phase 3
             wal_replication_manager: self.wal_replication_manager.clone(),  // v2.2.0 Phase 1
+            isr_ack_tracker: self.isr_ack_tracker.clone(),  // v2.5.0 Phase 4
         }
     }
 }

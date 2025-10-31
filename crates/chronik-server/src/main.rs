@@ -31,6 +31,8 @@ mod raft_metadata;
 mod raft_cluster;
 // v2.5.0 Phase 3: ISR tracking for partition replication
 mod isr_tracker;
+// v2.5.0 Phase 4: ISR ACK tracking for acks=-1 quorum support
+mod isr_ack_tracker;
 
 mod cli;
 
