@@ -26,7 +26,11 @@ chronik-config = { path = "../chronik-config" }  # Required for cluster configur
 chronik-search = { path = "../chronik-search", optional = true }
 chronik-query = { path = "../chronik-query", optional = true }
 chronik-backup = { path = "../chronik-backup", optional = true }
-# Removed chronik-raft and raft dependencies (v2.2.0 - moving to WAL streaming)
+
+# Raft consensus (v2.5.0 - metadata coordination only, NOT data replication)
+raft = { version = "0.7", optional = true }
+raft-proto = { version = "0.7", optional = true }
+prost = { version = "0.12", optional = true }
 
 # Core dependencies
 tokio = { workspace = true }
@@ -78,8 +82,8 @@ tabled = "0.15"
 default = ["search", "backup"]
 search = ["dep:chronik-search", "dep:chronik-query"]
 backup = ["dep:chronik-backup"]
-# Removed raft feature (v2.2.0 - migrating to WAL streaming replication)
-full = ["search", "backup"]
+raft = ["dep:raft", "dep:raft-proto", "dep:prost"]  # v2.5.0: Metadata coordination (NOT data replication)
+full = ["search", "backup", "raft"]
 
 # Minimal build without optional features
 minimal = []

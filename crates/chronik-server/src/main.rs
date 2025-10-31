@@ -27,6 +27,16 @@ mod wal_integration;
 mod metadata_dr;
 mod wal_replication;  // v2.2.0: PostgreSQL-style WAL streaming
 // Removed raft_integration and raft_cluster modules (v2.2.0 - Raft removed)
+
+// v2.5.0 Phase 2: Raft for metadata coordination only (NOT data replication)
+#[cfg(feature = "raft")]
+mod raft_metadata;
+
+// Compatibility shim for old chronik_raft references (temporary until full migration)
+mod chronik_raft_compat;
+// Re-export as chronik_raft for compatibility with old code
+use chronik_raft_compat as chronik_raft;
+
 mod cli;
 
 use integrated_server::{IntegratedKafkaServer, IntegratedServerConfig};
