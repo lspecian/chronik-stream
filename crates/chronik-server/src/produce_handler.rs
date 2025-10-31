@@ -39,6 +39,25 @@ use tokio::time::timeout;
 use tracing::{debug, error, info, warn, trace, instrument};
 use bytes::Bytes;
 
+/// WAL Replication Manager for PostgreSQL-style streaming (v2.2.0+)
+///
+/// Stub implementation - Phase 1: Structure only, no functionality yet
+/// This allows us to add the field without changing behavior
+#[derive(Debug, Clone)]
+pub struct WalReplicationManager {
+    // Placeholder - will be populated in Phase 3
+    _placeholder: (),
+}
+
+impl WalReplicationManager {
+    /// Create a new WAL replication manager (stub for Phase 1)
+    pub fn new() -> Self {
+        Self {
+            _placeholder: (),
+        }
+    }
+}
+
 /// Maximum segment size before rotation (256MB)
 const MAX_SEGMENT_SIZE: u64 = 256 * 1024 * 1024;
 
@@ -329,6 +348,10 @@ pub struct ProduceHandler {
     /// If None, all produce requests use existing direct-write path (backward compatible)
     #[cfg(feature = "raft")]
     raft_manager: Option<Arc<crate::raft_integration::RaftReplicaManager>>,
+    /// WAL replication manager for PostgreSQL-style streaming (v2.2.0+)
+    /// CRITICAL: Option<Arc<>> NOT Arc<RwLock<>> to avoid hot path locks!
+    /// Fire-and-forget async replication, never blocks produce path
+    wal_replication_manager: Option<Arc<WalReplicationManager>>,
 }
 
 /// Replication request for ISR management
@@ -649,6 +672,7 @@ impl ProduceHandler {
             wal_manager: None,
             #[cfg(feature = "raft")]
             raft_manager: None,
+            wal_replication_manager: None,  // v2.2.0 Phase 1: Initialize as None
         })
     }
 
@@ -2423,6 +2447,7 @@ impl Clone for ProduceHandler {
             wal_manager: self.wal_manager.clone(),
             #[cfg(feature = "raft")]
             raft_manager: self.raft_manager.clone(),
+            wal_replication_manager: self.wal_replication_manager.clone(),  // v2.2.0 Phase 1
         }
     }
 }
