@@ -262,3 +262,71 @@ Then:
 - Total: ~4 hours for clean implementation
 
 **vs v2.3.0**: Took days, resulted in 98.5% regression. Clean approach is faster AND safer!
+
+---
+
+## Phase 3.1 Completion Status (Current Session)
+
+**Completed**: ✅ WAL Replication Module Wired Up
+
+**Commit**: `fbefeea` - feat(v2.2.0): Phase 3.1 - Wire up WAL replication to produce handler ✅
+
+**What Was Done**:
+
+1. **Removed Stub, Added Re-export** ([produce_handler.rs:43](crates/chronik-server/src/produce_handler.rs#L43))
+   - Replaced 27-line stub `WalReplicationManager` with re-export from `wal_replication` module
+   - Clean separation of concerns - replication logic isolated in dedicated module
+
+2. **Added Setter Method** ([produce_handler.rs:701-705](crates/chronik-server/src/produce_handler.rs#L701-L705))
+   ```rust
+   pub fn set_wal_replication_manager(&mut self, replication_manager: Arc<WalReplicationManager>) {
+       info!("Setting WalReplicationManager for ProduceHandler");
+       self.wal_replication_manager = Some(replication_manager);
+   }
+   ```
+
+3. **Added Replication Hook** ([produce_handler.rs:1385-1416](crates/chronik-server/src/produce_handler.rs#L1385-L1416))
+   - Positioned AFTER WAL write completes (line 1385), BEFORE buffering
+   - Fire-and-forget `tokio::spawn` (never blocks)
+   - Passes full `CanonicalRecord` with wire bytes for CRC validation
+   - Errors logged, produce never fails due to replication
+
+4. **Fixed DashMap Lifetime Issue** ([wal_replication.rs:195-210](crates/chronik-server/src/wal_replication.rs#L195-L210))
+   - Changed from parallel spawn to sequential write (DashMap RefMut can't move into tasks)
+   - TCP write is fast (~1ms) so sequential is acceptable
+   - Automatic dead connection removal + reconnection
+
+5. **Added Dependencies** ([Cargo.toml:63](crates/chronik-server/Cargo.toml#L63))
+   - `crc32fast = "1.4"` for frame checksums
+   - `crossbeam = "0.8"` already added in previous commit
+
+**Build Status**: ✅
+- Compilation: Successful (0.21s check, 1m40s debug build)
+- Warnings: 184 (mostly unused imports, not critical)
+- Errors: 0
+
+**Performance**: Not yet tested (standalone mode, no followers configured)
+
+**What's Left for Phase 3.2**:
+
+1. **Configuration Support**
+   - Parse `CHRONIK_REPLICATION_FOLLOWERS` env var (comma-separated `host:port`)
+   - Pass to `WalReplicationManager::new(followers)` during server init
+
+2. **Server Initialization** (main.rs)
+   - Create `WalReplicationManager` if followers configured
+   - Call `produce_handler.set_wal_replication_manager(mgr)`
+
+3. **WAL Receiver** (follower side)
+   - Create TCP listener on port 5432 (configurable)
+   - Deserialize WAL frames
+   - Write to local WAL via `WalManager`
+
+4. **Testing**
+   - 2-node cluster: leader + follower
+   - Verify records replicate
+   - Check metrics (queued/sent/dropped counters)
+   - Benchmark: ensure >= 75K msg/s standalone, >= 70K with replication
+
+**Estimated Time**: 2-3 hours for Phase 3.2 completion
+

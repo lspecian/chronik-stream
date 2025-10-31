@@ -362,3 +362,215 @@ pub fn deserialize_wal_frame(mut data: Bytes) -> Result<WalReplicationRecord> {
         data: record_data,
     })
 }
+
+/// WAL Receiver (Follower Side)
+///
+/// Listens for incoming WAL replication frames from leader and writes to local WAL
+pub struct WalReceiver {
+    /// TCP listener for incoming connections
+    listener_addr: String,
+
+    /// WAL manager for writing received records
+    wal_manager: Arc<chronik_wal::WalManager>,
+
+    /// Shutdown signal
+    shutdown: Arc<AtomicBool>,
+}
+
+impl WalReceiver {
+    /// Create a new WAL receiver
+    pub fn new(listener_addr: String, wal_manager: Arc<chronik_wal::WalManager>) -> Self {
+        Self {
+            listener_addr,
+            wal_manager,
+            shutdown: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Start the WAL receiver (blocking)
+    pub async fn run(&self) -> Result<()> {
+        info!("Starting WAL receiver on {}", self.listener_addr);
+
+        let listener = TcpListener::bind(&self.listener_addr).await
+            .context(format!("Failed to bind WAL receiver to {}", self.listener_addr))?;
+
+        info!("✅ WAL receiver listening on {}", self.listener_addr);
+
+        while !self.shutdown.load(Ordering::Relaxed) {
+            // Accept incoming connection with timeout
+            let accept_result = timeout(Duration::from_secs(1), listener.accept()).await;
+
+            match accept_result {
+                Ok(Ok((stream, peer_addr))) => {
+                    info!("WAL receiver: Accepted connection from {}", peer_addr);
+
+                    // Spawn handler for this connection
+                    let wal_mgr = Arc::clone(&self.wal_manager);
+                    let shutdown = Arc::clone(&self.shutdown);
+
+                    tokio::spawn(async move {
+                        if let Err(e) = Self::handle_connection(stream, wal_mgr, shutdown).await {
+                            error!("WAL receiver connection from {} failed: {}", peer_addr, e);
+                        } else {
+                            info!("WAL receiver connection from {} closed", peer_addr);
+                        }
+                    });
+                }
+                Ok(Err(e)) => {
+                    error!("WAL receiver: Failed to accept connection: {}", e);
+                }
+                Err(_) => {
+                    // Timeout - just continue loop to check shutdown signal
+                    continue;
+                }
+            }
+        }
+
+        info!("WAL receiver stopped");
+        Ok(())
+    }
+
+    /// Handle a single connection from leader
+    async fn handle_connection(
+        mut stream: TcpStream,
+        wal_manager: Arc<chronik_wal::WalManager>,
+        shutdown: Arc<AtomicBool>,
+    ) -> Result<()> {
+        let mut buffer = BytesMut::with_capacity(64 * 1024); // 64KB buffer
+
+        while !shutdown.load(Ordering::Relaxed) {
+            // Read frame header (8 bytes: magic + version + length)
+            if buffer.len() < 8 {
+                // Need more data for header
+                let read_timeout = timeout(Duration::from_secs(60), stream.read_buf(&mut buffer)).await;
+
+                match read_timeout {
+                    Ok(Ok(0)) => {
+                        // Connection closed
+                        debug!("WAL receiver: Connection closed by peer");
+                        return Ok(());
+                    }
+                    Ok(Ok(n)) => {
+                        debug!("WAL receiver: Read {} bytes", n);
+                    }
+                    Ok(Err(e)) => {
+                        return Err(anyhow::anyhow!("Read error: {}", e));
+                    }
+                    Err(_) => {
+                        // Timeout - check for heartbeat or shutdown
+                        if buffer.is_empty() {
+                            // No data received in 60s, connection might be dead
+                            warn!("WAL receiver: No data received for 60s, closing connection");
+                            return Ok(());
+                        }
+                        continue;
+                    }
+                }
+            }
+
+            // Try to parse frame if we have enough data
+            if buffer.len() >= 8 {
+                // Peek at header to determine frame type and size
+                let magic = u16::from_be_bytes([buffer[0], buffer[1]]);
+                let total_length = u32::from_be_bytes([buffer[4], buffer[5], buffer[6], buffer[7]]) as usize;
+                let frame_size = 8 + total_length; // header + payload
+
+                if magic == HEARTBEAT_MAGIC {
+                    // Heartbeat frame - just consume it
+                    if buffer.len() >= 8 {
+                        buffer.advance(8);
+                        debug!("WAL receiver: Received heartbeat");
+                    }
+                    continue;
+                }
+
+                if magic != FRAME_MAGIC {
+                    return Err(anyhow::anyhow!("Invalid frame magic: 0x{:04x}", magic));
+                }
+
+                // Wait until we have the complete frame
+                while buffer.len() < frame_size && !shutdown.load(Ordering::Relaxed) {
+                    match timeout(Duration::from_secs(30), stream.read_buf(&mut buffer)).await {
+                        Ok(Ok(0)) => {
+                            return Err(anyhow::anyhow!("Connection closed before complete frame received"));
+                        }
+                        Ok(Ok(n)) => {
+                            debug!("WAL receiver: Read {} more bytes (total: {})", n, buffer.len());
+                        }
+                        Ok(Err(e)) => {
+                            return Err(anyhow::anyhow!("Read error: {}", e));
+                        }
+                        Err(_) => {
+                            return Err(anyhow::anyhow!("Timeout waiting for complete frame"));
+                        }
+                    }
+                }
+
+                // We have a complete frame - deserialize and process
+                let frame_bytes = buffer.split_to(frame_size).freeze();
+
+                match deserialize_wal_frame(frame_bytes) {
+                    Ok(wal_record) => {
+                        // Write to local WAL
+                        if let Err(e) = Self::write_to_wal(&wal_manager, &wal_record).await {
+                            error!(
+                                "Failed to write replicated WAL record to local WAL for {}-{}: {}",
+                                wal_record.topic, wal_record.partition, e
+                            );
+                        } else {
+                            info!(
+                                "WAL✓ Replicated: {}-{} offset {} ({} records, {} bytes)",
+                                wal_record.topic,
+                                wal_record.partition,
+                                wal_record.base_offset,
+                                wal_record.record_count,
+                                wal_record.data.len()
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to deserialize WAL frame: {}", e);
+                        // Continue processing other frames
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Write a replicated WAL record to local WAL
+    async fn write_to_wal(
+        wal_manager: &Arc<chronik_wal::WalManager>,
+        record: &WalReplicationRecord,
+    ) -> Result<()> {
+        // Deserialize CanonicalRecord from data
+        use chronik_storage::canonical_record::CanonicalRecord;
+        let canonical_record: CanonicalRecord = bincode::deserialize(&record.data)
+            .context("Failed to deserialize CanonicalRecord from replicated data")?;
+
+        // Serialize back to bincode for WAL storage
+        let serialized = bincode::serialize(&canonical_record)
+            .context("Failed to serialize CanonicalRecord for WAL")?;
+
+        // Write to local WAL (acks=1 for immediate fsync on follower)
+        wal_manager.append_canonical_with_acks(
+            record.topic.clone(),
+            record.partition,
+            serialized,
+            record.base_offset,
+            record.base_offset + record.record_count as i64 - 1,
+            record.record_count as i32,
+            1, // acks=1 for immediate fsync
+        ).await
+        .context("Failed to append replicated record to local WAL")?;
+
+        Ok(())
+    }
+
+    /// Shutdown the receiver
+    pub fn shutdown(&self) {
+        info!("Shutting down WAL receiver");
+        self.shutdown.store(true, Ordering::Relaxed);
+    }
+}

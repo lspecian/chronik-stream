@@ -672,6 +672,27 @@ impl IntegratedKafkaServer {
             produce_handler_inner.set_raft_manager(raft_mgr);
         }
 
+        // v2.2.0: Initialize WAL replication manager if followers configured
+        if let Ok(followers_str) = std::env::var("CHRONIK_REPLICATION_FOLLOWERS") {
+            if !followers_str.is_empty() {
+                let followers: Vec<String> = followers_str
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+
+                if !followers.is_empty() {
+                    info!("WAL replication enabled with {} followers: {}", followers.len(), followers.join(", "));
+                    let replication_manager = crate::wal_replication::WalReplicationManager::new(followers);
+                    produce_handler_inner.set_wal_replication_manager(replication_manager);
+                } else {
+                    info!("CHRONIK_REPLICATION_FOLLOWERS is empty, WAL replication disabled");
+                }
+            }
+        } else {
+            info!("CHRONIK_REPLICATION_FOLLOWERS not set, WAL replication disabled");
+        }
+
         let produce_handler_base = Arc::new(produce_handler_inner);
 
         // CRITICAL FIX (v1.3.52): Clear all partition buffers before WAL recovery
@@ -975,6 +996,26 @@ impl IntegratedKafkaServer {
                     }
                     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                 }
+            }
+        }
+
+        // v2.2.0: Start WAL receiver if enabled (follower mode)
+        if let Ok(receiver_addr) = std::env::var("CHRONIK_WAL_RECEIVER_ADDR") {
+            if !receiver_addr.is_empty() {
+                info!("WAL receiver enabled on {}", receiver_addr);
+                let wal_receiver = crate::wal_replication::WalReceiver::new(
+                    receiver_addr.clone(),
+                    wal_manager.clone(),
+                );
+
+                // Spawn receiver in background
+                tokio::spawn(async move {
+                    if let Err(e) = wal_receiver.run().await {
+                        error!("WAL receiver failed: {}", e);
+                    }
+                });
+
+                info!("✅ WAL receiver started on {}", receiver_addr);
             }
         }
 
