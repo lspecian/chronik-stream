@@ -1121,6 +1121,10 @@ impl ProtocolHandler {
     
     /// Encode OffsetCommit response
     pub fn encode_offset_commit_response(&self, buf: &mut BytesMut, response: &crate::types::OffsetCommitResponse, version: i16) -> Result<()> {
+        tracing::debug!("encode_offset_commit_response: version={}, throttle_time_ms={}, topics.len()={}, flexible={}",
+                       version, response.throttle_time_ms, response.topics.len(), version >= 8);
+
+        let start_len = buf.len();
         let mut encoder = Encoder::new(buf);
 
         // v8+ uses flexible/compact format
@@ -1172,6 +1176,9 @@ impl ProtocolHandler {
         if flexible {
             encoder.write_tagged_fields();
         }
+
+        tracing::debug!("encode_offset_commit_response: DONE, input buf was {} bytes, now {} bytes (grew by {})",
+                       start_len, buf.len(), buf.len() - start_len);
 
         Ok(())
     }

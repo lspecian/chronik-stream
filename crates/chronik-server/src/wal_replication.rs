@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::net::{TcpStream, TcpListener};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::time::{sleep, Duration, timeout};
 use tracing::{debug, error, info, warn};
 use serde::{Serialize, Deserialize};
@@ -26,11 +27,17 @@ use dashmap::DashMap;
 use crate::raft_cluster::RaftCluster;
 use crate::isr_tracker::IsrTracker;
 
+// v2.5.0 Phase 4: Import IsrAckTracker for acks=-1 support
+use crate::isr_ack_tracker::IsrAckTracker;
+
 /// Magic number for WAL frames ('WA' in hex)
 const FRAME_MAGIC: u16 = 0x5741;
 
 /// Magic number for heartbeat frames ('HB' in hex)
 const HEARTBEAT_MAGIC: u16 = 0x4842;
+
+/// Magic number for ACK frames ('AK' in hex) - v2.5.0 Phase 4
+const ACK_MAGIC: u16 = 0x414B;
 
 /// Current protocol version
 const PROTOCOL_VERSION: u16 = 1;
@@ -69,15 +76,33 @@ pub struct WalReplicationRecord {
     pub data: Bytes,
 }
 
+/// ACK message sent from follower to leader after successful WAL write (v2.5.0 Phase 4)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WalAckMessage {
+    /// Topic name
+    pub topic: String,
+
+    /// Partition ID
+    pub partition: i32,
+
+    /// Offset that was successfully replicated
+    pub offset: i64,
+
+    /// Follower node ID
+    pub node_id: u64,
+}
+
 /// WAL Replication Manager for PostgreSQL-style streaming
 ///
 /// Phase 3 implementation with actual TCP streaming and lock-free queue
+/// Phase 4 update: Bidirectional streams for ACK reception
 pub struct WalReplicationManager {
     /// Queue of pending WAL records (lock-free MPMC)
     queue: Arc<SegQueue<WalReplicationRecord>>,
 
-    /// Active TCP connections to followers (topic -> TcpStream)
-    connections: Arc<DashMap<String, TcpStream>>,
+    /// Active TCP write connections to followers (addr -> OwnedWriteHalf)
+    /// v2.5.0 Phase 4: Changed from TcpStream to OwnedWriteHalf to allow separate ACK reading
+    connections: Arc<DashMap<String, OwnedWriteHalf>>,
 
     /// Follower addresses ("host:port")
     followers: Vec<String>,
@@ -99,6 +124,9 @@ pub struct WalReplicationManager {
 
     /// ISR tracker for determining in-sync replicas (v2.5.0 Phase 3)
     isr_tracker: Option<Arc<IsrTracker>>,
+
+    /// ISR ACK tracker for recording follower ACKs for acks=-1 (v2.5.0 Phase 4)
+    isr_ack_tracker: Option<Arc<IsrAckTracker>>,
 }
 
 impl WalReplicationManager {
@@ -106,7 +134,7 @@ impl WalReplicationManager {
     ///
     /// Spawns background workers for connection management and record sending
     pub fn new(followers: Vec<String>) -> Arc<Self> {
-        Self::new_with_dependencies(followers, None, None)
+        Self::new_with_dependencies(followers, None, None, None)
     }
 
     /// Create a new WAL replication manager with Raft cluster and ISR tracker (v2.5.0 Phase 3)
@@ -116,11 +144,13 @@ impl WalReplicationManager {
         followers: Vec<String>,
         raft_cluster: Option<Arc<RaftCluster>>,
         isr_tracker: Option<Arc<IsrTracker>>,
+        isr_ack_tracker: Option<Arc<IsrAckTracker>>,
     ) -> Arc<Self> {
-        info!("Creating WalReplicationManager with {} followers, Raft: {}, ISR: {}",
+        info!("Creating WalReplicationManager with {} followers, Raft: {}, ISR: {}, AckTracker: {}",
               followers.len(),
               raft_cluster.is_some(),
-              isr_tracker.is_some());
+              isr_tracker.is_some(),
+              isr_ack_tracker.is_some());
 
         let manager = Arc::new(Self {
             queue: Arc::new(SegQueue::new()),
@@ -130,8 +160,9 @@ impl WalReplicationManager {
             total_queued: Arc::new(AtomicU64::new(0)),
             total_sent: Arc::new(AtomicU64::new(0)),
             total_dropped: Arc::new(AtomicU64::new(0)),
-            raft_cluster,   // v2.5.0: Accept directly in constructor
-            isr_tracker,    // v2.5.0: Accept directly in constructor
+            raft_cluster,       // v2.5.0: Accept directly in constructor
+            isr_tracker,        // v2.5.0: Accept directly in constructor
+            isr_ack_tracker,    // v2.5.0 Phase 4: Accept ACK tracker
         });
 
         // Spawn background worker for sending records
@@ -371,14 +402,26 @@ impl WalReplicationManager {
                         Ok(Ok(stream)) => {
                             info!("✅ Connected to follower: {}", follower_addr);
 
-                            // Send handshake
-                            if let Err(e) = self.send_handshake(&stream).await {
-                                error!("Failed to send handshake to {}: {}", follower_addr, e);
-                                continue;
+                            // v2.5.0 Phase 4: Split stream for bidirectional communication
+                            // Write half: used by send_to_followers
+                            // Read half: used by ACK reader task
+                            let (read_half, write_half) = stream.into_split();
+
+                            // Spawn ACK reader task for this follower (v2.5.0 Phase 4)
+                            if let Some(ref ack_tracker) = self.isr_ack_tracker {
+                                let tracker = Arc::clone(ack_tracker);
+                                let shutdown = Arc::clone(&self.shutdown);
+                                let addr = follower_addr.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) = Self::run_ack_reader(read_half, tracker, shutdown, addr.clone()).await {
+                                        error!("ACK reader for {} failed: {}", addr, e);
+                                    }
+                                });
+                                info!("✅ Spawned ACK reader for follower: {}", follower_addr);
                             }
 
-                            // Store connection
-                            self.connections.insert(follower_addr.clone(), stream);
+                            // Store write-half connection (for send_to_followers)
+                            self.connections.insert(follower_addr.clone(), write_half);
                         }
                         Ok(Err(e)) => {
                             warn!("Failed to connect to follower {}: {}", follower_addr, e);
@@ -397,12 +440,124 @@ impl WalReplicationManager {
         info!("WAL replication connection manager stopped");
     }
 
-    /// Send handshake to follower
-    async fn send_handshake(&self, stream: &TcpStream) -> Result<()> {
-        // TODO: Implement handshake protocol
-        // For Phase 3.1, we'll skip handshake and go straight to streaming
+    /// Background worker for reading ACKs from a follower (v2.5.0 Phase 4)
+    ///
+    /// This is the CRITICAL missing piece that completes acks=-1 support.
+    /// Followers send ACKs after successful WAL writes, and this task reads them.
+    async fn run_ack_reader(
+        mut read_half: OwnedReadHalf,
+        isr_ack_tracker: Arc<IsrAckTracker>,
+        shutdown: Arc<AtomicBool>,
+        follower_addr: String,
+    ) -> Result<()> {
+        info!("ACK reader started for follower: {}", follower_addr);
+        let mut buffer = BytesMut::with_capacity(4096);
+
+        while !shutdown.load(Ordering::Relaxed) {
+            // Read ACK frame header (8 bytes: magic + version + length)
+            if buffer.len() < 8 {
+                match timeout(Duration::from_secs(60), read_half.read_buf(&mut buffer)).await {
+                    Ok(Ok(0)) => {
+                        // Connection closed
+                        info!("ACK reader: Connection closed by follower {}", follower_addr);
+                        return Ok(());
+                    }
+                    Ok(Ok(n)) => {
+                        debug!("ACK reader: Read {} bytes from {}", n, follower_addr);
+                    }
+                    Ok(Err(e)) => {
+                        return Err(anyhow::anyhow!("ACK reader: Read error from {}: {}", follower_addr, e));
+                    }
+                    Err(_) => {
+                        // Timeout - check shutdown and continue
+                        if buffer.is_empty() {
+                            // No ACKs in 60s is normal if no replication happening
+                            continue;
+                        }
+                        return Err(anyhow::anyhow!("ACK reader: Timeout reading from {}", follower_addr));
+                    }
+                }
+            }
+
+            // Parse frame header if we have enough data
+            if buffer.len() >= 8 {
+                let magic = u16::from_be_bytes([buffer[0], buffer[1]]);
+
+                // Skip heartbeat frames (if any)
+                if magic == HEARTBEAT_MAGIC {
+                    buffer.advance(8);
+                    debug!("ACK reader: Received heartbeat from {}", follower_addr);
+                    continue;
+                }
+
+                // Validate ACK magic
+                if magic != ACK_MAGIC {
+                    return Err(anyhow::anyhow!(
+                        "ACK reader: Invalid frame magic from {}: 0x{:04x} (expected ACK 0x{:04x})",
+                        follower_addr, magic, ACK_MAGIC
+                    ));
+                }
+
+                // Read frame length
+                let frame_length = u32::from_be_bytes([buffer[4], buffer[5], buffer[6], buffer[7]]) as usize;
+                let frame_size = 8 + frame_length; // header + payload
+
+                // Wait for complete frame
+                while buffer.len() < frame_size && !shutdown.load(Ordering::Relaxed) {
+                    match timeout(Duration::from_secs(30), read_half.read_buf(&mut buffer)).await {
+                        Ok(Ok(0)) => {
+                            return Err(anyhow::anyhow!(
+                                "ACK reader: Connection closed before complete ACK frame from {}",
+                                follower_addr
+                            ));
+                        }
+                        Ok(Ok(n)) => {
+                            debug!("ACK reader: Read {} more bytes from {} (total: {})", n, follower_addr, buffer.len());
+                        }
+                        Ok(Err(e)) => {
+                            return Err(anyhow::anyhow!("ACK reader: Read error from {}: {}", follower_addr, e));
+                        }
+                        Err(_) => {
+                            return Err(anyhow::anyhow!("ACK reader: Timeout waiting for complete ACK from {}", follower_addr));
+                        }
+                    }
+                }
+
+                // Deserialize complete ACK frame
+                let frame_bytes = buffer.split_to(frame_size);
+                let payload = &frame_bytes[8..]; // Skip header
+
+                match bincode::deserialize::<WalAckMessage>(payload) {
+                    Ok(ack_msg) => {
+                        info!(
+                            "ACK✓ Received from {}: {}-{} offset {} (node {})",
+                            follower_addr,
+                            ack_msg.topic,
+                            ack_msg.partition,
+                            ack_msg.offset,
+                            ack_msg.node_id
+                        );
+
+                        // THIS IS THE KEY FIX: Record ACK in IsrAckTracker on leader
+                        isr_ack_tracker.record_ack(
+                            &ack_msg.topic,
+                            ack_msg.partition,
+                            ack_msg.offset,
+                            ack_msg.node_id,
+                        );
+                    }
+                    Err(e) => {
+                        error!("ACK reader: Failed to deserialize ACK from {}: {}", follower_addr, e);
+                        // Continue processing other ACKs
+                    }
+                }
+            }
+        }
+
+        info!("ACK reader stopped for follower: {}", follower_addr);
         Ok(())
     }
+
 
     /// Shutdown the replication manager
     pub async fn shutdown(&self) {
@@ -522,15 +677,40 @@ pub struct WalReceiver {
 
     /// Shutdown signal
     shutdown: Arc<AtomicBool>,
+
+    /// ISR ACK tracker for notifying leader of successful replication (v2.5.0 Phase 4)
+    isr_ack_tracker: Option<Arc<crate::isr_ack_tracker::IsrAckTracker>>,
+
+    /// This follower's node ID (v2.5.0 Phase 4)
+    node_id: u64,
 }
 
 impl WalReceiver {
-    /// Create a new WAL receiver
+    /// Create a new WAL receiver (legacy constructor without ISR tracking)
     pub fn new(listener_addr: String, wal_manager: Arc<chronik_wal::WalManager>) -> Self {
         Self {
             listener_addr,
             wal_manager,
             shutdown: Arc::new(AtomicBool::new(false)),
+            isr_ack_tracker: None,
+            node_id: 0, // Default node ID (standalone mode)
+        }
+    }
+
+    /// Create a new WAL receiver with ISR tracking (v2.5.0 Phase 4)
+    pub fn new_with_isr_tracker(
+        listener_addr: String,
+        wal_manager: Arc<chronik_wal::WalManager>,
+        isr_ack_tracker: Arc<crate::isr_ack_tracker::IsrAckTracker>,
+        node_id: u64,
+    ) -> Self {
+        info!("Creating WalReceiver with ISR ACK tracking for node {}", node_id);
+        Self {
+            listener_addr,
+            wal_manager,
+            shutdown: Arc::new(AtomicBool::new(false)),
+            isr_ack_tracker: Some(isr_ack_tracker),
+            node_id,
         }
     }
 
@@ -554,9 +734,17 @@ impl WalReceiver {
                     // Spawn handler for this connection
                     let wal_mgr = Arc::clone(&self.wal_manager);
                     let shutdown = Arc::clone(&self.shutdown);
+                    let isr_ack_tracker = self.isr_ack_tracker.clone();
+                    let node_id = self.node_id;
 
                     tokio::spawn(async move {
-                        if let Err(e) = Self::handle_connection(stream, wal_mgr, shutdown).await {
+                        if let Err(e) = Self::handle_connection(
+                            stream,
+                            wal_mgr,
+                            shutdown,
+                            isr_ack_tracker,
+                            node_id
+                        ).await {
                             error!("WAL receiver connection from {} failed: {}", peer_addr, e);
                         } else {
                             info!("WAL receiver connection from {} closed", peer_addr);
@@ -582,6 +770,8 @@ impl WalReceiver {
         mut stream: TcpStream,
         wal_manager: Arc<chronik_wal::WalManager>,
         shutdown: Arc<AtomicBool>,
+        isr_ack_tracker: Option<Arc<crate::isr_ack_tracker::IsrAckTracker>>,
+        node_id: u64,
     ) -> Result<()> {
         let mut buffer = BytesMut::with_capacity(64 * 1024); // 64KB buffer
 
@@ -673,6 +863,37 @@ impl WalReceiver {
                                 wal_record.record_count,
                                 wal_record.data.len()
                             );
+
+                            // v2.5.0 Phase 4: Send ACK back to leader for acks=-1 support
+                            if let Some(ref tracker) = isr_ack_tracker {
+                                let ack_msg = WalAckMessage {
+                                    topic: wal_record.topic.clone(),
+                                    partition: wal_record.partition,
+                                    offset: wal_record.base_offset,
+                                    node_id,
+                                };
+
+                                // Send ACK frame back to leader
+                                if let Err(e) = Self::send_ack(&mut stream, &ack_msg).await {
+                                    error!(
+                                        "Failed to send ACK for {}-{} offset {}: {}",
+                                        wal_record.topic, wal_record.partition, wal_record.base_offset, e
+                                    );
+                                } else {
+                                    debug!(
+                                        "ACK✓ Sent to leader: {}-{} offset {} from node {}",
+                                        wal_record.topic, wal_record.partition, wal_record.base_offset, node_id
+                                    );
+
+                                    // Notify the IsrAckTracker (for local leader-follower acks=-1)
+                                    tracker.record_ack(
+                                        &wal_record.topic,
+                                        wal_record.partition,
+                                        wal_record.base_offset,
+                                        node_id,
+                                    );
+                                }
+                            }
                         }
                     }
                     Err(e) => {
@@ -711,6 +932,29 @@ impl WalReceiver {
             1, // acks=1 for immediate fsync
         ).await
         .context("Failed to append replicated record to local WAL")?;
+
+        Ok(())
+    }
+
+    /// Send ACK frame back to leader (v2.5.0 Phase 4)
+    async fn send_ack(stream: &mut TcpStream, ack_msg: &WalAckMessage) -> Result<()> {
+        // Serialize ACK message
+        let serialized = bincode::serialize(ack_msg)
+            .context("Failed to serialize ACK message")?;
+
+        // Build ACK frame: [magic(2) | version(2) | length(4) | payload(N)]
+        let mut frame = BytesMut::with_capacity(8 + serialized.len());
+        frame.put_u16(ACK_MAGIC); // 'AK' magic number
+        frame.put_u16(PROTOCOL_VERSION);
+        frame.put_u32(serialized.len() as u32);
+        frame.put_slice(&serialized);
+
+        // Send frame
+        stream.write_all(&frame).await
+            .context("Failed to send ACK frame to leader")?;
+
+        stream.flush().await
+            .context("Failed to flush ACK frame")?;
 
         Ok(())
     }

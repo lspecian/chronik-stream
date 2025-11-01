@@ -33,6 +33,8 @@ mod raft_cluster;
 mod isr_tracker;
 // v2.5.0 Phase 4: ISR ACK tracking for acks=-1 quorum support
 mod isr_ack_tracker;
+// v2.5.0 Phase 5: Automatic leader election per partition
+mod leader_election;
 
 mod cli;
 
@@ -96,10 +98,6 @@ struct Cli {
     #[cfg(feature = "dynamic-config")]
     #[arg(long, env = "CHRONIK_ENABLE_DYNAMIC_CONFIG", default_value = "false")]
     enable_dynamic_config: bool,
-
-    /// Use file-based metadata store instead of WAL-based (legacy mode)
-    #[arg(long, env = "CHRONIK_FILE_METADATA", default_value = "false")]
-    file_metadata: bool,
 
     /// Path to cluster configuration file (TOML)
     #[arg(long, env = "CHRONIK_CLUSTER_CONFIG")]
@@ -735,7 +733,6 @@ async fn run_standalone_server(cli: &Cli) -> Result<()> {
         auto_create_topics: true,
         num_partitions: 3,
         replication_factor,
-        use_wal_metadata: !cli.file_metadata,  // Use WAL by default, file-based if flag is set
         enable_wal_indexing: true,  // Enable WAL→Tantivy indexing
         wal_indexing_interval_secs: 30,  // Index every 30 seconds
         object_store_config,  // Pass custom object store config if provided
@@ -976,7 +973,6 @@ async fn run_all_components(cli: &Cli) -> Result<()> {
         auto_create_topics: true,
         num_partitions: 3,
         replication_factor,
-        use_wal_metadata: !cli.file_metadata,  // Use WAL by default, file-based if flag is set
         enable_wal_indexing: true,  // Enable WAL→Tantivy indexing
         wal_indexing_interval_secs: 30,  // Index every 30 seconds
         object_store_config,  // Pass custom object store config if provided

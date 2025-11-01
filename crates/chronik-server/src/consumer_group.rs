@@ -1933,12 +1933,11 @@ impl PartitionAssignor for RoundRobinAssignor {
 mod tests {
     use super::*;
     use tempfile::TempDir;
-    use chronik_common::metadata::FileMetadataStore;
-    
+    use chronik_common::metadata::InMemoryMetadataStore;
+
     #[tokio::test]
     async fn test_consumer_group_lifecycle() {
-        let temp_dir = TempDir::new().unwrap();
-        let metadata_store = Arc::new(FileMetadataStore::new(temp_dir.path().join("metadata")).await.unwrap());
+        let metadata_store = Arc::new(InMemoryMetadataStore::new());
         let manager = Arc::new(GroupManager::new(metadata_store));
         
         // Create group

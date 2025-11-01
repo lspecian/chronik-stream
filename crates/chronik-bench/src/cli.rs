@@ -57,8 +57,8 @@ pub struct Args {
     #[arg(short = 'r', long, default_value = "1")]
     pub replication_factor: i16,
 
-    /// Acks setting for producer (0, 1, or -1/all)
-    #[arg(long, default_value = "1")]
+    /// Acks setting for producer (0, 1, -1, or "all")
+    #[arg(long, default_value = "1", value_parser = parse_acks)]
     pub acks: i32,
 
     /// Linger time for producer batching (milliseconds)
@@ -175,6 +175,17 @@ pub enum PayloadPattern {
     Random,
     Zeros,
     Text,
+}
+
+/// Parse acks from string (0, 1, -1, or "all")
+fn parse_acks(s: &str) -> Result<i32, String> {
+    match s.trim().to_lowercase().as_str() {
+        "all" | "-1" => Ok(-1),
+        "0" => Ok(0),
+        "1" => Ok(1),
+        _ => s.parse::<i32>()
+            .map_err(|_| format!("Invalid acks value '{}', must be 0, 1, -1, or 'all'", s))
+    }
 }
 
 /// Parse duration from string (e.g., "60s", "5m", "1h")

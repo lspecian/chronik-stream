@@ -7,9 +7,7 @@ use std::collections::HashMap;
 async fn test_buffer_high_watermark_calculation() {
     let temp_dir = TempDir::new().unwrap();
     
-    let metadata_store = Arc::new(chronik_common::metadata::file_store::FileMetadataStore::new(
-        temp_dir.path().join("metadata")
-    ).await.unwrap());
+    let metadata_store = Arc::new(chronik_common::metadata::InMemoryMetadataStore::new());
     
     let object_store = Arc::new(chronik_storage::object_store::LocalObjectStore::new(
         temp_dir.path().join("segments")
@@ -87,9 +85,7 @@ async fn test_buffer_high_watermark_calculation() {
 async fn test_fetch_from_buffer_only() {
     let temp_dir = TempDir::new().unwrap();
     
-    let metadata_store = Arc::new(chronik_common::metadata::file_store::FileMetadataStore::new(
-        temp_dir.path().join("metadata")
-    ).await.unwrap());
+    let metadata_store = Arc::new(chronik_common::metadata::InMemoryMetadataStore::new());
     
     let object_store = Arc::new(chronik_storage::object_store::LocalObjectStore::new(
         temp_dir.path().join("segments")
@@ -172,9 +168,7 @@ async fn test_fetch_from_buffer_only() {
 async fn test_buffer_with_segment_high_watermark() {
     let temp_dir = TempDir::new().unwrap();
     
-    let metadata_store = Arc::new(chronik_common::metadata::file_store::FileMetadataStore::new(
-        temp_dir.path().join("metadata")
-    ).await.unwrap());
+    let metadata_store = Arc::new(chronik_common::metadata::InMemoryMetadataStore::new());
     
     let object_store = Arc::new(chronik_storage::object_store::LocalObjectStore::new(
         temp_dir.path().join("segments")
@@ -243,9 +237,7 @@ async fn test_buffer_with_segment_high_watermark() {
 async fn test_out_of_order_fetch() {
     let temp_dir = TempDir::new().unwrap();
     
-    let metadata_store = Arc::new(chronik_common::metadata::file_store::FileMetadataStore::new(
-        temp_dir.path().join("metadata")
-    ).await.unwrap());
+    let metadata_store = Arc::new(chronik_common::metadata::InMemoryMetadataStore::new());
     
     let object_store = Arc::new(chronik_storage::object_store::LocalObjectStore::new(
         temp_dir.path().join("segments")
@@ -335,9 +327,7 @@ async fn test_out_of_order_fetch() {
 async fn test_buffer_overflow_trimming() {
     let temp_dir = TempDir::new().unwrap();
     
-    let metadata_store = Arc::new(chronik_common::metadata::file_store::FileMetadataStore::new(
-        temp_dir.path().join("metadata")
-    ).await.unwrap());
+    let metadata_store = Arc::new(chronik_common::metadata::InMemoryMetadataStore::new());
     
     let object_store = Arc::new(chronik_storage::object_store::LocalObjectStore::new(
         temp_dir.path().join("segments")
@@ -385,9 +375,7 @@ async fn test_buffer_overflow_trimming() {
 async fn test_clear_topic_buffers() {
     let temp_dir = TempDir::new().unwrap();
     
-    let metadata_store = Arc::new(chronik_common::metadata::file_store::FileMetadataStore::new(
-        temp_dir.path().join("metadata")
-    ).await.unwrap());
+    let metadata_store = Arc::new(chronik_common::metadata::InMemoryMetadataStore::new());
     
     let object_store = Arc::new(chronik_storage::object_store::LocalObjectStore::new(
         temp_dir.path().join("segments")
@@ -460,9 +448,7 @@ async fn test_concurrent_buffer_access() {
     
     let temp_dir = TempDir::new().unwrap();
     
-    let metadata_store = Arc::new(chronik_common::metadata::file_store::FileMetadataStore::new(
-        temp_dir.path().join("metadata")
-    ).await.unwrap());
+    let metadata_store = Arc::new(chronik_common::metadata::InMemoryMetadataStore::new());
     
     let object_store = Arc::new(chronik_storage::object_store::LocalObjectStore::new(
         temp_dir.path().join("segments")

@@ -1,0 +1,55 @@
+[package]
+name = "chronik-raft"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Chronik crates
+chronik-common = { path = "../chronik-common" }
+chronik-monitoring = { path = "../chronik-monitoring" }
+chronik-raft-bridge = { path = "../chronik-raft-bridge" }
+
+# Raft consensus (Apache 2.0)
+raft = { workspace = true }
+
+# gRPC framework
+tonic = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+bincode = { workspace = true }
+bytes = { workspace = true }
+
+# Async
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+
+# Utils
+dashmap = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Tracing
+tracing = { workspace = true }
+
+# Logging (for Raft integration)
+slog = { workspace = true }
+slog-stdlog = { workspace = true }
+
+[build-dependencies]
+tonic-build = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true }
+criterion = { workspace = true }

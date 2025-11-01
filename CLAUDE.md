@@ -267,9 +267,6 @@ CHRONIK_METADATA_DR=true  # Already enabled by default
 
 # Change upload interval (default: 60s)
 CHRONIK_METADATA_UPLOAD_INTERVAL=120 cargo run --bin chronik-server
-
-# Disable if using file-based metadata
-CHRONIK_FILE_METADATA=true cargo run --bin chronik-server  # DR disabled
 ```
 
 **See [docs/DISASTER_RECOVERY.md](docs/DISASTER_RECOVERY.md) for complete DR guide.**
@@ -408,9 +405,7 @@ RUST_LOG=chronik_server::fetch_handler=debug cargo run --bin chronik-server
 
 **3. Metadata Store** (`chronik-common/metadata`)
 - Trait-based abstraction (`MetadataStore`)
-- Two implementations:
-  - **ChronikMetaLog (WAL-based)** - Default, event-sourced metadata
-  - File-based (legacy) - Use `--file-metadata` flag
+- **ChronikMetaLog (WAL-based)** - Event-sourced metadata persistence
 - Stores topics, partitions, consumer groups, offsets
 - Location: `crates/chronik-common/src/metadata/`
 
@@ -882,7 +877,6 @@ Key environment variables:
 - `CHRONIK_ADVERTISED_ADDR` - **CRITICAL** for Docker/remote access
 - `CHRONIK_ADVERTISED_PORT` - Port advertised to clients
 - `CHRONIK_DATA_DIR` - Data directory (default: ./data)
-- `CHRONIK_FILE_METADATA` - Use file-based metadata (default: false, uses WAL)
 - `CHRONIK_PRODUCE_PROFILE` - ProduceHandler flush profile: `low-latency`, `balanced` (default), `high-throughput`
 - `CHRONIK_WAL_PROFILE` - WAL commit profile: `low`, `medium`, `high`, `ultra` (auto-detected by default)
 - `CHRONIK_WAL_ROTATION_SIZE` - Segment seal threshold: `100KB`, `250MB` (default), `1GB`, or raw bytes `268435456`

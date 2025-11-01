@@ -30,7 +30,6 @@ use chronik_storage::{
 
 // Metadata store
 use chronik_common::metadata::{
-    file_store::FileMetadataStore,
     traits::MetadataStore,
     ChronikMetaLogStore,
 };
@@ -59,8 +58,6 @@ pub struct IntegratedServerConfig {
     pub num_partitions: u32,
     /// Default replication factor
     pub replication_factor: u32,
-    /// Use WAL-based metadata store instead of file-based
-    pub use_wal_metadata: bool,
     /// Enable background WAL indexing (WAL → Tantivy → Object Store)
     pub enable_wal_indexing: bool,
     /// WAL indexing interval in seconds
@@ -87,7 +84,6 @@ impl Default for IntegratedServerConfig {
             auto_create_topics: true,
             num_partitions: 3,
             replication_factor: 1,
-            use_wal_metadata: true, // Default to WAL-based metadata
             enable_wal_indexing: true, // Enable WAL→Tantivy indexing by default
             wal_indexing_interval_secs: 30, // Index every 30 seconds
             object_store_config: None, // Use default local storage unless specified
@@ -105,6 +101,8 @@ pub struct IntegratedKafkaServer {
     metadata_store: Arc<dyn MetadataStore>,
     wal_indexer: Arc<WalIndexer>,
     metadata_uploader: Option<Arc<chronik_common::metadata::MetadataUploader>>,
+    /// v2.5.0 Phase 5: Leader election per partition
+    leader_elector: Option<Arc<crate::leader_election::LeaderElector>>,
 }
 
 impl Clone for IntegratedKafkaServer {
@@ -115,6 +113,7 @@ impl Clone for IntegratedKafkaServer {
             metadata_store: self.metadata_store.clone(),
             wal_indexer: self.wal_indexer.clone(),
             metadata_uploader: self.metadata_uploader.clone(),
+            leader_elector: self.leader_elector.clone(),
         }
     }
 }
@@ -136,83 +135,65 @@ impl IntegratedKafkaServer {
         let segments_dir = format!("{}/segments", config.data_dir);
         std::fs::create_dir_all(&segments_dir)?;
         
-        // Initialize metadata store based on configuration
-        let metadata_store: Arc<dyn MetadataStore> = if config.use_wal_metadata {
-            info!("Initializing WAL-based metadata store with real WAL adapter");
+        // Initialize WAL-based metadata store (always enabled)
+        info!("Initializing WAL-based metadata store with real WAL adapter");
 
-            // Create WAL configuration for metadata
-            let wal_config = chronik_wal::config::WalConfig {
+        // Create WAL configuration for metadata
+        let wal_config = chronik_wal::config::WalConfig {
+            enabled: true,
+            data_dir: PathBuf::from(format!("{}/wal_metadata", config.data_dir)),
+            segment_size: 50 * 1024 * 1024, // 50MB segments for metadata
+            flush_interval_ms: 100, // Flush every 100ms
+            flush_threshold: 1024 * 1024, // 1MB buffer threshold
+            compression: chronik_wal::config::CompressionType::None,
+            checkpointing: chronik_wal::config::CheckpointConfig {
                 enabled: true,
-                data_dir: PathBuf::from(format!("{}/wal_metadata", config.data_dir)),
-                segment_size: 50 * 1024 * 1024, // 50MB segments for metadata
-                flush_interval_ms: 100, // Flush every 100ms
-                flush_threshold: 1024 * 1024, // 1MB buffer threshold
-                compression: chronik_wal::config::CompressionType::None,
-                checkpointing: chronik_wal::config::CheckpointConfig {
-                    enabled: true,
-                    interval_records: 1000,
-                    interval_bytes: 10 * 1024 * 1024,
-                },
-                rotation: chronik_wal::config::RotationConfig {
-                    max_segment_size: 50 * 1024 * 1024,
-                    max_segment_age_ms: 60 * 60 * 1000, // 1 hour
-                    coordinate_with_storage: false,
-                },
-                fsync: chronik_wal::config::FsyncConfig {
-                    enabled: true,
-                    batch_size: 1,
-                    batch_timeout_ms: 0,
-                },
-                ..Default::default()
-            };
-
-            // Create the real WAL adapter
-            use chronik_storage::WalMetadataAdapter;
-            let wal_adapter = Arc::new(WalMetadataAdapter::new(wal_config).await?);
-
-            let metalog_store = ChronikMetaLogStore::new(
-                wal_adapter,
-                PathBuf::from(format!("{}/metalog_snapshots", config.data_dir)),
-            ).await?;
-
-            info!("Successfully initialized WAL-based metadata store with real WAL adapter");
-
-            // Ensure __meta topic exists for metadata storage
-            let metalog_store_arc = Arc::new(metalog_store);
-            if metalog_store_arc.get_topic(chronik_common::metadata::METADATA_TOPIC).await?.is_none() {
-                info!("Creating internal metadata topic: {}", chronik_common::metadata::METADATA_TOPIC);
-                let meta_config = chronik_common::metadata::TopicConfig {
-                    partition_count: 1, // Metadata topic only needs 1 partition
-                    replication_factor: 1,
-                    retention_ms: None, // Never delete metadata
-                    segment_bytes: 50 * 1024 * 1024, // 50MB segments
-                    config: {
-                        let mut cfg = std::collections::HashMap::new();
-                        cfg.insert("compression.type".to_string(), "snappy".to_string());
-                        cfg.insert("cleanup.policy".to_string(), "compact".to_string());
-                        cfg
-                    },
-                };
-                metalog_store_arc.create_topic(chronik_common::metadata::METADATA_TOPIC, meta_config).await?;
-                info!("Successfully created internal metadata topic");
-            }
-
-            metalog_store_arc
-        } else {
-            info!("Initializing file-based metadata store (legacy mode)");
-            let metadata_dir = format!("{}/metadata", config.data_dir);
-            std::fs::create_dir_all(&metadata_dir)?;
-
-            match FileMetadataStore::new(&metadata_dir).await {
-                Ok(store) => {
-                    info!("Successfully initialized file-based metadata store (legacy) at {}", metadata_dir);
-                    Arc::new(store)
-                },
-                Err(e) => {
-                    return Err(anyhow::anyhow!("Failed to initialize file-based metadata store: {:?}. Please ensure the metadata directory {} is writable.", e, metadata_dir));
-                }
-            }
+                interval_records: 1000,
+                interval_bytes: 10 * 1024 * 1024,
+            },
+            rotation: chronik_wal::config::RotationConfig {
+                max_segment_size: 50 * 1024 * 1024,
+                max_segment_age_ms: 60 * 60 * 1000, // 1 hour
+                coordinate_with_storage: false,
+            },
+            fsync: chronik_wal::config::FsyncConfig {
+                enabled: true,
+                batch_size: 1,
+                batch_timeout_ms: 0,
+            },
+            ..Default::default()
         };
+
+        // Create the real WAL adapter
+        use chronik_storage::WalMetadataAdapter;
+        let wal_adapter = Arc::new(WalMetadataAdapter::new(wal_config).await?);
+
+        let metalog_store = ChronikMetaLogStore::new(
+            wal_adapter,
+            PathBuf::from(format!("{}/metalog_snapshots", config.data_dir)),
+        ).await?;
+
+        info!("Successfully initialized WAL-based metadata store with real WAL adapter");
+
+        // Ensure __meta topic exists for metadata storage
+        let metadata_store: Arc<dyn MetadataStore> = Arc::new(metalog_store);
+        if metadata_store.get_topic(chronik_common::metadata::METADATA_TOPIC).await?.is_none() {
+            info!("Creating internal metadata topic: {}", chronik_common::metadata::METADATA_TOPIC);
+            let meta_config = chronik_common::metadata::TopicConfig {
+                partition_count: 1, // Metadata topic only needs 1 partition
+                replication_factor: 1,
+                retention_ms: None, // Never delete metadata
+                segment_bytes: 50 * 1024 * 1024, // 50MB segments
+                config: {
+                    let mut cfg = std::collections::HashMap::new();
+                    cfg.insert("compression.type".to_string(), "snappy".to_string());
+                    cfg.insert("cleanup.policy".to_string(), "compact".to_string());
+                    cfg
+                },
+            };
+            metadata_store.create_topic(chronik_common::metadata::METADATA_TOPIC, meta_config).await?;
+            info!("Successfully created internal metadata topic");
+        }
         
         // Register this broker in metadata
         // CRITICAL FIX (v1.3.66): Wait for broker registration BEFORE accepting connections
@@ -427,6 +408,139 @@ impl IntegratedKafkaServer {
             produce_handler_inner.set_raft_cluster(Arc::clone(cluster));
         }
 
+        // v2.5.0 Phase 4: Create ISR ACK tracker for acks=-1 quorum support FIRST
+        // CRITICAL: Must be created on ALL nodes (leader + followers) so ACKs can flow bidirectionally
+        // AND must be shared with both WalReplicationManager (for ACK reading) and ProduceHandler (for waiting)
+        let isr_ack_tracker = crate::isr_ack_tracker::IsrAckTracker::new();
+        info!("Created IsrAckTracker for acks=-1 quorum tracking");
+        produce_handler_inner.set_isr_ack_tracker(isr_ack_tracker.clone());
+
+        // v2.5.0 Phase 5: Create leader elector if Raft clustering is enabled
+        // Must be created BEFORE ProduceHandler so it can record heartbeats
+        let leader_elector_for_produce = if let Some(ref raft) = raft_cluster {
+            info!("Creating LeaderElector for ProduceHandler heartbeat tracking");
+            let elector = Arc::new(crate::leader_election::LeaderElector::new(raft.clone()));
+
+            // Start background monitoring (health checks every 3s, timeout after 10s)
+            elector.start_monitoring();
+
+            info!("✓ LeaderElector monitoring started");
+            Some(elector)
+        } else {
+            None
+        };
+
+        // Wire leader elector to ProduceHandler for heartbeat recording
+        if let Some(ref elector) = leader_elector_for_produce {
+            produce_handler_inner.set_leader_elector(elector.clone());
+        }
+
+        // v2.5.0 Phase 5: Initialize Raft metadata for existing topics on startup
+        // CRITICAL: Without this, restarted servers won't have partition metadata in Raft!
+        if let Some(ref raft) = raft_cluster {
+            info!("Initializing Raft metadata for existing topics on startup...");
+
+            // CRITICAL: Wait for Raft leader election before proposing metadata
+            // Raft requires a leader to accept proposals, so we must wait
+            info!("Waiting for Raft leader election before proposing metadata...");
+            let mut leader_ready = false;
+            for attempt in 1..=30 {  // Wait up to 30 seconds
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+                // Check if Raft has a leader
+                let (is_ready, leader_id, state) = raft.is_leader_ready();
+
+                if is_ready {
+                    if leader_id == raft.node_id() {
+                        info!("✓ This node is Raft leader (state={}), proceeding with metadata initialization", state);
+                    } else {
+                        info!("✓ Raft leader elected (leader_id={}, state={}), proceeding with metadata initialization", leader_id, state);
+                    }
+                    leader_ready = true;
+                    break;
+                }
+
+                if attempt % 5 == 0 {
+                    debug!("Still waiting for Raft leader election... ({}s elapsed, state={})", attempt, state);
+                }
+            }
+
+            if !leader_ready {
+                warn!("Raft leader election did not complete within 30 seconds - metadata proposals may fail");
+            }
+
+            // Get all existing topics from metadata store
+            match metadata_store.list_topics().await {
+                Ok(topics) => {
+                    let topic_count = topics.len();
+                    info!("Found {} existing topics to initialize in Raft", topic_count);
+
+                    for topic_meta in topics {
+                        let topic_name = &topic_meta.name;
+                        let partition_count = topic_meta.config.partition_count;
+
+                        info!("Initializing Raft metadata for topic '{}' ({} partitions)", topic_name, partition_count);
+
+                        // Get all nodes in cluster
+                        let all_nodes = vec![1_u64, 2_u64, 3_u64];
+                        let replication_factor = config.replication_factor.min(all_nodes.len() as u32);
+
+                        for partition in 0..partition_count {
+                            // Check if metadata already exists (avoid duplicate proposals)
+                            if raft.get_partition_replicas(topic_name, partition as i32).is_some() {
+                                debug!("Raft metadata already exists for {}-{}, skipping", topic_name, partition);
+                                continue;
+                            }
+
+                            // Assign replicas (round-robin)
+                            let mut replicas = Vec::new();
+                            for i in 0..replication_factor {
+                                let node_idx = (partition as usize + i as usize) % all_nodes.len();
+                                replicas.push(all_nodes[node_idx]);
+                            }
+
+                            // Propose partition assignment
+                            if let Err(e) = raft.propose(crate::raft_metadata::MetadataCommand::AssignPartition {
+                                topic: topic_name.to_string(),
+                                partition: partition as i32,
+                                replicas: replicas.clone(),
+                            }).await {
+                                warn!("Failed to propose partition assignment for {}-{}: {:?}", topic_name, partition, e);
+                                continue;
+                            }
+
+                            // Set initial leader (first replica)
+                            let leader = replicas[0];
+                            if let Err(e) = raft.propose(crate::raft_metadata::MetadataCommand::SetPartitionLeader {
+                                topic: topic_name.to_string(),
+                                partition: partition as i32,
+                                leader,
+                            }).await {
+                                warn!("Failed to propose partition leader for {}-{}: {:?}", topic_name, partition, e);
+                            }
+
+                            // Set initial ISR (all replicas in-sync initially)
+                            if let Err(e) = raft.propose(crate::raft_metadata::MetadataCommand::UpdateISR {
+                                topic: topic_name.to_string(),
+                                partition: partition as i32,
+                                isr: replicas.clone(),
+                            }).await {
+                                warn!("Failed to propose ISR for {}-{}: {:?}", topic_name, partition, e);
+                            }
+
+                            info!("✓ Proposed Raft metadata for {}-{}: replicas={:?}, leader={}, ISR={:?}",
+                                  topic_name, partition, replicas, leader, replicas);
+                        }
+                    }
+
+                    info!("✓ Completed Raft metadata initialization for {} existing topics", topic_count);
+                }
+                Err(e) => {
+                    warn!("Failed to list topics for Raft metadata initialization: {:?}", e);
+                }
+            }
+        }
+
         // v2.2.0: Initialize WAL replication manager if followers configured
         if let Ok(followers_str) = std::env::var("CHRONIK_REPLICATION_FOLLOWERS") {
             if !followers_str.is_empty() {
@@ -446,13 +560,15 @@ impl IntegratedKafkaServer {
                     ));
                     info!("Created ISR tracker (max_lag: 10K entries / 10s)");
 
-                    // v2.5.0 Phase 3: Create replication manager with dependencies
+                    // v2.5.0 Phase 3/4: Create replication manager with dependencies
+                    // CRITICAL: Use the SAME isr_ack_tracker instance that ProduceHandler uses
                     let replication_manager = crate::wal_replication::WalReplicationManager::new_with_dependencies(
                         followers,
-                        raft_cluster.clone(),  // Pass RaftCluster for partition metadata
-                        Some(isr_tracker),     // Pass ISR tracker for replica filtering
+                        raft_cluster.clone(),              // Pass RaftCluster for partition metadata
+                        Some(isr_tracker),                 // Pass ISR tracker for replica filtering
+                        Some(isr_ack_tracker.clone()),     // v2.5.0 Phase 4: Pass SAME ACK tracker
                     );
-                    info!("Created WalReplicationManager with Raft and ISR support");
+                    info!("Created WalReplicationManager with Raft, ISR, and ACK tracking (sharing IsrAckTracker)");
 
                     produce_handler_inner.set_wal_replication_manager(replication_manager);
                 } else {
@@ -650,7 +766,7 @@ impl IntegratedKafkaServer {
             chronik_storage::object_store::StorageBackend::Azure { .. }
         );
 
-        let metadata_uploader = if config.enable_metadata_dr && config.use_wal_metadata && is_remote_object_store {
+        let metadata_uploader = if config.enable_metadata_dr && is_remote_object_store {
             info!("Initializing Metadata Uploader for disaster recovery (metadata WAL → Object Store)");
 
             let uploader_config = chronik_common::metadata::MetadataUploaderConfig {
@@ -678,9 +794,7 @@ impl IntegratedKafkaServer {
 
             Some(uploader)
         } else {
-            if !config.use_wal_metadata {
-                info!("Metadata Uploader disabled (file-based metadata store in use)");
-            } else if !is_remote_object_store {
+            if !is_remote_object_store {
                 info!("Metadata Uploader disabled (local filesystem backend - no DR benefit)");
                 info!("  Local metadata already persists to disk and survives restarts");
                 info!("  For true DR, configure S3/GCS/Azure object store");
@@ -699,8 +813,9 @@ impl IntegratedKafkaServer {
         info!("  Indexing: {}", config.enable_indexing);
         info!("  WAL Indexing: {}", config.enable_wal_indexing);
 
-        // Clone cluster config before moving config into server
+        // Clone cluster config and node_id before moving config into server
         let cluster_config_clone = config.cluster_config.clone();
+        let node_id = config.node_id;
 
         // Create default topic on startup to ensure clients can connect
         // This solves the chicken-and-egg problem where clients need at least one topic
@@ -711,6 +826,7 @@ impl IntegratedKafkaServer {
             metadata_store: metadata_store.clone(),
             wal_indexer,
             metadata_uploader,
+            leader_elector: leader_elector_for_produce,
         };
 
         // Create default topic
@@ -771,10 +887,15 @@ impl IntegratedKafkaServer {
         if let Ok(receiver_addr) = std::env::var("CHRONIK_WAL_RECEIVER_ADDR") {
             if !receiver_addr.is_empty() {
                 info!("WAL receiver enabled on {}", receiver_addr);
-                let wal_receiver = crate::wal_replication::WalReceiver::new(
+
+                // v2.5.0 Phase 4: Pass IsrAckTracker to WalReceiver so it can send ACKs back to leader
+                let wal_receiver = crate::wal_replication::WalReceiver::new_with_isr_tracker(
                     receiver_addr.clone(),
                     wal_manager.clone(),
+                    isr_ack_tracker.clone(),
+                    node_id as u64,
                 );
+                info!("WAL receiver configured with IsrAckTracker (node_id={})", node_id);
 
                 // Spawn receiver in background
                 tokio::spawn(async move {

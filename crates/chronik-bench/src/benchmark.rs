@@ -491,8 +491,24 @@ impl BenchmarkRunner {
         // Consume messages
         let start_time = Instant::now();
         let duration = self.args.duration;
+        let message_count = self.args.message_count;
 
-        while duration.as_secs() == 0 || start_time.elapsed() < duration {
+        loop {
+            // Check duration limit
+            if duration.as_secs() > 0 && start_time.elapsed() >= duration {
+                info!("Duration limit reached, stopping consumer");
+                break;
+            }
+
+            // Check message count limit
+            if message_count > 0 {
+                let received = messages_received.load(Ordering::Relaxed);
+                if received >= message_count {
+                    info!("Message count limit reached ({}/{}), stopping consumer", received, message_count);
+                    break;
+                }
+            }
+
             match consumer.recv().await {
                 Ok(message) => {
                     messages_received.fetch_add(1, Ordering::Relaxed);

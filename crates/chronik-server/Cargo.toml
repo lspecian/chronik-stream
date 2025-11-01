@@ -28,9 +28,12 @@ chronik-query = { path = "../chronik-query", optional = true }
 chronik-backup = { path = "../chronik-backup", optional = true }
 
 # Raft consensus (v2.5.0 - metadata coordination only, NOT data replication)
-raft = "0.7"
-raft-proto = "0.7"
-prost = "0.12"
+chronik-raft = { path = "../chronik-raft" }
+raft = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+slog = { workspace = true }
+slog-stdlog = { workspace = true }
 
 # Core dependencies
 tokio = { workspace = true }
