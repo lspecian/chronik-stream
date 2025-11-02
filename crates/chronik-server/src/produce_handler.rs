@@ -1228,127 +1228,16 @@ impl ProduceHandler {
             topic, partition, base_offset, records.len(), total_bytes
         );
 
-        // PHASE 3: Raft-based Produce Path
-        // Check if this partition is Raft-enabled FIRST, before writing to WAL directly
-        #[cfg(feature = "raft")]
-        {
-            if let Some(ref raft_manager) = self.raft_manager {
-                if raft_manager.has_replica(topic, partition) {
-                    // LEADER CHECK: Only the leader can accept produce requests
-                    if !raft_manager.is_leader(topic, partition) {
-                        // This node is not the leader - return error with leader info
-                        let leader_id = raft_manager.get_leader(topic, partition);
-                        warn!(
-                            "NOT_LEADER: {}-{} leader_id={:?}, this node cannot accept produce requests",
-                            topic, partition, leader_id
-                        );
-
-                        // Drop memory permit before returning error
-                        drop(memory_permit);
-
-                        // Return LEADER_NOT_AVAILABLE error (Kafka standard for non-leader)
-                        return Ok(ProduceResponsePartition {
-                            index: partition,
-                            error_code: chronik_protocol::error_codes::LEADER_NOT_AVAILABLE,
-                            base_offset: -1,
-                            log_append_time: -1,
-                            log_start_offset: -1,
-                        });
-                    }
-
-                    info!("Raft-enabled partition {}-{}: Proposing write to Raft consensus (leader)", topic, partition);
-
-                    // Serialize the canonical record for Raft proposal
-                    use chronik_storage::canonical_record::CanonicalRecord;
-                    match CanonicalRecord::from_kafka_batch(&re_encoded_bytes) {
-                        Ok(mut canonical_record) => {
-                            // Preserve original wire bytes for CRC validation
-                            canonical_record.compressed_records_wire_bytes = Some(re_encoded_bytes.to_vec());
-
-                            match bincode::serialize(&canonical_record) {
-                                Ok(serialized) => {
-                                    // CRITICAL (v2.0.0 Phase 3): Log before proposing to Raft
-                                    info!(
-                                        "PRODUCE: Proposing {} bytes to Raft for {}-{}, base_offset={}, num_records={}",
-                                        serialized.len(), topic, partition, canonical_record.base_offset, canonical_record.records.len()
-                                    );
-
-                                    if serialized.is_empty() {
-                                        error!("PRODUCE: ❌ EMPTY serialized bytes before propose! This is a BUG in {}-{}", topic, partition);
-                                    }
-
-                                    // Propose to Raft (will block until committed by quorum)
-                                    // The state machine will handle WAL writes and storage
-                                    match raft_manager.propose(topic, partition, serialized.clone()).await {
-                                        Ok(raft_index) => {
-                                            info!("Raft✓ {}-{}: Committed at index={}, offsets={}-{}",
-                                                topic, partition, raft_index, base_offset, last_offset);
-
-                                            // Update metrics
-                                            self.metrics.records_produced.fetch_add(records.len() as u64, Ordering::Relaxed);
-                                            self.metrics.bytes_produced.fetch_add(total_bytes, Ordering::Relaxed);
-
-                                            // Update high watermark after successful Raft commit
-                                            partition_state.high_watermark.store((last_offset + 1) as u64, Ordering::SeqCst);
-
-                                            // Send to indexing pipeline if enabled
-                                            if self.config.enable_indexing {
-                                                self.send_to_indexer(topic, partition, &records).await;
-                                            }
-
-                                            // Update producer sequence for idempotence
-                                            if kafka_batch.header.producer_id >= 0 {
-                                                self.update_producer_sequence(
-                                                    kafka_batch.header.producer_id,
-                                                    topic,
-                                                    partition,
-                                                    kafka_batch.header.base_sequence + records.len() as i32 - 1,
-                                                ).await;
-                                            }
-
-                                            // Drop memory permit
-                                            drop(memory_permit);
-
-                                            // Get partition state for response
-                                            let log_start_offset = partition_state.log_start_offset.load(Ordering::Relaxed) as i64;
-
-                                            // Return success immediately - Raft has replicated the data
-                                            return Ok(ProduceResponsePartition {
-                                                index: partition,
-                                                error_code: ErrorCode::None.code(),
-                                                base_offset: base_offset as i64,
-                                                log_append_time: if (kafka_batch.header.attributes >> 3) & 0b111 == TimestampType::LogAppendTime as u16 {
-                                                    kafka_batch.header.max_timestamp
-                                                } else {
-                                                    -1
-                                                },
-                                                log_start_offset,
-                                            });
-                                        }
-                                        Err(e) => {
-                                            error!("Raft proposal failed for {}-{}: {}", topic, partition, e);
-                                            return Err(Error::Internal(format!("Raft consensus failed: {}", e)));
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    error!("Failed to serialize for Raft {}-{}: {}", topic, partition, e);
-                                    return Err(Error::Internal(format!("Raft serialization failed: {}", e)));
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            error!("Failed to parse batch for Raft {}-{}: {}", topic, partition, e);
-                            return Err(Error::Protocol(format!("Invalid batch for Raft: {}", e)));
-                        }
-                    }
-                }
-            }
-        }
-
-        // NON-RAFT PATH: Direct WAL write for partitions not managed by Raft
-        // This is the fallback for standalone mode or non-Raft partitions
-        warn!("DEBUG_TRACE: Using non-Raft path for {}-{}", topic, partition);
+        // REMOVED: Old Raft data replication code (was behind #[cfg(feature = "raft")])
+        // REASON: Raft should ONLY handle metadata (leader election, ISR tracking, assignments)
+        // MESSAGE DATA replication is handled by WAL streaming (wal_replication.rs)
+        // See docs/HYBRID_CLUSTERING_ARCHITECTURE.md for design rationale
+        //
+        // Performance: Raft data replication = 2-5K msg/s, WAL streaming = 60K+ msg/s
+        //
+        // The hybrid design:
+        // - Raft: Metadata coordination (data/wal/__meta/)
+        // - WAL Streaming: Message data (data/wal/{topic}/{partition}/)
 
         // CRITICAL (v1.3.47+): Write to WAL BEFORE updating high watermark
         // This ensures durability guarantee - data is persisted before acknowledgment
