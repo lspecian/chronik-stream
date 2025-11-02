@@ -1123,10 +1123,20 @@ impl IntegratedKafkaServer {
 
                         while let Some((sequence, correlation_id, response_data)) = response_rx.recv().await {
                             // Add response to buffer
-                            pending_responses.insert(sequence, (correlation_id, response_data));
+                            pending_responses.insert(sequence, (correlation_id, response_data.clone()));
+
+                            tracing::info!(
+                                "[RESPONSE PIPELINE] Step 3: Response writer received response, sequence={}, correlation_id={}, size={} bytes, pending_count={}",
+                                sequence, correlation_id, response_data.len(), pending_responses.len()
+                            );
 
                             // Send all consecutive responses starting from next_sequence
                             while let Some((corr_id, resp_data)) = pending_responses.remove(&next_sequence) {
+                                tracing::info!(
+                                    "[RESPONSE PIPELINE] Step 4: Writing response to socket, sequence={}, correlation_id={}, size={} bytes",
+                                    next_sequence, corr_id, resp_data.len()
+                                );
+
                                 // Write response to socket
                                 if let Err(e) = socket_writer.write_all(&resp_data).await {
                                     error!("Failed to write response for sequence={}, correlation_id={}: {}",
@@ -1139,7 +1149,7 @@ impl IntegratedKafkaServer {
                                     return;
                                 }
 
-                                tracing::debug!("Sent response: sequence={}, correlation_id={}", next_sequence, corr_id);
+                                tracing::info!("[RESPONSE PIPELINE] Step 5: Response sent and flushed successfully, sequence={}, correlation_id={}", next_sequence, corr_id);
                                 next_sequence += 1;
                             }
                         }
@@ -1283,11 +1293,22 @@ impl IntegratedKafkaServer {
                                     full_response.extend_from_slice(&header_bytes);
                                     full_response.extend_from_slice(&response.body);
 
+                                    // DETAILED LOGGING FOR DEBUGGING
+                                    tracing::info!(
+                                        "[RESPONSE PIPELINE] Step 1: Built response for API {:?}, correlation_id={}, sequence={}, total_size={} bytes (header={}, body={})",
+                                        response.api_key, response.header.correlation_id, sequence, full_response.len(), header_bytes.len(), response.body.len()
+                                    );
+
                                     // Measure channel send delay to detect backpressure
                                     let send_start = std::time::Instant::now();
                                     // Send response with sequence number for ordering
-                                    if let Err(e) = response_sender.send((sequence, response.header.correlation_id, full_response)).await {
+                                    if let Err(e) = response_sender.send((sequence, response.header.correlation_id, full_response.clone())).await {
                                         error!("Failed to send response to writer for addr={}: {}", addr_clone, e);
+                                    } else {
+                                        tracing::info!(
+                                            "[RESPONSE PIPELINE] Step 2: Sent to channel for API {:?}, correlation_id={}, sequence={}",
+                                            response.api_key, response.header.correlation_id, sequence
+                                        );
                                     }
                                     let send_duration = send_start.elapsed();
                                     if send_duration.as_millis() > 10 {

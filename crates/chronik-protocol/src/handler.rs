@@ -1621,7 +1621,8 @@ impl ProtocolHandler {
                     // Empty records
                     tracing::trace!("        Records: empty (0 bytes)");
                     if flexible {
-                        encoder.write_unsigned_varint(0); // Null in compact encoding
+                        // CRITICAL FIX: Compact encoding - 1 = empty (0 bytes), NOT 0 (which is null)
+                        encoder.write_unsigned_varint(1); // Empty array (0 bytes)
                     } else {
                         encoder.write_i32(0); // Empty byte array
                     }

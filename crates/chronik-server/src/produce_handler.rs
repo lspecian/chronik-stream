@@ -979,37 +979,36 @@ impl ProduceHandler {
                     continue;
                 }
                 
-                // Check leadership: Raft takes precedence over metadata store
-                #[cfg(feature = "raft")]
+                // Check leadership: RaftCluster takes precedence over metadata store
+                // v2.5.0 Phase 2: Use RaftCluster for partition leadership checks
                 let (is_leader, leader_hint) = {
-                    if let Some(ref raft_manager) = self.raft_manager {
-                        // Check if this partition is managed by Raft
-                        if raft_manager.has_replica(&topic_data.name, partition_data.index) {
-                            let is_raft_leader = raft_manager.is_leader(&topic_data.name, partition_data.index);
-                            let leader_id = raft_manager.get_leader(&topic_data.name, partition_data.index);
+                    if let Some(ref raft_cluster) = self.raft_cluster {
+                        // Get partition leader from Raft metadata state machine
+                        let leader_id = raft_cluster.get_partition_leader(&topic_data.name, partition_data.index);
+
+                        if let Some(leader) = leader_id {
+                            // Partition is managed by Raft
+                            let is_raft_leader = leader == raft_cluster.node_id();
 
                             debug!(
-                                "Raft leadership check for {}-{}: is_leader={}, leader_id={:?}",
-                                topic_data.name, partition_data.index, is_raft_leader, leader_id
+                                "Raft leadership check for {}-{}: node_id={}, leader={}, is_leader={}",
+                                topic_data.name, partition_data.index, raft_cluster.node_id(), leader, is_raft_leader
                             );
 
-                            (is_raft_leader, leader_id)
+                            (is_raft_leader, Some(leader))
                         } else {
-                            // Partition not managed by Raft, fall back to metadata store
+                            // Partition not yet assigned in Raft, fall back to metadata store
                             debug!(
-                                "Partition {}-{} not managed by Raft, using metadata store for leadership",
+                                "Partition {}-{} not assigned in Raft, using metadata store for leadership",
                                 topic_data.name, partition_data.index
                             );
                             self.check_metadata_leadership(&topic_data.name, partition_data.index).await?
                         }
                     } else {
-                        // No Raft manager, use metadata store
+                        // No Raft cluster, use metadata store (standalone mode)
                         self.check_metadata_leadership(&topic_data.name, partition_data.index).await?
                     }
                 };
-
-                #[cfg(not(feature = "raft"))]
-                let (is_leader, leader_hint) = self.check_metadata_leadership(&topic_data.name, partition_data.index).await?;
 
                 if !is_leader {
                     debug!(
@@ -2485,7 +2484,83 @@ impl ProduceHandler {
         
         result
     }
-    
+
+    /// Initialize Raft partition metadata for an existing topic
+    ///
+    /// This method is called by CreateTopics API handler to ensure partition
+    /// assignments are proposed to Raft cluster for topics created explicitly.
+    ///
+    /// # Arguments
+    /// - `topic_name`: Name of the topic
+    /// - `num_partitions`: Number of partitions in the topic
+    ///
+    /// # Returns
+    /// Ok(()) if partition metadata was successfully initialized, or if Raft is not enabled
+    pub async fn initialize_raft_partitions(&self, topic_name: &str, num_partitions: u32) -> Result<()> {
+        // Only initialize if Raft is enabled
+        if let Some(ref raft) = self.raft_cluster {
+            info!("Initializing Raft partition metadata for topic '{}' ({} partitions)",
+                  topic_name, num_partitions);
+
+            // Get all nodes in the cluster (for replication)
+            // For now, use a fixed list of node IDs (1, 2, 3 for a 3-node cluster)
+            // TODO: Get this from cluster configuration
+            let all_nodes = vec![1_u64, 2_u64, 3_u64];
+            let replication_factor = self.config.default_replication_factor.min(all_nodes.len() as u32);
+
+            for partition in 0..num_partitions {
+                // Assign replicas (round-robin across nodes)
+                let mut replicas = Vec::new();
+                for i in 0..replication_factor {
+                    let node_idx = (partition as usize + i as usize) % all_nodes.len();
+                    replicas.push(all_nodes[node_idx]);
+                }
+
+                // Propose partition assignment to Raft
+                // NOTE: This will fail on follower nodes - only leader can propose
+                // That's OK - followers will get the assignment via Raft replication
+                if let Err(e) = raft.propose(crate::raft_metadata::MetadataCommand::AssignPartition {
+                    topic: topic_name.to_string(),
+                    partition: partition as i32,
+                    replicas: replicas.clone(),
+                }).await {
+                    debug!("Could not propose partition assignment for {}-{} (expected on followers): {}", topic_name, partition, e);
+                    // Break out - we're not the leader, so skip remaining proposals
+                    // The leader will propose when it creates the topic
+                    return Ok(());
+                }
+
+                // Set initial leader (first replica)
+                let leader = replicas[0];
+                if let Err(e) = raft.propose(crate::raft_metadata::MetadataCommand::SetPartitionLeader {
+                    topic: topic_name.to_string(),
+                    partition: partition as i32,
+                    leader,
+                }).await {
+                    warn!("Failed to propose partition leader for {}-{}: {:?}", topic_name, partition, e);
+                }
+
+                // Set initial ISR (all replicas are in-sync initially)
+                if let Err(e) = raft.propose(crate::raft_metadata::MetadataCommand::UpdateISR {
+                    topic: topic_name.to_string(),
+                    partition: partition as i32,
+                    isr: replicas.clone(),
+                }).await {
+                    warn!("Failed to propose ISR for {}-{}: {:?}", topic_name, partition, e);
+                }
+
+                info!("✓ Initialized Raft partition metadata for {}-{}: replicas={:?}, leader={}, ISR={:?}",
+                      topic_name, partition, replicas, leader, replicas);
+            }
+
+            info!("✓ Completed Raft partition metadata initialization for topic '{}' (leader node)", topic_name);
+        } else {
+            debug!("Raft not enabled, skipping partition metadata initialization for '{}'", topic_name);
+        }
+
+        Ok(())
+    }
+
     /// Validate topic name according to Kafka rules
     fn is_valid_topic_name(name: &str) -> bool {
         // Kafka topic naming rules:

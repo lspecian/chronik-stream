@@ -23,7 +23,7 @@ use crate::raft_metadata::{MetadataCommand, MetadataStateMachine, PartitionKey};
 use anyhow::{Result, Context};
 use std::sync::{Arc, RwLock};
 use std::collections::HashMap;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
 
 use raft::{prelude::*, storage::MemStorage};
 use slog::Drain;
@@ -53,6 +53,11 @@ pub struct RaftCluster {
 
     /// gRPC server handle
     grpc_server_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+
+    /// Channel for sending Raft messages asynchronously
+    /// Messages are taken from Ready and sent to this channel (non-blocking)
+    /// A background task reads from channel and sends via gRPC
+    message_sender: mpsc::UnboundedSender<(u64, Message)>,
 }
 
 impl RaftCluster {
@@ -106,15 +111,20 @@ impl RaftCluster {
 
         tracing::info!("✓ Raft WAL storage initialized (persistent)");
 
-        // Initialize with voter configuration
-        wal_storage.set_raft_state(RaftState {
-            hard_state: HardState::default(),
-            conf_state: ConfState {
-                voters: all_nodes.clone(),
-                learners: vec![],
-                ..Default::default()
-            },
-        });
+        // Initialize with voter configuration ONLY if no state was recovered
+        if !wal_storage.has_recovered_state() {
+            tracing::info!("No recovered Raft state - initializing fresh cluster");
+            wal_storage.set_raft_state(RaftState {
+                hard_state: HardState::default(),
+                conf_state: ConfState {
+                    voters: all_nodes.clone(),
+                    learners: vec![],
+                    ..Default::default()
+                },
+            });
+        } else {
+            tracing::info!("✓ Using recovered Raft state from WAL");
+        }
 
         // Create logger for Raft (it uses slog)
         let logger = slog::Logger::root(slog_stdlog::StdLog.fuse(), slog::o!());
@@ -149,6 +159,39 @@ impl RaftCluster {
 
         tracing::info!("✓ Raft cluster initialized with {} voters and gRPC transport", all_nodes.len());
 
+        // Create channel for async message sending
+        // CRITICAL: This allows us to take_messages() from Ready (satisfying Raft),
+        // then send to channel (non-blocking), while a background task does actual gRPC sends
+        let (message_sender, mut message_receiver) = mpsc::unbounded_channel::<(u64, Message)>();
+
+        // Start background message sender task
+        let transport_for_sender = transport.clone();
+        tokio::spawn(async move {
+            while let Some((peer_id, msg)) = message_receiver.recv().await {
+                let msg_type = msg.msg_type;
+                tracing::debug!("Message sender: sending {:?} to peer {}", msg_type, peer_id);
+
+                // Use gRPC transport to send the message
+                const METADATA_TOPIC: &str = "__raft_metadata";
+                const METADATA_PARTITION: i32 = 0;
+
+                match transport_for_sender
+                    .send_message(METADATA_TOPIC, METADATA_PARTITION, peer_id, msg)
+                    .await
+                {
+                    Ok(_) => {
+                        tracing::debug!("✓ Message sender: sent {:?} to peer {}", msg_type, peer_id);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Message sender: failed to send {:?} to peer {}: {}", msg_type, peer_id, e);
+                    }
+                }
+            }
+            tracing::info!("Message sender task shutting down");
+        });
+
+        tracing::info!("✓ Raft message sender task started");
+
         Ok(Self {
             node_id,
             state_machine,
@@ -156,6 +199,7 @@ impl RaftCluster {
             storage: Arc::new(storage_for_async),
             transport,
             grpc_server_handle: Arc::new(Mutex::new(None)),
+            message_sender,
         })
     }
 
@@ -405,26 +449,28 @@ impl RaftCluster {
                 }
 
                 // Process Ready state
-                let mut ready = {
-                    let mut raft = match self.raft_node.write() {
-                        Ok(r) => r,
-                        Err(e) => {
-                            tracing::error!("Failed to acquire Raft lock for ready: {}", e);
-                            continue;
-                        }
-                    };
-
-                    if !raft.has_ready() {
+                // CRITICAL: Must hold lock from ready() through advance() to prevent
+                // other threads from calling step() and adding messages
+                let mut raft_lock = match self.raft_node.write() {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::error!("Failed to acquire Raft lock for ready: {}", e);
                         continue;
                     }
-
-                    raft.ready()
                 };
+
+                if !raft_lock.has_ready() {
+                    continue;
+                }
+
+                let mut ready = raft_lock.ready();
 
                 // CRITICAL: Follow proper Raft Ready handling order
                 // See: https://github.com/tikv/raft-rs/blob/master/examples/single_mem_node/main.rs
 
                 // Step 1: Send unpersisted messages first
+                // CRITICAL: MUST call take_messages() to satisfy Raft's ownership requirements
+                // Then immediately send to channel (non-blocking) - background task handles actual sends
                 if !ready.messages().is_empty() {
                     let messages = ready.take_messages();
                     tracing::info!("Raft ready: {} unpersisted messages to send", messages.len());
@@ -432,27 +478,57 @@ impl RaftCluster {
                     for msg in messages {
                         let peer_id = msg.to;
                         let msg_type = msg.msg_type;
-                        let self_clone = self.clone();
 
-                        tracing::info!("Sending unpersisted {:?} to peer {}", msg_type, peer_id);
+                        tracing::debug!("Queueing unpersisted {:?} to peer {}", msg_type, peer_id);
 
-                        tokio::spawn(async move {
-                            match self_clone.send_raft_message(peer_id, msg).await {
-                                Ok(_) => {
-                                    tracing::info!("Successfully sent {:?} to peer {}", msg_type, peer_id);
-                                }
-                                Err(e) => {
-                                    tracing::warn!("Failed to send {:?} to peer {}: {}", msg_type, peer_id, e);
-                                }
-                            }
-                        });
+                        // Send to channel - non-blocking, background task does gRPC
+                        if let Err(e) = self.message_sender.send((peer_id, msg)) {
+                            tracing::error!("Failed to queue message to peer {}: {}", peer_id, e);
+                        }
                     }
                 }
 
-                // Step 2: Apply snapshot if present
+                // Step 2: Apply snapshot if present (Phase 5)
                 if !raft::is_empty_snap(ready.snapshot()) {
-                    // TODO: Persist snapshot
-                    tracing::debug!("Snapshot available (not persisted yet)");
+                    let snapshot = ready.snapshot();
+                    tracing::info!("Received snapshot from leader: index={}, term={}",
+                        snapshot.get_metadata().index, snapshot.get_metadata().term);
+
+                    // Clone storage before async operation
+                    let storage_clone = self.storage.clone();
+                    let state_machine_clone = self.state_machine.clone();
+                    let snapshot_clone = snapshot.clone();
+
+                    // Persist snapshot and apply to state machine
+                    let apply_result = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(async {
+                            // Save snapshot to disk
+                            storage_clone.save_snapshot(&snapshot_clone).await?;
+
+                            // Deserialize and apply state machine
+                            let state_machine_data = snapshot_clone.get_data();
+                            if !state_machine_data.is_empty() {
+                                let new_state: MetadataStateMachine = bincode::deserialize(state_machine_data)
+                                    .context("Failed to deserialize state machine from snapshot")?;
+
+                                // Replace state machine with snapshot state
+                                *state_machine_clone.write().unwrap() = new_state;
+
+                                tracing::info!("✓ Applied state machine from snapshot");
+                            }
+
+                            // Truncate log entries covered by snapshot
+                            storage_clone.truncate_log_to_snapshot(snapshot_clone.get_metadata().index).await?;
+
+                            Ok::<(), anyhow::Error>(())
+                        })
+                    });
+
+                    if let Err(e) = apply_result {
+                        tracing::error!("Failed to apply snapshot: {}", e);
+                    } else {
+                        tracing::info!("✓ Snapshot applied successfully");
+                    }
                 }
 
                 // Step 3: Handle committed entries
@@ -473,40 +549,55 @@ impl RaftCluster {
                 }
 
                 // Step 4: Persist entries (required before persisted_messages)
-                // CRITICAL FIX: Must AWAIT persistence before calling advance()
-                // Spawning in background violates Raft safety - we MUST wait for disk sync
+                // CRITICAL: Run async operations WHILE HOLDING LOCK using block_in_place
+                // This prevents other threads from calling step() between ready() and advance()
                 if !ready.entries().is_empty() {
                     let entries = ready.entries();
                     tracing::info!("Persisting {} Raft entries to WAL", entries.len());
 
                     let entries_clone: Vec<_> = entries.iter().cloned().collect();
+                    let storage_clone = self.storage.clone();
 
-                    // AWAIT the persistence - don't spawn in background!
-                    if let Err(e) = self.storage.append_entries(&entries_clone).await {
+                    // Block in place to run async operation synchronously
+                    // This keeps the lock held but allows async runtime to work
+                    let persist_result = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(async {
+                            storage_clone.append_entries(&entries_clone).await
+                        })
+                    });
+
+                    if let Err(e) = persist_result {
                         tracing::error!("Failed to persist Raft entries: {}", e);
-                        // Continue anyway - Raft will recover on next restart
                     } else {
                         tracing::info!("✓ Persisted {} Raft entries to WAL", entries_clone.len());
                     }
                 }
 
                 // Step 5: Persist hard state (required before persisted_messages)
-                // CRITICAL FIX: Must AWAIT persistence before calling advance()
+                // CRITICAL: Run async operations WHILE HOLDING LOCK using block_in_place
                 if let Some(hs) = ready.hs() {
                     tracing::info!("Persisting HardState: term={}, vote={}, commit={}", hs.term, hs.vote, hs.commit);
 
                     let hs_clone = hs.clone();
+                    let storage_clone = self.storage.clone();
 
-                    // AWAIT the persistence - don't spawn in background!
-                    if let Err(e) = self.storage.persist_hard_state(&hs_clone).await {
+                    // Block in place to run async operation synchronously
+                    let persist_result = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(async {
+                            storage_clone.persist_hard_state(&hs_clone).await
+                        })
+                    });
+
+                    if let Err(e) = persist_result {
                         tracing::error!("Failed to persist HardState: {}", e);
-                        // Continue anyway - Raft will recover on next restart
                     } else {
                         tracing::info!("✓ Persisted HardState: term={}, vote={}, commit={}", hs_clone.term, hs_clone.vote, hs_clone.commit);
                     }
                 }
 
                 // Step 6: Send persisted messages (AFTER persistence)
+                // CRITICAL: MUST call take_persisted_messages() to satisfy Raft's ownership requirements
+                // Then immediately send to channel (non-blocking) - background task handles actual sends
                 if !ready.persisted_messages().is_empty() {
                     let persisted_msgs = ready.take_persisted_messages();
                     tracing::info!("Raft ready: {} persisted messages to send", persisted_msgs.len());
@@ -514,34 +605,84 @@ impl RaftCluster {
                     for msg in persisted_msgs {
                         let peer_id = msg.to;
                         let msg_type = msg.msg_type;
-                        let self_clone = self.clone();
 
-                        tracing::info!("Sending persisted {:?} to peer {}", msg_type, peer_id);
+                        tracing::debug!("Queueing persisted {:?} to peer {}", msg_type, peer_id);
 
-                        tokio::spawn(async move {
-                            match self_clone.send_raft_message(peer_id, msg).await {
-                                Ok(_) => {
-                                    tracing::info!("Successfully sent persisted {:?} to peer {}", msg_type, peer_id);
-                                }
-                                Err(e) => {
-                                    tracing::warn!("Failed to send persisted {:?} to peer {}: {}", msg_type, peer_id, e);
-                                }
-                            }
-                        });
+                        // Send to channel - non-blocking, background task does gRPC
+                        if let Err(e) = self.message_sender.send((peer_id, msg)) {
+                            tracing::error!("Failed to queue persisted message to peer {}: {}", peer_id, e);
+                        }
                     }
                 }
 
                 // Step 7: Advance Raft (marks Ready as processed)
-                {
-                    let mut raft = match self.raft_node.write() {
-                        Ok(r) => r,
-                        Err(e) => {
-                            tracing::error!("Failed to acquire Raft lock for advance: {}", e);
-                            continue;
-                        }
-                    };
-                    raft.advance(ready);
+                // CRITICAL: Use SAME raft_lock instance that created ready
+                // Lock has been held continuously from ready() to here
+                tracing::debug!("Advancing Raft (state={:?})", raft_lock.raft.state);
+
+                raft_lock.advance(ready);
+
+                tracing::debug!("✓ Advanced Raft successfully");
+
+                // Step 8: Check if we should create a snapshot (Phase 5)
+                // Trigger when applied >= last_index - 1000
+                let applied = {
+                    let raft_state = self.storage.initial_state().unwrap();
+                    raft_state.hard_state.commit
+                };
+
+                let last_index = self.storage.last_index().unwrap();
+
+                if applied > 0 && last_index > 1000 && applied >= last_index - 1000 {
+                    tracing::info!(
+                        "Snapshot trigger: applied={}, last_index={} (threshold: {})",
+                        applied,
+                        last_index,
+                        last_index - 1000
+                    );
+
+                    // Clone needed data before async operations
+                    let state_machine_clone = self.state_machine.clone();
+                    let storage_clone = self.storage.clone();
+
+                    // Create snapshot (async operations using block_in_place)
+                    let snapshot_result = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(async {
+                            // Serialize state machine
+                            let state_machine = state_machine_clone.read().unwrap();
+                            let state_machine_bytes = bincode::serialize(&*state_machine)
+                                .context("Failed to serialize state machine")?;
+
+                            // Get applied term (from last applied entry)
+                            let applied_term = if applied > 0 {
+                                storage_clone.term(applied).unwrap_or(0)
+                            } else {
+                                0
+                            };
+
+                            // Create snapshot
+                            let snapshot = storage_clone
+                                .create_snapshot(state_machine_bytes, applied, applied_term)
+                                .await?;
+
+                            // Save snapshot to disk
+                            storage_clone.save_snapshot(&snapshot).await?;
+
+                            // Truncate log entries covered by snapshot
+                            storage_clone.truncate_log_to_snapshot(applied).await?;
+
+                            Ok::<(), anyhow::Error>(())
+                        })
+                    });
+
+                    if let Err(e) = snapshot_result {
+                        tracing::error!("Failed to create/save snapshot: {}", e);
+                    } else {
+                        tracing::info!("✓ Created and saved snapshot at index={}", applied);
+                    }
                 }
+
+                // Lock is released here at end of loop iteration
             }
         });
 
@@ -620,7 +761,10 @@ pub async fn run_raft_cluster(config: RaftClusterConfig) -> Result<()> {
         config.raft_addr
     );
 
-    // Step 1: Bootstrap RaftCluster for metadata coordination
+    // Step 1: Clone peers before bootstrap (needed for WAL replication config later)
+    let peers_for_replication = config.peers.clone();
+
+    // Bootstrap RaftCluster for metadata coordination
     let raft_cluster = Arc::new(RaftCluster::bootstrap(
         config.node_id,
         config.peers,
@@ -639,6 +783,48 @@ pub async fn run_raft_cluster(config: RaftClusterConfig) -> Result<()> {
     raft_cluster.clone().start_grpc_server(config.raft_addr.clone()).await?;
     tracing::info!("✓ Raft gRPC server started on {}", config.raft_addr);
 
+    // Step 1.7: Auto-configure WAL replication for Raft cluster (Phase 4 fix)
+    // CRITICAL: Without this, acks=-1 hangs because no follower ACKs are sent!
+    // Convert Raft peer addresses to WAL replication addresses
+    // Port mapping: raft_port → kafka_port (raft - 100) → wal_port (kafka + 10)
+    let wal_followers: Vec<String> = peers_for_replication.iter()
+        .filter_map(|(peer_id, raft_addr)| {
+            // Parse Raft address to extract host and port
+            // Format: "host:raft_port" where kafka_port = raft_port - 100, wal_port = kafka_port + 10
+            if let Some(colon_pos) = raft_addr.rfind(':') {
+                let host = &raft_addr[..colon_pos];
+                if let Ok(raft_port) = raft_addr[colon_pos+1..].parse::<u16>() {
+                    let kafka_port = raft_port - 100;  // Kafka port = Raft port - 100
+                    let wal_port = kafka_port + 10;    // WAL replication port = Kafka port + 10
+                    let wal_addr = format!("{}:{}", host, wal_port);
+                    tracing::info!("Mapped Raft peer {} (Raft={}:{}) to WAL follower: {} (Kafka={}, WAL={})",
+                        peer_id, host, raft_port, wal_addr, kafka_port, wal_port);
+                    return Some(wal_addr);
+                }
+            }
+            tracing::warn!("Failed to parse Raft peer address: {}", raft_addr);
+            None
+        })
+        .collect();
+
+    // Set environment variable for WAL replication (leader → followers)
+    if !wal_followers.is_empty() {
+        let followers_str = wal_followers.join(",");
+        tracing::info!("Auto-configuring WAL replication with {} followers: {}",
+            wal_followers.len(), followers_str);
+        std::env::set_var("CHRONIK_REPLICATION_FOLLOWERS", followers_str);
+    } else {
+        tracing::warn!("No WAL followers derived from Raft peers - WAL replication disabled");
+    }
+
+    // Step 1.8: Enable WalReceiver on THIS node (so it can receive replication as a follower)
+    // CRITICAL: Without this, followers can't receive data and send ACKs back!
+    // Use a separate port for WAL replication (Kafka port + 10) to avoid conflicts
+    let wal_replication_port = config.kafka_port + 10;
+    let this_wal_receiver_addr = format!("{}:{}", config.advertised_addr, wal_replication_port);
+    tracing::info!("Enabling WAL receiver on this node: {} (WAL replication port)", this_wal_receiver_addr);
+    std::env::set_var("CHRONIK_WAL_RECEIVER_ADDR", &this_wal_receiver_addr);
+
     // Step 2: Create IntegratedKafkaServer configuration
     let server_config = IntegratedServerConfig {
         node_id: config.node_id as i32,
@@ -649,7 +835,7 @@ pub async fn run_raft_cluster(config: RaftClusterConfig) -> Result<()> {
         enable_compression: true,
         auto_create_topics: true,
         num_partitions: 1,
-        replication_factor: 1,
+        replication_factor: 3,  // CRITICAL: Raft cluster needs replication_factor=3 for ISR quorum!
         enable_wal_indexing: false,
         wal_indexing_interval_secs: 300,
         object_store_config: None,

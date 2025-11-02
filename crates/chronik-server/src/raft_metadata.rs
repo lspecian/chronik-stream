@@ -57,7 +57,7 @@ pub enum MetadataCommand {
 }
 
 /// Metadata state machine (applied from Raft log)
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MetadataStateMachine {
     /// Cluster nodes: node_id → address
     pub nodes: HashMap<u64, String>,

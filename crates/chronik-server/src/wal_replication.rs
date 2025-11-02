@@ -233,19 +233,38 @@ impl WalReplicationManager {
         leader_high_watermark: i64,
         serialized_data: Vec<u8>,
     ) {
-        // Get replicas from Raft metadata
-        let replicas = match &self.raft_cluster {
+        // CRITICAL FIX for acks=-1: Get ISR from Raft metadata (source of truth)
+        // Do NOT use IsrTracker for filtering - it's for runtime monitoring only
+        let isr_replicas = match &self.raft_cluster {
             Some(cluster) => {
-                match cluster.get_partition_replicas(&topic, partition) {
-                    Some(r) => r,
-                    None => {
-                        // No replicas assigned, fall back to broadcast
+                match cluster.get_isr(&topic, partition) {
+                    Some(isr) => {
                         debug!(
-                            "No replicas found for {}-{}, falling back to replicate_serialized",
-                            topic, partition
+                            "Got ISR from Raft metadata for {}-{}: {:?}",
+                            topic, partition, isr
                         );
-                        self.replicate_serialized(topic, partition, offset, serialized_data).await;
-                        return;
+                        isr
+                    }
+                    None => {
+                        // No ISR in Raft metadata, fall back to all replicas
+                        match cluster.get_partition_replicas(&topic, partition) {
+                            Some(replicas) => {
+                                debug!(
+                                    "No ISR found for {}-{}, using all replicas: {:?}",
+                                    topic, partition, replicas
+                                );
+                                replicas
+                            }
+                            None => {
+                                // No replicas assigned, fall back to broadcast
+                                debug!(
+                                    "No replicas found for {}-{}, falling back to replicate_serialized",
+                                    topic, partition
+                                );
+                                self.replicate_serialized(topic, partition, offset, serialized_data).await;
+                                return;
+                            }
+                        }
                     }
                 }
             }
@@ -257,24 +276,9 @@ impl WalReplicationManager {
             }
         };
 
-        // Filter to only in-sync replicas
-        let isr_replicas: Vec<u64> = match &self.isr_tracker {
-            Some(tracker) => {
-                replicas
-                    .into_iter()
-                    .filter(|&node_id| {
-                        tracker.is_in_sync(node_id, &topic, partition, leader_high_watermark)
-                    })
-                    .collect()
-            }
-            None => {
-                // No ISR tracker, send to all replicas
-                debug!("No IsrTracker configured, sending to all replicas");
-                replicas
-            }
-        };
-
-        // Log if we filtered out any replicas
+        // Filter out the leader node (don't replicate to self)
+        // We need to know which node is the leader - for now, just send to all ISR members
+        // The followers will receive and apply the data
         if isr_replicas.is_empty() {
             warn!(
                 "No in-sync replicas for {}-{} (offset={}), skipping replication",
@@ -284,7 +288,7 @@ impl WalReplicationManager {
         }
 
         debug!(
-            "Replicating {}-{} offset {} to {} in-sync replicas: {:?}",
+            "Replicating {}-{} offset {} to {} ISR members: {:?}",
             topic,
             partition,
             offset,
