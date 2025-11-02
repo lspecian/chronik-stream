@@ -393,22 +393,27 @@ fn validate_config(config: &ClusterConfig) -> Result<()> {
 }
 ```
 
-### Migration from Old CLI (Backward Compatibility)
+### Clean Break - No Backward Compatibility
 
-**Keep old subcommands with deprecation warnings:**
-```bash
-# Old command still works (with warning):
-$ chronik-server standalone
-⚠️  WARNING: 'standalone' subcommand is deprecated
-⚠️  Use 'chronik-server start' instead
-⚠️  See: https://docs.chronik.dev/migration-guide
+**REMOVED subcommands:**
+- `standalone` → use `start`
+- `raft-cluster` → use `start --config`
+- `ingest`, `search`, `all` → not implemented, remove entirely
 
-# Old env vars still work (with warning):
-$ CHRONIK_REPLICATION_FOLLOWERS=localhost:9291 chronik-server start
-⚠️  WARNING: CHRONIK_REPLICATION_FOLLOWERS is deprecated
-⚠️  Use cluster config file instead: chronik-server start --config cluster.toml
-⚠️  See: https://docs.chronik.dev/cluster-setup
-```
+**REMOVED env vars:**
+- `CHRONIK_REPLICATION_FOLLOWERS` → now automatic from config
+- `CHRONIK_WAL_RECEIVER_ADDR` → now automatic from config
+- `CHRONIK_RAFT_ADDR`, `CHRONIK_RAFT_PEERS` → now in config file
+- `CHRONIK_KAFKA_PORT`, `CHRONIK_METRICS_PORT`, etc. → now in config file
+
+**REMOVED CLI flags:**
+- `--kafka-port`, `--admin-port`, `--metrics-port`, `--search-port` → config file
+- `--raft-addr`, `--peers`, `--bootstrap` → config file
+- `--cluster-config` → renamed to `--config`
+- `--bind-addr` → renamed to `--bind`
+- `--advertised-addr`, `--advertised-port` → merged into `--advertise`
+
+**User base**: Just us, so clean break is fine.
 
 ---
 
@@ -1078,12 +1083,11 @@ Options:
 # - peers (from cluster config)
 ```
 
-### Backward Compatibility
+### New Subcommand Structure
 
-Keep existing `standalone` and `raft-cluster` subcommands for backward compatibility:
-- `standalone` - Single node or manual WAL replication (current behavior)
-- `raft-cluster` - Manual Raft setup (current behavior)
-- `cluster` - **NEW**: Unified automatic cluster mode
+Replace old subcommands with clear, simple ones:
+- `start` - Start server (auto-detects single-node or cluster mode from config)
+- `cluster` - Manage cluster operations (add/remove nodes, status)
 
 ---
 
@@ -1139,43 +1143,6 @@ const SEARCH_OFFSET_DOWN: u16 = 3000;  // 9092 - 3000 = 6092
 **Recommendation**: Use Option A (explicit ports in config) for production deployments.
 
 ---
-
-## Migration from Current Implementation
-
-### Step 1: Add Unified Config Support (Backward Compatible)
-
-```rust
-// Support BOTH old env vars AND new cluster config
-let wal_replication_manager = if let Some(ref cluster) = cluster_config {
-    // NEW: Automatic cluster mode
-    Some(WalReplicationManager::new_with_cluster(cluster, raft, isr, ack))
-} else if let Ok(manual) = std::env::var("CHRONIK_REPLICATION_FOLLOWERS") {
-    // OLD: Manual env var mode (still works)
-    Some(WalReplicationManager::new(parse_followers(manual)))
-} else {
-    None
-};
-```
-
-### Step 2: Deprecation Warnings
-
-```rust
-if std::env::var("CHRONIK_REPLICATION_FOLLOWERS").is_ok() {
-    warn!("⚠️  CHRONIK_REPLICATION_FOLLOWERS is deprecated");
-    warn!("⚠️  Use cluster config instead: chronik-server cluster --config cluster.toml");
-}
-
-if std::env::var("CHRONIK_WAL_RECEIVER_ADDR").is_ok() {
-    warn!("⚠️  CHRONIK_WAL_RECEIVER_ADDR is deprecated");
-    warn!("⚠️  WAL receiver now auto-starts in cluster mode");
-}
-```
-
-### Step 3: Documentation Update
-
-- Update CLAUDE.md with new cluster setup instructions
-- Update HYBRID_CLUSTERING_ARCHITECTURE.md with automatic discovery
-- Add examples to docs/CLUSTER_SETUP_GUIDE.md
 
 ---
 
@@ -1240,7 +1207,7 @@ if std::env::var("CHRONIK_WAL_RECEIVER_ADDR").is_ok() {
 
 ### Phase 4: CLI Simplification (Week 3)
 - [ ] Implement `Commands::Cluster` variant
-- [ ] Add backward compatibility for old subcommands
+- [ ] Remove old subcommands (standalone, raft-cluster, ingest, search, all)
 - [ ] Add deprecation warnings for old env vars
 - [ ] Update all documentation
 
@@ -1355,8 +1322,8 @@ raft_port = 5001
 
 ## Open Questions
 
-1. **Should we remove `standalone` + manual `CHRONIK_REPLICATION_FOLLOWERS` entirely?**
-   - **Recommendation**: Keep for backward compatibility, add deprecation warnings
+1. **Should we provide a simple config generator tool?**
+   - **Recommendation**: Add `chronik-server init-cluster` to generate cluster.toml template
 
 2. **Should `cluster` subcommand require Raft, or support WAL-only replication?**
    - **Recommendation**: Require Raft for metadata coordination (this is the hybrid design)
