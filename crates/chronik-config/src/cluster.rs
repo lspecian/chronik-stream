@@ -10,6 +10,44 @@ use validator::Validate;
 
 use crate::{ConfigError, Result};
 
+/// Node addresses for binding (where server listens)
+#[derive(Debug, Clone, Serialize, Deserialize, Validate)]
+pub struct NodeBindAddresses {
+    /// Kafka API bind address (e.g., "0.0.0.0:9092")
+    #[validate(custom = "validate_addr")]
+    pub kafka: String,
+
+    /// WAL receiver bind address (e.g., "0.0.0.0:9291")
+    #[validate(custom = "validate_addr")]
+    pub wal: String,
+
+    /// Raft gRPC bind address (e.g., "0.0.0.0:5001")
+    #[validate(custom = "validate_addr")]
+    pub raft: String,
+
+    /// Metrics endpoint bind address (optional)
+    pub metrics: Option<String>,
+
+    /// Search API bind address (optional, requires search feature)
+    pub search: Option<String>,
+}
+
+/// Node addresses for advertising (what clients connect to)
+#[derive(Debug, Clone, Serialize, Deserialize, Validate)]
+pub struct NodeAdvertiseAddresses {
+    /// Kafka API advertised address (e.g., "node1.example.com:9092")
+    #[validate(custom = "validate_addr")]
+    pub kafka: String,
+
+    /// WAL receiver advertised address (e.g., "node1.example.com:9291")
+    #[validate(custom = "validate_addr")]
+    pub wal: String,
+
+    /// Raft gRPC advertised address (e.g., "node1.example.com:5001")
+    #[validate(custom = "validate_addr")]
+    pub raft: String,
+}
+
 /// Cluster configuration for static peer discovery
 #[derive(Debug, Clone, Serialize, Deserialize, Validate)]
 pub struct ClusterConfig {
@@ -31,6 +69,12 @@ pub struct ClusterConfig {
     /// List of all peers in the cluster (including this node)
     #[validate(length(min = 1))]
     pub peers: Vec<NodeConfig>,
+
+    /// This node's bind addresses (where to listen) - optional for env-based config
+    pub bind: Option<NodeBindAddresses>,
+
+    /// This node's advertise addresses (what to tell clients) - optional for env-based config
+    pub advertise: Option<NodeAdvertiseAddresses>,
 
     /// Gossip configuration (optional, for automatic bootstrap)
     pub gossip: Option<GossipConfig>,
@@ -59,13 +103,26 @@ pub struct NodeConfig {
     #[validate(custom = "validate_node_id")]
     pub id: u64,
 
-    /// Kafka API address (hostname:port)
+    /// Kafka API address (advertised, for clients)
     #[validate(custom = "validate_addr")]
-    pub addr: String,
+    pub kafka: String,
 
-    /// Raft gRPC port for consensus communication
-    #[validate(range(min = 1024, max = 65535))]
-    pub raft_port: u16,
+    /// WAL receiver address (advertised, for followers)
+    #[validate(custom = "validate_addr")]
+    pub wal: String,
+
+    /// Raft gRPC address (advertised, for peers)
+    #[validate(custom = "validate_addr")]
+    pub raft: String,
+
+    // DEPRECATED: Kept for backward compatibility only
+    /// @deprecated Use `kafka` field instead
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub addr: Option<String>,
+
+    /// @deprecated Use `raft` field instead
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raft_port: Option<u16>,
 }
 
 impl ClusterConfig {
@@ -114,6 +171,8 @@ impl ClusterConfig {
             replication_factor,
             min_insync_replicas,
             peers,
+            bind: None, // Bind addresses set via config file
+            advertise: None, // Advertise addresses set via config file
             gossip: None, // TODO: Parse from env if needed
         };
 
@@ -122,6 +181,7 @@ impl ClusterConfig {
     }
 
     /// Parse peers from CHRONIK_CLUSTER_PEERS environment variable
+    /// Format: "host:kafka_port:wal_port:raft_port,host:kafka_port:wal_port:raft_port,..."
     fn parse_peers_from_env() -> Result<Vec<NodeConfig>> {
         let peers_str = std::env::var("CHRONIK_CLUSTER_PEERS")
             .map_err(|_| ConfigError::Parse("CHRONIK_CLUSTER_PEERS not set".to_string()))?;
@@ -129,9 +189,9 @@ impl ClusterConfig {
         let mut peers = Vec::new();
         for (idx, peer_str) in peers_str.split(',').enumerate() {
             let parts: Vec<&str> = peer_str.split(':').collect();
-            if parts.len() != 3 {
+            if parts.len() != 4 {
                 return Err(ConfigError::Parse(format!(
-                    "Invalid peer format '{}': expected 'host:kafka_port:raft_port'",
+                    "Invalid peer format '{}': expected 'host:kafka_port:wal_port:raft_port'",
                     peer_str
                 )));
             }
@@ -140,14 +200,20 @@ impl ClusterConfig {
             let kafka_port = parts[1].parse::<u16>().map_err(|e| {
                 ConfigError::Parse(format!("Invalid Kafka port '{}': {}", parts[1], e))
             })?;
-            let raft_port = parts[2].parse::<u16>().map_err(|e| {
-                ConfigError::Parse(format!("Invalid Raft port '{}': {}", parts[2], e))
+            let wal_port = parts[2].parse::<u16>().map_err(|e| {
+                ConfigError::Parse(format!("Invalid WAL port '{}': {}", parts[2], e))
+            })?;
+            let raft_port = parts[3].parse::<u16>().map_err(|e| {
+                ConfigError::Parse(format!("Invalid Raft port '{}': {}", parts[3], e))
             })?;
 
             peers.push(NodeConfig {
                 id: (idx + 1) as u64, // Auto-assign IDs based on order
-                addr: format!("{}:{}", host, kafka_port),
-                raft_port,
+                kafka: format!("{}:{}", host, kafka_port),
+                wal: format!("{}:{}", host, wal_port),
+                raft: format!("{}:{}", host, raft_port),
+                addr: None, // Deprecated
+                raft_port: None, // Deprecated
             });
         }
 
@@ -203,14 +269,37 @@ impl ClusterConfig {
 
     /// Validate no duplicate addresses
     fn validate_unique_addresses(&self) -> Result<()> {
-        let mut seen = HashSet::new();
+        let mut seen_kafka = HashSet::new();
+        let mut seen_wal = HashSet::new();
+        let mut seen_raft = HashSet::new();
+
         for peer in &self.peers {
-            let key = format!("{}:{}", peer.addr, peer.raft_port);
-            if !seen.insert(key.clone()) {
+            // Check Kafka address
+            if !seen_kafka.insert(peer.kafka.clone()) {
                 return Err(ConfigError::Validation(
                     crate::validation::ValidationError::Custom(format!(
-                        "Duplicate address: {}",
-                        key
+                        "Duplicate Kafka address: {}",
+                        peer.kafka
+                    )),
+                ));
+            }
+
+            // Check WAL address
+            if !seen_wal.insert(peer.wal.clone()) {
+                return Err(ConfigError::Validation(
+                    crate::validation::ValidationError::Custom(format!(
+                        "Duplicate WAL address: {}",
+                        peer.wal
+                    )),
+                ));
+            }
+
+            // Check Raft address
+            if !seen_raft.insert(peer.raft.clone()) {
+                return Err(ConfigError::Validation(
+                    crate::validation::ValidationError::Custom(format!(
+                        "Duplicate Raft address: {}",
+                        peer.raft
                     )),
                 ));
             }
@@ -257,26 +346,37 @@ impl ClusterConfig {
     pub fn raft_peer_addrs(&self) -> Vec<String> {
         self.peers
             .iter()
-            .map(|p| p.raft_addr())
+            .map(|p| p.raft.clone())
             .collect()
     }
 }
 
 impl NodeConfig {
-    /// Get the full Raft gRPC address
-    pub fn raft_addr(&self) -> String {
-        // Extract hostname from kafka addr
-        let hostname = self.addr.split(':').next().unwrap_or("localhost");
-        format!("{}:{}", hostname, self.raft_port)
-    }
-
     /// Parse the Kafka address as a SocketAddr
     pub fn kafka_socket_addr(&self) -> Result<SocketAddr> {
-        self.addr
+        self.kafka
             .to_socket_addrs()
-            .map_err(|e| ConfigError::Parse(format!("Invalid address '{}': {}", self.addr, e)))?
+            .map_err(|e| ConfigError::Parse(format!("Invalid address '{}': {}", self.kafka, e)))?
             .next()
-            .ok_or_else(|| ConfigError::Parse(format!("No socket address for '{}'", self.addr)))
+            .ok_or_else(|| ConfigError::Parse(format!("No socket address for '{}'", self.kafka)))
+    }
+
+    /// Parse the WAL address as a SocketAddr
+    pub fn wal_socket_addr(&self) -> Result<SocketAddr> {
+        self.wal
+            .to_socket_addrs()
+            .map_err(|e| ConfigError::Parse(format!("Invalid address '{}': {}", self.wal, e)))?
+            .next()
+            .ok_or_else(|| ConfigError::Parse(format!("No socket address for '{}'", self.wal)))
+    }
+
+    /// Parse the Raft address as a SocketAddr
+    pub fn raft_socket_addr(&self) -> Result<SocketAddr> {
+        self.raft
+            .to_socket_addrs()
+            .map_err(|e| ConfigError::Parse(format!("Invalid address '{}': {}", self.raft, e)))?
+            .next()
+            .ok_or_else(|| ConfigError::Parse(format!("No socket address for '{}'", self.raft)))
     }
 }
 
@@ -288,6 +388,8 @@ impl Default for ClusterConfig {
             replication_factor: 3,
             min_insync_replicas: 2,
             peers: vec![],
+            bind: None,
+            advertise: None,
             gossip: None,
         }
     }
@@ -326,18 +428,27 @@ mod tests {
         vec![
             NodeConfig {
                 id: 1,
-                addr: "10.0.1.10:9092".to_string(),
-                raft_port: 9093,
+                kafka: "10.0.1.10:9092".to_string(),
+                wal: "10.0.1.10:9291".to_string(),
+                raft: "10.0.1.10:5001".to_string(),
+                addr: None,
+                raft_port: None,
             },
             NodeConfig {
                 id: 2,
-                addr: "10.0.1.11:9092".to_string(),
-                raft_port: 9093,
+                kafka: "10.0.1.11:9092".to_string(),
+                wal: "10.0.1.11:9291".to_string(),
+                raft: "10.0.1.11:5001".to_string(),
+                addr: None,
+                raft_port: None,
             },
             NodeConfig {
                 id: 3,
-                addr: "10.0.1.12:9092".to_string(),
-                raft_port: 9093,
+                kafka: "10.0.1.12:9092".to_string(),
+                wal: "10.0.1.12:9291".to_string(),
+                raft: "10.0.1.12:5001".to_string(),
+                addr: None,
+                raft_port: None,
             },
         ]
     }
@@ -350,6 +461,8 @@ mod tests {
             replication_factor: 3,
             min_insync_replicas: 2,
             peers: create_test_peers(),
+            bind: None,
+            advertise: None,
             gossip: None,
         };
 
@@ -364,6 +477,8 @@ mod tests {
             replication_factor: 3,
             min_insync_replicas: 2,
             peers: create_test_peers(),
+            bind: None,
+            advertise: None,
             gossip: None,
         };
 
@@ -375,13 +490,19 @@ mod tests {
         let peers = vec![
             NodeConfig {
                 id: 1,
-                addr: "10.0.1.10:9092".to_string(),
-                raft_port: 9093,
+                kafka: "10.0.1.10:9092".to_string(),
+                wal: "10.0.1.10:9291".to_string(),
+                raft: "10.0.1.10:5001".to_string(),
+                addr: None,
+                raft_port: None,
             },
             NodeConfig {
                 id: 1, // Duplicate!
-                addr: "10.0.1.11:9092".to_string(),
-                raft_port: 9093,
+                kafka: "10.0.1.11:9092".to_string(),
+                wal: "10.0.1.11:9291".to_string(),
+                raft: "10.0.1.11:5001".to_string(),
+                addr: None,
+                raft_port: None,
             },
         ];
 
@@ -391,6 +512,8 @@ mod tests {
             replication_factor: 2,
             min_insync_replicas: 1,
             peers,
+            bind: None,
+            advertise: None,
             gossip: None,
         };
 
@@ -402,13 +525,19 @@ mod tests {
         let peers = vec![
             NodeConfig {
                 id: 1,
-                addr: "10.0.1.10:9092".to_string(),
-                raft_port: 9093,
+                kafka: "10.0.1.10:9092".to_string(),
+                wal: "10.0.1.10:9291".to_string(),
+                raft: "10.0.1.10:5001".to_string(),
+                addr: None,
+                raft_port: None,
             },
             NodeConfig {
                 id: 2,
-                addr: "10.0.1.10:9092".to_string(), // Duplicate address!
-                raft_port: 9093,
+                kafka: "10.0.1.10:9092".to_string(), // Duplicate kafka address!
+                wal: "10.0.1.10:9291".to_string(), // Duplicate wal address!
+                raft: "10.0.1.10:5001".to_string(), // Duplicate raft address!
+                addr: None,
+                raft_port: None,
             },
         ];
 
@@ -418,6 +547,8 @@ mod tests {
             replication_factor: 2,
             min_insync_replicas: 1,
             peers,
+            bind: None,
+            advertise: None,
             gossip: None,
         };
 
@@ -432,6 +563,8 @@ mod tests {
             replication_factor: 5, // More than peer count
             min_insync_replicas: 2,
             peers: create_test_peers(),
+            bind: None,
+            advertise: None,
             gossip: None,
         };
 
@@ -446,6 +579,8 @@ mod tests {
             replication_factor: 2,
             min_insync_replicas: 3, // More than replication factor
             peers: create_test_peers(),
+            bind: None,
+            advertise: None,
             gossip: None,
         };
 
@@ -460,12 +595,14 @@ mod tests {
             replication_factor: 3,
             min_insync_replicas: 2,
             peers: create_test_peers(),
+            bind: None,
+            advertise: None,
             gossip: None,
         };
 
         let this_node = config.this_node().unwrap();
         assert_eq!(this_node.id, 2);
-        assert_eq!(this_node.addr, "10.0.1.11:9092");
+        assert_eq!(this_node.kafka, "10.0.1.11:9092");
     }
 
     #[test]
@@ -476,23 +613,14 @@ mod tests {
             replication_factor: 3,
             min_insync_replicas: 2,
             peers: create_test_peers(),
+            bind: None,
+            advertise: None,
             gossip: None,
         };
 
         let peers = config.peer_nodes();
         assert_eq!(peers.len(), 2);
         assert!(peers.iter().all(|p| p.id != 2));
-    }
-
-    #[test]
-    fn test_raft_addr() {
-        let node = NodeConfig {
-            id: 1,
-            addr: "node1.example.com:9092".to_string(),
-            raft_port: 9093,
-        };
-
-        assert_eq!(node.raft_addr(), "node1.example.com:9093");
     }
 
     #[test]
@@ -503,26 +631,31 @@ mod tests {
             replication_factor: 3,
             min_insync_replicas: 2,
             peers: create_test_peers(),
+            bind: None,
+            advertise: None,
             gossip: None,
         };
 
         let addrs = config.raft_peer_addrs();
         assert_eq!(addrs.len(), 3);
-        assert!(addrs.contains(&"10.0.1.10:9093".to_string()));
-        assert!(addrs.contains(&"10.0.1.11:9093".to_string()));
-        assert!(addrs.contains(&"10.0.1.12:9093".to_string()));
+        assert!(addrs.contains(&"10.0.1.10:5001".to_string()));
+        assert!(addrs.contains(&"10.0.1.11:5001".to_string()));
+        assert!(addrs.contains(&"10.0.1.12:5001".to_string()));
     }
 
     #[test]
     fn test_invalid_address_format() {
         let node = NodeConfig {
             id: 1,
-            addr: "invalid-no-port".to_string(), // Missing port
-            raft_port: 9093,
+            kafka: "invalid-no-port".to_string(), // Missing port
+            wal: "localhost:9291".to_string(),
+            raft: "localhost:5001".to_string(),
+            addr: None,
+            raft_port: None,
         };
 
         // Validation should fail
-        let result = validate_addr(&node.addr);
+        let result = validate_addr(&node.kafka);
         assert!(result.is_err());
     }
 
@@ -534,6 +667,8 @@ mod tests {
             replication_factor: 3,
             min_insync_replicas: 2,
             peers: create_test_peers(),
+            bind: None,
+            advertise: None,
             gossip: None,
         };
 

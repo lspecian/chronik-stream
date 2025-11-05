@@ -128,6 +128,10 @@ pub struct Args {
     /// Validate message correctness (for round-trip tests)
     #[arg(long)]
     pub validate: bool,
+
+    /// Disable auto-commit for consumers (for debugging OffsetCommit issues)
+    #[arg(long)]
+    pub disable_auto_commit: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, Serialize, Deserialize)]

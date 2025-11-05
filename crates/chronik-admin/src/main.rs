@@ -40,10 +40,11 @@ async fn main() -> Result<()> {
     
     // Start server
     let addr = SocketAddr::from(([0, 0, 0, 0], config.server.port));
-    let listener = TcpListener::bind(addr).await?;
     info!("Admin API listening on {}", addr);
-    
-    axum::serve(listener, app).await?;
+
+    axum::Server::bind(&addr)
+        .serve(app.into_make_service())
+        .await?;
     
     Ok(())
 }

@@ -14,7 +14,7 @@
 use bytes::{Bytes, BytesMut};
 // Explicitly use prost's Message trait, not protobuf's
 use prost::Message as ProstMessage;
-use raft::prelude::{ConfChange, Message as RaftMessage};
+use raft::prelude::{ConfChange, ConfChangeV2, Message as RaftMessage};
 
 /// Encode a raft::Message to protobuf bytes using prost 0.11
 pub fn encode_raft_message(msg: &RaftMessage) -> Result<Vec<u8>, String> {
@@ -36,4 +36,12 @@ pub fn decode_conf_change(bytes: &[u8]) -> Result<ConfChange, String> {
     // Explicitly use prost::Message::decode, not protobuf's decode
     ProstMessage::decode(Bytes::from(bytes.to_vec()))
         .map_err(|e| format!("Failed to decode conf change: {}", e))
+}
+
+/// Decode a raft::ConfChangeV2 from protobuf bytes using prost 0.11
+/// (Priority 2: Zero-Downtime Node Addition)
+pub fn decode_conf_change_v2(bytes: &[u8]) -> Result<ConfChangeV2, String> {
+    // Explicitly use prost::Message::decode, not protobuf's decode
+    ProstMessage::decode(Bytes::from(bytes.to_vec()))
+        .map_err(|e| format!("Failed to decode conf change v2: {}", e))
 }

@@ -135,6 +135,18 @@ impl MetadataStateMachine {
             .map(|isr| isr.contains(&node_id))
             .unwrap_or(false)
     }
+
+    /// Get all partitions where the specified node is the leader
+    ///
+    /// Returns a list of (topic, partition) tuples where this node is the leader.
+    /// Used by WAL replication discovery to know which partitions to replicate.
+    pub fn get_partitions_where_leader(&self, node_id: u64) -> Vec<PartitionKey> {
+        self.partition_leaders
+            .iter()
+            .filter(|(_key, &leader)| leader == node_id)
+            .map(|(key, _leader)| key.clone())
+            .collect()
+    }
 }
 
 #[cfg(test)]

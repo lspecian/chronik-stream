@@ -822,7 +822,17 @@ impl ProduceHandler {
         let topic_names: Vec<(String, Vec<i32>)> = request.topics.iter()
             .map(|t| (t.name.clone(), t.partitions.iter().map(|p| p.index).collect()))
             .collect();
-        
+
+        // PARTITION_DEBUG: Log which partitions client is requesting
+        for topic in &request.topics {
+            info!("PARTITION_DEBUG: PRODUCE topic={} partition_count={}",
+                topic.name, topic.partitions.len());
+            for partition_data in &topic.partitions {
+                info!("PARTITION_DEBUG:   partition={} records_bytes={}",
+                    partition_data.index, partition_data.records.len());
+            }
+        }
+
         // Handle request with timeout
         let result = timeout(
             Duration::from_millis(timeout_ms.max(self.config.request_timeout_ms)),
@@ -1259,11 +1269,12 @@ impl ProduceHandler {
             // Convert to CanonicalRecord and serialize (ONCE - reused for replication)
             match CanonicalRecord::from_kafka_batch(&re_encoded_bytes) {
                 Ok(mut canonical_record) => {
-                    // Preserve original wire bytes ONLY if replication enabled
-                    // This saves ~5-10% CPU by avoiding unnecessary Vec clone
-                    if needs_replication {
-                        canonical_record.compressed_records_wire_bytes = Some(re_encoded_bytes.to_vec());
-                    }
+                    // v2.5.1 FIX: ALWAYS preserve original wire bytes for CRC preservation
+                    // CRITICAL: Even in standalone mode, we MUST preserve compressed_records_wire_bytes
+                    // so that WAL → Fetch path can serve byte-perfect RecordBatches with matching CRC.
+                    // Without this, to_kafka_batch() re-encodes and generates NEW CRC → clients reject!
+                    // See CLAUDE.md "Historical CRC Issues" and v1.3.59 fix.
+                    canonical_record.compressed_records_wire_bytes = Some(re_encoded_bytes.to_vec());
 
                     match bincode::serialize(&canonical_record) {
                         Ok(serialized) => {

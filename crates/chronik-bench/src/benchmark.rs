@@ -79,9 +79,25 @@ impl BenchmarkRunner {
             BenchmarkMode::Consume | BenchmarkMode::RoundTrip
         ) {
             let mut consumer_config = config.clone();
+            // Generate a unique client ID for this consumer instance
+            // This ensures proper consumer group rebalancing when multiple consumers join
+            // Using thread_rng() for guaranteed fresh randomness on each process invocation
+            use rand::Rng;
+            let random_suffix: u64 = rand::thread_rng().gen();
+            let unique_client_id = format!("chronik-bench-{}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_micros(),
+                random_suffix
+            );
+            info!("Generated unique client_id: {}", unique_client_id);  // Debug log
+            let auto_commit = if args.disable_auto_commit { "false" } else { "true" };
             consumer_config
                 .set("group.id", &args.consumer_group)
-                .set("enable.auto.commit", "true")
+                .set("client.id", &unique_client_id)  // Unique client ID for proper group membership
+                .set("enable.auto.commit", auto_commit)
                 .set("auto.offset.reset", "earliest")
                 .set("session.timeout.ms", "30000")
                 .set("fetch.min.bytes", "1")

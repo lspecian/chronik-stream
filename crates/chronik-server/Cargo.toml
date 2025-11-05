@@ -35,6 +35,13 @@ prost = { workspace = true }
 slog = { workspace = true }
 slog-stdlog = { workspace = true }
 
+# HTTP admin API (v2.6.0 - cluster management)
+axum = { workspace = true }
+hyper = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+reqwest = { workspace = true }
+
 # Core dependencies
 tokio = { workspace = true }
 tokio-util = { workspace = true }

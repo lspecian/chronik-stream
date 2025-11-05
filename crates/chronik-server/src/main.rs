@@ -35,6 +35,10 @@ mod isr_tracker;
 mod isr_ack_tracker;
 // v2.5.0 Phase 5: Automatic leader election per partition
 mod leader_election;
+// v2.6.0: HTTP Admin API for cluster management
+mod admin_api;
+// v2.6.0 Priority 2 Step 3: Automatic partition rebalancing
+mod partition_rebalancer;
 
 mod cli;
 
@@ -48,72 +52,22 @@ use serde_json;
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "chronik-server",
-    about = "Chronik Stream - Unified Kafka-compatible streaming platform",
+    about = "Chronik Stream - Kafka-compatible streaming platform",
     version,
     author,
-    long_about = "A high-performance, Kafka-compatible streaming platform with optional search capabilities"
+    long_about = "A high-performance, Kafka-compatible streaming platform with WAL durability"
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Option<Commands>,
-
-    /// Port for Kafka protocol (default: 9092)
-    #[arg(short = 'p', long, env = "CHRONIK_KAFKA_PORT", default_value = "9092")]
-    kafka_port: u16,
-
-    /// Port for Admin API (default: 3000)
-    #[arg(short = 'a', long, env = "CHRONIK_ADMIN_PORT", default_value = "3000")]
-    admin_port: u16,
-
-    /// Port for Metrics endpoint (default: 9093)
-    #[arg(short = 'm', long, env = "CHRONIK_METRICS_PORT", default_value = "9093")]
-    metrics_port: u16,
+    command: Commands,
 
     /// Data directory for storage
-    #[arg(short = 'd', long, env = "CHRONIK_DATA_DIR", default_value = "./data")]
+    #[arg(short = 'd', long, env = "CHRONIK_DATA_DIR", default_value = "./data", global = true)]
     data_dir: PathBuf,
 
     /// Log level (error, warn, info, debug, trace)
-    #[arg(short = 'l', long, env = "RUST_LOG", default_value = "info")]
+    #[arg(short = 'l', long, env = "RUST_LOG", default_value = "info", global = true)]
     log_level: String,
-
-    /// Bind address (default: 0.0.0.0)
-    #[arg(short = 'b', long, env = "CHRONIK_BIND_ADDR", default_value = "0.0.0.0")]
-    bind_addr: String,
-    
-    /// Advertised address for clients to connect (defaults to bind address)
-    #[arg(long, env = "CHRONIK_ADVERTISED_ADDR")]
-    advertised_addr: Option<String>,
-    
-    /// Advertised port for clients to connect (defaults to kafka port)
-    #[arg(long, env = "CHRONIK_ADVERTISED_PORT")]
-    advertised_port: Option<u16>,
-
-    /// Enable backup functionality
-    #[cfg(feature = "backup")]
-    #[arg(long, env = "CHRONIK_ENABLE_BACKUP", default_value = "false")]
-    enable_backup: bool,
-
-    /// Enable dynamic configuration
-    #[cfg(feature = "dynamic-config")]
-    #[arg(long, env = "CHRONIK_ENABLE_DYNAMIC_CONFIG", default_value = "false")]
-    enable_dynamic_config: bool,
-
-    /// Path to cluster configuration file (TOML)
-    #[arg(long, env = "CHRONIK_CLUSTER_CONFIG")]
-    cluster_config: Option<PathBuf>,
-
-    /// Node ID for cluster mode (overrides config file)
-    #[arg(long, env = "CHRONIK_NODE_ID")]
-    node_id: Option<u64>,
-
-    /// Port for Search API (default: 6080, only used if search feature is enabled)
-    #[arg(long, env = "CHRONIK_SEARCH_PORT", default_value = "6080")]
-    search_port: u16,
-
-    /// Disable Search API (default: false, search API enabled if search feature compiled)
-    #[arg(long, env = "CHRONIK_DISABLE_SEARCH", default_value = "false")]
-    disable_search: bool,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -181,55 +135,32 @@ enum CompactAction {
 
 #[derive(Subcommand, Debug, Clone)]
 enum Commands {
-    /// Run in standalone mode (default)
-    #[command(about = "Run as a standalone Kafka-compatible server")]
-    Standalone,
+    /// Start a Chronik server (single-node or cluster mode)
+    #[command(about = "Start server (auto-detects mode from config)")]
+    Start {
+        /// Cluster config file (TOML)
+        #[arg(short = 'c', long, env = "CHRONIK_CONFIG")]
+        config: Option<PathBuf>,
 
-    /// Run in Raft cluster mode
-    #[command(about = "Run as a node in a Raft-replicated cluster")]
-    RaftCluster {
-        /// Raft listen address (gRPC)
-        #[arg(long, env = "CHRONIK_RAFT_ADDR", default_value = "0.0.0.0:5001")]
-        raft_addr: String,
+        /// Bind address for all services (default: 0.0.0.0)
+        #[arg(long, env = "CHRONIK_BIND", default_value = "0.0.0.0")]
+        bind: String,
 
-        /// Comma-separated list of peer nodes (format: id@host:port)
-        /// Example: 2@node2:5001,3@node3:5001
-        #[arg(long, env = "CHRONIK_RAFT_PEERS")]
-        peers: Option<String>,
+        /// Advertised address for clients (overrides config)
+        #[arg(long, env = "CHRONIK_ADVERTISE")]
+        advertise: Option<String>,
 
-        /// Bootstrap the cluster (only run on initial cluster creation)
-        #[arg(long, default_value = "false")]
-        bootstrap: bool,
+        /// Node ID (overrides config file)
+        #[arg(long, env = "CHRONIK_NODE_ID")]
+        node_id: Option<u64>,
     },
 
-    /// Run as ingest node (future: for distributed mode)
-    #[command(about = "Run as an ingest node in a distributed cluster")]
-    Ingest {
-        /// Controller URL for cluster coordination
-        #[arg(long, env = "CHRONIK_CONTROLLER_URL")]
-        controller_url: Option<String>,
+    /// Manage cluster membership
+    #[command(about = "Cluster management commands")]
+    Cluster {
+        #[command(subcommand)]
+        action: ClusterAction,
     },
-
-    /// Run as search node (future: for distributed mode)
-    #[cfg(feature = "search")]
-    #[command(about = "Run as a search node in a distributed cluster")]
-    Search {
-        /// Storage backend URL
-        #[arg(long, env = "CHRONIK_STORAGE_URL")]
-        storage_url: String,
-    },
-
-    /// Run with all components enabled
-    #[command(about = "Run with all components in a single process")]
-    All {
-        /// Enable experimental features
-        #[arg(long, default_value = "false")]
-        experimental: bool,
-    },
-
-    /// Show version and build information
-    #[command(about = "Display version and build information")]
-    Version,
 
     /// WAL compaction management
     #[command(about = "Manage WAL compaction")]
@@ -238,7 +169,79 @@ enum Commands {
         action: CompactAction,
     },
 
-    // Cluster command replaced with raft-cluster subcommand (v2.5.0 Phase 2)
+    /// Show version and build information
+    #[command(about = "Display version and build information")]
+    Version,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum ClusterAction {
+    /// Show cluster status
+    #[command(about = "Display cluster status")]
+    Status {
+        /// Cluster config file
+        #[arg(short = 'c', long, env = "CHRONIK_CONFIG")]
+        config: PathBuf,
+    },
+
+    /// Add a node to the cluster (zero-downtime)
+    #[command(about = "Add a new node to the cluster")]
+    AddNode {
+        /// Node ID to add
+        node_id: u64,
+
+        /// Kafka address (host:port)
+        #[arg(long)]
+        kafka: String,
+
+        /// WAL address (host:port)
+        #[arg(long)]
+        wal: String,
+
+        /// Raft address (host:port)
+        #[arg(long)]
+        raft: String,
+
+        /// Cluster config file
+        #[arg(short = 'c', long, env = "CHRONIK_CONFIG")]
+        config: PathBuf,
+    },
+
+    /// Remove a node from the cluster (zero-downtime)
+    #[command(about = "Remove a node from the cluster")]
+    RemoveNode {
+        /// Node ID to remove
+        node_id: u64,
+
+        /// Force removal (don't wait for partition reassignment)
+        #[arg(long, default_value = "false")]
+        force: bool,
+
+        /// Cluster config file
+        #[arg(short = 'c', long, env = "CHRONIK_CONFIG")]
+        config: PathBuf,
+    },
+
+    /// Trigger partition rebalancing
+    #[command(about = "Manually trigger partition rebalancing")]
+    Rebalance {
+        /// Cluster config file
+        #[arg(short = 'c', long, env = "CHRONIK_CONFIG")]
+        config: PathBuf,
+    },
+}
+
+/// Parse Kafka address (host:port) from cluster config
+fn parse_kafka_addr(addr: &str) -> Result<(String, i32)> {
+    if let Some(colon_pos) = addr.rfind(':') {
+        let host = addr[..colon_pos].to_string();
+        let port_str = &addr[colon_pos + 1..];
+        let port = port_str.parse::<u16>()
+            .map_err(|e| anyhow::anyhow!("Invalid port in address '{}': {}", addr, e))?;
+        Ok((host, port as i32))
+    } else {
+        Err(anyhow::anyhow!("Address '{}' must be in format 'host:port'", addr))
+    }
 }
 
 /// Parse object store configuration from environment variables
@@ -389,53 +392,88 @@ fn parse_object_store_config_from_env() -> Option<ObjectStoreConfig> {
     }
 }
 
-/// Load cluster configuration from file or environment variables
-fn load_cluster_config(cli: &Cli) -> Result<Option<ClusterConfig>> {
-    // Priority 1: Try environment variables
-    if let Ok(Some(config)) = ClusterConfig::from_env() {
+/// Load cluster configuration from file
+fn load_cluster_config_from_file(path: &PathBuf, node_id_override: Option<u64>) -> Result<ClusterConfig> {
+    info!("Loading cluster configuration from file: {}", path.display());
+    let contents = std::fs::read_to_string(path)?;
+    let mut config: ClusterConfig = toml::from_str(&contents)?;
+
+    if let Some(node_id) = node_id_override {
+        info!("Overriding node_id from CLI: {}", node_id);
+        config.node_id = node_id;
+    }
+
+    config.validate_config().map_err(|e| {
+        anyhow::anyhow!("Invalid cluster configuration: {}", e)
+    })?;
+
+    info!("Loaded cluster configuration from file");
+    info!("  Node ID: {}", config.node_id);
+    info!("  Replication Factor: {}", config.replication_factor);
+    info!("  Min In-Sync Replicas: {}", config.min_insync_replicas);
+    info!("  Peers: {}", config.peers.len());
+
+    Ok(config)
+}
+
+/// Load cluster configuration from environment variables
+fn load_cluster_config_from_env(node_id_override: Option<u64>) -> Result<Option<ClusterConfig>> {
+    if let Ok(Some(mut config)) = ClusterConfig::from_env() {
+        if let Some(node_id) = node_id_override {
+            info!("Overriding node_id from CLI: {}", node_id);
+            config.node_id = node_id;
+        }
         info!("Loaded cluster configuration from environment variables");
         info!("  Node ID: {}", config.node_id);
         info!("  Replication Factor: {}", config.replication_factor);
         info!("  Min In-Sync Replicas: {}", config.min_insync_replicas);
         info!("  Peers: {}", config.peers.len());
-        return Ok(Some(config));
+        Ok(Some(config))
+    } else {
+        Ok(None)
     }
+}
 
-    // Priority 2: Try config file
-    if let Some(config_path) = &cli.cluster_config {
-        info!("Loading cluster configuration from file: {}", config_path.display());
-
-        let contents = std::fs::read_to_string(config_path)?;
-        let mut config: ClusterConfig = toml::from_str(&contents)?;
-
-        // Override node_id from CLI if provided
-        if let Some(node_id) = cli.node_id {
-            info!("Overriding node_id from CLI: {}", node_id);
-            config.node_id = node_id;
+/// Parse advertised address from string or derive from bind address
+fn parse_advertise_addr(advertise: Option<&str>, bind: &str, default_port: u16) -> Result<(String, i32)> {
+    if let Some(addr) = advertise {
+        // User provided advertised address - parse it
+        if let Some(colon_pos) = addr.rfind(':') {
+            let potential_port = &addr[colon_pos + 1..];
+            if potential_port.chars().all(|c| c.is_ascii_digit()) && !potential_port.is_empty() {
+                let host = addr[..colon_pos].to_string();
+                let port = potential_port.parse::<u16>().unwrap_or(default_port);
+                Ok((host, port as i32))
+            } else {
+                Ok((addr.to_string(), default_port as i32))
+            }
+        } else {
+            Ok((addr.to_string(), default_port as i32))
         }
+    } else if bind == "0.0.0.0" || bind == "[::]" {
+        // Binding to all interfaces - use hostname or localhost
+        let hostname = std::env::var("HOSTNAME")
+            .or_else(|_| std::env::var("DOCKER_HOSTNAME"))
+            .unwrap_or_else(|_| "127.0.0.1".to_string());
 
-        // Validate configuration
-        config.validate_config().map_err(|e| {
-            anyhow::anyhow!("Invalid cluster configuration: {}", e)
-        })?;
-
-        info!("Loaded cluster configuration from file");
-        info!("  Node ID: {}", config.node_id);
-        info!("  Replication Factor: {}", config.replication_factor);
-        info!("  Min In-Sync Replicas: {}", config.min_insync_replicas);
-        info!("  Peers: {}", config.peers.len());
-
-        return Ok(Some(config));
+        if hostname != "127.0.0.1" {
+            info!("Binding to all interfaces, using hostname '{}' as advertised address", hostname);
+        } else {
+            warn!("Binding to all interfaces without advertised address configured");
+            warn!("Using '127.0.0.1' - remote clients may not connect");
+            warn!("Set --advertise to your hostname/IP for remote access");
+        }
+        Ok((hostname, default_port as i32))
+    } else {
+        // Use bind address as advertised
+        Ok((bind.to_string(), default_port as i32))
     }
-
-    // No clustering configured
-    Ok(None)
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    
+
     // Initialize logging
     std::env::set_var("RUST_LOG", &cli.log_level);
     tracing_subscriber::fmt()
@@ -450,16 +488,24 @@ async fn main() -> Result<()> {
         cfg!(feature = "dynamic-config")
     );
 
-    // Show deprecation warnings for old binaries
-    if std::env::args().next().unwrap().contains("chronik-ingest") {
-        warn!("chronik-ingest is deprecated. Please use chronik-server instead.");
+    // Show deprecation warnings for old environment variables
+    if std::env::var("CHRONIK_KAFKA_PORT").is_ok() {
+        warn!("CHRONIK_KAFKA_PORT is deprecated. Use cluster config file instead.");
     }
-    if std::env::args().next().unwrap().contains("chronik-all-in-one") {
-        warn!("chronik-all-in-one is deprecated. Please use chronik-server instead.");
+    if std::env::var("CHRONIK_REPLICATION_FOLLOWERS").is_ok() {
+        warn!("CHRONIK_REPLICATION_FOLLOWERS is deprecated. WAL replication now auto-discovers from cluster config file.");
+        warn!("If using cluster config file (recommended), remove CHRONIK_REPLICATION_FOLLOWERS from environment.");
+        warn!("If not using cluster config, CHRONIK_REPLICATION_FOLLOWERS still works for manual configuration.");
+    }
+    if std::env::var("CHRONIK_WAL_RECEIVER_ADDR").is_ok() {
+        warn!("CHRONIK_WAL_RECEIVER_ADDR is deprecated. Use cluster config file with 'wal' address instead.");
+    }
+    if std::env::var("CHRONIK_WAL_RECEIVER_PORT").is_ok() {
+        warn!("CHRONIK_WAL_RECEIVER_PORT is deprecated. Use cluster config file with 'wal' address instead.");
     }
 
-    match cli.command {
-        Some(Commands::Version) => {
+    match &cli.command {
+        Commands::Version => {
             println!("Chronik Server v{}", env!("CARGO_PKG_VERSION"));
             println!("Build features:");
             #[cfg(feature = "search")]
@@ -468,300 +514,151 @@ async fn main() -> Result<()> {
             println!("  - Backup: enabled");
             #[cfg(feature = "dynamic-config")]
             println!("  - Dynamic Config: enabled");
-            return Ok(());
-        }
-        
-        Some(Commands::Standalone) => {
-            info!("Starting Chronik Server in standalone mode");
-            run_standalone_server(&cli).await?;
+            Ok(())
         }
 
-        Some(Commands::RaftCluster { ref raft_addr, ref peers, bootstrap }) => {
-            use raft_cluster::{run_raft_cluster, RaftClusterConfig};
-
-            info!("Starting Chronik Server in Raft cluster mode");
-
-            // Parse node ID
-            let node_id = cli.node_id.unwrap_or(1);
-
-            // Parse peers (format: "2@node2:5001,3@node3:5001")
-            let parsed_peers: Vec<(u64, String)> = if let Some(peers_str) = peers {
-                peers_str
-                    .split(',')
-                    .filter_map(|s| {
-                        let parts: Vec<&str> = s.split('@').collect();
-                        if parts.len() == 2 {
-                            if let Ok(id) = parts[0].parse::<u64>() {
-                                return Some((id, parts[1].to_string()));
-                            }
-                        }
-                        warn!("Invalid peer format: {} (expected id@host:port)", s);
-                        None
-                    })
-                    .collect()
-            } else {
-                vec![]
-            };
-
-            // Parse advertised address (similar to standalone mode)
-            let (advertised_host, advertised_port) = if let Some(ref addr) = cli.advertised_addr {
-                if let Some(colon_pos) = addr.rfind(':') {
-                    let potential_port = &addr[colon_pos + 1..];
-                    if potential_port.chars().all(|c| c.is_ascii_digit()) && !potential_port.is_empty() {
-                        let host = addr[..colon_pos].to_string();
-                        let port = potential_port.parse::<u16>().unwrap_or(cli.kafka_port);
-                        (host, port)
-                    } else {
-                        (addr.clone(), cli.advertised_port.unwrap_or(cli.kafka_port))
-                    }
-                } else {
-                    (addr.clone(), cli.advertised_port.unwrap_or(cli.kafka_port))
-                }
-            } else {
-                ("localhost".to_string(), cli.kafka_port)
-            };
-
-            // Auto-derive metrics port for cluster mode (same logic as standalone)
-            let metrics_port = if cli.metrics_port == 9093 {
-                // Metrics port = kafka_port + 4000 (separate range from Kafka/Raft ports)
-                // This ensures Node 1 (9092) gets 13092, Node 2 (9093) gets 13093, Node 3 (9094) gets 13094
-                let derived = cli.kafka_port + 4000;
-                info!("Auto-derived metrics port: {} (kafka_port + 4000)", derived);
-                derived
-            } else {
-                cli.metrics_port
-            };
-
-            let config = RaftClusterConfig {
-                node_id,
-                raft_addr: raft_addr.clone(),
-                peers: parsed_peers,
-                bootstrap,
-                data_dir: cli.data_dir.to_string_lossy().to_string(),
-                kafka_port: cli.kafka_port,
-                advertised_addr: advertised_host,
-            };
-
-            run_raft_cluster(config).await?;
+        Commands::Start { config, bind, advertise, node_id } => {
+            run_start_command(&cli, config.clone(), bind.clone(), advertise.clone(), *node_id).await
         }
 
-        Some(Commands::Ingest { ref controller_url }) => {
-            info!("Starting Chronik Server as ingest node");
-            if controller_url.is_some() {
-                warn!("Distributed mode not yet implemented - running in standalone mode");
-            }
-            run_ingest_server(&cli).await?;
-        }
-        
-        #[cfg(feature = "search")]
-        Some(Commands::Search { ref storage_url }) => {
-            info!("Starting Chronik Server as search node");
-            info!("Storage URL: {}", storage_url);
-            warn!("Search-only mode not yet implemented - running in standalone mode");
-            run_standalone_server(&cli).await?;
+        Commands::Cluster { action } => {
+            handle_cluster_command(&cli, action.clone()).await
         }
 
-        Some(Commands::All { experimental }) => {
-            info!("Starting Chronik Server with all components");
-            if experimental {
-                warn!("Experimental features enabled");
-            }
-            run_all_components(&cli).await?;
-        }
-
-        Some(Commands::Compact { ref action }) => {
-            handle_compaction_command(&cli, action.clone()).await?;
-        }
-
-        // Cluster command replaced with raft-cluster subcommand (v2.5.0 Phase 2)
-
-        None => {
-            // Default to standalone mode
-            info!("Starting Chronik Server in standalone mode (default)");
-            run_standalone_server(&cli).await?;
+        Commands::Compact { action } => {
+            handle_compaction_command(&cli, action.clone()).await
         }
     }
-
-    Ok(())
 }
 
-async fn run_standalone_server(cli: &Cli) -> Result<()> {
-    // CRITICAL FIX: Auto-derive metrics and search API ports to avoid conflicts in multi-node clusters
-    // If metrics_port or search_port are at their default values and we're in cluster mode,
-    // derive them from kafka_port to allow multiple nodes on the same machine
-    let mut cli = cli.clone();
-
-    // Check if clustering is enabled
-    let is_cluster_mode = std::env::var("CHRONIK_CLUSTER_ENABLED").unwrap_or_default() == "true"
-        || cli.cluster_config.is_some()
-        || cli.node_id.is_some()
-        || std::env::var("CHRONIK_CLUSTER_PEERS").is_ok();
-
-    // Auto-derive metrics port if at default value (9093) and in cluster mode
-    if cli.metrics_port == 9093 && is_cluster_mode {
-        // Metrics port = kafka_port + 4000 (separate range from Kafka/Raft ports)
-        // This ensures Node 1 (9092) gets 13092, Node 2 (9093) gets 13093, Node 3 (9094) gets 13094
-        cli.metrics_port = cli.kafka_port + 4000;
-        info!("Auto-derived metrics port: {} (kafka_port + 4000)", cli.metrics_port);
-    }
-
-    // Auto-derive search API port if at default value (6080) and in cluster mode
-    if cli.search_port == 6080 && is_cluster_mode {
-        // Search port = kafka_port - 3000
-        // This ensures Node 1 (9092) gets 6092, Node 2 (9192) gets 6192, etc.
-        cli.search_port = if cli.kafka_port >= 3000 {
-            cli.kafka_port - 3000
-        } else {
-            cli.kafka_port + 3000  // Fallback for low ports
-        };
-        info!("Auto-derived search API port: {} (kafka_port - 3000)", cli.search_port);
-    }
-
-    // Parse bind address to handle "host:port" format
-    let bind_host = if cli.bind_addr.contains(':') {
-        cli.bind_addr.split(':').next().unwrap_or("0.0.0.0").to_string()
+/// Run the start command (auto-detects single-node vs cluster mode)
+async fn run_start_command(
+    cli: &Cli,
+    config_path: Option<PathBuf>,
+    bind: String,
+    advertise: Option<String>,
+    node_id_override: Option<u64>,
+) -> Result<()> {
+    // Load cluster config (from file or env)
+    let cluster_config = if let Some(path) = config_path {
+        Some(load_cluster_config_from_file(&path, node_id_override)?)
     } else {
-        cli.bind_addr.clone()
+        load_cluster_config_from_env(node_id_override)?
     };
-    
-    // Parse advertised address and port (handle both "host" and "host:port" formats)
-    let (advertised_host, advertised_port) = if let Some(ref addr) = cli.advertised_addr {
-        // User provided advertised address - parse it
-        // Check for IPv6 format first (contains multiple colons or starts with '[')
-        if addr.starts_with('[') || addr.matches(':').count() > 1 {
-            // IPv6 address
-            if let Some(bracket_end) = addr.rfind(']') {
-                // Format: [::1]:9092
-                if let Some(colon_after_bracket) = addr[bracket_end..].find(':') {
-                    let port_str = &addr[bracket_end + colon_after_bracket + 1..];
-                    if let Ok(port) = port_str.parse::<u16>() {
-                        let host = addr[..bracket_end + 1].to_string();
-                        info!("Using advertised address '{}' with port {}", host, port);
-                        (host, port as i32)
-                    } else {
-                        // No valid port after bracket
-                        let port = cli.advertised_port.unwrap_or(cli.kafka_port) as i32;
-                        info!("Using advertised address '{}' with default port {}", addr, port);
-                        (addr.clone(), port)
-                    }
-                } else {
-                    // Format: [::1] without port
-                    let port = cli.advertised_port.unwrap_or(cli.kafka_port) as i32;
-                    info!("Using advertised address '{}' with default port {}", addr, port);
-                    (addr.clone(), port)
-                }
-            } else {
-                // IPv6 without brackets
-                let port = cli.advertised_port.unwrap_or(cli.kafka_port) as i32;
-                info!("Using IPv6 address '{}' with default port {}", addr, port);
-                (addr.clone(), port)
-            }
-        } else if let Some(colon_pos) = addr.rfind(':') {
-            // IPv4 or hostname with possible port
-            let potential_port = &addr[colon_pos + 1..];
-            if potential_port.chars().all(|c| c.is_ascii_digit()) && !potential_port.is_empty() {
-                // Has port - split it
-                let host = addr[..colon_pos].to_string();
-                let port = potential_port.parse::<u16>()
-                    .unwrap_or(cli.kafka_port) as i32;
-                info!("Using advertised address '{}' with port {}", host, port);
-                (host, port)
-            } else {
-                // Colon but not a valid port
-                let port = cli.advertised_port.unwrap_or(cli.kafka_port) as i32;
-                info!("Using advertised address '{}' with default port {}", addr, port);
-                (addr.clone(), port)
-            }
-        } else {
-            // No colon - just a hostname
-            let port = cli.advertised_port.unwrap_or(cli.kafka_port) as i32;
-            info!("Using advertised address '{}' with port {}", addr, port);
-            (addr.clone(), port)
-        }
-    } else if bind_host == "0.0.0.0" || bind_host == "[::]" {
-        // If binding to all interfaces and no advertised address specified,
-        // try to use hostname or localhost as a better default
-        let hostname = std::env::var("HOSTNAME")
-            .or_else(|_| std::env::var("DOCKER_HOSTNAME"))
-            .unwrap_or_else(|_| "127.0.0.1".to_string());
-        
-        let port = cli.advertised_port.unwrap_or(cli.kafka_port) as i32;
-        
-        if hostname != "127.0.0.1" {
-            info!("Binding to all interfaces ({}), using hostname '{}' as advertised address", bind_host, hostname);
-            info!("To override, set CHRONIK_ADVERTISED_ADDR environment variable");
-        } else {
-            warn!("Binding to all interfaces ({}) without advertised address configured", bind_host);
-            warn!("Using '127.0.0.1' as advertised address - remote clients may not connect");
-            warn!("Set CHRONIK_ADVERTISED_ADDR to your hostname/IP for remote access");
-        }
-        (hostname, port)
+
+    if let Some(config) = cluster_config {
+        info!("Starting in CLUSTER mode (node_id={})", config.node_id);
+        run_cluster_mode(cli, config, bind, advertise).await
     } else {
-        // Use bind host as advertised host
-        let port = cli.advertised_port.unwrap_or(cli.kafka_port) as i32;
-        (bind_host.clone(), port)
+        info!("Starting in SINGLE-NODE mode");
+        run_single_node_mode(cli, bind, advertise).await
+    }
+}
+
+/// Run in cluster mode (with Raft + WAL replication)
+/// Phase 1: CLI Redesign & Unified Config - IMPLEMENTED
+async fn run_cluster_mode(
+    cli: &Cli,
+    config: ClusterConfig,
+    bind: String,
+    advertise: Option<String>,
+) -> Result<()> {
+    info!("Starting Chronik in CLUSTER mode (node_id={})", config.node_id);
+    info!("Cluster peers: {} nodes", config.peers.len());
+
+    // Get this node's configuration
+    let this_node = config.this_node()
+        .ok_or_else(|| anyhow::anyhow!("Node ID {} not found in cluster config", config.node_id))?;
+
+    // Parse advertise address (use cluster config or CLI override)
+    let (advertised_host, advertised_port) = if let Some(adv) = advertise.as_deref() {
+        parse_advertise_addr(Some(adv), &bind, 9092)?
+    } else {
+        // Extract from cluster config
+        parse_kafka_addr(&this_node.kafka)?
     };
-    
-    // Parse object store configuration from environment (for Tier 3: Tantivy archives)
+
+    // Parse object store configuration
     let object_store_config = parse_object_store_config_from_env();
 
-    // Load cluster configuration
-    let cluster_config = load_cluster_config(&cli)?;
+    // Bootstrap Raft cluster
+    info!("Bootstrapping Raft cluster...");
+    let raft_peers: Vec<(u64, String)> = config.peer_nodes()
+        .iter()
+        .map(|peer| (peer.id, peer.raft.clone()))
+        .collect();
 
-    // Determine node_id from cluster config or default to 1
-    let node_id = if let Some(ref cluster) = cluster_config {
-        cluster.node_id as i32
-    } else {
-        1
-    };
+    let data_dir = PathBuf::from(&cli.data_dir);
+    let raft_cluster = Arc::new(
+        crate::raft_cluster::RaftCluster::bootstrap(
+            config.node_id,
+            raft_peers,
+            data_dir.clone(),
+        ).await?
+    );
+    info!("Raft cluster bootstrapped successfully");
 
-    // Determine replication factor from cluster config or default
-    let replication_factor = if let Some(ref cluster) = cluster_config {
-        cluster.replication_factor as u32
-    } else {
-        1
-    };
+    // CRITICAL FIX: Start Raft gRPC server to listen for peer messages
+    // Use bind address (where to listen), not advertise address
+    let raft_bind_addr = config.bind.as_ref()
+        .map(|b| b.raft.clone())
+        .or_else(|| config.advertise.as_ref().map(|a| a.raft.clone()))
+        .unwrap_or_else(|| "0.0.0.0:5001".to_string());
 
-    // Create server configuration
-    let config = IntegratedServerConfig {
-        node_id,
+    info!("Starting Raft gRPC server on {}...", raft_bind_addr);
+    raft_cluster.clone().start_grpc_server(raft_bind_addr).await?;
+    info!("Raft gRPC server started successfully");
+
+    // CRITICAL FIX: Start Raft message processing loop for leader election
+    info!("Starting Raft message processing loop...");
+    raft_cluster.clone().start_message_loop();
+    info!("Raft message loop started successfully");
+
+    // Create IntegratedKafkaServer config with cluster config
+    let server_config = IntegratedServerConfig {
+        node_id: config.node_id as i32,
         advertised_host,
         advertised_port,
         data_dir: cli.data_dir.to_string_lossy().to_string(),
-        enable_indexing: cfg!(feature = "search"),  // Enable when search feature is compiled
+        enable_indexing: cfg!(feature = "search"),
         enable_compression: true,
         auto_create_topics: true,
-        num_partitions: 3,
-        replication_factor,
-        enable_wal_indexing: true,  // Enable WAL→Tantivy indexing
-        wal_indexing_interval_secs: 30,  // Index every 30 seconds
-        object_store_config,  // Pass custom object store config if provided
-        enable_metadata_dr: true,  // Enable metadata DR by default
-        metadata_upload_interval_secs: 60,  // Upload metadata every minute
-        cluster_config: cluster_config.clone(),  // Pass cluster configuration
+        num_partitions: 3,  // Default to 3 partitions for better parallelism (configurable via --num-partitions)
+        replication_factor: config.replication_factor as u32,
+        enable_wal_indexing: true,
+        wal_indexing_interval_secs: 30,
+        object_store_config,
+        enable_metadata_dr: true,
+        metadata_upload_interval_secs: 60,
+        cluster_config: Some(config.clone()),  // Phase 2 auto-discovery activates here!
     };
 
-    // Create and start the integrated server
-    let server = IntegratedKafkaServer::new(config, None).await?;
+    // Create server with Raft cluster
+    info!("Initializing IntegratedKafkaServer...");
+    let server = IntegratedKafkaServer::new(server_config, Some(raft_cluster.clone())).await?;
+    info!("IntegratedKafkaServer initialized successfully");
 
-    // Initialize monitoring (metrics + optional tracing)
+    // Initialize monitoring
+    let metrics_port = 13000 + (config.node_id as u16);  // 13001, 13002, 13003, etc.
     let _metrics_registry = init_monitoring(
         "chronik-server",
-        cli.metrics_port,
-        None, // TODO: Add tracing config support
+        metrics_port,
+        None,
     ).await?;
-    
-    let kafka_addr = format!("{}:{}", cli.bind_addr, cli.kafka_port);
+
+    // Parse Kafka bind address from cluster config
+    let kafka_addr = this_node.kafka.clone();
     info!("Kafka protocol listening on {}", kafka_addr);
-    info!("Metrics endpoint available at http://{}:{}/metrics", cli.bind_addr, cli.metrics_port);
+    info!("WAL receiver auto-started on {}", this_node.wal);
+    info!("Raft consensus on {}", this_node.raft);
+    info!("Metrics endpoint available at http://{}:{}/metrics", bind, metrics_port);
 
-    // Start search API if search feature is compiled and not disabled
+    // Start search API if search feature is compiled
     #[cfg(feature = "search")]
-    if !cli.disable_search {
-        info!("Starting Search API on port {}", cli.search_port);
-
-        let search_bind = cli.bind_addr.clone();
-        let search_port = cli.search_port;
+    {
+        let search_port = 6000 + (config.node_id as u16);
+        info!("Starting Search API on port {}", search_port);
+        let search_bind = bind.clone();
         let wal_indexer = server.get_wal_indexer();
         let index_base_path = format!("{}/tantivy_indexes", cli.data_dir.to_string_lossy());
 
@@ -769,13 +666,8 @@ async fn run_standalone_server(cli: &Cli) -> Result<()> {
             use chronik_search::api::SearchApi;
             use std::sync::Arc;
 
-            // Create search API instance with WAL indexer integration
             let search_api = Arc::new(SearchApi::new_with_wal_indexer(wal_indexer, index_base_path).unwrap());
-
-            // Create router
             let app = search_api.router();
-
-            // Start server
             let addr = format!("{}:{}", search_bind, search_port);
             info!("Search API listening on http://{}", addr);
 
@@ -783,24 +675,32 @@ async fn run_standalone_server(cli: &Cli) -> Result<()> {
             chronik_search::serve_app(listener, app).await.unwrap()
         });
 
-        info!("Search API available at http://{}:{}", cli.bind_addr, cli.search_port);
-        info!("  - Search: POST http://{}:{}/_search", cli.bind_addr, cli.search_port);
-        info!("  - Index: PUT http://{}:{}/{{index}}", cli.bind_addr, cli.search_port);
-        info!("  - Document: POST http://{}:{}/{{index}}/_doc/{{id}}", cli.bind_addr, cli.search_port);
-    } else {
-        #[cfg(feature = "search")]
-        info!("Search API disabled via --disable-search flag");
+        info!("Search API available at http://{}:{}", bind, search_port);
     }
 
-    // CRITICAL FIX (v1.3.66): Add signal handling for graceful shutdown
-    // Spawn server task
+    // v2.6.0: Start Admin API HTTP server for cluster management
+    let admin_port = 10000 + (config.node_id as u16);  // 10001, 10002, 10003, etc.
+    info!("Starting Admin API on port {}", admin_port);
+    let admin_api_key = std::env::var("CHRONIK_ADMIN_API_KEY").ok();
+    admin_api::start_admin_api(raft_cluster.clone(), admin_port, admin_api_key).await?;
+    info!("Admin API available at http://{}:{}/admin", bind, admin_port);
+
+    // v2.6.0 Priority 2 Step 3: Start Partition Rebalancer
+    info!("Starting Partition Rebalancer (RF={})", config.replication_factor);
+    let _rebalancer = partition_rebalancer::PartitionRebalancer::new(
+        raft_cluster.clone(),
+        server.metadata_store().clone(),
+        config.replication_factor,
+    );
+    info!("✓ Partition Rebalancer started (will check every 30s for membership changes)");
+
+    // Start server with signal handling
     let server_clone = server.clone();
     let kafka_addr_clone = kafka_addr.clone();
     let server_task = tokio::spawn(async move {
         server_clone.run(&kafka_addr_clone).await
     });
 
-    // Wait for shutdown signal (SIGINT or SIGTERM)
     tokio::select! {
         result = server_task => {
             match result {
@@ -810,7 +710,7 @@ async fn run_standalone_server(cli: &Cli) -> Result<()> {
             }
         }
         _ = tokio::signal::ctrl_c() => {
-            info!("Received SIGINT, gracefully shutting down...");
+            info!("Received SIGINT, shutting down...");
         }
         _ = async {
             #[cfg(unix)]
@@ -824,226 +724,463 @@ async fn run_standalone_server(cli: &Cli) -> Result<()> {
                 std::future::pending::<()>().await
             }
         } => {
-            info!("Received SIGTERM, gracefully shutting down...");
+            info!("Received SIGTERM, shutting down...");
         }
     }
 
-    // Graceful shutdown: flush all partitions
-    info!("Flushing all partitions before shutdown...");
-    if let Err(e) = server.shutdown().await {
-        error!("Failed to shutdown server gracefully: {}", e);
-    } else {
-        info!("Server shutdown complete");
-    }
+    info!("Shutting down cluster node {}...", config.node_id);
+    server.shutdown().await?;
 
     Ok(())
 }
 
-async fn run_ingest_server(cli: &Cli) -> Result<()> {
-    // For now, just run standalone
-    // In the future, this would connect to a controller for coordination
-    run_standalone_server(cli).await
-}
-
-async fn run_all_components(cli: &Cli) -> Result<()> {
-    // Run with all features enabled
-    let mut tasks = vec![];
-    
-    // Initialize monitoring (metrics + optional tracing)
-    let _metrics_registry = init_monitoring(
-        "chronik-server-all",
-        cli.metrics_port,
-        None, // TODO: Add tracing config support
-    ).await?;
-    info!("Metrics endpoint available at http://{}:{}/metrics", cli.bind_addr, cli.metrics_port);
-    
-    // Parse bind address to handle "host:port" format
-    let bind_host = if cli.bind_addr.contains(':') {
-        cli.bind_addr.split(':').next().unwrap_or("0.0.0.0").to_string()
-    } else {
-        cli.bind_addr.clone()
-    };
-    
-    // Parse advertised address and port (handle both "host" and "host:port" formats)
-    let (advertised_host, advertised_port) = if let Some(ref addr) = cli.advertised_addr {
-        // User provided advertised address - parse it
-        // Check for IPv6 format first (contains multiple colons or starts with '[')
-        if addr.starts_with('[') || addr.matches(':').count() > 1 {
-            // IPv6 address
-            if let Some(bracket_end) = addr.rfind(']') {
-                // Format: [::1]:9092
-                if let Some(colon_after_bracket) = addr[bracket_end..].find(':') {
-                    let port_str = &addr[bracket_end + colon_after_bracket + 1..];
-                    if let Ok(port) = port_str.parse::<u16>() {
-                        let host = addr[..bracket_end + 1].to_string();
-                        info!("Using advertised address '{}' with port {}", host, port);
-                        (host, port as i32)
-                    } else {
-                        // No valid port after bracket
-                        let port = cli.advertised_port.unwrap_or(cli.kafka_port) as i32;
-                        info!("Using advertised address '{}' with default port {}", addr, port);
-                        (addr.clone(), port)
-                    }
-                } else {
-                    // Format: [::1] without port
-                    let port = cli.advertised_port.unwrap_or(cli.kafka_port) as i32;
-                    info!("Using advertised address '{}' with default port {}", addr, port);
-                    (addr.clone(), port)
-                }
-            } else {
-                // IPv6 without brackets
-                let port = cli.advertised_port.unwrap_or(cli.kafka_port) as i32;
-                info!("Using IPv6 address '{}' with default port {}", addr, port);
-                (addr.clone(), port)
-            }
-        } else if let Some(colon_pos) = addr.rfind(':') {
-            // IPv4 or hostname with possible port
-            let potential_port = &addr[colon_pos + 1..];
-            if potential_port.chars().all(|c| c.is_ascii_digit()) && !potential_port.is_empty() {
-                // Has port - split it
-                let host = addr[..colon_pos].to_string();
-                let port = potential_port.parse::<u16>()
-                    .unwrap_or(cli.kafka_port) as i32;
-                info!("Using advertised address '{}' with port {}", host, port);
-                (host, port)
-            } else {
-                // Colon but not a valid port
-                let port = cli.advertised_port.unwrap_or(cli.kafka_port) as i32;
-                info!("Using advertised address '{}' with default port {}", addr, port);
-                (addr.clone(), port)
-            }
-        } else {
-            // No colon - just a hostname
-            let port = cli.advertised_port.unwrap_or(cli.kafka_port) as i32;
-            info!("Using advertised address '{}' with port {}", addr, port);
-            (addr.clone(), port)
-        }
-    } else if bind_host == "0.0.0.0" || bind_host == "[::]" {
-        // If binding to all interfaces and no advertised address specified,
-        // try to use hostname or localhost as a better default
-        let hostname = std::env::var("HOSTNAME")
-            .or_else(|_| std::env::var("DOCKER_HOSTNAME"))
-            .unwrap_or_else(|_| "127.0.0.1".to_string());
-        
-        let port = cli.advertised_port.unwrap_or(cli.kafka_port) as i32;
-        
-        if hostname != "127.0.0.1" {
-            info!("Binding to all interfaces ({}), using hostname '{}' as advertised address", bind_host, hostname);
-            info!("To override, set CHRONIK_ADVERTISED_ADDR environment variable");
-        } else {
-            warn!("Binding to all interfaces ({}) without advertised address configured", bind_host);
-            warn!("Using '127.0.0.1' as advertised address - remote clients may not connect");
-            warn!("Set CHRONIK_ADVERTISED_ADDR to your hostname/IP for remote access");
-        }
-        (hostname, port)
-    } else {
-        // Use bind host as advertised host
-        let port = cli.advertised_port.unwrap_or(cli.kafka_port) as i32;
-        (bind_host.clone(), port)
-    };
+/// Run in single-node mode (standalone, no clustering)
+async fn run_single_node_mode(
+    cli: &Cli,
+    bind: String,
+    advertise: Option<String>,
+) -> Result<()> {
+    let (advertised_host, advertised_port) = parse_advertise_addr(
+        advertise.as_deref(),
+        &bind,
+        9092, // Default Kafka port
+    )?;
 
     // Parse object store configuration from environment (for Tier 3: Tantivy archives)
     let object_store_config = parse_object_store_config_from_env();
 
-    // Load cluster configuration
-    let cluster_config = load_cluster_config(&cli)?;
-
-    // Determine node_id from cluster config or default to 1
-    let node_id = if let Some(ref cluster) = cluster_config {
-        cluster.node_id as i32
-    } else {
-        1
-    };
-
-    // Determine replication factor from cluster config or default
-    let replication_factor = if let Some(ref cluster) = cluster_config {
-        cluster.replication_factor as u32
-    } else {
-        1
-    };
-
-    // Create server configuration with all features
     let config = IntegratedServerConfig {
-        node_id,
+        node_id: 1,
         advertised_host,
         advertised_port,
         data_dir: cli.data_dir.to_string_lossy().to_string(),
         enable_indexing: cfg!(feature = "search"),
         enable_compression: true,
         auto_create_topics: true,
-        num_partitions: 3,
-        replication_factor,
-        enable_wal_indexing: true,  // Enable WAL→Tantivy indexing
-        wal_indexing_interval_secs: 30,  // Index every 30 seconds
-        object_store_config,  // Pass custom object store config if provided
-        enable_metadata_dr: true,  // Enable metadata DR by default
-        metadata_upload_interval_secs: 60,  // Upload metadata every minute
-        cluster_config,  // Pass cluster configuration
+        num_partitions: 3,  // Default to 3 partitions for better parallelism (configurable via --num-partitions)
+        replication_factor: 1,
+        enable_wal_indexing: true,
+        wal_indexing_interval_secs: 30,
+        object_store_config,
+        enable_metadata_dr: true,
+        metadata_upload_interval_secs: 60,
+        cluster_config: None,
     };
-    
-    // Start Kafka protocol server
-    let kafka_addr = format!("{}:{}", cli.bind_addr, cli.kafka_port);
-    let kafka_task = tokio::spawn(async move {
-        let server = IntegratedKafkaServer::new(config, None).await?;
-        server.run(&kafka_addr).await
-    });
-    tasks.push(kafka_task);
-    
-    info!("Kafka protocol listening on {}:{}", cli.bind_addr, cli.kafka_port);
-    
-    #[cfg(feature = "search")]
-    if !cli.disable_search {
-        info!("Search API enabled, starting on port {}", cli.search_port);
 
-        // Start the search API server
-        let search_bind = cli.bind_addr.clone();
-        let search_port = cli.search_port;
-        let search_task = tokio::spawn(async move {
+    let server = IntegratedKafkaServer::new(config, None).await?;
+
+    // Initialize monitoring
+    let _metrics_registry = init_monitoring(
+        "chronik-server",
+        13092, // Default metrics port for single-node
+        None,
+    ).await?;
+
+    let kafka_addr = format!("{}:9092", bind);
+    info!("Kafka protocol listening on {}", kafka_addr);
+    info!("Metrics endpoint available at http://{}:13092/metrics", bind);
+
+    // Start search API if search feature is compiled
+    #[cfg(feature = "search")]
+    {
+        info!("Starting Search API on port 6092");
+        let search_bind = bind.clone();
+        let wal_indexer = server.get_wal_indexer();
+        let index_base_path = format!("{}/tantivy_indexes", cli.data_dir.to_string_lossy());
+
+        tokio::spawn(async move {
             use chronik_search::api::SearchApi;
             use std::sync::Arc;
 
-            // Create search API instance
-            let search_api = Arc::new(SearchApi::new().map_err(|e| anyhow::anyhow!("Failed to create search API: {}", e))?);
-
-            // Create router
+            let search_api = Arc::new(SearchApi::new_with_wal_indexer(wal_indexer, index_base_path).unwrap());
             let app = search_api.router();
-
-            // Start server
-            let addr = format!("{}:{}", search_bind, search_port);
+            let addr = format!("{}:6092", search_bind);
             info!("Search API listening on http://{}", addr);
 
-            let listener = tokio::net::TcpListener::bind(&addr).await
-                .map_err(|e| anyhow::anyhow!("Failed to bind search API port: {}", e))?;
-
-            chronik_search::serve_app(listener, app).await
-                .map_err(|e| anyhow::anyhow!("Search API server error: {}", e))
+            let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+            chronik_search::serve_app(listener, app).await.unwrap()
         });
-        tasks.push(search_task);
 
-        info!("Search API available at http://{}:{}", cli.bind_addr, cli.search_port);
-        info!("  - Search: POST http://{}:{}/_search", cli.bind_addr, cli.search_port);
-        info!("  - Index: PUT http://{}:{}/{{index}}", cli.bind_addr, cli.search_port);
-        info!("  - Document: POST http://{}:{}/{{index}}/_doc/{{id}}", cli.bind_addr, cli.search_port);
-    } else {
-        #[cfg(feature = "search")]
-        info!("Search API disabled via --disable-search flag");
-    }
-    
-    #[cfg(feature = "backup")]
-    {
-        info!("Backup service enabled");
-        // Future: Start backup scheduler
-    }
-    
-    // Wait for all components
-    for task in tasks {
-        task.await??;
+        info!("Search API available at http://{}:6092", bind);
     }
 
+    // Start server with signal handling
+    let server_clone = server.clone();
+    let kafka_addr_clone = kafka_addr.clone();
+    let server_task = tokio::spawn(async move {
+        server_clone.run(&kafka_addr_clone).await
+    });
+
+    tokio::select! {
+        result = server_task => {
+            match result {
+                Ok(Ok(_)) => info!("Server task completed normally"),
+                Ok(Err(e)) => error!("Server task failed: {}", e),
+                Err(e) => error!("Server task panicked: {}", e),
+            }
+        }
+        _ = tokio::signal::ctrl_c() => {
+            info!("Received SIGINT, shutting down...");
+        }
+        _ = async {
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{signal, SignalKind};
+                let mut sigterm = signal(SignalKind::terminate()).unwrap();
+                sigterm.recv().await
+            }
+            #[cfg(not(unix))]
+            {
+                std::future::pending::<()>().await
+            }
+        } => {
+            info!("Received SIGTERM, shutting down...");
+        }
+    }
+
+    server.shutdown().await?;
     Ok(())
 }
 
-/// Handle WAL compaction commands
+/// Handle cluster management commands (v2.6.0+)
+async fn handle_cluster_command(_cli: &Cli, action: ClusterAction) -> Result<()> {
+    match action {
+        ClusterAction::Status { config } => {
+            info!("CLI: Querying cluster status");
+
+            // Load cluster config to get node information
+            let cluster_config = load_cluster_config_from_file(&config, None)?;
+
+            println!("Discovering cluster leader...\n");
+
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()?;
+
+            let mut leader_url = None;
+            let mut tried_nodes = Vec::new();
+
+            // Try all peers to find the leader
+            for peer in &cluster_config.peers {
+                let admin_port = 10000 + peer.id;
+                let health_url = format!("http://localhost:{}/admin/health", admin_port);
+
+                tried_nodes.push((peer.id, admin_port));
+
+                match client.get(&health_url).send().await {
+                    Ok(response) => {
+                        if response.status().is_success() {
+                            if let Ok(health) = response.json::<admin_api::HealthResponse>().await {
+                                if health.is_leader {
+                                    println!("✓ Found leader: node {} (port {})\n", peer.id, admin_port);
+                                    leader_url = Some(format!("http://localhost:{}/admin/status", admin_port));
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        // Node is down, continue
+                    }
+                }
+            }
+
+            let status_url = leader_url.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Could not find cluster leader. Tried nodes: {:?}\n\
+                     Make sure at least one node is running and has elected a leader.",
+                    tried_nodes
+                )
+            })?;
+
+            // Get API key from environment
+            let api_key = std::env::var("CHRONIK_ADMIN_API_KEY").ok();
+            if api_key.is_none() {
+                warn!("CHRONIK_ADMIN_API_KEY not set - authentication may fail");
+            }
+
+            // Send request to leader with API key
+            let mut request_builder = client.get(&status_url);
+
+            if let Some(key) = api_key {
+                request_builder = request_builder.header("X-API-Key", key);
+            }
+
+            let response = request_builder
+                .send()
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to query cluster status: {}", e))?;
+
+            // Parse response
+            if response.status().is_success() {
+                let status: admin_api::ClusterStatusResponse = response.json().await?;
+
+                // Pretty-print cluster status
+                println!("═══════════════════════════════════════════════════");
+                println!("             CHRONIK CLUSTER STATUS");
+                println!("═══════════════════════════════════════════════════\n");
+
+                println!("Cluster Information:");
+                println!("  Current Node: {}", status.node_id);
+                println!("  Leader:       {}",
+                    status.leader_id.map(|id| id.to_string()).unwrap_or_else(|| "unknown".to_string()));
+                println!("  Total Nodes:  {}\n", status.nodes.len());
+
+                println!("───────────────────────────────────────────────────");
+                println!("Nodes:");
+                println!("───────────────────────────────────────────────────");
+                for node in &status.nodes {
+                    let role = if node.is_leader { "[LEADER]" } else { "[FOLLOWER]" };
+                    println!("  Node {}: {} {}", node.node_id, node.address, role);
+                }
+
+                if !status.partitions.is_empty() {
+                    println!("\n───────────────────────────────────────────────────");
+                    println!("Partitions:");
+                    println!("───────────────────────────────────────────────────");
+
+                    let mut topics: std::collections::HashMap<String, Vec<&admin_api::PartitionInfo>> = std::collections::HashMap::new();
+                    for partition in &status.partitions {
+                        topics.entry(partition.topic.clone()).or_default().push(partition);
+                    }
+
+                    for (topic, partitions) in topics {
+                        println!("\n  Topic: {}", topic);
+                        for partition in partitions {
+                            let leader_str = partition.leader.map(|id| id.to_string()).unwrap_or_else(|| "none".to_string());
+                            println!("    Partition {}: Leader={}, Replicas={:?}, ISR={:?}",
+                                partition.partition, leader_str, partition.replicas, partition.isr);
+                        }
+                    }
+                } else {
+                    println!("\n───────────────────────────────────────────────────");
+                    println!("No partitions assigned yet.");
+                    println!("───────────────────────────────────────────────────");
+                }
+
+                println!("\n═══════════════════════════════════════════════════");
+                Ok(())
+            } else if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+                eprintln!("✗ Authentication failed. Set CHRONIK_ADMIN_API_KEY environment variable.");
+                std::process::exit(1);
+            } else {
+                let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+                eprintln!("✗ Failed to get cluster status: {}", error_text);
+                std::process::exit(1);
+            }
+        }
+
+        ClusterAction::AddNode { node_id, kafka, wal, raft, config } => {
+            info!("CLI: Adding node {} to cluster", node_id);
+
+            // Load cluster config to determine which node is likely the leader
+            let cluster_config = load_cluster_config_from_file(&config, None)?;
+
+            // Smart leader discovery: Query all peers to find the leader
+            println!("Discovering cluster leader...");
+
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()?;
+
+            let mut leader_url = None;
+            let mut tried_nodes = Vec::new();
+
+            // Try all peers to find the leader
+            for peer in &cluster_config.peers {
+                let admin_port = 10000 + peer.id;
+                let health_url = format!("http://localhost:{}/admin/health", admin_port);
+
+                tried_nodes.push((peer.id, admin_port));
+
+                match client.get(&health_url).send().await {
+                    Ok(response) => {
+                        if response.status().is_success() {
+                            if let Ok(health) = response.json::<admin_api::HealthResponse>().await {
+                                if health.is_leader {
+                                    println!("✓ Found leader: node {} (port {})", peer.id, admin_port);
+                                    leader_url = Some(format!("http://localhost:{}/admin/add-node", admin_port));
+                                    break;
+                                } else {
+                                    info!("  Node {} is not the leader (state: follower)", peer.id);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("  Node {} unreachable: {}", peer.id, e);
+                    }
+                }
+            }
+
+            let admin_url = leader_url.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Could not find cluster leader. Tried nodes: {:?}\n\
+                     Make sure at least one node is running and has elected a leader.",
+                    tried_nodes
+                )
+            })?;
+
+            println!("Sending add-node request to leader...");
+
+            // Get API key from environment
+            let api_key = std::env::var("CHRONIK_ADMIN_API_KEY").ok();
+
+            // Prepare request
+            let request_body = serde_json::json!({
+                "node_id": node_id,
+                "kafka_addr": kafka,
+                "wal_addr": wal,
+                "raft_addr": raft,
+            });
+
+            // Send request to leader with API key
+            let mut request_builder = client
+                .post(&admin_url)
+                .json(&request_body);
+
+            if let Some(key) = api_key {
+                request_builder = request_builder.header("X-API-Key", key);
+            }
+
+            let response = request_builder
+                .send()
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to send request to leader: {}", e))?;
+
+            // Parse response
+            if response.status().is_success() {
+                let resp: admin_api::AddNodeResponse = response.json().await?;
+
+                if resp.success {
+                    println!("✓ {}", resp.message);
+                    println!("\nNode Details:");
+                    println!("  ID:    {}", node_id);
+                    println!("  Kafka: {}", kafka);
+                    println!("  WAL:   {}", wal);
+                    println!("  Raft:  {}", raft);
+                    println!("\nThe node will be added to the cluster once Raft achieves consensus.");
+                    println!("Monitor cluster status with: chronik-server cluster status --config {}", config.display());
+                } else {
+                    eprintln!("✗ Failed to add node: {}", resp.message);
+                    std::process::exit(1);
+                }
+            } else {
+                eprintln!("✗ HTTP error: {}", response.status());
+                eprintln!("  {}", response.text().await?);
+                std::process::exit(1);
+            }
+
+            Ok(())
+        }
+
+        ClusterAction::RemoveNode { node_id, force, config } => {
+            info!("CLI: Removing node {} from cluster (force={})", node_id, force);
+
+            // Load cluster config to get node information
+            let cluster_config = load_cluster_config_from_file(&config, None)?;
+
+            println!("Discovering cluster leader...\n");
+
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()?;
+
+            let mut leader_url = None;
+            let mut tried_nodes = Vec::new();
+
+            // Try all peers to find the leader
+            for peer in &cluster_config.peers {
+                let admin_port = 10000 + peer.id;
+                let health_url = format!("http://localhost:{}/admin/health", admin_port);
+
+                tried_nodes.push((peer.id, admin_port));
+
+                match client.get(&health_url).send().await {
+                    Ok(response) => {
+                        if response.status().is_success() {
+                            if let Ok(health) = response.json::<admin_api::HealthResponse>().await {
+                                if health.is_leader {
+                                    println!("✓ Found leader: node {} (port {})\n", peer.id, admin_port);
+                                    leader_url = Some(format!("http://localhost:{}/admin/remove-node", admin_port));
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        // Node is down, continue
+                    }
+                }
+            }
+
+            let admin_url = leader_url.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Could not find cluster leader. Tried nodes: {:?}\n\
+                     Make sure at least one node is running and has elected a leader.",
+                    tried_nodes
+                )
+            })?;
+
+            println!("Sending remove-node request to leader...");
+
+            // Get API key from environment
+            let api_key = std::env::var("CHRONIK_ADMIN_API_KEY").ok();
+
+            // Prepare request
+            let request_body = serde_json::json!({
+                "node_id": node_id,
+                "force": force,
+            });
+
+            // Send request to leader with API key
+            let mut request_builder = client
+                .post(&admin_url)
+                .json(&request_body);
+
+            if let Some(key) = api_key {
+                request_builder = request_builder.header("X-API-Key", key);
+            }
+
+            let response = request_builder
+                .send()
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to send request to leader: {}", e))?;
+
+            // Parse response
+            if response.status().is_success() {
+                let resp: admin_api::RemoveNodeResponse = response.json().await?;
+
+                if resp.success {
+                    println!("✓ {}", resp.message);
+                    println!("\nNode {} will be removed from the cluster once Raft achieves consensus.", node_id);
+                    if !force {
+                        println!("Partitions have been reassigned away from this node.");
+                    }
+                    println!("\nMonitor cluster status with: chronik-server cluster status --config {}", config.display());
+                } else {
+                    eprintln!("✗ Failed to remove node: {}", resp.message);
+                    std::process::exit(1);
+                }
+            } else if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+                eprintln!("✗ Authentication failed. Set CHRONIK_ADMIN_API_KEY environment variable.");
+                std::process::exit(1);
+            } else {
+                let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+                eprintln!("✗ Failed to remove node: {}", error_text);
+                std::process::exit(1);
+            }
+
+            Ok(())
+        }
+
+        ClusterAction::Rebalance { config: _config } => {
+            println!("Rebalance partitions - TODO: Priority 3", );
+            Ok(())
+        }
+    }
+}
+
 async fn handle_compaction_command(cli: &Cli, action: CompactAction) -> Result<()> {
     use std::sync::Arc;
     use tokio::sync::RwLock;

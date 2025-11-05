@@ -8,6 +8,7 @@ use axum::{
     response::IntoResponse,
     routing::get,
     Router,
+    Server,
 };
 use std::net::SocketAddr;
 use tower_http::trace::TraceLayer;
@@ -68,11 +69,12 @@ impl MetricsServer {
         
         let addr = SocketAddr::from(([0, 0, 0, 0], self.port));
         tracing::info!("Metrics server listening on {}", addr);
-        
-        // In axum 0.7, use the simpler serve API
-        let listener = tokio::net::TcpListener::bind(addr).await?;
-        axum::serve(listener, app).await?;
-        
+
+        // In axum 0.6, Server is re-exported from axum
+        Server::bind(&addr)
+            .serve(app.into_make_service())
+            .await?;
+
         Ok(())
     }
 }

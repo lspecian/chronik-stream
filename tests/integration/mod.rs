@@ -30,6 +30,10 @@ mod partition_assignment_persistence;
 #[cfg(feature = "raft")]
 mod raft_snapshot_test;
 
+// Priority 2: Admin API tests (v2.6.0)
+#[cfg(feature = "raft")]
+mod admin_api_test;
+
 // Tests that require full cluster setup
 // mod cluster;
 // mod kafka_protocol;

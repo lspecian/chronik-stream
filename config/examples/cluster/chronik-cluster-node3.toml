@@ -5,15 +5,18 @@ min_insync_replicas = 2
 
 [[peers]]
 id = 1
-addr = "127.0.0.1:9092"
-raft_port = 5001
+kafka = "localhost:9092"
+wal = "localhost:9291"
+raft = "localhost:5001"
 
 [[peers]]
 id = 2
-addr = "127.0.0.1:9093"
-raft_port = 5002
+kafka = "localhost:9093"
+wal = "localhost:9292"
+raft = "localhost:5002"
 
 [[peers]]
 id = 3
-addr = "127.0.0.1:9094"
-raft_port = 5003
+kafka = "localhost:9094"
+wal = "localhost:9293"
+raft = "localhost:5003"

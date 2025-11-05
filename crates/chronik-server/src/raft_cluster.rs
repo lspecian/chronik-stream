@@ -230,6 +230,18 @@ impl RaftCluster {
             .unwrap_or(false)
     }
 
+    /// Get all partitions where the specified node is the leader
+    ///
+    /// Returns a list of (topic, partition) tuples where this node is the leader.
+    /// Used by WAL replication manager to discover which partitions to replicate.
+    pub fn get_partitions_where_leader(&self, node_id: u64) -> Vec<PartitionKey> {
+        self.state_machine
+            .read()
+            .ok()
+            .map(|sm| sm.get_partitions_where_leader(node_id))
+            .unwrap_or_default()
+    }
+
     /// Propose a metadata command to the Raft cluster
     ///
     /// This serializes the command and proposes it via Raft consensus.
@@ -272,26 +284,352 @@ impl RaftCluster {
         Ok(())
     }
 
+    /// Propose adding a new node to the cluster (Priority 2: Zero-Downtime Node Addition)
+    ///
+    /// This creates a ConfChangeV2 entry that, when committed by Raft consensus,
+    /// adds the node as a voting member.
+    ///
+    /// **CRITICAL**: This method MUST be called on the Raft leader. Non-leader
+    /// calls will return an error.
+    ///
+    /// # Arguments
+    /// - `node_id`: ID of the new node (must be unique)
+    /// - `kafka_addr`: Kafka broker address for client connections
+    /// - `wal_addr`: WAL replication receiver address
+    /// - `raft_addr`: Raft gRPC server address
+    ///
+    /// # Returns
+    /// - Ok(()) if ConfChange was proposed (not yet committed)
+    /// - Err if not leader, node_id exists, or Raft error
+    ///
+    /// # Example
+    /// ```rust
+    /// // On the leader node:
+    /// raft_cluster.propose_add_node(
+    ///     4,
+    ///     "node4.example.com:9092",
+    ///     "node4.example.com:9291",
+    ///     "node4.example.com:5001"
+    /// ).await?;
+    /// ```
+    pub async fn propose_add_node(
+        &self,
+        node_id: u64,
+        kafka_addr: String,
+        wal_addr: String,
+        raft_addr: String,
+    ) -> Result<()> {
+        // STEP 1: Validate we're the leader
+        {
+            let raft = self.raft_node.read()
+                .map_err(|e| anyhow::anyhow!("Failed to acquire Raft lock: {}", e))?;
+
+            if raft.raft.state != raft::StateRole::Leader {
+                return Err(anyhow::anyhow!(
+                    "Cannot add node: this node (id={}) is not the leader (state={:?}, leader={})",
+                    self.node_id,
+                    raft.raft.state,
+                    raft.raft.leader_id
+                ));
+            }
+        }
+
+        // STEP 2: Check if node_id already exists
+        let current_nodes = self.get_all_nodes();
+        if current_nodes.contains(&node_id) {
+            return Err(anyhow::anyhow!(
+                "Node {} already exists in cluster (current nodes: {:?})",
+                node_id,
+                current_nodes
+            ));
+        }
+
+        tracing::info!(
+            "Proposing to add node {} to cluster (current nodes: {:?})",
+            node_id,
+            current_nodes
+        );
+
+        // STEP 3: Create ConfChangeV2 to add voter
+        use raft::prelude::*;
+
+        let mut cc = ConfChangeV2::default();
+        cc.set_transition(ConfChangeTransition::Auto);
+
+        let mut change = ConfChangeSingle::default();
+        change.set_change_type(ConfChangeType::AddNode);
+        change.set_node_id(node_id);
+
+        cc.set_changes(vec![change].into());
+
+        // Context: Store node addresses for later use
+        // Format: "kafka_addr|wal_addr|raft_addr"
+        let context = format!("{}|{}|{}", kafka_addr, wal_addr, raft_addr);
+        tracing::debug!("ConfChangeV2 context: {}", context);
+
+        cc.set_context(context.into_bytes());
+
+        // STEP 4: Propose ConfChange via Raft
+        // CRITICAL: propose_conf_change takes the ConfChangeV2 directly, NOT serialized bytes
+        let mut raft = self.raft_node.write()
+            .map_err(|e| anyhow::anyhow!("Failed to acquire Raft lock: {}", e))?;
+
+        raft.propose_conf_change(vec![], cc)
+            .context("Failed to propose ConfChange")?;
+
+        tracing::info!(
+            "✓ Proposed adding node {} to cluster (kafka={}, wal={}, raft={})",
+            node_id, kafka_addr, wal_addr, raft_addr
+        );
+
+        Ok(())
+    }
+
+    /// Propose removing a node from the cluster (Priority 4: Zero-Downtime Node Removal)
+    ///
+    /// This creates a ConfChangeV2 entry that, when committed by Raft consensus,
+    /// removes the node as a voting member.
+    ///
+    /// **CRITICAL**: This method MUST be called on the Raft leader. Non-leader
+    /// calls will return an error.
+    ///
+    /// **SAFETY**: This method checks that removing the node won't break quorum.
+    /// For a 3-node cluster, you cannot remove a node (would leave 2 nodes, no quorum).
+    /// Minimum cluster size after removal is 3 nodes.
+    ///
+    /// # Arguments
+    /// - `node_id`: ID of the node to remove
+    /// - `force`: If true, skip partition reassignment (for dead nodes)
+    ///
+    /// # Returns
+    /// - Ok(()) if ConfChange was proposed (not yet committed)
+    /// - Err if not leader, node doesn't exist, or would break quorum
+    ///
+    /// # Example
+    /// ```rust
+    /// // On the leader node:
+    /// // Graceful removal (reassigns partitions first)
+    /// raft_cluster.propose_remove_node(3, false).await?;
+    ///
+    /// // Force removal (for dead node)
+    /// raft_cluster.propose_remove_node(3, true).await?;
+    /// ```
+    pub async fn propose_remove_node(
+        &self,
+        node_id: u64,
+        force: bool,
+    ) -> Result<()> {
+        // STEP 1: Validate we're the leader
+        {
+            let raft = self.raft_node.read()
+                .map_err(|e| anyhow::anyhow!("Failed to acquire Raft lock: {}", e))?;
+
+            if raft.raft.state != raft::StateRole::Leader {
+                return Err(anyhow::anyhow!(
+                    "Cannot remove node: this node (id={}) is not the leader (state={:?}, leader={})",
+                    self.node_id,
+                    raft.raft.state,
+                    raft.raft.leader_id
+                ));
+            }
+        }
+
+        // STEP 2: Check if node exists
+        let current_nodes = self.get_all_nodes();
+        if !current_nodes.contains(&node_id) {
+            return Err(anyhow::anyhow!(
+                "Node {} does not exist in cluster (current nodes: {:?})",
+                node_id,
+                current_nodes
+            ));
+        }
+
+        // STEP 3: Check quorum safety (need at least 3 nodes after removal for future operations)
+        let nodes_after_removal = current_nodes.len() - 1;
+        if nodes_after_removal < 3 && !force {
+            return Err(anyhow::anyhow!(
+                "Cannot remove node {}: would leave {} nodes (minimum 3 required for safe operations). \
+                 Current nodes: {:?}. Use --force to override (WARNING: may cause cluster instability)",
+                node_id,
+                nodes_after_removal,
+                current_nodes
+            ));
+        }
+
+        // STEP 4: Check if we're trying to remove ourselves
+        if node_id == self.node_id && !force {
+            return Err(anyhow::anyhow!(
+                "Cannot remove self (node {}): leader cannot remove itself gracefully. \
+                 Transfer leadership first or use --force",
+                node_id
+            ));
+        }
+
+        tracing::info!(
+            "Proposing to remove node {} from cluster (current nodes: {:?}, force={})",
+            node_id,
+            current_nodes,
+            force
+        );
+
+        // STEP 5: If not force, reassign partitions away from this node first
+        if !force {
+            tracing::info!("Reassigning partitions away from node {} before removal", node_id);
+            self.reassign_partitions_from_node(node_id).await?;
+        } else {
+            tracing::warn!("Force removal: skipping partition reassignment for node {}", node_id);
+        }
+
+        // STEP 6: Create ConfChangeV2 to remove voter
+        use raft::prelude::*;
+
+        let mut cc = ConfChangeV2::default();
+        cc.set_transition(ConfChangeTransition::Auto);
+
+        let mut change = ConfChangeSingle::default();
+        change.set_change_type(ConfChangeType::RemoveNode);
+        change.set_node_id(node_id);
+
+        cc.set_changes(vec![change].into());
+
+        // No context needed for removal
+        cc.set_context(vec![]);
+
+        // STEP 7: Propose ConfChange via Raft
+        let mut raft = self.raft_node.write()
+            .map_err(|e| anyhow::anyhow!("Failed to acquire Raft lock: {}", e))?;
+
+        raft.propose_conf_change(vec![], cc)
+            .context("Failed to propose ConfChange for node removal")?;
+
+        tracing::info!(
+            "✓ Proposed removing node {} from cluster (force={})",
+            node_id, force
+        );
+
+        Ok(())
+    }
+
+    /// Reassign partitions away from a node before removal (Priority 4)
+    ///
+    /// This method finds all partitions where the target node is a replica
+    /// and proposes new partition assignments excluding that node.
+    async fn reassign_partitions_from_node(&self, node_id: u64) -> Result<()> {
+        // Scope the lock guard explicitly to ensure it's dropped before await
+        let partitions_to_reassign = {
+            let sm = self.state_machine.read()
+                .map_err(|e| anyhow::anyhow!("Failed to acquire state machine lock: {}", e))?;
+
+            let mut partitions = Vec::new();
+
+            // Find all partitions where node_id is a replica
+            for ((topic, partition), replicas) in &sm.partition_assignments {
+                if replicas.contains(&node_id) {
+                    partitions.push((topic.clone(), *partition, replicas.clone()));
+                }
+            }
+
+            partitions
+        }; // sm lock guard dropped here
+
+        if partitions_to_reassign.is_empty() {
+            tracing::info!("No partitions assigned to node {}, nothing to reassign", node_id);
+            return Ok(());
+        }
+
+        tracing::info!(
+            "Reassigning {} partitions away from node {}",
+            partitions_to_reassign.len(),
+            node_id
+        );
+
+        // Get all nodes except the one being removed
+        let available_nodes: Vec<u64> = self.get_all_nodes()
+            .into_iter()
+            .filter(|&id| id != node_id)
+            .collect();
+
+        if available_nodes.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Cannot reassign partitions: no other nodes available"
+            ));
+        }
+
+        // For each partition, create new replica set without node_id
+        for (topic, partition, old_replicas) in partitions_to_reassign {
+            let mut new_replicas: Vec<u64> = old_replicas
+                .into_iter()
+                .filter(|&id| id != node_id)
+                .collect();
+
+            // If we removed a replica, add a new one from available nodes
+            // to maintain replication factor
+            if new_replicas.len() < 3 && !available_nodes.is_empty() {
+                // Find a node not already in new_replicas
+                for &candidate in &available_nodes {
+                    if !new_replicas.contains(&candidate) {
+                        new_replicas.push(candidate);
+                        break;
+                    }
+                }
+            }
+
+            tracing::info!(
+                "Reassigning partition {}-{}: removing node {}, new replicas: {:?}",
+                topic, partition, node_id, new_replicas
+            );
+
+            // Propose new partition assignment
+            let cmd = crate::raft_metadata::MetadataCommand::AssignPartition {
+                topic: topic.clone(),
+                partition,
+                replicas: new_replicas,
+            };
+
+            self.propose(cmd).await?;
+        }
+
+        Ok(())
+    }
+
     /// Apply committed Raft entries to the state machine
     ///
     /// This should be called by the Raft message processing loop when
     /// entries are committed.
+    ///
+    /// **Priority 2 Enhancement**: Now handles ConfChangeV2 entries for dynamic
+    /// node addition/removal.
     pub fn apply_committed_entries(&self, entries: &[Entry]) -> Result<()> {
+        use raft::prelude::*;
+
         let mut sm = self.state_machine.write()
             .map_err(|e| anyhow::anyhow!("Failed to acquire state machine lock: {}", e))?;
 
         for entry in entries {
-            // Skip empty entries (configuration changes)
+            // Skip empty entries
             if entry.data.is_empty() {
                 continue;
             }
 
-            // Deserialize command
-            let cmd: MetadataCommand = bincode::deserialize(&entry.data)
-                .context("Failed to deserialize metadata command")?;
+            // Check entry type
+            let entry_type = entry.get_entry_type();
 
-            // Apply to state machine
-            sm.apply(cmd)?;
+            if entry_type == EntryType::EntryConfChangeV2 {
+                // PRIORITY 2: Handle ConfChangeV2 (node addition/removal)
+                // NOTE: ConfChange entries are handled by the message loop before committed entries
+                // We don't process them here - they're automatically applied by Raft
+                tracing::debug!("Skipping ConfChangeV2 entry (already processed by message loop)");
+
+            } else if entry_type == EntryType::EntryNormal {
+                // Normal metadata command
+                let cmd: MetadataCommand = bincode::deserialize(&entry.data)
+                    .context("Failed to deserialize metadata command")?;
+
+                // Apply to state machine
+                sm.apply(cmd)?;
+            } else {
+                tracing::debug!("Skipping entry type: {:?}", entry_type);
+            }
         }
 
         Ok(())
@@ -300,6 +638,15 @@ impl RaftCluster {
     /// Get this node's ID
     pub fn node_id(&self) -> u64 {
         self.node_id
+    }
+
+    /// Check if this node is currently the Raft leader
+    pub async fn is_leader(&self) -> bool {
+        let raft = match self.raft_node.read() {
+            Ok(r) => r,
+            Err(_) => return false,
+        };
+        raft.raft.state == raft::StateRole::Leader
     }
 
     /// List all partitions tracked in metadata
@@ -311,6 +658,72 @@ impl RaftCluster {
             Some(sm) => sm.partition_assignments.keys().cloned().collect(),
             None => vec![],
         }
+    }
+
+    /// Get all nodes currently in the cluster (voting members)
+    ///
+    /// Returns the list of node IDs that are currently voting members
+    /// of the Raft cluster.
+    ///
+    /// # Returns
+    /// Vector of node IDs (e.g., [1, 2, 3])
+    pub fn get_all_nodes(&self) -> Vec<u64> {
+        let raft = match self.raft_node.read() {
+            Ok(r) => r,
+            Err(_) => return vec![],
+        };
+
+        // Get voter IDs from Raft's configuration state
+        // For a simple approach, iterate over the progress tracker
+        let mut voters = Vec::new();
+        for (id, _progress) in raft.raft.prs().iter() {
+            voters.push(*id);
+        }
+        voters
+    }
+
+    /// Get node information (ID -> address mapping)
+    ///
+    /// # Returns
+    /// Vector of (node_id, address) tuples
+    pub fn get_node_info(&self) -> Vec<(u64, String)> {
+        let sm = match self.state_machine.read() {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+
+        sm.nodes.iter().map(|(id, addr)| (*id, addr.clone())).collect()
+    }
+
+    /// Get all partition information
+    ///
+    /// # Returns
+    /// Vector of PartitionInfo with topic, partition, leader, replicas, and ISR
+    pub fn get_all_partition_info(&self) -> Vec<crate::admin_api::PartitionInfo> {
+        let sm = match self.state_machine.read() {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+
+        let mut partitions = Vec::new();
+
+        // Collect all unique partition keys from assignments
+        for ((topic, partition), replicas) in &sm.partition_assignments {
+            let leader = sm.partition_leaders.get(&(topic.clone(), *partition)).copied();
+            let isr = sm.isr_sets.get(&(topic.clone(), *partition))
+                .cloned()
+                .unwrap_or_default();
+
+            partitions.push(crate::admin_api::PartitionInfo {
+                topic: topic.clone(),
+                partition: *partition,
+                leader,
+                replicas: replicas.clone(),
+                isr,
+            });
+        }
+
+        partitions
     }
 
     /// Propose a partition leader change
@@ -531,7 +944,104 @@ impl RaftCluster {
                     }
                 }
 
-                // Step 3: Handle committed entries
+                // Step 3a: Handle ConfChange entries (Priority 2: Zero-Downtime Node Addition)
+                // CRITICAL: ConfChange must be processed BEFORE normal committed entries
+                if !ready.committed_entries().is_empty() {
+                    use raft::prelude::*;
+
+                    for entry in ready.committed_entries() {
+                        if entry.get_entry_type() == EntryType::EntryConfChangeV2 {
+                            tracing::info!("Processing ConfChangeV2 entry (index={})", entry.index);
+
+                            // Decode ConfChangeV2 from protobuf bytes in entry.data
+                            // raft-rs stores ConfChange entries as protobuf-encoded bytes
+                            // Use chronik-raft bridge to handle prost 0.11 / 0.13 compatibility
+                            use chronik_raft::prost_bridge;
+                            let cc = match prost_bridge::decode_conf_change_v2(&entry.data) {
+                                Ok(cc) => cc,
+                                Err(e) => {
+                                    tracing::error!("Failed to decode ConfChangeV2: {}", e);
+                                    continue;
+                                }
+                            };
+
+                            // Apply to Raft (updates voter list)
+                            let cs = {
+                                let mut raft = match self.raft_node.write() {
+                                    Ok(r) => r,
+                                    Err(e) => {
+                                        tracing::error!("Failed to acquire Raft lock: {}", e);
+                                        continue;
+                                    }
+                                };
+
+                                match raft.apply_conf_change(&cc) {
+                                    Ok(cs) => cs,
+                                    Err(e) => {
+                                        tracing::error!("Failed to apply ConfChange: {:?}", e);
+                                        continue;
+                                    }
+                                }
+                            };
+
+                            tracing::debug!("✓ Applied ConfChange to Raft (new config: {:?})", cs);
+
+                            // Parse context to get node addresses
+                            let context = String::from_utf8_lossy(&cc.context);
+                            let parts: Vec<&str> = context.split('|').collect();
+
+                            if parts.len() == 3 {
+                                let (kafka_addr, wal_addr, raft_addr) = (parts[0], parts[1], parts[2]);
+
+                                // Get change details
+                                if let Some(change) = cc.changes.first() {
+                                    let node_id = change.get_node_id();
+                                    let change_type = change.get_change_type();
+
+                                    match change_type {
+                                        ConfChangeType::AddNode => {
+                                            tracing::info!(
+                                                "ConfChange AddNode: node_id={}, kafka={}, wal={}, raft={}",
+                                                node_id, kafka_addr, wal_addr, raft_addr
+                                            );
+
+                                            // Register new peer with gRPC transport (async)
+                                            let transport_clone = self.transport.clone();
+                                            let raft_addr_owned = raft_addr.to_string();
+                                            tokio::spawn(async move {
+                                                let grpc_url = if raft_addr_owned.starts_with("http") {
+                                                    raft_addr_owned.clone()
+                                                } else {
+                                                    format!("http://{}", raft_addr_owned)
+                                                };
+
+                                                if let Err(e) = transport_clone.add_peer(node_id, grpc_url).await {
+                                                    tracing::error!("Failed to register peer {} in transport: {}", node_id, e);
+                                                } else {
+                                                    tracing::info!("✅ Registered peer {} in gRPC transport (raft={})", node_id, raft_addr_owned);
+                                                }
+                                            });
+
+                                            tracing::info!("✅ Node {} successfully added to cluster", node_id);
+                                        }
+                                        ConfChangeType::RemoveNode => {
+                                            tracing::info!("ConfChange RemoveNode: node_id={}", node_id);
+                                            // TODO Priority 4: Remove peer from transport
+                                            tracing::info!("✅ Node {} successfully removed from cluster", node_id);
+                                        }
+                                        _ => {
+                                            tracing::warn!("Unsupported ConfChange type: {:?}", change_type);
+                                        }
+                                    }
+                                }
+                            } else {
+                                tracing::warn!("Invalid ConfChange context format: '{}'", context);
+                            }
+                        }
+                    }
+                }
+
+                // Step 3b: Handle normal committed entries
                 if !ready.committed_entries().is_empty() {
                     tracing::debug!(
                         "Processing {} committed entries",

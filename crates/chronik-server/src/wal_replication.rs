@@ -27,6 +27,9 @@ use dashmap::DashMap;
 use crate::raft_cluster::RaftCluster;
 use crate::isr_tracker::IsrTracker;
 
+// v2.5.0 Phase 6: Import ClusterConfig for auto-discovery
+use chronik_config::ClusterConfig;
+
 // v2.5.0 Phase 4: Import IsrAckTracker for acks=-1 support
 use crate::isr_ack_tracker::IsrAckTracker;
 
@@ -127,6 +130,20 @@ pub struct WalReplicationManager {
 
     /// ISR ACK tracker for recording follower ACKs for acks=-1 (v2.5.0 Phase 4)
     isr_ack_tracker: Option<Arc<IsrAckTracker>>,
+
+    /// Cluster config for auto-discovering followers (v2.5.0 Phase 6)
+    cluster_config: Option<Arc<chronik_config::ClusterConfig>>,
+
+    /// Last known Raft leader ID (for Phase 3 dynamic leader change detection)
+    last_known_leader: Arc<AtomicU64>,
+
+    /// Whether this node is currently the leader (for Phase 3)
+    is_currently_leader: Arc<AtomicBool>,
+
+    /// Per-partition follower addresses: (topic, partition) → [wal_addr1, wal_addr2]
+    /// Enables partition-specific replication routing (Priority 1)
+    /// Maps each partition to its specific replicas (not all followers)
+    partition_followers: Arc<DashMap<(String, i32), Vec<String>>>,
 }
 
 impl WalReplicationManager {
@@ -134,28 +151,51 @@ impl WalReplicationManager {
     ///
     /// Spawns background workers for connection management and record sending
     pub fn new(followers: Vec<String>) -> Arc<Self> {
-        Self::new_with_dependencies(followers, None, None, None)
+        Self::new_with_dependencies(followers, None, None, None, None)
     }
 
     /// Create a new WAL replication manager with Raft cluster and ISR tracker (v2.5.0 Phase 3)
     ///
     /// This is the recommended constructor for cluster mode.
+    ///
+    /// v2.5.0 Phase 6: Added cluster_config parameter for automatic follower discovery.
+    /// If followers is empty and cluster_config is provided, followers will be auto-discovered.
     pub fn new_with_dependencies(
         followers: Vec<String>,
         raft_cluster: Option<Arc<RaftCluster>>,
         isr_tracker: Option<Arc<IsrTracker>>,
         isr_ack_tracker: Option<Arc<IsrAckTracker>>,
+        cluster_config: Option<Arc<ClusterConfig>>,
     ) -> Arc<Self> {
-        info!("Creating WalReplicationManager with {} followers, Raft: {}, ISR: {}, AckTracker: {}",
-              followers.len(),
+        // v2.5.0 Phase 6: Auto-discover followers from cluster config
+        let final_followers = if followers.is_empty() && cluster_config.is_some() {
+            let config = cluster_config.as_ref().unwrap();
+            let discovered: Vec<String> = config.peer_nodes()
+                .iter()
+                .map(|peer| peer.wal.clone())
+                .collect();
+
+            if !discovered.is_empty() {
+                info!("Auto-discovered {} followers from cluster config: {}",
+                      discovered.len(),
+                      discovered.join(", "));
+            }
+            discovered
+        } else {
+            followers
+        };
+
+        info!("Creating WalReplicationManager with {} followers, Raft: {}, ISR: {}, AckTracker: {}, ClusterConfig: {}",
+              final_followers.len(),
               raft_cluster.is_some(),
               isr_tracker.is_some(),
-              isr_ack_tracker.is_some());
+              isr_ack_tracker.is_some(),
+              cluster_config.is_some());
 
         let manager = Arc::new(Self {
             queue: Arc::new(SegQueue::new()),
             connections: Arc::new(DashMap::new()),
-            followers,
+            followers: final_followers,  // v2.5.0 Phase 6: Use auto-discovered or manual followers
             shutdown: Arc::new(AtomicBool::new(false)),
             total_queued: Arc::new(AtomicU64::new(0)),
             total_sent: Arc::new(AtomicU64::new(0)),
@@ -163,6 +203,10 @@ impl WalReplicationManager {
             raft_cluster,       // v2.5.0: Accept directly in constructor
             isr_tracker,        // v2.5.0: Accept directly in constructor
             isr_ack_tracker,    // v2.5.0 Phase 4: Accept ACK tracker
+            cluster_config,     // v2.5.0 Phase 6: Store for potential dynamic updates
+            last_known_leader: Arc::new(AtomicU64::new(0)), // Phase 3: Track leader changes
+            is_currently_leader: Arc::new(AtomicBool::new(false)), // Phase 3: Track leadership
+            partition_followers: Arc::new(DashMap::new()), // Priority 1: Per-partition follower map
         });
 
         // Spawn background worker for sending records
@@ -175,6 +219,18 @@ impl WalReplicationManager {
         let manager_clone2 = Arc::clone(&manager);
         tokio::spawn(async move {
             manager_clone2.run_connection_manager().await;
+        });
+
+        // Phase 3: Spawn background worker for dynamic leader change detection
+        let manager_clone3 = Arc::clone(&manager);
+        tokio::spawn(async move {
+            manager_clone3.run_leader_watcher().await;
+        });
+
+        // Priority 1: Spawn background worker for partition-level follower discovery
+        let manager_clone4 = Arc::clone(&manager);
+        tokio::spawn(async move {
+            manager_clone4.run_follower_discovery_worker().await;
         });
 
         manager
@@ -364,7 +420,12 @@ impl WalReplicationManager {
         info!("WAL replication sender worker stopped");
     }
 
-    /// Send a WAL record to all active followers
+    /// Send a WAL record to partition-specific followers (Priority 1: Partition-aware routing)
+    ///
+    /// This method now uses the partition_followers map to route records only to
+    /// replicas assigned to this specific partition (not broadcast to all followers).
+    ///
+    /// Fallback: If no partition assignment found, uses static followers list.
     async fn send_to_followers(&self, record: &WalReplicationRecord) {
         let frame = match serialize_wal_frame(record) {
             Ok(f) => f,
@@ -374,8 +435,32 @@ impl WalReplicationManager {
             }
         };
 
-        // Send to each follower sequentially (DashMap doesn't allow moving RefMut into tasks)
-        for follower_addr in &self.followers {
+        // Priority 1: Look up partition-specific followers from discovery worker
+        let partition_key = (record.topic.clone(), record.partition);
+        let target_followers = match self.partition_followers.get(&partition_key) {
+            Some(followers_ref) => {
+                let followers = followers_ref.value().clone();
+                debug!(
+                    "Routing {}-{} to {} partition-specific followers (not all {} followers)",
+                    record.topic,
+                    record.partition,
+                    followers.len(),
+                    self.followers.len()
+                );
+                followers
+            }
+            None => {
+                // Fallback: No partition assignment yet, use static followers
+                debug!(
+                    "No partition assignment for {}-{}, using static followers",
+                    record.topic, record.partition
+                );
+                self.followers.clone()
+            }
+        };
+
+        // Send to each target follower sequentially (DashMap doesn't allow moving RefMut into tasks)
+        for follower_addr in &target_followers {
             if let Some(mut conn) = self.connections.get_mut(follower_addr) {
                 // Write frame to TCP stream
                 // Note: This is fast (~1ms) so sequential is fine
@@ -385,8 +470,10 @@ impl WalReplicationManager {
                     drop(conn); // Drop RefMut before removing
                     self.connections.remove(follower_addr);
                 } else {
-                    debug!("Sent WAL record to follower: {}", follower_addr);
+                    debug!("Sent WAL record for {}-{} to follower: {}", record.topic, record.partition, follower_addr);
                 }
+            } else {
+                debug!("No connection to follower {} for {}-{}", follower_addr, record.topic, record.partition);
             }
         }
     }
@@ -562,6 +649,196 @@ impl WalReplicationManager {
         Ok(())
     }
 
+    /// Phase 3: Background worker that watches for Raft leadership changes
+    ///
+    /// When this node becomes leader → automatically discover followers and connect
+    /// When this node loses leadership → close all replication connections
+    ///
+    /// This enables automatic disaster recovery without manual intervention.
+    async fn run_leader_watcher(&self) {
+        // Only run if we have both Raft cluster and cluster config
+        let (raft, config) = match (&self.raft_cluster, &self.cluster_config) {
+            (Some(r), Some(c)) => (r, c),
+            _ => {
+                info!("Leader watcher disabled: no Raft cluster or cluster config");
+                return;
+            }
+        };
+
+        info!("Starting dynamic leader change detection (polling every 5s)");
+
+        // Check every 5 seconds (responsive to leadership changes)
+        let check_interval = Duration::from_secs(5);
+
+        while !self.shutdown.load(Ordering::Relaxed) {
+            sleep(check_interval).await;
+
+            // Query Raft for current leadership status
+            let (is_ready, leader_id, state_role) = raft.is_leader_ready();
+            let my_node_id = config.node_id;
+            let am_i_leader = is_ready && leader_id == my_node_id;
+
+            // Check if leadership changed
+            let was_leader = self.is_currently_leader.load(Ordering::Relaxed);
+            let last_leader = self.last_known_leader.load(Ordering::Relaxed);
+
+            if leader_id != last_leader || am_i_leader != was_leader {
+                // Leadership changed!
+                info!(
+                    "Cluster leadership changed - previous_leader: {}, new_leader: {}, node_id: {}, role: {}, was_leader: {}, is_leader: {}",
+                    last_leader, leader_id, my_node_id, state_role, was_leader, am_i_leader
+                );
+
+                self.last_known_leader.store(leader_id, Ordering::Relaxed);
+                self.is_currently_leader.store(am_i_leader, Ordering::Relaxed);
+
+                if am_i_leader && !was_leader {
+                    // Became leader → start replication
+                    info!("✅ Became cluster leader - starting WAL replication to followers");
+                    self.on_became_leader(config).await;
+                } else if !am_i_leader && was_leader {
+                    // Lost leadership → stop replication
+                    warn!("⚠️ Lost cluster leadership - stopping WAL replication (new_leader: {})", leader_id);
+                    self.on_lost_leadership().await;
+                }
+            }
+        }
+
+        info!("Leader watcher stopped");
+    }
+
+    /// Called when this node becomes the cluster leader
+    ///
+    /// Automatically discovers followers from cluster config and establishes connections.
+    async fn on_became_leader(&self, config: &ClusterConfig) {
+        info!("Discovering cluster followers from configuration...");
+
+        // Get list of peer nodes (already filters out self)
+        let peer_wal_addresses: Vec<String> = config.peer_nodes()
+            .iter()
+            .map(|peer| peer.wal.clone())
+            .collect();
+
+        if peer_wal_addresses.is_empty() {
+            warn!("No followers found in cluster configuration");
+            return;
+        }
+
+        info!(
+            "Discovered {} follower nodes: {}",
+            peer_wal_addresses.len(),
+            peer_wal_addresses.join(", ")
+        );
+
+        // Close any existing connections first (clean slate)
+        self.connections.clear();
+
+        // NOTE: Connection manager worker will handle actual connection establishment
+        // We just need to ensure connections map is empty so it can reconnect
+        info!("Cleared old connections - connection manager will establish new follower connections");
+    }
+
+    /// Called when this node loses cluster leadership
+    ///
+    /// Closes all WAL replication connections since only leaders replicate.
+    async fn on_lost_leadership(&self) {
+        info!("Closing all WAL replication connections (no longer leader)");
+
+        // Close all connections
+        let connection_count = self.connections.len();
+        self.connections.clear();
+
+        info!("Closed {} WAL replication connections", connection_count);
+
+        // Clear the queue (no point in sending queued records if we're not the leader)
+        let mut cleared_count = 0;
+        while self.queue.pop().is_some() {
+            cleared_count += 1;
+        }
+
+        if cleared_count > 0 {
+            info!("Cleared {} queued WAL records from replication queue", cleared_count);
+        }
+    }
+
+    /// Background worker for dynamic partition-level follower discovery (Priority 1)
+    ///
+    /// This polls Raft every 10 seconds to check for partition assignment changes.
+    /// When detected, it updates the per-partition follower map automatically.
+    ///
+    /// This enables:
+    /// - Partition-specific replication routing (not broadcast to all followers)
+    /// - Dynamic partition reassignment without restart
+    /// - Automatic handling of leader changes with correct routing
+    async fn run_follower_discovery_worker(&self) {
+        // Only run if we have both Raft cluster and cluster config
+        let (raft, config) = match (&self.raft_cluster, &self.cluster_config) {
+            (Some(r), Some(c)) => (r, c),
+            _ => {
+                debug!("Follower discovery worker disabled: no Raft cluster or cluster config");
+                return;
+            }
+        };
+
+        info!("Starting dynamic partition-level follower discovery (polling every 10s)");
+        let check_interval = Duration::from_secs(10);
+        let node_id = config.node_id;
+
+        while !self.shutdown.load(Ordering::Relaxed) {
+            sleep(check_interval).await;
+
+            // Query: Which partitions am I the leader for?
+            let my_partitions = raft.get_partitions_where_leader(node_id);
+
+            if my_partitions.is_empty() {
+                debug!("Node {} is not leader for any partitions", node_id);
+                continue;
+            }
+
+            debug!("Node {} is leader for {} partitions", node_id, my_partitions.len());
+
+            // For each partition, update follower list
+            for (topic, partition) in my_partitions {
+                // Query: Who are the replicas for this partition?
+                if let Some(replicas) = raft.get_partition_replicas(&topic, partition) {
+                    // Filter out self (leader doesn't replicate to itself)
+                    let followers: Vec<u64> = replicas
+                        .into_iter()
+                        .filter(|&id| id != node_id)
+                        .collect();
+
+                    // Map node IDs → WAL addresses from cluster config
+                    let follower_addrs: Vec<String> = followers
+                        .iter()
+                        .filter_map(|&id| {
+                            config.peers.iter()
+                                .find(|p| p.id == id)
+                                .map(|p| p.wal.clone())
+                        })
+                        .collect();
+
+                    // Update partition followers map
+                    let partition_key = (topic.clone(), partition);
+                    let current_followers = self.partition_followers.get(&partition_key)
+                        .map(|entry| entry.value().clone());
+
+                    // Only log if followers changed
+                    if current_followers.as_ref() != Some(&follower_addrs) {
+                        info!(
+                            "Updated followers for {}-{}: {:?} (was: {:?})",
+                            topic, partition, follower_addrs, current_followers
+                        );
+
+                        self.partition_followers.insert(partition_key, follower_addrs);
+                    }
+                } else {
+                    debug!("No replicas found for {}-{}", topic, partition);
+                }
+            }
+        }
+
+        info!("Follower discovery worker stopped");
+    }
 
     /// Shutdown the replication manager
     pub async fn shutdown(&self) {
@@ -967,5 +1244,119 @@ impl WalReceiver {
     pub fn shutdown(&self) {
         info!("Shutting down WAL receiver");
         self.shutdown.store(true, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chronik_config::{ClusterConfig, NodeConfig};
+
+    fn create_test_cluster_config(node_id: u64) -> ClusterConfig {
+        ClusterConfig {
+            enabled: true,
+            node_id,
+            replication_factor: 3,
+            min_insync_replicas: 2,
+            peers: vec![
+                NodeConfig {
+                    id: 1,
+                    kafka: "node1.example.com:9092".to_string(),
+                    wal: "node1.example.com:9291".to_string(),
+                    raft: "node1.example.com:5001".to_string(),
+                    addr: None,
+                    raft_port: None,
+                },
+                NodeConfig {
+                    id: 2,
+                    kafka: "node2.example.com:9092".to_string(),
+                    wal: "node2.example.com:9291".to_string(),
+                    raft: "node2.example.com:5001".to_string(),
+                    addr: None,
+                    raft_port: None,
+                },
+                NodeConfig {
+                    id: 3,
+                    kafka: "node3.example.com:9092".to_string(),
+                    wal: "node3.example.com:9291".to_string(),
+                    raft: "node3.example.com:5001".to_string(),
+                    addr: None,
+                    raft_port: None,
+                },
+            ],
+            bind: None,
+            advertise: None,
+            gossip: None,
+        }
+    }
+
+    #[test]
+    fn test_auto_discover_followers_from_cluster_config() {
+        let cluster = create_test_cluster_config(1);
+        let manager = WalReplicationManager::new_with_dependencies(
+            vec![],  // Empty - should trigger auto-discovery
+            None,
+            None,
+            None,
+            Some(Arc::new(cluster)),
+        );
+
+        // Node 1 is the current node, so followers should be nodes 2 and 3
+        assert_eq!(manager.followers.len(), 2);
+        assert!(manager.followers.contains(&"node2.example.com:9291".to_string()));
+        assert!(manager.followers.contains(&"node3.example.com:9291".to_string()));
+    }
+
+    #[test]
+    fn test_manual_followers_override_auto_discovery() {
+        let cluster = create_test_cluster_config(1);
+        let manual_followers = vec!["custom.host:9291".to_string()];
+        
+        let manager = WalReplicationManager::new_with_dependencies(
+            manual_followers.clone(),
+            None,
+            None,
+            None,
+            Some(Arc::new(cluster)),
+        );
+
+        // Manual followers should be used, not auto-discovered ones
+        assert_eq!(manager.followers, manual_followers);
+    }
+
+    #[test]
+    fn test_no_replication_without_config_or_manual() {
+        let manager = WalReplicationManager::new_with_dependencies(
+            vec![],  // Empty
+            None,
+            None,
+            None,
+            None,  // No cluster config
+        );
+
+        // No followers should be configured
+        assert!(manager.followers.is_empty());
+    }
+
+    #[test]
+    fn test_auto_discovery_filters_self() {
+        // Test all three nodes to ensure each filters itself correctly
+        for node_id in 1..=3 {
+            let cluster = create_test_cluster_config(node_id);
+            let manager = WalReplicationManager::new_with_dependencies(
+                vec![],
+                None,
+                None,
+                None,
+                Some(Arc::new(cluster)),
+            );
+
+            // Should have 2 followers (not counting self)
+            assert_eq!(manager.followers.len(), 2);
+            
+            // Self should not be in followers
+            let self_wal = format!("node{}.example.com:9291", node_id);
+            assert!(!manager.followers.contains(&self_wal));
+        }
     }
 }

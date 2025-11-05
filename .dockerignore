@@ -61,3 +61,8 @@ data/
 .claude/
 test-cluster*
 .env*
+
+data*
+*.segment
+*.db
+*.idx

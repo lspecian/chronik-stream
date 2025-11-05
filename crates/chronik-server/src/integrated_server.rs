@@ -541,42 +541,44 @@ impl IntegratedKafkaServer {
             }
         }
 
-        // v2.2.0: Initialize WAL replication manager if followers configured
-        if let Ok(followers_str) = std::env::var("CHRONIK_REPLICATION_FOLLOWERS") {
+        // v2.5.0 Phase 6: Initialize WAL replication with auto-discovery from cluster config
+        let manual_followers = if let Ok(followers_str) = std::env::var("CHRONIK_REPLICATION_FOLLOWERS") {
             if !followers_str.is_empty() {
-                let followers: Vec<String> = followers_str
+                followers_str
                     .split(',')
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
-                    .collect();
-
-                if !followers.is_empty() {
-                    info!("WAL replication enabled with {} followers: {}", followers.len(), followers.join(", "));
-
-                    // v2.5.0 Phase 3: Create ISR tracker
-                    let isr_tracker = Arc::new(crate::isr_tracker::IsrTracker::new(
-                        10_000,  // max_lag_entries: 10K messages
-                        10_000,  // max_lag_ms: 10 seconds
-                    ));
-                    info!("Created ISR tracker (max_lag: 10K entries / 10s)");
-
-                    // v2.5.0 Phase 3/4: Create replication manager with dependencies
-                    // CRITICAL: Use the SAME isr_ack_tracker instance that ProduceHandler uses
-                    let replication_manager = crate::wal_replication::WalReplicationManager::new_with_dependencies(
-                        followers,
-                        raft_cluster.clone(),              // Pass RaftCluster for partition metadata
-                        Some(isr_tracker),                 // Pass ISR tracker for replica filtering
-                        Some(isr_ack_tracker.clone()),     // v2.5.0 Phase 4: Pass SAME ACK tracker
-                    );
-                    info!("Created WalReplicationManager with Raft, ISR, and ACK tracking (sharing IsrAckTracker)");
-
-                    produce_handler_inner.set_wal_replication_manager(replication_manager);
-                } else {
-                    info!("CHRONIK_REPLICATION_FOLLOWERS is empty, WAL replication disabled");
-                }
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
             }
         } else {
-            info!("CHRONIK_REPLICATION_FOLLOWERS not set, WAL replication disabled");
+            Vec::new()
+        };
+
+        // Enable WAL replication if either manual followers or cluster config is available
+        if !manual_followers.is_empty() || config.cluster_config.is_some() {
+            // v2.5.0 Phase 3: Create ISR tracker
+            let isr_tracker = Arc::new(crate::isr_tracker::IsrTracker::new(
+                10_000,  // max_lag_entries: 10K messages
+                10_000,  // max_lag_ms: 10 seconds
+            ));
+            info!("Created ISR tracker (max_lag: 10K entries / 10s)");
+
+            // v2.5.0 Phase 6: Create replication manager with cluster config for auto-discovery
+            // CRITICAL: Use the SAME isr_ack_tracker instance that ProduceHandler uses
+            let replication_manager = crate::wal_replication::WalReplicationManager::new_with_dependencies(
+                manual_followers,
+                raft_cluster.clone(),              // Pass RaftCluster for partition metadata
+                Some(isr_tracker),                 // Pass ISR tracker for replica filtering
+                Some(isr_ack_tracker.clone()),     // v2.5.0 Phase 4: Pass SAME ACK tracker
+                config.cluster_config.clone().map(Arc::new), // v2.5.0 Phase 6: Pass cluster config for auto-discovery
+            );
+            info!("Created WalReplicationManager with Raft, ISR, and ACK tracking (sharing IsrAckTracker)");
+
+            produce_handler_inner.set_wal_replication_manager(replication_manager);
+        } else {
+            info!("WAL replication disabled: no cluster config and CHRONIK_REPLICATION_FOLLOWERS not set");
         }
 
         let produce_handler_base = Arc::new(produce_handler_inner);
@@ -817,6 +819,15 @@ impl IntegratedKafkaServer {
         let cluster_config_clone = config.cluster_config.clone();
         let node_id = config.node_id;
 
+        // v2.5.0 Phase 6 FIX: Extract WAL receiver address BEFORE moving config
+        let wal_receiver_addr = if let Some(ref cluster_cfg) = config.cluster_config {
+            // Priority 1: Use cluster config bind.wal address (v2.5.0+)
+            cluster_cfg.bind.as_ref().map(|b| b.wal.clone())
+        } else {
+            // Priority 2: Fall back to env var (backward compatibility)
+            std::env::var("CHRONIK_WAL_RECEIVER_ADDR").ok()
+        };
+
         // Create default topic on startup to ensure clients can connect
         // This solves the chicken-and-egg problem where clients need at least one topic
         // in metadata responses before they can produce messages
@@ -884,7 +895,8 @@ impl IntegratedKafkaServer {
         }
 
         // v2.2.0: Start WAL receiver if enabled (follower mode)
-        if let Ok(receiver_addr) = std::env::var("CHRONIK_WAL_RECEIVER_ADDR") {
+        // v2.5.0 Phase 6 FIX: WAL receiver address already extracted before config move
+        if let Some(receiver_addr) = wal_receiver_addr {
             if !receiver_addr.is_empty() {
                 info!("WAL receiver enabled on {}", receiver_addr);
 
@@ -1281,11 +1293,25 @@ impl IntegratedKafkaServer {
                                     let mut header_bytes = Vec::new();
                                     header_bytes.extend_from_slice(&response.header.correlation_id.to_be_bytes());
 
-                                    if response.is_flexible {
+                                    // TODO(v2.5.0): CRITICAL BUG - OffsetCommit v8 flexible protocol issue
+                                    // Current: Only adds tagged fields for non-ApiVersions flexible responses
+                                    // Bug: Consumers get "Protocol read buffer underflow" for OffsetCommit v8
+                                    // Need to research correct format from KIP-482 and working APIs
+                                    let tagged_byte_added = if response.is_flexible {
                                         if response.api_key != chronik_protocol::parser::ApiKey::ApiVersions {
                                             header_bytes.push(0);
+                                            true
+                                        } else {
+                                            false
                                         }
-                                    }
+                                    } else {
+                                        false
+                                    };
+
+                                    tracing::warn!(
+                                        "[RESPONSE DEBUG] API {:?}: is_flexible={}, tagged_byte_added={}, header_bytes_len={}, body_len={}",
+                                        response.api_key, response.is_flexible, tagged_byte_added, header_bytes.len(), response.body.len()
+                                    );
 
                                     let mut full_response = Vec::with_capacity(header_bytes.len() + response.body.len() + 4);
                                     let size = (header_bytes.len() + response.body.len()) as i32;
@@ -1298,6 +1324,32 @@ impl IntegratedKafkaServer {
                                         "[RESPONSE PIPELINE] Step 1: Built response for API {:?}, correlation_id={}, sequence={}, total_size={} bytes (header={}, body={})",
                                         response.api_key, response.header.correlation_id, sequence, full_response.len(), header_bytes.len(), response.body.len()
                                     );
+
+                                    // CRITICAL DEBUGGING: Log full OffsetCommit response bytes
+                                    if matches!(response.api_key, chronik_protocol::parser::ApiKey::OffsetCommit) {
+                                        tracing::error!(
+                                            "!!! OFFSETCOMMIT FULL RESPONSE (all {} bytes): {:02x?}",
+                                            full_response.len(), full_response
+                                        );
+                                        // Verify structure
+                                        if full_response.len() >= 12 {
+                                            let msg_size = i32::from_be_bytes([full_response[0], full_response[1], full_response[2], full_response[3]]);
+                                            let corr_id = i32::from_be_bytes([full_response[4], full_response[5], full_response[6], full_response[7]]);
+                                            let throttle = i32::from_be_bytes([full_response[8], full_response[9], full_response[10], full_response[11]]);
+                                            tracing::error!(
+                                                "!!! OFFSETCOMMIT STRUCTURE: msg_size={}, correlation_id={}, throttle_time={}",
+                                                msg_size, corr_id, throttle
+                                            );
+                                            if full_response.len() >= 16 {
+                                                let topics_len = i32::from_be_bytes([full_response[12], full_response[13], full_response[14], full_response[15]]);
+                                                tracing::error!("!!! OFFSETCOMMIT topics_array_len={}", topics_len);
+                                            } else {
+                                                tracing::error!("!!! OFFSETCOMMIT ERROR: Response too short to include topics array! Only {} bytes", full_response.len());
+                                            }
+                                        } else {
+                                            tracing::error!("!!! OFFSETCOMMIT ERROR: Full response too short! Only {} bytes", full_response.len());
+                                        }
+                                    }
 
                                     // Measure channel send delay to detect backpressure
                                     let send_start = std::time::Instant::now();

@@ -17,6 +17,7 @@ chronik-monitoring = { path = "../chronik-monitoring" }
 
 # Web framework
 axum = { workspace = true }
+hyper = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
 hyper = "0.14"
