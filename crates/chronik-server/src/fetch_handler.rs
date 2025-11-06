@@ -1018,21 +1018,36 @@ impl FetchHandler {
             if let chronik_wal::record::WalRecord::V2 { canonical_data, .. } = wal_record {
                 match bincode::deserialize::<CanonicalRecord>(&canonical_data) {
                     Ok(canonical_record) => {
-                        // Use the ORIGINAL compressed_records_wire_bytes preserved during produce
-                        if let Some(ref raw_bytes) = canonical_record.compressed_records_wire_bytes {
-                            // Verify this batch's records are in the requested range
-                            let base_offset = canonical_record.base_offset;
-                            let last_offset = canonical_record.last_offset();
+                        // Verify this batch's records are in the requested range
+                        let base_offset = canonical_record.base_offset;
+                        let last_offset = canonical_record.last_offset();
 
-                            if last_offset >= fetch_offset && base_offset < high_watermark {
-                                concatenated_bytes.extend_from_slice(raw_bytes);
-                                batches_concatenated += 1;
+                        if last_offset >= fetch_offset && base_offset < high_watermark {
+                            // CRITICAL: Call to_kafka_batch() to reconstruct the full RecordBatch
+                            // with 61-byte header + compressed records payload
+                            // compressed_records_wire_bytes alone is NOT a valid RecordBatch!
+                            match canonical_record.to_kafka_batch() {
+                                Ok(kafka_batch_bytes) => {
+                                    concatenated_bytes.extend_from_slice(&kafka_batch_bytes);
+                                    batches_concatenated += 1;
 
-                                debug!(
-                                    "RAW→WAL: Appended original batch offsets {}-{} ({} bytes)",
-                                    base_offset, last_offset, raw_bytes.len()
-                                );
+                                    warn!(
+                                        "RAW→WAL: ✓ APPENDED reconstructed batch offsets {}-{} ({} bytes)",
+                                        base_offset, last_offset, kafka_batch_bytes.len()
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!("Failed to convert CanonicalRecord to Kafka batch: {}", e);
+                                    continue;
+                                }
                             }
+                        } else {
+                            warn!(
+                                "RAW→WAL: ✗ SKIPPED batch offsets {}-{} (condition failed: last_offset >= fetch_offset: {}, base_offset < high_watermark: {})",
+                                base_offset, last_offset,
+                                last_offset >= fetch_offset,
+                                base_offset < high_watermark
+                            );
                         }
                     }
                     Err(e) => {

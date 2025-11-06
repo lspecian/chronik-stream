@@ -661,7 +661,7 @@ pub fn is_flexible_version(api_key: ApiKey, api_version: i16) -> bool {
         ApiKey::Fetch => api_version >= 12,
         ApiKey::ListOffsets => api_version >= 6,
         ApiKey::Metadata => api_version >= 9,
-        ApiKey::OffsetCommit => api_version >= 9,  // v8 is NON-flexible, v9+ is flexible
+        ApiKey::OffsetCommit => api_version >= 8,  // CRITICAL: Kafka spec says "flexibleVersions": "8+", NOT 9+
         ApiKey::OffsetFetch => api_version >= 6,
         ApiKey::FindCoordinator => api_version >= 3,
         ApiKey::JoinGroup => api_version >= 6,

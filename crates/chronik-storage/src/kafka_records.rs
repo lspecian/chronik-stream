@@ -220,6 +220,16 @@ impl KafkaRecordBatch {
         let crc_data = &buf[crc_start..];
         let crc = calculate_crc32(crc_data);
 
+        // DEBUG: Log CRC calculation details
+        eprintln!("KAFKA_BATCH→CRC: base_offset={}, records_count={}, crc_data_len={}, calculated_crc={:#010x}",
+            self.header.base_offset, self.header.records_count, crc_data.len(), crc);
+        if crc_data.len() <= 200 {
+            eprintln!("KAFKA_BATCH→CRC: crc_data hex: {}", hex::encode(crc_data));
+        } else {
+            eprintln!("KAFKA_BATCH→CRC: crc_data hex (first 100 bytes): {}", hex::encode(&crc_data[..100]));
+            eprintln!("KAFKA_BATCH→CRC: crc_data hex (last 100 bytes): {}", hex::encode(&crc_data[crc_data.len()-100..]));
+        }
+
         // Write CRC as LITTLE-ENDIAN (Kafka protocol requirement)
         buf[crc_pos..crc_pos + 4].copy_from_slice(&crc.to_le_bytes());
         
@@ -450,14 +460,15 @@ impl KafkaRecordBatch {
 
         let compression = CompressionType::from_attributes(attributes);
 
-        // CRITICAL: Preserve original compressed bytes for byte-perfect round-trip
-        // Compression is non-deterministic (gzip includes timestamps) so we MUST
-        // keep the original bytes to maintain CRC validity
-        let compressed_records_data = if compression != CompressionType::None {
-            Some(Bytes::from(compressed_buf.clone()))
-        } else {
-            None
-        };
+        // CRITICAL: Preserve original records bytes for byte-perfect round-trip
+        // For compressed batches: Compression is non-deterministic (gzip includes timestamps)
+        // For uncompressed batches: CRC still covers the records section, so we need original bytes
+        // In BOTH cases, we MUST keep the original bytes to maintain CRC validity when re-encoding
+        let compressed_records_data = Some(Bytes::from(compressed_buf.clone()));
+
+        // DEBUG: Verify this is being set
+        eprintln!("KAFKA_RECORDS→DEBUG: Setting compressed_records_data, len={}, compression={:?}",
+                  compressed_buf.len(), compression);
 
         // Decompress if needed
         let records_data = match compression {
@@ -733,6 +744,12 @@ impl KafkaRecordBatch {
 
         // Calculate bytes consumed (position where cursor stopped)
         let bytes_consumed = cursor.position() as usize;
+
+        // IMPORTANT: Do NOT preserve original v0/v1 MessageSet bytes!
+        // Legacy messages must be converted to v2 RecordBatch format for consumers.
+        // Preserving v1 bytes would create a hybrid message (v2 header + v1 records = invalid CRC).
+        // Instead, let to_kafka_batch() re-encode everything properly as v2.
+        eprintln!("LEGACY_DECODE→DEBUG: Parsed {} records from legacy MessageSet, will re-encode as v2", records.len());
 
         Ok((Self { header, records, compressed_records_data: None }, bytes_consumed))
     }

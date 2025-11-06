@@ -340,12 +340,23 @@ impl KafkaProtocolHandler {
 
                     for _ in 0..partitions_count {
                         let partition_index = decoder.read_i32()?;
-                        let current_leader_epoch = if header.api_version >= 4 {
-                            decoder.read_i32()?
+
+                        // v0 format is different from v1+
+                        let (current_leader_epoch, timestamp) = if header.api_version == 0 {
+                            // v0 format: Partition + Timestamp + MaxNumberOfOffsets
+                            let timestamp = decoder.read_i64()?;
+                            let _max_offsets = decoder.read_i32()?; // Skip max_offsets (not used)
+                            (-1, timestamp)
                         } else {
-                            -1
+                            // v1+ format: Partition + [CurrentLeaderEpoch (v4+)] + Timestamp
+                            let current_leader_epoch = if header.api_version >= 4 {
+                                decoder.read_i32()?
+                            } else {
+                                -1
+                            };
+                            let timestamp = decoder.read_i64()?;
+                            (current_leader_epoch, timestamp)
                         };
-                        let timestamp = decoder.read_i64()?;
 
                         // Skip tagged fields for each partition in flexible versions
                         if is_flexible {
@@ -532,7 +543,7 @@ impl KafkaProtocolHandler {
                 // Handle the join group request, passing the client_id from the request header
                 // This ensures each consumer gets a unique member_id based on its actual client_id
                 // Note: handle_join_group already returns chronik_protocol::join_group_types::JoinGroupResponse
-                let response = self.group_manager.handle_join_group(request, header.client_id.clone()).await?;
+                let response = self.group_manager.handle_join_group(request, header.client_id.clone(), header.api_version).await?;
 
                 // Encode the response
                 let mut body_buf = BytesMut::new();
@@ -621,66 +632,26 @@ impl KafkaProtocolHandler {
                 })
             }
             ApiKey::OffsetCommit => {
-                error!("!!! OFFSETCOMMIT HANDLER REACHED - v{}", header.api_version);
-                debug!("Processing OffsetCommit request");
+                debug!("Processing OffsetCommit v{} request", header.api_version);
                 // Parse the offset commit request
                 let request = self.protocol_handler.parse_offset_commit_request(&header, &mut buf)?;
-                error!("!!! OFFSETCOMMIT PARSED - group_id={}", request.group_id);
 
                 // Handle the offset commit request
                 let response = self.group_manager.handle_offset_commit(request).await?;
 
-                error!("OFFSETCOMMIT_ENCODE: v{} response has {} topics", header.api_version, response.topics.len());
-                for (i, topic) in response.topics.iter().enumerate() {
-                    error!("OFFSETCOMMIT_ENCODE:   Topic {}: name='{}', {} partitions",
-                           i, topic.name, topic.partitions.len());
-                }
-
                 // Encode the response
                 let mut body_buf = BytesMut::new();
-                let before_len = body_buf.len();
                 self.protocol_handler.encode_offset_commit_response(&mut body_buf, &response, header.api_version)?;
-                let after_len = body_buf.len();
 
-                error!("OFFSETCOMMIT_ENCODE: Encoded {} bytes: {:02x?}",
-                       after_len - before_len, &body_buf[before_len..after_len.min(before_len + 50)]);
-
-                // CRITICAL DEBUGGING: Log EXACT body bytes for OffsetCommit v8
-                if header.api_version == 8 {
-                    let body_bytes = body_buf.freeze();
-                    error!("!!! OFFSETCOMMIT v8 BODY BYTES (all {} bytes): {:02x?}",
-                           body_bytes.len(), body_bytes);
-
-                    // Decode to verify structure
-                    if body_bytes.len() >= 8 {
-                        let throttle = i32::from_be_bytes([body_bytes[0], body_bytes[1], body_bytes[2], body_bytes[3]]);
-                        let topics_len = i32::from_be_bytes([body_bytes[4], body_bytes[5], body_bytes[6], body_bytes[7]]);
-                        error!("!!! OFFSETCOMMIT v8 DECODED: throttle_time={}, topics_array_len={}",
-                               throttle, topics_len);
-                    } else {
-                        error!("!!! OFFSETCOMMIT v8 ERROR: Body too short! Only {} bytes", body_bytes.len());
-                    }
-
-                    Ok(Response {
-                        header: ResponseHeader {
-                            correlation_id: header.correlation_id,
-                        },
-                        body: body_bytes,
-                        is_flexible: false, // v8 is NON-flexible
-                        api_key: ApiKey::OffsetCommit,
-                        throttle_time_ms: None,
-                    })
-                } else {
-                    Ok(Response {
-                        header: ResponseHeader {
-                            correlation_id: header.correlation_id,
-                        },
-                        body: body_buf.freeze(),
-                        is_flexible: header.api_version >= 9, // v9+ flexible (rdkafka compatibility)
-                        api_key: ApiKey::OffsetCommit,
-                        throttle_time_ms: None,
-                    })
-                }
+                Ok(Response {
+                    header: ResponseHeader {
+                        correlation_id: header.correlation_id,
+                    },
+                    body: body_buf.freeze(),
+                    is_flexible: header.api_version >= 8, // CRITICAL: Kafka spec "flexibleVersions": "8+"
+                    api_key: ApiKey::OffsetCommit,
+                    throttle_time_ms: None,
+                })
             }
             ApiKey::OffsetFetch => {
                 debug!("Processing OffsetFetch request");

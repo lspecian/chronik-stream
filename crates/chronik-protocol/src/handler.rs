@@ -995,7 +995,12 @@ impl ProtocolHandler {
 
         // Field 4: ProtocolType (v7+)
         if version >= 7 {
-            if flexible {
+            // v9+ flexible format requires non-nullable strings (convert None to empty string)
+            if version >= 9 && flexible {
+                let value = response.protocol_type.as_deref().unwrap_or("");
+                encoder.write_compact_string(Some(value));
+                tracing::debug!("  [4] ProtocolType (compact, non-null): {:?}", value);
+            } else if flexible {
                 encoder.write_compact_string(response.protocol_type.as_deref());
                 tracing::debug!("  [4] ProtocolType (compact): {:?}", response.protocol_type);
             } else {
@@ -1005,7 +1010,12 @@ impl ProtocolHandler {
         }
 
         // Field 5: ProtocolName (v0+)
-        if flexible {
+        // v9+ flexible format requires non-nullable strings (convert None to empty string)
+        if version >= 9 && flexible {
+            let value = response.protocol_name.as_deref().unwrap_or("");
+            encoder.write_compact_string(Some(value));
+            tracing::debug!("  [5] ProtocolName (compact, non-null): {:?}", value);
+        } else if flexible {
             encoder.write_compact_string(response.protocol_name.as_deref());
             tracing::debug!("  [5] ProtocolName (compact): {:?}", response.protocol_name);
         } else {
@@ -5667,15 +5677,15 @@ impl ProtocolHandler {
             protocols,
         };
         
-        tracing::info!(
-            "JoinGroup request for group '{}', member '{}', protocol '{}', session_timeout: {}ms, rebalance_timeout: {}ms",
-            request.group_id, request.member_id, request.protocol_type,
+        tracing::warn!(
+            "JoinGroup request parsed: group='{}', member='{}', protocol_type='{}', protocols_count={}, session_timeout={}ms, rebalance_timeout={}ms",
+            request.group_id, request.member_id, request.protocol_type, request.protocols.len(),
             request.session_timeout_ms, request.rebalance_timeout_ms
         );
 
         // Log protocol details
-        for protocol in &request.protocols {
-            tracing::debug!("  Protocol: {}, metadata_size: {}", protocol.name, protocol.metadata.len());
+        for (i, protocol) in request.protocols.iter().enumerate() {
+            tracing::warn!("  Protocol[{}]: name='{}', metadata_size={}", i, protocol.name, protocol.metadata.len());
         }
         
         // Update consumer group state
@@ -5737,6 +5747,11 @@ impl ProtocolHandler {
         // Select first protocol if available
         let selected_protocol = request.protocols.first().map(|p| p.name.clone());
         group.protocol = selected_protocol.clone();
+
+        tracing::warn!(
+            "JoinGroup protocol selection: request_protocols_count={}, selected_protocol={:?}",
+            request.protocols.len(), selected_protocol
+        );
         
         // Update state to Stable once we have a leader
         group.state = "Stable".to_string();
@@ -5801,7 +5816,13 @@ impl ProtocolHandler {
             error_code: error_codes::NONE,
             generation_id,
             protocol_type: if header.api_version >= 7 {
-                Some(request.protocol_type)
+                // Use request protocol_type, or default to "consumer" if empty
+                let ptype = if request.protocol_type.is_empty() {
+                    "consumer".to_string()
+                } else {
+                    request.protocol_type
+                };
+                Some(ptype)
             } else {
                 None
             },

@@ -1689,7 +1689,8 @@ impl GroupManager {
     pub async fn handle_join_group(
         &self,
         request: chronik_protocol::join_group_types::JoinGroupRequest,
-        header_client_id: Option<String>
+        header_client_id: Option<String>,
+        api_version: i16,
     ) -> Result<chronik_protocol::join_group_types::JoinGroupResponse> {
         use std::time::Duration;
 
@@ -1706,6 +1707,9 @@ impl GroupManager {
             client_id = %client_id,
             "JoinGroup request received"
         );
+
+        // Save protocol_type before we move the request fields
+        let protocol_type_for_response = request.protocol_type.clone();
 
         // Convert protocol request to internal format
         let protocols = request.protocols.into_iter()
@@ -1755,7 +1759,18 @@ impl GroupManager {
         Ok(chronik_protocol::join_group_types::JoinGroupResponse {
             error_code: result.error_code,
             generation_id: result.generation_id,
-            protocol_type: None, // v7+ only - MUST be None for v5 compatibility
+            protocol_type: if api_version >= 7 {
+                // v7+ requires protocol_type to be non-null
+                // Use saved protocol_type, or default to "consumer" if empty
+                let ptype = if protocol_type_for_response.is_empty() {
+                    "consumer".to_string()
+                } else {
+                    protocol_type_for_response
+                };
+                Some(ptype)
+            } else {
+                None // v6 and earlier don't have this field
+            },
             protocol_name: Some(result.protocol), // Already ensured non-empty in complete_join_phase
             leader: result.leader_id,
             member_id: result.member_id,
@@ -2306,8 +2321,13 @@ fn decode_assignment(bytes: &[u8]) -> Result<HashMap<String, Vec<i32>>> {
     // Read version
     let version = cursor.read_i16::<BigEndian>()
         .map_err(|e| Error::Serialization(format!("Failed to read version: {}", e)))?;
-    
-    if version != 0 && version != 1 {
+
+    // Support versions 0-3 (Kafka 0.9-3.x)
+    // Version 0: topic-partitions only
+    // Version 1: topic-partitions + user_data
+    // Version 2: topic-partitions + user_data (same as v1)
+    // Version 3: topic-partitions + user_data (same as v1, v2)
+    if version < 0 || version > 3 {
         return Err(Error::Protocol(format!("Unsupported assignment version: {}", version)));
     }
     

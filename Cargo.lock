@@ -1362,6 +1362,7 @@ dependencies = [
  "fastrand",
  "flate2",
  "futures",
+ "hex",
  "lz4_flex",
  "md5",
  "memmap2",

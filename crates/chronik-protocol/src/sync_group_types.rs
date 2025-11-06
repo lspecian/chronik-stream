@@ -156,12 +156,17 @@ impl KafkaEncodable for SyncGroupResponse {
         encoder.write_i16(self.error_code);
 
         if version >= 5 {
+            // v5+ requires protocol_type and protocol_name to be non-nullable
+            // If None, write empty string instead of null
+            let protocol_type_str = self.protocol_type.as_deref().unwrap_or("");
+            let protocol_name_str = self.protocol_name.as_deref().unwrap_or("");
+
             if flexible {
-                encoder.write_compact_string(self.protocol_type.as_deref());
-                encoder.write_compact_string(self.protocol_name.as_deref());
+                encoder.write_compact_string(Some(protocol_type_str));
+                encoder.write_compact_string(Some(protocol_name_str));
             } else {
-                encoder.write_string(self.protocol_type.as_deref());
-                encoder.write_string(self.protocol_name.as_deref());
+                encoder.write_string(Some(protocol_type_str));
+                encoder.write_string(Some(protocol_name_str));
             }
         }
 

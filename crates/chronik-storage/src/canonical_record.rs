@@ -23,7 +23,9 @@
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use chronik_common::{Error, Result};
-use crc32fast::Hasher as Crc32;
+// CRITICAL: Kafka uses CRC-32C (Castagnoli), not CRC-32 (IEEE)!
+// Using wrong CRC causes kafka-python CRC validation failures
+use crc32c::crc32c as calculate_crc32c;
 use flate2::read::{GzDecoder, ZlibDecoder};
 use flate2::write::{GzEncoder, ZlibEncoder};
 use flate2::Compression;
@@ -149,9 +151,51 @@ pub struct CanonicalRecord {
     ///
     /// **SERIALIZATION:**
     /// This field IS included in bincode serialization (WAL V2), so the original bytes
-    /// are preserved across WAL recovery. We skip serialization only if None to save space.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// are preserved across WAL recovery.
     pub compressed_records_wire_bytes: Option<Vec<u8>>,
+
+    // === v1 FORMAT PRESERVATION (Session 22 Fix) ===
+    /// Original v1 MessageSet wire format (if source was v1).
+    ///
+    /// **WHY THIS EXISTS:**
+    /// kafka-python sends v1 MessageSet format. Previously, we converted v1→v2 on ingress,
+    /// which required re-encoding and broke CRC validation. Now we preserve the ENTIRE
+    /// original v1 batch and return it unchanged to consumers.
+    ///
+    /// **WHEN IT'S SOME:**
+    /// - Producer sent v1 MessageSet format
+    /// - Contains the complete original v1 batch including offset, size, CRC, magic byte, etc.
+    ///
+    /// **WHEN IT'S NONE:**
+    /// - Producer sent v2 RecordBatch format (use original_v2_wire_format instead)
+    /// - Batch created internally (encode as v2)
+    ///
+    /// **USAGE:**
+    /// In `to_kafka_batch()`, if this is Some, return these bytes unchanged (preserves CRC).
+    /// Otherwise, check original_v2_wire_format or encode as v2 RecordBatch.
+    pub original_v1_wire_format: Option<Vec<u8>>,
+
+    // === v2 FORMAT PRESERVATION (Session 25 Fix - Java Client CRC) ===
+    /// Original v2 RecordBatch wire format (if source was v2).
+    ///
+    /// **WHY THIS EXISTS:**
+    /// Java Kafka clients validate CRC over the ENTIRE RecordBatch (header + compressed payload).
+    /// When we reconstruct batches using to_kafka_batch(), even with preserved compressed_records_wire_bytes,
+    /// the CRC recalculation can differ due to header field variations. To guarantee byte-perfect
+    /// CRC preservation, we must store the FULL original v2 wire bytes.
+    ///
+    /// **WHEN IT'S SOME:**
+    /// - Producer sent v2 RecordBatch format
+    /// - Contains the complete original v2 batch (61-byte header + compressed payload)
+    ///
+    /// **WHEN IT'S NONE:**
+    /// - Producer sent v1 MessageSet format (use original_v1_wire_format instead)
+    /// - Batch created internally (encode as v2)
+    ///
+    /// **USAGE:**
+    /// In `to_kafka_batch()`, check this FIRST. If Some, return these bytes unchanged (preserves CRC).
+    /// Otherwise, encode as v2 RecordBatch.
+    pub original_v2_wire_format: Option<Vec<u8>>,
 }
 
 /// Individual record entry within a CanonicalRecord batch.
@@ -260,6 +304,8 @@ impl CanonicalRecord {
             max_timestamp,
             records: entries,
             compressed_records_wire_bytes: None, // Created from entries, no original bytes
+            original_v1_wire_format: None, // Created from entries, not from wire format
+            original_v2_wire_format: None, // Created from entries, not from wire format
         })
     }
 
@@ -286,10 +332,35 @@ impl CanonicalRecord {
         // Use KafkaRecordBatch::decode() which handles v0, v1, v2 formats
         use crate::kafka_records::KafkaRecordBatch;
 
-        let (kafka_batch, _bytes_consumed) = KafkaRecordBatch::decode(wire_bytes)?;
+        // CRITICAL (Session 22 Fix): Detect v1 format BEFORE decoding
+        // If v1, we need to preserve the ENTIRE original wire format (not just compressed records)
+        let is_v1_format = if wire_bytes.len() >= 17 {
+            // v1 MessageSet format: offset(8) + size(4) + CRC(4) + magic(1)
+            // Check magic byte at position 16 (0-indexed: 8+4+4 = 16)
+            let magic = wire_bytes[16] as i8;
+            magic == 1 || magic == 0  // v0 or v1
+        } else {
+            false
+        };
+
+        let (kafka_batch, bytes_consumed) = KafkaRecordBatch::decode(wire_bytes)?;
 
         // Convert to CanonicalRecord
-        Self::from_kafka_record_batch(kafka_batch)
+        let mut canonical = Self::from_kafka_record_batch(kafka_batch)?;
+
+        // CRITICAL (Session 25 Fix - Java Client CRC): Preserve FULL original wire bytes
+        // For v1: preserve entire MessageSet (already had this)
+        // For v2: preserve entire RecordBatch (NEW - fixes Java client CRC validation)
+        if is_v1_format {
+            eprintln!("V1→DETECTED: Preserving {} bytes of original v1 MessageSet wire format", bytes_consumed);
+            canonical.original_v1_wire_format = Some(wire_bytes[..bytes_consumed].to_vec());
+        } else {
+            // v2 RecordBatch - preserve FULL batch (header + compressed payload)
+            eprintln!("V2→DETECTED: Preserving {} bytes of original v2 RecordBatch wire format", bytes_consumed);
+            canonical.original_v2_wire_format = Some(wire_bytes[..bytes_consumed].to_vec());
+        }
+
+        Ok(canonical)
     }
 
     /// Convert KafkaRecordBatch to CanonicalRecord (internal helper).
@@ -316,13 +387,18 @@ impl CanonicalRecord {
         let base_timestamp = batch.header.base_timestamp;
         let max_timestamp = batch.header.max_timestamp;
 
-        // CRITICAL: Preserve original compressed records bytes if batch was compressed
+        // CRITICAL: Preserve original records bytes for ALL batches (compressed or not)
+        // CRC validation covers the records section regardless of compression
         // This is stored in KafkaRecordBatch.compressed_records_data after decoding
-        let compressed_records_wire_bytes = if compression != CompressionType::None {
-            batch.compressed_records_data.map(|bytes| bytes.to_vec())
-        } else {
-            None
-        };
+        eprintln!("CANONICAL_RECORD→DEBUG: batch.compressed_records_data is_some={}, len={}",
+                  batch.compressed_records_data.is_some(),
+                  batch.compressed_records_data.as_ref().map(|b| b.len()).unwrap_or(0));
+
+        let compressed_records_wire_bytes = batch.compressed_records_data.map(|bytes| bytes.to_vec());
+
+        eprintln!("CANONICAL_RECORD→DEBUG: After .map(), compressed_records_wire_bytes is_some={}, len={}",
+                  compressed_records_wire_bytes.is_some(),
+                  compressed_records_wire_bytes.as_ref().map(|b| b.len()).unwrap_or(0));
 
         // Convert records
         let mut entries = Vec::with_capacity(batch.records.len());
@@ -354,6 +430,8 @@ impl CanonicalRecord {
             max_timestamp,
             records: entries,
             compressed_records_wire_bytes,
+            original_v1_wire_format: None,  // Set later in from_kafka_batch() if v1 detected
+            original_v2_wire_format: None,  // Set later in from_kafka_batch() if v2 detected
         })
     }
 
@@ -451,6 +529,8 @@ impl CanonicalRecord {
             max_timestamp,
             records,
             compressed_records_wire_bytes: None, // Old implementation, doesn't preserve
+            original_v1_wire_format: None, // Old implementation path
+            original_v2_wire_format: None, // Old implementation path
         })
     }
 
@@ -467,6 +547,26 @@ impl CanonicalRecord {
     ///
     /// Returns an error if encoding fails (compression error, etc.)
     pub fn to_kafka_batch(&self) -> Result<Bytes> {
+        // CRITICAL (Session 25 Fix - Java Client CRC): If we have original v2 wire format, return it!
+        // v2 RecordBatch CRC is calculated over the ENTIRE batch (header + compressed payload).
+        // We MUST return the original bytes to guarantee CRC matches what Java clients expect.
+        if let Some(ref v2_bytes) = self.original_v2_wire_format {
+            eprintln!("V2→PRESERVED: Returning original v2 RecordBatch ({} bytes, {} records)",
+                v2_bytes.len(), self.records.len());
+            return Ok(Bytes::from(v2_bytes.clone()));
+        }
+
+        // CRITICAL (Session 23 Fix): If we have original v1 wire format, update offsets and return!
+        // v1 MessageSet format: offset (8 bytes) + size (4) + CRC (4) + magic (1) + ...
+        // The CRC covers bytes STARTING FROM magic byte (position 17), NOT the offset field!
+        // So we can update the offset field without invalidating the CRC.
+        if let Some(ref v1_bytes) = self.original_v1_wire_format {
+            let updated_v1 = self.update_v1_messageset_offsets(v1_bytes)?;
+            eprintln!("V1→PRESERVED: Returning v1 MessageSet with updated offsets ({} bytes, {} records)",
+                updated_v1.len(), self.records.len());
+            return Ok(Bytes::from(updated_v1));
+        }
+
         let mut buf = BytesMut::new();
 
         // Write base offset and reserve space for batch length
@@ -540,6 +640,16 @@ impl CanonicalRecord {
         // CRC is calculated over everything from partition_leader_epoch to end
         let crc_data = &buf[crc_start..];
         let crc = calculate_crc32(crc_data);
+
+        // DEBUG: Log CRC calculation details
+        eprintln!("CRC→DEBUG: base_offset={}, records_count={}, crc_data_len={}, calculated_crc={:#010x}",
+            self.base_offset, self.records.len(), crc_data.len(), crc);
+        if crc_data.len() <= 200 {
+            eprintln!("CRC→DEBUG: crc_data hex: {}", hex::encode(crc_data));
+        } else {
+            eprintln!("CRC→DEBUG: crc_data hex (first 100 bytes): {}", hex::encode(&crc_data[..100]));
+            eprintln!("CRC→DEBUG: crc_data hex (last 100 bytes): {}", hex::encode(&crc_data[crc_data.len()-100..]));
+        }
 
         // Write CRC as little-endian (Kafka protocol requirement)
         buf[crc_pos..crc_pos + 4].copy_from_slice(&crc.to_le_bytes());
@@ -670,6 +780,107 @@ impl CanonicalRecord {
         Ok(buf.freeze())
     }
 
+    /// Recalculate all record offsets based on base_offset (for v1 MessageSets after offset assignment).
+    ///
+    /// CRITICAL (Session 24 Fix): When v1 MessageSets are decoded, if only the first message's offset
+    /// was updated in the wire bytes (produce_handler.rs:1157), the subsequent messages still have
+    /// their original offsets (1, 2, 3, ...). This causes offset_delta calculations to be wrong
+    /// (offset - base_offset = 1 - 100 = -99), resulting in incorrect final offsets.
+    ///
+    /// This method fixes the record offsets to be sequential starting from base_offset.
+    ///
+    /// Example:
+    /// - Before: base_offset=100, records=[100, 1, 2, 3, ..., 99] (WRONG!)
+    /// - After: base_offset=100, records=[100, 101, 102, 103, ..., 199] (CORRECT!)
+    pub fn recalculate_record_offsets(&mut self) {
+        for (i, record) in self.records.iter_mut().enumerate() {
+            record.offset = self.base_offset + i as i64;
+        }
+    }
+
+    /// Update offsets in v1 MessageSet format without breaking CRC.
+    ///
+    /// CRITICAL (Session 23 Fix): In v1 MessageSet, each message has:
+    /// - offset (8 bytes) - NOT covered by CRC!
+    /// - size (4 bytes) - NOT covered by CRC!
+    /// - CRC (4 bytes) - CRC itself
+    /// - magic (1 byte) - CRC starts HERE (byte 17)
+    /// - ...rest of message...
+    ///
+    /// So we can update the offset field (first 8 bytes) of each message
+    /// without invalidating the CRC. This is how Apache Kafka does it!
+    ///
+    /// # Arguments
+    ///
+    /// * `v1_bytes` - Original v1 MessageSet wire bytes
+    ///
+    /// # Returns
+    ///
+    /// Updated v1 MessageSet with offsets matching self.records[].offset values
+    fn update_v1_messageset_offsets(&self, v1_bytes: &[u8]) -> Result<Vec<u8>> {
+        use byteorder::{BigEndian, WriteBytesExt};
+
+        let mut updated = v1_bytes.to_vec();
+        let mut cursor_pos = 0;
+        let mut record_index = 0;
+
+        // Iterate through v1 MessageSet and update each message's offset field
+        while cursor_pos + 17 < updated.len() && record_index < self.records.len() {
+            // v1 Message structure:
+            // offset (8 bytes, big-endian)
+            // size (4 bytes, big-endian)
+            // CRC (4 bytes)
+            // magic (1 byte)
+            // ...
+
+            // Read message size to know where next message starts
+            let size_bytes = &updated[cursor_pos + 8..cursor_pos + 12];
+            let message_size = i32::from_be_bytes([
+                size_bytes[0],
+                size_bytes[1],
+                size_bytes[2],
+                size_bytes[3],
+            ]);
+
+            if message_size <= 0 || message_size > 10_000_000 {
+                // Invalid message size, stop
+                break;
+            }
+
+            // Check if magic byte is 0x01 (v1) or 0x00 (v0)
+            let magic_offset = cursor_pos + 16;
+            if magic_offset >= updated.len() {
+                break;
+            }
+
+            let magic = updated[magic_offset];
+            if magic != 0x01 && magic != 0x00 {
+                // Not a valid v1/v0 message, stop
+                break;
+            }
+
+            // Update offset field (first 8 bytes of message)
+            // CRITICAL: This does NOT affect CRC because CRC starts at byte 17 (magic byte)!
+            let new_offset = self.records[record_index].offset;
+            let offset_bytes = new_offset.to_be_bytes();
+            updated[cursor_pos..cursor_pos + 8].copy_from_slice(&offset_bytes);
+
+            eprintln!("V1→OFFSET_UPDATE: Message {} at pos {} updated to offset {}",
+                record_index, cursor_pos, new_offset);
+
+            // Move to next message: current position + 12 (offset + size fields) + message_size
+            cursor_pos += 12 + message_size as usize;
+            record_index += 1;
+        }
+
+        if record_index != self.records.len() {
+            eprintln!("V1→WARNING: Expected {} records but updated {} offsets",
+                self.records.len(), record_index);
+        }
+
+        Ok(updated)
+    }
+
     /// Estimate the size of this record in bytes (for buffer management)
     pub fn estimated_size(&self) -> usize {
         let mut size = 61; // Header size
@@ -690,10 +901,10 @@ impl CanonicalRecord {
 /// Calculate CRC-32C (Castagnoli) checksum as used by Kafka.
 ///
 /// Uses the crc32fast library which implements the Castagnoli polynomial (0x1EDC6F41).
+/// Calculate CRC-32C (Castagnoli) checksum for Kafka RecordBatch.
+/// CRITICAL: Kafka uses CRC-32C, not CRC-32 (IEEE)!
 fn calculate_crc32(data: &[u8]) -> u32 {
-    let mut hasher = Crc32::new();
-    hasher.update(data);
-    hasher.finalize()
+    calculate_crc32c(data)
 }
 
 /// Decompress record data if needed.
@@ -856,58 +1067,53 @@ fn encode_records(
         let offset_delta = (record.offset - base_offset) as i32;
         let timestamp_delta = record.timestamp - base_timestamp;
 
-        // Calculate record length (will be filled in after encoding)
-        let length_pos = buf.len();
-        write_varint(&mut buf, 0); // Placeholder
-
-        let record_start = buf.len();
+        // CRITICAL FIX: Build record in separate buffer first, then write length + data
+        // This avoids the splice() bug where variable-length varint encoding could
+        // shift bytes and corrupt the CRC.
+        let mut record_buf = Vec::new();
 
         // Attributes
-        buf.push(record.attributes as u8);
+        record_buf.push(record.attributes as u8);
 
         // Timestamp delta
-        write_varlong(&mut buf, timestamp_delta);
+        write_varlong(&mut record_buf, timestamp_delta);
 
         // Offset delta
-        write_varint(&mut buf, offset_delta);
+        write_varint(&mut record_buf, offset_delta);
 
         // Key
         if let Some(ref key) = record.key {
-            write_varint(&mut buf, key.len() as i32);
-            buf.extend_from_slice(key);
+            write_varint(&mut record_buf, key.len() as i32);
+            record_buf.extend_from_slice(key);
         } else {
-            write_varint(&mut buf, -1);
+            write_varint(&mut record_buf, -1);
         }
 
         // Value
         if let Some(ref value) = record.value {
-            write_varint(&mut buf, value.len() as i32);
-            buf.extend_from_slice(value);
+            write_varint(&mut record_buf, value.len() as i32);
+            record_buf.extend_from_slice(value);
         } else {
-            write_varint(&mut buf, -1);
+            write_varint(&mut record_buf, -1);
         }
 
         // Headers
-        write_varint(&mut buf, record.headers.len() as i32);
+        write_varint(&mut record_buf, record.headers.len() as i32);
         for header in &record.headers {
-            write_varint(&mut buf, header.key.len() as i32);
-            buf.extend_from_slice(header.key.as_bytes());
+            write_varint(&mut record_buf, header.key.len() as i32);
+            record_buf.extend_from_slice(header.key.as_bytes());
 
             if let Some(ref value) = header.value {
-                write_varint(&mut buf, value.len() as i32);
-                buf.extend_from_slice(value);
+                write_varint(&mut record_buf, value.len() as i32);
+                record_buf.extend_from_slice(value);
             } else {
-                write_varint(&mut buf, -1);
+                write_varint(&mut record_buf, -1);
             }
         }
 
-        // Calculate and write actual length
-        let record_length = (buf.len() - record_start) as i32;
-        let mut length_buf = Vec::new();
-        write_varint(&mut length_buf, record_length);
-
-        // Replace placeholder length
-        buf.splice(length_pos..record_start, length_buf);
+        // Write record length and data to main buffer
+        write_varint(&mut buf, record_buf.len() as i32);
+        buf.extend_from_slice(&record_buf);
     }
 
     Ok(buf)

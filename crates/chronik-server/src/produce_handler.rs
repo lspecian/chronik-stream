@@ -1267,14 +1267,24 @@ impl ProduceHandler {
             let needs_replication = self.wal_replication_manager.is_some();
 
             // Convert to CanonicalRecord and serialize (ONCE - reused for replication)
+            // from_kafka_batch() now automatically preserves compressed_records_wire_bytes
+            // for BOTH compressed and uncompressed batches (v2.5.1 fix)
             match CanonicalRecord::from_kafka_batch(&re_encoded_bytes) {
                 Ok(mut canonical_record) => {
-                    // v2.5.1 FIX: ALWAYS preserve original wire bytes for CRC preservation
-                    // CRITICAL: Even in standalone mode, we MUST preserve compressed_records_wire_bytes
-                    // so that WAL → Fetch path can serve byte-perfect RecordBatches with matching CRC.
-                    // Without this, to_kafka_batch() re-encodes and generates NEW CRC → clients reject!
-                    // See CLAUDE.md "Historical CRC Issues" and v1.3.59 fix.
-                    canonical_record.compressed_records_wire_bytes = Some(re_encoded_bytes.to_vec());
+                    // CRITICAL FIX (Session 24): For v1 MessageSets, recalculate record offsets
+                    // because only the first message's offset was updated in wire bytes (line 1157),
+                    // leaving subsequent messages with incorrect offsets.
+                    if canonical_record.original_v1_wire_format.is_some() {
+                        warn!("SESSION24_FIX: v1 MessageSet detected, recalculating record offsets from base_offset={}",
+                              canonical_record.base_offset);
+                        canonical_record.recalculate_record_offsets();
+                    }
+
+                    // DEBUG: Check if compressed_records_wire_bytes is populated before serialization
+                    warn!("PRODUCE→DEBUG: compressed_records_wire_bytes is_some={}, len={}, compression={:?}",
+                          canonical_record.compressed_records_wire_bytes.is_some(),
+                          canonical_record.compressed_records_wire_bytes.as_ref().map(|b| b.len()).unwrap_or(0),
+                          canonical_record.compression);
 
                     match bincode::serialize(&canonical_record) {
                         Ok(serialized) => {
