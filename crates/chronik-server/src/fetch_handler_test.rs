@@ -1,6 +1,7 @@
 use super::*;
 use chronik_storage::Record;
 use chronik_storage::object_store::{ObjectStoreConfig, ObjectStoreFactory, StorageBackend};
+use chronik_common::metadata::TopicConfig;
 use tempfile::TempDir;
 use std::collections::HashMap;
 
@@ -29,7 +30,9 @@ async fn test_buffer_high_watermark_calculation() {
     );
     
     // Create topic
-    metadata_store.create_topic("test-topic", 1, HashMap::new()).await.unwrap();
+    let mut topic_config = TopicConfig::default();
+    topic_config.partition_count = 1;
+    metadata_store.create_topic("test-topic", topic_config).await.unwrap();
     
     // Test 1: Empty buffer and no segments - high watermark should be 0
     let response = handler.fetch_partition(
@@ -109,7 +112,9 @@ async fn test_fetch_from_buffer_only() {
         object_store,
     );
     
-    metadata_store.create_topic("test-topic", 1, HashMap::new()).await.unwrap();
+    let mut topic_config = TopicConfig::default();
+    topic_config.partition_count = 1;
+    metadata_store.create_topic("test-topic", topic_config).await.unwrap();
     
     // Add records only to buffer (no segments)
     let records = vec![
@@ -195,7 +200,9 @@ async fn test_buffer_with_segment_high_watermark() {
         object_store.clone(),
     );
     
-    metadata_store.create_topic("test-topic", 1, HashMap::new()).await.unwrap();
+    let mut topic_config = TopicConfig::default();
+    topic_config.partition_count = 1;
+    metadata_store.create_topic("test-topic", topic_config).await.unwrap();
     
     // Create a segment with some data (simulating flushed data)
     let segment_id = uuid::Uuid::new_v4().to_string();
@@ -267,7 +274,9 @@ async fn test_out_of_order_fetch() {
         object_store,
     );
     
-    metadata_store.create_topic("test-topic", 1, HashMap::new()).await.unwrap();
+    let mut topic_config = TopicConfig::default();
+    topic_config.partition_count = 1;
+    metadata_store.create_topic("test-topic", topic_config).await.unwrap();
     
     // Add records to buffer
     let records = vec![
@@ -360,7 +369,9 @@ async fn test_buffer_overflow_trimming() {
         object_store,
     );
     
-    metadata_store.create_topic("test-topic", 1, HashMap::new()).await.unwrap();
+    let mut topic_config = TopicConfig::default();
+    topic_config.partition_count = 1;
+    metadata_store.create_topic("test-topic", topic_config).await.unwrap();
     
     // Add more than 1000 records to trigger trimming
     let mut large_batch = Vec::new();
@@ -411,8 +422,12 @@ async fn test_clear_topic_buffers() {
         object_store,
     );
     
-    metadata_store.create_topic("topic1", 2, HashMap::new()).await.unwrap();
-    metadata_store.create_topic("topic2", 1, HashMap::new()).await.unwrap();
+    let mut topic_config = TopicConfig::default();
+    topic_config.partition_count = 2;
+    metadata_store.create_topic("topic1", topic_config).await.unwrap();
+    let mut topic_config2 = TopicConfig::default();
+    topic_config2.partition_count = 1;
+    metadata_store.create_topic("topic2", topic_config2).await.unwrap();
     
     // Add records to multiple topics and partitions
     let records1 = vec![Record {
@@ -487,7 +502,9 @@ async fn test_concurrent_buffer_access() {
         object_store,
     ));
     
-    metadata_store.create_topic("test-topic", 1, HashMap::new()).await.unwrap();
+    let mut topic_config = TopicConfig::default();
+    topic_config.partition_count = 1;
+    metadata_store.create_topic("test-topic", topic_config).await.unwrap();
     
     let barrier = Arc::new(Barrier::new(3));
     let mut handles = vec![];
