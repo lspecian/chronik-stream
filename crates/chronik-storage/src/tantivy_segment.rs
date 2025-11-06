@@ -477,6 +477,9 @@ mod tests {
             base_timestamp: 1700000000000,
             max_timestamp: 1700000000000 + ((num_records - 1) as i64 * 1000),
             records,
+            compressed_records_wire_bytes: None,
+            original_v1_wire_format: None,
+            original_v2_wire_format: None,
         }
     }
 
