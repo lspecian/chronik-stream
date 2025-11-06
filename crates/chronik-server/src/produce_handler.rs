@@ -3394,24 +3394,19 @@ mod tests {
         use std::sync::atomic::Ordering;
         
         let temp_dir = TempDir::new().unwrap();
-        let config = ProduceConfig {
-            data_dir: temp_dir.path().to_path_buf(),
-            flush_interval_ms: 1000,
-            flush_bytes: 1024 * 1024,
-            ..Default::default()
-        };
-        
+        let produce_config = ProduceHandlerConfig::default();
+
         let metadata_store = Arc::new(InMemoryMetadataStore::new());
-        
-        let mut config = chronik_storage::object_store::ObjectStoreConfig::default();
-        config.backend = chronik_storage::object_store::StorageBackend::Local {
+
+        let mut object_store_config = chronik_storage::object_store::ObjectStoreConfig::default();
+        object_store_config.backend = chronik_storage::object_store::StorageBackend::Local {
             path: temp_dir.path().join("segments").to_str().unwrap().to_string(),
         };
         let object_store: Arc<dyn chronik_storage::object_store::ObjectStoreTrait> =
-            Arc::from(chronik_storage::object_store::ObjectStoreFactory::create(config).await.unwrap());
-        
+            Arc::from(chronik_storage::object_store::ObjectStoreFactory::create(object_store_config).await.unwrap());
+
         let mut handler = ProduceHandler::new(
-            config,
+            produce_config,
             object_store,
             metadata_store.clone(),
         ).await.unwrap();
@@ -3449,24 +3444,19 @@ mod tests {
         use std::sync::atomic::Ordering;
         
         let temp_dir = TempDir::new().unwrap();
-        let config = ProduceConfig {
-            data_dir: temp_dir.path().to_path_buf(),
-            flush_interval_ms: 1000,
-            flush_bytes: 1024 * 1024,
-            ..Default::default()
-        };
-        
+        let produce_config = ProduceHandlerConfig::default();
+
         let metadata_store = Arc::new(InMemoryMetadataStore::new());
-        
-        let mut config = chronik_storage::object_store::ObjectStoreConfig::default();
-        config.backend = chronik_storage::object_store::StorageBackend::Local {
+
+        let mut object_store_config = chronik_storage::object_store::ObjectStoreConfig::default();
+        object_store_config.backend = chronik_storage::object_store::StorageBackend::Local {
             path: temp_dir.path().join("segments").to_str().unwrap().to_string(),
         };
         let object_store: Arc<dyn chronik_storage::object_store::ObjectStoreTrait> =
-            Arc::from(chronik_storage::object_store::ObjectStoreFactory::create(config).await.unwrap());
-        
+            Arc::from(chronik_storage::object_store::ObjectStoreFactory::create(object_store_config).await.unwrap());
+
         let mut handler = ProduceHandler::new(
-            config,
+            produce_config,
             object_store,
             metadata_store.clone(),
         ).await.unwrap();
@@ -3504,7 +3494,7 @@ mod tests {
         use std::sync::atomic::Ordering;
         
         let temp_dir = TempDir::new().unwrap();
-        let config = ProduceConfig {
+        let config = ProduceHandlerConfig {
             data_dir: temp_dir.path().to_path_buf(),
             flush_interval_ms: 1000,
             flush_bytes: 1024 * 1024,
