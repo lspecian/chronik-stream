@@ -1,20 +1,24 @@
 use super::*;
 use chronik_storage::Record;
+use chronik_storage::object_store::{ObjectStoreConfig, ObjectStoreFactory, StorageBackend};
 use tempfile::TempDir;
 use std::collections::HashMap;
 
 #[tokio::test]
 async fn test_buffer_high_watermark_calculation() {
     let temp_dir = TempDir::new().unwrap();
-    
+
     let metadata_store = Arc::new(chronik_common::metadata::InMemoryMetadataStore::new());
-    
-    let object_store = Arc::new(chronik_storage::object_store::LocalObjectStore::new(
-        temp_dir.path().join("segments")
-    ).await.unwrap());
+
+    let mut config = ObjectStoreConfig::default();
+    config.backend = StorageBackend::Local {
+        path: temp_dir.path().join("segments").to_str().unwrap().to_string(),
+    };
+    let object_store: Arc<dyn chronik_storage::object_store::ObjectStoreTrait> =
+        Arc::from(ObjectStoreFactory::create(config).await.unwrap());
     
     let segment_reader = Arc::new(chronik_storage::SegmentReader::new(
-        object_store.clone(),
+        chronik_storage::SegmentReaderConfig::default(),
         object_store.clone()
     ));
     
@@ -86,13 +90,16 @@ async fn test_fetch_from_buffer_only() {
     let temp_dir = TempDir::new().unwrap();
     
     let metadata_store = Arc::new(chronik_common::metadata::InMemoryMetadataStore::new());
-    
-    let object_store = Arc::new(chronik_storage::object_store::LocalObjectStore::new(
-        temp_dir.path().join("segments")
-    ).await.unwrap());
+
+    let mut config = ObjectStoreConfig::default();
+    config.backend = StorageBackend::Local {
+        path: temp_dir.path().join("segments").to_str().unwrap().to_string(),
+    };
+    let object_store: Arc<dyn chronik_storage::object_store::ObjectStoreTrait> =
+        Arc::from(ObjectStoreFactory::create(config).await.unwrap());
     
     let segment_reader = Arc::new(chronik_storage::SegmentReader::new(
-        object_store.clone(),
+        chronik_storage::SegmentReaderConfig::default(),
         object_store.clone()
     ));
     
@@ -169,13 +176,16 @@ async fn test_buffer_with_segment_high_watermark() {
     let temp_dir = TempDir::new().unwrap();
     
     let metadata_store = Arc::new(chronik_common::metadata::InMemoryMetadataStore::new());
-    
-    let object_store = Arc::new(chronik_storage::object_store::LocalObjectStore::new(
-        temp_dir.path().join("segments")
-    ).await.unwrap());
+
+    let mut config = ObjectStoreConfig::default();
+    config.backend = StorageBackend::Local {
+        path: temp_dir.path().join("segments").to_str().unwrap().to_string(),
+    };
+    let object_store: Arc<dyn chronik_storage::object_store::ObjectStoreTrait> =
+        Arc::from(ObjectStoreFactory::create(config).await.unwrap());
     
     let segment_reader = Arc::new(chronik_storage::SegmentReader::new(
-        object_store.clone(),
+        chronik_storage::SegmentReaderConfig::default(),
         object_store.clone()
     ));
     
@@ -238,13 +248,16 @@ async fn test_out_of_order_fetch() {
     let temp_dir = TempDir::new().unwrap();
     
     let metadata_store = Arc::new(chronik_common::metadata::InMemoryMetadataStore::new());
-    
-    let object_store = Arc::new(chronik_storage::object_store::LocalObjectStore::new(
-        temp_dir.path().join("segments")
-    ).await.unwrap());
+
+    let mut config = ObjectStoreConfig::default();
+    config.backend = StorageBackend::Local {
+        path: temp_dir.path().join("segments").to_str().unwrap().to_string(),
+    };
+    let object_store: Arc<dyn chronik_storage::object_store::ObjectStoreTrait> =
+        Arc::from(ObjectStoreFactory::create(config).await.unwrap());
     
     let segment_reader = Arc::new(chronik_storage::SegmentReader::new(
-        object_store.clone(),
+        chronik_storage::SegmentReaderConfig::default(),
         object_store.clone()
     ));
     
@@ -328,13 +341,16 @@ async fn test_buffer_overflow_trimming() {
     let temp_dir = TempDir::new().unwrap();
     
     let metadata_store = Arc::new(chronik_common::metadata::InMemoryMetadataStore::new());
-    
-    let object_store = Arc::new(chronik_storage::object_store::LocalObjectStore::new(
-        temp_dir.path().join("segments")
-    ).await.unwrap());
+
+    let mut config = ObjectStoreConfig::default();
+    config.backend = StorageBackend::Local {
+        path: temp_dir.path().join("segments").to_str().unwrap().to_string(),
+    };
+    let object_store: Arc<dyn chronik_storage::object_store::ObjectStoreTrait> =
+        Arc::from(ObjectStoreFactory::create(config).await.unwrap());
     
     let segment_reader = Arc::new(chronik_storage::SegmentReader::new(
-        object_store.clone(),
+        chronik_storage::SegmentReaderConfig::default(),
         object_store.clone()
     ));
     
@@ -376,13 +392,16 @@ async fn test_clear_topic_buffers() {
     let temp_dir = TempDir::new().unwrap();
     
     let metadata_store = Arc::new(chronik_common::metadata::InMemoryMetadataStore::new());
-    
-    let object_store = Arc::new(chronik_storage::object_store::LocalObjectStore::new(
-        temp_dir.path().join("segments")
-    ).await.unwrap());
+
+    let mut config = ObjectStoreConfig::default();
+    config.backend = StorageBackend::Local {
+        path: temp_dir.path().join("segments").to_str().unwrap().to_string(),
+    };
+    let object_store: Arc<dyn chronik_storage::object_store::ObjectStoreTrait> =
+        Arc::from(ObjectStoreFactory::create(config).await.unwrap());
     
     let segment_reader = Arc::new(chronik_storage::SegmentReader::new(
-        object_store.clone(),
+        chronik_storage::SegmentReaderConfig::default(),
         object_store.clone()
     ));
     
@@ -449,13 +468,16 @@ async fn test_concurrent_buffer_access() {
     let temp_dir = TempDir::new().unwrap();
     
     let metadata_store = Arc::new(chronik_common::metadata::InMemoryMetadataStore::new());
-    
-    let object_store = Arc::new(chronik_storage::object_store::LocalObjectStore::new(
-        temp_dir.path().join("segments")
-    ).await.unwrap());
+
+    let mut config = ObjectStoreConfig::default();
+    config.backend = StorageBackend::Local {
+        path: temp_dir.path().join("segments").to_str().unwrap().to_string(),
+    };
+    let object_store: Arc<dyn chronik_storage::object_store::ObjectStoreTrait> =
+        Arc::from(ObjectStoreFactory::create(config).await.unwrap());
     
     let segment_reader = Arc::new(chronik_storage::SegmentReader::new(
-        object_store.clone(),
+        chronik_storage::SegmentReaderConfig::default(),
         object_store.clone()
     ));
     

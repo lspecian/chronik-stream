@@ -3403,9 +3403,12 @@ mod tests {
         
         let metadata_store = Arc::new(InMemoryMetadataStore::new());
         
-        let object_store = Arc::new(chronik_storage::LocalObjectStore::new(
-            temp_dir.path().join("segments")
-        ).await.unwrap());
+        let mut config = chronik_storage::object_store::ObjectStoreConfig::default();
+        config.backend = chronik_storage::object_store::StorageBackend::Local {
+            path: temp_dir.path().join("segments").to_str().unwrap().to_string(),
+        };
+        let object_store: Arc<dyn chronik_storage::object_store::ObjectStoreTrait> =
+            Arc::from(chronik_storage::object_store::ObjectStoreFactory::create(config).await.unwrap());
         
         let mut handler = ProduceHandler::new(
             config,
@@ -3455,9 +3458,12 @@ mod tests {
         
         let metadata_store = Arc::new(InMemoryMetadataStore::new());
         
-        let object_store = Arc::new(chronik_storage::LocalObjectStore::new(
-            temp_dir.path().join("segments")
-        ).await.unwrap());
+        let mut config = chronik_storage::object_store::ObjectStoreConfig::default();
+        config.backend = chronik_storage::object_store::StorageBackend::Local {
+            path: temp_dir.path().join("segments").to_str().unwrap().to_string(),
+        };
+        let object_store: Arc<dyn chronik_storage::object_store::ObjectStoreTrait> =
+            Arc::from(chronik_storage::object_store::ObjectStoreFactory::create(config).await.unwrap());
         
         let mut handler = ProduceHandler::new(
             config,
@@ -3507,9 +3513,12 @@ mod tests {
         
         let metadata_store = Arc::new(InMemoryMetadataStore::new());
         
-        let object_store = Arc::new(chronik_storage::LocalObjectStore::new(
-            temp_dir.path().join("segments")
-        ).await.unwrap());
+        let mut config = chronik_storage::object_store::ObjectStoreConfig::default();
+        config.backend = chronik_storage::object_store::StorageBackend::Local {
+            path: temp_dir.path().join("segments").to_str().unwrap().to_string(),
+        };
+        let object_store: Arc<dyn chronik_storage::object_store::ObjectStoreTrait> =
+            Arc::from(chronik_storage::object_store::ObjectStoreFactory::create(config).await.unwrap());
         
         // Create FetchHandler
         let segment_reader = Arc::new(chronik_storage::SegmentReader::new(

@@ -97,5 +97,8 @@ full = ["search", "backup"]
 # Minimal build without optional features (Raft is always included)
 minimal = []
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [lints]
 workspace = true
