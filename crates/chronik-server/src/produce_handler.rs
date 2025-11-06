@@ -2626,6 +2626,7 @@ mod tests {
                 path: storage_path.to_string_lossy().to_string(),
             },
             retry: Default::default(),
+            ..Default::default()
         };
         let storage: Arc<dyn chronik_storage::object_store::ObjectStore> = Arc::new(
             LocalBackend::new(storage_config).await.unwrap()
@@ -3073,6 +3074,7 @@ mod tests {
                 path: storage_path.to_string_lossy().to_string(),
             },
             retry: Default::default(),
+            ..Default::default()
         };
         let storage: Arc<dyn chronik_storage::object_store::ObjectStore> = Arc::new(
             LocalBackend::new(storage_config).await.unwrap()
@@ -3140,6 +3142,7 @@ mod tests {
                 path: storage_path.to_string_lossy().to_string(),
             },
             retry: Default::default(),
+            ..Default::default()
         };
         let storage: Arc<dyn chronik_storage::object_store::ObjectStore> = Arc::new(
             LocalBackend::new(storage_config).await.unwrap()
@@ -3197,6 +3200,7 @@ mod tests {
                 path: storage_path.to_string_lossy().to_string(),
             },
             retry: Default::default(),
+            ..Default::default()
         };
         let storage: Arc<dyn chronik_storage::object_store::ObjectStore> = Arc::new(
             LocalBackend::new(storage_config).await.unwrap()
@@ -3289,6 +3293,7 @@ mod tests {
                 path: storage_path.to_string_lossy().to_string(),
             },
             retry: Default::default(),
+            ..Default::default()
         };
         let storage: Arc<dyn chronik_storage::object_store::ObjectStore> = Arc::new(
             LocalBackend::new(storage_config).await.unwrap()
