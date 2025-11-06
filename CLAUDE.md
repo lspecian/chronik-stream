@@ -19,18 +19,14 @@ Chronik Stream is a high-performance Kafka-compatible streaming platform written
 # Build all components (default: standalone, ingest, search, all modes)
 cargo build --release
 
-# Build with Raft support (adds raft-cluster subcommand)
-# NOTE: This is the RECOMMENDED build - standalone mode still works!
-cargo build --release --bin chronik-server --features raft
-
-# Build specific binary (without Raft)
+# Build specific binary
 cargo build --release --bin chronik-server
 
 # Check without building
 cargo check --all-features --workspace
 ```
 
-**IMPORTANT**: Building with `--features raft` does NOT break standalone mode. It only adds the `raft-cluster` subcommand for multi-node deployments. All other modes (`standalone`, `ingest`, `search`, `all`) work identically.
+**IMPORTANT**: The chronik-server binary includes both standalone and multi-node Raft cluster modes. All modes (`standalone`, `ingest`, `search`, `all`, `raft-cluster`) are available in a single binary.
 
 ### Testing
 ```bash
@@ -50,23 +46,68 @@ cargo test --test integration
 cargo bench
 ```
 
-### Running the Server
+### Running the Server (v2.5.0+ New CLI)
+
+**IMPORTANT**: CLI redesigned in v2.5.0 for simplicity. Old commands removed.
+
 ```bash
-# Development mode (default standalone)
-cargo run --bin chronik-server
+# Single-node mode (simplest - just works)
+cargo run --bin chronik-server start
 
-# Standalone with options
-cargo run --bin chronik-server -- standalone --dual-storage
+# Single-node with custom data directory
+cargo run --bin chronik-server start --data-dir ./my-data
 
-# With advertised address (required for Docker/remote clients)
-cargo run --bin chronik-server -- --advertised-addr localhost standalone
+# Single-node with advertised address (for Docker/remote clients)
+cargo run --bin chronik-server start --advertise my-hostname.com:9092
 
-# All components mode
-cargo run --bin chronik-server -- all
+# Cluster mode (from config file)
+cargo run --bin chronik-server start --config examples/cluster-3node.toml
+
+# Cluster mode with node ID override
+cargo run --bin chronik-server start --config cluster.toml --node-id 2
 
 # Check version and features
-cargo run --bin chronik-server -- version
+cargo run --bin chronik-server version
+
+# Cluster management (Priorities 2-4: All Complete)
+
+# Add node to running cluster (zero-downtime)
+cargo run --bin chronik-server cluster add-node 4 --kafka node4:9092 --wal node4:9291 --raft node4:5001 --config cluster.toml
+
+# Query cluster status
+cargo run --bin chronik-server cluster status --config cluster.toml
+
+# Remove node from cluster (zero-downtime) - NEW in Priority 4
+cargo run --bin chronik-server cluster remove-node 4 --config cluster.toml
+
+# Force remove (for dead/crashed nodes)
+cargo run --bin chronik-server cluster remove-node 4 --force --config cluster.toml
 ```
+
+**Zero-Downtime Node Addition** (Priority 2 - Complete):
+- Nodes can be added to a running cluster without downtime
+- Automatic partition rebalancing
+- Requires authentication via `CHRONIK_ADMIN_API_KEY`
+- See [docs/ADMIN_API_SECURITY.md](docs/ADMIN_API_SECURITY.md) for security setup
+
+**Cluster Status Command** (Priority 3 - Complete):
+- Query cluster state: nodes, leader, partitions, ISR
+- Pretty-printed output with node roles and partition assignments
+- Automatically discovers cluster leader
+- Requires authentication via `CHRONIK_ADMIN_API_KEY`
+
+**Zero-Downtime Node Removal** (Priority 4 - Complete):
+- Graceful removal: Reassigns partitions away from node before removal
+- Force removal: Handles dead/crashed nodes (skips partition reassignment)
+- Safety checks: Prevents removing below minimum quorum (3 nodes)
+- Automatic re-replication to remaining nodes
+- See [docs/TESTING_NODE_REMOVAL.md](docs/TESTING_NODE_REMOVAL.md) for testing guide
+- See [docs/PRIORITY4_COMPLETE.md](docs/PRIORITY4_COMPLETE.md) for implementation details
+
+**Auto-detection**: The `start` command automatically detects:
+- If `--config` provided or `CHRONIK_CONFIG` set → cluster mode
+- If `CHRONIK_CLUSTER_PEERS` env var set → cluster mode
+- Otherwise → single-node mode
 
 ### Docker
 
@@ -271,9 +312,6 @@ CHRONIK_METADATA_DR=true  # Already enabled by default
 
 # Change upload interval (default: 60s)
 CHRONIK_METADATA_UPLOAD_INTERVAL=120 cargo run --bin chronik-server
-
-# Disable if using file-based metadata
-CHRONIK_FILE_METADATA=true cargo run --bin chronik-server  # DR disabled
 ```
 
 **See [docs/DISASTER_RECOVERY.md](docs/DISASTER_RECOVERY.md) for complete DR guide.**
@@ -412,9 +450,7 @@ RUST_LOG=chronik_server::fetch_handler=debug cargo run --bin chronik-server
 
 **3. Metadata Store** (`chronik-common/metadata`)
 - Trait-based abstraction (`MetadataStore`)
-- Two implementations:
-  - **ChronikMetaLog (WAL-based)** - Default, event-sourced metadata
-  - File-based (legacy) - Use `--file-metadata` flag
+- **ChronikMetaLog (WAL-based)** - Event-sourced metadata persistence
 - Stores topics, partitions, consumer groups, offsets
 - Location: `crates/chronik-common/src/metadata/`
 
@@ -582,14 +618,15 @@ After successful persistence, old WAL segments are truncated.
 3. Update `ObjectStoreConfig` enum
 4. Test with `storage_test.rs`
 
-## Operational Modes
+## Operational Modes (v2.5.0+)
 
-The `chronik-server` binary supports:
-- **Standalone** (default) - Single-node Kafka server with WAL-only (no Raft)
-- **Raft Cluster** - Multi-node Kafka cluster with Raft consensus (requires `--raft` flag and 3+ nodes)
-- **Ingest** - Data ingestion (future: distributed)
-- **Search** - Search node (requires `--features search`)
-- **All** - All components in one process
+**IMPORTANT**: CLI redesigned in v2.5.0. Old subcommands removed.
+
+The `chronik-server` binary now has a single `start` command that auto-detects mode:
+- **Single-Node** (default) - Standalone Kafka server with WAL durability
+- **Cluster** (from config) - Multi-node cluster with Raft + WAL replication (requires config file)
+
+**Removed in v2.5.0**: `standalone`, `raft-cluster`, `ingest`, `search`, `all` subcommands
 
 ### Raft Clustering (Multi-Node Replication)
 
@@ -603,67 +640,85 @@ Raft provides **zero benefit** for single-node deployments:
 - ❌ Adds latency (Raft state machine overhead)
 - ✅ WAL already provides durability for single-node
 
-**Use standalone mode for single-node:**
+**Use single-node mode** (v2.5.0+):
 ```bash
-# Correct: Single-node with WAL-only (fast path)
-cargo run --bin chronik-server -- standalone
-
-# REJECTED: Single-node with Raft (will error)
-cargo run --bin chronik-server -- --raft standalone  # Error: "Raft requires 3+ nodes"
+# Correct: Single-node with WAL durability
+cargo run --bin chronik-server start
 ```
 
-#### Multi-Node Raft Cluster Setup
+#### Multi-Node Cluster Setup (v2.5.0+)
 
-**CRITICAL**: Must build with `--features raft` and specify `--node-id` for each node!
+**NEW in v2.5.0**: Cluster configuration via TOML file for clarity and validation.
 
-**Minimum 3 nodes required for quorum:**
+**Example config files provided**:
+- `examples/cluster-3node.toml` - Production template
+- `examples/cluster-local-3node.toml` - Local testing template
+
+**Quick Start - 3-Node Local Cluster:**
+
+1. **Create config files** (copy and customize `examples/cluster-local-3node.toml`):
 ```bash
-# Build with raft feature FIRST
-cargo build --release --bin chronik-server --features raft
-
-# Node 1 (port 9092)
-./target/release/chronik-server \
-  --kafka-port 9092 \
-  --advertised-addr localhost \
-  --node-id 1 \                    # ← CRITICAL: Must specify unique node ID!
-  raft-cluster \
-  --raft-addr 0.0.0.0:9192 \
-  --peers "2@localhost:9193,3@localhost:9194" \
-  --bootstrap
-
-# Node 2 (port 9093)
-./target/release/chronik-server \
-  --kafka-port 9093 \
-  --advertised-addr localhost \
-  --node-id 2 \                    # ← CRITICAL: Must specify unique node ID!
-  raft-cluster \
-  --raft-addr 0.0.0.0:9193 \
-  --peers "1@localhost:9192,3@localhost:9194" \
-  --bootstrap
-
-# Node 3 (port 9094)
-./target/release/chronik-server \
-  --kafka-port 9094 \
-  --advertised-addr localhost \
-  --node-id 3 \                    # ← CRITICAL: Must specify unique node ID!
-  raft-cluster \
-  --raft-addr 0.0.0.0:9194 \
-  --peers "1@localhost:9192,2@localhost:9193" \
-  --bootstrap
+# Node 1: cluster-node1.toml (set node_id=1, ports: 9092, 9291, 5001)
+# Node 2: cluster-node2.toml (set node_id=2, ports: 9093, 9292, 5002)
+# Node 3: cluster-node3.toml (set node_id=3, ports: 9094, 9293, 5003)
 ```
 
-**Common Mistakes (See [docs/RAFT_TESTING_GUIDE.md](docs/RAFT_TESTING_GUIDE.md) for details):**
-- ❌ Forgetting `--features raft` when building → "unrecognized subcommand 'raft-cluster'"
-- ❌ Forgetting `--node-id N` → All nodes default to node_id=1, leader election fails
-- ❌ Using `all` or `standalone` mode → Multi-node Raft rejected
-- ❌ Using `cluster` subcommand → That's the mock CLI, not for starting clusters
+2. **Start nodes**:
+```bash
+# Build server binary
+cargo build --release --bin chronik-server
 
-**Raft Configuration:**
-- Each node MUST have unique `--node-id` (1, 2, 3, etc.)
-- Each node MUST have unique `--kafka-port`
-- Each node MUST have unique `--raft-addr`
-- Each node MUST have unique `--data-dir`
-- Requires peer connectivity on both Kafka and Raft ports
+# Terminal 1 - Node 1
+./target/release/chronik-server start --config cluster-node1.toml
+
+# Terminal 2 - Node 2
+./target/release/chronik-server start --config cluster-node2.toml
+
+# Terminal 3 - Node 3
+./target/release/chronik-server start --config cluster-node3.toml
+```
+
+**Config File Format** (see examples/cluster-3node.toml):
+```toml
+node_id = 1  # CHANGE THIS on each node (1, 2, 3)
+
+replication_factor = 3
+min_insync_replicas = 2
+
+[node.addresses]
+kafka = "0.0.0.0:9092"    # Where to bind
+wal = "0.0.0.0:9291"      # WAL replication receiver
+raft = "0.0.0.0:5001"     # Raft consensus
+
+[node.advertise]
+kafka = "localhost:9092"   # What clients connect to
+wal = "localhost:9291"     # What followers connect to
+raft = "localhost:5001"    # What peers connect to
+
+[[peers]]
+id = 1
+kafka = "localhost:9092"
+wal = "localhost:9291"
+raft = "localhost:5001"
+
+[[peers]]
+id = 2
+kafka = "localhost:9093"
+wal = "localhost:9292"
+raft = "localhost:5002"
+
+[[peers]]
+id = 3
+kafka = "localhost:9094"
+wal = "localhost:9293"
+raft = "localhost:5003"
+```
+
+**Benefits**:
+- ✅ All configuration in one file (reviewable, versionable)
+- ✅ Clear separation: bind (where to listen) vs advertise (what clients see)
+- ✅ WAL address is explicit (enables automatic replication discovery)
+- ✅ No magic port offsets or confusing flags
 
 **Benefits of Raft Cluster:**
 - ✅ Quorum-based replication (survives minority failures)
@@ -671,6 +726,180 @@ cargo build --release --bin chronik-server --features raft
 - ✅ Strong consistency (linearizable reads/writes)
 - ✅ Fault tolerance (can lose minority of nodes)
 - ✅ Automatic log compaction via snapshots (prevents unbounded log growth)
+- ✅ Zero-downtime node addition and removal (v2.5.0+)
+
+### Cluster Management (v2.5.0 - Priorities 2-4 Complete)
+
+**NEW in v2.5.0**: Complete zero-downtime cluster management via CLI and HTTP API.
+
+#### Node Addition (Priority 2)
+
+Add a new node to a running cluster without downtime:
+
+```bash
+# Step 1: Add node to cluster membership (run on any existing node)
+./target/release/chronik-server cluster add-node 4 \
+  --kafka localhost:9095 \
+  --wal localhost:9294 \
+  --raft localhost:5004 \
+  --config cluster.toml
+
+# Step 2: Start the new node
+./target/release/chronik-server start --config cluster-node4.toml
+
+# Step 3: Verify (partitions automatically rebalance)
+./target/release/chronik-server cluster status --config cluster.toml
+```
+
+**What happens automatically:**
+- Node 4 joins Raft cluster
+- Partition rebalancer detects new capacity
+- Partitions redistribute across all 4 nodes
+- WAL replication connects to new node
+- Zero client interruptions
+
+#### Node Removal (Priority 4 - NEW!)
+
+Remove a node from a running cluster gracefully:
+
+```bash
+# Graceful removal (reassigns partitions first)
+./target/release/chronik-server cluster remove-node 4 --config cluster.toml
+
+# What happens automatically:
+# 1. Finds all partitions where node 4 is a replica
+# 2. Reassigns partitions to other nodes (excluding node 4)
+# 3. Waits for new replicas to catch up
+# 4. Removes node 4 from Raft cluster
+# 5. Node 4 can be safely shut down
+```
+
+**Force removal** (for dead/crashed nodes):
+
+```bash
+# Skip partition reassignment - use when node is already dead
+./target/release/chronik-server cluster remove-node 4 --force --config cluster.toml
+
+# WARNING: Partitions on dead node become under-replicated
+# Automatic re-replication will begin to restore replication factor
+```
+
+**Safety checks** (prevent invalid operations):
+- ✅ Can't remove below minimum 3 nodes (prevents split-brain)
+- ✅ Can't remove non-existent node
+- ✅ Can't remove self without `--force` (prevents accidental leader removal)
+- ✅ Validates quorum will be maintained after removal
+
+#### Cluster Status (Priority 3)
+
+Query cluster state at any time:
+
+```bash
+./target/release/chronik-server cluster status --config cluster.toml
+```
+
+**Example output:**
+```
+Chronik Cluster Status
+======================
+
+Nodes: 3
+Leader: Node 1 (elected by Raft)
+
+Node Details:
+  Node 1: kafka=localhost:9092, wal=localhost:9291, raft=localhost:5001
+  Node 2: kafka=localhost:9093, wal=localhost:9292, raft=localhost:5002
+  Node 3: kafka=localhost:9094, wal=localhost:9293, raft=localhost:5003
+
+Partition Assignments:
+  topic1-0: leader=1, replicas=[1, 2, 3], ISR=[1, 2, 3]
+  topic1-1: leader=2, replicas=[2, 3, 1], ISR=[2, 3, 1]
+  topic2-0: leader=3, replicas=[3, 1, 2], ISR=[3, 1, 2]
+```
+
+#### Complete Workflow Example
+
+End-to-end cluster lifecycle:
+
+```bash
+# 1. Start 3-node cluster
+./target/release/chronik-server start --config cluster-node{1,2,3}.toml
+
+# 2. Check initial status
+./target/release/chronik-server cluster status --config cluster-node1.toml
+# Shows: 3 nodes
+
+# 3. Add node 4 (zero downtime)
+./target/release/chronik-server cluster add-node 4 \
+  --kafka localhost:9095 --wal localhost:9294 --raft localhost:5004 \
+  --config cluster-node1.toml
+
+# 4. Start node 4
+./target/release/chronik-server start --config cluster-node4.toml
+
+# 5. Verify 4 nodes with rebalanced partitions
+./target/release/chronik-server cluster status --config cluster-node1.toml
+# Shows: 4 nodes, partitions redistributed
+
+# 6. Remove node 4 (zero downtime)
+./target/release/chronik-server cluster remove-node 4 --config cluster-node1.toml
+
+# 7. Verify back to 3 nodes
+./target/release/chronik-server cluster status --config cluster-node1.toml
+# Shows: 3 nodes, partitions rebalanced again
+
+# 8. Stop node 4 (safe - no longer owns partitions)
+kill <node4-pid>
+```
+
+**Zero downtime achieved:** Clients never interrupted, partitions always available.
+
+#### HTTP Admin API (Alternative Interface)
+
+All cluster commands also available via HTTP API:
+
+```bash
+# Get API key from server logs
+grep "Admin API key" ./data/node1/chronik.log
+
+# Query status
+curl http://localhost:10001/admin/status \
+  -H "X-API-Key: <api-key>"
+
+# Add node
+curl -X POST http://localhost:10001/admin/add-node \
+  -H "X-API-Key: <api-key>" \
+  -H "Content-Type: application/json" \
+  -d '{"node_id": 4, "kafka_addr": "localhost:9095", "wal_addr": "localhost:9294", "raft_addr": "localhost:5004"}'
+
+# Remove node
+curl -X POST http://localhost:10001/admin/remove-node \
+  -H "X-API-Key: <api-key>" \
+  -H "Content-Type: application/json" \
+  -d '{"node_id": 4, "force": false}'
+```
+
+**Admin API runs on port:** `10000 + node_id` (e.g., Node 1 → 10001, Node 2 → 10002)
+
+**Security:** All endpoints except `/admin/health` require API key authentication.
+
+See [docs/ADMIN_API_SECURITY.md](docs/ADMIN_API_SECURITY.md) for details.
+
+#### Testing
+
+Comprehensive test suite for node management:
+
+```bash
+# Automated test script
+./tests/test_node_removal.sh
+
+# Manual testing guide
+# See docs/TESTING_NODE_REMOVAL.md for step-by-step instructions
+```
+
+**Implementation details:**
+- [docs/PRIORITY4_COMPLETE.md](docs/PRIORITY4_COMPLETE.md) - Node removal design
+- [docs/CLUSTER_PLAN_STATUS_UPDATE.md](docs/CLUSTER_PLAN_STATUS_UPDATE.md) - Complete status
 
 ### Raft Snapshots & Log Compaction (v2.0.0+)
 
@@ -755,26 +984,38 @@ s3://{bucket}/{prefix}/snapshots/{topic}/{partition}/{snapshot_id}.snap
 
 ```bash
 # Start Raft cluster with snapshots enabled (default)
-cargo run --features raft --bin chronik-server -- \
+cargo run --bin chronik-server -- \
   --node-id 1 \
-  --advertised-addr localhost:9092 \
-  standalone --raft
+  --advertised-addr localhost \
+  --kafka-port 9092 \
+  raft-cluster \
+  --raft-addr 0.0.0.0:9192 \
+  --peers "2@localhost:9193,3@localhost:9194" \
+  --bootstrap
 
 # Disable snapshots for testing
-CHRONIK_SNAPSHOT_ENABLED=false cargo run --features raft --bin chronik-server -- \
+CHRONIK_SNAPSHOT_ENABLED=false cargo run --bin chronik-server -- \
   --node-id 1 \
-  --advertised-addr localhost:9092 \
-  standalone --raft
+  --advertised-addr localhost \
+  --kafka-port 9092 \
+  raft-cluster \
+  --raft-addr 0.0.0.0:9192 \
+  --peers "2@localhost:9193,3@localhost:9194" \
+  --bootstrap
 
 # Custom snapshot configuration
 CHRONIK_SNAPSHOT_LOG_THRESHOLD=50000 \
 CHRONIK_SNAPSHOT_TIME_THRESHOLD_SECS=7200 \
 CHRONIK_SNAPSHOT_COMPRESSION=zstd \
 CHRONIK_SNAPSHOT_RETENTION_COUNT=5 \
-cargo run --features raft --bin chronik-server -- \
+cargo run --bin chronik-server -- \
   --node-id 1 \
-  --advertised-addr localhost:9092 \
-  standalone --raft
+  --advertised-addr localhost \
+  --kafka-port 9092 \
+  raft-cluster \
+  --raft-addr 0.0.0.0:9192 \
+  --peers "2@localhost:9193,3@localhost:9194" \
+  --bootstrap
 ```
 
 #### Monitoring
@@ -875,10 +1116,12 @@ Key environment variables:
 - `CHRONIK_ADVERTISED_ADDR` - **CRITICAL** for Docker/remote access
 - `CHRONIK_ADVERTISED_PORT` - Port advertised to clients
 - `CHRONIK_DATA_DIR` - Data directory (default: ./data)
-- `CHRONIK_FILE_METADATA` - Use file-based metadata (default: false, uses WAL)
 - `CHRONIK_PRODUCE_PROFILE` - ProduceHandler flush profile: `low-latency`, `balanced` (default), `high-throughput`
 - `CHRONIK_WAL_PROFILE` - WAL commit profile: `low`, `medium`, `high`, `ultra` (auto-detected by default)
 - `CHRONIK_WAL_ROTATION_SIZE` - Segment seal threshold: `100KB`, `250MB` (default), `1GB`, or raw bytes `268435456`
+- `CHRONIK_ADMIN_API_KEY` - API key for admin API authentication (Priority 2, **REQUIRED for production**)
+- `CHRONIK_ADMIN_TLS_CERT` - Path to TLS certificate for admin API (Priority 2, optional)
+- `CHRONIK_ADMIN_TLS_KEY` - Path to TLS private key for admin API (Priority 2, optional)
 
 ## CRC and Checksum Architecture
 

@@ -105,12 +105,6 @@ pub struct FetchHandler {
     segment_index: Option<Arc<SegmentIndex>>,
     produce_handler: Option<Arc<crate::produce_handler::ProduceHandler>>,
     state: Arc<RwLock<FetchState>>,
-    /// Raft replica manager for multi-partition replication (v1.3.66+)
-    #[cfg(feature = "raft")]
-    raft_manager: Option<Arc<crate::raft_integration::RaftReplicaManager>>,
-    /// ReadIndex managers per partition for read-your-writes consistency (v2.0.0+)
-    #[cfg(feature = "raft")]
-    read_index_managers: Arc<dashmap::DashMap<(String, i32), Arc<chronik_raft::ReadIndexManager>>>,
     /// Configuration for fetch behavior
     config: FetchHandlerConfig,
 }
@@ -133,10 +127,6 @@ impl FetchHandler {
                 buffers: HashMap::new(),
                 segment_cache: HashMap::new(),
             })),
-            #[cfg(feature = "raft")]
-            raft_manager: None,
-            #[cfg(feature = "raft")]
-            read_index_managers: Arc::new(dashmap::DashMap::new()),
             config: FetchHandlerConfig::default(),
         }
     }
@@ -161,10 +151,6 @@ impl FetchHandler {
                 buffers: HashMap::new(),
                 segment_cache: HashMap::new(),
             })),
-            #[cfg(feature = "raft")]
-            raft_manager: None,
-            #[cfg(feature = "raft")]
-            read_index_managers: Arc::new(dashmap::DashMap::new()),
             config: FetchHandlerConfig::default(),
         }
     }
@@ -189,23 +175,17 @@ impl FetchHandler {
                 buffers: HashMap::new(),
                 segment_cache: HashMap::new(),
             })),
-            #[cfg(feature = "raft")]
-            raft_manager: None,
-            #[cfg(feature = "raft")]
-            read_index_managers: Arc::new(dashmap::DashMap::new()),
             config: FetchHandlerConfig::default(),
         }
     }
 
-    /// Create a new fetch handler with WAL, ProduceHandler, and Raft integration (v1.3.66+)
-    #[cfg(feature = "raft")]
-    pub fn new_with_wal_and_raft(
+    /// Create a new fetch handler with WAL and ProduceHandler (v2.5.0)
+    pub fn new_with_wal_and_produce(
         segment_reader: Arc<SegmentReader>,
         metadata_store: Arc<dyn MetadataStore>,
         object_store: Arc<dyn ObjectStoreTrait>,
         wal_manager: Arc<WalManager>,
         produce_handler: Arc<crate::produce_handler::ProduceHandler>,
-        raft_manager: Arc<crate::raft_integration::RaftReplicaManager>,
         config: FetchHandlerConfig,
     ) -> Self {
         info!(
@@ -224,40 +204,9 @@ impl FetchHandler {
                 buffers: HashMap::new(),
                 segment_cache: HashMap::new(),
             })),
-            raft_manager: Some(raft_manager),
-            read_index_managers: Arc::new(dashmap::DashMap::new()),
             config,
         }
     }
-
-    /// Get or create ReadIndexManager for a partition (v2.0.0+)
-    ///
-    /// ReadIndexManager is created lazily on first fetch request for a partition.
-    /// This ensures we only create managers for partitions that are actually being read.
-    #[cfg(feature = "raft")]
-    fn get_or_create_read_index_manager(
-        &self,
-        topic: &str,
-        partition: i32,
-        replica: &Arc<chronik_raft::PartitionReplica>,
-    ) -> Arc<chronik_raft::ReadIndexManager> {
-        let key = (topic.to_string(), partition);
-
-        self.read_index_managers
-            .entry(key.clone())
-            .or_insert_with(|| {
-                tracing::debug!(
-                    "Creating ReadIndexManager for {}-{} (node_id={})",
-                    topic, partition, self.config.node_id
-                );
-                Arc::new(chronik_raft::ReadIndexManager::new(
-                    self.config.node_id as u64,
-                    replica.clone(),
-                ))
-            })
-            .clone()
-    }
-
     /// Handle a fetch request
     pub async fn handle_fetch(
         &self,
@@ -312,177 +261,6 @@ impl FetchHandler {
             topic, partition, fetch_offset, max_bytes
         );
 
-        // PHASE 0: Raft-aware leadership and commit checking (v1.3.66+)
-        // Check if we need to enforce leader-only reads or check commit offset
-        #[cfg(feature = "raft")]
-        if let Some(ref raft_manager) = self.raft_manager {
-            if raft_manager.is_enabled() {
-                // Check if replica exists for this partition
-                let replica = match raft_manager.get_replica(topic, partition) {
-                    Some(r) => r,
-                    None => {
-                        // No replica - either not yet created or not part of this node's partitions
-                        warn!(
-                            "No Raft replica found for {}-{} on node {}, returning NOT_LEADER",
-                            topic, partition, self.config.node_id
-                        );
-                        return Ok(FetchResponsePartition {
-                            partition,
-                            error_code: 6, // NOT_LEADER_FOR_PARTITION
-                            high_watermark: -1,
-                            last_stable_offset: -1,
-                            log_start_offset: -1,
-                            aborted: None,
-                            preferred_read_replica: -1,
-                            records: vec![],
-                        });
-                    }
-                };
-
-                // Option B: Leader-only reads (if configured)
-                if !self.config.allow_follower_reads {
-                    if !replica.is_leader() {
-                        let leader_id = replica.leader_id();
-                        info!(
-                            "Leader-only mode: Node {} is not leader for {}-{} (leader={}), returning NOT_LEADER",
-                            self.config.node_id, topic, partition, leader_id
-                        );
-                        return Ok(FetchResponsePartition {
-                            partition,
-                            error_code: 6, // NOT_LEADER_FOR_PARTITION
-                            high_watermark: -1,
-                            last_stable_offset: -1,
-                            log_start_offset: -1,
-                            aborted: None,
-                            preferred_read_replica: leader_id as i32,
-                            records: vec![],
-                        });
-                    }
-                }
-
-                // Option A: Follower reads (default)
-                // Get committed offset from Raft - this is the highest offset safe to serve
-                let committed_offset = replica.commit_index() as i64;
-
-                info!(
-                    "Raft-aware fetch for {}-{}: fetch_offset={}, committed_offset={}, is_leader={}",
-                    topic, partition, fetch_offset, committed_offset, replica.is_leader()
-                );
-
-                // If requesting data beyond committed offset, use ReadIndex protocol
-                // for read-your-writes consistency (v2.0.0+)
-                if fetch_offset >= committed_offset {
-                    info!(
-                        "Fetch for {}-{} at offset {} waiting for commit (committed_offset={})",
-                        topic, partition, fetch_offset, committed_offset
-                    );
-
-                    // v2.0.0+: Implement read-your-writes with ReadIndex protocol
-                    // Get or create ReadIndexManager for this partition
-                    let read_index_manager = self.get_or_create_read_index_manager(topic, partition, &replica);
-
-                    // Request read index from leader
-                    let read_request = chronik_raft::ReadIndexRequest {
-                        topic: topic.to_string(),
-                        partition,
-                    };
-
-                    // Try to get read index (with timeout)
-                    let max_wait_ms = self.config.follower_read_max_wait_ms;
-                    let wait_start = std::time::Instant::now();
-
-                    loop {
-                        match read_index_manager.request_read_index(read_request.clone()).await {
-                            Ok(response) => {
-                                // Got read index, now wait for apply
-                                let required_index = response.commit_index;
-
-                                debug!(
-                                    "ReadIndex for {}-{}: required_index={}, applied_index={}, is_leader={}",
-                                    topic, partition, required_index, replica.applied_index(), response.is_leader
-                                );
-
-                                // Wait until applied_index >= required_index
-                                let mut retries = 0;
-                                while replica.applied_index() < required_index {
-                                    if wait_start.elapsed().as_millis() > max_wait_ms as u128 {
-                                        warn!(
-                                            "ReadIndex wait timeout for {}-{}: applied_index={}, required_index={}",
-                                            topic, partition, replica.applied_index(), required_index
-                                        );
-                                        // Return empty on timeout
-                                        let empty_records = self.encode_kafka_records(&[], 0)?;
-                                        return Ok(FetchResponsePartition {
-                                            partition,
-                                            error_code: 0,
-                                            high_watermark: committed_offset,
-                                            last_stable_offset: committed_offset,
-                                            log_start_offset: 0,
-                                            aborted: None,
-                                            preferred_read_replica: -1,
-                                            records: empty_records,
-                                        });
-                                    }
-
-                                    // Backoff: wait 1ms, 2ms, 5ms, 10ms, then 10ms
-                                    let wait_ms = match retries {
-                                        0 => 1,
-                                        1 => 2,
-                                        2 => 5,
-                                        _ => 10,
-                                    };
-                                    tokio::time::sleep(tokio::time::Duration::from_millis(wait_ms)).await;
-                                    retries += 1;
-                                }
-
-                                // Applied! Now safe to read - break and continue with fetch
-                                info!(
-                                    "ReadIndex satisfied for {}-{}: applied_index={} >= required_index={} (waited {}ms)",
-                                    topic, partition, replica.applied_index(), required_index, wait_start.elapsed().as_millis()
-                                );
-                                break;
-                            }
-                            Err(e) => {
-                                // ReadIndex failed (no leader, timeout, etc.)
-                                if wait_start.elapsed().as_millis() > max_wait_ms as u128 {
-                                    warn!(
-                                        "ReadIndex request timeout for {}-{}: {:?}",
-                                        topic, partition, e
-                                    );
-                                    // Return empty on failure
-                                    let empty_records = self.encode_kafka_records(&[], 0)?;
-                                    return Ok(FetchResponsePartition {
-                                        partition,
-                                        error_code: 0,
-                                        high_watermark: committed_offset,
-                                        last_stable_offset: committed_offset,
-                                        log_start_offset: 0,
-                                        aborted: None,
-                                        preferred_read_replica: -1,
-                                        records: empty_records,
-                                    });
-                                }
-
-                                // Retry after brief delay
-                                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-                            }
-                        }
-                    }
-
-                    // After breaking from loop, update committed_offset from replica
-                    // (may have advanced during wait)
-                    let updated_committed_offset = replica.commit_index() as i64;
-                    debug!(
-                        "Updated committed_offset={} after ReadIndex wait for {}-{}",
-                        updated_committed_offset, topic, partition
-                    );
-                }
-
-                // Data is committed and available, cap fetch at committed_offset
-                // This ensures we never serve uncommitted data from followers
-                debug!("Capping high_watermark to committed_offset={} for follower read", committed_offset);
-            }
-        }
 
         // First check if topic exists
         let topic_metadata = match self.metadata_store.get_topic(topic).await? {
@@ -1240,21 +1018,36 @@ impl FetchHandler {
             if let chronik_wal::record::WalRecord::V2 { canonical_data, .. } = wal_record {
                 match bincode::deserialize::<CanonicalRecord>(&canonical_data) {
                     Ok(canonical_record) => {
-                        // Use the ORIGINAL compressed_records_wire_bytes preserved during produce
-                        if let Some(ref raw_bytes) = canonical_record.compressed_records_wire_bytes {
-                            // Verify this batch's records are in the requested range
-                            let base_offset = canonical_record.base_offset;
-                            let last_offset = canonical_record.last_offset();
+                        // Verify this batch's records are in the requested range
+                        let base_offset = canonical_record.base_offset;
+                        let last_offset = canonical_record.last_offset();
 
-                            if last_offset >= fetch_offset && base_offset < high_watermark {
-                                concatenated_bytes.extend_from_slice(raw_bytes);
-                                batches_concatenated += 1;
+                        if last_offset >= fetch_offset && base_offset < high_watermark {
+                            // CRITICAL: Call to_kafka_batch() to reconstruct the full RecordBatch
+                            // with 61-byte header + compressed records payload
+                            // compressed_records_wire_bytes alone is NOT a valid RecordBatch!
+                            match canonical_record.to_kafka_batch() {
+                                Ok(kafka_batch_bytes) => {
+                                    concatenated_bytes.extend_from_slice(&kafka_batch_bytes);
+                                    batches_concatenated += 1;
 
-                                debug!(
-                                    "RAW→WAL: Appended original batch offsets {}-{} ({} bytes)",
-                                    base_offset, last_offset, raw_bytes.len()
-                                );
+                                    warn!(
+                                        "RAW→WAL: ✓ APPENDED reconstructed batch offsets {}-{} ({} bytes)",
+                                        base_offset, last_offset, kafka_batch_bytes.len()
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!("Failed to convert CanonicalRecord to Kafka batch: {}", e);
+                                    continue;
+                                }
                             }
+                        } else {
+                            warn!(
+                                "RAW→WAL: ✗ SKIPPED batch offsets {}-{} (condition failed: last_offset >= fetch_offset: {}, base_offset < high_watermark: {})",
+                                base_offset, last_offset,
+                                last_offset >= fetch_offset,
+                                base_offset < high_watermark
+                            );
                         }
                     }
                     Err(e) => {

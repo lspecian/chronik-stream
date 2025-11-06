@@ -354,11 +354,18 @@ pub struct OffsetCommitResponsePartition {
     pub error_code: i16,
 }
 
+/// Offset fetch request topic
+#[derive(Debug, Clone)]
+pub struct OffsetFetchRequestTopic {
+    pub name: String,
+    pub partitions: Vec<i32>,  // Partition indexes
+}
+
 /// Offset fetch request
 #[derive(Debug, Clone)]
 pub struct OffsetFetchRequest {
     pub group_id: String,
-    pub topics: Option<Vec<String>>,
+    pub topics: Option<Vec<OffsetFetchRequestTopic>>,
 }
 
 /// Offset fetch response

@@ -3,13 +3,13 @@
 pub mod unified_metrics;  // New unified lock-free atomic metrics
 pub mod tracing;
 pub mod server;
-pub mod raft_metrics;  // Raft-specific metrics
+// Removed raft_metrics module (v2.2.0 - Raft removed)
 
 // Re-export for compatibility
 pub use unified_metrics::{UnifiedMetrics, MetricsRecorder, global_metrics};
 pub use tracing::{init_tracing, TracingConfig};
 pub use server::{MetricsServer, ServerMetrics, ConnectionMetrics};
-pub use raft_metrics::RaftMetrics;
+// Removed RaftMetrics re-export (v2.2.0)
 
 // Keep MetricsRegistry as a placeholder for compatibility
 #[derive(Clone)]

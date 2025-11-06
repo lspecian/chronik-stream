@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{RwLock, Mutex};
+use tokio::sync::{RwLock, Mutex, oneshot};
 use tracing::{debug, info, warn, error};
 
 /// Consumer group state
@@ -139,18 +139,30 @@ pub struct ConsumerGroup {
     pub protocol: Option<String>,
     pub leader_id: Option<String>,
     pub members: HashMap<String, GroupMember>,
-    
+
     // KIP-848 incremental rebalance fields
     pub group_epoch: i32,
     pub assignment_strategy: AssignmentStrategy,
     pub pending_members: HashSet<String>, // Members pending assignment
     #[serde(skip, default)]
     pub rebalance_start_time: Option<Instant>,
+    #[serde(skip, default)]
+    pub expected_members_count: usize, // Expected members to rejoin during rebalance
+    #[serde(skip, default)]
+    pub previous_member_count: usize, // Member count before rebalance (to detect scale-up/down)
     pub static_members: HashMap<String, String>, // static_member_id -> member_id mapping
-    
+
     // Metadata persistence
     #[serde(skip, default)]
     pub last_persisted: Option<Instant>,
+
+    // Async waiting mechanism for JoinGroup responses
+    #[serde(skip)]
+    pub pending_join_futures: Arc<Mutex<HashMap<String, oneshot::Sender<JoinGroupResponse>>>>,
+
+    // Async waiting mechanism for SyncGroup responses (followers wait for leader to compute assignments)
+    #[serde(skip)]
+    pub pending_sync_futures: Arc<Mutex<HashMap<String, oneshot::Sender<SyncGroupResponse>>>>,
 }
 
 impl ConsumerGroup {
@@ -168,8 +180,12 @@ impl ConsumerGroup {
             assignment_strategy: AssignmentStrategy::CooperativeSticky,
             pending_members: HashSet::new(),
             rebalance_start_time: None,
+            expected_members_count: 0,
+            previous_member_count: 0,
             static_members: HashMap::new(),
             last_persisted: None,
+            pending_join_futures: Arc::new(Mutex::new(HashMap::new())),
+            pending_sync_futures: Arc::new(Mutex::new(HashMap::new())),
         }
     }
     
@@ -245,21 +261,49 @@ impl ConsumerGroup {
     
     /// Trigger a rebalance
     pub fn trigger_rebalance(&mut self) {
+        self.trigger_rebalance_internal(false);
+    }
+
+    pub fn trigger_rebalance_with_redistribution(&mut self) {
+        self.trigger_rebalance_internal(true);
+    }
+
+    fn trigger_rebalance_internal(&mut self, force_redistribution: bool) {
         if self.state == GroupState::Stable || self.state == GroupState::CompletingRebalance {
-            info!(group_id = %self.group_id, "Triggering rebalance");
+            let current_member_count = self.members.len();
+            let is_scale_up = current_member_count > self.previous_member_count;
+
+            info!(
+                group_id = %self.group_id,
+                current_members = current_member_count,
+                previous_members = self.previous_member_count,
+                is_scale_up = is_scale_up,
+                force_redistribution = force_redistribution,
+                "Triggering rebalance"
+            );
+
             self.state = GroupState::PreparingRebalance;
             self.generation_id += 1;
             self.group_epoch += 1;
             self.rebalance_start_time = Some(Instant::now());
-            
+
+            // Track how many members we expect to rejoin
+            self.expected_members_count = current_member_count;
+            self.previous_member_count = current_member_count;
+
             // For incremental rebalance, save current assignments as owned partitions
-            if self.assignment_strategy == AssignmentStrategy::CooperativeSticky {
+            // UNLESS force_redistribution is true OR this is a scale-up (new member joining)
+            //
+            // Key insight: On scale-up, we want to clear owned_partitions so that the
+            // CooperativeStickyAssignor can redistribute partitions to include new members.
+            // On scale-down or same-size rebalance, we preserve assignments for stickiness.
+            if self.assignment_strategy == AssignmentStrategy::CooperativeSticky && !force_redistribution && !is_scale_up {
                 for member in self.members.values_mut() {
                     member.owned_partitions = member.assignment.clone();
                     member.target_assignment = None;
                 }
             } else {
-                // For eager rebalance, clear assignments immediately
+                // For eager rebalance OR forced redistribution OR scale-up, clear assignments
                 for member in self.members.values_mut() {
                     member.assignment.clear();
                     member.owned_partitions.clear();
@@ -348,6 +392,150 @@ impl ConsumerGroup {
     /// Mark as persisted
     pub fn mark_persisted(&mut self) {
         self.last_persisted = Some(Instant::now());
+    }
+
+    /// Check if all expected members have joined for this generation
+    /// NOTE: This is called from an async context, so we can't access pending_join_futures here
+    /// Instead, the caller (join_group) should pass the pending count
+    pub fn all_members_joined_with_pending_count(&self, pending_count: usize) -> bool {
+        // During PreparingRebalance, wait for ALL expected members to rejoin
+        // Use both member count AND time-based criteria
+
+        if self.state != GroupState::PreparingRebalance {
+            return false;
+        }
+
+        // Need at least one member
+        if self.members.is_empty() {
+            return false;
+        }
+
+        // Primary condition: All expected members have pending join requests
+        // This indicates they've all sent fresh JoinGroup requests for this generation
+        if pending_count >= self.expected_members_count {
+            info!(
+                group_id = %self.group_id,
+                pending = pending_count,
+                expected = self.expected_members_count,
+                "All expected members have rejoined - completing rebalance"
+            );
+            return true;
+        }
+
+        // Fallback: Wait at least 3 seconds (heartbeat interval) since rebalance started
+        // This allows existing members to discover rebalance via heartbeat and rejoin
+        if let Some(start_time) = self.rebalance_start_time {
+            let elapsed = start_time.elapsed();
+            if elapsed >= Duration::from_secs(3) {
+                info!(
+                    group_id = %self.group_id,
+                    pending = pending_count,
+                    expected = self.expected_members_count,
+                    elapsed_ms = elapsed.as_millis(),
+                    "Timeout waiting for all members - completing rebalance with available members"
+                );
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Legacy method for compatibility
+    pub fn all_members_joined(&self) -> bool {
+        // Can't access pending_join_futures from sync context
+        // Default to time-based check only
+        if self.state != GroupState::PreparingRebalance {
+            return false;
+        }
+
+        if self.members.is_empty() {
+            return false;
+        }
+
+        if let Some(start_time) = self.rebalance_start_time {
+            start_time.elapsed() >= Duration::from_secs(3)
+        } else {
+            false
+        }
+    }
+
+    /// Complete the join phase - send responses to all waiting members
+    pub async fn complete_join_phase(&mut self, pending_futures: &mut HashMap<String, oneshot::Sender<JoinGroupResponse>>) {
+        if self.members.is_empty() {
+            return;
+        }
+
+        // Select leader (first member by key order for deterministic selection)
+        let leader_id = self.members.keys().min().cloned().unwrap();
+        self.leader_id = Some(leader_id.clone());
+
+        // Transition to CompletingRebalance
+        self.state = GroupState::CompletingRebalance;
+
+        info!(
+            group_id = %self.group_id,
+            generation = self.generation_id,
+            member_count = self.members.len(),
+            leader = %leader_id,
+            "Completing join phase - sending responses to all members"
+        );
+
+        // Send responses to all waiting members
+        for (member_id, member) in &self.members {
+            let is_leader = member_id == &leader_id;
+
+            // Build member list for leader
+            let members = if is_leader {
+                self.members.iter().enumerate().map(|(idx, (id, m))| {
+                    let metadata = m.protocols.first()
+                        .map(|(_, data)| data.clone())
+                        .unwrap_or_default();
+                    tracing::warn!(
+                        "Building member[{}] for leader: member_id={}, metadata_len={}, metadata_first_16={:02x?}",
+                        idx, id, metadata.len(), &metadata[..metadata.len().min(16)]
+                    );
+                    MemberInfo {
+                        member_id: id.clone(),
+                        metadata,
+                        owned_partitions: m.owned_partitions.clone(),
+                    }
+                }).collect()
+            } else {
+                vec![]
+            };
+
+            // Select protocol name - use first available, or use "range" as default
+            // CRITICAL: NEVER use empty string as it causes JoinGroup v5 protocol encoding errors
+            let protocol_name = member.protocols.first()
+                .map(|(name, _)| name.clone())
+                .unwrap_or_else(|| "range".to_string()); // Default to "range" protocol
+
+            debug!(
+                member_id = %member_id,
+                protocol = %protocol_name,
+                protocol_len = protocol_name.len(),
+                is_empty = protocol_name.is_empty(),
+                "Sending JoinGroup response with protocol_name"
+            );
+
+            let response = JoinGroupResponse {
+                error_code: 0,
+                generation_id: self.generation_id,
+                protocol: protocol_name,
+                leader_id: leader_id.clone(),
+                member_id: member_id.clone(),
+                member_epoch: member.member_epoch,
+                members,
+            };
+
+            // Send response via oneshot channel
+            if let Some(tx) = pending_futures.remove(member_id) {
+                if tx.send(response).is_err() {
+                    warn!(member_id = %member_id, "Failed to send JoinGroup response - receiver dropped");
+                }
+            }
+        }
     }
 }
 
@@ -452,8 +640,12 @@ impl GroupManager {
                 assignment_strategy: group.assignment_strategy,
                 pending_members: group.pending_members.clone(),
                 rebalance_start_time: group.rebalance_start_time,
+                expected_members_count: group.expected_members_count,
+                previous_member_count: group.previous_member_count,
                 static_members: group.static_members.clone(),
                 last_persisted: group.last_persisted,
+                pending_join_futures: Arc::new(Mutex::new(HashMap::new())),
+                pending_sync_futures: Arc::new(Mutex::new(HashMap::new())),
             }))
         } else {
             // Try to load from metadata store
@@ -566,11 +758,11 @@ impl GroupManager {
     ) -> Result<JoinGroupResponse> {
         // Ensure group exists
         self.get_or_create_group(group_id.clone(), protocol_type.clone()).await?;
-        
+
         let mut groups = self.groups.write().await;
         let group = groups.get_mut(&group_id)
             .ok_or_else(|| Error::Internal("Group not found after creation".into()))?;
-        
+
         // Handle static membership
         let member_id = if let Some(static_id) = &static_member_id {
             // Check if static member already exists
@@ -591,22 +783,17 @@ impl GroupManager {
                 format!("{}-{}", client_id, uuid::Uuid::new_v4())
             })
         };
-        
+
         // Check if this is a rejoin
         let is_rejoin = group.members.contains_key(&member_id);
-        let prev_member_epoch = if is_rejoin {
-            group.members.get(&member_id).map(|m| m.member_epoch).unwrap_or(0)
-        } else {
-            0
-        };
-        
+
         // Parse subscription from protocols
         let subscription = if let Some((_, metadata)) = protocols.first() {
             parse_subscription_metadata(metadata)?
         } else {
             vec![]
         };
-        
+
         // Create or update member
         let mut member = GroupMember::new(
             member_id.clone(),
@@ -617,80 +804,181 @@ impl GroupManager {
             subscription,
             protocols.clone(),
         );
-        
+
         // Preserve owned partitions for incremental rebalance
         if is_rejoin && group.assignment_strategy == AssignmentStrategy::CooperativeSticky {
             if let Some(existing) = group.members.get(&member_id) {
                 member.owned_partitions = existing.owned_partitions.clone();
-                member.member_epoch = prev_member_epoch + 1;
             }
         }
-        
+
         group.add_member(member);
-        
-        // Determine if rebalance is needed
-        let needs_rebalance = !is_rejoin || 
-                            group.state != GroupState::Stable ||
-                            group.needs_rebalance();
-        
-        if needs_rebalance {
-            group.trigger_rebalance();
-        }
-        
-        // Select leader if needed
-        if group.leader_id.is_none() || !group.members.contains_key(group.leader_id.as_ref().unwrap()) {
-            // Choose the member with the lowest member_id as leader for deterministic selection
-            if let Some(leader_id) = group.members.keys().min().cloned() {
-                group.leader_id = Some(leader_id);
+
+        // **CRITICAL FIX**: Handle rebalances triggered by new members joining Stable groups
+        // When a new member joins a Stable group, trigger_rebalance() transitions to PreparingRebalance
+        // We MUST notify all existing members to rejoin with REBALANCE_IN_PROGRESS error
+
+        if group.state == GroupState::Stable && !is_rejoin {
+            // New member joining stable group - trigger rebalance
+            info!(
+                group_id = %group_id,
+                member_id = %member_id,
+                member_count = group.members.len(),
+                "New member joining stable group - triggering rebalance and notifying existing members"
+            );
+
+            // BEFORE triggering rebalance, send REBALANCE_IN_PROGRESS to existing members
+            // This ensures they know to rejoin with fresh JoinGroup requests
+            {
+                let mut pending_futures = group.pending_join_futures.lock().await;
+                let existing_member_ids: Vec<String> = group.members.keys()
+                    .filter(|id| *id != &member_id) // Exclude the new member we just added
+                    .cloned()
+                    .collect();
+
+                for existing_member_id in existing_member_ids {
+                    if let Some(tx) = pending_futures.remove(&existing_member_id) {
+                        warn!(
+                            group_id = %group_id,
+                            member_id = %existing_member_id,
+                            "Sending REBALANCE_IN_PROGRESS to existing member to trigger rejoin"
+                        );
+                        let rebalance_response = JoinGroupResponse {
+                            error_code: 27, // REBALANCE_IN_PROGRESS
+                            generation_id: group.generation_id,
+                            protocol: group.protocol.clone().unwrap_or_else(|| "range".to_string()),
+                            leader_id: group.leader_id.clone().unwrap_or_default(),
+                            member_id: existing_member_id.clone(),
+                            member_epoch: group.members.get(&existing_member_id).map(|m| m.member_epoch).unwrap_or(0),
+                            members: vec![],
+                        };
+                        let _ = tx.send(rebalance_response); // Ignore error if receiver dropped
+                    }
+                }
             }
+
+            // Now trigger the rebalance with forced redistribution (new member joining)
+            group.trigger_rebalance_with_redistribution();
+            // NOTE: trigger_rebalance_with_redistribution() clears owned_partitions to force
+            // redistribution of partitions across all members (including new member)
+            // Fall through to PreparingRebalance handler below (DO NOT return here!)
         }
-        
-        // Persist group state
-        if group.needs_persistence() {
-            if let Err(e) = self.persist_group(group).await {
-                warn!(
-                    group_id = %group.group_id,
-                    error = %e,
-                    "Failed to persist group state"
-                );
-            } else {
-                group.mark_persisted();
+
+        // Handle PreparingRebalance and Empty states with timer-based waiting
+        if group.state == GroupState::PreparingRebalance || group.state == GroupState::Empty {
+            // Create a oneshot channel for this member's response
+            let (tx, rx) = oneshot::channel();
+
+            {
+                let mut pending_futures = group.pending_join_futures.lock().await;
+                pending_futures.insert(member_id.clone(), tx);
             }
+
+            // Clone group_id for logging in spawned task
+            let group_id_clone = group_id.clone();
+            let groups_clone = self.groups.clone();
+
+            // Spawn a task to check if join phase should complete
+            tokio::spawn(async move {
+                // Poll every 200ms to check if all members have joined
+                loop {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+
+                    let mut groups = groups_clone.write().await;
+                    if let Some(group) = groups.get_mut(&group_id_clone) {
+                        let pending_futures_arc = group.pending_join_futures.clone();
+                        let pending_futures = pending_futures_arc.lock().await;
+                        let pending_count = pending_futures.len();
+
+                        if group.all_members_joined_with_pending_count(pending_count) {
+                            info!(
+                                group_id = %group_id_clone,
+                                members = group.members.len(),
+                                pending = pending_count,
+                                "All members joined - completing join phase"
+                            );
+                            drop(pending_futures); // Release lock before calling complete_join_phase
+                            let mut pending_futures_mut = pending_futures_arc.lock().await;
+                            group.complete_join_phase(&mut *pending_futures_mut).await;
+                            break; // Exit loop after completing
+                        }
+
+                        // Check if group is no longer in PreparingRebalance (might have been cancelled)
+                        if group.state != GroupState::PreparingRebalance {
+                            break;
+                        }
+                    } else {
+                        // Group was deleted
+                        break;
+                    }
+                }
+            });
+
+            // Drop the write lock before awaiting
+            drop(groups);
+
+            // Wait for response (will be sent by complete_join_phase after delay)
+            match tokio::time::timeout(rebalance_timeout, rx).await {
+                Ok(Ok(response)) => {
+                    info!(
+                        group_id = %group_id,
+                        member_id = %response.member_id,
+                        generation = response.generation_id,
+                        is_leader = response.member_id == response.leader_id,
+                        "Member received JoinGroup response after waiting"
+                    );
+                    Ok(response)
+                }
+                Ok(Err(_)) => Err(Error::Internal("JoinGroup response channel closed".into())),
+                Err(_) => Err(Error::Internal("JoinGroup timeout waiting for rebalance".into())),
+            }
+        } else if group.state == GroupState::Stable {
+            // Rejoin of existing member in stable group - return immediate response
+            // (This path only for rejoins, new members are handled above)
+            let is_leader = group.leader_id.as_ref() == Some(&member_id);
+            let member_epoch_val = group.members.get(&member_id).map(|m| m.member_epoch).unwrap_or(0);
+
+            // Select protocol name - use first available, or use "range" as default
+            // CRITICAL: NEVER use empty string as it causes JoinGroup v5 protocol encoding errors
+            let protocol_name = protocols.first()
+                .map(|(name, _)| name.clone())
+                .or_else(|| {
+                    // Check if member has protocols stored
+                    group.members.get(&member_id)
+                        .and_then(|m| m.protocols.first())
+                        .map(|(name, _)| name.clone())
+                })
+                .unwrap_or_else(|| "range".to_string()); // Default to "range" protocol
+
+            Ok(JoinGroupResponse {
+                error_code: 0,
+                generation_id: group.generation_id,
+                protocol: protocol_name,
+                leader_id: group.leader_id.clone().unwrap_or_default(),
+                member_id,
+                member_epoch: member_epoch_val,
+                members: if is_leader {
+                    group.members.iter().map(|(id, m)| MemberInfo {
+                        member_id: id.clone(),
+                        metadata: m.protocols.first()
+                            .map(|(_, data)| data.clone())
+                            .unwrap_or_default(),
+                        owned_partitions: m.owned_partitions.clone(),
+                    }).collect()
+                } else {
+                    vec![]
+                },
+            })
+        } else {
+            Err(Error::InvalidInput(format!("Invalid group state: {:?}", group.state)))
         }
-        
-        let response = JoinGroupResponse {
-            error_code: 0,
-            generation_id: group.generation_id,
-            protocol: protocols.first().map(|(name, _)| name.clone()).unwrap_or_default(),
-            leader_id: group.leader_id.clone().unwrap_or_default(),
-            member_id: member_id.clone(),
-            member_epoch: group.members.get(&member_id).map(|m| m.member_epoch).unwrap_or(0),
-            members: if Some(&member_id) == group.leader_id.as_ref() {
-                // Leader gets all member metadata
-                group.members.iter().map(|(id, member)| MemberInfo {
-                    member_id: id.clone(),
-                    metadata: member.protocols.first()
-                        .map(|(_, data)| data.clone())
-                        .unwrap_or_default(),
-                    owned_partitions: member.owned_partitions.clone(),
-                }).collect()
-            } else {
-                vec![]
-            },
-        };
-        
-        info!(
-            group_id = %group.group_id,
-            member_id = %member_id,
-            generation = group.generation_id,
-            is_leader = Some(&member_id) == group.leader_id.as_ref(),
-            "Member joined group"
-        );
-        
-        Ok(response)
     }
     
     /// Sync group state with incremental rebalance support
+    ///
+    /// **CRITICAL FIX**: Followers MUST wait for leader to compute assignments
+    /// This prevents the race condition where followers call SyncGroup before the leader,
+    /// receive empty assignments, and prematurely transition to Stable state.
     pub async fn sync_group(
         &self,
         group_id: String,
@@ -702,7 +990,7 @@ impl GroupManager {
         let mut groups = self.groups.write().await;
         let group = groups.get_mut(&group_id)
             .ok_or_else(|| Error::InvalidInput(format!("Unknown group: {}", group_id)))?;
-        
+
         // Validate generation
         if group.generation_id != generation_id {
             return Ok(SyncGroupResponse {
@@ -711,7 +999,7 @@ impl GroupManager {
                 member_epoch: 0,
             });
         }
-        
+
         // Validate member epoch for incremental rebalance
         if let Some(member) = group.members.get(&member_id) {
             if member.member_epoch != member_epoch {
@@ -722,41 +1010,266 @@ impl GroupManager {
                 });
             }
         }
-        
-        // If leader, compute and distribute assignments
-        if Some(&member_id) == group.leader_id.as_ref() {
-            // Compute partition assignments if we're in a rebalance or leader has empty assignments
-            let computed_assignments = if group.state == GroupState::PreparingRebalance || 
-                                          group.state == GroupState::CompletingRebalance ||
-                                          assignments.as_ref().map(|a| a.is_empty()).unwrap_or(true) {
+
+        // Remove member from pending set (they've now synced)
+        group.pending_members.remove(&member_id);
+
+        let is_leader = Some(&member_id) == group.leader_id.as_ref();
+        let rebalance_timeout = Duration::from_secs(60); // Default rebalance timeout
+
+        // **CRITICAL FIX**: If this is a follower during rebalance, BLOCK until leader provides assignments
+        if !is_leader && (group.state == GroupState::CompletingRebalance || group.state == GroupState::PreparingRebalance) {
+            info!(
+                group_id = %group_id,
+                member_id = %member_id,
+                state = ?group.state,
+                "Follower waiting for leader to compute assignments"
+            );
+
+            // Create oneshot channel to wait for assignment
+            let (tx, rx) = oneshot::channel();
+
+            {
+                let mut pending_sync = group.pending_sync_futures.lock().await;
+                pending_sync.insert(member_id.clone(), tx);
+
+                // WORKAROUND for kafka-python bug: If ALL followers are now waiting but leader hasn't
+                // sent SyncGroup, the leader might never send it (kafka-python rebalance bug).
+                // Spawn a fallback task to compute assignments server-side after 2 seconds.
+                let follower_count = group.members.len() - 1; // All members except leader
+                if pending_sync.len() == follower_count && follower_count > 0 {
+                    warn!(
+                        group_id = %group_id,
+                        pending_count = pending_sync.len(),
+                        follower_count = follower_count,
+                        "All followers waiting for SyncGroup from leader - activating fallback timer"
+                    );
+
+                    // Spawn background task to compute assignments if leader doesn't send SyncGroup
+                    let groups_clone = self.groups.clone();
+                    let metadata_store_clone = self.metadata_store.clone();
+                    let assignor_clone = self.assignor.clone();
+                    let group_id_clone = group_id.clone();
+
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+
+                        // Check if we still need server-side assignment
+                        let mut groups_write = groups_clone.write().await;
+                        if let Some(group) = groups_write.get_mut(&group_id_clone) {
+                            // Only proceed if still in CompletingRebalance and followers still waiting
+                            if group.state == GroupState::CompletingRebalance {
+                                let pending_sync_arc = group.pending_sync_futures.clone();
+                                let pending_count = pending_sync_arc.lock().await.len();
+
+                                if pending_count > 0 {
+                                    warn!(
+                                        group_id = %group_id_clone,
+                                        pending_count = pending_count,
+                                        "Leader failed to send SyncGroup after 2s - computing assignments server-side (kafka-python workaround)"
+                                    );
+
+                                    // Compute assignments server-side
+                                    let manager = GroupManager {
+                                        groups: groups_clone.clone(),
+                                        metadata_store: metadata_store_clone.clone(),
+                                        assignor: assignor_clone.clone(),
+                                    };
+
+                                    match manager.compute_assignments(group).await {
+                                        Ok(computed_assignments) => {
+                                            // Apply assignments to group members
+                                            for (mid, assignment) in &computed_assignments {
+                                                if let Some(member) = group.members.get_mut(mid) {
+                                                    member.assignment = assignment.clone();
+                                                }
+                                            }
+
+                                            // Transition to Stable
+                                            group.state = GroupState::Stable;
+                                            group.rebalance_start_time = None;
+
+                                            info!(
+                                                group_id = %group_id_clone,
+                                                generation = group.generation_id,
+                                                assignment_count = computed_assignments.len(),
+                                                "Server-side assignment completed - transitioning to Stable"
+                                            );
+
+                                            // Send assignments to all waiting followers
+                                            let mut pending_sync = pending_sync_arc.lock().await;
+                                            for (mid, assignment) in &computed_assignments {
+                                                if let Some(tx) = pending_sync.remove(mid) {
+                                                    let member_assignment = encode_assignment(assignment);
+                                                    let member_epoch = group.members.get(mid)
+                                                        .map(|m| m.member_epoch)
+                                                        .unwrap_or(0);
+
+                                                    let response = SyncGroupResponse {
+                                                        error_code: 0,
+                                                        assignment: member_assignment,
+                                                        member_epoch,
+                                                    };
+
+                                                    let _ = tx.send(response);
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            error!(
+                                                group_id = %group_id_clone,
+                                                error = %e,
+                                                "Failed to compute server-side assignments"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+
+            // Drop the write lock before awaiting
+            drop(groups);
+
+            // Wait for leader to send assignment
+            match tokio::time::timeout(rebalance_timeout, rx).await {
+                Ok(Ok(response)) => {
+                    info!(
+                        group_id = %group_id,
+                        member_id = %member_id,
+                        assignment_size = response.assignment.len(),
+                        "Follower received assignment from leader"
+                    );
+                    return Ok(response);
+                }
+                Ok(Err(_)) => {
+                    return Err(Error::Internal("SyncGroup response channel closed".into()));
+                }
+                Err(_) => {
+                    return Err(Error::Internal("SyncGroup timeout waiting for leader".into()));
+                }
+            }
+        }
+
+        // **LEADER PATH**: Compute assignments and distribute to all waiting members
+        if is_leader {
+            // Try to use client-provided assignments first (standard Kafka protocol)
+            // Fall back to server-side computation if client didn't provide assignments for ALL members
+            let computed_assignments = if let Some(assignments) = assignments {
+                // CRITICAL FIX: Check if assignments cover ALL members, not just "not empty"
+                // kafka-python leader sometimes only sends assignment for itself (incomplete)
+                if !assignments.is_empty() && assignments.len() == group.members.len() {
+                    // Client provided COMPLETE assignments for all members - use them!
+                    info!(
+                        group_id = %group.group_id,
+                        member_id = %member_id,
+                        assignment_count = assignments.len(),
+                        member_count = group.members.len(),
+                        "Using client-provided partition assignments from leader (complete)"
+                    );
+                    let mut parsed = HashMap::new();
+                    for (member_id, assignment_bytes) in assignments {
+                        let assignment = decode_assignment(&assignment_bytes)?;
+                        parsed.insert(member_id, assignment);
+                    }
+                    parsed
+                } else {
+                    // Client sent incomplete/empty assignments - compute server-side
+                    warn!(
+                        group_id = %group.group_id,
+                        member_id = %member_id,
+                        state = ?group.state,
+                        assignment_count = assignments.len(),
+                        member_count = group.members.len(),
+                        "Leader sent incomplete assignments ({} assignments for {} members) - falling back to server-side computation",
+                        assignments.len(),
+                        group.members.len()
+                    );
+                    self.compute_assignments(group).await?
+                }
+            } else {
+                // No assignments provided - compute server-side
                 info!(
                     group_id = %group.group_id,
                     member_id = %member_id,
                     state = ?group.state,
-                    "Leader computing partition assignments"
+                    member_count = group.members.len(),
+                    "No client assignments provided - computing server-side"
                 );
                 self.compute_assignments(group).await?
-            } else if let Some(assignments) = assignments {
-                // Parse provided assignments
-                let mut parsed = HashMap::new();
-                for (member_id, assignment_bytes) in assignments {
-                    let assignment = decode_assignment(&assignment_bytes)?;
-                    parsed.insert(member_id, assignment);
-                }
-                parsed
-            } else {
-                // No assignments to process
-                HashMap::new()
             };
-            
+
             if !computed_assignments.is_empty() {
                 info!(
                     group_id = %group.group_id,
                     assignments = ?computed_assignments.keys().collect::<Vec<_>>(),
-                    "Completing rebalance with assignments"
+                    "Leader computed assignments for all members"
                 );
-                group.complete_rebalance(computed_assignments);
-                
+
+                // Apply assignments to all members
+                for (mid, assignment) in &computed_assignments {
+                    if let Some(member) = group.members.get_mut(mid) {
+                        member.assignment = assignment.clone();
+                    }
+                }
+
+                // Transition to Stable state
+                group.state = GroupState::Stable;
+                group.rebalance_start_time = None;
+
+                info!(
+                    group_id = %group.group_id,
+                    generation = group.generation_id,
+                    "Rebalance completed - transitioning to Stable"
+                );
+
+                // Send assignments to all waiting followers
+                let pending_sync_arc = group.pending_sync_futures.clone();
+                let mut pending_sync = pending_sync_arc.lock().await;
+
+                for (mid, assignment) in &computed_assignments {
+                    if mid != &member_id {  // Don't send to leader (we return directly below)
+                        if let Some(tx) = pending_sync.remove(mid) {
+                            let member_assignment = encode_assignment(assignment);
+                            let member_epoch = group.members.get(mid)
+                                .map(|m| m.member_epoch)
+                                .unwrap_or(0);
+
+                            // DEBUG: Log assignment details
+                            for (topic, partitions) in assignment {
+                                info!(
+                                    group_id = %group.group_id,
+                                    member_id = %mid,
+                                    topic = %topic,
+                                    partitions = ?partitions,
+                                    "Sending partition assignment to follower"
+                                );
+                            }
+
+                            let response = SyncGroupResponse {
+                                error_code: 0,
+                                assignment: member_assignment,
+                                member_epoch,
+                            };
+
+                            if tx.send(response).is_err() {
+                                warn!(
+                                    member_id = %mid,
+                                    "Failed to send SyncGroup response - receiver dropped"
+                                );
+                            } else {
+                                info!(
+                                    member_id = %mid,
+                                    assignment_size = assignment.len(),
+                                    "Sent assignment to follower"
+                                );
+                            }
+                        }
+                    }
+                }
+
                 // Persist group state after assignment
                 if let Err(e) = self.persist_group(group).await {
                     warn!(
@@ -765,9 +1278,43 @@ impl GroupManager {
                         "Failed to persist group state after assignment"
                     );
                 }
+
+                // Return leader's assignment
+                let leader_assignment = computed_assignments.get(&member_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let encoded_assignment = encode_assignment(&leader_assignment);
+                let leader_epoch = group.members.get(&member_id)
+                    .map(|m| m.member_epoch)
+                    .unwrap_or(0);
+
+                // DEBUG: Log leader's assignment details
+                for (topic, partitions) in &leader_assignment {
+                    info!(
+                        group_id = %group.group_id,
+                        member_id = %member_id,
+                        topic = %topic,
+                        partitions = ?partitions,
+                        "Leader's own partition assignment"
+                    );
+                }
+
+                info!(
+                    group_id = %group.group_id,
+                    member_id = %member_id,
+                    assignment_size = encoded_assignment.len(),
+                    "Leader returning own assignment"
+                );
+
+                return Ok(SyncGroupResponse {
+                    error_code: 0,
+                    assignment: encoded_assignment,
+                    member_epoch: leader_epoch,
+                });
             }
         }
-        
+
+        // **FALLBACK PATH**: For stable groups or when no assignments computed
         // Get member's assignment based on rebalance strategy
         let (assignment, epoch) = if let Some(member) = group.members.get(&member_id) {
             let member_assignment = if group.assignment_strategy == AssignmentStrategy::CooperativeSticky {
@@ -777,14 +1324,15 @@ impl GroupManager {
             } else {
                 &member.assignment
             };
-            
+
             info!(
                 group_id = %group.group_id,
                 member_id = %member_id,
                 assignment = ?member_assignment,
-                "Returning assignment to member"
+                state = ?group.state,
+                "Returning assignment to member (fallback path)"
             );
-            
+
             (encode_assignment(member_assignment), member.member_epoch)
         } else {
             warn!(
@@ -794,17 +1342,7 @@ impl GroupManager {
             );
             (vec![], 0)
         };
-        
-        info!(
-            group_id = %group.group_id,
-            member_id = %member_id,
-            generation = generation_id,
-            state = ?group.state,
-            assignment_size = assignment.len(),
-            is_leader = Some(&member_id) == group.leader_id.as_ref(),
-            "Member synced group"
-        );
-        
+
         Ok(SyncGroupResponse {
             error_code: 0,
             assignment,
@@ -1148,8 +1686,30 @@ impl GroupManager {
     }
     
     // Protocol wrapper methods for kafka_handler compatibility
-    pub async fn handle_join_group(&self, request: chronik_protocol::join_group_types::JoinGroupRequest) -> Result<chronik_protocol::join_group_types::JoinGroupResponse> {
+    pub async fn handle_join_group(
+        &self,
+        request: chronik_protocol::join_group_types::JoinGroupRequest,
+        header_client_id: Option<String>,
+        api_version: i16,
+    ) -> Result<chronik_protocol::join_group_types::JoinGroupResponse> {
         use std::time::Duration;
+
+        // Use client_id from request header (most reliable source for dynamic membership)
+        // Fall back to group_instance_id (for static membership), then generate unique ID
+        let client_id = header_client_id
+            .or_else(|| request.group_instance_id.clone())
+            .unwrap_or_else(|| format!("chronik-consumer-{}", uuid::Uuid::new_v4()));
+
+        info!(
+            group_id = %request.group_id,
+            member_id = %request.member_id,
+            group_instance_id = ?request.group_instance_id,
+            client_id = %client_id,
+            "JoinGroup request received"
+        );
+
+        // Save protocol_type before we move the request fields
+        let protocol_type_for_response = request.protocol_type.clone();
 
         // Convert protocol request to internal format
         let protocols = request.protocols.into_iter()
@@ -1159,8 +1719,8 @@ impl GroupManager {
         // Call the real join_group implementation with proper parameters
         let result = self.join_group(
             request.group_id,
-            if request.member_id.is_empty() { None } else { Some(request.member_id) },
-            "kafka-python".to_string(), // TODO: Parse from request if available
+            if request.member_id.is_empty() { None } else { Some(request.member_id.clone()) },
+            client_id,  // Use extracted client_id instead of hardcoded value
             "/127.0.0.1".to_string(),   // TODO: Parse from connection info
             Duration::from_millis(request.session_timeout_ms as u64),
             Duration::from_millis(if request.rebalance_timeout_ms > 0 {
@@ -1175,8 +1735,16 @@ impl GroupManager {
 
         // Convert internal response to protocol format
         let is_leader = result.member_id == result.leader_id;
+        tracing::warn!(
+            "handle_join_group response received: member_id={}, leader_id={}, is_leader={}, result.members.len()={}",
+            result.member_id, result.leader_id, is_leader, result.members.len()
+        );
         let members = if is_leader {
-            result.members.into_iter().map(|m| {
+            result.members.into_iter().enumerate().map(|(idx, m)| {
+                tracing::warn!(
+                    "Converting member[{}] to wire format: member_id={}, metadata_len={}, metadata_first_16={:02x?}",
+                    idx, m.member_id, m.metadata.len(), &m.metadata[..m.metadata.len().min(16)]
+                );
                 chronik_protocol::join_group_types::JoinGroupResponseMember {
                     member_id: m.member_id,
                     group_instance_id: None, // Not supported in MemberInfo struct
@@ -1184,14 +1752,26 @@ impl GroupManager {
                 }
             }).collect()
         } else {
+            tracing::warn!("Non-leader member, members list will be empty");
             vec![]
         };
 
         Ok(chronik_protocol::join_group_types::JoinGroupResponse {
             error_code: result.error_code,
             generation_id: result.generation_id,
-            protocol_type: Some("consumer".to_string()), // Use default since internal struct uses 'protocol'
-            protocol_name: Some(result.protocol),
+            protocol_type: if api_version >= 7 {
+                // v7+ requires protocol_type to be non-null
+                // Use saved protocol_type, or default to "consumer" if empty
+                let ptype = if protocol_type_for_response.is_empty() {
+                    "consumer".to_string()
+                } else {
+                    protocol_type_for_response
+                };
+                Some(ptype)
+            } else {
+                None // v6 and earlier don't have this field
+            },
+            protocol_name: Some(result.protocol), // Already ensured non-empty in complete_join_phase
             leader: result.leader_id,
             member_id: result.member_id,
             members,
@@ -1200,6 +1780,10 @@ impl GroupManager {
     }
     
     pub async fn handle_sync_group(&self, request: chronik_protocol::sync_group_types::SyncGroupRequest) -> Result<chronik_protocol::sync_group_types::SyncGroupResponse> {
+        // Clone values we'll need for logging later
+        let group_id_for_log = request.group_id.clone();
+        let member_id_for_log = request.member_id.clone();
+
         // Convert assignments from protocol format to our internal format
         let assignments = if !request.assignments.is_empty() {
             let mut parsed_assignments = Vec::new();
@@ -1221,18 +1805,42 @@ impl GroupManager {
         ).await?;
 
         // Convert back to protocol format
+        let assignment_bytes = bytes::Bytes::from(sync_response.assignment);
+
+        // DEBUG: Log assignment bytes in hex format
+        let hex_str: String = assignment_bytes.iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        info!(
+            group_id = %group_id_for_log,
+            member_id = %member_id_for_log,
+            assignment_len = assignment_bytes.len(),
+            assignment_hex = %hex_str,
+            "SyncGroup response assignment bytes"
+        );
+
         Ok(chronik_protocol::sync_group_types::SyncGroupResponse {
             error_code: sync_response.error_code,
             protocol_name: request.protocol_name,
             protocol_type: request.protocol_type,
-            assignment: bytes::Bytes::from(sync_response.assignment),
+            assignment: assignment_bytes,
             throttle_time_ms: 0,
         })
     }
     
-    pub async fn handle_heartbeat(&self, _request: chronik_protocol::heartbeat_types::HeartbeatRequest) -> Result<chronik_protocol::heartbeat_types::HeartbeatResponse> {
+    pub async fn handle_heartbeat(&self, request: chronik_protocol::heartbeat_types::HeartbeatRequest) -> Result<chronik_protocol::heartbeat_types::HeartbeatResponse> {
+        // Call the real heartbeat implementation to update member's last_heartbeat timestamp
+        let heartbeat_response = self.heartbeat(
+            request.group_id,
+            request.member_id,
+            request.generation_id,
+            None, // member_epoch not used in v3
+        ).await?;
+
         Ok(chronik_protocol::heartbeat_types::HeartbeatResponse {
-            error_code: 0,
+            error_code: heartbeat_response.error_code,
             throttle_time_ms: 0,
         })
     }
@@ -1325,64 +1933,83 @@ impl GroupManager {
         let topics = if let Some(requested_topics) = request.topics {
             let mut response_topics = Vec::new();
 
-            for topic_name in requested_topics {
-                // Try to get committed offset for partition 0 (default)
-                info!("DEBUG: Fetching offset for group={} topic={} partition=0", request.group_id, topic_name);
-                match self.metadata_store.get_consumer_offset(&request.group_id, &topic_name, 0).await {
-                    Ok(Some(offset_info)) => {
-                        info!(
-                            "✓ Retrieved offset from metadata: group={} topic={} partition=0 offset={}",
-                            request.group_id, topic_name, offset_info.offset
-                        );
-                        response_topics.push(OffsetFetchResponseTopic {
-                            name: topic_name,
-                            partitions: vec![
-                                OffsetFetchResponsePartition {
-                                    partition_index: 0,
-                                    committed_offset: offset_info.offset,
-                                    metadata: offset_info.metadata,
-                                    error_code: 0,
-                                }
-                            ],
-                        });
+            for topic_request in requested_topics {
+                let mut partition_responses = Vec::new();
+
+                // If no specific partitions requested, fetch for all partitions
+                let partitions = if topic_request.partitions.is_empty() {
+                    // v0-v7: No partitions specified means "fetch ALL partitions for this topic"
+                    // Query metadata to find actual partition count
+                    match self.metadata_store.get_topic(&topic_request.name).await {
+                        Ok(Some(topic_meta)) => {
+                            // Return ALL partitions for this topic
+                            (0..topic_meta.config.partition_count as i32).collect()
+                        }
+                        Ok(None) => {
+                            // Topic doesn't exist, return empty (client will get error_code 3 for unknown topic)
+                            warn!("Topic '{}' not found for OffsetFetch request", topic_request.name);
+                            Vec::new()
+                        }
+                        Err(e) => {
+                            warn!("Failed to get topic metadata for '{}': {}", topic_request.name, e);
+                            Vec::new()
+                        }
                     }
-                    Ok(None) => {
-                        // No committed offset found, return -1
-                        info!(
-                            "✗ No committed offset found for group={} topic={} partition=0 (returning -1)",
-                            request.group_id, topic_name
-                        );
-                        response_topics.push(OffsetFetchResponseTopic {
-                            name: topic_name,
-                            partitions: vec![
-                                OffsetFetchResponsePartition {
-                                    partition_index: 0,
-                                    committed_offset: -1,  // No committed offset
-                                    metadata: None,
-                                    error_code: 0,
-                                }
-                            ],
-                        });
-                    }
-                    Err(e) => {
-                        // Error retrieving offset
-                        warn!(
-                            "✗ ERROR retrieving offset for group={} topic={} partition=0: {}",
-                            request.group_id, topic_name, e
-                        );
-                        response_topics.push(OffsetFetchResponseTopic {
-                            name: topic_name,
-                            partitions: vec![
-                                OffsetFetchResponsePartition {
-                                    partition_index: 0,
-                                    committed_offset: -1,  // No committed offset
-                                    metadata: None,
-                                    error_code: 0,
-                                }
-                            ],
-                        });
+                } else {
+                    topic_request.partitions
+                };
+
+                // Fetch offset for each requested partition
+                for partition_id in partitions {
+                    info!("DEBUG: Fetching offset for group={} topic={} partition={}",
+                          request.group_id, topic_request.name, partition_id);
+
+                    match self.metadata_store.get_consumer_offset(&request.group_id, &topic_request.name, partition_id as u32).await {
+                        Ok(Some(offset_info)) => {
+                            info!(
+                                "✓ Retrieved offset from metadata: group={} topic={} partition={} offset={}",
+                                request.group_id, topic_request.name, partition_id, offset_info.offset
+                            );
+                            partition_responses.push(OffsetFetchResponsePartition {
+                                partition_index: partition_id,
+                                committed_offset: offset_info.offset,
+                                metadata: offset_info.metadata,
+                                error_code: 0,
+                            });
+                        }
+                        Ok(None) => {
+                            // No committed offset found, return -1
+                            info!(
+                                "✗ No committed offset found for group={} topic={} partition={} (returning -1)",
+                                request.group_id, topic_request.name, partition_id
+                            );
+                            partition_responses.push(OffsetFetchResponsePartition {
+                                partition_index: partition_id,
+                                committed_offset: -1,  // No committed offset
+                                metadata: None,
+                                error_code: 0,
+                            });
+                        }
+                        Err(e) => {
+                            // Error retrieving offset
+                            warn!(
+                                "✗ ERROR retrieving offset for group={} topic={} partition={}: {}",
+                                request.group_id, topic_request.name, partition_id, e
+                            );
+                            partition_responses.push(OffsetFetchResponsePartition {
+                                partition_index: partition_id,
+                                committed_offset: -1,  // No committed offset
+                                metadata: None,
+                                error_code: 0,
+                            });
+                        }
                     }
                 }
+
+                response_topics.push(OffsetFetchResponseTopic {
+                    name: topic_request.name,
+                    partitions: partition_responses,
+                });
             }
 
             response_topics
@@ -1640,11 +2267,12 @@ impl PartitionAssignor for CooperativeStickyAssignor {
 /// Encode assignment to bytes
 fn encode_assignment(assignment: &HashMap<String, Vec<i32>>) -> Vec<u8> {
     use byteorder::{BigEndian, WriteBytesExt};
-    
+
     let mut bytes = Vec::new();
-    
+
     // Version (0 for legacy, 1 for incremental)
-    bytes.write_i16::<BigEndian>(1).unwrap();
+    // CRITICAL: Use version 0 for kafka-python/rdkafka compatibility
+    bytes.write_i16::<BigEndian>(0).unwrap();
     
     // Topic count
     bytes.write_i32::<BigEndian>(assignment.len() as i32).unwrap();
@@ -1667,7 +2295,18 @@ fn encode_assignment(assignment: &HashMap<String, Vec<i32>>) -> Vec<u8> {
     
     // User data (empty)
     bytes.write_i32::<BigEndian>(0).unwrap();
-    
+
+    // DEBUG: Log hex dump of assignment bytes
+    let hex_str = bytes.iter()
+        .map(|b| format!("{:02x}", b))
+        .collect::<Vec<_>>()
+        .join(" ");
+    tracing::info!(
+        assignment_hex = %hex_str,
+        assignment_len = bytes.len(),
+        "Encoded assignment bytes (hex dump)"
+    );
+
     bytes
 }
 
@@ -1682,8 +2321,13 @@ fn decode_assignment(bytes: &[u8]) -> Result<HashMap<String, Vec<i32>>> {
     // Read version
     let version = cursor.read_i16::<BigEndian>()
         .map_err(|e| Error::Serialization(format!("Failed to read version: {}", e)))?;
-    
-    if version != 0 && version != 1 {
+
+    // Support versions 0-3 (Kafka 0.9-3.x)
+    // Version 0: topic-partitions only
+    // Version 1: topic-partitions + user_data
+    // Version 2: topic-partitions + user_data (same as v1)
+    // Version 3: topic-partitions + user_data (same as v1, v2)
+    if version < 0 || version > 3 {
         return Err(Error::Protocol(format!("Unsupported assignment version: {}", version)));
     }
     
@@ -1933,12 +2577,11 @@ impl PartitionAssignor for RoundRobinAssignor {
 mod tests {
     use super::*;
     use tempfile::TempDir;
-    use chronik_common::metadata::FileMetadataStore;
-    
+    use chronik_common::metadata::InMemoryMetadataStore;
+
     #[tokio::test]
     async fn test_consumer_group_lifecycle() {
-        let temp_dir = TempDir::new().unwrap();
-        let metadata_store = Arc::new(FileMetadataStore::new(temp_dir.path().join("metadata")).await.unwrap());
+        let metadata_store = Arc::new(InMemoryMetadataStore::new());
         let manager = Arc::new(GroupManager::new(metadata_store));
         
         // Create group

@@ -4,7 +4,6 @@ use crate::error::{Result, RaftError};
 use crate::rpc::proto;
 use crate::transport::Transport;
 use async_trait::async_trait;
-use chronik_monitoring::RaftMetrics;
 use raft::prelude::Message as RaftMessage;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -35,9 +34,6 @@ pub struct GrpcTransport {
 
     /// Maximum number of concurrent connections (default: 1000)
     max_pool_size: usize,
-
-    /// Raft metrics collector
-    metrics: RaftMetrics,
 }
 
 impl GrpcTransport {
@@ -57,7 +53,6 @@ impl GrpcTransport {
             clients: Arc::new(RwLock::new(HashMap::new())),
             peer_addrs: Arc::new(RwLock::new(HashMap::new())),
             max_pool_size,
-            metrics: RaftMetrics::new(),
         }
     }
 
@@ -276,41 +271,31 @@ impl Transport for GrpcTransport {
             }
         };
 
-        // Record metrics
+        // Log metrics (proper metrics collection will be added later)
         let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
-        let success = result.is_ok();
-        let target_node = to.to_string();
-
-        self.metrics.record_rpc_call(rpc_type, &target_node, success, latency_ms);
-
-        if !success {
-            let error_type = match &result {
-                Err(RaftError::Grpc(status)) => {
-                    if status.code() == tonic::Code::Unavailable {
-                        "unavailable"
-                    } else if status.code() == tonic::Code::DeadlineExceeded {
-                        "timeout"
-                    } else {
-                        "other_grpc"
-                    }
-                }
-                Err(_) => "other",
-                Ok(_) => unreachable!(),
-            };
-            self.metrics.record_rpc_error(rpc_type, &target_node, error_type);
+        if result.is_ok() {
+            debug!(
+                topic = %topic,
+                partition = partition,
+                to = to,
+                rpc_type = rpc_type,
+                latency_ms = latency_ms,
+                "Raft RPC completed successfully"
+            );
         }
 
         result
     }
 
     async fn add_peer(&self, node_id: u64, addr: String) -> Result<()> {
-        info!("Adding peer {} at {}", node_id, addr);
+        info!("Adding peer {} at {} (will connect lazily on first message)", node_id, addr);
 
-        // Store the address
+        // Store the address for later connection
         self.peer_addrs.write().await.insert(node_id, addr.clone());
 
-        // Connect to the peer
-        self.connect(node_id, &addr).await?;
+        // Don't connect immediately - let get_or_connect() handle lazy connection
+        // when the first Raft message is sent. This avoids chicken-and-egg issues
+        // during cluster bootstrap where peers aren't running yet.
 
         Ok(())
     }

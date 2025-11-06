@@ -574,7 +574,10 @@ pub fn parse_request_header_with_correlation(buf: &mut Bytes) -> Result<(Request
     } else {
         decoder.read_string()?
     };
-    
+
+    // DEBUG: Log the parsed client_id to verify what's being read from the wire
+    tracing::info!("Parsed client_id from request header: {:?}", client_id);
+
     // Skip tagged fields if flexible
     if flexible {
         let tagged_field_count = decoder.read_unsigned_varint()?;
@@ -658,7 +661,7 @@ pub fn is_flexible_version(api_key: ApiKey, api_version: i16) -> bool {
         ApiKey::Fetch => api_version >= 12,
         ApiKey::ListOffsets => api_version >= 6,
         ApiKey::Metadata => api_version >= 9,
-        ApiKey::OffsetCommit => api_version >= 8,
+        ApiKey::OffsetCommit => api_version >= 8,  // CRITICAL: Kafka spec says "flexibleVersions": "8+", NOT 9+
         ApiKey::OffsetFetch => api_version >= 6,
         ApiKey::FindCoordinator => api_version >= 3,
         ApiKey::JoinGroup => api_version >= 6,

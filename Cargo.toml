@@ -14,13 +14,14 @@ members = [
     "crates/chronik-config",
     "crates/chronik-server",
     "crates/chronik-wal",
-    "crates/chronik-raft",
     "crates/chronik-bench",
+    "crates/chronik-raft-bridge",
+    "crates/chronik-raft",
 ]
 exclude = ["tests"]
 
 [workspace.package]
-version = "2.1.0"
+version = "2.2.0"
 edition = "2021"
 authors = ["Chronik Stream Contributors"]
 license = "Apache-2.0"
@@ -32,10 +33,11 @@ tokio = { version = "1.35", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 tokio-stream = "0.1"
 
-# Web framework
-axum = "0.7"
+# Web framework (downgraded to 0.6.20 to match opentelemetry-otlp → tonic 0.9.2 dependency)
+axum = "0.6.20"
+hyper = { version = "0.14", features = ["full"] }
 tower = "0.4"
-tower-http = { version = "0.5", features = ["cors", "trace"] }
+tower-http = { version = "0.4", features = ["cors", "trace"] }
 warp = "0.3"
 
 # Serialization
@@ -67,9 +69,18 @@ lz4_flex = "0.11"
 kube = { version = "0.87", features = ["runtime", "derive"] }
 k8s-openapi = { version = "0.20", features = ["v1_28"] }
 
-# Consensus (Apache 2.0)
-# Use prost-codec to avoid protoc dependency (pure Rust toolchain)
+# Consensus (v2.5.0+)
+# Raft for metadata/leader election, WAL streaming for data replication
 raft = { version = "0.7", default-features = false, features = ["prost-codec"] }
+
+# gRPC for Raft network layer (downgraded to 0.9 to match opentelemetry-otlp)
+tonic = "0.9"
+prost = "0.11"
+prost-types = "0.11"
+
+# Logging for Raft
+slog = "2.7"
+slog-stdlog = "4.1"
 
 # Observability
 tracing = "0.1"
@@ -93,6 +104,9 @@ murmur2 = "0.1"
 
 # CLI
 clap = { version = "4.4", features = ["derive", "env"] }
+
+# Build dependencies
+tonic-build = "0.9"
 
 # Testing
 proptest = "1.4"

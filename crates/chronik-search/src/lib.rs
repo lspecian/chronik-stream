@@ -25,5 +25,15 @@ pub async fn serve_app(
     listener: tokio::net::TcpListener,
     app: axum::Router,
 ) -> Result<(), std::io::Error> {
-    axum::serve(listener, app).await
+    // Convert tokio TcpListener to std::net::TcpListener for hyper
+    // CRITICAL: Do NOT bind again - listener is already bound!
+    let std_listener = listener.into_std()?;
+    std_listener.set_nonblocking(true)?;
+
+    // In axum 0.6, use from_tcp to reuse the existing listener
+    axum::Server::from_tcp(std_listener)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+        .serve(app.into_make_service())
+        .await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
 }

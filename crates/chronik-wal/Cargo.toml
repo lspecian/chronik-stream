@@ -7,12 +7,12 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-default = []
+default = ["raft-storage"]
 wal = ["dep:memmap2"]
 wal-encryption = ["wal", "dep:ring"]
 wal-compression = ["wal", "dep:zstd"]
 async-io = ["dep:tokio-uring"]
-raft-storage = ["dep:chronik-raft"]
+raft-storage = ["dep:chronik-raft", "dep:raft", "dep:protobuf"]
 
 [dependencies]
 # Workspace dependencies
@@ -46,6 +46,10 @@ tokio-uring = { version = "0.4", optional = true }
 chronik-common = { path = "../chronik-common" }
 chronik-monitoring = { path = "../chronik-monitoring" }
 chronik-raft = { path = "../chronik-raft", optional = true }
+
+# Raft dependencies (for adapter)
+raft = { workspace = true, optional = true }
+protobuf = { version = "2.28", optional = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

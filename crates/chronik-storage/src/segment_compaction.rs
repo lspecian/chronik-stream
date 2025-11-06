@@ -456,9 +456,13 @@ mod tests {
     #[tokio::test]
     async fn test_time_based_retention() {
         let index = Arc::new(SegmentIndex::new());
-        let store = Arc::new(ObjectStoreFactory::create(ObjectStoreConfig::Local {
-            root: "/tmp/test_compaction".into(),
-        }).unwrap());
+
+        let mut config = ObjectStoreConfig::default();
+        config.backend = crate::object_store::StorageBackend::Local {
+            path: "/tmp/test_compaction".to_string(),
+        };
+
+        let store = Arc::new(ObjectStoreFactory::create(config).await.unwrap());
 
         let config = CompactionConfig {
             strategy: CompactionStrategy::TimeBasedRetention {

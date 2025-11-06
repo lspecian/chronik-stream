@@ -4,7 +4,7 @@
 //! crate that ONLY depends on raft (prost 0.11), avoiding the conflict with our
 //! prost 0.13 dependency used for tonic/grpc.
 
-use raft::prelude::{ConfChange, Message as RaftMessage};
+use raft::prelude::{ConfChange, ConfChangeV2, Message as RaftMessage};
 
 /// Encode a raft::Message to protobuf bytes
 pub fn encode_raft_message(msg: &RaftMessage) -> Result<Vec<u8>, String> {
@@ -19,4 +19,10 @@ pub fn decode_raft_message(bytes: &[u8]) -> Result<RaftMessage, String> {
 /// Decode a raft::ConfChange from protobuf bytes
 pub fn decode_conf_change(bytes: &[u8]) -> Result<ConfChange, String> {
     chronik_raft_bridge::decode_conf_change(bytes)
+}
+
+/// Decode a raft::ConfChangeV2 from protobuf bytes
+/// (Priority 2: Zero-Downtime Node Addition)
+pub fn decode_conf_change_v2(bytes: &[u8]) -> Result<ConfChangeV2, String> {
+    chronik_raft_bridge::decode_conf_change_v2(bytes)
 }

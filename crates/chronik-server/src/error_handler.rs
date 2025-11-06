@@ -310,6 +310,15 @@ impl ErrorHandler {
                 // Topics array count (4 bytes)
                 response.extend_from_slice(&0i32.to_be_bytes());
             }
+            // OffsetCommit
+            8 => {
+                if api_version >= 3 {
+                    // Throttle time (4 bytes)
+                    response.extend_from_slice(&0i32.to_be_bytes());
+                }
+                // Topics array count (4 bytes) - empty array
+                response.extend_from_slice(&0i32.to_be_bytes());
+            }
             _ => {
                 // Generic error response
                 response.extend_from_slice(&error_code.to_i16().to_be_bytes());

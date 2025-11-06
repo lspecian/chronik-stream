@@ -317,20 +317,75 @@ impl WalManager {
                 }
 
                 // Parse V2 record body
-                let topic_len = rdr.read_u16::<LittleEndian>().unwrap() as usize;
+                // CRITICAL FIX: Handle truncated WAL files gracefully instead of panicking
+                // During cluster startup or crashes, WAL files may be incomplete
+                let topic_len = match rdr.read_u16::<LittleEndian>() {
+                    Ok(len) => len as usize,
+                    Err(e) => {
+                        debug!("Failed to read topic_len at cursor {}: {} - skipping rest of file (likely truncated)", cursor, e);
+                        break;
+                    }
+                };
+
                 let mut topic_bytes = vec![0u8; topic_len];
-                std::io::Read::read_exact(&mut rdr, &mut topic_bytes).unwrap();
-                let record_topic = String::from_utf8(topic_bytes).unwrap();
+                if let Err(e) = std::io::Read::read_exact(&mut rdr, &mut topic_bytes) {
+                    debug!("Failed to read topic bytes at cursor {}: {} - skipping rest of file (likely truncated)", cursor, e);
+                    break;
+                }
 
-                let record_partition = rdr.read_i32::<LittleEndian>().unwrap();
+                let record_topic = match String::from_utf8(topic_bytes) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        debug!("Invalid UTF-8 in topic at cursor {}: {} - skipping rest of file", cursor, e);
+                        break;
+                    }
+                };
 
-                let canonical_data_len = rdr.read_u32::<LittleEndian>().unwrap() as usize;
+                let record_partition = match rdr.read_i32::<LittleEndian>() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        debug!("Failed to read partition at cursor {}: {} - skipping rest of file", cursor, e);
+                        break;
+                    }
+                };
+
+                let canonical_data_len = match rdr.read_u32::<LittleEndian>() {
+                    Ok(len) => len as usize,
+                    Err(e) => {
+                        debug!("Failed to read canonical_data_len at cursor {}: {} - skipping rest of file", cursor, e);
+                        break;
+                    }
+                };
+
                 let mut canonical_data = vec![0u8; canonical_data_len];
-                std::io::Read::read_exact(&mut rdr, &mut canonical_data).unwrap();
+                if let Err(e) = std::io::Read::read_exact(&mut rdr, &mut canonical_data) {
+                    debug!("Failed to read canonical data at cursor {}: {} - skipping rest of file (likely truncated)", cursor, e);
+                    break;
+                }
 
-                let base_offset = rdr.read_i64::<LittleEndian>().unwrap();
-                let last_offset = rdr.read_i64::<LittleEndian>().unwrap();
-                let record_count = rdr.read_i32::<LittleEndian>().unwrap();
+                let base_offset = match rdr.read_i64::<LittleEndian>() {
+                    Ok(o) => o,
+                    Err(e) => {
+                        debug!("Failed to read base_offset at cursor {}: {} - skipping rest of file", cursor, e);
+                        break;
+                    }
+                };
+
+                let last_offset = match rdr.read_i64::<LittleEndian>() {
+                    Ok(o) => o,
+                    Err(e) => {
+                        debug!("Failed to read last_offset at cursor {}: {} - skipping rest of file", cursor, e);
+                        break;
+                    }
+                };
+
+                let record_count = match rdr.read_i32::<LittleEndian>() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        debug!("Failed to read record_count at cursor {}: {} - skipping rest of file", cursor, e);
+                        break;
+                    }
+                };
 
                 // Filter by offset range
                 let should_include = last_offset >= offset;

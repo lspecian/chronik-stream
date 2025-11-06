@@ -472,7 +472,7 @@ mod tests {
         index.add_segment(seg1.clone()).await.unwrap();
         index.add_segment(seg2.clone()).await.unwrap();
 
-        let all_segs = index.get_all_segments("test-topic", 0).await.unwrap();
+        let all_segs = index.get_all_segments().await.unwrap();
         assert_eq!(all_segs.len(), 2);
         assert_eq!(all_segs[0].min_offset, 0);
         assert_eq!(all_segs[1].min_offset, 100);
@@ -509,7 +509,7 @@ mod tests {
         let removed = index.remove_segment("test-topic", 0, &seg.segment_id).await.unwrap();
         assert!(removed);
 
-        let all_segs = index.get_all_segments("test-topic", 0).await.unwrap();
+        let all_segs = index.get_all_segments().await.unwrap();
         assert_eq!(all_segs.len(), 0);
     }
 

@@ -37,7 +37,7 @@ pub struct TopicConfig {
 impl Default for TopicConfig {
     fn default() -> Self {
         Self {
-            partition_count: 1,
+            partition_count: 3,  // Changed from 1 to 3 for proper consumer group distribution
             replication_factor: 1,
             retention_ms: Some(7 * 24 * 60 * 60 * 1000), // 7 days
             segment_bytes: 1024 * 1024 * 1024, // 1GB

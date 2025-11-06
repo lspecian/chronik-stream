@@ -576,10 +576,11 @@ impl ProtocolHandler {
         use crate::parser::Decoder;
         use crate::types::{OffsetCommitRequest, OffsetCommitTopic, OffsetCommitPartition};
 
-        let mut decoder = Decoder::new(body);
-
-        // v8+ uses flexible/compact format
+        // CRITICAL (Session 10 FINAL): Kafka spec says v8 is flexible ("flexibleVersions": "8+")
+        // Use flexible format (COMPACT strings/arrays + tagged fields) for v8+
         let flexible = header.api_version >= 8;
+
+        let mut decoder = Decoder::new(body);
 
         // Read group_id
         let group_id = if flexible {
@@ -597,8 +598,9 @@ impl ProtocolHandler {
             decoder.read_string()?
         }.ok_or_else(|| Error::Protocol("Member ID cannot be null".into()))?;
 
-        // v6+ has group_instance_id
-        let _group_instance_id = if header.api_version >= 6 {
+        // v7+ has group_instance_id (NOT v6!)
+        // From Kafka spec: "version 7 adds a new field called groupInstanceId"
+        let _group_instance_id = if header.api_version >= 7 {
             if flexible {
                 decoder.read_compact_string()?
             } else {
@@ -608,12 +610,11 @@ impl ProtocolHandler {
             None
         };
 
-        // V2-4 has retention_time field (v5 removed it, v7 added it back)
+        // Retention time field: ONLY v2-4 (v5+ removed it!)
+        // From Kafka spec line 29: "Version 5 removes the retention time"
+        // From Kafka spec line 54: "RetentionTimeMs", "versions": "2-4"
         if header.api_version >= 2 && header.api_version <= 4 {
-            let _retention_time = decoder.read_i64()?; // We ignore this for now
-        }
-        if header.api_version == 7 || header.api_version >= 8 {
-            let _retention_time = decoder.read_i64()?; // We ignore this for now
+            let _retention_time = decoder.read_i64()?;
         }
 
         // Read topics array
@@ -755,44 +756,58 @@ impl ProtocolHandler {
                     None // Null means fetch all topics
                 } else {
                     let actual_count = topic_count - 1;
-                    let mut topic_names = Vec::with_capacity(actual_count);
+                    let mut topics = Vec::with_capacity(actual_count);
                     for _ in 0..actual_count {
                         let topic_name = decoder.read_compact_string()?
                             .ok_or_else(|| Error::Protocol("Topic name cannot be null".into()))?;
 
-                        // Skip PartitionIndexes array
+                        // Read PartitionIndexes array
                         let partition_count = decoder.read_unsigned_varint()? as usize;
-                        if partition_count > 0 {
-                            for _ in 0..(partition_count - 1) {
-                                let _partition_index = decoder.read_i32()?;
+                        let partitions = if partition_count > 0 {
+                            let actual_partition_count = partition_count - 1;
+                            let mut partitions = Vec::with_capacity(actual_partition_count);
+                            for _ in 0..actual_partition_count {
+                                let partition_index = decoder.read_i32()?;
+                                partitions.push(partition_index);
                             }
-                        }
+                            partitions
+                        } else {
+                            Vec::new()
+                        };
 
                         // Tagged fields at topic level
                         let _tag_count = decoder.read_unsigned_varint()?;
 
-                        topic_names.push(topic_name);
+                        topics.push(crate::types::OffsetFetchRequestTopic {
+                            name: topic_name,
+                            partitions,
+                        });
                     }
-                    Some(topic_names)
+                    Some(topics)
                 }
             } else {
                 let topic_count = decoder.read_i32()?;
                 if topic_count < 0 {
                     None
                 } else {
-                    let mut topic_names = Vec::with_capacity(topic_count as usize);
+                    let mut topics = Vec::with_capacity(topic_count as usize);
                     for _ in 0..topic_count {
                         let topic_name = decoder.read_string()?
                             .ok_or_else(|| Error::Protocol("Topic name cannot be null".into()))?;
 
                         let partition_count = decoder.read_i32()? as usize;
+                        let mut partitions = Vec::with_capacity(partition_count);
                         for _ in 0..partition_count {
-                            let _partition_index = decoder.read_i32()?;
+                            let partition_index = decoder.read_i32()?;
+                            partitions.push(partition_index);
                         }
 
-                        topic_names.push(topic_name);
+                        topics.push(crate::types::OffsetFetchRequestTopic {
+                            name: topic_name,
+                            partitions,
+                        });
                     }
-                    Some(topic_names)
+                    Some(topics)
                 }
             };
 
@@ -851,6 +866,7 @@ impl ProtocolHandler {
             };
 
             // Read topics array (null means all topics)
+            // v0-v7 doesn't have partition-level granularity in the request
             let topics = if header.api_version >= 1 {
                 if flexible {
                     let topic_count = decoder.read_unsigned_varint()? as usize;
@@ -862,7 +878,11 @@ impl ProtocolHandler {
                         for _ in 0..actual_count {
                             let topic_name = decoder.read_compact_string()?
                                 .ok_or_else(|| Error::Protocol("Topic name cannot be null".into()))?;
-                            topics.push(topic_name);
+                            // v0-v7: No partitions in request, return empty vec (means all partitions)
+                            topics.push(crate::types::OffsetFetchRequestTopic {
+                                name: topic_name,
+                                partitions: Vec::new(),
+                            });
                         }
                         Some(topics)
                     }
@@ -875,7 +895,11 @@ impl ProtocolHandler {
                         for _ in 0..topic_count {
                             let topic_name = decoder.read_string()?
                                 .ok_or_else(|| Error::Protocol("Topic name cannot be null".into()))?;
-                            topics.push(topic_name);
+                            // v0-v7: No partitions in request, return empty vec (means all partitions)
+                            topics.push(crate::types::OffsetFetchRequestTopic {
+                                name: topic_name,
+                                partitions: Vec::new(),
+                            });
                         }
                         Some(topics)
                     }
@@ -949,8 +973,8 @@ impl ProtocolHandler {
         let start_len = buf.len();
         let mut encoder = Encoder::new(buf);
 
-        // v6+ uses flexible/compact format
-        let flexible = version >= 6;
+        // v9+ uses flexible/compact format (rdkafka with broker.version.fallback expects non-flexible v5-v8)
+        let flexible = version >= 9;
 
         tracing::debug!("JoinGroup v{} response encoding START: error={}, gen={}, protocol={:?}, leader={}, member_id={}, members={}",
             version, response.error_code, response.generation_id, response.protocol_name, response.leader, response.member_id, response.members.len());
@@ -971,7 +995,12 @@ impl ProtocolHandler {
 
         // Field 4: ProtocolType (v7+)
         if version >= 7 {
-            if flexible {
+            // v9+ flexible format requires non-nullable strings (convert None to empty string)
+            if version >= 9 && flexible {
+                let value = response.protocol_type.as_deref().unwrap_or("");
+                encoder.write_compact_string(Some(value));
+                tracing::debug!("  [4] ProtocolType (compact, non-null): {:?}", value);
+            } else if flexible {
                 encoder.write_compact_string(response.protocol_type.as_deref());
                 tracing::debug!("  [4] ProtocolType (compact): {:?}", response.protocol_type);
             } else {
@@ -981,7 +1010,12 @@ impl ProtocolHandler {
         }
 
         // Field 5: ProtocolName (v0+)
-        if flexible {
+        // v9+ flexible format requires non-nullable strings (convert None to empty string)
+        if version >= 9 && flexible {
+            let value = response.protocol_name.as_deref().unwrap_or("");
+            encoder.write_compact_string(Some(value));
+            tracing::debug!("  [5] ProtocolName (compact, non-null): {:?}", value);
+        } else if flexible {
             encoder.write_compact_string(response.protocol_name.as_deref());
             tracing::debug!("  [5] ProtocolName (compact): {:?}", response.protocol_name);
         } else {
@@ -1022,14 +1056,20 @@ impl ProtocolHandler {
             tracing::debug!("  [9] Members array: {} members", response.members.len());
         }
 
+        let before_members = encoder.position();
+        tracing::warn!("  Before encoding members: buf_len={}, version={}, flexible={}, member_count={}, member_id={}", before_members, version, flexible, response.members.len(), response.member_id);
+
         for (idx, member) in response.members.iter().enumerate() {
-            tracing::debug!("    Member[{}]: id={}, instance_id={:?}", idx, member.member_id, member.group_instance_id);
+            let member_start = encoder.position();
+            tracing::warn!("    Member[{}] START: buf_len={}, id={}, instance_id={:?}", idx, member_start, member.member_id, member.group_instance_id);
 
             if flexible {
                 encoder.write_compact_string(Some(&member.member_id));
             } else {
                 encoder.write_string(Some(&member.member_id));
             }
+            let after_member_id = encoder.position();
+            tracing::warn!("      After member_id: buf_len={}, bytes_written={}", after_member_id, after_member_id - member_start);
 
             if version >= 5 {
                 if flexible {
@@ -1037,6 +1077,8 @@ impl ProtocolHandler {
                 } else {
                     encoder.write_string(member.group_instance_id.as_deref());
                 }
+                let after_instance_id = encoder.position();
+                tracing::warn!("      After group_instance_id: buf_len={}, bytes_written={}", after_instance_id, after_instance_id - after_member_id);
             }
 
             if flexible {
@@ -1044,9 +1086,18 @@ impl ProtocolHandler {
                 // Tagged fields at member level
                 encoder.write_tagged_fields();
             } else {
+                tracing::warn!("      Member[{}] metadata: len={}, first_16_bytes={:02x?}",
+                    idx, member.metadata.len(), &member.metadata[..member.metadata.len().min(16)]);
                 encoder.write_bytes(Some(&member.metadata));
             }
+
+            let member_end = encoder.position();
+            let member_bytes = member_end - member_start;
+            tracing::warn!("    Member[{}] END: buf_len={}, total_member_bytes={}", idx, member_end, member_bytes);
         }
+
+        let after_members = encoder.position();
+        tracing::warn!("  After encoding members: buf_len={}, total_member_section_bytes={}", after_members, after_members - before_members);
 
         // Tagged fields at response level (flexible versions only)
         if flexible {
@@ -1121,19 +1172,28 @@ impl ProtocolHandler {
     
     /// Encode OffsetCommit response
     pub fn encode_offset_commit_response(&self, buf: &mut BytesMut, response: &crate::types::OffsetCommitResponse, version: i16) -> Result<()> {
-        let mut encoder = Encoder::new(buf);
-
-        // v8+ uses flexible/compact format
+        // CRITICAL (Session 10): Kafka spec says v8 is flexible ("flexibleVersions": "8+")
+        // Must match request parser threshold
         let flexible = version >= 8;
 
+        tracing::debug!("encode_offset_commit_response: version={}, throttle_time_ms={}, topics.len()={}, flexible={}",
+                       version, response.throttle_time_ms, response.topics.len(), flexible);
+
+        let start_len = buf.len();
+        tracing::trace!("encode_offset_commit_response: buf.len() before encoding = {}", start_len);
+        let mut encoder = Encoder::new(buf);
+
         if version >= 3 {
+            tracing::trace!("encode_offset_commit_response: writing ThrottleTimeMs={} as INT32", response.throttle_time_ms);
             encoder.write_i32(response.throttle_time_ms);
         }
 
         // Write topics array
         if flexible {
+            tracing::trace!("encode_offset_commit_response: writing topics array len={} as COMPACT_ARRAY", response.topics.len());
             encoder.write_compact_array_len(response.topics.len());
         } else {
+            tracing::trace!("encode_offset_commit_response: writing topics array len={} as INT32", response.topics.len());
             encoder.write_i32(response.topics.len() as i32);
         }
 
@@ -1170,8 +1230,13 @@ impl ProtocolHandler {
 
         // Tagged fields at response level
         if flexible {
+            tracing::trace!("encode_offset_commit_response: writing response-level tagged fields");
             encoder.write_tagged_fields();
         }
+
+        tracing::debug!("encode_offset_commit_response: DONE, input buf was {} bytes, now {} bytes (grew by {})",
+                       start_len, buf.len(), buf.len() - start_len);
+        tracing::trace!("encode_offset_commit_response: FINAL BYTES (first 64): {:02x?}", &buf[start_len..buf.len().min(start_len + 64)]);
 
         Ok(())
     }
@@ -1614,7 +1679,8 @@ impl ProtocolHandler {
                     // Empty records
                     tracing::trace!("        Records: empty (0 bytes)");
                     if flexible {
-                        encoder.write_unsigned_varint(0); // Null in compact encoding
+                        // CRITICAL FIX: Compact encoding - 1 = empty (0 bytes), NOT 0 (which is null)
+                        encoder.write_unsigned_varint(1); // Empty array (0 bytes)
                     } else {
                         encoder.write_i32(0); // Empty byte array
                     }
@@ -5611,15 +5677,15 @@ impl ProtocolHandler {
             protocols,
         };
         
-        tracing::info!(
-            "JoinGroup request for group '{}', member '{}', protocol '{}', session_timeout: {}ms, rebalance_timeout: {}ms",
-            request.group_id, request.member_id, request.protocol_type,
+        tracing::warn!(
+            "JoinGroup request parsed: group='{}', member='{}', protocol_type='{}', protocols_count={}, session_timeout={}ms, rebalance_timeout={}ms",
+            request.group_id, request.member_id, request.protocol_type, request.protocols.len(),
             request.session_timeout_ms, request.rebalance_timeout_ms
         );
 
         // Log protocol details
-        for protocol in &request.protocols {
-            tracing::debug!("  Protocol: {}, metadata_size: {}", protocol.name, protocol.metadata.len());
+        for (i, protocol) in request.protocols.iter().enumerate() {
+            tracing::warn!("  Protocol[{}]: name='{}', metadata_size={}", i, protocol.name, protocol.metadata.len());
         }
         
         // Update consumer group state
@@ -5681,6 +5747,11 @@ impl ProtocolHandler {
         // Select first protocol if available
         let selected_protocol = request.protocols.first().map(|p| p.name.clone());
         group.protocol = selected_protocol.clone();
+
+        tracing::warn!(
+            "JoinGroup protocol selection: request_protocols_count={}, selected_protocol={:?}",
+            request.protocols.len(), selected_protocol
+        );
         
         // Update state to Stable once we have a leader
         group.state = "Stable".to_string();
@@ -5745,7 +5816,13 @@ impl ProtocolHandler {
             error_code: error_codes::NONE,
             generation_id,
             protocol_type: if header.api_version >= 7 {
-                Some(request.protocol_type)
+                // Use request protocol_type, or default to "consumer" if empty
+                let ptype = if request.protocol_type.is_empty() {
+                    "consumer".to_string()
+                } else {
+                    request.protocol_type
+                };
+                Some(ptype)
             } else {
                 None
             },
@@ -6347,10 +6424,22 @@ impl ProtocolHandler {
         use crate::types::{OffsetCommitResponse, OffsetCommitResponseTopic, OffsetCommitResponsePartition};
         use chronik_common::metadata::ConsumerOffset;
 
+        tracing::error!("🔵 HANDLE_OFFSET_COMMIT CALLED - v{}, correlation_id={}", header.api_version, header.correlation_id);
+
         tracing::info!("Handling OffsetCommit request - version: {}", header.api_version);
 
         // Parse request
-        let request = self.parse_offset_commit_request(&header, body)?;
+        tracing::error!("🔵 About to parse OffsetCommit request...");
+        let request = match self.parse_offset_commit_request(&header, body) {
+            Ok(req) => {
+                tracing::error!("🟢 OffsetCommit parse SUCCESS!");
+                req
+            },
+            Err(e) => {
+                tracing::error!("🔴 OffsetCommit parse FAILED: {}", e);
+                return Err(e);
+            }
+        };
         tracing::info!("OffsetCommit for group: {}", request.group_id);
 
         // Store offsets - use both in-memory and WAL for now (transitional)
@@ -6430,8 +6519,22 @@ impl ProtocolHandler {
             topics: response_topics,
         };
 
+        tracing::error!("OFFSETCOMMIT_DEBUG: About to encode v{} response with {} topics",
+                       header.api_version, response.topics.len());
+        for (i, topic) in response.topics.iter().enumerate() {
+            tracing::error!("OFFSETCOMMIT_DEBUG:   Topic {}: name='{}', partitions={}",
+                           i, topic.name, topic.partitions.len());
+        }
+
         let mut body_buf = BytesMut::new();
+        let buf_len_before = body_buf.len();
         self.encode_offset_commit_response(&mut body_buf, &response, header.api_version)?;
+        let buf_len_after = body_buf.len();
+
+        tracing::error!("OFFSETCOMMIT_DEBUG: Encoded {} bytes (buf grew from {} to {})",
+                       buf_len_after - buf_len_before, buf_len_before, buf_len_after);
+        tracing::error!("OFFSETCOMMIT_DEBUG: Response bytes: {:02x?}",
+                       &body_buf[buf_len_before..buf_len_after.min(buf_len_before + 50)]);
 
         Ok(Self::make_response(&header, ApiKey::OffsetCommit, body_buf.freeze()))
     }
@@ -6745,10 +6848,14 @@ impl ProtocolHandler {
                 for partition_id in 0..topic_meta.config.partition_count {
                     // Get leader for this partition (queries the leader-flagged assignment)
                     let leader_id = match metadata_store.get_partition_leader(&topic_meta.name, partition_id).await {
-                        Ok(Some(leader)) => leader,
+                        Ok(Some(leader)) => {
+                            tracing::info!("PARTITION_LEADER: topic={} partition={} leader={}",
+                                         topic_meta.name, partition_id, leader);
+                            leader
+                        }
                         Ok(None) => {
-                            tracing::warn!("No leader found for partition {}/{}, using default broker",
-                                         topic_meta.name, partition_id);
+                            tracing::warn!("No leader found for partition {}/{}, using default broker {}",
+                                         topic_meta.name, partition_id, self.broker_id);
                             self.broker_id
                         }
                         Err(e) => {
@@ -6760,10 +6867,14 @@ impl ProtocolHandler {
 
                     // Get replicas for this partition
                     let replica_nodes = match metadata_store.get_partition_replicas(&topic_meta.name, partition_id).await {
-                        Ok(Some(replicas)) => replicas,
+                        Ok(Some(replicas)) => {
+                            tracing::info!("PARTITION_REPLICAS: topic={} partition={} replicas={:?}",
+                                         topic_meta.name, partition_id, replicas);
+                            replicas
+                        }
                         Ok(None) => {
-                            tracing::warn!("No replicas found for partition {}/{}, using leader as sole replica",
-                                         topic_meta.name, partition_id);
+                            tracing::warn!("No replicas found for partition {}/{}, using leader {} as sole replica",
+                                         topic_meta.name, partition_id, leader_id);
                             vec![leader_id]
                         }
                         Err(e) => {
@@ -6773,17 +6884,32 @@ impl ProtocolHandler {
                         }
                     };
 
-                    partitions.push(MetadataPartition {
+                    let partition_metadata = MetadataPartition {
                         error_code: 0,
                         partition_index: partition_id as i32,
                         leader_id,
                         leader_epoch: 0,
                         replica_nodes: replica_nodes.clone(),
-                        isr_nodes: replica_nodes, // For now, all replicas are in-sync
+                        isr_nodes: replica_nodes.clone(), // For now, all replicas are in-sync
                         offline_replicas: vec![],
-                    });
+                    };
+
+                    tracing::info!("METADATA_PARTITION_FINAL: topic={} partition={} error_code={} leader_id={} replicas={:?} isr={:?}",
+                                 topic_meta.name, partition_id, partition_metadata.error_code,
+                                 partition_metadata.leader_id, partition_metadata.replica_nodes,
+                                 partition_metadata.isr_nodes);
+
+                    partitions.push(partition_metadata);
                 }
-                
+
+                // PARTITION_DEBUG: Confirm final partition list
+                tracing::info!("PARTITION_DEBUG: METADATA_RESPONSE topic={} returning {} partitions",
+                              topic_meta.name, partitions.len());
+                for (idx, p) in partitions.iter().enumerate() {
+                    tracing::debug!("PARTITION_DEBUG:   partition={} leader={} replicas={:?}",
+                                  idx, p.leader_id, p.replica_nodes);
+                }
+
                 result.push(MetadataTopic {
                     error_code: 0,
                     name: topic_meta.name,

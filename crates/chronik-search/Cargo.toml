@@ -10,10 +10,11 @@ chronik-common = { path = "../chronik-common" }
 chronik-storage = { path = "../chronik-storage" }
 chronik-protocol = { path = "../chronik-protocol" }
 
-# Web framework
-axum = "0.7"
-tower = "0.4"
-tower-http = { version = "0.5", features = ["cors", "trace"] }
+# Web framework (use workspace axum 0.6.20)
+axum = { workspace = true }
+hyper = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
 
 # Search
 tantivy = { workspace = true }
@@ -55,7 +56,7 @@ reqwest = { version = "0.11", default-features = false, features = ["json", "rus
 reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
 tokio-test = "0.4"
 tempfile = "3.8"
-axum-test = "14.0"
+# axum-test = "14.0"  # Temporarily disabled - requires axum 0.7, we're on 0.6 for compatibility
 criterion = { workspace = true }
 
 [[bench]]

@@ -578,22 +578,29 @@ impl RequestHandler {
         let topic_partitions = if let Some(topics) = &request.topics {
             // Validate topic names
             let mut tp = Vec::new();
-            for topic in topics {
-                if topic.is_empty() {
+            for topic_request in topics {
+                if topic_request.name.is_empty() {
                     continue; // Skip invalid topic names
                 }
-                
-                // Query actual partition count from metadata
-                match self.produce_handler.get_metadata_store().get_topic(topic).await? {
-                    Some(topic_meta) => {
-                        for partition in 0..topic_meta.config.partition_count {
-                            tp.push((topic.clone(), partition));
-                        }
+
+                // If specific partitions requested, use those
+                if !topic_request.partitions.is_empty() {
+                    for partition_id in &topic_request.partitions {
+                        tp.push((topic_request.name.clone(), *partition_id as u32));
                     }
-                    None => {
-                        // Topic doesn't exist - add default partitions for error response
-                        for partition in 0..1 {
-                            tp.push((topic.clone(), partition));
+                } else {
+                    // No specific partitions - query all partitions from metadata
+                    match self.produce_handler.get_metadata_store().get_topic(&topic_request.name).await? {
+                        Some(topic_meta) => {
+                            for partition in 0..topic_meta.config.partition_count {
+                                tp.push((topic_request.name.clone(), partition));
+                            }
+                        }
+                        None => {
+                            // Topic doesn't exist - add default partitions for error response
+                            for partition in 0..1 {
+                                tp.push((topic_request.name.clone(), partition));
+                            }
                         }
                     }
                 }
@@ -622,8 +629,8 @@ impl RequestHandler {
         // Build response
         let response_topics = if let Some(requested_topics) = request.topics {
             // Return offsets for requested topics
-            requested_topics.into_iter().map(|topic| {
-                let partitions = if let Some(topic_offsets) = topics_map.get(&topic) {
+            requested_topics.into_iter().map(|topic_request| {
+                let partitions = if let Some(topic_offsets) = topics_map.get(&topic_request.name) {
                     topic_offsets.iter().map(|(partition, offset, metadata)| {
                         OffsetFetchResponsePartition {
                             partition_index: *partition,
@@ -643,7 +650,7 @@ impl RequestHandler {
                 };
                 
                 OffsetFetchResponseTopic {
-                    name: topic,
+                    name: topic_request.name,
                     partitions,
                 }
             }).collect()

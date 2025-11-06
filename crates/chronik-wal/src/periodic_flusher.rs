@@ -103,7 +103,7 @@ mod tests {
         config.data_dir = temp_dir.path().to_path_buf();
 
         let manager = WalManager::new(config).await.unwrap();
-        let manager_arc = Arc::new(RwLock::new(manager));
+        let manager_arc = Arc::new(manager);
 
         let flusher_config = PeriodicFlusherConfig {
             enabled: true,

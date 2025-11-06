@@ -65,9 +65,10 @@ impl QueryApi {
         let app = self.build_router();
         
         tracing::info!("Starting Query API on {}", listen_addr);
-        
-        let listener = tokio::net::TcpListener::bind(&listen_addr).await?;
-        axum::serve(listener, app).await
+
+        axum::Server::bind(&listen_addr)
+            .serve(app.into_make_service())
+            .await
             .map_err(|e| chronik_common::Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
         
         Ok(())

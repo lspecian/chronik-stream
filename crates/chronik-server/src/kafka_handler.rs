@@ -15,7 +15,7 @@ use crate::fetch_handler::FetchHandler;
 use crate::wal_integration::WalProduceHandler;
 use bytes::{Bytes, BytesMut, BufMut, Buf};
 use tokio::sync::RwLock;
-use tracing::{debug, instrument};
+use tracing::{debug, error, instrument};
 
 /// Kafka protocol handler with ingest-specific extensions
 pub struct KafkaProtocolHandler {
@@ -340,12 +340,23 @@ impl KafkaProtocolHandler {
 
                     for _ in 0..partitions_count {
                         let partition_index = decoder.read_i32()?;
-                        let current_leader_epoch = if header.api_version >= 4 {
-                            decoder.read_i32()?
+
+                        // v0 format is different from v1+
+                        let (current_leader_epoch, timestamp) = if header.api_version == 0 {
+                            // v0 format: Partition + Timestamp + MaxNumberOfOffsets
+                            let timestamp = decoder.read_i64()?;
+                            let _max_offsets = decoder.read_i32()?; // Skip max_offsets (not used)
+                            (-1, timestamp)
                         } else {
-                            -1
+                            // v1+ format: Partition + [CurrentLeaderEpoch (v4+)] + Timestamp
+                            let current_leader_epoch = if header.api_version >= 4 {
+                                decoder.read_i32()?
+                            } else {
+                                -1
+                            };
+                            let timestamp = decoder.read_i64()?;
+                            (current_leader_epoch, timestamp)
                         };
-                        let timestamp = decoder.read_i64()?;
 
                         // Skip tagged fields for each partition in flexible versions
                         if is_flexible {
@@ -528,20 +539,28 @@ impl KafkaProtocolHandler {
                 debug!("Processing JoinGroup request");
                 // Parse the join group request
                 let request = self.protocol_handler.parse_join_group_request(&header, &mut buf)?;
-                
-                // Handle the join group request
-                let response = self.group_manager.handle_join_group(request).await?;
-                
+
+                // Handle the join group request, passing the client_id from the request header
+                // This ensures each consumer gets a unique member_id based on its actual client_id
+                // Note: handle_join_group already returns chronik_protocol::join_group_types::JoinGroupResponse
+                let response = self.group_manager.handle_join_group(request, header.client_id.clone(), header.api_version).await?;
+
                 // Encode the response
                 let mut body_buf = BytesMut::new();
                 self.protocol_handler.encode_join_group_response(&mut body_buf, &response, header.api_version)?;
-                
+
+                let is_flexible = header.api_version >= 9;
+                tracing::warn!(
+                    "JoinGroup v{} response: is_flexible={}, body_len={}, correlation_id={}",
+                    header.api_version, is_flexible, body_buf.len(), header.correlation_id
+                );
+
                 Ok(Response {
                     header: ResponseHeader {
                         correlation_id: header.correlation_id,
                     },
                     body: body_buf.freeze(),
-                    is_flexible: header.api_version >= 6, // JoinGroup uses flexible from v6+
+                    is_flexible, // JoinGroup v9+ flexible (rdkafka compatibility)
                     api_key: ApiKey::JoinGroup,
                     throttle_time_ms: None,
                 })
@@ -613,23 +632,23 @@ impl KafkaProtocolHandler {
                 })
             }
             ApiKey::OffsetCommit => {
-                debug!("Processing OffsetCommit request");
+                debug!("Processing OffsetCommit v{} request", header.api_version);
                 // Parse the offset commit request
                 let request = self.protocol_handler.parse_offset_commit_request(&header, &mut buf)?;
-                
+
                 // Handle the offset commit request
                 let response = self.group_manager.handle_offset_commit(request).await?;
-                
+
                 // Encode the response
                 let mut body_buf = BytesMut::new();
                 self.protocol_handler.encode_offset_commit_response(&mut body_buf, &response, header.api_version)?;
-                
+
                 Ok(Response {
                     header: ResponseHeader {
                         correlation_id: header.correlation_id,
                     },
                     body: body_buf.freeze(),
-                    is_flexible: header.api_version >= 8, // OffsetCommit uses flexible from v8+
+                    is_flexible: header.api_version >= 8, // CRITICAL: Kafka spec "flexibleVersions": "8+"
                     api_key: ApiKey::OffsetCommit,
                     throttle_time_ms: None,
                 })
@@ -673,7 +692,7 @@ impl KafkaProtocolHandler {
                 let mut body_buf = BytesMut::new();
                 self.protocol_handler.encode_find_coordinator_response(&mut body_buf, &response, header.api_version)?;
                 tracing::debug!("FindCoordinator response encoded: {} bytes: {:?}", body_buf.len(), &body_buf[..std::cmp::min(body_buf.len(), 64)]);
-                
+
                 Ok(Response {
                     header: ResponseHeader {
                         correlation_id: header.correlation_id,
@@ -683,6 +702,65 @@ impl KafkaProtocolHandler {
                     api_key: ApiKey::FindCoordinator,
                     throttle_time_ms: None,
                 })
+            }
+            ApiKey::CreateTopics => {
+                tracing::info!("Processing CreateTopics v{} request", header.api_version);
+
+                // First, let protocol handler create the topics in metadata store
+                let response = self.protocol_handler.handle_request(request_bytes.clone()).await?;
+
+                // Phase 3: Initialize Raft partition metadata for created topics
+                // Parse the request to extract topic names and partition counts
+                use chronik_protocol::create_topics_types::CreateTopicsRequest;
+                use chronik_protocol::parser::Decoder;
+
+                let mut decoder = Decoder::new(&mut buf);
+                let use_compact = header.api_version >= 5;
+
+                // Parse topic count
+                let topic_count = if use_compact {
+                    let compact_len = decoder.read_unsigned_varint()?;
+                    if compact_len > 0 { (compact_len - 1) as usize } else { 0 }
+                } else {
+                    let len = decoder.read_i32()?;
+                    if len >= 0 { len as usize } else { 0 }
+                };
+
+                // Parse each topic and initialize Raft partition metadata
+                for _ in 0..topic_count {
+                    // Topic name
+                    let topic_name = if use_compact {
+                        decoder.read_compact_string()?.unwrap_or_default()
+                    } else {
+                        decoder.read_string()?.unwrap_or_default()
+                    };
+
+                    // Number of partitions
+                    let num_partitions = decoder.read_i32()?;
+
+                    if num_partitions > 0 {
+                        // Initialize Raft partition metadata asynchronously
+                        // This proposes AssignPartition, SetPartitionLeader, and UpdateISR commands
+                        if let Err(e) = self.produce_handler.initialize_raft_partitions(
+                            &topic_name,
+                            num_partitions as u32
+                        ).await {
+                            tracing::warn!("Failed to initialize Raft partition metadata for '{}': {:?}",
+                                         topic_name, e);
+                            // Continue anyway - topic is already created in metadata store
+                        } else {
+                            tracing::info!("✓ Phase 3: Initialized Raft partition metadata for topic '{}' ({} partitions)",
+                                         topic_name, num_partitions);
+                        }
+                    }
+
+                    // Skip remaining fields (we only need topic name and partition count)
+                    // This is a simplified parse - full parsing is done by protocol handler
+                    // We just need to extract the topic names to initialize Raft metadata
+                    break; // For now, handle first topic only (can extend later)
+                }
+
+                Ok(response)
             }
             _ => {
                 // For all other API calls, delegate to the protocol handler

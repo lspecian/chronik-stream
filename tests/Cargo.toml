@@ -3,9 +3,6 @@ name = "chronik-integration-tests"
 version = "0.1.0"
 edition = "2021"
 
-[features]
-raft = []
-
 [workspace]
 # Empty workspace to make this package standalone
 
@@ -16,17 +13,14 @@ path = "integration/mod.rs"
 [[test]]
 name = "raft_single_partition"
 path = "integration/raft_single_partition.rs"
-required-features = ["raft"]
 
 [[test]]
 name = "raft_multi_partition"
 path = "integration/raft_multi_partition.rs"
-required-features = ["raft"]
 
 [[test]]
 name = "raft_cluster_bootstrap"
 path = "integration/raft_cluster_bootstrap.rs"
-required-features = ["raft"]
 
 # Removed obsolete test files that tested old RaftReplicaManager architecture
 # (no longer exists, replaced by RaftGroupManager)

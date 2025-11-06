@@ -10,6 +10,7 @@
 
 use crate::storage::{StorageConfig, StorageService};
 use crate::fetch_handler::FetchHandler;
+use crate::raft_cluster::RaftCluster;  // NEW: v2.5.0 Phase 3
 use chronik_common::{Result, Error};
 use chronik_monitoring::MetricsRecorder;
 use chronik_protocol::{
@@ -38,6 +39,9 @@ use tokio::sync::{RwLock, Mutex, mpsc, Semaphore};
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn, trace, instrument};
 use bytes::Bytes;
+
+/// Re-export WalReplicationManager from wal_replication module (v2.2.0 Phase 3.1)
+pub use crate::wal_replication::WalReplicationManager;
 
 /// Maximum segment size before rotation (256MB)
 const MAX_SEGMENT_SIZE: u64 = 256 * 1024 * 1024;
@@ -324,11 +328,20 @@ pub struct ProduceHandler {
     /// WAL manager for inline durability writes (v1.3.47+)
     /// Uses Arc<WalManager> directly - no RwLock needed since WalManager uses DashMap internally
     wal_manager: Option<Arc<WalManager>>,
-    /// Raft replica manager for multi-partition replication (optional, for Raft-enabled partitions)
-    /// If Some, produce requests will use Raft consensus for those partitions
-    /// If None, all produce requests use existing direct-write path (backward compatible)
-    #[cfg(feature = "raft")]
-    raft_manager: Option<Arc<crate::raft_integration::RaftReplicaManager>>,
+    /// Raft cluster for metadata coordination (v2.5.0 Phase 3)
+    /// CRITICAL: Option<Arc<>> NOT Arc<RwLock<>> to avoid hot path locks!
+    /// Used to query partition replicas and ISR for replication decisions
+    raft_cluster: Option<Arc<RaftCluster>>,
+    /// WAL replication manager for PostgreSQL-style streaming (v2.2.0+)
+    /// CRITICAL: Option<Arc<>> NOT Arc<RwLock<>> to avoid hot path locks!
+    /// Fire-and-forget async replication, never blocks produce path
+    wal_replication_manager: Option<Arc<WalReplicationManager>>,
+    /// ISR ACK tracker for acks=-1 quorum support (v2.5.0 Phase 4)
+    /// Tracks pending acks=-1 requests and notifies when ISR quorum reached
+    isr_ack_tracker: Option<Arc<crate::isr_ack_tracker::IsrAckTracker>>,
+    /// Leader elector for partition leader failover (v2.5.0 Phase 5)
+    /// Used to record heartbeats when handling produce requests as leader
+    leader_elector: Option<Arc<crate::leader_election::LeaderElector>>,
 }
 
 /// Replication request for ISR management
@@ -647,8 +660,10 @@ impl ProduceHandler {
             fetch_handler: None,
             topic_creation_cache: Arc::new(RwLock::new(HashMap::new())),
             wal_manager: None,
-            #[cfg(feature = "raft")]
-            raft_manager: None,
+            raft_cluster: None,  // v2.5.0 Phase 3: Initialize as None (set via set_raft_cluster)
+            wal_replication_manager: None,  // v2.2.0 Phase 1: Initialize as None
+            isr_ack_tracker: None,  // v2.5.0 Phase 4: Initialize as None (set via set_isr_ack_tracker)
+            leader_elector: None,  // v2.5.0 Phase 5: Initialize as None (set via set_leader_elector)
         })
     }
 
@@ -683,13 +698,30 @@ impl ProduceHandler {
         self.fetch_handler = Some(fetch_handler);
     }
 
-    /// Set the Raft replica manager for Raft-enabled partitions (optional)
-    #[cfg(feature = "raft")]
-    pub fn set_raft_manager(&mut self, raft_manager: Arc<crate::raft_integration::RaftReplicaManager>) {
-        info!("Setting RaftReplicaManager for ProduceHandler");
-        self.raft_manager = Some(raft_manager);
+    /// Set the Raft cluster for metadata coordination (v2.5.0 Phase 3)
+    pub fn set_raft_cluster(&mut self, raft_cluster: Arc<RaftCluster>) {
+        info!("Setting RaftCluster for ProduceHandler - enables partition replication routing");
+        self.raft_cluster = Some(raft_cluster);
     }
-    
+
+    /// Set the WAL replication manager for PostgreSQL-style streaming (v2.2.0+)
+    pub fn set_wal_replication_manager(&mut self, replication_manager: Arc<WalReplicationManager>) {
+        info!("Setting WalReplicationManager for ProduceHandler");
+        self.wal_replication_manager = Some(replication_manager);
+    }
+
+    /// Set the ISR ACK tracker for acks=-1 quorum support (v2.5.0 Phase 4)
+    pub fn set_isr_ack_tracker(&mut self, tracker: Arc<crate::isr_ack_tracker::IsrAckTracker>) {
+        info!("Setting IsrAckTracker for ProduceHandler - enables acks=-1 quorum");
+        self.isr_ack_tracker = Some(tracker);
+    }
+
+    /// Set the leader elector for partition leader failover (v2.5.0 Phase 5)
+    pub fn set_leader_elector(&mut self, elector: Arc<crate::leader_election::LeaderElector>) {
+        info!("Setting LeaderElector for ProduceHandler - enables heartbeat tracking");
+        self.leader_elector = Some(elector);
+    }
+
     /// Create a new produce handler with fetch handler connected
     pub async fn new_with_fetch_handler(
         config: ProduceHandlerConfig,
@@ -790,7 +822,17 @@ impl ProduceHandler {
         let topic_names: Vec<(String, Vec<i32>)> = request.topics.iter()
             .map(|t| (t.name.clone(), t.partitions.iter().map(|p| p.index).collect()))
             .collect();
-        
+
+        // PARTITION_DEBUG: Log which partitions client is requesting
+        for topic in &request.topics {
+            info!("PARTITION_DEBUG: PRODUCE topic={} partition_count={}",
+                topic.name, topic.partitions.len());
+            for partition_data in &topic.partitions {
+                info!("PARTITION_DEBUG:   partition={} records_bytes={}",
+                    partition_data.index, partition_data.records.len());
+            }
+        }
+
         // Handle request with timeout
         let result = timeout(
             Duration::from_millis(timeout_ms.max(self.config.request_timeout_ms)),
@@ -947,37 +989,36 @@ impl ProduceHandler {
                     continue;
                 }
                 
-                // Check leadership: Raft takes precedence over metadata store
-                #[cfg(feature = "raft")]
+                // Check leadership: RaftCluster takes precedence over metadata store
+                // v2.5.0 Phase 2: Use RaftCluster for partition leadership checks
                 let (is_leader, leader_hint) = {
-                    if let Some(ref raft_manager) = self.raft_manager {
-                        // Check if this partition is managed by Raft
-                        if raft_manager.has_replica(&topic_data.name, partition_data.index) {
-                            let is_raft_leader = raft_manager.is_leader(&topic_data.name, partition_data.index);
-                            let leader_id = raft_manager.get_leader(&topic_data.name, partition_data.index);
+                    if let Some(ref raft_cluster) = self.raft_cluster {
+                        // Get partition leader from Raft metadata state machine
+                        let leader_id = raft_cluster.get_partition_leader(&topic_data.name, partition_data.index);
+
+                        if let Some(leader) = leader_id {
+                            // Partition is managed by Raft
+                            let is_raft_leader = leader == raft_cluster.node_id();
 
                             debug!(
-                                "Raft leadership check for {}-{}: is_leader={}, leader_id={:?}",
-                                topic_data.name, partition_data.index, is_raft_leader, leader_id
+                                "Raft leadership check for {}-{}: node_id={}, leader={}, is_leader={}",
+                                topic_data.name, partition_data.index, raft_cluster.node_id(), leader, is_raft_leader
                             );
 
-                            (is_raft_leader, leader_id)
+                            (is_raft_leader, Some(leader))
                         } else {
-                            // Partition not managed by Raft, fall back to metadata store
+                            // Partition not yet assigned in Raft, fall back to metadata store
                             debug!(
-                                "Partition {}-{} not managed by Raft, using metadata store for leadership",
+                                "Partition {}-{} not assigned in Raft, using metadata store for leadership",
                                 topic_data.name, partition_data.index
                             );
                             self.check_metadata_leadership(&topic_data.name, partition_data.index).await?
                         }
                     } else {
-                        // No Raft manager, use metadata store
+                        // No Raft cluster, use metadata store (standalone mode)
                         self.check_metadata_leadership(&topic_data.name, partition_data.index).await?
                     }
                 };
-
-                #[cfg(not(feature = "raft"))]
-                let (is_leader, leader_hint) = self.check_metadata_leadership(&topic_data.name, partition_data.index).await?;
 
                 if !is_leader {
                     debug!(
@@ -1197,144 +1238,65 @@ impl ProduceHandler {
             topic, partition, base_offset, records.len(), total_bytes
         );
 
-        // PHASE 3: Raft-based Produce Path
-        // Check if this partition is Raft-enabled FIRST, before writing to WAL directly
-        #[cfg(feature = "raft")]
-        {
-            if let Some(ref raft_manager) = self.raft_manager {
-                if raft_manager.has_replica(topic, partition) {
-                    // LEADER CHECK: Only the leader can accept produce requests
-                    if !raft_manager.is_leader(topic, partition) {
-                        // This node is not the leader - return error with leader info
-                        let leader_id = raft_manager.get_leader(topic, partition);
-                        warn!(
-                            "NOT_LEADER: {}-{} leader_id={:?}, this node cannot accept produce requests",
-                            topic, partition, leader_id
-                        );
-
-                        // Drop memory permit before returning error
-                        drop(memory_permit);
-
-                        // Return LEADER_NOT_AVAILABLE error (Kafka standard for non-leader)
-                        return Ok(ProduceResponsePartition {
-                            index: partition,
-                            error_code: chronik_protocol::error_codes::LEADER_NOT_AVAILABLE,
-                            base_offset: -1,
-                            log_append_time: -1,
-                            log_start_offset: -1,
-                        });
-                    }
-
-                    info!("Raft-enabled partition {}-{}: Proposing write to Raft consensus (leader)", topic, partition);
-
-                    // Serialize the canonical record for Raft proposal
-                    use chronik_storage::canonical_record::CanonicalRecord;
-                    match CanonicalRecord::from_kafka_batch(&re_encoded_bytes) {
-                        Ok(mut canonical_record) => {
-                            // Preserve original wire bytes for CRC validation
-                            canonical_record.compressed_records_wire_bytes = Some(re_encoded_bytes.to_vec());
-
-                            match bincode::serialize(&canonical_record) {
-                                Ok(serialized) => {
-                                    // CRITICAL (v2.0.0 Phase 3): Log before proposing to Raft
-                                    info!(
-                                        "PRODUCE: Proposing {} bytes to Raft for {}-{}, base_offset={}, num_records={}",
-                                        serialized.len(), topic, partition, canonical_record.base_offset, canonical_record.records.len()
-                                    );
-
-                                    if serialized.is_empty() {
-                                        error!("PRODUCE: ❌ EMPTY serialized bytes before propose! This is a BUG in {}-{}", topic, partition);
-                                    }
-
-                                    // Propose to Raft (will block until committed by quorum)
-                                    // The state machine will handle WAL writes and storage
-                                    match raft_manager.propose(topic, partition, serialized.clone()).await {
-                                        Ok(raft_index) => {
-                                            info!("Raft✓ {}-{}: Committed at index={}, offsets={}-{}",
-                                                topic, partition, raft_index, base_offset, last_offset);
-
-                                            // Update metrics
-                                            self.metrics.records_produced.fetch_add(records.len() as u64, Ordering::Relaxed);
-                                            self.metrics.bytes_produced.fetch_add(total_bytes, Ordering::Relaxed);
-
-                                            // Update high watermark after successful Raft commit
-                                            partition_state.high_watermark.store((last_offset + 1) as u64, Ordering::SeqCst);
-
-                                            // Send to indexing pipeline if enabled
-                                            if self.config.enable_indexing {
-                                                self.send_to_indexer(topic, partition, &records).await;
-                                            }
-
-                                            // Update producer sequence for idempotence
-                                            if kafka_batch.header.producer_id >= 0 {
-                                                self.update_producer_sequence(
-                                                    kafka_batch.header.producer_id,
-                                                    topic,
-                                                    partition,
-                                                    kafka_batch.header.base_sequence + records.len() as i32 - 1,
-                                                ).await;
-                                            }
-
-                                            // Drop memory permit
-                                            drop(memory_permit);
-
-                                            // Get partition state for response
-                                            let log_start_offset = partition_state.log_start_offset.load(Ordering::Relaxed) as i64;
-
-                                            // Return success immediately - Raft has replicated the data
-                                            return Ok(ProduceResponsePartition {
-                                                index: partition,
-                                                error_code: ErrorCode::None.code(),
-                                                base_offset: base_offset as i64,
-                                                log_append_time: if (kafka_batch.header.attributes >> 3) & 0b111 == TimestampType::LogAppendTime as u16 {
-                                                    kafka_batch.header.max_timestamp
-                                                } else {
-                                                    -1
-                                                },
-                                                log_start_offset,
-                                            });
-                                        }
-                                        Err(e) => {
-                                            error!("Raft proposal failed for {}-{}: {}", topic, partition, e);
-                                            return Err(Error::Internal(format!("Raft consensus failed: {}", e)));
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    error!("Failed to serialize for Raft {}-{}: {}", topic, partition, e);
-                                    return Err(Error::Internal(format!("Raft serialization failed: {}", e)));
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            error!("Failed to parse batch for Raft {}-{}: {}", topic, partition, e);
-                            return Err(Error::Protocol(format!("Invalid batch for Raft: {}", e)));
-                        }
-                    }
-                }
-            }
-        }
-
-        // NON-RAFT PATH: Direct WAL write for partitions not managed by Raft
-        // This is the fallback for standalone mode or non-Raft partitions
-        warn!("DEBUG_TRACE: Using non-Raft path for {}-{}", topic, partition);
+        // REMOVED: Old Raft data replication code (was behind #[cfg(feature = "raft")])
+        // REASON: Raft should ONLY handle metadata (leader election, ISR tracking, assignments)
+        // MESSAGE DATA replication is handled by WAL streaming (wal_replication.rs)
+        // See docs/HYBRID_CLUSTERING_ARCHITECTURE.md for design rationale
+        //
+        // Performance: Raft data replication = 2-5K msg/s, WAL streaming = 60K+ msg/s
+        //
+        // The hybrid design:
+        // - Raft: Metadata coordination (data/wal/__meta/)
+        // - WAL Streaming: Message data (data/wal/{topic}/{partition}/)
 
         // CRITICAL (v1.3.47+): Write to WAL BEFORE updating high watermark
         // This ensures durability guarantee - data is persisted before acknowledgment
+        // v2.2.0: Parse and serialize ONCE, reuse for both local WAL and replication
         if self.wal_manager.is_none() {
             warn!("WAL manager is None - WAL writes DISABLED! Data will NOT be durable!");
         }
+
+        // v2.2.0: Store serialized WAL data for replication (zero-copy optimization)
+        let serialized_for_replication: Option<Vec<u8>>;
+
         if let Some(ref wal_mgr) = self.wal_manager {
             use chronik_storage::canonical_record::CanonicalRecord;
 
-            // Convert to CanonicalRecord and serialize
+            // PERFORMANCE OPTIMIZATION (v2.5.0): Skip wire bytes preservation if no replication
+            // This avoids an expensive .to_vec() clone when replication is disabled
+            let needs_replication = self.wal_replication_manager.is_some();
+
+            // Convert to CanonicalRecord and serialize (ONCE - reused for replication)
+            // from_kafka_batch() now automatically preserves compressed_records_wire_bytes
+            // for BOTH compressed and uncompressed batches (v2.5.1 fix)
             match CanonicalRecord::from_kafka_batch(&re_encoded_bytes) {
                 Ok(mut canonical_record) => {
-                    // Preserve original wire bytes for byte-perfect CRC
-                    canonical_record.compressed_records_wire_bytes = Some(re_encoded_bytes.to_vec());
+                    // CRITICAL FIX (Session 24): For v1 MessageSets, recalculate record offsets
+                    // because only the first message's offset was updated in wire bytes (line 1157),
+                    // leaving subsequent messages with incorrect offsets.
+                    if canonical_record.original_v1_wire_format.is_some() {
+                        warn!("SESSION24_FIX: v1 MessageSet detected, recalculating record offsets from base_offset={}",
+                              canonical_record.base_offset);
+                        canonical_record.recalculate_record_offsets();
+                    }
+
+                    // DEBUG: Check if compressed_records_wire_bytes is populated before serialization
+                    warn!("PRODUCE→DEBUG: compressed_records_wire_bytes is_some={}, len={}, compression={:?}",
+                          canonical_record.compressed_records_wire_bytes.is_some(),
+                          canonical_record.compressed_records_wire_bytes.as_ref().map(|b| b.len()).unwrap_or(0),
+                          canonical_record.compression);
 
                     match bincode::serialize(&canonical_record) {
                         Ok(serialized) => {
+                            // v2.5.0: ALWAYS populate serialized_for_replication when wal_replication_manager exists
+                            // The wire bytes optimization (line 1375-1377) only affects CRC preservation, not replication!
+                            // BUG FIX: Previously set to None when !needs_replication, breaking replication entirely
+                            serialized_for_replication = if needs_replication {
+                                Some(serialized.clone())
+                            } else {
+                                None  // No replication manager = no data to replicate
+                            };
+
                             // v1.3.52+: Group commit with acks parameter
                             // - acks=0: Fire-and-forget (buffered, ~50ms flush window)
                             // - acks=1/−1: Immediate fsync (zero data loss guarantee)
@@ -1365,6 +1327,40 @@ impl ProduceHandler {
                     error!("WAL PARSE FAILED: topic={} partition={} error={}", topic, partition, e);
                     return Err(Error::Protocol(format!("Invalid Kafka batch: {}", e)));
                 }
+            }
+        } else {
+            serialized_for_replication = None;
+        }
+
+        // v2.5.0 Phase 3: WAL Replication Hook with ISR-aware routing
+        // Zero-copy optimization: Reuse serialized WAL data from above (no re-parsing!)
+        // This is called AFTER WAL write completes, so data is durable locally
+        if let Some(ref wal_repl_mgr) = self.wal_replication_manager {
+            if let Some(serialized_data) = serialized_for_replication {
+                // Clone necessary metadata (cheap - just strings and ints)
+                let topic_clone = topic.to_string();
+                let partition_clone = partition;
+                let base_offset_clone = base_offset as i64;
+                let repl_mgr_clone = Arc::clone(wal_repl_mgr);
+
+                // Get current high watermark for ISR filtering
+                let high_watermark = partition_state.high_watermark.load(Ordering::SeqCst) as i64;
+
+                // Spawn background task (fire-and-forget, never blocks)
+                // v2.5.0: Use replicate_partition for ISR-aware routing
+                tokio::spawn(async move {
+                    repl_mgr_clone.replicate_partition(
+                        topic_clone,
+                        partition_clone,
+                        base_offset_clone,
+                        high_watermark,  // For ISR filtering
+                        serialized_data,
+                    ).await;
+                    // Errors are logged inside replicate_partition, we don't block produce
+                });
+            } else {
+                // WAL manager was None, nothing to replicate
+                warn!("Skipping replication for {}-{}: no WAL data serialized", topic, partition);
             }
         }
 
@@ -1431,42 +1427,69 @@ impl ProduceHandler {
                 partition_state.high_watermark.store((last_offset + 1) as u64, Ordering::SeqCst);
             }
             -1 => {
-                // Wait for replication to all ISR - this requires immediate flush
+                // v2.5.0 Phase 4: acks=-1 with IsrAckTracker
+                // Wait for replication to ISR quorum (leader + majority of followers)
                 self.flush_partition_if_needed(topic, partition, &partition_state).await?;
-                
-                if let Some(ref sender) = self.replication_sender {
-                    let (resp_tx, mut resp_rx) = mpsc::channel(1);
-                    
-                    let replication_req = ReplicationRequest {
-                        topic: topic.to_string(),
+
+                if let Some(ref tracker) = self.isr_ack_tracker {
+                    // Register this produce request for ISR quorum tracking
+                    // TODO: Get actual ISR size from RaftCluster or configuration
+                    // For now, assume quorum = 2 (leader + 1 follower for 3-node cluster)
+                    let quorum_size = 2;
+
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    // CRITICAL FIX: Register for base_offset (not last_offset)
+                    // Followers ACK base_offset of the batch, so we must wait for that offset
+                    tracker.register_wait(
+                        topic.to_string(),
                         partition,
-                        offset: last_offset,
-                        data: Bytes::copy_from_slice(&re_encoded_bytes),
-                        acks_required: -1,
-                        response_sender: resp_tx,
-                    };
-                    
-                    // Send replication request
-                    sender.send(replication_req).await
-                        .map_err(|_| Error::Internal("Replication channel closed".into()))?;
-                    
-                    // Wait for replication confirmation
-                    match timeout(REPLICATION_TIMEOUT, resp_rx.recv()).await {
-                        Ok(Some(Ok(()))) => {
-                            debug!("Acks=-1: Replication to all ISR completed");
-                            
-                            // Update high watermark
+                        base_offset as i64,
+                        quorum_size,
+                        tx,
+                    );
+
+                    debug!(
+                        "acks=-1: Registered {}-{} offset {} for ISR quorum tracking (quorum={})",
+                        topic, partition, base_offset, quorum_size
+                    );
+
+                    // Wait for ISR quorum with configured timeout (default: 30s)
+                    match timeout(REPLICATION_TIMEOUT, rx).await {
+                        Ok(Ok(Ok(()))) => {
+                            debug!(
+                                "acks=-1: ISR quorum reached for {}-{} offset {}",
+                                topic, partition, last_offset
+                            );
+
+                            // Update high watermark after quorum reached
                             partition_state.high_watermark.store((last_offset + 1) as u64, Ordering::SeqCst);
                         }
-                        Ok(Some(Err(e))) => {
-                            return Err(Error::Internal(format!("Replication failed: {}", e)));
+                        Ok(Ok(Err(e))) => {
+                            error!(
+                                "acks=-1: ISR quorum failed for {}-{} offset {}: {}",
+                                topic, partition, last_offset, e
+                            );
+                            return Err(Error::Internal(format!("ISR quorum failed: {}", e)));
                         }
-                        _ => {
-                            return Err(Error::Internal("Replication timeout".into()));
+                        Ok(Err(_)) => {
+                            error!(
+                                "acks=-1: ISR quorum channel closed for {}-{} offset {}",
+                                topic, partition, last_offset
+                            );
+                            return Err(Error::Internal("ISR quorum channel closed".into()));
+                        }
+                        Err(_) => {
+                            error!(
+                                "acks=-1: ISR quorum timeout for {}-{} offset {} after {:?}",
+                                topic, partition, last_offset, REPLICATION_TIMEOUT
+                            );
+                            return Err(Error::Internal("ISR quorum timeout".into()));
                         }
                     }
                 } else {
-                    // No replication configured, just update high watermark
+                    // No ISR tracker configured (standalone mode or no replication)
+                    // Just update high watermark immediately
+                    debug!("acks=-1: No ISR tracker, updating high watermark immediately (standalone mode)");
                     partition_state.high_watermark.store((last_offset + 1) as u64, Ordering::SeqCst);
                 }
             }
@@ -1511,16 +1534,35 @@ impl ProduceHandler {
                 tracing::info!("PRODUCE→BUFFER: Successfully stored raw batch for {}-{}", topic, partition);
             }
         }
-        
-        // Flush immediately to ensure data is available for fetch
-        // Note: We don't force rotation here - let the background task handle rotation
-        // based on time/size thresholds to avoid infinite rotation loops
-        if let Err(e) = self.flush_partition_if_needed(topic, partition, &partition_state).await {
-            warn!("Failed to flush partition {}-{}: {:?}", topic, partition, e);
-        }
-        
+
+        // PERFORMANCE FIX (v2.5.0): Remove duplicate flush call
+        // flush_partition_if_needed is already called at line 1514 for acks=-1
+        // For acks=0 and acks=1, flush is NOT needed immediately (background flush handles it)
+        // This duplicate call was causing unnecessary mutex contention and overhead
+        //
+        // Background flush strategy:
+        // - acks=0: Fire-and-forget, background flush after linger_ms
+        // - acks=1: Data already in WAL (durable), background flush makes it visible
+        // - acks=-1: Already flushed at line 1514 before ISR quorum wait
+        //
+        // REMOVED: self.flush_partition_if_needed(topic, partition, &partition_state).await
+
+        // v2.2.0: WAL replication hook already called earlier (after WAL write, before buffering)
+        // No need to duplicate the call here
+
         // Get partition state for response
         let log_start_offset = partition_state.log_start_offset.load(Ordering::Relaxed) as i64;
+
+        // v2.5.0 Phase 5: Record heartbeat for leader election monitoring
+        // This tells the LeaderElector that this node is actively handling produce requests
+        // for this partition (acting as leader). Prevents unnecessary leader elections.
+        if let Some(ref elector) = self.leader_elector {
+            elector.record_heartbeat(topic, partition, self.config.node_id as u64);
+            trace!(
+                "Recorded leader heartbeat for {}-{} (node_id={})",
+                topic, partition, self.config.node_id
+            );
+        }
 
         Ok(ProduceResponsePartition {
             index: partition,
@@ -2061,6 +2103,63 @@ impl ProduceHandler {
         // Attempt to create the topic
         let result = match self.metadata_store.create_topic(topic_name, topic_config).await {
             Ok(metadata) => {
+                // v2.5.0 Phase 5: Initialize partition assignments in RaftCluster
+                // This ensures the LeaderElector can monitor partitions from the start
+                if let Some(ref raft) = self.raft_cluster {
+                    info!("v2.5.0: Initializing partition metadata in RaftCluster for topic '{}'", topic_name);
+
+                    // Get all nodes in the cluster (for replication)
+                    // For now, use a fixed list of node IDs (1, 2, 3 for a 3-node cluster)
+                    // TODO: Get this from cluster configuration
+                    let all_nodes = vec![1_u64, 2_u64, 3_u64];
+                    let replication_factor = self.config.default_replication_factor.min(all_nodes.len() as u32);
+
+                    for partition in 0..self.config.num_partitions {
+                        // Assign replicas (round-robin across nodes)
+                        let mut replicas = Vec::new();
+                        for i in 0..replication_factor {
+                            let node_idx = (partition as usize + i as usize) % all_nodes.len();
+                            replicas.push(all_nodes[node_idx]);
+                        }
+
+                        // Propose partition assignment to Raft
+                        if let Err(e) = raft.propose(crate::raft_metadata::MetadataCommand::AssignPartition {
+                            topic: topic_name.to_string(),
+                            partition: partition as i32,
+                            replicas: replicas.clone(),
+                        }).await {
+                            warn!("Failed to propose partition assignment for {}-{}: {:?}", topic_name, partition, e);
+                            continue;
+                        }
+
+                        // Set initial leader (first replica)
+                        let leader = replicas[0];
+                        if let Err(e) = raft.propose(crate::raft_metadata::MetadataCommand::SetPartitionLeader {
+                            topic: topic_name.to_string(),
+                            partition: partition as i32,
+                            leader,
+                        }).await {
+                            warn!("Failed to propose partition leader for {}-{}: {:?}", topic_name, partition, e);
+                        }
+
+                        // Set initial ISR (all replicas are in-sync initially)
+                        if let Err(e) = raft.propose(crate::raft_metadata::MetadataCommand::UpdateISR {
+                            topic: topic_name.to_string(),
+                            partition: partition as i32,
+                            isr: replicas.clone(),
+                        }).await {
+                            warn!("Failed to propose ISR for {}-{}: {:?}", topic_name, partition, e);
+                        }
+
+                        info!(
+                            "✓ Initialized partition metadata for {}-{}: replicas={:?}, leader={}, ISR={:?}",
+                            topic_name, partition, replicas, leader, replicas
+                        );
+                    }
+
+                    info!("✓ Completed RaftCluster metadata initialization for topic '{}'", topic_name);
+                }
+
                 // Create partition assignments
                 // For clustered mode, use round-robin assignment across nodes
                 // For standalone mode, assign all partitions to this node
@@ -2308,7 +2407,83 @@ impl ProduceHandler {
         
         result
     }
-    
+
+    /// Initialize Raft partition metadata for an existing topic
+    ///
+    /// This method is called by CreateTopics API handler to ensure partition
+    /// assignments are proposed to Raft cluster for topics created explicitly.
+    ///
+    /// # Arguments
+    /// - `topic_name`: Name of the topic
+    /// - `num_partitions`: Number of partitions in the topic
+    ///
+    /// # Returns
+    /// Ok(()) if partition metadata was successfully initialized, or if Raft is not enabled
+    pub async fn initialize_raft_partitions(&self, topic_name: &str, num_partitions: u32) -> Result<()> {
+        // Only initialize if Raft is enabled
+        if let Some(ref raft) = self.raft_cluster {
+            info!("Initializing Raft partition metadata for topic '{}' ({} partitions)",
+                  topic_name, num_partitions);
+
+            // Get all nodes in the cluster (for replication)
+            // For now, use a fixed list of node IDs (1, 2, 3 for a 3-node cluster)
+            // TODO: Get this from cluster configuration
+            let all_nodes = vec![1_u64, 2_u64, 3_u64];
+            let replication_factor = self.config.default_replication_factor.min(all_nodes.len() as u32);
+
+            for partition in 0..num_partitions {
+                // Assign replicas (round-robin across nodes)
+                let mut replicas = Vec::new();
+                for i in 0..replication_factor {
+                    let node_idx = (partition as usize + i as usize) % all_nodes.len();
+                    replicas.push(all_nodes[node_idx]);
+                }
+
+                // Propose partition assignment to Raft
+                // NOTE: This will fail on follower nodes - only leader can propose
+                // That's OK - followers will get the assignment via Raft replication
+                if let Err(e) = raft.propose(crate::raft_metadata::MetadataCommand::AssignPartition {
+                    topic: topic_name.to_string(),
+                    partition: partition as i32,
+                    replicas: replicas.clone(),
+                }).await {
+                    debug!("Could not propose partition assignment for {}-{} (expected on followers): {}", topic_name, partition, e);
+                    // Break out - we're not the leader, so skip remaining proposals
+                    // The leader will propose when it creates the topic
+                    return Ok(());
+                }
+
+                // Set initial leader (first replica)
+                let leader = replicas[0];
+                if let Err(e) = raft.propose(crate::raft_metadata::MetadataCommand::SetPartitionLeader {
+                    topic: topic_name.to_string(),
+                    partition: partition as i32,
+                    leader,
+                }).await {
+                    warn!("Failed to propose partition leader for {}-{}: {:?}", topic_name, partition, e);
+                }
+
+                // Set initial ISR (all replicas are in-sync initially)
+                if let Err(e) = raft.propose(crate::raft_metadata::MetadataCommand::UpdateISR {
+                    topic: topic_name.to_string(),
+                    partition: partition as i32,
+                    isr: replicas.clone(),
+                }).await {
+                    warn!("Failed to propose ISR for {}-{}: {:?}", topic_name, partition, e);
+                }
+
+                info!("✓ Initialized Raft partition metadata for {}-{}: replicas={:?}, leader={}, ISR={:?}",
+                      topic_name, partition, replicas, leader, replicas);
+            }
+
+            info!("✓ Completed Raft partition metadata initialization for topic '{}' (leader node)", topic_name);
+        } else {
+            debug!("Raft not enabled, skipping partition metadata initialization for '{}'", topic_name);
+        }
+
+        Ok(())
+    }
+
     /// Validate topic name according to Kafka rules
     fn is_valid_topic_name(name: &str) -> bool {
         // Kafka topic naming rules:
@@ -2421,8 +2596,10 @@ impl Clone for ProduceHandler {
             fetch_handler: self.fetch_handler.clone(),
             topic_creation_cache: Arc::clone(&self.topic_creation_cache),
             wal_manager: self.wal_manager.clone(),
-            #[cfg(feature = "raft")]
-            raft_manager: self.raft_manager.clone(),
+            raft_cluster: self.raft_cluster.clone(),  // v2.5.0 Phase 3
+            wal_replication_manager: self.wal_replication_manager.clone(),  // v2.2.0 Phase 1
+            isr_ack_tracker: self.isr_ack_tracker.clone(),  // v2.5.0 Phase 4
+            leader_elector: self.leader_elector.clone(),  // v2.5.0 Phase 5
         }
     }
 }
@@ -2430,7 +2607,7 @@ impl Clone for ProduceHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chronik_common::metadata::FileMetadataStore;
+    use chronik_common::metadata::InMemoryMetadataStore;
     use chronik_storage::object_store::backends::local::LocalBackend;
     use chronik_protocol::types::{ProduceRequestTopic, ProduceRequestPartition};
     use tempfile::TempDir;
@@ -2455,7 +2632,7 @@ mod tests {
         );
         let pd_endpoints = vec!["localhost:2379".to_string()];
         let temp_dir = TempDir::new().unwrap();
-        let metadata_store = Arc::new(FileMetadataStore::new(temp_dir.path().join("metadata")).await.unwrap());
+        let metadata_store = Arc::new(InMemoryMetadataStore::new());
         
         // Create test topic
         let topic_config = chronik_common::metadata::TopicConfig {
@@ -2902,7 +3079,7 @@ mod tests {
         );
         let pd_endpoints = vec!["localhost:2379".to_string()];
         let temp_dir = TempDir::new().unwrap();
-        let metadata_store = Arc::new(FileMetadataStore::new(temp_dir.path().join("metadata")).await.unwrap());
+        let metadata_store = Arc::new(InMemoryMetadataStore::new());
         
         let config = ProduceHandlerConfig {
             node_id: 0,
@@ -2969,7 +3146,7 @@ mod tests {
         );
         let pd_endpoints = vec!["localhost:2379".to_string()];
         let temp_dir = TempDir::new().unwrap();
-        let metadata_store = Arc::new(FileMetadataStore::new(temp_dir.path().join("metadata")).await.unwrap());
+        let metadata_store = Arc::new(InMemoryMetadataStore::new());
         
         let config = ProduceHandlerConfig {
             node_id: 0,
@@ -3026,7 +3203,7 @@ mod tests {
         );
         let pd_endpoints = vec!["localhost:2379".to_string()];
         let temp_dir = TempDir::new().unwrap();
-        let metadata_store = Arc::new(FileMetadataStore::new(temp_dir.path().join("metadata")).await.unwrap());
+        let metadata_store = Arc::new(InMemoryMetadataStore::new());
         
         let config = ProduceHandlerConfig {
             node_id: 0,
@@ -3118,7 +3295,7 @@ mod tests {
         );
         let pd_endpoints = vec!["localhost:2379".to_string()];
         let temp_dir = TempDir::new().unwrap();
-        let metadata_store = Arc::new(FileMetadataStore::new(temp_dir.path().join("metadata")).await.unwrap());
+        let metadata_store = Arc::new(InMemoryMetadataStore::new());
         
         let config = ProduceHandlerConfig {
             node_id: 0,
@@ -3224,9 +3401,7 @@ mod tests {
             ..Default::default()
         };
         
-        let metadata_store = Arc::new(chronik_common::metadata::file_store::FileMetadataStore::new(
-            temp_dir.path().join("metadata")
-        ).await.unwrap());
+        let metadata_store = Arc::new(InMemoryMetadataStore::new());
         
         let object_store = Arc::new(chronik_storage::LocalObjectStore::new(
             temp_dir.path().join("segments")
@@ -3278,9 +3453,7 @@ mod tests {
             ..Default::default()
         };
         
-        let metadata_store = Arc::new(chronik_common::metadata::file_store::FileMetadataStore::new(
-            temp_dir.path().join("metadata")
-        ).await.unwrap());
+        let metadata_store = Arc::new(InMemoryMetadataStore::new());
         
         let object_store = Arc::new(chronik_storage::LocalObjectStore::new(
             temp_dir.path().join("segments")
@@ -3332,9 +3505,7 @@ mod tests {
             ..Default::default()
         };
         
-        let metadata_store = Arc::new(chronik_common::metadata::file_store::FileMetadataStore::new(
-            temp_dir.path().join("metadata")
-        ).await.unwrap());
+        let metadata_store = Arc::new(InMemoryMetadataStore::new());
         
         let object_store = Arc::new(chronik_storage::LocalObjectStore::new(
             temp_dir.path().join("segments")
