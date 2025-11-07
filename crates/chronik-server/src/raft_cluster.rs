@@ -242,6 +242,23 @@ impl RaftCluster {
             .unwrap_or_default()
     }
 
+    /// Get all brokers from the Raft state machine
+    ///
+    /// Returns a list of (broker_id, host, port, rack) tuples for all registered brokers.
+    /// This is used to synchronize broker metadata across the cluster.
+    pub fn get_all_brokers_from_state_machine(&self) -> Vec<(i32, String, i32, Option<String>)> {
+        self.state_machine
+            .read()
+            .ok()
+            .map(|sm| {
+                sm.get_all_brokers()
+                    .into_iter()
+                    .map(|b| (b.broker_id, b.host.clone(), b.port, b.rack.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Propose a metadata command to the Raft cluster
     ///
     /// This serializes the command and proposes it via Raft consensus.

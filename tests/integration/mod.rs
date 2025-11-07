@@ -34,6 +34,10 @@ mod raft_snapshot_test;
 #[cfg(feature = "raft")]
 mod admin_api_test;
 
+// v2.2.1: Cluster broker discovery test (critical bug fix)
+#[cfg(feature = "raft")]
+mod cluster_broker_discovery_test;
+
 // Tests that require full cluster setup
 // mod cluster;
 // mod kafka_protocol;

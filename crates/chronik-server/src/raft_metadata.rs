@@ -34,6 +34,25 @@ pub enum MetadataCommand {
         node_id: u64,
     },
 
+    /// Register a broker in the cluster (for Kafka client discovery)
+    RegisterBroker {
+        broker_id: i32,
+        host: String,
+        port: i32,
+        rack: Option<String>,
+    },
+
+    /// Update broker status (online/offline/maintenance)
+    UpdateBrokerStatus {
+        broker_id: i32,
+        status: String,  // "online", "offline", "maintenance"
+    },
+
+    /// Remove a broker from the cluster
+    RemoveBroker {
+        broker_id: i32,
+    },
+
     /// Assign partition replicas
     AssignPartition {
         topic: String,
@@ -56,11 +75,26 @@ pub enum MetadataCommand {
     },
 }
 
+/// Broker information stored in Raft state machine
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrokerInfo {
+    pub broker_id: i32,
+    pub host: String,
+    pub port: i32,
+    pub rack: Option<String>,
+    pub status: String,  // "online", "offline", "maintenance"
+}
+
 /// Metadata state machine (applied from Raft log)
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MetadataStateMachine {
-    /// Cluster nodes: node_id → address
+    /// Cluster nodes: node_id → address (for Raft consensus)
     pub nodes: HashMap<u64, String>,
+
+    /// Brokers: broker_id → broker info (for Kafka client discovery)
+    /// This is separate from nodes because broker_id (i32) != node_id (u64)
+    /// and brokers need additional metadata (host, port, rack)
+    pub brokers: HashMap<i32, BrokerInfo>,
 
     /// Partition assignments: (topic, partition) → replica node IDs
     pub partition_assignments: HashMap<PartitionKey, Vec<u64>>,
@@ -88,6 +122,30 @@ impl MetadataStateMachine {
 
             MetadataCommand::RemoveNode { node_id } => {
                 self.nodes.remove(&node_id);
+                Ok(vec![])
+            }
+
+            MetadataCommand::RegisterBroker { broker_id, host, port, rack } => {
+                let broker_info = BrokerInfo {
+                    broker_id,
+                    host,
+                    port,
+                    rack,
+                    status: "online".to_string(),
+                };
+                self.brokers.insert(broker_id, broker_info);
+                Ok(vec![])
+            }
+
+            MetadataCommand::UpdateBrokerStatus { broker_id, status } => {
+                if let Some(broker) = self.brokers.get_mut(&broker_id) {
+                    broker.status = status;
+                }
+                Ok(vec![])
+            }
+
+            MetadataCommand::RemoveBroker { broker_id } => {
+                self.brokers.remove(&broker_id);
                 Ok(vec![])
             }
 
@@ -146,6 +204,21 @@ impl MetadataStateMachine {
             .filter(|(_key, &leader)| leader == node_id)
             .map(|(key, _leader)| key.clone())
             .collect()
+    }
+
+    /// Get broker information
+    pub fn get_broker(&self, broker_id: i32) -> Option<&BrokerInfo> {
+        self.brokers.get(&broker_id)
+    }
+
+    /// Get all brokers
+    pub fn get_all_brokers(&self) -> Vec<&BrokerInfo> {
+        self.brokers.values().collect()
+    }
+
+    /// Get all broker IDs
+    pub fn get_broker_ids(&self) -> Vec<i32> {
+        self.brokers.keys().copied().collect()
     }
 }
 

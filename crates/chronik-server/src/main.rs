@@ -606,7 +606,7 @@ async fn run_cluster_mode(
         .unwrap_or_else(|| "0.0.0.0:5001".to_string());
 
     info!("Starting Raft gRPC server on {}...", raft_bind_addr);
-    raft_cluster.clone().start_grpc_server(raft_bind_addr).await?;
+    raft_cluster.clone().start_grpc_server(raft_bind_addr.clone()).await?;
     info!("Raft gRPC server started successfully");
 
     // CRITICAL FIX: Start Raft message processing loop for leader election
@@ -647,10 +647,14 @@ async fn run_cluster_mode(
     ).await?;
 
     // Parse Kafka bind address from cluster config
-    let kafka_addr = this_node.kafka.clone();
+    // CRITICAL: Use bind address (where to listen), not advertise address
+    let kafka_addr = config.bind.as_ref()
+        .map(|b| b.kafka.clone())
+        .unwrap_or_else(|| this_node.kafka.clone());  // Fallback to advertise if bind not specified
+
     info!("Kafka protocol listening on {}", kafka_addr);
-    info!("WAL receiver auto-started on {}", this_node.wal);
-    info!("Raft consensus on {}", this_node.raft);
+    info!("WAL receiver auto-started on {}", config.bind.as_ref().map(|b| b.wal.as_str()).unwrap_or(&this_node.wal));
+    info!("Raft consensus on {}", raft_bind_addr);
     info!("Metrics endpoint available at http://{}:{}/metrics", bind, metrics_port);
 
     // Start search API if search feature is compiled

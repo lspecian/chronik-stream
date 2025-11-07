@@ -1,0 +1,179 @@
+================================================================================
+CRITICAL BUG: Broker Metadata Not Synchronized Across Cluster Nodes
+================================================================================
+
+SEVERITY: CRITICAL - Cluster mode completely broken for client connectivity
+
+================================================================================
+ROOT CAUSE (In One Sentence)
+================================================================================
+
+Broker registration events are written to the local metadata WAL but are NOT
+proposed to the Raft cluster, so other nodes never see the registration.
+
+================================================================================
+SYMPTOM
+================================================================================
+
+When running a 3-node cluster:
+- Node 1 sees only broker [1] in its metadata
+- Node 2 sees only broker [2] in its metadata  
+- Node 3 sees only broker [3] in its metadata
+
+Kafka clients get a timeout because they query metadata and see an incomplete
+broker list. When they try to connect to replicas on other nodes, those nodes
+aren't listed in the Metadata response.
+
+Log shows: "✓ Successfully registered broker X in Raft metadata"
+(This is MISLEADING - it's NOT in Raft, only in local WAL!)
+
+================================================================================
+THE MISSING PIECE
+================================================================================
+
+File: crates/chronik-server/src/raft_metadata.rs (lines 23-57)
+
+The MetadataCommand enum is MISSING broker-related commands:
+
+MISSING:
+  - RegisterBroker { broker_id, host, port, rack }
+  - UpdateBrokerStatus { broker_id, status }
+  - RemoveBroker { broker_id }
+
+CURRENT (PARTIAL):
+  - AddNode (only for cluster membership, not broker discovery)
+  - RemoveNode
+  - AssignPartition ✓ Works via Raft
+  - SetPartitionLeader ✓ Works via Raft
+  - UpdateISR ✓ Works via Raft
+
+The state machine has NO BROKER STORAGE, so it can't apply broker commands.
+
+================================================================================
+THE BROKEN CODE PATH
+================================================================================
+
+File: crates/chronik-server/src/integrated_server.rs (lines 198-248)
+
+Step 1: Create broker metadata ✓
+Step 2: Call metadata_store.register_broker() ✓
+Step 3: THIS WRITES TO LOCAL WAL ONLY ✓
+Step 4: MISSING - Raft proposal! ✗
+
+The broker registration goes ONLY to the local ChronikMetaLogStore's WAL.
+It never gets proposed to Raft consensus.
+
+Compare with partition assignment (lines 502-507):
+- Also calls metadata_store.assign_partition()
+- ALSO calls raft.propose(MetadataCommand::AssignPartition {...})
+
+Broker registration is missing the second step!
+
+================================================================================
+ARCHITECTURE: Current vs Required
+================================================================================
+
+CURRENT (BROKEN):
+
+  Node 1 startup:
+    register_broker(1) → metadata_store.WAL only
+    Raft state machine: no brokers
+    
+  Node 2 startup:
+    register_broker(2) → metadata_store.WAL only
+    Raft state machine: no brokers
+    
+  Result: Each node's Metadata API response = "brokers: [self]"
+
+REQUIRED (FIXED):
+
+  Node 1 startup:
+    register_broker(1) → metadata_store.WAL
+    raft.propose(RegisterBroker {1, ...}) → all nodes
+    Raft applies: state_machine.brokers[1] = metadata
+    
+  Node 2 startup:
+    register_broker(2) → metadata_store.WAL
+    raft.propose(RegisterBroker {2, ...}) → all nodes
+    Raft applies: state_machine.brokers[2] = metadata
+    
+  Node 3 startup:
+    register_broker(3) → metadata_store.WAL
+    raft.propose(RegisterBroker {3, ...}) → all nodes
+    Raft applies: state_machine.brokers[3] = metadata
+    
+  Result: ALL nodes' Metadata API response = "brokers: [1, 2, 3]"
+
+================================================================================
+FILES TO MODIFY
+================================================================================
+
+1. crates/chronik-server/src/raft_metadata.rs
+   - Add RegisterBroker, UpdateBrokerStatus, RemoveBroker to MetadataCommand
+   - Add brokers: HashMap<i32, BrokerInfo> to MetadataStateMachine
+   - Implement apply() logic for these commands
+
+2. crates/chronik-server/src/integrated_server.rs (lines 220-241)
+   - Add Raft proposal after metadata_store.register_broker() call
+   - Pattern: raft_cluster.propose(MetadataCommand::RegisterBroker {...})
+
+3. crates/chronik-server/src/kafka_handler.rs
+   - Update Metadata API response to use Raft state machine's broker list
+   - Currently queries metadata_store only - needs to include Raft brokers
+
+4. crates/chronik-server/src/raft_cluster.rs
+   - Add get_broker() / list_brokers() methods to query state machine
+   - Ensure they return the Raft-replicated broker metadata
+
+================================================================================
+WHY IT WENT UNDETECTED
+================================================================================
+
+1. Logs are misleading: "Successfully registered broker X in Raft metadata"
+   (It's NOT in Raft, only in local WAL)
+
+2. Partition metadata IS synced via Raft:
+   - AssignPartition ✓
+   - SetPartitionLeader ✓
+   - UpdateISR ✓
+   
+   So the team assumed brokers were too (they're not)
+
+3. Single-node testing works fine (no replication needed)
+
+4. Bug only manifests in 3+ node clusters with external Kafka clients
+
+5. The metadata_store.register_broker() call makes it look like it's working
+
+================================================================================
+TEST TO VERIFY BUG
+================================================================================
+
+1. Start 3-node cluster
+2. On Node 1, query metadata:
+   $ kafka-metadata-shell --bootstrap-server localhost:9092 --command describe
+   Expected: Brokers: 1, 2, 3
+   Actual: Brokers: 1
+
+3. On Node 2, query metadata:
+   Expected: Brokers: 1, 2, 3
+   Actual: Brokers: 2
+
+4. Try to produce to a topic with replication factor 3:
+   Expected: Message written to replicas on all 3 nodes
+   Actual: Timeout (client can't see the other brokers)
+
+================================================================================
+ESTIMATED FIX COMPLEXITY
+================================================================================
+
+LOW - The infrastructure is already there. Just need to:
+1. Add 3 enum variants to MetadataCommand
+2. Add broker storage to MetadataStateMachine
+3. Implement apply() for the 3 new commands
+4. Add 1 raft.propose() call in broker registration
+5. Update Metadata API response to include Raft brokers
+
+Total: ~100 lines of code
+
+================================================================================
