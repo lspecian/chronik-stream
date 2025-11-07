@@ -592,8 +592,11 @@ impl IntegratedKafkaServer {
 
             // CRITICAL: Wait for Raft leader election before proposing metadata
             // Raft requires a leader to accept proposals, so we must wait
+            // CRITICAL FIX (v2.2.1): Only the Raft leader should propose metadata
+            // Follower nodes must wait and receive metadata via Raft replication
             info!("Waiting for Raft leader election before proposing metadata...");
             let mut leader_ready = false;
+            let mut this_node_is_leader = false;
             for attempt in 1..=30 {  // Wait up to 30 seconds
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
@@ -603,11 +606,15 @@ impl IntegratedKafkaServer {
                 if is_ready {
                     if leader_id == raft.node_id() {
                         info!("✓ This node is Raft leader (state={}), proceeding with metadata initialization", state);
+                        this_node_is_leader = true;
+                        leader_ready = true;
+                        break;
                     } else {
-                        info!("✓ Raft leader elected (leader_id={}, state={}), proceeding with metadata initialization", leader_id, state);
+                        info!("✓ Raft leader elected (leader_id={}, state={}), this node is a follower - waiting for leader to initialize metadata", leader_id, state);
+                        leader_ready = true;
+                        this_node_is_leader = false;
+                        break;
                     }
-                    leader_ready = true;
-                    break;
                 }
 
                 if attempt % 5 == 0 {
@@ -619,74 +626,83 @@ impl IntegratedKafkaServer {
                 warn!("Raft leader election did not complete within 30 seconds - metadata proposals may fail");
             }
 
-            // Get all existing topics from metadata store
-            match metadata_store.list_topics().await {
-                Ok(topics) => {
-                    let topic_count = topics.len();
-                    info!("Found {} existing topics to initialize in Raft", topic_count);
+            // CRITICAL FIX (v2.2.1): Only Raft leader proposes partition metadata
+            // This prevents "Cannot propose: not the leader" errors and partition leadership conflicts
+            if !this_node_is_leader {
+                info!("Skipping metadata initialization - this node is a Raft follower (will receive metadata via Raft replication)");
+            } else {
+                // Only Raft leader initializes partition metadata
+                info!("This node is Raft leader - initializing partition metadata for existing topics");
 
-                    for topic_meta in topics {
-                        let topic_name = &topic_meta.name;
-                        let partition_count = topic_meta.config.partition_count;
+                // Get all existing topics from metadata store
+                match metadata_store.list_topics().await {
+                    Ok(topics) => {
+                        let topic_count = topics.len();
+                        info!("Found {} existing topics to initialize in Raft", topic_count);
 
-                        info!("Initializing Raft metadata for topic '{}' ({} partitions)", topic_name, partition_count);
+                        for topic_meta in topics {
+                            let topic_name = &topic_meta.name;
+                            let partition_count = topic_meta.config.partition_count;
 
-                        // Get all nodes in cluster
-                        let all_nodes = vec![1_u64, 2_u64, 3_u64];
-                        let replication_factor = config.replication_factor.min(all_nodes.len() as u32);
+                            info!("Initializing Raft metadata for topic '{}' ({} partitions)", topic_name, partition_count);
 
-                        for partition in 0..partition_count {
-                            // Check if metadata already exists (avoid duplicate proposals)
-                            if raft.get_partition_replicas(topic_name, partition as i32).is_some() {
-                                debug!("Raft metadata already exists for {}-{}, skipping", topic_name, partition);
-                                continue;
+                            // Get all nodes in cluster
+                            let all_nodes = vec![1_u64, 2_u64, 3_u64];
+                            let replication_factor = config.replication_factor.min(all_nodes.len() as u32);
+
+                            for partition in 0..partition_count {
+                                // Check if metadata already exists (avoid duplicate proposals)
+                                if raft.get_partition_replicas(topic_name, partition as i32).is_some() {
+                                    debug!("Raft metadata already exists for {}-{}, skipping", topic_name, partition);
+                                    continue;
+                                }
+
+                                // Assign replicas (round-robin)
+                                let mut replicas = Vec::new();
+                                for i in 0..replication_factor {
+                                    let node_idx = (partition as usize + i as usize) % all_nodes.len();
+                                    replicas.push(all_nodes[node_idx]);
+                                }
+
+                                // Propose partition assignment
+                                if let Err(e) = raft.propose(crate::raft_metadata::MetadataCommand::AssignPartition {
+                                    topic: topic_name.to_string(),
+                                    partition: partition as i32,
+                                    replicas: replicas.clone(),
+                                }).await {
+                                    warn!("Failed to propose partition assignment for {}-{}: {:?}", topic_name, partition, e);
+                                    continue;
+                                }
+
+                                // Set initial leader (first replica)
+                                let leader = replicas[0];
+                                if let Err(e) = raft.propose(crate::raft_metadata::MetadataCommand::SetPartitionLeader {
+                                    topic: topic_name.to_string(),
+                                    partition: partition as i32,
+                                    leader,
+                                }).await {
+                                    warn!("Failed to propose partition leader for {}-{}: {:?}", topic_name, partition, e);
+                                }
+
+                                // Set initial ISR (all replicas in-sync initially)
+                                if let Err(e) = raft.propose(crate::raft_metadata::MetadataCommand::UpdateISR {
+                                    topic: topic_name.to_string(),
+                                    partition: partition as i32,
+                                    isr: replicas.clone(),
+                                }).await {
+                                    warn!("Failed to propose ISR for {}-{}: {:?}", topic_name, partition, e);
+                                }
+
+                                info!("✓ Proposed Raft metadata for {}-{}: replicas={:?}, leader={}, ISR={:?}",
+                                      topic_name, partition, replicas, leader, replicas);
                             }
-
-                            // Assign replicas (round-robin)
-                            let mut replicas = Vec::new();
-                            for i in 0..replication_factor {
-                                let node_idx = (partition as usize + i as usize) % all_nodes.len();
-                                replicas.push(all_nodes[node_idx]);
-                            }
-
-                            // Propose partition assignment
-                            if let Err(e) = raft.propose(crate::raft_metadata::MetadataCommand::AssignPartition {
-                                topic: topic_name.to_string(),
-                                partition: partition as i32,
-                                replicas: replicas.clone(),
-                            }).await {
-                                warn!("Failed to propose partition assignment for {}-{}: {:?}", topic_name, partition, e);
-                                continue;
-                            }
-
-                            // Set initial leader (first replica)
-                            let leader = replicas[0];
-                            if let Err(e) = raft.propose(crate::raft_metadata::MetadataCommand::SetPartitionLeader {
-                                topic: topic_name.to_string(),
-                                partition: partition as i32,
-                                leader,
-                            }).await {
-                                warn!("Failed to propose partition leader for {}-{}: {:?}", topic_name, partition, e);
-                            }
-
-                            // Set initial ISR (all replicas in-sync initially)
-                            if let Err(e) = raft.propose(crate::raft_metadata::MetadataCommand::UpdateISR {
-                                topic: topic_name.to_string(),
-                                partition: partition as i32,
-                                isr: replicas.clone(),
-                            }).await {
-                                warn!("Failed to propose ISR for {}-{}: {:?}", topic_name, partition, e);
-                            }
-
-                            info!("✓ Proposed Raft metadata for {}-{}: replicas={:?}, leader={}, ISR={:?}",
-                                  topic_name, partition, replicas, leader, replicas);
                         }
-                    }
 
-                    info!("✓ Completed Raft metadata initialization for {} existing topics", topic_count);
-                }
-                Err(e) => {
-                    warn!("Failed to list topics for Raft metadata initialization: {:?}", e);
+                        info!("✓ Completed Raft metadata initialization for {} existing topics", topic_count);
+                    }
+                    Err(e) => {
+                        warn!("Failed to list topics for Raft metadata initialization: {:?}", e);
+                    }
                 }
             }
         }
