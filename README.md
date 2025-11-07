@@ -112,18 +112,18 @@ Chronik implements a unique 3-tier storage system with automatic failover that p
 ### Using Docker (Recommended)
 
 ```bash
-# Quick start - single command
+# Quick start - single node
 docker run -d -p 9092:9092 \
   -e CHRONIK_ADVERTISED_ADDR=localhost \
-  ghcr.io/lspecian/chronik-stream:latest
+  ghcr.io/lspecian/chronik-stream:latest start
 
-# With persistent storage and custom configuration
+# With persistent storage
 docker run -d --name chronik \
   -p 9092:9092 \
   -v chronik-data:/data \
   -e CHRONIK_ADVERTISED_ADDR=localhost \
   -e RUST_LOG=info \
-  ghcr.io/lspecian/chronik-stream:latest
+  ghcr.io/lspecian/chronik-stream:latest start
 
 # Using docker-compose
 curl -O https://raw.githubusercontent.com/lspecian/chronik-stream/main/docker-compose.yml
@@ -143,7 +143,7 @@ docker run -d --name chronik \
   -e S3_ACCESS_KEY=minioadmin \
   -e S3_SECRET_KEY=minioadmin \
   -e S3_PATH_STYLE=true \
-  ghcr.io/lspecian/chronik-stream:latest
+  ghcr.io/lspecian/chronik-stream:latest start
 
 # AWS S3 for production (uses IAM role)
 docker run -d --name chronik \
@@ -152,7 +152,7 @@ docker run -d --name chronik \
   -e OBJECT_STORE_BACKEND=s3 \
   -e S3_REGION=us-west-2 \
   -e S3_BUCKET=chronik-prod-archives \
-  ghcr.io/lspecian/chronik-stream:latest
+  ghcr.io/lspecian/chronik-stream:latest start
 ```
 
 ### ⚠️ Critical Docker Configuration
@@ -205,12 +205,12 @@ for message in consumer:
 # Download latest release (Linux x86_64)
 curl -L https://github.com/lspecian/chronik-stream/releases/latest/download/chronik-server-linux-amd64.tar.gz -o chronik-server.tar.gz
 tar xzf chronik-server.tar.gz
-./chronik-server --advertised-addr localhost standalone
+./chronik-server start
 
 # macOS (Apple Silicon)
 curl -L https://github.com/lspecian/chronik-stream/releases/latest/download/chronik-server-darwin-arm64.tar.gz -o chronik-server.tar.gz
 tar xzf chronik-server.tar.gz
-./chronik-server --advertised-addr localhost standalone
+./chronik-server start
 ```
 
 ### Building from Source
@@ -223,8 +223,13 @@ cd chronik-stream
 # Build release binary
 cargo build --release --bin chronik-server
 
-# Run
-./target/release/chronik-server standalone
+# Run single-node
+./target/release/chronik-server start
+
+# Or run 3-node cluster locally
+./target/release/chronik-server start --config config/examples/cluster/chronik-cluster-node1.toml
+./target/release/chronik-server start --config config/examples/cluster/chronik-cluster-node2.toml
+./target/release/chronik-server start --config config/examples/cluster/chronik-cluster-node3.toml
 ```
 
 ## 🌟 KSQL Integration
@@ -241,127 +246,160 @@ For detailed KSQL setup and usage examples, see [docs/KSQL_INTEGRATION_GUIDE.md]
 
 ## 🎯 Operational Modes
 
-The unified `chronik-server` binary supports multiple operational modes:
+The unified `chronik-server` binary supports two deployment modes via the `start` command:
 
-### Standalone Mode (Default)
-Single-node Kafka-compatible server, perfect for development and small deployments:
+### Single-Node Mode (Default)
+Perfect for development, testing, and single-node production deployments:
+
 ```bash
-chronik-server standalone
-# or just
-chronik-server
+# Simplest - just start
+./chronik-server start
+
+# With custom data directory
+./chronik-server start --data-dir /var/lib/chronik
+
+# With advertised address (required for Docker/remote clients)
+./chronik-server start --advertise my-hostname.com:9092
 ```
 
-### Raft Cluster Mode (Multi-Node Replication)
-**NEW in v2.0.0**: Production-ready multi-node cluster with automatic replication, leader election, and fault tolerance.
+**Features:**
+- ✅ Full Kafka protocol compatibility
+- ✅ WAL-based durability (zero message loss)
+- ✅ Automatic crash recovery
+- ✅ 3-tier storage (local + S3/GCS/Azure)
+- ✅ Full-text search with Tantivy
 
-**Minimum 3 nodes required** for quorum-based replication:
+### Cluster Mode (Multi-Node Replication)
+**Available in v2.2.0+**: Production-ready multi-node cluster with Raft consensus, automatic replication, and zero-downtime operations.
 
+**Minimum 3 nodes required** for quorum-based replication.
+
+**Quick Start (Local Testing):**
 ```bash
-# Node 1 (port 9092, Raft port 9192)
-cargo run --release --features raft --bin chronik-server -- \
-  --kafka-port 9092 \
-  --advertised-addr node1.example.com \
-  --data-dir /data/node1 \
-  --node-id 1 \
-  raft-cluster \
-  --raft-addr 0.0.0.0:9192 \
-  --peers "2@node2.example.com:9193,3@node3.example.com:9194" \
-  --bootstrap
+# Terminal 1 - Node 1
+./chronik-server start --config config/examples/cluster/chronik-cluster-node1.toml
 
-# Node 2 (port 9092, Raft port 9193)
-cargo run --release --features raft --bin chronik-server -- \
-  --kafka-port 9092 \
-  --advertised-addr node2.example.com \
-  --data-dir /data/node2 \
-  --node-id 2 \
-  raft-cluster \
-  --raft-addr 0.0.0.0:9193 \
-  --peers "1@node1.example.com:9192,3@node3.example.com:9194"
+# Terminal 2 - Node 2
+./chronik-server start --config config/examples/cluster/chronik-cluster-node2.toml
 
-# Node 3 (port 9092, Raft port 9194)
-cargo run --release --features raft --bin chronik-server -- \
-  --kafka-port 9092 \
-  --advertised-addr node3.example.com \
-  --data-dir /data/node3 \
-  --node-id 3 \
-  raft-cluster \
-  --raft-addr 0.0.0.0:9194 \
-  --peers "1@node1.example.com:9192,2@node2.example.com:9193"
+# Terminal 3 - Node 3
+./chronik-server start --config config/examples/cluster/chronik-cluster-node3.toml
+```
+
+**Production Setup (3 Machines):**
+```bash
+# On each node, create config file with unique node_id
+# Example node1.toml:
+enabled = true
+node_id = 1
+replication_factor = 3
+min_insync_replicas = 2
+
+[[peers]]
+id = 1
+kafka = "node1.example.com:9092"
+wal = "node1.example.com:9291"
+raft = "node1.example.com:5001"
+
+[[peers]]
+id = 2
+kafka = "node2.example.com:9092"
+wal = "node2.example.com:9291"
+raft = "node2.example.com:5001"
+
+[[peers]]
+id = 3
+kafka = "node3.example.com:9092"
+wal = "node3.example.com:9291"
+raft = "node3.example.com:5001"
+
+# Start each node
+./chronik-server start --config /etc/chronik/node1.toml
 ```
 
 **Key Features:**
 - ✅ Quorum-based replication (survives minority node failures)
 - ✅ Automatic leader election via Raft consensus
 - ✅ Strong consistency (linearizable reads/writes)
-- ✅ Automatic log compaction with S3-backed snapshots
-- ✅ Zero-downtime rolling restarts
+- ✅ Zero-downtime node addition and removal (v2.2.0+)
+- ✅ Automatic partition rebalancing
 - ✅ Comprehensive monitoring via Prometheus metrics
 
-**Important Notes:**
-- Raft port = Kafka port + 100 (e.g., 9092 → 9192)
-- Each node MUST have a unique `--node-id` (1, 2, 3, ...)
-- Only ONE node should use `--bootstrap` flag (creates initial cluster)
-- Requires connectivity on both Kafka AND Raft ports between all nodes
-
-See [docs/raft/README.md](docs/raft/README.md) for complete setup guide and [docs/RAFT_DEPLOYMENT_GUIDE.md](docs/RAFT_DEPLOYMENT_GUIDE.md) for production deployment.
-
-### All Mode
-Run all components (Kafka protocol, search, backup) in a single process:
+**Cluster Management:**
 ```bash
-chronik-server all
+# Add node to running cluster
+export CHRONIK_ADMIN_API_KEY=<key>
+./chronik-server cluster add-node 4 \
+  --kafka node4:9092 \
+  --wal node4:9291 \
+  --raft node4:5001 \
+  --config cluster.toml
+
+# Query cluster status
+./chronik-server cluster status --config cluster.toml
+
+# Remove node gracefully
+./chronik-server cluster remove-node 4 --config cluster.toml
 ```
 
+**Complete Guide:** See [docs/RUNNING_A_CLUSTER.md](docs/RUNNING_A_CLUSTER.md) for step-by-step instructions.
+
 ### Configuration Options
+
+**Commands:**
 ```bash
-chronik-server [OPTIONS] [COMMAND]
+chronik-server start [OPTIONS]          # Start server (auto-detects single-node or cluster)
+chronik-server cluster <SUBCOMMAND>     # Manage cluster (add-node, remove-node, status)
+chronik-server version                  # Display version info
+chronik-server compact <SUBCOMMAND>     # Manage WAL compaction
+```
+
+**Start Command Options:**
+```bash
+chronik-server start [OPTIONS]
 
 Options:
-  -p, --kafka-port <PORT>      Kafka protocol port (default: 9092)
-  -a, --admin-port <PORT>      Admin API port (default: 3000)
-  -d, --data-dir <PATH>        Data directory (default: ./data)
-  -b, --bind-addr <ADDR>       Bind address (default: 0.0.0.0)
-  --advertised-addr <ADDR>     Address advertised to clients (REQUIRED for Docker/remote access)
-  --advertised-port <PORT>     Port advertised to clients (default: kafka port)
-  --file-metadata              Use file-based metadata store instead of WAL-based (legacy mode)
-  --enable-search              Enable search functionality
-  --enable-backup              Enable backup functionality
+  -d, --data-dir <DIR>         Data directory (default: ./data)
+  --config <FILE>              Cluster config file (enables cluster mode)
+  --node-id <ID>               Override node ID from config
+  --advertise <ADDR:PORT>      Advertised Kafka address (for remote clients)
+  -l, --log-level <LEVEL>      Log level (error/warn/info/debug/trace)
+```
 
-Environment Variables:
-  CHRONIK_KAFKA_PORT           Kafka protocol port
-  CHRONIK_BIND_ADDR            Server bind address (just host, no port)
-  CHRONIK_ADVERTISED_ADDR      Address advertised to clients (CRITICAL for Docker)
-  CHRONIK_ADVERTISED_PORT      Port advertised to clients
-  CHRONIK_DATA_DIR             Data directory path
-  CHRONIK_FILE_METADATA        Set to "true" to use legacy file-based metadata store
-  CHRONIK_WAL_PROFILE          WAL performance profile: low/medium/high/ultra (auto-detects if not set)
-  CHRONIK_PRODUCE_PROFILE      Producer flush profile: low-latency/balanced/high-throughput (default: balanced)
-  CHRONIK_WAL_ROTATION_SIZE    Segment seal threshold: 100KB/250MB (default)/1GB/bytes (controls when WAL segments are sealed and uploaded to S3)
-  RUST_LOG                     Log level (error, warn, info, debug, trace)
+**Key Environment Variables:**
+```bash
+# Server Configuration
+CHRONIK_DATA_DIR             Data directory path (default: ./data)
+CHRONIK_ADVERTISED_ADDR      Address advertised to clients (CRITICAL for Docker)
+RUST_LOG                     Log level (error, warn, info, debug, trace)
 
-Object Store Configuration (Tier 2 + Tier 3):
-  OBJECT_STORE_BACKEND         Backend type: s3/gcs/azure/local (default: local)
-                               • local: All data stays on local disk, no S3 upload
-                               • s3/gcs/azure: Enable 3-tier storage with cloud archival
+# Performance Tuning
+CHRONIK_WAL_PROFILE          WAL performance: low/medium/high/ultra (auto-detects)
+CHRONIK_PRODUCE_PROFILE      Producer flush: low-latency/balanced/high-throughput
+CHRONIK_WAL_ROTATION_SIZE    WAL segment size: 100KB/250MB (default)/1GB
 
-  S3 Configuration:
-    S3_ENDPOINT                S3-compatible endpoint (for MinIO, Wasabi, etc.)
-    S3_REGION                  AWS region (default: us-east-1)
-    S3_BUCKET                  Bucket name (default: chronik-storage)
-    S3_ACCESS_KEY              Access key ID (optional, uses IAM if not set)
-    S3_SECRET_KEY              Secret access key (optional)
-    S3_PATH_STYLE              Use path-style URLs (default: true, required for MinIO)
-    S3_DISABLE_SSL             Disable SSL (default: false)
-    S3_PREFIX                  Key prefix for all objects (optional)
+# Cluster Management (v2.2.0+)
+CHRONIK_ADMIN_API_KEY        Admin API authentication key (REQUIRED for production clusters)
 
-  GCS Configuration:
-    GCS_BUCKET                 GCS bucket name (default: chronik-storage)
-    GCS_PROJECT_ID             GCP project ID (optional)
-    GCS_PREFIX                 Key prefix for all objects (optional)
+# Object Store (3-Tier Storage)
+OBJECT_STORE_BACKEND         Backend: s3/gcs/azure/local (default: local)
 
-  Azure Configuration:
-    AZURE_ACCOUNT_NAME         Storage account name (required)
-    AZURE_CONTAINER            Container name (default: chronik-storage)
-    AZURE_USE_EMULATOR         Use Azurite emulator (default: false)
+# S3/MinIO Configuration
+S3_ENDPOINT                  S3 endpoint (e.g., http://minio:9000)
+S3_REGION                    AWS region (default: us-east-1)
+S3_BUCKET                    Bucket name (default: chronik-storage)
+S3_ACCESS_KEY                Access key ID
+S3_SECRET_KEY                Secret access key
+S3_PATH_STYLE                Path-style URLs (default: true, required for MinIO)
+S3_DISABLE_SSL               Disable SSL (default: false)
+
+# GCS Configuration
+GCS_BUCKET                   GCS bucket name
+GCS_PROJECT_ID               GCP project ID
+
+# Azure Configuration
+AZURE_ACCOUNT_NAME           Storage account name
+AZURE_CONTAINER              Container name
 ```
 
 ## ⚡ Performance Tuning
@@ -578,16 +616,21 @@ Apache License 2.0. See [LICENSE](LICENSE) for details.
 
 ## 📚 Documentation
 
+### Getting Started
 - [CHANGELOG.md](CHANGELOG.md) - Detailed release history
-- [CLAUDE.md](CLAUDE.md) - Development guide for AI assistants
+- [docs/RUNNING_A_CLUSTER.md](docs/RUNNING_A_CLUSTER.md) - **Complete cluster setup guide (v2.2.0+)**
 - [docs/KSQL_INTEGRATION_GUIDE.md](docs/KSQL_INTEGRATION_GUIDE.md) - KSQL setup and usage
-- [docs/WAL_AUTO_TUNING.md](docs/WAL_AUTO_TUNING.md) - WAL performance auto-tuning guide
 
-### Raft Clustering (Multi-Node Replication)
-- [docs/raft/README.md](docs/raft/README.md) - Raft cluster overview and quick start
-- [docs/RAFT_DEPLOYMENT_GUIDE.md](docs/RAFT_DEPLOYMENT_GUIDE.md) - Production deployment guide
-- [docs/raft/CONFIGURATION.md](docs/raft/CONFIGURATION.md) - Detailed configuration reference
-- [docs/RAFT_TESTING_GUIDE.md](docs/RAFT_TESTING_GUIDE.md) - Testing and debugging Raft clusters
+### Operations & Performance
+- [docs/WAL_AUTO_TUNING.md](docs/WAL_AUTO_TUNING.md) - WAL performance auto-tuning guide
 - [docs/DISASTER_RECOVERY.md](docs/DISASTER_RECOVERY.md) - Disaster recovery and backup strategies
-- [docs/raft/TROUBLESHOOTING.md](docs/raft/TROUBLESHOOTING.md) - Common issues and solutions
-- [docs/RAFT_METRICS_GUIDE.md](docs/RAFT_METRICS_GUIDE.md) - Monitoring Raft clusters with Prometheus
+- [docs/ADMIN_API_SECURITY.md](docs/ADMIN_API_SECURITY.md) - Admin API security configuration
+
+### Cluster Management (v2.2.0+)
+- [docs/TESTING_NODE_REMOVAL.md](docs/TESTING_NODE_REMOVAL.md) - Testing node addition/removal
+- [docs/PRIORITY4_COMPLETE.md](docs/PRIORITY4_COMPLETE.md) - Node removal implementation details
+
+### Development
+- [CLAUDE.md](CLAUDE.md) - Development guide for AI assistants
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) - System architecture and design
+- [docs/BUILD_INSTRUCTIONS.md](docs/BUILD_INSTRUCTIONS.md) - Build and development setup

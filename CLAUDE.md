@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Chronik Stream is a high-performance Kafka-compatible streaming platform written in Rust that implements the Kafka wire protocol with comprehensive Write-Ahead Log (WAL) durability and automatic recovery. Current version: v1.3.11.
+Chronik Stream is a high-performance Kafka-compatible streaming platform written in Rust that implements the Kafka wire protocol with comprehensive Write-Ahead Log (WAL) durability and automatic recovery. Current version: v2.2.0.
 
 **Key Differentiators:**
 - Full Kafka protocol compatibility tested with real clients (kafka-python, confluent-kafka, KSQL, Apache Flink)
@@ -46,9 +46,9 @@ cargo test --test integration
 cargo bench
 ```
 
-### Running the Server (v2.5.0+ New CLI)
+### Running the Server (v2.2.0+ CLI)
 
-**IMPORTANT**: CLI redesigned in v2.5.0 for simplicity. Old commands removed.
+**IMPORTANT**: CLI redesigned in v2.2.0 for simplicity. Old commands removed.
 
 ```bash
 # Single-node mode (simplest - just works)
@@ -618,15 +618,15 @@ After successful persistence, old WAL segments are truncated.
 3. Update `ObjectStoreConfig` enum
 4. Test with `storage_test.rs`
 
-## Operational Modes (v2.5.0+)
+## Operational Modes (v2.2.0+)
 
-**IMPORTANT**: CLI redesigned in v2.5.0. Old subcommands removed.
+**IMPORTANT**: CLI redesigned in v2.2.0. Old subcommands removed.
 
 The `chronik-server` binary now has a single `start` command that auto-detects mode:
 - **Single-Node** (default) - Standalone Kafka server with WAL durability
 - **Cluster** (from config) - Multi-node cluster with Raft + WAL replication (requires config file)
 
-**Removed in v2.5.0**: `standalone`, `raft-cluster`, `ingest`, `search`, `all` subcommands
+**Removed in v2.2.0**: `standalone`, `raft-cluster`, `ingest`, `search`, `all` subcommands
 
 ### Raft Clustering (Multi-Node Replication)
 
@@ -640,15 +640,15 @@ Raft provides **zero benefit** for single-node deployments:
 - ❌ Adds latency (Raft state machine overhead)
 - ✅ WAL already provides durability for single-node
 
-**Use single-node mode** (v2.5.0+):
+**Use single-node mode** (v2.2.0+):
 ```bash
 # Correct: Single-node with WAL durability
 cargo run --bin chronik-server start
 ```
 
-#### Multi-Node Cluster Setup (v2.5.0+)
+#### Multi-Node Cluster Setup (v2.2.0+)
 
-**NEW in v2.5.0**: Cluster configuration via TOML file for clarity and validation.
+**NEW in v2.2.0**: Cluster configuration via TOML file for clarity and validation.
 
 **Example config files provided**:
 - `examples/cluster-3node.toml` - Production template
@@ -726,11 +726,11 @@ raft = "localhost:5003"
 - ✅ Strong consistency (linearizable reads/writes)
 - ✅ Fault tolerance (can lose minority of nodes)
 - ✅ Automatic log compaction via snapshots (prevents unbounded log growth)
-- ✅ Zero-downtime node addition and removal (v2.5.0+)
+- ✅ Zero-downtime node addition and removal (v2.2.0+)
 
-### Cluster Management (v2.5.0 - Priorities 2-4 Complete)
+### Cluster Management (v2.2.0 - Priorities 2-4 Complete)
 
-**NEW in v2.5.0**: Complete zero-downtime cluster management via CLI and HTTP API.
+**NEW in v2.2.0**: Complete zero-downtime cluster management via CLI and HTTP API.
 
 #### Node Addition (Priority 2)
 

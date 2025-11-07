@@ -499,6 +499,94 @@ mod tests {
         async fn init_system_state(&self) -> chronik_common::metadata::traits::Result<()> {
             unimplemented!()
         }
+
+        // New methods for partition leadership and transactional support
+        async fn get_partition_leader(&self, _topic: &str, _partition: u32) -> chronik_common::metadata::traits::Result<Option<i32>> {
+            unimplemented!()
+        }
+
+        async fn get_partition_replicas(&self, _topic: &str, _partition: u32) -> chronik_common::metadata::traits::Result<Option<Vec<i32>>> {
+            unimplemented!()
+        }
+
+        async fn commit_transactional_offsets(
+            &self,
+            _transactional_id: String,
+            _producer_id: i64,
+            _producer_epoch: i16,
+            _group_id: String,
+            _offsets: Vec<(String, u32, i64, Option<String>)>,
+        ) -> chronik_common::metadata::traits::Result<()> {
+            unimplemented!()
+        }
+
+        async fn begin_transaction(
+            &self,
+            _transactional_id: String,
+            _producer_id: i64,
+            _producer_epoch: i16,
+            _timeout_ms: i32,
+        ) -> chronik_common::metadata::traits::Result<()> {
+            unimplemented!()
+        }
+
+        async fn add_partitions_to_transaction(
+            &self,
+            _transactional_id: String,
+            _producer_id: i64,
+            _producer_epoch: i16,
+            _partitions: Vec<(String, u32)>,
+        ) -> chronik_common::metadata::traits::Result<()> {
+            unimplemented!()
+        }
+
+        async fn add_offsets_to_transaction(
+            &self,
+            _transactional_id: String,
+            _producer_id: i64,
+            _producer_epoch: i16,
+            _group_id: String,
+        ) -> chronik_common::metadata::traits::Result<()> {
+            unimplemented!()
+        }
+
+        async fn prepare_commit_transaction(
+            &self,
+            _transactional_id: String,
+            _producer_id: i64,
+            _producer_epoch: i16,
+        ) -> chronik_common::metadata::traits::Result<()> {
+            unimplemented!()
+        }
+
+        async fn commit_transaction(
+            &self,
+            _transactional_id: String,
+            _producer_id: i64,
+            _producer_epoch: i16,
+        ) -> chronik_common::metadata::traits::Result<()> {
+            unimplemented!()
+        }
+
+        async fn abort_transaction(
+            &self,
+            _transactional_id: String,
+            _producer_id: i64,
+            _producer_epoch: i16,
+        ) -> chronik_common::metadata::traits::Result<()> {
+            unimplemented!()
+        }
+
+        async fn fence_producer(
+            &self,
+            _transactional_id: String,
+            _old_producer_id: i64,
+            _old_producer_epoch: i16,
+            _new_producer_id: i64,
+            _new_producer_epoch: i16,
+        ) -> chronik_common::metadata::traits::Result<()> {
+            unimplemented!()
+        }
     }
     
     #[test]
