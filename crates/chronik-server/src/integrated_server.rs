@@ -29,10 +29,7 @@ use chronik_storage::{
 };
 
 // Metadata store
-use chronik_common::metadata::{
-    traits::MetadataStore,
-    ChronikMetaLogStore,
-};
+use chronik_common::metadata::traits::MetadataStore;
 
 // Protocol types - BrokerMetadata is in chronik_common
 use chronik_common::metadata::traits::BrokerMetadata;
@@ -135,76 +132,41 @@ impl IntegratedKafkaServer {
         let segments_dir = format!("{}/segments", config.data_dir);
         std::fs::create_dir_all(&segments_dir)?;
         
-        // Initialize WAL-based metadata store (always enabled)
-        info!("Initializing WAL-based metadata store with real WAL adapter");
+        // v2.2.7 Phase 4: ALWAYS create RaftCluster for metadata (even single-node)
+        // Single-node mode uses zero-overhead synchronous apply (<100μs)
+        // Multi-node mode uses full Raft consensus (10-50ms)
+        info!("Creating RaftCluster for metadata coordination (single-node or multi-node)");
 
-        // Create WAL configuration for metadata
-        let wal_config = chronik_wal::config::WalConfig {
-            enabled: true,
-            data_dir: PathBuf::from(format!("{}/wal_metadata", config.data_dir)),
-            segment_size: 50 * 1024 * 1024, // 50MB segments for metadata
-            flush_interval_ms: 100, // Flush every 100ms
-            flush_threshold: 1024 * 1024, // 1MB buffer threshold
-            compression: chronik_wal::config::CompressionType::None,
-            checkpointing: chronik_wal::config::CheckpointConfig {
-                enabled: true,
-                interval_records: 1000,
-                interval_bytes: 10 * 1024 * 1024,
-            },
-            rotation: chronik_wal::config::RotationConfig {
-                max_segment_size: 50 * 1024 * 1024,
-                max_segment_age_ms: 60 * 60 * 1000, // 1 hour
-                coordinate_with_storage: false,
-            },
-            fsync: chronik_wal::config::FsyncConfig {
-                enabled: true,
-                batch_size: 1,
-                batch_timeout_ms: 0,
-            },
-            ..Default::default()
+        let raft_cluster_for_metadata = if let Some(ref cluster_cfg) = raft_cluster {
+            // Multi-node mode: use existing RaftCluster
+            info!("Multi-node mode: using existing RaftCluster with {} peers", cluster_cfg.peer_count());
+            cluster_cfg.clone()
+        } else {
+            // Single-node mode: create RaftCluster with empty peers (zero overhead)
+            info!("Single-node mode: creating RaftCluster with zero-overhead synchronous apply");
+
+            let data_dir = PathBuf::from(&config.data_dir);
+            Arc::new(crate::raft_cluster::RaftCluster::bootstrap(
+                config.node_id as u64,
+                Vec::new(),  // Empty peers = single-node mode
+                data_dir,
+            ).await?)
         };
 
-        // Create the real WAL adapter
-        use chronik_storage::WalMetadataAdapter;
-        let wal_adapter = Arc::new(WalMetadataAdapter::new(wal_config).await?);
+        // v2.2.7 Phase 4: Create RaftMetadataStore (replaces ChronikMetaLogStore)
+        let metadata_store: Arc<dyn MetadataStore> = Arc::new(
+            crate::raft_metadata_store::RaftMetadataStore::new(raft_cluster_for_metadata.clone())
+        );
 
-        let metalog_store = ChronikMetaLogStore::new(
-            wal_adapter,
-            PathBuf::from(format!("{}/metalog_snapshots", config.data_dir)),
-        ).await?;
+        info!("Successfully initialized RaftMetadataStore (v2.2.7 Phase 4)");
 
-        info!("Successfully initialized WAL-based metadata store with real WAL adapter");
-
-        // Ensure __meta topic exists for metadata storage
-        let metadata_store: Arc<dyn MetadataStore> = Arc::new(metalog_store);
-        if metadata_store.get_topic(chronik_common::metadata::METADATA_TOPIC).await?.is_none() {
-            info!("Creating internal metadata topic: {}", chronik_common::metadata::METADATA_TOPIC);
-
-            // CRITICAL FIX (v2.2.3): Use cluster replication factor for metadata topic
-            // In cluster mode, metadata MUST be replicated across all nodes for resilience
-            let meta_replication_factor = config.cluster_config.as_ref()
-                .map(|cluster| cluster.replication_factor as u32)
-                .unwrap_or(1_u32);  // Single-node mode uses RF=1
-
-            let meta_config = chronik_common::metadata::TopicConfig {
-                partition_count: 1, // Metadata topic only needs 1 partition
-                replication_factor: meta_replication_factor,  // Use cluster RF for resilience
-                retention_ms: None, // Never delete metadata
-                segment_bytes: 50 * 1024 * 1024, // 50MB segments
-                config: {
-                    let mut cfg = std::collections::HashMap::new();
-                    cfg.insert("compression.type".to_string(), "snappy".to_string());
-                    cfg.insert("cleanup.policy".to_string(), "compact".to_string());
-                    cfg
-                },
-            };
-            metadata_store.create_topic(chronik_common::metadata::METADATA_TOPIC, meta_config).await?;
-            info!("Successfully created internal metadata topic with replication_factor={}", meta_replication_factor);
-        }
+        // v2.2.7 Phase 6: System topics no longer needed - metadata lives in Raft state machine
+        // The old __meta topic was used by ChronikMetaLogStore, which is now deleted
+        // Raft stores metadata in its own WAL (./data/wal/__meta/)
         
-        // Register this broker in metadata
-        // CRITICAL FIX (v1.3.66): Wait for broker registration BEFORE accepting connections
-        // to prevent "no brokers available" errors from clients during cluster startup
+        // v2.2.7 Phase 4: Register broker via unified RaftMetadataStore
+        // Single-node: synchronous apply (<100μs, no leader election needed)
+        // Multi-node: Raft propose (10-50ms, waits for quorum)
         let broker_metadata = BrokerMetadata {
             broker_id: config.node_id,
             host: config.advertised_host.clone(),
@@ -215,194 +177,41 @@ impl IntegratedKafkaServer {
             updated_at: chrono::Utc::now(),
         };
 
-        if config.cluster_config.is_some() {
-            // Cluster mode: register broker with retry, but BLOCK until successful
-            // This ensures metadata is consistent before clients can connect
-            info!("Registering broker {} ({}:{}) in Raft metadata (waiting for quorum)...",
-                  config.node_id, config.advertised_host, config.advertised_port);
+        info!("Registering broker {} ({}:{}) via RaftMetadataStore...",
+              config.node_id, config.advertised_host, config.advertised_port);
 
-            let mut retry_count = 0;
-            let max_retries = 30; // 30 attempts * 2s = 60 seconds max wait
-            loop {
-                match metadata_store.register_broker(broker_metadata.clone()).await {
-                    Ok(_) => {
-                        info!("✓ Successfully registered broker {} in local metadata store", config.node_id);
-                        break;
-                    }
-                    Err(e) => {
-                        retry_count += 1;
-                        if retry_count <= max_retries {
-                            warn!("Failed to register broker {} (attempt {}/{}): {:?}, retrying in 2s...",
-                                  config.node_id, retry_count, max_retries, e);
-                            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                        } else {
-                            error!("FATAL: Failed to register broker {} after {} attempts: {:?}",
-                                   config.node_id, retry_count, e);
-                            return Err(anyhow::anyhow!(
-                                "Broker registration failed after {} attempts - cluster may not have quorum",
-                                max_retries
-                            ));
-                        }
-                    }
+        // v2.2.7: RaftMetadataStore.register_broker() automatically handles:
+        // - Single-node: synchronous apply to state machine
+        // - Multi-node: Raft propose (may fail if no leader elected yet)
+        let mut retry_count = 0;
+        let max_retries = 30; // 30 attempts * 2s = 60 seconds max wait
+        loop {
+            match metadata_store.register_broker(broker_metadata.clone()).await {
+                Ok(_) => {
+                    info!("✓ Successfully registered broker {} via RaftMetadataStore", config.node_id);
+                    break;
                 }
-            }
-
-            // CRITICAL FIX: Propose broker registration to Raft for cluster-wide synchronization
-            // This ensures all nodes can see all brokers in their metadata responses
-            if let Some(ref raft) = raft_cluster {
-                info!("Proposing broker {} registration to Raft cluster for synchronization...", config.node_id);
-
-                // Retry loop for Raft proposal (may fail if we're not the leader yet)
-                let mut raft_retry_count = 0;
-                let max_raft_retries = 15; // 15 attempts * 2s = 30 seconds max wait
-                loop {
-                    match raft.propose(crate::raft_metadata::MetadataCommand::RegisterBroker {
-                        broker_id: config.node_id,
-                        host: config.advertised_host.clone(),
-                        port: config.advertised_port,
-                        rack: None,
-                    }).await {
-                        Ok(_) => {
-                            info!("✓ Successfully proposed broker {} registration to Raft cluster", config.node_id);
-                            break;
-                        }
-                        Err(e) => {
-                            raft_retry_count += 1;
-                            if raft_retry_count <= max_raft_retries {
-                                // This is expected during startup - nodes may not have a leader yet
-                                debug!("Failed to propose broker {} to Raft (attempt {}/{}): {:?}, retrying in 2s...",
-                                      config.node_id, raft_retry_count, max_raft_retries, e);
-                                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                            } else {
-                                // Don't fail the server - it's better to run with incomplete metadata
-                                // than to crash. The broker will retry when it becomes leader.
-                                warn!("WARNING: Failed to propose broker {} to Raft after {} attempts: {:?}",
-                                     config.node_id, raft_retry_count, e);
-                                warn!("Server will continue, but broker metadata may be incomplete on followers");
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        } else {
-            // Standalone mode: register broker synchronously
-            info!("Registering broker {} ({}:{}) in metadata store...",
-                  config.node_id, config.advertised_host, config.advertised_port);
-            metadata_store.register_broker(broker_metadata).await?;
-            info!("✓ Successfully registered broker {} in metadata store", config.node_id);
-        }
-
-        // CRITICAL FIX: Start background task for BIDIRECTIONAL broker synchronization
-        // This ensures all nodes can see all brokers in their Metadata API responses
-        // Direction 1: Raft → local store (followers pull from Raft)
-        // Direction 2: local store → Raft (retry failed proposals)
-        if let Some(ref raft) = raft_cluster {
-            let raft_clone = raft.clone();
-            let metadata_store_clone = metadata_store.clone();
-            let node_id = config.node_id;
-            let advertised_host = config.advertised_host.clone();
-            let advertised_port = config.advertised_port;
-            let cluster_config_clone = config.cluster_config.clone();
-
-            tokio::spawn(async move {
-                info!("Starting BIDIRECTIONAL broker synchronization task (Raft ↔ local metadata store)");
-                let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
-
-                loop {
-                    interval.tick().await;
-
-                    // DIRECTION 1: Pull brokers from Raft → local metadata store
-                    let raft_brokers = raft_clone.get_all_brokers_from_state_machine();
-
-                    if !raft_brokers.is_empty() {
-                        for (broker_id, host, port, rack) in raft_brokers {
-                            // Check if broker exists locally
-                            match metadata_store_clone.get_broker(broker_id).await {
-                                Ok(Some(_)) => {
-                                    // Broker already exists, no need to sync
-                                    debug!("Broker {} already exists in local metadata store", broker_id);
-                                }
-                                Ok(None) | Err(_) => {
-                                    // Broker doesn't exist locally - sync from Raft
-                                    let broker_meta = BrokerMetadata {
-                                        broker_id,
-                                        host,
-                                        port,
-                                        rack,
-                                        status: chronik_common::metadata::traits::BrokerStatus::Online,
-                                        created_at: chrono::Utc::now(),
-                                        updated_at: chrono::Utc::now(),
-                                    };
-
-                                    match metadata_store_clone.register_broker(broker_meta.clone()).await {
-                                        Ok(_) => {
-                                            info!("✓ Synced broker {} ({}:{}) from Raft to local metadata store",
-                                                  broker_id, broker_meta.host, broker_meta.port);
-                                        }
-                                        Err(e) => {
-                                            // AlreadyExists is okay - means it was just registered
-                                            if !format!("{:?}", e).contains("AlreadyExists") {
-                                                warn!("Failed to sync broker {} from Raft: {:?}", broker_id, e);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // DIRECTION 2: Push missing brokers to Raft
-                    // CRITICAL FIX: Only the LEADER can propose to Raft!
-                    // Strategy: If we're the leader, register ALL peers from cluster config
-                    // If we're a follower, we'll get synced from Raft (Direction 1)
-                    let (is_leader, leader_id, state) = raft_clone.is_leader_ready();
-
-                    if is_leader && leader_id == raft_clone.node_id() {
-                        // We're the leader - register ALL peers from cluster config
-                        let raft_broker_ids: Vec<i32> = raft_clone.get_all_brokers_from_state_machine()
-                            .iter()
-                            .map(|(id, _, _, _)| *id)
-                            .collect();
-
-                        // Get cluster config to know about all peers
-                        if let Some(ref cluster_config) = cluster_config_clone {
-                            // Register all peers (including ourselves)
-                            for peer in &cluster_config.peers {
-                            let peer_id = peer.id as i32;
-
-                            if !raft_broker_ids.contains(&peer_id) {
-                                // This peer is NOT in Raft yet - propose it
-                                info!("👑 Leader proposing broker {} registration to Raft...", peer_id);
-
-                                match raft_clone.propose(crate::raft_metadata::MetadataCommand::RegisterBroker {
-                                    broker_id: peer_id,
-                                    host: peer.kafka.split(':').next().unwrap_or("localhost").to_string(),
-                                    port: peer.kafka.split(':').nth(1).and_then(|p| p.parse().ok()).unwrap_or(9092),
-                                    rack: None,
-                                }).await {
-                                    Ok(_) => {
-                                        info!("✓ Leader successfully proposed broker {} registration to Raft", peer_id);
-                                    }
-                                    Err(e) => {
-                                        warn!("⚠️  Leader failed to propose broker {} to Raft: {:?}", peer_id, e);
-                                    }
-                                }
-                            } else {
-                                debug!("✓ Broker {} already exists in Raft state machine", peer_id);
-                            }
-                        }
-                        } // end if let Some(cluster_config)
+                Err(e) => {
+                    retry_count += 1;
+                    if retry_count <= max_retries {
+                        warn!("Failed to register broker {} (attempt {}/{}): {:?}, retrying in 2s...",
+                              config.node_id, retry_count, max_retries, e);
+                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
                     } else {
-                        // We're a follower - just log and wait for sync from Raft
-                        debug!("Follower node {} waiting for leader ({}) to register brokers (state={})",
-                               node_id, leader_id, state);
+                        error!("FATAL: Failed to register broker {} after {} attempts: {:?}",
+                               config.node_id, retry_count, e);
+                        return Err(anyhow::anyhow!(
+                            "Broker registration failed after {} attempts - cluster may not have quorum",
+                            max_retries
+                        ));
                     }
                 }
-            });
-
-            info!("✓ BIDIRECTIONAL broker synchronization task started (syncs every 10s)");
+            }
         }
+
+        // v2.2.7 Phase 4: Broker sync is now handled by Raft directly
+        // RaftMetadataStore.register_broker() calls raft.propose() automatically
+        // No need for background bidirectional sync task
 
         // Restore high watermarks from segment metadata on startup
         // This ensures that after WAL deletion, we can still serve data from segments

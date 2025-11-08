@@ -123,6 +123,17 @@ impl GrpcTransport {
         info!("Connected to peer {} at {}", node_id, addr);
         Ok(client)
     }
+
+    /// Get the number of registered peers (v2.2.7 Phase 2)
+    ///
+    /// Returns the count of peer nodes (not including self).
+    /// Used to detect single-node vs multi-node deployment.
+    pub fn peer_count(&self) -> usize {
+        // Use try_read to avoid blocking - if lock is held, assume non-zero peers
+        self.peer_addrs.try_read()
+            .map(|addrs| addrs.len())
+            .unwrap_or(1) // Conservative: assume multi-node if can't read
+    }
 }
 
 impl Default for GrpcTransport {

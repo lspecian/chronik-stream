@@ -20,7 +20,7 @@ pub mod segment_cache;
 pub mod optimized_segment;
 pub mod vector_search;
 pub mod extended_segment;
-pub mod metadata_wal_adapter;
+// v2.2.7 Phase 5: Deleted metadata_wal_adapter.rs (old WAL adapter, replaced by Raft)
 
 pub use canonical_record::{
     CanonicalRecord, CanonicalRecordEntry, RecordHeader as CanonicalRecordHeader,
@@ -55,7 +55,7 @@ pub use extended_segment::{
     ExtendedTansuSegment, ExtendedSegmentMetadata, ExtendedSegmentBuilder,
     VectorFieldConfig, HybridStats, SegmentMigration
 };
-pub use metadata_wal_adapter::WalMetadataAdapter;
+// v2.2.7 Phase 5: Removed WalMetadataAdapter export (deleted file)
 pub use wal_indexer::{
     WalIndexer, WalIndexerConfig, IndexingStats, TopicPartition as WalIndexerTopicPartition,
 };

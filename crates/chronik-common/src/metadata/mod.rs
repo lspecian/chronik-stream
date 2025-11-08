@@ -1,9 +1,11 @@
 //! Metadata management module.
+//!
+//! v2.2.7: All metadata now flows through Raft (see chronik-server/raft_metadata_store.rs)
 
 pub mod traits;
 pub mod memory;
 pub mod events;
-pub mod metalog_store;
+// v2.2.7 Phase 5: Deleted metalog_store.rs (old WAL-based metadata, replaced by Raft)
 pub mod metrics;
 pub mod metadata_uploader;
 pub mod object_store_adapter;
@@ -17,7 +19,9 @@ pub mod raft_state_machine;
 pub use traits::*;
 pub use memory::InMemoryMetadataStore;
 pub use events::{MetadataEvent, MetadataEventPayload, EventLog, EventApplicator};
-pub use metalog_store::{ChronikMetaLogStore, MetaLogWalInterface, MetadataState, METADATA_TOPIC, MockWal};
+// v2.2.7 Phase 5: Removed ChronikMetaLogStore exports (deleted file)
+// Kept METADATA_TOPIC constant for backward compatibility
+pub const METADATA_TOPIC: &str = "__chronik_metadata";
 pub use metrics::{WalMetadataMetrics, MetricsReport, global_metrics};
 pub use metadata_uploader::{MetadataUploader, MetadataUploaderConfig, ObjectStoreInterface, UploadStats};
 pub use object_store_adapter::{ObjectStoreAdapter, ObjectStoreImpl};

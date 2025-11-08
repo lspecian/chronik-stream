@@ -29,6 +29,7 @@ mod wal_replication;  // v2.2.0: PostgreSQL-style WAL streaming
 // v2.5.0 Phase 2: Raft for metadata coordination only (NOT data replication)
 mod raft_metadata;
 mod raft_cluster;
+mod raft_metadata_store;  // v2.2.7 Phase 3: Unified metadata store (1-N nodes)
 // v2.5.0 Phase 3: ISR tracking for partition replication
 mod isr_tracker;
 // v2.5.0 Phase 4: ISR ACK tracking for acks=-1 quorum support

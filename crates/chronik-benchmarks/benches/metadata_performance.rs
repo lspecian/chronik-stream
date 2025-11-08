@@ -1,4 +1,6 @@
-//! Performance benchmarks comparing WAL vs TiKV metadata stores
+//! Performance benchmarks for metadata store operations
+//!
+//! v2.2.7: Updated to use InMemoryMetadataStore (Raft-based stores benchmarked separately)
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
 use tokio::runtime::Runtime;
@@ -9,31 +11,20 @@ use uuid::Uuid;
 use chronik_common::metadata::{
     MetadataStore, TopicConfig, TopicMetadata, BrokerMetadata, BrokerStatus,
     ConsumerGroupMetadata, ConsumerOffset, SegmentMetadata,
-    metalog_store::ChronikMetaLogStore,
+    InMemoryMetadataStore,
 };
-use chronik_storage::metadata_wal_adapter::WalMetadataAdapter;
-use chronik_wal::config::WalConfig;
 
 struct BenchmarkSetup {
-    wal_store: Arc<ChronikMetaLogStore>,
-    temp_dir: TempDir,
+    store: Arc<dyn MetadataStore>,
+    _temp_dir: TempDir,
 }
 
 impl BenchmarkSetup {
     async fn new() -> Self {
         let temp_dir = TempDir::new().unwrap();
-        let wal_config = WalConfig {
-            enabled: true,
-            data_dir: temp_dir.path().to_path_buf(),
-            flush_interval_ms: 10, // Fast flush for benchmarks
-            flush_threshold: 1024, // Small threshold
-            ..Default::default()
-        };
+        let store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
 
-        let adapter = Arc::new(WalMetadataAdapter::new(wal_config).await.unwrap());
-        let wal_store = Arc::new(ChronikMetaLogStore::new(adapter).await.unwrap());
-
-        Self { wal_store, temp_dir }
+        Self { store, _temp_dir: temp_dir }
     }
 }
 
@@ -60,7 +51,7 @@ fn bench_topic_operations(c: &mut Criterion) {
                         };
 
                         black_box(
-                            setup.wal_store.create_topic(&topic_name, config).await.unwrap()
+                            setup.store.create_topic(&topic_name, config).await.unwrap()
                         );
                     }
                 })
@@ -78,11 +69,11 @@ fn bench_topic_operations(c: &mut Criterion) {
                     for i in 0..topic_count {
                         let topic_name = format!("test-topic-{}", i);
                         let config = TopicConfig::default();
-                        setup.wal_store.create_topic(&topic_name, config).await.unwrap();
+                        setup.store.create_topic(&topic_name, config).await.unwrap();
                     }
 
                     // Benchmark reading all topics
-                    black_box(setup.wal_store.list_topics().await.unwrap());
+                    black_box(setup.store.list_topics().await.unwrap());
                 })
             },
         );
@@ -98,12 +89,12 @@ fn bench_topic_operations(c: &mut Criterion) {
                     for i in 0..topic_count {
                         let topic_name = format!("test-topic-{}", i);
                         let config = TopicConfig::default();
-                        setup.wal_store.create_topic(&topic_name, config).await.unwrap();
+                        setup.store.create_topic(&topic_name, config).await.unwrap();
                     }
 
                     // Benchmark getting a specific topic
                     black_box(
-                        setup.wal_store.get_topic("test-topic-50").await.unwrap()
+                        setup.store.get_topic("test-topic-50").await.unwrap()
                     );
                 })
             },
@@ -127,7 +118,7 @@ fn bench_segment_operations(c: &mut Criterion) {
                     let setup = BenchmarkSetup::new().await;
 
                     // Create a topic first
-                    setup.wal_store.create_topic("test-topic", TopicConfig::default()).await.unwrap();
+                    setup.store.create_topic("test-topic", TopicConfig::default()).await.unwrap();
 
                     for i in 0..segment_count {
                         let segment = SegmentMetadata {
@@ -143,7 +134,7 @@ fn bench_segment_operations(c: &mut Criterion) {
                         };
 
                         black_box(
-                            setup.wal_store.persist_segment_metadata(segment).await.unwrap()
+                            setup.store.persist_segment_metadata(segment).await.unwrap()
                         );
                     }
                 })
@@ -158,7 +149,7 @@ fn bench_segment_operations(c: &mut Criterion) {
                     let setup = BenchmarkSetup::new().await;
 
                     // Create topic and segments
-                    setup.wal_store.create_topic("test-topic", TopicConfig::default()).await.unwrap();
+                    setup.store.create_topic("test-topic", TopicConfig::default()).await.unwrap();
 
                     for i in 0..segment_count {
                         let segment = SegmentMetadata {
@@ -173,12 +164,12 @@ fn bench_segment_operations(c: &mut Criterion) {
                             created_at: chrono::Utc::now(),
                         };
 
-                        setup.wal_store.persist_segment_metadata(segment).await.unwrap();
+                        setup.store.persist_segment_metadata(segment).await.unwrap();
                     }
 
                     // Benchmark listing segments
                     black_box(
-                        setup.wal_store.list_segments("test-topic", Some(0)).await.unwrap()
+                        setup.store.list_segments("test-topic", Some(0)).await.unwrap()
                     );
                 })
             },
@@ -214,7 +205,7 @@ fn bench_consumer_operations(c: &mut Criterion) {
                         };
 
                         black_box(
-                            setup.wal_store.create_consumer_group(group_metadata).await.unwrap()
+                            setup.store.create_consumer_group(group_metadata).await.unwrap()
                         );
                     }
                 })
@@ -229,7 +220,7 @@ fn bench_consumer_operations(c: &mut Criterion) {
                     let setup = BenchmarkSetup::new().await;
 
                     // Pre-create topic and consumer group
-                    setup.wal_store.create_topic("test-topic", TopicConfig::default()).await.unwrap();
+                    setup.store.create_topic("test-topic", TopicConfig::default()).await.unwrap();
 
                     let group_metadata = ConsumerGroupMetadata {
                         group_id: "test-group".to_string(),
@@ -241,7 +232,7 @@ fn bench_consumer_operations(c: &mut Criterion) {
                         created_at: chrono::Utc::now(),
                         updated_at: chrono::Utc::now(),
                     };
-                    setup.wal_store.create_consumer_group(group_metadata).await.unwrap();
+                    setup.store.create_consumer_group(group_metadata).await.unwrap();
 
                     // Benchmark offset commits
                     for i in 0..consumer_count {
@@ -255,7 +246,7 @@ fn bench_consumer_operations(c: &mut Criterion) {
                         };
 
                         black_box(
-                            setup.wal_store.commit_offset(offset).await.unwrap()
+                            setup.store.commit_offset(offset).await.unwrap()
                         );
                     }
                 })
@@ -326,14 +317,14 @@ fn bench_mixed_workload(c: &mut Criterion) {
                         metadata: None,
                         commit_timestamp: chrono::Utc::now(),
                     };
-                    setup.wal_store.commit_offset(offset).await.unwrap();
+                    setup.store.commit_offset(offset).await.unwrap();
                 }
             }
 
             // Do some reads
-            black_box(setup.wal_store.list_topics().await.unwrap());
-            black_box(setup.wal_store.list_segments("topic-0", None).await.unwrap());
-            black_box(setup.wal_store.get_consumer_group("group-0").await.unwrap());
+            black_box(setup.store.list_topics().await.unwrap());
+            black_box(setup.store.list_segments("topic-0", None).await.unwrap());
+            black_box(setup.store.get_consumer_group("group-0").await.unwrap());
         })
     });
 
@@ -345,69 +336,15 @@ fn bench_recovery_performance(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("recovery_performance");
 
-    for event_count in [100, 1000, 5000].iter() {
-        group.bench_with_input(
-            BenchmarkId::new("wal_recovery", event_count),
-            event_count,
-            |b, &event_count| {
-                b.to_async(&rt).iter(|| async {
-                    let temp_dir = TempDir::new().unwrap();
-                    let wal_config = WalConfig {
-                        enabled: true,
-                        data_dir: temp_dir.path().to_path_buf(),
-                        flush_interval_ms: 1, // Force immediate flush
-                        flush_threshold: 1,   // Force flush every record
-                        ..Default::default()
-                    };
+    // v2.2.7: Recovery benchmarks not applicable to InMemoryMetadataStore
+    // Raft-based recovery will be benchmarked separately with cluster setup
 
-                    // Create initial store and populate with data
-                    {
-                        let adapter = Arc::new(WalMetadataAdapter::new(wal_config.clone()).await.unwrap());
-                        let store = Arc::new(ChronikMetaLogStore::new(adapter).await.unwrap());
-
-                        // Create events
-                        for i in 0..event_count {
-                            if i % 3 == 0 {
-                                let topic_name = format!("topic-{}", i / 3);
-                                let config = TopicConfig::default();
-                                store.create_topic(&topic_name, config).await.unwrap();
-                            } else if i % 3 == 1 {
-                                let group_metadata = ConsumerGroupMetadata {
-                                    group_id: format!("group-{}", i / 3),
-                                    state: "Stable".to_string(),
-                                    protocol: "range".to_string(),
-                                    protocol_type: "consumer".to_string(),
-                                    generation_id: 1,
-                                    leader_id: Some(format!("consumer-{}", i)),
-                                    created_at: chrono::Utc::now(),
-                                    updated_at: chrono::Utc::now(),
-                                };
-                                store.create_consumer_group(group_metadata).await.unwrap();
-                            } else {
-                                let offset = ConsumerOffset {
-                                    group_id: format!("group-{}", (i / 3).max(0)),
-                                    topic: format!("topic-{}", (i / 3).max(0)),
-                                    partition: 0,
-                                    offset: i as i64 * 1000,
-                                    metadata: None,
-                                    commit_timestamp: chrono::Utc::now(),
-                                };
-                                store.commit_offset(offset).await.unwrap();
-                            }
-                        }
-                    }
-
-                    // Benchmark recovery
-                    let start = std::time::Instant::now();
-                    let adapter = Arc::new(WalMetadataAdapter::new(wal_config).await.unwrap());
-                    let _store = Arc::new(ChronikMetaLogStore::new(adapter).await.unwrap());
-                    let recovery_time = start.elapsed();
-
-                    black_box(recovery_time);
-                })
-            },
-        );
-    }
+    group.bench_function("in_memory_initialization", |b| {
+        b.to_async(&rt).iter(|| async {
+            let _store = Arc::new(InMemoryMetadataStore::new());
+            black_box(_store);
+        })
+    });
 
     group.finish();
 }

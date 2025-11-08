@@ -1,43 +1,36 @@
-//! Basic tests for WAL metadata adapter functionality
+//! Basic tests for storage layer functionality
+//!
+//! v2.2.7: WalMetadataAdapter deleted (replaced by Raft-backed metadata)
+//! Metadata tests now use InMemoryMetadataStore
 
-use chronik_common::metadata::{MetaLogWalInterface, MetadataEventPayload};
-use chronik_storage::metadata_wal_adapter::WalMetadataAdapter;
-use chronik_wal::config::WalConfig;
+use chronik_common::metadata::{MetadataStore, TopicConfig, InMemoryMetadataStore};
 use std::sync::Arc;
-use tempfile::TempDir;
-use chrono::Utc;
-use uuid::Uuid;
 
 #[tokio::test]
-async fn test_wal_adapter_basic_operations() {
-    let temp_dir = TempDir::new().unwrap();
-    let config = WalConfig {
-        enabled: true,
-        data_dir: temp_dir.path().to_path_buf(),
-        ..Default::default()
-    };
+async fn test_metadata_store_basic_operations() {
+    let metadata_store = Arc::new(InMemoryMetadataStore::new());
 
-    let adapter: Arc<dyn MetaLogWalInterface> = Arc::new(
-        WalMetadataAdapter::new(config).await.unwrap()
-    );
+    // Test topic creation
+    let topic_metadata = metadata_store.create_topic("test-topic", TopicConfig {
+        partition_count: 3,
+        replication_factor: 1,
+        retention_ms: None,
+        segment_bytes: 1024 * 1024,
+        config: Default::default(),
+    }).await.unwrap();
 
-    // Test reading from empty WAL
-    let events = adapter.read_metadata_events(0).await.unwrap();
-    assert_eq!(events.len(), 0);
+    assert_eq!(topic_metadata.name, "test-topic");
+    assert_eq!(topic_metadata.config.partition_count, 3);
 
-    // Test getting latest offset from empty WAL
-    let offset = adapter.get_latest_offset().await.unwrap();
-    assert_eq!(offset, 0);
+    // Test topic retrieval
+    let retrieved = metadata_store.get_topic("test-topic").await.unwrap();
+    assert!(retrieved.is_some());
+    assert_eq!(retrieved.unwrap().name, "test-topic");
 
-    println!("Basic WAL adapter operations work correctly");
+    // Test list topics
+    let topics = metadata_store.list_topics().await.unwrap();
+    assert_eq!(topics.len(), 1);
+    assert_eq!(topics[0].name, "test-topic");
+
+    println!("✓ Metadata store operations work correctly");
 }
-
-// TODO: Fix WAL persistence - currently the WAL buffer doesn't persist properly across restarts
-// This test is commented out until the persistence issue is resolved
-/*
-#[tokio::test]
-async fn test_wal_adapter_persistence() {
-    // Test currently fails because WAL data doesn't persist across restarts
-    // This is likely due to buffering in the WAL that doesn't get flushed to disk
-}
-*/
