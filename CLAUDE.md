@@ -129,17 +129,37 @@ docker run -d -p 9092:9092 \
 docker-compose up -d
 ```
 
-**For development testing on macOS:**
+**For development testing - Local Cluster:**
+
+**DEFINITIVE METHOD** - This is THE ONLY way to run a local test cluster:
+
 ```bash
-# Test with native binary instead
-./target/release/chronik-server --advertised-addr localhost standalone --dual-storage
+# Start 3-node cluster (ports 9092, 9093, 9094)
+./tests/cluster/start.sh
 
 # Test with Python Kafka clients
-python3 test_script.py
+python3 test_node_ready.py
 
-# Test with kafka-console-producer/consumer (if installed via brew)
-kafka-console-producer --bootstrap-server localhost:9092 --topic test
+# Stop cluster
+./tests/cluster/stop.sh
+
+# View logs
+tail -f tests/cluster/logs/node*.log
 ```
+
+**Location:** `tests/cluster/` contains:
+- `node1.toml`, `node2.toml`, `node3.toml` - Node configurations
+- `start.sh` - Start cluster script
+- `stop.sh` - Stop cluster script
+- `logs/` - Log files
+- `data/` - Data directories (cleaned on start)
+
+**DO NOT:**
+- ❌ Create cluster configs elsewhere
+- ❌ Start nodes manually
+- ❌ Use Docker on macOS for testing
+
+See [tests/cluster/README.md](tests/cluster/README.md) for details.
 
 ## Layered Storage Architecture with Full Disaster Recovery
 

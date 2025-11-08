@@ -2028,19 +2028,17 @@ impl ProtocolHandler {
                 encoder.write_i16(api.max_version);
             }
         } else {
-            // v1+ field order depends on version:
+            // CRITICAL: Correct field order from Kafka protocol spec
             // v1-2: throttle_time_ms, error_code, api_versions
-            // v3: error_code, api_versions (NO throttle_time_ms according to spec)
-            // v4+: throttle_time_ms, error_code, api_versions
-            
-            // Write throttle_time_ms for v1-2 and v4+, but NOT v3
+            // v3+: error_code, api_versions, throttle_time_ms, tagged_fields
+            // v4+: error_code, api_versions, throttle_time_ms, tagged_fields
+
+            // Write throttle_time_ms FIRST for v1-2 only
             if version >= 1 && version <= 2 {
                 encoder.write_i32(response.throttle_time_ms);
-            } else if version >= 4 {
-                encoder.write_i32(response.throttle_time_ms);
             }
-            
-            // Then error_code
+
+            // Then error_code (for ALL v1+ versions)
             encoder.write_i16(response.error_code);
             
             // Write array of API versions
@@ -2049,40 +2047,37 @@ impl ProtocolHandler {
                 // Compact arrays use length+1 encoding
                 let array_len = (response.api_versions.len() + 1) as u32;
                 encoder.write_unsigned_varint(array_len);
-                
+
                 for (i, api) in response.api_versions.iter().enumerate() {
                     // CRITICAL: librdkafka compatibility issue
                     // Kafka spec says v3+ uses INT8 for min/max, but librdkafka v2.11.1
                     // seems to expect INT16. Let's try INT16 for compatibility.
                     encoder.write_i16(api.api_key);
-                    
+
                     // Try INT16 for librdkafka compatibility
                     encoder.write_i16(api.min_version);
                     encoder.write_i16(api.max_version);
-                    
+
                     // Write tagged fields (empty for now)
                     encoder.write_unsigned_varint(0);
                 }
             } else {
                 encoder.write_i32(response.api_versions.len() as i32);
-                
+
                 for api in &response.api_versions {
                     encoder.write_i16(api.api_key);
                     encoder.write_i16(api.min_version);
                     encoder.write_i16(api.max_version);
                 }
             }
-            
-            // CRITICAL FIX: librdkafka expects throttle_time_ms at the end for v3
-            // The error shows it expects 4 bytes at position 423/424
-            if version == 3 {
+
+            // CRITICAL: throttle_time_ms comes AFTER api_versions for v3+
+            if version >= 3 {
                 encoder.write_i32(response.throttle_time_ms);
-                encoder.write_unsigned_varint(0);
             }
-            
-            // v4+ has tagged fields at the end (and throttle_time is earlier)
-            if version >= 4 {
-                // Write tagged fields at the end (empty for now)
+
+            // Tagged fields at the end for v3+
+            if version >= 3 {
                 encoder.write_unsigned_varint(0);
             }
         }

@@ -1,0 +1,37 @@
+# DEFINITIVE Local Test Cluster - Node 3
+# This is THE ONLY config for local 3-node testing
+# Use: ./tests/cluster/start.sh
+
+enabled = true
+node_id = 3
+data_dir = "/home/ubuntu/Development/chronik-stream/tests/cluster/data/node3"
+replication_factor = 3
+min_insync_replicas = 2
+
+[bind]
+kafka = "0.0.0.0:9094"
+wal = "0.0.0.0:9293"
+raft = "0.0.0.0:5003"
+
+[advertise]
+kafka = "localhost:9094"
+wal = "localhost:9293"
+raft = "localhost:5003"
+
+[[peers]]
+id = 1
+kafka = "localhost:9092"
+wal = "localhost:9291"
+raft = "localhost:5001"
+
+[[peers]]
+id = 2
+kafka = "localhost:9093"
+wal = "localhost:9292"
+raft = "localhost:5002"
+
+[[peers]]
+id = 3
+kafka = "localhost:9094"
+wal = "localhost:9293"
+raft = "localhost:5003"
