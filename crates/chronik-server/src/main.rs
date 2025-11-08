@@ -618,7 +618,7 @@ async fn run_cluster_mode(
     // Create IntegratedKafkaServer config with cluster config
     let server_config = IntegratedServerConfig {
         node_id: config.node_id as i32,
-        advertised_host,
+        advertised_host: advertised_host.clone(),  // Clone for later use in broker registration
         advertised_port,
         data_dir: cli.data_dir.to_string_lossy().to_string(),
         enable_indexing: cfg!(feature = "search"),
@@ -638,6 +638,74 @@ async fn run_cluster_mode(
     info!("Initializing IntegratedKafkaServer...");
     let server = IntegratedKafkaServer::new(server_config, Some(raft_cluster.clone())).await?;
     info!("IntegratedKafkaServer initialized successfully");
+
+    // ARCHITECTURAL FIX v2.2.7: Register broker NOW (after Raft message loop started)
+    // Multi-node broker registration happens here, AFTER:
+    // 1. Raft message loop started (leader election can proceed)
+    // 2. gRPC server started (nodes can communicate)
+    // 3. IntegratedServer created (metadata store ready)
+    info!("Waiting for Raft leader election before broker registration...");
+
+    // Wait for leader election (max 10 seconds)
+    let mut election_attempts = 0;
+    let max_election_wait = 100; // 100 * 100ms = 10 seconds
+    while election_attempts < max_election_wait {
+        let (has_leader, leader_id, state) = raft_cluster.is_leader_ready();
+        if has_leader {
+            info!("✓ Raft leader elected: leader_id={}, state={}", leader_id, state);
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        election_attempts += 1;
+    }
+
+    // Now register broker via RaftMetadataStore
+    use chronik_common::metadata::traits::BrokerMetadata;
+    let broker_metadata = BrokerMetadata {
+        broker_id: config.node_id as i32,
+        host: advertised_host.clone(),
+        port: advertised_port,
+        rack: None,
+        status: chronik_common::metadata::traits::BrokerStatus::Online,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+
+    info!("Registering broker {} via Raft (after leader election)...", config.node_id);
+
+    // Get metadata store from server
+    let metadata_store = server.metadata_store();
+
+    // Retry registration with backoff (follower may need time to connect to leader)
+    let mut retry_count = 0;
+    let max_retries = 30; // 30 attempts * 2s = 60 seconds max wait
+    loop {
+        match metadata_store.register_broker(broker_metadata.clone()).await {
+            Ok(_) => {
+                info!("✅ Successfully registered broker {} via Raft", config.node_id);
+                break;
+            }
+            Err(e) => {
+                retry_count += 1;
+                if retry_count <= max_retries {
+                    warn!(
+                        "Failed to register broker {} (attempt {}/{}): {:?}, retrying in 2s...",
+                        config.node_id, retry_count, max_retries, e
+                    );
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                } else {
+                    error!(
+                        "FATAL: Failed to register broker {} after {} attempts: {:?}",
+                        config.node_id, retry_count, e
+                    );
+                    return Err(anyhow::anyhow!(
+                        "Broker registration failed after {} attempts - cluster may not have quorum",
+                        max_retries
+                    ));
+                }
+            }
+        }
+    }
 
     // Initialize monitoring
     let metrics_port = 13000 + (config.node_id as u16);  // 13001, 13002, 13003, etc.

@@ -820,42 +820,49 @@ impl IntegratedKafkaServer {
                     warn!("Failed to assign existing partitions: {:?}", e);
                 }
 
-                // CRITICAL FIX (v1.3.66): Verify broker is visible in metadata before accepting connections
-                // In Raft cluster mode, allow extra time for consensus and replication
-                info!("Verifying broker {} is visible in metadata store (Raft cluster mode)...", server.config.node_id);
-                let mut verify_retry = 0;
-                let max_verify_retries = 60; // 60 seconds for Raft cluster to stabilize
-                loop {
-                    match metadata_store.list_brokers().await {
-                        Ok(brokers) if !brokers.is_empty() => {
-                            let broker_ids: Vec<i32> = brokers.iter().map(|b| b.broker_id).collect();
-                            info!("✓ Metadata store has {} broker(s): {:?}", brokers.len(), broker_ids);
+                // v2.2.7 ARCHITECTURAL FIX: Skip broker verification for multi-node Raft clusters
+                // because broker registration happens AFTER IntegratedServer::new() returns
+                // (registration requires Raft message loop to be running, which starts after this)
+                if raft_cluster.is_none() {
+                    // Single-node mode: Broker was registered above, verify it now
+                    info!("Verifying broker {} is visible in metadata store (single-node mode)...", server.config.node_id);
+                    let mut verify_retry = 0;
+                    let max_verify_retries = 10; // 10 seconds for single-node (should be instant)
+                    loop {
+                        match metadata_store.list_brokers().await {
+                            Ok(brokers) if !brokers.is_empty() => {
+                                let broker_ids: Vec<i32> = brokers.iter().map(|b| b.broker_id).collect();
+                                info!("✓ Metadata store has {} broker(s): {:?}", brokers.len(), broker_ids);
 
-                            // Verify THIS broker is in the list
-                            if brokers.iter().any(|b| b.broker_id == server.config.node_id) {
-                                info!("✓ Broker {} confirmed visible in metadata", server.config.node_id);
-                                break;
-                            } else {
-                                warn!("Broker {} not yet visible in metadata (found: {:?}), retrying...",
-                                      server.config.node_id, broker_ids);
+                                // Verify THIS broker is in the list
+                                if brokers.iter().any(|b| b.broker_id == server.config.node_id) {
+                                    info!("✓ Broker {} confirmed visible in metadata", server.config.node_id);
+                                    break;
+                                } else {
+                                    warn!("Broker {} not yet visible in metadata (found: {:?}), retrying...",
+                                          server.config.node_id, broker_ids);
+                                }
+                            }
+                            Ok(_) => {
+                                warn!("Metadata store has no brokers yet (attempt {}/{}), retrying in 1s...", verify_retry + 1, max_verify_retries);
+                            }
+                            Err(e) => {
+                                warn!("Failed to list brokers (attempt {}/{}): {:?}, retrying in 1s...", verify_retry + 1, max_verify_retries, e);
                             }
                         }
-                        Ok(_) => {
-                            warn!("Metadata store has no brokers yet (attempt {}/{}), retrying in 1s...", verify_retry + 1, max_verify_retries);
-                        }
-                        Err(e) => {
-                            warn!("Failed to list brokers (attempt {}/{}): {:?}, retrying in 1s...", verify_retry + 1, max_verify_retries, e);
-                        }
-                    }
 
-                    verify_retry += 1;
-                    if verify_retry >= max_verify_retries {
-                        return Err(anyhow::anyhow!(
-                            "Broker {} not visible in metadata after {} attempts ({} seconds) - cluster metadata inconsistent",
-                            server.config.node_id, verify_retry, verify_retry
-                        ));
+                        verify_retry += 1;
+                        if verify_retry >= max_verify_retries {
+                            return Err(anyhow::anyhow!(
+                                "Broker {} not visible in metadata after {} attempts ({} seconds) - cluster metadata inconsistent",
+                                server.config.node_id, verify_retry, verify_retry
+                            ));
+                        }
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                     }
-                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                } else {
+                    // Multi-node Raft mode: Broker registration happens in main.rs AFTER message loop starts
+                    info!("Multi-node Raft mode: Broker verification deferred to post-initialization (in main.rs)");
                 }
             }
         }
