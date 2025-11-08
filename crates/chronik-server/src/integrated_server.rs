@@ -3,7 +3,7 @@
 //! This module properly integrates the complete, production-ready implementation
 //! from chronik-ingest instead of reimplementing everything from scratch.
 
-use anyhow::Result;
+use anyhow::{Result, Context};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use std::path::PathBuf;
@@ -164,9 +164,9 @@ impl IntegratedKafkaServer {
         // The old __meta topic was used by ChronikMetaLogStore, which is now deleted
         // Raft stores metadata in its own WAL (./data/wal/__meta/)
         
-        // v2.2.7 Phase 4: Register broker via unified RaftMetadataStore
-        // Single-node: synchronous apply (<100μs, no leader election needed)
-        // Multi-node: Raft propose (10-50ms, waits for quorum)
+        // v2.2.7 Phase 4: Prepare broker metadata for registration
+        // ARCHITECTURAL FIX: Don't register here for multi-node clusters
+        // Multi-node registration happens AFTER Raft message loop starts (in run_raft_cluster)
         let broker_metadata = BrokerMetadata {
             broker_id: config.node_id,
             host: config.advertised_host.clone(),
@@ -177,41 +177,18 @@ impl IntegratedKafkaServer {
             updated_at: chrono::Utc::now(),
         };
 
-        info!("Registering broker {} ({}:{}) via RaftMetadataStore...",
-              config.node_id, config.advertised_host, config.advertised_port);
-
-        // v2.2.7: RaftMetadataStore.register_broker() automatically handles:
-        // - Single-node: synchronous apply to state machine
-        // - Multi-node: Raft propose (may fail if no leader elected yet)
-        let mut retry_count = 0;
-        let max_retries = 30; // 30 attempts * 2s = 60 seconds max wait
-        loop {
-            match metadata_store.register_broker(broker_metadata.clone()).await {
-                Ok(_) => {
-                    info!("✓ Successfully registered broker {} via RaftMetadataStore", config.node_id);
-                    break;
-                }
-                Err(e) => {
-                    retry_count += 1;
-                    if retry_count <= max_retries {
-                        warn!("Failed to register broker {} (attempt {}/{}): {:?}, retrying in 2s...",
-                              config.node_id, retry_count, max_retries, e);
-                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                    } else {
-                        error!("FATAL: Failed to register broker {} after {} attempts: {:?}",
-                               config.node_id, retry_count, e);
-                        return Err(anyhow::anyhow!(
-                            "Broker registration failed after {} attempts - cluster may not have quorum",
-                            max_retries
-                        ));
-                    }
-                }
-            }
+        // Only register broker immediately for single-node mode
+        // Multi-node clusters MUST register after Raft message loop starts
+        if raft_cluster.is_none() {
+            // Single-node mode: synchronous apply, no leader election needed
+            info!("Single-node mode: Registering broker {} immediately", config.node_id);
+            metadata_store.register_broker(broker_metadata.clone()).await
+                .context("Failed to register broker in single-node mode")?;
+            info!("✓ Successfully registered broker {} via RaftMetadataStore", config.node_id);
+        } else {
+            // Multi-node mode: defer registration until after Raft message loop starts
+            info!("Multi-node mode: Deferring broker registration until Raft leader election completes");
         }
-
-        // v2.2.7 Phase 4: Broker sync is now handled by Raft directly
-        // RaftMetadataStore.register_broker() calls raft.propose() automatically
-        // No need for background bidirectional sync task
 
         // Restore high watermarks from segment metadata on startup
         // This ensures that after WAL deletion, we can still serve data from segments

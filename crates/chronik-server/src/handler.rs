@@ -74,6 +74,7 @@ pub struct RequestHandler {
     auth_middleware: Arc<AuthMiddleware>,
     offset_storage: Arc<OffsetStorage>,
     coordinator_manager: Arc<CoordinatorManager>,
+    metadata_store: Arc<dyn MetadataStore>,
 }
 
 impl RequestHandler {
@@ -144,6 +145,7 @@ impl RequestHandler {
             auth_middleware,
             offset_storage,
             coordinator_manager,
+            metadata_store,
         })
     }
     
@@ -266,32 +268,87 @@ impl RequestHandler {
                 rack: None,
             }
         ];
-        
+
         let mut topics = Vec::new();
-        
+
         // If specific topics requested, return metadata for those
         if let Some(topic_names) = request.topics {
             for topic_name in topic_names {
-                // For now, return a simple response
-                topics.push(MetadataTopic {
-                    error_code: 0,
-                    name: topic_name.clone(),
-                    is_internal: false,
-                    partitions: vec![
-                        MetadataPartition {
-                            error_code: 0,
-                            partition_index: 0,
-                            leader_id: self.config.node_id,
-                            leader_epoch: 0,
-                            replica_nodes: vec![self.config.node_id],
-                            isr_nodes: vec![self.config.node_id],
-                            offline_replicas: vec![],
+                // Query actual metadata from metadata_store (v2.2.8 fix)
+                match self.metadata_store.get_topic(&topic_name).await {
+                    Ok(Some(topic_meta)) => {
+                        // Topic exists - return real metadata
+                        let mut partitions = Vec::new();
+                        for partition_id in 0..topic_meta.config.partition_count {
+                            partitions.push(MetadataPartition {
+                                error_code: 0,
+                                partition_index: partition_id as i32,  // Cast u32 to i32
+                                leader_id: self.config.node_id,
+                                leader_epoch: 0,
+                                replica_nodes: vec![self.config.node_id],
+                                isr_nodes: vec![self.config.node_id],
+                                offline_replicas: vec![],
+                            });
                         }
-                    ],
-                });
+                        topics.push(MetadataTopic {
+                            error_code: 0,
+                            name: topic_name.clone(),
+                            is_internal: false,
+                            partitions,
+                        });
+                    }
+                    Ok(None) => {
+                        // Topic doesn't exist - return UNKNOWN_TOPIC_OR_PARTITION (error code 3)
+                        topics.push(MetadataTopic {
+                            error_code: 3, // UNKNOWN_TOPIC_OR_PARTITION
+                            name: topic_name.clone(),
+                            is_internal: false,
+                            partitions: vec![],
+                        });
+                    }
+                    Err(e) => {
+                        // Error querying metadata - return error
+                        tracing::warn!("Failed to query topic '{}': {:?}", topic_name, e);
+                        topics.push(MetadataTopic {
+                            error_code: 3, // UNKNOWN_TOPIC_OR_PARTITION
+                            name: topic_name.clone(),
+                            is_internal: false,
+                            partitions: vec![],
+                        });
+                    }
+                }
+            }
+        } else {
+            // No specific topics - return all topics
+            match self.metadata_store.list_topics().await {
+                Ok(all_topics) => {
+                    for topic_meta in all_topics {
+                        let mut partitions = Vec::new();
+                        for partition_id in 0..topic_meta.config.partition_count {
+                            partitions.push(MetadataPartition {
+                                error_code: 0,
+                                partition_index: partition_id as i32,  // Cast u32 to i32
+                                leader_id: self.config.node_id,
+                                leader_epoch: 0,
+                                replica_nodes: vec![self.config.node_id],
+                                isr_nodes: vec![self.config.node_id],
+                                offline_replicas: vec![],
+                            });
+                        }
+                        topics.push(MetadataTopic {
+                            error_code: 0,
+                            name: topic_meta.name.clone(),
+                            is_internal: false,
+                            partitions,
+                        });
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to list topics: {:?}", e);
+                }
             }
         }
-        
+
         Ok(Response::Metadata(MetadataResponse {
             throttle_time_ms: 0,
             brokers,

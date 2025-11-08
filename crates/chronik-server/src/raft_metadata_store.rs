@@ -54,11 +54,40 @@ impl MetadataStore for RaftMetadataStore {
             config: config.config.clone(),
         }).await.map_err(|e| MetadataError::StorageError(e.to_string()))?;
 
-        // Read from state machine
-        let state = self.state();
-        state.topics.get(name)
-            .cloned()
-            .ok_or_else(|| MetadataError::NotFound(format!("Topic {} not found after creation", name)))
+        // Wait for Raft entry to be applied with retry logic (v2.2.7 fix)
+        // In multi-node clusters, the Raft entry needs time to be committed and applied
+        let max_attempts = 20; // 20 attempts * 50ms = 1 second max wait
+        let retry_interval = tokio::time::Duration::from_millis(50);
+
+        for attempt in 1..=max_attempts {
+            // Check if topic exists in state machine (scope to release lock immediately)
+            let found_topic = {
+                let state = self.state();
+                state.topics.get(name).cloned()
+            }; // Lock dropped here
+
+            if let Some(topic) = found_topic {
+                tracing::debug!(
+                    "Topic '{}' found in state machine after {} attempts ({} ms)",
+                    name,
+                    attempt,
+                    attempt * 50
+                );
+                return Ok(topic);
+            }
+
+            // If not found and not last attempt, wait before retry
+            if attempt < max_attempts {
+                tokio::time::sleep(retry_interval).await;
+            }
+        }
+
+        // After all retries, topic still not found
+        Err(MetadataError::NotFound(format!(
+            "Topic {} not found after creation (waited {} ms)",
+            name,
+            max_attempts * 50
+        )))
     }
 
     async fn get_topic(&self, name: &str) -> Result<Option<TopicMetadata>> {
@@ -149,7 +178,41 @@ impl MetadataStore for RaftMetadataStore {
             rack: metadata.rack.clone(),
         }).await.map_err(|e| MetadataError::StorageError(e.to_string()))?;
 
-        Ok(())
+        // Wait for Raft entry to be applied with retry logic (v2.2.7+ fix)
+        // In multi-node clusters, the Raft entry needs time to be committed and applied
+        // ALSO wait for leader election - followers may take 2-3 seconds to connect
+        let max_attempts = 80; // 80 attempts * 50ms = 4 seconds max wait (covers leader election)
+        let retry_interval = tokio::time::Duration::from_millis(50);
+
+        for attempt in 1..=max_attempts {
+            // Check if broker exists in state machine (scope to release lock immediately)
+            let found_broker = {
+                let state = self.state();
+                state.brokers.get(&metadata.broker_id).cloned()
+            }; // Lock dropped here
+
+            if found_broker.is_some() {
+                tracing::debug!(
+                    "Broker {} registered in state machine after {} attempts ({} ms)",
+                    metadata.broker_id,
+                    attempt,
+                    attempt * 50
+                );
+                return Ok(());
+            }
+
+            // If not found and not last attempt, wait before retry
+            if attempt < max_attempts {
+                tokio::time::sleep(retry_interval).await;
+            }
+        }
+
+        // After all retries, broker still not registered
+        Err(MetadataError::NotFound(format!(
+            "Broker {} not found after registration (waited {} ms)",
+            metadata.broker_id,
+            max_attempts * 50
+        )))
     }
 
     async fn get_broker(&self, broker_id: i32) -> Result<Option<BrokerMetadata>> {
