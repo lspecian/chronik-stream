@@ -1899,12 +1899,13 @@ impl ProtocolHandler {
 
         let mut decoder = Decoder::new(body);
 
-        // client_software_name (COMPACT_STRING - varint length)
-        let _software_name = decoder.read_compact_string()?;
+        // CRITICAL: ApiVersions v3 uses STRING (int16 length), NOT COMPACT_STRING
+        // client_software_name (STRING - int16 length prefix)
+        let _software_name = decoder.read_string()?;
         tracing::trace!("ApiVersions v3+ client_software_name: {:?}", _software_name);
 
-        // client_software_version (COMPACT_STRING - varint length)
-        let _software_version = decoder.read_compact_string()?;
+        // client_software_version (STRING - int16 length prefix)
+        let _software_version = decoder.read_string()?;
         tracing::trace!("ApiVersions v3+ client_software_version: {:?}", _software_version);
 
         // Tagged fields (required for v3+)
