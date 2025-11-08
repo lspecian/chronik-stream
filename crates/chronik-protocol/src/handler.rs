@@ -1893,32 +1893,21 @@ impl ProtocolHandler {
 
     /// Consume ApiVersions v3+ request body fields (ignorable but must be consumed)
     fn try_consume_api_versions_body(&self, body: &mut Bytes) -> Result<()> {
-        if body.remaining() == 0 {
-            return Ok(());
+        // CRITICAL FIX: Different Kafka clients send different v3 body formats:
+        // - kafka-python 2.2.15+: Sends full body with software name/version
+        // - kafka-python 2.0.2: May send minimal/empty body
+        // - Java clients: Variable formats
+        //
+        // Since these fields are marked "ignorable" in the Kafka spec, and ApiVersions
+        // response is identical regardless of client software, we can safely skip parsing
+        // the body entirely. Just consume all remaining bytes.
+        //
+        // This avoids parsing errors from client format variations while maintaining
+        // full protocol compliance.
+        if body.remaining() > 0 {
+            tracing::trace!("Skipping {} bytes of ApiVersions v3+ body (ignorable per spec)", body.remaining());
+            body.advance(body.remaining());
         }
-
-        let mut decoder = Decoder::new(body);
-
-        // CRITICAL: ApiVersions v3 uses STRING (int16 length), NOT COMPACT_STRING
-        // client_software_name (STRING - int16 length prefix)
-        let _software_name = decoder.read_string()?;
-        tracing::trace!("ApiVersions v3+ client_software_name: {:?}", _software_name);
-
-        // client_software_version (STRING - int16 length prefix)
-        let _software_version = decoder.read_string()?;
-        tracing::trace!("ApiVersions v3+ client_software_version: {:?}", _software_version);
-
-        // Tagged fields (required for v3+)
-        let tag_count = decoder.read_unsigned_varint()?;
-        tracing::trace!("ApiVersions v3+ tagged fields count: {}", tag_count);
-
-        for _ in 0..tag_count {
-            let tag_id = decoder.read_unsigned_varint()?;
-            let tag_size = decoder.read_unsigned_varint()? as usize;
-            tracing::trace!("  Skipping tagged field: id={}, size={}", tag_id, tag_size);
-            decoder.advance(tag_size)?;
-        }
-
         Ok(())
     }
 
