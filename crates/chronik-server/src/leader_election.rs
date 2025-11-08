@@ -102,14 +102,13 @@ impl LeaderElector {
         raft_cluster: &Arc<RaftCluster>,
         partition_health: &Arc<DashMap<PartitionKey, PartitionHealth>>,
     ) {
-        // CRITICAL FIX: Only the Raft leader can propose partition leader changes
-        // Follower nodes should not attempt elections - they will fail with "Cannot propose"
-        let (is_leader, leader_id, state) = raft_cluster.is_leader_ready();
-        if !is_leader {
-            debug!(
-                "Skipping partition leader check - this node is not the Raft leader (state={}, leader={})",
-                state, leader_id
-            );
+        // CRITICAL FIX (v2.2.3): Only the Raft leader can propose partition leader changes
+        // Follower nodes must not attempt elections - they will fail with "Cannot propose"
+        //
+        // Root cause: is_leader_ready() returns true for BOTH leaders and followers with a known leader.
+        // Fix: Use am_i_leader() which only returns true if THIS node is the leader.
+        if !raft_cluster.am_i_leader() {
+            debug!("Skipping partition leader check - this node is not the Raft leader");
             return;
         }
 

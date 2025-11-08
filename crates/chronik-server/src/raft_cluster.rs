@@ -761,9 +761,24 @@ impl RaftCluster {
         self.propose(cmd).await
     }
 
+    /// Check if THIS node is the Raft leader
+    ///
+    /// CRITICAL (v2.2.3): Use this function to check leadership before proposing metadata changes.
+    /// This fixes the root cause of partition leadership conflicts where followers were incorrectly
+    /// attempting to propose partition leader elections.
+    ///
+    /// Returns true only if THIS node is currently the Raft leader.
+    pub fn am_i_leader(&self) -> bool {
+        let raft_node = self.raft_node.read().unwrap();
+        raft_node.raft.state == raft::StateRole::Leader
+    }
+
     /// Check if Raft has a leader (either we're the leader or there's a valid leader)
     ///
-    /// Returns (is_leader_ready, leader_id, state_role)
+    /// NOTE: This function returns true for BOTH leaders AND followers with a known leader.
+    /// If you want to check if THIS node is the leader, use `am_i_leader()` instead.
+    ///
+    /// Returns (has_leader, leader_id, state_role)
     pub fn is_leader_ready(&self) -> (bool, u64, String) {
         let raft_node = self.raft_node.read().unwrap();
         let state = raft_node.raft.state;

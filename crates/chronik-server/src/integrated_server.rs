@@ -179,9 +179,16 @@ impl IntegratedKafkaServer {
         let metadata_store: Arc<dyn MetadataStore> = Arc::new(metalog_store);
         if metadata_store.get_topic(chronik_common::metadata::METADATA_TOPIC).await?.is_none() {
             info!("Creating internal metadata topic: {}", chronik_common::metadata::METADATA_TOPIC);
+
+            // CRITICAL FIX (v2.2.3): Use cluster replication factor for metadata topic
+            // In cluster mode, metadata MUST be replicated across all nodes for resilience
+            let meta_replication_factor = config.cluster_config.as_ref()
+                .map(|cluster| cluster.replication_factor as u32)
+                .unwrap_or(1_u32);  // Single-node mode uses RF=1
+
             let meta_config = chronik_common::metadata::TopicConfig {
                 partition_count: 1, // Metadata topic only needs 1 partition
-                replication_factor: 1,
+                replication_factor: meta_replication_factor,  // Use cluster RF for resilience
                 retention_ms: None, // Never delete metadata
                 segment_bytes: 50 * 1024 * 1024, // 50MB segments
                 config: {
@@ -192,7 +199,7 @@ impl IntegratedKafkaServer {
                 },
             };
             metadata_store.create_topic(chronik_common::metadata::METADATA_TOPIC, meta_config).await?;
-            info!("Successfully created internal metadata topic");
+            info!("Successfully created internal metadata topic with replication_factor={}", meta_replication_factor);
         }
         
         // Register this broker in metadata
@@ -674,8 +681,15 @@ impl IntegratedKafkaServer {
                                     continue;
                                 }
 
-                                // Set initial leader (first replica)
-                                let leader = replicas[0];
+                                // Set initial leader - prefer Raft leader if it's a replica
+                                // CRITICAL FIX (v2.2.3): Prefer Raft leader as partition leader
+                                // This ensures partition leaders can handle their own elections locally
+                                let raft_leader_id = raft.node_id();
+                                let leader = if replicas.contains(&raft_leader_id) {
+                                    raft_leader_id  // Raft leader can handle elections locally
+                                } else {
+                                    replicas[0]  // Fallback if Raft leader not in replica set
+                                };
                                 if let Err(e) = raft.propose(crate::raft_metadata::MetadataCommand::SetPartitionLeader {
                                     topic: topic_name.to_string(),
                                     partition: partition as i32,
