@@ -2422,7 +2422,18 @@ impl ProduceHandler {
     pub async fn initialize_raft_partitions(&self, topic_name: &str, num_partitions: u32) -> Result<()> {
         // Only initialize if Raft is enabled
         if let Some(ref raft) = self.raft_cluster {
-            info!("Initializing Raft partition metadata for topic '{}' ({} partitions)",
+            // CRITICAL FIX (v2.2.2): Only Raft leader should initialize partition metadata
+            // This prevents "Failed to elect leader" errors from follower nodes during runtime topic creation
+            let (is_leader, leader_id, state) = raft.is_leader_ready();
+            if !is_leader {
+                debug!(
+                    "Skipping Raft partition initialization for topic '{}' - this node is a Raft follower (state={}, leader={})",
+                    topic_name, state, leader_id
+                );
+                return Ok(());  // Follower will receive partition metadata via Raft replication
+            }
+
+            info!("Initializing Raft partition metadata for topic '{}' ({} partitions) - this node is Raft leader",
                   topic_name, num_partitions);
 
             // Get all nodes in the cluster (for replication)
@@ -2440,17 +2451,14 @@ impl ProduceHandler {
                 }
 
                 // Propose partition assignment to Raft
-                // NOTE: This will fail on follower nodes - only leader can propose
-                // That's OK - followers will get the assignment via Raft replication
+                // NOTE: We already checked that this node is the Raft leader above (v2.2.2 fix)
                 if let Err(e) = raft.propose(crate::raft_metadata::MetadataCommand::AssignPartition {
                     topic: topic_name.to_string(),
                     partition: partition as i32,
                     replicas: replicas.clone(),
                 }).await {
-                    debug!("Could not propose partition assignment for {}-{} (expected on followers): {}", topic_name, partition, e);
-                    // Break out - we're not the leader, so skip remaining proposals
-                    // The leader will propose when it creates the topic
-                    return Ok(());
+                    warn!("Failed to propose partition assignment for {}-{}: {:?}", topic_name, partition, e);
+                    continue;  // Skip this partition, try next one
                 }
 
                 // Set initial leader (first replica)
