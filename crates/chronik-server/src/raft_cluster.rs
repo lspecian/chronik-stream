@@ -112,8 +112,20 @@ impl RaftCluster {
         tracing::info!("✓ Raft WAL storage initialized (persistent)");
 
         // Initialize with voter configuration ONLY if no state was recovered
-        if !wal_storage.has_recovered_state() {
-            tracing::info!("No recovered Raft state - initializing fresh cluster");
+        // OR if recovered state has empty voters (regression fix for v2.2.7)
+        let recovered_state = wal_storage.initial_state().unwrap();
+        let has_voters = !recovered_state.conf_state.voters.is_empty();
+
+        if !wal_storage.has_recovered_state() || !has_voters {
+            if !has_voters {
+                tracing::warn!(
+                    "Recovered Raft state has ZERO voters - reinitializing with {:?} (v2.2.7 regression fix)",
+                    all_nodes
+                );
+            } else {
+                tracing::info!("No recovered Raft state - initializing fresh cluster");
+            }
+
             wal_storage.set_raft_state(RaftState {
                 hard_state: HardState::default(),
                 conf_state: ConfState {
@@ -123,7 +135,10 @@ impl RaftCluster {
                 },
             });
         } else {
-            tracing::info!("✓ Using recovered Raft state from WAL");
+            tracing::info!(
+                "✓ Using recovered Raft state from WAL (voters: {:?})",
+                recovered_state.conf_state.voters
+            );
         }
 
         // Create logger for Raft (it uses slog)
