@@ -1280,12 +1280,6 @@ impl ProduceHandler {
                         canonical_record.recalculate_record_offsets();
                     }
 
-                    // DEBUG: Check if compressed_records_wire_bytes is populated before serialization
-                    warn!("PRODUCE→DEBUG: compressed_records_wire_bytes is_some={}, len={}, compression={:?}",
-                          canonical_record.compressed_records_wire_bytes.is_some(),
-                          canonical_record.compressed_records_wire_bytes.as_ref().map(|b| b.len()).unwrap_or(0),
-                          canonical_record.compression);
-
                     match bincode::serialize(&canonical_record) {
                         Ok(serialized) => {
                             // v2.5.0: ALWAYS populate serialized_for_replication when wal_replication_manager exists
@@ -1313,9 +1307,6 @@ impl ProduceHandler {
                                        topic, partition, acks, e);
                                 return Err(Error::Internal(format!("WAL write failed: {}", e)));
                             }
-                            warn!("WAL✓ {}-{}: {} bytes, {} records (offsets {}-{}), acks={}",
-                                topic, partition, re_encoded_bytes.len(), records.len(),
-                                base_offset, last_offset, acks);
                         }
                         Err(e) => {
                             error!("WAL SERIALIZATION FAILED: topic={} partition={} error={}", topic, partition, e);
@@ -1553,16 +1544,8 @@ impl ProduceHandler {
         // Get partition state for response
         let log_start_offset = partition_state.log_start_offset.load(Ordering::Relaxed) as i64;
 
-        // v2.5.0 Phase 5: Record heartbeat for leader election monitoring
-        // This tells the LeaderElector that this node is actively handling produce requests
-        // for this partition (acting as leader). Prevents unnecessary leader elections.
-        if let Some(ref elector) = self.leader_elector {
-            elector.record_heartbeat(topic, partition, self.config.node_id as u64);
-            trace!(
-                "Recorded leader heartbeat for {}-{} (node_id={})",
-                topic, partition, self.config.node_id
-            );
-        }
+        // v2.2.7: Leader election is now event-driven (triggered by WAL stream timeouts)
+        // No need to record heartbeats from produce path - elections only happen on actual failures
 
         Ok(ProduceResponsePartition {
             index: partition,
@@ -2103,13 +2086,46 @@ impl ProduceHandler {
         // Attempt to create the topic
         let result = match self.metadata_store.create_topic(topic_name, topic_config).await {
             Ok(metadata) => {
-                // v2.5.0 Phase 5: Initialize partition assignments in RaftCluster
-                // CRITICAL FIX (v2.2.3): Call centralized function instead of duplicating logic
-                // This ensures we get the v2.2.3 Raft leadership check (am_i_leader) automatically
-                if self.raft_cluster.is_some() {
-                    if let Err(e) = self.initialize_raft_partitions(topic_name, metadata.config.partition_count).await {
-                        warn!("Failed to initialize Raft partitions for '{}': {:?}", topic_name, e);
-                        // Continue anyway - follower will receive metadata via Raft replication
+                // v2.2.8 CRITICAL FIX: Partition initialization MUST go through Raft on leader only
+                // The create_topic call already went through Raft and was replicated to all nodes.
+                // Now we need to initialize partition metadata (assignments, leader, ISR).
+                //
+                // IMPORTANT: Only the Raft leader should propose partition metadata.
+                // Followers will receive it via Raft replication automatically.
+                if let Some(ref raft) = self.raft_cluster {
+                    // Check if THIS node is the Raft leader
+                    if raft.am_i_leader() {
+                        // Leader node: Initialize partition metadata via Raft
+                        if let Err(e) = self.initialize_raft_partitions(topic_name, metadata.config.partition_count).await {
+                            error!("Raft leader failed to initialize partitions for '{}': {:?}", topic_name, e);
+                            // FAIL FAST: If leader can't initialize partitions, topic is broken
+                            return Err(Error::Internal(format!("Failed to initialize partition metadata: {}", e)));
+                        }
+                        info!("✓ Raft leader initialized partition metadata for '{}'", topic_name);
+                    } else {
+                        // Follower node: Wait for partition metadata to arrive via Raft replication
+                        debug!("Follower node waiting for partition metadata for '{}' via Raft replication", topic_name);
+
+                        // Wait for partition leader to be set (indicates initialization complete)
+                        let max_wait_ms = 2000; // 2 seconds
+                        let check_interval_ms = 50;
+                        let max_attempts = max_wait_ms / check_interval_ms;
+
+                        for attempt in 1..=max_attempts {
+                            // Check if partition 0 has a leader (indicates initialization done)
+                            if let Ok(Some(_leader)) = self.metadata_store.get_partition_leader(topic_name, 0).await {
+                                info!("✓ Follower received partition metadata for '{}' after {}ms",
+                                      topic_name, attempt * check_interval_ms);
+                                break;
+                            }
+
+                            if attempt < max_attempts {
+                                tokio::time::sleep(tokio::time::Duration::from_millis(check_interval_ms)).await;
+                            } else {
+                                warn!("Follower did not receive partition metadata for '{}' after {}ms - may cause ISR issues",
+                                      topic_name, max_wait_ms);
+                            }
+                        }
                     }
                 }
 
@@ -2375,17 +2391,17 @@ impl ProduceHandler {
     pub async fn initialize_raft_partitions(&self, topic_name: &str, num_partitions: u32) -> Result<()> {
         // Only initialize if Raft is enabled
         if let Some(ref raft) = self.raft_cluster {
-            // CRITICAL FIX (v2.2.3): Only Raft leader should initialize partition metadata
-            // This prevents "Failed to elect leader" errors from follower nodes during runtime topic creation
-            //
-            // Root cause: is_leader_ready() returns true for BOTH leaders and followers with a known leader.
-            // Fix: Use am_i_leader() which only returns true if THIS node is the leader.
+            // v2.2.8 CRITICAL FIX: This method should ONLY be called by the Raft leader
+            // The caller (auto_create_topic) must check am_i_leader() before calling this method.
+            // We assert this condition to catch programming errors.
             if !raft.am_i_leader() {
-                debug!(
-                    "Skipping Raft partition initialization for topic '{}' - this node is a Raft follower",
+                error!(
+                    "PROGRAMMING ERROR: initialize_raft_partitions called on Raft follower for topic '{}'",
                     topic_name
                 );
-                return Ok(());  // Follower will receive partition metadata via Raft replication
+                return Err(Error::Internal(
+                    "Cannot initialize partitions on Raft follower - this is a programming error".into()
+                ));
             }
 
             info!("Initializing Raft partition metadata for topic '{}' ({} partitions) - this node is Raft leader",

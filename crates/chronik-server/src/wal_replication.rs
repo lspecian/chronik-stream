@@ -964,6 +964,12 @@ pub struct WalReceiver {
 
     /// This follower's node ID (v2.5.0 Phase 4)
     node_id: u64,
+
+    /// Leader elector for triggering elections on timeout (v2.2.7)
+    leader_elector: Option<Arc<crate::leader_election::LeaderElector>>,
+
+    /// Last heartbeat timestamp per partition (v2.2.7)
+    last_heartbeat: Arc<DashMap<(String, i32), std::time::Instant>>,
 }
 
 impl WalReceiver {
@@ -975,6 +981,8 @@ impl WalReceiver {
             shutdown: Arc::new(AtomicBool::new(false)),
             isr_ack_tracker: None,
             node_id: 0, // Default node ID (standalone mode)
+            leader_elector: None,
+            last_heartbeat: Arc::new(DashMap::new()),
         }
     }
 
@@ -992,7 +1000,15 @@ impl WalReceiver {
             shutdown: Arc::new(AtomicBool::new(false)),
             isr_ack_tracker: Some(isr_ack_tracker),
             node_id,
+            leader_elector: None,
+            last_heartbeat: Arc::new(DashMap::new()),
         }
+    }
+
+    /// Set leader elector for event-driven elections (v2.2.7)
+    pub fn set_leader_elector(&mut self, elector: Arc<crate::leader_election::LeaderElector>) {
+        info!("WalReceiver: Enabling event-driven leader election");
+        self.leader_elector = Some(elector);
     }
 
     /// Start the WAL receiver (blocking)
@@ -1017,6 +1033,8 @@ impl WalReceiver {
                     let shutdown = Arc::clone(&self.shutdown);
                     let isr_ack_tracker = self.isr_ack_tracker.clone();
                     let node_id = self.node_id;
+                    let last_heartbeat = Arc::clone(&self.last_heartbeat);
+                    let leader_elector = self.leader_elector.clone();
 
                     tokio::spawn(async move {
                         if let Err(e) = Self::handle_connection(
@@ -1024,7 +1042,9 @@ impl WalReceiver {
                             wal_mgr,
                             shutdown,
                             isr_ack_tracker,
-                            node_id
+                            node_id,
+                            last_heartbeat,
+                            leader_elector,
                         ).await {
                             error!("WAL receiver connection from {} failed: {}", peer_addr, e);
                         } else {
@@ -1053,8 +1073,25 @@ impl WalReceiver {
         shutdown: Arc<AtomicBool>,
         isr_ack_tracker: Option<Arc<crate::isr_ack_tracker::IsrAckTracker>>,
         node_id: u64,
+        last_heartbeat: Arc<DashMap<(String, i32), std::time::Instant>>,
+        leader_elector: Option<Arc<crate::leader_election::LeaderElector>>,
     ) -> Result<()> {
         let mut buffer = BytesMut::with_capacity(64 * 1024); // 64KB buffer
+
+        // v2.2.7: Spawn background timeout monitor if leader elector is available
+        if let Some(ref elector) = leader_elector {
+            let elector_clone = Arc::clone(elector);
+            let last_heartbeat_clone = Arc::clone(&last_heartbeat);
+            let shutdown_clone = Arc::clone(&shutdown);
+
+            tokio::spawn(async move {
+                Self::monitor_timeouts(
+                    elector_clone,
+                    last_heartbeat_clone,
+                    shutdown_clone,
+                ).await;
+            });
+        }
 
         while !shutdown.load(Ordering::Relaxed) {
             // Read frame header (8 bytes: magic + version + length)
@@ -1098,6 +1135,7 @@ impl WalReceiver {
                     if buffer.len() >= 8 {
                         buffer.advance(8);
                         debug!("WAL receiver: Received heartbeat");
+                        // Note: Global heartbeat - we'll track per-partition when we receive data
                     }
                     continue;
                 }
@@ -1129,6 +1167,10 @@ impl WalReceiver {
 
                 match deserialize_wal_frame(frame_bytes) {
                     Ok(wal_record) => {
+                        // v2.2.7: Track last heartbeat for this partition
+                        let partition_key = (wal_record.topic.clone(), wal_record.partition);
+                        last_heartbeat.insert(partition_key.clone(), std::time::Instant::now());
+
                         // Write to local WAL
                         if let Err(e) = Self::write_to_wal(&wal_manager, &wal_record).await {
                             error!(
@@ -1238,6 +1280,47 @@ impl WalReceiver {
             .context("Failed to flush ACK frame")?;
 
         Ok(())
+    }
+
+    /// Monitor partition heartbeat timeouts and trigger elections (v2.2.7)
+    async fn monitor_timeouts(
+        leader_elector: Arc<crate::leader_election::LeaderElector>,
+        last_heartbeat: Arc<DashMap<(String, i32), std::time::Instant>>,
+        shutdown: Arc<AtomicBool>,
+    ) {
+        info!("Started WAL timeout monitor for event-driven elections");
+
+        while !shutdown.load(Ordering::Relaxed) {
+            // Check every 5 seconds
+            sleep(Duration::from_secs(5)).await;
+
+            let now = std::time::Instant::now();
+
+            // Check each partition for timeout
+            for entry in last_heartbeat.iter() {
+                let (topic, partition) = entry.key();
+                let last_seen = *entry.value();
+
+                if now.duration_since(last_seen) > HEARTBEAT_TIMEOUT {
+                    warn!(
+                        "WAL stream timeout detected for {}-{} ({}s since last heartbeat)",
+                        topic, partition, now.duration_since(last_seen).as_secs()
+                    );
+
+                    // Trigger election
+                    leader_elector.trigger_election_on_timeout(
+                        topic,
+                        *partition,
+                        &format!("WAL stream timeout ({}s)", now.duration_since(last_seen).as_secs()),
+                    );
+
+                    // Remove from tracking to avoid repeated triggers
+                    last_heartbeat.remove(entry.key());
+                }
+            }
+        }
+
+        info!("Stopped WAL timeout monitor");
     }
 
     /// Shutdown the receiver

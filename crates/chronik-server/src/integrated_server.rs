@@ -358,16 +358,12 @@ impl IntegratedKafkaServer {
         info!("Created IsrAckTracker for acks=-1 quorum tracking");
         produce_handler_inner.set_isr_ack_tracker(isr_ack_tracker.clone());
 
-        // v2.5.0 Phase 5: Create leader elector if Raft clustering is enabled
-        // Must be created BEFORE ProduceHandler so it can record heartbeats
+        // v2.2.7: Create leader elector if Raft clustering is enabled
+        // Event-driven elections (no background polling)
         let leader_elector_for_produce = if let Some(ref raft) = raft_cluster {
-            info!("Creating LeaderElector for ProduceHandler heartbeat tracking");
+            info!("Creating LeaderElector for event-driven elections");
             let elector = Arc::new(crate::leader_election::LeaderElector::new(raft.clone()));
-
-            // Start background monitoring (health checks every 3s, timeout after 10s)
-            elector.start_monitoring();
-
-            info!("✓ LeaderElector monitoring started");
+            info!("✓ LeaderElector ready (event-driven mode)");
             Some(elector)
         } else {
             None
@@ -378,134 +374,17 @@ impl IntegratedKafkaServer {
             produce_handler_inner.set_leader_elector(elector.clone());
         }
 
-        // v2.5.0 Phase 5: Initialize Raft metadata for existing topics on startup
-        // CRITICAL: Without this, restarted servers won't have partition metadata in Raft!
-        if let Some(ref raft) = raft_cluster {
-            info!("Initializing Raft metadata for existing topics on startup...");
+        // v2.2.8 FIX: REMOVED BLOCKING Raft leader wait from IntegratedKafkaServer::new()
+        // CHICKEN-AND-EGG DEADLOCK: Old code waited for Raft leader election HERE,
+        // but Raft message loop starts AFTER new() returns (in main.rs line 580+).
+        // RESULT: new() never returned → message loop never started → deadlock!
+        // FIX: Partition metadata initialization MOVED to main.rs (after Raft loop starts)
 
-            // CRITICAL: Wait for Raft leader election before proposing metadata
-            // Raft requires a leader to accept proposals, so we must wait
-            // CRITICAL FIX (v2.2.1): Only the Raft leader should propose metadata
-            // Follower nodes must wait and receive metadata via Raft replication
-            info!("Waiting for Raft leader election before proposing metadata...");
-            let mut leader_ready = false;
-            let mut this_node_is_leader = false;
-            for attempt in 1..=30 {  // Wait up to 30 seconds
-                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-
-                // Check if Raft has a leader
-                let (is_ready, leader_id, state) = raft.is_leader_ready();
-
-                if is_ready {
-                    if leader_id == raft.node_id() {
-                        info!("✓ This node is Raft leader (state={}), proceeding with metadata initialization", state);
-                        this_node_is_leader = true;
-                        leader_ready = true;
-                        break;
-                    } else {
-                        info!("✓ Raft leader elected (leader_id={}, state={}), this node is a follower - waiting for leader to initialize metadata", leader_id, state);
-                        leader_ready = true;
-                        this_node_is_leader = false;
-                        break;
-                    }
-                }
-
-                if attempt % 5 == 0 {
-                    debug!("Still waiting for Raft leader election... ({}s elapsed, state={})", attempt, state);
-                }
-            }
-
-            if !leader_ready {
-                warn!("Raft leader election did not complete within 30 seconds - metadata proposals may fail");
-            }
-
-            // CRITICAL FIX (v2.2.1): Only Raft leader proposes partition metadata
-            // This prevents "Cannot propose: not the leader" errors and partition leadership conflicts
-            if !this_node_is_leader {
-                info!("Skipping metadata initialization - this node is a Raft follower (will receive metadata via Raft replication)");
-            } else {
-                // Only Raft leader initializes partition metadata
-                info!("This node is Raft leader - initializing partition metadata for existing topics");
-
-                // Get all existing topics from metadata store
-                match metadata_store.list_topics().await {
-                    Ok(topics) => {
-                        let topic_count = topics.len();
-                        info!("Found {} existing topics to initialize in Raft", topic_count);
-
-                        for topic_meta in topics {
-                            let topic_name = &topic_meta.name;
-                            let partition_count = topic_meta.config.partition_count;
-
-                            info!("Initializing Raft metadata for topic '{}' ({} partitions)", topic_name, partition_count);
-
-                            // Get all nodes in cluster
-                            let all_nodes = vec![1_u64, 2_u64, 3_u64];
-                            let replication_factor = config.replication_factor.min(all_nodes.len() as u32);
-
-                            for partition in 0..partition_count {
-                                // Check if metadata already exists (avoid duplicate proposals)
-                                if raft.get_partition_replicas(topic_name, partition as i32).is_some() {
-                                    debug!("Raft metadata already exists for {}-{}, skipping", topic_name, partition);
-                                    continue;
-                                }
-
-                                // Assign replicas (round-robin)
-                                let mut replicas = Vec::new();
-                                for i in 0..replication_factor {
-                                    let node_idx = (partition as usize + i as usize) % all_nodes.len();
-                                    replicas.push(all_nodes[node_idx]);
-                                }
-
-                                // Propose partition assignment
-                                if let Err(e) = raft.propose(crate::raft_metadata::MetadataCommand::AssignPartition {
-                                    topic: topic_name.to_string(),
-                                    partition: partition as i32,
-                                    replicas: replicas.clone(),
-                                }).await {
-                                    warn!("Failed to propose partition assignment for {}-{}: {:?}", topic_name, partition, e);
-                                    continue;
-                                }
-
-                                // Set initial leader - prefer Raft leader if it's a replica
-                                // CRITICAL FIX (v2.2.3): Prefer Raft leader as partition leader
-                                // This ensures partition leaders can handle their own elections locally
-                                let raft_leader_id = raft.node_id();
-                                let leader = if replicas.contains(&raft_leader_id) {
-                                    raft_leader_id  // Raft leader can handle elections locally
-                                } else {
-                                    replicas[0]  // Fallback if Raft leader not in replica set
-                                };
-                                if let Err(e) = raft.propose(crate::raft_metadata::MetadataCommand::SetPartitionLeader {
-                                    topic: topic_name.to_string(),
-                                    partition: partition as i32,
-                                    leader,
-                                }).await {
-                                    warn!("Failed to propose partition leader for {}-{}: {:?}", topic_name, partition, e);
-                                }
-
-                                // Set initial ISR (all replicas in-sync initially)
-                                if let Err(e) = raft.propose(crate::raft_metadata::MetadataCommand::UpdateISR {
-                                    topic: topic_name.to_string(),
-                                    partition: partition as i32,
-                                    isr: replicas.clone(),
-                                }).await {
-                                    warn!("Failed to propose ISR for {}-{}: {:?}", topic_name, partition, e);
-                                }
-
-                                info!("✓ Proposed Raft metadata for {}-{}: replicas={:?}, leader={}, ISR={:?}",
-                                      topic_name, partition, replicas, leader, replicas);
-                            }
-                        }
-
-                        info!("✓ Completed Raft metadata initialization for {} existing topics", topic_count);
-                    }
-                    Err(e) => {
-                        warn!("Failed to list topics for Raft metadata initialization: {:?}", e);
-                    }
-                }
-            }
+        if let Some(ref _raft) = raft_cluster {
+            info!("Raft cluster enabled - partition metadata initialization will happen after Raft message loop starts (v2.2.8 fix)");
         }
+
+        // v2.2.8: DELETED 130+ lines of blocking code (moved to main.rs after Raft loop starts)
 
         // v2.5.0 Phase 6: Initialize WAL replication with auto-discovery from cluster config
         let manual_followers = if let Ok(followers_str) = std::env::var("CHRONIK_REPLICATION_FOLLOWERS") {
@@ -718,6 +597,7 @@ impl IntegratedKafkaServer {
         ));
 
         // Start the background indexing task
+        info!("DEBUG: About to call wal_indexer.start().await...");
         wal_indexer.start().await
             .map_err(|e| anyhow::anyhow!("Failed to start WAL indexer: {}", e))?;
 
@@ -754,6 +634,7 @@ impl IntegratedKafkaServer {
             ));
 
             // Start the background upload task
+            info!("DEBUG: About to call metadata_uploader.start().await...");
             uploader.start().await
                 .map_err(|e| anyhow::anyhow!("Failed to start metadata uploader: {}", e))?;
 
@@ -803,7 +684,7 @@ impl IntegratedKafkaServer {
             metadata_store: metadata_store.clone(),
             wal_indexer,
             metadata_uploader,
-            leader_elector: leader_elector_for_produce,
+            leader_elector: leader_elector_for_produce.clone(),
         };
 
         // Create default topic
@@ -874,13 +755,19 @@ impl IntegratedKafkaServer {
                 info!("WAL receiver enabled on {}", receiver_addr);
 
                 // v2.5.0 Phase 4: Pass IsrAckTracker to WalReceiver so it can send ACKs back to leader
-                let wal_receiver = crate::wal_replication::WalReceiver::new_with_isr_tracker(
+                let mut wal_receiver = crate::wal_replication::WalReceiver::new_with_isr_tracker(
                     receiver_addr.clone(),
                     wal_manager.clone(),
                     isr_ack_tracker.clone(),
                     node_id as u64,
                 );
                 info!("WAL receiver configured with IsrAckTracker (node_id={})", node_id);
+
+                // v2.2.7: Wire up leader elector for event-driven elections
+                if let Some(ref elector) = leader_elector_for_produce {
+                    wal_receiver.set_leader_elector(elector.clone());
+                    info!("WAL receiver: Event-driven elections enabled");
+                }
 
                 // Spawn receiver in background
                 tokio::spawn(async move {
@@ -1280,11 +1167,6 @@ impl IntegratedKafkaServer {
                                     } else {
                                         false
                                     };
-
-                                    tracing::warn!(
-                                        "[RESPONSE DEBUG] API {:?}: is_flexible={}, tagged_byte_added={}, header_bytes_len={}, body_len={}",
-                                        response.api_key, response.is_flexible, tagged_byte_added, header_bytes.len(), response.body.len()
-                                    );
 
                                     let mut full_response = Vec::with_capacity(header_bytes.len() + response.body.len() + 4);
                                     let size = (header_bytes.len() + response.body.len()) as i32;

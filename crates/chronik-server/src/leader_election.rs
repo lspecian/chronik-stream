@@ -1,23 +1,35 @@
-//! Leader Election per Partition (v2.5.0 Phase 5)
+//! Event-Driven Leader Election per Partition (v2.2.7)
 //!
-//! This module implements automatic partition leader election when the current leader fails.
+//! This module implements Redpanda-style event-driven partition leader election.
+//!
+//! **KEY DESIGN CHANGE (v2.2.7):**
+//! - NO continuous monitoring or background health checks
+//! - Elections triggered ONLY by actual failure detection events:
+//!   1. WAL replication stream timeout (follower detects dead leader)
+//!   2. Raft node failure notification
+//!   3. Manual administrative action
+//!
+//! **Why Event-Driven?**
+//! - Eliminates 3-second polling loop overhead
+//! - Reduces Raft proposals (only on actual failures)
+//! - Follows Redpanda's design: heartbeats are implicit in WAL streams
+//! - More Kafka-like: elections on failure, not continuous monitoring
 //!
 //! Algorithm:
-//! 1. Detect leader failure (heartbeat timeout)
+//! 1. WAL follower detects stream timeout (leader dead)
 //! 2. Check ISR (in-sync replicas) from RaftCluster metadata
 //! 3. Elect first ISR member as new leader
-//! 4. Propose SetPartitionLeader to Raft
+//! 4. Propose SetPartitionLeader to Raft (only Raft leader can do this)
 //! 5. Update produce/fetch routing
 //!
 //! Usage:
 //! ```rust
 //! let elector = LeaderElector::new(raft_cluster.clone());
 //!
-//! // Start monitoring
-//! elector.start_monitoring().await;
+//! // NO start_monitoring() call - it's event-driven!
 //!
-//! // Trigger election (called when leader fails)
-//! elector.elect_partition_leader("orders", 0).await?;
+//! // Trigger election when WAL stream fails:
+//! elector.trigger_election_on_timeout("orders", 0).await?;
 //! ```
 
 use crate::raft_cluster::RaftCluster;
@@ -30,177 +42,113 @@ use dashmap::DashMap;
 use tracing::{info, warn, error, debug};
 
 /// Leader election timeout (how long before declaring leader dead)
-const LEADER_TIMEOUT: Duration = Duration::from_secs(10);
+/// Used by WAL replication to detect failures
+pub const LEADER_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Health check interval (how often to ping leaders)
-const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(3);
-
-/// Partition health state
+/// Track ongoing elections to prevent duplicates
 #[derive(Debug, Clone)]
-struct PartitionHealth {
-    /// Last time we received a heartbeat from the leader
-    last_heartbeat: Instant,
-
-    /// Current leader node ID
-    current_leader: u64,
+struct ElectionState {
+    /// Timestamp when election started
+    started_at: Instant,
 
     /// Whether election is in progress
-    electing: bool,
+    in_progress: bool,
 }
 
-/// Leader elector for partition-level leader election
+/// Event-driven leader elector for partition-level leader election (v2.2.7)
+///
+/// This struct provides leader election capabilities WITHOUT continuous monitoring.
+/// Elections are triggered by external events (WAL timeouts, Raft notifications, etc.)
 pub struct LeaderElector {
     /// RaftCluster for metadata queries and proposals
     raft_cluster: Arc<RaftCluster>,
 
-    /// Per-partition health tracking
-    partition_health: Arc<DashMap<PartitionKey, PartitionHealth>>,
-
-    /// Shutdown signal
-    shutdown: Arc<tokio::sync::Notify>,
+    /// Track ongoing elections to prevent duplicates
+    /// Key: (topic, partition), Value: election state
+    ongoing_elections: Arc<DashMap<PartitionKey, ElectionState>>,
 }
 
 impl LeaderElector {
-    /// Create a new leader elector
+    /// Create a new event-driven leader elector (v2.2.7)
+    ///
+    /// No background tasks are started - elections happen only when triggered by events
     pub fn new(raft_cluster: Arc<RaftCluster>) -> Self {
+        info!("LeaderElector created in EVENT-DRIVEN mode (no continuous monitoring)");
         Self {
             raft_cluster,
-            partition_health: Arc::new(DashMap::new()),
-            shutdown: Arc::new(tokio::sync::Notify::new()),
+            ongoing_elections: Arc::new(DashMap::new()),
         }
     }
 
-    /// Start monitoring partition leaders (background task)
-    pub fn start_monitoring(&self) {
-        let raft_cluster = self.raft_cluster.clone();
-        let partition_health = self.partition_health.clone();
-        let shutdown = self.shutdown.clone();
-
-        tokio::spawn(async move {
-            info!("Leader election monitor started");
-
-            loop {
-                tokio::select! {
-                    _ = tokio::time::sleep(HEALTH_CHECK_INTERVAL) => {
-                        // Check all partitions for leader health
-                        Self::check_partition_leaders(
-                            &raft_cluster,
-                            &partition_health
-                        ).await;
-                    }
-                    _ = shutdown.notified() => {
-                        info!("Leader election monitor shutting down");
-                        break;
-                    }
-                }
-            }
-        });
-    }
-
-    /// Check all partition leaders for health
-    async fn check_partition_leaders(
-        raft_cluster: &Arc<RaftCluster>,
-        partition_health: &Arc<DashMap<PartitionKey, PartitionHealth>>,
-    ) {
-        // CRITICAL FIX (v2.2.3): Only the Raft leader can propose partition leader changes
-        // Follower nodes must not attempt elections - they will fail with "Cannot propose"
-        //
-        // Root cause: is_leader_ready() returns true for BOTH leaders and followers with a known leader.
-        // Fix: Use am_i_leader() which only returns true if THIS node is the leader.
-        if !raft_cluster.am_i_leader() {
-            debug!("Skipping partition leader check - this node is not the Raft leader");
-            return;
-        }
-
-        // Get all partitions from raft metadata
-        let partitions = raft_cluster.list_all_partitions();
-
-        for (topic, partition) in partitions {
-            // Get current leader
-            let leader = match raft_cluster.get_partition_leader(&topic, partition) {
-                Some(l) => l,
-                None => {
-                    // No leader assigned yet, trigger election
-                    debug!("No leader for {}-{}, triggering election", topic, partition);
-                    Self::trigger_election(
-                        raft_cluster,
-                        partition_health,
-                        &topic,
-                        partition
-                    ).await;
-                    continue;
-                }
-            };
-
-            // Check health state
-            let needs_election = partition_health
-                .get(&(topic.clone(), partition))
-                .map(|health| {
-                    let elapsed = health.last_heartbeat.elapsed();
-                    elapsed > LEADER_TIMEOUT && !health.electing
-                })
-                .unwrap_or(true);  // No health record = need election
-
-            if needs_election {
-                warn!(
-                    "Leader timeout for {}-{} (leader={}), triggering election",
-                    topic, partition, leader
-                );
-                Self::trigger_election(
-                    raft_cluster,
-                    partition_health,
-                    &topic,
-                    partition
-                ).await;
-            }
-        }
-    }
-
-    /// Trigger leader election for a partition
-    async fn trigger_election(
-        raft_cluster: &Arc<RaftCluster>,
-        partition_health: &Arc<DashMap<PartitionKey, PartitionHealth>>,
+    /// Trigger leader election for a partition on timeout (v2.2.7)
+    ///
+    /// This is the main entry point for event-driven elections.
+    /// Called by WAL replication when a follower detects the leader has stopped sending.
+    ///
+    /// **IMPORTANT**: This should only be called by the Raft leader node, as only
+    /// the Raft leader can propose metadata changes.
+    pub async fn trigger_election_on_timeout(
+        &self,
         topic: &str,
         partition: i32,
-    ) {
+        reason: &str,
+    ) -> Result<u64> {
+        // CRITICAL: Only Raft leader can propose partition leader changes
+        if !self.raft_cluster.am_i_leader() {
+            debug!(
+                "Skipping election for {}-{}: this node is not the Raft leader (reason: {})",
+                topic, partition, reason
+            );
+            anyhow::bail!("Cannot trigger election: not Raft leader");
+        }
+
         let key = (topic.to_string(), partition);
 
-        // Mark as electing to prevent duplicate elections
-        partition_health.insert(
+        // Check if election already in progress
+        if let Some(state) = self.ongoing_elections.get(&key) {
+            if state.in_progress && state.started_at.elapsed() < Duration::from_secs(30) {
+                debug!(
+                    "Election already in progress for {}-{} (started {:?} ago)",
+                    topic, partition, state.started_at.elapsed()
+                );
+                anyhow::bail!("Election already in progress");
+            }
+        }
+
+        warn!(
+            "Triggering leader election for {}-{}: {}",
+            topic, partition, reason
+        );
+
+        // Mark election as in progress
+        self.ongoing_elections.insert(
             key.clone(),
-            PartitionHealth {
-                last_heartbeat: Instant::now(),
-                current_leader: 0,  // Unknown during election
-                electing: true,
+            ElectionState {
+                started_at: Instant::now(),
+                in_progress: true,
             },
         );
 
         // Elect new leader
-        match Self::elect_leader_from_isr(raft_cluster, topic, partition).await {
+        let result = Self::elect_leader_from_isr(&self.raft_cluster, topic, partition).await;
+
+        // Clear election state
+        self.ongoing_elections.remove(&key);
+
+        match result {
             Ok(new_leader) => {
                 info!(
-                    "✅ Elected new leader for {}-{}: node {}",
-                    topic, partition, new_leader
+                    "✅ Elected new leader for {}-{}: node {} (reason: {})",
+                    topic, partition, new_leader, reason
                 );
-
-                // Update health state
-                partition_health.insert(
-                    key,
-                    PartitionHealth {
-                        last_heartbeat: Instant::now(),
-                        current_leader: new_leader,
-                        electing: false,
-                    },
-                );
+                Ok(new_leader)
             }
             Err(e) => {
                 error!(
-                    "❌ Failed to elect leader for {}-{}: {}",
-                    topic, partition, e
+                    "❌ Failed to elect leader for {}-{}: {} (reason: {})",
+                    topic, partition, e, reason
                 );
-
-                // Clear electing flag to allow retry
-                partition_health.remove(&key);
+                Err(e)
             }
         }
     }
@@ -257,34 +205,11 @@ impl LeaderElector {
         Ok(new_leader)
     }
 
-    /// Record a heartbeat from a partition leader (called by produce/fetch handlers)
-    pub fn record_heartbeat(&self, topic: &str, partition: i32, leader_node_id: u64) {
-        let key = (topic.to_string(), partition);
-
-        self.partition_health.insert(
-            key,
-            PartitionHealth {
-                last_heartbeat: Instant::now(),
-                current_leader: leader_node_id,
-                electing: false,
-            },
-        );
-    }
-
     /// Manually trigger election for a partition (for testing or admin ops)
+    ///
+    /// This bypasses the normal timeout-based triggering and immediately elects a new leader.
     pub async fn elect_partition_leader(&self, topic: &str, partition: i32) -> Result<u64> {
-        info!("Manual leader election triggered for {}-{}", topic, partition);
-
-        Self::elect_leader_from_isr(
-            &self.raft_cluster,
-            topic,
-            partition
-        ).await
-    }
-
-    /// Shutdown the monitor
-    pub fn shutdown(&self) {
-        self.shutdown.notify_waiters();
+        self.trigger_election_on_timeout(topic, partition, "manual trigger").await
     }
 }
 

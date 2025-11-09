@@ -649,62 +649,58 @@ async fn run_cluster_mode(
     // Wait for leader election (max 10 seconds)
     let mut election_attempts = 0;
     let max_election_wait = 100; // 100 * 100ms = 10 seconds
+    let mut is_leader = false;
     while election_attempts < max_election_wait {
         let (has_leader, leader_id, state) = raft_cluster.is_leader_ready();
         if has_leader {
-            info!("✓ Raft leader elected: leader_id={}, state={}", leader_id, state);
+            is_leader = leader_id == config.node_id;
+            info!("✓ Raft leader elected: leader_id={}, this_node={}, is_leader={}, state={}",
+                leader_id, config.node_id, is_leader, state);
             break;
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         election_attempts += 1;
     }
 
-    // Now register broker via RaftMetadataStore
-    use chronik_common::metadata::traits::BrokerMetadata;
-    let broker_metadata = BrokerMetadata {
-        broker_id: config.node_id as i32,
-        host: advertised_host.clone(),
-        port: advertised_port,
-        rack: None,
-        status: chronik_common::metadata::traits::BrokerStatus::Online,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
-    };
+    // v2.2.8 FIX: Spawn broker registration as background task to avoid blocking Raft loop
+    // CRITICAL: Cannot block main thread waiting for Raft proposals - must yield to message loop!
+    if !is_leader {
+        info!("This node is a follower - skipping broker registration (will receive via Raft replication)");
+    } else {
+        // Leader registers ALL brokers from config (in background task)
+        use chronik_common::metadata::traits::BrokerMetadata;
+        info!("This node is the Raft leader - spawning broker registration task");
+        let metadata_store = server.metadata_store();
+        let peers_clone = config.peers.clone();
 
-    info!("Registering broker {} via Raft (after leader election)...", config.node_id);
+        tokio::spawn(async move {
+            info!("Background task: Registering {} brokers from config", peers_clone.len());
 
-    // Get metadata store from server
-    let metadata_store = server.metadata_store();
+            for peer in &peers_clone {
+                let broker_metadata = BrokerMetadata {
+                    broker_id: peer.id as i32,
+                    host: peer.kafka.split(':').next().unwrap_or("localhost").to_string(),
+                    port: peer.kafka.split(':').nth(1).and_then(|p| p.parse().ok()).unwrap_or(9092),
+                    rack: None,
+                    status: chronik_common::metadata::traits::BrokerStatus::Online,
+                    created_at: chrono::Utc::now(),
+                    updated_at: chrono::Utc::now(),
+                };
 
-    // Retry registration with backoff (follower may need time to connect to leader)
-    let mut retry_count = 0;
-    let max_retries = 30; // 30 attempts * 2s = 60 seconds max wait
-    loop {
-        match metadata_store.register_broker(broker_metadata.clone()).await {
-            Ok(_) => {
-                info!("✅ Successfully registered broker {} via Raft", config.node_id);
-                break;
-            }
-            Err(e) => {
-                retry_count += 1;
-                if retry_count <= max_retries {
-                    warn!(
-                        "Failed to register broker {} (attempt {}/{}): {:?}, retrying in 2s...",
-                        config.node_id, retry_count, max_retries, e
-                    );
-                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                } else {
-                    error!(
-                        "FATAL: Failed to register broker {} after {} attempts: {:?}",
-                        config.node_id, retry_count, e
-                    );
-                    return Err(anyhow::anyhow!(
-                        "Broker registration failed after {} attempts - cluster may not have quorum",
-                        max_retries
-                    ));
+                match metadata_store.register_broker(broker_metadata.clone()).await {
+                    Ok(_) => {
+                        info!("✅ Successfully registered broker {} via Raft", peer.id);
+                    }
+                    Err(e) => {
+                        error!("❌ Failed to register broker {}: {:?}", peer.id, e);
+                    }
                 }
             }
-        }
+
+            info!("✓ Broker registration task completed");
+        });
+
+        info!("Broker registration task spawned - will complete in background");
     }
 
     // Initialize monitoring

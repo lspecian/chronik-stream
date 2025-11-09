@@ -706,35 +706,57 @@ impl RaftCluster {
     pub fn apply_committed_entries(&self, entries: &[Entry]) -> Result<()> {
         use raft::prelude::*;
 
+        tracing::info!("🔍 DEBUG apply_committed_entries: Called with {} entries", entries.len());
+
         let mut sm = self.state_machine.write()
             .map_err(|e| anyhow::anyhow!("Failed to acquire state machine lock: {}", e))?;
 
-        for entry in entries {
+        let mut applied_count = 0;
+        let mut skipped_count = 0;
+
+        for (idx, entry) in entries.iter().enumerate() {
+            tracing::info!("🔍 DEBUG apply_committed_entries: Entry {}/{} - index={}, data.len()={}",
+                idx + 1, entries.len(), entry.index, entry.data.len());
+
             // Skip empty entries
             if entry.data.is_empty() {
+                tracing::warn!("⚠️ DEBUG apply_committed_entries: Entry {} has empty data, skipping", idx + 1);
+                skipped_count += 1;
                 continue;
             }
 
             // Check entry type
             let entry_type = entry.get_entry_type();
+            tracing::info!("🔍 DEBUG apply_committed_entries: Entry {} type={:?}", idx + 1, entry_type);
 
             if entry_type == EntryType::EntryConfChangeV2 {
                 // PRIORITY 2: Handle ConfChangeV2 (node addition/removal)
                 // NOTE: ConfChange entries are handled by the message loop before committed entries
                 // We don't process them here - they're automatically applied by Raft
-                tracing::debug!("Skipping ConfChangeV2 entry (already processed by message loop)");
+                tracing::info!("🔍 DEBUG apply_committed_entries: Skipping ConfChangeV2 entry (already processed by message loop)");
+                skipped_count += 1;
 
             } else if entry_type == EntryType::EntryNormal {
                 // Normal metadata command
+                tracing::info!("🔍 DEBUG apply_committed_entries: Deserializing entry {}", idx + 1);
                 let cmd: MetadataCommand = bincode::deserialize(&entry.data)
                     .context("Failed to deserialize metadata command")?;
 
+                tracing::info!("🔍 DEBUG apply_committed_entries: Applying command: {:?}", cmd);
+
                 // Apply to state machine
-                sm.apply(cmd)?;
+                sm.apply(cmd.clone())?;
+                applied_count += 1;
+
+                tracing::info!("✅ DEBUG apply_committed_entries: Successfully applied entry {}: {:?}", idx + 1, cmd);
             } else {
-                tracing::debug!("Skipping entry type: {:?}", entry_type);
+                tracing::warn!("⚠️ DEBUG apply_committed_entries: Skipping unknown entry type: {:?}", entry_type);
+                skipped_count += 1;
             }
         }
+
+        tracing::info!("🔍 DEBUG apply_committed_entries: Finished - applied={}, skipped={}, total={}",
+            applied_count, skipped_count, entries.len());
 
         Ok(())
     }
@@ -1167,19 +1189,21 @@ impl RaftCluster {
 
                 // Step 3b: Handle normal committed entries
                 if !ready.committed_entries().is_empty() {
-                    tracing::debug!(
-                        "Processing {} committed entries",
+                    tracing::info!(
+                        "🔍 DEBUG: Processing {} committed entries (BEFORE apply_committed_entries)",
                         ready.committed_entries().len()
                     );
 
                     if let Err(e) = self.apply_committed_entries(ready.committed_entries()) {
-                        tracing::error!("Failed to apply committed entries: {}", e);
+                        tracing::error!("❌ DEBUG: Failed to apply committed entries: {}", e);
                     } else {
                         tracing::info!(
-                            "✓ Applied {} committed entries to state machine",
+                            "✅ DEBUG: Applied {} committed entries to state machine (AFTER apply_committed_entries)",
                             ready.committed_entries().len()
                         );
                     }
+                } else {
+                    tracing::debug!("🔍 DEBUG: No committed entries in this Ready (ready.committed_entries().is_empty())");
                 }
 
                 // Step 4: Persist entries (required before persisted_messages)
@@ -1491,59 +1515,54 @@ pub async fn run_raft_cluster(config: RaftClusterConfig) -> Result<()> {
     // Wait for leader election (max 10 seconds)
     let mut election_attempts = 0;
     let max_election_wait = 100; // 100 * 100ms = 10 seconds
+    let mut is_leader = false;
     while election_attempts < max_election_wait {
         let (has_leader, leader_id, state) = raft_cluster.is_leader_ready();
         if has_leader {
-            tracing::info!("✓ Raft leader elected: leader_id={}, state={}", leader_id, state);
+            is_leader = leader_id == config.node_id;
+            tracing::info!("✓ Raft leader elected: leader_id={}, this_node={}, is_leader={}",
+                leader_id, config.node_id, is_leader);
             break;
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         election_attempts += 1;
     }
 
-    // Now register broker via RaftMetadataStore
-    use chronik_common::metadata::traits::BrokerMetadata;
-    let broker_metadata = BrokerMetadata {
-        broker_id: config.node_id as i32,
-        host: config.advertised_addr.clone(),
-        port: config.kafka_port as i32,
-        rack: None,
-        status: chronik_common::metadata::traits::BrokerStatus::Online,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
-    };
+    // CRITICAL FIX: Only the leader registers brokers
+    // Followers will receive broker metadata via Raft replication
+    if !is_leader {
+        tracing::info!("This node is a follower - skipping broker registration (will receive via Raft replication)");
+    } else {
+        // Leader registers ALL brokers from config
+        use chronik_common::metadata::traits::BrokerMetadata;
 
-    tracing::info!("Registering broker {} via Raft (after leader election)...", config.node_id);
+        tracing::info!("This node is the Raft leader - registering all brokers from config");
 
-    // Get metadata store from server
-    let metadata_store = server.metadata_store();
+        // Get metadata store from server
+        let metadata_store = server.metadata_store();
 
-    // Retry registration with backoff (follower may need time to connect to leader)
-    let mut retry_count = 0;
-    let max_retries = 30; // 30 attempts * 2s = 60 seconds max wait
-    loop {
-        match metadata_store.register_broker(broker_metadata.clone()).await {
-            Ok(_) => {
-                tracing::info!("✅ Successfully registered broker {} via Raft", config.node_id);
-                break;
-            }
-            Err(e) => {
-                retry_count += 1;
-                if retry_count <= max_retries {
-                    tracing::warn!(
-                        "Failed to register broker {} (attempt {}/{}): {:?}, retrying in 2s...",
-                        config.node_id, retry_count, max_retries, e
-                    );
-                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                } else {
-                    tracing::error!(
-                        "FATAL: Failed to register broker {} after {} attempts: {:?}",
-                        config.node_id, retry_count, e
-                    );
-                    return Err(anyhow::anyhow!(
-                        "Broker registration failed after {} attempts - cluster may not have quorum",
-                        max_retries
-                    ));
+        // Register all peers (including self) from config
+        for peer_id in [1, 2, 3] {  // TODO: Get from config.peers instead of hardcoded
+            let peer_kafka_port = 9091 + peer_id;  // TODO: Get from config
+            let peer_host = "localhost".to_string();  // TODO: Get from config
+
+            let broker_metadata = BrokerMetadata {
+                broker_id: peer_id as i32,
+                host: peer_host,
+                port: peer_kafka_port as i32,
+                rack: None,
+                status: chronik_common::metadata::traits::BrokerStatus::Online,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            };
+
+            match metadata_store.register_broker(broker_metadata.clone()).await {
+                Ok(_) => {
+                    tracing::info!("✅ Successfully registered broker {} via Raft", peer_id);
+                }
+                Err(e) => {
+                    tracing::error!("Failed to register broker {}: {:?}", peer_id, e);
+                    return Err(anyhow::anyhow!("Broker registration failed for broker {}: {}", peer_id, e));
                 }
             }
         }
