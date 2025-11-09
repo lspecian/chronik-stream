@@ -177,16 +177,24 @@ impl IntegratedKafkaServer {
             updated_at: chrono::Utc::now(),
         };
 
-        // Only register broker immediately for single-node mode
-        // Multi-node clusters MUST register after Raft message loop starts
+        // v2.2.7 FIX: Start Raft message loop for BOTH single-node and multi-node
+        // Even single-node Raft needs message loop to elect itself as leader!
+        info!("Starting Raft message loop (required for leader election)");
+        raft_cluster_for_metadata.clone().start_message_loop();
+        info!("✓ Raft message loop started");
+
+        // Wait for leader election (single-node should become leader immediately)
         if raft_cluster.is_none() {
-            // Single-node mode: synchronous apply, no leader election needed
-            info!("Single-node mode: Registering broker {} immediately", config.node_id);
+            // Single-node mode: wait briefly for self-election
+            info!("Single-node mode: Waiting for Raft self-election...");
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+            info!("Single-node mode: Registering broker {} after election", config.node_id);
             metadata_store.register_broker(broker_metadata.clone()).await
                 .context("Failed to register broker in single-node mode")?;
             info!("✓ Successfully registered broker {} via RaftMetadataStore", config.node_id);
         } else {
-            // Multi-node mode: defer registration until after Raft message loop starts
+            // Multi-node mode: defer registration until after Raft leader election completes
             info!("Multi-node mode: Deferring broker registration until Raft leader election completes");
         }
 
