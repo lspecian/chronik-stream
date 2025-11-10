@@ -39,23 +39,23 @@ rm -rf "$SCRIPT_DIR"/data/node{1,2,3}
 mkdir -p "$SCRIPT_DIR"/data/node{1,2,3}
 mkdir -p "$SCRIPT_DIR"/logs
 
-# Start nodes
+# Start nodes (P4: WAL ultra profile for maximum throughput)
 echo -e "${GREEN}Starting Node 1...${NC}"
-RUST_LOG=info "$BINARY" start --config "$SCRIPT_DIR/node1.toml" \
+RUST_LOG=info CHRONIK_WAL_PROFILE=ultra "$BINARY" start --config "$SCRIPT_DIR/node1.toml" \
     > "$SCRIPT_DIR/logs/node1.log" 2>&1 &
 echo $! > "$SCRIPT_DIR/data/node1.pid"
 
 sleep 2
 
 echo -e "${GREEN}Starting Node 2...${NC}"
-RUST_LOG=info "$BINARY" start --config "$SCRIPT_DIR/node2.toml" \
+RUST_LOG=info CHRONIK_WAL_PROFILE=ultra "$BINARY" start --config "$SCRIPT_DIR/node2.toml" \
     > "$SCRIPT_DIR/logs/node2.log" 2>&1 &
 echo $! > "$SCRIPT_DIR/data/node2.pid"
 
 sleep 2
 
 echo -e "${GREEN}Starting Node 3...${NC}"
-RUST_LOG=info "$BINARY" start --config "$SCRIPT_DIR/node3.toml" \
+RUST_LOG=info CHRONIK_WAL_PROFILE=ultra "$BINARY" start --config "$SCRIPT_DIR/node3.toml" \
     > "$SCRIPT_DIR/logs/node3.log" 2>&1 &
 echo $! > "$SCRIPT_DIR/data/node3.pid"
 

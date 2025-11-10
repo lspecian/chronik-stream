@@ -23,7 +23,8 @@ use crate::raft_metadata::{MetadataCommand, MetadataStateMachine, PartitionKey};
 use anyhow::{Result, Context};
 use std::sync::{Arc, RwLock};
 use std::collections::HashMap;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, Notify};
+use dashmap::DashMap;
 
 use raft::{prelude::*, storage::MemStorage};
 use slog::Drain;
@@ -62,6 +63,19 @@ pub struct RaftCluster {
     /// SNAPSHOT STORM FIX (v2.2.8): Track last snapshot index to prevent repeated snapshots
     /// Only create new snapshot if we've advanced significantly beyond this index
     last_snapshot_index: Arc<RwLock<u64>>,
+
+    /// v2.2.9 EVENT-DRIVEN NOTIFICATION: Pending topic creation notifications
+    /// Shared with RaftMetadataStore to enable instant wake-up when entries are applied
+    pending_topics: Arc<DashMap<String, Arc<Notify>>>,
+
+    /// v2.2.7 EVENT-DRIVEN NOTIFICATION: Pending broker registration notifications
+    /// Shared with RaftMetadataStore to enable instant wake-up when entries are applied
+    pending_brokers: Arc<DashMap<i32, Arc<Notify>>>,
+
+    /// v2.2.7 EVENT-DRIVEN NOTIFICATION (P1): Pending partition leader notifications
+    /// Key: "topic:partition" (e.g., "my-topic:0")
+    /// Used by followers waiting for partition metadata to arrive via Raft replication
+    pending_partitions: Arc<DashMap<String, Arc<Notify>>>,
 }
 
 impl RaftCluster {
@@ -252,7 +266,25 @@ impl RaftCluster {
             grpc_server_handle: Arc::new(Mutex::new(None)),
             message_sender,
             last_snapshot_index: Arc::new(RwLock::new(0)), // SNAPSHOT STORM FIX (v2.2.8)
+            pending_topics: Arc::new(DashMap::new()), // v2.2.7 EVENT-DRIVEN NOTIFICATION
+            pending_brokers: Arc::new(DashMap::new()), // v2.2.7 EVENT-DRIVEN NOTIFICATION
+            pending_partitions: Arc::new(DashMap::new()), // v2.2.7 EVENT-DRIVEN NOTIFICATION (P1)
         })
+    }
+
+    /// v2.2.7 EVENT-DRIVEN NOTIFICATION: Get shared notification maps for metadata store
+    pub fn get_pending_topics_notifications(&self) -> Arc<DashMap<String, Arc<Notify>>> {
+        self.pending_topics.clone()
+    }
+
+    /// v2.2.7 EVENT-DRIVEN NOTIFICATION: Get shared notification maps for metadata store
+    pub fn get_pending_brokers_notifications(&self) -> Arc<DashMap<i32, Arc<Notify>>> {
+        self.pending_brokers.clone()
+    }
+
+    /// v2.2.7 EVENT-DRIVEN NOTIFICATION (P1): Get partition metadata notification map
+    pub fn get_pending_partitions_notifications(&self) -> Arc<DashMap<String, Arc<Notify>>> {
+        self.pending_partitions.clone()
     }
 
     /// Get partition replicas (nodes that should replicate this partition)
@@ -369,7 +401,32 @@ impl RaftCluster {
         // Apply to state machine synchronously (just a HashMap update)
         self.state_machine.write()
             .map_err(|e| anyhow::anyhow!("Lock error: {}", e))?
-            .apply(cmd)?;
+            .apply(cmd.clone())?;
+
+        // v2.2.7 EVENT-DRIVEN NOTIFICATION: Fire notifications after applying command
+        match &cmd {
+            MetadataCommand::CreateTopic { name, .. } => {
+                if let Some((_, notify)) = self.pending_topics.remove(name) {
+                    notify.notify_waiters(); // Wake up ALL waiting threads
+                    tracing::debug!("✓ Notified waiting threads for topic '{}' (single-node mode)", name);
+                }
+            }
+            MetadataCommand::RegisterBroker { broker_id, .. } => {
+                if let Some((_, notify)) = self.pending_brokers.remove(broker_id) {
+                    notify.notify_waiters();
+                    tracing::debug!("✓ Notified waiting threads for broker {} (single-node mode)", broker_id);
+                }
+            }
+            MetadataCommand::SetPartitionLeader { topic, partition, .. } => {
+                // v2.2.7 EVENT-DRIVEN NOTIFICATION (P1): Notify followers waiting for partition metadata
+                let key = format!("{}:{}", topic, partition);
+                if let Some((_, notify)) = self.pending_partitions.remove(&key) {
+                    notify.notify_waiters();
+                    tracing::debug!("✓ Notified waiting threads for partition '{}' (single-node mode)", key);
+                }
+            }
+            _ => {} // Other commands don't need notifications yet
+        }
 
         Ok(())
     }
@@ -384,10 +441,18 @@ impl RaftCluster {
     /// **CRITICAL**: Only the leader can propose. If this node is not the leader,
     /// this method returns an error.
     async fn propose_via_raft(&self, cmd: MetadataCommand) -> Result<()> {
+        tracing::info!("🔍 DEBUG propose_via_raft: ENTER - command={:?}", cmd);
+
         // Check if we're the leader
         {
             let raft = self.raft_node.read()
                 .map_err(|e| anyhow::anyhow!("Failed to acquire Raft lock: {}", e))?;
+
+            let state = raft.raft.state;
+            let leader_id = raft.raft.leader_id;
+
+            tracing::info!("🔍 DEBUG propose_via_raft: Leadership check - node_id={}, state={:?}, leader_id={}",
+                self.node_id, state, leader_id);
 
             if raft.raft.state != raft::StateRole::Leader {
                 return Err(anyhow::anyhow!(
@@ -403,18 +468,25 @@ impl RaftCluster {
         let data = bincode::serialize(&cmd)
             .context("Failed to serialize metadata command")?;
 
+        tracing::info!("🔍 DEBUG propose_via_raft: Serialized command, data.len()={}", data.len());
+
+        // Propose to Raft - the entry will be committed asynchronously
+        // The metadata store has its own retry logic to poll for the applied state
         {
             let mut raft = self.raft_node.write()
                 .map_err(|e| anyhow::anyhow!("Failed to acquire Raft lock: {}", e))?;
 
-            raft.propose(vec![], data)
+            tracing::info!("🔍 DEBUG propose_via_raft: About to call raft.propose()");
+
+            raft.propose(vec![], data.clone())
                 .context("Failed to propose to Raft")?;
-        } // Lock dropped here
 
-        // Wait for apply (via background message loop)
-        // TODO: Implement proper wait mechanism (watch channel, condition var, etc.)
-        tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+            tracing::info!("✅ DEBUG propose_via_raft: raft.propose() succeeded! Command will be committed asynchronously");
+        }
 
+        // PERFORMANCE (v2.2.9): Return immediately - don't wait for commit!
+        // The RaftMetadataStore has event-driven notifications for instant wake-up.
+        tracing::info!("✅ DEBUG propose_via_raft: EXIT - returning Ok()");
         Ok(())
     }
 
@@ -777,6 +849,31 @@ impl RaftCluster {
                 // Apply to state machine
                 sm.apply(cmd.clone())?;
                 applied_count += 1;
+
+                // v2.2.7 EVENT-DRIVEN NOTIFICATION: Fire notifications after applying command
+                match &cmd {
+                    MetadataCommand::CreateTopic { name, .. } => {
+                        if let Some((_, notify)) = self.pending_topics.remove(name) {
+                            notify.notify_waiters(); // Wake up ALL waiting threads
+                            tracing::debug!("✓ Notified waiting threads for topic '{}'", name);
+                        }
+                    }
+                    MetadataCommand::RegisterBroker { broker_id, .. } => {
+                        if let Some((_, notify)) = self.pending_brokers.remove(broker_id) {
+                            notify.notify_waiters();
+                            tracing::debug!("✓ Notified waiting threads for broker {}", broker_id);
+                        }
+                    }
+                    MetadataCommand::SetPartitionLeader { topic, partition, .. } => {
+                        // v2.2.7 EVENT-DRIVEN NOTIFICATION (P1): Notify followers waiting for partition metadata
+                        let key = format!("{}:{}", topic, partition);
+                        if let Some((_, notify)) = self.pending_partitions.remove(&key) {
+                            notify.notify_waiters();
+                            tracing::debug!("✓ Notified waiting threads for partition '{}'", key);
+                        }
+                    }
+                    _ => {} // Other commands don't need notifications yet
+                }
 
                 tracing::info!("✅ DEBUG apply_committed_entries: Successfully applied entry {}: {:?}", idx + 1, cmd);
             } else {
