@@ -639,7 +639,7 @@ async fn run_cluster_mode(
     let server = IntegratedKafkaServer::new(server_config, Some(raft_cluster.clone())).await?;
     info!("IntegratedKafkaServer initialized successfully");
 
-    // ARCHITECTURAL FIX v2.2.7: Register broker NOW (after Raft message loop started)
+    // ARCHITECTURAL FIX v2.2.8: Register broker NOW with actual peer configs from TOML
     // Multi-node broker registration happens here, AFTER:
     // 1. Raft message loop started (leader election can proceed)
     // 2. gRPC server started (nodes can communicate)
@@ -662,7 +662,7 @@ async fn run_cluster_mode(
         election_attempts += 1;
     }
 
-    // v2.2.8 FIX: Spawn broker registration as background task to avoid blocking Raft loop
+    // v2.2.8 FIX: Use actual peer configs from TOML instead of hardcoded IDs
     // CRITICAL: Cannot block main thread waiting for Raft proposals - must yield to message loop!
     if !is_leader {
         info!("This node is a follower - skipping broker registration (will receive via Raft replication)");
@@ -677,10 +677,24 @@ async fn run_cluster_mode(
             info!("Background task: Registering {} brokers from config", peers_clone.len());
 
             for peer in &peers_clone {
+                // v2.2.8 FIX: Parse actual Kafka address from config instead of hardcoded calculation
+                let (host, port) = if let Some(colon_pos) = peer.kafka.rfind(':') {
+                    let host = peer.kafka[..colon_pos].to_string();
+                    let port = peer.kafka[colon_pos+1..].parse::<i32>()
+                        .unwrap_or_else(|_| {
+                            tracing::warn!("Failed to parse Kafka port from '{}', using default 9092", peer.kafka);
+                            9092
+                        });
+                    (host, port)
+                } else {
+                    tracing::warn!("Invalid Kafka address format '{}', using defaults", peer.kafka);
+                    (peer.kafka.clone(), 9092)
+                };
+
                 let broker_metadata = BrokerMetadata {
                     broker_id: peer.id as i32,
-                    host: peer.kafka.split(':').next().unwrap_or("localhost").to_string(),
-                    port: peer.kafka.split(':').nth(1).and_then(|p| p.parse().ok()).unwrap_or(9092),
+                    host,
+                    port,
                     rack: None,
                     status: chronik_common::metadata::traits::BrokerStatus::Online,
                     created_at: chrono::Utc::now(),
@@ -689,15 +703,15 @@ async fn run_cluster_mode(
 
                 match metadata_store.register_broker(broker_metadata.clone()).await {
                     Ok(_) => {
-                        info!("✅ Successfully registered broker {} via Raft", peer.id);
+                        tracing::info!("✅ Successfully registered broker {} ({}) via Raft", peer.id, peer.kafka);
                     }
                     Err(e) => {
-                        error!("❌ Failed to register broker {}: {:?}", peer.id, e);
+                        tracing::error!("❌ Failed to register broker {} ({}): {:?}", peer.id, peer.kafka, e);
                     }
                 }
             }
 
-            info!("✓ Broker registration task completed");
+            tracing::info!("✓ Broker registration task completed");
         });
 
         info!("Broker registration task spawned - will complete in background");

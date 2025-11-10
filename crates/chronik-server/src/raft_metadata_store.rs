@@ -56,7 +56,8 @@ impl MetadataStore for RaftMetadataStore {
 
         // Wait for Raft entry to be applied with retry logic (v2.2.7 fix)
         // In multi-node clusters, the Raft entry needs time to be committed and applied
-        let max_attempts = 20; // 20 attempts * 50ms = 1 second max wait
+        // v2.2.8: Increased to 80 attempts (4 seconds) to handle high-concurrency topic creation
+        let max_attempts = 80; // 80 attempts * 50ms = 4 seconds max wait
         let retry_interval = tokio::time::Duration::from_millis(50);
 
         for attempt in 1..=max_attempts {

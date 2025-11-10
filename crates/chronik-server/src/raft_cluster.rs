@@ -58,6 +58,10 @@ pub struct RaftCluster {
     /// Messages are taken from Ready and sent to this channel (non-blocking)
     /// A background task reads from channel and sends via gRPC
     message_sender: mpsc::UnboundedSender<(u64, Message)>,
+
+    /// SNAPSHOT STORM FIX (v2.2.8): Track last snapshot index to prevent repeated snapshots
+    /// Only create new snapshot if we've advanced significantly beyond this index
+    last_snapshot_index: Arc<RwLock<u64>>,
 }
 
 impl RaftCluster {
@@ -190,15 +194,47 @@ impl RaftCluster {
                 const METADATA_TOPIC: &str = "__raft_metadata";
                 const METADATA_PARTITION: i32 = 0;
 
-                match transport_for_sender
-                    .send_message(METADATA_TOPIC, METADATA_PARTITION, peer_id, msg)
-                    .await
-                {
-                    Ok(_) => {
-                        tracing::debug!("✓ Message sender: sent {:?} to peer {}", msg_type, peer_id);
-                    }
-                    Err(e) => {
-                        tracing::warn!("Message sender: failed to send {:?} to peer {}: {}", msg_type, peer_id, e);
+                // CRITICAL FIX (v2.2.8): Retry failed messages with exponential backoff
+                // When gRPC transport fails (peer not connected), we MUST retry until success.
+                // Otherwise, AppendEntries with committed entries are LOST, causing followers
+                // to have commit index > last_index (split-brain state).
+                //
+                // Retry strategy:
+                // - Max 10 retries with exponential backoff (50ms, 100ms, 200ms, ...)
+                // - If all retries fail, log error but continue (message is lost)
+                // - This prevents infinite retry loops while giving transport time to connect
+                let mut retry_count = 0;
+                let max_retries = 10;
+                let mut backoff_ms = 50;
+
+                loop {
+                    match transport_for_sender
+                        .send_message(METADATA_TOPIC, METADATA_PARTITION, peer_id, msg.clone())
+                        .await
+                    {
+                        Ok(_) => {
+                            tracing::debug!("✓ Message sender: sent {:?} to peer {} (retries: {})", msg_type, peer_id, retry_count);
+                            break; // Success - exit retry loop
+                        }
+                        Err(e) => {
+                            retry_count += 1;
+                            if retry_count >= max_retries {
+                                tracing::error!(
+                                    "Message sender: FAILED to send {:?} to peer {} after {} retries - MESSAGE LOST: {}",
+                                    msg_type, peer_id, max_retries, e
+                                );
+                                break; // Give up after max retries
+                            }
+
+                            tracing::debug!(
+                                "Message sender: retry {}/{} for {:?} to peer {} (backoff: {}ms): {}",
+                                retry_count, max_retries, msg_type, peer_id, backoff_ms, e
+                            );
+
+                            // Exponential backoff
+                            tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
+                            backoff_ms = (backoff_ms * 2).min(1000); // Cap at 1 second
+                        }
                     }
                 }
             }
@@ -215,6 +251,7 @@ impl RaftCluster {
             transport,
             grpc_server_handle: Arc::new(Mutex::new(None)),
             message_sender,
+            last_snapshot_index: Arc::new(RwLock::new(0)), // SNAPSHOT STORM FIX (v2.2.8)
         })
     }
 
@@ -1105,21 +1142,12 @@ impl RaftCluster {
                             };
 
                             // Apply to Raft (updates voter list)
-                            let cs = {
-                                let mut raft = match self.raft_node.write() {
-                                    Ok(r) => r,
-                                    Err(e) => {
-                                        tracing::error!("Failed to acquire Raft lock: {}", e);
-                                        continue;
-                                    }
-                                };
-
-                                match raft.apply_conf_change(&cc) {
-                                    Ok(cs) => cs,
-                                    Err(e) => {
-                                        tracing::error!("Failed to apply ConfChange: {:?}", e);
-                                        continue;
-                                    }
+                            // CRITICAL: Use existing raft_lock from line 1006 - DO NOT acquire lock again (deadlock!)
+                            let cs = match raft_lock.apply_conf_change(&cc) {
+                                Ok(cs) => cs,
+                                Err(e) => {
+                                    tracing::error!("Failed to apply ConfChange: {:?}", e);
+                                    continue;
                                 }
                             };
 
@@ -1180,20 +1208,32 @@ impl RaftCluster {
                     }
                 }
 
-                // Step 3b: Handle normal committed entries
+                // Step 3b: Handle normal committed entries (SKIP ConfChange entries - already processed in Step 3a)
                 if !ready.committed_entries().is_empty() {
-                    tracing::info!(
-                        "🔍 DEBUG: Processing {} committed entries (BEFORE apply_committed_entries)",
-                        ready.committed_entries().len()
-                    );
+                    // Filter out ConfChange entries - only process normal entries
+                    let normal_entries: Vec<_> = ready.committed_entries()
+                        .iter()
+                        .filter(|entry| entry.get_entry_type() != raft::prelude::EntryType::EntryConfChangeV2)
+                        .cloned()
+                        .collect();
 
-                    if let Err(e) = self.apply_committed_entries(ready.committed_entries()) {
-                        tracing::error!("❌ DEBUG: Failed to apply committed entries: {}", e);
-                    } else {
+                    if !normal_entries.is_empty() {
                         tracing::info!(
-                            "✅ DEBUG: Applied {} committed entries to state machine (AFTER apply_committed_entries)",
-                            ready.committed_entries().len()
+                            "🔍 DEBUG: Processing {} normal committed entries (BEFORE apply_committed_entries, filtered out {} ConfChange)",
+                            normal_entries.len(),
+                            ready.committed_entries().len() - normal_entries.len()
                         );
+
+                        if let Err(e) = self.apply_committed_entries(&normal_entries) {
+                            tracing::error!("❌ DEBUG: Failed to apply committed entries: {}", e);
+                        } else {
+                            tracing::info!(
+                                "✅ DEBUG: Applied {} committed entries to state machine (AFTER apply_committed_entries)",
+                                normal_entries.len()
+                            );
+                        }
+                    } else {
+                        tracing::debug!("🔍 DEBUG: No normal entries in this Ready (all were ConfChange)");
                     }
                 } else {
                     tracing::debug!("🔍 DEBUG: No committed entries in this Ready (ready.committed_entries().is_empty())");
@@ -1276,25 +1316,39 @@ impl RaftCluster {
                 tracing::debug!("✓ Advanced Raft successfully");
 
                 // Step 8: Check if we should create a snapshot (Phase 5)
-                // Trigger when applied >= last_index - 1000
+                // SNAPSHOT STORM FIX (v2.2.8): Only create snapshot if we've advanced significantly
+                // since the last snapshot. This prevents the same snapshot from being created
+                // repeatedly on every Raft ready event.
                 let applied = {
                     let raft_state = self.storage.initial_state().unwrap();
                     raft_state.hard_state.commit
                 };
 
                 let last_index = self.storage.last_index().unwrap();
+                let last_snapshot_idx = *self.last_snapshot_index.read().unwrap();
 
-                if applied > 0 && last_index > 1000 && applied >= last_index - 1000 {
+                // Only snapshot if:
+                // 1. We have enough log entries (last_index > 1000)
+                // 2. We're close to the end of the log (applied >= last_index - 1000)
+                // 3. We've advanced significantly since last snapshot (applied >= last_snapshot_idx + 500)
+                //    This ensures we don't create the same snapshot repeatedly
+                let should_snapshot = applied > 0
+                    && last_index > 1000
+                    && applied >= last_index - 1000
+                    && applied >= last_snapshot_idx + 500;
+
+                if should_snapshot {
                     tracing::info!(
-                        "Snapshot trigger: applied={}, last_index={} (threshold: {})",
+                        "Snapshot trigger: applied={}, last_index={}, last_snapshot={} (will create new snapshot)",
                         applied,
                         last_index,
-                        last_index - 1000
+                        last_snapshot_idx
                     );
 
                     // Clone needed data before async operations
                     let state_machine_clone = self.state_machine.clone();
                     let storage_clone = self.storage.clone();
+                    let last_snapshot_index_clone = self.last_snapshot_index.clone();
 
                     // Create snapshot (async operations using block_in_place)
                     let snapshot_result = tokio::task::block_in_place(|| {
@@ -1322,6 +1376,9 @@ impl RaftCluster {
                             // Truncate log entries covered by snapshot
                             storage_clone.truncate_log_to_snapshot(applied).await?;
 
+                            // SNAPSHOT STORM FIX: Update last snapshot index
+                            *last_snapshot_index_clone.write().unwrap() = applied;
+
                             Ok::<(), anyhow::Error>(())
                         })
                     });
@@ -1331,6 +1388,13 @@ impl RaftCluster {
                     } else {
                         tracing::info!("✓ Created and saved snapshot at index={}", applied);
                     }
+                } else if applied > 0 && last_index > 1000 && applied >= last_index - 1000 {
+                    // Would have triggered snapshot but already have recent one
+                    tracing::debug!(
+                        "Snapshot skipped: applied={}, last_snapshot={} (need +500 progress)",
+                        applied,
+                        last_snapshot_idx
+                    );
                 }
 
                 // Lock is released here at end of loop iteration
@@ -1390,7 +1454,7 @@ mod tests {
 pub struct RaftClusterConfig {
     pub node_id: u64,
     pub raft_addr: String,
-    pub peers: Vec<(u64, String)>,
+    pub peers: Vec<chronik_config::NodeConfig>,  // Full peer info (Kafka, WAL, Raft)
     pub bootstrap: bool,
     pub kafka_port: u16,
     pub advertised_addr: String,
@@ -1412,13 +1476,17 @@ pub async fn run_raft_cluster(config: RaftClusterConfig) -> Result<()> {
         config.raft_addr
     );
 
-    // Step 1: Clone peers before bootstrap (needed for WAL replication config later)
+    // Step 1: Extract Raft addresses for bootstrap (node_id, raft_addr)
+    // Keep full peer configs for later use (broker registration, WAL replication)
     let peers_for_replication = config.peers.clone();
+    let raft_peers: Vec<(u64, String)> = config.peers.iter()
+        .map(|peer| (peer.id, peer.raft.clone()))
+        .collect();
 
     // Bootstrap RaftCluster for metadata coordination
     let raft_cluster = Arc::new(RaftCluster::bootstrap(
         config.node_id,
-        config.peers,
+        raft_peers,
         PathBuf::from(&config.data_dir)
     ).await?);
 
@@ -1434,27 +1502,14 @@ pub async fn run_raft_cluster(config: RaftClusterConfig) -> Result<()> {
     raft_cluster.clone().start_grpc_server(config.raft_addr.clone()).await?;
     tracing::info!("✓ Raft gRPC server started on {}", config.raft_addr);
 
-    // Step 1.7: Auto-configure WAL replication for Raft cluster (Phase 4 fix)
+    // Step 1.7: Auto-configure WAL replication for Raft cluster (v2.2.8 fix)
     // CRITICAL: Without this, acks=-1 hangs because no follower ACKs are sent!
-    // Convert Raft peer addresses to WAL replication addresses
-    // Port mapping: raft_port → kafka_port (raft - 100) → wal_port (kafka + 10)
+    // Use actual WAL addresses from peer configs (not calculated from Raft ports)
     let wal_followers: Vec<String> = peers_for_replication.iter()
-        .filter_map(|(peer_id, raft_addr)| {
-            // Parse Raft address to extract host and port
-            // Format: "host:raft_port" where kafka_port = raft_port - 100, wal_port = kafka_port + 10
-            if let Some(colon_pos) = raft_addr.rfind(':') {
-                let host = &raft_addr[..colon_pos];
-                if let Ok(raft_port) = raft_addr[colon_pos+1..].parse::<u16>() {
-                    let kafka_port = raft_port - 100;  // Kafka port = Raft port - 100
-                    let wal_port = kafka_port + 10;    // WAL replication port = Kafka port + 10
-                    let wal_addr = format!("{}:{}", host, wal_port);
-                    tracing::info!("Mapped Raft peer {} (Raft={}:{}) to WAL follower: {} (Kafka={}, WAL={})",
-                        peer_id, host, raft_port, wal_addr, kafka_port, wal_port);
-                    return Some(wal_addr);
-                }
-            }
-            tracing::warn!("Failed to parse Raft peer address: {}", raft_addr);
-            None
+        .map(|peer| {
+            tracing::info!("Mapped peer {} to WAL follower: {} (Kafka={}, Raft={})",
+                peer.id, peer.wal, peer.kafka, peer.raft);
+            peer.wal.clone()
         })
         .collect();
 
@@ -1526,7 +1581,7 @@ pub async fn run_raft_cluster(config: RaftClusterConfig) -> Result<()> {
     if !is_leader {
         tracing::info!("This node is a follower - skipping broker registration (will receive via Raft replication)");
     } else {
-        // Leader registers ALL brokers from config
+        // Leader registers ALL brokers from config (v2.2.8: use actual peer configs)
         use chronik_common::metadata::traits::BrokerMetadata;
 
         tracing::info!("This node is the Raft leader - registering all brokers from config");
@@ -1534,15 +1589,26 @@ pub async fn run_raft_cluster(config: RaftClusterConfig) -> Result<()> {
         // Get metadata store from server
         let metadata_store = server.metadata_store();
 
-        // Register all peers (including self) from config
-        for peer_id in [1, 2, 3] {  // TODO: Get from config.peers instead of hardcoded
-            let peer_kafka_port = 9091 + peer_id;  // TODO: Get from config
-            let peer_host = "localhost".to_string();  // TODO: Get from config
+        // Register all peers from config (using actual Kafka addresses)
+        for peer in &peers_for_replication {
+            // Parse Kafka address to extract host and port
+            let (host, port) = if let Some(colon_pos) = peer.kafka.rfind(':') {
+                let host = peer.kafka[..colon_pos].to_string();
+                let port = peer.kafka[colon_pos+1..].parse::<i32>()
+                    .unwrap_or_else(|_| {
+                        tracing::warn!("Failed to parse Kafka port from '{}', using default 9092", peer.kafka);
+                        9092
+                    });
+                (host, port)
+            } else {
+                tracing::warn!("Invalid Kafka address format '{}', using defaults", peer.kafka);
+                (peer.kafka.clone(), 9092)
+            };
 
             let broker_metadata = BrokerMetadata {
-                broker_id: peer_id as i32,
-                host: peer_host,
-                port: peer_kafka_port as i32,
+                broker_id: peer.id as i32,
+                host,
+                port,
                 rack: None,
                 status: chronik_common::metadata::traits::BrokerStatus::Online,
                 created_at: chrono::Utc::now(),
@@ -1551,11 +1617,11 @@ pub async fn run_raft_cluster(config: RaftClusterConfig) -> Result<()> {
 
             match metadata_store.register_broker(broker_metadata.clone()).await {
                 Ok(_) => {
-                    tracing::info!("✅ Successfully registered broker {} via Raft", peer_id);
+                    tracing::info!("✅ Successfully registered broker {} ({}) via Raft", peer.id, peer.kafka);
                 }
                 Err(e) => {
-                    tracing::error!("Failed to register broker {}: {:?}", peer_id, e);
-                    return Err(anyhow::anyhow!("Broker registration failed for broker {}: {}", peer_id, e));
+                    tracing::error!("Failed to register broker {} ({}): {:?}", peer.id, peer.kafka, e);
+                    return Err(anyhow::anyhow!("Broker registration failed for broker {} ({}): {}", peer.id, peer.kafka, e));
                 }
             }
         }

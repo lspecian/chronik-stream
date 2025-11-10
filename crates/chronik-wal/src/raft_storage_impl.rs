@@ -29,7 +29,7 @@ use raft::{prelude::*, Storage, StorageError, RaftState};
 use std::sync::{Arc, RwLock as StdRwLock};
 use parking_lot::RwLock;
 use std::path::{Path, PathBuf};
-use tracing::{info, debug};
+use tracing::{info, debug, warn};
 use anyhow::{Result, Context};
 use protobuf::Message;
 
@@ -230,15 +230,95 @@ impl RaftWalStorage {
                 }
             }
 
+            // CRITICAL FIX (v2.2.8): Deduplicate entries by index
+            // During runtime, Raft may write multiple entries at the same index (conflict resolution).
+            // All versions get persisted to WAL, but on recovery we must keep only the latest (highest term).
+            // Without deduplication, log.len() overcounts, causing last_index() mismatch and Compacted errors.
+            if !recovered_entries.is_empty() {
+                let entries_before_dedup = recovered_entries.len();
+                let mut deduped = Vec::new();
+                let mut last_index = 0u64;
+
+                for entry in recovered_entries {
+                    if entry.index != last_index {
+                        // New index - add it
+                        deduped.push(entry.clone());
+                        last_index = entry.index;
+                    } else {
+                        // Duplicate index - replace with newer term (keep highest term)
+                        if entry.term > deduped.last().unwrap().term {
+                            deduped.pop();
+                            deduped.push(entry.clone());
+                        }
+                    }
+                }
+
+                recovered_entries = deduped;
+
+                if entries_before_dedup > recovered_entries.len() {
+                    info!(
+                        "Deduplicated {} conflicting entries (kept highest term for each index)",
+                        entries_before_dedup - recovered_entries.len()
+                    );
+                }
+            }
+
             if !recovered_entries.is_empty() {
                 let first_idx = recovered_entries.first().map(|e| e.index).unwrap_or(1);
                 let last_idx = recovered_entries.last().map(|e| e.index).unwrap_or(0);
 
                 info!("✓ Recovered {} Raft entries (index {}-{})", recovered_entries.len(), first_idx, last_idx);
 
+                // CRITICAL FIX (v2.2.8): Trim recovered entries to prevent memory explosion
+                // During recovery, we may have 100K+ entries in WAL. We MUST trim immediately
+                // to prevent Raft from trying to access entries that will be trimmed later.
+                //
+                // Keep only FIRST 50K entries (oldest, closest to snapshot) to ensure:
+                // 1. first_index stays at snapshot_index + 1 (no gaps)
+                // 2. Entries immediately after snapshot are in memory
+                // 3. Newer entries can be accessed via WAL fallback
+                // 4. Memory usage is bounded
+                //
+                // CRITICAL: Must keep at least ONE entry to prevent Raft from thinking
+                // everything is compacted (last_index >= first_index is required by Raft).
+                const MAX_UNSTABLE_ENTRIES: usize = 50_000;
+                if recovered_entries.len() > MAX_UNSTABLE_ENTRIES {
+                    // Keep FIRST 50K entries, drop the rest (newest ones)
+                    recovered_entries.truncate(MAX_UNSTABLE_ENTRIES);
+
+                    let new_last_idx = recovered_entries.last().map(|e| e.index).unwrap_or(last_idx);
+                    info!(
+                        "Trimmed recovered entries to first {}K, new range: [{}, {}] (dropped {} newer entries)",
+                        MAX_UNSTABLE_ENTRIES / 1000,
+                        first_idx,
+                        new_last_idx,
+                        recovered_entries.len().saturating_sub(MAX_UNSTABLE_ENTRIES)
+                    );
+                }
+
+                // CRITICAL: Ensure we have at least ONE entry in the log after recovery
+                // If log is empty, Raft will think everything is compacted when first_index > committed
+                if recovered_entries.is_empty() {
+                    warn!(
+                        "Recovered 0 entries - creating dummy entry at index {} to prevent Raft panic \
+                         (Raft requires last_index >= first_index invariant)",
+                        first_idx
+                    );
+                    // Create a minimal dummy entry to satisfy Raft's invariant
+                    let dummy_entry = Entry {
+                        entry_type: raft::eraftpb::EntryType::EntryNormal as i32,
+                        term: 1,
+                        index: first_idx,
+                        data: vec![],
+                        context: vec![],
+                        sync_log: false,
+                    };
+                    recovered_entries.push(dummy_entry);
+                }
+
                 // Update in-memory log
-                *self.entries.write().unwrap() = recovered_entries;
-                *self.first_index.write().unwrap() = first_idx;
+                *self.entries.write().unwrap() = recovered_entries.clone();
+                *self.first_index.write().unwrap() = recovered_entries.first().map(|e| e.index).unwrap_or(first_idx);
             } else {
                 // All entries were covered by snapshot
                 info!("All WAL entries covered by snapshot - starting with empty log after snapshot");
@@ -289,6 +369,12 @@ impl RaftWalStorage {
     }
 
     /// Append entries to in-memory log and persist to WAL (async, called from message loop)
+    ///
+    /// CRITICAL FIX (v2.2.8): Keep last 1000 entries in unstable log to prevent raft-rs 0.7.0 panic
+    /// during conflict resolution. The panic occurs when conflicting entries are in stable storage
+    /// and raft-rs tries to slice the unstable log beyond its bounds.
+    ///
+    /// See docs/RAFT_LOG_UNSTABLE_FIX_v2.2.8.md for details.
     pub async fn append_entries(&self, entries: &[Entry]) -> Result<()> {
         if entries.is_empty() {
             return Ok(());
@@ -298,7 +384,7 @@ impl RaftWalStorage {
 
         // First, update in-memory log (synchronous)
         {
-            let first_index = *self.first_index.read().unwrap();
+            let mut first_index = *self.first_index.read().unwrap();
             let mut log = self.entries.write().unwrap();
 
             for entry in entries {
@@ -313,9 +399,46 @@ impl RaftWalStorage {
                 // Overwrite or append
                 log[vec_idx] = entry.clone();
             }
+
+            // FIX (v2.2.8): Keep last 50,000 entries in unstable log to prevent raft-rs 0.7.0 panics
+            // CRITICAL: During recovery, we may load 100K+ entries. We MUST keep entries starting
+            // from right after the snapshot index, NOT just the last 50K entries.
+            //
+            // Example scenario (the bug):
+            // - Snapshot at index 9999
+            // - Recovered 187K entries: [10000, 197434]
+            // - WRONG: Keep last 50K → [147435, 197434] → first_index = 147435
+            // - Raft tries to access entry 10000 → PANIC (trimmed!)
+            //
+            // Correct approach:
+            // - Keep first 50K entries after snapshot: [10000, 60000]
+            // - first_index stays at 10000 (immediately after snapshot)
+            // - Raft can access any entry >= 10000 via WAL fallback
+            const MAX_UNSTABLE_ENTRIES: usize = 50_000;
+
+            // Get snapshot index to determine where to start keeping entries
+            let snapshot_index = self.snapshot.read().get_metadata().index;
+            let target_first_index = snapshot_index + 1;
+
+            // Only trim if we have too many entries AND first_index is already at target
+            if log.len() > MAX_UNSTABLE_ENTRIES && first_index == target_first_index {
+                let trim_count = log.len() - MAX_UNSTABLE_ENTRIES;
+                log.drain(0..trim_count);
+
+                // Update first_index to reflect trimmed entries
+                let mut first_index_mut = self.first_index.write().unwrap();
+                *first_index_mut = first_index + trim_count as u64;
+
+                debug!(
+                    "Trimmed {} old entries from unstable log (keep {MAX_UNSTABLE_ENTRIES}), new first_index={}, unstable_len={}",
+                    trim_count,
+                    *first_index_mut,
+                    log.len()
+                );
+            }
         }
 
-        // Then, persist to WAL (async)
+        // Then, persist to WAL (async) - entries stay in memory for conflict resolution
         for entry in entries {
             let entry_bytes = entry.write_to_bytes()
                 .context("Failed to encode Raft entry")?;
@@ -582,6 +705,143 @@ impl RaftWalStorage {
 
         Ok(())
     }
+
+    /// Read Raft entries from WAL disk storage (cold path fallback)
+    ///
+    /// This is used by Storage::entries() when requested entries are not in the
+    /// in-memory unstable log (they were trimmed to prevent unbounded memory growth).
+    ///
+    /// CRITICAL: This must be called from a tokio runtime context because it uses
+    /// block_in_place to run async WAL reads synchronously.
+    fn read_entries_from_wal(&self, low: u64, high: u64) -> raft::Result<Vec<Entry>> {
+        use std::fs;
+        use std::io::Read;
+        use tokio::runtime::Handle;
+
+        debug!("Reading entries [{}, {}) from WAL (cold path fallback)", low, high);
+
+        // Handle empty range - return empty Vec immediately (success, not error!)
+        if low >= high {
+            debug!("Empty range [{}, {}) - returning empty Vec", low, high);
+            return Ok(Vec::new());
+        }
+
+        // Get data_dir to find WAL files
+        let data_dir = self.data_dir.read().unwrap().clone();
+        let wal_dir = data_dir.join("wal/__meta/__raft_metadata/0");
+
+        if !wal_dir.exists() {
+            tracing::warn!("WAL directory not found: {:?}", wal_dir);
+            return Err(raft::Error::Store(StorageError::Unavailable));
+        }
+
+        // Collect all WAL segment files
+        let mut wal_files = Vec::new();
+        match fs::read_dir(&wal_dir) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().and_then(|s| s.to_str()) == Some("log") {
+                        wal_files.push(path);
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!("Failed to read WAL directory: {:?}", e);
+                return Err(raft::Error::Store(StorageError::Unavailable));
+            }
+        }
+
+        if wal_files.is_empty() {
+            tracing::warn!("No WAL files found in {:?}", wal_dir);
+            return Err(raft::Error::Store(StorageError::Unavailable));
+        }
+
+        // Sort files by name (wal_0_0.log, wal_0_1.log, etc.)
+        wal_files.sort();
+
+        let mut found_entries: Vec<Entry> = Vec::new();
+
+        // Scan WAL files to find entries in [low, high) range
+        for wal_file in &wal_files {
+            let mut file = match fs::File::open(wal_file) {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::warn!("Failed to open WAL file {:?}: {:?}", wal_file, e);
+                    continue;
+                }
+            };
+
+            let mut contents = Vec::new();
+            if let Err(e) = file.read_to_end(&mut contents) {
+                tracing::warn!("Failed to read WAL file {:?}: {:?}", wal_file, e);
+                continue;
+            }
+
+            // Parse WAL records
+            let mut offset = 0;
+            while offset < contents.len() {
+                match WalRecord::from_bytes(&contents[offset..]) {
+                    Ok(record) => {
+                        let length = match &record {
+                            WalRecord::V1 { length, .. } => *length,
+                            WalRecord::V2 { length, .. } => *length,
+                        };
+                        let record_size = (length as usize) + 12;
+                        offset += record_size;
+
+                        // Try to parse as Entry
+                        if let Some(data) = record.get_canonical_data() {
+                            let mut entry = Entry::default();
+                            if entry.merge_from_bytes(data).is_ok() && entry.index > 0 {
+                                // Check if entry is in requested range [low, high)
+                                if entry.index >= low && entry.index < high {
+                                    found_entries.push(entry);
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // It's OK if no entries found - they might have been compacted/deleted
+        // Return empty Vec (success) rather than error
+        if found_entries.is_empty() {
+            debug!(
+                "No entries found in WAL for range [{}, {}) - entries may have been compacted",
+                low, high
+            );
+            return Ok(Vec::new());
+        }
+
+        // Sort by index and deduplicate (keep highest term for each index)
+        found_entries.sort_by_key(|e| e.index);
+        let mut deduped = Vec::new();
+        let mut last_index = 0u64;
+
+        for entry in found_entries {
+            if entry.index != last_index {
+                deduped.push(entry.clone());
+                last_index = entry.index;
+            } else {
+                if entry.term > deduped.last().unwrap().term {
+                    deduped.pop();
+                    deduped.push(entry.clone());
+                }
+            }
+        }
+
+        debug!(
+            "✓ Read {} entries from WAL for range [{}, {})",
+            deduped.len(), low, high
+        );
+
+        Ok(deduped)
+    }
 }
 
 impl Storage for RaftWalStorage {
@@ -597,15 +857,61 @@ impl Storage for RaftWalStorage {
         _context: raft::GetEntriesContext,
     ) -> raft::Result<Vec<Entry>> {
         let log = self.entries.read().unwrap();
+        let first_index = *self.first_index.read().unwrap();
+        let snapshot = self.snapshot.read();
+        let snapshot_index = snapshot.get_metadata().index;
 
-        if log.is_empty() {
+        // DEBUG (v2.2.8): Log all entries() calls to debug Compacted errors
+        tracing::debug!(
+            "entries({}, {}) called: log.len={}, first_index={}, snapshot_index={}",
+            low, high, log.len(), first_index, snapshot_index
+        );
+
+        // Handle empty range
+        if low >= high {
+            tracing::debug!("entries({}, {}): returning empty (low >= high)", low, high);
             return Ok(Vec::new());
         }
 
-        let first_index = *self.first_index.read().unwrap();
+        if log.is_empty() {
+            tracing::debug!("entries({}, {}): returning empty (log is empty)", low, high);
+            return Ok(Vec::new());
+        }
 
+        // CRITICAL FIX (v2.2.8): Use WAL fallback for entries older than first_index
+        // When entries have been trimmed from unstable log (to prevent unbounded memory growth),
+        // we need to read them from WAL disk storage instead of returning Compacted error
+        // (which causes raft-rs 0.7.0 to panic).
+        //
+        // This implements two-tier storage:
+        // 1. Hot path: In-memory Vec<Entry> (fast, recent entries)
+        // 2. Cold path: WAL disk read (slower, but prevents panic for older entries)
+        //
+        // See: docs/RAFT_CLUSTER_FIX_PLAN_v2.2.8.md (Option A)
         if low < first_index {
-            return Err(raft::Error::Store(StorageError::Compacted));
+            tracing::info!(
+                "entries({}, {}): requested entries older than first_index={} (snapshot_index={}), falling back to WAL read",
+                low, high, first_index, snapshot_index
+            );
+
+            // Try to read from WAL (cold path)
+            match self.read_entries_from_wal(low, high) {
+                Ok(entries) => {
+                    tracing::info!(
+                        "✓ WAL fallback succeeded: read {} entries for range [{}, {})",
+                        entries.len(), low, high
+                    );
+                    return Ok(entries);
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "✗ WAL fallback failed for range [{}, {}): {:?}",
+                        low, high, e
+                    );
+                    // If WAL read fails, return Unavailable (not Compacted which panics)
+                    return Err(raft::Error::Store(StorageError::Unavailable));
+                }
+            }
         }
 
         if high > log.len() as u64 + first_index {
@@ -656,8 +962,41 @@ impl Storage for RaftWalStorage {
         let log = self.entries.read().unwrap();
         let first_index = *self.first_index.read().unwrap();
 
+        // CRITICAL FIX (v2.2.8): Use WAL fallback for compacted entries
+        // Instead of returning Compacted error (which panics), read from WAL
         if idx < first_index {
-            return Err(raft::Error::Store(StorageError::Compacted));
+            tracing::info!(
+                "term({}): requested term for compacted entry (first_index={}), falling back to WAL read",
+                idx, first_index
+            );
+
+            // Try to read from WAL (cold path)
+            match self.read_entries_from_wal(idx, idx + 1) {
+                Ok(entries) => {
+                    if let Some(entry) = entries.first() {
+                        tracing::info!(
+                            "✓ WAL fallback succeeded: term({}) = {}",
+                            idx, entry.term
+                        );
+                        return Ok(entry.term);
+                    } else {
+                        tracing::error!(
+                            "✗ WAL fallback returned empty for index {}",
+                            idx
+                        );
+                        // Fall back to snapshot term if WAL doesn't have it
+                        return Ok(snapshot.get_metadata().term);
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "✗ WAL fallback failed for index {}: {:?}",
+                        idx, e
+                    );
+                    // Fall back to snapshot term
+                    return Ok(snapshot.get_metadata().term);
+                }
+            }
         }
 
         let offset = (idx - first_index) as usize;

@@ -602,7 +602,7 @@ impl GroupCommitWal {
                 debug!("🔄 WORKER_LOOP: Waiting for notification or interval tick");
                 tokio::select! {
                     _ = queue.write_notify.notified() => {
-                        info!("🔔 WORKER_NOTIFIED: Received write notification");
+                        debug!("🔔 WORKER_NOTIFIED: Received write notification");
                     }
                     _ = interval.tick() => {
                         debug!("⏰ WORKER_TICK: Interval tick fired");

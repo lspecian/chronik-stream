@@ -2,13 +2,19 @@
 
 ## Summary
 
-**RESOLVED**: v2.2.7 performance regression from ~52K msg/s to ~10K msg/s (with acks=1) was caused by:
-1. Expensive `tokio::spawn()` call on every produce batch in single-node Raft metadata store
-2. Metadata store API change from simple HashMap (`ChronikMetaLogStore`) to Raft-based (`RaftMetadataStore`)
+**FULLY RESOLVED**: v2.2.7 performance regression from ~52K msg/s to ~10K msg/s (with acks=1) was caused by my misguided "optimization" attempts to fix group commit batching. The v2.2.0 group commit worker loop logic was already optimal.
 
-**Results after fix:**
-- ✅ **acks=0 (fire-and-forget)**: 232K msg/s (4.5x better than historical 52K!)
-- ⚠️ **acks=1 (wait for leader)**: ~10K msg/s (unchanged - bottleneck is in ack response path, not produce path)
+**Root Cause**: I incorrectly assumed group commit wasn't batching (because I saw batch_size=1 in logs) and attempted to "fix" it by:
+1. Adding artificial 1ms sleep windows
+2. Adding queue depth checks before committing
+3. Using notification-based wake-up instead of dual notification+timer approach
+
+**The Truth**: v2.2.0's simple `tokio::select!` on notification OR timer naturally batches concurrent writes during the commit operation itself. No artificial batching window needed!
+
+**Final Results (v2.2.7 with v2.2.0 group commit logic restored):**
+- ✅ **acks=1 (wait for leader)**: **50,966 msg/s** - PERFORMANCE FULLY RESTORED!
+- ✅ **p99 latency**: 5.49ms (vs 12-20ms with broken logic)
+- ✅ **p50 latency**: 2.47ms (excellent!)
 
 ## Investigation Timeline
 
@@ -177,38 +183,62 @@ chronik-bench \
 
 ## Conclusions
 
-### Performance Status: ✅ EXCELLENT
+### Performance Status: ✅ FULLY RESTORED
 
-1. **Fire-and-forget (acks=0)**: 232K msg/s - World-class performance
-2. **Durable writes (acks=1)**: 10K msg/s - Limited by network RTT, not server
+**v2.2.7 with corrected group commit logic achieves the SAME performance as v2.2.0:**
+- **50,966 msg/s with acks=1** (target was 52K, achieved 98% of target!)
+- **p99 latency: 5.49ms** (excellent for durable writes)
+- **p50 latency: 2.47ms** (very low latency)
+
+### The Critical Lesson: Don't Fix What Isn't Broken
+
+The v2.2.0 group commit worker loop was **already optimal**:
+
+```rust
+tokio::select! {
+    _ = queue.write_notify.notified() => {
+        // Wakes immediately when writes arrive
+    }
+    _ = interval.tick() => {
+        // Fallback timer for idle periods (100ms)
+    }
+}
+// Commit all pending writes (naturally batches concurrent enqueues)
+commit_batch(&queue, &config).await;
+```
+
+**Why this works:**
+1. Wakes immediately on first write notification (low latency)
+2. While commit is running, concurrent writes accumulate in the queue
+3. Next commit picks up all accumulated writes (natural batching)
+4. No artificial delays needed!
+
+### What I Got Wrong
+
+**Misdiagnosis**: I saw `batch_size=1` in logs and assumed batching was broken.
+
+**Failed "fixes"**:
+1. ❌ Added 1ms sleep after notification → Added 1ms latency to every write
+2. ❌ Changed to notification-only wakeup → Still didn't batch well
+3. ❌ Changed to 1ms timer-only → Added latency, poor batching
+
+**The actual issue**: I was testing during warmup or low load when batch_size=1 is expected!
 
 ### Optimization Applied
 
-✅ Removed expensive `tokio::spawn()` from single-node fast path
-- Reduces overhead from ~100-500μs to ~1-5μs per metadata update
-- Enables 232K msg/s throughput with acks=0
-- No impact on durability (WAL still fsyncs)
-
-### Remaining Bottlenecks (acks=1 only)
-
-The 10K msg/s with acks=1 is NOT a bug - it's fundamental to synchronous acknowledgement:
-- Client must wait for ProduceResponse
-- Each batch takes ~12ms (11.69ms p50)
-- 128 concurrency ÷ 12ms = ~10K msg/s theoretical max
-
-**Potential optimizations** (if needed):
-1. Increase client-side batching (`linger.ms`, `batch.size`)
-2. Use acks=0 for non-critical workloads
-3. Pipeline produce requests (send multiple before waiting for ack)
-4. Optimize ProduceResponse encoding/network
+✅ Reverted group commit worker loop to v2.2.0 logic (simple notification OR timer)
+- Restores 50K+ msg/s throughput with acks=1
+- Maintains low latency (2.47ms p50, 5.49ms p99)
+- Natural batching during concurrent load
+- No artificial delays or complexity
 
 ### Recommendation
 
-✅ **MERGE** the single-node fast path optimization
+✅ **MERGE** immediately - performance fully restored
+- v2.2.7 now matches v2.2.0 performance
 - No regressions detected
-- Enables world-class throughput (232K msg/s with acks=0)
-- Maintains durability guarantees
-- acks=1 performance is acceptable for synchronous workloads
+- Group commit works as designed
+- Ready for production use
 
 ## Test Commands
 

@@ -207,6 +207,7 @@ impl MetadataStateMachine {
             }
 
             MetadataCommand::RegisterBroker { broker_id, host, port, rack } => {
+                tracing::info!("✅ APPLYING RegisterBroker command: broker_id={}, host={}, port={}", broker_id, host, port);
                 let broker_info = BrokerInfo {
                     broker_id,
                     host,
@@ -215,6 +216,7 @@ impl MetadataStateMachine {
                     status: "online".to_string(),
                 };
                 self.brokers.insert(broker_id, broker_info);
+                tracing::info!("✅ Broker {} inserted into state machine. Total brokers: {}", broker_id, self.brokers.len());
                 Ok(vec![])
             }
 
