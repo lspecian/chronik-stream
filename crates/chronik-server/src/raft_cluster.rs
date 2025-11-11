@@ -76,6 +76,11 @@ pub struct RaftCluster {
     /// Key: "topic:partition" (e.g., "my-topic:0")
     /// Used by followers waiting for partition metadata to arrive via Raft replication
     pending_partitions: Arc<DashMap<String, Arc<Notify>>>,
+
+    /// v2.3.0 Phase 3: Heartbeat broadcast channel for leader leases
+    /// Leader broadcasts heartbeats to followers via this channel
+    /// Followers subscribe to receive heartbeats and update their leases
+    heartbeat_sender: tokio::sync::broadcast::Sender<crate::leader_heartbeat::LeaderHeartbeat>,
 }
 
 impl RaftCluster {
@@ -257,6 +262,10 @@ impl RaftCluster {
 
         tracing::info!("✓ Raft message sender task started");
 
+        // Create heartbeat broadcast channel for Phase 3 leader leases
+        // Capacity: 16 heartbeats (enough for 16 seconds at 1Hz heartbeat rate)
+        let (heartbeat_sender, _) = tokio::sync::broadcast::channel(16);
+
         Ok(Self {
             node_id,
             state_machine,
@@ -269,6 +278,7 @@ impl RaftCluster {
             pending_topics: Arc::new(DashMap::new()), // v2.2.7 EVENT-DRIVEN NOTIFICATION
             pending_brokers: Arc::new(DashMap::new()), // v2.2.7 EVENT-DRIVEN NOTIFICATION
             pending_partitions: Arc::new(DashMap::new()), // v2.2.7 EVENT-DRIVEN NOTIFICATION (P1)
+            heartbeat_sender, // v2.3.0 Phase 3: Leader lease heartbeats
         })
     }
 
@@ -364,6 +374,23 @@ impl RaftCluster {
     /// Used by RaftMetadataStore to read metadata without proposing.
     pub fn get_state_machine(&self) -> std::sync::RwLockReadGuard<crate::raft_metadata::MetadataStateMachine> {
         self.state_machine.read().expect("Failed to acquire state machine lock")
+    }
+
+    /// Apply metadata command directly to state machine (Phase 2.2: WAL-based metadata writes)
+    ///
+    /// # WARNING
+    /// This bypasses Raft consensus! Only use when:
+    /// 1. Command is already persisted to metadata WAL
+    /// 2. Caller handles replication separately
+    ///
+    /// Phase 2 usage: Leader writes to WAL → applies via this method → async replicates
+    pub fn apply_metadata_command_direct(&self, cmd: MetadataCommand) -> Result<()> {
+        let mut state = self.state_machine.write()
+            .map_err(|e| anyhow::anyhow!("Failed to acquire state machine write lock: {}", e))?;
+
+        state.apply(cmd)
+            .map(|_| ()) // Discard Vec<u8> return value, we only care about success
+            .map_err(|e| anyhow::anyhow!("Failed to apply metadata command: {}", e))
     }
 
     /// Propose a metadata command to the Raft cluster (v2.2.7 Phase 2)
@@ -1009,6 +1036,283 @@ impl RaftCluster {
         raft_node.raft.state == raft::StateRole::Leader
     }
 
+    /// Get the current Raft leader ID (Phase 1.2)
+    ///
+    /// Returns the node ID of the current Raft leader, or None if no leader elected.
+    pub fn get_leader_id(&self) -> Option<u64> {
+        let raft_node = self.raft_node.read().unwrap();
+        let leader_id = raft_node.raft.leader_id;
+
+        if leader_id == raft::INVALID_ID {
+            None
+        } else {
+            Some(leader_id)
+        }
+    }
+
+    /// Query metadata from the leader (Phase 1.2)
+    ///
+    /// Forwards a metadata query to the Raft leader via gRPC.
+    /// If this node is the leader, executes the query locally.
+    ///
+    /// # Arguments
+    /// - `query`: The metadata query to execute
+    ///
+    /// # Returns
+    /// - Ok(response) if query succeeded
+    /// - Err if no leader, RPC failed, or query execution failed
+    pub async fn query_leader(
+        &self,
+        query: crate::metadata_rpc::MetadataQuery,
+    ) -> Result<crate::metadata_rpc::MetadataQueryResponse> {
+        // Check if we're the leader
+        if self.am_i_leader() {
+            // Execute query locally on state machine
+            return self.execute_query_local(query);
+        }
+
+        // Get leader ID
+        let leader_id = self.get_leader_id()
+            .ok_or_else(|| anyhow::anyhow!("No Raft leader elected"))?;
+
+        // Serialize query
+        let query_data = bincode::serialize(&query)
+            .context("Failed to serialize metadata query")?;
+
+        // Forward to leader via gRPC
+        use chronik_raft::rpc::raft_service_client::RaftServiceClient;
+        use chronik_raft::rpc::QueryMetadataRequest;
+
+        // Get leader's Raft address from transport
+        let leader_addr = self.transport.get_peer_address(leader_id).await
+            .ok_or_else(|| anyhow::anyhow!("Leader {} not found in transport", leader_id))?;
+
+        tracing::debug!("Forwarding metadata query to leader {} at {}", leader_id, leader_addr);
+
+        let mut client = RaftServiceClient::connect(leader_addr.clone()).await
+            .context(format!("Failed to connect to leader {} at {}", leader_id, leader_addr))?;
+
+        let request = tonic::Request::new(QueryMetadataRequest {
+            query_data,
+        });
+
+        let response = client.query_metadata(request).await
+            .context("QueryMetadata RPC failed")?
+            .into_inner();
+
+        if !response.success {
+            return Err(anyhow::anyhow!("Leader query failed: {}", response.error));
+        }
+
+        // Deserialize response
+        let query_response = bincode::deserialize(&response.response_data)
+            .context("Failed to deserialize query response")?;
+
+        Ok(query_response)
+    }
+
+    /// Execute a metadata query locally on the state machine (Phase 1.2)
+    ///
+    /// Helper method called by query_leader when this node is the leader.
+    fn execute_query_local(
+        &self,
+        query: crate::metadata_rpc::MetadataQuery,
+    ) -> Result<crate::metadata_rpc::MetadataQueryResponse> {
+        use crate::metadata_rpc::{MetadataQuery, MetadataQueryResponse};
+
+        let state = self.state_machine.read()
+            .map_err(|e| anyhow::anyhow!("Failed to acquire state machine lock: {}", e))?;
+
+        match query {
+            MetadataQuery::GetTopic { name } => {
+                let topic = state.topics.get(&name).map(|t| {
+                    chronik_common::metadata::TopicMetadata {
+                        id: uuid::Uuid::new_v4(), // Generate UUID (not stored in state machine)
+                        name: t.name.clone(),
+                        config: t.config.clone(),
+                        created_at: chrono::Utc::now(), // Not stored in state machine
+                        updated_at: chrono::Utc::now(),
+                    }
+                });
+                Ok(MetadataQueryResponse::Topic(topic))
+            }
+            MetadataQuery::ListTopics => {
+                let topics: Vec<_> = state.topics.values().map(|t| {
+                    chronik_common::metadata::TopicMetadata {
+                        id: uuid::Uuid::new_v4(),
+                        name: t.name.clone(),
+                        config: t.config.clone(),
+                        created_at: chrono::Utc::now(),
+                        updated_at: chrono::Utc::now(),
+                    }
+                }).collect();
+                Ok(MetadataQueryResponse::TopicList(topics))
+            }
+            MetadataQuery::GetBroker { broker_id } => {
+                let broker = state.brokers.get(&broker_id).map(|b| {
+                    chronik_common::metadata::BrokerMetadata {
+                        broker_id,
+                        host: b.host.clone(),
+                        port: b.port,
+                        rack: b.rack.clone(),
+                        status: chronik_common::metadata::BrokerStatus::Online,
+                        created_at: chrono::Utc::now(),
+                        updated_at: chrono::Utc::now(),
+                    }
+                });
+                Ok(MetadataQueryResponse::Broker(broker))
+            }
+            MetadataQuery::ListBrokers => {
+                let brokers: Vec<_> = state.brokers.iter().map(|(&broker_id, b)| {
+                    chronik_common::metadata::BrokerMetadata {
+                        broker_id,
+                        host: b.host.clone(),
+                        port: b.port,
+                        rack: b.rack.clone(),
+                        status: chronik_common::metadata::BrokerStatus::Online,
+                        created_at: chrono::Utc::now(),
+                        updated_at: chrono::Utc::now(),
+                    }
+                }).collect();
+                Ok(MetadataQueryResponse::BrokerList(brokers))
+            }
+            MetadataQuery::GetPartitionAssignment { topic, partition } => {
+                let key = (topic.clone(), partition);
+                let replicas = state.partition_assignments.get(&key);
+                let leader = state.partition_leaders.get(&key).copied();
+
+                let assignment = replicas.and_then(|replicas| {
+                    leader.map(|leader_node_id| {
+                        chronik_common::metadata::PartitionAssignment {
+                            topic,
+                            partition: partition as u32,
+                            broker_id: leader_node_id as i32,
+                            is_leader: true,
+                        }
+                    })
+                });
+
+                Ok(MetadataQueryResponse::PartitionAssignment(assignment))
+            }
+            MetadataQuery::GetHighWatermark { topic, partition } => {
+                let key = (topic, partition);
+                let hw = state.partition_high_watermarks.get(&key).copied().unwrap_or(0);
+                Ok(MetadataQueryResponse::HighWatermark(hw))
+            }
+            MetadataQuery::GetPartitionCount { topic } => {
+                let count = state.topics.get(&topic)
+                    .map(|t| t.config.partition_count as i32)
+                    .unwrap_or(0);
+                Ok(MetadataQueryResponse::PartitionCount(count))
+            }
+        }
+    }
+
+    /// Forward a write command to the leader (Phase 1.2)
+    ///
+    /// Forwards a metadata write command to the Raft leader via gRPC.
+    /// If this node is the leader, proposes the command locally via Raft.
+    ///
+    /// # Arguments
+    /// - `command`: The metadata write command to execute
+    ///
+    /// # Returns
+    /// - Ok(()) if write succeeded
+    /// - Err if no leader, RPC failed, or write execution failed
+    pub async fn forward_write_to_leader(
+        &self,
+        command: crate::metadata_rpc::MetadataWriteCommand,
+    ) -> Result<()> {
+        // Check if we're the leader
+        if self.am_i_leader() {
+            // Execute write locally via Raft proposal
+            return self.execute_write_local(command).await;
+        }
+
+        // Get leader ID
+        let leader_id = self.get_leader_id()
+            .ok_or_else(|| anyhow::anyhow!("No Raft leader elected"))?;
+
+        // Serialize command
+        let command_data = bincode::serialize(&command)
+            .context("Failed to serialize metadata write command")?;
+
+        // Forward to leader via gRPC
+        use chronik_raft::rpc::raft_service_client::RaftServiceClient;
+        use chronik_raft::rpc::ForwardWriteRequest;
+
+        // Get leader's Raft address from transport
+        let leader_addr = self.transport.get_peer_address(leader_id).await
+            .ok_or_else(|| anyhow::anyhow!("Leader {} not found in transport", leader_id))?;
+
+        tracing::debug!("Forwarding metadata write to leader {} at {}", leader_id, leader_addr);
+
+        let mut client = RaftServiceClient::connect(leader_addr.clone()).await
+            .context(format!("Failed to connect to leader {} at {}", leader_id, leader_addr))?;
+
+        let request = tonic::Request::new(ForwardWriteRequest {
+            command_data,
+        });
+
+        let response = client.forward_write(request).await
+            .context("ForwardWrite RPC failed")?
+            .into_inner();
+
+        if !response.success {
+            return Err(anyhow::anyhow!("Leader write failed: {}", response.error));
+        }
+
+        Ok(())
+    }
+
+    /// Execute a metadata write locally via Raft proposal (Phase 1.2)
+    ///
+    /// Helper method called by forward_write_to_leader when this node is the leader.
+    async fn execute_write_local(
+        &self,
+        command: crate::metadata_rpc::MetadataWriteCommand,
+    ) -> Result<()> {
+        use crate::metadata_rpc::MetadataWriteCommand;
+
+        // Convert MetadataWriteCommand to MetadataCommand and propose via Raft
+        let raft_command = match command {
+            MetadataWriteCommand::CreateTopic { name, partition_count, replication_factor, config } => {
+                MetadataCommand::CreateTopic {
+                    name,
+                    partition_count: partition_count as u32,  // Convert i32 to u32
+                    replication_factor: replication_factor as u32,  // Convert i32 to u32
+                    config,
+                }
+            }
+            MetadataWriteCommand::RegisterBroker { broker_id, host, port, rack } => {
+                MetadataCommand::RegisterBroker {
+                    broker_id,
+                    host,
+                    port,
+                    rack,
+                }
+            }
+            MetadataWriteCommand::SetPartitionLeader { topic, partition, leader_id } => {
+                MetadataCommand::SetPartitionLeader {
+                    topic,
+                    partition,  // Already i32
+                    leader: leader_id,
+                }
+            }
+            MetadataWriteCommand::UpdateHighWatermark { topic, partition, offset } => {
+                MetadataCommand::UpdatePartitionOffset {
+                    topic,
+                    partition: partition as u32,  // Convert i32 to u32
+                    high_watermark: offset,
+                    log_start_offset: 0, // Not provided in write command
+                }
+            }
+        };
+
+        // Propose via Raft (handles single-node vs multi-node)
+        self.propose(raft_command).await
+    }
+
     /// Check if Raft has a leader (either we're the leader or there's a valid leader)
     ///
     /// NOTE: This function returns true for BOTH leaders AND followers with a known leader.
@@ -1076,8 +1380,42 @@ impl RaftCluster {
             Ok(())
         });
 
-        // Create RPC service
-        let service = RaftServiceImpl::new(message_handler);
+        // Create query handler for metadata queries (Phase 1.2)
+        let cluster_for_query = self.clone();
+        let query_handler = Arc::new(move |query_data: Vec<u8>| {
+            // Deserialize query
+            let query: crate::metadata_rpc::MetadataQuery = bincode::deserialize(&query_data)
+                .map_err(|e| format!("Failed to deserialize query: {}", e))?;
+
+            // Execute query on local state machine
+            let response = cluster_for_query.execute_query_local(query)
+                .map_err(|e| format!("Failed to execute query: {}", e))?;
+
+            // Serialize response
+            bincode::serialize(&response)
+                .map_err(|e| format!("Failed to serialize response: {}", e))
+        });
+
+        // Create write handler for metadata writes (Phase 1.2)
+        let cluster_for_write = self.clone();
+        let write_handler = Arc::new(move |command_data: Vec<u8>| {
+            // Deserialize command
+            let command: crate::metadata_rpc::MetadataWriteCommand = bincode::deserialize(&command_data)
+                .map_err(|e| format!("Failed to deserialize command: {}", e))?;
+
+            // Execute write via Raft proposal
+            // CRITICAL: This is blocking context, need to use block_on
+            let runtime_handle = tokio::runtime::Handle::current();
+            runtime_handle.block_on(async {
+                cluster_for_write.execute_write_local(command).await
+                    .map_err(|e| format!("Failed to execute write: {}", e))
+            })
+        });
+
+        // Create RPC service with all handlers (Phase 1.2)
+        let service = RaftServiceImpl::new(message_handler)
+            .with_query_handler(query_handler)
+            .with_write_handler(write_handler);
 
         // Start gRPC server
         let server = Server::builder()
@@ -1499,6 +1837,50 @@ impl RaftCluster {
         });
 
         tracing::info!("✓ Raft message loop started");
+    }
+
+    /// v2.3.0 Phase 3: Broadcast heartbeat to followers
+    ///
+    /// Called by HeartbeatSender on the leader to send periodic heartbeats.
+    /// Followers receive these heartbeats and update their leases.
+    pub async fn broadcast_heartbeat(
+        &self,
+        heartbeat: crate::leader_heartbeat::LeaderHeartbeat,
+    ) -> Result<()> {
+        // Send heartbeat to all subscribed followers
+        // Broadcast channel automatically delivers to all receivers
+        match self.heartbeat_sender.send(heartbeat) {
+            Ok(receiver_count) => {
+                tracing::trace!(
+                    "Broadcast heartbeat: leader={}, term={}, receivers={}",
+                    self.node_id,
+                    self.current_term(),
+                    receiver_count
+                );
+                Ok(())
+            }
+            Err(e) => {
+                // This only fails if there are no receivers, which is fine
+                tracing::trace!("Heartbeat broadcast skipped (no receivers): {}", e);
+                Ok(())
+            }
+        }
+    }
+
+    /// v2.3.0 Phase 3: Subscribe to heartbeat messages
+    ///
+    /// Called by HeartbeatReceiver on followers to receive heartbeats from leader.
+    /// Returns a receiver that gets notified when leader sends heartbeats.
+    pub fn subscribe_heartbeats(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::leader_heartbeat::LeaderHeartbeat> {
+        self.heartbeat_sender.subscribe()
+    }
+
+    /// Get current Raft term for heartbeat messages
+    pub fn current_term(&self) -> u64 {
+        let node = self.raft_node.read().unwrap();
+        node.raft.term
     }
 }
 

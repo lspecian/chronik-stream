@@ -16,6 +16,14 @@ pub use proto::*;
 /// The callback receives the deserialized Raft message and processes it.
 pub type MessageHandler = Arc<dyn Fn(raft::prelude::Message) -> Result<(), String> + Send + Sync>;
 
+/// Metadata query handler callback type.
+/// Executes metadata queries on the leader's state machine.
+pub type QueryHandler = Arc<dyn Fn(Vec<u8>) -> Result<Vec<u8>, String> + Send + Sync>;
+
+/// Metadata write handler callback type.
+/// Proposes metadata write commands via Raft consensus.
+pub type WriteHandler = Arc<dyn Fn(Vec<u8>) -> Result<(), String> + Send + Sync>;
+
 use std::sync::Arc;
 
 /// gRPC service implementation for Raft protocol.
@@ -25,12 +33,32 @@ use std::sync::Arc;
 pub struct RaftServiceImpl {
     /// Message handler that processes incoming Raft messages
     message_handler: MessageHandler,
+    /// Query handler for metadata queries (Phase 1.2)
+    query_handler: Option<QueryHandler>,
+    /// Write handler for metadata writes (Phase 1.2)
+    write_handler: Option<WriteHandler>,
 }
 
 impl RaftServiceImpl {
     /// Create a new Raft service with the given message handler.
     pub fn new(message_handler: MessageHandler) -> Self {
-        Self { message_handler }
+        Self {
+            message_handler,
+            query_handler: None,
+            write_handler: None,
+        }
+    }
+
+    /// Set the metadata query handler (Phase 1.2)
+    pub fn with_query_handler(mut self, handler: QueryHandler) -> Self {
+        self.query_handler = Some(handler);
+        self
+    }
+
+    /// Set the metadata write handler (Phase 1.2)
+    pub fn with_write_handler(mut self, handler: WriteHandler) -> Self {
+        self.write_handler = Some(handler);
+        self
     }
 }
 
@@ -140,5 +168,70 @@ impl raft_service_server::RaftService for RaftServiceImpl {
         _request: Request<ProposeMetadataRequest>,
     ) -> Result<Response<ProposeMetadataResponse>, Status> {
         Err(Status::unimplemented("Not implemented yet"))
+    }
+
+    async fn query_metadata(
+        &self,
+        request: Request<QueryMetadataRequest>,
+    ) -> Result<Response<QueryMetadataResponse>, Status> {
+        // This RPC is called by followers to query metadata from the leader
+        // The handler should execute the query on the leader's state machine
+        // and return the result
+
+        let req = request.into_inner();
+
+        debug!("Received QueryMetadata RPC with {} bytes", req.query_data.len());
+
+        // Check if query handler is configured
+        let handler = self.query_handler.as_ref()
+            .ok_or_else(|| Status::unimplemented("Query handler not configured"))?;
+
+        // Execute query via handler
+        match handler(req.query_data) {
+            Ok(response_data) => Ok(Response::new(QueryMetadataResponse {
+                success: true,
+                error: String::new(),
+                response_data,
+            })),
+            Err(e) => {
+                error!(error = %e, "Failed to execute metadata query");
+                Ok(Response::new(QueryMetadataResponse {
+                    success: false,
+                    error: e,
+                    response_data: vec![],
+                }))
+            }
+        }
+    }
+
+    async fn forward_write(
+        &self,
+        request: Request<ForwardWriteRequest>,
+    ) -> Result<Response<ForwardWriteResponse>, Status> {
+        // This RPC is called by followers to forward write commands to the leader
+        // The handler should propose the command via Raft consensus
+
+        let req = request.into_inner();
+
+        debug!("Received ForwardWrite RPC with {} bytes", req.command_data.len());
+
+        // Check if write handler is configured
+        let handler = self.write_handler.as_ref()
+            .ok_or_else(|| Status::unimplemented("Write handler not configured"))?;
+
+        // Forward write via handler
+        match handler(req.command_data) {
+            Ok(()) => Ok(Response::new(ForwardWriteResponse {
+                success: true,
+                error: String::new(),
+            })),
+            Err(e) => {
+                error!(error = %e, "Failed to forward metadata write");
+                Ok(Response::new(ForwardWriteResponse {
+                    success: false,
+                    error: e,
+                }))
+            }
+        }
     }
 }

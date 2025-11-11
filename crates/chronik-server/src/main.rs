@@ -30,6 +30,9 @@ mod wal_replication;  // v2.2.0: PostgreSQL-style WAL streaming
 mod raft_metadata;
 mod raft_cluster;
 mod raft_metadata_store;  // v2.2.7 Phase 3: Unified metadata store (1-N nodes)
+// v2.3.0 Phase 2: WAL-based metadata writes (fast path, bypasses Raft consensus)
+mod metadata_wal;          // Fast local WAL for metadata operations (1-2ms vs 10-50ms Raft)
+mod metadata_wal_replication;  // Async replication using existing WalReplicationManager
 // v2.5.0 Phase 3: ISR tracking for partition replication
 mod isr_tracker;
 // v2.5.0 Phase 4: ISR ACK tracking for acks=-1 quorum support
@@ -40,6 +43,11 @@ mod leader_election;
 mod admin_api;
 // v2.6.0 Priority 2 Step 3: Automatic partition rebalancing
 mod partition_rebalancer;
+// v2.3.0 Phase 1: Leader-forwarding RPC for metadata queries
+mod metadata_rpc;
+// v2.3.0 Phase 3: Leader leases for fast follower reads
+mod leader_lease;
+mod leader_heartbeat;
 
 mod cli;
 

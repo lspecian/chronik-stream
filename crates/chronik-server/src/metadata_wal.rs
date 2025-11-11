@@ -1,0 +1,205 @@
+//! Metadata WAL - Fast local WAL for metadata operations (Phase 2)
+//!
+//! This module provides a specialized WAL for cluster metadata operations.
+//! Unlike Raft consensus (10-50ms), metadata WAL writes are local and fast (1-2ms).
+//!
+//! Architecture:
+//! - Leader writes metadata commands to local WAL (durable, fast)
+//! - Leader applies commands to state machine immediately
+//! - Leader asynchronously replicates to followers (fire-and-forget)
+//! - Followers receive replication and apply to their state machines
+//!
+//! Why this is faster than Raft:
+//! - No quorum wait (1-2ms vs 10-50ms)
+//! - Reuses proven GroupCommitWal infrastructure (90K+ msg/s proven)
+//! - Reuses existing WalReplicationManager (works for partition data)
+//!
+//! Topic name convention:
+//! - Uses "__chronik_metadata" as topic name for replication routing
+//! - Partition 0 only (metadata is a single stream)
+
+use anyhow::{Result, Context};
+use chronik_wal::{GroupCommitWal, GroupCommitConfig, WalRecord};
+use crate::raft_metadata::MetadataCommand;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
+use tracing::{debug, info};
+
+/// Metadata WAL - Special-purpose WAL for metadata operations
+///
+/// Provides fast local writes (1-2ms) compared to Raft consensus (10-50ms).
+/// Uses "__chronik_metadata" as topic name for replication routing.
+pub struct MetadataWal {
+    /// Underlying GroupCommitWal (reuses existing infrastructure)
+    wal: Arc<GroupCommitWal>,
+
+    /// Topic name for replication routing (always "__chronik_metadata")
+    topic_name: String,
+
+    /// Partition ID (always 0, metadata is single stream)
+    partition: i32,
+
+    /// Next offset to assign (metadata WAL manages its own offset sequence)
+    next_offset: AtomicI64,
+}
+
+impl MetadataWal {
+    /// Create new metadata WAL
+    ///
+    /// # Arguments
+    /// - `data_dir`: Base data directory (WAL will be created at `data_dir/metadata_wal/`)
+    ///
+    /// # Returns
+    /// Metadata WAL instance ready for writes
+    pub async fn new(data_dir: PathBuf) -> Result<Self> {
+        let topic_name = "__chronik_metadata".to_string();
+        let partition = 0;
+
+        // Create WAL directory: data_dir/metadata_wal/
+        let wal_dir = data_dir.join("metadata_wal");
+        tokio::fs::create_dir_all(&wal_dir).await
+            .context("Failed to create metadata WAL directory")?;
+
+        info!("Creating metadata WAL at: {}", wal_dir.display());
+
+        // Use GroupCommitWal with default config
+        // Can be overridden via CHRONIK_WAL_PROFILE environment variable
+        // Default: high profile (10K batches, 100ms flush, 50MB buffer)
+        let config = GroupCommitConfig::default();
+        let wal = GroupCommitWal::new(wal_dir, config);
+
+        info!(
+            "Metadata WAL created successfully (topic='{}', partition={})",
+            topic_name,
+            partition
+        );
+
+        Ok(Self {
+            wal: Arc::new(wal),
+            topic_name,
+            partition,
+            next_offset: AtomicI64::new(0),
+        })
+    }
+
+    /// Append metadata command to WAL
+    ///
+    /// This is a durable, synchronous write that returns immediately after fsync (1-2ms).
+    /// Uses group commit for efficiency - multiple concurrent writes are batched together.
+    ///
+    /// # Arguments
+    /// - `cmd`: Metadata command to persist
+    ///
+    /// # Returns
+    /// Offset of the written command in the WAL
+    pub async fn append(&self, cmd: &MetadataCommand) -> Result<i64> {
+        // Serialize command to bytes (bincode)
+        let data = bincode::serialize(cmd)
+            .context("Failed to serialize metadata command")?;
+
+        // Allocate next offset
+        let offset = self.next_offset.fetch_add(1, Ordering::SeqCst);
+
+        // Create WAL record
+        let record = WalRecord::new_v2(
+            self.topic_name.clone(),
+            self.partition,
+            data,
+            offset,                // base_offset
+            offset,                // last_offset (single command per record)
+            1,                     // record_count (always 1 for metadata)
+        );
+
+        // Write to WAL (synchronous, but fast with group commit)
+        // Use acks=1 for metadata (wait for fsync, but don't wait for replication)
+        self.wal.append(
+            self.topic_name.clone(),
+            self.partition,
+            record,
+            1, // acks=1: wait for local fsync only
+        ).await.context("Failed to append to metadata WAL")?;
+
+        debug!(
+            "Appended metadata command to WAL at offset {}: {:?}",
+            offset,
+            cmd
+        );
+
+        Ok(offset)
+    }
+
+    /// Get topic name for replication routing
+    ///
+    /// Always returns "__chronik_metadata" - this is used by WalReplicationManager
+    /// to route metadata replication correctly.
+    pub fn topic_name(&self) -> &str {
+        &self.topic_name
+    }
+
+    /// Get partition ID (always 0)
+    pub fn partition(&self) -> i32 {
+        self.partition
+    }
+
+    /// Get reference to underlying GroupCommitWal
+    ///
+    /// Useful for advanced operations like recovery, compaction, etc.
+    pub fn wal(&self) -> &Arc<GroupCommitWal> {
+        &self.wal
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn test_metadata_wal_basic() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let wal = MetadataWal::new(temp_dir.path().to_path_buf()).await.unwrap();
+
+        // Test topic name and partition
+        assert_eq!(wal.topic_name(), "__chronik_metadata");
+        assert_eq!(wal.partition(), 0);
+
+        // Test append
+        let cmd = MetadataCommand::CreateTopic {
+            name: "test-topic".to_string(),
+            partition_count: 3,
+            replication_factor: 2,
+            config: HashMap::new(),
+        };
+
+        let offset = wal.append(&cmd).await.unwrap();
+        assert_eq!(offset, 0); // First write
+    }
+
+    #[tokio::test]
+    async fn test_metadata_wal_multiple_writes() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let wal = MetadataWal::new(temp_dir.path().to_path_buf()).await.unwrap();
+
+        // Write multiple commands
+        let cmd1 = MetadataCommand::RegisterBroker {
+            broker_id: 1,
+            host: "localhost".to_string(),
+            port: 9092,
+            rack: None,
+        };
+
+        let cmd2 = MetadataCommand::RegisterBroker {
+            broker_id: 2,
+            host: "localhost".to_string(),
+            port: 9093,
+            rack: None,
+        };
+
+        let offset1 = wal.append(&cmd1).await.unwrap();
+        let offset2 = wal.append(&cmd2).await.unwrap();
+
+        assert_eq!(offset1, 0);
+        assert_eq!(offset2, 1);
+    }
+}

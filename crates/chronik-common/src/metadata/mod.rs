@@ -6,7 +6,7 @@ pub mod traits;
 pub mod memory;
 pub mod events;
 // v2.2.7 Phase 5: Deleted metalog_store.rs (old WAL-based metadata, replaced by Raft)
-pub mod metrics;
+// Deleted metrics.rs (consolidated into chronik-monitoring::UnifiedMetrics)
 pub mod metadata_uploader;
 pub mod object_store_adapter;
 
@@ -22,7 +22,7 @@ pub use events::{MetadataEvent, MetadataEventPayload, EventLog, EventApplicator}
 // v2.2.7 Phase 5: Removed ChronikMetaLogStore exports (deleted file)
 // Kept METADATA_TOPIC constant for backward compatibility
 pub const METADATA_TOPIC: &str = "__chronik_metadata";
-pub use metrics::{WalMetadataMetrics, MetricsReport, global_metrics};
+// Removed WalMetadataMetrics, MetricsReport, global_metrics exports (use chronik-monitoring::UnifiedMetrics instead)
 pub use metadata_uploader::{MetadataUploader, MetadataUploaderConfig, ObjectStoreInterface, UploadStats};
 pub use object_store_adapter::{ObjectStoreAdapter, ObjectStoreImpl};
 

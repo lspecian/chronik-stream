@@ -33,6 +33,31 @@ pub struct UnifiedMetrics {
     pub metadata_offset_commits: AtomicU64,
     pub metadata_offset_gets: AtomicU64,
 
+    // ========== Phase 3: Metadata Performance & Lease Metrics ==========
+    pub metadata_write_latency_sum_ms: AtomicU64,      // Sum for histogram
+    pub metadata_write_count: AtomicU64,                // Count for average
+    pub metadata_read_latency_sum_ms: AtomicU64,       // Sum for histogram
+    pub metadata_read_count: AtomicU64,                 // Count for average
+    pub metadata_topic_creation_throughput: AtomicU64,  // Topics/sec (updated periodically)
+    pub metadata_lease_expirations: AtomicU64,          // Lease expiration events
+    pub metadata_replication_lag_ms: AtomicU64,         // Current lag (gauge)
+
+    // ========== WalMetadataMetrics Migration ==========
+    // Segment operations (from WalMetadataMetrics)
+    pub metadata_segment_persists: AtomicU64,
+    pub metadata_segment_gets: AtomicU64,
+    pub metadata_segment_lists: AtomicU64,
+    // Cache metrics (from WalMetadataMetrics)
+    pub metadata_cache_hits: AtomicU64,
+    pub metadata_cache_misses: AtomicU64,
+    pub metadata_cache_size: AtomicUsize,
+    pub metadata_cache_evictions: AtomicU64,
+    // Error metrics (from WalMetadataMetrics - note: total_errors already exists globally)
+    pub metadata_not_found_errors: AtomicU64,
+    // State metrics (from WalMetadataMetrics - note: total_topics/consumer_groups already exist)
+    pub metadata_total_segments: AtomicUsize,
+    pub metadata_memory_usage_bytes: AtomicUsize,
+
     // ========== Ingest/Produce Metrics ==========
     pub messages_received_total: AtomicU64,
     pub messages_stored_total: AtomicU64,
@@ -125,6 +150,27 @@ impl UnifiedMetrics {
             metadata_consumer_group_gets: AtomicU64::new(0),
             metadata_offset_commits: AtomicU64::new(0),
             metadata_offset_gets: AtomicU64::new(0),
+
+            // Phase 3: Metadata Performance & Lease Metrics
+            metadata_write_latency_sum_ms: AtomicU64::new(0),
+            metadata_write_count: AtomicU64::new(0),
+            metadata_read_latency_sum_ms: AtomicU64::new(0),
+            metadata_read_count: AtomicU64::new(0),
+            metadata_topic_creation_throughput: AtomicU64::new(0),
+            metadata_lease_expirations: AtomicU64::new(0),
+            metadata_replication_lag_ms: AtomicU64::new(0),
+
+            // WalMetadataMetrics Migration
+            metadata_segment_persists: AtomicU64::new(0),
+            metadata_segment_gets: AtomicU64::new(0),
+            metadata_segment_lists: AtomicU64::new(0),
+            metadata_cache_hits: AtomicU64::new(0),
+            metadata_cache_misses: AtomicU64::new(0),
+            metadata_cache_size: AtomicUsize::new(0),
+            metadata_cache_evictions: AtomicU64::new(0),
+            metadata_not_found_errors: AtomicU64::new(0),
+            metadata_total_segments: AtomicUsize::new(0),
+            metadata_memory_usage_bytes: AtomicUsize::new(0),
 
             // Ingest/Produce
             messages_received_total: AtomicU64::new(0),
@@ -234,6 +280,93 @@ impl UnifiedMetrics {
             self.metadata_offset_commits.load(Ordering::Relaxed)));
         output.push_str(&format!("chronik_metadata_operations_total{{operation=\"offset_get\"}} {}\n",
             self.metadata_offset_gets.load(Ordering::Relaxed)));
+
+        // ========== Phase 3: Metadata Performance & Lease Metrics ==========
+        let write_count = self.metadata_write_count.load(Ordering::Relaxed);
+        let write_sum = self.metadata_write_latency_sum_ms.load(Ordering::Relaxed);
+        let write_avg = if write_count > 0 { write_sum / write_count } else { 0 };
+
+        output.push_str("# HELP chronik_metadata_write_latency_ms Metadata write latency in milliseconds\n");
+        output.push_str("# TYPE chronik_metadata_write_latency_ms gauge\n");
+        output.push_str(&format!("chronik_metadata_write_latency_ms{{type=\"average\"}} {}\n", write_avg));
+
+        let read_count = self.metadata_read_count.load(Ordering::Relaxed);
+        let read_sum = self.metadata_read_latency_sum_ms.load(Ordering::Relaxed);
+        let read_avg = if read_count > 0 { read_sum / read_count } else { 0 };
+
+        output.push_str("# HELP chronik_metadata_read_latency_ms Metadata read latency in milliseconds\n");
+        output.push_str("# TYPE chronik_metadata_read_latency_ms gauge\n");
+        output.push_str(&format!("chronik_metadata_read_latency_ms{{type=\"average\"}} {}\n", read_avg));
+
+        output.push_str("# HELP chronik_metadata_topic_creation_throughput Topics created per second\n");
+        output.push_str("# TYPE chronik_metadata_topic_creation_throughput gauge\n");
+        output.push_str(&format!("chronik_metadata_topic_creation_throughput {}\n",
+            self.metadata_topic_creation_throughput.load(Ordering::Relaxed)));
+
+        output.push_str("# HELP chronik_metadata_lease_expirations_total Lease expiration events\n");
+        output.push_str("# TYPE chronik_metadata_lease_expirations_total counter\n");
+        output.push_str(&format!("chronik_metadata_lease_expirations_total {}\n",
+            self.metadata_lease_expirations.load(Ordering::Relaxed)));
+
+        output.push_str("# HELP chronik_metadata_replication_lag_ms Metadata replication lag in milliseconds\n");
+        output.push_str("# TYPE chronik_metadata_replication_lag_ms gauge\n");
+        output.push_str(&format!("chronik_metadata_replication_lag_ms {}\n",
+            self.metadata_replication_lag_ms.load(Ordering::Relaxed)));
+
+        // ========== WalMetadataMetrics Migration: Segment Operations ==========
+        output.push_str("# HELP chronik_metadata_segment_operations_total Metadata segment operations\n");
+        output.push_str("# TYPE chronik_metadata_segment_operations_total counter\n");
+        output.push_str(&format!("chronik_metadata_segment_operations_total{{operation=\"persist\"}} {}\n",
+            self.metadata_segment_persists.load(Ordering::Relaxed)));
+        output.push_str(&format!("chronik_metadata_segment_operations_total{{operation=\"get\"}} {}\n",
+            self.metadata_segment_gets.load(Ordering::Relaxed)));
+        output.push_str(&format!("chronik_metadata_segment_operations_total{{operation=\"list\"}} {}\n",
+            self.metadata_segment_lists.load(Ordering::Relaxed)));
+
+        // ========== WalMetadataMetrics Migration: Cache Operations ==========
+        output.push_str("# HELP chronik_metadata_cache_operations_total Metadata cache operations\n");
+        output.push_str("# TYPE chronik_metadata_cache_operations_total counter\n");
+        output.push_str(&format!("chronik_metadata_cache_operations_total{{operation=\"hit\"}} {}\n",
+            self.metadata_cache_hits.load(Ordering::Relaxed)));
+        output.push_str(&format!("chronik_metadata_cache_operations_total{{operation=\"miss\"}} {}\n",
+            self.metadata_cache_misses.load(Ordering::Relaxed)));
+        output.push_str(&format!("chronik_metadata_cache_operations_total{{operation=\"eviction\"}} {}\n",
+            self.metadata_cache_evictions.load(Ordering::Relaxed)));
+
+        let cache_hits = self.metadata_cache_hits.load(Ordering::Relaxed);
+        let cache_misses = self.metadata_cache_misses.load(Ordering::Relaxed);
+        let cache_total = cache_hits + cache_misses;
+        let cache_hit_rate = if cache_total > 0 {
+            cache_hits as f64 / cache_total as f64
+        } else {
+            0.0
+        };
+
+        output.push_str("# HELP chronik_metadata_cache_hit_rate Metadata cache hit rate (0.0 to 1.0)\n");
+        output.push_str("# TYPE chronik_metadata_cache_hit_rate gauge\n");
+        output.push_str(&format!("chronik_metadata_cache_hit_rate {:.4}\n", cache_hit_rate));
+
+        output.push_str("# HELP chronik_metadata_cache_size Metadata cache size\n");
+        output.push_str("# TYPE chronik_metadata_cache_size gauge\n");
+        output.push_str(&format!("chronik_metadata_cache_size {}\n",
+            self.metadata_cache_size.load(Ordering::Relaxed)));
+
+        // ========== WalMetadataMetrics Migration: Error Metrics ==========
+        output.push_str("# HELP chronik_metadata_not_found_errors_total Metadata not-found errors\n");
+        output.push_str("# TYPE chronik_metadata_not_found_errors_total counter\n");
+        output.push_str(&format!("chronik_metadata_not_found_errors_total {}\n",
+            self.metadata_not_found_errors.load(Ordering::Relaxed)));
+
+        // ========== WalMetadataMetrics Migration: State Metrics ==========
+        output.push_str("# HELP chronik_metadata_total_segments Total metadata segments\n");
+        output.push_str("# TYPE chronik_metadata_total_segments gauge\n");
+        output.push_str(&format!("chronik_metadata_total_segments {}\n",
+            self.metadata_total_segments.load(Ordering::Relaxed)));
+
+        output.push_str("# HELP chronik_metadata_memory_usage_bytes Metadata memory usage in bytes\n");
+        output.push_str("# TYPE chronik_metadata_memory_usage_bytes gauge\n");
+        output.push_str(&format!("chronik_metadata_memory_usage_bytes {}\n",
+            self.metadata_memory_usage_bytes.load(Ordering::Relaxed)));
 
         // ========== Ingest/Produce Metrics ==========
         output.push_str("# HELP chronik_messages_received_total Total messages received\n");
@@ -573,5 +706,84 @@ impl MetricsRecorder {
         let metrics = global_metrics();
         metrics.wal_batch_size_sum.fetch_add(batch_size, Ordering::Relaxed);
         metrics.wal_batch_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    // ========== Phase 3: Metadata Performance & Lease Metrics ==========
+
+    /// Record metadata write latency (Phase 2 WAL writes)
+    pub fn record_metadata_write_latency(duration: std::time::Duration) {
+        let ms = duration.as_millis() as u64;
+        let metrics = global_metrics();
+        metrics.metadata_write_latency_sum_ms.fetch_add(ms, Ordering::Relaxed);
+        metrics.metadata_write_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record metadata read latency (Phase 1 forwarding or Phase 3 local read)
+    pub fn record_metadata_read_latency(duration: std::time::Duration) {
+        let ms = duration.as_millis() as u64;
+        let metrics = global_metrics();
+        metrics.metadata_read_latency_sum_ms.fetch_add(ms, Ordering::Relaxed);
+        metrics.metadata_read_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record lease expiration event
+    pub fn record_lease_expiration() {
+        let metrics = global_metrics();
+        metrics.metadata_lease_expirations.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Update topic creation throughput (called periodically, e.g., every second)
+    pub fn update_topic_creation_throughput(topics_per_sec: u64) {
+        let metrics = global_metrics();
+        metrics.metadata_topic_creation_throughput.store(topics_per_sec, Ordering::Relaxed);
+    }
+
+    /// Update metadata replication lag (called by followers)
+    pub fn update_metadata_replication_lag(lag_ms: u64) {
+        let metrics = global_metrics();
+        metrics.metadata_replication_lag_ms.store(lag_ms, Ordering::Relaxed);
+    }
+
+    // ========== WalMetadataMetrics Migration ==========
+
+    /// Record segment operation
+    pub fn record_segment_operation(operation: &str) {
+        let metrics = global_metrics();
+        match operation {
+            "persist" => metrics.metadata_segment_persists.fetch_add(1, Ordering::Relaxed),
+            "get" => metrics.metadata_segment_gets.fetch_add(1, Ordering::Relaxed),
+            "list" => metrics.metadata_segment_lists.fetch_add(1, Ordering::Relaxed),
+            _ => return,
+        };
+    }
+
+    /// Record cache operation
+    pub fn record_cache_operation(operation: &str) {
+        let metrics = global_metrics();
+        match operation {
+            "hit" => metrics.metadata_cache_hits.fetch_add(1, Ordering::Relaxed),
+            "miss" => metrics.metadata_cache_misses.fetch_add(1, Ordering::Relaxed),
+            "eviction" => metrics.metadata_cache_evictions.fetch_add(1, Ordering::Relaxed),
+            _ => return,
+        };
+    }
+
+    /// Update cache size
+    pub fn update_cache_size(size: usize) {
+        let metrics = global_metrics();
+        metrics.metadata_cache_size.store(size, Ordering::Relaxed);
+    }
+
+    /// Record not-found error
+    pub fn record_not_found_error() {
+        let metrics = global_metrics();
+        metrics.metadata_not_found_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Update metadata state counts
+    pub fn update_metadata_state(segments: usize, memory_bytes: usize) {
+        let metrics = global_metrics();
+        metrics.metadata_total_segments.store(segments, Ordering::Relaxed);
+        metrics.metadata_memory_usage_bytes.store(memory_bytes, Ordering::Relaxed);
     }
 }

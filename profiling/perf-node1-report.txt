@@ -1,0 +1,80 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 1K of event 'cycles:P'
+# Event count (approx.): 3533662995
+#
+# Children      Self       Samples  Command          Shared Object     Symbol                                
+# ........  ........  ............  ...............  ................  ......................................
+#
+    63.09%     0.91%             7  tokio-runtime-w  [unknown]         [.] 0xffffffff9f00012b
+            |          
+             --62.17%--0xffffffff9f00012b
+                       |          
+                       |--59.38%--0xffffffff9ee9797e
+                       |          |          
+                       |          |--31.65%--0xffffffff9dc0b979
+                       |          |          |          
+                       |          |          |--25.41%--0xffffffff9e18f34f
+                       |          |          |          |          
+                       |          |          |           --24.94%--0xffffffff9e18e67e
+                       |          |          |                     |          
+                       |          |          |                     |--14.71%--0xffffffff9e18e532
+                       |          |          |                     |          0xffffffff9eeadcf3
+                       |          |          |                     |          |          
+                       |          |          |                     |          |--12.14%--0xffffffff9eeadc71
+                       |          |          |                     |          |          0xffffffff9eea6c69
+                       |          |          |                     |          |          |          
+                       |          |          |                     |          |          |--3.79%--0xffffffff9eea6930
+                       |          |          |                     |          |          |          |          
+                       |          |          |                     |          |          |           --3.36%--0xffffffff9dd62a62
+                       |          |          |                     |          |          |                     |          
+                       |          |          |                     |          |          |                      --2.30%--0xffffffff9dd7a39f
+                       |          |          |                     |          |          |          
+                       |          |          |                     |          |          |--2.20%--0xffffffff9eea6752
+                       |          |          |                     |          |          |          0xffffffff9dd5e8d9
+                       |          |          |                     |          |          |          0xffffffff9dfc5e35
+                       |          |          |                     |          |          |          |          
+                       |          |          |                     |          |          |           --1.68%--0xffffffff9dfc4a58
+                       |          |          |                     |          |          |                     |          
+                       |          |          |                     |          |          |                      --1.06%--0xffffffff9dfc1d3c
+                       |          |          |                     |          |          |          
+                       |          |          |                     |          |          |--1.86%--0xffffffff9eea669e
+                       |          |          |                     |          |          |          
+                       |          |          |                     |          |           --1.80%--0xffffffff9eea68d4
+                       |          |          |                     |          |                     |          
+                       |          |          |                     |          |                      --1.48%--0xffffffff9ddaad4e
+                       |          |          |                     |          |          
+                       |          |          |                     |           --2.56%--0xffffffff9eeadc65
+                       |          |          |                     |                     |          
+                       |          |          |                     |                      --2.07%--0xffffffff9de16be4
+                       |          |          |                     |                                |          
+                       |          |          |                     |                                 --2.06%--0xffffffff9de159cd
+                       |          |          |                     |                                           |          
+                       |          |          |                     |                                            --1.27%--0xffffffff9ee0ea92
+                       |          |          |                     |          
+                       |          |          |                     |--7.84%--0xffffffff9e18e353
+                       |          |          |                     |          |          
+                       |          |          |                     |           --7.83%--0xffffffff9e137ce1
+                       |          |          |                     |                     0xffffffff9de1a557
+                       |          |          |                     |                     |          
+                       |          |          |                     |                      --7.43%--0xffffffff9dccad22
+                       |          |          |                     |          
+                       |          |          |                      --1.74%--0xffffffff9e18e4a8
+                       |          |          |                                |          
+                       |          |          |                                 --1.38%--0xffffffff9e18e122
+                       |          |          |          
+                       |          |           --5.87%--0xffffffff9e18f3bb
+                       |          |                     |          
+                       |          |                      --5.80%--0xffffffff9de1a557
+                       |          |                                |          
+                       |          |                                 --5.33%--0xffffffff9dccad22
+                       |          |          
+                       |          |--19.21%--0xffffffff9dc0bab4
+                       |          |          |          
+                       |          |           --18.50%--0xffffffff9de24760
+                       |          |                     |          
+                       |          |                      --17.56%--0xffffffff9de24398
+                       |          |                                |          

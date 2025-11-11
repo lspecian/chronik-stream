@@ -810,12 +810,13 @@ impl KafkaProtocolHandler {
     /// - Raft replica creation (if Raft is enabled)
     /// - Validation and deduplication
     async fn auto_create_topics(&self, topic_names: &[String]) -> Result<()> {
-        // Get list of existing topics
-        let existing_topics = self.metadata_store.list_topics().await
-            .map_err(|e| Error::Internal(format!("Failed to list topics: {:?}", e)))?;
-
-        let existing_topic_names: std::collections::HashSet<String> =
-            existing_topics.into_iter().map(|t| t.name).collect();
+        // DEADLOCK FIX: Clone topic list to avoid holding read lock
+        // while calling auto_create_topic() which needs write lock
+        let existing_topic_names: std::collections::HashSet<String> = {
+            let existing_topics = self.metadata_store.list_topics().await
+                .map_err(|e| Error::Internal(format!("Failed to list topics: {:?}", e)))?;
+            existing_topics.into_iter().map(|t| t.name).collect()
+        }; // Read lock released here
 
         // Find topics that don't exist
         let topics_to_create: Vec<&String> = topic_names

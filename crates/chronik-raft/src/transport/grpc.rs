@@ -134,6 +134,14 @@ impl GrpcTransport {
             .map(|addrs| addrs.len())
             .unwrap_or(1) // Conservative: assume multi-node if can't read
     }
+
+    /// Get the gRPC address for a peer node (Phase 1.2)
+    ///
+    /// Returns the registered address for the specified peer.
+    /// Used for leader-forwarding RPCs.
+    pub async fn get_peer_address(&self, node_id: u64) -> Option<String> {
+        self.peer_addrs.read().await.get(&node_id).cloned()
+    }
 }
 
 impl Default for GrpcTransport {

@@ -26,6 +26,14 @@ service RaftService {
   // ProposeMetadata proposes a metadata operation to the leader
   // Followers can use this to forward proposals to the leader
   rpc ProposeMetadata(ProposeMetadataRequest) returns (ProposeMetadataResponse);
+
+  // QueryMetadata forwards a metadata query from follower to leader
+  // Phase 1.2: Leader-forwarding pattern to prevent split-brain
+  rpc QueryMetadata(QueryMetadataRequest) returns (QueryMetadataResponse);
+
+  // ForwardWrite forwards a metadata write from follower to leader
+  // Phase 1.2: Leader-forwarding pattern for write operations
+  rpc ForwardWrite(ForwardWriteRequest) returns (ForwardWriteResponse);
 }
 
 message StepResponse {
@@ -124,4 +132,25 @@ message ReadIndexResponse {
   uint64 read_id = 1;
   uint64 commit_index = 2;
   bool is_leader = 3;
+}
+
+// QueryMetadata RPC (Phase 1.2: Leader-forwarding pattern)
+message QueryMetadataRequest {
+  bytes query_data = 1;  // Serialized MetadataQuery
+}
+
+message QueryMetadataResponse {
+  bool success = 1;
+  string error = 2;
+  bytes response_data = 3;  // Serialized MetadataQueryResponse
+}
+
+// ForwardWrite RPC (Phase 1.2: Leader-forwarding pattern)
+message ForwardWriteRequest {
+  bytes command_data = 1;  // Serialized MetadataWriteCommand
+}
+
+message ForwardWriteResponse {
+  bool success = 1;
+  string error = 2;
 }

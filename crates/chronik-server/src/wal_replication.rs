@@ -970,6 +970,10 @@ pub struct WalReceiver {
 
     /// Last heartbeat timestamp per partition (v2.2.7)
     last_heartbeat: Arc<DashMap<(String, i32), std::time::Instant>>,
+
+    /// Raft cluster for applying metadata commands (Phase 2.3: Metadata WAL replication)
+    /// Only used when receiving "__chronik_metadata" topic replication from leader
+    raft_cluster: Option<Arc<RaftCluster>>,
 }
 
 impl WalReceiver {
@@ -983,6 +987,7 @@ impl WalReceiver {
             node_id: 0, // Default node ID (standalone mode)
             leader_elector: None,
             last_heartbeat: Arc::new(DashMap::new()),
+            raft_cluster: None,
         }
     }
 
@@ -1002,6 +1007,7 @@ impl WalReceiver {
             node_id,
             leader_elector: None,
             last_heartbeat: Arc::new(DashMap::new()),
+            raft_cluster: None,
         }
     }
 
@@ -1009,6 +1015,12 @@ impl WalReceiver {
     pub fn set_leader_elector(&mut self, elector: Arc<crate::leader_election::LeaderElector>) {
         info!("WalReceiver: Enabling event-driven leader election");
         self.leader_elector = Some(elector);
+    }
+
+    /// Set Raft cluster for metadata WAL replication (Phase 2.3)
+    pub fn set_raft_cluster(&mut self, raft_cluster: Arc<RaftCluster>) {
+        info!("WalReceiver: Enabling metadata WAL replication (Phase 2.3)");
+        self.raft_cluster = Some(raft_cluster);
     }
 
     /// Start the WAL receiver (blocking)
@@ -1035,6 +1047,7 @@ impl WalReceiver {
                     let node_id = self.node_id;
                     let last_heartbeat = Arc::clone(&self.last_heartbeat);
                     let leader_elector = self.leader_elector.clone();
+                    let raft_cluster = self.raft_cluster.clone();
 
                     tokio::spawn(async move {
                         if let Err(e) = Self::handle_connection(
@@ -1045,6 +1058,7 @@ impl WalReceiver {
                             node_id,
                             last_heartbeat,
                             leader_elector,
+                            raft_cluster,
                         ).await {
                             error!("WAL receiver connection from {} failed: {}", peer_addr, e);
                         } else {
@@ -1075,6 +1089,7 @@ impl WalReceiver {
         node_id: u64,
         last_heartbeat: Arc<DashMap<(String, i32), std::time::Instant>>,
         leader_elector: Option<Arc<crate::leader_election::LeaderElector>>,
+        raft_cluster: Option<Arc<RaftCluster>>,
     ) -> Result<()> {
         let mut buffer = BytesMut::with_capacity(64 * 1024); // 64KB buffer
 
@@ -1171,7 +1186,32 @@ impl WalReceiver {
                         let partition_key = (wal_record.topic.clone(), wal_record.partition);
                         last_heartbeat.insert(partition_key.clone(), std::time::Instant::now());
 
-                        // Write to local WAL
+                        // Phase 2.3: Special handling for metadata WAL replication
+                        if wal_record.topic == "__chronik_metadata" && wal_record.partition == 0 {
+                            if let Some(ref raft) = raft_cluster {
+                                if let Err(e) = Self::handle_metadata_wal_record(raft, &wal_record).await {
+                                    error!(
+                                        "Failed to apply metadata WAL record: {}",
+                                        e
+                                    );
+                                } else {
+                                    info!(
+                                        "METADATA✓ Replicated: {}-{} offset {} ({} bytes)",
+                                        wal_record.topic,
+                                        wal_record.partition,
+                                        wal_record.base_offset,
+                                        wal_record.data.len()
+                                    );
+                                }
+                            } else {
+                                warn!(
+                                    "Received metadata WAL replication but no RaftCluster configured"
+                                );
+                            }
+                            continue; // Skip normal WAL write for metadata
+                        }
+
+                        // Write to local WAL (normal partition data)
                         if let Err(e) = Self::write_to_wal(&wal_manager, &wal_record).await {
                             error!(
                                 "Failed to write replicated WAL record to local WAL for {}-{}: {}",
@@ -1255,6 +1295,63 @@ impl WalReceiver {
             1, // acks=1 for immediate fsync
         ).await
         .context("Failed to append replicated record to local WAL")?;
+
+        Ok(())
+    }
+
+    /// Handle metadata WAL record replication (Phase 2.3)
+    ///
+    /// When followers receive metadata replication from leader:
+    /// 1. Deserialize MetadataCommand from data
+    /// 2. Apply directly to Raft state machine (bypassing Raft consensus)
+    /// 3. Fire notification for any waiting threads
+    async fn handle_metadata_wal_record(
+        raft_cluster: &Arc<RaftCluster>,
+        record: &WalReplicationRecord,
+    ) -> Result<()> {
+        use crate::raft_metadata::MetadataCommand;
+
+        // Deserialize metadata command
+        let cmd: MetadataCommand = bincode::deserialize(&record.data)
+            .context("Failed to deserialize MetadataCommand from replicated data")?;
+
+        tracing::debug!(
+            "Phase 2.3: Follower received metadata replication at offset {}: {:?}",
+            record.base_offset,
+            cmd
+        );
+
+        // Apply directly to state machine (bypassing Raft consensus)
+        raft_cluster.apply_metadata_command_direct(cmd.clone())
+            .context("Failed to apply replicated metadata command")?;
+
+        tracing::info!(
+            "Phase 2.3: Follower applied replicated metadata command: {:?}",
+            cmd
+        );
+
+        // Fire notification for any waiting threads
+        // (Followers might have threads waiting for metadata updates via Phase 1 forwarding)
+        let pending_topics = raft_cluster.get_pending_topics_notifications();
+        let pending_brokers = raft_cluster.get_pending_brokers_notifications();
+
+        match &cmd {
+            MetadataCommand::CreateTopic { name, .. } => {
+                if let Some((_, notify)) = pending_topics.remove(name) {
+                    notify.notify_waiters();
+                    tracing::debug!("Notified waiting threads for topic '{}'", name);
+                }
+            }
+            MetadataCommand::RegisterBroker { broker_id, .. } => {
+                if let Some((_, notify)) = pending_brokers.remove(broker_id) {
+                    notify.notify_waiters();
+                    tracing::debug!("Notified waiting threads for broker {}", broker_id);
+                }
+            }
+            _ => {
+                // Other command types don't need notifications yet
+            }
+        }
 
         Ok(())
     }
