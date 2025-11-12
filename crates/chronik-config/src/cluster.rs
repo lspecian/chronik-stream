@@ -78,6 +78,17 @@ pub struct ClusterConfig {
 
     /// Gossip configuration (optional, for automatic bootstrap)
     pub gossip: Option<GossipConfig>,
+
+    /// Enable automatic quorum recovery (v2.2.7 Phase 2.5)
+    ///
+    /// When enabled (default: true), the cluster will automatically remove dead nodes after
+    /// quorum is lost for 5 minutes to restore availability.
+    ///
+    /// **Safety**: Will never remove nodes if it would go below 2 nodes.
+    /// **Use case**: Kubernetes/cloud deployments where nodes can be replaced.
+    /// **Disable**: Set to false in config if you want manual intervention for node failures.
+    #[serde(default = "default_auto_recover")]
+    pub auto_recover: bool,
 }
 
 /// Gossip configuration for automatic cluster discovery and bootstrap
@@ -174,6 +185,7 @@ impl ClusterConfig {
             bind: None, // Bind addresses set via config file
             advertise: None, // Advertise addresses set via config file
             gossip: None, // TODO: Parse from env if needed
+            auto_recover: true, // Default to enabled for resilient cloud deployments
         };
 
         config.validate_config()?;
@@ -391,8 +403,14 @@ impl Default for ClusterConfig {
             bind: None,
             advertise: None,
             gossip: None,
+            auto_recover: true,  // v2.2.7 Phase 2.5: Enabled by default for resilience
         }
     }
+}
+
+/// Default value for auto_recover (v2.2.7 Phase 2.5)
+fn default_auto_recover() -> bool {
+    true  // Enable by default for resilient cloud/K8s deployments
 }
 
 /// Custom validator for node_id (must be non-zero)

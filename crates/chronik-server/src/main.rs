@@ -49,6 +49,9 @@ mod metadata_rpc;
 mod leader_lease;
 mod leader_heartbeat;
 
+// v2.2.7 Phase 2.5: Automatic quorum recovery
+mod quorum_recovery;
+
 mod cli;
 
 use integrated_server::{IntegratedKafkaServer, IntegratedServerConfig};

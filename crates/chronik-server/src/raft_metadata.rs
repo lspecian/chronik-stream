@@ -233,7 +233,14 @@ impl MetadataStateMachine {
             }
 
             MetadataCommand::AssignPartition { topic, partition, replicas } => {
-                self.partition_assignments.insert((topic, partition), replicas);
+                tracing::info!("🔍 DEBUG AssignPartition handler: topic='{}', partition={}, replicas={:?}", topic, partition, replicas);
+                tracing::info!("🔍 DEBUG partition_assignments BEFORE insert: {} entries", self.partition_assignments.len());
+
+                self.partition_assignments.insert((topic.clone(), partition.clone()), replicas.clone());
+
+                tracing::info!("🔍 DEBUG partition_assignments AFTER insert: {} entries", self.partition_assignments.len());
+                tracing::info!("🔍 DEBUG Inserted key: ('{}', {}) => {:?}", topic, partition, replicas);
+
                 Ok(vec![])
             }
 

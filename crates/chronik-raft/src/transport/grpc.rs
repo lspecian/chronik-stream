@@ -142,6 +142,18 @@ impl GrpcTransport {
     pub async fn get_peer_address(&self, node_id: u64) -> Option<String> {
         self.peer_addrs.read().await.get(&node_id).cloned()
     }
+
+    /// Ping a peer to check if it's reachable (v2.2.7 Phase 2.5: Quorum Recovery)
+    ///
+    /// Returns Ok(()) if peer is reachable, Err otherwise.
+    /// This is used by QuorumRecoveryManager to detect dead nodes.
+    pub async fn ping_peer(&self, node_id: u64) -> Result<()> {
+        // Try to get or establish connection
+        let _client = self.get_or_connect(node_id).await?;
+
+        // If we got a client, the node is reachable
+        Ok(())
+    }
 }
 
 impl Default for GrpcTransport {

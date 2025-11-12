@@ -863,9 +863,19 @@ impl MetadataStore for RaftMetadataStore {
 
     async fn get_partition_replicas(&self, topic: &str, partition: u32) -> Result<Option<Vec<i32>>> {
         let state = self.state();
-        Ok(state.partition_assignments
-            .get(&(topic.to_string(), partition as i32))
-            .map(|replicas| replicas.iter().map(|&node_id| node_id as i32).collect()))
+
+        // DEBUG: Log ALL partition assignments in the map
+        tracing::info!("🔍 DEBUG get_partition_replicas: topic={} partition={}", topic, partition);
+        tracing::info!("🔍 DEBUG partition_assignments map has {} entries:", state.partition_assignments.len());
+        for ((t, p), replicas) in state.partition_assignments.iter() {
+            tracing::info!("🔍 DEBUG   ('{}', {}) => {:?}", t, p, replicas);
+        }
+
+        let key = (topic.to_string(), partition as i32);
+        let result = state.partition_assignments.get(&key);
+        tracing::info!("🔍 DEBUG get_partition_replicas: Lookup result for ({:?}) = {:?}", key, result);
+
+        Ok(result.map(|replicas| replicas.iter().map(|&node_id| node_id as i32).collect()))
     }
 
     async fn update_partition_offset(&self, topic: &str, partition: u32, high_watermark: i64, log_start_offset: i64) -> Result<()> {

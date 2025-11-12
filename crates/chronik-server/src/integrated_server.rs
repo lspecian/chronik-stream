@@ -476,17 +476,21 @@ impl IntegratedKafkaServer {
         };
 
         // AUTO-DISCOVERY: Extract follower WAL addresses from cluster config
+        // CRITICAL FIX: Exclude current node from followers list to prevent self-replication!
         if let Some(ref cluster_cfg) = config.cluster_config {
+            let my_node_id = cluster_cfg.node_id;
             let auto_discovered: Vec<String> = cluster_cfg
-                .peer_nodes()  // Get all peers except this node
+                .peer_nodes()  // Get all peers
                 .iter()
+                .filter(|peer| peer.id != my_node_id)  // CRITICAL: Exclude current node!
                 .map(|peer| peer.wal.clone())  // Extract WAL address
                 .collect();
 
             if !auto_discovered.is_empty() {
                 info!(
-                    "🔍 Phase 1: Auto-discovered {} follower WAL addresses from cluster config: {:?}",
+                    "🔍 Phase 1: Auto-discovered {} follower WAL addresses from cluster config (excluding self node {}): {:?}",
                     auto_discovered.len(),
+                    my_node_id,
                     auto_discovered
                 );
                 manual_followers.extend(auto_discovered);
@@ -531,6 +535,31 @@ impl IntegratedKafkaServer {
                 // to create the metadata store AFTER the replication manager is available.
                 // TODO: Refactor to avoid placeholder replicator
                 info!("✅ Phase 2: Metadata WAL replication configured");
+            }
+
+            // v2.2.7 Phase 2: Spawn leader change handler for WAL replication
+            // This enables automatic reconnection when Raft leader changes
+            if let Some(ref rc) = raft_cluster {
+                info!("🔄 Spawning WAL replication leader change handler");
+                replication_manager.spawn_leader_change_handler(rc.clone());
+                info!("✅ Phase 2: Leader change handler spawned - will reconnect on failover");
+
+                // v2.2.7 Phase 2.5: Spawn quorum recovery manager (if enabled in config)
+                if let Some(cluster_cfg) = &config.cluster_config {
+                    use crate::quorum_recovery::{QuorumRecoveryManager, QuorumRecoveryConfig};
+
+                    let recovery_config = QuorumRecoveryConfig {
+                        enabled: cluster_cfg.auto_recover,
+                        ..QuorumRecoveryConfig::default()
+                    };
+
+                    let quorum_manager = QuorumRecoveryManager::new(rc.clone(), recovery_config);
+                    quorum_manager.spawn();
+
+                    if cluster_cfg.auto_recover {
+                        info!("✅ Phase 2.5: Automatic quorum recovery ENABLED (will recover after 5min quorum loss)");
+                    }
+                }
             }
         } else {
             info!("WAL replication disabled: no cluster config and CHRONIK_REPLICATION_FOLLOWERS not set");

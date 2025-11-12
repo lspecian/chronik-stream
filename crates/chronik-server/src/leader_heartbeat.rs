@@ -28,6 +28,39 @@ pub struct LeaderHeartbeat {
     pub timestamp: u64,
 }
 
+/// Leader change event for Phase 2: WAL Replication Reconnection
+///
+/// Emitted when the Raft leader changes to trigger WAL replication reconnection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LeaderChangeEvent {
+    /// ID of the new leader
+    pub new_leader_id: u64,
+
+    /// ID of the old leader (0 if no previous leader)
+    pub old_leader_id: u64,
+
+    /// Current Raft term
+    pub term: u64,
+
+    /// Timestamp when leader change was detected
+    pub timestamp: u64,
+}
+
+impl LeaderChangeEvent {
+    /// Create a new leader change event
+    pub fn new(new_leader_id: u64, old_leader_id: u64, term: u64) -> Self {
+        Self {
+            new_leader_id,
+            old_leader_id,
+            term,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        }
+    }
+}
+
 impl LeaderHeartbeat {
     /// Create a new heartbeat message
     pub fn new(leader_id: u64, term: u64) -> Self {

@@ -48,13 +48,13 @@ pub struct RaftCluster {
     /// v2.2.7 DEADLOCK FIX: Uses tokio::Mutex since start_message_loop holds lock across await points.
     /// Async storage operations drop the lock before awaiting to avoid holding across async boundaries.
     /// NOTE: Cannot use parking_lot::Mutex here because MutexGuard is !Send and tokio::spawn requires Send.
-    raft_node: Arc<tokio::sync::Mutex<RawNode<RaftWalStorage>>>,
+    pub(crate) raft_node: Arc<tokio::sync::Mutex<RawNode<RaftWalStorage>>>,
 
     /// Storage reference for async persist operations
     storage: Arc<RaftWalStorage>,
 
     /// gRPC transport for Raft messages (v2.2.7)
-    transport: Arc<GrpcTransport>,
+    pub(crate) transport: Arc<GrpcTransport>,
 
     /// gRPC server handle (uses tokio::Mutex for async context)
     grpc_server_handle: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
@@ -95,6 +95,10 @@ pub struct RaftCluster {
     /// Leader broadcasts heartbeats to followers via this channel
     /// Followers subscribe to receive heartbeats and update their leases
     heartbeat_sender: tokio::sync::broadcast::Sender<crate::leader_heartbeat::LeaderHeartbeat>,
+
+    /// v2.2.7 Phase 2: Leader change broadcast channel for WAL replication
+    /// Emits events when Raft leader changes to trigger WAL reconnection
+    leader_change_sender: tokio::sync::broadcast::Sender<crate::leader_heartbeat::LeaderChangeEvent>,
 }
 
 impl RaftCluster {
@@ -284,6 +288,10 @@ impl RaftCluster {
         // Capacity: 16 heartbeats (enough for 16 seconds at 1Hz heartbeat rate)
         let (heartbeat_sender, _) = tokio::sync::broadcast::channel(16);
 
+        // Create leader change broadcast channel for Phase 2 WAL replication
+        // Capacity: 16 leader changes (more than enough for typical cluster behavior)
+        let (leader_change_sender, _) = tokio::sync::broadcast::channel(16);
+
         Ok(Self {
             node_id,
             state_machine,
@@ -299,6 +307,7 @@ impl RaftCluster {
             pending_brokers: Arc::new(DashMap::new()), // v2.2.7 EVENT-DRIVEN NOTIFICATION
             pending_partitions: Arc::new(DashMap::new()), // v2.2.7 EVENT-DRIVEN NOTIFICATION (P1)
             heartbeat_sender, // v2.2.7 Phase 3: Leader lease heartbeats
+            leader_change_sender, // v2.2.7 Phase 2: WAL replication leader changes
         })
     }
 
@@ -533,6 +542,82 @@ impl RaftCluster {
         // The RaftMetadataStore has event-driven notifications for instant wake-up.
         tracing::info!("✅ DEBUG propose_via_raft: EXIT - returning Ok()");
         Ok(())
+    }
+
+    /// Propose partition assignment and WAIT for Raft commit (RACE CONDITION FIX)
+    ///
+    /// This is a synchronous variant of `propose()` specifically for AssignPartition
+    /// commands. It registers a notification, proposes the command, then waits for
+    /// Raft consensus to complete before returning.
+    ///
+    /// **Why this is needed**: The standard `propose()` returns immediately, causing
+    /// a race condition where clients query metadata before partition assignments
+    /// are committed and visible.
+    ///
+    /// **Performance**: Blocks for Raft consensus duration (typically 10-100ms for
+    /// 3-node cluster). This is acceptable for topic creation (rare operation).
+    ///
+    /// # Arguments
+    /// * `topic` - Topic name
+    /// * `partition` - Partition ID
+    /// * `replicas` - Replica node IDs
+    ///
+    /// # Returns
+    /// * `Ok(())` - Command committed and applied to state machine
+    /// * `Err` - Failed to propose or timeout waiting for commit
+    pub async fn propose_partition_assignment_and_wait(
+        &self,
+        topic: String,
+        partition: i32,
+        replicas: Vec<u64>,
+    ) -> Result<()> {
+        // Single-node fast path: apply immediately (no waiting needed)
+        if self.is_single_node() {
+            let cmd = MetadataCommand::AssignPartition {
+                topic: topic.clone(),
+                partition,
+                replicas,
+            };
+            return self.apply_immediately(cmd).await;
+        }
+
+        // Multi-node: register notification BEFORE proposing
+        let key = format!("{}:{}", topic, partition);
+        let notify = Arc::new(Notify::new());
+        self.pending_partitions.insert(key.clone(), notify.clone());
+
+        tracing::info!("🔔 Registered wait notification for partition assignment '{}'", key);
+
+        // Propose command via Raft
+        let cmd = MetadataCommand::AssignPartition {
+            topic: topic.clone(),
+            partition,
+            replicas,
+        };
+
+        if let Err(e) = self.propose_via_raft(cmd).await {
+            // Cleanup notification on failure
+            self.pending_partitions.remove(&key);
+            return Err(e);
+        }
+
+        tracing::info!("⏳ Waiting for partition assignment '{}' to be committed...", key);
+
+        // Wait for notification (with timeout)
+        tokio::select! {
+            _ = notify.notified() => {
+                tracing::info!("✅ Partition assignment '{}' committed and applied!", key);
+                Ok(())
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                // Cleanup on timeout
+                self.pending_partitions.remove(&key);
+                Err(anyhow::anyhow!(
+                    "Timeout waiting for partition assignment '{}' to be committed (waited 5s)",
+                    key
+                ))
+            }
+        }
     }
 
     /// Propose adding a new node to the cluster (Priority 2: Zero-Downtime Node Addition)
@@ -913,6 +998,15 @@ impl RaftCluster {
                             tracing::debug!("✓ Notified waiting threads for partition '{}'", key);
                         }
                     }
+                    MetadataCommand::AssignPartition { topic, partition, .. } => {
+                        // RACE CONDITION FIX: Notify waiting threads for partition assignment
+                        // This ensures produce_handler waits for Raft commit before returning
+                        let key = format!("{}:{}", topic, partition);
+                        if let Some((_, notify)) = self.pending_partitions.remove(&key) {
+                            notify.notify_waiters();
+                            tracing::debug!("✓ Notified waiting threads for partition assignment '{}'", key);
+                        }
+                    }
                     _ => {} // Other commands don't need notifications yet
                 }
 
@@ -1063,6 +1157,8 @@ impl RaftCluster {
     /// Forwards a metadata query to the Raft leader via gRPC.
     /// If this node is the leader, executes the query locally.
     ///
+    /// Includes retry logic to handle intermittent leader election issues.
+    ///
     /// # Arguments
     /// - `query`: The metadata query to execute
     ///
@@ -1079,12 +1175,64 @@ impl RaftCluster {
             return self.execute_query_local(query);
         }
 
-        // Get leader ID
-        let leader_id = self.get_leader_id().await
-            .ok_or_else(|| anyhow::anyhow!("No Raft leader elected"))?;
+        // Retry logic to handle intermittent leader election issues
+        const MAX_RETRIES: usize = 3;
+        const INITIAL_DELAY_MS: u64 = 50;
 
+        for attempt in 0..=MAX_RETRIES {
+            // Get leader ID
+            match self.get_leader_id().await {
+                Some(leader_id) => {
+                    // Leader found - attempt to forward query
+                    match self.forward_query_to_leader(leader_id, &query).await {
+                        Ok(response) => {
+                            if attempt > 0 {
+                                tracing::debug!(
+                                    "Successfully queried leader after {} retries",
+                                    attempt
+                                );
+                            }
+                            return Ok(response);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to query leader {} (attempt {}/{}): {:?}",
+                                leader_id, attempt + 1, MAX_RETRIES + 1, e
+                            );
+                            if attempt < MAX_RETRIES {
+                                let delay_ms = INITIAL_DELAY_MS * 2_u64.pow(attempt as u32);
+                                tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                            }
+                        }
+                    }
+                }
+                None => {
+                    // No leader yet
+                    if attempt < MAX_RETRIES {
+                        let delay_ms = INITIAL_DELAY_MS * 2_u64.pow(attempt as u32);
+                        tracing::debug!(
+                            "No Raft leader elected (attempt {}/{}), retrying in {}ms",
+                            attempt + 1, MAX_RETRIES + 1, delay_ms
+                        );
+                        tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                    } else {
+                        return Err(anyhow::anyhow!("No Raft leader elected after {} retries", MAX_RETRIES + 1));
+                    }
+                }
+            }
+        }
+
+        Err(anyhow::anyhow!("Failed to query leader after {} retries", MAX_RETRIES + 1))
+    }
+
+    /// Forward query to leader via gRPC (helper for query_leader)
+    async fn forward_query_to_leader(
+        &self,
+        leader_id: u64,
+        query: &crate::metadata_rpc::MetadataQuery,
+    ) -> Result<crate::metadata_rpc::MetadataQueryResponse> {
         // Serialize query
-        let query_data = bincode::serialize(&query)
+        let query_data = bincode::serialize(query)
             .context("Failed to serialize metadata query")?;
 
         // Forward to leader via gRPC
@@ -1221,6 +1369,8 @@ impl RaftCluster {
     /// Forwards a metadata write command to the Raft leader via gRPC.
     /// If this node is the leader, proposes the command locally via Raft.
     ///
+    /// Includes retry logic to handle intermittent leader election issues.
+    ///
     /// # Arguments
     /// - `command`: The metadata write command to execute
     ///
@@ -1237,12 +1387,64 @@ impl RaftCluster {
             return self.execute_write_local(command).await;
         }
 
-        // Get leader ID
-        let leader_id = self.get_leader_id().await
-            .ok_or_else(|| anyhow::anyhow!("No Raft leader elected"))?;
+        // Retry logic to handle intermittent leader election issues
+        const MAX_RETRIES: usize = 3;
+        const INITIAL_DELAY_MS: u64 = 50;
 
+        for attempt in 0..=MAX_RETRIES {
+            // Get leader ID
+            match self.get_leader_id().await {
+                Some(leader_id) => {
+                    // Leader found - attempt to forward write
+                    match self.do_forward_write_to_leader(leader_id, &command).await {
+                        Ok(()) => {
+                            if attempt > 0 {
+                                tracing::debug!(
+                                    "Successfully forwarded write to leader after {} retries",
+                                    attempt
+                                );
+                            }
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to forward write to leader {} (attempt {}/{}): {:?}",
+                                leader_id, attempt + 1, MAX_RETRIES + 1, e
+                            );
+                            if attempt < MAX_RETRIES {
+                                let delay_ms = INITIAL_DELAY_MS * 2_u64.pow(attempt as u32);
+                                tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                            }
+                        }
+                    }
+                }
+                None => {
+                    // No leader yet
+                    if attempt < MAX_RETRIES {
+                        let delay_ms = INITIAL_DELAY_MS * 2_u64.pow(attempt as u32);
+                        tracing::debug!(
+                            "No Raft leader elected for write (attempt {}/{}), retrying in {}ms",
+                            attempt + 1, MAX_RETRIES + 1, delay_ms
+                        );
+                        tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                    } else {
+                        return Err(anyhow::anyhow!("No Raft leader elected for write after {} retries", MAX_RETRIES + 1));
+                    }
+                }
+            }
+        }
+
+        Err(anyhow::anyhow!("Failed to forward write to leader after {} retries", MAX_RETRIES + 1))
+    }
+
+    /// Actually forward write to leader via gRPC (helper for forward_write_to_leader)
+    async fn do_forward_write_to_leader(
+        &self,
+        leader_id: u64,
+        command: &crate::metadata_rpc::MetadataWriteCommand,
+    ) -> Result<()> {
         // Serialize command
-        let command_data = bincode::serialize(&command)
+        let command_data = bincode::serialize(command)
             .context("Failed to serialize metadata write command")?;
 
         // Forward to leader via gRPC
@@ -1515,6 +1717,9 @@ impl RaftCluster {
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
+
+            // v2.2.7 Phase 2: Track previous leader for change detection
+            let mut previous_leader_id: Option<u64> = None;
 
             loop {
                 interval.tick().await;
@@ -1812,6 +2017,46 @@ impl RaftCluster {
 
                 tracing::debug!("✓ Advanced Raft successfully");
 
+                // v2.2.7 Phase 2: Detect leader changes for WAL replication
+                let current_leader_id = raft_lock.raft.leader_id;
+                let current_term = raft_lock.raft.term;
+
+                if current_leader_id != raft::INVALID_ID {
+                    if let Some(prev_leader) = previous_leader_id {
+                        if prev_leader != current_leader_id {
+                            // Leader changed!
+                            tracing::info!(
+                                "🔄 Leader change detected: {} → {} (term={})",
+                                prev_leader,
+                                current_leader_id,
+                                current_term
+                            );
+
+                            // Emit leader change event
+                            let event = crate::leader_heartbeat::LeaderChangeEvent::new(
+                                current_leader_id,
+                                prev_leader,
+                                current_term,
+                            );
+
+                            match self.leader_change_sender.send(event) {
+                                Ok(receiver_count) => {
+                                    tracing::info!(
+                                        "📢 Broadcast leader change event: new_leader={}, old_leader={}, receivers={}",
+                                        current_leader_id,
+                                        prev_leader,
+                                        receiver_count
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::trace!("Leader change broadcast skipped (no receivers): {}", e);
+                                }
+                            }
+                        }
+                    }
+                    previous_leader_id = Some(current_leader_id);
+                }
+
                 // Step 8: Check if we should create a snapshot (Phase 5)
                 // SNAPSHOT STORM FIX (v2.2.7): Only create snapshot if we've advanced significantly
                 // since the last snapshot. This prevents the same snapshot from being created
@@ -1937,6 +2182,16 @@ impl RaftCluster {
         &self,
     ) -> tokio::sync::broadcast::Receiver<crate::leader_heartbeat::LeaderHeartbeat> {
         self.heartbeat_sender.subscribe()
+    }
+
+    /// Subscribe to leader change events (v2.2.7 Phase 2: WAL Replication)
+    ///
+    /// Returns a receiver that gets notified when the Raft leader changes.
+    /// Used by WalReplicationManager to reconnect to the new leader.
+    pub fn subscribe_leader_changes(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::leader_heartbeat::LeaderChangeEvent> {
+        self.leader_change_sender.subscribe()
     }
 
     /// Get current Raft term for heartbeat messages

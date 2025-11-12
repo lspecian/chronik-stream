@@ -275,7 +275,10 @@ impl RequestHandler {
         if let Some(topic_names) = request.topics {
             for topic_name in topic_names {
                 // Query actual metadata from metadata_store (v2.2.7 fix)
-                match self.metadata_store.get_topic(&topic_name).await {
+                // Retry with backoff to handle WAL replication lag (v2.2.7 Phase 2 fix)
+                let topic_meta = self.get_topic_with_retry(&topic_name).await;
+
+                match topic_meta {
                     Ok(Some(topic_meta)) => {
                         // Topic exists - return real metadata
                         let mut partitions = Vec::new();
@@ -868,6 +871,51 @@ impl RequestHandler {
                 }))
             }
         }
+    }
+
+    /// Get topic metadata with retry to handle WAL replication lag (v2.2.7 Phase 2 fix)
+    ///
+    /// When a topic is created on the leader, it takes time to replicate via WAL to followers.
+    /// This method retries with exponential backoff to handle that replication lag gracefully.
+    async fn get_topic_with_retry(&self, topic_name: &str) -> Result<Option<chronik_common::metadata::TopicMetadata>> {
+        const MAX_RETRIES: usize = 3;
+        const INITIAL_DELAY_MS: u64 = 50;
+
+        for attempt in 0..=MAX_RETRIES {
+            match self.metadata_store.get_topic(topic_name).await {
+                Ok(Some(topic_meta)) => {
+                    // Found it!
+                    if attempt > 0 {
+                        tracing::debug!(
+                            "Found topic '{}' after {} retries (WAL replication lag handled)",
+                            topic_name, attempt
+                        );
+                    }
+                    return Ok(Some(topic_meta));
+                }
+                Ok(None) if attempt < MAX_RETRIES => {
+                    // Not found yet, but we have retries left
+                    let delay_ms = INITIAL_DELAY_MS * 2_u64.pow(attempt as u32);
+                    tracing::debug!(
+                        "Topic '{}' not found (attempt {}/{}), retrying in {}ms (waiting for WAL replication)",
+                        topic_name, attempt + 1, MAX_RETRIES + 1, delay_ms
+                    );
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                }
+                Ok(None) => {
+                    // Final attempt - topic doesn't exist
+                    tracing::debug!("Topic '{}' not found after {} retries", topic_name, MAX_RETRIES + 1);
+                    return Ok(None);
+                }
+                Err(e) => {
+                    tracing::warn!("Error querying topic '{}': {:?}", topic_name, e);
+                    return Err(e.into());
+                }
+            }
+        }
+
+        // Shouldn't reach here, but for safety
+        Ok(None)
     }
 }
 

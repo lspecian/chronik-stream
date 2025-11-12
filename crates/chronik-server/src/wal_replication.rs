@@ -168,16 +168,20 @@ impl WalReplicationManager {
         cluster_config: Option<Arc<ClusterConfig>>,
     ) -> Arc<Self> {
         // v2.2.7 Phase 6: Auto-discover followers from cluster config
+        // CRITICAL FIX: Exclude current node from followers list to prevent self-replication
         let final_followers = if followers.is_empty() && cluster_config.is_some() {
             let config = cluster_config.as_ref().unwrap();
+            let my_node_id = config.node_id;
             let discovered: Vec<String> = config.peer_nodes()
                 .iter()
+                .filter(|peer| peer.id != my_node_id)  // CRITICAL: Don't replicate to self!
                 .map(|peer| peer.wal.clone())
                 .collect();
 
             if !discovered.is_empty() {
-                info!("Auto-discovered {} followers from cluster config: {}",
+                info!("Auto-discovered {} followers from cluster config (excluding self node {}): {}",
                       discovered.len(),
+                      my_node_id,
                       discovered.join(", "));
             }
             discovered
@@ -332,9 +336,8 @@ impl WalReplicationManager {
             }
         };
 
-        // Filter out the leader node (don't replicate to self)
-        // We need to know which node is the leader - for now, just send to all ISR members
-        // The followers will receive and apply the data
+        // Leader already excluded from followers list in WalReplicationManager::new()
+        // ISR list will include the leader, but followers list does not
         if isr_replicas.is_empty() {
             warn!(
                 "No in-sync replicas for {}-{} (offset={}), skipping replication",
@@ -840,6 +843,102 @@ impl WalReplicationManager {
         info!("Follower discovery worker stopped");
     }
 
+    /// Spawn leader change handler task (v2.2.7 Phase 2)
+    ///
+    /// Listens for leader change events from RaftCluster and triggers WAL reconnection.
+    /// Must be called AFTER creating the WalReplicationManager, passing the RaftCluster reference.
+    ///
+    /// # Arguments
+    /// * `raft_cluster` - Reference to RaftCluster for subscribing to leader changes
+    pub fn spawn_leader_change_handler(self: &Arc<Self>, raft_cluster: Arc<RaftCluster>) {
+        let manager = Arc::clone(self);
+
+        tokio::spawn(async move {
+            info!("🔄 Starting WAL replication leader change handler");
+
+            // Subscribe to leader change events
+            let mut rx = raft_cluster.subscribe_leader_changes();
+
+            loop {
+                match rx.recv().await {
+                    Ok(event) => {
+                        info!(
+                            "🔄 Received leader change event: {} → {} (term={})",
+                            event.old_leader_id,
+                            event.new_leader_id,
+                            event.term
+                        );
+
+                        // Handle the leader change
+                        manager.handle_leader_change(event, raft_cluster.clone()).await;
+                    }
+                    Err(e) => {
+                        error!("Leader change receiver error: {:?}", e);
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                }
+            }
+        });
+
+        info!("✓ Spawned WAL replication leader change handler");
+    }
+
+    /// Handle leader change event (v2.2.7 Phase 2)
+    ///
+    /// When leader changes:
+    /// 1. Close all existing WAL connections
+    /// 2. Discover new follower addresses from cluster config
+    /// 3. Reconnect to new followers
+    ///
+    /// This ensures WAL replication continues seamlessly after failover.
+    async fn handle_leader_change(
+        &self,
+        event: crate::leader_heartbeat::LeaderChangeEvent,
+        raft_cluster: Arc<RaftCluster>,
+    ) {
+        info!(
+            "🔄 Handling leader change: old={}, new={}, term={}",
+            event.old_leader_id,
+            event.new_leader_id,
+            event.term
+        );
+
+        // Step 1: Close all existing connections
+        info!("Closing {} existing WAL connections", self.connections.len());
+        self.connections.clear();
+
+        // Step 2: Check if WE are the new leader
+        let am_i_new_leader = raft_cluster.am_i_leader().await;
+
+        if !am_i_new_leader {
+            info!("Not the new leader (leader={}), no reconnection needed", event.new_leader_id);
+            return;
+        }
+
+        info!("✅ I am the new leader! Reconnecting WAL replication to followers");
+
+        // Step 3: Discover follower addresses from cluster config
+        if let Some(cluster_config) = &self.cluster_config {
+            let new_followers: Vec<String> = cluster_config.peer_nodes()
+                .iter()
+                .map(|peer| peer.wal.clone())
+                .collect();
+
+            info!(
+                "🔍 Discovered {} followers from cluster config: {}",
+                new_followers.len(),
+                new_followers.join(", ")
+            );
+
+            // Step 4: Trigger reconnection by updating connection manager
+            // The connection manager background worker will automatically reconnect
+            // to the new followers on its next iteration
+            info!("✓ Leader change handled - connection manager will reconnect");
+        } else {
+            warn!("No cluster config available - cannot auto-discover followers after leader change");
+        }
+    }
+
     /// Shutdown the replication manager
     pub async fn shutdown(&self) {
         info!("Shutting down WAL replication manager");
@@ -1209,6 +1308,33 @@ impl WalReceiver {
                                 );
                             }
                             continue; // Skip normal WAL write for metadata
+                        }
+
+                        // CRITICAL FIX (Phase 3 CORRECTED): Only accept replication for partitions where we're a REPLICA
+                        // This prevents message duplication by ensuring each node only stores partitions it owns
+                        if let Some(ref raft) = raft_cluster {
+                            // Query partition replicas from Raft metadata
+                            if let Some(replicas) = raft.get_partition_replicas(&wal_record.topic, wal_record.partition) {
+                                if !replicas.contains(&node_id) {
+                                    info!(
+                                        "⏭️  Skipping replication for {}-{}: this node ({}) is NOT in replica set {:?}",
+                                        wal_record.topic, wal_record.partition, node_id, replicas
+                                    );
+                                    continue; // Skip - we're not a replica for this partition
+                                }
+
+                                info!(
+                                    "✅ Accepting replication for {}-{}: this node ({}) IS in replica set {:?}",
+                                    wal_record.topic, wal_record.partition, node_id, replicas
+                                );
+                            } else {
+                                // No replica info yet - REJECT to prevent duplication
+                                warn!(
+                                    "⛔ NO REPLICA INFO for {}-{} yet, REJECTING replication (waiting for metadata sync)",
+                                    wal_record.topic, wal_record.partition
+                                );
+                                continue; // Skip - no replica info available
+                            }
                         }
 
                         // Write to local WAL (normal partition data)

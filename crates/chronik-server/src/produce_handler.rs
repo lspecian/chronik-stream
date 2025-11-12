@@ -2575,13 +2575,14 @@ impl ProduceHandler {
                     replicas.push(all_nodes[node_idx]);
                 }
 
-                // Propose partition assignment to Raft
+                // RACE CONDITION FIX: Use propose_and_wait for partition assignments
+                // This ensures Raft consensus completes BEFORE clients query metadata
                 // NOTE: We already checked that this node is the Raft leader above (v2.2.2 fix)
-                if let Err(e) = raft.propose(crate::raft_metadata::MetadataCommand::AssignPartition {
-                    topic: topic_name.to_string(),
-                    partition: partition as i32,
-                    replicas: replicas.clone(),
-                }).await {
+                if let Err(e) = raft.propose_partition_assignment_and_wait(
+                    topic_name.to_string(),
+                    partition as i32,
+                    replicas.clone(),
+                ).await {
                     warn!("Failed to propose partition assignment for {}-{}: {:?}", topic_name, partition, e);
                     continue;  // Skip this partition, try next one
                 }
