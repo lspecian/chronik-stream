@@ -23,14 +23,14 @@ use tracing::{debug, error, info, warn};
 use serde::{Serialize, Deserialize};
 use dashmap::DashMap;
 
-// v2.5.0 Phase 3: Import RaftCluster and IsrTracker
+// v2.2.7 Phase 3: Import RaftCluster and IsrTracker
 use crate::raft_cluster::RaftCluster;
 use crate::isr_tracker::IsrTracker;
 
-// v2.5.0 Phase 6: Import ClusterConfig for auto-discovery
+// v2.2.7 Phase 6: Import ClusterConfig for auto-discovery
 use chronik_config::ClusterConfig;
 
-// v2.5.0 Phase 4: Import IsrAckTracker for acks=-1 support
+// v2.2.7 Phase 4: Import IsrAckTracker for acks=-1 support
 use crate::isr_ack_tracker::IsrAckTracker;
 
 /// Magic number for WAL frames ('WA' in hex)
@@ -39,7 +39,7 @@ const FRAME_MAGIC: u16 = 0x5741;
 /// Magic number for heartbeat frames ('HB' in hex)
 const HEARTBEAT_MAGIC: u16 = 0x4842;
 
-/// Magic number for ACK frames ('AK' in hex) - v2.5.0 Phase 4
+/// Magic number for ACK frames ('AK' in hex) - v2.2.7 Phase 4
 const ACK_MAGIC: u16 = 0x414B;
 
 /// Current protocol version
@@ -79,7 +79,7 @@ pub struct WalReplicationRecord {
     pub data: Bytes,
 }
 
-/// ACK message sent from follower to leader after successful WAL write (v2.5.0 Phase 4)
+/// ACK message sent from follower to leader after successful WAL write (v2.2.7 Phase 4)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalAckMessage {
     /// Topic name
@@ -104,7 +104,7 @@ pub struct WalReplicationManager {
     queue: Arc<SegQueue<WalReplicationRecord>>,
 
     /// Active TCP write connections to followers (addr -> OwnedWriteHalf)
-    /// v2.5.0 Phase 4: Changed from TcpStream to OwnedWriteHalf to allow separate ACK reading
+    /// v2.2.7 Phase 4: Changed from TcpStream to OwnedWriteHalf to allow separate ACK reading
     connections: Arc<DashMap<String, OwnedWriteHalf>>,
 
     /// Follower addresses ("host:port")
@@ -122,16 +122,16 @@ pub struct WalReplicationManager {
     /// Total records dropped (queue overflow)
     total_dropped: Arc<AtomicU64>,
 
-    /// Raft cluster for querying partition replicas (v2.5.0 Phase 3)
+    /// Raft cluster for querying partition replicas (v2.2.7 Phase 3)
     raft_cluster: Option<Arc<RaftCluster>>,
 
-    /// ISR tracker for determining in-sync replicas (v2.5.0 Phase 3)
+    /// ISR tracker for determining in-sync replicas (v2.2.7 Phase 3)
     isr_tracker: Option<Arc<IsrTracker>>,
 
-    /// ISR ACK tracker for recording follower ACKs for acks=-1 (v2.5.0 Phase 4)
+    /// ISR ACK tracker for recording follower ACKs for acks=-1 (v2.2.7 Phase 4)
     isr_ack_tracker: Option<Arc<IsrAckTracker>>,
 
-    /// Cluster config for auto-discovering followers (v2.5.0 Phase 6)
+    /// Cluster config for auto-discovering followers (v2.2.7 Phase 6)
     cluster_config: Option<Arc<chronik_config::ClusterConfig>>,
 
     /// Last known Raft leader ID (for Phase 3 dynamic leader change detection)
@@ -154,11 +154,11 @@ impl WalReplicationManager {
         Self::new_with_dependencies(followers, None, None, None, None)
     }
 
-    /// Create a new WAL replication manager with Raft cluster and ISR tracker (v2.5.0 Phase 3)
+    /// Create a new WAL replication manager with Raft cluster and ISR tracker (v2.2.7 Phase 3)
     ///
     /// This is the recommended constructor for cluster mode.
     ///
-    /// v2.5.0 Phase 6: Added cluster_config parameter for automatic follower discovery.
+    /// v2.2.7 Phase 6: Added cluster_config parameter for automatic follower discovery.
     /// If followers is empty and cluster_config is provided, followers will be auto-discovered.
     pub fn new_with_dependencies(
         followers: Vec<String>,
@@ -167,7 +167,7 @@ impl WalReplicationManager {
         isr_ack_tracker: Option<Arc<IsrAckTracker>>,
         cluster_config: Option<Arc<ClusterConfig>>,
     ) -> Arc<Self> {
-        // v2.5.0 Phase 6: Auto-discover followers from cluster config
+        // v2.2.7 Phase 6: Auto-discover followers from cluster config
         let final_followers = if followers.is_empty() && cluster_config.is_some() {
             let config = cluster_config.as_ref().unwrap();
             let discovered: Vec<String> = config.peer_nodes()
@@ -195,15 +195,15 @@ impl WalReplicationManager {
         let manager = Arc::new(Self {
             queue: Arc::new(SegQueue::new()),
             connections: Arc::new(DashMap::new()),
-            followers: final_followers,  // v2.5.0 Phase 6: Use auto-discovered or manual followers
+            followers: final_followers,  // v2.2.7 Phase 6: Use auto-discovered or manual followers
             shutdown: Arc::new(AtomicBool::new(false)),
             total_queued: Arc::new(AtomicU64::new(0)),
             total_sent: Arc::new(AtomicU64::new(0)),
             total_dropped: Arc::new(AtomicU64::new(0)),
-            raft_cluster,       // v2.5.0: Accept directly in constructor
-            isr_tracker,        // v2.5.0: Accept directly in constructor
-            isr_ack_tracker,    // v2.5.0 Phase 4: Accept ACK tracker
-            cluster_config,     // v2.5.0 Phase 6: Store for potential dynamic updates
+            raft_cluster,       // v2.2.7: Accept directly in constructor
+            isr_tracker,        // v2.2.7: Accept directly in constructor
+            isr_ack_tracker,    // v2.2.7 Phase 4: Accept ACK tracker
+            cluster_config,     // v2.2.7 Phase 6: Store for potential dynamic updates
             last_known_leader: Arc::new(AtomicU64::new(0)), // Phase 3: Track leader changes
             is_currently_leader: Arc::new(AtomicBool::new(false)), // Phase 3: Track leadership
             partition_followers: Arc::new(DashMap::new()), // Priority 1: Per-partition follower map
@@ -273,7 +273,7 @@ impl WalReplicationManager {
         self.total_queued.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Replicate to specific partition replicas based on Raft metadata and ISR (v2.5.0 Phase 3)
+    /// Replicate to specific partition replicas based on Raft metadata and ISR (v2.2.7 Phase 3)
     ///
     /// This method:
     /// 1. Queries RaftCluster for partition replicas
@@ -493,12 +493,12 @@ impl WalReplicationManager {
                         Ok(Ok(stream)) => {
                             info!("✅ Connected to follower: {}", follower_addr);
 
-                            // v2.5.0 Phase 4: Split stream for bidirectional communication
+                            // v2.2.7 Phase 4: Split stream for bidirectional communication
                             // Write half: used by send_to_followers
                             // Read half: used by ACK reader task
                             let (read_half, write_half) = stream.into_split();
 
-                            // Spawn ACK reader task for this follower (v2.5.0 Phase 4)
+                            // Spawn ACK reader task for this follower (v2.2.7 Phase 4)
                             if let Some(ref ack_tracker) = self.isr_ack_tracker {
                                 let tracker = Arc::clone(ack_tracker);
                                 let shutdown = Arc::clone(&self.shutdown);
@@ -531,7 +531,7 @@ impl WalReplicationManager {
         info!("WAL replication connection manager stopped");
     }
 
-    /// Background worker for reading ACKs from a follower (v2.5.0 Phase 4)
+    /// Background worker for reading ACKs from a follower (v2.2.7 Phase 4)
     ///
     /// This is the CRITICAL missing piece that completes acks=-1 support.
     /// Followers send ACKs after successful WAL writes, and this task reads them.
@@ -674,7 +674,7 @@ impl WalReplicationManager {
             sleep(check_interval).await;
 
             // Query Raft for current leadership status
-            let (is_ready, leader_id, state_role) = raft.is_leader_ready();
+            let (is_ready, leader_id, state_role) = raft.is_leader_ready().await;
             let my_node_id = config.node_id;
             let am_i_leader = is_ready && leader_id == my_node_id;
 
@@ -959,10 +959,10 @@ pub struct WalReceiver {
     /// Shutdown signal
     shutdown: Arc<AtomicBool>,
 
-    /// ISR ACK tracker for notifying leader of successful replication (v2.5.0 Phase 4)
+    /// ISR ACK tracker for notifying leader of successful replication (v2.2.7 Phase 4)
     isr_ack_tracker: Option<Arc<crate::isr_ack_tracker::IsrAckTracker>>,
 
-    /// This follower's node ID (v2.5.0 Phase 4)
+    /// This follower's node ID (v2.2.7 Phase 4)
     node_id: u64,
 
     /// Leader elector for triggering elections on timeout (v2.2.7)
@@ -991,7 +991,7 @@ impl WalReceiver {
         }
     }
 
-    /// Create a new WAL receiver with ISR tracking (v2.5.0 Phase 4)
+    /// Create a new WAL receiver with ISR tracking (v2.2.7 Phase 4)
     pub fn new_with_isr_tracker(
         listener_addr: String,
         wal_manager: Arc<chronik_wal::WalManager>,
@@ -1227,7 +1227,7 @@ impl WalReceiver {
                                 wal_record.data.len()
                             );
 
-                            // v2.5.0 Phase 4: Send ACK back to leader for acks=-1 support
+                            // v2.2.7 Phase 4: Send ACK back to leader for acks=-1 support
                             if let Some(ref tracker) = isr_ack_tracker {
                                 let ack_msg = WalAckMessage {
                                     topic: wal_record.topic.clone(),
@@ -1356,7 +1356,7 @@ impl WalReceiver {
         Ok(())
     }
 
-    /// Send ACK frame back to leader (v2.5.0 Phase 4)
+    /// Send ACK frame back to leader (v2.2.7 Phase 4)
     async fn send_ack(stream: &mut TcpStream, ack_msg: &WalAckMessage) -> Result<()> {
         // Serialize ACK message
         let serialized = bincode::serialize(ack_msg)

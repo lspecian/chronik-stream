@@ -274,7 +274,7 @@ impl RequestHandler {
         // If specific topics requested, return metadata for those
         if let Some(topic_names) = request.topics {
             for topic_name in topic_names {
-                // Query actual metadata from metadata_store (v2.2.8 fix)
+                // Query actual metadata from metadata_store (v2.2.7 fix)
                 match self.metadata_store.get_topic(&topic_name).await {
                     Ok(Some(topic_meta)) => {
                         // Topic exists - return real metadata

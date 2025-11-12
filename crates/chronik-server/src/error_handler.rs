@@ -283,6 +283,40 @@ impl ErrorHandler {
         
         // Error handling based on API
         match api_key {
+            // Metadata (API key 3)
+            3 => {
+                // Metadata v9+ format (v12 is flexible)
+                // throttle_time_ms (4 bytes) - v9+
+                if api_version >= 9 {
+                    response.extend_from_slice(&0i32.to_be_bytes());
+                }
+
+                // brokers array (4 bytes for empty array)
+                response.extend_from_slice(&0i32.to_be_bytes());
+
+                // cluster_id (nullable string - null = 0xffff)
+                if api_version >= 2 {
+                    response.extend_from_slice(&(-1i16).to_be_bytes()); // null cluster_id
+                }
+
+                // controller_id (4 bytes)
+                if api_version >= 1 {
+                    response.extend_from_slice(&(-1i32).to_be_bytes()); // -1 = no controller
+                }
+
+                // topics array (4 bytes for empty array)
+                response.extend_from_slice(&0i32.to_be_bytes());
+
+                // cluster_authorized_operations (4 bytes) - v8+
+                if api_version >= 8 {
+                    response.extend_from_slice(&(-2147483648i32).to_be_bytes()); // Unknown
+                }
+
+                // tagged_fields (1 byte = 0x00 for empty) - v9+ flexible
+                if api_version >= 9 {
+                    response.push(0x00);
+                }
+            }
             // CreateTopics
             19 => {
                 if api_version >= 1 {

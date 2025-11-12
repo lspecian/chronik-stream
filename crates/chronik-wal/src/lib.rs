@@ -11,7 +11,6 @@ pub mod record;
 pub mod segment;
 pub mod config;
 pub mod fsync;
-pub mod async_io;
 pub mod buffer_pool;
 // Temporarily disabled due to Send trait issues
 // pub mod concurrency_test;
@@ -22,6 +21,8 @@ pub mod rotation;
 pub mod compaction;
 pub mod periodic_flusher;
 pub mod group_commit;
+pub mod io_priority; // I/O priority control for WAL vs Tantivy
+pub mod io_uring_thread; // Dedicated io_uring thread (hybrid tokio + tokio-uring)
 
 // Future-ready modules
 pub mod replication;

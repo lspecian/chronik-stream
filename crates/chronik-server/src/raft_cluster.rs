@@ -1,4 +1,4 @@
-//! RaftCluster wrapper (v2.5.0 Phase 2)
+//! RaftCluster wrapper (v2.2.7 Phase 2)
 //!
 //! This module wraps raft::RawNode with our MetadataStateMachine to provide
 //! cluster metadata coordination (NOT data replication).
@@ -23,7 +23,8 @@ use crate::raft_metadata::{MetadataCommand, MetadataStateMachine, PartitionKey};
 use anyhow::{Result, Context};
 use std::sync::{Arc, RwLock};
 use std::collections::HashMap;
-use tokio::sync::{Mutex, mpsc, Notify};
+use tokio::sync::{mpsc, Notify};
+use parking_lot::Mutex;
 use dashmap::DashMap;
 
 use raft::{prelude::*, storage::MemStorage};
@@ -31,7 +32,7 @@ use slog::Drain;
 use chronik_wal::{RaftWalStorage, GroupCommitWal, GroupCommitConfig};
 use std::path::PathBuf;
 
-// v2.5.0: gRPC transport for production Raft networking
+// v2.2.7: gRPC transport for production Raft networking
 use chronik_raft::{GrpcTransport, Transport, rpc::{RaftServiceImpl, raft_service_server}};
 use tonic::transport::Server;
 
@@ -44,27 +45,40 @@ pub struct RaftCluster {
     state_machine: Arc<RwLock<MetadataStateMachine>>,
 
     /// Raft node with WAL-backed persistent storage
-    raft_node: Arc<RwLock<RawNode<RaftWalStorage>>>,
+    /// v2.2.7 DEADLOCK FIX: Uses tokio::Mutex since start_message_loop holds lock across await points.
+    /// Async storage operations drop the lock before awaiting to avoid holding across async boundaries.
+    /// NOTE: Cannot use parking_lot::Mutex here because MutexGuard is !Send and tokio::spawn requires Send.
+    raft_node: Arc<tokio::sync::Mutex<RawNode<RaftWalStorage>>>,
 
     /// Storage reference for async persist operations
     storage: Arc<RaftWalStorage>,
 
-    /// gRPC transport for Raft messages (v2.5.0)
+    /// gRPC transport for Raft messages (v2.2.7)
     transport: Arc<GrpcTransport>,
 
-    /// gRPC server handle
-    grpc_server_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// gRPC server handle (uses tokio::Mutex for async context)
+    grpc_server_handle: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
 
     /// Channel for sending Raft messages asynchronously
     /// Messages are taken from Ready and sent to this channel (non-blocking)
     /// A background task reads from channel and sends via gRPC
     message_sender: mpsc::UnboundedSender<(u64, Message)>,
 
-    /// SNAPSHOT STORM FIX (v2.2.8): Track last snapshot index to prevent repeated snapshots
+    /// v2.2.7 DEADLOCK FIX: Channel for receiving incoming Raft messages from gRPC
+    /// gRPC handler queues messages here (non-blocking) instead of calling raft.step() directly
+    /// Raft ready loop processes these messages inside the lock (no deadlock)
+    incoming_message_sender: mpsc::UnboundedSender<Message>,
+
+    /// v2.2.7 DEADLOCK FIX (PART 2): Receiver for incoming Raft messages
+    /// Processed by the ready loop INSIDE the Raft lock to avoid contention
+    /// Uses tokio::Mutex since it's accessed in async context
+    incoming_message_receiver: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<Message>>>,
+
+    /// SNAPSHOT STORM FIX (v2.2.7): Track last snapshot index to prevent repeated snapshots
     /// Only create new snapshot if we've advanced significantly beyond this index
     last_snapshot_index: Arc<RwLock<u64>>,
 
-    /// v2.2.9 EVENT-DRIVEN NOTIFICATION: Pending topic creation notifications
+    /// v2.2.7 EVENT-DRIVEN NOTIFICATION: Pending topic creation notifications
     /// Shared with RaftMetadataStore to enable instant wake-up when entries are applied
     pending_topics: Arc<DashMap<String, Arc<Notify>>>,
 
@@ -77,7 +91,7 @@ pub struct RaftCluster {
     /// Used by followers waiting for partition metadata to arrive via Raft replication
     pending_partitions: Arc<DashMap<String, Arc<Notify>>>,
 
-    /// v2.3.0 Phase 3: Heartbeat broadcast channel for leader leases
+    /// v2.2.7 Phase 3: Heartbeat broadcast channel for leader leases
     /// Leader broadcasts heartbeats to followers via this channel
     /// Followers subscribe to receive heartbeats and update their leases
     heartbeat_sender: tokio::sync::broadcast::Sender<crate::leader_heartbeat::LeaderHeartbeat>,
@@ -213,7 +227,7 @@ impl RaftCluster {
                 const METADATA_TOPIC: &str = "__raft_metadata";
                 const METADATA_PARTITION: i32 = 0;
 
-                // CRITICAL FIX (v2.2.8): Retry failed messages with exponential backoff
+                // CRITICAL FIX (v2.2.7): Retry failed messages with exponential backoff
                 // When gRPC transport fails (peer not connected), we MUST retry until success.
                 // Otherwise, AppendEntries with committed entries are LOST, causing followers
                 // to have commit index > last_index (split-brain state).
@@ -262,6 +276,10 @@ impl RaftCluster {
 
         tracing::info!("✓ Raft message sender task started");
 
+        // v2.2.7 DEADLOCK FIX: Create channel for incoming Raft messages from gRPC
+        // This decouples gRPC message reception from Raft processing (prevents deadlock)
+        let (incoming_message_sender, incoming_message_receiver) = mpsc::unbounded_channel::<Message>();
+
         // Create heartbeat broadcast channel for Phase 3 leader leases
         // Capacity: 16 heartbeats (enough for 16 seconds at 1Hz heartbeat rate)
         let (heartbeat_sender, _) = tokio::sync::broadcast::channel(16);
@@ -269,16 +287,18 @@ impl RaftCluster {
         Ok(Self {
             node_id,
             state_machine,
-            raft_node: Arc::new(RwLock::new(raft_node)),
+            raft_node: Arc::new(tokio::sync::Mutex::new(raft_node)), // v2.2.7: tokio::Mutex (required for async context)
             storage: Arc::new(storage_for_async),
             transport,
-            grpc_server_handle: Arc::new(Mutex::new(None)),
+            grpc_server_handle: Arc::new(tokio::sync::Mutex::new(None)),
             message_sender,
-            last_snapshot_index: Arc::new(RwLock::new(0)), // SNAPSHOT STORM FIX (v2.2.8)
+            incoming_message_sender: incoming_message_sender.clone(), // v2.2.7 DEADLOCK FIX
+            incoming_message_receiver: Arc::new(tokio::sync::Mutex::new(incoming_message_receiver)), // v2.2.7 DEADLOCK FIX (PART 2)
+            last_snapshot_index: Arc::new(RwLock::new(0)), // SNAPSHOT STORM FIX (v2.2.7)
             pending_topics: Arc::new(DashMap::new()), // v2.2.7 EVENT-DRIVEN NOTIFICATION
             pending_brokers: Arc::new(DashMap::new()), // v2.2.7 EVENT-DRIVEN NOTIFICATION
             pending_partitions: Arc::new(DashMap::new()), // v2.2.7 EVENT-DRIVEN NOTIFICATION (P1)
-            heartbeat_sender, // v2.3.0 Phase 3: Leader lease heartbeats
+            heartbeat_sender, // v2.2.7 Phase 3: Leader lease heartbeats
         })
     }
 
@@ -472,8 +492,7 @@ impl RaftCluster {
 
         // Check if we're the leader
         {
-            let raft = self.raft_node.read()
-                .map_err(|e| anyhow::anyhow!("Failed to acquire Raft lock: {}", e))?;
+            let raft = self.raft_node.lock().await;
 
             let state = raft.raft.state;
             let leader_id = raft.raft.leader_id;
@@ -500,8 +519,7 @@ impl RaftCluster {
         // Propose to Raft - the entry will be committed asynchronously
         // The metadata store has its own retry logic to poll for the applied state
         {
-            let mut raft = self.raft_node.write()
-                .map_err(|e| anyhow::anyhow!("Failed to acquire Raft lock: {}", e))?;
+            let mut raft = self.raft_node.lock().await;
 
             tracing::info!("🔍 DEBUG propose_via_raft: About to call raft.propose()");
 
@@ -511,7 +529,7 @@ impl RaftCluster {
             tracing::info!("✅ DEBUG propose_via_raft: raft.propose() succeeded! Command will be committed asynchronously");
         }
 
-        // PERFORMANCE (v2.2.9): Return immediately - don't wait for commit!
+        // PERFORMANCE (v2.2.7): Return immediately - don't wait for commit!
         // The RaftMetadataStore has event-driven notifications for instant wake-up.
         tracing::info!("✅ DEBUG propose_via_raft: EXIT - returning Ok()");
         Ok(())
@@ -554,8 +572,7 @@ impl RaftCluster {
     ) -> Result<()> {
         // STEP 1: Validate we're the leader
         {
-            let raft = self.raft_node.read()
-                .map_err(|e| anyhow::anyhow!("Failed to acquire Raft lock: {}", e))?;
+            let raft = self.raft_node.lock().await;
 
             if raft.raft.state != raft::StateRole::Leader {
                 return Err(anyhow::anyhow!(
@@ -568,7 +585,7 @@ impl RaftCluster {
         }
 
         // STEP 2: Check if node_id already exists
-        let current_nodes = self.get_all_nodes();
+        let current_nodes = self.get_all_nodes().await;
         if current_nodes.contains(&node_id) {
             return Err(anyhow::anyhow!(
                 "Node {} already exists in cluster (current nodes: {:?})",
@@ -604,8 +621,7 @@ impl RaftCluster {
 
         // STEP 4: Propose ConfChange via Raft
         // CRITICAL: propose_conf_change takes the ConfChangeV2 directly, NOT serialized bytes
-        let mut raft = self.raft_node.write()
-            .map_err(|e| anyhow::anyhow!("Failed to acquire Raft lock: {}", e))?;
+        let mut raft = self.raft_node.lock().await;
 
         raft.propose_conf_change(vec![], cc)
             .context("Failed to propose ConfChange")?;
@@ -654,8 +670,7 @@ impl RaftCluster {
     ) -> Result<()> {
         // STEP 1: Validate we're the leader
         {
-            let raft = self.raft_node.read()
-                .map_err(|e| anyhow::anyhow!("Failed to acquire Raft lock: {}", e))?;
+            let raft = self.raft_node.lock().await;
 
             if raft.raft.state != raft::StateRole::Leader {
                 return Err(anyhow::anyhow!(
@@ -668,7 +683,7 @@ impl RaftCluster {
         }
 
         // STEP 2: Check if node exists
-        let current_nodes = self.get_all_nodes();
+        let current_nodes = self.get_all_nodes().await;
         if !current_nodes.contains(&node_id) {
             return Err(anyhow::anyhow!(
                 "Node {} does not exist in cluster (current nodes: {:?})",
@@ -729,8 +744,7 @@ impl RaftCluster {
         cc.set_context(vec![]);
 
         // STEP 7: Propose ConfChange via Raft
-        let mut raft = self.raft_node.write()
-            .map_err(|e| anyhow::anyhow!("Failed to acquire Raft lock: {}", e))?;
+        let mut raft = self.raft_node.lock().await;
 
         raft.propose_conf_change(vec![], cc)
             .context("Failed to propose ConfChange for node removal")?;
@@ -777,7 +791,7 @@ impl RaftCluster {
         );
 
         // Get all nodes except the one being removed
-        let available_nodes: Vec<u64> = self.get_all_nodes()
+        let available_nodes: Vec<u64> = self.get_all_nodes().await
             .into_iter()
             .filter(|&id| id != node_id)
             .collect();
@@ -922,10 +936,7 @@ impl RaftCluster {
 
     /// Check if this node is currently the Raft leader
     pub async fn is_leader(&self) -> bool {
-        let raft = match self.raft_node.read() {
-            Ok(r) => r,
-            Err(_) => return false,
-        };
+        let raft = self.raft_node.lock().await;
         raft.raft.state == raft::StateRole::Leader
     }
 
@@ -947,11 +958,8 @@ impl RaftCluster {
     ///
     /// # Returns
     /// Vector of node IDs (e.g., [1, 2, 3])
-    pub fn get_all_nodes(&self) -> Vec<u64> {
-        let raft = match self.raft_node.read() {
-            Ok(r) => r,
-            Err(_) => return vec![],
-        };
+    pub async fn get_all_nodes(&self) -> Vec<u64> {
+        let raft = self.raft_node.lock().await;
 
         // Get voter IDs from Raft's configuration state
         // For a simple approach, iterate over the progress tracker
@@ -1031,16 +1039,16 @@ impl RaftCluster {
     /// attempting to propose partition leader elections.
     ///
     /// Returns true only if THIS node is currently the Raft leader.
-    pub fn am_i_leader(&self) -> bool {
-        let raft_node = self.raft_node.read().unwrap();
+    pub async fn am_i_leader(&self) -> bool {
+        let raft_node = self.raft_node.lock().await;
         raft_node.raft.state == raft::StateRole::Leader
     }
 
     /// Get the current Raft leader ID (Phase 1.2)
     ///
     /// Returns the node ID of the current Raft leader, or None if no leader elected.
-    pub fn get_leader_id(&self) -> Option<u64> {
-        let raft_node = self.raft_node.read().unwrap();
+    pub async fn get_leader_id(&self) -> Option<u64> {
+        let raft_node = self.raft_node.lock().await;
         let leader_id = raft_node.raft.leader_id;
 
         if leader_id == raft::INVALID_ID {
@@ -1066,13 +1074,13 @@ impl RaftCluster {
         query: crate::metadata_rpc::MetadataQuery,
     ) -> Result<crate::metadata_rpc::MetadataQueryResponse> {
         // Check if we're the leader
-        if self.am_i_leader() {
+        if self.am_i_leader().await {
             // Execute query locally on state machine
             return self.execute_query_local(query);
         }
 
         // Get leader ID
-        let leader_id = self.get_leader_id()
+        let leader_id = self.get_leader_id().await
             .ok_or_else(|| anyhow::anyhow!("No Raft leader elected"))?;
 
         // Serialize query
@@ -1224,13 +1232,13 @@ impl RaftCluster {
         command: crate::metadata_rpc::MetadataWriteCommand,
     ) -> Result<()> {
         // Check if we're the leader
-        if self.am_i_leader() {
+        if self.am_i_leader().await {
             // Execute write locally via Raft proposal
             return self.execute_write_local(command).await;
         }
 
         // Get leader ID
-        let leader_id = self.get_leader_id()
+        let leader_id = self.get_leader_id().await
             .ok_or_else(|| anyhow::anyhow!("No Raft leader elected"))?;
 
         // Serialize command
@@ -1307,6 +1315,54 @@ impl RaftCluster {
                     log_start_offset: 0, // Not provided in write command
                 }
             }
+            MetadataWriteCommand::CreateConsumerGroup { group_id, protocol_type, protocol } => {
+                MetadataCommand::CreateConsumerGroup {
+                    group_id,
+                    protocol_type,
+                    protocol,
+                }
+            }
+            MetadataWriteCommand::DeleteTopic { name } => {
+                MetadataCommand::DeleteTopic { name }
+            }
+            MetadataWriteCommand::CommitOffset { group_id, topic, partition, offset } => {
+                MetadataCommand::CommitOffset {
+                    group_id,
+                    topic,
+                    partition: partition as u32,
+                    offset,
+                    metadata: None,  // RPC doesn't carry metadata
+                }
+            }
+            MetadataWriteCommand::AssignPartition { topic, partition, replicas } => {
+                MetadataCommand::AssignPartition {
+                    topic,
+                    partition,
+                    replicas,
+                }
+            }
+            MetadataWriteCommand::UpdateBrokerStatus { broker_id, status } => {
+                MetadataCommand::UpdateBrokerStatus {
+                    broker_id,
+                    status,
+                }
+            }
+            MetadataWriteCommand::UpdateConsumerGroup { group_id, state, generation_id, leader } => {
+                MetadataCommand::UpdateConsumerGroup {
+                    group_id,
+                    state,
+                    generation_id,
+                    leader: leader.unwrap_or_default(),  // Unwrap Option<String> to String
+                }
+            }
+            MetadataWriteCommand::UpdatePartitionOffset { topic, partition, high_watermark, log_start_offset } => {
+                MetadataCommand::UpdatePartitionOffset {
+                    topic,
+                    partition,
+                    high_watermark,
+                    log_start_offset,
+                }
+            }
         };
 
         // Propose via Raft (handles single-node vs multi-node)
@@ -1319,8 +1375,8 @@ impl RaftCluster {
     /// If you want to check if THIS node is the leader, use `am_i_leader()` instead.
     ///
     /// Returns (has_leader, leader_id, state_role)
-    pub fn is_leader_ready(&self) -> (bool, u64, String) {
-        let raft_node = self.raft_node.read().unwrap();
+    pub async fn is_leader_ready(&self) -> (bool, u64, String) {
+        let raft_node = self.raft_node.lock().await;
         let state = raft_node.raft.state;
         let leader_id = raft_node.raft.leader_id;
 
@@ -1368,14 +1424,12 @@ impl RaftCluster {
         tracing::info!("Starting Raft gRPC server on {}", listen_addr);
 
         // Create message handler that feeds messages to Raft
+        // v2.2.7 DEADLOCK FIX: Queue messages instead of blocking on Raft lock
         let cluster = self.clone();
         let message_handler = Arc::new(move |msg: Message| {
-            // Feed message into Raft via step()
-            let mut raft = cluster.raft_node.write()
-                .map_err(|e| format!("Failed to acquire Raft lock: {}", e))?;
-
-            raft.step(msg)
-                .map_err(|e| format!("Failed to step Raft: {:?}", e))?;
+            // Queue message for asynchronous processing instead of blocking
+            cluster.incoming_message_sender.send(msg)
+                .map_err(|e| format!("Failed to queue incoming Raft message: {}", e))?;
 
             Ok(())
         });
@@ -1404,12 +1458,18 @@ impl RaftCluster {
                 .map_err(|e| format!("Failed to deserialize command: {}", e))?;
 
             // Execute write via Raft proposal
-            // CRITICAL: This is blocking context, need to use block_on
-            let runtime_handle = tokio::runtime::Handle::current();
-            runtime_handle.block_on(async {
-                cluster_for_write.execute_write_local(command).await
-                    .map_err(|e| format!("Failed to execute write: {}", e))
-            })
+            // Use spawn to avoid blocking inside async runtime
+            let cluster_clone = cluster_for_write.clone();
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+
+            tokio::spawn(async move {
+                let result = cluster_clone.execute_write_local(command).await
+                    .map_err(|e| format!("Failed to execute write: {}", e));
+                let _ = tx.send(result);
+            });
+
+            // Wait for result (this is okay because we're in a gRPC handler thread pool)
+            rx.recv().map_err(|_| "Write task failed".to_string())?
         });
 
         // Create RPC service with all handlers (Phase 1.2)
@@ -1448,11 +1508,10 @@ impl RaftCluster {
     /// never get committed and metadata never replicates.
     pub fn start_message_loop(self: Arc<Self>) {
         if self.is_single_node() {
-            tracing::info!("Single-node mode: skipping Raft message loop (not needed)");
-            return;
+            tracing::info!("Single-node mode: starting Raft message loop (required for leader election)");
+        } else {
+            tracing::info!("Multi-node mode: starting Raft message processing loop");
         }
-
-        tracing::info!("Multi-node mode: starting Raft message processing loop");
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
@@ -1460,29 +1519,36 @@ impl RaftCluster {
             loop {
                 interval.tick().await;
 
-                // Tick Raft
-                {
-                    let mut raft = match self.raft_node.write() {
-                        Ok(r) => r,
-                        Err(e) => {
-                            tracing::error!("Failed to acquire Raft lock for tick: {}", e);
-                            continue;
-                        }
-                    };
-                    raft.tick();
-                }
-
-                // Process Ready state
-                // CRITICAL: Must hold lock from ready() through advance() to prevent
-                // other threads from calling step() and adding messages
-                let mut raft_lock = match self.raft_node.write() {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::error!("Failed to acquire Raft lock for ready: {}", e);
-                        continue;
+                // v2.2.7 DEADLOCK FIX: Process ALL incoming messages BEFORE acquiring the Raft lock
+                // This ensures messages don't pile up while we hold the lock
+                let incoming_messages: Vec<Message> = {
+                    let mut receiver = self.incoming_message_receiver.lock().await;
+                    let mut messages = Vec::new();
+                    while let Ok(msg) = receiver.try_recv() {
+                        messages.push(msg);
                     }
+                    messages
                 };
 
+                // Acquire Raft lock for the tick + step + ready cycle
+                // CRITICAL: Lock must be held from ready() to advance()
+                let mut raft_lock = self.raft_node.lock().await;
+
+                // Step 1: Tick Raft (while holding lock)
+                raft_lock.tick();
+
+                // Step 2: Process incoming messages from gRPC (while holding lock)
+                // This is the KEY fix - we process messages INSIDE the lock, not competing for it
+                if !incoming_messages.is_empty() {
+                    tracing::debug!("Processing {} queued incoming Raft messages", incoming_messages.len());
+                    for msg in incoming_messages {
+                        if let Err(e) = raft_lock.step(msg) {
+                            tracing::error!("Failed to step Raft with incoming message: {:?}", e);
+                        }
+                    }
+                }
+
+                // Step 3: Check if Raft has anything ready to process
                 if !raft_lock.has_ready() {
                     continue;
                 }
@@ -1523,36 +1589,40 @@ impl RaftCluster {
                     let state_machine_clone = self.state_machine.clone();
                     let snapshot_clone = snapshot.clone();
 
+                    // Drop lock before async operations
+                    drop(raft_lock);
+
                     // Persist snapshot and apply to state machine
-                    let apply_result = tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(async {
-                            // Save snapshot to disk
-                            storage_clone.save_snapshot(&snapshot_clone).await?;
+                    let apply_result = async {
+                        // Save snapshot to disk
+                        storage_clone.save_snapshot(&snapshot_clone).await?;
 
-                            // Deserialize and apply state machine
-                            let state_machine_data = snapshot_clone.get_data();
-                            if !state_machine_data.is_empty() {
-                                let new_state: MetadataStateMachine = bincode::deserialize(state_machine_data)
-                                    .context("Failed to deserialize state machine from snapshot")?;
+                        // Deserialize and apply state machine
+                        let state_machine_data = snapshot_clone.get_data();
+                        if !state_machine_data.is_empty() {
+                            let new_state: MetadataStateMachine = bincode::deserialize(state_machine_data)
+                                .context("Failed to deserialize state machine from snapshot")?;
 
-                                // Replace state machine with snapshot state
-                                *state_machine_clone.write().unwrap() = new_state;
+                            // Replace state machine with snapshot state
+                            *state_machine_clone.write().unwrap() = new_state;
 
-                                tracing::info!("✓ Applied state machine from snapshot");
-                            }
+                            tracing::info!("✓ Applied state machine from snapshot");
+                        }
 
-                            // Truncate log entries covered by snapshot
-                            storage_clone.truncate_log_to_snapshot(snapshot_clone.get_metadata().index).await?;
+                        // Truncate log entries covered by snapshot
+                        storage_clone.truncate_log_to_snapshot(snapshot_clone.get_metadata().index).await?;
 
-                            Ok::<(), anyhow::Error>(())
-                        })
-                    });
+                        Ok::<(), anyhow::Error>(())
+                    }.await;
 
                     if let Err(e) = apply_result {
                         tracing::error!("Failed to apply snapshot: {}", e);
                     } else {
                         tracing::info!("✓ Snapshot applied successfully");
                     }
+
+                    // Lock was dropped, skip to next iteration
+                    continue;
                 }
 
                 // Step 3a: Handle ConfChange entries (Priority 2: Zero-Downtime Node Addition)
@@ -1675,49 +1745,41 @@ impl RaftCluster {
                 }
 
                 // Step 4: Persist entries (required before persisted_messages)
-                // CRITICAL: Run async operations WHILE HOLDING LOCK using block_in_place
-                // This prevents other threads from calling step() between ready() and advance()
+                // NOTE: tokio::Mutex allows holding lock across await points
                 if !ready.entries().is_empty() {
                     let entries = ready.entries();
-                    tracing::info!("Persisting {} Raft entries to WAL", entries.len());
+                    let entries_len = entries.len();
+                    tracing::info!("Persisting {} Raft entries to WAL", entries_len);
 
                     let entries_clone: Vec<_> = entries.iter().cloned().collect();
-                    let storage_clone = self.storage.clone();
 
-                    // Block in place to run async operation synchronously
-                    // This keeps the lock held but allows async runtime to work
-                    let persist_result = tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(async {
-                            storage_clone.append_entries(&entries_clone).await
-                        })
-                    });
-
-                    if let Err(e) = persist_result {
-                        tracing::error!("Failed to persist Raft entries: {}", e);
-                    } else {
-                        tracing::info!("✓ Persisted {} Raft entries to WAL", entries_clone.len());
+                    // Persist while holding lock (tokio::Mutex is async-safe)
+                    match self.storage.append_entries(&entries_clone).await {
+                        Ok(()) => {
+                            tracing::info!("✓ Persisted {} Raft entries to WAL", entries_len);
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to persist Raft entries: {}", e);
+                        }
                     }
                 }
 
                 // Step 5: Persist hard state (required before persisted_messages)
-                // CRITICAL: Run async operations WHILE HOLDING LOCK using block_in_place
+                // NOTE: tokio::Mutex allows holding lock across await points
                 if let Some(hs) = ready.hs() {
-                    tracing::info!("Persisting HardState: term={}, vote={}, commit={}", hs.term, hs.vote, hs.commit);
+                    let term = hs.term;
+                    let vote = hs.vote;
+                    let commit = hs.commit;
+                    tracing::info!("Persisting HardState: term={}, vote={}, commit={}", term, vote, commit);
 
-                    let hs_clone = hs.clone();
-                    let storage_clone = self.storage.clone();
-
-                    // Block in place to run async operation synchronously
-                    let persist_result = tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(async {
-                            storage_clone.persist_hard_state(&hs_clone).await
-                        })
-                    });
-
-                    if let Err(e) = persist_result {
-                        tracing::error!("Failed to persist HardState: {}", e);
-                    } else {
-                        tracing::info!("✓ Persisted HardState: term={}, vote={}, commit={}", hs_clone.term, hs_clone.vote, hs_clone.commit);
+                    // Persist while holding lock (tokio::Mutex is async-safe)
+                    match self.storage.persist_hard_state(hs).await {
+                        Ok(()) => {
+                            tracing::info!("✓ Persisted HardState: term={}, vote={}, commit={}", term, vote, commit);
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to persist HardState: {}", e);
+                        }
                     }
                 }
 
@@ -1751,7 +1813,7 @@ impl RaftCluster {
                 tracing::debug!("✓ Advanced Raft successfully");
 
                 // Step 8: Check if we should create a snapshot (Phase 5)
-                // SNAPSHOT STORM FIX (v2.2.8): Only create snapshot if we've advanced significantly
+                // SNAPSHOT STORM FIX (v2.2.7): Only create snapshot if we've advanced significantly
                 // since the last snapshot. This prevents the same snapshot from being created
                 // repeatedly on every Raft ready event.
                 let applied = {
@@ -1785,38 +1847,38 @@ impl RaftCluster {
                     let storage_clone = self.storage.clone();
                     let last_snapshot_index_clone = self.last_snapshot_index.clone();
 
-                    // Create snapshot (async operations using block_in_place)
-                    let snapshot_result = tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(async {
-                            // Serialize state machine
+                    // Create snapshot (run async operations directly)
+                    let snapshot_result = async {
+                        // Serialize state machine
+                        let state_machine_bytes = {
                             let state_machine = state_machine_clone.read().unwrap();
-                            let state_machine_bytes = bincode::serialize(&*state_machine)
-                                .context("Failed to serialize state machine")?;
+                            bincode::serialize(&*state_machine)
+                                .context("Failed to serialize state machine")?
+                        };
 
-                            // Get applied term (from last applied entry)
-                            let applied_term = if applied > 0 {
-                                storage_clone.term(applied).unwrap_or(0)
-                            } else {
-                                0
-                            };
+                        // Get applied term (from last applied entry)
+                        let applied_term = if applied > 0 {
+                            storage_clone.term(applied).unwrap_or(0)
+                        } else {
+                            0
+                        };
 
-                            // Create snapshot
-                            let snapshot = storage_clone
-                                .create_snapshot(state_machine_bytes, applied, applied_term)
-                                .await?;
+                        // Create snapshot
+                        let snapshot = storage_clone
+                            .create_snapshot(state_machine_bytes, applied, applied_term)
+                            .await?;
 
-                            // Save snapshot to disk
-                            storage_clone.save_snapshot(&snapshot).await?;
+                        // Save snapshot to disk
+                        storage_clone.save_snapshot(&snapshot).await?;
 
-                            // Truncate log entries covered by snapshot
-                            storage_clone.truncate_log_to_snapshot(applied).await?;
+                        // Truncate log entries covered by snapshot
+                        storage_clone.truncate_log_to_snapshot(applied).await?;
 
-                            // SNAPSHOT STORM FIX: Update last snapshot index
-                            *last_snapshot_index_clone.write().unwrap() = applied;
+                        // SNAPSHOT STORM FIX: Update last snapshot index
+                        *last_snapshot_index_clone.write().unwrap() = applied;
 
-                            Ok::<(), anyhow::Error>(())
-                        })
-                    });
+                        Ok::<(), anyhow::Error>(())
+                    }.await;
 
                     if let Err(e) = snapshot_result {
                         tracing::error!("Failed to create/save snapshot: {}", e);
@@ -1839,7 +1901,7 @@ impl RaftCluster {
         tracing::info!("✓ Raft message loop started");
     }
 
-    /// v2.3.0 Phase 3: Broadcast heartbeat to followers
+    /// v2.2.7 Phase 3: Broadcast heartbeat to followers
     ///
     /// Called by HeartbeatSender on the leader to send periodic heartbeats.
     /// Followers receive these heartbeats and update their leases.
@@ -1854,7 +1916,7 @@ impl RaftCluster {
                 tracing::trace!(
                     "Broadcast heartbeat: leader={}, term={}, receivers={}",
                     self.node_id,
-                    self.current_term(),
+                    self.current_term().await,
                     receiver_count
                 );
                 Ok(())
@@ -1867,7 +1929,7 @@ impl RaftCluster {
         }
     }
 
-    /// v2.3.0 Phase 3: Subscribe to heartbeat messages
+    /// v2.2.7 Phase 3: Subscribe to heartbeat messages
     ///
     /// Called by HeartbeatReceiver on followers to receive heartbeats from leader.
     /// Returns a receiver that gets notified when leader sends heartbeats.
@@ -1878,8 +1940,8 @@ impl RaftCluster {
     }
 
     /// Get current Raft term for heartbeat messages
-    pub fn current_term(&self) -> u64 {
-        let node = self.raft_node.read().unwrap();
+    pub async fn current_term(&self) -> u64 {
+        let node = self.raft_node.lock().await;
         node.raft.term
     }
 }
@@ -1971,17 +2033,17 @@ pub async fn run_raft_cluster(config: RaftClusterConfig) -> Result<()> {
 
     tracing::info!("Raft cluster bootstrapped successfully");
 
-    // Step 1.5: Start Raft message processing loop (v2.5.0 Phase 5 fix)
+    // Step 1.5: Start Raft message processing loop (v2.2.7 Phase 5 fix)
     // CRITICAL: Without this, Raft proposals never get committed!
     raft_cluster.clone().start_message_loop();
     tracing::info!("✓ Raft message processing loop started");
 
-    // Step 1.6: Start Raft gRPC server (v2.5.0 - production gRPC transport)
+    // Step 1.6: Start Raft gRPC server (v2.2.7 - production gRPC transport)
     // CRITICAL: Without this, nodes can't communicate and leader election fails!
     raft_cluster.clone().start_grpc_server(config.raft_addr.clone()).await?;
     tracing::info!("✓ Raft gRPC server started on {}", config.raft_addr);
 
-    // Step 1.7: Auto-configure WAL replication for Raft cluster (v2.2.8 fix)
+    // Step 1.7: Auto-configure WAL replication for Raft cluster (v2.2.7 fix)
     // CRITICAL: Without this, acks=-1 hangs because no follower ACKs are sent!
     // Use actual WAL addresses from peer configs (not calculated from Raft ports)
     let wal_followers: Vec<String> = peers_for_replication.iter()
@@ -2044,7 +2106,7 @@ pub async fn run_raft_cluster(config: RaftClusterConfig) -> Result<()> {
     let max_election_wait = 100; // 100 * 100ms = 10 seconds
     let mut is_leader = false;
     while election_attempts < max_election_wait {
-        let (has_leader, leader_id, state) = raft_cluster.is_leader_ready();
+        let (has_leader, leader_id, state) = raft_cluster.is_leader_ready().await;
         if has_leader {
             is_leader = leader_id == config.node_id;
             tracing::info!("✓ Raft leader elected: leader_id={}, this_node={}, is_leader={}",
@@ -2060,7 +2122,7 @@ pub async fn run_raft_cluster(config: RaftClusterConfig) -> Result<()> {
     if !is_leader {
         tracing::info!("This node is a follower - skipping broker registration (will receive via Raft replication)");
     } else {
-        // Leader registers ALL brokers from config (v2.2.8: use actual peer configs)
+        // Leader registers ALL brokers from config (v2.2.7: use actual peer configs)
         use chronik_common::metadata::traits::BrokerMetadata;
 
         tracing::info!("This node is the Raft leader - registering all brokers from config");

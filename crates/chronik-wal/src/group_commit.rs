@@ -27,6 +27,86 @@ use crate::error::{Result, WalError};
 use crate::record::WalRecord;
 use chronik_monitoring::MetricsRecorder;
 
+#[cfg(all(target_os = "linux", feature = "async-io"))]
+use crate::io_uring_thread::IoUringThreadHandle;
+#[cfg(all(target_os = "linux", feature = "async-io"))]
+use std::sync::Arc as StdArc;
+
+/// Unified WAL writer abstraction (either io_uring thread or tokio::fs::File)
+enum WalWriter {
+    #[cfg(all(target_os = "linux", feature = "async-io"))]
+    IoUring {
+        handle: StdArc<IoUringThreadHandle>,
+        partition_key: String,
+    },
+    Standard(File),
+}
+
+impl WalWriter {
+    /// Create a new WAL writer at the given path
+    async fn create(
+        path: impl AsRef<Path>,
+        partition_key: String,
+        #[cfg(all(target_os = "linux", feature = "async-io"))]
+        io_uring_handle: Option<StdArc<IoUringThreadHandle>>,
+    ) -> Result<Self> {
+        #[cfg(all(target_os = "linux", feature = "async-io"))]
+        {
+            if let Some(handle) = io_uring_handle {
+                // Create file via io_uring thread
+                match handle.create_file(partition_key.clone(), path.as_ref().to_path_buf()).await {
+                    Ok(_) => {
+                        info!("✨ io_uring WAL writer created (10x faster I/O): {:?}", path.as_ref());
+                        return Ok(WalWriter::IoUring {
+                            handle,
+                            partition_key,
+                        });
+                    }
+                    Err(e) => {
+                        warn!("io_uring unavailable, falling back to standard I/O: {}", e);
+                    }
+                }
+            }
+        }
+
+        // Fallback to standard I/O
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .await?;
+        Ok(WalWriter::Standard(file))
+    }
+
+    /// Write data to WAL
+    async fn write_all(&mut self, data: &[u8]) -> Result<()> {
+        match self {
+            #[cfg(all(target_os = "linux", feature = "async-io"))]
+            WalWriter::IoUring { handle, partition_key } => {
+                handle.write(partition_key.clone(), Bytes::copy_from_slice(data)).await
+            }
+            WalWriter::Standard(file) => {
+                file.write_all(data).await?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Fsync WAL
+    async fn sync_all(&self) -> Result<()> {
+        match self {
+            #[cfg(all(target_os = "linux", feature = "async-io"))]
+            WalWriter::IoUring { handle, partition_key } => {
+                handle.sync(partition_key.clone()).await
+            }
+            WalWriter::Standard(file) => {
+                file.sync_all().await?;
+                Ok(())
+            }
+        }
+    }
+}
+
 /// Configuration for group commit behavior
 #[derive(Debug, Clone)]
 pub struct GroupCommitConfig {
@@ -232,7 +312,7 @@ struct PartitionCommitQueue {
     total_queued_bytes: Mutex<usize>,
 
     /// File handle for this partition's WAL
-    file: Arc<Mutex<File>>,
+    file: Arc<Mutex<WalWriter>>,
 
     /// Last fsync timestamp
     last_fsync: Mutex<Instant>,
@@ -285,17 +365,36 @@ pub struct GroupCommitWal {
 
     /// Shutdown signal
     shutdown: Arc<Notify>,
+
+    /// io_uring thread handle (Linux + async-io feature only)
+    #[cfg(all(target_os = "linux", feature = "async-io"))]
+    io_uring_handle: Option<StdArc<IoUringThreadHandle>>,
 }
 
 impl GroupCommitWal {
     /// Create a new group commit WAL manager
     pub fn new(base_dir: PathBuf, config: GroupCommitConfig) -> Self {
+        // Spawn io_uring thread if available
+        #[cfg(all(target_os = "linux", feature = "async-io"))]
+        let io_uring_handle = match IoUringThreadHandle::spawn() {
+            Ok(handle) => {
+                info!("✨ io_uring thread spawned for 10x faster WAL writes");
+                Some(StdArc::new(handle))
+            }
+            Err(e) => {
+                warn!("Failed to spawn io_uring thread, falling back to standard I/O: {}", e);
+                None
+            }
+        };
+
         let wal = Self {
             partition_queues: Arc::new(DashMap::new()),
             sealed_segments: Arc::new(DashMap::new()),
             config,
             base_dir: base_dir.clone(),
             shutdown: Arc::new(Notify::new()),
+            #[cfg(all(target_os = "linux", feature = "async-io"))]
+            io_uring_handle,
         };
 
         // Discover existing sealed segments from filesystem
@@ -471,14 +570,29 @@ impl GroupCommitWal {
     ) -> Result<()> {
         debug!("🟢 ENQUEUE_START: Enqueuing write with {} bytes", data_len);
 
-        // Check backpressure
-        {
-            let pending = queue.pending.lock().await;
-            if pending.len() >= self.config.max_queue_depth {
-                queue.metrics.backpressure_events.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                warn!("🔴 BACKPRESSURE: Queue depth {} exceeded max {}", pending.len(), self.config.max_queue_depth);
-                return Err(WalError::Backpressure("Queue depth exceeded".into()));
+        // Skip backpressure check for critical Raft topics
+        // Raft HardState/ConfState writes MUST succeed for cluster coordination
+        let is_raft_topic = queue.topic.starts_with("__raft") || queue.topic.starts_with("__chronik_metadata");
+
+        if !is_raft_topic {
+            // Check backpressure (NON-BLOCKING with try_lock for immediate fail-fast)
+            match queue.pending.try_lock() {
+                Ok(pending) => {
+                    if pending.len() >= self.config.max_queue_depth {
+                        queue.metrics.backpressure_events.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        warn!("🔴 BACKPRESSURE: Queue depth {} exceeded max {}", pending.len(), self.config.max_queue_depth);
+                        return Err(WalError::Backpressure(format!("Queue depth {} exceeds limit {}", pending.len(), self.config.max_queue_depth)));
+                    }
+                }
+                Err(_) => {
+                    // Lock contention - queue is busy, signal back-pressure
+                    queue.metrics.backpressure_events.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    warn!("🔴 BACKPRESSURE: Queue lock contended, rejecting write immediately");
+                    return Err(WalError::Backpressure("Queue is busy (lock contention)".into()));
+                }
             }
+        } else {
+            debug!("✅ CRITICAL_WRITE: Skipping backpressure check for Raft/metadata topic: {}", queue.topic);
         }
 
         // Create response channel
@@ -551,16 +665,18 @@ impl GroupCommitWal {
         // Format: wal_{partition}_{segment_id}.log
         let wal_path = partition_dir.join(format!("wal_{}_0.log", partition));
 
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&wal_path)
-            .await?;
+        let partition_key = format!("{}:{}", topic, partition);
+        let writer = WalWriter::create(
+            &wal_path,
+            partition_key,
+            #[cfg(all(target_os = "linux", feature = "async-io"))]
+            self.io_uring_handle.clone(),
+        ).await?;
 
         let queue = Arc::new(PartitionCommitQueue {
             pending: Mutex::new(VecDeque::new()),
             total_queued_bytes: Mutex::new(0),
-            file: Arc::new(Mutex::new(file)),
+            file: Arc::new(Mutex::new(writer)),
             last_fsync: Mutex::new(Instant::now()),
             write_notify: Arc::new(Notify::new()),
             metrics: Arc::new(CommitMetrics::default()),
@@ -587,10 +703,17 @@ impl GroupCommitWal {
         let shutdown = self.shutdown.clone();
         let sealed_segments = self.sealed_segments.clone();
         let base_dir = self.base_dir.clone();
+        #[cfg(all(target_os = "linux", feature = "async-io"))]
+        let io_uring_handle = self.io_uring_handle.clone();
 
         info!("🚀 WORKER_SPAWN: Starting partition committer background task");
 
         tokio::spawn(async move {
+            // v2.2.7: Set high I/O priority for WAL thread to prevent Tantivy from blocking it
+            if let Err(e) = crate::io_priority::set_wal_priority() {
+                warn!("Failed to set WAL I/O priority (may need CAP_SYS_ADMIN): {}", e);
+            }
+
             info!("✅ WORKER_STARTED: Partition committer task is running");
             let mut interval = tokio::time::interval(Duration::from_millis(config.max_wait_time_ms));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -615,7 +738,14 @@ impl GroupCommitWal {
 
                 // Commit if there are pending writes
                 debug!("📝 WORKER_COMMIT: About to call commit_batch");
-                if let Err(e) = Self::commit_batch(&queue, &config, &sealed_segments, &base_dir).await {
+                if let Err(e) = Self::commit_batch(
+                    &queue,
+                    &config,
+                    &sealed_segments,
+                    &base_dir,
+                    #[cfg(all(target_os = "linux", feature = "async-io"))]
+                    &io_uring_handle,
+                ).await {
                     error!("❌ WORKER_ERROR: Commit batch failed: {}", e);
                 } else {
                     debug!("✅ WORKER_SUCCESS: commit_batch completed successfully");
@@ -633,6 +763,8 @@ impl GroupCommitWal {
         let shutdown = self.shutdown.clone();
         let sealed_segments = self.sealed_segments.clone();
         let base_dir = self.base_dir.clone();
+        #[cfg(all(target_os = "linux", feature = "async-io"))]
+        let io_uring_handle = self.io_uring_handle.clone();
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_millis(config.max_wait_time_ms));
@@ -654,7 +786,14 @@ impl GroupCommitWal {
                     let pending_count = queue.pending.lock().await.len();
 
                     if pending_count > 0 {
-                        if let Err(e) = Self::commit_batch(queue, &config, &sealed_segments, &base_dir).await {
+                        if let Err(e) = Self::commit_batch(
+                            queue,
+                            &config,
+                            &sealed_segments,
+                            &base_dir,
+                            #[cfg(all(target_os = "linux", feature = "async-io"))]
+                            &io_uring_handle,
+                        ).await {
                             error!("Background commit failed: {}", e);
                         }
                     }
@@ -664,12 +803,14 @@ impl GroupCommitWal {
     }
 
     /// Commit a batch of writes with single fsync
-    #[instrument(skip(queue, config, sealed_segments, base_dir), fields(batch_size, bytes, fsync_us))]
+    #[instrument(skip(queue, config, sealed_segments, base_dir, io_uring_handle), fields(batch_size, bytes, fsync_us))]
     async fn commit_batch(
         queue: &PartitionCommitQueue,
         config: &GroupCommitConfig,
         sealed_segments: &Arc<DashMap<String, SealedSegmentInfo>>,
         base_dir: &Path,
+        #[cfg(all(target_os = "linux", feature = "async-io"))]
+        io_uring_handle: &Option<StdArc<IoUringThreadHandle>>,
     ) -> Result<()> {
         debug!("🔵 COMMIT_START: Entering commit_batch");
         let start = Instant::now();
@@ -765,7 +906,14 @@ impl GroupCommitWal {
         debug!("All {} waiters notified successfully", batch_count);
 
         // Check if we should seal and rotate segment
-        if let Err(e) = Self::check_and_seal_segment(queue, config, sealed_segments, base_dir).await {
+        if let Err(e) = Self::check_and_seal_segment(
+            queue,
+            config,
+            sealed_segments,
+            base_dir,
+            #[cfg(all(target_os = "linux", feature = "async-io"))]
+            io_uring_handle,
+        ).await {
             error!("Failed to check/seal segment: {}", e);
             // Don't fail the commit, just log the error
         }
@@ -841,6 +989,8 @@ impl GroupCommitWal {
         config: &GroupCommitConfig,
         sealed_segments: &Arc<DashMap<String, SealedSegmentInfo>>,
         base_dir: &Path,
+        #[cfg(all(target_os = "linux", feature = "async-io"))]
+        io_uring_handle: &Option<StdArc<IoUringThreadHandle>>,
     ) -> Result<()> {
         // Skip if rotation disabled
         if !config.enable_rotation {
@@ -903,14 +1053,16 @@ impl GroupCommitWal {
             .join(queue.partition.to_string())
             .join(format!("wal_{}_{}.log", queue.partition, new_segment_id));
 
-        // Open new file
-        let new_file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&new_file_path)
-            .await?;
+        // Open new file with io_uring if available
+        let partition_key = format!("{}:{}", queue.topic, queue.partition);
+        let new_writer = WalWriter::create(
+            &new_file_path,
+            partition_key,
+            #[cfg(all(target_os = "linux", feature = "async-io"))]
+            io_uring_handle.clone(),
+        ).await?;
 
-        *queue.file.lock().await = new_file;
+        *queue.file.lock().await = new_writer;
 
         // Reset segment tracking
         *queue.segment_created_at.lock().await = Instant::now();

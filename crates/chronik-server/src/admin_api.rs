@@ -1,4 +1,4 @@
-//! HTTP Admin API for Cluster Management (v2.6.0+)
+//! HTTP Admin API for Cluster Management (v2.2.7+)
 //!
 //! Provides REST endpoints for managing cluster membership:
 //! - POST /admin/add-node - Add new node to cluster
@@ -269,7 +269,7 @@ async fn handle_add_node(
 async fn handle_health(
     State(state): State<AdminApiState>,
 ) -> Result<Json<HealthResponse>, AdminApiError> {
-    let cluster_nodes = state.raft_cluster.get_all_nodes();
+    let cluster_nodes = state.raft_cluster.get_all_nodes().await;
     let node_id = state.raft_cluster.node_id();
 
     // Check if this node is the leader
@@ -291,7 +291,7 @@ async fn handle_status(
 
     let node_id = state.raft_cluster.node_id();
     let is_leader = state.raft_cluster.is_leader().await;
-    let (leader_ready, leader_id, _) = state.raft_cluster.is_leader_ready();
+    let (leader_ready, leader_id, _) = state.raft_cluster.is_leader_ready().await;
 
     // Get all nodes with their information
     let node_info = state.raft_cluster.get_node_info();

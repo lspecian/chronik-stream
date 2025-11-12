@@ -1,4 +1,4 @@
-/// ISR ACK Tracker for acks=-1 Support (v2.5.0 Phase 4)
+/// ISR ACK Tracker for acks=-1 Support (v2.2.7 Phase 4)
 ///
 /// This component tracks pending acks=-1 produce requests and notifies producers
 /// when ISR quorum is reached. It bridges the gap between:

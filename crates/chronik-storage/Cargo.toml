@@ -38,6 +38,7 @@ lz4_flex = { workspace = true }
 
 # Checksum
 crc32fast = { workspace = true }
+libc = "0.2"
 crc32c = "0.6"  # For Kafka CRC-32C (Castagnoli)
 hex = "0.4"  # For debug hex dumps
 

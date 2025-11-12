@@ -94,13 +94,13 @@ impl HeartbeatSender {
             tick.tick().await;
 
             // Only send heartbeats if we're the leader
-            if !raft_cluster.am_i_leader() {
+            if !raft_cluster.am_i_leader().await {
                 tracing::debug!("Not leader anymore, pausing heartbeats");
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
             }
 
-            let term = raft_cluster.current_term();
+            let term = raft_cluster.current_term().await;
             let heartbeat = LeaderHeartbeat::new(self.node_id, term);
 
             heartbeat_count += 1;

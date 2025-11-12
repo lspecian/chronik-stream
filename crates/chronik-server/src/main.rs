@@ -26,26 +26,26 @@ mod coordinator_manager;
 mod wal_integration;
 mod metadata_dr;
 mod wal_replication;  // v2.2.0: PostgreSQL-style WAL streaming
-// v2.5.0 Phase 2: Raft for metadata coordination only (NOT data replication)
+// v2.2.7 Phase 2: Raft for metadata coordination only (NOT data replication)
 mod raft_metadata;
 mod raft_cluster;
 mod raft_metadata_store;  // v2.2.7 Phase 3: Unified metadata store (1-N nodes)
-// v2.3.0 Phase 2: WAL-based metadata writes (fast path, bypasses Raft consensus)
+// v2.2.7 Phase 2: WAL-based metadata writes (fast path, bypasses Raft consensus)
 mod metadata_wal;          // Fast local WAL for metadata operations (1-2ms vs 10-50ms Raft)
 mod metadata_wal_replication;  // Async replication using existing WalReplicationManager
-// v2.5.0 Phase 3: ISR tracking for partition replication
+// v2.2.7 Phase 3: ISR tracking for partition replication
 mod isr_tracker;
-// v2.5.0 Phase 4: ISR ACK tracking for acks=-1 quorum support
+// v2.2.7 Phase 4: ISR ACK tracking for acks=-1 quorum support
 mod isr_ack_tracker;
-// v2.5.0 Phase 5: Automatic leader election per partition
+// v2.2.7 Phase 5: Automatic leader election per partition
 mod leader_election;
-// v2.6.0: HTTP Admin API for cluster management
+// v2.2.7: HTTP Admin API for cluster management
 mod admin_api;
-// v2.6.0 Priority 2 Step 3: Automatic partition rebalancing
+// v2.2.7 Priority 2 Step 3: Automatic partition rebalancing
 mod partition_rebalancer;
-// v2.3.0 Phase 1: Leader-forwarding RPC for metadata queries
+// v2.2.7 Phase 1: Leader-forwarding RPC for metadata queries
 mod metadata_rpc;
-// v2.3.0 Phase 3: Leader leases for fast follower reads
+// v2.2.7 Phase 3: Leader leases for fast follower reads
 mod leader_lease;
 mod leader_heartbeat;
 
@@ -647,7 +647,7 @@ async fn run_cluster_mode(
     let server = IntegratedKafkaServer::new(server_config, Some(raft_cluster.clone())).await?;
     info!("IntegratedKafkaServer initialized successfully");
 
-    // ARCHITECTURAL FIX v2.2.8: Register broker NOW with actual peer configs from TOML
+    // ARCHITECTURAL FIX v2.2.7: Register broker NOW with actual peer configs from TOML
     // Multi-node broker registration happens here, AFTER:
     // 1. Raft message loop started (leader election can proceed)
     // 2. gRPC server started (nodes can communicate)
@@ -659,7 +659,7 @@ async fn run_cluster_mode(
     let max_election_wait = 100; // 100 * 100ms = 10 seconds
     let mut is_leader = false;
     while election_attempts < max_election_wait {
-        let (has_leader, leader_id, state) = raft_cluster.is_leader_ready();
+        let (has_leader, leader_id, state) = raft_cluster.is_leader_ready().await;
         if has_leader {
             is_leader = leader_id == config.node_id;
             info!("✓ Raft leader elected: leader_id={}, this_node={}, is_leader={}, state={}",
@@ -670,7 +670,7 @@ async fn run_cluster_mode(
         election_attempts += 1;
     }
 
-    // v2.2.8 FIX: Use actual peer configs from TOML instead of hardcoded IDs
+    // v2.2.7 FIX: Use actual peer configs from TOML instead of hardcoded IDs
     // CRITICAL: Cannot block main thread waiting for Raft proposals - must yield to message loop!
     if !is_leader {
         info!("This node is a follower - skipping broker registration (will receive via Raft replication)");
@@ -685,7 +685,7 @@ async fn run_cluster_mode(
             info!("Background task: Registering {} brokers from config", peers_clone.len());
 
             for peer in &peers_clone {
-                // v2.2.8 FIX: Parse actual Kafka address from config instead of hardcoded calculation
+                // v2.2.7 FIX: Parse actual Kafka address from config instead of hardcoded calculation
                 let (host, port) = if let Some(colon_pos) = peer.kafka.rfind(':') {
                     let host = peer.kafka[..colon_pos].to_string();
                     let port = peer.kafka[colon_pos+1..].parse::<i32>()
@@ -769,20 +769,20 @@ async fn run_cluster_mode(
         info!("Search API available at http://{}:{}", bind, search_port);
     }
 
-    // v2.6.0: Start Admin API HTTP server for cluster management
+    // v2.2.7: Start Admin API HTTP server for cluster management
     let admin_port = 10000 + (config.node_id as u16);  // 10001, 10002, 10003, etc.
     info!("Starting Admin API on port {}", admin_port);
     let admin_api_key = std::env::var("CHRONIK_ADMIN_API_KEY").ok();
     admin_api::start_admin_api(raft_cluster.clone(), admin_port, admin_api_key).await?;
     info!("Admin API available at http://{}:{}/admin", bind, admin_port);
 
-    // v2.6.0 Priority 2 Step 3: Start Partition Rebalancer
+    // v2.2.7 Priority 2 Step 3: Start Partition Rebalancer
     info!("Starting Partition Rebalancer (RF={})", config.replication_factor);
     let _rebalancer = partition_rebalancer::PartitionRebalancer::new(
         raft_cluster.clone(),
         server.metadata_store().clone(),
         config.replication_factor,
-    );
+    ).await;
     info!("✓ Partition Rebalancer started (will check every 30s for membership changes)");
 
     // Start server with signal handling
@@ -933,7 +933,7 @@ async fn run_single_node_mode(
     Ok(())
 }
 
-/// Handle cluster management commands (v2.6.0+)
+/// Handle cluster management commands (v2.2.7+)
 async fn handle_cluster_command(_cli: &Cli, action: ClusterAction) -> Result<()> {
     match action {
         ClusterAction::Status { config } => {

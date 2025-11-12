@@ -75,6 +75,10 @@ pub enum Error {
     #[error("Invalid transaction state: {0}")]
     InvalidTransactionState(String),
 
+    /// Queue full - back-pressure signaling
+    #[error("Queue full: {0}")]
+    QueueFull(String),
+
     /// Internal errors
     #[error("Internal error: {0}")]
     Internal(String),

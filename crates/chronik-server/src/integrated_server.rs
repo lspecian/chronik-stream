@@ -98,7 +98,7 @@ pub struct IntegratedKafkaServer {
     metadata_store: Arc<dyn MetadataStore>,
     wal_indexer: Arc<WalIndexer>,
     metadata_uploader: Option<Arc<chronik_common::metadata::MetadataUploader>>,
-    /// v2.5.0 Phase 5: Leader election per partition
+    /// v2.2.7 Phase 5: Leader election per partition
     leader_elector: Option<Arc<crate::leader_election::LeaderElector>>,
 }
 
@@ -120,7 +120,7 @@ impl IntegratedKafkaServer {
     ///
     /// # Arguments
     /// - `config`: Server configuration
-    /// - `raft_cluster`: Optional Raft cluster for metadata coordination (v2.5.0 Phase 3)
+    /// - `raft_cluster`: Optional Raft cluster for metadata coordination (v2.2.7 Phase 3)
     pub async fn new(
         config: IntegratedServerConfig,
         raft_cluster: Option<Arc<crate::raft_cluster::RaftCluster>>,
@@ -153,90 +153,50 @@ impl IntegratedKafkaServer {
             ).await?)
         };
 
-        // v2.3.0 Phase 2: Create Metadata WAL for fast metadata writes (1-2ms vs 10-50ms Raft)
-        // Only create for multi-node clusters (single-node uses zero-overhead Raft anyway)
-        let (metadata_wal, metadata_wal_replicator) = if raft_cluster.is_some() {
-            info!("Phase 2: Creating Metadata WAL for fast metadata operations");
-            let data_dir_path = PathBuf::from(&config.data_dir);
+        // WAL-ONLY Architecture: Metadata WAL is MANDATORY for all deployments
+        // Raft is used ONLY for cluster coordination (membership, leader election)
+        info!("Creating Metadata WAL for WAL-ONLY metadata operations");
+        let data_dir_path = PathBuf::from(&config.data_dir);
 
-            let metadata_wal = Arc::new(
-                crate::metadata_wal::MetadataWal::new(data_dir_path.clone()).await
-                    .context("Failed to create metadata WAL")?
-            );
-            info!("✅ Phase 2: Metadata WAL created (topic='__chronik_metadata', partition=0)");
+        let metadata_wal = Arc::new(
+            crate::metadata_wal::MetadataWal::new(data_dir_path.clone()).await
+                .context("Failed to create metadata WAL")?
+        );
+        info!("✅ Metadata WAL created (topic='__chronik_metadata', partition=0)");
 
-            // Note: WalReplicationManager will be created later, so we'll set this up after
-            (Some(metadata_wal), None::<Arc<crate::metadata_wal_replication::MetadataWalReplicator>>)
-        } else {
-            info!("Single-node mode: Skipping Phase 2 Metadata WAL (zero-overhead Raft is sufficient)");
-            (None::<Arc<crate::metadata_wal::MetadataWal>>, None::<Arc<crate::metadata_wal_replication::MetadataWalReplicator>>)
-        };
+        // Create WAL replicator for metadata
+        let metadata_wal_replicator = Arc::new(
+            crate::metadata_wal_replication::MetadataWalReplicator::new(
+                metadata_wal.clone(),
+                // Placeholder: will be replaced with real replication manager after it's created
+                crate::wal_replication::WalReplicationManager::new_with_dependencies(
+                    Vec::new(),
+                    Some(raft_cluster_for_metadata.clone()),
+                    None,
+                    None,
+                    None,
+                ),
+            )
+        );
+        info!("✅ Metadata WAL replicator created");
 
-        // v2.3.0 Phase 3: Create LeaseManager for fast follower reads (1-2ms vs 2-5ms forwarding)
-        // Only create for multi-node clusters (followers need leases to read locally)
-        let lease_manager = if raft_cluster.is_some() {
-            info!("✅ Phase 3: Creating LeaseManager (lease_duration=5s)");
-            Some(Arc::new(crate::leader_lease::LeaseManager::new(
-                std::time::Duration::from_secs(5)
-            )))
-        } else {
-            None
-        };
+        // Create LeaseManager for fast follower reads (1-2ms vs 2-5ms forwarding)
+        let lease_manager = Arc::new(crate::leader_lease::LeaseManager::new(
+            std::time::Duration::from_secs(5)
+        ));
+        info!("✅ LeaseManager created (lease_duration=5s)");
 
-        // v2.2.7 Phase 4 / v2.3.0 Phase 2+3: Create RaftMetadataStore
-        let metadata_store: Arc<dyn MetadataStore> = match (&metadata_wal, &lease_manager) {
-            (Some(wal), Some(lease_mgr)) => {
-                // Phase 2 + Phase 3: WAL fast path + lease-based follower reads
-                info!("Phase 2+3: Creating RaftMetadataStore with WAL and leases (full fast path)");
-                Arc::new(
-                    crate::raft_metadata_store::RaftMetadataStore::new_with_wal_and_lease(
-                        raft_cluster_for_metadata.clone(),
-                        wal.clone(),
-                        Arc::new(crate::metadata_wal_replication::MetadataWalReplicator::new(
-                            wal.clone(),
-                            // Placeholder: will be replaced with real replication manager after it's created
-                            crate::wal_replication::WalReplicationManager::new_with_dependencies(
-                                Vec::new(),
-                                Some(raft_cluster_for_metadata.clone()),
-                                None,
-                                None,
-                                None,
-                            ),
-                        )),
-                        lease_mgr.clone(),
-                    )
-                )
-            }
-            (Some(wal), None) => {
-                // Phase 2 only: WAL fast path (should not happen - Phase 3 always enabled with Phase 2)
-                info!("Phase 2: Creating RaftMetadataStore with WAL only (Phase 3 disabled)");
-                Arc::new(
-                    crate::raft_metadata_store::RaftMetadataStore::new_with_wal(
-                        raft_cluster_for_metadata.clone(),
-                        wal.clone(),
-                        Arc::new(crate::metadata_wal_replication::MetadataWalReplicator::new(
-                            wal.clone(),
-                            crate::wal_replication::WalReplicationManager::new_with_dependencies(
-                                Vec::new(),
-                                Some(raft_cluster_for_metadata.clone()),
-                                None,
-                                None,
-                                None,
-                            ),
-                        )),
-                    )
-                )
-            }
-            _ => {
-                // Phase 1 mode: Raft consensus only (single-node)
-                Arc::new(
-                    crate::raft_metadata_store::RaftMetadataStore::new(raft_cluster_for_metadata.clone())
-                )
-            }
-        };
+        // Create RaftMetadataStore with WAL-ONLY architecture
+        let metadata_store: Arc<dyn MetadataStore> = Arc::new(
+            crate::raft_metadata_store::RaftMetadataStore::new(
+                raft_cluster_for_metadata.clone(),
+                metadata_wal.clone(),
+                metadata_wal_replicator.clone(),
+                lease_manager.clone(),
+            )
+        );
 
-        info!("Successfully initialized RaftMetadataStore (v2.3.0 Phase 2: {}))",
-            if metadata_wal.is_some() { "WAL fast path enabled" } else { "Raft-only mode" });
+        info!("✅ Successfully initialized RaftMetadataStore with WAL-ONLY architecture (no Raft for metadata)");
 
         // v2.2.7 Phase 6: System topics no longer needed - metadata lives in Raft state machine
         // The old __meta topic was used by ChronikMetaLogStore, which is now deleted
@@ -261,10 +221,10 @@ impl IntegratedKafkaServer {
         raft_cluster_for_metadata.clone().start_message_loop();
         info!("✓ Raft message loop started");
 
-        // v2.3.0 Phase 3: Start heartbeat sender/receiver for leader leases
-        if let Some(ref lease_mgr) = lease_manager {
+        // WAL-ONLY: Start heartbeat sender/receiver for leader leases
+        {
             let raft_for_heartbeat = raft_cluster_for_metadata.clone();
-            let lease_mgr_for_receiver = lease_mgr.clone();
+            let lease_mgr_for_receiver = lease_manager.clone();
 
             // Start heartbeat sender (runs on leader)
             let heartbeat_sender = crate::leader_heartbeat::HeartbeatSender::new(
@@ -442,7 +402,7 @@ impl IntegratedKafkaServer {
         // WalManager uses DashMap internally - no external RwLock needed
         info!("Initializing WAL manager with recovery...");
 
-        // v2.5.0: Always use direct WAL recovery
+        // v2.2.7: Always use direct WAL recovery
         let wal_manager_recovered = WalManager::recover(&wal_config)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to recover WAL: {}", e))?;
@@ -458,13 +418,13 @@ impl IntegratedKafkaServer {
             wal_manager.clone(),
         ).await?;
 
-        // v2.5.0 Phase 3: Wire RaftCluster to ProduceHandler for partition metadata
+        // v2.2.7 Phase 3: Wire RaftCluster to ProduceHandler for partition metadata
         if let Some(ref cluster) = raft_cluster {
             info!("Setting RaftCluster for ProduceHandler");
             produce_handler_inner.set_raft_cluster(Arc::clone(cluster));
         }
 
-        // v2.5.0 Phase 4: Create ISR ACK tracker for acks=-1 quorum support FIRST
+        // v2.2.7 Phase 4: Create ISR ACK tracker for acks=-1 quorum support FIRST
         // CRITICAL: Must be created on ALL nodes (leader + followers) so ACKs can flow bidirectionally
         // AND must be shared with both WalReplicationManager (for ACK reading) and ProduceHandler (for waiting)
         let isr_ack_tracker = crate::isr_ack_tracker::IsrAckTracker::new();
@@ -487,20 +447,21 @@ impl IntegratedKafkaServer {
             produce_handler_inner.set_leader_elector(elector.clone());
         }
 
-        // v2.2.8 FIX: REMOVED BLOCKING Raft leader wait from IntegratedKafkaServer::new()
+        // v2.2.7 FIX: REMOVED BLOCKING Raft leader wait from IntegratedKafkaServer::new()
         // CHICKEN-AND-EGG DEADLOCK: Old code waited for Raft leader election HERE,
         // but Raft message loop starts AFTER new() returns (in main.rs line 580+).
         // RESULT: new() never returned → message loop never started → deadlock!
         // FIX: Partition metadata initialization MOVED to main.rs (after Raft loop starts)
 
         if let Some(ref _raft) = raft_cluster {
-            info!("Raft cluster enabled - partition metadata initialization will happen after Raft message loop starts (v2.2.8 fix)");
+            info!("Raft cluster enabled - partition metadata initialization will happen after Raft message loop starts (v2.2.7 fix)");
         }
 
-        // v2.2.8: DELETED 130+ lines of blocking code (moved to main.rs after Raft loop starts)
+        // v2.2.7: DELETED 130+ lines of blocking code (moved to main.rs after Raft loop starts)
 
-        // v2.5.0 Phase 6: Initialize WAL replication with auto-discovery from cluster config
-        let manual_followers = if let Ok(followers_str) = std::env::var("CHRONIK_REPLICATION_FOLLOWERS") {
+        // v2.2.7 Phase 6: Initialize WAL replication with auto-discovery from cluster config
+        // Phase 1 (v2.2.7+): Auto-discover follower WAL addresses from RaftCluster
+        let mut manual_followers = if let Ok(followers_str) = std::env::var("CHRONIK_REPLICATION_FOLLOWERS") {
             if !followers_str.is_empty() {
                 followers_str
                     .split(',')
@@ -514,34 +475,52 @@ impl IntegratedKafkaServer {
             Vec::new()
         };
 
+        // AUTO-DISCOVERY: Extract follower WAL addresses from cluster config
+        if let Some(ref cluster_cfg) = config.cluster_config {
+            let auto_discovered: Vec<String> = cluster_cfg
+                .peer_nodes()  // Get all peers except this node
+                .iter()
+                .map(|peer| peer.wal.clone())  // Extract WAL address
+                .collect();
+
+            if !auto_discovered.is_empty() {
+                info!(
+                    "🔍 Phase 1: Auto-discovered {} follower WAL addresses from cluster config: {:?}",
+                    auto_discovered.len(),
+                    auto_discovered
+                );
+                manual_followers.extend(auto_discovered);
+            }
+        }
+
         // Enable WAL replication if either manual followers or cluster config is available
         if !manual_followers.is_empty() || config.cluster_config.is_some() {
-            // v2.5.0 Phase 3: Create ISR tracker
+            // v2.2.7 Phase 3: Create ISR tracker
             let isr_tracker = Arc::new(crate::isr_tracker::IsrTracker::new(
                 10_000,  // max_lag_entries: 10K messages
                 10_000,  // max_lag_ms: 10 seconds
             ));
             info!("Created ISR tracker (max_lag: 10K entries / 10s)");
 
-            // v2.5.0 Phase 6: Create replication manager with cluster config for auto-discovery
+            // v2.2.7 Phase 6: Create replication manager with cluster config for auto-discovery
             // CRITICAL: Use the SAME isr_ack_tracker instance that ProduceHandler uses
             let replication_manager = crate::wal_replication::WalReplicationManager::new_with_dependencies(
                 manual_followers,
                 raft_cluster.clone(),              // Pass RaftCluster for partition metadata
                 Some(isr_tracker),                 // Pass ISR tracker for replica filtering
-                Some(isr_ack_tracker.clone()),     // v2.5.0 Phase 4: Pass SAME ACK tracker
-                config.cluster_config.clone().map(Arc::new), // v2.5.0 Phase 6: Pass cluster config for auto-discovery
+                Some(isr_ack_tracker.clone()),     // v2.2.7 Phase 4: Pass SAME ACK tracker
+                config.cluster_config.clone().map(Arc::new), // v2.2.7 Phase 6: Pass cluster config for auto-discovery
             );
             info!("Created WalReplicationManager with Raft, ISR, and ACK tracking (sharing IsrAckTracker)");
 
             produce_handler_inner.set_wal_replication_manager(replication_manager.clone());
 
-            // v2.3.0 Phase 2: Wire up Metadata WAL replication if Phase 2 is enabled
-            if let Some(ref wal) = metadata_wal {
-                info!("Phase 2: Creating MetadataWalReplicator with WalReplicationManager");
+            // WAL-ONLY: Wire up Metadata WAL replication (always enabled)
+            {
+                info!("Creating MetadataWalReplicator with WalReplicationManager");
                 let _metadata_replicator = Arc::new(
                     crate::metadata_wal_replication::MetadataWalReplicator::new(
-                        wal.clone(),
+                        metadata_wal.clone(),
                         replication_manager.clone(),
                     )
                 );
@@ -797,9 +776,9 @@ impl IntegratedKafkaServer {
         let cluster_config_clone = config.cluster_config.clone();
         let node_id = config.node_id;
 
-        // v2.5.0 Phase 6 FIX: Extract WAL receiver address BEFORE moving config
+        // v2.2.7 Phase 6 FIX: Extract WAL receiver address BEFORE moving config
         let wal_receiver_addr = if let Some(ref cluster_cfg) = config.cluster_config {
-            // Priority 1: Use cluster config bind.wal address (v2.5.0+)
+            // Priority 1: Use cluster config bind.wal address (v2.2.7+)
             cluster_cfg.bind.as_ref().map(|b| b.wal.clone())
         } else {
             // Priority 2: Fall back to env var (backward compatibility)
@@ -880,12 +859,12 @@ impl IntegratedKafkaServer {
         }
 
         // v2.2.0: Start WAL receiver if enabled (follower mode)
-        // v2.5.0 Phase 6 FIX: WAL receiver address already extracted before config move
+        // v2.2.7 Phase 6 FIX: WAL receiver address already extracted before config move
         if let Some(receiver_addr) = wal_receiver_addr {
             if !receiver_addr.is_empty() {
                 info!("WAL receiver enabled on {}", receiver_addr);
 
-                // v2.5.0 Phase 4: Pass IsrAckTracker to WalReceiver so it can send ACKs back to leader
+                // v2.2.7 Phase 4: Pass IsrAckTracker to WalReceiver so it can send ACKs back to leader
                 let mut wal_receiver = crate::wal_replication::WalReceiver::new_with_isr_tracker(
                     receiver_addr.clone(),
                     wal_manager.clone(),
@@ -900,7 +879,7 @@ impl IntegratedKafkaServer {
                     info!("WAL receiver: Event-driven elections enabled");
                 }
 
-                // v2.3.0 Phase 2.3: Wire up RaftCluster for metadata WAL replication
+                // v2.2.7 Phase 2.3: Wire up RaftCluster for metadata WAL replication
                 if raft_cluster.is_some() {
                     wal_receiver.set_raft_cluster(raft_cluster_for_metadata.clone());
                     info!("✅ Phase 2.3: WalReceiver configured for metadata replication");
@@ -1115,51 +1094,83 @@ impl IntegratedKafkaServer {
                     let (socket_reader, mut socket_writer) = socket.into_split();
 
                     // Elastic response channel capacity for burst traffic handling
-                    // 10x semaphore limit provides buffer for burst traffic when handlers complete simultaneously
-                    // With 1000 concurrent handlers + 100ms WAL batch window (ultra profile),
-                    // handlers complete together and need elastic response buffering
+                    // PERF FIX: Increased from 10K to 1M to handle high-throughput benchmarks
+                    // With 128 concurrent producers sending continuously, 10K was too small
                     // Channel now carries (sequence_number, correlation_id, response_data)
-                    let (response_tx, mut response_rx) = tokio::sync::mpsc::channel::<(u64, i32, Vec<u8>)>(10_000);
+                    // CRITICAL: Small buffer (1000) provides back-pressure when TCP buffer fills
+                    // This prevents unbounded memory growth and ensures flow control
+                    let (response_tx, mut response_rx) = tokio::sync::mpsc::channel::<(u64, i32, Vec<u8>)>(1_000);
 
                     // Spawn response writer task with ordering guarantee
                     // CRITICAL: Responses MUST be sent in request order (Kafka protocol requirement)
+                    // v2.2.7 MILESTONE 1: NON-BLOCKING I/O - eliminates TCP backpressure deadlock
+                    // See docs/HIGH_THROUGHPUT_ARCHITECTURE.md for design details
                     tokio::spawn(async move {
-                        use std::collections::BTreeMap;
+                        use std::collections::{BTreeMap, VecDeque};
+                        use tokio::io::AsyncWriteExt;
+                        use std::io::ErrorKind;
 
                         // Buffer for out-of-order responses
                         let mut pending_responses: BTreeMap<u64, (i32, Vec<u8>)> = BTreeMap::new();
                         let mut next_sequence: u64 = 0;
 
-                        while let Some((sequence, correlation_id, response_data)) = response_rx.recv().await {
-                            // Add response to buffer
-                            pending_responses.insert(sequence, (correlation_id, response_data.clone()));
+                        // Write queue: responses ready to send (in order)
+                        let mut write_queue: VecDeque<Vec<u8>> = VecDeque::with_capacity(1000);
+                        let mut current_write: Option<(Vec<u8>, usize)> = None; // (buffer, offset for partial writes)
 
-                            tracing::info!(
-                                "[RESPONSE PIPELINE] Step 3: Response writer received response, sequence={}, correlation_id={}, size={} bytes, pending_count={}",
-                                sequence, correlation_id, response_data.len(), pending_responses.len()
-                            );
+                        loop {
+                            tokio::select! {
+                                // Receive new responses from request handlers
+                                Some((sequence, _correlation_id, response_data)) = response_rx.recv() => {
+                                    pending_responses.insert(sequence, (_correlation_id, response_data));
 
-                            // Send all consecutive responses starting from next_sequence
-                            while let Some((corr_id, resp_data)) = pending_responses.remove(&next_sequence) {
-                                tracing::info!(
-                                    "[RESPONSE PIPELINE] Step 4: Writing response to socket, sequence={}, correlation_id={}, size={} bytes",
-                                    next_sequence, corr_id, resp_data.len()
-                                );
-
-                                // Write response to socket
-                                if let Err(e) = socket_writer.write_all(&resp_data).await {
-                                    error!("Failed to write response for sequence={}, correlation_id={}: {}",
-                                           next_sequence, corr_id, e);
-                                    return;
-                                }
-                                if let Err(e) = socket_writer.flush().await {
-                                    error!("Failed to flush response for sequence={}, correlation_id={}: {}",
-                                           next_sequence, corr_id, e);
-                                    return;
+                                    // Move consecutive responses to write queue
+                                    while let Some((_corr_id, resp_data)) = pending_responses.remove(&next_sequence) {
+                                        write_queue.push_back(resp_data);
+                                        next_sequence += 1;
+                                    }
                                 }
 
-                                tracing::info!("[RESPONSE PIPELINE] Step 5: Response sent and flushed successfully, sequence={}, correlation_id={}", next_sequence, corr_id);
-                                next_sequence += 1;
+                                // Try to write when socket is ready (NON-BLOCKING - no deadlock!)
+                                Ok(()) = socket_writer.writable(), if current_write.is_some() || !write_queue.is_empty() => {
+                                    // Get buffer to write (either partial write or next from queue)
+                                    let (buffer, offset) = if let Some((buf, off)) = current_write.take() {
+                                        (buf, off)
+                                    } else if let Some(buf) = write_queue.pop_front() {
+                                        (buf, 0)
+                                    } else {
+                                        continue;
+                                    };
+
+                                    // Non-blocking write (may write partial data)
+                                    match socket_writer.try_write(&buffer[offset..]) {
+                                        Ok(n) => {
+                                            let new_offset = offset + n;
+                                            if new_offset < buffer.len() {
+                                                // Partial write - save state for next iteration
+                                                current_write = Some((buffer, new_offset));
+                                            }
+                                            // else: complete write, buffer dropped
+                                        }
+                                        Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
+                                            // Socket not ready yet, save state and wait
+                                            current_write = Some((buffer, offset));
+                                        }
+                                        Err(e) => {
+                                            error!("Socket write error: {}", e);
+                                            return;
+                                        }
+                                    }
+                                }
+
+                                // Channel closed and all writes complete
+                                else => {
+                                    if write_queue.is_empty() && current_write.is_none() {
+                                        // Flush any remaining buffered data
+                                        let _ = socket_writer.flush().await;
+                                        return;
+                                    }
+                                }
                             }
                         }
                     });
@@ -1290,7 +1301,7 @@ impl IntegratedKafkaServer {
                                     let mut header_bytes = Vec::new();
                                     header_bytes.extend_from_slice(&response.header.correlation_id.to_be_bytes());
 
-                                    // TODO(v2.5.0): CRITICAL BUG - OffsetCommit v8 flexible protocol issue
+                                    // TODO(v2.2.7): CRITICAL BUG - OffsetCommit v8 flexible protocol issue
                                     // Current: Only adds tagged fields for non-ApiVersions flexible responses
                                     // Bug: Consumers get "Protocol read buffer underflow" for OffsetCommit v8
                                     // Need to research correct format from KIP-482 and working APIs
@@ -1370,12 +1381,22 @@ impl IntegratedKafkaServer {
 
                                     match recovery {
                                         ErrorRecovery::ReturnError(error_code) => {
-                                            // Build proper error response with preserved correlation ID
+                                            // Parse API key and version from request_data for proper error response
+                                            let (api_key, api_version) = if request_data.len() >= 4 {
+                                                (
+                                                    i16::from_be_bytes([request_data[0], request_data[1]]),
+                                                    i16::from_be_bytes([request_data[2], request_data[3]])
+                                                )
+                                            } else {
+                                                (0, 0) // Fallback for malformed requests
+                                            };
+
+                                            // Build proper error response with preserved correlation ID and API info
                                             let error_response = error_handler_clone.build_error_response(
                                                 error_code,
                                                 correlation_id,
-                                                0, // Unknown API key
-                                                0, // Unknown API version
+                                                api_key,
+                                                api_version,
                                             );
 
                                             // Measure channel send delay for error responses too

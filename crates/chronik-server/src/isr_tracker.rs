@@ -1,4 +1,4 @@
-//! ISR (In-Sync Replica) Tracker (v2.5.0 Phase 3)
+//! ISR (In-Sync Replica) Tracker (v2.2.7 Phase 3)
 //!
 //! Tracks follower lag per partition to determine which replicas are in-sync.
 //! A replica is considered in-sync if:

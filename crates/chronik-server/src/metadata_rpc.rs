@@ -1,6 +1,6 @@
 //! RPC protocol for metadata forwarding between Raft nodes
 //!
-//! v2.3.0 Phase 1: Leader-Forwarding Pattern
+//! v2.2.7 Phase 1: Leader-Forwarding Pattern
 //!
 //! This module defines the RPC types used for followers to forward
 //! metadata queries and writes to the Raft leader. This prevents
@@ -96,6 +96,55 @@ pub enum MetadataWriteCommand {
         topic: String,
         partition: i32,
         offset: i64,
+    },
+
+    /// Create a consumer group
+    CreateConsumerGroup {
+        group_id: String,
+        protocol_type: String,
+        protocol: String,
+    },
+
+    /// Delete a topic
+    DeleteTopic {
+        name: String,
+    },
+
+    /// Commit consumer offset
+    CommitOffset {
+        group_id: String,
+        topic: String,
+        partition: i32,
+        offset: i64,
+    },
+
+    /// Assign partition
+    AssignPartition {
+        topic: String,
+        partition: i32,
+        replicas: Vec<u64>,
+    },
+
+    /// Update broker status
+    UpdateBrokerStatus {
+        broker_id: i32,
+        status: String, // "Online" or "Offline"
+    },
+
+    /// Update consumer group
+    UpdateConsumerGroup {
+        group_id: String,
+        state: String,
+        generation_id: i32,
+        leader: Option<String>,
+    },
+
+    /// Update partition offset
+    UpdatePartitionOffset {
+        topic: String,
+        partition: u32,
+        high_watermark: i64,
+        log_start_offset: i64,
     },
 }
 

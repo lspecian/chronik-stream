@@ -61,4 +61,7 @@ pub enum WalError {
 
     #[error("Commit failed: {0}")]
     CommitFailed(String),
+
+    #[error("Unsupported feature: {0}")]
+    Unsupported(String),
 }

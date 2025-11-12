@@ -9,11 +9,12 @@
 //! - **Seamless scaling**: Same interface for 1-N nodes
 //! - **Single source of truth**: Raft state machine
 //!
-//! v2.2.9 Performance Fix: Event-driven notifications for topic creation
+//! v2.2.7 Performance Fix: Event-driven notifications for topic creation
 //! Replaces polling-based retry loop (50ms intervals) with instant wake-up
 //! when Raft entries are applied. Provides 10-40x faster topic creation.
 
 use std::sync::Arc;
+use std::time::Duration;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use tokio::sync::Notify;
@@ -34,88 +35,46 @@ use crate::metadata_wal_replication::MetadataWalReplicator;
 /// - Single-node: Zero overhead (synchronous apply)
 /// - Multi-node: Full Raft consensus (replicated)
 ///
-/// v2.2.9: Event-driven notifications for fast topic creation
-/// v2.3.0 Phase 2: WAL-based metadata writes (bypasses Raft consensus for 4-5x throughput)
+/// v2.2.7: Event-driven notifications for fast topic creation
+/// Future: WAL-based metadata writes (bypasses Raft consensus for 4-5x throughput)
 pub struct RaftMetadataStore {
     raft: Arc<RaftCluster>,
-    /// Pending topic creation notifications (v2.2.9 performance fix)
+    /// Pending topic creation notifications (v2.2.7 performance fix)
     /// Maps topic name → notification channel
     /// When Raft applies CreateTopic command, notifies all waiting threads
     pending_topics: Arc<DashMap<String, Arc<Notify>>>,
-    /// Pending broker registration notifications (v2.2.9 performance fix)
+    /// Pending broker registration notifications (v2.2.7 performance fix)
     pending_brokers: Arc<DashMap<i32, Arc<Notify>>>,
 
-    /// Phase 2: Metadata WAL for fast local writes (1-2ms vs 10-50ms Raft)
-    /// Only used on leader nodes. Followers continue to forward writes to leader.
-    metadata_wal: Option<Arc<MetadataWal>>,
+    /// Metadata WAL for fast local writes (1-2ms vs 10-50ms Raft)
+    /// MANDATORY for all deployments - no Raft fallback
+    metadata_wal: Arc<MetadataWal>,
 
-    /// Phase 2: Metadata WAL replicator (async fire-and-forget to followers)
+    /// Metadata WAL replicator (async fire-and-forget to followers)
     /// Reuses existing WalReplicationManager - no new ports or protocols!
-    metadata_wal_replicator: Option<Arc<MetadataWalReplicator>>,
+    metadata_wal_replicator: Arc<MetadataWalReplicator>,
 
-    /// Phase 3: Leader lease manager for fast follower reads
+    /// Leader lease manager for fast follower reads
     /// Followers track leader heartbeats to determine if they can safely read
     /// from local replicated state without forwarding to leader
-    lease_manager: Option<Arc<crate::leader_lease::LeaseManager>>,
+    lease_manager: Arc<crate::leader_lease::LeaseManager>,
 }
 
 impl RaftMetadataStore {
-    /// Create a new RaftMetadataStore (v2.2.9 event-driven notifications)
+    /// Create a new RaftMetadataStore with WAL-ONLY metadata operations
     ///
     /// # Arguments
-    /// - `raft`: The RaftCluster that provides metadata state machine
-    ///
-    /// The notification maps are shared with RaftCluster so that when Raft
-    /// applies entries, it can fire notifications to wake up waiting threads.
-    ///
-    /// Phase 2: This constructor creates a store WITHOUT metadata WAL.
-    /// Use `new_with_wal()` for Phase 2 WAL-based writes.
-    pub fn new(raft: Arc<RaftCluster>) -> Self {
-        Self {
-            pending_topics: raft.get_pending_topics_notifications(),
-            pending_brokers: raft.get_pending_brokers_notifications(),
-            raft,
-            metadata_wal: None,
-            metadata_wal_replicator: None,
-            lease_manager: None,
-        }
-    }
-
-    /// Create a new RaftMetadataStore with metadata WAL (Phase 2)
-    ///
-    /// # Arguments
-    /// - `raft`: The RaftCluster that provides metadata state machine
-    /// - `metadata_wal`: Metadata WAL for fast local writes
+    /// - `raft`: The RaftCluster (used ONLY for cluster coordination, NOT metadata)
+    /// - `metadata_wal`: Metadata WAL for fast local writes (1-2ms)
     /// - `replicator`: Metadata WAL replicator for async replication to followers
+    /// - `lease_manager`: Leader lease manager for fast follower reads
     ///
-    /// Phase 2: This enables fast local WAL writes (1-2ms) instead of Raft consensus (10-50ms).
-    /// Expected improvement: 4-5x throughput (1,600 → 6,000-8,000 msg/s).
-    pub fn new_with_wal(
-        raft: Arc<RaftCluster>,
-        metadata_wal: Arc<MetadataWal>,
-        replicator: Arc<MetadataWalReplicator>,
-    ) -> Self {
-        Self {
-            pending_topics: raft.get_pending_topics_notifications(),
-            pending_brokers: raft.get_pending_brokers_notifications(),
-            raft,
-            metadata_wal: Some(metadata_wal),
-            metadata_wal_replicator: Some(replicator),
-            lease_manager: None,
-        }
-    }
-
-    /// Create a new RaftMetadataStore with Phase 2 + Phase 3 enabled
+    /// **WAL-ONLY Architecture**: Raft is used ONLY for cluster coordination
+    /// (membership changes, leader election). ALL metadata operations go through
+    /// the WAL fast path - NO Raft propose() for metadata.
     ///
-    /// # Arguments
-    /// - `raft`: The RaftCluster that provides metadata state machine
-    /// - `metadata_wal`: Metadata WAL for fast local writes (Phase 2)
-    /// - `replicator`: Metadata WAL replicator for async replication (Phase 2)
-    /// - `lease_manager`: Lease manager for fast follower reads (Phase 3)
-    ///
-    /// Phase 3: This enables fast follower reads (1-2ms) by checking lease validity.
-    /// If lease is valid, read from local state. If expired, forward to leader.
-    pub fn new_with_wal_and_lease(
+    /// Expected performance: 10,000+ msg/s (6-10x over Raft-based approaches)
+    pub fn new(
         raft: Arc<RaftCluster>,
         metadata_wal: Arc<MetadataWal>,
         replicator: Arc<MetadataWalReplicator>,
@@ -125,9 +84,9 @@ impl RaftMetadataStore {
             pending_topics: raft.get_pending_topics_notifications(),
             pending_brokers: raft.get_pending_brokers_notifications(),
             raft,
-            metadata_wal: Some(metadata_wal),
-            metadata_wal_replicator: Some(replicator),
-            lease_manager: Some(lease_manager),
+            metadata_wal,
+            metadata_wal_replicator: replicator,
+            lease_manager,
         }
     }
 
@@ -136,7 +95,7 @@ impl RaftMetadataStore {
         self.raft.get_state_machine()
     }
 
-    /// Notify waiting threads that a topic was created (v2.2.9 performance fix)
+    /// Notify waiting threads that a topic was created (v2.2.7 performance fix)
     ///
     /// Called by RaftCluster when it applies a CreateTopic command to state machine.
     /// Wakes up all threads waiting for this topic to be created.
@@ -147,7 +106,7 @@ impl RaftMetadataStore {
         }
     }
 
-    /// Notify waiting threads that a broker was registered (v2.2.9 performance fix)
+    /// Notify waiting threads that a broker was registered (v2.2.7 performance fix)
     pub fn notify_broker_registered(&self, broker_id: i32) {
         if let Some((_, notify)) = self.pending_brokers.remove(&broker_id) {
             notify.notify_waiters();
@@ -161,107 +120,78 @@ impl MetadataStore for RaftMetadataStore {
     // ========== Topic operations ==========
 
     async fn create_topic(&self, name: &str, config: TopicConfig) -> Result<TopicMetadata> {
-        // Phase 2: Check if we have metadata WAL enabled (leader fast path)
-        if let (Some(metadata_wal), Some(replicator)) = (&self.metadata_wal, &self.metadata_wal_replicator) {
-            // PHASE 2 FAST PATH: WAL-based metadata write (1-2ms vs 10-50ms Raft)
+        // WAL-ONLY: All metadata operations go through WAL (no Raft fallback)
 
-            // Check if we're the leader
-            if self.raft.am_i_leader() {
-                tracing::info!("Phase 2: Leader creating topic '{}' via metadata WAL (fast path)", name);
+        // LEADER PATH: Write to WAL and replicate
+        if self.raft.am_i_leader().await {
+            tracing::info!("Leader creating topic '{}' via metadata WAL", name);
 
-                // Create metadata command
-                let cmd = MetadataCommand::CreateTopic {
-                    name: name.to_string(),
-                    partition_count: config.partition_count,
-                    replication_factor: config.replication_factor,
-                    config: config.config.clone(),
-                };
+            let cmd = MetadataCommand::CreateTopic {
+                name: name.to_string(),
+                partition_count: config.partition_count,
+                replication_factor: config.replication_factor,
+                config: config.config.clone(),
+            };
 
-                // 1. Write to metadata WAL (durable, 1-2ms)
-                let offset = metadata_wal.append(&cmd).await
-                    .map_err(|e| MetadataError::StorageError(format!("Metadata WAL write failed: {}", e)))?;
+            // 1. Write to metadata WAL (durable, 1-2ms)
+            let offset = self.metadata_wal.append(&cmd).await
+                .map_err(|e| MetadataError::StorageError(format!("Metadata WAL write failed: {}", e)))?;
 
-                tracing::info!(
-                    "Wrote CreateTopic('{}') to metadata WAL at offset {} (fast!)",
-                    name,
-                    offset
-                );
+            tracing::debug!("Wrote CreateTopic('{}') to WAL at offset {}", name, offset);
 
-                // 2. Apply to local state machine immediately
-                self.raft.apply_metadata_command_direct(cmd.clone())
-                    .map_err(|e| MetadataError::StorageError(format!("Failed to apply command: {}", e)))?;
+            // 2. Apply to local state machine immediately
+            self.raft.apply_metadata_command_direct(cmd.clone())
+                .map_err(|e| MetadataError::StorageError(format!("Failed to apply command: {}", e)))?;
 
-                tracing::info!("Applied CreateTopic('{}') to state machine", name);
-
-                // 3. Fire notification for any waiting threads
-                if let Some((_, notify)) = self.pending_topics.remove(name) {
-                    notify.notify_waiters();
-                    tracing::debug!("Notified waiting threads for topic '{}'", name);
-                }
-
-                // 4. Async replicate to followers (fire-and-forget)
-                let replicator_clone = Arc::clone(replicator);
-                let cmd_clone = cmd.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = replicator_clone.replicate(&cmd_clone, offset).await {
-                        tracing::warn!("Metadata replication failed for CreateTopic: {}", e);
-                        // Don't fail the write - replication is eventual consistency
-                    }
-                });
-
-                // 5. Return immediately (no waiting for followers!)
-                let state = self.state();
-                return state.topics.get(name).cloned()
-                    .ok_or_else(|| MetadataError::NotFound(format!(
-                        "Topic {} not found after creation",
-                        name
-                    )));
+            // 3. Fire notification
+            if let Some((_, notify)) = self.pending_topics.remove(name) {
+                notify.notify_waiters();
             }
+
+            // 4. Async replicate to followers (fire-and-forget)
+            let replicator = self.metadata_wal_replicator.clone();
+            let cmd_clone = cmd.clone();
+            tokio::spawn(async move {
+                if let Err(e) = replicator.replicate(&cmd_clone, offset).await {
+                    tracing::warn!("Metadata replication failed: {}", e);
+                }
+            });
+
+            // 5. Return immediately
+            let state = self.state();
+            return state.topics.get(name).cloned()
+                .ok_or_else(|| MetadataError::NotFound(format!(
+                    "Topic {} not found after creation",
+                    name
+                )));
         }
 
-        // FALLBACK PATH: Use Raft consensus (Phase 1 behavior)
-        // This path is used by:
-        // 1. Followers (always forward to leader via Phase 1 RPC)
-        // 2. Leaders without metadata WAL (backward compatibility)
-        // 3. Single-node deployments without WAL
+        // FOLLOWER PATH: Wait for WAL replication from leader
+        tracing::debug!("Follower waiting for topic '{}' to be replicated", name);
 
-        tracing::debug!("Phase 1 fallback: Creating topic '{}' via Raft consensus", name);
-
-        // Register notification channel BEFORE proposing to Raft
+        // Register notification channel
         let notify = Arc::new(Notify::new());
         self.pending_topics.insert(name.to_string(), Arc::clone(&notify));
 
-        // Propose to Raft (handles single-node vs multi-node internally)
-        self.raft.propose(MetadataCommand::CreateTopic {
-            name: name.to_string(),
-            partition_count: config.partition_count,
-            replication_factor: config.replication_factor,
-            config: config.config.clone(),
-        }).await.map_err(|e| MetadataError::StorageError(e.to_string()))?;
-
         // Wait for notification with timeout
-        let timeout_duration = tokio::time::Duration::from_millis(2000);
+        let timeout_duration = tokio::time::Duration::from_millis(5000);
 
         match tokio::time::timeout(timeout_duration, notify.notified()).await {
             Ok(_) => {
                 let state = self.state();
                 state.topics.get(name).cloned()
                     .ok_or_else(|| MetadataError::NotFound(format!(
-                        "Topic {} notified but not found in state machine",
+                        "Topic {} notified but not found",
                         name
                     )))
             }
             Err(_) => {
-                tracing::warn!(
-                    "Topic '{}' creation timed out after {}ms",
-                    name,
-                    timeout_duration.as_millis()
-                );
+                tracing::warn!("Topic '{}' creation timed out after {}ms", name, timeout_duration.as_millis());
 
                 let state = self.state();
                 state.topics.get(name).cloned()
                     .ok_or_else(|| MetadataError::NotFound(format!(
-                        "Topic {} not found after creation (timeout)",
+                        "Topic {} not found after timeout",
                         name
                     )))
             }
@@ -269,68 +199,58 @@ impl MetadataStore for RaftMetadataStore {
     }
 
     async fn get_topic(&self, name: &str) -> Result<Option<TopicMetadata>> {
-        // Phase 3: Check if we can read from local state using lease
-        if !self.raft.am_i_leader() {
-            // We're a follower - check if we have a valid lease
-            if let Some(lease_manager) = &self.lease_manager {
-                if lease_manager.has_valid_lease().await {
-                    // Fast path: Read from local replicated state (1-2ms)
-                    tracing::trace!("Phase 3: Fast follower read for get_topic('{}')", name);
-                    let state = self.state();
-                    return Ok(state.topics.get(name).cloned());
-                } else {
-                    tracing::trace!("Phase 3: Lease expired, forwarding get_topic('{}') to leader", name);
-                }
-            }
-
-            // Phase 1.2: No valid lease - forward to leader (safe fallback)
-            tracing::debug!("Forwarding get_topic('{}') to leader", name);
-            let query = crate::metadata_rpc::MetadataQuery::GetTopic {
-                name: name.to_string(),
-            };
-            let response = self.raft.query_leader(query).await
-                .map_err(|e| MetadataError::StorageError(e.to_string()))?;
-
-            match response {
-                crate::metadata_rpc::MetadataQueryResponse::Topic(topic) => Ok(topic),
-                _ => Err(MetadataError::StorageError("Unexpected response type".to_string())),
-            }
-        } else {
-            // We're the leader, read from local state
+        // LEADER: Always read from local state
+        if self.raft.am_i_leader().await {
             let state = self.state();
-            Ok(state.topics.get(name).cloned())
+            return Ok(state.topics.get(name).cloned());
+        }
+
+        // FOLLOWER: Check lease before reading
+        if self.lease_manager.has_valid_lease().await {
+            // Fast path: Read from local replicated state (1-2ms)
+            tracing::trace!("Fast follower read for get_topic('{}') with valid lease", name);
+            let state = self.state();
+            return Ok(state.topics.get(name).cloned());
+        }
+
+        // No valid lease - forward to leader for safety
+        tracing::debug!("Lease expired, forwarding get_topic('{}') to leader", name);
+        let query = crate::metadata_rpc::MetadataQuery::GetTopic {
+            name: name.to_string(),
+        };
+        let response = self.raft.query_leader(query).await
+            .map_err(|e| MetadataError::StorageError(e.to_string()))?;
+
+        match response {
+            crate::metadata_rpc::MetadataQueryResponse::Topic(topic) => Ok(topic),
+            _ => Err(MetadataError::StorageError("Unexpected response type".to_string())),
         }
     }
 
     async fn list_topics(&self) -> Result<Vec<TopicMetadata>> {
-        // Phase 3: Check if we can read from local state using lease
-        if !self.raft.am_i_leader() {
-            // We're a follower - check if we have a valid lease
-            if let Some(lease_manager) = &self.lease_manager {
-                if lease_manager.has_valid_lease().await {
-                    // Fast path: Read from local replicated state (1-2ms)
-                    tracing::trace!("Phase 3: Fast follower read for list_topics()");
-                    let state = self.state();
-                    return Ok(state.topics.values().cloned().collect());
-                } else {
-                    tracing::trace!("Phase 3: Lease expired, forwarding list_topics() to leader");
-                }
-            }
-
-            // Phase 1.2: No valid lease - forward to leader (safe fallback)
-            tracing::debug!("Forwarding list_topics() to leader");
-            let query = crate::metadata_rpc::MetadataQuery::ListTopics;
-            let response = self.raft.query_leader(query).await
-                .map_err(|e| MetadataError::StorageError(e.to_string()))?;
-
-            match response {
-                crate::metadata_rpc::MetadataQueryResponse::TopicList(topics) => Ok(topics),
-                _ => Err(MetadataError::StorageError("Unexpected response type".to_string())),
-            }
-        } else {
-            // We're the leader, read from local state
+        // LEADER: Always read from local state
+        if self.raft.am_i_leader().await {
             let state = self.state();
-            Ok(state.topics.values().cloned().collect())
+            return Ok(state.topics.values().cloned().collect());
+        }
+
+        // FOLLOWER: Check lease before reading
+        if self.lease_manager.has_valid_lease().await {
+            // Fast path: Read from local replicated state (1-2ms)
+            tracing::trace!("Fast follower read for list_topics() with valid lease");
+            let state = self.state();
+            return Ok(state.topics.values().cloned().collect());
+        }
+
+        // No valid lease - forward to leader for safety
+        tracing::debug!("Lease expired, forwarding list_topics() to leader");
+        let query = crate::metadata_rpc::MetadataQuery::ListTopics;
+        let response = self.raft.query_leader(query).await
+            .map_err(|e| MetadataError::StorageError(e.to_string()))?;
+
+        match response {
+            crate::metadata_rpc::MetadataQueryResponse::TopicList(topics) => Ok(topics),
+            _ => Err(MetadataError::StorageError("Unexpected response type".to_string())),
         }
     }
 
@@ -343,11 +263,59 @@ impl MetadataStore for RaftMetadataStore {
     }
 
     async fn delete_topic(&self, name: &str) -> Result<()> {
-        self.raft.propose(MetadataCommand::DeleteTopic {
-            name: name.to_string(),
-        }).await.map_err(|e| MetadataError::StorageError(e.to_string()))?;
+        // WAL-ONLY: All metadata operations go through WAL (no Raft fallback)
 
-        Ok(())
+        // LEADER PATH: Write to WAL and replicate
+        if self.raft.am_i_leader().await {
+            tracing::info!("Leader deleting topic '{}' via metadata WAL", name);
+
+            let cmd = MetadataCommand::DeleteTopic {
+                name: name.to_string(),
+            };
+
+            // 1. Write to metadata WAL (durable, 1-2ms)
+            let offset = self.metadata_wal.append(&cmd).await
+                .map_err(|e| MetadataError::StorageError(format!("Metadata WAL write failed: {}", e)))?;
+
+            // 2. Apply to local state machine immediately
+            self.raft.apply_metadata_command_direct(cmd.clone())
+                .map_err(|e| MetadataError::StorageError(format!("Failed to apply command: {}", e)))?;
+
+            // 3. Async replicate to followers (fire-and-forget)
+            let replicator = self.metadata_wal_replicator.clone();
+            let cmd_clone = cmd.clone();
+            tokio::spawn(async move {
+                if let Err(e) = replicator.replicate(&cmd_clone, offset).await {
+                    tracing::warn!("Metadata replication failed: {}", e);
+                }
+            });
+
+            return Ok(());
+        }
+
+        // FOLLOWER PATH: Wait for WAL replication from leader
+        tracing::debug!("Follower waiting for topic '{}' deletion to be replicated", name);
+
+        // Wait for deletion with timeout (5 seconds)
+        let start = tokio::time::Instant::now();
+        while start.elapsed() < Duration::from_millis(5000) {
+            {
+                let state = self.state();
+                if !state.topics.contains_key(name) {
+                    tracing::debug!("✓ DeleteTopic replicated to follower");
+                    return Ok(());
+                }
+            } // Drop the RwLockReadGuard before await
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // Timeout - check state anyway
+        let state = self.state();
+        if !state.topics.contains_key(name) {
+            Ok(())
+        } else {
+            Err(MetadataError::StorageError("Timeout waiting for topic deletion".to_string()))
+        }
     }
 
     // ========== Segment operations (local, not in Raft) ==========
@@ -372,15 +340,70 @@ impl MetadataStore for RaftMetadataStore {
     // ========== Consumer offset operations ==========
 
     async fn commit_offset(&self, offset: ConsumerOffset) -> Result<()> {
-        self.raft.propose(MetadataCommand::CommitOffset {
-            group_id: offset.group_id.clone(),
-            topic: offset.topic.clone(),
-            partition: offset.partition,
-            offset: offset.offset,
-            metadata: offset.metadata.clone(),
-        }).await.map_err(|e| MetadataError::StorageError(e.to_string()))?;
+        // WAL-ONLY: All metadata operations go through WAL (no Raft fallback)
 
-        Ok(())
+        // LEADER PATH: Write to WAL and replicate
+        if self.raft.am_i_leader().await {
+            tracing::debug!("Leader committing offset via metadata WAL: {}:{}@{}",
+                offset.group_id, offset.topic, offset.offset);
+
+            let cmd = MetadataCommand::CommitOffset {
+                group_id: offset.group_id.clone(),
+                topic: offset.topic.clone(),
+                partition: offset.partition,
+                offset: offset.offset,
+                metadata: offset.metadata.clone(),
+            };
+
+            // 1. Write to metadata WAL (durable, 1-2ms)
+            let wal_offset = self.metadata_wal.append(&cmd).await
+                .map_err(|e| MetadataError::StorageError(format!("Metadata WAL write failed: {}", e)))?;
+
+            // 2. Apply to local state machine immediately
+            self.raft.apply_metadata_command_direct(cmd.clone())
+                .map_err(|e| MetadataError::StorageError(format!("Failed to apply command: {}", e)))?;
+
+            // 3. Async replicate to followers (fire-and-forget)
+            let replicator = self.metadata_wal_replicator.clone();
+            let cmd_clone = cmd.clone();
+            tokio::spawn(async move {
+                if let Err(e) = replicator.replicate(&cmd_clone, wal_offset).await {
+                    tracing::warn!("Metadata replication failed: {}", e);
+                }
+            });
+
+            return Ok(());
+        }
+
+        // FOLLOWER PATH: Wait for WAL replication from leader
+        tracing::debug!("Follower waiting for offset commit to be replicated");
+
+        // Wait for replication with timeout (5 seconds)
+        let start = tokio::time::Instant::now();
+        while start.elapsed() < Duration::from_millis(5000) {
+            {
+                let state = self.state();
+                let key = (offset.group_id.clone(), offset.topic.clone(), offset.partition);
+                if let Some(&committed_offset) = state.consumer_offsets.get(&key) {
+                    if committed_offset == offset.offset {
+                        tracing::debug!("✓ CommitOffset replicated to follower");
+                        return Ok(());
+                    }
+                }
+            } // Drop the RwLockReadGuard before await
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // Timeout - check state anyway
+        let state = self.state();
+        let key = (offset.group_id.clone(), offset.topic.clone(), offset.partition);
+        if let Some(&committed_offset) = state.consumer_offsets.get(&key) {
+            if committed_offset == offset.offset {
+                return Ok(());
+            }
+        }
+
+        Err(MetadataError::StorageError("Timeout waiting for offset commit replication".to_string()))
     }
 
     async fn get_consumer_offset(&self, group_id: &str, topic: &str, partition: u32) -> Result<Option<ConsumerOffset>> {
@@ -405,81 +428,62 @@ impl MetadataStore for RaftMetadataStore {
     // ========== Broker operations ==========
 
     async fn register_broker(&self, metadata: BrokerMetadata) -> Result<()> {
-        // Phase 2: Check if we have metadata WAL enabled (leader fast path)
-        if let (Some(metadata_wal), Some(replicator)) = (&self.metadata_wal, &self.metadata_wal_replicator) {
-            // PHASE 2 FAST PATH: WAL-based metadata write (1-2ms vs 10-50ms Raft)
+        // WAL-ONLY: All metadata operations go through WAL (no Raft fallback)
 
-            if self.raft.am_i_leader() {
-                tracing::info!("Phase 2: Leader registering broker {} via metadata WAL (fast path)", metadata.broker_id);
+        // LEADER PATH: Write to WAL and replicate
+        if self.raft.am_i_leader().await {
+            tracing::info!("Leader registering broker {} via metadata WAL", metadata.broker_id);
 
-                // Create metadata command
-                let cmd = MetadataCommand::RegisterBroker {
-                    broker_id: metadata.broker_id,
-                    host: metadata.host.clone(),
-                    port: metadata.port,
-                    rack: metadata.rack.clone(),
-                };
+            let cmd = MetadataCommand::RegisterBroker {
+                broker_id: metadata.broker_id,
+                host: metadata.host.clone(),
+                port: metadata.port,
+                rack: metadata.rack.clone(),
+            };
 
-                // 1. Write to metadata WAL (durable, 1-2ms)
-                let offset = metadata_wal.append(&cmd).await
-                    .map_err(|e| MetadataError::StorageError(format!("Metadata WAL write failed: {}", e)))?;
+            // 1. Write to metadata WAL (durable, 1-2ms)
+            let offset = self.metadata_wal.append(&cmd).await
+                .map_err(|e| MetadataError::StorageError(format!("Metadata WAL write failed: {}", e)))?;
 
-                tracing::info!(
-                    "Wrote RegisterBroker({}) to metadata WAL at offset {} (fast!)",
-                    metadata.broker_id,
-                    offset
-                );
+            // 2. Apply to local state machine immediately
+            self.raft.apply_metadata_command_direct(cmd.clone())
+                .map_err(|e| MetadataError::StorageError(format!("Failed to apply command: {}", e)))?;
 
-                // 2. Apply to local state machine immediately
-                self.raft.apply_metadata_command_direct(cmd.clone())
-                    .map_err(|e| MetadataError::StorageError(format!("Failed to apply command: {}", e)))?;
+            // 3. Fire notification for any waiting threads
+            if let Some((_, notify)) = self.pending_brokers.remove(&metadata.broker_id) {
+                notify.notify_waiters();
+            }
 
-                tracing::info!("Applied RegisterBroker({}) to state machine", metadata.broker_id);
-
-                // 3. Fire notification for any waiting threads
-                if let Some((_, notify)) = self.pending_brokers.remove(&metadata.broker_id) {
-                    notify.notify_waiters();
-                    tracing::debug!("Notified waiting threads for broker {}", metadata.broker_id);
+            // 4. Async replicate to followers (fire-and-forget)
+            let replicator = self.metadata_wal_replicator.clone();
+            let cmd_clone = cmd.clone();
+            tokio::spawn(async move {
+                if let Err(e) = replicator.replicate(&cmd_clone, offset).await {
+                    tracing::warn!("Metadata replication failed: {}", e);
                 }
+            });
 
-                // 4. Async replicate to followers (fire-and-forget)
-                let replicator_clone = Arc::clone(replicator);
-                let cmd_clone = cmd.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = replicator_clone.replicate(&cmd_clone, offset).await {
-                        tracing::warn!("Metadata replication failed for RegisterBroker: {}", e);
-                    }
-                });
-
-                // 5. Return immediately
-                let state = self.state();
-                if state.brokers.get(&metadata.broker_id).is_some() {
-                    return Ok(());
-                } else {
-                    return Err(MetadataError::NotFound(format!(
-                        "Broker {} not found after registration",
-                        metadata.broker_id
-                    )));
-                }
+            // 5. Return immediately
+            let state = self.state();
+            if state.brokers.get(&metadata.broker_id).is_some() {
+                return Ok(());
+            } else {
+                return Err(MetadataError::NotFound(format!(
+                    "Broker {} not found after registration",
+                    metadata.broker_id
+                )));
             }
         }
 
-        // FALLBACK PATH: Use Raft consensus (Phase 1 behavior)
-        tracing::debug!("Phase 1 fallback: Registering broker {} via Raft consensus", metadata.broker_id);
+        // FOLLOWER PATH: Wait for WAL replication from leader
+        tracing::debug!("Follower waiting for broker {} registration to be replicated", metadata.broker_id);
 
+        // Register notification channel
         let notify = Arc::new(Notify::new());
         self.pending_brokers.insert(metadata.broker_id, Arc::clone(&notify));
 
-        self.raft.propose(MetadataCommand::RegisterBroker {
-            broker_id: metadata.broker_id,
-            host: metadata.host.clone(),
-            port: metadata.port,
-            rack: metadata.rack.clone(),
-        }).await.map_err(|e| MetadataError::StorageError(e.to_string()))?;
-
-        let timeout_duration = tokio::time::Duration::from_millis(2000);
-
-        match tokio::time::timeout(timeout_duration, notify.notified()).await {
+        // Wait for notification with timeout (5 seconds)
+        match tokio::time::timeout(Duration::from_millis(5000), notify.notified()).await {
             Ok(_) => {
                 let state = self.state();
                 if state.brokers.get(&metadata.broker_id).is_some() {
@@ -492,18 +496,13 @@ impl MetadataStore for RaftMetadataStore {
                 }
             }
             Err(_) => {
-                tracing::warn!(
-                    "Broker {} registration timed out after {}ms",
-                    metadata.broker_id,
-                    timeout_duration.as_millis()
-                );
-
+                // Timeout - check state anyway
                 let state = self.state();
                 if state.brokers.get(&metadata.broker_id).is_some() {
                     Ok(())
                 } else {
                     Err(MetadataError::NotFound(format!(
-                        "Broker {} not found after registration (timeout)",
+                        "Broker {} registration timeout",
                         metadata.broker_id
                     )))
                 }
@@ -512,22 +511,11 @@ impl MetadataStore for RaftMetadataStore {
     }
 
     async fn get_broker(&self, broker_id: i32) -> Result<Option<BrokerMetadata>> {
-        // Phase 1.2: Forward to leader if we're a follower
-        if !self.raft.am_i_leader() {
-            tracing::debug!("Forwarding get_broker({}) to leader", broker_id);
-            let query = crate::metadata_rpc::MetadataQuery::GetBroker { broker_id };
-            let response = self.raft.query_leader(query).await
-                .map_err(|e| MetadataError::StorageError(e.to_string()))?;
-
-            match response {
-                crate::metadata_rpc::MetadataQueryResponse::Broker(broker) => Ok(broker),
-                _ => Err(MetadataError::StorageError("Unexpected response type".to_string())),
-            }
-        } else {
-            // We're the leader, read from local state
+        // LEADER: Always read from local state
+        if self.raft.am_i_leader().await {
             let state = self.state();
             if let Some(broker_info) = state.brokers.get(&broker_id) {
-                Ok(Some(BrokerMetadata {
+                return Ok(Some(BrokerMetadata {
                     broker_id,
                     host: broker_info.host.clone(),
                     port: broker_info.port,
@@ -535,27 +523,47 @@ impl MetadataStore for RaftMetadataStore {
                     status: BrokerStatus::Online,
                     created_at: chrono::Utc::now(),
                     updated_at: chrono::Utc::now(),
-                }))
+                }));
             } else {
-                Ok(None)
+                return Ok(None);
             }
+        }
+
+        // FOLLOWER: Check lease before reading
+        if self.lease_manager.has_valid_lease().await {
+            // Fast path: Read from local replicated state (1-2ms)
+            tracing::trace!("Fast follower read for get_broker({}) with valid lease", broker_id);
+            let state = self.state();
+            if let Some(broker_info) = state.brokers.get(&broker_id) {
+                return Ok(Some(BrokerMetadata {
+                    broker_id,
+                    host: broker_info.host.clone(),
+                    port: broker_info.port,
+                    rack: broker_info.rack.clone(),
+                    status: BrokerStatus::Online,
+                    created_at: chrono::Utc::now(),
+                    updated_at: chrono::Utc::now(),
+                }));
+            } else {
+                return Ok(None);
+            }
+        }
+
+        // No valid lease - forward to leader for safety
+        tracing::debug!("Lease expired, forwarding get_broker({}) to leader", broker_id);
+        let query = crate::metadata_rpc::MetadataQuery::GetBroker { broker_id };
+        let response = self.raft.query_leader(query).await
+            .map_err(|e| MetadataError::StorageError(e.to_string()))?;
+
+        match response {
+            crate::metadata_rpc::MetadataQueryResponse::Broker(broker) => Ok(broker),
+            _ => Err(MetadataError::StorageError("Unexpected response type".to_string())),
         }
     }
 
     async fn list_brokers(&self) -> Result<Vec<BrokerMetadata>> {
-        // Phase 1.2: Forward to leader if we're a follower
-        if !self.raft.am_i_leader() {
-            tracing::debug!("Forwarding list_brokers() to leader");
-            let query = crate::metadata_rpc::MetadataQuery::ListBrokers;
-            let response = self.raft.query_leader(query).await
-                .map_err(|e| MetadataError::StorageError(e.to_string()))?;
-
-            match response {
-                crate::metadata_rpc::MetadataQueryResponse::BrokerList(brokers) => Ok(brokers),
-                _ => Err(MetadataError::StorageError("Unexpected response type".to_string())),
-            }
-        } else {
-            // We're the leader, read from local state
+        // LEADER: Always read from local state
+        if self.raft.am_i_leader().await {
             let state = self.state();
             let brokers = state.brokers.iter().map(|(&broker_id, broker_info)| {
                 BrokerMetadata {
@@ -568,22 +576,95 @@ impl MetadataStore for RaftMetadataStore {
                     updated_at: chrono::Utc::now(),
                 }
             }).collect();
+            return Ok(brokers);
+        }
 
-            Ok(brokers)
+        // FOLLOWER: Check lease before reading
+        if self.lease_manager.has_valid_lease().await {
+            // Fast path: Read from local replicated state (1-2ms)
+            tracing::trace!("Fast follower read for list_brokers() with valid lease");
+            let state = self.state();
+            let brokers = state.brokers.iter().map(|(&broker_id, broker_info)| {
+                BrokerMetadata {
+                    broker_id,
+                    host: broker_info.host.clone(),
+                    port: broker_info.port,
+                    rack: broker_info.rack.clone(),
+                    status: BrokerStatus::Online,
+                    created_at: chrono::Utc::now(),
+                    updated_at: chrono::Utc::now(),
+                }
+            }).collect();
+            return Ok(brokers);
+        }
+
+        // No valid lease - forward to leader for safety
+        tracing::debug!("Lease expired, forwarding list_brokers() to leader");
+        let query = crate::metadata_rpc::MetadataQuery::ListBrokers;
+        let response = self.raft.query_leader(query).await
+            .map_err(|e| MetadataError::StorageError(e.to_string()))?;
+
+        match response {
+            crate::metadata_rpc::MetadataQueryResponse::BrokerList(brokers) => Ok(brokers),
+            _ => Err(MetadataError::StorageError("Unexpected response type".to_string())),
         }
     }
 
     async fn update_broker_status(&self, broker_id: i32, status: BrokerStatus) -> Result<()> {
+        // WAL-ONLY: All metadata operations go through WAL (no Raft fallback)
+
         let status_str = match status {
             BrokerStatus::Online => "online",
             BrokerStatus::Offline => "offline",
             BrokerStatus::Maintenance => "maintenance",
         };
 
-        self.raft.propose(MetadataCommand::UpdateBrokerStatus {
-            broker_id,
-            status: status_str.to_string(),
-        }).await.map_err(|e| MetadataError::StorageError(e.to_string()))?;
+        // LEADER PATH: Write to WAL and replicate
+        if self.raft.am_i_leader().await {
+            tracing::debug!("Leader updating broker {} status to {} via metadata WAL", broker_id, status_str);
+
+            let cmd = MetadataCommand::UpdateBrokerStatus {
+                broker_id,
+                status: status_str.to_string(),
+            };
+
+            // 1. Write to metadata WAL (durable, 1-2ms)
+            let offset = self.metadata_wal.append(&cmd).await
+                .map_err(|e| MetadataError::StorageError(format!("Metadata WAL write failed: {}", e)))?;
+
+            // 2. Apply to local state machine immediately
+            self.raft.apply_metadata_command_direct(cmd.clone())
+                .map_err(|e| MetadataError::StorageError(format!("Failed to apply command: {}", e)))?;
+
+            // 3. Async replicate to followers (fire-and-forget)
+            let replicator = self.metadata_wal_replicator.clone();
+            let cmd_clone = cmd.clone();
+            tokio::spawn(async move {
+                if let Err(e) = replicator.replicate(&cmd_clone, offset).await {
+                    tracing::warn!("Metadata replication failed: {}", e);
+                }
+            });
+
+            return Ok(());
+        }
+
+        // FOLLOWER PATH: Wait for WAL replication from leader
+        tracing::debug!("Follower waiting for broker status update to be replicated");
+
+        // Wait for replication with timeout (5 seconds)
+        let start = tokio::time::Instant::now();
+        while start.elapsed() < Duration::from_millis(5000) {
+            {
+                let state = self.state();
+                if let Some(broker) = state.brokers.get(&broker_id) {
+                    if broker.status.to_lowercase() == status_str {
+                        tracing::debug!("✓ UpdateBrokerStatus replicated to follower");
+                        return Ok(());
+                    }
+                }
+            } // Drop the RwLockReadGuard before await
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
 
         Ok(())
     }
@@ -592,22 +673,83 @@ impl MetadataStore for RaftMetadataStore {
     // ========== Partition assignment operations ==========
 
     async fn assign_partition(&self, assignment: PartitionAssignment) -> Result<()> {
-        // For now, we use the existing AssignPartition command which uses node IDs
-        // Convert broker_id to node_id (they should be the same in our case)
+        // WAL-ONLY: All metadata operations go through WAL (no Raft fallback)
+
         let node_id = assignment.broker_id as u64;
 
-        self.raft.propose(MetadataCommand::AssignPartition {
-            topic: assignment.topic.clone(),
-            partition: assignment.partition as i32,
-            replicas: vec![node_id],
-        }).await.map_err(|e| MetadataError::StorageError(e.to_string()))?;
+        // LEADER PATH: Write to WAL and replicate
+        if self.raft.am_i_leader().await {
+            tracing::debug!("Leader assigning partition {}:{} to node {} via metadata WAL",
+                assignment.topic, assignment.partition, node_id);
 
-        if assignment.is_leader {
-            self.raft.propose(MetadataCommand::SetPartitionLeader {
+            // 1. Write AssignPartition to WAL
+            let cmd1 = MetadataCommand::AssignPartition {
                 topic: assignment.topic.clone(),
                 partition: assignment.partition as i32,
-                leader: node_id,
-            }).await.map_err(|e| MetadataError::StorageError(e.to_string()))?;
+                replicas: vec![node_id],
+            };
+            let offset1 = self.metadata_wal.append(&cmd1).await
+                .map_err(|e| MetadataError::StorageError(format!("Metadata WAL write failed: {}", e)))?;
+            self.raft.apply_metadata_command_direct(cmd1.clone())
+                .map_err(|e| MetadataError::StorageError(format!("Failed to apply command: {}", e)))?;
+
+            // 2. Replicate assignment
+            let replicator = self.metadata_wal_replicator.clone();
+            let cmd1_clone = cmd1.clone();
+            tokio::spawn(async move {
+                if let Err(e) = replicator.replicate(&cmd1_clone, offset1).await {
+                    tracing::warn!("Metadata replication failed: {}", e);
+                }
+            });
+
+            // 3. If leader, write SetPartitionLeader to WAL
+            if assignment.is_leader {
+                let cmd2 = MetadataCommand::SetPartitionLeader {
+                    topic: assignment.topic.clone(),
+                    partition: assignment.partition as i32,
+                    leader: node_id,
+                };
+                let offset2 = self.metadata_wal.append(&cmd2).await
+                    .map_err(|e| MetadataError::StorageError(format!("Metadata WAL write failed: {}", e)))?;
+                self.raft.apply_metadata_command_direct(cmd2.clone())
+                    .map_err(|e| MetadataError::StorageError(format!("Failed to apply command: {}", e)))?;
+
+                // 4. Replicate leader assignment
+                let replicator2 = self.metadata_wal_replicator.clone();
+                let cmd2_clone = cmd2.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = replicator2.replicate(&cmd2_clone, offset2).await {
+                        tracing::warn!("Metadata replication failed: {}", e);
+                    }
+                });
+            }
+
+            return Ok(());
+        }
+
+        // FOLLOWER PATH: Wait for WAL replication from leader
+        tracing::debug!("Follower waiting for partition assignment to be replicated");
+
+        // Wait for replication with timeout (5 seconds)
+        let start = tokio::time::Instant::now();
+        while start.elapsed() < Duration::from_millis(5000) {
+            {
+                let state = self.state();
+                let key = (assignment.topic.clone(), assignment.partition as i32);
+                if state.partition_assignments.contains_key(&key) {
+                    // If waiting for leader assignment, check that too
+                    if assignment.is_leader {
+                        if let Some(&leader_node) = state.partition_leaders.get(&key) {
+                            if leader_node as u64 == node_id {
+                                return Ok(());
+                            }
+                        }
+                    } else {
+                        return Ok(());
+                    }
+                }
+            } // Drop the RwLockReadGuard before await
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
         Ok(())
@@ -630,12 +772,56 @@ impl MetadataStore for RaftMetadataStore {
     }
 
     async fn update_consumer_group(&self, metadata: ConsumerGroupMetadata) -> Result<()> {
-        self.raft.propose(MetadataCommand::UpdateConsumerGroup {
-            group_id: metadata.group_id.clone(),
-            state: metadata.state.clone(),
-            generation_id: metadata.generation_id,
-            leader: metadata.leader.clone(),
-        }).await.map_err(|e| MetadataError::StorageError(e.to_string()))?;
+        // WAL-ONLY: All metadata operations go through WAL (no Raft fallback)
+
+        // LEADER PATH: Write to WAL and replicate
+        if self.raft.am_i_leader().await {
+            tracing::debug!("Leader updating consumer group '{}' via metadata WAL", metadata.group_id);
+
+            let cmd = MetadataCommand::UpdateConsumerGroup {
+                group_id: metadata.group_id.clone(),
+                state: metadata.state.clone(),
+                generation_id: metadata.generation_id,
+                leader: metadata.leader.clone(),
+            };
+
+            // 1. Write to metadata WAL (durable, 1-2ms)
+            let offset = self.metadata_wal.append(&cmd).await
+                .map_err(|e| MetadataError::StorageError(format!("Metadata WAL write failed: {}", e)))?;
+
+            // 2. Apply to local state machine immediately
+            self.raft.apply_metadata_command_direct(cmd.clone())
+                .map_err(|e| MetadataError::StorageError(format!("Failed to apply command: {}", e)))?;
+
+            // 3. Async replicate to followers (fire-and-forget)
+            let replicator = self.metadata_wal_replicator.clone();
+            let cmd_clone = cmd.clone();
+            tokio::spawn(async move {
+                if let Err(e) = replicator.replicate(&cmd_clone, offset).await {
+                    tracing::warn!("Metadata replication failed: {}", e);
+                }
+            });
+
+            return Ok(());
+        }
+
+        // FOLLOWER PATH: Wait for WAL replication from leader
+        tracing::debug!("Follower waiting for consumer group update to be replicated");
+
+        // Wait for replication with timeout (5 seconds)
+        let start = tokio::time::Instant::now();
+        while start.elapsed() < Duration::from_millis(5000) {
+            {
+                let state = self.state();
+                if let Some(group) = state.consumer_groups.get(&metadata.group_id) {
+                    if group.state == metadata.state && group.generation_id == metadata.generation_id {
+                        tracing::debug!("✓ UpdateConsumerGroup replicated to follower");
+                        return Ok(());
+                    }
+                }
+            } // Drop the RwLockReadGuard before await
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
 
         Ok(())
     }
@@ -683,12 +869,57 @@ impl MetadataStore for RaftMetadataStore {
     }
 
     async fn update_partition_offset(&self, topic: &str, partition: u32, high_watermark: i64, log_start_offset: i64) -> Result<()> {
-        self.raft.propose(MetadataCommand::UpdatePartitionOffset {
-            topic: topic.to_string(),
-            partition,
-            high_watermark,
-            log_start_offset,
-        }).await.map_err(|e| MetadataError::StorageError(e.to_string()))?;
+        // WAL-ONLY: All metadata operations go through WAL (no Raft fallback)
+
+        // LEADER PATH: Write to WAL and replicate
+        if self.raft.am_i_leader().await {
+            tracing::trace!("Leader updating partition offset {}:{} HW={} via metadata WAL",
+                topic, partition, high_watermark);
+
+            let cmd = MetadataCommand::UpdatePartitionOffset {
+                topic: topic.to_string(),
+                partition,
+                high_watermark,
+                log_start_offset,
+            };
+
+            // 1. Write to metadata WAL (durable, 1-2ms)
+            let offset = self.metadata_wal.append(&cmd).await
+                .map_err(|e| MetadataError::StorageError(format!("Metadata WAL write failed: {}", e)))?;
+
+            // 2. Apply to local state machine immediately
+            self.raft.apply_metadata_command_direct(cmd.clone())
+                .map_err(|e| MetadataError::StorageError(format!("Failed to apply command: {}", e)))?;
+
+            // 3. Async replicate to followers (fire-and-forget)
+            let replicator = self.metadata_wal_replicator.clone();
+            let cmd_clone = cmd.clone();
+            tokio::spawn(async move {
+                if let Err(e) = replicator.replicate(&cmd_clone, offset).await {
+                    tracing::warn!("Metadata replication failed: {}", e);
+                }
+            });
+
+            return Ok(());
+        }
+
+        // FOLLOWER PATH: Wait for WAL replication from leader
+        tracing::trace!("Follower waiting for partition offset update to be replicated");
+
+        // Wait for replication with timeout (5 seconds)
+        let start = tokio::time::Instant::now();
+        while start.elapsed() < Duration::from_millis(5000) {
+            {
+                let state = self.state();
+                let key = (topic.to_string(), partition as i32);
+                if let Some(&hw) = state.partition_high_watermarks.get(&key) {
+                    if hw == high_watermark {
+                        return Ok(());
+                    }
+                }
+            } // Drop the RwLockReadGuard before await
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
 
         Ok(())
     }
@@ -719,24 +950,84 @@ impl MetadataStore for RaftMetadataStore {
         _offsets: Vec<(u32, i64, i64)>
     ) -> Result<TopicMetadata> {
         // Create topic first
-        let metadata = self.create_topic(topic_name, config).await?;
+        let metadata = self.create_topic(topic_name, config).await.map_err(|e| MetadataError::StorageError(e.to_string()))?;
 
         // Then assign partitions
         for assignment in assignments {
-            self.assign_partition(assignment).await?;
+            self.assign_partition(assignment).await.map_err(|e| MetadataError::StorageError(e.to_string()))?;
         }
 
         Ok(metadata)
     }
 
     async fn create_consumer_group(&self, metadata: ConsumerGroupMetadata) -> Result<()> {
-        self.raft.propose(MetadataCommand::CreateConsumerGroup {
-            group_id: metadata.group_id.clone(),
-            protocol_type: metadata.protocol_type.clone(),
-            protocol: metadata.protocol.clone(),
-        }).await.map_err(|e| MetadataError::StorageError(e.to_string()))?;
+        // WAL-ONLY: All metadata operations go through WAL (no Raft fallback)
 
-        Ok(())
+        // LEADER PATH: Write to WAL and replicate
+        if self.raft.am_i_leader().await {
+            tracing::info!("Leader creating consumer group '{}' via metadata WAL", metadata.group_id);
+
+            let cmd = MetadataCommand::CreateConsumerGroup {
+                group_id: metadata.group_id.clone(),
+                protocol_type: metadata.protocol_type.clone(),
+                protocol: metadata.protocol.clone(),
+            };
+
+            // 1. Write to metadata WAL (durable, 1-2ms)
+            let offset = self.metadata_wal.append(&cmd).await
+                .map_err(|e| MetadataError::StorageError(format!("Metadata WAL write failed: {}", e)))?;
+
+            // 2. Apply to local state machine immediately
+            self.raft.apply_metadata_command_direct(cmd.clone())
+                .map_err(|e| MetadataError::StorageError(format!("Failed to apply command: {}", e)))?;
+
+            // 3. Async replicate to followers (fire-and-forget)
+            let replicator = self.metadata_wal_replicator.clone();
+            let cmd_clone = cmd.clone();
+            tokio::spawn(async move {
+                if let Err(e) = replicator.replicate(&cmd_clone, offset).await {
+                    tracing::warn!("Metadata replication failed: {}", e);
+                }
+            });
+
+            // 4. Return immediately
+            let state = self.state();
+            if state.consumer_groups.get(&metadata.group_id).is_some() {
+                return Ok(());
+            } else {
+                return Err(MetadataError::NotFound(format!(
+                    "Consumer group {} not found after creation",
+                    metadata.group_id
+                )));
+            }
+        }
+
+        // FOLLOWER PATH: Wait for WAL replication from leader
+        tracing::debug!("Follower waiting for consumer group '{}' creation to be replicated", metadata.group_id);
+
+        // Wait for replication with timeout (5 seconds)
+        let start = tokio::time::Instant::now();
+        while start.elapsed() < Duration::from_millis(5000) {
+            {
+                let state = self.state();
+                if state.consumer_groups.get(&metadata.group_id).is_some() {
+                    tracing::debug!("✓ CreateConsumerGroup replicated to follower");
+                    return Ok(());
+                }
+            } // Drop the RwLockReadGuard before await
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // Timeout - check state anyway
+        let state = self.state();
+        if state.consumer_groups.get(&metadata.group_id).is_some() {
+            Ok(())
+        } else {
+            Err(MetadataError::NotFound(format!(
+                "Consumer group {} creation timeout",
+                metadata.group_id
+            )))
+        }
     }
 
     // ========== Transaction operations (not implemented yet) ==========

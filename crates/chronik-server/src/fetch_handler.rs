@@ -179,7 +179,7 @@ impl FetchHandler {
         }
     }
 
-    /// Create a new fetch handler with WAL and ProduceHandler (v2.5.0)
+    /// Create a new fetch handler with WAL and ProduceHandler (v2.2.7)
     pub fn new_with_wal_and_produce(
         segment_reader: Arc<SegmentReader>,
         metadata_store: Arc<dyn MetadataStore>,

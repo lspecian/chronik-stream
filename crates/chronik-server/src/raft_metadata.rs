@@ -1,4 +1,4 @@
-//! Raft metadata state machine (v2.5.0 Phase 2)
+//! Raft metadata state machine (v2.2.7 Phase 2)
 //!
 //! This module implements a MINIMAL Raft state machine for cluster metadata coordination.
 //! It does NOT handle data replication - that's done by WAL streaming.

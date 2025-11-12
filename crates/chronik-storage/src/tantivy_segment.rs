@@ -250,16 +250,40 @@ impl TantivySegmentWriter {
         object_store: Arc<dyn ObjectStore>,
         key_prefix: &str,
     ) -> Result<(String, SegmentMetadata)> {
-        // Create temp directory for serialization
-        let temp_dir = tempfile::tempdir()
-            .map_err(|e| Error::Internal(format!("Failed to create temp dir: {}", e)))?;
+        // v2.2.7: Move blocking I/O to dedicated threadpool to prevent blocking tokio workers
+        // This fixes the 391ms disk I/O stall that was blocking all WAL writes
+        let (tar_gz_path, metadata) = tokio::task::spawn_blocking(move || {
+            // Set lower I/O priority for Tantivy (best-effort priority 4)
+            // This prevents Tantivy commits from starving WAL fsyncs (which use priority 0)
+            #[cfg(target_os = "linux")]
+            {
+                use libc::{syscall, SYS_ioprio_set};
+                const IOPRIO_WHO_PROCESS: i32 = 1;  // Target current thread
+                const IOPRIO_CLASS_SHIFT: i32 = 13;
+                const IOPRIO_CLASS_BE: i32 = 2; // Best-effort
+                const IOPRIO_LEVEL_LOW: i32 = 4; // Lower than WAL (which uses 0)
+                let ioprio = (IOPRIO_CLASS_BE << IOPRIO_CLASS_SHIFT) | IOPRIO_LEVEL_LOW;
+                unsafe { syscall(SYS_ioprio_set, IOPRIO_WHO_PROCESS, 0, ioprio) };
+            }
 
-        // Serialize to tar.gz
-        let (tar_gz_path, metadata) = self.commit_and_serialize(temp_dir.path())?;
+            // Create temp directory for serialization
+            let temp_dir = tempfile::tempdir()
+                .map_err(|e| Error::Internal(format!("Failed to create temp dir: {}", e)))?;
 
-        // Read file into memory
-        let file_data = fs::read(&tar_gz_path)
-            .map_err(|e| Error::Internal(format!("Failed to read tar.gz: {}", e)))?;
+            // Serialize to tar.gz (BLOCKING: 391ms fsync, but now won't block WAL)
+            self.commit_and_serialize(temp_dir.path())
+        })
+        .await
+        .map_err(|e| Error::Internal(format!("Task join error: {}", e)))??;
+
+        // Read file into memory (also blocking I/O - move to threadpool)
+        let tar_gz_path_clone = tar_gz_path.clone();
+        let file_data = tokio::task::spawn_blocking(move || {
+            fs::read(&tar_gz_path_clone)
+                .map_err(|e| Error::Internal(format!("Failed to read tar.gz: {}", e)))
+        })
+        .await
+        .map_err(|e| Error::Internal(format!("Task join error: {}", e)))??;
 
         // Generate object store key
         let object_key = format!("{}/segment_{}_{}_{}_{}.tar.gz",

@@ -5439,12 +5439,7 @@ impl ProtocolHandler {
             tracing::debug!("Writing controller_id {} at position {}", response.controller_id, encoder.position());
             encoder.write_i32(response.controller_id);
         }
-        
-        // Cluster authorized operations (v8-v10 only, librdkafka doesn't read for v11+)
-        if version >= 8 && version <= 10 {
-            encoder.write_i32(-2147483648); // INT32_MIN indicates this field is null
-        }
-        
+
         // Topics array
         if flexible {
             encoder.write_compact_array_len(response.topics.len());
@@ -5523,19 +5518,21 @@ impl ProtocolHandler {
                     encoder.write_tagged_fields();
                 }
             }
-            
+
             // Topic authorized operations (v8+)
+            // Note: This was NOT removed in v11 (only cluster_authorized_operations was removed)
             if version >= 8 {
                 encoder.write_i32(-2147483648); // INT32_MIN means "null"
             }
-            
+
             if flexible {
                 encoder.write_tagged_fields();
             }
         }
 
-        // Cluster authorized operations (v8+)
-        if version >= 8 {
+        // Cluster authorized operations (v8-v10 only, removed in v11+)
+        // KIP-430: cluster_authorized_operations was removed starting from v11
+        if version >= 8 && version <= 10 {
             if let Some(ops) = response.cluster_authorized_operations {
                 encoder.write_i32(ops);
             } else {

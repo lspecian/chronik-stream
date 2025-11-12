@@ -230,7 +230,7 @@ impl RaftWalStorage {
                 }
             }
 
-            // CRITICAL FIX (v2.2.8): Deduplicate entries by index
+            // CRITICAL FIX (v2.2.7): Deduplicate entries by index
             // During runtime, Raft may write multiple entries at the same index (conflict resolution).
             // All versions get persisted to WAL, but on recovery we must keep only the latest (highest term).
             // Without deduplication, log.len() overcounts, causing last_index() mismatch and Compacted errors.
@@ -269,7 +269,7 @@ impl RaftWalStorage {
 
                 info!("✓ Recovered {} Raft entries (index {}-{})", recovered_entries.len(), first_idx, last_idx);
 
-                // CRITICAL FIX (v2.2.8): Trim recovered entries to prevent memory explosion
+                // CRITICAL FIX (v2.2.7): Trim recovered entries to prevent memory explosion
                 // During recovery, we may have 100K+ entries in WAL. We MUST trim immediately
                 // to prevent Raft from trying to access entries that will be trimmed later.
                 //
@@ -370,11 +370,11 @@ impl RaftWalStorage {
 
     /// Append entries to in-memory log and persist to WAL (async, called from message loop)
     ///
-    /// CRITICAL FIX (v2.2.8): Keep last 1000 entries in unstable log to prevent raft-rs 0.7.0 panic
+    /// CRITICAL FIX (v2.2.7): Keep last 1000 entries in unstable log to prevent raft-rs 0.7.0 panic
     /// during conflict resolution. The panic occurs when conflicting entries are in stable storage
     /// and raft-rs tries to slice the unstable log beyond its bounds.
     ///
-    /// See docs/RAFT_LOG_UNSTABLE_FIX_v2.2.8.md for details.
+    /// See docs/RAFT_LOG_UNSTABLE_FIX_v2.2.7.md for details.
     pub async fn append_entries(&self, entries: &[Entry]) -> Result<()> {
         if entries.is_empty() {
             return Ok(());
@@ -400,7 +400,7 @@ impl RaftWalStorage {
                 log[vec_idx] = entry.clone();
             }
 
-            // FIX (v2.2.8): Keep last 50,000 entries in unstable log to prevent raft-rs 0.7.0 panics
+            // FIX (v2.2.7): Keep last 50,000 entries in unstable log to prevent raft-rs 0.7.0 panics
             // CRITICAL: During recovery, we may load 100K+ entries. We MUST keep entries starting
             // from right after the snapshot index, NOT just the last 50K entries.
             //
@@ -861,7 +861,7 @@ impl Storage for RaftWalStorage {
         let snapshot = self.snapshot.read();
         let snapshot_index = snapshot.get_metadata().index;
 
-        // DEBUG (v2.2.8): Log all entries() calls to debug Compacted errors
+        // DEBUG (v2.2.7): Log all entries() calls to debug Compacted errors
         tracing::debug!(
             "entries({}, {}) called: log.len={}, first_index={}, snapshot_index={}",
             low, high, log.len(), first_index, snapshot_index
@@ -878,7 +878,7 @@ impl Storage for RaftWalStorage {
             return Ok(Vec::new());
         }
 
-        // CRITICAL FIX (v2.2.8): Use WAL fallback for entries older than first_index
+        // CRITICAL FIX (v2.2.7): Use WAL fallback for entries older than first_index
         // When entries have been trimmed from unstable log (to prevent unbounded memory growth),
         // we need to read them from WAL disk storage instead of returning Compacted error
         // (which causes raft-rs 0.7.0 to panic).
@@ -887,7 +887,7 @@ impl Storage for RaftWalStorage {
         // 1. Hot path: In-memory Vec<Entry> (fast, recent entries)
         // 2. Cold path: WAL disk read (slower, but prevents panic for older entries)
         //
-        // See: docs/RAFT_CLUSTER_FIX_PLAN_v2.2.8.md (Option A)
+        // See: docs/RAFT_CLUSTER_FIX_PLAN_v2.2.7.md (Option A)
         if low < first_index {
             tracing::info!(
                 "entries({}, {}): requested entries older than first_index={} (snapshot_index={}), falling back to WAL read",
@@ -962,7 +962,7 @@ impl Storage for RaftWalStorage {
         let log = self.entries.read().unwrap();
         let first_index = *self.first_index.read().unwrap();
 
-        // CRITICAL FIX (v2.2.8): Use WAL fallback for compacted entries
+        // CRITICAL FIX (v2.2.7): Use WAL fallback for compacted entries
         // Instead of returning Compacted error (which panics), read from WAL
         if idx < first_index {
             tracing::info!(

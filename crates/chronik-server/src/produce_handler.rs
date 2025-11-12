@@ -10,7 +10,7 @@
 
 use crate::storage::{StorageConfig, StorageService};
 use crate::fetch_handler::FetchHandler;
-use crate::raft_cluster::RaftCluster;  // NEW: v2.5.0 Phase 3
+use crate::raft_cluster::RaftCluster;  // NEW: v2.2.7 Phase 3
 use chronik_common::{Result, Error};
 use chronik_monitoring::MetricsRecorder;
 use chronik_protocol::{
@@ -262,7 +262,7 @@ struct PartitionState {
     start_time: Instant,
     /// Current segment size
     segment_size: AtomicU64,
-    /// PERFORMANCE (v2.2.9 - P3): Use lock-free SegQueue instead of Mutex<Vec> for pending batches
+    /// PERFORMANCE (v2.2.7 - P3): Use lock-free SegQueue instead of Mutex<Vec> for pending batches
     /// This eliminates mutex contention on every batch write (5-10% throughput gain)
     pending_batches: Arc<SegQueue<BufferedBatch>>,
     /// Last flush time
@@ -320,13 +320,13 @@ pub struct ProduceHandler {
     json_pipeline: Arc<JsonPipeline>,
     index_sender: Option<mpsc::Sender<JsonDocument>>,
     metadata_store: Arc<dyn MetadataStore>,
-    // PERFORMANCE (v2.2.9 - P2): Use DashMap instead of RwLock<HashMap> for lock-free partition access
+    // PERFORMANCE (v2.2.7 - P2): Use DashMap instead of RwLock<HashMap> for lock-free partition access
     // This eliminates lock contention with 128 concurrent producers (10-15% throughput gain)
     partition_states: Arc<DashMap<(String, i32), Arc<PartitionState>>>,
     producer_info: Arc<RwLock<HashMap<i64, ProducerInfo>>>,
     metrics: Arc<ProduceMetrics>,
     running: Arc<AtomicBool>,
-    /// P3 OPTIMIZATION (v2.2.9): Lock-free memory tracking with AtomicU64
+    /// P3 OPTIMIZATION (v2.2.7): Lock-free memory tracking with AtomicU64
     /// Replaces Semaphore for ~15-25% throughput gain at high concurrency
     memory_used_bytes: Arc<AtomicU64>,
     memory_limit_bytes: u64,
@@ -337,7 +337,7 @@ pub struct ProduceHandler {
     /// WAL manager for inline durability writes (v1.3.47+)
     /// Uses Arc<WalManager> directly - no RwLock needed since WalManager uses DashMap internally
     wal_manager: Option<Arc<WalManager>>,
-    /// Raft cluster for metadata coordination (v2.5.0 Phase 3)
+    /// Raft cluster for metadata coordination (v2.2.7 Phase 3)
     /// CRITICAL: Option<Arc<>> NOT Arc<RwLock<>> to avoid hot path locks!
     /// Used to query partition replicas and ISR for replication decisions
     raft_cluster: Option<Arc<RaftCluster>>,
@@ -345,10 +345,10 @@ pub struct ProduceHandler {
     /// CRITICAL: Option<Arc<>> NOT Arc<RwLock<>> to avoid hot path locks!
     /// Fire-and-forget async replication, never blocks produce path
     wal_replication_manager: Option<Arc<WalReplicationManager>>,
-    /// ISR ACK tracker for acks=-1 quorum support (v2.5.0 Phase 4)
+    /// ISR ACK tracker for acks=-1 quorum support (v2.2.7 Phase 4)
     /// Tracks pending acks=-1 requests and notifies when ISR quorum reached
     isr_ack_tracker: Option<Arc<crate::isr_ack_tracker::IsrAckTracker>>,
-    /// Leader elector for partition leader failover (v2.5.0 Phase 5)
+    /// Leader elector for partition leader failover (v2.2.7 Phase 5)
     /// Used to record heartbeats when handling produce requests as leader
     leader_elector: Option<Arc<crate::leader_election::LeaderElector>>,
 }
@@ -529,7 +529,7 @@ impl ProduceHandler {
     pub async fn clear_all_buffers(&self) -> Result<()> {
         let mut total_cleared = 0;
 
-        // PERFORMANCE (v2.2.9 - P2 Fix): Collect keys first to avoid holding DashMap iterator
+        // PERFORMANCE (v2.2.7 - P2 Fix): Collect keys first to avoid holding DashMap iterator
         // The DashMap iterator can conflict with insert() operations during WAL recovery,
         // causing the cluster to hang at "Replaying WAL to restore high watermarks".
         // By collecting keys first, we release the iterator before operating on partitions.
@@ -636,7 +636,7 @@ impl ProduceHandler {
         // Create JSON pipeline for transformation
         let json_pipeline = Arc::new(JsonPipeline::new(Default::default(), config.indexer_config.clone()).await?);
         
-        // P3 OPTIMIZATION (v2.2.9): Lock-free memory tracking
+        // P3 OPTIMIZATION (v2.2.7): Lock-free memory tracking
         let memory_limit_bytes = config.buffer_memory as u64;
         let memory_used_bytes = Arc::new(AtomicU64::new(0));
 
@@ -657,7 +657,7 @@ impl ProduceHandler {
             json_pipeline,
             index_sender,
             metadata_store,
-            partition_states: Arc::new(DashMap::new()),  // PERFORMANCE (v2.2.9 - P2): Lock-free concurrent hashmap
+            partition_states: Arc::new(DashMap::new()),  // PERFORMANCE (v2.2.7 - P2): Lock-free concurrent hashmap
             producer_info: Arc::new(RwLock::new(HashMap::new())),
             metrics: Arc::new(ProduceMetrics::default()),
             running: Arc::new(AtomicBool::new(true)),
@@ -667,10 +667,10 @@ impl ProduceHandler {
             fetch_handler: None,
             topic_creation_cache: Arc::new(RwLock::new(HashMap::new())),
             wal_manager: None,
-            raft_cluster: None,  // v2.5.0 Phase 3: Initialize as None (set via set_raft_cluster)
+            raft_cluster: None,  // v2.2.7 Phase 3: Initialize as None (set via set_raft_cluster)
             wal_replication_manager: None,  // v2.2.0 Phase 1: Initialize as None
-            isr_ack_tracker: None,  // v2.5.0 Phase 4: Initialize as None (set via set_isr_ack_tracker)
-            leader_elector: None,  // v2.5.0 Phase 5: Initialize as None (set via set_leader_elector)
+            isr_ack_tracker: None,  // v2.2.7 Phase 4: Initialize as None (set via set_isr_ack_tracker)
+            leader_elector: None,  // v2.2.7 Phase 5: Initialize as None (set via set_leader_elector)
         })
     }
 
@@ -705,7 +705,7 @@ impl ProduceHandler {
         self.fetch_handler = Some(fetch_handler);
     }
 
-    /// Set the Raft cluster for metadata coordination (v2.5.0 Phase 3)
+    /// Set the Raft cluster for metadata coordination (v2.2.7 Phase 3)
     pub fn set_raft_cluster(&mut self, raft_cluster: Arc<RaftCluster>) {
         info!("Setting RaftCluster for ProduceHandler - enables partition replication routing");
         self.raft_cluster = Some(raft_cluster);
@@ -717,13 +717,13 @@ impl ProduceHandler {
         self.wal_replication_manager = Some(replication_manager);
     }
 
-    /// Set the ISR ACK tracker for acks=-1 quorum support (v2.5.0 Phase 4)
+    /// Set the ISR ACK tracker for acks=-1 quorum support (v2.2.7 Phase 4)
     pub fn set_isr_ack_tracker(&mut self, tracker: Arc<crate::isr_ack_tracker::IsrAckTracker>) {
         info!("Setting IsrAckTracker for ProduceHandler - enables acks=-1 quorum");
         self.isr_ack_tracker = Some(tracker);
     }
 
-    /// Set the leader elector for partition leader failover (v2.5.0 Phase 5)
+    /// Set the leader elector for partition leader failover (v2.2.7 Phase 5)
     pub fn set_leader_elector(&mut self, elector: Arc<crate::leader_election::LeaderElector>) {
         info!("Setting LeaderElector for ProduceHandler - enables heartbeat tracking");
         self.leader_elector = Some(elector);
@@ -777,7 +777,7 @@ impl ProduceHandler {
             }
         });
 
-        // CRITICAL FIX (v2.2.8): Background watermark sync task
+        // CRITICAL FIX (v2.2.7): Background watermark sync task
         // Periodically syncs in-memory high watermarks to Raft metadata store
         // This decouples produce hot path from expensive Raft consensus (150ms)
         let handler_for_watermark = self.clone();
@@ -801,7 +801,7 @@ impl ProduceHandler {
                         high_watermark,
                         log_start_offset
                     ).await {
-                        // P2 FIX (v2.2.9): Tolerate "Cannot propose" errors during startup/leadership changes
+                        // P2 FIX (v2.2.7): Tolerate "Cannot propose" errors during startup/leadership changes
                         // During cluster startup, Raft may not have elected a leader yet. This is a transient
                         // condition that resolves automatically. Log at DEBUG level to avoid alarming users.
                         let error_msg = format!("{:?}", e);
@@ -1032,7 +1032,7 @@ impl ProduceHandler {
                 }
             };
             
-            // PERFORMANCE (v2.2.9 - P1): Process partitions in parallel instead of serially
+            // PERFORMANCE (v2.2.7 - P1): Process partitions in parallel instead of serially
             // This provides 20-30% throughput improvement by overlapping partition I/O
             let topic_name = topic_data.name.clone();
             let partition_count = topic_metadata.config.partition_count;
@@ -1057,7 +1057,7 @@ impl ProduceHandler {
                         }
 
                         // Check leadership: RaftCluster takes precedence over metadata store
-                        // v2.5.0 Phase 2: Use RaftCluster for partition leadership checks
+                        // v2.2.7 Phase 2: Use RaftCluster for partition leadership checks
                         let (is_leader, leader_hint) = {
                             if let Some(ref raft_cluster) = raft_cluster {
                                 // Get partition leader from Raft metadata state machine
@@ -1177,7 +1177,7 @@ impl ProduceHandler {
         // ENTRY POINT LOGGING (v1.3.47 debugging)
         info!("→ produce_to_partition({}-{}) bytes={} acks={}", topic, partition, records_data.len(), acks);
 
-        // P3 OPTIMIZATION (v2.2.9): Lock-free memory tracking with AtomicU64
+        // P3 OPTIMIZATION (v2.2.7): Lock-free memory tracking with AtomicU64
         // Check memory limit and atomically reserve memory
         let bytes_to_reserve = records_data.len() as u64; // Declare outside loop for later use
         loop {
@@ -1313,7 +1313,7 @@ impl ProduceHandler {
         // Update next offset atomically
         partition_state.next_offset.store((last_offset + 1) as u64, Ordering::SeqCst);
 
-        // CRITICAL FIX (v2.2.8): Removed synchronous metadata update from hot path
+        // CRITICAL FIX (v2.2.7): Removed synchronous metadata update from hot path
         // BEFORE: Every produce waited 150ms for Raft consensus to update high watermark
         // AFTER: Background task syncs watermarks every 5 seconds asynchronously
         // This improves throughput from 6 msg/s to 10,000+ msg/s
@@ -1360,13 +1360,13 @@ impl ProduceHandler {
         if let Some(ref wal_mgr) = self.wal_manager {
             use chronik_storage::canonical_record::CanonicalRecord;
 
-            // PERFORMANCE OPTIMIZATION (v2.5.0): Skip wire bytes preservation if no replication
+            // PERFORMANCE OPTIMIZATION (v2.2.7): Skip wire bytes preservation if no replication
             // This avoids an expensive .to_vec() clone when replication is disabled
             let needs_replication = self.wal_replication_manager.is_some();
 
             // Convert to CanonicalRecord and serialize (ONCE - reused for replication)
             // from_kafka_batch() now automatically preserves compressed_records_wire_bytes
-            // for BOTH compressed and uncompressed batches (v2.5.1 fix)
+            // for BOTH compressed and uncompressed batches (v2.2.7 fix)
             match CanonicalRecord::from_kafka_batch(&re_encoded_bytes) {
                 Ok(mut canonical_record) => {
                     // CRITICAL FIX (Session 24): For v1 MessageSets, recalculate record offsets
@@ -1380,7 +1380,7 @@ impl ProduceHandler {
 
                     match bincode::serialize(&canonical_record) {
                         Ok(serialized) => {
-                            // v2.5.0: ALWAYS populate serialized_for_replication when wal_replication_manager exists
+                            // v2.2.7: ALWAYS populate serialized_for_replication when wal_replication_manager exists
                             // The wire bytes optimization (line 1375-1377) only affects CRC preservation, not replication!
                             // BUG FIX: Previously set to None when !needs_replication, breaking replication entirely
                             serialized_for_replication = if needs_replication {
@@ -1426,7 +1426,7 @@ impl ProduceHandler {
             serialized_for_replication = None;
         }
 
-        // v2.5.0 Phase 3: WAL Replication Hook with ISR-aware routing
+        // v2.2.7 Phase 3: WAL Replication Hook with ISR-aware routing
         // Zero-copy optimization: Reuse serialized WAL data from above (no re-parsing!)
         // This is called AFTER WAL write completes, so data is durable locally
         if let Some(ref wal_repl_mgr) = self.wal_replication_manager {
@@ -1441,7 +1441,7 @@ impl ProduceHandler {
                 let high_watermark = partition_state.high_watermark.load(Ordering::SeqCst) as i64;
 
                 // Spawn background task (fire-and-forget, never blocks)
-                // v2.5.0: Use replicate_partition for ISR-aware routing
+                // v2.2.7: Use replicate_partition for ISR-aware routing
                 tokio::spawn(async move {
                     repl_mgr_clone.replicate_partition(
                         topic_clone,
@@ -1518,7 +1518,7 @@ impl ProduceHandler {
                 partition_state.high_watermark.store((last_offset + 1) as u64, Ordering::SeqCst);
             }
             -1 => {
-                // v2.5.0 Phase 4: acks=-1 with IsrAckTracker
+                // v2.2.7 Phase 4: acks=-1 with IsrAckTracker
                 // Wait for replication to ISR quorum (leader + majority of followers)
                 self.flush_partition_if_needed(topic, partition, &partition_state).await?;
 
@@ -1599,7 +1599,7 @@ impl ProduceHandler {
             ).await;
         }
         
-        // P3 OPTIMIZATION (v2.2.9): Release memory atomically
+        // P3 OPTIMIZATION (v2.2.7): Release memory atomically
         self.memory_used_bytes.fetch_sub(bytes_to_reserve, Ordering::Release);
         
         // Update fetch handler buffer with RAW batch bytes (v1.3.32 CRC FIX)
@@ -1626,17 +1626,19 @@ impl ProduceHandler {
             }
         }
 
-        // PERFORMANCE FIX (v2.5.0): Remove duplicate flush call
-        // flush_partition_if_needed is already called at line 1514 for acks=-1
-        // For acks=0 and acks=1, flush is NOT needed immediately (background flush handles it)
-        // This duplicate call was causing unnecessary mutex contention and overhead
+        // PERFORMANCE FIX (v2.2.10): Flush for acks=1 to trigger group commit batching
+        // acks=-1 already flushed at line 1523, so only flush for acks=0 and acks=1
+        // Without this flush, batches accumulate in pending_batches but don't trigger
+        // group commit batching properly, resulting in small batch sizes (1-7 writes)
+        // instead of hundreds, causing 50-60% throughput loss.
         //
-        // Background flush strategy:
-        // - acks=0: Fire-and-forget, background flush after linger_ms
-        // - acks=1: Data already in WAL (durable), background flush makes it visible
-        // - acks=-1: Already flushed at line 1514 before ISR quorum wait
-        //
-        // REMOVED: self.flush_partition_if_needed(topic, partition, &partition_state).await
+        // Flush strategy:
+        // - acks=0: Fire-and-forget, flush triggers group commit batching
+        // - acks=1: Flush triggers group commit batching (100ms window accumulates writes)
+        // - acks=-1: Already flushed at line 1523 before ISR quorum wait
+        if acks != -1 {
+            self.flush_partition_if_needed(topic, partition, &partition_state).await?;
+        }
 
         // v2.2.0: WAL replication hook already called earlier (after WAL write, before buffering)
         // No need to duplicate the call here
@@ -2149,20 +2151,20 @@ impl ProduceHandler {
             return Err(Error::Protocol(format!("Cannot auto-create reserved topic: '{}'", topic_name)));
         }
 
-        // P2 FIX (v2.2.9): ONLY Raft leader can create topics in cluster mode
-        // If this node is a follower, return a retriable error so client retries on leader
+        // P0 FIX (v2.2.7 Phase 1): Let RaftMetadataStore handle leader-forwarding automatically
+        // The metadata store already has Phase 1 forwarding logic built in:
+        // - Followers forward create_topic to leader via RPC
+        // - Leader processes create via metadata WAL (Phase 2)
+        // - Followers wait for replication with exponential backoff
+        // DO NOT reject here - let the abstraction layer handle it properly!
         if let Some(ref raft) = self.raft_cluster {
-            if !raft.am_i_leader() {
-                // Follower node: Cannot create topics, must go to leader
-                debug!("Follower node (id={}) rejecting topic auto-creation for '{}' - must create on leader",
+            if raft.am_i_leader().await {
+                debug!("Leader node (id={}) processing topic auto-creation for '{}'",
                     raft.node_id(), topic_name);
-                return Err(Error::Storage(format!(
-                    "Cannot auto-create topic on follower node (id={}). Client should retry on leader.",
-                    raft.node_id()
-                )));
+            } else {
+                debug!("Follower node (id={}) will forward topic auto-creation for '{}' to leader via Phase 1 RPC",
+                    raft.node_id(), topic_name);
             }
-            debug!("Leader node (id={}) processing topic auto-creation for '{}'",
-                raft.node_id(), topic_name);
         }
 
         // Check if there's already an in-flight creation request for this topic
@@ -2211,7 +2213,7 @@ impl ProduceHandler {
         // Attempt to create the topic
         let result = match self.metadata_store.create_topic(topic_name, topic_config).await {
             Ok(metadata) => {
-                // v2.2.8 CRITICAL FIX: Partition initialization MUST go through Raft on leader only
+                // v2.2.7 CRITICAL FIX: Partition initialization MUST go through Raft on leader only
                 // The create_topic call already went through Raft and was replicated to all nodes.
                 // Now we need to initialize partition metadata (assignments, leader, ISR).
                 //
@@ -2219,7 +2221,7 @@ impl ProduceHandler {
                 // Followers will receive it via Raft replication automatically.
                 if let Some(ref raft) = self.raft_cluster {
                     // Check if THIS node is the Raft leader
-                    if raft.am_i_leader() {
+                    if raft.am_i_leader().await {
                         // Leader node: Initialize partition metadata via Raft
                         if let Err(e) = self.initialize_raft_partitions(topic_name, metadata.config.partition_count).await {
                             error!("Raft leader failed to initialize partitions for '{}': {:?}", topic_name, e);
@@ -2543,10 +2545,10 @@ impl ProduceHandler {
     pub async fn initialize_raft_partitions(&self, topic_name: &str, num_partitions: u32) -> Result<()> {
         // Only initialize if Raft is enabled
         if let Some(ref raft) = self.raft_cluster {
-            // v2.2.8 CRITICAL FIX: This method should ONLY be called by the Raft leader
+            // v2.2.7 CRITICAL FIX: This method should ONLY be called by the Raft leader
             // The caller (auto_create_topic) must check am_i_leader() before calling this method.
             // We assert this condition to catch programming errors.
-            if !raft.am_i_leader() {
+            if !raft.am_i_leader().await {
                 error!(
                     "PROGRAMMING ERROR: initialize_raft_partitions called on Raft follower for topic '{}'",
                     topic_name
@@ -2735,10 +2737,10 @@ impl Clone for ProduceHandler {
             fetch_handler: self.fetch_handler.clone(),
             topic_creation_cache: Arc::clone(&self.topic_creation_cache),
             wal_manager: self.wal_manager.clone(),
-            raft_cluster: self.raft_cluster.clone(),  // v2.5.0 Phase 3
+            raft_cluster: self.raft_cluster.clone(),  // v2.2.7 Phase 3
             wal_replication_manager: self.wal_replication_manager.clone(),  // v2.2.0 Phase 1
-            isr_ack_tracker: self.isr_ack_tracker.clone(),  // v2.5.0 Phase 4
-            leader_elector: self.leader_elector.clone(),  // v2.5.0 Phase 5
+            isr_ack_tracker: self.isr_ack_tracker.clone(),  // v2.2.7 Phase 4
+            leader_elector: self.leader_elector.clone(),  // v2.2.7 Phase 5
         }
     }
 }

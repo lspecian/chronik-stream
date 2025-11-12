@@ -1,4 +1,4 @@
-//! Partition Rebalancer (v2.6.0 - Priority 2 Step 3)
+//! Partition Rebalancer (v2.2.7 - Priority 2 Step 3)
 //!
 //! Automatically rebalances partition assignments when cluster membership changes.
 //!
@@ -63,12 +63,12 @@ impl PartitionRebalancer {
     ///
     /// # Returns
     /// Arc-wrapped rebalancer with background worker started
-    pub fn new(
+    pub async fn new(
         raft_cluster: Arc<RaftCluster>,
         metadata_store: Arc<dyn MetadataStore>,
         replication_factor: usize,
     ) -> Arc<Self> {
-        let current_nodes = raft_cluster.get_all_nodes();
+        let current_nodes = raft_cluster.get_all_nodes().await;
 
         info!(
             "Initializing Partition Rebalancer (current nodes: {}, replication_factor: {})",
@@ -99,7 +99,7 @@ impl PartitionRebalancer {
                 sleep(rebalancer.rebalance_interval).await;
 
                 // Get current cluster membership
-                let current_nodes = rebalancer.raft_cluster.get_all_nodes();
+                let current_nodes = rebalancer.raft_cluster.get_all_nodes().await;
                 let current_count = current_nodes.len();
                 let last_count = rebalancer.last_member_count.load(Ordering::Relaxed);
 
@@ -297,8 +297,8 @@ impl PartitionRebalancer {
     /// Get current rebalancing status
     ///
     /// Returns information about the rebalancer state.
-    pub fn status(&self) -> RebalancerStatus {
-        let current_nodes = self.raft_cluster.get_all_nodes();
+    pub async fn status(&self) -> RebalancerStatus {
+        let current_nodes = self.raft_cluster.get_all_nodes().await;
         let last_count = self.last_member_count.load(Ordering::Relaxed);
 
         RebalancerStatus {

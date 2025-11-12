@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Chronik Stream is a high-performance Kafka-compatible streaming platform written in Rust that implements the Kafka wire protocol with comprehensive Write-Ahead Log (WAL) durability and automatic recovery. Current version: v2.2.0.
+Chronik Stream is a high-performance Kafka-compatible streaming platform written in Rust that implements the Kafka wire protocol with comprehensive Write-Ahead Log (WAL) durability and automatic recovery. Current version: v2.2.7.
 
 **Key Differentiators:**
 - Full Kafka protocol compatibility tested with real clients (kafka-python, confluent-kafka, KSQL, Apache Flink)

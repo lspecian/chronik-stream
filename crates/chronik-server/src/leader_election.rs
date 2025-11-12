@@ -94,7 +94,7 @@ impl LeaderElector {
         reason: &str,
     ) -> Result<u64> {
         // CRITICAL: Only Raft leader can propose partition leader changes
-        if !self.raft_cluster.am_i_leader() {
+        if !self.raft_cluster.am_i_leader().await {
             debug!(
                 "Skipping election for {}-{}: this node is not the Raft leader (reason: {})",
                 topic, partition, reason
