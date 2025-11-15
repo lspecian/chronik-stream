@@ -351,6 +351,9 @@ pub struct ProduceHandler {
     /// Leader elector for partition leader failover (v2.2.7 Phase 5)
     /// Used to record heartbeats when handling produce requests as leader
     leader_elector: Option<Arc<crate::leader_election::LeaderElector>>,
+    /// Metadata event bus for high watermark replication (v2.2.7.2)
+    /// Emits HighWatermarkUpdated events to replicate watermarks < 10ms via metadata WAL
+    event_bus: Option<Arc<crate::metadata_events::MetadataEventBus>>,
 }
 
 /// Replication request for ISR management
@@ -446,13 +449,19 @@ impl ProduceHandler {
 
     /// Get high watermark for a partition (NEW architecture v1.3.39+)
     ///
-    /// Returns the next offset that will be assigned = the high watermark.
+    /// Returns the replicated offset (high watermark).
     /// This is the SOURCE OF TRUTH for FetchHandler - no need to query metadata store.
+    ///
+    /// CRITICAL FIX (v2.2.7): Return actual high_watermark, not next_offset!
+    /// BUG: Was returning next_offset which is updated immediately on produce
+    /// CORRECT: Return high_watermark which is updated after ISR acknowledgment
+    /// This caused large batch consumption to stall - consumer saw next_offset
+    /// but actual replicated data (high_watermark) lagged behind, causing 60s timeouts.
     pub async fn get_high_watermark(&self, topic: &str, partition: i32) -> Result<i64> {
         let key = (topic.to_string(), partition);
 
         if let Some(state) = self.partition_states.get(&key) {
-            let high_watermark = state.value().next_offset.load(Ordering::SeqCst) as i64;
+            let high_watermark = state.value().high_watermark.load(Ordering::SeqCst) as i64;
             Ok(high_watermark)
         } else {
             // Partition doesn't exist yet, high watermark is 0
@@ -671,6 +680,7 @@ impl ProduceHandler {
             wal_replication_manager: None,  // v2.2.0 Phase 1: Initialize as None
             isr_ack_tracker: None,  // v2.2.7 Phase 4: Initialize as None (set via set_isr_ack_tracker)
             leader_elector: None,  // v2.2.7 Phase 5: Initialize as None (set via set_leader_elector)
+            event_bus: None,  // v2.2.7.2: Initialize as None (set via set_event_bus)
         })
     }
 
@@ -729,6 +739,28 @@ impl ProduceHandler {
         self.leader_elector = Some(elector);
     }
 
+    /// Set the metadata event bus for high watermark replication (v2.2.7.2)
+    pub fn set_event_bus(&mut self, event_bus: Arc<crate::metadata_events::MetadataEventBus>) {
+        info!("Setting MetadataEventBus for ProduceHandler - enables < 10ms watermark replication");
+        self.event_bus = Some(event_bus);
+    }
+
+    /// Emit high watermark update event (v2.2.7.2)
+    /// Replaces 5-second background sync with < 10ms metadata WAL replication
+    fn emit_watermark_event(&self, topic: &str, partition: i32, offset: i64) {
+        if let Some(ref event_bus) = self.event_bus {
+            let subscriber_count = event_bus.publish(crate::metadata_events::MetadataEvent::HighWatermarkUpdated {
+                topic: topic.to_string(),
+                partition,
+                offset,
+            });
+            warn!("📡 Emitted HighWatermarkUpdated: {}-{} => {}, subscribers={}",
+                  topic, partition, offset, subscriber_count);
+        } else {
+            warn!("⚠️  No event_bus configured - watermark event NOT emitted for {}-{}", topic, partition);
+        }
+    }
+
     /// Create a new produce handler with fetch handler connected
     pub async fn new_with_fetch_handler(
         config: ProduceHandlerConfig,
@@ -780,17 +812,21 @@ impl ProduceHandler {
         // CRITICAL FIX (v2.2.7): Background watermark sync task
         // Periodically syncs in-memory high watermarks to Raft metadata store
         // This decouples produce hot path from expensive Raft consensus (150ms)
+        //
+        // REVERTED (v2.2.7.2): Removed watermark monitoring improvements from v2.2.7.1
+        // - Reason: Made consumption worse (-9% regression) without solving actual problem
+        // - No watermark lag was detected (improvements solving wrong problem)
+        // - Actual issue likely in fetch handler pagination or partition balancing
         let handler_for_watermark = self.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(5));
-
             while handler_for_watermark.running.load(Ordering::Relaxed) {
-                interval.tick().await;
+                tokio::time::sleep(Duration::from_secs(5)).await;
 
                 // Sync watermarks for each partition asynchronously
                 for entry in handler_for_watermark.partition_states.iter() {
                     let (topic, partition) = entry.key();
                     let state = entry.value();
+
                     let high_watermark = state.high_watermark.load(Ordering::SeqCst) as i64;
                     let log_start_offset = state.log_start_offset.load(Ordering::SeqCst) as i64;
 
@@ -807,12 +843,12 @@ impl ProduceHandler {
                         let error_msg = format!("{:?}", e);
                         if error_msg.contains("Cannot propose") {
                             debug!(
-                                "Background watermark sync waiting for Raft leader election for {}-{}: {:?} (will retry in 5s)",
+                                "Background watermark sync waiting for Raft leader election for {}-{}: {:?}",
                                 topic, partition, e
                             );
                         } else {
                             warn!(
-                                "Background watermark sync failed for {}-{}: {:?} (will retry in 5s)",
+                                "Background watermark sync failed for {}-{}: {:?}",
                                 topic, partition, e
                             );
                         }
@@ -1499,24 +1535,49 @@ impl ProduceHandler {
         if self.config.enable_indexing {
             self.send_to_indexer(topic, partition, &records).await;
         }
-        
+
         // Handle acknowledgment modes
+        warn!("🎯 PRODUCE REQUEST: topic={}, partition={}, acks={}, base_offset={}, last_offset={}",
+              topic, partition, acks, base_offset, last_offset);
+
         match acks {
             0 => {
                 // No acknowledgment required, return immediately
                 debug!("Acks=0: Returning immediately without waiting for persistence");
-                
+
                 // Update high watermark for acks=0
-                partition_state.high_watermark.store((last_offset + 1) as u64, Ordering::SeqCst);
+                // Use fetch_max to prevent backward progression during retries (idempotent)
+                let old_watermark = partition_state.high_watermark.load(Ordering::SeqCst) as i64;
+                let new_watermark = (last_offset + 1) as i64;
+                let prev_watermark = partition_state.high_watermark.fetch_max(new_watermark as u64, Ordering::SeqCst) as i64;
+
+                warn!(
+                    "🔥 WATERMARK UPDATE [acks=0]: topic={}, partition={}, old={}, new={}, last_offset={}, actually_updated={}",
+                    topic, partition, old_watermark, new_watermark, last_offset, prev_watermark < new_watermark
+                );
+
+                // v2.2.7.2: Emit watermark event for < 10ms replication
+                self.emit_watermark_event(topic, partition, new_watermark);
             }
             1 => {
                 // For acks=1, we don't need to flush immediately
                 // The background task will handle flushing based on time/size thresholds
                 // We just need to ensure the data is buffered
                 debug!("Acks=1: Data buffered, will be persisted by background task");
-                
+
                 // Update high watermark for acks=1
-                partition_state.high_watermark.store((last_offset + 1) as u64, Ordering::SeqCst);
+                // Use fetch_max to prevent backward progression during retries (idempotent)
+                let old_watermark = partition_state.high_watermark.load(Ordering::SeqCst) as i64;
+                let new_watermark = (last_offset + 1) as i64;
+                let prev_watermark = partition_state.high_watermark.fetch_max(new_watermark as u64, Ordering::SeqCst) as i64;
+
+                warn!(
+                    "🔥 WATERMARK UPDATE [acks=1]: topic={}, partition={}, old={}, new={}, last_offset={}, actually_updated={}",
+                    topic, partition, old_watermark, new_watermark, last_offset, prev_watermark < new_watermark
+                );
+
+                // v2.2.7.2: Emit watermark event for < 10ms replication
+                self.emit_watermark_event(topic, partition, new_watermark);
             }
             -1 => {
                 // v2.2.7 Phase 4: acks=-1 with IsrAckTracker
@@ -1589,7 +1650,18 @@ impl ProduceHandler {
                             );
 
                             // Update high watermark after quorum reached
-                            partition_state.high_watermark.store((last_offset + 1) as u64, Ordering::SeqCst);
+                            // Use fetch_max to prevent backward progression during retries (idempotent)
+                            let old_watermark = partition_state.high_watermark.load(Ordering::SeqCst) as i64;
+                            let new_watermark = (last_offset + 1) as i64;
+                            let prev_watermark = partition_state.high_watermark.fetch_max(new_watermark as u64, Ordering::SeqCst) as i64;
+
+                            warn!(
+                                "🔥 WATERMARK UPDATE [acks=-1, quorum reached]: topic={}, partition={}, old={}, new={}, last_offset={}, actually_updated={}",
+                                topic, partition, old_watermark, new_watermark, last_offset, prev_watermark < new_watermark
+                            );
+
+                            // v2.2.7.2: Emit watermark event for < 10ms replication
+                            self.emit_watermark_event(topic, partition, new_watermark);
                         }
                         Ok(Ok(Err(e))) => {
                             error!(
@@ -1617,7 +1689,18 @@ impl ProduceHandler {
                     // No ISR tracker configured (standalone mode or no replication)
                     // Just update high watermark immediately
                     debug!("acks=-1: No ISR tracker, updating high watermark immediately (standalone mode)");
-                    partition_state.high_watermark.store((last_offset + 1) as u64, Ordering::SeqCst);
+                    // Use fetch_max to prevent backward progression during retries (idempotent)
+                    let old_watermark = partition_state.high_watermark.load(Ordering::SeqCst) as i64;
+                    let new_watermark = (last_offset + 1) as i64;
+                    let prev_watermark = partition_state.high_watermark.fetch_max(new_watermark as u64, Ordering::SeqCst) as i64;
+
+                    warn!(
+                        "🔥 WATERMARK UPDATE [acks=-1, no ISR tracker]: topic={}, partition={}, old={}, new={}, last_offset={}, actually_updated={}",
+                        topic, partition, old_watermark, new_watermark, last_offset, prev_watermark < new_watermark
+                    );
+
+                    // v2.2.7.2: Emit watermark event for < 10ms replication
+                    self.emit_watermark_event(topic, partition, new_watermark);
                 }
             }
             _ => {
@@ -2717,6 +2800,7 @@ impl Clone for ProduceHandler {
             wal_replication_manager: self.wal_replication_manager.clone(),  // v2.2.0 Phase 1
             isr_ack_tracker: self.isr_ack_tracker.clone(),  // v2.2.7 Phase 4
             leader_elector: self.leader_elector.clone(),  // v2.2.7 Phase 5
+            event_bus: self.event_bus.clone(),  // v2.2.7.2
         }
     }
 }

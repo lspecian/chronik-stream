@@ -230,10 +230,18 @@ impl MetadataWalReplicator {
             }
 
             MetadataEvent::HighWatermarkUpdated { topic, partition, offset } => {
-                tracing::debug!("📡 Skipping HighWatermarkUpdated replication: {}-{} => {}",
+                tracing::debug!("📡 Replicating HighWatermarkUpdated: {}-{} => {}",
                     topic, partition, offset);
-                // High watermarks are NOT replicated via metadata WAL
-                // They're updated via partition data replication (ISR tracking)
+
+                // v2.2.7.2 FIX: Replicate high watermark updates via metadata WAL
+                // This enables < 10ms watermark propagation instead of 5-second background sync
+                let cmd = MetadataCommand::UpdatePartitionOffset {
+                    topic,
+                    partition: partition as u32,
+                    high_watermark: offset,
+                    log_start_offset: 0,  // Not updated here (only high watermark)
+                };
+                self.replicate_command(cmd).await?;
             }
 
             MetadataEvent::TopicCreated { topic, num_partitions } => {

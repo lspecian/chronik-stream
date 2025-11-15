@@ -434,6 +434,10 @@ impl IntegratedKafkaServer {
             produce_handler_inner.set_raft_cluster(Arc::clone(cluster));
         }
 
+        // v2.2.7.2: Wire MetadataEventBus to ProduceHandler for < 10ms watermark replication
+        info!("Setting MetadataEventBus for ProduceHandler");
+        produce_handler_inner.set_event_bus(metadata_event_bus.clone());
+
         // v2.2.7 Phase 4: Create ISR ACK tracker for acks=-1 quorum support FIRST
         // CRITICAL: Must be created on ALL nodes (leader + followers) so ACKs can flow bidirectionally
         // AND must be shared with both WalReplicationManager (for ACK reading) and ProduceHandler (for waiting)

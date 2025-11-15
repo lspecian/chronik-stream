@@ -256,9 +256,11 @@ impl FetchHandler {
         max_wait_ms: i32,
         min_bytes: i32,
     ) -> Result<FetchResponsePartition> {
-        tracing::info!(
-            "fetch_partition called - topic: {}, partition: {}, fetch_offset: {}, max_bytes: {}",
-            topic, partition, fetch_offset, max_bytes
+        // v2.2.7.2: Enhanced tracing to debug large batch consumption stalls
+        let fetch_start = Instant::now();
+        info!(
+            "🔍 FETCH START: topic={}, partition={}, offset={}, max_bytes={}, max_wait_ms={}, min_bytes={}",
+            topic, partition, fetch_offset, max_bytes, max_wait_ms, min_bytes
         );
 
 
@@ -311,14 +313,15 @@ impl FetchHandler {
                 .unwrap_or(0)
         };
         
-        tracing::info!(
-            "High watermark for {}-{}: {} (from ProduceHandler)",
-            topic, partition, high_watermark
+        // v2.2.7.2: Log watermark details for debugging
+        info!(
+            "📊 WATERMARK: topic={}, partition={}, high_watermark={}, fetch_offset={}, gap={} (from ProduceHandler)",
+            topic, partition, high_watermark, fetch_offset, high_watermark - fetch_offset
         );
 
         // Log start offset is always 0 in NEW architecture (WAL-based)
         let log_start_offset = 0;
-        
+
         // Check if offset is out of range
         if fetch_offset < log_start_offset {
             return Ok(FetchResponsePartition {
@@ -335,20 +338,21 @@ impl FetchHandler {
         
         // If we have data available (fetch_offset < high_watermark), fetch it
         if fetch_offset < high_watermark {
-            tracing::info!(
-                "Data available for fetch - topic: {}, partition: {}, fetch_offset: {}, high_watermark: {}",
-                topic, partition, fetch_offset, high_watermark
+            // v2.2.7.2: Log data available path
+            info!(
+                "✅ DATA AVAILABLE: topic={}, partition={}, fetch_offset={}, high_watermark={}, available={}",
+                topic, partition, fetch_offset, high_watermark, high_watermark - fetch_offset
             );
-            
+
             // Data is available, fetch it
             let fetch_timeout = if max_wait_ms > 0 {
                 Duration::from_millis(max_wait_ms as u64)
             } else {
                 Duration::from_secs(30) // Default timeout
             };
-            
+
             // CRITICAL CRC FIX v1.3.32: Try to fetch raw Kafka bytes first to preserve CRC
-            tracing::info!("Trying to fetch raw bytes (CRC-preserving) for {}-{}", topic, partition);
+            info!("📦 FETCH RAW: Trying raw bytes (CRC-preserving) for {}-{}", topic, partition);
             let raw_bytes_result = timeout(fetch_timeout, async {
                 self.fetch_raw_bytes(
                     topic,
@@ -406,7 +410,14 @@ impl FetchHandler {
                     self.encode_kafka_records(&records, 0)?
                 }
             };
-            
+
+            // v2.2.7.2: Log successful fetch completion
+            let fetch_elapsed = fetch_start.elapsed();
+            info!(
+                "✅ FETCH SUCCESS: topic={}, partition={}, offset={}, bytes={}, elapsed={:?}",
+                topic, partition, fetch_offset, records_bytes.len(), fetch_elapsed
+            );
+
             return Ok(FetchResponsePartition {
                 partition,
                 error_code: 0,
@@ -418,9 +429,14 @@ impl FetchHandler {
                 records: records_bytes,
             });
         }
-        
+
         // No data available yet (fetch_offset >= high_watermark)
         if fetch_offset >= high_watermark {
+            // v2.2.7.2: Log no data available case
+            info!(
+                "⏸️  NO DATA: topic={}, partition={}, fetch_offset={}, high_watermark={} (waiting...)",
+                topic, partition, fetch_offset, high_watermark
+            );
             // No data available yet - implement wait logic
             if max_wait_ms > 0 && min_bytes > 0 {
                 // Wait for new data or timeout
