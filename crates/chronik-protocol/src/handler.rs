@@ -6622,7 +6622,14 @@ impl ProtocolHandler {
             // Create partition assignments using round-robin assignment
             let mut assignments = Vec::new();
             let broker_count = if online_brokers.is_empty() { 1 } else { online_brokers.len() };
-            
+
+            // Build list of all replica node IDs (for cluster mode)
+            let all_replicas: Vec<u64> = if online_brokers.is_empty() {
+                vec![self.broker_id as u64]  // Standalone mode: single broker
+            } else {
+                online_brokers.iter().map(|b| b.broker_id as u64).collect()  // Cluster mode: all brokers
+            };
+
             for partition in 0..topic.num_partitions {
                 let broker_index = (partition as usize) % broker_count;
                 let broker_id = if online_brokers.is_empty() {
@@ -6630,12 +6637,14 @@ impl ProtocolHandler {
                 } else {
                     online_brokers[broker_index].broker_id
                 };
-                
+
                 assignments.push(PartitionAssignment {
                     topic: topic.name.clone(),
                     partition: partition as u32,
                     broker_id,
-                    is_leader: true, // For now, all replicas are leaders
+                    is_leader: true, // Deprecated field
+                    replicas: all_replicas.clone(),  // FIXED: All brokers as replicas for cluster mode
+                    leader_id: broker_id as u64,
                 });
             }
             
@@ -6961,17 +6970,23 @@ impl ProtocolHandler {
                         tracing::warn!("No online brokers available for auto-topic creation");
                         continue;
                     }
-                    
-                    let broker_id = online_brokers[0].broker_id;
-                    
+
+                    // Build list of all replica node IDs (for cluster mode)
+                    let all_replicas: Vec<u64> = online_brokers.iter().map(|b| b.broker_id as u64).collect();
+
                     // Create assignments for all partitions
                     let mut assignments = Vec::new();
                     for partition in 0..default_num_partitions {
+                        let broker_index = (partition as usize) % online_brokers.len();
+                        let broker_id = online_brokers[broker_index].broker_id;
+
                         assignments.push(chronik_common::metadata::PartitionAssignment {
                             topic: topic_name.clone(),
                             partition,
                             broker_id,
-                            is_leader: true,
+                            is_leader: true,  // Deprecated field
+                            replicas: all_replicas.clone(),  // FIXED: All brokers as replicas for cluster mode
+                            leader_id: broker_id as u64,
                         });
                     }
                     

@@ -58,6 +58,10 @@ pub struct RaftMetadataStore {
     /// Followers track leader heartbeats to determine if they can safely read
     /// from local replicated state without forwarding to leader
     lease_manager: Arc<crate::leader_lease::LeaseManager>,
+
+    /// Event bus for metadata changes (event-based WAL replication)
+    /// Replaces old Raft propose() with event-driven architecture
+    event_bus: Arc<crate::metadata_events::MetadataEventBus>,
 }
 
 impl RaftMetadataStore {
@@ -79,6 +83,7 @@ impl RaftMetadataStore {
         metadata_wal: Arc<MetadataWal>,
         replicator: Arc<MetadataWalReplicator>,
         lease_manager: Arc<crate::leader_lease::LeaseManager>,
+        event_bus: Arc<crate::metadata_events::MetadataEventBus>,
     ) -> Self {
         Self {
             pending_topics: raft.get_pending_topics_notifications(),
@@ -87,11 +92,12 @@ impl RaftMetadataStore {
             metadata_wal,
             metadata_wal_replicator: replicator,
             lease_manager,
+            event_bus,
         }
     }
 
     /// Get read-only access to state machine
-    fn state(&self) -> std::sync::RwLockReadGuard<crate::raft_metadata::MetadataStateMachine> {
+    fn state(&self) -> Arc<crate::raft_metadata::MetadataStateMachine> {
         self.raft.get_state_machine()
     }
 
@@ -143,12 +149,18 @@ impl MetadataStore for RaftMetadataStore {
             self.raft.apply_metadata_command_direct(cmd.clone())
                 .map_err(|e| MetadataError::StorageError(format!("Failed to apply command: {}", e)))?;
 
-            // 3. Fire notification
+            // 3. Emit event for topic creation
+            self.event_bus.publish(crate::metadata_events::MetadataEvent::TopicCreated {
+                topic: name.to_string(),
+                num_partitions: config.partition_count as i32,
+            });
+
+            // 4. Fire notification
             if let Some((_, notify)) = self.pending_topics.remove(name) {
                 notify.notify_waiters();
             }
 
-            // 4. Async replicate to followers (fire-and-forget)
+            // 5. Async replicate to followers (fire-and-forget)
             let replicator = self.metadata_wal_replicator.clone();
             let cmd_clone = cmd.clone();
             tokio::spawn(async move {
@@ -675,23 +687,32 @@ impl MetadataStore for RaftMetadataStore {
     async fn assign_partition(&self, assignment: PartitionAssignment) -> Result<()> {
         // WAL-ONLY: All metadata operations go through WAL (no Raft fallback)
 
-        let node_id = assignment.broker_id as u64;
+        let replicas = assignment.replicas.clone();
+        let leader_id = assignment.leader_id;
 
         // LEADER PATH: Write to WAL and replicate
         if self.raft.am_i_leader().await {
-            tracing::debug!("Leader assigning partition {}:{} to node {} via metadata WAL",
-                assignment.topic, assignment.partition, node_id);
+            tracing::debug!("Leader assigning partition {}:{} to replicas {:?} (leader={}) via metadata WAL",
+                assignment.topic, assignment.partition, replicas, leader_id);
 
-            // 1. Write AssignPartition to WAL
+            // 1. Write AssignPartition to WAL with FULL replica list
             let cmd1 = MetadataCommand::AssignPartition {
                 topic: assignment.topic.clone(),
                 partition: assignment.partition as i32,
-                replicas: vec![node_id],
+                replicas: replicas.clone(),
             };
             let offset1 = self.metadata_wal.append(&cmd1).await
                 .map_err(|e| MetadataError::StorageError(format!("Metadata WAL write failed: {}", e)))?;
             self.raft.apply_metadata_command_direct(cmd1.clone())
                 .map_err(|e| MetadataError::StorageError(format!("Failed to apply command: {}", e)))?;
+
+            // Emit event for partition assignment with full replica list
+            self.event_bus.publish(crate::metadata_events::MetadataEvent::PartitionAssigned {
+                topic: assignment.topic.clone(),
+                partition: assignment.partition as i32,
+                replicas: replicas.clone(),
+                leader: leader_id,
+            });
 
             // 2. Replicate assignment
             let replicator = self.metadata_wal_replicator.clone();
@@ -702,27 +723,32 @@ impl MetadataStore for RaftMetadataStore {
                 }
             });
 
-            // 3. If leader, write SetPartitionLeader to WAL
-            if assignment.is_leader {
-                let cmd2 = MetadataCommand::SetPartitionLeader {
-                    topic: assignment.topic.clone(),
-                    partition: assignment.partition as i32,
-                    leader: node_id,
-                };
-                let offset2 = self.metadata_wal.append(&cmd2).await
-                    .map_err(|e| MetadataError::StorageError(format!("Metadata WAL write failed: {}", e)))?;
-                self.raft.apply_metadata_command_direct(cmd2.clone())
-                    .map_err(|e| MetadataError::StorageError(format!("Failed to apply command: {}", e)))?;
+            // 3. Write SetPartitionLeader to WAL
+            let cmd2 = MetadataCommand::SetPartitionLeader {
+                topic: assignment.topic.clone(),
+                partition: assignment.partition as i32,
+                leader: leader_id,
+            };
+            let offset2 = self.metadata_wal.append(&cmd2).await
+                .map_err(|e| MetadataError::StorageError(format!("Metadata WAL write failed: {}", e)))?;
+            self.raft.apply_metadata_command_direct(cmd2.clone())
+                .map_err(|e| MetadataError::StorageError(format!("Failed to apply command: {}", e)))?;
 
-                // 4. Replicate leader assignment
-                let replicator2 = self.metadata_wal_replicator.clone();
-                let cmd2_clone = cmd2.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = replicator2.replicate(&cmd2_clone, offset2).await {
-                        tracing::warn!("Metadata replication failed: {}", e);
-                    }
-                });
-            }
+            // Emit event for leader change
+            self.event_bus.publish(crate::metadata_events::MetadataEvent::LeaderChanged {
+                topic: assignment.topic.clone(),
+                partition: assignment.partition as i32,
+                new_leader: leader_id,
+            });
+
+            // 4. Replicate leader assignment
+            let replicator2 = self.metadata_wal_replicator.clone();
+            let cmd2_clone = cmd2.clone();
+            tokio::spawn(async move {
+                if let Err(e) = replicator2.replicate(&cmd2_clone, offset2).await {
+                    tracing::warn!("Metadata replication failed: {}", e);
+                }
+            });
 
             return Ok(());
         }
@@ -740,7 +766,7 @@ impl MetadataStore for RaftMetadataStore {
                     // If waiting for leader assignment, check that too
                     if assignment.is_leader {
                         if let Some(&leader_node) = state.partition_leaders.get(&key) {
-                            if leader_node as u64 == node_id {
+                            if leader_node as u64 == leader_id {
                                 return Ok(());
                             }
                         }
@@ -847,14 +873,18 @@ impl MetadataStore for RaftMetadataStore {
             if let Some(replicas) = state.partition_assignments.get(&key) {
                 let leader = state.partition_leaders.get(&key).copied();
 
-                for &replica_node_id in replicas {
-                    assignments.push(PartitionAssignment {
-                        topic: topic.to_string(),
-                        partition,
-                        broker_id: replica_node_id as i32,
-                        is_leader: Some(replica_node_id) == leader,
-                    });
-                }
+                // Create ONE assignment per partition with ALL replicas
+                // (not one assignment per replica - that was the old buggy behavior)
+                let leader_id = leader.unwrap_or_else(|| replicas.get(0).copied().unwrap_or(0));
+
+                assignments.push(PartitionAssignment {
+                    topic: topic.to_string(),
+                    partition,
+                    broker_id: leader_id as i32,  // Deprecated field
+                    is_leader: true,  // Deprecated field
+                    replicas: replicas.clone(),  // CORRECT: Full replica list
+                    leader_id,
+                });
             }
         }
 

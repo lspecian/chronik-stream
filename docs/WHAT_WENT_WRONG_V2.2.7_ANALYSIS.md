@@ -15,7 +15,7 @@ We attempted to fix metadata split-brain by implementing `RaftMetadataStore` to 
 - v2.2.7 (current): Fixed split-brain but introduced **deadlocks** - completely broken
 - Result: Traded a data consistency problem for a **liveness problem**
 
-**We're NOT on v2.2.8.** We're on v2.2.7 with unfinished patches trying to fix the deadlocks.
+**We're NOT on v2.2.7.** We're on v2.2.7 with unfinished patches trying to fix the deadlocks.
 
 ---
 
@@ -680,7 +680,7 @@ We violated both.
 
 ### What NOT to Do
 
-❌ Increment to v2.2.8
+❌ Increment to v2.2.7
 ❌ Increment to v2.2.9
 ❌ Add more features while broken
 ❌ Create workarounds without fixing root cause

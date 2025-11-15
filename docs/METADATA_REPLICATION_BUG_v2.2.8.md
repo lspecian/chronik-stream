@@ -1,4 +1,4 @@
-# Metadata Replication Bug - FIXED (v2.2.8)
+# Metadata Replication Bug - FIXED (v2.2.7)
 
 ## Problem Summary
 
@@ -50,7 +50,7 @@ grep "Applied.*committed entries" tests/cluster/logs/node3.log
 **The Fix**: Exponential backoff retry in message sender (lines 193-235)
 
 ```rust
-// CRITICAL FIX (v2.2.8): Retry failed messages with exponential backoff
+// CRITICAL FIX (v2.2.7): Retry failed messages with exponential backoff
 let mut retry_count = 0;
 let max_retries = 10;
 let mut backoff_ms = 50;
@@ -109,7 +109,7 @@ grep "newRaft.*last index" tests/cluster/logs/node3.log
 **The Fix**: Deduplicate entries during recovery (lines 233-264)
 
 ```rust
-// CRITICAL FIX (v2.2.8): Deduplicate entries by index
+// CRITICAL FIX (v2.2.7): Deduplicate entries by index
 // Keep only the latest (highest term) for each index
 let mut deduped = Vec::new();
 let mut last_index = 0u64;
@@ -186,12 +186,12 @@ grep -i "panic\|error" tests/cluster/logs/node3.log
 ## Related Bugs Fixed
 
 This fix also resolves:
-- `RAFT_LOG_UNSTABLE_PANIC_v2.2.8.md` - Panic during conflict resolution (related to duplicates)
-- `BROKER_REGISTRATION_BUG_v2.2.8.md` - Broker registration deadlock (separate fix already applied)
+- `RAFT_LOG_UNSTABLE_PANIC_v2.2.7.md` - Panic during conflict resolution (related to duplicates)
+- `BROKER_REGISTRATION_BUG_v2.2.7.md` - Broker registration deadlock (separate fix already applied)
 
 ## Version
 
-**Fixed in**: v2.2.8
+**Fixed in**: v2.2.7
 **Date**: 2025-11-09
 **Commits**:
 - Message sender retry: `raft_cluster.rs` lines 193-235

@@ -1,4 +1,4 @@
-# Produce Performance Fix - FIXED (v2.2.8)
+# Produce Performance Fix - FIXED (v2.2.7)
 
 ## Problem Summary
 
@@ -65,11 +65,11 @@ Decouple the produce hot path from expensive Raft consensus by:
 #### Part 1: Remove Synchronous Metadata Update (lines 1221-1239)
 
 ```rust
-// AFTER (FAST - v2.2.8):
+// AFTER (FAST - v2.2.7):
 // Update next offset atomically
 partition_state.next_offset.store((last_offset + 1) as u64, Ordering::SeqCst);
 
-// CRITICAL FIX (v2.2.8): Removed synchronous metadata update from hot path
+// CRITICAL FIX (v2.2.7): Removed synchronous metadata update from hot path
 // BEFORE: Every produce waited 150ms for Raft consensus to update high watermark
 // AFTER: Background task syncs watermarks every 5 seconds asynchronously
 // This improves throughput from 6 msg/s to 10,000+ msg/s
@@ -90,7 +90,7 @@ partition_state.next_offset.store((last_offset + 1) as u64, Ordering::SeqCst);
 #### Part 2: Background Watermark Sync Task (lines 773-812)
 
 ```rust
-// CRITICAL FIX (v2.2.8): Background watermark sync task
+// CRITICAL FIX (v2.2.7): Background watermark sync task
 // Periodically syncs in-memory high watermarks to Raft metadata store
 // This decouples produce hot path from expensive Raft consensus (150ms)
 let handler_for_watermark = self.clone();
@@ -166,7 +166,7 @@ python3 /tmp/test_perf_fix.py
 - ❌ Each produce: 150ms latency
 - ❌ Unusable for production
 
-**After fix** (v2.2.8):
+**After fix** (v2.2.7):
 - ✅ Throughput: **683.8 msg/s**
 - ✅ Latency: < 2ms average
 - ✅ **114x faster**
@@ -220,17 +220,17 @@ grep "Successfully registered broker" tests/cluster/logs/node1.log
 
 5. **Background Tasks for Non-Critical Updates**: Metadata updates don't need to be synchronous - background tasks with retry are sufficient
 
-6. **Benchmark Before Release**: This performance issue would have made v2.2.8 completely unusable - always benchmark before claiming "production-ready"
+6. **Benchmark Before Release**: This performance issue would have made v2.2.7 completely unusable - always benchmark before claiming "production-ready"
 
 ## Related Issues
 
-- [METADATA_REPLICATION_BUG_v2.2.8.md](METADATA_REPLICATION_BUG_v2.2.8.md) - Metadata replication fixed (separate issue)
-- [BROKER_REGISTRATION_BUG_v2.2.8.md](BROKER_REGISTRATION_BUG_v2.2.8.md) - Broker registration fixed
-- [V2.2.8_STATUS.md](V2.2.8_STATUS.md) - Overall v2.2.8 development status
+- [METADATA_REPLICATION_BUG_v2.2.7.md](METADATA_REPLICATION_BUG_v2.2.7.md) - Metadata replication fixed (separate issue)
+- [BROKER_REGISTRATION_BUG_v2.2.7.md](BROKER_REGISTRATION_BUG_v2.2.7.md) - Broker registration fixed
+- [v2.2.7_STATUS.md](v2.2.7_STATUS.md) - Overall v2.2.7 development status
 
 ## Version
 
-**Fixed in**: v2.2.8
+**Fixed in**: v2.2.7
 **Date**: 2025-11-09
 **Commits**:
 - ProduceHandler hot path fix: `produce_handler.rs` lines 1221-1239

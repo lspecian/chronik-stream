@@ -94,8 +94,10 @@ pub enum BrokerStatus {
 pub struct PartitionAssignment {
     pub topic: String,
     pub partition: u32,
-    pub broker_id: i32,
-    pub is_leader: bool,
+    pub broker_id: i32,  // Deprecated: use leader_id instead
+    pub is_leader: bool,  // Deprecated: leader determined by leader_id field
+    pub replicas: Vec<u64>,  // All replica node IDs (leader is first)
+    pub leader_id: u64,  // Leader node ID
 }
 
 /// Group member information

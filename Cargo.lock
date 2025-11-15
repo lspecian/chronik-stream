@@ -1288,6 +1288,7 @@ name = "chronik-server"
 version = "2.2.7"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "async-trait",
  "axum",
  "base64 0.22.1",

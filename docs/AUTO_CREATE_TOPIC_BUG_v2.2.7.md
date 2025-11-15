@@ -202,7 +202,7 @@ This ensures ALL metadata changes go through Raft consensus, not just partition 
 
 **Hybrid Approach:**
 
-1. **Short-term (v2.2.8)**: Implement Option 1 - Forward to leader
+1. **Short-term (v2.2.7)**: Implement Option 1 - Forward to leader
    - Fast fix, minimal code changes
    - Followers return `NOT_LEADER_FOR_PARTITION` error
    - Clients retry with correct broker from metadata
@@ -306,5 +306,5 @@ Without this fix:
 
 ---
 
-**Next Step:** Implement Option 1 (forward to leader) in v2.2.8
+**Next Step:** Implement Option 1 (forward to leader) in v2.2.7
 

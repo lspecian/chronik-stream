@@ -22,6 +22,8 @@
 use crate::raft_metadata::{MetadataCommand, MetadataStateMachine, PartitionKey};
 use anyhow::{Result, Context};
 use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
+use arc_swap::ArcSwap;  // v2.2.7 DEADLOCK FIX: Lock-free atomic pointer swapping
 use std::collections::HashMap;
 use tokio::sync::{mpsc, Notify};
 use parking_lot::Mutex;
@@ -42,7 +44,11 @@ pub struct RaftCluster {
     node_id: u64,
 
     /// Metadata state machine (shared with Raft)
-    state_machine: Arc<RwLock<MetadataStateMachine>>,
+    /// v2.2.7 DEADLOCK FIX: Uses ArcSwap for lock-free atomic pointer swapping
+    /// - Reads: Zero-cost via .load() - just atomic pointer dereference
+    /// - Writes: Clone state, modify clone, swap pointer atomically
+    /// - NO lock contention, NO deadlocks, perfect for read-heavy metadata
+    state_machine: Arc<ArcSwap<MetadataStateMachine>>,
 
     /// Raft node with WAL-backed persistent storage
     /// v2.2.7 DEADLOCK FIX: Uses tokio::Mutex since start_message_loop holds lock across await points.
@@ -99,6 +105,16 @@ pub struct RaftCluster {
     /// v2.2.7 Phase 2: Leader change broadcast channel for WAL replication
     /// Emits events when Raft leader changes to trigger WAL reconnection
     leader_change_sender: tokio::sync::broadcast::Sender<crate::leader_heartbeat::LeaderChangeEvent>,
+
+    /// v2.2.7 LOCK CONTENTION FIX: Cached leader ID (avoids locking raft_node on every query)
+    /// Updated by Raft message loop when leader changes
+    /// Using AtomicU64 for lock-free reads (critical for metadata query performance)
+    cached_leader_id: Arc<AtomicU64>,
+
+    /// v2.2.7 LOCK CONTENTION FIX: Cached leadership state (am I the leader?)
+    /// Updated by Raft message loop when state changes
+    /// Using AtomicBool for lock-free reads
+    cached_is_leader: Arc<AtomicBool>,
 }
 
 impl RaftCluster {
@@ -192,8 +208,9 @@ impl RaftCluster {
         let raft_node = RawNode::new(&config, wal_storage, &logger)
             .context("Failed to create Raft node")?;
 
-        // Create state machine
-        let state_machine = Arc::new(RwLock::new(MetadataStateMachine::new()));
+        // Create state machine (v2.2.7 DEADLOCK FIX: ArcSwap for lock-free access)
+        // ArcSwap stores Arc<T> internally, so we wrap: Arc<ArcSwap<MetadataStateMachine>>
+        let state_machine = Arc::new(ArcSwap::new(Arc::new(MetadataStateMachine::new())));
 
         // Create gRPC transport
         let transport = Arc::new(GrpcTransport::new());
@@ -308,6 +325,8 @@ impl RaftCluster {
             pending_partitions: Arc::new(DashMap::new()), // v2.2.7 EVENT-DRIVEN NOTIFICATION (P1)
             heartbeat_sender, // v2.2.7 Phase 3: Leader lease heartbeats
             leader_change_sender, // v2.2.7 Phase 2: WAL replication leader changes
+            cached_leader_id: Arc::new(AtomicU64::new(raft::INVALID_ID)), // v2.2.7 LOCK CONTENTION FIX
+            cached_is_leader: Arc::new(AtomicBool::new(false)), // v2.2.7 LOCK CONTENTION FIX
         })
     }
 
@@ -328,29 +347,26 @@ impl RaftCluster {
 
     /// Get partition replicas (nodes that should replicate this partition)
     pub fn get_partition_replicas(&self, topic: &str, partition: i32) -> Option<Vec<u64>> {
-        let sm = self.state_machine.read().ok()?;
+        let sm = self.state_machine.load();
         sm.get_partition_replicas(topic, partition)
     }
 
     /// Get partition leader (node ID that's the leader for this partition)
     pub fn get_partition_leader(&self, topic: &str, partition: i32) -> Option<u64> {
-        let sm = self.state_machine.read().ok()?;
+        let sm = self.state_machine.load();
         sm.get_partition_leader(topic, partition)
     }
 
     /// Get ISR (in-sync replicas) for a partition
     pub fn get_isr(&self, topic: &str, partition: i32) -> Option<Vec<u64>> {
-        let sm = self.state_machine.read().ok()?;
+        let sm = self.state_machine.load();
         sm.get_isr(topic, partition)
     }
 
     /// Check if a node is in-sync for a partition
     pub fn is_in_sync(&self, topic: &str, partition: i32, node_id: u64) -> bool {
-        self.state_machine
-            .read()
-            .ok()
-            .map(|sm| sm.is_in_sync(topic, partition, node_id))
-            .unwrap_or(false)
+        let sm = self.state_machine.load();
+        sm.is_in_sync(topic, partition, node_id)
     }
 
     /// Get all partitions where the specified node is the leader
@@ -358,11 +374,8 @@ impl RaftCluster {
     /// Returns a list of (topic, partition) tuples where this node is the leader.
     /// Used by WAL replication manager to discover which partitions to replicate.
     pub fn get_partitions_where_leader(&self, node_id: u64) -> Vec<PartitionKey> {
-        self.state_machine
-            .read()
-            .ok()
-            .map(|sm| sm.get_partitions_where_leader(node_id))
-            .unwrap_or_default()
+        let sm = self.state_machine.load();
+        sm.get_partitions_where_leader(node_id)
     }
 
     /// Get all brokers from the Raft state machine
@@ -370,16 +383,11 @@ impl RaftCluster {
     /// Returns a list of (broker_id, host, port, rack) tuples for all registered brokers.
     /// This is used to synchronize broker metadata across the cluster.
     pub fn get_all_brokers_from_state_machine(&self) -> Vec<(i32, String, i32, Option<String>)> {
-        self.state_machine
-            .read()
-            .ok()
-            .map(|sm| {
-                sm.get_all_brokers()
-                    .into_iter()
-                    .map(|b| (b.broker_id, b.host.clone(), b.port, b.rack.clone()))
-                    .collect()
-            })
-            .unwrap_or_default()
+        let sm = self.state_machine.load();
+        sm.get_all_brokers()
+            .into_iter()
+            .map(|b| (b.broker_id, b.host.clone(), b.port, b.rack.clone()))
+            .collect()
     }
 
     /// Check if running in single-node mode (v2.2.7 Phase 2)
@@ -399,10 +407,10 @@ impl RaftCluster {
 
     /// Get read-only access to state machine (v2.2.7 Phase 3)
     ///
-    /// Returns a read guard to the Raft state machine.
+    /// Returns an Arc to the Raft state machine.
     /// Used by RaftMetadataStore to read metadata without proposing.
-    pub fn get_state_machine(&self) -> std::sync::RwLockReadGuard<crate::raft_metadata::MetadataStateMachine> {
-        self.state_machine.read().expect("Failed to acquire state machine lock")
+    pub fn get_state_machine(&self) -> Arc<crate::raft_metadata::MetadataStateMachine> {
+        self.state_machine.load_full()
     }
 
     /// Apply metadata command directly to state machine (Phase 2.2: WAL-based metadata writes)
@@ -414,12 +422,13 @@ impl RaftCluster {
     ///
     /// Phase 2 usage: Leader writes to WAL → applies via this method → async replicates
     pub fn apply_metadata_command_direct(&self, cmd: MetadataCommand) -> Result<()> {
-        let mut state = self.state_machine.write()
-            .map_err(|e| anyhow::anyhow!("Failed to acquire state machine write lock: {}", e))?;
+        let current = self.state_machine.load();
+        let mut new_state = (**current).clone();
 
-        state.apply(cmd)
-            .map(|_| ()) // Discard Vec<u8> return value, we only care about success
-            .map_err(|e| anyhow::anyhow!("Failed to apply metadata command: {}", e))
+        new_state.apply(cmd)?;
+
+        self.state_machine.store(Arc::new(new_state));
+        Ok(())
     }
 
     /// Propose a metadata command to the Raft cluster (v2.2.7 Phase 2)
@@ -455,9 +464,10 @@ impl RaftCluster {
     /// 4. Metadata is already persisted in RaftMetadataStore state machine
     async fn apply_immediately(&self, cmd: MetadataCommand) -> Result<()> {
         // Apply to state machine synchronously (just a HashMap update)
-        self.state_machine.write()
-            .map_err(|e| anyhow::anyhow!("Lock error: {}", e))?
-            .apply(cmd.clone())?;
+        let current = self.state_machine.load();
+        let mut new_state = (**current).clone();
+        new_state.apply(cmd.clone())?;
+        self.state_machine.store(Arc::new(new_state));
 
         // v2.2.7 EVENT-DRIVEN NOTIFICATION: Fire notifications after applying command
         match &cmd {
@@ -847,10 +857,9 @@ impl RaftCluster {
     /// This method finds all partitions where the target node is a replica
     /// and proposes new partition assignments excluding that node.
     async fn reassign_partitions_from_node(&self, node_id: u64) -> Result<()> {
-        // Scope the lock guard explicitly to ensure it's dropped before await
+        // Load current state
         let partitions_to_reassign = {
-            let sm = self.state_machine.read()
-                .map_err(|e| anyhow::anyhow!("Failed to acquire state machine lock: {}", e))?;
+            let sm = self.state_machine.load();
 
             let mut partitions = Vec::new();
 
@@ -862,7 +871,7 @@ impl RaftCluster {
             }
 
             partitions
-        }; // sm lock guard dropped here
+        };
 
         if partitions_to_reassign.is_empty() {
             tracing::info!("No partitions assigned to node {}, nothing to reassign", node_id);
@@ -936,8 +945,9 @@ impl RaftCluster {
 
         tracing::info!("🔍 DEBUG apply_committed_entries: Called with {} entries", entries.len());
 
-        let mut sm = self.state_machine.write()
-            .map_err(|e| anyhow::anyhow!("Failed to acquire state machine lock: {}", e))?;
+        // Load current state once at the beginning
+        let current = self.state_machine.load();
+        let mut new_state = (**current).clone();
 
         let mut applied_count = 0;
         let mut skipped_count = 0;
@@ -973,7 +983,7 @@ impl RaftCluster {
                 tracing::info!("🔍 DEBUG apply_committed_entries: Applying command: {:?}", cmd);
 
                 // Apply to state machine
-                sm.apply(cmd.clone())?;
+                new_state.apply(cmd.clone())?;
                 applied_count += 1;
 
                 // v2.2.7 EVENT-DRIVEN NOTIFICATION: Fire notifications after applying command
@@ -1017,6 +1027,11 @@ impl RaftCluster {
             }
         }
 
+        // Store the new state once at the end
+        if applied_count > 0 {
+            self.state_machine.store(Arc::new(new_state));
+        }
+
         tracing::info!("🔍 DEBUG apply_committed_entries: Finished - applied={}, skipped={}, total={}",
             applied_count, skipped_count, entries.len());
 
@@ -1038,11 +1053,8 @@ impl RaftCluster {
     ///
     /// Returns a list of (topic, partition) tuples for all known partitions.
     pub fn list_all_partitions(&self) -> Vec<(String, i32)> {
-        let sm = self.state_machine.read().ok();
-        match sm {
-            Some(sm) => sm.partition_assignments.keys().cloned().collect(),
-            None => vec![],
-        }
+        let sm = self.state_machine.load();
+        sm.partition_assignments.keys().cloned().collect()
     }
 
     /// Get all nodes currently in the cluster (voting members)
@@ -1069,11 +1081,7 @@ impl RaftCluster {
     /// # Returns
     /// Vector of (node_id, address) tuples
     pub fn get_node_info(&self) -> Vec<(u64, String)> {
-        let sm = match self.state_machine.read() {
-            Ok(s) => s,
-            Err(_) => return vec![],
-        };
-
+        let sm = self.state_machine.load();
         sm.nodes.iter().map(|(id, addr)| (*id, addr.clone())).collect()
     }
 
@@ -1082,10 +1090,7 @@ impl RaftCluster {
     /// # Returns
     /// Vector of PartitionInfo with topic, partition, leader, replicas, and ISR
     pub fn get_all_partition_info(&self) -> Vec<crate::admin_api::PartitionInfo> {
-        let sm = match self.state_machine.read() {
-            Ok(s) => s,
-            Err(_) => return vec![],
-        };
+        let sm = self.state_machine.load();
 
         let mut partitions = Vec::new();
 
@@ -1132,18 +1137,24 @@ impl RaftCluster {
     /// This fixes the root cause of partition leadership conflicts where followers were incorrectly
     /// attempting to propose partition leader elections.
     ///
+    /// v2.2.7 LOCK CONTENTION FIX: Now uses cached value (lock-free atomic read)
+    /// Updated by Raft message loop when leadership changes
+    ///
     /// Returns true only if THIS node is currently the Raft leader.
     pub async fn am_i_leader(&self) -> bool {
-        let raft_node = self.raft_node.lock().await;
-        raft_node.raft.state == raft::StateRole::Leader
+        // v2.2.7: Lock-free read from cached atomic (no raft_node lock needed!)
+        self.cached_is_leader.load(Ordering::Relaxed)
     }
 
     /// Get the current Raft leader ID (Phase 1.2)
     ///
+    /// v2.2.7 LOCK CONTENTION FIX: Now uses cached value (lock-free atomic read)
+    /// Updated by Raft message loop when leader changes
+    ///
     /// Returns the node ID of the current Raft leader, or None if no leader elected.
     pub async fn get_leader_id(&self) -> Option<u64> {
-        let raft_node = self.raft_node.lock().await;
-        let leader_id = raft_node.raft.leader_id;
+        // v2.2.7: Lock-free read from cached atomic (no raft_node lock needed!)
+        let leader_id = self.cached_leader_id.load(Ordering::Relaxed);
 
         if leader_id == raft::INVALID_ID {
             None
@@ -1276,8 +1287,7 @@ impl RaftCluster {
     ) -> Result<crate::metadata_rpc::MetadataQueryResponse> {
         use crate::metadata_rpc::{MetadataQuery, MetadataQueryResponse};
 
-        let state = self.state_machine.read()
-            .map_err(|e| anyhow::anyhow!("Failed to acquire state machine lock: {}", e))?;
+        let state = self.state_machine.load();
 
         match query {
             MetadataQuery::GetTopic { name } => {
@@ -1337,13 +1347,15 @@ impl RaftCluster {
                 let replicas = state.partition_assignments.get(&key);
                 let leader = state.partition_leaders.get(&key).copied();
 
-                let assignment = replicas.and_then(|replicas| {
+                let assignment = replicas.and_then(|replicas_vec| {
                     leader.map(|leader_node_id| {
                         chronik_common::metadata::PartitionAssignment {
                             topic,
                             partition: partition as u32,
                             broker_id: leader_node_id as i32,
                             is_leader: true,
+                            replicas: replicas_vec.clone(),
+                            leader_id: leader_node_id as u64,
                         }
                     })
                 });
@@ -1809,7 +1821,7 @@ impl RaftCluster {
                                 .context("Failed to deserialize state machine from snapshot")?;
 
                             // Replace state machine with snapshot state
-                            *state_machine_clone.write().unwrap() = new_state;
+                            state_machine_clone.store(Arc::new(new_state));
 
                             tracing::info!("✓ Applied state machine from snapshot");
                         }
@@ -1918,8 +1930,11 @@ impl RaftCluster {
                     }
                 }
 
-                // Step 3b: Handle normal committed entries (SKIP ConfChange entries - already processed in Step 3a)
-                if !ready.committed_entries().is_empty() {
+                // Step 3b: Collect normal committed entries (SKIP ConfChange entries - already processed in Step 3a)
+                // DEADLOCK FIX (v2.2.7): DON'T apply entries yet - just collect them for later.
+                // We must keep raft_lock held through advance() to satisfy Raft's API contract.
+                // We'll apply entries AFTER advance() by dropping the lock temporarily.
+                let entries_to_apply = if !ready.committed_entries().is_empty() {
                     // Filter out ConfChange entries - only process normal entries
                     let normal_entries: Vec<_> = ready.committed_entries()
                         .iter()
@@ -1929,25 +1944,19 @@ impl RaftCluster {
 
                     if !normal_entries.is_empty() {
                         tracing::info!(
-                            "🔍 DEBUG: Processing {} normal committed entries (BEFORE apply_committed_entries, filtered out {} ConfChange)",
+                            "🔍 DEBUG: Collected {} normal committed entries for application (filtered out {} ConfChange)",
                             normal_entries.len(),
                             ready.committed_entries().len() - normal_entries.len()
                         );
-
-                        if let Err(e) = self.apply_committed_entries(&normal_entries) {
-                            tracing::error!("❌ DEBUG: Failed to apply committed entries: {}", e);
-                        } else {
-                            tracing::info!(
-                                "✅ DEBUG: Applied {} committed entries to state machine (AFTER apply_committed_entries)",
-                                normal_entries.len()
-                            );
-                        }
+                        Some(normal_entries)
                     } else {
                         tracing::debug!("🔍 DEBUG: No normal entries in this Ready (all were ConfChange)");
+                        None
                     }
                 } else {
-                    tracing::debug!("🔍 DEBUG: No committed entries in this Ready (ready.committed_entries().is_empty())");
-                }
+                    tracing::debug!("🔍 DEBUG: No committed entries in this Ready");
+                    None
+                };
 
                 // Step 4: Persist entries (required before persisted_messages)
                 // NOTE: tokio::Mutex allows holding lock across await points
@@ -2016,6 +2025,46 @@ impl RaftCluster {
                 raft_lock.advance(ready);
 
                 tracing::debug!("✓ Advanced Raft successfully");
+
+                // v2.2.7 LOCK CONTENTION FIX: Update cached leader state for lock-free reads
+                // This enables metadata queries to check leadership without locking raft_node
+                let current_leader_id_val = raft_lock.raft.leader_id;
+                let current_state = raft_lock.raft.state;
+                self.cached_leader_id.store(current_leader_id_val, Ordering::Relaxed);
+                self.cached_is_leader.store(
+                    current_state == raft::StateRole::Leader,
+                    Ordering::Relaxed
+                );
+
+                // DEADLOCK FIX (v2.2.7): Now that advance() is called, we can safely drop the lock
+                // and apply committed entries to the state machine. This prevents deadlock with
+                // metadata queries that hold state_machine.read() and try to acquire raft_lock.
+                //
+                // KEY INSIGHT: After dropping the lock and applying entries, we MUST continue to
+                // the next iteration of the loop (not re-acquire the lock). The next iteration
+                // will acquire a fresh lock and get the next Ready state from Raft.
+                if let Some(entries) = entries_to_apply {
+                    // Drop the lock before applying entries
+                    drop(raft_lock);
+
+                    tracing::info!(
+                        "🔍 DEBUG: Applying {} committed entries to state machine (AFTER advance)",
+                        entries.len()
+                    );
+
+                    if let Err(e) = self.apply_committed_entries(&entries) {
+                        tracing::error!("❌ DEBUG: Failed to apply committed entries: {}", e);
+                    } else {
+                        tracing::info!(
+                            "✅ DEBUG: Successfully applied {} committed entries to state machine",
+                            entries.len()
+                        );
+                    }
+
+                    // Continue to next iteration (will acquire fresh lock)
+                    // DO NOT re-acquire the lock here - it causes Raft state machine issues
+                    continue;
+                }
 
                 // v2.2.7 Phase 2: Detect leader changes for WAL replication
                 let current_leader_id = raft_lock.raft.leader_id;
@@ -2096,8 +2145,8 @@ impl RaftCluster {
                     let snapshot_result = async {
                         // Serialize state machine
                         let state_machine_bytes = {
-                            let state_machine = state_machine_clone.read().unwrap();
-                            bincode::serialize(&*state_machine)
+                            let state_machine = state_machine_clone.load();
+                            bincode::serialize(&**state_machine)
                                 .context("Failed to serialize state machine")?
                         };
 

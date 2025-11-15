@@ -1,4 +1,4 @@
-# Produce Path Bottleneck Analysis (v2.2.8)
+# Produce Path Bottleneck Analysis (v2.2.7)
 
 ## Executive Summary
 

@@ -33,6 +33,7 @@ mod raft_metadata_store;  // v2.2.7 Phase 3: Unified metadata store (1-N nodes)
 // v2.2.7 Phase 2: WAL-based metadata writes (fast path, bypasses Raft consensus)
 mod metadata_wal;          // Fast local WAL for metadata operations (1-2ms vs 10-50ms Raft)
 mod metadata_wal_replication;  // Async replication using existing WalReplicationManager
+mod metadata_events;       // Event-based architecture for metadata WAL replication
 // v2.2.7 Phase 3: ISR tracking for partition replication
 mod isr_tracker;
 // v2.2.7 Phase 4: ISR ACK tracking for acks=-1 quorum support
@@ -600,7 +601,8 @@ async fn run_cluster_mode(
         .map(|peer| (peer.id, peer.raft.clone()))
         .collect();
 
-    let data_dir = PathBuf::from(&cli.data_dir);
+    // FIX: Use config.data_dir from TOML, not cli.data_dir (CLI default)
+    let data_dir = PathBuf::from(&config.data_dir);
     let raft_cluster = Arc::new(
         crate::raft_cluster::RaftCluster::bootstrap(
             config.node_id,
@@ -631,7 +633,7 @@ async fn run_cluster_mode(
         node_id: config.node_id as i32,
         advertised_host: advertised_host.clone(),  // Clone for later use in broker registration
         advertised_port,
-        data_dir: cli.data_dir.to_string_lossy().to_string(),
+        data_dir: config.data_dir.clone(),  // FIX: Use TOML config data_dir, not CLI default
         enable_indexing: cfg!(feature = "search"),
         enable_compression: true,
         auto_create_topics: true,
@@ -684,6 +686,9 @@ async fn run_cluster_mode(
         let metadata_store = server.metadata_store();
         let peers_clone = config.peers.clone();
 
+        // v2.2.7 CRITICAL FIX: Signal when broker registration completes so partition assignment can proceed
+        let (broker_reg_tx, broker_reg_rx) = tokio::sync::oneshot::channel();
+
         tokio::spawn(async move {
             info!("Background task: Registering {} brokers from config", peers_clone.len());
 
@@ -723,9 +728,34 @@ async fn run_cluster_mode(
             }
 
             tracing::info!("✓ Broker registration task completed");
+            let _ = broker_reg_tx.send(()); // Signal completion (ignore error if receiver dropped)
         });
 
         info!("Broker registration task spawned - will complete in background");
+
+        // v2.2.7 CRITICAL ARCHITECTURAL FIX: Partition assignment MUST happen AFTER:
+        // 1. Raft message loop started (line 628)
+        // 2. Raft leader elected (line 676)
+        // 3. Brokers registered (above)
+        // This fixes "No Raft leader elected" errors that prevented partition assignment.
+        info!("Waiting for broker registration to complete before partition assignment...");
+        let server_clone = server.clone();
+        let config_clone = config.clone();
+        tokio::spawn(async move {
+            // Wait for broker registration to complete
+            if let Ok(_) = broker_reg_rx.await {
+                info!("Broker registration completed - starting partition assignment");
+
+                // Perform partition assignment for existing topics
+                if let Err(e) = server_clone.assign_existing_partitions(&config_clone).await {
+                    tracing::error!("❌ Failed to assign existing partitions: {:?}", e);
+                } else {
+                    tracing::info!("✅ Partition assignment completed successfully");
+                }
+            } else {
+                tracing::warn!("⚠️ Broker registration task dropped before completing - skipping partition assignment");
+            }
+        });
     }
 
     // Initialize monitoring

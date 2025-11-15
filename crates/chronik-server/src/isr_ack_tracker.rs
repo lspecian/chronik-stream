@@ -16,7 +16,7 @@ use dashmap::DashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Tracks acks=-1 requests waiting for ISR quorum
 pub struct IsrAckTracker {
@@ -75,8 +75,8 @@ impl IsrAckTracker {
     ) {
         let key = (topic.clone(), partition, offset);
 
-        debug!(
-            "Registered acks=-1 wait: {}-{} offset {} (quorum: {})",
+        info!(
+            "📝 IsrAckTracker: Registered acks=-1 wait: {}-{} offset {} (quorum: {})",
             topic, partition, offset, quorum_size
         );
 
@@ -86,6 +86,11 @@ impl IsrAckTracker {
             acked_nodes: Vec::new(),
             timestamp: Instant::now(),
         });
+
+        info!(
+            "📊 IsrAckTracker: Total pending requests: {}",
+            self.pending.len()
+        );
     }
 
     /// Record an ACK from a follower
@@ -101,14 +106,19 @@ impl IsrAckTracker {
     pub fn record_ack(&self, topic: &str, partition: i32, offset: i64, node_id: u64) {
         let key = (topic.to_string(), partition, offset);
 
+        info!(
+            "📨 IsrAckTracker: record_ack() called for {}-{} offset {} from node {} (pending count: {})",
+            topic, partition, offset, node_id, self.pending.len()
+        );
+
         // Check if we have a pending wait for this offset
         if let Some(mut entry) = self.pending.get_mut(&key) {
             // Add node to acked list (if not already present)
             if !entry.acked_nodes.contains(&node_id) {
                 entry.acked_nodes.push(node_id);
 
-                debug!(
-                    "Received ACK from node {} for {}-{} offset {} ({}/{} ACKs)",
+                info!(
+                    "✅ IsrAckTracker: Received ACK from node {} for {}-{} offset {} ({}/{} ACKs)",
                     node_id, topic, partition, offset,
                     entry.acked_nodes.len(),
                     entry.quorum_size
@@ -116,7 +126,7 @@ impl IsrAckTracker {
             } else {
                 // Duplicate ACK (shouldn't happen in normal operation)
                 warn!(
-                    "Duplicate ACK from node {} for {}-{} offset {}",
+                    "⚠️  IsrAckTracker: Duplicate ACK from node {} for {}-{} offset {}",
                     node_id, topic, partition, offset
                 );
                 return;
@@ -128,6 +138,11 @@ impl IsrAckTracker {
                 let ack_count = entry.acked_nodes.len();
                 let quorum = entry.quorum_size;
 
+                info!(
+                    "🎉 IsrAckTracker: QUORUM REACHED for {}-{} offset {}: {}/{} ACKs - notifying producer",
+                    topic, partition, offset, ack_count, quorum
+                );
+
                 // Take ownership of tx (must drop RefMut before removing from map)
                 let tx = entry.tx.take();
                 drop(entry);  // Release RefMut
@@ -137,11 +152,21 @@ impl IsrAckTracker {
                     // Notify producer
                     if let Some(tx) = tx.or(wait_entry.tx) {
                         let _ = tx.send(Ok(()));
-                        debug!(
-                            "✅ ISR quorum reached for {}-{} offset {}: {}/{} ACKs",
+                        info!(
+                            "✅ IsrAckTracker: Producer notified for {}-{} offset {}: {}/{} ACKs",
                             topic, partition, offset, ack_count, quorum
                         );
+                    } else {
+                        warn!(
+                            "⚠️  IsrAckTracker: No channel to notify for {}-{} offset {}",
+                            topic, partition, offset
+                        );
                     }
+                } else {
+                    warn!(
+                        "⚠️  IsrAckTracker: Failed to remove entry for {}-{} offset {}",
+                        topic, partition, offset
+                    );
                 }
             }
         } else {
@@ -150,8 +175,8 @@ impl IsrAckTracker {
             // 1. Producer timed out and we cleaned up
             // 2. ACK arrived after quorum already reached
             // 3. Follower sent unsolicited ACK
-            debug!(
-                "Received ACK for non-tracked offset: {}-{} offset {} from node {}",
+            warn!(
+                "⚠️  IsrAckTracker: Received ACK for NON-TRACKED offset: {}-{} offset {} from node {}",
                 topic, partition, offset, node_id
             );
         }

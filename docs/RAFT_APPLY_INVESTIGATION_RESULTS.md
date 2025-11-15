@@ -21,7 +21,7 @@ The cluster is **fully operational**.
 
 ## What We Thought Was Wrong
 
-From previous analysis (V2.2.8_STATUS.md), we believed:
+From previous analysis (v2.2.7_STATUS.md), we believed:
 
 > ### Deadlock #2: register_broker() waits for Raft state machine (STILL BLOCKING)
 >
@@ -68,7 +68,7 @@ $ python3 -c "from kafka import KafkaAdminClient; ..."
 
 ### Mistake #1: Looking at Stale Logs
 
-The investigation in V2.2.8_STATUS.md analyzed logs from **BEFORE** the fixes were applied:
+The investigation in v2.2.7_STATUS.md analyzed logs from **BEFORE** the fixes were applied:
 
 - Logs showed: "Persisting 2 Raft entries to WAL" but NO apply messages
 - **But**: Those logs were from an OLD cluster run with the chicken-and-egg deadlock
@@ -133,7 +133,7 @@ pub async fn new(...) -> Result<Self> {
 pub async fn new(...) -> Result<Self> {
     // NO WAIT - just initialize and return
     if let Some(ref _raft) = raft_cluster {
-        info!("Raft cluster enabled - partition metadata initialization will happen after Raft message loop starts (v2.2.8 fix)");
+        info!("Raft cluster enabled - partition metadata initialization will happen after Raft message loop starts (v2.2.7 fix)");
     }
 
     Ok(Self { ... })  // ← ALWAYS RETURNS NOW!

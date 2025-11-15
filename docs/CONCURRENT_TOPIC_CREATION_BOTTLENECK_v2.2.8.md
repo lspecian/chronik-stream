@@ -1,4 +1,4 @@
-# Concurrent Topic Creation Bottleneck Investigation (v2.2.8)
+# Concurrent Topic Creation Bottleneck Investigation (v2.2.7)
 
 ## Executive Summary
 
@@ -73,7 +73,7 @@ async fn create_topic(&self, name: &str, config: TopicConfig) -> Result<TopicMet
     }).await.map_err(|e| MetadataError::StorageError(e.to_string()))?;
 
     // STEP 2: RETRY LOOP (❌ THE BOTTLENECK!)
-    // v2.2.8: Increased to 80 attempts (4 seconds) to handle high-concurrency topic creation
+    // v2.2.7: Increased to 80 attempts (4 seconds) to handle high-concurrency topic creation
     let max_attempts = 80; // 80 attempts * 50ms = 4 seconds max wait
     let retry_interval = tokio::time::Duration::from_millis(50);
 
@@ -170,14 +170,14 @@ async fn create_topic(&self, name: &str, config: TopicConfig) -> Result<TopicMet
 
 **Question**: "we never had this issue before of creating a topic"
 
-**Answer**: The retry loop with 80 attempts (4 seconds max) was added in **v2.2.8** to handle "high-concurrency topic creation". The comment in the code says:
+**Answer**: The retry loop with 80 attempts (4 seconds max) was added in **v2.2.7** to handle "high-concurrency topic creation". The comment in the code says:
 
 ```rust
-// v2.2.8: Increased to 80 attempts (4 seconds) to handle high-concurrency topic creation
+// v2.2.7: Increased to 80 attempts (4 seconds) to handle high-concurrency topic creation
 let max_attempts = 80; // 80 attempts * 50ms = 4 seconds max wait
 ```
 
-**Before v2.2.8**:
+**Before v2.2.7**:
 - Retry loop likely had fewer attempts or shorter wait time
 - May have failed faster instead of waiting up to 4 seconds
 - The 50ms polling interval existed but with fewer attempts
@@ -321,7 +321,7 @@ fn apply_metadata_command(command: MetadataCommand) {
 
 ## Expected Performance After Fix
 
-**Before Fix** (v2.2.8 with polling):
+**Before Fix** (v2.2.7 with polling):
 - Single topic creation: 50-200ms
 - 128 concurrent clients: 1,396 msg/s (85% regression)
 - Bottleneck: Polling loop serialization
@@ -354,5 +354,5 @@ fn apply_metadata_command(command: MetadataCommand) {
 ---
 
 **Date**: 2025-11-10
-**Version**: v2.2.8 (concurrent topic creation bottleneck identified)
+**Version**: v2.2.7 (concurrent topic creation bottleneck identified)
 **Confidence**: ✅ HIGH - Verified with code inspection, performance testing, and standalone comparison

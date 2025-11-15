@@ -19,6 +19,7 @@ use tokio::net::{TcpStream, TcpListener};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::time::{sleep, Duration, timeout};
+use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use serde::{Serialize, Deserialize};
 use dashmap::DashMap;
@@ -54,8 +55,20 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 /// Heartbeat timeout (30 seconds)
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Reconnect delay (30 seconds)
-const RECONNECT_DELAY: Duration = Duration::from_secs(30);
+/// Reconnect delay (1 second) - CRITICAL FIX: Fast reconnection for startup race conditions
+const RECONNECT_DELAY: Duration = Duration::from_secs(1);
+
+/// Maximum retry attempts before logging warning (10 attempts = ~17 minutes with exponential backoff)
+const MAX_RETRY_ATTEMPTS: usize = 10;
+
+/// Initial backoff for connection retries (1 second)
+const INITIAL_RETRY_BACKOFF: Duration = Duration::from_secs(1);
+
+/// Maximum backoff for connection retries (60 seconds) - prevents unbounded exponential growth
+const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(60);
+
+/// Backoff multiplier for exponential backoff (doubles each retry: 1s, 2s, 4s, 8s, 16s, 32s, 60s cap)
+const RETRY_BACKOFF_MULTIPLIER: u32 = 2;
 
 /// WAL replication record sent over the wire
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,6 +106,19 @@ pub struct WalAckMessage {
 
     /// Follower node ID
     pub node_id: u64,
+}
+
+/// Election trigger message for non-blocking leader election (v2.2.7 deadlock fix)
+#[derive(Debug, Clone)]
+struct ElectionTriggerMessage {
+    /// Topic name
+    topic: String,
+
+    /// Partition ID
+    partition: i32,
+
+    /// Reason for triggering election
+    reason: String,
 }
 
 /// WAL Replication Manager for PostgreSQL-style streaming
@@ -144,6 +170,14 @@ pub struct WalReplicationManager {
     /// Enables partition-specific replication routing (Priority 1)
     /// Maps each partition to its specific replicas (not all followers)
     partition_followers: Arc<DashMap<(String, i32), Vec<String>>>,
+
+    /// Connection failure tracking: follower_addr → consecutive_failures
+    /// Used for exponential backoff when nodes go down
+    connection_failures: Arc<DashMap<String, usize>>,
+
+    /// Election trigger channel sender (v2.2.7 deadlock fix)
+    /// Used to trigger elections asynchronously without blocking the timeout monitor
+    election_tx: Option<mpsc::UnboundedSender<ElectionTriggerMessage>>,
 }
 
 impl WalReplicationManager {
@@ -211,7 +245,10 @@ impl WalReplicationManager {
             last_known_leader: Arc::new(AtomicU64::new(0)), // Phase 3: Track leader changes
             is_currently_leader: Arc::new(AtomicBool::new(false)), // Phase 3: Track leadership
             partition_followers: Arc::new(DashMap::new()), // Priority 1: Per-partition follower map
+            connection_failures: Arc::new(DashMap::new()), // Error handling: Track connection failures for exponential backoff
+            election_tx: None, // Not used in WalReplicationManager (only in WalReceiver)
         });
+
 
         // Spawn background worker for sending records
         let manager_clone = Arc::clone(&manager);
@@ -408,15 +445,28 @@ impl WalReplicationManager {
     async fn run_sender_worker(&self) {
         info!("WAL replication sender worker started");
 
+        let mut last_heartbeat = std::time::Instant::now();
+
         while !self.shutdown.load(Ordering::Relaxed) {
             // Try to dequeue a record (non-blocking)
             if let Some(record) = self.queue.pop() {
                 // Send to all active followers (fan-out)
                 self.send_to_followers(&record).await;
                 self.total_sent.fetch_add(1, Ordering::Relaxed);
+
+                // Reset heartbeat timer (data was sent)
+                last_heartbeat = std::time::Instant::now();
             } else {
-                // Queue empty, sleep briefly to avoid busy-wait
-                sleep(Duration::from_millis(1)).await;
+                // Queue empty - check if we need to send heartbeat
+                if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
+                    debug!("Sending heartbeat to followers ({}s since last activity)",
+                           last_heartbeat.elapsed().as_secs());
+                    self.send_heartbeat_to_followers().await;
+                    last_heartbeat = std::time::Instant::now();
+                }
+
+                // Sleep briefly to avoid busy-wait
+                sleep(Duration::from_millis(100)).await;
             }
         }
 
@@ -464,7 +514,14 @@ impl WalReplicationManager {
 
         // Send to each target follower sequentially (DashMap doesn't allow moving RefMut into tasks)
         for follower_addr in &target_followers {
+            info!(
+                "🔍 send_to_followers: Attempting to send to {} (frame size: {} bytes, connections map has {} entries)",
+                follower_addr, frame.len(), self.connections.len()
+            );
+
             if let Some(mut conn) = self.connections.get_mut(follower_addr) {
+                info!("🔍 send_to_followers: Found connection for {}, calling write_all()", follower_addr);
+
                 // Write frame to TCP stream
                 // Note: This is fast (~1ms) so sequential is fine
                 if let Err(e) = conn.write_all(&frame).await {
@@ -473,10 +530,50 @@ impl WalReplicationManager {
                     drop(conn); // Drop RefMut before removing
                     self.connections.remove(follower_addr);
                 } else {
-                    debug!("Sent WAL record for {}-{} to follower: {}", record.topic, record.partition, follower_addr);
+                    // CRITICAL: Flush the TCP stream to actually send the data
+                    // Without this, data sits in buffer and never reaches followers!
+                    if let Err(e) = conn.flush().await {
+                        error!("Failed to flush WAL record to {}: {}", follower_addr, e);
+                        drop(conn);
+                        self.connections.remove(follower_addr);
+                    } else {
+                        info!("✅ Sent and flushed WAL record for {}-{} to follower: {} ({} bytes)",
+                            record.topic, record.partition, follower_addr, frame.len());
+                    }
                 }
             } else {
-                debug!("No connection to follower {} for {}-{}", follower_addr, record.topic, record.partition);
+                warn!("⚠️  No connection to follower {} for {}-{} (connections: {:?})",
+                    follower_addr, record.topic, record.partition,
+                    self.connections.iter().map(|e| e.key().clone()).collect::<Vec<_>>());
+            }
+        }
+    }
+
+    /// Send heartbeat frames to all followers (v2.2.7 heartbeat fix)
+    ///
+    /// Heartbeats keep the connection alive and signal to followers that the leader
+    /// is still active, preventing timeout-based elections.
+    async fn send_heartbeat_to_followers(&self) {
+        // Build heartbeat frame: [magic(2) | version(2) | length(4)]
+        let mut frame = BytesMut::with_capacity(8);
+        frame.put_u16(HEARTBEAT_MAGIC); // 'HB' magic
+        frame.put_u16(PROTOCOL_VERSION);
+        frame.put_u32(0); // No payload
+
+        // Send to ALL followers (heartbeat is not partition-specific)
+        for follower_addr in &self.followers {
+            if let Some(mut conn) = self.connections.get_mut(follower_addr) {
+                if let Err(e) = conn.write_all(&frame).await {
+                    debug!("Failed to send heartbeat to {}: {}", follower_addr, e);
+                    drop(conn);
+                    self.connections.remove(follower_addr);
+                } else if let Err(e) = conn.flush().await {
+                    debug!("Failed to flush heartbeat to {}: {}", follower_addr, e);
+                    drop(conn);
+                    self.connections.remove(follower_addr);
+                } else {
+                    debug!("Sent heartbeat to follower: {}", follower_addr);
+                }
             }
         }
     }
@@ -489,12 +586,30 @@ impl WalReplicationManager {
             for follower_addr in &self.followers {
                 // Check if we have an active connection
                 if !self.connections.contains_key(follower_addr) {
+                    // Get current failure count for exponential backoff
+                    let failure_count = self.connection_failures
+                        .get(follower_addr)
+                        .map(|r| *r.value())
+                        .unwrap_or(0);
+
+                    // Calculate exponential backoff delay: 1s, 2s, 4s, 8s, 16s, 32s, 60s (max)
+                    let backoff_delay = if failure_count > 0 {
+                        let delay_secs = INITIAL_RETRY_BACKOFF.as_secs() * (RETRY_BACKOFF_MULTIPLIER.pow(failure_count as u32 - 1) as u64);
+                        Duration::from_secs(delay_secs.min(MAX_RETRY_BACKOFF.as_secs()))
+                    } else {
+                        INITIAL_RETRY_BACKOFF
+                    };
+
                     // Attempt to connect
-                    info!("Attempting to connect to follower: {}", follower_addr);
+                    info!("Attempting to connect to follower: {} (failures: {}, backoff: {}s)",
+                          follower_addr, failure_count, backoff_delay.as_secs());
 
                     match timeout(Duration::from_secs(5), TcpStream::connect(follower_addr)).await {
                         Ok(Ok(stream)) => {
-                            info!("✅ Connected to follower: {}", follower_addr);
+                            info!("✅ Connected to follower: {} (after {} failures)", follower_addr, failure_count);
+
+                            // Reset failure counter on successful connection
+                            self.connection_failures.remove(follower_addr);
 
                             // v2.2.7 Phase 4: Split stream for bidirectional communication
                             // Write half: used by send_to_followers
@@ -518,16 +633,44 @@ impl WalReplicationManager {
                             self.connections.insert(follower_addr.clone(), write_half);
                         }
                         Ok(Err(e)) => {
-                            warn!("Failed to connect to follower {}: {}", follower_addr, e);
+                            // Increment failure counter
+                            let new_count = self.connection_failures
+                                .entry(follower_addr.clone())
+                                .or_insert(0)
+                                .value()
+                                .wrapping_add(1);
+                            self.connection_failures.insert(follower_addr.clone(), new_count);
+
+                            // Log warning if exceeded max retries
+                            if new_count >= MAX_RETRY_ATTEMPTS {
+                                error!("⚠️ Failed to connect to follower {} after {} attempts: {}. Will continue retrying with exponential backoff.",
+                                       follower_addr, new_count, e);
+                            } else {
+                                warn!("Failed to connect to follower {} (attempt {}): {}", follower_addr, new_count, e);
+                            }
                         }
                         Err(_) => {
-                            warn!("Connection timeout to follower {}", follower_addr);
+                            // Increment failure counter for timeout
+                            let new_count = self.connection_failures
+                                .entry(follower_addr.clone())
+                                .or_insert(0)
+                                .value()
+                                .wrapping_add(1);
+                            self.connection_failures.insert(follower_addr.clone(), new_count);
+
+                            // Log warning if exceeded max retries
+                            if new_count >= MAX_RETRY_ATTEMPTS {
+                                error!("⚠️ Connection timeout to follower {} after {} attempts. Will continue retrying with exponential backoff.",
+                                       follower_addr, new_count);
+                            } else {
+                                warn!("Connection timeout to follower {} (attempt {})", follower_addr, new_count);
+                            }
                         }
                     }
                 }
             }
 
-            // Sleep before next connection check
+            // Sleep before next connection check (fixed 1s interval - backoff is per-follower)
             sleep(RECONNECT_DELAY).await;
         }
 
@@ -544,12 +687,13 @@ impl WalReplicationManager {
         shutdown: Arc<AtomicBool>,
         follower_addr: String,
     ) -> Result<()> {
-        info!("ACK reader started for follower: {}", follower_addr);
+        info!("🔍 DEBUG: ACK reader started for follower: {}", follower_addr);
         let mut buffer = BytesMut::with_capacity(4096);
 
         while !shutdown.load(Ordering::Relaxed) {
             // Read ACK frame header (8 bytes: magic + version + length)
             if buffer.len() < 8 {
+                info!("🔍 DEBUG ACK reader: Waiting to read header from {} (buffer: {} bytes)", follower_addr, buffer.len());
                 match timeout(Duration::from_secs(60), read_half.read_buf(&mut buffer)).await {
                     Ok(Ok(0)) => {
                         // Connection closed
@@ -557,7 +701,7 @@ impl WalReplicationManager {
                         return Ok(());
                     }
                     Ok(Ok(n)) => {
-                        debug!("ACK reader: Read {} bytes from {}", n, follower_addr);
+                        info!("🔍 DEBUG ACK reader: Read {} bytes from {} (total buffer: {})", n, follower_addr, buffer.len());
                     }
                     Ok(Err(e)) => {
                         return Err(anyhow::anyhow!("ACK reader: Read error from {}: {}", follower_addr, e));
@@ -576,11 +720,12 @@ impl WalReplicationManager {
             // Parse frame header if we have enough data
             if buffer.len() >= 8 {
                 let magic = u16::from_be_bytes([buffer[0], buffer[1]]);
+                info!("🔍 DEBUG ACK reader: Got header from {}, magic=0x{:04x}", follower_addr, magic);
 
                 // Skip heartbeat frames (if any)
                 if magic == HEARTBEAT_MAGIC {
                     buffer.advance(8);
-                    debug!("ACK reader: Received heartbeat from {}", follower_addr);
+                    info!("ACK reader: Received heartbeat from {}", follower_addr);
                     continue;
                 }
 
@@ -595,6 +740,7 @@ impl WalReplicationManager {
                 // Read frame length
                 let frame_length = u32::from_be_bytes([buffer[4], buffer[5], buffer[6], buffer[7]]) as usize;
                 let frame_size = 8 + frame_length; // header + payload
+                info!("🔍 DEBUG ACK reader: ACK frame length={}, total size={}", frame_length, frame_size);
 
                 // Wait for complete frame
                 while buffer.len() < frame_size && !shutdown.load(Ordering::Relaxed) {
@@ -620,11 +766,12 @@ impl WalReplicationManager {
                 // Deserialize complete ACK frame
                 let frame_bytes = buffer.split_to(frame_size);
                 let payload = &frame_bytes[8..]; // Skip header
+                info!("🔍 DEBUG ACK reader: Deserializing {} bytes of payload", payload.len());
 
                 match bincode::deserialize::<WalAckMessage>(payload) {
                     Ok(ack_msg) => {
                         info!(
-                            "ACK✓ Received from {}: {}-{} offset {} (node {})",
+                            "✅ ACK RECEIVED from {}: {}-{} offset {} (node {})",
                             follower_addr,
                             ack_msg.topic,
                             ack_msg.partition,
@@ -633,11 +780,19 @@ impl WalReplicationManager {
                         );
 
                         // THIS IS THE KEY FIX: Record ACK in IsrAckTracker on leader
+                        info!(
+                            "🔍 DEBUG: Recording ACK in tracker for {}-{} offset {} node {}",
+                            ack_msg.topic, ack_msg.partition, ack_msg.offset, ack_msg.node_id
+                        );
                         isr_ack_tracker.record_ack(
                             &ack_msg.topic,
                             ack_msg.partition,
                             ack_msg.offset,
                             ack_msg.node_id,
+                        );
+                        info!(
+                            "✅ ACK recorded in tracker: {}-{} offset {} node {}",
+                            ack_msg.topic, ack_msg.partition, ack_msg.offset, ack_msg.node_id
                         );
                     }
                     Err(e) => {
@@ -939,6 +1094,223 @@ impl WalReplicationManager {
         }
     }
 
+    /// Subscribe to metadata events for immediate partition follower registration (NEW)
+    ///
+    /// This method listens for PartitionAssigned events and immediately populates
+    /// the partition_followers map, eliminating the 10-second delay from the polling-based
+    /// discovery worker. This is critical for acks=all to work immediately after topic creation.
+    ///
+    /// # Arguments
+    /// * `event_bus` - Metadata event bus to subscribe to
+    /// * `cluster_config` - Cluster config for mapping node IDs to WAL addresses
+    ///
+    /// # Call this from IntegratedServer after creating WalReplicationManager
+    pub fn start_metadata_event_listener(
+        self: &Arc<Self>,
+        event_bus: Arc<crate::metadata_events::MetadataEventBus>,
+    ) {
+        let manager = Arc::clone(self);
+        let cluster_config = self.cluster_config.clone();
+
+        tokio::spawn(async move {
+            let mut rx = event_bus.subscribe();
+            info!("📡 WalReplicationManager metadata event listener started");
+
+            loop {
+                match rx.recv().await {
+                    Ok(event) => {
+                        if let Err(e) = manager.handle_metadata_event(event, cluster_config.as_deref()).await {
+                            warn!("Failed to handle metadata event: {}", e);
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+                        warn!("WalReplicationManager lagged by {} metadata events", count);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        warn!("Metadata event bus closed - stopping listener");
+                        break;
+                    }
+                }
+            }
+
+            info!("📡 WalReplicationManager metadata event listener stopped");
+        });
+    }
+
+    /// Handle a metadata event (partition assignment, leader change, ISR update)
+    async fn handle_metadata_event(
+        &self,
+        event: crate::metadata_events::MetadataEvent,
+        cluster_config: Option<&chronik_config::ClusterConfig>,
+    ) -> anyhow::Result<()> {
+        use crate::metadata_events::MetadataEvent;
+
+        match event {
+            MetadataEvent::PartitionAssigned { topic, partition, replicas, leader } => {
+                info!(
+                    "📡 PartitionAssigned event: {}-{} => replicas={:?}, leader={}",
+                    topic, partition, replicas, leader
+                );
+
+                // Get my node ID to filter out self
+                let my_node_id = cluster_config
+                    .map(|cfg| cfg.node_id as u64)
+                    .unwrap_or(0);
+
+                // Filter out self from replicas (leader doesn't replicate to itself)
+                let followers: Vec<u64> = replicas
+                    .into_iter()
+                    .filter(|&id| id != my_node_id)
+                    .collect();
+
+                if followers.is_empty() {
+                    info!("No followers for {}-{} (single replica or I'm not the leader)", topic, partition);
+                    return Ok(());
+                }
+
+                // Map node IDs to WAL addresses
+                let follower_addrs: Vec<String> = if let Some(cfg) = cluster_config {
+                    followers
+                        .iter()
+                        .filter_map(|&node_id| {
+                            cfg.peers.iter()
+                                .find(|p| p.id == node_id)
+                                .map(|p| p.wal.clone())
+                        })
+                        .collect()
+                } else {
+                    warn!("No cluster config - cannot map node IDs to addresses");
+                    Vec::new()
+                };
+
+                if !follower_addrs.is_empty() {
+                    let partition_key = (topic.clone(), partition);
+                    self.partition_followers.insert(partition_key, follower_addrs.clone());
+                    info!(
+                        "✅ Registered partition followers for {}-{}: {:?}",
+                        topic, partition, follower_addrs
+                    );
+                } else {
+                    warn!("No follower addresses mapped for {}-{}", topic, partition);
+                }
+            }
+
+            MetadataEvent::LeaderChanged { topic, partition, new_leader } => {
+                info!("📡 LeaderChanged event: {}-{} => leader={}", topic, partition, new_leader);
+                // Leader changes are handled by spawn_leader_change_handler
+                // This is just for logging/debugging
+            }
+
+            MetadataEvent::ISRUpdated { topic, partition, isr } => {
+                info!("📡 ISRUpdated event: {}-{} => ISR={:?}", topic, partition, isr);
+                // ISR updates don't require follower list changes (replicas are the source of truth)
+            }
+
+            _ => {
+                // Other events (HighWatermarkUpdated, TopicCreated, TopicDeleted) don't affect routing
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Register followers for __chronik_metadata partition (required for metadata WAL replication)
+    ///
+    /// This special internal partition must be registered immediately on server startup
+    /// so that metadata commands can be replicated to followers. Unlike normal partitions
+    /// which are registered via PartitionAssigned events, __chronik_metadata-0 never goes
+    /// through normal partition assignment.
+    ///
+    /// Call this during server initialization, AFTER connect_all_peers().
+    pub fn register_metadata_partition_followers(&self) {
+        let partition_key = ("__chronik_metadata".to_string(), 0);
+
+        if self.followers.is_empty() {
+            info!("No followers configured - metadata partition will not replicate");
+            return;
+        }
+
+        self.partition_followers.insert(partition_key.clone(), self.followers.clone());
+
+        info!(
+            "✅ Registered metadata partition followers for __chronik_metadata-0: {:?}",
+            self.followers
+        );
+    }
+
+    /// Pre-warm all WAL replication connections during server startup
+    ///
+    /// This ensures all follower connections are established BEFORE accepting client traffic,
+    /// eliminating the race condition where first produce requests fail due to missing connections.
+    ///
+    /// Returns Ok(()) if all connections succeeded, Err with details about failures.
+    pub async fn connect_all_peers(&self) -> Result<()> {
+        info!("🔄 Pre-warming WAL replication connections to {} followers", self.followers.len());
+
+        let mut connection_results = Vec::new();
+        let mut successful = 0;
+        let mut failed = 0;
+
+        for follower_addr in &self.followers {
+            info!("Attempting to connect to follower: {}", follower_addr);
+
+            match timeout(Duration::from_secs(5), TcpStream::connect(follower_addr)).await {
+                Ok(Ok(stream)) => {
+                    info!("✅ Connected to follower: {}", follower_addr);
+
+                    // Split stream for bidirectional communication (leader sends WAL, receives ACKs)
+                    let (read_half, write_half) = stream.into_split();
+
+                    // Spawn ACK reader task if ISR ACK tracker is available
+                    if let Some(ref ack_tracker) = self.isr_ack_tracker {
+                        let tracker = Arc::clone(ack_tracker);
+                        let shutdown = Arc::clone(&self.shutdown);
+                        let addr = follower_addr.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = Self::run_ack_reader(read_half, tracker, shutdown, addr.clone()).await {
+                                error!("ACK reader for {} failed: {}", addr, e);
+                            }
+                        });
+                        info!("✅ Spawned ACK reader for follower: {}", follower_addr);
+                    }
+
+                    // Store write-half connection (for send_to_followers)
+                    self.connections.insert(follower_addr.clone(), write_half);
+                    successful += 1;
+                    connection_results.push((follower_addr.clone(), true));
+                }
+                Ok(Err(e)) => {
+                    warn!("Failed to connect to follower {}: {}", follower_addr, e);
+                    failed += 1;
+                    connection_results.push((follower_addr.clone(), false));
+                }
+                Err(_) => {
+                    warn!("Connection timeout to follower {} (5s)", follower_addr);
+                    failed += 1;
+                    connection_results.push((follower_addr.clone(), false));
+                }
+            }
+        }
+
+        info!("WAL replication connection pre-warming complete: {} successful, {} failed", successful, failed);
+
+        if failed > 0 {
+            let failed_followers: Vec<&String> = connection_results.iter()
+                .filter(|(_, success)| !success)
+                .map(|(addr, _)| addr)
+                .collect();
+            warn!("Failed to connect to followers: {:?}", failed_followers);
+
+            // Return error if any connections failed
+            return Err(anyhow::anyhow!(
+                "Failed to connect to {} out of {} followers: {:?}",
+                failed, self.followers.len(), failed_followers
+            ));
+        }
+
+        Ok(())
+    }
+
     /// Shutdown the replication manager
     pub async fn shutdown(&self) {
         info!("Shutting down WAL replication manager");
@@ -1192,19 +1564,31 @@ impl WalReceiver {
     ) -> Result<()> {
         let mut buffer = BytesMut::with_capacity(64 * 1024); // 64KB buffer
 
-        // v2.2.7: Spawn background timeout monitor if leader elector is available
+        // v2.2.7 DEADLOCK FIX: Spawn timeout monitor with channel-based elections
+        // The monitor sends election requests to a channel instead of calling directly,
+        // preventing deadlocks with raft_node lock
         if let Some(ref elector) = leader_elector {
+            // Create election trigger channel
+            let (election_tx, election_rx) = mpsc::unbounded_channel();
+
+            // Spawn election worker that can safely lock raft_node
             let elector_clone = Arc::clone(elector);
+            tokio::spawn(async move {
+                Self::run_election_worker(election_rx, elector_clone).await;
+            });
+
+            // Spawn timeout monitor that sends to channel (non-blocking)
             let last_heartbeat_clone = Arc::clone(&last_heartbeat);
             let shutdown_clone = Arc::clone(&shutdown);
-
             tokio::spawn(async move {
                 Self::monitor_timeouts(
-                    elector_clone,
+                    election_tx,
                     last_heartbeat_clone,
                     shutdown_clone,
                 ).await;
             });
+
+            info!("WAL timeout monitoring ENABLED with channel-based elections (deadlock-free)");
         }
 
         while !shutdown.load(Ordering::Relaxed) {
@@ -1355,6 +1739,11 @@ impl WalReceiver {
 
                             // v2.2.7 Phase 4: Send ACK back to leader for acks=-1 support
                             if let Some(ref tracker) = isr_ack_tracker {
+                                info!(
+                                    "🔍 DEBUG: Preparing to send ACK for {}-{} offset {} from node {}",
+                                    wal_record.topic, wal_record.partition, wal_record.base_offset, node_id
+                                );
+
                                 let ack_msg = WalAckMessage {
                                     topic: wal_record.topic.clone(),
                                     partition: wal_record.partition,
@@ -1363,25 +1752,25 @@ impl WalReceiver {
                                 };
 
                                 // Send ACK frame back to leader
+                                // NOTE: ACK is sent over TCP to leader's ACK reader
+                                // The ACK reader on the leader will call tracker.record_ack()
+                                // We do NOT call tracker.record_ack() here (that would be wrong - followers don't track their own ACKs)
                                 if let Err(e) = Self::send_ack(&mut stream, &ack_msg).await {
                                     error!(
-                                        "Failed to send ACK for {}-{} offset {}: {}",
+                                        "❌ Failed to send ACK for {}-{} offset {}: {}",
                                         wal_record.topic, wal_record.partition, wal_record.base_offset, e
                                     );
                                 } else {
-                                    debug!(
-                                        "ACK✓ Sent to leader: {}-{} offset {} from node {}",
+                                    info!(
+                                        "✅ ACK SENT to leader: {}-{} offset {} from node {}",
                                         wal_record.topic, wal_record.partition, wal_record.base_offset, node_id
                                     );
-
-                                    // Notify the IsrAckTracker (for local leader-follower acks=-1)
-                                    tracker.record_ack(
-                                        &wal_record.topic,
-                                        wal_record.partition,
-                                        wal_record.base_offset,
-                                        node_id,
-                                    );
                                 }
+                            } else {
+                                warn!(
+                                    "⚠️ DEBUG: No ISR ACK tracker configured - ACKs will NOT be sent for {}-{} offset {}",
+                                    wal_record.topic, wal_record.partition, wal_record.base_offset
+                                );
                             }
                         }
                     }
@@ -1484,9 +1873,19 @@ impl WalReceiver {
 
     /// Send ACK frame back to leader (v2.2.7 Phase 4)
     async fn send_ack(stream: &mut TcpStream, ack_msg: &WalAckMessage) -> Result<()> {
+        info!(
+            "🔍 DEBUG send_ack: Serializing ACK for {}-{} offset {} from node {}",
+            ack_msg.topic, ack_msg.partition, ack_msg.offset, ack_msg.node_id
+        );
+
         // Serialize ACK message
         let serialized = bincode::serialize(ack_msg)
             .context("Failed to serialize ACK message")?;
+
+        info!(
+            "🔍 DEBUG send_ack: Serialized {} bytes, building frame with magic 0x{:04x}",
+            serialized.len(), ACK_MAGIC
+        );
 
         // Build ACK frame: [magic(2) | version(2) | length(4) | payload(N)]
         let mut frame = BytesMut::with_capacity(8 + serialized.len());
@@ -1495,29 +1894,78 @@ impl WalReceiver {
         frame.put_u32(serialized.len() as u32);
         frame.put_slice(&serialized);
 
+        info!(
+            "🔍 DEBUG send_ack: Frame built ({} bytes total), writing to stream",
+            frame.len()
+        );
+
         // Send frame
         stream.write_all(&frame).await
             .context("Failed to send ACK frame to leader")?;
 
+        info!("🔍 DEBUG send_ack: Frame written, flushing");
+
         stream.flush().await
             .context("Failed to flush ACK frame")?;
+
+        info!("🔍 DEBUG send_ack: Flush complete, ACK sent successfully");
 
         Ok(())
     }
 
+    /// Election worker task - processes election triggers from channel (v2.2.7 deadlock fix)
+    ///
+    /// This task runs independently and can safely lock raft_node because it doesn't
+    /// hold any other locks. The timeout monitor sends election requests to this worker
+    /// via the channel, avoiding deadlocks.
+    async fn run_election_worker(
+        mut election_rx: mpsc::UnboundedReceiver<ElectionTriggerMessage>,
+        leader_elector: Arc<crate::leader_election::LeaderElector>,
+    ) {
+        info!("Started election worker task (non-blocking elections)");
+
+        while let Some(msg) = election_rx.recv().await {
+            debug!(
+                "Election worker: Processing trigger for {}-{}: {}",
+                msg.topic, msg.partition, msg.reason
+            );
+
+            // This is safe because the worker doesn't hold any locks
+            // It can wait for raft_node lock without blocking other operations
+            let result = leader_elector.trigger_election_on_timeout(
+                &msg.topic,
+                msg.partition,
+                &msg.reason,
+            ).await;
+
+            if let Err(e) = result {
+                debug!(
+                    "Election trigger failed for {}-{}: {} (this is normal if not leader)",
+                    msg.topic, msg.partition, e
+                );
+            }
+        }
+
+        info!("Election worker stopped");
+    }
+
     /// Monitor partition heartbeat timeouts and trigger elections (v2.2.7)
     async fn monitor_timeouts(
-        leader_elector: Arc<crate::leader_election::LeaderElector>,
+        election_tx: mpsc::UnboundedSender<ElectionTriggerMessage>,
         last_heartbeat: Arc<DashMap<(String, i32), std::time::Instant>>,
         shutdown: Arc<AtomicBool>,
     ) {
-        info!("Started WAL timeout monitor for event-driven elections");
+        info!("Started WAL timeout monitor for event-driven elections (channel-based)");
 
         while !shutdown.load(Ordering::Relaxed) {
             // Check every 5 seconds
             sleep(Duration::from_secs(5)).await;
 
             let now = std::time::Instant::now();
+
+            // v2.2.7 DEADLOCK FIX: Collect keys to remove FIRST, then remove after iteration
+            // CRITICAL: Cannot call remove() while iterating - causes DashMap shard lock deadlock!
+            let mut to_remove = Vec::new();
 
             // Check each partition for timeout
             for entry in last_heartbeat.iter() {
@@ -1530,16 +1978,23 @@ impl WalReceiver {
                         topic, partition, now.duration_since(last_seen).as_secs()
                     );
 
-                    // Trigger election
-                    leader_elector.trigger_election_on_timeout(
-                        topic,
-                        *partition,
-                        &format!("WAL stream timeout ({}s)", now.duration_since(last_seen).as_secs()),
-                    );
+                    // v2.2.7 DEADLOCK FIX: Send to channel instead of calling directly
+                    // This never blocks, preventing deadlock with raft_node lock
+                    let _ = election_tx.send(ElectionTriggerMessage {
+                        topic: topic.to_string(),
+                        partition: *partition,
+                        reason: format!("WAL stream timeout ({}s)", now.duration_since(last_seen).as_secs()),
+                    });
 
-                    // Remove from tracking to avoid repeated triggers
-                    last_heartbeat.remove(entry.key());
+                    // Collect key for removal (cannot remove during iteration!)
+                    to_remove.push((topic.clone(), *partition));
                 }
+            }
+
+            // Remove timed-out entries AFTER iteration completes (avoids iterator invalidation deadlock)
+            for key in to_remove {
+                last_heartbeat.remove(&key);
+                debug!("Removed {}-{} from heartbeat tracking after timeout", key.0, key.1);
             }
         }
 

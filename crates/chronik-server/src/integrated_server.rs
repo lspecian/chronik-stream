@@ -164,21 +164,30 @@ impl IntegratedKafkaServer {
         );
         info!("✅ Metadata WAL created (topic='__chronik_metadata', partition=0)");
 
-        // Create WAL replicator for metadata
+        // v2.2.7 EVENT-DRIVEN: Create event bus for metadata event-driven replication
+        let metadata_event_bus = Arc::new(crate::metadata_events::MetadataEventBus::default());
+        info!("✅ Metadata event bus created (buffer_size=1000)");
+
+        // v2.2.7 EVENT-DRIVEN: Create WAL replicator for metadata with event bus
         let metadata_wal_replicator = Arc::new(
             crate::metadata_wal_replication::MetadataWalReplicator::new(
                 metadata_wal.clone(),
                 // Placeholder: will be replaced with real replication manager after it's created
                 crate::wal_replication::WalReplicationManager::new_with_dependencies(
-                    Vec::new(),
+                    Vec::new(),                          // Empty for auto-discovery
                     Some(raft_cluster_for_metadata.clone()),
-                    None,
-                    None,
-                    None,
+                    None,                                // No ISR tracker for metadata
+                    None,                                // No ACK tracker for metadata
+                    config.cluster_config.clone().map(Arc::new), // ✅ FIX: Pass cluster config for auto-discovery
                 ),
+                metadata_event_bus.clone(),  // v2.2.7 EVENT-DRIVEN: Use shared event bus
             )
         );
         info!("✅ Metadata WAL replicator created");
+
+        // v2.2.7 EVENT-DRIVEN: Start event listener for metadata replication
+        metadata_wal_replicator.clone().start_event_listener();
+        info!("✅ Metadata event listener started");
 
         // Create LeaseManager for fast follower reads (1-2ms vs 2-5ms forwarding)
         let lease_manager = Arc::new(crate::leader_lease::LeaseManager::new(
@@ -186,13 +195,14 @@ impl IntegratedKafkaServer {
         ));
         info!("✅ LeaseManager created (lease_duration=5s)");
 
-        // Create RaftMetadataStore with WAL-ONLY architecture
+        // v2.2.7 EVENT-DRIVEN: Create RaftMetadataStore with WAL-ONLY architecture and event bus
         let metadata_store: Arc<dyn MetadataStore> = Arc::new(
             crate::raft_metadata_store::RaftMetadataStore::new(
                 raft_cluster_for_metadata.clone(),
                 metadata_wal.clone(),
                 metadata_wal_replicator.clone(),
                 lease_manager.clone(),
+                metadata_event_bus.clone(),  // v2.2.7 EVENT-DRIVEN: Use shared event bus
             )
         );
 
@@ -475,27 +485,30 @@ impl IntegratedKafkaServer {
             Vec::new()
         };
 
-        // AUTO-DISCOVERY: Extract follower WAL addresses from cluster config
+        // COMMENTED OUT (STEP 5): AUTO-DISCOVERY: Extract follower WAL addresses from cluster config
         // CRITICAL FIX: Exclude current node from followers list to prevent self-replication!
-        if let Some(ref cluster_cfg) = config.cluster_config {
-            let my_node_id = cluster_cfg.node_id;
-            let auto_discovered: Vec<String> = cluster_cfg
-                .peer_nodes()  // Get all peers
-                .iter()
-                .filter(|peer| peer.id != my_node_id)  // CRITICAL: Exclude current node!
-                .map(|peer| peer.wal.clone())  // Extract WAL address
-                .collect();
+        // if let Some(ref cluster_cfg) = config.cluster_config {
+        //     let my_node_id = cluster_cfg.node_id;
+        //     let auto_discovered: Vec<String> = cluster_cfg
+        //         .peer_nodes()  // Get all peers
+        //         .iter()
+        //         .filter(|peer| peer.id != my_node_id)  // CRITICAL: Exclude current node!
+        //         .map(|peer| peer.wal.clone())  // Extract WAL address
+        //         .collect();
 
-            if !auto_discovered.is_empty() {
-                info!(
-                    "🔍 Phase 1: Auto-discovered {} follower WAL addresses from cluster config (excluding self node {}): {:?}",
-                    auto_discovered.len(),
-                    my_node_id,
-                    auto_discovered
-                );
-                manual_followers.extend(auto_discovered);
-            }
-        }
+        //     if !auto_discovered.is_empty() {
+        //         info!(
+        //             "🔍 Phase 1: Auto-discovered {} follower WAL addresses from cluster config (excluding self node {}): {:?}",
+        //             auto_discovered.len(),
+        //             my_node_id,
+        //             auto_discovered
+        //         );
+        //         manual_followers.extend(auto_discovered);
+        //     }
+        // }
+
+        // COMMENTED OUT (STEP 6): Declare replication_manager outside the block so it's available for pre-warming later
+        // let mut maybe_replication_manager: Option<Arc<crate::wal_replication::WalReplicationManager>> = None;
 
         // Enable WAL replication if either manual followers or cluster config is available
         if !manual_followers.is_empty() || config.cluster_config.is_some() {
@@ -517,49 +530,44 @@ impl IntegratedKafkaServer {
             );
             info!("Created WalReplicationManager with Raft, ISR, and ACK tracking (sharing IsrAckTracker)");
 
+            // COMMENTED OUT (STEP 6): Store for pre-warming later
+            // maybe_replication_manager = Some(replication_manager.clone());
+
             produce_handler_inner.set_wal_replication_manager(replication_manager.clone());
 
-            // WAL-ONLY: Wire up Metadata WAL replication (always enabled)
-            {
-                info!("Creating MetadataWalReplicator with WalReplicationManager");
-                let _metadata_replicator = Arc::new(
-                    crate::metadata_wal_replication::MetadataWalReplicator::new(
-                        metadata_wal.clone(),
-                        replication_manager.clone(),
-                    )
-                );
+            // v2.2.7 EVENT-DRIVEN: Event-based metadata replication is already configured via event listener
+            // (started earlier with metadata_wal_replicator.start_event_listener())
+            info!("✅ Metadata WAL replication using event-driven architecture");
 
-                // Note: The metadata store was already created with a placeholder replicator
-                // In practice, the placeholder will work for now since it shares the same
-                // WalReplicationManager infrastructure. For production, we should refactor
-                // to create the metadata store AFTER the replication manager is available.
-                // TODO: Refactor to avoid placeholder replicator
-                info!("✅ Phase 2: Metadata WAL replication configured");
-            }
-
-            // v2.2.7 Phase 2: Spawn leader change handler for WAL replication
+            // v2.2.7 EVENT-DRIVEN Phase 2: Spawn leader change handler for WAL replication
             // This enables automatic reconnection when Raft leader changes
             if let Some(ref rc) = raft_cluster {
                 info!("🔄 Spawning WAL replication leader change handler");
                 replication_manager.spawn_leader_change_handler(rc.clone());
                 info!("✅ Phase 2: Leader change handler spawned - will reconnect on failover");
 
-                // v2.2.7 Phase 2.5: Spawn quorum recovery manager (if enabled in config)
-                if let Some(cluster_cfg) = &config.cluster_config {
-                    use crate::quorum_recovery::{QuorumRecoveryManager, QuorumRecoveryConfig};
+                // v2.2.7 EVENT-DRIVEN: Start metadata event listener for immediate partition follower registration
+                // This eliminates the 10-second delay from polling-based discovery, critical for acks=all
+                info!("🔄 Starting WAL replication metadata event listener");
+                replication_manager.start_metadata_event_listener(metadata_event_bus.clone());
+                info!("✅ WAL replication will receive partition assignments immediately via events");
 
-                    let recovery_config = QuorumRecoveryConfig {
-                        enabled: cluster_cfg.auto_recover,
-                        ..QuorumRecoveryConfig::default()
-                    };
+                // COMMENTED OUT (STEP 10): v2.2.7 Phase 2.5: Spawn quorum recovery manager (if enabled in config)
+                // if let Some(cluster_cfg) = &config.cluster_config {
+                //     use crate::quorum_recovery::{QuorumRecoveryManager, QuorumRecoveryConfig};
 
-                    let quorum_manager = QuorumRecoveryManager::new(rc.clone(), recovery_config);
-                    quorum_manager.spawn();
+                //     let recovery_config = QuorumRecoveryConfig {
+                //         enabled: cluster_cfg.auto_recover,
+                //         ..QuorumRecoveryConfig::default()
+                //     };
 
-                    if cluster_cfg.auto_recover {
-                        info!("✅ Phase 2.5: Automatic quorum recovery ENABLED (will recover after 5min quorum loss)");
-                    }
-                }
+                //     let quorum_manager = QuorumRecoveryManager::new(rc.clone(), recovery_config);
+                //     quorum_manager.spawn();
+
+                //     if cluster_cfg.auto_recover {
+                //         info!("✅ Phase 2.5: Automatic quorum recovery ENABLED (will recover after 5min quorum loss)");
+                //     }
+                // }
             }
         } else {
             info!("WAL replication disabled: no cluster config and CHRONIK_REPLICATION_FOLLOWERS not set");
@@ -832,13 +840,16 @@ impl IntegratedKafkaServer {
             warn!("Failed to create default topic on startup: {:?}", e);
         }
 
-        // If clustering is enabled, perform initial partition assignment
+        // v2.2.7 ARCHITECTURAL FIX: Partition assignment moved to main.rs (lines 736-758)
+        // Partition assignment now happens AFTER:
+        // 1. Raft message loop starts
+        // 2. Raft leader is elected
+        // 3. Brokers are registered
+        // This fixes "No Raft leader elected" errors that previously prevented partition assignment.
+
         if let Some(ref cluster_config) = cluster_config_clone {
             if cluster_config.enabled {
-                info!("Cluster mode enabled - performing initial partition assignment");
-                if let Err(e) = server.assign_existing_partitions(cluster_config).await {
-                    warn!("Failed to assign existing partitions: {:?}", e);
-                }
+                info!("Cluster mode enabled - partition assignment handled in main.rs after Raft initialization");
 
                 // v2.2.7 ARCHITECTURAL FIX: Skip broker verification for multi-node Raft clusters
                 // because broker registration happens AFTER IntegratedServer::new() returns
@@ -874,11 +885,14 @@ impl IntegratedKafkaServer {
                         verify_retry += 1;
                         if verify_retry >= max_verify_retries {
                             return Err(anyhow::anyhow!(
-                                "Broker {} not visible in metadata after {} attempts ({} seconds) - cluster metadata inconsistent",
-                                server.config.node_id, verify_retry, verify_retry
+                                "Broker {} not visible in metadata after {} attempts - cluster metadata inconsistent",
+                                server.config.node_id, verify_retry
                             ));
                         }
-                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+                        // v2.2.7 EVENT-DRIVEN: Exponential backoff: 100ms, 200ms, 400ms, 800ms, 1600ms (max 2s)
+                        let backoff_ms = std::cmp::min(100 * (1 << verify_retry), 2000);
+                        tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
                     }
                 } else {
                     // Multi-node Raft mode: Broker registration happens in main.rs AFTER message loop starts
@@ -925,6 +939,28 @@ impl IntegratedKafkaServer {
             }
         }
 
+        // COMMENTED OUT (STEP 12): Spawn background task for pre-warming WAL replication connections
+        // This ensures we don't block server startup, while still trying to establish connections early
+        // if let Some(ref replication_manager) = maybe_replication_manager {
+        //     let replication_manager_clone = replication_manager.clone();
+        //     tokio::spawn(async move {
+        //         // Give WAL receivers a moment to start (non-blocking)
+        //         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        //         info!("🔄 Pre-warming WAL replication connections in background...");
+        //         let connection_timeout = tokio::time::Duration::from_secs(5);
+        //         match tokio::time::timeout(connection_timeout, replication_manager_clone.connect_all_peers()).await {
+        //             Ok(Ok(())) => info!("✅ All WAL replication connections established"),
+        //             Ok(Err(e)) => info!("Some WAL replication connections pending (will retry automatically): {}", e),
+        //             Err(_) => info!("WAL replication connections will establish on-demand"),
+        //         }
+
+        //         // Register metadata partition followers (critical for metadata replication)
+        //         replication_manager_clone.register_metadata_partition_followers();
+        //         info!("✅ Metadata partition followers registered");
+        //     });
+        // }
+
         Ok(server)
     }
 
@@ -938,7 +974,7 @@ impl IntegratedKafkaServer {
     ///
     /// This method is called on cluster startup to ensure all partitions have assignments.
     /// It uses the round-robin strategy from `crates/chronik-common/src/partition_assignment.rs`.
-    async fn assign_existing_partitions(&self, cluster_config: &chronik_config::ClusterConfig) -> Result<()> {
+    pub async fn assign_existing_partitions(&self, cluster_config: &chronik_config::ClusterConfig) -> Result<()> {
         use chronik_common::partition_assignment::PartitionAssignment as AssignmentManager;
         use chronik_common::metadata::PartitionAssignment;
 
@@ -992,31 +1028,26 @@ impl IntegratedKafkaServer {
             // Convert to metadata PartitionAssignment and persist
             let topic_assignments = assignment_mgr.get_topic_assignments(topic_name);
             for (partition_id, partition_info) in topic_assignments {
-                // For each replica, create a PartitionAssignment
-                for (replica_idx, &node_id) in partition_info.replicas.iter().enumerate() {
-                    let is_leader = node_id == partition_info.leader;
-                    let assignment = PartitionAssignment {
-                        topic: topic_name.clone(),
-                        partition: partition_id as u32,
-                        broker_id: node_id as i32,
-                        is_leader,
-                    };
+                // Create SINGLE assignment per partition with FULL replica list
+                let replicas: Vec<u64> = partition_info.replicas.iter().map(|&id| id as u64).collect();
+                let leader_id = partition_info.leader as u64;
 
-                    // Persist assignment via metadata store (will replicate via Raft)
-                    self.metadata_store.assign_partition(assignment).await?;
+                let assignment = PartitionAssignment {
+                    topic: topic_name.clone(),
+                    partition: partition_id as u32,
+                    broker_id: leader_id as i32,  // Deprecated field
+                    is_leader: true,  // Deprecated field
+                    replicas: replicas.clone(),
+                    leader_id,
+                };
 
-                    if is_leader {
-                        info!(
-                            "Assigned partition {}/{} to node {} (leader)",
-                            topic_name, partition_id, node_id
-                        );
-                    } else {
-                        debug!(
-                            "Assigned partition {}/{} to node {} (replica #{})",
-                            topic_name, partition_id, node_id, replica_idx
-                        );
-                    }
-                }
+                // Persist assignment via metadata store (will replicate via Raft)
+                self.metadata_store.assign_partition(assignment).await?;
+
+                info!(
+                    "Assigned partition {}/{} to replicas {:?} (leader={})",
+                    topic_name, partition_id, replicas, leader_id
+                );
             }
 
             info!(
@@ -1104,7 +1135,9 @@ impl IntegratedKafkaServer {
         let request_semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent_requests));
         info!("Request concurrency limited to {} (prevents acks=0 overload)", max_concurrent_requests);
 
+        debug!("DEBUG: Entering accept loop - ready to accept connections");
         loop {
+            debug!("DEBUG: Before listener.accept() - waiting for connection...");
             match listener.accept().await {
                 Ok((mut socket, addr)) => {
                     debug!("New connection from {}", addr);

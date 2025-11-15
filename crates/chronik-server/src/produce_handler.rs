@@ -1430,7 +1430,11 @@ impl ProduceHandler {
         // Zero-copy optimization: Reuse serialized WAL data from above (no re-parsing!)
         // This is called AFTER WAL write completes, so data is durable locally
         if let Some(ref wal_repl_mgr) = self.wal_replication_manager {
+            info!("🔍 DEBUG: WAL replication manager exists for {}-{}", topic, partition);
             if let Some(serialized_data) = serialized_for_replication {
+                info!("🔍 DEBUG: Serialized data exists ({} bytes), spawning replication task for {}-{} offset={}",
+                    serialized_data.len(), topic, partition, base_offset);
+
                 // Clone necessary metadata (cheap - just strings and ints)
                 let topic_clone = topic.to_string();
                 let partition_clone = partition;
@@ -1443,6 +1447,8 @@ impl ProduceHandler {
                 // Spawn background task (fire-and-forget, never blocks)
                 // v2.2.7: Use replicate_partition for ISR-aware routing
                 tokio::spawn(async move {
+                    info!("🚀 DEBUG: Calling replicate_partition for {}-{} offset={}",
+                        topic_clone, partition_clone, base_offset_clone);
                     repl_mgr_clone.replicate_partition(
                         topic_clone,
                         partition_clone,
@@ -1454,8 +1460,10 @@ impl ProduceHandler {
                 });
             } else {
                 // WAL manager was None, nothing to replicate
-                warn!("Skipping replication for {}-{}: no WAL data serialized", topic, partition);
+                warn!("⚠️ DEBUG: Skipping replication for {}-{}: serialized_for_replication is None!", topic, partition);
             }
+        } else {
+            warn!("⚠️ DEBUG: Skipping replication for {}-{}: wal_replication_manager is None!", topic, partition);
         }
 
         // Buffer the batch for non-Raft partitions
@@ -1480,15 +1488,8 @@ impl ProduceHandler {
             }
         }
 
-        #[cfg(not(feature = "raft"))]
-        {
-            // Buffer the batch with re-encoded wire format (correct CRC)
-            partition_state.pending_batches.push(BufferedBatch {
-                raw_bytes: re_encoded_bytes.to_vec(),
-                records: records.clone(),
-                base_offset: base_offset as i64,
-            });
-        }
+        // v2.2.7 FIX: Removed duplicate buffering code that was always running
+        // (lines 1491-1499 were duplicate of lines 1475-1488)
 
         // Update metrics
         self.metrics.records_produced.fetch_add(records.len() as u64, Ordering::Relaxed);
@@ -1520,13 +1521,41 @@ impl ProduceHandler {
             -1 => {
                 // v2.2.7 Phase 4: acks=-1 with IsrAckTracker
                 // Wait for replication to ISR quorum (leader + majority of followers)
-                self.flush_partition_if_needed(topic, partition, &partition_state).await?;
+                // NOTE: We do NOT call flush_partition_if_needed() here because:
+                // 1. WAL write already completed synchronously (durability guaranteed)
+                // 2. Flushing with linger logic (100 batches / 500ms) kills throughput
+                // 3. Background task handles actual segment writes
+                // 4. Client just needs ISR quorum ACK (immediate in standalone)
 
                 if let Some(ref tracker) = self.isr_ack_tracker {
                     // Register this produce request for ISR quorum tracking
-                    // TODO: Get actual ISR size from RaftCluster or configuration
-                    // For now, assume quorum = 2 (leader + 1 follower for 3-node cluster)
-                    let quorum_size = 2;
+                    // v2.2.7 FIX: Calculate quorum based on actual ISR size (not hardcoded)
+                    let quorum_size = if let Some(ref raft_cluster) = self.raft_cluster {
+                        // Cluster mode: Get ISR from Raft metadata
+                        match raft_cluster.get_isr(topic, partition) {
+                            Some(isr) => {
+                                // Quorum = all ISR members must ack
+                                let size = isr.len();
+                                info!("📊 Cluster mode: ISR for {}-{}: {:?}, quorum={}",
+                                    topic, partition, isr, size);
+                                size
+                            }
+                            None => {
+                                // Fallback: if ISR not found, use 1 (just the leader)
+                                warn!("⚠️  No ISR found for {}-{}, using quorum=1", topic, partition);
+                                1
+                            }
+                        }
+                    } else {
+                        // Standalone mode: quorum = 1 (just the leader)
+                        info!("📊 Standalone mode: quorum=1 for {}-{}", topic, partition);
+                        1
+                    };
+
+                    info!(
+                        "🎯 acks=-1: About to register wait for {}-{} offset {} (base_offset={}, quorum={})",
+                        topic, partition, base_offset, base_offset, quorum_size
+                    );
 
                     let (tx, rx) = tokio::sync::oneshot::channel();
                     // CRITICAL FIX: Register for base_offset (not last_offset)
@@ -1539,10 +1568,17 @@ impl ProduceHandler {
                         tx,
                     );
 
-                    debug!(
-                        "acks=-1: Registered {}-{} offset {} for ISR quorum tracking (quorum={})",
+                    info!(
+                        "✅ acks=-1: Registered {}-{} offset {} for ISR quorum tracking (quorum={})",
                         topic, partition, base_offset, quorum_size
                     );
+
+                    // v2.2.7 FIX: Leader always records its own ACK immediately (cluster AND standalone)
+                    // In standalone mode (quorum=1), this is the only ACK needed
+                    // In cluster mode (quorum=N), leader counts as 1/N ACKs, then waits for followers
+                    info!("🏁 Recording leader self-ACK for {}-{} offset {} (quorum={}/{})",
+                        topic, partition, base_offset, 1, quorum_size);
+                    tracker.record_ack(topic, partition, base_offset as i64, self.config.node_id as u64);
 
                     // Wait for ISR quorum with configured timeout (default: 30s)
                     match timeout(REPLICATION_TIMEOUT, rx).await {
@@ -2213,164 +2249,89 @@ impl ProduceHandler {
         // Attempt to create the topic
         let result = match self.metadata_store.create_topic(topic_name, topic_config).await {
             Ok(metadata) => {
-                // v2.2.7 CRITICAL FIX: Partition initialization MUST go through Raft on leader only
-                // The create_topic call already went through Raft and was replicated to all nodes.
-                // Now we need to initialize partition metadata (assignments, leader, ISR).
-                //
-                // IMPORTANT: Only the Raft leader should propose partition metadata.
-                // Followers will receive it via Raft replication automatically.
-                if let Some(ref raft) = self.raft_cluster {
-                    // Check if THIS node is the Raft leader
-                    if raft.am_i_leader().await {
-                        // Leader node: Initialize partition metadata via Raft
-                        if let Err(e) = self.initialize_raft_partitions(topic_name, metadata.config.partition_count).await {
-                            error!("Raft leader failed to initialize partitions for '{}': {:?}", topic_name, e);
-                            // FAIL FAST: If leader can't initialize partitions, topic is broken
-                            return Err(Error::Internal(format!("Failed to initialize partition metadata: {}", e)));
-                        }
-                        info!("✓ Raft leader initialized partition metadata for '{}'", topic_name);
-                    } else {
-                        // v2.2.7 EVENT-DRIVEN NOTIFICATION (P1): Follower waits for partition metadata via instant notification
-                        // Replaces 10ms polling loop (10-40ms latency) with event-driven wait (1-5ms latency)
-                        debug!("Follower node waiting for partition metadata for '{}' via Raft replication (event-driven)", topic_name);
-
-                        if let Some(ref raft_cluster) = self.raft_cluster {
-                            // Register notification channel BEFORE checking state
-                            // This prevents race condition where leader sets partition leader between check and wait
-                            let notify = Arc::new(tokio::sync::Notify::new());
-                            let key = format!("{}:0", topic_name); // Wait for partition 0 leader
-                            let pending_partitions = raft_cluster.get_pending_partitions_notifications();
-                            pending_partitions.insert(key.clone(), Arc::clone(&notify));
-
-                            // Check if partition leader is already set (fast path - may already be replicated)
-                            if let Ok(Some(_leader)) = self.metadata_store.get_partition_leader(topic_name, 0).await {
-                                info!("✓ Follower: partition metadata for '{}' already replicated (fast path)", topic_name);
-                                pending_partitions.remove(&key); // Clean up notification channel
-                            } else {
-                                // Wait for notification with timeout (1-5ms typical, vs 10-40ms polling)
-                                let timeout_duration = tokio::time::Duration::from_millis(2000);
-                                match tokio::time::timeout(timeout_duration, notify.notified()).await {
-                                    Ok(_) => {
-                                        info!("✓ Follower received partition metadata for '{}' instantly (event-driven notification)", topic_name);
-                                    }
-                                    Err(_) => {
-                                        warn!("Follower did not receive partition metadata for '{}' after 2s - may cause ISR issues", topic_name);
-                                    }
-                                }
-                                pending_partitions.remove(&key); // Clean up notification channel
-                            }
-                        } else {
-                            // Fallback for non-Raft deployments (shouldn't happen in multi-node, but be defensive)
-                            warn!("Follower node without Raft cluster reference - falling back to polling");
-
-                            // Fallback to polling (should rarely execute)
-                            let max_wait_ms = 2000;
-                            let check_interval_ms = 10;
-                            let max_attempts = max_wait_ms / check_interval_ms;
-
-                            for attempt in 1..=max_attempts {
-                                if let Ok(Some(_leader)) = self.metadata_store.get_partition_leader(topic_name, 0).await {
-                                    info!("✓ Follower received partition metadata for '{}' after {}ms (fallback polling)",
-                                          topic_name, attempt * check_interval_ms);
-                                    break;
-                                }
-
-                                if attempt < max_attempts {
-                                    tokio::time::sleep(tokio::time::Duration::from_millis(check_interval_ms)).await;
-                                }
-                            }
-                        }
-                    }
-                }
+                // v2.2.7 FIX: Partition initialization happens through PartitionAssignment module below
+                // which has proper metadata WAL writes and replication (in raft_metadata_store.rs)
+                // The broken initialize_raft_partitions() method has been removed.
 
                 // Create partition assignments
                 // For clustered mode, use round-robin assignment across nodes
                 // For standalone mode, assign all partitions to this node
-                #[cfg(feature = "raft")]
-                if let Some(ref raft_manager) = self.raft_manager {
-                    if raft_manager.is_enabled() {
-                        // Clustered mode: Use round-robin assignment
-                        use chronik_common::partition_assignment::PartitionAssignment as AssignmentManager;
+                if let Some(ref raft_cluster) = self.raft_cluster {
+                    // Clustered mode: Use round-robin assignment
+                    use chronik_common::partition_assignment::PartitionAssignment as AssignmentManager;
 
-                        let peers = raft_manager.get_peers().await;
-                        info!("Auto-creating topic '{}' in cluster mode with {} peers", topic_name, peers.len());
+                    let nodes = raft_cluster.get_all_nodes().await;
+                    info!("Auto-creating topic '{}' in cluster mode with {} nodes", topic_name, nodes.len());
 
-                        // Convert peer IDs from u64 to u32 for partition_assignment module
-                        let peer_ids: Vec<u32> = peers.iter().map(|&id| id as u32).collect();
+                    // Convert node IDs from u64 to u32 for partition_assignment module
+                    let node_ids: Vec<u32> = nodes.iter().map(|&id| id as u32).collect();
 
-                        let mut assignment_mgr = AssignmentManager::new();
-                        if let Err(e) = assignment_mgr.add_topic(
-                            topic_name,
-                            self.config.num_partitions as i32,
-                            self.config.default_replication_factor.min(peers.len() as u32) as i32,
-                            &peer_ids,
-                        ) {
-                            warn!("Failed to create partition assignment plan for topic '{}': {:?}", topic_name, e);
-                        } else {
-                            // Persist assignments via metadata store
-                            let topic_assignments = assignment_mgr.get_topic_assignments(topic_name);
-                            for (partition_id, partition_info) in topic_assignments {
-                                for (replica_idx, &node_id) in partition_info.replicas.iter().enumerate() {
-                                    let is_leader = node_id == partition_info.leader;
-                                    let assignment = chronik_common::metadata::PartitionAssignment {
-                                        topic: topic_name.to_string(),
-                                        partition: partition_id as u32,
-                                        broker_id: node_id as i32,
-                                        is_leader,
-                                    };
-
-                                    if let Err(e) = self.metadata_store.assign_partition(assignment).await {
-                                        warn!("Failed to assign partition {} for topic '{}' to node {}: {:?}",
-                                            partition_id, topic_name, node_id, e);
-                                    } else if is_leader {
-                                        info!("Assigned partition {}/{} to node {} (leader)",
-                                            topic_name, partition_id, node_id);
-                                    }
-                                }
-                            }
-                        }
+                    let mut assignment_mgr = AssignmentManager::new();
+                    if let Err(e) = assignment_mgr.add_topic(
+                        topic_name,
+                        self.config.num_partitions as i32,
+                        self.config.default_replication_factor.min(nodes.len() as u32) as i32,
+                        &node_ids,
+                    ) {
+                        warn!("Failed to create partition assignment plan for topic '{}': {:?}", topic_name, e);
                     } else {
-                        // Standalone mode with Raft disabled
-                        for partition in 0..self.config.num_partitions {
-                            let assignment = chronik_common::metadata::PartitionAssignment {
-                                topic: topic_name.to_string(),
-                                partition,
-                                broker_id: self.config.node_id,
-                                is_leader: true,
-                            };
+                        // Persist assignments via Raft proposal (CORRECT: WAL write + replication)
+                        let topic_assignments = assignment_mgr.get_topic_assignments(topic_name);
+                        for (partition_id, partition_info) in topic_assignments {
+                            let replicas: Vec<u64> = partition_info.replicas.iter().map(|&id| id as u64).collect();
 
-                            if let Err(e) = self.metadata_store.assign_partition(assignment).await {
+                            // Use propose_partition_assignment_and_wait for proper Raft proposal
+                            if let Err(e) = raft_cluster.propose_partition_assignment_and_wait(
+                                topic_name.to_string(),
+                                partition_id as i32,
+                                replicas.clone(),
+                            ).await {
                                 warn!("Failed to assign partition {} for topic '{}': {:?}",
-                                    partition, topic_name, e);
+                                    partition_id, topic_name, e);
+                            } else {
+                                info!("✓ Assigned partition {}/{} with replica list: {:?} (leader: {})",
+                                    topic_name, partition_id, replicas, partition_info.leader);
+                            }
+
+                            // Set partition leader
+                            if let Err(e) = raft_cluster.propose_set_partition_leader(
+                                topic_name,
+                                partition_id as i32,
+                                partition_info.leader as u64,
+                            ).await {
+                                warn!("Failed to set leader for partition {}/{}: {:?}",
+                                    topic_name, partition_id, e);
+                            }
+
+                            // Initialize ISR with all replicas
+                            let isr_cmd = crate::raft_metadata::MetadataCommand::UpdateISR {
+                                topic: topic_name.to_string(),
+                                partition: partition_id as i32,
+                                isr: replicas,
+                            };
+                            if let Err(e) = raft_cluster.propose(isr_cmd).await {
+                                warn!("Failed to initialize ISR for partition {}/{}: {:?}",
+                                    topic_name, partition_id, e);
                             }
                         }
                     }
                 } else {
-                    // No Raft feature or no manager: standalone mode
-                    for partition in 0..self.config.num_partitions {
-                        let assignment = chronik_common::metadata::PartitionAssignment {
-                            topic: topic_name.to_string(),
-                            partition,
-                            broker_id: self.config.node_id,
-                            is_leader: true,
-                        };
-
-                        if let Err(e) = self.metadata_store.assign_partition(assignment).await {
-                            warn!("Failed to assign partition {} for topic '{}': {:?}",
-                                partition, topic_name, e);
-                        }
-                    }
+                    // Standalone mode: partitions will be assigned on-demand during first produce
+                    debug!("Standalone mode: topic '{}' created with {} partitions",
+                        topic_name, self.config.num_partitions);
                 }
 
-                // Non-Raft builds always use standalone assignment
-                #[cfg(not(feature = "raft"))]
-                {
+                // v2.2.7 FIX: Runtime check instead of compile-time cfg
+                // Standalone mode ONLY (when raft_cluster is None) assign partitions via metadata WAL
+                if self.raft_cluster.is_none() {
                     for partition in 0..self.config.num_partitions {
                         let assignment = chronik_common::metadata::PartitionAssignment {
                             topic: topic_name.to_string(),
                             partition,
                             broker_id: self.config.node_id,
                             is_leader: true,
+                            replicas: vec![self.config.node_id as u64],
+                            leader_id: self.config.node_id as u64,
                         };
 
                         if let Err(e) = self.metadata_store.assign_partition(assignment).await {
@@ -2378,6 +2339,8 @@ impl ProduceHandler {
                                 partition, topic_name, e);
                         }
                     }
+                    debug!("Standalone mode: assigned {} partitions for topic '{}'",
+                        self.config.num_partitions, topic_name);
                 }
 
                 // Create Raft replicas for each partition if Raft is enabled
@@ -2531,10 +2494,13 @@ impl ProduceHandler {
         result
     }
 
-    /// Initialize Raft partition metadata for an existing topic
+    /// Initialize partition metadata for an existing topic (WAL-ONLY, no Raft propose)
     ///
     /// This method is called by CreateTopics API handler to ensure partition
-    /// assignments are proposed to Raft cluster for topics created explicitly.
+    /// assignments are written to metadata WAL and replicated to followers.
+    ///
+    /// **CRITICAL**: Uses ONLY WAL-based metadata replication, NOT Raft propose().
+    /// This eliminates the race condition where Raft and WAL have different replica lists.
     ///
     /// # Arguments
     /// - `topic_name`: Name of the topic
@@ -2558,7 +2524,7 @@ impl ProduceHandler {
                 ));
             }
 
-            info!("Initializing Raft partition metadata for topic '{}' ({} partitions) - this node is Raft leader",
+            info!("Initializing partition metadata for topic '{}' ({} partitions) - WAL-ONLY (no Raft propose)",
                   topic_name, num_partitions);
 
             // Get all nodes in the cluster (for replication)
@@ -2575,49 +2541,58 @@ impl ProduceHandler {
                     replicas.push(all_nodes[node_idx]);
                 }
 
-                // RACE CONDITION FIX: Use propose_and_wait for partition assignments
-                // This ensures Raft consensus completes BEFORE clients query metadata
-                // NOTE: We already checked that this node is the Raft leader above (v2.2.2 fix)
-                if let Err(e) = raft.propose_partition_assignment_and_wait(
-                    topic_name.to_string(),
-                    partition as i32,
-                    replicas.clone(),
-                ).await {
-                    warn!("Failed to propose partition assignment for {}-{}: {:?}", topic_name, partition, e);
+                // WAL-ONLY: Use apply_metadata_command_direct (NO Raft propose)
+                // This writes to metadata WAL and replicates via WalReplicationManager
+                let assign_cmd = crate::raft_metadata::MetadataCommand::AssignPartition {
+                    topic: topic_name.to_string(),
+                    partition: partition as i32,
+                    replicas: replicas.clone(),
+                };
+
+                if let Err(e) = raft.apply_metadata_command_direct(assign_cmd) {
+                    warn!("Failed to assign partition {}-{}: {:?}", topic_name, partition, e);
                     continue;  // Skip this partition, try next one
                 }
 
                 // Set initial leader - prefer Raft leader if it's a replica
-                // CRITICAL FIX (v2.2.3): Prefer Raft leader as partition leader
-                // This ensures partition leaders can handle their own elections locally
-                let raft_leader_id = raft.node_id();
-                let leader = if replicas.contains(&raft_leader_id) {
-                    raft_leader_id  // Raft leader can handle elections locally
-                } else {
-                    replicas[0]  // Fallback if Raft leader not in replica set
-                };
-                if let Err(e) = raft.propose(crate::raft_metadata::MetadataCommand::SetPartitionLeader {
+                // Partition leader is ALWAYS the first replica (not the Raft leader!)
+                // This ensures correct routing for multi-partition topics where
+                // different partitions have different leaders
+                let leader = replicas[0];
+
+                // v2.2.7 DEBUG: Trace leader value before creating command
+                info!("🔍 DEBUG: About to create SetPartitionLeader command for {}-{}: replicas={:?}, leader={}, replicas[0]={}",
+                      topic_name, partition, replicas, leader, replicas[0]);
+
+                let leader_cmd = crate::raft_metadata::MetadataCommand::SetPartitionLeader {
                     topic: topic_name.to_string(),
                     partition: partition as i32,
                     leader,
-                }).await {
-                    warn!("Failed to propose partition leader for {}-{}: {:?}", topic_name, partition, e);
+                };
+
+                // v2.2.7 DEBUG: Log command immediately after creation
+                info!("🔍 DEBUG: Created command: {:?}", leader_cmd);
+
+                if let Err(e) = raft.apply_metadata_command_direct(leader_cmd) {
+                    warn!("Failed to set partition leader for {}-{}: {:?}", topic_name, partition, e);
                 }
 
                 // Set initial ISR (all replicas are in-sync initially)
-                if let Err(e) = raft.propose(crate::raft_metadata::MetadataCommand::UpdateISR {
+                let isr_cmd = crate::raft_metadata::MetadataCommand::UpdateISR {
                     topic: topic_name.to_string(),
                     partition: partition as i32,
                     isr: replicas.clone(),
-                }).await {
-                    warn!("Failed to propose ISR for {}-{}: {:?}", topic_name, partition, e);
+                };
+
+                if let Err(e) = raft.apply_metadata_command_direct(isr_cmd) {
+                    warn!("Failed to set ISR for {}-{}: {:?}", topic_name, partition, e);
                 }
 
-                info!("✓ Initialized Raft partition metadata for {}-{}: replicas={:?}, leader={}, ISR={:?}",
+                info!("✓ Initialized partition metadata for {}-{}: replicas={:?}, leader={}, ISR={:?} (WAL-ONLY)",
                       topic_name, partition, replicas, leader, replicas);
             }
 
-            info!("✓ Completed Raft partition metadata initialization for topic '{}' (leader node)", topic_name);
+            info!("✓ Completed partition metadata initialization for topic '{}' using WAL-ONLY approach", topic_name);
         } else {
             debug!("Raft not enabled, skipping partition metadata initialization for '{}'", topic_name);
         }

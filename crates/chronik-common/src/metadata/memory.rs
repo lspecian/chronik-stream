@@ -57,8 +57,10 @@ impl MetadataStore for InMemoryMetadataStore {
             let assignment = PartitionAssignment {
                 topic: name.to_string(),
                 partition,
-                broker_id: 1, // Use broker ID 1 (the current node)
-                is_leader: true,
+                broker_id: 1, // Use broker ID 1 (the current node) - deprecated field
+                is_leader: true,  // Deprecated field
+                replicas: vec![1],  // Single node for standalone mode
+                leader_id: 1,  // Node 1 is leader for standalone mode
             };
             let key = (name.to_string(), partition);
             partition_assignments.insert(key, assignment);

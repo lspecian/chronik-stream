@@ -41,7 +41,7 @@ mkdir -p "$SCRIPT_DIR"/logs
 
 # Start nodes (P4: WAL ultra profile for maximum throughput)
 echo -e "${GREEN}Starting Node 1...${NC}"
-RUST_LOG=info CHRONIK_WAL_PROFILE=ultra "$BINARY" start --config "$SCRIPT_DIR/node1.toml" \
+RUST_LOG=debug CHRONIK_WAL_PROFILE=ultra "$BINARY" start --config "$SCRIPT_DIR/node1.toml" \
     > "$SCRIPT_DIR/logs/node1.log" 2>&1 &
 echo $! > "$SCRIPT_DIR/data/node1.pid"
 

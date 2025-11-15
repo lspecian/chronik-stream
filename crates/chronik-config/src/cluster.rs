@@ -58,6 +58,10 @@ pub struct ClusterConfig {
     #[validate(custom = "validate_node_id")]
     pub node_id: u64,
 
+    /// Data directory for this node's storage
+    /// Example: "/home/ubuntu/Development/chronik-stream/tests/cluster/data/node1"
+    pub data_dir: String,
+
     /// Number of replicas for each partition
     #[validate(range(min = 1, max = 100))]
     pub replication_factor: usize,
@@ -179,6 +183,7 @@ impl ClusterConfig {
         let config = ClusterConfig {
             enabled,
             node_id,
+            data_dir: std::env::var("CHRONIK_DATA_DIR").unwrap_or_else(|_| "./data".to_string()),
             replication_factor,
             min_insync_replicas,
             peers,
@@ -397,6 +402,7 @@ impl Default for ClusterConfig {
         Self {
             enabled: false,
             node_id: 1,
+            data_dir: "./data".to_string(),  // Default data directory
             replication_factor: 3,
             min_insync_replicas: 2,
             peers: vec![],
@@ -476,6 +482,7 @@ mod tests {
         let config = ClusterConfig {
             enabled: true,
             node_id: 1,
+            data_dir: "./data".to_string(),
             replication_factor: 3,
             min_insync_replicas: 2,
             peers: create_test_peers(),
@@ -491,7 +498,8 @@ mod tests {
     fn test_node_id_not_in_peers() {
         let config = ClusterConfig {
             enabled: true,
-            node_id: 99, // Not in peers
+            node_id: 99,
+            data_dir: "./data".to_string(), // Not in peers
             replication_factor: 3,
             min_insync_replicas: 2,
             peers: create_test_peers(),
@@ -527,6 +535,7 @@ mod tests {
         let config = ClusterConfig {
             enabled: true,
             node_id: 1,
+            data_dir: "./data".to_string(),
             replication_factor: 2,
             min_insync_replicas: 1,
             peers,
@@ -562,6 +571,7 @@ mod tests {
         let config = ClusterConfig {
             enabled: true,
             node_id: 1,
+            data_dir: "./data".to_string(),
             replication_factor: 2,
             min_insync_replicas: 1,
             peers,
@@ -578,6 +588,7 @@ mod tests {
         let config = ClusterConfig {
             enabled: true,
             node_id: 1,
+            data_dir: "./data".to_string(),
             replication_factor: 5, // More than peer count
             min_insync_replicas: 2,
             peers: create_test_peers(),
@@ -594,6 +605,7 @@ mod tests {
         let config = ClusterConfig {
             enabled: true,
             node_id: 1,
+            data_dir: "./data".to_string(),
             replication_factor: 2,
             min_insync_replicas: 3, // More than replication factor
             peers: create_test_peers(),
@@ -610,6 +622,7 @@ mod tests {
         let config = ClusterConfig {
             enabled: true,
             node_id: 2,
+            data_dir: "./data".to_string(),
             replication_factor: 3,
             min_insync_replicas: 2,
             peers: create_test_peers(),
@@ -628,6 +641,7 @@ mod tests {
         let config = ClusterConfig {
             enabled: true,
             node_id: 2,
+            data_dir: "./data".to_string(),
             replication_factor: 3,
             min_insync_replicas: 2,
             peers: create_test_peers(),
@@ -646,6 +660,7 @@ mod tests {
         let config = ClusterConfig {
             enabled: true,
             node_id: 1,
+            data_dir: "./data".to_string(),
             replication_factor: 3,
             min_insync_replicas: 2,
             peers: create_test_peers(),
@@ -681,7 +696,8 @@ mod tests {
     fn test_zero_node_id() {
         let config = ClusterConfig {
             enabled: true,
-            node_id: 0, // Invalid!
+            node_id: 0,
+            data_dir: "./data".to_string(), // Invalid!
             replication_factor: 3,
             min_insync_replicas: 2,
             peers: create_test_peers(),

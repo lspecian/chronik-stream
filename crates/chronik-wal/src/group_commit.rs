@@ -575,22 +575,17 @@ impl GroupCommitWal {
         let is_raft_topic = queue.topic.starts_with("__raft") || queue.topic.starts_with("__chronik_metadata");
 
         if !is_raft_topic {
-            // Check backpressure (NON-BLOCKING with try_lock for immediate fail-fast)
-            match queue.pending.try_lock() {
-                Ok(pending) => {
-                    if pending.len() >= self.config.max_queue_depth {
-                        queue.metrics.backpressure_events.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        warn!("🔴 BACKPRESSURE: Queue depth {} exceeded max {}", pending.len(), self.config.max_queue_depth);
-                        return Err(WalError::Backpressure(format!("Queue depth {} exceeds limit {}", pending.len(), self.config.max_queue_depth)));
-                    }
-                }
-                Err(_) => {
-                    // Lock contention - queue is busy, signal back-pressure
-                    queue.metrics.backpressure_events.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    warn!("🔴 BACKPRESSURE: Queue lock contended, rejecting write immediately");
-                    return Err(WalError::Backpressure("Queue is busy (lock contention)".into()));
-                }
+            // Check backpressure (ASYNC WAIT - properly queue requests at high concurrency)
+            // CRITICAL FIX v2.2.7: Use lock().await instead of try_lock() to avoid spurious
+            // failures at high concurrency (64+ producers). try_lock() was causing immediate
+            // Backpressure errors even when queue had space, leading to client retry storms.
+            let pending = queue.pending.lock().await;
+            if pending.len() >= self.config.max_queue_depth {
+                queue.metrics.backpressure_events.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                warn!("🔴 BACKPRESSURE: Queue depth {} exceeded max {}", pending.len(), self.config.max_queue_depth);
+                return Err(WalError::Backpressure(format!("Queue depth {} exceeds limit {}", pending.len(), self.config.max_queue_depth)));
             }
+            drop(pending); // Release lock before continuing
         } else {
             debug!("✅ CRITICAL_WRITE: Skipping backpressure check for Raft/metadata topic: {}", queue.topic);
         }
