@@ -8,7 +8,16 @@
 
 A high-performance streaming platform built in Rust that implements core Kafka wire protocol functionality with comprehensive Write-Ahead Log (WAL) durability and automatic recovery.
 
-See [CHANGELOG.md](CHANGELOG.md) for release history and latest updates.
+**Latest Release: v2.2.8** - Critical watermark idempotence fix for 100% message consumption success. See [CHANGELOG.md](CHANGELOG.md) for full release history.
+
+## ✨ What's New in v2.2.8
+
+🔧 **Critical Bug Fix**: Watermark idempotence prevents message loss during producer retries
+📡 **Metadata Replication**: Sub-10ms watermark propagation via event-based replication
+📊 **100% Consumption**: Proven success with proper client configuration (all cluster brokers)
+📚 **Documentation**: Comprehensive investigation and root cause analysis
+
+**Upgrade Recommendation**: All users should upgrade to v2.2.8 for improved reliability.
 
 ## 🚀 Features
 
@@ -180,7 +189,7 @@ Without `CHRONIK_ADVERTISED_ADDR`, clients will receive `0.0.0.0:9092` in metada
 # Python example
 from kafka import KafkaProducer, KafkaConsumer
 
-# Producer
+# Single-node setup
 producer = KafkaProducer(
     bootstrap_servers='localhost:9092',
     api_version=(0, 10, 0)  # Important: specify version
@@ -198,6 +207,24 @@ consumer = KafkaConsumer(
 for message in consumer:
     print(f"Received: {message.value}")
 ```
+
+**⚠️ CRITICAL for Cluster Deployments**: When using a multi-node cluster, **ALWAYS configure clients with ALL cluster brokers** for 100% message consumption success:
+
+```python
+# ✅ CORRECT - Cluster configuration (ALL brokers)
+producer = KafkaProducer(
+    bootstrap_servers='localhost:9092,localhost:9093,localhost:9094',  # All 3 brokers!
+    api_version=(0, 10, 0)
+)
+
+# ❌ WRONG - Single broker causes leadership rejections and message loss
+producer = KafkaProducer(
+    bootstrap_servers='localhost:9092',  # Only one broker - NOT RECOMMENDED for clusters!
+    api_version=(0, 10, 0)
+)
+```
+
+See [docs/100_PERCENT_CONSUMPTION_INVESTIGATION.md](docs/100_PERCENT_CONSUMPTION_INVESTIGATION.md) for detailed analysis.
 
 ### Using Binary
 
@@ -469,7 +496,7 @@ All images support both **linux/amd64** and **linux/arm64** architectures:
 
 | Image | Tags | Description |
 |-------|------|-------------|
-| `ghcr.io/lspecian/chronik-stream` | `latest`, `1.3`, `v1.3.46` | Chronik server with full KSQL support |
+| `ghcr.io/lspecian/chronik-stream` | `latest`, `v2.2.8`, `2.2` | Chronik server with full KSQL support |
 
 ### Supported Platforms
 
@@ -620,6 +647,12 @@ Apache License 2.0. See [LICENSE](LICENSE) for details.
 - [CHANGELOG.md](CHANGELOG.md) - Detailed release history
 - [docs/RUNNING_A_CLUSTER.md](docs/RUNNING_A_CLUSTER.md) - **Complete cluster setup guide (v2.2.0+)**
 - [docs/KSQL_INTEGRATION_GUIDE.md](docs/KSQL_INTEGRATION_GUIDE.md) - KSQL setup and usage
+
+### v2.2.8 Release (Critical Fixes)
+- [docs/WATERMARK_IDEMPOTENCE_FIX_v2.2.7.md](docs/WATERMARK_IDEMPOTENCE_FIX_v2.2.7.md) - Watermark idempotence fix details
+- [docs/WATERMARK_OVERWRITE_BUG_ROOT_CAUSE.md](docs/WATERMARK_OVERWRITE_BUG_ROOT_CAUSE.md) - Root cause analysis
+- [docs/100_PERCENT_CONSUMPTION_INVESTIGATION.md](docs/100_PERCENT_CONSUMPTION_INVESTIGATION.md) - **100% consumption guide**
+- [docs/WATERMARK_REPLICATION_TEST_RESULTS_v2.2.7.2.md](docs/WATERMARK_REPLICATION_TEST_RESULTS_v2.2.7.2.md) - Test results and findings
 
 ### Operations & Performance
 - [docs/WAL_AUTO_TUNING.md](docs/WAL_AUTO_TUNING.md) - WAL performance auto-tuning guide
