@@ -911,7 +911,7 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
 name = "chronik-common"
-version = "2.2.7"
+version = "2.2.8"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -969,7 +969,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-monitoring"
-version = "2.2.7"
+version = "2.2.8"
 dependencies = [
  "anyhow",
  "axum 0.6.20",
@@ -991,7 +991,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-protocol"
-version = "2.2.7"
+version = "2.2.8"
 dependencies = [
  "anyhow",
  "base64 0.21.7",
@@ -1012,7 +1012,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-raft"
-version = "2.2.7"
+version = "2.2.8"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1040,7 +1040,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-raft-bridge"
-version = "2.2.7"
+version = "2.2.8"
 dependencies = [
  "bytes",
  "prost 0.11.9",
@@ -1049,7 +1049,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-storage"
-version = "2.2.7"
+version = "2.2.8"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1094,7 +1094,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-wal"
-version = "2.2.7"
+version = "2.2.8"
 dependencies = [
  "anyhow",
  "async-trait",

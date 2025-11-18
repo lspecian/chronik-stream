@@ -37,6 +37,8 @@ pub struct MetadataEvent {
     pub timestamp: DateTime<Utc>,
     /// Event version for compatibility
     pub version: u32,
+    /// Node ID that created this event (for conflict resolution)
+    pub created_by_node: u64,
     /// The actual event payload
     pub payload: MetadataEventPayload,
 }
@@ -48,6 +50,18 @@ impl MetadataEvent {
             event_id: Uuid::new_v4(),
             timestamp: Utc::now(),
             version: METADATA_EVENT_VERSION,
+            created_by_node: 0, // Default to 0 for single-node mode
+            payload,
+        }
+    }
+
+    /// Create a new metadata event with node ID (for cluster mode)
+    pub fn new_with_node(payload: MetadataEventPayload, node_id: u64) -> Self {
+        Self {
+            event_id: Uuid::new_v4(),
+            timestamp: Utc::now(),
+            version: METADATA_EVENT_VERSION,
+            created_by_node: node_id,
             payload,
         }
     }
@@ -58,8 +72,21 @@ impl MetadataEvent {
             event_id: Uuid::new_v4(),
             timestamp,
             version: METADATA_EVENT_VERSION,
+            created_by_node: 0,
             payload,
         }
+    }
+
+    /// Serialize event to bytes for WAL storage (bincode format)
+    pub fn to_bytes(&self) -> Result<Vec<u8>, String> {
+        bincode::serialize(self)
+            .map_err(|e| format!("Failed to serialize MetadataEvent: {}", e))
+    }
+
+    /// Deserialize event from bytes (bincode format)
+    pub fn from_bytes(data: &[u8]) -> Result<Self, String> {
+        bincode::deserialize(data)
+            .map_err(|e| format!("Failed to deserialize MetadataEvent: {}", e))
     }
 }
 
@@ -133,6 +160,13 @@ pub enum MetadataEventPayload {
         topic: String,
         partition: u32,
         new_offset: i64,
+    },
+
+    // High watermark events (for partition replication)
+    HighWatermarkUpdated {
+        topic: String,
+        partition: i32,
+        new_watermark: i64,
     },
 
     // Transactional offset events
@@ -346,6 +380,21 @@ mod tests {
         let event = MetadataEvent::new(payload.clone());
 
         assert_eq!(event.version, METADATA_EVENT_VERSION);
+        assert_eq!(event.created_by_node, 0); // Default single-node mode
+        assert!(matches!(event.payload, MetadataEventPayload::TopicCreated { .. }));
+    }
+
+    #[test]
+    fn test_event_creation_with_node() {
+        let payload = MetadataEventPayload::TopicCreated {
+            name: "test-topic".to_string(),
+            config: TopicConfig::default(),
+        };
+
+        let event = MetadataEvent::new_with_node(payload.clone(), 42);
+
+        assert_eq!(event.version, METADATA_EVENT_VERSION);
+        assert_eq!(event.created_by_node, 42);
         assert!(matches!(event.payload, MetadataEventPayload::TopicCreated { .. }));
     }
 
@@ -396,5 +445,39 @@ mod tests {
 
         assert_eq!(event.event_id, deserialized.event_id);
         assert_eq!(event.version, deserialized.version);
+        assert_eq!(event.created_by_node, deserialized.created_by_node);
+    }
+
+    #[test]
+    fn test_event_binary_serialization() {
+        let payload = MetadataEventPayload::TopicCreated {
+            name: "test-topic".to_string(),
+            config: TopicConfig::default(),
+        };
+
+        let event = MetadataEvent::new_with_node(payload, 1);
+
+        // Serialize to bytes
+        let bytes = event.to_bytes().unwrap();
+
+        // Deserialize back
+        let deserialized = MetadataEvent::from_bytes(&bytes).unwrap();
+
+        assert_eq!(event.event_id, deserialized.event_id);
+        assert_eq!(event.version, deserialized.version);
+        assert_eq!(event.created_by_node, deserialized.created_by_node);
+        assert!(matches!(deserialized.payload, MetadataEventPayload::TopicCreated { .. }));
+    }
+
+    #[test]
+    fn test_high_watermark_event() {
+        let payload = MetadataEventPayload::HighWatermarkUpdated {
+            topic: "test-topic".to_string(),
+            partition: 0,
+            new_watermark: 42,
+        };
+
+        let event = MetadataEvent::new_with_node(payload, 1);
+        assert!(matches!(event.payload, MetadataEventPayload::HighWatermarkUpdated { .. }));
     }
 }

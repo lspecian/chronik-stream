@@ -10,7 +10,7 @@
 
 ## Executive Summary
 
-This backlog contains **78 actionable tasks** across **5 implementation phases** to transform Chronik from its current state (201 msg/s, 3-hour deadlocks, 30-second topic creation) into a production-grade system capable of:
+This backlog contains **81 actionable tasks** across **5 implementation phases** to transform Chronik from its current state (201 msg/s, 3-hour deadlocks, 30-second topic creation) into a production-grade system capable of:
 
 - **Throughput**: 100,000+ msg/s (500x improvement)
 - **Availability**: 99.99% (4 nines)
@@ -20,15 +20,30 @@ This backlog contains **78 actionable tasks** across **5 implementation phases**
 
 **Timeline**: 5 phases over 12-16 weeks
 
+**Updates**: Added 3 NEW critical tasks based on v2.2.7/v2.2.8 testing:
+- P0.4: Fix Cluster Startup Deadlock (cold start issue)
+- P0.5: Investigate Topic Auto-Creation Timeout Bug
+- P5.5: Comprehensive Regression Testing
+
 ---
 
 ## Phase 0: Critical Stability Fixes (Week 1-2)
 
-**Goal**: Eliminate production outages (deadlocks, indefinite hangs)
+**Goal**: Eliminate production outages (deadlocks, indefinite hangs, cluster startup failures)
+**Tasks**: 5 (P0.1-P0.5) - **P0.4 MUST BE DONE FIRST!**
 **Success Metrics**:
+- Cluster starts successfully on cold start (all listeners running)
 - No deadlocks in 7-day stress test
 - All I/O operations have timeouts
 - Raft consensus latency p99 < 50ms
+- Topic creation timeout root cause identified
+
+**Recommended Order**:
+1. **P0.4** - Fix startup deadlock (4h) → **BLOCKS ALL TESTING**
+2. **P0.5** - Investigate topic timeout (2h) → **UNDERSTANDING**
+3. **P0.1** - Add I/O timeouts (8h) → **PREVENT HANGS**
+4. **P0.2** - Move I/O outside lock (12h) → **ELIMINATE DEADLOCKS**
+5. **P0.3** - Verify completeness (4h) → **REGRESSION PREVENTION**
 
 ### P0.1: Add Timeouts to All I/O Operations
 
@@ -219,6 +234,195 @@ This backlog contains **78 actionable tasks** across **5 implementation phases**
 - ✅ Static analysis passes
 - ✅ All storage I/O outside locks
 - ✅ Documentation updated
+
+---
+
+### P0.4: Fix Cluster Startup Deadlock (Cold Start)
+
+**Priority**: P0 - IMMEDIATE (MUST BE DONE FIRST!)
+**Effort**: 4 hours
+**Risk**: Low (isolated change in startup sequence)
+**Impact**: Eliminates 100% cluster failure on cold start
+**Source**: CLUSTER_STARTUP_DEADLOCK_ANALYSIS.md (discovered Nov 16, 2025)
+
+**Problem**:
+Follower nodes wait for leader election BEFORE starting TCP listeners (Kafka port 29092, WAL port 29291), but need those listeners running to participate in leader election → **circular dependency deadlock**.
+
+**Impact**:
+- 100% cluster failure on cold start
+- Only the node that wins initial election gets its listeners started
+- Followers deadlock with NO listeners, causing permanent election storms
+
+**Tasks**:
+
+1. **Modify startup sequence in main.rs** (3 hours)
+   - File: `crates/chronik-server/src/main.rs:660-825`
+   - Current (BROKEN):
+     ```
+     1. Initialize Raft cluster
+     2. Raft.start() → Raft gRPC listener binds ✅
+     3. Create IntegratedKafkaServer
+     4. WAIT for leader election ⚠️ BLOCKING
+     5. Spawn server.run() → Kafka listener binds ❌ TOO LATE
+     6. (WAL receiver never started on followers) ❌ MISSING
+     ```
+   - Fixed (CORRECT):
+     ```
+     1. Initialize Raft cluster
+     2. Raft.start() → Raft gRPC listener binds ✅
+     3. Create IntegratedKafkaServer
+     4. *** Spawn server.run() IMMEDIATELY → Kafka listener binds ✅
+     5. *** Spawn wal_receiver.run() IMMEDIATELY → WAL listener binds ✅
+     6. WAIT for leader election ✅ Now safe - all listeners running
+     7. Continue with broker registration (leader only)
+     ```
+   - Code change:
+     ```rust
+     // Start Kafka protocol listener (0.0.0.0:29092) on ALL nodes
+     let kafka_addr_clone = kafka_addr.clone();
+     let server_clone = Arc::clone(&server);
+     let server_task = tokio::spawn(async move {
+         if let Err(e) = server_clone.run(&kafka_addr_clone).await {
+             error!("Integrated server task failed: {}", e);
+         }
+     });
+     info!("✓ Kafka protocol listener started on {}", kafka_addr);
+
+     // Start WAL receiver listener (0.0.0.0:29291) on ALL nodes
+     if let Some(wal_rcv_addr) = &wal_receiver_addr {
+         if !wal_rcv_addr.is_empty() {
+             let mut wal_receiver = crate::wal_replication::WalReceiver::new_with_isr_tracker(...);
+             let wal_receiver_task = tokio::spawn(async move {
+                 if let Err(e) = wal_receiver.run().await {
+                     error!("WAL receiver task failed: {}", e);
+                 }
+             });
+             info!("✓ WAL receiver listener started on {}", wal_rcv_addr);
+         }
+     }
+
+     // Small delay to ensure listeners are bound
+     tokio::time::sleep(Duration::from_millis(500)).await;
+
+     // NOW it's safe to wait for leader election
+     info!("Waiting for Raft leader election (max 10s)...");
+     ```
+
+2. **Test cold start scenario** (1 hour)
+   - Stop all 3 nodes
+   - Clear Raft WAL: `rm -rf data/wal/__meta/__raft_metadata`
+   - Start all 3 simultaneously
+   - Verify: `netstat -tln | grep ':29092\|:29291\|:25001'` shows ALL 6 ports listening
+   - Verify: Stable leader election (no storm)
+   - Verify: Client connectivity to follower nodes
+
+**Testing Requirements**:
+- 3-node cold start test (clean Raft WAL)
+- Verify all 3 TCP listeners start on all 3 nodes within 10s
+- Verify no election storm (only 1 election)
+- Verify client can connect to ANY node (not just leader)
+
+**Documentation**:
+- Update startup sequence documentation
+- Add "Cold Start Troubleshooting" section to runbooks
+
+**Success Criteria**:
+- ✅ All 3 TCP ports listening on all 3 nodes (Kafka, WAL, Raft)
+- ✅ Stable leader election within 10 seconds
+- ✅ NO election storm
+- ✅ All nodes accept client connections
+- ✅ Cluster functional for produce/consume operations
+
+**CRITICAL**: This task MUST be completed FIRST before any other P0 tasks, as it blocks all cluster testing.
+
+---
+
+### P0.5: Investigate Topic Auto-Creation Timeout Bug
+
+**Priority**: P0 - IMMEDIATE (Investigation)
+**Effort**: 2 hours
+**Risk**: Low (investigation only, no code changes)
+**Impact**: Understand NEW failure mode discovered in v2.2.8
+**Source**: CLUSTER_STATUS_REPORT_v2.2.8.md (discovered Nov 16, 2025)
+
+**Problem**:
+`create_topic()` operations via Raft consensus time out after 5 seconds, even though Raft cluster is healthy.
+
+**Symptoms**:
+- ✅ Existing topics work (can produce/consume)
+- ❌ **New topics fail** (5s timeout, metadata not created)
+- ✅ Raft is healthy (leader elected, logs persisting)
+- ❌ Raft metadata operations timeout specifically
+
+**Evidence**:
+```
+[2025-11-16T14:35:41] Auto-creating topic 'perf-test-acks1-async'
+[2025-11-16T14:35:46] WARN: Topic creation timed out after 5000ms
+[2025-11-16T14:35:46] ERROR: Failed to auto-create topic
+```
+
+**Difference from Session 4 findings**:
+- Session 4: Topic creation **completes** but takes 20-30s (serial partition assignment)
+- This bug: Topic creation **fails** entirely after 5s timeout (Raft proposal doesn't complete)
+
+**Tasks**:
+
+1. **Add debug logging to Raft metadata flow** (1 hour)
+   - File: `crates/chronik-server/src/raft_metadata_store.rs:128-217`
+   - Add timestamps at each step:
+     ```rust
+     let start = Instant::now();
+     debug!("T+0ms: create_topic() called for '{}'", name);
+
+     // Raft propose
+     debug!("T+{}ms: Calling raft_cluster.propose_metadata()", start.elapsed().as_millis());
+     self.raft_cluster.propose_metadata(cmd.clone()).await?;
+     debug!("T+{}ms: Raft propose completed", start.elapsed().as_millis());
+
+     // Wait for notification
+     debug!("T+{}ms: Waiting for notification", start.elapsed().as_millis());
+     match tokio::time::timeout(timeout_duration, notify.notified()).await {
+         Ok(_) => {
+             debug!("T+{}ms: Notification received", start.elapsed().as_millis());
+         }
+         Err(_) => {
+             debug!("T+{}ms: TIMEOUT - notification never fired", start.elapsed().as_millis());
+         }
+     }
+     ```
+   - Log Raft commit index progression
+   - Log whether notification actually fires
+
+2. **Reproduce and capture logs** (1 hour)
+   - Start 3-node cluster
+   - Attempt topic creation (expect failure)
+   - Analyze logs to determine:
+     - Does Raft propose succeed? (Should see committed entry)
+     - Does Raft commit succeed? (Check commit index)
+     - Does apply_committed_entries() get called?
+     - Does notification fire?
+     - Where exactly does timeout occur?
+   - Document findings
+
+**Expected Discoveries**:
+- Likely caused by **P0.2** (lock held during I/O) → Raft consensus can't complete
+- Or caused by **P1.3** (incomplete event-driven notification) → Notification never fires
+- Or NEW issue not in original audit
+
+**Output Deliverable**:
+- Document: `docs/TOPIC_CREATION_TIMEOUT_ROOT_CAUSE.md`
+- Contains:
+  - Exact location of timeout
+  - Root cause analysis
+  - Which backlog item(s) will fix this
+  - Any additional fixes needed (if NEW issue)
+
+**Success Criteria**:
+- ✅ Root cause identified with evidence (logs/traces)
+- ✅ Confirmed which backlog task(s) fix this issue
+- ✅ Document created for future reference
+
+**NOTE**: This is an **investigation task**, not a fix. The actual fix may be covered by P0.2 or P1.3, or may require a NEW task if it's a different issue.
 
 ---
 
@@ -1291,6 +1495,161 @@ This backlog contains **78 actionable tasks** across **5 implementation phases**
 
 ---
 
+### P5.5: Comprehensive Regression Testing
+
+**Priority**: P5 - CRITICAL FOR RELEASE
+**Effort**: 24 hours
+**Risk**: Low
+**Impact**: Prevents regressions from fixes, ensures release quality
+**Source**: Lessons from v2.2.7/v2.2.8 releases (deployed without comprehensive testing)
+
+**Problem**:
+Recent releases (v2.2.7, v2.2.8) were deployed without comprehensive testing, leading to discovery of critical bugs in production:
+- 3-hour deadlock (discovered AFTER v2.2.7 release)
+- Topic auto-creation timeout (discovered AFTER v2.2.8 release)
+- Cold start deadlock (discovered AFTER v2.2.8 release)
+
+**Goal**:
+Establish comprehensive regression test suite to verify fixes don't break existing functionality and catch issues BEFORE release.
+
+**Tasks**:
+
+1. **Cold Start Regression Tests** (8 hours)
+   - Test: 3-node cluster cold start (clean Raft WAL)
+     ```bash
+     # Stop all nodes
+     pkill -9 chronik-server
+     # Clear Raft state
+     rm -rf data/wal/__meta/__raft_metadata
+     # Start all nodes simultaneously
+     ./start-cluster.sh
+     # Verify all listeners start within 10s
+     # Verify stable leader election
+     # Verify NO election storm
+     ```
+   - Test: 3-node cluster restart (existing Raft WAL)
+     ```bash
+     # Stop all nodes
+     pkill chronik-server
+     # Restart (keep Raft state)
+     ./start-cluster.sh
+     # Verify all nodes rejoin cluster
+     # Verify existing data preserved
+     ```
+   - Test: Single-node mode (ensure not broken by cluster fixes)
+     ```bash
+     ./chronik-server start
+     # Verify standalone mode still works
+     ```
+   - Success Criteria:
+     - All 3 scenarios pass 100% of the time
+     - No manual intervention required
+     - Startup time < 30 seconds
+
+2. **Performance Regression Tests** (8 hours)
+   - **Baseline before fixes**:
+     ```bash
+     # Measure current throughput
+     chronik-bench \
+       --bootstrap-servers localhost:9092 \
+       --topic perf-baseline \
+       --mode produce \
+       --concurrency 64 \
+       --message-size 1024 \
+       --duration 60s \
+       --acks all
+     # Record: throughput, p50/p95/p99 latency
+     ```
+   - **After each P0 fix**:
+     - P0.1: Measure throughput (should NOT regress with timeouts)
+     - P0.2: Measure throughput (should IMPROVE 10-50x from faster Raft)
+     - P0.3: Measure throughput (no change expected)
+   - **After each P1 fix**:
+     - P1.1: Measure topic creation time (should improve 3-6x)
+     - P1.2: Measure forwarding latency (should improve 20%)
+     - P1.3: Measure produce latency (should improve 10-50x)
+   - **Alert conditions**:
+     - Throughput regresses > 10%
+     - Latency p99 regresses > 20%
+     - Topic creation regresses
+   - Success Criteria:
+     - NO performance regressions
+     - Performance improvements match estimates
+
+3. **Deadlock Stress Test** (8 hours)
+   - **Setup**:
+     ```bash
+     # Simulate slow disk with cgroups
+     cgcreate -g blkio:/slow-disk
+     echo "8:0 10485760" > /sys/fs/cgroup/blkio/slow-disk/blkio.throttle.write_bps_device
+     cgexec -g blkio:slow-disk ./chronik-server start
+     ```
+   - **Workload**:
+     - High Raft activity (create 1000 topics)
+     - High produce traffic (10,000 msg/s)
+     - Random node restarts every 5 minutes
+     - Slow disk I/O (throttled to 10 MB/s)
+   - **Duration**: 24 hours
+   - **Monitor**:
+     - Lock hold time p99 (should be < 50ms even with slow disk)
+     - Timeout events (should fire, not hang)
+     - Deadlock detection (should be ZERO)
+     - Recovery time after node restart (should be < 1 minute)
+   - Success Criteria:
+     - NO deadlocks in 24-hour test
+     - All timeout events properly fire
+     - Cluster remains responsive (produce succeeds within 5s p99)
+     - No node hangs requiring manual intervention
+
+**Testing Framework**:
+```bash
+# File: tests/regression/run_all.sh
+
+#!/bin/bash
+set -e
+
+echo "=== Chronik Regression Test Suite ==="
+
+# 1. Cold start tests
+echo "Running cold start tests..."
+./tests/regression/test_cold_start.sh
+echo "✅ Cold start tests passed"
+
+# 2. Performance baseline
+echo "Running performance baseline..."
+./tests/regression/test_performance_baseline.sh
+echo "✅ Performance baseline recorded"
+
+# 3. Deadlock stress test
+echo "Running 24-hour deadlock stress test..."
+./tests/regression/test_deadlock_stress.sh
+echo "✅ Deadlock stress test passed"
+
+echo "=== ALL REGRESSION TESTS PASSED ==="
+```
+
+**Automation**:
+- Run: Before EVERY release
+- Run: In CI on every PR (shorter duration: 1h stress test)
+- Run: Nightly (full 24h stress test)
+- Alert: PagerDuty if ANY test fails
+
+**Documentation**:
+- Create: `docs/REGRESSION_TESTING.md` with full test procedures
+- Create: `tests/regression/README.md` with how to run tests
+- Update: `CLAUDE.md` with new testing requirements
+
+**Success Criteria**:
+- ✅ All regression tests pass 100% of the time
+- ✅ Performance baselines recorded for all phases
+- ✅ 24-hour stress test passes without deadlocks
+- ✅ Tests run automatically before every release
+- ✅ CI fails if regression tests fail
+
+**CRITICAL NOTE**: This task should run THROUGHOUT implementation, not just at the end. Run regression tests after EACH P0/P1 fix to catch regressions early.
+
+---
+
 ## Summary Roadmap
 
 ### Timeline Overview
@@ -1308,16 +1667,21 @@ This backlog contains **78 actionable tasks** across **5 implementation phases**
 
 | Phase | Tasks | Total Hours | Team-Weeks (40h/week) |
 |-------|-------|-------------|------------------------|
-| Phase 0 | 3 | 24 | 0.6 |
+| Phase 0 | 5 | 30 | 0.75 |
 | Phase 1 | 3 | 40 | 1.0 |
 | Phase 2 | 4 | 96 | 2.4 |
 | Phase 3 | 4 | 80 | 2.0 |
 | Phase 4 | 4 | 176 | 4.4 |
-| Phase 5 | 4 | 112 | 2.8 |
-| **Total** | **22** | **528** | **13.2** |
+| Phase 5 | 5 | 136 | 3.4 |
+| **Total** | **25** | **558** | **13.95** |
 
-**With 2 engineers**: ~6.6 weeks (~7 weeks)
-**With 1 engineer**: ~13.2 weeks (~14 weeks)
+**With 2 engineers**: ~7.0 weeks (~7 weeks)
+**With 1 engineer**: ~14.0 weeks (~14 weeks)
+
+**NEW Tasks Added** (based on v2.2.7/v2.2.8 testing):
+- P0.4: Fix Cluster Startup Deadlock (4h) - **MUST BE DONE FIRST!**
+- P0.5: Investigate Topic Auto-Creation Timeout (2h)
+- P5.5: Comprehensive Regression Testing (24h)
 
 ### Success Metrics Progression
 

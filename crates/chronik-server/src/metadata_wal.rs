@@ -98,8 +98,26 @@ impl MetadataWal {
         let data = bincode::serialize(cmd)
             .context("Failed to serialize metadata command")?;
 
+        // Use common append_bytes implementation
+        self.append_bytes(data).await
+    }
+
+    /// Append pre-serialized bytes to WAL (v2.2.9 Option A)
+    ///
+    /// Used by WalMetadataStore to write serialized MetadataEvent bytes directly.
+    /// This avoids double serialization (Event → Command → bytes).
+    ///
+    /// # Arguments
+    /// - `data`: Pre-serialized bytes (typically serialized MetadataEvent)
+    ///
+    /// # Returns
+    /// Offset of the written data in the WAL
+    pub async fn append_bytes(&self, data: Vec<u8>) -> Result<i64> {
         // Allocate next offset
         let offset = self.next_offset.fetch_add(1, Ordering::SeqCst);
+
+        // Capture data length before moving it into record
+        let data_len = data.len();
 
         // Create WAL record
         let record = WalRecord::new_v2(
@@ -121,12 +139,16 @@ impl MetadataWal {
         ).await.context("Failed to append to metadata WAL")?;
 
         debug!(
-            "Appended metadata command to WAL at offset {}: {:?}",
-            offset,
-            cmd
+            "Appended metadata bytes to WAL at offset {} ({} bytes)",
+            offset, data_len
         );
 
         Ok(offset)
+    }
+
+    /// Get the next offset that will be assigned (v2.2.9)
+    pub fn next_offset(&self) -> i64 {
+        self.next_offset.load(Ordering::SeqCst)
     }
 
     /// Get topic name for replication routing

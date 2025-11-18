@@ -29,7 +29,8 @@ mod wal_replication;  // v2.2.0: PostgreSQL-style WAL streaming
 // v2.2.7 Phase 2: Raft for metadata coordination only (NOT data replication)
 mod raft_metadata;
 mod raft_cluster;
-mod raft_metadata_store;  // v2.2.7 Phase 3: Unified metadata store (1-N nodes)
+// v2.2.9 Option A: REMOVED raft_metadata_store (replaced by WalMetadataStore in chronik-common)
+// mod raft_metadata_store;  // v2.2.7 Phase 3: OLD Raft-based metadata store (1-N nodes)
 // v2.2.7 Phase 2: WAL-based metadata writes (fast path, bypasses Raft consensus)
 mod metadata_wal;          // Fast local WAL for metadata operations (1-2ms vs 10-50ms Raft)
 mod metadata_wal_replication;  // Async replication using existing WalReplicationManager
@@ -631,10 +632,12 @@ async fn run_cluster_mode(
         cluster_for_prewarm.pre_warm_connections().await;
     });
 
-    // CRITICAL FIX: Start Raft message processing loop for leader election
-    info!("Starting Raft message processing loop...");
-    raft_cluster.clone().start_message_loop();
-    info!("Raft message loop started successfully");
+    // BUG FIX (2025-11-18): DO NOT start message loop here! IntegratedKafkaServer::new() already starts it.
+    // Starting it twice causes concurrent ready()/advance() calls on the same RaftNode, violating raft-rs invariant.
+    // Previous code: raft_cluster.clone().start_message_loop();
+    // This caused panic: "assertion failed: rd_record.number == rd.number"
+    // See docs/RAFT_ELECTION_STORM_BUG.md for full analysis
+    info!("Raft message loop will be started by IntegratedKafkaServer");
 
     // Create IntegratedKafkaServer config with cluster config
     let server_config = IntegratedServerConfig {

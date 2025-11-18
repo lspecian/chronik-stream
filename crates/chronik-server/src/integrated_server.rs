@@ -189,28 +189,41 @@ impl IntegratedKafkaServer {
         metadata_wal_replicator.clone().start_event_listener();
         info!("✅ Metadata event listener started");
 
-        // Create LeaseManager for fast follower reads (1-2ms vs 2-5ms forwarding)
-        let lease_manager = Arc::new(crate::leader_lease::LeaseManager::new(
-            std::time::Duration::from_secs(5)
-        ));
-        info!("✅ LeaseManager created (lease_duration=5s)");
+        // v2.2.9 Option A: WAL-based metadata store (Raft-free for performance)
+        // All metadata operations go through WAL (1-2ms writes) instead of Raft consensus (10-50ms)
+        // Replication happens via existing WalReplicationManager (fire-and-forget)
+        info!("Creating WalMetadataStore (Option A: Raft-free metadata with WAL replication)");
 
-        // v2.2.7 EVENT-DRIVEN: Create RaftMetadataStore with WAL-ONLY architecture and event bus
+        // Create WalAppendFn callback that wraps MetadataWal::append_bytes()
+        // v2.2.9: Use append_bytes() to avoid double serialization (Event → Command → bytes)
+        let metadata_wal_for_callback = metadata_wal.clone();
+        let wal_append_fn: chronik_common::metadata::WalAppendFn = Arc::new(move |bytes: Vec<u8>| {
+            let wal = metadata_wal_for_callback.clone();
+            Box::pin(async move {
+                // Write pre-serialized MetadataEvent bytes directly to WAL
+                let offset = wal.append_bytes(bytes).await
+                    .map_err(|e| format!("WAL append failed: {}", e))?;
+
+                Ok(offset)
+            })
+        });
+
+        // Instantiate WalMetadataStore with callback - THIS IS THE METADATA STORE FOR ALL MODES
         let metadata_store: Arc<dyn MetadataStore> = Arc::new(
-            crate::raft_metadata_store::RaftMetadataStore::new(
-                raft_cluster_for_metadata.clone(),
-                metadata_wal.clone(),
-                metadata_wal_replicator.clone(),
-                lease_manager.clone(),
-                metadata_event_bus.clone(),  // v2.2.7 EVENT-DRIVEN: Use shared event bus
+            chronik_common::metadata::WalMetadataStore::new(
+                config.node_id as u64,
+                wal_append_fn,
             )
         );
 
-        info!("✅ Successfully initialized RaftMetadataStore with WAL-ONLY architecture (no Raft for metadata)");
+        info!("✅ WalMetadataStore created successfully (Option A: WAL-only metadata)");
+        info!("   - Single-node mode: Local WAL only (no replication)");
+        info!("   - Multi-node mode: WAL + WalReplicationManager (fire-and-forget replication)");
+        info!("   - Expected performance: < 100ms topic creation (vs 20+ seconds with Raft)");
 
-        // v2.2.7 Phase 6: System topics no longer needed - metadata lives in Raft state machine
-        // The old __meta topic was used by ChronikMetaLogStore, which is now deleted
-        // Raft stores metadata in its own WAL (./data/wal/__meta/)
+        // v2.2.9 Option A: Metadata lives in WAL (./data/metadata_wal/)
+        // System topics no longer needed - metadata is event-sourced from WAL
+        // Raft is used ONLY for cluster membership and leader election, NOT for metadata operations
         
         // v2.2.7 Phase 4: Prepare broker metadata for registration
         // ARCHITECTURAL FIX: Don't register here for multi-node clusters
@@ -231,32 +244,8 @@ impl IntegratedKafkaServer {
         raft_cluster_for_metadata.clone().start_message_loop();
         info!("✓ Raft message loop started");
 
-        // WAL-ONLY: Start heartbeat sender/receiver for leader leases
-        {
-            let raft_for_heartbeat = raft_cluster_for_metadata.clone();
-            let lease_mgr_for_receiver = lease_manager.clone();
-
-            // Start heartbeat sender (runs on leader)
-            let heartbeat_sender = crate::leader_heartbeat::HeartbeatSender::new(
-                config.node_id as u64,
-                std::time::Duration::from_secs(1), // Send heartbeat every 1 second
-            );
-            let raft_for_sender = raft_for_heartbeat.clone();
-            tokio::spawn(async move {
-                heartbeat_sender.run(raft_for_sender).await;
-            });
-
-            // Start heartbeat receiver (runs on followers)
-            let heartbeat_receiver = crate::leader_heartbeat::HeartbeatReceiver::new(
-                config.node_id as u64,
-                lease_mgr_for_receiver,
-            );
-            tokio::spawn(async move {
-                heartbeat_receiver.run(raft_for_heartbeat).await;
-            });
-
-            info!("✅ Phase 3: Heartbeat sender and receiver started (interval=1s, lease=5s)");
-        }
+        // v2.2.9 Option A: REMOVED heartbeat sender/receiver (was for RaftMetadataStore leader leases)
+        // WalMetadataStore uses fire-and-forget WAL replication, no leader leases needed
 
         // Wait for leader election (single-node should become leader immediately)
         if raft_cluster.is_none() {
