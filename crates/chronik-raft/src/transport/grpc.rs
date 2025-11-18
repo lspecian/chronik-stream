@@ -154,6 +154,14 @@ impl GrpcTransport {
         // If we got a client, the node is reachable
         Ok(())
     }
+
+    /// Get all peer IDs (v2.2.8)
+    ///
+    /// Returns a list of all registered peer node IDs.
+    /// Used for pre-warming connections on startup.
+    pub async fn get_peer_ids(&self) -> Vec<u64> {
+        self.peer_addrs.read().await.keys().copied().collect()
+    }
 }
 
 impl Default for GrpcTransport {

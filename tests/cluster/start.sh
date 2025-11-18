@@ -48,14 +48,14 @@ echo $! > "$SCRIPT_DIR/data/node1.pid"
 sleep 2
 
 echo -e "${GREEN}Starting Node 2...${NC}"
-RUST_LOG=info CHRONIK_WAL_PROFILE=ultra "$BINARY" start --config "$SCRIPT_DIR/node2.toml" \
+RUST_LOG=debug CHRONIK_WAL_PROFILE=ultra "$BINARY" start --config "$SCRIPT_DIR/node2.toml" \
     > "$SCRIPT_DIR/logs/node2.log" 2>&1 &
 echo $! > "$SCRIPT_DIR/data/node2.pid"
 
 sleep 2
 
 echo -e "${GREEN}Starting Node 3...${NC}"
-RUST_LOG=info CHRONIK_WAL_PROFILE=ultra "$BINARY" start --config "$SCRIPT_DIR/node3.toml" \
+RUST_LOG=debug CHRONIK_WAL_PROFILE=ultra "$BINARY" start --config "$SCRIPT_DIR/node3.toml" \
     > "$SCRIPT_DIR/logs/node3.log" 2>&1 &
 echo $! > "$SCRIPT_DIR/data/node3.pid"
 

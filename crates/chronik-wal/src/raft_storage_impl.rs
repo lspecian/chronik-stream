@@ -362,6 +362,21 @@ impl RaftWalStorage {
         *self.raft_state.write().unwrap() = state;
     }
 
+    /// Clear all log entries (v2.2.8 RAFT PANIC FIX)
+    ///
+    /// Used when reinitializing cluster with ZERO voters to avoid inconsistent state.
+    /// Clears in-memory entries and resets first_index to 1.
+    ///
+    /// CRITICAL: Must be called when detected recovered state has zero voters,
+    /// otherwise nodes with mismatched log states will panic with:
+    /// "to_commit X is out of range [last_index Y]"
+    pub fn clear_entries(&self) {
+        let mut entries = self.entries.write().unwrap();
+        entries.clear();
+        *self.first_index.write().unwrap() = 1;
+        tracing::warn!("✓ Cleared Raft log entries and reset first_index (ZERO voters recovery)");
+    }
+
     /// Check if HardState was recovered (term > 0 means we have recovered state)
     pub fn has_recovered_state(&self) -> bool {
         let state = self.raft_state.read().unwrap();

@@ -623,6 +623,14 @@ async fn run_cluster_mode(
     raft_cluster.clone().start_grpc_server(raft_bind_addr.clone()).await?;
     info!("Raft gRPC server started successfully");
 
+    // v2.2.8 FIX: Pre-warm connections AFTER gRPC server starts
+    // This prevents chicken-and-egg problem during cluster startup
+    // Spawn in background so it doesn't block message loop startup
+    let cluster_for_prewarm = raft_cluster.clone();
+    tokio::spawn(async move {
+        cluster_for_prewarm.pre_warm_connections().await;
+    });
+
     // CRITICAL FIX: Start Raft message processing loop for leader election
     info!("Starting Raft message processing loop...");
     raft_cluster.clone().start_message_loop();
@@ -652,12 +660,53 @@ async fn run_cluster_mode(
     let server = IntegratedKafkaServer::new(server_config, Some(raft_cluster.clone())).await?;
     info!("IntegratedKafkaServer initialized successfully");
 
+    // ========================================
+    // CRITICAL FIX v2.2.9: Start Kafka protocol listener BEFORE leader election wait
+    // ========================================
+    // This fixes the cold-start deadlock where followers wait for leader
+    // election but need Kafka/WAL listeners running to participate.
+    //
+    // Original bug: Followers waited for election with no listeners →
+    //              couldn't replicate data → couldn't elect leader → deadlock
+    //
+    // Fix: Start Kafka listener FIRST, then wait for leader election
+    // Note: WalReceiver already started in IntegratedKafkaServer::new() as background task
+    // ========================================
+
+    // Parse Kafka bind address from cluster config (needed early for listener startup)
+    let kafka_addr = config.bind.as_ref()
+        .map(|b| b.kafka.clone())
+        .unwrap_or_else(|| this_node.kafka.clone());
+
+    info!("Starting Kafka protocol listener before leader election...");
+    info!("  (WalReceiver already running as background task from IntegratedKafkaServer::new())");
+
+    // Start Kafka protocol listener on ALL nodes (not just leader)
+    let kafka_addr_for_task = kafka_addr.clone();
+    let server_for_task = server.clone();
+    let server_task = tokio::spawn(async move {
+        server_for_task.run(&kafka_addr_for_task).await
+    });
+
+    // Small delay to ensure TCP listener is bound before proceeding
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    info!("✓ Kafka protocol listener started on {}", kafka_addr);
+    info!("✓ All TCP listeners now running:");
+    info!("  - Raft gRPC: {}", raft_bind_addr);
+    info!("  - Kafka protocol: {}", kafka_addr);
+    if let Some(wal_cfg) = config.bind.as_ref() {
+        info!("  - WAL replication: {} (background task)", wal_cfg.wal);
+    }
+
+    // NOW it's safe to wait for leader election - all nodes can communicate
     // ARCHITECTURAL FIX v2.2.7: Register broker NOW with actual peer configs from TOML
     // Multi-node broker registration happens here, AFTER:
     // 1. Raft message loop started (leader election can proceed)
     // 2. gRPC server started (nodes can communicate)
     // 3. IntegratedServer created (metadata store ready)
-    info!("Waiting for Raft leader election before broker registration...");
+    // 4. TCP listeners started (nodes can replicate) <- NEW in v2.2.9
+    info!("Waiting for Raft leader election (max 10s)...");
 
     // Wait for leader election (max 10 seconds)
     let mut election_attempts = 0;
@@ -818,13 +867,8 @@ async fn run_cluster_mode(
     ).await;
     info!("✓ Partition Rebalancer started (will check every 30s for membership changes)");
 
-    // Start server with signal handling
-    let server_clone = server.clone();
-    let kafka_addr_clone = kafka_addr.clone();
-    let server_task = tokio::spawn(async move {
-        server_clone.run(&kafka_addr_clone).await
-    });
-
+    // Wait for server task completion or shutdown signals
+    // NOTE: server_task was already started at line 679 before leader election
     tokio::select! {
         result = server_task => {
             match result {

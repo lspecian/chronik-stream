@@ -178,16 +178,23 @@ impl MetadataStore for RaftMetadataStore {
                 )));
         }
 
-        // FOLLOWER PATH: Wait for WAL replication from leader
-        tracing::debug!("Follower waiting for topic '{}' to be replicated", name);
+        // FOLLOWER PATH: Forward write to leader, then wait for replication
+        tracing::info!("Follower forwarding create_topic('{}') to leader", name);
 
-        // Register notification channel
+        // 1. Forward the write request to leader
+        self.raft.forward_write_to_leader(crate::metadata_rpc::MetadataWriteCommand::CreateTopic {
+            name: name.to_string(),
+            partition_count: config.partition_count as i32,
+            replication_factor: config.replication_factor as i32,
+            config: config.config.clone(),
+        }).await.map_err(|e| MetadataError::StorageError(format!("Failed to forward to leader: {}", e)))?;
+
+        // 2. Wait for WAL replication to arrive at this follower
+        tracing::debug!("Waiting for topic '{}' to be replicated to follower", name);
         let notify = Arc::new(Notify::new());
         self.pending_topics.insert(name.to_string(), Arc::clone(&notify));
 
-        // Wait for notification with timeout
         let timeout_duration = tokio::time::Duration::from_millis(5000);
-
         match tokio::time::timeout(timeout_duration, notify.notified()).await {
             Ok(_) => {
                 let state = self.state();
@@ -198,8 +205,7 @@ impl MetadataStore for RaftMetadataStore {
                     )))
             }
             Err(_) => {
-                tracing::warn!("Topic '{}' creation timed out after {}ms", name, timeout_duration.as_millis());
-
+                tracing::warn!("Topic '{}' replication timed out after {}ms", name, timeout_duration.as_millis());
                 let state = self.state();
                 state.topics.get(name).cloned()
                     .ok_or_else(|| MetadataError::NotFound(format!(

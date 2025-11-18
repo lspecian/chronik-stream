@@ -137,8 +137,12 @@ impl RaftCluster {
         // Create Raft configuration
         let config = Config {
             id: node_id,
-            election_tick: 10,
-            heartbeat_tick: 3,
+            // v2.2.8 FIX: Increase election timeout to prevent startup race conditions
+            // With election_tick=10 (~1 second), nodes can timeout before gRPC connections
+            // are established, causing election storms. election_tick=20 (~2 seconds) provides
+            // enough time for connection retries during cluster startup.
+            election_tick: 20,  // ~2 seconds (20 ticks * 100ms loop interval)
+            heartbeat_tick: 3,   // ~300ms (3 ticks * 100ms loop interval)
             max_size_per_msg: 1024 * 1024,
             max_inflight_msgs: 256,
             ..Default::default()
@@ -191,6 +195,11 @@ impl RaftCluster {
                     ..Default::default()
                 },
             });
+
+            // v2.2.8 RAFT PANIC FIX: Clear stale log entries when reinitializing
+            // Prevents panic: "to_commit X is out of range [last_index Y]"
+            // when nodes have mismatched Raft log states
+            wal_storage.clear_entries();
         } else {
             tracing::info!(
                 "✓ Using recovered Raft state from WAL (voters: {:?})",
@@ -216,15 +225,15 @@ impl RaftCluster {
         let transport = Arc::new(GrpcTransport::new());
 
         // Register peers with gRPC transport
-        for (peer_id, peer_addr) in peers {
+        for (peer_id, peer_addr) in &peers {
             // Convert Raft address (e.g., "0.0.0.0:5001") to gRPC URL (e.g., "http://localhost:5001")
             let grpc_url = if peer_addr.starts_with("http") {
-                peer_addr
+                peer_addr.clone()
             } else {
                 format!("http://{}", peer_addr)
             };
 
-            transport.add_peer(peer_id, grpc_url).await
+            transport.add_peer(*peer_id, grpc_url).await
                 .context(format!("Failed to add peer {} to transport", peer_id))?;
 
             tracing::info!("✓ Registered peer {} in gRPC transport", peer_id);
@@ -238,59 +247,66 @@ impl RaftCluster {
         let (message_sender, mut message_receiver) = mpsc::unbounded_channel::<(u64, Message)>();
 
         // Start background message sender task
+        // v2.2.8 FIX: Spawn concurrent tasks per message to prevent head-of-line blocking
+        // Previously, retries for one peer would block messages to ALL peers
         let transport_for_sender = transport.clone();
         tokio::spawn(async move {
             while let Some((peer_id, msg)) = message_receiver.recv().await {
                 let msg_type = msg.msg_type;
                 tracing::debug!("Message sender: sending {:?} to peer {}", msg_type, peer_id);
 
-                // Use gRPC transport to send the message
-                const METADATA_TOPIC: &str = "__raft_metadata";
-                const METADATA_PARTITION: i32 = 0;
+                // v2.2.8 FIX: Spawn separate task for each message to prevent blocking
+                // This allows messages to different peers to be sent concurrently
+                let transport_clone = transport_for_sender.clone();
+                tokio::spawn(async move {
+                    // Use gRPC transport to send the message
+                    const METADATA_TOPIC: &str = "__raft_metadata";
+                    const METADATA_PARTITION: i32 = 0;
 
-                // CRITICAL FIX (v2.2.7): Retry failed messages with exponential backoff
-                // When gRPC transport fails (peer not connected), we MUST retry until success.
-                // Otherwise, AppendEntries with committed entries are LOST, causing followers
-                // to have commit index > last_index (split-brain state).
-                //
-                // Retry strategy:
-                // - Max 10 retries with exponential backoff (50ms, 100ms, 200ms, ...)
-                // - If all retries fail, log error but continue (message is lost)
-                // - This prevents infinite retry loops while giving transport time to connect
-                let mut retry_count = 0;
-                let max_retries = 10;
-                let mut backoff_ms = 50;
+                    // CRITICAL FIX (v2.2.7): Retry failed messages with exponential backoff
+                    // When gRPC transport fails (peer not connected), we MUST retry until success.
+                    // Otherwise, AppendEntries with committed entries are LOST, causing followers
+                    // to have commit index > last_index (split-brain state).
+                    //
+                    // Retry strategy:
+                    // - Max 10 retries with exponential backoff (50ms, 100ms, 200ms, ...)
+                    // - If all retries fail, log error but continue (message is lost)
+                    // - This prevents infinite retry loops while giving transport time to connect
+                    let mut retry_count = 0;
+                    let max_retries = 10;
+                    let mut backoff_ms = 50;
 
-                loop {
-                    match transport_for_sender
-                        .send_message(METADATA_TOPIC, METADATA_PARTITION, peer_id, msg.clone())
-                        .await
-                    {
-                        Ok(_) => {
-                            tracing::debug!("✓ Message sender: sent {:?} to peer {} (retries: {})", msg_type, peer_id, retry_count);
-                            break; // Success - exit retry loop
-                        }
-                        Err(e) => {
-                            retry_count += 1;
-                            if retry_count >= max_retries {
-                                tracing::error!(
-                                    "Message sender: FAILED to send {:?} to peer {} after {} retries - MESSAGE LOST: {}",
-                                    msg_type, peer_id, max_retries, e
-                                );
-                                break; // Give up after max retries
+                    loop {
+                        match transport_clone
+                            .send_message(METADATA_TOPIC, METADATA_PARTITION, peer_id, msg.clone())
+                            .await
+                        {
+                            Ok(_) => {
+                                tracing::debug!("✓ Message sender: sent {:?} to peer {} (retries: {})", msg_type, peer_id, retry_count);
+                                break; // Success - exit retry loop
                             }
+                            Err(e) => {
+                                retry_count += 1;
+                                if retry_count >= max_retries {
+                                    tracing::error!(
+                                        "Message sender: FAILED to send {:?} to peer {} after {} retries - MESSAGE LOST: {}",
+                                        msg_type, peer_id, max_retries, e
+                                    );
+                                    break; // Give up after max retries
+                                }
 
-                            tracing::debug!(
-                                "Message sender: retry {}/{} for {:?} to peer {} (backoff: {}ms): {}",
-                                retry_count, max_retries, msg_type, peer_id, backoff_ms, e
-                            );
+                                tracing::debug!(
+                                    "Message sender: retry {}/{} for {:?} to peer {} (backoff: {}ms): {}",
+                                    retry_count, max_retries, msg_type, peer_id, backoff_ms, e
+                                );
 
-                            // Exponential backoff
-                            tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
-                            backoff_ms = (backoff_ms * 2).min(1000); // Cap at 1 second
+                                // Exponential backoff
+                                tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
+                                backoff_ms = (backoff_ms * 2).min(1000); // Cap at 1 second
+                            }
                         }
                     }
-                }
+                });
             }
             tracing::info!("Message sender task shutting down");
         });
@@ -343,6 +359,70 @@ impl RaftCluster {
     /// v2.2.7 EVENT-DRIVEN NOTIFICATION (P1): Get partition metadata notification map
     pub fn get_pending_partitions_notifications(&self) -> Arc<DashMap<String, Arc<Notify>>> {
         self.pending_partitions.clone()
+    }
+
+    /// Pre-warm gRPC connections to all peers (v2.2.8)
+    ///
+    /// CRITICAL: Must be called AFTER gRPC server starts, not before!
+    /// This prevents the chicken-and-egg problem where Node 1 tries to connect
+    /// to Node 2 before Node 2's gRPC server is ready.
+    ///
+    /// # Behavior
+    /// - Attempts to establish connection to each peer
+    /// - Retries up to 30 times with 100ms backoff (3s total)
+    /// - Logs warnings for failed connections but continues anyway
+    /// - Runs asynchronously in background (doesn't block startup)
+    pub async fn pre_warm_connections(&self) {
+        let peer_count = self.transport.peer_count();
+        if peer_count == 0 {
+            tracing::debug!("Skipping pre-warming: single-node cluster");
+            return;
+        }
+
+        tracing::info!("Pre-warming gRPC connections to {} peers...", peer_count);
+
+        // Get all peer IDs from the transport
+        let peer_ids = self.transport.get_peer_ids().await;
+
+        for peer_id in peer_ids {
+            // Attempt to establish connection with retries
+            const MAX_WARMUP_RETRIES: usize = 30;  // 30 retries @ 100ms = 3 seconds max
+            const WARMUP_BACKOFF_MS: u64 = 100;
+
+            let mut connected = false;
+            for attempt in 1..=MAX_WARMUP_RETRIES {
+                match self.transport.ping_peer(peer_id).await {
+                    Ok(()) => {
+                        tracing::info!("✓ Pre-warmed connection to peer {} (attempt {})", peer_id, attempt);
+                        connected = true;
+                        break;
+                    }
+                    Err(e) => {
+                        if attempt < MAX_WARMUP_RETRIES {
+                            tracing::debug!(
+                                "Pre-warm attempt {}/{} to peer {} failed (will retry): {}",
+                                attempt, MAX_WARMUP_RETRIES, peer_id, e
+                            );
+                            tokio::time::sleep(tokio::time::Duration::from_millis(WARMUP_BACKOFF_MS)).await;
+                        } else {
+                            tracing::warn!(
+                                "Failed to pre-warm connection to peer {} after {} attempts (continuing anyway): {}",
+                                peer_id, MAX_WARMUP_RETRIES, e
+                            );
+                        }
+                    }
+                }
+            }
+
+            if !connected {
+                tracing::warn!(
+                    "⚠ Peer {} may not be ready yet - first heartbeats may fail",
+                    peer_id
+                );
+            }
+        }
+
+        tracing::info!("✓ Completed gRPC connection pre-warming");
     }
 
     /// Get partition replicas (nodes that should replicate this partition)
@@ -1682,8 +1762,12 @@ impl RaftCluster {
                 let _ = tx.send(result);
             });
 
-            // Wait for result (this is okay because we're in a gRPC handler thread pool)
-            rx.recv().map_err(|_| "Write task failed".to_string())?
+            // Wait for result with timeout (prevents infinite blocking if Raft is stuck)
+            match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(e),
+                Err(e) => Err(format!("Write task timed out after 10s: {}", e)),
+            }
         });
 
         // Create RPC service with all handlers (Phase 1.2)
@@ -2346,6 +2430,14 @@ pub async fn run_raft_cluster(config: RaftClusterConfig) -> Result<()> {
     // CRITICAL: Without this, nodes can't communicate and leader election fails!
     raft_cluster.clone().start_grpc_server(config.raft_addr.clone()).await?;
     tracing::info!("✓ Raft gRPC server started on {}", config.raft_addr);
+
+    // v2.2.8 FIX: Pre-warm connections AFTER gRPC server starts
+    // This prevents chicken-and-egg problem during cluster startup
+    // Spawn in background so it doesn't block
+    let cluster_for_prewarm = raft_cluster.clone();
+    tokio::spawn(async move {
+        cluster_for_prewarm.pre_warm_connections().await;
+    });
 
     // Step 1.7: Auto-configure WAL replication for Raft cluster (v2.2.7 fix)
     // CRITICAL: Without this, acks=-1 hangs because no follower ACKs are sent!

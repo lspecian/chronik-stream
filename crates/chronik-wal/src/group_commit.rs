@@ -704,12 +704,13 @@ impl GroupCommitWal {
         info!("🚀 WORKER_SPAWN: Starting partition committer background task");
 
         tokio::spawn(async move {
-            // v2.2.7: Set high I/O priority for WAL thread to prevent Tantivy from blocking it
-            if let Err(e) = crate::io_priority::set_wal_priority() {
-                warn!("Failed to set WAL I/O priority (may need CAP_SYS_ADMIN): {}", e);
-            }
-
             info!("✅ WORKER_STARTED: Partition committer task is running");
+
+            // v2.2.7: Set high I/O priority for WAL thread to prevent Tantivy from blocking it
+            // NOTE: This is optional and failure is non-fatal
+            if let Err(e) = crate::io_priority::set_wal_priority() {
+                debug!("Could not set WAL I/O priority (requires CAP_SYS_ADMIN): {}", e);
+            }
             let mut interval = tokio::time::interval(Duration::from_millis(config.max_wait_time_ms));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 

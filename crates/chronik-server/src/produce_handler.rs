@@ -1130,17 +1130,56 @@ impl ProduceHandler {
                         };
 
                         if !is_leader {
-                            debug!(
-                                "Not leader for {}-{}, returning NOT_LEADER_FOR_PARTITION (leader_hint={:?})",
-                                topic_name, partition_data.index, leader_hint
-                            );
-                            return ProduceResponsePartition {
-                                index: partition_data.index,
-                                error_code: ErrorCode::NotLeaderForPartition.code(),
-                                base_offset: -1,
-                                log_append_time: -1,
-                                log_start_offset: 0,
-                            };
+                            // Forward request to leader instead of returning error (v2.2.9)
+                            if let Some(leader_id) = leader_hint {
+                                debug!(
+                                    "Not leader for {}-{}, forwarding to leader node {}",
+                                    topic_name, partition_data.index, leader_id
+                                );
+
+                                match self.forward_produce_to_leader(
+                                    leader_id,
+                                    &topic_name,
+                                    partition_data.index,
+                                    &partition_data.records,
+                                    acks,
+                                ).await {
+                                    Ok(response) => {
+                                        debug!(
+                                            "Successfully forwarded {}-{} to leader {}, offset={}",
+                                            topic_name, partition_data.index, leader_id, response.base_offset
+                                        );
+                                        return response;
+                                    }
+                                    Err(e) => {
+                                        error!(
+                                            "Failed to forward {}-{} to leader {}: {}",
+                                            topic_name, partition_data.index, leader_id, e
+                                        );
+                                        // Fallback to NOT_LEADER_FOR_PARTITION on forwarding failure
+                                        return ProduceResponsePartition {
+                                            index: partition_data.index,
+                                            error_code: ErrorCode::NotLeaderForPartition.code(),
+                                            base_offset: -1,
+                                            log_append_time: -1,
+                                            log_start_offset: 0,
+                                        };
+                                    }
+                                }
+                            } else {
+                                // No leader hint, return NOT_LEADER_FOR_PARTITION
+                                debug!(
+                                    "Not leader for {}-{} and no leader hint, returning NOT_LEADER_FOR_PARTITION",
+                                    topic_name, partition_data.index
+                                );
+                                return ProduceResponsePartition {
+                                    index: partition_data.index,
+                                    error_code: ErrorCode::NotLeaderForPartition.code(),
+                                    base_offset: -1,
+                                    log_append_time: -1,
+                                    log_start_offset: 0,
+                                };
+                            }
                         }
 
                         // Process the partition data
@@ -1195,7 +1234,211 @@ impl ProduceHandler {
         
         Ok(response_topics)
     }
-    
+
+    /// Forward produce request to the partition leader (v2.2.9)
+    ///
+    /// When a non-leader receives a produce request, forward it to the actual leader
+    /// instead of returning NOT_LEADER_FOR_PARTITION. This matches Kafka's behavior.
+    async fn forward_produce_to_leader(
+        &self,
+        leader_id: u64,
+        topic: &str,
+        partition: i32,
+        records_data: &[u8],
+        acks: i16,
+    ) -> Result<ProduceResponsePartition> {
+        use tokio::net::TcpStream;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use bytes::{Bytes, BytesMut, BufMut};
+        use chronik_protocol::parser::{Encoder, Decoder};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        // Get leader's Kafka address from metadata store
+        let leader_addr = match self.metadata_store.get_broker(leader_id as i32).await {
+            Ok(Some(broker)) => {
+                format!("{}:{}", broker.host, broker.port)
+            }
+            Ok(None) => {
+                error!("Leader node {} not found in metadata store", leader_id);
+                return Err(Error::Internal(format!("Leader node {} not found", leader_id)));
+            }
+            Err(e) => {
+                error!("Failed to get leader {} address: {}", leader_id, e);
+                return Err(Error::Internal(format!("Metadata error: {}", e)));
+            }
+        };
+
+        debug!(
+            "Forwarding produce request for {}-{} to leader {} at {}",
+            topic, partition, leader_id, leader_addr
+        );
+
+        // Connect to leader's Kafka port
+        let mut stream = match TcpStream::connect(&leader_addr).await {
+            Ok(s) => s,
+            Err(e) => {
+                error!("Failed to connect to leader {}: {}", leader_addr, e);
+                return Err(Error::Internal(format!("Connection failed: {}", e)));
+            }
+        };
+
+        // Encode request (Kafka wire format: length + request_header + request_body)
+        // Use timestamp-based correlation ID
+        let correlation_id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as i32;
+        let api_version = 9i16; // Use v9 for modern protocol
+
+        // Encode request header
+        let mut header_buf = BytesMut::new();
+        {
+            let mut encoder = Encoder::new(&mut header_buf);
+            encoder.write_i16(0); // API key 0 = Produce
+            encoder.write_i16(api_version);
+            encoder.write_i32(correlation_id);
+            encoder.write_compact_string(Some("chronik-forward")); // client_id
+            encoder.write_unsigned_varint(0); // No tagged fields
+        }
+
+        // Encode request body (following parse_produce_request in reverse)
+        let mut body_buf = BytesMut::new();
+        {
+            let mut body_encoder = Encoder::new(&mut body_buf);
+
+            // transactional_id (v3+, compact string for v9+)
+            body_encoder.write_compact_string(None);
+
+            // acks
+            body_encoder.write_i16(acks);
+
+            // timeout_ms
+            body_encoder.write_i32(5000); // 5 second timeout for forwarded requests
+
+            // topics array (compact for v9+)
+            body_encoder.write_unsigned_varint(2); // 1 topic + 1
+
+            // topic name (compact string for v9+)
+            body_encoder.write_compact_string(Some(topic));
+
+            // partitions array (compact for v9+)
+            body_encoder.write_unsigned_varint(2); // 1 partition + 1
+
+            // partition index
+            body_encoder.write_i32(partition);
+
+            // records (compact bytes for v9+)
+            body_encoder.write_compact_bytes(Some(records_data));
+
+            // Tagged fields for partition (v9+)
+            body_encoder.write_unsigned_varint(0);
+
+            // Tagged fields for topic (v9+)
+            body_encoder.write_unsigned_varint(0);
+
+            // Tagged fields for request (v9+)
+            body_encoder.write_unsigned_varint(0);
+        }
+
+        // Combine header + body with length prefix
+        let message_size = header_buf.len() + body_buf.len();
+        let mut frame_buf = BytesMut::with_capacity(4 + message_size);
+        frame_buf.put_i32(message_size as i32);
+        frame_buf.extend_from_slice(&header_buf);
+        frame_buf.extend_from_slice(&body_buf);
+
+        // Send request
+        if let Err(e) = stream.write_all(&frame_buf).await {
+            error!("Failed to send forwarded request: {}", e);
+            return Err(Error::Internal(format!("Send failed: {}", e)));
+        }
+
+        // Read response (length + response_header + response_body)
+        let mut length_buf = [0u8; 4];
+        if let Err(e) = stream.read_exact(&mut length_buf).await {
+            error!("Failed to read response length: {}", e);
+            return Err(Error::Internal(format!("Read failed: {}", e)));
+        }
+
+        let response_length = i32::from_be_bytes(length_buf) as usize;
+        if response_length > 10_000_000 {
+            error!("Response length too large: {}", response_length);
+            return Err(Error::Internal("Response too large".into()));
+        }
+
+        let mut response_buf = vec![0u8; response_length];
+        if let Err(e) = stream.read_exact(&mut response_buf).await {
+            error!("Failed to read response body: {}", e);
+            return Err(Error::Internal(format!("Read failed: {}", e)));
+        }
+
+        // Parse response header
+        let mut response_bytes = Bytes::from(response_buf);
+        let mut decoder = Decoder::new(&mut response_bytes);
+        let response_correlation_id = decoder.read_i32()?;
+
+        if response_correlation_id != correlation_id {
+            error!(
+                "Correlation ID mismatch: expected {}, got {}",
+                correlation_id, response_correlation_id
+            );
+            return Err(Error::Internal("Correlation ID mismatch".into()));
+        }
+
+        // Tagged fields in response header (v9+)
+        let tagged_count = decoder.read_unsigned_varint()?;
+        for _ in 0..tagged_count {
+            let _tag_id = decoder.read_unsigned_varint()?;
+            let tag_size = decoder.read_unsigned_varint()? as usize;
+            decoder.advance(tag_size)?;
+        }
+
+        // Parse response body (reverse of encode_produce_response)
+        // Topics array (compact for v9+)
+        let topic_count = (decoder.read_unsigned_varint()? - 1) as usize;
+        if topic_count != 1 {
+            error!("Expected 1 topic in response, got {}", topic_count);
+            return Err(Error::Internal("Unexpected topic count".into()));
+        }
+
+        // Topic name
+        let _topic_name = decoder.read_compact_string()?;
+
+        // Partitions array
+        let partition_count = (decoder.read_unsigned_varint()? - 1) as usize;
+        if partition_count != 1 {
+            error!("Expected 1 partition in response, got {}", partition_count);
+            return Err(Error::Internal("Unexpected partition count".into()));
+        }
+
+        // Partition response
+        let partition_index = decoder.read_i32()?;
+        let error_code = decoder.read_i16()?;
+        let base_offset = decoder.read_i64()?;
+
+        // log_append_time (v2+)
+        let log_append_time = decoder.read_i64()?;
+
+        // log_start_offset (v5+)
+        let log_start_offset = decoder.read_i64()?;
+
+        // Tagged fields for partition (v9+)
+        let tagged_count = decoder.read_unsigned_varint()?;
+        for _ in 0..tagged_count {
+            let _tag_id = decoder.read_unsigned_varint()?;
+            let tag_size = decoder.read_unsigned_varint()? as usize;
+            decoder.advance(tag_size)?;
+        }
+
+        Ok(ProduceResponsePartition {
+            index: partition_index,
+            error_code,
+            base_offset,
+            log_append_time,
+            log_start_offset,
+        })
+    }
+
     /// Produce records to a specific partition
     #[instrument(skip(self, records_data), fields(topic, partition, acks, bytes = records_data.len()))]
     async fn produce_to_partition(
