@@ -77,16 +77,36 @@ impl MetadataEvent {
         }
     }
 
-    /// Serialize event to bytes for WAL storage (bincode format)
+    /// Serialize event to bytes for WAL storage (JSON format)
+    ///
+    /// v2.2.9 CRITICAL FIX: Switched from bincode to JSON because bincode doesn't
+    /// support internally tagged enums (#[serde(tag = "type")]), which causes
+    /// deserialization to fail with "Bincode does not support deserialize_any".
     pub fn to_bytes(&self) -> Result<Vec<u8>, String> {
-        bincode::serialize(self)
+        serde_json::to_vec(self)
             .map_err(|e| format!("Failed to serialize MetadataEvent: {}", e))
     }
 
-    /// Deserialize event from bytes (bincode format)
+    /// Deserialize event from bytes (JSON format)
+    ///
+    /// v2.2.9: Supports JSON format (current) and falls back to bincode for
+    /// backward compatibility with existing WAL files.
     pub fn from_bytes(data: &[u8]) -> Result<Self, String> {
-        bincode::deserialize(data)
-            .map_err(|e| format!("Failed to deserialize MetadataEvent: {}", e))
+        // Try JSON first (current format)
+        match serde_json::from_slice(data) {
+            Ok(event) => Ok(event),
+            Err(json_err) => {
+                // Fall back to bincode for backward compatibility
+                // This will fail for internally tagged enums, but we try anyway
+                bincode::deserialize(data)
+                    .map_err(|bincode_err| {
+                        format!(
+                            "Failed to deserialize MetadataEvent: JSON error: {}, Bincode error: {}",
+                            json_err, bincode_err
+                        )
+                    })
+            }
+        }
     }
 }
 

@@ -178,10 +178,13 @@ impl BenchmarkRunner {
             TopicReplication::Fixed(self.args.replication_factor as i32),
         );
 
-        let results = admin
-            .create_topics(&[new_topic], &AdminOptions::new())
-            .await
-            .context("Failed to create topic")?;
+        // Wrap topic creation with explicit 60-second timeout to prevent indefinite hangs
+        use tokio::time::{timeout, Duration};
+        let results = match timeout(Duration::from_secs(60), admin.create_topics(&[new_topic], &AdminOptions::new())).await {
+            Ok(Ok(results)) => results,
+            Ok(Err(e)) => anyhow::bail!("Failed to create topic: {}", e),
+            Err(_) => anyhow::bail!("Topic creation timed out after 60 seconds - check if Chronik server is running and accessible"),
+        };
 
         for result in results {
             match result {

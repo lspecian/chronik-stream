@@ -260,14 +260,21 @@ impl RequestHandler {
     
     /// Handle metadata request
     async fn handle_metadata(&self, request: MetadataRequest, correlation_id: i32) -> Result<Response> {
-        let brokers = vec![
-            MetadataBroker {
-                node_id: self.config.node_id,
-                host: self.config.host.clone(),
-                port: self.config.port,
-                rack: None,
-            }
-        ];
+        // v2.2.9 CRITICAL FIX: Query ALL registered brokers from metadata_store
+        // Previously hardcoded only the current node, causing kafka-python to discover 0 brokers.
+        // This was Bug #3 in the RaftMetadataStore → WalMetadataStore migration.
+        let all_brokers = self.metadata_store.list_brokers().await
+            .map_err(|e| chronik_common::Error::Internal(format!("Failed to list brokers: {:?}", e)))?;
+
+        let brokers: Vec<MetadataBroker> = all_brokers.iter().map(|b| MetadataBroker {
+            node_id: b.broker_id,
+            host: b.host.clone(),
+            port: b.port,
+            rack: b.rack.clone(),
+        }).collect();
+
+        tracing::debug!("Metadata API returning {} brokers: {:?}", brokers.len(),
+            brokers.iter().map(|b| (b.node_id, format!("{}:{}", b.host, b.port))).collect::<Vec<_>>());
 
         let mut topics = Vec::new();
 

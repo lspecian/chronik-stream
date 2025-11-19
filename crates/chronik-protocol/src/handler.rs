@@ -4825,19 +4825,21 @@ impl ProtocolHandler {
                 // Get actual offsets from metadata store if available
                 let (offset, timestamp_found) = match partition.timestamp {
                     LATEST_TIMESTAMP => {
-                        // Get actual high watermark from metadata store
+                        // v2.2.9 CRITICAL FIX: Get actual high watermark from metadata store's partition_offsets
+                        // This is updated immediately by ProduceHandler, unlike segments which are created later
                         let high_watermark = if let Some(ref metadata_store) = self.metadata_store {
-                            // Get segments for this topic-partition
-                            match metadata_store.list_segments(&topic.name, Some(partition.partition_index as u32)).await {
-                                Ok(segments) => {
-                                    // Calculate high watermark from segments
-                                    segments.iter()
-                                        .map(|s| s.end_offset + 1)
-                                        .max()
-                                        .unwrap_or(0)
+                            // Get high watermark from partition_offsets (updated by ProduceHandler via event bus)
+                            match metadata_store.get_partition_offset(&topic.name, partition.partition_index as u32).await {
+                                Ok(Some((hwm, _lso))) => {
+                                    // Return watermark from metadata store (source of truth)
+                                    hwm
+                                }
+                                Ok(None) => {
+                                    // Partition not created yet
+                                    0
                                 }
                                 Err(e) => {
-                                    tracing::warn!("Failed to get segments for {}-{}: {}", 
+                                    tracing::warn!("Failed to get partition offset for {}-{}: {}",
                                         topic.name, partition.partition_index, e);
                                     0
                                 }

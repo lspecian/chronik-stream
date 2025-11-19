@@ -34,6 +34,9 @@ pub struct MetadataWal {
     /// Underlying GroupCommitWal (reuses existing infrastructure)
     wal: Arc<GroupCommitWal>,
 
+    /// WAL directory path (for recovery)
+    wal_dir: PathBuf,
+
     /// Topic name for replication routing (always "__chronik_metadata")
     topic_name: String,
 
@@ -67,7 +70,7 @@ impl MetadataWal {
         // Can be overridden via CHRONIK_WAL_PROFILE environment variable
         // Default: high profile (10K batches, 100ms flush, 50MB buffer)
         let config = GroupCommitConfig::default();
-        let wal = GroupCommitWal::new(wal_dir, config);
+        let wal = GroupCommitWal::new(wal_dir.clone(), config);
 
         info!(
             "Metadata WAL created successfully (topic='{}', partition={})",
@@ -77,6 +80,7 @@ impl MetadataWal {
 
         Ok(Self {
             wal: Arc::new(wal),
+            wal_dir,
             topic_name,
             partition,
             next_offset: AtomicI64::new(0),
@@ -169,6 +173,137 @@ impl MetadataWal {
     /// Useful for advanced operations like recovery, compaction, etc.
     pub fn wal(&self) -> &Arc<GroupCommitWal> {
         &self.wal
+    }
+
+    /// Recover metadata WAL state on startup
+    ///
+    /// This method:
+    /// 1. Reads all WAL segments to find the latest offset
+    /// 2. Restores next_offset to continue from where we left off
+    /// 3. Returns all metadata events for state machine replay
+    ///
+    /// # Returns
+    /// Vec of MetadataEvents in order (oldest to newest)
+    pub async fn recover(&self) -> Result<Vec<chronik_common::metadata::MetadataEvent>> {
+        info!("Starting metadata WAL recovery...");
+
+        // Read all WAL records from disk
+        let records = self.read_all_wal_records().await?;
+
+        if records.is_empty() {
+            info!("No metadata WAL records found - starting fresh");
+            return Ok(Vec::new());
+        }
+
+        // Find the highest offset to restore next_offset
+        let mut max_offset = -1i64;
+        for record in &records {
+            match record {
+                WalRecord::V2 { last_offset, .. } => {
+                    if *last_offset > max_offset {
+                        max_offset = *last_offset;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Restore next_offset (next write should be max_offset + 1)
+        let next = max_offset + 1;
+        self.next_offset.store(next, Ordering::SeqCst);
+        info!("Restored next_offset to {} (recovered {} records, max offset {})",
+            next, records.len(), max_offset);
+
+        // Convert WalRecords to MetadataEvents
+        let mut events = Vec::new();
+        for record in records {
+            match record {
+                WalRecord::V2 { canonical_data, .. } => {
+                    // Deserialize bytes to MetadataEvent
+                    match chronik_common::metadata::MetadataEvent::from_bytes(&canonical_data) {
+                        Ok(event) => events.push(event),
+                        Err(e) => {
+                            tracing::warn!("Failed to deserialize metadata event: {} - skipping", e);
+                            continue;
+                        }
+                    }
+                }
+                _ => {
+                    tracing::warn!("Unexpected WalRecord V1 in metadata WAL - skipping");
+                }
+            }
+        }
+
+        info!("Successfully recovered {} metadata events from WAL", events.len());
+        Ok(events)
+    }
+
+    /// Read all WAL records from disk (internal helper for recovery)
+    async fn read_all_wal_records(&self) -> Result<Vec<WalRecord>> {
+        use tokio::fs;
+        use tokio::io::AsyncReadExt;
+
+        // WAL files are stored at: wal_dir/__chronik_metadata/0/wal_*.log
+        let partition_dir = self.wal_dir.join(&self.topic_name).join(self.partition.to_string());
+
+        // Check if directory exists
+        if !partition_dir.exists() {
+            debug!("Partition directory does not exist: {}", partition_dir.display());
+            return Ok(Vec::new());
+        }
+
+        // Scan for all WAL files in the partition directory
+        let mut entries = fs::read_dir(&partition_dir).await
+            .context(format!("Failed to read partition directory: {}", partition_dir.display()))?;
+
+        let mut wal_files = Vec::new();
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("log") {
+                wal_files.push(path);
+            }
+        }
+
+        // Sort files by name (wal_0_0.log, wal_0_1.log, etc.)
+        wal_files.sort();
+
+        if wal_files.is_empty() {
+            debug!("No WAL files found in {}", partition_dir.display());
+            return Ok(Vec::new());
+        }
+
+        // Read and parse all WAL files
+        let num_files = wal_files.len();
+        let mut all_records = Vec::new();
+        for wal_file in wal_files {
+            debug!("Reading WAL file: {}", wal_file.display());
+
+            // Read entire file into memory
+            let mut file = fs::File::open(&wal_file).await
+                .context(format!("Failed to open WAL file: {}", wal_file.display()))?;
+            let mut buffer = Vec::new();
+            file.read_to_end(&mut buffer).await
+                .context("Failed to read WAL file")?;
+
+            // Parse all records from buffer
+            let mut offset = 0;
+            while offset < buffer.len() {
+                match WalRecord::from_bytes(&buffer[offset..]) {
+                    Ok(record) => {
+                        let record_len = record.to_bytes()?.len();
+                        all_records.push(record);
+                        offset += record_len;
+                    }
+                    Err(e) => {
+                        debug!("Failed to parse WAL record at offset {}: {} - end of file or corrupt", offset, e);
+                        break;
+                    }
+                }
+            }
+        }
+
+        debug!("Successfully read {} WAL records from {} files", all_records.len(), num_files);
+        Ok(all_records)
     }
 }
 

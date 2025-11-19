@@ -21,7 +21,7 @@ use dashmap::DashMap;
 use tokio::fs::{File, OpenOptions};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, oneshot, Notify};
-use tracing::{debug, info, warn, error, instrument};
+use tracing::{debug, info, warn, error, trace, instrument};
 
 use crate::error::{Result, WalError};
 use crate::record::WalRecord;
@@ -718,13 +718,15 @@ impl GroupCommitWal {
                 config.max_wait_time_ms, config.max_batch_size, config.max_batch_bytes);
 
             loop {
-                debug!("🔄 WORKER_LOOP: Waiting for notification or interval tick");
+                // v2.2.9 fix: Changed hot-path logs from debug! to trace! to prevent log bomb
+                // With 1000s of partitions, these logs fire 10x/sec per partition = 180K lines/sec
+                trace!("🔄 WORKER_LOOP: Waiting for notification or interval tick");
                 tokio::select! {
                     _ = queue.write_notify.notified() => {
-                        debug!("🔔 WORKER_NOTIFIED: Received write notification");
+                        trace!("🔔 WORKER_NOTIFIED: Received write notification");
                     }
                     _ = interval.tick() => {
-                        debug!("⏰ WORKER_TICK: Interval tick fired");
+                        trace!("⏰ WORKER_TICK: Interval tick fired");
                     }
                     _ = shutdown.notified() => {
                         info!("🛑 WORKER_SHUTDOWN: Partition committer shutting down");
@@ -733,7 +735,7 @@ impl GroupCommitWal {
                 }
 
                 // Commit if there are pending writes
-                debug!("📝 WORKER_COMMIT: About to call commit_batch");
+                trace!("📝 WORKER_COMMIT: About to call commit_batch");
                 if let Err(e) = Self::commit_batch(
                     &queue,
                     &config,
@@ -744,7 +746,7 @@ impl GroupCommitWal {
                 ).await {
                     error!("❌ WORKER_ERROR: Commit batch failed: {}", e);
                 } else {
-                    debug!("✅ WORKER_SUCCESS: commit_batch completed successfully");
+                    trace!("✅ WORKER_SUCCESS: commit_batch completed successfully");
                 }
             }
         });

@@ -209,17 +209,34 @@ impl IntegratedKafkaServer {
         });
 
         // Instantiate WalMetadataStore with callback - THIS IS THE METADATA STORE FOR ALL MODES
-        let metadata_store: Arc<dyn MetadataStore> = Arc::new(
-            chronik_common::metadata::WalMetadataStore::new(
-                config.node_id as u64,
-                wal_append_fn,
-            )
+        let wal_metadata_store = chronik_common::metadata::WalMetadataStore::new(
+            config.node_id as u64,
+            wal_append_fn,
         );
 
         info!("✅ WalMetadataStore created successfully (Option A: WAL-only metadata)");
         info!("   - Single-node mode: Local WAL only (no replication)");
         info!("   - Multi-node mode: WAL + WalReplicationManager (fire-and-forget replication)");
         info!("   - Expected performance: < 100ms topic creation (vs 20+ seconds with Raft)");
+
+        // v2.2.9 CRITICAL FIX: Recover metadata state from WAL on startup
+        // This was MISSING in the RaftMetadataStore → WalMetadataStore migration!
+        // Without recovery, in-memory state starts empty despite WAL having data.
+        info!("Recovering metadata state from WAL...");
+        let recovered_events = metadata_wal.recover().await
+            .context("Failed to recover metadata WAL on startup")?;
+
+        if !recovered_events.is_empty() {
+            info!("Replaying {} metadata events into WalMetadataStore...", recovered_events.len());
+            wal_metadata_store.replay_events(recovered_events).await
+                .context("Failed to replay metadata events")?;
+            info!("✅ Successfully recovered metadata state from WAL");
+        } else {
+            info!("No metadata events to recover - starting with fresh state");
+        }
+
+        // Wrap in Arc<dyn MetadataStore> for use throughout the system
+        let metadata_store: Arc<dyn MetadataStore> = Arc::new(wal_metadata_store);
 
         // v2.2.9 Option A: Metadata lives in WAL (./data/metadata_wal/)
         // System topics no longer needed - metadata is event-sourced from WAL
@@ -247,20 +264,15 @@ impl IntegratedKafkaServer {
         // v2.2.9 Option A: REMOVED heartbeat sender/receiver (was for RaftMetadataStore leader leases)
         // WalMetadataStore uses fire-and-forget WAL replication, no leader leases needed
 
-        // Wait for leader election (single-node should become leader immediately)
-        if raft_cluster.is_none() {
-            // Single-node mode: wait briefly for self-election
-            info!("Single-node mode: Waiting for Raft self-election...");
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-            info!("Single-node mode: Registering broker {} after election", config.node_id);
-            metadata_store.register_broker(broker_metadata.clone()).await
-                .context("Failed to register broker in single-node mode")?;
-            info!("✓ Successfully registered broker {} via RaftMetadataStore", config.node_id);
-        } else {
-            // Multi-node mode: defer registration until after Raft leader election completes
-            info!("Multi-node mode: Deferring broker registration until Raft leader election completes");
-        }
+        // v2.2.9 CRITICAL FIX: Register broker immediately using WalMetadataStore
+        // WalMetadataStore uses WAL replication (NOT Raft replication) for metadata.
+        // Each node registers itself, and WAL replication syncs to followers.
+        // This fixes P0 bug where multi-node brokers never registered because
+        // they waited for Raft leader election which never completed.
+        info!("Registering broker {} using WalMetadataStore (WAL-replicated)", config.node_id);
+        metadata_store.register_broker(broker_metadata.clone()).await
+            .context("Failed to register broker via WalMetadataStore")?;
+        info!("✅ Successfully registered broker {} (metadata will replicate via WAL)", config.node_id);
 
         // Restore high watermarks from segment metadata on startup
         // This ensures that after WAL deletion, we can still serve data from segments

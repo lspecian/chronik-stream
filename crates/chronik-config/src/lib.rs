@@ -13,6 +13,7 @@ pub mod watcher;
 pub mod validation;
 pub mod types;
 pub mod cluster;
+pub mod timeout_config;
 
 pub use manager::{ConfigManager, ConfigUpdate};
 pub use provider::{ConfigProvider, FileProvider, EnvironmentProvider};
@@ -20,6 +21,7 @@ pub use watcher::ConfigWatcher;
 pub use validation::{ConfigValidator, ValidationError};
 pub use types::{ConfigValue, ConfigSource};
 pub use cluster::{ClusterConfig, GossipConfig, NodeConfig};
+pub use timeout_config::{TimeoutConfig, NetworkTimeoutConfig, DiskTimeoutConfig, RaftTimeoutConfig, ClientTimeoutConfig};
 
 use thiserror::Error;
 
