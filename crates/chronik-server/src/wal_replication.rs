@@ -286,16 +286,25 @@ impl WalReplicationManager {
     /// Records are pushed to a lock-free queue and sent by background worker.
     pub async fn replicate_serialized(&self, topic: String, partition: i32, base_offset: i64, serialized_data: Vec<u8>) {
         // Data is already bincode-serialized CanonicalRecord from WAL write
+        // CRITICAL: We MUST deserialize to get record_count - it's used by followers for watermark calculation
+        use chronik_storage::canonical_record::CanonicalRecord;
+
+        let record_count = match bincode::deserialize::<CanonicalRecord>(&serialized_data) {
+            Ok(canonical) => canonical.records.len() as u32,
+            Err(e) => {
+                error!("Failed to deserialize CanonicalRecord for record count: {}. Skipping replication.", e);
+                return; // Can't replicate without valid record_count
+            }
+        };
+
         // Zero-copy: Just wrap in Bytes (cheap Arc clone)
         let data = Bytes::from(serialized_data);
 
-        // We don't know record_count from serialized data, but it's just for metrics
-        // Set to 0 (or we could deserialize just to count, but that defeats optimization)
         let wal_record = WalReplicationRecord {
             topic,
             partition,
             base_offset,
-            record_count: 0, // Unknown from serialized data (metrics only)
+            record_count, // FIXED: Extract from deserialized CanonicalRecord
             timestamp_ms: chrono::Utc::now().timestamp_millis(),
             data,
         };
@@ -1445,6 +1454,10 @@ pub struct WalReceiver {
     /// Raft cluster for applying metadata commands (Phase 2.3: Metadata WAL replication)
     /// Only used when receiving "__chronik_metadata" topic replication from leader
     raft_cluster: Option<Arc<RaftCluster>>,
+
+    /// ProduceHandler for updating watermarks on followers (v2.2.9)
+    /// Used to update watermarks when WAL data is replicated to followers
+    produce_handler: Option<Arc<crate::produce_handler::ProduceHandler>>,
 }
 
 impl WalReceiver {
@@ -1459,6 +1472,7 @@ impl WalReceiver {
             leader_elector: None,
             last_heartbeat: Arc::new(DashMap::new()),
             raft_cluster: None,
+            produce_handler: None,
         }
     }
 
@@ -1479,6 +1493,7 @@ impl WalReceiver {
             leader_elector: None,
             last_heartbeat: Arc::new(DashMap::new()),
             raft_cluster: None,
+            produce_handler: None,
         }
     }
 
@@ -1492,6 +1507,12 @@ impl WalReceiver {
     pub fn set_raft_cluster(&mut self, raft_cluster: Arc<RaftCluster>) {
         info!("WalReceiver: Enabling metadata WAL replication (Phase 2.3)");
         self.raft_cluster = Some(raft_cluster);
+    }
+
+    /// Set ProduceHandler for watermark updates on followers (v2.2.9)
+    pub fn set_produce_handler(&mut self, produce_handler: Arc<crate::produce_handler::ProduceHandler>) {
+        info!("WalReceiver: Enabling watermark updates via ProduceHandler (v2.2.9)");
+        self.produce_handler = Some(produce_handler);
     }
 
     /// Start the WAL receiver (blocking)
@@ -1520,6 +1541,8 @@ impl WalReceiver {
                     let leader_elector = self.leader_elector.clone();
                     let raft_cluster = self.raft_cluster.clone();
 
+                    let produce_handler_for_conn = self.produce_handler.clone();
+
                     tokio::spawn(async move {
                         if let Err(e) = Self::handle_connection(
                             stream,
@@ -1530,6 +1553,7 @@ impl WalReceiver {
                             last_heartbeat,
                             leader_elector,
                             raft_cluster,
+                            produce_handler_for_conn,
                         ).await {
                             error!("WAL receiver connection from {} failed: {}", peer_addr, e);
                         } else {
@@ -1561,6 +1585,7 @@ impl WalReceiver {
         last_heartbeat: Arc<DashMap<(String, i32), std::time::Instant>>,
         leader_elector: Option<Arc<crate::leader_election::LeaderElector>>,
         raft_cluster: Option<Arc<RaftCluster>>,
+        produce_handler: Option<Arc<crate::produce_handler::ProduceHandler>>,
     ) -> Result<()> {
         let mut buffer = BytesMut::with_capacity(64 * 1024); // 64KB buffer
 
@@ -1671,8 +1696,8 @@ impl WalReceiver {
 
                         // Phase 2.3: Special handling for metadata WAL replication
                         if wal_record.topic == "__chronik_metadata" && wal_record.partition == 0 {
-                            if let Some(ref raft) = raft_cluster {
-                                if let Err(e) = Self::handle_metadata_wal_record(raft, &wal_record).await {
+                            if let Some(ref ph) = produce_handler {
+                                if let Err(e) = Self::handle_metadata_wal_record(ph, &raft_cluster, &wal_record).await {
                                     error!(
                                         "Failed to apply metadata WAL record: {}",
                                         e
@@ -1688,41 +1713,41 @@ impl WalReceiver {
                                 }
                             } else {
                                 warn!(
-                                    "Received metadata WAL replication but no RaftCluster configured"
+                                    "Received metadata WAL replication but no ProduceHandler configured (v2.2.9 - watermarks won't update!)"
                                 );
                             }
                             continue; // Skip normal WAL write for metadata
                         }
 
-                        // CRITICAL FIX (Phase 3 CORRECTED): Only accept replication for partitions where we're a REPLICA
-                        // This prevents message duplication by ensuring each node only stores partitions it owns
-                        if let Some(ref raft) = raft_cluster {
-                            // Query partition replicas from Raft metadata
-                            if let Some(replicas) = raft.get_partition_replicas(&wal_record.topic, wal_record.partition) {
-                                if !replicas.contains(&node_id) {
-                                    info!(
-                                        "⏭️  Skipping replication for {}-{}: this node ({}) is NOT in replica set {:?}",
-                                        wal_record.topic, wal_record.partition, node_id, replicas
-                                    );
-                                    continue; // Skip - we're not a replica for this partition
-                                }
+                        // v2.2.9 FIX: Accept all WAL replication from leader (trust the leader)
+                        //
+                        // REMOVED: Raft metadata check that was causing race condition data loss
+                        // - Metadata is replicated via __chronik_metadata WAL topic (fast, microseconds)
+                        // - Partition assignments arrive before or concurrently with partition data
+                        // - The old Raft check rejected data if metadata hadn't synced yet (race condition)
+                        // - Result: 100% data loss on followers despite acks=all
+                        //
+                        // NEW APPROACH: Trust the leader to send correct replicas
+                        // - Leader already knows which nodes are replicas (from its own metadata)
+                        // - Leader only sends to nodes in the replica set
+                        // - If we receive WAL data, the leader thinks we should have it → accept it
+                        // - Metadata will arrive via __chronik_metadata (already implemented above)
+                        //
+                        // Safety: This is safe because:
+                        // 1. Leader sends metadata via __chronik_metadata BEFORE or WITH partition data
+                        // 2. Even if there's a race, metadata arrives within milliseconds
+                        // 3. Accepting "extra" data is better than losing data (can always clean up later)
+                        // 4. WAL compaction will remove data for partitions we don't own anymore
+                        //
+                        // See docs/RAFT_VS_WAL_METADATA_REDUNDANCY_ANALYSIS.md for full analysis
 
-                                info!(
-                                    "✅ Accepting replication for {}-{}: this node ({}) IS in replica set {:?}",
-                                    wal_record.topic, wal_record.partition, node_id, replicas
-                                );
-                            } else {
-                                // No replica info yet - REJECT to prevent duplication
-                                warn!(
-                                    "⛔ NO REPLICA INFO for {}-{} yet, REJECTING replication (waiting for metadata sync)",
-                                    wal_record.topic, wal_record.partition
-                                );
-                                continue; // Skip - no replica info available
-                            }
-                        }
+                        info!(
+                            "✅ Accepting WAL replication for {}-{} from leader (node {})",
+                            wal_record.topic, wal_record.partition, node_id
+                        );
 
                         // Write to local WAL (normal partition data)
-                        if let Err(e) = Self::write_to_wal(&wal_manager, &wal_record).await {
+                        if let Err(e) = Self::write_to_wal(&wal_manager, &wal_record, &raft_cluster, &produce_handler).await {
                             error!(
                                 "Failed to write replicated WAL record to local WAL for {}-{}: {}",
                                 wal_record.topic, wal_record.partition, e
@@ -1789,6 +1814,8 @@ impl WalReceiver {
     async fn write_to_wal(
         wal_manager: &Arc<chronik_wal::WalManager>,
         record: &WalReplicationRecord,
+        raft_cluster: &Option<Arc<crate::raft_cluster::RaftCluster>>,
+        produce_handler: &Option<Arc<crate::produce_handler::ProduceHandler>>,
     ) -> Result<()> {
         // Deserialize CanonicalRecord from data
         use chronik_storage::canonical_record::CanonicalRecord;
@@ -1811,17 +1838,55 @@ impl WalReceiver {
         ).await
         .context("Failed to append replicated record to local WAL")?;
 
+        // v2.2.9 FIX: Update high watermark on follower via ProduceHandler
+        // This ensures watermarks are visible via ListOffsets API (which queries ProduceHandler, not Raft)
+        // Trust the leader - we're receiving replicated state
+        if let Some(ref handler) = produce_handler {
+            let new_watermark = record.base_offset + record.record_count as i64;
+
+            if let Err(e) = handler.update_high_watermark(&record.topic, record.partition, new_watermark).await {
+                warn!("Failed to update watermark for {}-{} to {}: {}",
+                    record.topic, record.partition, new_watermark, e);
+            } else {
+                debug!("✅ Updated watermark for {}-{} to {}",
+                    record.topic, record.partition, new_watermark);
+            }
+        } else {
+            // Fallback to Raft if ProduceHandler not available (backwards compatibility)
+            if let Some(ref raft) = raft_cluster {
+                use crate::raft_metadata::MetadataCommand;
+
+                let new_watermark = record.base_offset + record.record_count as i64;
+                let cmd = MetadataCommand::UpdatePartitionOffset {
+                    topic: record.topic.clone(),
+                    partition: record.partition as u32,
+                    high_watermark: new_watermark,
+                    log_start_offset: 0,
+                };
+
+                if let Err(e) = raft.apply_metadata_command_direct(cmd) {
+                    warn!("Failed to update watermark for {}-{} to {}: {}",
+                        record.topic, record.partition, new_watermark, e);
+                } else {
+                    debug!("✅ Updated watermark for {}-{} to {}",
+                        record.topic, record.partition, new_watermark);
+                }
+            }
+        }
+
         Ok(())
     }
 
     /// Handle metadata WAL record replication (Phase 2.3)
     ///
+    /// v2.2.9 FIX: Removed Raft redundancy - metadata now updates ProduceHandler directly
     /// When followers receive metadata replication from leader:
     /// 1. Deserialize MetadataCommand from data
-    /// 2. Apply directly to Raft state machine (bypassing Raft consensus)
+    /// 2. Apply to ProduceHandler (NOT Raft - that's redundant!)
     /// 3. Fire notification for any waiting threads
     async fn handle_metadata_wal_record(
-        raft_cluster: &Arc<RaftCluster>,
+        produce_handler: &Arc<crate::produce_handler::ProduceHandler>,
+        raft_cluster: &Option<Arc<RaftCluster>>,  // Keep for notifications only
         record: &WalReplicationRecord,
     ) -> Result<()> {
         use crate::raft_metadata::MetadataCommand;
@@ -1836,35 +1901,60 @@ impl WalReceiver {
             cmd
         );
 
-        // Apply directly to state machine (bypassing Raft consensus)
-        raft_cluster.apply_metadata_command_direct(cmd.clone())
-            .context("Failed to apply replicated metadata command")?;
-
-        tracing::info!(
-            "Phase 2.3: Follower applied replicated metadata command: {:?}",
-            cmd
-        );
-
-        // Fire notification for any waiting threads
-        // (Followers might have threads waiting for metadata updates via Phase 1 forwarding)
-        let pending_topics = raft_cluster.get_pending_topics_notifications();
-        let pending_brokers = raft_cluster.get_pending_brokers_notifications();
-
+        // v2.2.9: Apply to ProduceHandler (which ListOffsets actually queries!)
+        // No more Raft state machine - that was causing the watermark visibility bug
         match &cmd {
-            MetadataCommand::CreateTopic { name, .. } => {
-                if let Some((_, notify)) = pending_topics.remove(name) {
-                    notify.notify_waiters();
-                    tracing::debug!("Notified waiting threads for topic '{}'", name);
-                }
-            }
-            MetadataCommand::RegisterBroker { broker_id, .. } => {
-                if let Some((_, notify)) = pending_brokers.remove(broker_id) {
-                    notify.notify_waiters();
-                    tracing::debug!("Notified waiting threads for broker {}", broker_id);
+            MetadataCommand::UpdatePartitionOffset {
+                topic,
+                partition,
+                high_watermark,
+                ..
+            } => {
+                if let Err(e) = produce_handler
+                    .update_high_watermark(topic, *partition as i32, *high_watermark)
+                    .await
+                {
+                    warn!(
+                        "Failed to update watermark for {}-{} to {}: {}",
+                        topic, partition, high_watermark, e
+                    );
+                } else {
+                    info!(
+                        "✅ Phase 2.3: Updated watermark for {}-{} to {} via ProduceHandler",
+                        topic, partition, high_watermark
+                    );
                 }
             }
             _ => {
-                // Other command types don't need notifications yet
+                // Other metadata commands (CreateTopic, RegisterBroker, etc.)
+                // are handled by __chronik_metadata WAL persistence and recovery
+                tracing::debug!(
+                    "Phase 2.3: Skipping non-watermark command (handled by WAL persistence): {:?}",
+                    cmd
+                );
+            }
+        }
+
+        // Fire notification for any waiting threads
+        // (Followers might have threads waiting for metadata updates via Phase 1 forwarding)
+        if let Some(ref raft) = raft_cluster {
+            let pending_topics = raft.get_pending_topics_notifications();
+            let pending_brokers = raft.get_pending_brokers_notifications();
+
+            match &cmd {
+                MetadataCommand::CreateTopic { name, .. } => {
+                    if let Some((_, notify)) = pending_topics.remove(name) {
+                        notify.notify_waiters();
+                        tracing::debug!("Notified waiting threads for topic '{}'", name);
+                    }
+                }
+                MetadataCommand::RegisterBroker { broker_id, .. } => {
+                    if let Some((_, notify)) = pending_brokers.remove(broker_id) {
+                        notify.notify_waiters();
+                        tracing::debug!("Notified waiting threads for broker {}", broker_id);
+                    }
+                }
+                _ => {}
             }
         }
 

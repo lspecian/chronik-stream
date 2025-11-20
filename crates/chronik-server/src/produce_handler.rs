@@ -469,25 +469,91 @@ impl ProduceHandler {
         }
     }
 
-    /// Update high watermark in metadata store (for WAL recovery)
+    /// Update high watermark in memory (v2.2.9 - simplified architecture)
     ///
-    /// NOTE: This is only used during WAL recovery to update the metadata store.
-    /// In normal operation, FetchHandler should call get_high_watermark() instead.
+    /// ARCHITECTURAL CHANGE: Removed redundant metadata_store persistence.
+    /// Watermarks are NOW single-source-of-truth:
+    /// - Runtime: partition_states (in-memory, fast)
+    /// - Recovery: WAL files (scanned on startup to reconstruct watermarks)
+    ///
+    /// The metadata_store update was redundant because:
+    /// 1. Recovery doesn't use metadata_store - it scans WAL files directly
+    /// 2. Extra I/O on every produce (performance penalty)
+    /// 3. Caused sync bugs (v2.2.8 watermark visibility issue)
+    ///
+    /// v2.2.9 FOLLOWER FIX: Auto-create partition state if it doesn't exist.
+    /// This handles the case where followers receive replicated data before
+    /// they've explicitly created the partition (which only happens on leader).
+    ///
+    /// See integrated_server.rs:632 for recovery flow.
     pub async fn update_high_watermark(
         &self,
         topic: &str,
         partition: i32,
         high_watermark: i64,
     ) -> Result<()> {
-        // Get current log_start_offset or default to 0
-        let log_start_offset = self.metadata_store
-            .get_partition_offset(topic, partition as u32)
-            .await?
-            .map(|(_, lso)| lso)
-            .unwrap_or(0);
+        // Update in-memory partition_states (authoritative for queries)
+        let key = (topic.to_string(), partition);
 
-        self.metadata_store.update_partition_offset(topic, partition as u32, high_watermark, log_start_offset).await
-            .map_err(|e| Error::Internal(format!("Failed to update partition offset: {}", e)))
+        if let Some(state) = self.partition_states.get(&key) {
+            // Partition exists - update watermark only if it's increasing
+            // v2.2.9 MONOTONICITY FIX: Watermarks should never decrease (prevent stale WAL data from overwriting)
+            let current = state.value().high_watermark.load(Ordering::SeqCst) as i64;
+            if high_watermark > current {
+                state.value().high_watermark.store(high_watermark as u64, Ordering::SeqCst);
+                debug!("✅ Updated watermark for {}-{} from {} to {}", topic, partition, current, high_watermark);
+                Ok(())
+            } else {
+                debug!("⏭️  Skipped watermark update for {}-{}: {} <= {} (current)", topic, partition, high_watermark, current);
+                Ok(())
+            }
+        } else {
+            // v2.2.9 FOLLOWER FIX: Partition doesn't exist yet (follower receiving replicated data)
+            // Create partition state with initial watermark
+            debug!("Creating partition state for {}-{} (follower receiving replication)", topic, partition);
+
+            // Build path from segment_writer_config
+            let base_dir = self.config.storage_config.segment_writer_config.data_dir.clone();
+            let segment_path = base_dir
+                .join(topic)
+                .join(format!("partition-{}", partition));
+
+            // Create directory if needed
+            std::fs::create_dir_all(&segment_path).map_err(|e|
+                Error::Internal(format!("Failed to create segment directory: {}", e)))?;
+
+            // Create segment writer config using existing settings
+            let segment_config = chronik_storage::SegmentWriterConfig {
+                data_dir: segment_path,
+                max_segment_size: self.config.storage_config.segment_writer_config.max_segment_size,
+                compression_codec: self.config.storage_config.segment_writer_config.compression_codec.clone(),
+                max_segment_age_secs: self.config.storage_config.segment_writer_config.max_segment_age_secs,
+                retention_period_secs: self.config.storage_config.segment_writer_config.retention_period_secs,
+                enable_cleanup: self.config.storage_config.segment_writer_config.enable_cleanup,
+            };
+
+            let segment_writer = SegmentWriter::new(segment_config)
+                .await
+                .map_err(|e| Error::Internal(format!("Failed to create segment writer: {}", e)))?;
+
+            // Create partition state
+            let state = PartitionState {
+                next_offset: AtomicU64::new(high_watermark as u64),
+                high_watermark: AtomicU64::new(high_watermark as u64),
+                log_start_offset: AtomicU64::new(0),
+                current_writer: Arc::new(Mutex::new(segment_writer)),
+                segment_created: AtomicU64::new(0),
+                start_time: Instant::now(),
+                segment_size: AtomicU64::new(0),
+                pending_batches: Arc::new(SegQueue::new()),
+                last_flush: Arc::new(Mutex::new(Instant::now())),
+            };
+
+            // Insert into partition_states (wrap in Arc)
+            self.partition_states.insert(key, Arc::new(state));
+            info!("✅ Created partition state for {}-{} with watermark {}", topic, partition, high_watermark);
+            Ok(())
+        }
     }
 
     /// Extract pending batches for WAL writing (v1.3.37)

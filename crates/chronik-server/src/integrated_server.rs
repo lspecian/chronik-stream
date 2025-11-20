@@ -933,6 +933,10 @@ impl IntegratedKafkaServer {
                     info!("✅ Phase 2.3: WalReceiver configured for metadata replication");
                 }
 
+                // v2.2.9: Wire up ProduceHandler for watermark updates on followers
+                wal_receiver.set_produce_handler(produce_handler_base.clone());
+                info!("✅ v2.2.9: WalReceiver configured for watermark updates");
+
                 // Spawn receiver in background
                 tokio::spawn(async move {
                     if let Err(e) = wal_receiver.run().await {
