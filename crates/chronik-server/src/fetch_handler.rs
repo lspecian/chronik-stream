@@ -297,21 +297,30 @@ impl FetchHandler {
         
         // NEW ARCHITECTURE (v1.3.39+): Get high watermark from ProduceHandler (source of truth)
         // This is the next offset that will be assigned = current high watermark
-        let high_watermark = if let Some(ref produce_handler) = self.produce_handler {
+        // v2.2.9 FIX: Fallback to metadata_store on followers where ProduceHandler.partition_states is empty
+        let mut high_watermark = if let Some(ref produce_handler) = self.produce_handler {
             produce_handler.get_high_watermark(topic, partition).await
                 .unwrap_or_else(|e| {
                     tracing::warn!("Failed to get high watermark from ProduceHandler for {}-{}: {}, defaulting to 0", topic, partition, e);
                     0
                 })
         } else {
-            // Fallback: try segments (OLD architecture path)
-            let segments = self.metadata_store.list_segments(topic, Some(partition as u32)).await?;
-            tracing::info!("Found {} segments for {}-{}", segments.len(), topic, partition);
-            segments.iter()
-                .map(|s| s.end_offset + 1)
-                .max()
-                .unwrap_or(0)
+            0
         };
+
+        // v2.2.9 FIX: On followers, ProduceHandler.partition_states may be empty for non-leader partitions
+        // Fallback to metadata_store which has replicated high watermarks via HighWatermarkUpdated events
+        if high_watermark == 0 {
+            if let Ok(Some((meta_hwm, _log_start))) = self.metadata_store.get_partition_offset(topic, partition as u32).await {
+                if meta_hwm > 0 {
+                    tracing::info!(
+                        "📊 WATERMARK FALLBACK: Using metadata_store for {}-{}: {} (ProduceHandler returned 0)",
+                        topic, partition, meta_hwm
+                    );
+                    high_watermark = meta_hwm;
+                }
+            }
+        }
         
         // v2.2.7.2: Log watermark details for debugging
         info!(

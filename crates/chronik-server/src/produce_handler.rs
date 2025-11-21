@@ -29,7 +29,7 @@ use chronik_storage::{
     RecordBatch, Record, SegmentWriter,
     object_store::storage::ObjectStore,
 };
-use chronik_common::metadata::traits::MetadataStore;
+use chronik_common::metadata::traits::{MetadataStore, PartitionAssignment};
 use chronik_wal::WalManager;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -376,6 +376,100 @@ impl ProduceHandler {
     /// Get request timeout in milliseconds
     pub fn get_request_timeout_ms(&self) -> u64 {
         self.config.request_timeout_ms
+    }
+
+    /// Assign a partition to replica nodes (writes to metadata WAL)
+    ///
+    /// v2.2.9 Phase 1: Direct metadata writes bypass Raft consensus.
+    /// This method writes partition assignment metadata directly to the __chronik_metadata WAL,
+    /// which then replicates to followers via WAL replication (microsecond latency).
+    pub async fn assign_partition(
+        &self,
+        topic: &str,
+        partition: i32,
+        replicas: Vec<u64>,
+    ) -> Result<()> {
+        // Assume first replica is the leader by default
+        let leader_id = replicas.first().copied().unwrap_or(self.config.node_id as u64);
+
+        let assignment = PartitionAssignment {
+            topic: topic.to_string(),
+            partition: partition as u32,
+            broker_id: -1,  // Deprecated field
+            is_leader: false,  // Deprecated field
+            replicas,
+            leader_id,
+        };
+
+        // Write AssignPartition event to metadata_store
+        // metadata_store will persist to __chronik_metadata WAL
+        // WAL replication will propagate to followers
+        self.metadata_store.assign_partition(assignment).await?;
+        Ok(())
+    }
+
+    /// Set partition leader (writes to metadata WAL)
+    ///
+    /// v2.2.9 Phase 1: Updates the leader for a partition by writing to metadata WAL.
+    /// This preserves the existing replicas but changes which node is the leader.
+    pub async fn set_partition_leader(
+        &self,
+        topic: &str,
+        partition: i32,
+        leader: u64,
+    ) -> Result<()> {
+        // Get current assignment to preserve replicas
+        let assignments = self.metadata_store
+            .get_partition_assignments(topic)
+            .await?;
+
+        let current = assignments.iter()
+            .find(|a| a.partition == partition as u32)
+            .ok_or_else(|| Error::Storage(format!("Partition not found: {}-{}", topic, partition)))?;
+
+        let assignment = PartitionAssignment {
+            topic: topic.to_string(),
+            partition: partition as u32,
+            broker_id: -1,  // Deprecated field
+            is_leader: false,  // Deprecated field
+            replicas: current.replicas.clone(),
+            leader_id: leader,
+        };
+
+        self.metadata_store.assign_partition(assignment).await?;
+        Ok(())
+    }
+
+    /// Update in-sync replica set (writes to metadata WAL)
+    ///
+    /// v2.2.9 Phase 1: Updates the ISR (in-sync replicas) for a partition via metadata WAL.
+    /// This preserves the existing leader but changes which nodes are in-sync.
+    pub async fn update_isr(
+        &self,
+        topic: &str,
+        partition: i32,
+        isr: Vec<u64>,
+    ) -> Result<()> {
+        // Get current assignment to preserve leader
+        let assignments = self.metadata_store
+            .get_partition_assignments(topic)
+            .await?;
+
+        let current = assignments.iter()
+            .find(|a| a.partition == partition as u32)
+            .ok_or_else(|| Error::Storage(format!("Partition not found: {}-{}", topic, partition)))?;
+
+        let assignment = PartitionAssignment {
+            topic: topic.to_string(),
+            partition: partition as u32,
+            broker_id: -1,  // Deprecated field
+            is_leader: false,  // Deprecated field
+            replicas: isr,
+            leader_id: current.leader_id,
+        };
+
+        self.metadata_store.assign_partition(assignment).await?;
+        Ok(())
     }
 
     /// Ensure a partition exists with the specified starting offset (for WAL recovery)
@@ -1142,7 +1236,8 @@ impl ProduceHandler {
             let response_partitions = stream::iter(topic_data.partitions)
                 .map(|partition_data| {
                     let topic_name = topic_name.clone();
-                    let raft_cluster = self.raft_cluster.clone();
+                    let metadata_store = self.metadata_store.clone();
+                    let node_id = self.config.node_id;
                     let transactional_id = transactional_id.clone();
                     let metrics = self.metrics.clone();
 
@@ -1158,39 +1253,36 @@ impl ProduceHandler {
                             };
                         }
 
-                        // Check leadership: RaftCluster takes precedence over metadata store
-                        // v2.2.7 Phase 2: Use RaftCluster for partition leadership checks
+                        // Check leadership using metadata store (WAL-only, no Raft queries)
+                        // v2.2.9 Phase 2: Option 4 - Use metadata_store only, bypass Raft
                         let (is_leader, leader_hint) = {
-                            if let Some(ref raft_cluster) = raft_cluster {
-                                // Get partition leader from Raft metadata state machine
-                                let leader_id = raft_cluster.get_partition_leader(&topic_name, partition_data.index);
-
-                                if let Some(leader) = leader_id {
-                                    // Partition is managed by Raft
-                                    let is_raft_leader = leader == raft_cluster.node_id();
-
-                                    debug!(
-                                        "Raft leadership check for {}-{}: node_id={}, leader={}, is_leader={}",
-                                        topic_name, partition_data.index, raft_cluster.node_id(), leader, is_raft_leader
-                                    );
-
-                                    (is_raft_leader, Some(leader))
-                                } else {
-                                    // Partition not yet assigned in Raft, fall back to metadata store
-                                    debug!(
-                                        "Partition {}-{} not assigned in Raft, using metadata store for leadership",
-                                        topic_name, partition_data.index
-                                    );
-                                    match self.check_metadata_leadership(&topic_name, partition_data.index).await {
-                                        Ok(result) => result,
-                                        Err(_) => (false, None),
-                                    }
+                            match metadata_store.get_partition_assignments(&topic_name).await {
+                                Ok(assignments) => {
+                                    assignments.iter()
+                                        .find(|a| a.partition == partition_data.index as u32)
+                                        .map(|a| {
+                                            let leader = a.leader_id;
+                                            let is_leader = leader == node_id as u64;
+                                            debug!(
+                                                "Metadata leadership check for {}-{}: node_id={}, leader={}, is_leader={}",
+                                                topic_name, partition_data.index, node_id, leader, is_leader
+                                            );
+                                            (is_leader, Some(leader))
+                                        })
+                                        .unwrap_or_else(|| {
+                                            debug!(
+                                                "Partition {}-{} not assigned in metadata store",
+                                                topic_name, partition_data.index
+                                            );
+                                            (false, None)
+                                        })
                                 }
-                            } else {
-                                // No Raft cluster, use metadata store (standalone mode)
-                                match self.check_metadata_leadership(&topic_name, partition_data.index).await {
-                                    Ok(result) => result,
-                                    Err(_) => (false, None),
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to get partition assignments for {}-{}: {:?}",
+                                        topic_name, partition_data.index, e
+                                    );
+                                    (false, None)
                                 }
                             }
                         };
@@ -1845,6 +1937,18 @@ impl ProduceHandler {
 
                 // v2.2.7.2: Emit watermark event for < 10ms replication
                 self.emit_watermark_event(topic, partition, new_watermark);
+
+                // v2.2.9 Phase 7 FIX: Synchronously update metadata_store for immediate ListOffsets queries
+                if prev_watermark < new_watermark {
+                    if let Err(e) = self.metadata_store.update_partition_offset(
+                        topic,
+                        partition as u32,
+                        new_watermark,
+                        0
+                    ).await {
+                        debug!("Failed to sync metadata_store watermark for {}-{}: {:?}", topic, partition, e);
+                    }
+                }
             }
             1 => {
                 // For acks=1, we don't need to flush immediately
@@ -1865,6 +1969,18 @@ impl ProduceHandler {
 
                 // v2.2.7.2: Emit watermark event for < 10ms replication
                 self.emit_watermark_event(topic, partition, new_watermark);
+
+                // v2.2.9 Phase 7 FIX: Synchronously update metadata_store for immediate ListOffsets queries
+                if prev_watermark < new_watermark {
+                    if let Err(e) = self.metadata_store.update_partition_offset(
+                        topic,
+                        partition as u32,
+                        new_watermark,
+                        0
+                    ).await {
+                        debug!("Failed to sync metadata_store watermark for {}-{}: {:?}", topic, partition, e);
+                    }
+                }
             }
             -1 => {
                 // v2.2.7 Phase 4: acks=-1 with IsrAckTracker
@@ -1877,27 +1993,32 @@ impl ProduceHandler {
 
                 if let Some(ref tracker) = self.isr_ack_tracker {
                     // Register this produce request for ISR quorum tracking
-                    // v2.2.7 FIX: Calculate quorum based on actual ISR size (not hardcoded)
-                    let quorum_size = if let Some(ref raft_cluster) = self.raft_cluster {
-                        // Cluster mode: Get ISR from Raft metadata
-                        match raft_cluster.get_isr(topic, partition) {
-                            Some(isr) => {
-                                // Quorum = all ISR members must ack
-                                let size = isr.len();
-                                info!("📊 Cluster mode: ISR for {}-{}: {:?}, quorum={}",
-                                    topic, partition, isr, size);
-                                size
-                            }
-                            None => {
-                                // Fallback: if ISR not found, use 1 (just the leader)
-                                warn!("⚠️  No ISR found for {}-{}, using quorum=1", topic, partition);
-                                1
+                    // v2.2.9 Phase 2: Option 4 - Get ISR from metadata_store (WAL-only, no Raft)
+                    let quorum_size = match self.metadata_store.get_partition_assignments(topic).await {
+                        Ok(assignments) => {
+                            match assignments.iter().find(|a| a.partition == partition as u32) {
+                                Some(assignment) => {
+                                    // Quorum = all replicas (ISR) must ack
+                                    let isr = &assignment.replicas;
+                                    let size = isr.len();
+                                    info!("📊 ISR for {}-{} from metadata_store: {:?}, quorum={}",
+                                        topic, partition, isr, size);
+                                    size
+                                }
+                                None => {
+                                    // Fallback: if partition not found, use 1 (just the leader)
+                                    warn!("⚠️  No partition assignment found for {}-{} in metadata_store, using quorum=1",
+                                        topic, partition);
+                                    1
+                                }
                             }
                         }
-                    } else {
-                        // Standalone mode: quorum = 1 (just the leader)
-                        info!("📊 Standalone mode: quorum=1 for {}-{}", topic, partition);
-                        1
+                        Err(e) => {
+                            // Error querying metadata_store, fall back to quorum=1
+                            warn!("⚠️  Failed to get partition assignments for {}-{}: {:?}, using quorum=1",
+                                topic, partition, e);
+                            1
+                        }
                     };
 
                     info!(
@@ -1949,6 +2070,26 @@ impl ProduceHandler {
 
                             // v2.2.7.2: Emit watermark event for < 10ms replication
                             self.emit_watermark_event(topic, partition, new_watermark);
+
+                            // v2.2.9.1 ASYNC FIX: Update metadata_store in background (don't block produce response)
+                            // In-memory watermark (line 2064) is already updated, so ListOffsets queries see it immediately
+                            // Metadata WAL update ensures durability and follower visibility, but doesn't need to block producer
+                            // This eliminates second fsync from critical path: ~100ms → ~50ms p50 latency (50% improvement)
+                            if prev_watermark < new_watermark {
+                                let metadata_store = self.metadata_store.clone();
+                                let topic_clone = topic.to_string();
+                                let partition_u32 = partition as u32;
+                                tokio::spawn(async move {
+                                    if let Err(e) = metadata_store.update_partition_offset(
+                                        &topic_clone,
+                                        partition_u32,
+                                        new_watermark,
+                                        0  // log_start_offset
+                                    ).await {
+                                        debug!("Background metadata watermark update failed for {}-{}: {:?}", topic_clone, partition_u32, e);
+                                    }
+                                });
+                            }
                         }
                         Ok(Ok(Err(e))) => {
                             error!(
@@ -2652,30 +2793,22 @@ impl ProduceHandler {
 
                         let topic_assignments = assignment_mgr.get_topic_assignments(topic_name);
 
-                        // Collect all operations into a batch
-                        let mut operations = Vec::new();
+                        // v2.2.9 Phase 3: Option 4 - Use metadata_store directly (WAL-only, no Raft proposal)
+                        // Instead of batching into a Raft command, call assign_partition() for each partition
+                        // This writes to __chronik_metadata WAL which replicates to followers automatically
                         for (partition_id, partition_info) in topic_assignments {
                             let replicas: Vec<u64> = partition_info.replicas.iter().map(|&id| id as u64).collect();
-                            let leader = partition_info.leader as u64;
-                            let isr = replicas.clone();  // Initialize ISR with all replicas
 
-                            operations.push((partition_id as i32, replicas, leader, isr));
-
-                            info!("  ✓ Prepared partition {}/{} with replica list: {:?} (leader: {})",
-                                topic_name, partition_id, partition_info.replicas, partition_info.leader);
+                            // assign_partition() sets leader (first replica) and ISR (all replicas) automatically
+                            if let Err(e) = self.assign_partition(topic_name, partition_id as i32, replicas.clone()).await {
+                                warn!("Failed to assign partition {}/{}: {:?}", topic_name, partition_id, e);
+                            } else {
+                                info!("  ✓ Assigned partition {}/{} with replica list: {:?} (leader: {})",
+                                    topic_name, partition_id, partition_info.replicas, partition_info.leader);
+                            }
                         }
 
-                        // Single Raft proposal for ALL partitions
-                        let batch_cmd = crate::raft_metadata::MetadataCommand::BatchPartitionOps {
-                            topic: topic_name.to_string(),
-                            operations,
-                        };
-
-                        if let Err(e) = raft_cluster.propose(batch_cmd).await {
-                            warn!("Failed to batch-assign partitions for topic '{}': {:?}", topic_name, e);
-                        } else {
-                            info!("✅ Batch-assigned all partitions for topic '{}' in single Raft proposal", topic_name);
-                        }
+                        info!("✅ Assigned all partitions for topic '{}' via metadata_store (WAL-only)", topic_name);
                     }
                 } else {
                     // Standalone mode: partitions will be assigned on-demand during first produce
@@ -2829,55 +2962,16 @@ impl ProduceHandler {
                     replicas.push(all_nodes[node_idx]);
                 }
 
-                // WAL-ONLY: Use apply_metadata_command_direct (NO Raft propose)
-                // This writes to metadata WAL and replicates via WalReplicationManager
-                let assign_cmd = crate::raft_metadata::MetadataCommand::AssignPartition {
-                    topic: topic_name.to_string(),
-                    partition: partition as i32,
-                    replicas: replicas.clone(),
-                };
-
-                if let Err(e) = raft.apply_metadata_command_direct(assign_cmd) {
-                    warn!("Failed to assign partition {}-{}: {:?}", topic_name, partition, e);
+                // v2.2.9 Phase 2: Option 4 - Use metadata_store methods (WAL-only, no Raft commands)
+                // assign_partition sets both leader (replicas[0]) and ISR (replicas) in one call
+                if let Err(e) = self.assign_partition(topic_name, partition as i32, replicas.clone()).await {
+                    warn!("Failed to assign partition {}-{} via metadata_store: {:?}", topic_name, partition, e);
                     continue;  // Skip this partition, try next one
                 }
 
-                // Set initial leader - prefer Raft leader if it's a replica
-                // Partition leader is ALWAYS the first replica (not the Raft leader!)
-                // This ensures correct routing for multi-partition topics where
-                // different partitions have different leaders
                 let leader = replicas[0];
-
-                // v2.2.7 DEBUG: Trace leader value before creating command
-                info!("🔍 DEBUG: About to create SetPartitionLeader command for {}-{}: replicas={:?}, leader={}, replicas[0]={}",
-                      topic_name, partition, replicas, leader, replicas[0]);
-
-                let leader_cmd = crate::raft_metadata::MetadataCommand::SetPartitionLeader {
-                    topic: topic_name.to_string(),
-                    partition: partition as i32,
-                    leader,
-                };
-
-                // v2.2.7 DEBUG: Log command immediately after creation
-                info!("🔍 DEBUG: Created command: {:?}", leader_cmd);
-
-                if let Err(e) = raft.apply_metadata_command_direct(leader_cmd) {
-                    warn!("Failed to set partition leader for {}-{}: {:?}", topic_name, partition, e);
-                }
-
-                // Set initial ISR (all replicas are in-sync initially)
-                let isr_cmd = crate::raft_metadata::MetadataCommand::UpdateISR {
-                    topic: topic_name.to_string(),
-                    partition: partition as i32,
-                    isr: replicas.clone(),
-                };
-
-                if let Err(e) = raft.apply_metadata_command_direct(isr_cmd) {
-                    warn!("Failed to set ISR for {}-{}: {:?}", topic_name, partition, e);
-                }
-
-                info!("✓ Initialized partition metadata for {}-{}: replicas={:?}, leader={}, ISR={:?} (WAL-ONLY)",
-                      topic_name, partition, replicas, leader, replicas);
+                info!("✓ Initialized partition metadata for {}-{}: replicas={:?}, leader={} (metadata_store)",
+                      topic_name, partition, replicas, leader);
             }
 
             info!("✓ Completed partition metadata initialization for topic '{}' using WAL-ONLY approach", topic_name);

@@ -239,7 +239,11 @@ pub trait MetadataStore: Send + Sync {
     // Partition offset operations
     async fn update_partition_offset(&self, topic: &str, partition: u32, high_watermark: i64, log_start_offset: i64) -> Result<()>;
     async fn get_partition_offset(&self, topic: &str, partition: u32) -> Result<Option<(i64, i64)>>; // Returns (high_watermark, log_start_offset)
-    
+
+    // Replicated event application (for followers receiving from leader)
+    // v2.2.9 Phase 7: Apply replicated metadata events WITHOUT writing to WAL
+    async fn apply_replicated_event(&self, event: super::events::MetadataEvent) -> Result<()>;
+
     // System initialization
     async fn init_system_state(&self) -> Result<()>;
     

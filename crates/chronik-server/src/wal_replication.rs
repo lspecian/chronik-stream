@@ -178,6 +178,9 @@ pub struct WalReplicationManager {
     /// Election trigger channel sender (v2.2.7 deadlock fix)
     /// Used to trigger elections asynchronously without blocking the timeout monitor
     election_tx: Option<mpsc::UnboundedSender<ElectionTriggerMessage>>,
+
+    /// Metadata store for querying partition replicas and ISR (v2.2.9 Option 4)
+    metadata_store: Option<Arc<dyn chronik_common::metadata::MetadataStore>>,
 }
 
 impl WalReplicationManager {
@@ -185,7 +188,7 @@ impl WalReplicationManager {
     ///
     /// Spawns background workers for connection management and record sending
     pub fn new(followers: Vec<String>) -> Arc<Self> {
-        Self::new_with_dependencies(followers, None, None, None, None)
+        Self::new_with_dependencies(followers, None, None, None, None, None)
     }
 
     /// Create a new WAL replication manager with Raft cluster and ISR tracker (v2.2.7 Phase 3)
@@ -194,12 +197,15 @@ impl WalReplicationManager {
     ///
     /// v2.2.7 Phase 6: Added cluster_config parameter for automatic follower discovery.
     /// If followers is empty and cluster_config is provided, followers will be auto-discovered.
+    ///
+    /// v2.2.9 Phase 7: Added metadata_store parameter for querying partition replicas/ISR (Option 4)
     pub fn new_with_dependencies(
         followers: Vec<String>,
         raft_cluster: Option<Arc<RaftCluster>>,
         isr_tracker: Option<Arc<IsrTracker>>,
         isr_ack_tracker: Option<Arc<IsrAckTracker>>,
         cluster_config: Option<Arc<ClusterConfig>>,
+        metadata_store: Option<Arc<dyn chronik_common::metadata::MetadataStore>>,
     ) -> Arc<Self> {
         // v2.2.7 Phase 6: Auto-discover followers from cluster config
         // CRITICAL FIX: Exclude current node from followers list to prevent self-replication
@@ -247,6 +253,7 @@ impl WalReplicationManager {
             partition_followers: Arc::new(DashMap::new()), // Priority 1: Per-partition follower map
             connection_failures: Arc::new(DashMap::new()), // Error handling: Track connection failures for exponential backoff
             election_tx: None, // Not used in WalReplicationManager (only in WalReceiver)
+            metadata_store,     // v2.2.9 Phase 7: Option 4 metadata store
         });
 
 
@@ -323,6 +330,40 @@ impl WalReplicationManager {
         self.total_queued.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Broadcast metadata event to all peers (v2.2.9 Phase 7 FIX #7)
+    ///
+    /// This method is for metadata events (MetadataEvent) which are NOT CanonicalRecord.
+    /// It bypasses the CanonicalRecord deserialization in replicate_serialized().
+    ///
+    /// # Arguments
+    /// - `topic`: Topic name (should be "__chronik_metadata")
+    /// - `partition`: Partition number (0 for metadata)
+    /// - `offset`: WAL offset of this event
+    /// - `data`: Serialized MetadataEvent bytes
+    pub async fn broadcast_metadata(&self, topic: String, partition: i32, offset: i64, data: Vec<u8>) {
+        let wal_record = WalReplicationRecord {
+            topic,
+            partition,
+            base_offset: offset,
+            record_count: 1, // Metadata events are single events
+            timestamp_ms: chrono::Utc::now().timestamp_millis(),
+            data: Bytes::from(data),
+        };
+
+        // Check queue size (prevent unbounded growth)
+        let queue_size = self.queue.len();
+        if queue_size > MAX_QUEUE_SIZE {
+            self.total_dropped.fetch_add(1, Ordering::Relaxed);
+            warn!("WAL replication queue overflow ({} records), dropping metadata record", queue_size);
+            return;
+        }
+
+        // Push to queue (lock-free, ~10 ns)
+        self.queue.push(wal_record);
+        self.total_queued.fetch_add(1, Ordering::Relaxed);
+        debug!("Queued metadata event for broadcast (offset={})", offset);
+    }
+
     /// Replicate to specific partition replicas based on Raft metadata and ISR (v2.2.7 Phase 3)
     ///
     /// This method:
@@ -339,38 +380,29 @@ impl WalReplicationManager {
         leader_high_watermark: i64,
         serialized_data: Vec<u8>,
     ) {
-        // CRITICAL FIX for acks=-1: Get ISR from Raft metadata (source of truth)
-        // Do NOT use IsrTracker for filtering - it's for runtime monitoring only
-        let isr_replicas = match &self.raft_cluster {
-            Some(cluster) => {
-                match cluster.get_isr(&topic, partition) {
-                    Some(isr) => {
+        // v2.2.9 Phase 7 FIX: Get replicas from WalMetadataStore (Option 4)
+        // For now, treat all replicas as in-sync (ISR = replicas)
+        // Proper ISR tracking will be added later
+        let isr_replicas = match &self.metadata_store {
+            Some(store) => {
+                match store.get_partition_replicas(&topic, partition as u32).await {
+                    Ok(Some(replicas)) => {
+                        // Convert Vec<i32> to Vec<u64>
+                        let replicas_u64: Vec<u64> = replicas.iter().map(|&id| id as u64).collect();
                         debug!(
-                            "Got ISR from Raft metadata for {}-{}: {:?}",
-                            topic, partition, isr
+                            "Got replicas from metadata store for {}-{}: {:?}",
+                            topic, partition, replicas_u64
                         );
-                        isr
+                        replicas_u64
                     }
-                    None => {
-                        // No ISR in Raft metadata, fall back to all replicas
-                        match cluster.get_partition_replicas(&topic, partition) {
-                            Some(replicas) => {
-                                debug!(
-                                    "No ISR found for {}-{}, using all replicas: {:?}",
-                                    topic, partition, replicas
-                                );
-                                replicas
-                            }
-                            None => {
-                                // No replicas assigned, fall back to broadcast
-                                debug!(
-                                    "No replicas found for {}-{}, falling back to replicate_serialized",
-                                    topic, partition
-                                );
-                                self.replicate_serialized(topic, partition, offset, serialized_data).await;
-                                return;
-                            }
-                        }
+                    Ok(None) | Err(_) => {
+                        // No replicas assigned, fall back to broadcast
+                        debug!(
+                            "No replicas found for {}-{} in metadata store, falling back to replicate_serialized",
+                            topic, partition
+                        );
+                        self.replicate_serialized(topic, partition, offset, serialized_data).await;
+                        return;
                     }
                 }
             }
@@ -459,8 +491,28 @@ impl WalReplicationManager {
         while !self.shutdown.load(Ordering::Relaxed) {
             // Try to dequeue a record (non-blocking)
             if let Some(record) = self.queue.pop() {
+                // v2.2.9 Phase 7 FIX: Check if any connections available for metadata records
+                // If no connections yet, re-queue metadata records to retry later
+                let is_metadata_record = record.topic == "__chronik_metadata";
+                if is_metadata_record && self.connections.is_empty() {
+                    // Re-queue metadata record for retry (connections not ready yet)
+                    debug!("Re-queuing metadata record (no connections yet)");
+                    self.queue.push(record);
+                    sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+
                 // Send to all active followers (fan-out)
-                self.send_to_followers(&record).await;
+                let sent_to_any = self.send_to_followers(&record).await;
+
+                // v2.2.9 Phase 7 FIX: Re-queue metadata records that failed to send
+                if is_metadata_record && !sent_to_any {
+                    debug!("Re-queuing metadata record (no successful sends)");
+                    self.queue.push(record);
+                    sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+
                 self.total_sent.fetch_add(1, Ordering::Relaxed);
 
                 // Reset heartbeat timer (data was sent)
@@ -474,8 +526,8 @@ impl WalReplicationManager {
                     last_heartbeat = std::time::Instant::now();
                 }
 
-                // Sleep briefly to avoid busy-wait
-                sleep(Duration::from_millis(100)).await;
+                // Sleep briefly to avoid busy-wait (1ms for low latency)
+                sleep(Duration::from_millis(1)).await;
             }
         }
 
@@ -488,12 +540,14 @@ impl WalReplicationManager {
     /// replicas assigned to this specific partition (not broadcast to all followers).
     ///
     /// Fallback: If no partition assignment found, uses static followers list.
-    async fn send_to_followers(&self, record: &WalReplicationRecord) {
+    ///
+    /// Returns: true if sent to at least one follower, false if all sends failed
+    async fn send_to_followers(&self, record: &WalReplicationRecord) -> bool {
         let frame = match serialize_wal_frame(record) {
             Ok(f) => f,
             Err(e) => {
                 error!("Failed to serialize WAL frame: {}", e);
-                return;
+                return false;
             }
         };
 
@@ -520,6 +574,9 @@ impl WalReplicationManager {
                 self.followers.clone()
             }
         };
+
+        // v2.2.9 Phase 7 FIX: Track whether we sent to at least one follower
+        let mut sent_to_any = false;
 
         // Send to each target follower sequentially (DashMap doesn't allow moving RefMut into tasks)
         for follower_addr in &target_followers {
@@ -548,6 +605,7 @@ impl WalReplicationManager {
                     } else {
                         info!("✅ Sent and flushed WAL record for {}-{} to follower: {} ({} bytes)",
                             record.topic, record.partition, follower_addr, frame.len());
+                        sent_to_any = true;
                     }
                 }
             } else {
@@ -556,6 +614,8 @@ impl WalReplicationManager {
                     self.connections.iter().map(|e| e.key().clone()).collect::<Vec<_>>());
             }
         }
+
+        sent_to_any
     }
 
     /// Send heartbeat frames to all followers (v2.2.7 heartbeat fix)
@@ -616,6 +676,12 @@ impl WalReplicationManager {
                     match timeout(Duration::from_secs(5), TcpStream::connect(follower_addr)).await {
                         Ok(Ok(stream)) => {
                             info!("✅ Connected to follower: {} (after {} failures)", follower_addr, failure_count);
+
+                            // v2.2.9 Performance: Enable TCP_NODELAY to disable Nagle's algorithm
+                            // This is CRITICAL for low-latency replication - Nagle can add 200ms delay!
+                            if let Err(e) = stream.set_nodelay(true) {
+                                error!("Failed to set TCP_NODELAY for WAL replication to {}: {}", follower_addr, e);
+                            }
 
                             // Reset failure counter on successful connection
                             self.connection_failures.remove(follower_addr);
@@ -955,7 +1021,41 @@ impl WalReplicationManager {
             sleep(check_interval).await;
 
             // Query: Which partitions am I the leader for?
-            let my_partitions = raft.get_partitions_where_leader(node_id);
+            // v2.2.9 Phase 7 CRITICAL FIX: Query metadata_store instead of stubbed raft method (Option 4)
+            let my_partitions = if let Some(ref store) = self.metadata_store {
+                let topics = match store.list_topics().await {
+                    Ok(topics) => topics,
+                    Err(e) => {
+                        warn!("Failed to list topics from metadata_store: {}", e);
+                        Vec::new()
+                    }
+                };
+
+                let mut leader_partitions = Vec::new();
+                for topic in topics {
+                    for partition in 0..topic.config.partition_count {
+                        match store.get_partition_leader(&topic.name, partition).await {
+                            Ok(Some(leader_id)) if leader_id == node_id as i32 => {
+                                leader_partitions.push((topic.name.clone(), partition as i32));
+                            }
+                            Ok(Some(_)) => {
+                                // This node is not the leader for this partition
+                            }
+                            Ok(None) => {
+                                debug!("No leader found for partition {}-{}", topic.name, partition);
+                            }
+                            Err(e) => {
+                                warn!("Failed to get leader for {}-{}: {}", topic.name, partition, e);
+                            }
+                        }
+                    }
+                }
+                leader_partitions
+            } else {
+                // Fallback: No metadata_store available (shouldn't happen in Option 4)
+                warn!("No metadata_store available - cannot determine leader partitions");
+                Vec::new()
+            };
 
             if my_partitions.is_empty() {
                 debug!("Node {} is not leader for any partitions", node_id);
@@ -966,11 +1066,18 @@ impl WalReplicationManager {
 
             // For each partition, update follower list
             for (topic, partition) in my_partitions {
-                // Query: Who are the replicas for this partition?
-                if let Some(replicas) = raft.get_partition_replicas(&topic, partition) {
-                    // Filter out self (leader doesn't replicate to itself)
+                // v2.2.9 Phase 7 FIX: Query replicas from metadata_store (Option 4)
+                let replicas_result = if let Some(ref store) = self.metadata_store {
+                    store.get_partition_replicas(&topic, partition as u32).await
+                } else {
+                    Ok(None)
+                };
+
+                if let Ok(Some(replicas)) = replicas_result {
+                    // Convert Vec<i32> to Vec<u64> and filter out self
                     let followers: Vec<u64> = replicas
                         .into_iter()
+                        .map(|id| id as u64)
                         .filter(|&id| id != node_id)
                         .collect();
 
@@ -1458,6 +1565,10 @@ pub struct WalReceiver {
     /// ProduceHandler for updating watermarks on followers (v2.2.9)
     /// Used to update watermarks when WAL data is replicated to followers
     produce_handler: Option<Arc<crate::produce_handler::ProduceHandler>>,
+
+    /// MetadataStore for updating partition offsets on followers (v2.2.9 Phase 7 FIX)
+    /// ListOffsets API queries this, so it must be kept in sync with replicated watermarks
+    metadata_store: Option<Arc<dyn chronik_common::metadata::MetadataStore>>,
 }
 
 impl WalReceiver {
@@ -1473,6 +1584,7 @@ impl WalReceiver {
             last_heartbeat: Arc::new(DashMap::new()),
             raft_cluster: None,
             produce_handler: None,
+            metadata_store: None,
         }
     }
 
@@ -1494,6 +1606,7 @@ impl WalReceiver {
             last_heartbeat: Arc::new(DashMap::new()),
             raft_cluster: None,
             produce_handler: None,
+            metadata_store: None,
         }
     }
 
@@ -1515,6 +1628,13 @@ impl WalReceiver {
         self.produce_handler = Some(produce_handler);
     }
 
+    /// Set MetadataStore for partition offset updates on followers (v2.2.9 Phase 7 FIX)
+    /// ListOffsets API queries metadata_store, so it must be kept in sync with replicated watermarks
+    pub fn set_metadata_store(&mut self, metadata_store: Arc<dyn chronik_common::metadata::MetadataStore>) {
+        info!("WalReceiver: Enabling partition offset updates via MetadataStore (v2.2.9 Phase 7)");
+        self.metadata_store = Some(metadata_store);
+    }
+
     /// Start the WAL receiver (blocking)
     pub async fn run(&self) -> Result<()> {
         info!("Starting WAL receiver on {}", self.listener_addr);
@@ -1532,6 +1652,12 @@ impl WalReceiver {
                 Ok(Ok((stream, peer_addr))) => {
                     info!("WAL receiver: Accepted connection from {}", peer_addr);
 
+                    // v2.2.9 Performance: Enable TCP_NODELAY to disable Nagle's algorithm
+                    // This is CRITICAL for low-latency ACK responses - Nagle can add 200ms delay!
+                    if let Err(e) = stream.set_nodelay(true) {
+                        error!("Failed to set TCP_NODELAY for WAL receiver from {}: {}", peer_addr, e);
+                    }
+
                     // Spawn handler for this connection
                     let wal_mgr = Arc::clone(&self.wal_manager);
                     let shutdown = Arc::clone(&self.shutdown);
@@ -1542,6 +1668,7 @@ impl WalReceiver {
                     let raft_cluster = self.raft_cluster.clone();
 
                     let produce_handler_for_conn = self.produce_handler.clone();
+                    let metadata_store_for_conn = self.metadata_store.clone();
 
                     tokio::spawn(async move {
                         if let Err(e) = Self::handle_connection(
@@ -1554,6 +1681,7 @@ impl WalReceiver {
                             leader_elector,
                             raft_cluster,
                             produce_handler_for_conn,
+                            metadata_store_for_conn,
                         ).await {
                             error!("WAL receiver connection from {} failed: {}", peer_addr, e);
                         } else {
@@ -1586,6 +1714,7 @@ impl WalReceiver {
         leader_elector: Option<Arc<crate::leader_election::LeaderElector>>,
         raft_cluster: Option<Arc<RaftCluster>>,
         produce_handler: Option<Arc<crate::produce_handler::ProduceHandler>>,
+        metadata_store: Option<Arc<dyn chronik_common::metadata::MetadataStore>>,
     ) -> Result<()> {
         let mut buffer = BytesMut::with_capacity(64 * 1024); // 64KB buffer
 
@@ -1697,7 +1826,7 @@ impl WalReceiver {
                         // Phase 2.3: Special handling for metadata WAL replication
                         if wal_record.topic == "__chronik_metadata" && wal_record.partition == 0 {
                             if let Some(ref ph) = produce_handler {
-                                if let Err(e) = Self::handle_metadata_wal_record(ph, &raft_cluster, &wal_record).await {
+                                if let Err(e) = Self::handle_metadata_wal_record(ph, &raft_cluster, &wal_record, &metadata_store).await {
                                     error!(
                                         "Failed to apply metadata WAL record: {}",
                                         e
@@ -1747,7 +1876,7 @@ impl WalReceiver {
                         );
 
                         // Write to local WAL (normal partition data)
-                        if let Err(e) = Self::write_to_wal(&wal_manager, &wal_record, &raft_cluster, &produce_handler).await {
+                        if let Err(e) = Self::write_to_wal(&wal_manager, &wal_record, &raft_cluster, &produce_handler, &metadata_store).await {
                             error!(
                                 "Failed to write replicated WAL record to local WAL for {}-{}: {}",
                                 wal_record.topic, wal_record.partition, e
@@ -1816,6 +1945,7 @@ impl WalReceiver {
         record: &WalReplicationRecord,
         raft_cluster: &Option<Arc<crate::raft_cluster::RaftCluster>>,
         produce_handler: &Option<Arc<crate::produce_handler::ProduceHandler>>,
+        metadata_store: &Option<Arc<dyn chronik_common::metadata::MetadataStore>>,
     ) -> Result<()> {
         // Deserialize CanonicalRecord from data
         use chronik_storage::canonical_record::CanonicalRecord;
@@ -1845,33 +1975,38 @@ impl WalReceiver {
             let new_watermark = record.base_offset + record.record_count as i64;
 
             if let Err(e) = handler.update_high_watermark(&record.topic, record.partition, new_watermark).await {
-                warn!("Failed to update watermark for {}-{} to {}: {}",
+                warn!("❌ Failed to update watermark for {}-{} to {}: {}",
                     record.topic, record.partition, new_watermark, e);
             } else {
-                debug!("✅ Updated watermark for {}-{} to {}",
+                info!("✅ v2.2.9 Phase 7 DEBUG: Updated watermark for {}-{} to {}",
                     record.topic, record.partition, new_watermark);
             }
         } else {
-            // Fallback to Raft if ProduceHandler not available (backwards compatibility)
-            if let Some(ref raft) = raft_cluster {
-                use crate::raft_metadata::MetadataCommand;
+            warn!("⚠️ v2.2.9 Phase 7 DEBUG: produce_handler is None! Cannot update watermark for {}-{}",
+                record.topic, record.partition);
+        }
 
-                let new_watermark = record.base_offset + record.record_count as i64;
-                let cmd = MetadataCommand::UpdatePartitionOffset {
-                    topic: record.topic.clone(),
-                    partition: record.partition as u32,
-                    high_watermark: new_watermark,
-                    log_start_offset: 0,
-                };
-
-                if let Err(e) = raft.apply_metadata_command_direct(cmd) {
-                    warn!("Failed to update watermark for {}-{} to {}: {}",
-                        record.topic, record.partition, new_watermark, e);
-                } else {
-                    debug!("✅ Updated watermark for {}-{} to {}",
-                        record.topic, record.partition, new_watermark);
-                }
+        // v2.2.9 Phase 7 FIX: ALSO update MetadataStore partition offsets
+        // ListOffsets API queries metadata_store, NOT ProduceHandler
+        // This was the root cause of Bug #4: followers had correct ProduceHandler watermarks
+        // but metadata_store offsets were 0, causing ListOffsets to timeout
+        if let Some(ref store) = metadata_store {
+            let new_watermark = record.base_offset + record.record_count as i64;
+            if let Err(e) = store.update_partition_offset(
+                &record.topic,
+                record.partition as u32,
+                new_watermark,
+                0  // log_start_offset - we don't track this separately yet
+            ).await {
+                warn!("❌ Failed to update metadata_store offset for {}-{} to {}: {}",
+                    record.topic, record.partition, new_watermark, e);
+            } else {
+                info!("✅ v2.2.9 Phase 7 FIX: Updated MetadataStore offset for {}-{} to {} (for ListOffsets API)",
+                    record.topic, record.partition, new_watermark);
             }
+        } else {
+            warn!("⚠️ v2.2.9 Phase 7: metadata_store is None! ListOffsets API will fail on follower for {}-{}",
+                record.topic, record.partition);
         }
 
         Ok(())
@@ -1881,17 +2016,58 @@ impl WalReceiver {
     ///
     /// v2.2.9 FIX: Removed Raft redundancy - metadata now updates ProduceHandler directly
     /// When followers receive metadata replication from leader:
-    /// 1. Deserialize MetadataCommand from data
-    /// 2. Apply to ProduceHandler (NOT Raft - that's redundant!)
+    /// 1. Deserialize MetadataCommand or MetadataEvent from data
+    /// 2. Apply to ProduceHandler or MetadataStore
     /// 3. Fire notification for any waiting threads
     async fn handle_metadata_wal_record(
         produce_handler: &Arc<crate::produce_handler::ProduceHandler>,
         raft_cluster: &Option<Arc<RaftCluster>>,  // Keep for notifications only
         record: &WalReplicationRecord,
+        metadata_store: &Option<Arc<dyn chronik_common::metadata::MetadataStore>>,
     ) -> Result<()> {
         use crate::raft_metadata::MetadataCommand;
+        use chronik_common::metadata::{MetadataEvent as CommonMetadataEvent, MetadataEventPayload};
 
-        // Deserialize metadata command
+        // v2.2.9 Phase 7 FIX #5: Try deserializing as MetadataEvent first (new format)
+        // Then fall back to MetadataCommand (legacy format)
+        if let Ok(event) = CommonMetadataEvent::from_bytes(&record.data) {
+            tracing::info!(
+                "📥 Follower received MetadataEvent at offset {}: {:?}",
+                record.base_offset,
+                event.payload
+            );
+
+            // Apply to metadata_store if available
+            if let Some(ref store) = metadata_store {
+                if let Err(e) = store.apply_replicated_event(event.clone()).await {
+                    tracing::warn!("Failed to apply replicated MetadataEvent: {}", e);
+                } else {
+                    match &event.payload {
+                        MetadataEventPayload::PartitionAssigned { assignment } => {
+                            tracing::info!(
+                                "✅ Follower applied PartitionAssigned: {}-{}, leader={}, replicas={:?}",
+                                assignment.topic, assignment.partition, assignment.leader_id, assignment.replicas
+                            );
+                        }
+                        MetadataEventPayload::HighWatermarkUpdated { topic, partition, new_watermark } => {
+                            tracing::info!(
+                                "✅ Follower applied HighWatermarkUpdated: {}-{} => {}",
+                                topic, partition, new_watermark
+                            );
+                        }
+                        _ => {
+                            tracing::debug!("✅ Follower applied MetadataEvent: {:?}", event.payload);
+                        }
+                    }
+                }
+            } else {
+                tracing::warn!("Received MetadataEvent but no metadata_store configured!");
+            }
+
+            return Ok(());
+        }
+
+        // Legacy path: Try deserializing as MetadataCommand
         let cmd: MetadataCommand = bincode::deserialize(&record.data)
             .context("Failed to deserialize MetadataCommand from replicated data")?;
 
@@ -1901,53 +2077,15 @@ impl WalReceiver {
             cmd
         );
 
-        // v2.2.9: Apply to ProduceHandler (which ListOffsets actually queries!)
-        // No more Raft state machine - that was causing the watermark visibility bug
-        match &cmd {
-            MetadataCommand::UpdatePartitionOffset {
-                topic,
-                partition,
-                high_watermark,
-                ..
-            } => {
-                if let Err(e) = produce_handler
-                    .update_high_watermark(topic, *partition as i32, *high_watermark)
-                    .await
-                {
-                    warn!(
-                        "Failed to update watermark for {}-{} to {}: {}",
-                        topic, partition, high_watermark, e
-                    );
-                } else {
-                    info!(
-                        "✅ Phase 2.3: Updated watermark for {}-{} to {} via ProduceHandler",
-                        topic, partition, high_watermark
-                    );
-                }
-            }
-            _ => {
-                // Other metadata commands (CreateTopic, RegisterBroker, etc.)
-                // are handled by __chronik_metadata WAL persistence and recovery
-                tracing::debug!(
-                    "Phase 2.3: Skipping non-watermark command (handled by WAL persistence): {:?}",
-                    cmd
-                );
-            }
-        }
+        // v2.2.9 Option 4: Partition metadata moved to WalMetadataStore
+        // Most commands are now handled via MetadataEvent path above
 
         // Fire notification for any waiting threads
         // (Followers might have threads waiting for metadata updates via Phase 1 forwarding)
         if let Some(ref raft) = raft_cluster {
-            let pending_topics = raft.get_pending_topics_notifications();
             let pending_brokers = raft.get_pending_brokers_notifications();
 
             match &cmd {
-                MetadataCommand::CreateTopic { name, .. } => {
-                    if let Some((_, notify)) = pending_topics.remove(name) {
-                        notify.notify_waiters();
-                        tracing::debug!("Notified waiting threads for topic '{}'", name);
-                    }
-                }
                 MetadataCommand::RegisterBroker { broker_id, .. } => {
                     if let Some((_, notify)) = pending_brokers.remove(broker_id) {
                         notify.notify_waiters();
@@ -2150,6 +2288,7 @@ mod tests {
             None,
             None,
             Some(Arc::new(cluster)),
+            None,    // No metadata store for test
         );
 
         // Node 1 is the current node, so followers should be nodes 2 and 3
@@ -2162,13 +2301,14 @@ mod tests {
     fn test_manual_followers_override_auto_discovery() {
         let cluster = create_test_cluster_config(1);
         let manual_followers = vec!["custom.host:9291".to_string()];
-        
+
         let manager = WalReplicationManager::new_with_dependencies(
             manual_followers.clone(),
             None,
             None,
             None,
             Some(Arc::new(cluster)),
+            None,    // No metadata store for test
         );
 
         // Manual followers should be used, not auto-discovered ones
@@ -2183,6 +2323,7 @@ mod tests {
             None,
             None,
             None,  // No cluster config
+            None,  // No metadata store for test
         );
 
         // No followers should be configured
@@ -2200,6 +2341,7 @@ mod tests {
                 None,
                 None,
                 Some(Arc::new(cluster)),
+                None,  // No metadata store for test
             );
 
             // Should have 2 followers (not counting self)

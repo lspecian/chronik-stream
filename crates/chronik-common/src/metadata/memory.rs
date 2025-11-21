@@ -257,7 +257,41 @@ impl MetadataStore for InMemoryMetadataStore {
         let key = (topic.to_string(), partition);
         Ok(offsets.get(&key).cloned())
     }
-    
+
+    async fn apply_replicated_event(&self, event: super::events::MetadataEvent) -> Result<()> {
+        use super::events::MetadataEventPayload;
+        match event.payload {
+            MetadataEventPayload::PartitionAssigned { assignment } => {
+                let mut assignments = self.partition_assignments.write().await;
+                let key = (assignment.topic.clone(), assignment.partition);
+                assignments.insert(key, assignment);
+            }
+            MetadataEventPayload::HighWatermarkUpdated { topic, partition, new_watermark } => {
+                let mut offsets = self.partition_offsets.write().await;
+                let key = (topic, partition as u32);
+                let log_start = offsets.get(&key).map(|(_, ls)| *ls).unwrap_or(0);
+                offsets.insert(key, (new_watermark, log_start));
+            }
+            MetadataEventPayload::TopicCreated { name, config } => {
+                let mut topics = self.topics.write().await;
+                if !topics.contains_key(&name) {
+                    let metadata = TopicMetadata {
+                        id: uuid::Uuid::new_v4(),
+                        name: name.clone(),
+                        config: config.into(),
+                        created_at: chrono::Utc::now(),
+                        updated_at: chrono::Utc::now(),
+                    };
+                    topics.insert(name, metadata);
+                }
+            }
+            _ => {
+                // Other events not handled by InMemoryMetadataStore
+            }
+        }
+        Ok(())
+    }
+
     async fn init_system_state(&self) -> Result<()> {
         // No-op for in-memory store
         Ok(())

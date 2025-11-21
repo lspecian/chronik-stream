@@ -22,6 +22,7 @@ use crate::wal_replication::WalReplicationManager;
 use crate::raft_metadata::MetadataCommand;
 use std::sync::Arc;
 use tracing::{debug, warn};
+use chronik_common::metadata::MetadataStore;  // v2.2.9 Phase 7 FIX: Import trait for methods
 
 /// Metadata WAL Replicator
 ///
@@ -36,6 +37,9 @@ pub struct MetadataWalReplicator {
 
     /// Event bus for metadata changes (event-based replication)
     event_bus: Arc<crate::metadata_events::MetadataEventBus>,
+
+    /// Metadata store (v2.2.9 Phase 7 FIX: needed to apply events on followers)
+    metadata_store: Arc<chronik_common::metadata::WalMetadataStore>,
 }
 
 impl MetadataWalReplicator {
@@ -44,6 +48,8 @@ impl MetadataWalReplicator {
     /// # Arguments
     /// - `wal`: Metadata WAL instance (provides topic name "__chronik_metadata")
     /// - `replication_mgr`: Existing WalReplicationManager (reuses partition data transport)
+    /// - `event_bus`: Event bus for metadata changes
+    /// - `metadata_store`: Metadata store to apply events on followers
     ///
     /// # Returns
     /// Replicator ready to send metadata commands to followers
@@ -51,11 +57,13 @@ impl MetadataWalReplicator {
         wal: Arc<MetadataWal>,
         replication_mgr: Arc<WalReplicationManager>,
         event_bus: Arc<crate::metadata_events::MetadataEventBus>,
+        metadata_store: Arc<chronik_common::metadata::WalMetadataStore>,
     ) -> Self {
         Self {
             wal,
             replication_mgr,
             event_bus,
+            metadata_store,
         }
     }
 
@@ -158,6 +166,7 @@ impl MetadataWalReplicator {
             loop {
                 match rx.recv().await {
                     Ok(event) => {
+                        tracing::info!("📩 MetadataWalReplicator received event: {:?}", event);
                         if let Err(e) = self.handle_event(event).await {
                             tracing::warn!("Failed to handle metadata event: {}", e);
                         }
@@ -182,66 +191,96 @@ impl MetadataWalReplicator {
         use crate::metadata_events::MetadataEvent;
 
         match event {
+            // v2.2.9 Phase 7 FIX #4: Replicate PartitionAssigned events to followers via WalReplicationManager
+            // The leader receives this from local event bus AFTER write_and_apply() completes
+            // So local state is ALREADY applied - we just need to replicate to followers
             MetadataEvent::PartitionAssigned { topic, partition, replicas, leader } => {
-                tracing::info!("📡 Replicating PartitionAssigned: {}-{} => {:?}, leader={}",
-                    topic, partition, replicas, leader);
+                tracing::info!("📡 Replicating PartitionAssigned to followers: {}-{}, leader={}, replicas={:?}",
+                    topic, partition, leader, replicas);
 
-                // Replicate AssignPartition command
-                let cmd = MetadataCommand::AssignPartition {
+                // Create the partition assignment struct for serialization
+                let assignment = chronik_common::metadata::PartitionAssignment {
                     topic: topic.clone(),
-                    partition,
-                    replicas,
+                    partition: partition as u32,
+                    broker_id: leader as i32,  // Deprecated field
+                    is_leader: true,  // Deprecated field
+                    replicas: replicas.clone(),
+                    leader_id: leader,
                 };
-                self.replicate_command(cmd).await?;
 
-                // If leader is set, also replicate SetPartitionLeader
-                if leader != 0 {
-                    let cmd2 = MetadataCommand::SetPartitionLeader {
-                        topic,
-                        partition,
-                        leader,
-                    };
-                    self.replicate_command(cmd2).await?;
+                // Create MetadataEvent for replication (same format as WAL writes)
+                let metadata_event = chronik_common::metadata::MetadataEvent::new(
+                    chronik_common::metadata::MetadataEventPayload::PartitionAssigned {
+                        assignment,
+                    },
+                );
+
+                // Serialize and replicate via WalReplicationManager
+                // v2.2.9 Phase 7 FIX #7: Use broadcast_metadata() instead of replicate_partition()
+                // replicate_partition() tries to deserialize as CanonicalRecord, which fails for MetadataEvent
+                match metadata_event.to_bytes() {
+                    Ok(data) => {
+                        // Broadcast to all followers via __chronik_metadata topic
+                        self.replication_mgr.broadcast_metadata(
+                            self.wal.topic_name().to_string(),  // "__chronik_metadata"
+                            self.wal.partition(),                // 0
+                            0,  // dummy offset (event-based, not WAL-offset-based)
+                            data,
+                        ).await;
+                        tracing::info!("✅ PartitionAssigned broadcast to followers: {}-{}", topic, partition);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to serialize PartitionAssigned {}-{}: {}", topic, partition, e);
+                    }
                 }
             }
 
+            // v2.2.9 Option 4: Partition metadata moved to WalMetadataStore
             MetadataEvent::LeaderChanged { topic, partition, new_leader } => {
-                tracing::info!("📡 Replicating LeaderChanged: {}-{} => {}",
+                tracing::debug!("Skipping LeaderChanged replication (now in WalMetadataStore): {}-{} => {}",
                     topic, partition, new_leader);
-
-                let cmd = MetadataCommand::SetPartitionLeader {
-                    topic,
-                    partition,
-                    leader: new_leader,
-                };
-                self.replicate_command(cmd).await?;
+                // let cmd = MetadataCommand::SetPartitionLeader {
+                //     topic,
+                //     partition,
+                //     leader: new_leader,
+                // };
+                // self.replicate_command(cmd).await?;
             }
 
-            MetadataEvent::ISRUpdated { topic, partition, isr } => {
-                tracing::info!("📡 Replicating ISRUpdated: {}-{} => {:?}",
-                    topic, partition, isr);
-
-                let cmd = MetadataCommand::UpdateISR {
-                    topic,
-                    partition,
-                    isr,
-                };
-                self.replicate_command(cmd).await?;
+            // v2.2.9 Option 4: Partition metadata moved to WalMetadataStore
+            MetadataEvent::ISRUpdated { topic, partition, isr: _ } => {
+                tracing::debug!("Skipping ISRUpdated replication (now in WalMetadataStore): {}-{}",
+                    topic, partition);
+                // let cmd = MetadataCommand::UpdateISR {
+                //     topic,
+                //     partition,
+                //     isr,
+                // };
+                // self.replicate_command(cmd).await?;
             }
 
+            // v2.2.9 Phase 7 FIX #2: Apply HighWatermarkUpdated events to metadata_store on followers
+            // CRITICAL: Use apply_replicated_event() NOT update_partition_offset()
+            // update_partition_offset() writes to WAL then applies - wrong for followers
+            // apply_replicated_event() ONLY applies to in-memory state - correct for followers
             MetadataEvent::HighWatermarkUpdated { topic, partition, offset } => {
-                tracing::debug!("📡 Replicating HighWatermarkUpdated: {}-{} => {}",
+                tracing::info!("📥 Applying HighWatermarkUpdated to metadata_store (follower mode): {}-{} => {}",
                     topic, partition, offset);
 
-                // v2.2.7.2 FIX: Replicate high watermark updates via metadata WAL
-                // This enables < 10ms watermark propagation instead of 5-second background sync
-                let cmd = MetadataCommand::UpdatePartitionOffset {
-                    topic,
-                    partition: partition as u32,
-                    high_watermark: offset,
-                    log_start_offset: 0,  // Not updated here (only high watermark)
-                };
-                self.replicate_command(cmd).await?;
+                // Create MetadataEvent for apply_replicated_event
+                let metadata_event = chronik_common::metadata::MetadataEvent::new(
+                    chronik_common::metadata::MetadataEventPayload::HighWatermarkUpdated {
+                        topic: topic.clone(),
+                        partition,
+                        new_watermark: offset,
+                    },
+                );
+
+                // Apply directly to state WITHOUT writing to WAL (follower receives via replication)
+                self.metadata_store.apply_replicated_event(metadata_event)
+                    .await.context(format!("Failed to apply replicated watermark for {}-{}", topic, partition))?;
+
+                tracing::info!("✅ HighWatermarkUpdated applied to metadata_store (follower): {}-{} => {}", topic, partition, offset);
             }
 
             MetadataEvent::TopicCreated { topic, num_partitions } => {
@@ -280,6 +319,7 @@ impl Clone for MetadataWalReplicator {
             wal: Arc::clone(&self.wal),
             replication_mgr: Arc::clone(&self.replication_mgr),
             event_bus: Arc::clone(&self.event_bus),
+            metadata_store: Arc::clone(&self.metadata_store),  // v2.2.9 Phase 7 FIX
         }
     }
 }

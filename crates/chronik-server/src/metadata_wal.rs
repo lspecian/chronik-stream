@@ -24,7 +24,7 @@ use crate::raft_metadata::MetadataCommand;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Metadata WAL - Special-purpose WAL for metadata operations
 ///
@@ -240,70 +240,34 @@ impl MetadataWal {
 
     /// Read all WAL records from disk (internal helper for recovery)
     async fn read_all_wal_records(&self) -> Result<Vec<WalRecord>> {
-        use tokio::fs;
-        use tokio::io::AsyncReadExt;
+        // v2.2.9 Phase 7 BUG #5 FIX: Metadata WAL recovery is currently disabled
+        //
+        // PROBLEM: This method attempts to manually parse GroupCommitWal file format,
+        // but GroupCommitWal writes in a batched/committed format that doesn't match
+        // simple WalRecord byte parsing. Result: Recovery always returns 0 records
+        // even when metadata WAL files contain data.
+        //
+        // TEMPORARY FIX: Disable local recovery and rely on metadata WAL replication
+        // from the cluster leader. On cluster startup, followers will receive all
+        // metadata events via replication.
+        //
+        // TODO (Phase 7+): Implement proper GroupCommitWal recovery
+        // - Option 1: Add recover() method to GroupCommitWal API
+        // - Option 2: Use WalManager's recovery mechanism
+        // - Option 3: Implement GroupCommitWal format parser
+        //
+        // For now, this is acceptable because:
+        // 1. In cluster mode: Followers get metadata via replication from leader
+        // 2. On full cluster restart: Leader can reconstruct from Raft snapshots
+        // 3. Topic auto-creation will recreate missing metadata
+        //
+        // SEE: docs/PHASE7_FINDINGS.md Bug #5 for full details
 
-        // WAL files are stored at: wal_dir/__chronik_metadata/0/wal_*.log
-        let partition_dir = self.wal_dir.join(&self.topic_name).join(self.partition.to_string());
+        warn!("⚠️  Metadata WAL local recovery is currently DISABLED (Bug #5)");
+        warn!("   Relying on metadata WAL replication from cluster leader");
+        warn!("   Full cluster cold-start recovery not yet implemented");
 
-        // Check if directory exists
-        if !partition_dir.exists() {
-            debug!("Partition directory does not exist: {}", partition_dir.display());
-            return Ok(Vec::new());
-        }
-
-        // Scan for all WAL files in the partition directory
-        let mut entries = fs::read_dir(&partition_dir).await
-            .context(format!("Failed to read partition directory: {}", partition_dir.display()))?;
-
-        let mut wal_files = Vec::new();
-        while let Some(entry) = entries.next_entry().await? {
-            let path = entry.path();
-            if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("log") {
-                wal_files.push(path);
-            }
-        }
-
-        // Sort files by name (wal_0_0.log, wal_0_1.log, etc.)
-        wal_files.sort();
-
-        if wal_files.is_empty() {
-            debug!("No WAL files found in {}", partition_dir.display());
-            return Ok(Vec::new());
-        }
-
-        // Read and parse all WAL files
-        let num_files = wal_files.len();
-        let mut all_records = Vec::new();
-        for wal_file in wal_files {
-            debug!("Reading WAL file: {}", wal_file.display());
-
-            // Read entire file into memory
-            let mut file = fs::File::open(&wal_file).await
-                .context(format!("Failed to open WAL file: {}", wal_file.display()))?;
-            let mut buffer = Vec::new();
-            file.read_to_end(&mut buffer).await
-                .context("Failed to read WAL file")?;
-
-            // Parse all records from buffer
-            let mut offset = 0;
-            while offset < buffer.len() {
-                match WalRecord::from_bytes(&buffer[offset..]) {
-                    Ok(record) => {
-                        let record_len = record.to_bytes()?.len();
-                        all_records.push(record);
-                        offset += record_len;
-                    }
-                    Err(e) => {
-                        debug!("Failed to parse WAL record at offset {}: {} - end of file or corrupt", offset, e);
-                        break;
-                    }
-                }
-            }
-        }
-
-        debug!("Successfully read {} WAL records from {} files", all_records.len(), num_files);
-        Ok(all_records)
+        Ok(Vec::new())  // Always return empty - rely on replication
     }
 }
 

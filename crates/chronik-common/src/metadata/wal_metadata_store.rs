@@ -31,6 +31,12 @@ use super::traits::*;
 /// Returns: WAL offset
 pub type WalAppendFn = Arc<dyn Fn(Vec<u8>) -> Pin<Box<dyn Future<Output = std::result::Result<i64, String>> + Send>> + Send + Sync>;
 
+/// Type alias for event bus publish callback (injected by chronik-server)
+///
+/// Signature: fn(event: MetadataEvent) -> usize
+/// Returns: Number of subscribers that received the event
+pub type EventBusPublishFn = Arc<dyn Fn(MetadataEvent) -> usize + Send + Sync>;
+
 /// WAL-based metadata store with event sourcing
 pub struct WalMetadataStore {
     /// Node ID for cluster coordination
@@ -42,6 +48,10 @@ pub struct WalMetadataStore {
     /// WAL append callback (provided by chronik-server's MetadataWal)
     /// This avoids circular dependency between chronik-common and chronik-server
     wal_append: WalAppendFn,
+
+    /// Event bus publish callback (v2.2.9 Phase 7 FIX: for metadata replication)
+    /// This publishes events to MetadataWalReplicator so followers receive metadata updates
+    event_bus_publish: Option<EventBusPublishFn>,
 }
 
 /// In-memory metadata state (built from events)
@@ -89,23 +99,18 @@ impl MetadataState {
                 topics.insert(name.clone(), metadata);
                 drop(topics);
 
-                // Create partition assignments
-                let mut assignments = self.partition_assignments.write().await;
-                for partition in 0..config.partition_count {
-                    let assignment = PartitionAssignment {
-                        topic: name.clone(),
-                        partition,
-                        broker_id: event.created_by_node as i32,
-                        is_leader: true,
-                        replicas: vec![event.created_by_node],
-                        leader_id: event.created_by_node,
-                    };
-                    let key = (name.clone(), partition);
-                    assignments.insert(key, assignment);
-                }
-                drop(assignments);
+                // v2.2.9 Phase 7 FIX #3: Do NOT create partition assignments here!
+                // Partition assignments should be created via separate PartitionAssigned events
+                // from assign_partitions_to_nodes() which has proper replica information from cluster config.
+                // Creating assignments here with only creator node as replica caused replication to break.
+                //
+                // OLD CODE (REMOVED - caused single-replica assignments):
+                // for partition in 0..config.partition_count {
+                //     let assignment = PartitionAssignment { ... replicas: vec![event.created_by_node] };
+                //     assignments.insert(key, assignment);
+                // }
 
-                // Initialize partition offsets
+                // Initialize partition offsets only (assignments come from PartitionAssigned events)
                 let mut offsets = self.partition_offsets.write().await;
                 for partition in 0..config.partition_count {
                     let key = (name.clone(), partition);
@@ -246,7 +251,16 @@ impl WalMetadataStore {
             node_id,
             state: Arc::new(MetadataState::new()),
             wal_append,
+            event_bus_publish: None, // Set later via set_event_bus()
         }
+    }
+
+    /// Set the event bus publish callback (v2.2.9 Phase 7 FIX)
+    ///
+    /// This is called after construction to wire up metadata replication.
+    /// Late binding is necessary to avoid circular dependencies during initialization.
+    pub fn set_event_bus(&mut self, event_bus_publish: EventBusPublishFn) {
+        self.event_bus_publish = Some(event_bus_publish);
     }
 
     /// Write event to WAL and apply to local state
@@ -262,8 +276,21 @@ impl WalMetadataStore {
         // 3. Apply to local state machine (in-memory)
         self.state.apply_event(&event).await?;
 
-        // Note: Replication to followers happens automatically via MetadataWalReplicator
-        // listening to the event bus. No manual replication needed here.
+        // 4. v2.2.9 Phase 7 FIX: Publish event to event bus for replication
+        // This allows MetadataWalReplicator to hear the event and replicate to followers
+        if let Some(ref publish_fn) = self.event_bus_publish {
+            let subscriber_count = publish_fn(event.clone());
+            tracing::info!(
+                "✅ Published metadata event to {} subscribers: {:?}",
+                subscriber_count,
+                event.payload
+            );
+        } else {
+            tracing::warn!(
+                "⚠️  Event bus not wired up - metadata will NOT replicate to followers! Event: {:?}",
+                event.payload
+            );
+        }
 
         Ok(())
     }
@@ -445,26 +472,25 @@ impl MetadataStore for WalMetadataStore {
     async fn get_partition_leader(&self, topic: &str, partition: u32) -> Result<Option<i32>> {
         let assignments = self.state.partition_assignments.read().await;
         let key = (topic.to_string(), partition);
-        Ok(assignments.get(&key).and_then(|a| {
-            if a.is_leader {
-                Some(a.broker_id)
-            } else {
-                None
-            }
-        }))
+        // v2.2.9 Phase 7 FIX: Use leader_id field instead of deprecated is_leader/broker_id
+        // Bug: was checking is_leader (always false) and returning broker_id (always -1)
+        // Fix: return leader_id which is set correctly by ProduceHandler
+        Ok(assignments.get(&key).map(|a| a.leader_id as i32))
     }
 
     async fn get_partition_replicas(&self, topic: &str, partition: u32) -> Result<Option<Vec<i32>>> {
         let assignments = self.state.partition_assignments.read().await;
-        let replicas: Vec<i32> = assignments.values()
-            .filter(|a| a.topic == topic && a.partition == partition)
-            .map(|a| a.broker_id)
-            .collect();
+        let key = (topic.to_string(), partition);
 
-        if replicas.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(replicas))
+        // v2.2.9 Phase 7 FIX: Return the replicas field, not deprecated broker_id
+        // Each partition has ONE assignment with a Vec<u64> of replica node IDs
+        match assignments.get(&key) {
+            Some(assignment) => {
+                // Convert Vec<u64> to Vec<i32>
+                let replicas: Vec<i32> = assignment.replicas.iter().map(|&id| id as i32).collect();
+                Ok(Some(replicas))
+            }
+            None => Ok(None)
         }
     }
 
@@ -538,6 +564,12 @@ impl MetadataStore for WalMetadataStore {
         let offsets = self.state.partition_offsets.read().await;
         let key = (topic.to_string(), partition);
         Ok(offsets.get(&key).cloned())
+    }
+
+    async fn apply_replicated_event(&self, event: super::events::MetadataEvent) -> Result<()> {
+        // v2.2.9 Phase 7: Apply replicated events from leader WITHOUT writing to WAL
+        // This is for followers receiving events via WalReplicationManager
+        self.state.apply_event(&event).await
     }
 
     async fn init_system_state(&self) -> Result<()> {

@@ -168,28 +168,8 @@ impl IntegratedKafkaServer {
         let metadata_event_bus = Arc::new(crate::metadata_events::MetadataEventBus::default());
         info!("✅ Metadata event bus created (buffer_size=1000)");
 
-        // v2.2.7 EVENT-DRIVEN: Create WAL replicator for metadata with event bus
-        let metadata_wal_replicator = Arc::new(
-            crate::metadata_wal_replication::MetadataWalReplicator::new(
-                metadata_wal.clone(),
-                // Placeholder: will be replaced with real replication manager after it's created
-                crate::wal_replication::WalReplicationManager::new_with_dependencies(
-                    Vec::new(),                          // Empty for auto-discovery
-                    Some(raft_cluster_for_metadata.clone()),
-                    None,                                // No ISR tracker for metadata
-                    None,                                // No ACK tracker for metadata
-                    config.cluster_config.clone().map(Arc::new), // ✅ FIX: Pass cluster config for auto-discovery
-                ),
-                metadata_event_bus.clone(),  // v2.2.7 EVENT-DRIVEN: Use shared event bus
-            )
-        );
-        info!("✅ Metadata WAL replicator created");
-
-        // v2.2.7 EVENT-DRIVEN: Start event listener for metadata replication
-        metadata_wal_replicator.clone().start_event_listener();
-        info!("✅ Metadata event listener started");
-
         // v2.2.9 Option A: WAL-based metadata store (Raft-free for performance)
+        // MOVED BEFORE MetadataWalReplicator so we can pass it as a parameter (Phase 7 FIX)
         // All metadata operations go through WAL (1-2ms writes) instead of Raft consensus (10-50ms)
         // Replication happens via existing WalReplicationManager (fire-and-forget)
         info!("Creating WalMetadataStore (Option A: Raft-free metadata with WAL replication)");
@@ -209,10 +189,65 @@ impl IntegratedKafkaServer {
         });
 
         // Instantiate WalMetadataStore with callback - THIS IS THE METADATA STORE FOR ALL MODES
-        let wal_metadata_store = chronik_common::metadata::WalMetadataStore::new(
+        let mut wal_metadata_store = chronik_common::metadata::WalMetadataStore::new(
             config.node_id as u64,
             wal_append_fn,
         );
+
+        // v2.2.9 Phase 7 FIX: Wire up event bus for metadata replication
+        // This enables followers to receive metadata updates via WAL replication
+        //
+        // CRITICAL: We need to convert between two different MetadataEvent types:
+        // - chronik_common::metadata::MetadataEvent (struct with UUID, timestamp, payload)
+        // - crate::metadata_events::MetadataEvent (simple enum for event bus)
+        let event_bus_for_store = metadata_event_bus.clone();
+        let event_bus_publish_fn: chronik_common::metadata::EventBusPublishFn = Arc::new(move |common_event| {
+            use chronik_common::metadata::MetadataEventPayload;
+            use crate::metadata_events::MetadataEvent as ServerEvent;
+
+            // Convert common MetadataEvent to server MetadataEvent
+            let server_event = match &common_event.payload {
+                MetadataEventPayload::TopicCreated { name, config } => {
+                    Some(ServerEvent::TopicCreated {
+                        topic: name.clone(),
+                        num_partitions: config.partition_count as i32,
+                    })
+                }
+                MetadataEventPayload::TopicDeleted { name } => {
+                    Some(ServerEvent::TopicDeleted {
+                        topic: name.clone(),
+                    })
+                }
+                MetadataEventPayload::PartitionAssigned { assignment } => {
+                    Some(ServerEvent::PartitionAssigned {
+                        topic: assignment.topic.clone(),
+                        partition: assignment.partition as i32,
+                        replicas: assignment.replicas.clone(),
+                        leader: assignment.leader_id,
+                    })
+                }
+                MetadataEventPayload::HighWatermarkUpdated { topic, partition, new_watermark } => {
+                    Some(ServerEvent::HighWatermarkUpdated {
+                        topic: topic.clone(),
+                        partition: *partition,
+                        offset: *new_watermark,
+                    })
+                }
+                // Skip other event types not needed for replication
+                _ => None,
+            };
+
+            // Publish to event bus if we have a relevant event
+            match server_event {
+                Some(event) => event_bus_for_store.publish(event),
+                None => {
+                    tracing::trace!("Skipping non-replication event: {:?}", common_event.payload);
+                    0 // No subscribers notified
+                }
+            }
+        });
+        wal_metadata_store.set_event_bus(event_bus_publish_fn);
+        info!("✅ Event bus wired to WalMetadataStore (metadata will replicate to followers)");
 
         info!("✅ WalMetadataStore created successfully (Option A: WAL-only metadata)");
         info!("   - Single-node mode: Local WAL only (no replication)");
@@ -235,8 +270,36 @@ impl IntegratedKafkaServer {
             info!("No metadata events to recover - starting with fresh state");
         }
 
+        // v2.2.9 Phase 7 FIX: Create Arc<WalMetadataStore> first (needed by MetadataWalReplicator)
+        let wal_metadata_store = Arc::new(wal_metadata_store);
+
+        // v2.2.7 EVENT-DRIVEN: Create WAL replicator for metadata with event bus
+        // NOW WITH METADATA_STORE (Phase 7 FIX) so followers can apply events
+        let metadata_wal_replicator = Arc::new(
+            crate::metadata_wal_replication::MetadataWalReplicator::new(
+                metadata_wal.clone(),
+                // v2.2.9 Phase 7 FIX #6: Pass cluster_config so metadata replication can discover followers!
+                // Without cluster_config, WalReplicationManager has no way to find peer nodes.
+                crate::wal_replication::WalReplicationManager::new_with_dependencies(
+                    Vec::new(),                          // Empty for auto-discovery
+                    Some(raft_cluster_for_metadata.clone()),
+                    None,                                // No ISR tracker for metadata
+                    None,                                // No ACK tracker for metadata
+                    config.cluster_config.clone().map(Arc::new), // v2.2.9 Phase 7 FIX #6: NEED cluster_config to find followers!
+                    None,                                // No metadata store needed for metadata WAL replication
+                ),
+                metadata_event_bus.clone(),              // v2.2.7 EVENT-DRIVEN: Use shared event bus
+                wal_metadata_store.clone(),              // v2.2.9 Phase 7 FIX: Pass metadata_store so followers can apply events
+            )
+        );
+        info!("✅ Metadata WAL replicator created (with cluster_config for follower discovery)");
+
+        // v2.2.7 EVENT-DRIVEN: Start event listener for metadata replication
+        metadata_wal_replicator.clone().start_event_listener();
+        info!("✅ Metadata event listener started");
+
         // Wrap in Arc<dyn MetadataStore> for use throughout the system
-        let metadata_store: Arc<dyn MetadataStore> = Arc::new(wal_metadata_store);
+        let metadata_store: Arc<dyn MetadataStore> = wal_metadata_store.clone();
 
         // v2.2.9 Option A: Metadata lives in WAL (./data/metadata_wal/)
         // System topics no longer needed - metadata is event-sourced from WAL
@@ -448,9 +511,10 @@ impl IntegratedKafkaServer {
 
         // v2.2.7: Create leader elector if Raft clustering is enabled
         // Event-driven elections (no background polling)
+        // v2.2.9 Phase 7: Pass metadata_store for ISR queries (Option 4: WAL-Only Metadata)
         let leader_elector_for_produce = if let Some(ref raft) = raft_cluster {
             info!("Creating LeaderElector for event-driven elections");
-            let elector = Arc::new(crate::leader_election::LeaderElector::new(raft.clone()));
+            let elector = Arc::new(crate::leader_election::LeaderElector::new(raft.clone(), metadata_store.clone()));
             info!("✓ LeaderElector ready (event-driven mode)");
             Some(elector)
         } else {
@@ -526,12 +590,14 @@ impl IntegratedKafkaServer {
 
             // v2.2.7 Phase 6: Create replication manager with cluster config for auto-discovery
             // CRITICAL: Use the SAME isr_ack_tracker instance that ProduceHandler uses
+            // v2.2.9 Phase 7: Pass metadata_store for partition replica/ISR queries (Option 4)
             let replication_manager = crate::wal_replication::WalReplicationManager::new_with_dependencies(
                 manual_followers,
                 raft_cluster.clone(),              // Pass RaftCluster for partition metadata
                 Some(isr_tracker),                 // Pass ISR tracker for replica filtering
                 Some(isr_ack_tracker.clone()),     // v2.2.7 Phase 4: Pass SAME ACK tracker
                 config.cluster_config.clone().map(Arc::new), // v2.2.7 Phase 6: Pass cluster config for auto-discovery
+                Some(metadata_store.clone()),      // v2.2.9 Phase 7: Pass metadata store for ISR/replica queries
             );
             info!("Created WalReplicationManager with Raft, ISR, and ACK tracking (sharing IsrAckTracker)");
 
@@ -937,6 +1003,11 @@ impl IntegratedKafkaServer {
                 wal_receiver.set_produce_handler(produce_handler_base.clone());
                 info!("✅ v2.2.9: WalReceiver configured for watermark updates");
 
+                // v2.2.9 Phase 7 FIX: Wire up MetadataStore for partition offset updates
+                // ListOffsets API queries metadata_store, so it must be kept in sync with replication
+                wal_receiver.set_metadata_store(metadata_store.clone());
+                info!("✅ v2.2.9 Phase 7: WalReceiver configured for partition offset updates");
+
                 // Spawn receiver in background
                 tokio::spawn(async move {
                     if let Err(e) = wal_receiver.run().await {
@@ -1189,21 +1260,46 @@ impl IntegratedKafkaServer {
                         let mut write_queue: VecDeque<Vec<u8>> = VecDeque::with_capacity(1000);
                         let mut current_write: Option<(Vec<u8>, usize)> = None; // (buffer, offset for partial writes)
 
+                        // v2.2.9 Phase 7 DEBUG: Track socket writer activity
+                        let mut responses_received = 0u64;
+                        let mut responses_queued = 0u64;
+                        let mut socket_writable_count = 0u64;
+                        let mut bytes_written_total = 0u64;
+
                         loop {
                             tokio::select! {
                                 // Receive new responses from request handlers
                                 Some((sequence, _correlation_id, response_data)) = response_rx.recv() => {
+                                    responses_received += 1;
+                                    tracing::info!(
+                                        "[SOCKET WRITER {}] Received response #{}, sequence={}, size={} bytes (pending={}, queue={})",
+                                        addr, responses_received, sequence, response_data.len(), pending_responses.len(), write_queue.len()
+                                    );
                                     pending_responses.insert(sequence, (_correlation_id, response_data));
 
                                     // Move consecutive responses to write queue
+                                    let mut moved = 0;
                                     while let Some((_corr_id, resp_data)) = pending_responses.remove(&next_sequence) {
                                         write_queue.push_back(resp_data);
                                         next_sequence += 1;
+                                        moved += 1;
+                                        responses_queued += 1;
+                                    }
+                                    if moved > 0 {
+                                        tracing::info!(
+                                            "[SOCKET WRITER {}] Moved {} responses to write queue (queue now {} items)",
+                                            addr, moved, write_queue.len()
+                                        );
                                     }
                                 }
 
                                 // Try to write when socket is ready (NON-BLOCKING - no deadlock!)
                                 Ok(()) = socket_writer.writable(), if current_write.is_some() || !write_queue.is_empty() => {
+                                    socket_writable_count += 1;
+                                    tracing::info!(
+                                        "[SOCKET WRITER {}] Socket writable #{} (queue={}, current_write={})",
+                                        addr, socket_writable_count, write_queue.len(), current_write.is_some()
+                                    );
                                     // Get buffer to write (either partial write or next from queue)
                                     let (buffer, offset) = if let Some((buf, off)) = current_write.take() {
                                         (buf, off)
@@ -1216,19 +1312,37 @@ impl IntegratedKafkaServer {
                                     // Non-blocking write (may write partial data)
                                     match socket_writer.try_write(&buffer[offset..]) {
                                         Ok(n) => {
+                                            bytes_written_total += n as u64;
                                             let new_offset = offset + n;
+                                            tracing::info!(
+                                                "[SOCKET WRITER {}] Wrote {} bytes (offset {} -> {}, buffer_size={}, total_written={})",
+                                                addr, n, offset, new_offset, buffer.len(), bytes_written_total
+                                            );
                                             if new_offset < buffer.len() {
                                                 // Partial write - save state for next iteration
+                                                tracing::info!(
+                                                    "[SOCKET WRITER {}] Partial write, {} bytes remaining",
+                                                    addr, buffer.len() - new_offset
+                                                );
                                                 current_write = Some((buffer, new_offset));
+                                            } else {
+                                                tracing::info!(
+                                                    "[SOCKET WRITER {}] Complete write, buffer done",
+                                                    addr
+                                                );
                                             }
                                             // else: complete write, buffer dropped
                                         }
                                         Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
                                             // Socket not ready yet, save state and wait
+                                            tracing::warn!(
+                                                "[SOCKET WRITER {}] WouldBlock on write (buffer={}, offset={})",
+                                                addr, buffer.len(), offset
+                                            );
                                             current_write = Some((buffer, offset));
                                         }
                                         Err(e) => {
-                                            error!("Socket write error: {}", e);
+                                            error!("[SOCKET WRITER {}] Socket write error: {}", addr, e);
                                             return;
                                         }
                                     }

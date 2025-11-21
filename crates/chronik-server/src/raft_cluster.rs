@@ -425,37 +425,39 @@ impl RaftCluster {
         tracing::info!("✓ Completed gRPC connection pre-warming");
     }
 
-    /// Get partition replicas (nodes that should replicate this partition)
-    pub fn get_partition_replicas(&self, topic: &str, partition: i32) -> Option<Vec<u64>> {
-        let sm = self.state_machine.load();
-        sm.get_partition_replicas(topic, partition)
+    // ============================================================================
+    // v2.2.9 Option 4: DEPRECATED - Partition metadata now in WalMetadataStore
+    // ============================================================================
+    // These methods are kept as stubs for backward compatibility but return
+    // empty/None since partition metadata is no longer in Raft state machine.
+    // Callers should use WalMetadataStore instead.
+    // ============================================================================
+
+    /// Get partition replicas (DEPRECATED - use WalMetadataStore)
+    pub fn get_partition_replicas(&self, _topic: &str, _partition: i32) -> Option<Vec<u64>> {
+        None  // v2.2.9: Partition metadata moved to WalMetadataStore
     }
 
-    /// Get partition leader (node ID that's the leader for this partition)
-    pub fn get_partition_leader(&self, topic: &str, partition: i32) -> Option<u64> {
-        let sm = self.state_machine.load();
-        sm.get_partition_leader(topic, partition)
+    /// Get partition leader (DEPRECATED - use WalMetadataStore)
+    pub fn get_partition_leader(&self, _topic: &str, _partition: i32) -> Option<u64> {
+        None  // v2.2.9: Partition metadata moved to WalMetadataStore
     }
 
-    /// Get ISR (in-sync replicas) for a partition
-    pub fn get_isr(&self, topic: &str, partition: i32) -> Option<Vec<u64>> {
-        let sm = self.state_machine.load();
-        sm.get_isr(topic, partition)
+    /// Get ISR (in-sync replicas) for a partition (DEPRECATED - use WalMetadataStore)
+    pub fn get_isr(&self, _topic: &str, _partition: i32) -> Option<Vec<u64>> {
+        None  // v2.2.9: Partition metadata moved to WalMetadataStore
     }
 
-    /// Check if a node is in-sync for a partition
-    pub fn is_in_sync(&self, topic: &str, partition: i32, node_id: u64) -> bool {
-        let sm = self.state_machine.load();
-        sm.is_in_sync(topic, partition, node_id)
+    /// Check if a node is in-sync for a partition (DEPRECATED - use WalMetadataStore)
+    pub fn is_in_sync(&self, _topic: &str, _partition: i32, _node_id: u64) -> bool {
+        false  // v2.2.9: Partition metadata moved to WalMetadataStore
     }
 
-    /// Get all partitions where the specified node is the leader
+    /// Get all partitions where the specified node is the leader (DEPRECATED - use WalMetadataStore)
     ///
-    /// Returns a list of (topic, partition) tuples where this node is the leader.
-    /// Used by WAL replication manager to discover which partitions to replicate.
-    pub fn get_partitions_where_leader(&self, node_id: u64) -> Vec<PartitionKey> {
-        let sm = self.state_machine.load();
-        sm.get_partitions_where_leader(node_id)
+    /// Returns empty vec - partition metadata is now in WalMetadataStore.
+    pub fn get_partitions_where_leader(&self, _node_id: u64) -> Vec<PartitionKey> {
+        Vec::new()  // v2.2.9: Partition metadata moved to WalMetadataStore
     }
 
     /// Get all brokers from the Raft state machine
@@ -551,26 +553,28 @@ impl RaftCluster {
 
         // v2.2.7 EVENT-DRIVEN NOTIFICATION: Fire notifications after applying command
         match &cmd {
-            MetadataCommand::CreateTopic { name, .. } => {
-                if let Some((_, notify)) = self.pending_topics.remove(name) {
-                    notify.notify_waiters(); // Wake up ALL waiting threads
-                    tracing::debug!("✓ Notified waiting threads for topic '{}' (single-node mode)", name);
-                }
-            }
+            // v2.2.9 Option 4: Partition metadata moved to WalMetadataStore
+            // MetadataCommand::CreateTopic { name, .. } => {
+            //     if let Some((_, notify)) = self.pending_topics.remove(name) {
+            //         notify.notify_waiters(); // Wake up ALL waiting threads
+            //         tracing::debug!("✓ Notified waiting threads for topic '{}' (single-node mode)", name);
+            //     }
+            // }
             MetadataCommand::RegisterBroker { broker_id, .. } => {
                 if let Some((_, notify)) = self.pending_brokers.remove(broker_id) {
                     notify.notify_waiters();
                     tracing::debug!("✓ Notified waiting threads for broker {} (single-node mode)", broker_id);
                 }
             }
-            MetadataCommand::SetPartitionLeader { topic, partition, .. } => {
-                // v2.2.7 EVENT-DRIVEN NOTIFICATION (P1): Notify followers waiting for partition metadata
-                let key = format!("{}:{}", topic, partition);
-                if let Some((_, notify)) = self.pending_partitions.remove(&key) {
-                    notify.notify_waiters();
-                    tracing::debug!("✓ Notified waiting threads for partition '{}' (single-node mode)", key);
-                }
-            }
+            // v2.2.9 Option 4: Partition metadata moved to WalMetadataStore
+            // MetadataCommand::SetPartitionLeader { topic, partition, .. } => {
+            //     // v2.2.7 EVENT-DRIVEN NOTIFICATION (P1): Notify followers waiting for partition metadata
+            //     let key = format!("{}:{}", topic, partition);
+            //     if let Some((_, notify)) = self.pending_partitions.remove(&key) {
+            //         notify.notify_waiters();
+            //         tracing::debug!("✓ Notified waiting threads for partition '{}' (single-node mode)", key);
+            //     }
+            // }
             _ => {} // Other commands don't need notifications yet
         }
 
@@ -661,53 +665,58 @@ impl RaftCluster {
         partition: i32,
         replicas: Vec<u64>,
     ) -> Result<()> {
-        // Single-node fast path: apply immediately (no waiting needed)
-        if self.is_single_node() {
-            let cmd = MetadataCommand::AssignPartition {
-                topic: topic.clone(),
-                partition,
-                replicas,
-            };
-            return self.apply_immediately(cmd).await;
-        }
+        // v2.2.9 Option 4: Partition metadata moved to WalMetadataStore
+        // This function is no longer needed - partition assignments handled by WalMetadataStore
+        tracing::warn!("propose_partition_assignment_and_wait called but partition metadata now in WalMetadataStore");
+        return Ok(());
 
-        // Multi-node: register notification BEFORE proposing
-        let key = format!("{}:{}", topic, partition);
-        let notify = Arc::new(Notify::new());
-        self.pending_partitions.insert(key.clone(), notify.clone());
+        // // Single-node fast path: apply immediately (no waiting needed)
+        // if self.is_single_node() {
+        //     let cmd = MetadataCommand::AssignPartition {
+        //         topic: topic.clone(),
+        //         partition,
+        //         replicas,
+        //     };
+        //     return self.apply_immediately(cmd).await;
+        // }
 
-        tracing::info!("🔔 Registered wait notification for partition assignment '{}'", key);
+        // // Multi-node: register notification BEFORE proposing
+        // let key = format!("{}:{}", topic, partition);
+        // let notify = Arc::new(Notify::new());
+        // self.pending_partitions.insert(key.clone(), notify.clone());
 
-        // Propose command via Raft
-        let cmd = MetadataCommand::AssignPartition {
-            topic: topic.clone(),
-            partition,
-            replicas,
-        };
+        // tracing::info!("🔔 Registered wait notification for partition assignment '{}'", key);
 
-        if let Err(e) = self.propose_via_raft(cmd).await {
-            // Cleanup notification on failure
-            self.pending_partitions.remove(&key);
-            return Err(e);
-        }
+        // // Propose command via Raft
+        // let cmd = MetadataCommand::AssignPartition {
+        //     topic: topic.clone(),
+        //     partition,
+        //     replicas,
+        // };
 
-        tracing::info!("⏳ Waiting for partition assignment '{}' to be committed...", key);
+        // if let Err(e) = self.propose_via_raft(cmd).await {
+        //     // Cleanup notification on failure
+        //     self.pending_partitions.remove(&key);
+        //     return Err(e);
+        // }
 
-        // Wait for notification (with timeout)
-        tokio::select! {
-            _ = notify.notified() => {
-                tracing::info!("✅ Partition assignment '{}' committed and applied!", key);
-                Ok(())
-            }
-            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
-                // Cleanup on timeout
-                self.pending_partitions.remove(&key);
-                Err(anyhow::anyhow!(
-                    "Timeout waiting for partition assignment '{}' to be committed (waited 5s)",
-                    key
-                ))
-            }
-        }
+        // tracing::info!("⏳ Waiting for partition assignment '{}' to be committed...", key);
+
+        // // Wait for notification (with timeout)
+        // tokio::select! {
+        //     _ = notify.notified() => {
+        //         tracing::info!("✅ Partition assignment '{}' committed and applied!", key);
+        //         Ok(())
+        //     }
+        //     _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+        //         // Cleanup on timeout
+        //         self.pending_partitions.remove(&key);
+        //         Err(anyhow::anyhow!(
+        //             "Timeout waiting for partition assignment '{}' to be committed (waited 5s)",
+        //             key
+        //         ))
+        //     }
+        // }
     }
 
     /// Propose adding a new node to the cluster (Priority 2: Zero-Downtime Node Addition)
@@ -937,78 +946,84 @@ impl RaftCluster {
     /// This method finds all partitions where the target node is a replica
     /// and proposes new partition assignments excluding that node.
     async fn reassign_partitions_from_node(&self, node_id: u64) -> Result<()> {
-        // Load current state
-        let partitions_to_reassign = {
-            let sm = self.state_machine.load();
+        // v2.2.9 Option 4: Partition metadata moved to WalMetadataStore
+        // Partition reassignment now handled by WalMetadataStore
+        tracing::warn!("reassign_partitions_from_node called but partition metadata now in WalMetadataStore");
+        return Ok(());
 
-            let mut partitions = Vec::new();
+        // // Load current state
+        // let partitions_to_reassign = {
+        //     let sm = self.state_machine.load();
 
-            // Find all partitions where node_id is a replica
-            for ((topic, partition), replicas) in &sm.partition_assignments {
-                if replicas.contains(&node_id) {
-                    partitions.push((topic.clone(), *partition, replicas.clone()));
-                }
-            }
+        //     let mut partitions = Vec::new();
 
-            partitions
-        };
+        //     // Find all partitions where node_id is a replica
+        //     for ((topic, partition), replicas) in &sm.partition_assignments {
+        //         if replicas.contains(&node_id) {
+        //             partitions.push((topic.clone(), *partition, replicas.clone()));
+        //         }
+        //     }
 
-        if partitions_to_reassign.is_empty() {
-            tracing::info!("No partitions assigned to node {}, nothing to reassign", node_id);
-            return Ok(());
-        }
+        //     partitions
+        // };
 
-        tracing::info!(
-            "Reassigning {} partitions away from node {}",
-            partitions_to_reassign.len(),
-            node_id
-        );
+        // if partitions_to_reassign.is_empty() {
+        //     tracing::info!("No partitions assigned to node {}, nothing to reassign", node_id);
+        //     return Ok(());
+        // }
 
-        // Get all nodes except the one being removed
-        let available_nodes: Vec<u64> = self.get_all_nodes().await
-            .into_iter()
-            .filter(|&id| id != node_id)
-            .collect();
+        // tracing::info!(
+        //     "Reassigning {} partitions away from node {}",
+        //     partitions_to_reassign.len(),
+        //     node_id
+        // );
 
-        if available_nodes.is_empty() {
-            return Err(anyhow::anyhow!(
-                "Cannot reassign partitions: no other nodes available"
-            ));
-        }
+        // // Get all nodes except the one being removed
+        // let available_nodes: Vec<u64> = self.get_all_nodes().await
+        //     .into_iter()
+        //     .filter(|&id| id != node_id)
+        //     .collect();
 
-        // For each partition, create new replica set without node_id
-        for (topic, partition, old_replicas) in partitions_to_reassign {
-            let mut new_replicas: Vec<u64> = old_replicas
-                .into_iter()
-                .filter(|&id| id != node_id)
-                .collect();
+        // if available_nodes.is_empty() {
+        //     return Err(anyhow::anyhow!(
+        //         "Cannot reassign partitions: no other nodes available"
+        //     ));
+        // }
 
-            // If we removed a replica, add a new one from available nodes
-            // to maintain replication factor
-            if new_replicas.len() < 3 && !available_nodes.is_empty() {
-                // Find a node not already in new_replicas
-                for &candidate in &available_nodes {
-                    if !new_replicas.contains(&candidate) {
-                        new_replicas.push(candidate);
-                        break;
-                    }
-                }
-            }
+        // // For each partition, create new replica set without node_id
+        // for (topic, partition, old_replicas) in partitions_to_reassign {
+        //     let mut new_replicas: Vec<u64> = old_replicas
+        //         .into_iter()
+        //         .filter(|&id| id != node_id)
+        //         .collect();
 
-            tracing::info!(
-                "Reassigning partition {}-{}: removing node {}, new replicas: {:?}",
-                topic, partition, node_id, new_replicas
-            );
+        //     // If we removed a replica, add a new one from available nodes
+        //     // to maintain replication factor
+        //     if new_replicas.len() < 3 && !available_nodes.is_empty() {
+        //         // Find a node not already in new_replicas
+        //         for &candidate in &available_nodes {
+        //             if !new_replicas.contains(&candidate) {
+        //                 new_replicas.push(candidate);
+        //                 break;
+        //             }
+        //         }
+        //     }
 
-            // Propose new partition assignment
-            let cmd = crate::raft_metadata::MetadataCommand::AssignPartition {
-                topic: topic.clone(),
-                partition,
-                replicas: new_replicas,
-            };
+            // tracing::info!(
+            //     "Reassigning partition {}-{}: removing node {}, new replicas: {:?}",
+            //     topic, partition, node_id, new_replicas
+            // );
 
-            self.propose(cmd).await?;
-        }
+            // // v2.2.9 Option 4: Partition metadata moved to WalMetadataStore
+            // // Propose new partition assignment
+            // let cmd = crate::raft_metadata::MetadataCommand::AssignPartition {
+            //     topic: topic.clone(),
+            //     partition,
+            //     replicas: new_replicas,
+            // };
+
+            // self.propose(cmd).await?;
+        // }
 
         Ok(())
     }
@@ -1068,35 +1083,37 @@ impl RaftCluster {
 
                 // v2.2.7 EVENT-DRIVEN NOTIFICATION: Fire notifications after applying command
                 match &cmd {
-                    MetadataCommand::CreateTopic { name, .. } => {
-                        if let Some((_, notify)) = self.pending_topics.remove(name) {
-                            notify.notify_waiters(); // Wake up ALL waiting threads
-                            tracing::debug!("✓ Notified waiting threads for topic '{}'", name);
-                        }
-                    }
+                    // v2.2.9 Option 4: Partition metadata moved to WalMetadataStore
+                    // MetadataCommand::CreateTopic { name, .. } => {
+                    //     if let Some((_, notify)) = self.pending_topics.remove(name) {
+                    //         notify.notify_waiters(); // Wake up ALL waiting threads
+                    //         tracing::debug!("✓ Notified waiting threads for topic '{}'", name);
+                    //     }
+                    // }
                     MetadataCommand::RegisterBroker { broker_id, .. } => {
                         if let Some((_, notify)) = self.pending_brokers.remove(broker_id) {
                             notify.notify_waiters();
                             tracing::debug!("✓ Notified waiting threads for broker {}", broker_id);
                         }
                     }
-                    MetadataCommand::SetPartitionLeader { topic, partition, .. } => {
-                        // v2.2.7 EVENT-DRIVEN NOTIFICATION (P1): Notify followers waiting for partition metadata
-                        let key = format!("{}:{}", topic, partition);
-                        if let Some((_, notify)) = self.pending_partitions.remove(&key) {
-                            notify.notify_waiters();
-                            tracing::debug!("✓ Notified waiting threads for partition '{}'", key);
-                        }
-                    }
-                    MetadataCommand::AssignPartition { topic, partition, .. } => {
-                        // RACE CONDITION FIX: Notify waiting threads for partition assignment
-                        // This ensures produce_handler waits for Raft commit before returning
-                        let key = format!("{}:{}", topic, partition);
-                        if let Some((_, notify)) = self.pending_partitions.remove(&key) {
-                            notify.notify_waiters();
-                            tracing::debug!("✓ Notified waiting threads for partition assignment '{}'", key);
-                        }
-                    }
+                    // v2.2.9 Option 4: Partition metadata moved to WalMetadataStore
+                    // MetadataCommand::SetPartitionLeader { topic, partition, .. } => {
+                    //     // v2.2.7 EVENT-DRIVEN NOTIFICATION (P1): Notify followers waiting for partition metadata
+                    //     let key = format!("{}:{}", topic, partition);
+                    //     if let Some((_, notify)) = self.pending_partitions.remove(&key) {
+                    //         notify.notify_waiters();
+                    //         tracing::debug!("✓ Notified waiting threads for partition '{}'", key);
+                    //     }
+                    // }
+                    // MetadataCommand::AssignPartition { topic, partition, .. } => {
+                    //     // RACE CONDITION FIX: Notify waiting threads for partition assignment
+                    //     // This ensures produce_handler waits for Raft commit before returning
+                    //     let key = format!("{}:{}", topic, partition);
+                    //     if let Some((_, notify)) = self.pending_partitions.remove(&key) {
+                    //         notify.notify_waiters();
+                    //         tracing::debug!("✓ Notified waiting threads for partition assignment '{}'", key);
+                    //     }
+                    // }
                     _ => {} // Other commands don't need notifications yet
                 }
 
@@ -1133,8 +1150,12 @@ impl RaftCluster {
     ///
     /// Returns a list of (topic, partition) tuples for all known partitions.
     pub fn list_all_partitions(&self) -> Vec<(String, i32)> {
-        let sm = self.state_machine.load();
-        sm.partition_assignments.keys().cloned().collect()
+        // v2.2.9 Option 4: Partition metadata moved to WalMetadataStore
+        // Return empty list - partitions now tracked in WalMetadataStore
+        Vec::new()
+
+        // let sm = self.state_machine.load();
+        // sm.partition_assignments.keys().cloned().collect()
     }
 
     /// Get all nodes currently in the cluster (voting members)
@@ -1170,27 +1191,31 @@ impl RaftCluster {
     /// # Returns
     /// Vector of PartitionInfo with topic, partition, leader, replicas, and ISR
     pub fn get_all_partition_info(&self) -> Vec<crate::admin_api::PartitionInfo> {
-        let sm = self.state_machine.load();
+        // v2.2.9 Option 4: Partition metadata moved to WalMetadataStore
+        // Return empty list - partitions now tracked in WalMetadataStore
+        Vec::new()
 
-        let mut partitions = Vec::new();
+        // let sm = self.state_machine.load();
 
-        // Collect all unique partition keys from assignments
-        for ((topic, partition), replicas) in &sm.partition_assignments {
-            let leader = sm.partition_leaders.get(&(topic.clone(), *partition)).copied();
-            let isr = sm.isr_sets.get(&(topic.clone(), *partition))
-                .cloned()
-                .unwrap_or_default();
+        // let mut partitions = Vec::new();
 
-            partitions.push(crate::admin_api::PartitionInfo {
-                topic: topic.clone(),
-                partition: *partition,
-                leader,
-                replicas: replicas.clone(),
-                isr,
-            });
-        }
+        // // Collect all unique partition keys from assignments
+        // for ((topic, partition), replicas) in &sm.partition_assignments {
+        //     let leader = sm.partition_leaders.get(&(topic.clone(), *partition)).copied();
+        //     let isr = sm.isr_sets.get(&(topic.clone(), *partition))
+        //         .cloned()
+        //         .unwrap_or_default();
 
-        partitions
+        //     partitions.push(crate::admin_api::PartitionInfo {
+        //         topic: topic.clone(),
+        //         partition: *partition,
+        //         leader,
+        //         replicas: replicas.clone(),
+        //         isr,
+        //     });
+        // }
+
+        // partitions
     }
 
     /// Propose a partition leader change
@@ -1202,13 +1227,18 @@ impl RaftCluster {
         partition: i32,
         leader: u64,
     ) -> Result<()> {
-        let cmd = MetadataCommand::SetPartitionLeader {
-            topic: topic.to_string(),
-            partition,
-            leader,
-        };
+        // v2.2.9 Option 4: Partition metadata moved to WalMetadataStore
+        // This function is no longer needed - partition leaders handled by WalMetadataStore
+        tracing::warn!("propose_set_partition_leader called but partition metadata now in WalMetadataStore");
+        Ok(())
 
-        self.propose(cmd).await
+        // let cmd = MetadataCommand::SetPartitionLeader {
+        //     topic: topic.to_string(),
+        //     partition,
+        //     leader,
+        // };
+
+        // self.propose(cmd).await
     }
 
     /// Check if THIS node is the Raft leader
@@ -1370,29 +1400,25 @@ impl RaftCluster {
         let state = self.state_machine.load();
 
         match query {
-            MetadataQuery::GetTopic { name } => {
-                let topic = state.topics.get(&name).map(|t| {
-                    chronik_common::metadata::TopicMetadata {
-                        id: uuid::Uuid::new_v4(), // Generate UUID (not stored in state machine)
-                        name: t.name.clone(),
-                        config: t.config.clone(),
-                        created_at: chrono::Utc::now(), // Not stored in state machine
-                        updated_at: chrono::Utc::now(),
-                    }
-                });
-                Ok(MetadataQueryResponse::Topic(topic))
+            // v2.2.9 Option 4: Partition metadata moved to WalMetadataStore
+            MetadataQuery::GetTopic { name: _ } => {
+                // Return None - topics now tracked in WalMetadataStore
+                Ok(MetadataQueryResponse::Topic(None))
             }
+            // v2.2.9 Option 4: Partition metadata moved to WalMetadataStore
             MetadataQuery::ListTopics => {
-                let topics: Vec<_> = state.topics.values().map(|t| {
-                    chronik_common::metadata::TopicMetadata {
-                        id: uuid::Uuid::new_v4(),
-                        name: t.name.clone(),
-                        config: t.config.clone(),
-                        created_at: chrono::Utc::now(),
-                        updated_at: chrono::Utc::now(),
-                    }
-                }).collect();
-                Ok(MetadataQueryResponse::TopicList(topics))
+                // Return empty list - topics now tracked in WalMetadataStore
+                Ok(MetadataQueryResponse::TopicList(Vec::new()))
+                // let topics: Vec<_> = state.topics.values().map(|t| {
+                //     chronik_common::metadata::TopicMetadata {
+                //         id: uuid::Uuid::new_v4(),
+                //         name: t.name.clone(),
+                //         config: t.config.clone(),
+                //         created_at: chrono::Utc::now(),
+                //         updated_at: chrono::Utc::now(),
+                //     }
+                // }).collect();
+                // Ok(MetadataQueryResponse::TopicList(topics))
             }
             MetadataQuery::GetBroker { broker_id } => {
                 let broker = state.brokers.get(&broker_id).map(|b| {
@@ -1422,36 +1448,45 @@ impl RaftCluster {
                 }).collect();
                 Ok(MetadataQueryResponse::BrokerList(brokers))
             }
-            MetadataQuery::GetPartitionAssignment { topic, partition } => {
-                let key = (topic.clone(), partition);
-                let replicas = state.partition_assignments.get(&key);
-                let leader = state.partition_leaders.get(&key).copied();
+            // v2.2.9 Option 4: Partition metadata moved to WalMetadataStore
+            MetadataQuery::GetPartitionAssignment { topic: _, partition: _ } => {
+                // Return None - partition assignments now tracked in WalMetadataStore
+                Ok(MetadataQueryResponse::PartitionAssignment(None))
+                // let key = (topic.clone(), partition);
+                // let replicas = state.partition_assignments.get(&key);
+                // let leader = state.partition_leaders.get(&key).copied();
 
-                let assignment = replicas.and_then(|replicas_vec| {
-                    leader.map(|leader_node_id| {
-                        chronik_common::metadata::PartitionAssignment {
-                            topic,
-                            partition: partition as u32,
-                            broker_id: leader_node_id as i32,
-                            is_leader: true,
-                            replicas: replicas_vec.clone(),
-                            leader_id: leader_node_id as u64,
-                        }
-                    })
-                });
+                // let assignment = replicas.and_then(|replicas_vec| {
+                //     leader.map(|leader_node_id| {
+                //         chronik_common::metadata::PartitionAssignment {
+                //             topic,
+                //             partition: partition as u32,
+                //             broker_id: leader_node_id as i32,
+                //             is_leader: true,
+                //             replicas: replicas_vec.clone(),
+                //             leader_id: leader_node_id as u64,
+                //         }
+                //     })
+                // });
 
-                Ok(MetadataQueryResponse::PartitionAssignment(assignment))
+                // Ok(MetadataQueryResponse::PartitionAssignment(assignment))
             }
-            MetadataQuery::GetHighWatermark { topic, partition } => {
-                let key = (topic, partition);
-                let hw = state.partition_high_watermarks.get(&key).copied().unwrap_or(0);
-                Ok(MetadataQueryResponse::HighWatermark(hw))
+            // v2.2.9 Option 4: Partition metadata moved to WalMetadataStore
+            MetadataQuery::GetHighWatermark { topic: _, partition: _ } => {
+                // Return 0 - high watermarks now tracked in WalMetadataStore
+                Ok(MetadataQueryResponse::HighWatermark(0))
+                // let key = (topic, partition);
+                // let hw = state.partition_high_watermarks.get(&key).copied().unwrap_or(0);
+                // Ok(MetadataQueryResponse::HighWatermark(hw))
             }
-            MetadataQuery::GetPartitionCount { topic } => {
-                let count = state.topics.get(&topic)
-                    .map(|t| t.config.partition_count as i32)
-                    .unwrap_or(0);
-                Ok(MetadataQueryResponse::PartitionCount(count))
+            // v2.2.9 Option 4: Partition metadata moved to WalMetadataStore
+            MetadataQuery::GetPartitionCount { topic: _ } => {
+                // Return 0 - partition counts now tracked in WalMetadataStore
+                Ok(MetadataQueryResponse::PartitionCount(0))
+                // let count = state.topics.get(&topic)
+                //     .map(|t| t.config.partition_count as i32)
+                //     .unwrap_or(0);
+                // Ok(MetadataQueryResponse::PartitionCount(count))
             }
         }
     }
@@ -1578,13 +1613,15 @@ impl RaftCluster {
 
         // Convert MetadataWriteCommand to MetadataCommand and propose via Raft
         let raft_command = match command {
-            MetadataWriteCommand::CreateTopic { name, partition_count, replication_factor, config } => {
-                MetadataCommand::CreateTopic {
-                    name,
-                    partition_count: partition_count as u32,  // Convert i32 to u32
-                    replication_factor: replication_factor as u32,  // Convert i32 to u32
-                    config,
-                }
+            // v2.2.9 Option 4: Partition metadata moved to WalMetadataStore
+            MetadataWriteCommand::CreateTopic { name: _, partition_count: _, replication_factor: _, config: _ } => {
+                return Err(anyhow::anyhow!("CreateTopic: partition metadata now in WalMetadataStore"));
+                // MetadataCommand::CreateTopic {
+                //     name,
+                //     partition_count: partition_count as u32,  // Convert i32 to u32
+                //     replication_factor: replication_factor as u32,  // Convert i32 to u32
+                //     config,
+                // }
             }
             MetadataWriteCommand::RegisterBroker { broker_id, host, port, rack } => {
                 MetadataCommand::RegisterBroker {
@@ -1594,46 +1631,58 @@ impl RaftCluster {
                     rack,
                 }
             }
-            MetadataWriteCommand::SetPartitionLeader { topic, partition, leader_id } => {
-                MetadataCommand::SetPartitionLeader {
-                    topic,
-                    partition,  // Already i32
-                    leader: leader_id,
-                }
+            // v2.2.9 Option 4: Partition metadata moved to WalMetadataStore
+            MetadataWriteCommand::SetPartitionLeader { topic: _, partition: _, leader_id: _ } => {
+                return Err(anyhow::anyhow!("SetPartitionLeader: partition metadata now in WalMetadataStore"));
+                // MetadataCommand::SetPartitionLeader {
+                //     topic,
+                //     partition,  // Already i32
+                //     leader: leader_id,
+                // }
             }
-            MetadataWriteCommand::UpdateHighWatermark { topic, partition, offset } => {
-                MetadataCommand::UpdatePartitionOffset {
-                    topic,
-                    partition: partition as u32,  // Convert i32 to u32
-                    high_watermark: offset,
-                    log_start_offset: 0, // Not provided in write command
-                }
+            // v2.2.9 Option 4: Partition metadata moved to WalMetadataStore
+            MetadataWriteCommand::UpdateHighWatermark { topic: _, partition: _, offset: _ } => {
+                return Err(anyhow::anyhow!("UpdateHighWatermark: partition metadata now in WalMetadataStore"));
+                // MetadataCommand::UpdatePartitionOffset {
+                //     topic,
+                //     partition: partition as u32,  // Convert i32 to u32
+                //     high_watermark: offset,
+                //     log_start_offset: 0, // Not provided in write command
+                // }
             }
-            MetadataWriteCommand::CreateConsumerGroup { group_id, protocol_type, protocol } => {
-                MetadataCommand::CreateConsumerGroup {
-                    group_id,
-                    protocol_type,
-                    protocol,
-                }
+            // v2.2.9 Option 4: Consumer groups moved to WalMetadataStore
+            MetadataWriteCommand::CreateConsumerGroup { group_id: _, protocol_type: _, protocol: _ } => {
+                return Err(anyhow::anyhow!("CreateConsumerGroup: consumer group metadata now in WalMetadataStore"));
+                // MetadataCommand::CreateConsumerGroup {
+                //     group_id,
+                //     protocol_type,
+                //     protocol,
+                // }
             }
-            MetadataWriteCommand::DeleteTopic { name } => {
-                MetadataCommand::DeleteTopic { name }
+            // v2.2.9 Option 4: Partition metadata moved to WalMetadataStore
+            MetadataWriteCommand::DeleteTopic { name: _ } => {
+                return Err(anyhow::anyhow!("DeleteTopic: partition metadata now in WalMetadataStore"));
+                // MetadataCommand::DeleteTopic { name }
             }
-            MetadataWriteCommand::CommitOffset { group_id, topic, partition, offset } => {
-                MetadataCommand::CommitOffset {
-                    group_id,
-                    topic,
-                    partition: partition as u32,
-                    offset,
-                    metadata: None,  // RPC doesn't carry metadata
-                }
+            // v2.2.9 Option 4: Consumer groups moved to WalMetadataStore
+            MetadataWriteCommand::CommitOffset { group_id: _, topic: _, partition: _, offset: _ } => {
+                return Err(anyhow::anyhow!("CommitOffset: consumer group metadata now in WalMetadataStore"));
+                // MetadataCommand::CommitOffset {
+                //     group_id,
+                //     topic,
+                //     partition: partition as u32,
+                //     offset,
+                //     metadata: None,  // RPC doesn't carry metadata
+                // }
             }
-            MetadataWriteCommand::AssignPartition { topic, partition, replicas } => {
-                MetadataCommand::AssignPartition {
-                    topic,
-                    partition,
-                    replicas,
-                }
+            // v2.2.9 Option 4: Partition metadata moved to WalMetadataStore
+            MetadataWriteCommand::AssignPartition { topic: _, partition: _, replicas: _ } => {
+                return Err(anyhow::anyhow!("AssignPartition: partition metadata now in WalMetadataStore"));
+                // MetadataCommand::AssignPartition {
+                //     topic,
+                //     partition,
+                //     replicas,
+                // }
             }
             MetadataWriteCommand::UpdateBrokerStatus { broker_id, status } => {
                 MetadataCommand::UpdateBrokerStatus {
@@ -1641,21 +1690,25 @@ impl RaftCluster {
                     status,
                 }
             }
-            MetadataWriteCommand::UpdateConsumerGroup { group_id, state, generation_id, leader } => {
-                MetadataCommand::UpdateConsumerGroup {
-                    group_id,
-                    state,
-                    generation_id,
-                    leader: leader.unwrap_or_default(),  // Unwrap Option<String> to String
-                }
+            // v2.2.9 Option 4: Consumer groups moved to WalMetadataStore
+            MetadataWriteCommand::UpdateConsumerGroup { group_id: _, state: _, generation_id: _, leader: _ } => {
+                return Err(anyhow::anyhow!("UpdateConsumerGroup: consumer group metadata now in WalMetadataStore"));
+                // MetadataCommand::UpdateConsumerGroup {
+                //     group_id,
+                //     state,
+                //     generation_id,
+                //     leader: leader.unwrap_or_default(),  // Unwrap Option<String> to String
+                // }
             }
-            MetadataWriteCommand::UpdatePartitionOffset { topic, partition, high_watermark, log_start_offset } => {
-                MetadataCommand::UpdatePartitionOffset {
-                    topic,
-                    partition,
-                    high_watermark,
-                    log_start_offset,
-                }
+            // v2.2.9 Option 4: Partition metadata moved to WalMetadataStore
+            MetadataWriteCommand::UpdatePartitionOffset { topic: _, partition: _, high_watermark: _, log_start_offset: _ } => {
+                return Err(anyhow::anyhow!("UpdatePartitionOffset: partition metadata now in WalMetadataStore"));
+                // MetadataCommand::UpdatePartitionOffset {
+                //     topic,
+                //     partition,
+                //     high_watermark,
+                //     log_start_offset,
+                // }
             }
         };
 

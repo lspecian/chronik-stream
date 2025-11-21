@@ -29,7 +29,6 @@ use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, warn};
 
 use crate::raft_cluster::RaftCluster;
-use crate::raft_metadata::MetadataCommand;
 use chronik_common::metadata::MetadataStore;
 
 /// Partition Rebalancer
@@ -194,25 +193,32 @@ impl PartitionRebalancer {
         let new_assignments =
             self.calculate_assignments(partition_count, nodes, self.replication_factor);
 
-        // Propose new assignments via Raft
+        // Assign partitions via metadata_store (WAL-based, not Raft - Option 4 / Phase 4)
         for (partition, new_replicas) in new_assignments {
-            let cmd = MetadataCommand::AssignPartition {
+            use chronik_common::metadata::PartitionAssignment;
+
+            let leader_id = new_replicas.first().copied().unwrap_or(0);
+
+            let assignment = PartitionAssignment {
                 topic: topic.to_string(),
-                partition,
+                partition: partition as u32,
+                broker_id: leader_id as i32, // Deprecated field
+                is_leader: true, // Deprecated field
                 replicas: new_replicas.clone(),
+                leader_id,
             };
 
-            self.raft_cluster
-                .propose(cmd)
+            self.metadata_store
+                .assign_partition(assignment)
                 .await
                 .context(format!(
-                    "Failed to propose assignment for {}-{}",
+                    "Failed to assign partition {}-{}",
                     topic, partition
                 ))?;
 
             debug!(
-                "Proposed new assignment for {}-{}: {:?}",
-                topic, partition, new_replicas
+                "Assigned partition {}-{}: replicas={:?}, leader={}",
+                topic, partition, new_replicas, leader_id
             );
         }
 
