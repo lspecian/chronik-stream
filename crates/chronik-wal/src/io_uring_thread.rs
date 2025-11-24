@@ -128,8 +128,12 @@ impl IoUringThreadHandle {
 async fn run_io_uring_loop(cmd_rx: Receiver<IoUringCommand>) -> Result<()> {
     use tokio_uring::fs::File;
     use std::collections::HashMap;
+    use std::time::Duration;
+    use crossbeam::channel::RecvTimeoutError;
 
     let mut files: HashMap<String, File> = HashMap::new();
+    // Track current file offset for append-mode WAL writes
+    let mut file_offsets: HashMap<String, u64> = HashMap::new();
 
     // Set WAL I/O priority in this thread
     if let Err(e) = crate::io_priority::set_wal_priority() {
@@ -137,76 +141,129 @@ async fn run_io_uring_loop(cmd_rx: Receiver<IoUringCommand>) -> Result<()> {
     }
 
     loop {
-        // Receive command from main tokio thread (blocking)
-        let cmd = match cmd_rx.recv() {
+        // BATCHED PARALLEL FSYNC: Drain all pending commands and process Sync operations in parallel
+
+        // Step 1: Get first command (with timeout for async progress)
+        let first_cmd = match cmd_rx.recv_timeout(Duration::from_millis(1)) {
             Ok(cmd) => cmd,
-            Err(_) => {
+            Err(RecvTimeoutError::Timeout) => {
+                // Timeout - continue loop to allow async ops to progress
+                continue;
+            }
+            Err(RecvTimeoutError::Disconnected) => {
                 info!("Command channel closed, shutting down io_uring thread");
                 break;
             }
         };
 
-        match cmd {
-            IoUringCommand::Write { partition_key, data, response } => {
-                let result = match files.get_mut(&partition_key) {
-                    Some(file) => {
-                        // Convert Bytes to Vec<u8> for io_uring's IoBuf
-                        let buf = data.to_vec();
-                        let mut offset = 0u64;
-                        let mut remaining = buf;
+        // Step 2: Drain all additional pending commands (non-blocking)
+        let mut all_cmds = vec![first_cmd];
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            all_cmds.push(cmd);
+        }
 
-                        loop {
-                            let (res, buf_back) = file.write_at(remaining, offset).await;
-                            match res {
-                                Ok(n) if n > 0 => {
-                                    offset += n as u64;
-                                    if n == buf_back.len() {
-                                        break Ok(());
+        // Step 3: Separate Sync commands from others
+        let mut sync_cmds = Vec::new();
+        let mut other_cmds = Vec::new();
+
+        for cmd in all_cmds {
+            match cmd {
+                IoUringCommand::Sync { .. } => sync_cmds.push(cmd),
+                _ => other_cmds.push(cmd),
+            }
+        }
+
+        // Step 4: Process all Sync commands in PARALLEL using futures::join_all
+        if !sync_cmds.is_empty() {
+            use futures::future::join_all;
+
+            let sync_futures: Vec<_> = sync_cmds.into_iter().map(|cmd| {
+                if let IoUringCommand::Sync { partition_key, response } = cmd {
+                    let file_ref = files.get(&partition_key);
+                    async move {
+                        let result = match file_ref {
+                            Some(file) => {
+                                file.sync_all().await.map_err(|e| crate::WalError::Io(e))
+                            }
+                            None => {
+                                Err(crate::WalError::IoError(format!("File not found for partition: {}", partition_key)))
+                            }
+                        };
+                        let _ = response.send(result);
+                    }
+                } else {
+                    unreachable!()
+                }
+            }).collect();
+
+            // All fsyncs execute in parallel here!
+            join_all(sync_futures).await;
+        }
+
+        // Step 5: Process other commands sequentially (Write, CreateFile, Shutdown)
+        for cmd in other_cmds {
+            match cmd {
+                IoUringCommand::Write { partition_key, data, response } => {
+                    let result = match files.get_mut(&partition_key) {
+                        Some(file) => {
+                            // Get current file offset (or 0 for new file)
+                            let file_offset = file_offsets.get(&partition_key).copied().unwrap_or(0);
+
+                            // Convert Bytes to Vec<u8> for io_uring's IoBuf
+                            let buf = data.to_vec();
+                            let mut current_offset = file_offset;
+                            let mut remaining = buf;
+
+                            loop {
+                                let (res, buf_back) = file.write_at(remaining, current_offset).await;
+                                match res {
+                                    Ok(n) if n > 0 => {
+                                        current_offset += n as u64;
+                                        if n == buf_back.len() {
+                                            // Success - update tracked offset
+                                            file_offsets.insert(partition_key.clone(), current_offset);
+                                            break Ok(());
+                                        }
+                                        remaining = buf_back[n..].to_vec();
                                     }
-                                    remaining = buf_back[n..].to_vec();
+                                    Ok(_) => break Err(crate::WalError::Io(std::io::Error::new(
+                                        std::io::ErrorKind::WriteZero,
+                                        "failed to write whole buffer"
+                                    ))),
+                                    Err(e) => break Err(crate::WalError::Io(e)),
                                 }
-                                Ok(_) => break Err(crate::WalError::Io(std::io::Error::new(
-                                    std::io::ErrorKind::WriteZero,
-                                    "failed to write whole buffer"
-                                ))),
-                                Err(e) => break Err(crate::WalError::Io(e)),
                             }
                         }
-                    }
-                    None => {
-                        Err(crate::WalError::IoError(format!("File not found for partition: {}", partition_key)))
-                    }
-                };
-                let _ = response.send(result);
-            }
+                        None => {
+                            Err(crate::WalError::IoError(format!("File not found for partition: {}", partition_key)))
+                        }
+                    };
+                    let _ = response.send(result);
+                }
 
-            IoUringCommand::Sync { partition_key, response } => {
-                let result = match files.get(&partition_key) {
-                    Some(file) => {
-                        file.sync_all().await.map_err(|e| crate::WalError::Io(e))
-                    }
-                    None => {
-                        Err(crate::WalError::IoError(format!("File not found for partition: {}", partition_key)))
-                    }
-                };
-                let _ = response.send(result);
-            }
+                IoUringCommand::CreateFile { partition_key, path, response } => {
+                    let result = match File::create(&path).await {
+                        Ok(file) => {
+                            info!("✨ io_uring: Created WAL file for {}: {:?}", partition_key, path);
+                            files.insert(partition_key.clone(), file);
+                            // Initialize offset to 0 for new file
+                            file_offsets.insert(partition_key, 0);
+                            Ok(())
+                        }
+                        Err(e) => Err(crate::WalError::Io(e))
+                    };
+                    let _ = response.send(result);
+                }
 
-            IoUringCommand::CreateFile { partition_key, path, response } => {
-                let result = match File::create(&path).await {
-                    Ok(file) => {
-                        info!("✨ io_uring: Created WAL file for {}: {:?}", partition_key, path);
-                        files.insert(partition_key, file);
-                        Ok(())
-                    }
-                    Err(e) => Err(crate::WalError::Io(e))
-                };
-                let _ = response.send(result);
-            }
+                IoUringCommand::Shutdown => {
+                    info!("Received shutdown command");
+                    break;
+                }
 
-            IoUringCommand::Shutdown => {
-                info!("Received shutdown command");
-                break;
+                IoUringCommand::Sync { .. } => {
+                    // Already processed in parallel batch above
+                    unreachable!("Sync commands should be processed in parallel batch")
+                }
             }
         }
     }

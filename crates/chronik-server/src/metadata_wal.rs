@@ -66,10 +66,39 @@ impl MetadataWal {
 
         info!("Creating metadata WAL at: {}", wal_dir.display());
 
-        // Use GroupCommitWal with default config
-        // Can be overridden via CHRONIK_WAL_PROFILE environment variable
-        // Default: high profile (10K batches, 100ms flush, 50MB buffer)
-        let config = GroupCommitConfig::default();
+        // Use GroupCommitWal with metadata-specific config
+        // CHRONIK_METADATA_WAL_PROFILE overrides for metadata WAL only
+        // CRITICAL: Metadata always defaults to HIGH profile for stability
+        // (prevents regression where changing data WAL profile affected metadata)
+        let config = if let Ok(profile) = std::env::var("CHRONIK_METADATA_WAL_PROFILE") {
+            match profile.to_lowercase().as_str() {
+                "low" | "small" | "container" => {
+                    warn!("Using LOW profile for metadata WAL (not recommended for production)");
+                    GroupCommitConfig::low_resource()
+                }
+                "medium" | "balanced" => {
+                    info!("Using MEDIUM profile for metadata WAL");
+                    GroupCommitConfig::medium_resource()
+                }
+                "high" | "aggressive" | "dedicated" => {
+                    info!("Using HIGH profile for metadata WAL");
+                    GroupCommitConfig::high_resource()
+                }
+                "ultra" | "maximum" | "throughput" => {
+                    info!("Using ULTRA profile for metadata WAL");
+                    GroupCommitConfig::ultra_resource()
+                }
+                _ => {
+                    warn!("Unknown CHRONIK_METADATA_WAL_PROFILE '{}', using HIGH (default)", profile);
+                    GroupCommitConfig::high_resource()
+                }
+            }
+        } else {
+            // Always default to HIGH for metadata (stable critical path)
+            info!("Using HIGH profile for metadata WAL (default for stability)");
+            GroupCommitConfig::high_resource()
+        };
+
         let wal = GroupCommitWal::new(wal_dir.clone(), config);
 
         info!(

@@ -15,6 +15,7 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::RwLock;  // v2.2.10: For interior mutability of commit_callback
 use std::time::{Duration, Instant};
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -31,6 +32,11 @@ use chronik_monitoring::MetricsRecorder;
 use crate::io_uring_thread::IoUringThreadHandle;
 #[cfg(all(target_os = "linux", feature = "async-io"))]
 use std::sync::Arc as StdArc;
+
+/// v2.2.10: Callback invoked after successful batch commit
+/// Enables async response delivery without blocking on WAL fsync
+/// Args: (topic, partition, min_offset, max_offset)
+pub type CommitCallback = Arc<dyn Fn(&str, i32, i64, i64) + Send + Sync>;
 
 /// Unified WAL writer abstraction (either io_uring thread or tokio::fs::File)
 enum WalWriter {
@@ -178,14 +184,15 @@ impl Default for GroupCommitConfig {
                 "high" | "aggressive" | "dedicated" => Self::high_resource(),
                 "ultra" | "maximum" | "throughput" => Self::ultra_resource(),
                 _ => {
-                    warn!("Unknown CHRONIK_WAL_PROFILE '{}', using high profile", profile);
-                    Self::high_resource()
+                    warn!("Unknown CHRONIK_WAL_PROFILE '{}', using low profile (default)", profile);
+                    Self::low_resource()
                 }
             };
         }
 
-        // Default to high profile: good balance of throughput and latency
-        Self::high_resource()
+        // Default to low profile: optimized for low-latency workloads
+        // Note: Metadata WAL always uses HIGH via CHRONIK_METADATA_WAL_PROFILE
+        Self::low_resource()
     }
 }
 
@@ -216,11 +223,11 @@ impl GroupCommitConfig {
     }
 
     /// Low resource profile (containers, small VMs: <= 1 CPU, < 512MB RAM)
-    fn low_resource() -> Self {
+    pub fn low_resource() -> Self {
         Self {
             max_batch_size: 500,            // 500 writes per batch
             max_batch_bytes: 5_000_000,     // 5MB per batch
-            max_wait_time_ms: 20,           // 20ms latency
+            max_wait_time_ms: 2,            // 2ms latency
             max_queue_depth: 2_500,         // 2.5K queue depth
             enable_metrics: true,
             enable_rotation: true,          // Enable S3 archival
@@ -230,7 +237,7 @@ impl GroupCommitConfig {
     }
 
     /// Medium resource profile (typical servers: 2-4 CPUs, 512MB-4GB RAM)
-    fn medium_resource() -> Self {
+    pub fn medium_resource() -> Self {
         Self {
             max_batch_size: 2_000,          // 2K writes per batch
             max_batch_bytes: 15_000_000,    // 15MB per batch
@@ -245,11 +252,11 @@ impl GroupCommitConfig {
 
     /// High resource profile (dedicated servers: 4+ CPUs, 4GB+ RAM)
     /// Default profile: balanced throughput and reduced disk I/O with 100ms batching
-    fn high_resource() -> Self {
+    pub fn high_resource() -> Self {
         Self {
             max_batch_size: 10_000,         // 10K writes per batch
             max_batch_bytes: 50_000_000,    // 50MB per batch
-            max_wait_time_ms: 100,          // 100ms latency (reduce disk I/O)
+            max_wait_time_ms: 50,           // 50ms latency (reduce disk I/O)
             max_queue_depth: 50_000,        // 50K queue depth
             enable_metrics: true,
             enable_rotation: true,          // Enable S3 archival
@@ -261,7 +268,7 @@ impl GroupCommitConfig {
     /// Ultra resource profile (maximum throughput: 16+ CPUs, 16GB+ RAM)
     /// Uses 100ms batching window for massive throughput at cost of higher latency
     /// Trade-off: ~100ms p99 latency for potentially 2-3x higher throughput
-    fn ultra_resource() -> Self {
+    pub fn ultra_resource() -> Self {
         Self {
             max_batch_size: 20_000,         // 20K writes per batch (4x high profile)
             max_batch_bytes: 100_000_000,   // 100MB per batch (4x high profile)
@@ -301,6 +308,13 @@ struct PendingWrite {
 
     /// Channel to notify caller when commit completes
     response_tx: Option<oneshot::Sender<Result<()>>>,
+
+    /// v2.2.10: Metadata for async response callbacks
+    /// Base offset of this batch (for ResponsePipeline notification)
+    base_offset: i64,
+
+    /// Last offset of this batch (for ResponsePipeline notification)
+    last_offset: i64,
 }
 
 /// Per-partition commit queue
@@ -308,8 +322,8 @@ struct PartitionCommitQueue {
     /// Pending writes waiting for commit
     pending: Mutex<VecDeque<PendingWrite>>,
 
-    /// Total bytes in queue (for memory tracking)
-    total_queued_bytes: Mutex<usize>,
+    /// Total bytes in queue (for memory tracking) - CHANGED to AtomicU64 for lock-free updates
+    total_queued_bytes: AtomicU64,
 
     /// File handle for this partition's WAL
     file: Arc<Mutex<WalWriter>>,
@@ -369,6 +383,11 @@ pub struct GroupCommitWal {
     /// io_uring thread handle (Linux + async-io feature only)
     #[cfg(all(target_os = "linux", feature = "async-io"))]
     io_uring_handle: Option<StdArc<IoUringThreadHandle>>,
+
+    /// v2.2.10: Optional callback invoked after successful batch commit
+    /// Enables async response delivery for acks=1 without blocking on fsync
+    /// Wrapped in Arc<RwLock<>> for interior mutability (can be set after construction)
+    commit_callback: Arc<RwLock<Option<CommitCallback>>>,
 }
 
 impl GroupCommitWal {
@@ -395,19 +414,65 @@ impl GroupCommitWal {
             shutdown: Arc::new(Notify::new()),
             #[cfg(all(target_os = "linux", feature = "async-io"))]
             io_uring_handle,
+            commit_callback: Arc::new(RwLock::new(None)),  // v2.2.10: Interior mutability for async responses
         };
 
         // Discover existing sealed segments from filesystem
         wal.discover_sealed_segments();
-
-        // Start background commit thread
-        wal.start_background_committer();
 
         info!("Group commit WAL initialized: max_batch={}, max_wait={}ms, max_queue={}, rotation={}",
               wal.config.max_batch_size, wal.config.max_wait_time_ms, wal.config.max_queue_depth,
               if wal.config.enable_rotation { "enabled" } else { "disabled" });
 
         wal
+    }
+
+    /// Create a new group commit WAL manager with a callback for async response delivery (v2.2.10)
+    pub fn with_callback(base_dir: PathBuf, config: GroupCommitConfig, callback: CommitCallback) -> Self {
+        // Spawn io_uring thread if available
+        #[cfg(all(target_os = "linux", feature = "async-io"))]
+        let io_uring_handle = match IoUringThreadHandle::spawn() {
+            Ok(handle) => {
+                info!("✨ io_uring thread spawned for 10x faster WAL writes");
+                Some(StdArc::new(handle))
+            }
+            Err(e) => {
+                warn!("Failed to spawn io_uring thread, falling back to standard I/O: {}", e);
+                None
+            }
+        };
+
+        let wal = Self {
+            partition_queues: Arc::new(DashMap::new()),
+            sealed_segments: Arc::new(DashMap::new()),
+            config,
+            base_dir: base_dir.clone(),
+            shutdown: Arc::new(Notify::new()),
+            #[cfg(all(target_os = "linux", feature = "async-io"))]
+            io_uring_handle,
+            commit_callback: Arc::new(RwLock::new(Some(callback))),  // v2.2.10: Interior mutability for async responses
+        };
+
+        // Discover existing sealed segments from filesystem
+        wal.discover_sealed_segments();
+
+        info!("Group commit WAL initialized with async callback: max_batch={}, max_wait={}ms, max_queue={}, rotation={}",
+              wal.config.max_batch_size, wal.config.max_wait_time_ms, wal.config.max_queue_depth,
+              if wal.config.enable_rotation { "enabled" } else { "disabled" });
+
+        wal
+    }
+
+    /// Set the commit callback for async response delivery (v2.2.10)
+    /// Allows setting callback after construction for flexible initialization ordering
+    /// This enables WalManager to be created first, then ResponsePipeline wired later
+    pub fn set_commit_callback(&self, callback: CommitCallback) {
+        if let Ok(mut guard) = self.commit_callback.write() {
+            *guard = Some(callback);
+            info!("✅ Commit callback registered for async response delivery (v2.2.10 - CRITICAL FIX #7)");
+        } else {
+            warn!("Failed to acquire write lock for commit_callback - callback NOT set");
+        }
     }
 
     /// Discover sealed segments from filesystem (called on startup)
@@ -498,6 +563,12 @@ impl GroupCommitWal {
         record: WalRecord,
         acks: i16,
     ) -> Result<()> {
+        // v2.2.10: Extract offset metadata from WalRecord before serialization (for async response callbacks)
+        let (base_offset, last_offset) = match &record {
+            WalRecord::V2 { base_offset, last_offset, .. } => (*base_offset, *last_offset),
+            WalRecord::V1 { offset, .. } => (*offset, *offset),  // V1 has single offset
+        };
+
         // Serialize record
         let data = record.to_bytes()?;
         let data_len = data.len();
@@ -507,11 +578,11 @@ impl GroupCommitWal {
 
         // Handle acks=0 (fire-and-forget)
         if acks == 0 {
-            return self.enqueue_nowait(queue, data.into()).await;
+            return self.enqueue_nowait(queue, data.into(), base_offset, last_offset).await;
         }
 
         // Handle acks=1 or acks=-1 (wait for commit)
-        self.enqueue_and_wait(queue, data.into(), data_len).await
+        self.enqueue_and_wait(queue, data.into(), data_len, base_offset, last_offset).await
     }
 
     /// Enqueue without waiting (acks=0 mode)
@@ -526,20 +597,20 @@ impl GroupCommitWal {
         &self,
         queue: Arc<PartitionCommitQueue>,
         data: Bytes,
+        base_offset: i64,  // v2.2.10: For async response callbacks
+        last_offset: i64,  // v2.2.10: For async response callbacks
     ) -> Result<()> {
         let data_len = data.len();
 
         // Monitor backpressure but don't block - elastic buffer with high threshold
-        {
-            let queued_bytes = *queue.total_queued_bytes.lock().await;
-            if queued_bytes >= self.config.max_batch_bytes * 10 {
-                queue.metrics.backpressure_events.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                warn!(
-                    "acks=0 queue growing large: {} MB (elastic threshold {} MB), continuing",
-                    queued_bytes / 1_000_000,
-                    (self.config.max_batch_bytes * 10) / 1_000_000
-                );
-            }
+        let queued_bytes = queue.total_queued_bytes.load(Ordering::Relaxed);
+        if queued_bytes >= (self.config.max_batch_bytes * 10) as u64 {
+            queue.metrics.backpressure_events.fetch_add(1, Ordering::Relaxed);
+            warn!(
+                "acks=0 queue growing large: {} MB (elastic threshold {} MB), continuing",
+                queued_bytes / 1_000_000,
+                (self.config.max_batch_bytes * 10) / 1_000_000
+            );
         }
 
         // Enqueue without response channel
@@ -547,13 +618,13 @@ impl GroupCommitWal {
         pending.push_back(PendingWrite {
             data,
             response_tx: None,
+            base_offset,  // v2.2.10: Offset metadata
+            last_offset,  // v2.2.10: Offset metadata
         });
         drop(pending);
 
-        // Update queue size
-        let mut total_bytes = queue.total_queued_bytes.lock().await;
-        *total_bytes += data_len;
-        drop(total_bytes);
+        // Update queue size atomically (lock-free)
+        queue.total_queued_bytes.fetch_add(data_len as u64, Ordering::Relaxed);
 
         // Notify committer
         queue.write_notify.notify_one();
@@ -562,11 +633,18 @@ impl GroupCommitWal {
     }
 
     /// Enqueue and wait for commit (acks=1 or acks=-1 mode)
+    ///
+    /// PERFORMANCE OPTIMIZATION (P1): Reduced lock acquisitions from 4 to 1
+    /// - Before: 4 separate lock acquisitions (backpressure check, enqueue, bytes update, commit check)
+    /// - After: 1 lock acquisition combining all operations
+    /// - Expected gain: 2-4x throughput at high concurrency
     async fn enqueue_and_wait(
         &self,
         queue: Arc<PartitionCommitQueue>,
         data: Bytes,
         data_len: usize,
+        base_offset: i64,  // v2.2.10: For async response callbacks
+        last_offset: i64,  // v2.2.10: For async response callbacks
     ) -> Result<()> {
         debug!("🟢 ENQUEUE_START: Enqueuing write with {} bytes", data_len);
 
@@ -574,45 +652,42 @@ impl GroupCommitWal {
         // Raft HardState/ConfState writes MUST succeed for cluster coordination
         let is_raft_topic = queue.topic.starts_with("__raft") || queue.topic.starts_with("__chronik_metadata");
 
-        if !is_raft_topic {
-            // Check backpressure (ASYNC WAIT - properly queue requests at high concurrency)
-            // CRITICAL FIX v2.2.7: Use lock().await instead of try_lock() to avoid spurious
-            // failures at high concurrency (64+ producers). try_lock() was causing immediate
-            // Backpressure errors even when queue had space, leading to client retry storms.
-            let pending = queue.pending.lock().await;
-            if pending.len() >= self.config.max_queue_depth {
-                queue.metrics.backpressure_events.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                warn!("🔴 BACKPRESSURE: Queue depth {} exceeded max {}", pending.len(), self.config.max_queue_depth);
-                return Err(WalError::Backpressure(format!("Queue depth {} exceeds limit {}", pending.len(), self.config.max_queue_depth)));
-            }
-            drop(pending); // Release lock before continuing
-        } else {
-            debug!("✅ CRITICAL_WRITE: Skipping backpressure check for Raft/metadata topic: {}", queue.topic);
-        }
-
-        // Create response channel
+        // Create response channel before locking
         let (tx, rx) = oneshot::channel();
         debug!("📫 ENQUEUE_CHANNEL: Created oneshot channel for fsync confirmation");
 
-        // Enqueue with response channel
-        {
+        // OPTIMIZATION: Single lock acquisition combines 4 operations
+        // 1. Backpressure check
+        // 2. Enqueue write
+        // 3. Commit decision (was in should_commit_now)
+        // 4. Return queue depth
+        let should_commit = {
             let mut pending = queue.pending.lock().await;
+
+            // Check backpressure (inside lock to avoid TOCTOU race)
+            if !is_raft_topic && pending.len() >= self.config.max_queue_depth {
+                queue.metrics.backpressure_events.fetch_add(1, Ordering::Relaxed);
+                warn!("🔴 BACKPRESSURE: Queue depth {} exceeded max {}", pending.len(), self.config.max_queue_depth);
+                return Err(WalError::Backpressure(format!("Queue depth {} exceeds limit {}", pending.len(), self.config.max_queue_depth)));
+            }
+
+            // Enqueue write
             pending.push_back(PendingWrite {
                 data,
                 response_tx: Some(tx),
+                base_offset,  // v2.2.10: Offset metadata
+                last_offset,  // v2.2.10: Offset metadata
             });
-            info!("📥 ENQUEUE_ADDED: Enqueued write (with wait), queue depth now: {}", pending.len());
-        }
+            let queue_depth = pending.len();
+            info!("📥 ENQUEUE_ADDED: Enqueued write (with wait), queue depth now: {}", queue_depth);
 
-        // Update queue size
-        {
-            let mut total_bytes = queue.total_queued_bytes.lock().await;
-            *total_bytes += data_len;
-            debug!("📊 ENQUEUE_BYTES: Total queued bytes now: {}", *total_bytes);
-        }
+            // Update bytes atomically (lock-free after this point)
+            let total_bytes = queue.total_queued_bytes.fetch_add(data_len as u64, Ordering::Relaxed) + data_len as u64;
+            debug!("📊 ENQUEUE_BYTES: Total queued bytes now: {}", total_bytes);
 
-        // Check if we should trigger immediate commit
-        let should_commit = self.should_commit_now(&queue).await;
+            // Check if we should commit immediately (inline instead of separate function)
+            queue_depth >= self.config.max_batch_size || total_bytes >= self.config.max_batch_bytes as u64
+        }; // Lock released here
 
         // Notify committer
         queue.write_notify.notify_one();
@@ -629,15 +704,6 @@ impl GroupCommitWal {
             .map_err(|_| WalError::CommitFailed("Response channel closed".into()))?;
         info!("✅ ENQUEUE_DONE: Fsync confirmed! Returning success to caller");
         result
-    }
-
-    /// Check if we should commit immediately
-    async fn should_commit_now(&self, queue: &PartitionCommitQueue) -> bool {
-        let pending = queue.pending.lock().await;
-        let total_bytes = queue.total_queued_bytes.lock().await;
-
-        pending.len() >= self.config.max_batch_size ||
-        *total_bytes >= self.config.max_batch_bytes
     }
 
     /// Get or create a partition queue
@@ -670,7 +736,7 @@ impl GroupCommitWal {
 
         let queue = Arc::new(PartitionCommitQueue {
             pending: Mutex::new(VecDeque::new()),
-            total_queued_bytes: Mutex::new(0),
+            total_queued_bytes: AtomicU64::new(0),  // Now atomic instead of Mutex
             file: Arc::new(Mutex::new(writer)),
             last_fsync: Mutex::new(Instant::now()),
             write_notify: Arc::new(Notify::new()),
@@ -700,6 +766,7 @@ impl GroupCommitWal {
         let base_dir = self.base_dir.clone();
         #[cfg(all(target_os = "linux", feature = "async-io"))]
         let io_uring_handle = self.io_uring_handle.clone();
+        let commit_callback = self.commit_callback.clone();  // v2.2.10: For async response delivery
 
         info!("🚀 WORKER_SPAWN: Starting partition committer background task");
 
@@ -720,22 +787,47 @@ impl GroupCommitWal {
             loop {
                 // v2.2.9 fix: Changed hot-path logs from debug! to trace! to prevent log bomb
                 // With 1000s of partitions, these logs fire 10x/sec per partition = 180K lines/sec
-                trace!("🔄 WORKER_LOOP: Waiting for notification or interval tick");
+                trace!("🔄 WORKER_LOOP: Waiting for interval tick (PostgreSQL-style wait queue)");
+
+                // POSTGRESQL-STYLE WAIT QUEUE (v2.2.11 - FIX for acks=1 batching)
+                //
+                // PROBLEM (v2.2.10): Adaptive batching failed because:
+                //   - Every write calls write_notify.notify_one()
+                //   - Worker wakes up, checks queue length
+                //   - Writes arrive spaced (1-4ms apart due to network/client pipelining)
+                //   - Queue rarely reaches MIN_BATCH_SIZE before tick
+                //   - Result: batch_size=1, throughput stuck at ~10K msg/s
+                //
+                // SOLUTION (v2.2.11): PostgreSQL wait queue approach:
+                //   - IGNORE write notifications entirely
+                //   - ONLY commit on interval tick (50ms for MEDIUM profile)
+                //   - Let writes naturally accumulate during interval
+                //   - All accumulated writes committed together in one batch
+                //
+                // With 128 concurrent clients at 50ms interval:
+                //   - ~64-128 writes accumulate naturally
+                //   - Single fsync commits entire batch
+                //   - Expected throughput: 40K-60K msg/s
+                //
+                // This matches PostgreSQL commit_delay behavior:
+                //   - PostgreSQL waits commit_delay microseconds
+                //   - If commit_siblings backends waiting, one commits for all
+                //   - Chronik: All clients wait on oneshot channel, worker commits for all
                 tokio::select! {
-                    _ = queue.write_notify.notified() => {
-                        trace!("🔔 WORKER_NOTIFIED: Received write notification");
-                    }
                     _ = interval.tick() => {
-                        trace!("⏰ WORKER_TICK: Interval tick fired");
+                        trace!("⏰ WORKER_TICK: Interval tick fired - committing all accumulated writes");
+                        // Fall through to commit
                     }
                     _ = shutdown.notified() => {
                         info!("🛑 WORKER_SHUTDOWN: Partition committer shutting down");
-                        break;
+                        return;  // Exit worker entirely
                     }
+                    // NOTE: write_notify branch REMOVED - we ignore notifications and only commit on tick
+                    // This allows natural write accumulation without synchronization
                 }
 
-                // Commit if there are pending writes
-                trace!("📝 WORKER_COMMIT: About to call commit_batch");
+                // Commit batch (triggered ONLY by interval tick)
+                trace!("📝 WORKER_COMMIT: Committing accumulated writes");
                 if let Err(e) = Self::commit_batch(
                     &queue,
                     &config,
@@ -743,6 +835,7 @@ impl GroupCommitWal {
                     &base_dir,
                     #[cfg(all(target_os = "linux", feature = "async-io"))]
                     &io_uring_handle,
+                    &commit_callback,  // v2.2.10: Pass callback for async response delivery
                 ).await {
                     error!("❌ WORKER_ERROR: Commit batch failed: {}", e);
                 } else {
@@ -754,54 +847,14 @@ impl GroupCommitWal {
         info!("🎯 WORKER_SPAWNED: tokio::spawn returned (worker should be running in background)");
     }
 
-    /// Start background commit thread for all partitions
-    fn start_background_committer(&self) {
-        let queues = self.partition_queues.clone();
-        let config = self.config.clone();
-        let shutdown = self.shutdown.clone();
-        let sealed_segments = self.sealed_segments.clone();
-        let base_dir = self.base_dir.clone();
-        #[cfg(all(target_os = "linux", feature = "async-io"))]
-        let io_uring_handle = self.io_uring_handle.clone();
-
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(config.max_wait_time_ms));
-
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        // Time-based commit for all partitions
-                    }
-                    _ = shutdown.notified() => {
-                        info!("Background committer shutting down");
-                        break;
-                    }
-                }
-
-                // Commit all partitions with pending writes
-                for entry in queues.iter() {
-                    let queue = entry.value();
-                    let pending_count = queue.pending.lock().await.len();
-
-                    if pending_count > 0 {
-                        if let Err(e) = Self::commit_batch(
-                            queue,
-                            &config,
-                            &sealed_segments,
-                            &base_dir,
-                            #[cfg(all(target_os = "linux", feature = "async-io"))]
-                            &io_uring_handle,
-                        ).await {
-                            error!("Background commit failed: {}", e);
-                        }
-                    }
-                }
-            }
-        });
-    }
 
     /// Commit a batch of writes with single fsync
-    #[instrument(skip(queue, config, sealed_segments, base_dir, io_uring_handle), fields(batch_size, bytes, fsync_us))]
+    ///
+    /// PERFORMANCE OPTIMIZATION (P3): Optimized fsync path
+    /// - Before: Lock held during write loop + blocking fsync
+    /// - After: Pre-combine buffer + single write + non-blocking fsync
+    /// - Expected gain: 40-60% throughput improvement
+    #[instrument(skip(queue, config, sealed_segments, base_dir, io_uring_handle, commit_callback), fields(batch_size, bytes, fsync_us))]
     async fn commit_batch(
         queue: &PartitionCommitQueue,
         config: &GroupCommitConfig,
@@ -809,12 +862,14 @@ impl GroupCommitWal {
         base_dir: &Path,
         #[cfg(all(target_os = "linux", feature = "async-io"))]
         io_uring_handle: &Option<StdArc<IoUringThreadHandle>>,
+        commit_callback: &Arc<RwLock<Option<CommitCallback>>>,  // v2.2.10: Interior mutability for post-construction callback setting
     ) -> Result<()> {
         debug!("🔵 COMMIT_START: Entering commit_batch");
         let start = Instant::now();
 
-        // Drain queue (up to max_batch_size)
-        let batch = {
+        // OPTIMIZATION P3: Drain queue and pre-combine all writes into single buffer
+        // This minimizes lock hold time and enables single write syscall
+        let (batch, combined_buffer) = {
             let mut pending = queue.pending.lock().await;
 
             if pending.is_empty() {
@@ -828,26 +883,27 @@ impl GroupCommitWal {
 
             info!("📦 COMMIT_DRAIN: Draining {} writes from queue (total depth: {}) for batch commit", batch_size, queue_depth);
 
+            // Pre-allocate buffer for combined writes (avoids reallocations)
+            let mut combined = Vec::new();
+
             for _ in 0..batch_size {
                 if let Some(write) = pending.pop_front() {
+                    combined.extend_from_slice(&write.data);
                     batch.push(write);
                 }
             }
 
-            batch
-        };
+            (batch, combined)
+        }; // Lock released here - much shorter critical section!
 
         let batch_count = batch.len();
-        let mut total_bytes = 0;
+        let total_bytes = combined_buffer.len();
 
-        debug!("💾 COMMIT_WRITE: Writing {} records to file", batch_count);
+        debug!("💾 COMMIT_WRITE: Writing {} records ({} bytes) to file in single syscall", batch_count, total_bytes);
 
-        // Write all to file
+        // OPTIMIZATION P3: Single write instead of loop
         let mut file = queue.file.lock().await;
-        for write in &batch {
-            file.write_all(&write.data).await?;
-            total_bytes += write.data.len();
-        }
+        file.write_all(&combined_buffer).await?;
 
         debug!("🔄 COMMIT_FSYNC: Starting fsync for {} bytes", total_bytes);
         // Single fsync for entire batch ⭐
@@ -861,11 +917,8 @@ impl GroupCommitWal {
             *last_fsync = Instant::now();
         }
 
-        // Update queue size
-        {
-            let mut queued_bytes = queue.total_queued_bytes.lock().await;
-            *queued_bytes = queued_bytes.saturating_sub(total_bytes);
-        }
+        // Update queue size atomically (lock-free)
+        queue.total_queued_bytes.fetch_sub(total_bytes as u64, Ordering::Relaxed);
 
         let fsync_duration = start.elapsed();
 
@@ -893,6 +946,27 @@ impl GroupCommitWal {
             "✅ Group commit: {} writes, {} bytes, fsync took {:?}",
             batch_count, total_bytes, fsync_duration
         );
+
+        // v2.2.10: Invoke commit callback for async response delivery (if configured)
+        if let Ok(callback_guard) = commit_callback.read() {
+            if let Some(callback) = callback_guard.as_ref() {
+                if !batch.is_empty() {
+                    // Extract offset range from batch metadata
+                    let min_offset = batch.iter().map(|w| w.base_offset).min().unwrap_or(0);
+                    let max_offset = batch.iter().map(|w| w.last_offset).max().unwrap_or(0);
+
+                    info!("🔔 INVOKING_CALLBACK: topic={}, partition={}, offsets={}-{}, batch_size={}",
+                          &queue.topic, queue.partition, min_offset, max_offset, batch.len());
+
+                    callback(&queue.topic, queue.partition, min_offset, max_offset);
+
+                    info!("✅ CALLBACK_COMPLETED: topic={}, partition={}", &queue.topic, queue.partition);
+                }
+            } else {
+                warn!("⚠️  NO_CALLBACK_SET: topic={}, partition={} - responses will timeout!",
+                      &queue.topic, queue.partition);
+            }
+        }
 
         // Notify all waiters
         debug!("📢 COMMIT_NOTIFY: Notifying {} waiters that fsync is complete", batch_count);

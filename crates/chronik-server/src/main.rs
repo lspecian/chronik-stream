@@ -17,6 +17,8 @@ mod integrated_server;
 mod error_handler;
 mod kafka_handler;
 mod produce_handler;
+mod pipelined_connection;  // v2.2.9: Async request pipelining for leader forwarding
+mod response_pipeline;     // v2.2.10: Async response delivery for acks=1 (eliminates 168x bottleneck)
 mod storage;
 mod consumer_group;
 mod fetch_handler;

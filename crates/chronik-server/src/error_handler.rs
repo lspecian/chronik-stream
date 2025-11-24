@@ -353,6 +353,37 @@ impl ErrorHandler {
                 // Topics array count (4 bytes) - empty array
                 response.extend_from_slice(&0i32.to_be_bytes());
             }
+            // JoinGroup (API key 11)
+            11 => {
+                // ThrottleTimeMs (v2+, required for v5+)
+                if api_version >= 2 {
+                    response.extend_from_slice(&0i32.to_be_bytes());
+                }
+                // ErrorCode (v0+)
+                response.extend_from_slice(&error_code.to_i16().to_be_bytes());
+                // GenerationId (v0+)
+                response.extend_from_slice(&(-1i32).to_be_bytes());
+                // ProtocolType (v7+, nullable string)
+                if api_version >= 7 {
+                    response.extend_from_slice(&(-1i16).to_be_bytes()); // null
+                }
+                // ProtocolName (v0+, nullable string)
+                response.extend_from_slice(&(-1i16).to_be_bytes()); // null
+                // Leader (v0+, non-nullable string)
+                response.extend_from_slice(&0i16.to_be_bytes()); // empty string
+                // SkipAssignment (v9+)
+                if api_version >= 9 {
+                    response.push(0x00); // false
+                }
+                // MemberId (v0+, non-nullable string)
+                response.extend_from_slice(&0i16.to_be_bytes()); // empty string
+                // Members array (v0+)
+                response.extend_from_slice(&0i32.to_be_bytes()); // empty array
+                // Tagged fields (v9+ flexible)
+                if api_version >= 9 {
+                    response.push(0x00); // no tagged fields
+                }
+            }
             _ => {
                 // Generic error response
                 response.extend_from_slice(&error_code.to_i16().to_be_bytes());

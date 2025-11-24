@@ -59,85 +59,97 @@ Producer receives response
 
 **Current Default**: Medium profile (auto-detected)
 
-### The Queueing Problem
+### PostgreSQL-Style GroupCommit (What We Already Do)
+
+**IMPORTANT**: Chronik already implements PostgreSQL-style group commit perfectly. This means:
+
+✅ **Multiple writes share a single fsync**
+✅ **Up to 2,000 writes batched per commit** (medium profile)
+✅ **Cost amortization**: 10ms fsync / 42 writes = 0.24ms per write
+
+**Example from our code** ([group_commit.rs:845-854](crates/chronik-wal/src/group_commit.rs#L845-L854)):
+
+```rust
+// Write ALL to file (batched)
+let mut file = queue.file.lock().await;
+for write in &batch {
+    file.write_all(&write.data).await?;  // 42 sequential writes
+    total_bytes += write.data.len();
+}
+
+// Single fsync for entire batch ⭐ (PostgreSQL-style!)
+file.sync_all().await?;  // 10ms for ALL 42 writes
+```
+
+This is **EXACTLY** what PostgreSQL does with `synchronous_commit=on` and `commit_delay`.
+
+### The Real Problem: Sequential Commits Over Time
 
 With 128 concurrent requests and 3 partitions:
 - **42 requests per partition** on average
 - **Medium profile**: max_batch_size=2,000, max_wait_time_ms=10ms
+- **GroupCommit is working perfectly** - all 42 writes in 1 batch!
 
-**Scenario A: Requests arrive uniformly over 100ms**
+**But**, at sustained load, we need MULTIPLE commit cycles:
 
-```
-Time 0ms:   42 requests enqueued
-Time 10ms:  Commit Task 1 wakes (timer)
-            - Drains all 42 writes (< 2,000 batch size)
-            - Writes to file
-            - fsync takes 10ms
-Time 20ms:  All waiters notified
-Result: p99 = 20ms ✅ (good!)
-```
-
-**Scenario B: Requests arrive in bursts**
+**Scenario: Continuous High Load (300ms window)**
 
 ```
-Burst 1 (0ms):    20 requests enqueued
-Burst 2 (5ms):    20 requests enqueued
-Time 10ms:        Commit Task 1 wakes (timer)
-                  - Drains 40 writes
-                  - fsync takes 10ms
-Time 20ms:        First 40 requests complete (p50 ~15ms)
+Partition 0 Timeline:
 
-Burst 3 (15ms):   20 requests enqueued
-Time 20ms:        Commit Task 2 wakes (notification)
-                  - Drains 20 writes
-                  - fsync takes 10ms
-Time 30ms:        Last 20 requests complete (p99 ~25ms)
+Time 0ms:     Request 1-42 enqueued (batch 1)
+Time 0ms:     Commit Task wakes (notification)
+Time 0-10ms:  Commit 1: write 42 records, fsync ✅
+Time 10ms:    Request 1-42 complete (latency: 10ms) ✅ Perfect!
 
-Result: p99 = 25-30ms ✅ (acceptable)
+Time 8ms:     Request 43-84 enqueued (batch 2) ← Arrived during commit 1
+Time 10ms:    Commit Task wakes (notification)
+Time 10-20ms: Commit 2: write 42 records, fsync ✅
+Time 20ms:    Request 43-84 complete (latency: 12ms) ✅ Great!
+
+Time 18ms:    Request 85-126 enqueued (batch 3)
+Time 20ms:    Commit Task wakes
+Time 20-30ms: Commit 3: write 42 records, fsync ✅
+Time 30ms:    Request 85-126 complete (latency: 12ms) ✅
+
+...this pattern continues...
+
+Time 180ms:   Request 337-378 enqueued (batch 19)
+Time 190ms:   Commit Task wakes
+Time 190-200ms: Commit 19: write 42 records, fsync
+Time 200ms:   Request 337-378 complete (latency: 20ms) ✅
+
+Time 250ms:   Request 463-504 enqueued (batch 25) ← Queue starting to build
+Time 250ms:   Notification, but Commit 24 still running!
+Time 260ms:   Commit 24 completes
+Time 260-270ms: Commit 25: write 42 records, fsync
+Time 270ms:   Request 463-504 complete (latency: 20ms) ⚠️
+
+...queue continues to fluctuate...
+
+Worst case (late arrivals):
+Time 280ms:   Request 547-588 enqueued (batch 30)
+Time 280ms:   Queue has 2 batches waiting (84 requests)
+Time 290ms:   Commit 29 completes
+Time 290-300ms: Commit 30: write 42 records, fsync
+Time 300ms:   First 42 complete (latency: 20ms)
+Time 310ms:   Commit 31: write 42 records, fsync
+Time 320ms:   Last 42 complete (latency: 40ms) ⚠️
+
+Result at sustained load:
+- p50: 15-20ms (most requests wait 1-2 commits)
+- p75: 30-40ms (some wait 3-4 commits)
+- p99: 100-268ms (unlucky timing + queue fluctuations)
 ```
 
-**Scenario C: Continuous high load (128 concurrent)**
+**Root Cause**: Not lack of batching, but **sequential nature of commits**:
+1. Each commit takes 10-20ms (write + fsync + notify)
+2. Commits execute sequentially (can't overlap)
+3. At sustained load, queue depth fluctuates: 0 → 42 → 84 → 126 → back to 0
+4. Unlucky arrivals (right after commit starts) wait for next commit cycle
+5. With 3 partitions × 10 commits/sec = 30 fsync operations happening across cluster
 
-```
-Time 0ms:    Request 1-42 enqueued (partition 0)
-Time 0ms:    Immediate notification triggers commit
-Time 0-10ms: Commit 1 (42 writes, fsync 10ms)
-Time 10ms:   Request 1-42 complete (latency: 10ms)
-
-Time 5ms:    Request 43-84 enqueued (partition 0)
-Time 10ms:   Notification from previous drain triggers
-Time 10-20ms: Commit 2 (42 writes, fsync 10ms)
-Time 20ms:   Request 43-84 complete (latency: 15ms)
-
-Time 12ms:   Request 85-126 enqueued
-Time 20ms:   Notification triggers
-Time 20-30ms: Commit 3 (42 writes, fsync 10ms)
-Time 30ms:   Request 85-126 complete (latency: 18ms)
-
-BUT IF requests keep arriving faster than draining:
-
-Time 0ms:    Request batch 1 (42) enqueued
-Time 10ms:   Commit 1 starts (42 writes)
-Time 10ms:   Request batch 2 (42) enqueued ← Overlap!
-Time 20ms:   Commit 1 completes
-Time 20ms:   Commit 2 starts (42 writes)
-Time 20ms:   Request batch 3 (42) enqueued
-Time 30ms:   Commit 2 completes
-Time 30ms:   Commit 3 starts (42 writes)
-Time 40ms:   Commit 3 completes
-
-Result: Requests in batch 3 wait 30-40ms
-        p99 grows to 40-50ms
-
-With 10 batches queued:
-Time 100ms: Batch 10 completes
-Result: p99 = 100ms ❌
-
-With continuous load:
-Result: p99 can reach 268ms ❌ (observed)
-```
-
-**Root Cause**: At sustained high load, the commit task can't drain the queue faster than requests arrive, causing **queue buildup**.
+**This is NOT a GroupCommit failure** - it's working as designed! The issue is the fundamental constraint: **fsyncs are sequential and blocking**, even with perfect batching.
 
 ## Benchmark Data Analysis
 

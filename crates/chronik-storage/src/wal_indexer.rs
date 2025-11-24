@@ -144,6 +144,11 @@ pub struct WalIndexer {
 
     /// Whether the indexer is running
     running: Arc<RwLock<bool>>,
+
+    /// CRITICAL v2.2.10: Dedicated tokio runtime for background indexing
+    /// Prevents WalIndexer from starving the main runtime's accept loop under heavy load
+    /// 2 worker threads are sufficient for sequential segment processing
+    runtime: Arc<tokio::runtime::Runtime>,
 }
 
 impl WalIndexer {
@@ -164,6 +169,20 @@ impl WalIndexer {
             Arc::new(SegmentIndex::new())
         };
 
+        // CRITICAL v2.2.10: Create dedicated runtime for WalIndexer background task
+        // This prevents indexing from starving the main runtime's accept loop
+        // Pattern: High-performance servers use separate runtimes for background work
+        // - Main runtime: Accept loop + request handlers (latency-critical)
+        // - Background runtime: Indexing, compaction, cleanup (throughput-oriented)
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)  // 2 threads sufficient for sequential indexing
+            .thread_name("wal-indexer")
+            .enable_all()  // Enable time and I/O drivers
+            .build()
+            .expect("Failed to create WalIndexer dedicated runtime");
+
+        info!("Created dedicated runtime for WalIndexer with 2 worker threads");
+
         Self {
             config,
             wal_manager,
@@ -173,6 +192,7 @@ impl WalIndexer {
             indexing_in_progress: Arc::new(RwLock::new(HashSet::new())),
             last_stats: Arc::new(RwLock::new(IndexingStats::default())),
             running: Arc::new(RwLock::new(false)),
+            runtime: Arc::new(runtime),
         }
     }
 
@@ -199,7 +219,7 @@ impl WalIndexer {
 
         info!(
             interval_secs = self.config.interval_secs,
-            "Starting WAL indexer background task"
+            "Starting WAL indexer background task on dedicated runtime"
         );
 
         let config = self.config.clone();
@@ -210,8 +230,11 @@ impl WalIndexer {
         let indexing_in_progress = Arc::clone(&self.indexing_in_progress);
         let last_stats = Arc::clone(&self.last_stats);
         let running = Arc::clone(&self.running);
+        let runtime = Arc::clone(&self.runtime);
 
-        tokio::spawn(async move {
+        // CRITICAL v2.2.10: Spawn on dedicated runtime, NOT main runtime
+        // This guarantees accept loop can never be starved by indexing work
+        runtime.spawn(async move {
             let mut interval_timer = interval(Duration::from_secs(config.interval_secs));
 
             loop {
@@ -609,7 +632,7 @@ impl WalIndexer {
         // Create TantivySegmentWriter
         let mut writer = TantivySegmentWriter::new(tp.topic.clone(), tp.partition, base_offset)?;
 
-        // Write all batches
+        // Write all batches (CPU-intensive: 285K records)
         for canonical_record in canonical_records {
             writer.write_batch(&canonical_record)?;
         }
@@ -618,7 +641,7 @@ impl WalIndexer {
         let temp_dir = tempfile::tempdir()
             .map_err(|e| Error::Internal(format!("Failed to create temp dir: {}", e)))?;
 
-        // Commit and serialize to tar.gz
+        // Commit and serialize to tar.gz (CPU + I/O intensive)
         let (tar_gz_path, metadata) = writer.commit_and_serialize(temp_dir.path())?;
 
         info!(
@@ -627,11 +650,12 @@ impl WalIndexer {
             record_count = metadata.record_count,
             base_offset = metadata.base_offset,
             last_offset = metadata.last_offset,
-            "Committed Tantivy index"
+            "Committed Tantivy index (record_count={})",
+            metadata.record_count
         );
 
-        // Read tar.gz file
-        let tar_gz_data = std::fs::read(&tar_gz_path)
+        // Read tar.gz file (blocking I/O)
+        let tar_gz_data = tokio::fs::read(&tar_gz_path).await
             .map_err(|e| Error::Internal(format!("Failed to read tar.gz: {}", e)))?;
         let bytes_written = tar_gz_data.len() as u64;
 

@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-default = ["raft-storage"]
+default = ["raft-storage", "async-io"]  # io_uring enabled (both bugs fixed)
 wal = ["dep:memmap2"]
 wal-encryption = ["wal", "dep:ring"]
 wal-compression = ["wal", "dep:zstd"]

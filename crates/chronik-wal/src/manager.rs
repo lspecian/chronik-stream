@@ -49,10 +49,11 @@ impl WalManager {
         let fsync_batcher = FsyncBatcher::new(config.fsync.clone());
 
         // Initialize GroupCommitWal for zero-loss durability (v1.3.54+)
-        // Default profile: high (good balance). Override with CHRONIK_WAL_PROFILE env var
+        // Default profile: low (optimized for latency). Override with CHRONIK_WAL_PROFILE env var
+        // Note: Metadata WAL always uses HIGH profile via CHRONIK_METADATA_WAL_PROFILE
         let group_commit_config = GroupCommitConfig::default();
         info!(
-            "GroupCommitWal configured: batch_size={}, batch_MB={}, wait_ms={}, queue_depth={} (profile: high, override with CHRONIK_WAL_PROFILE=low/medium/high/ultra)",
+            "GroupCommitWal configured: batch_size={}, batch_MB={}, wait_ms={}, queue_depth={} (default: low, override with CHRONIK_WAL_PROFILE=low/medium/high/ultra)",
             group_commit_config.max_batch_size,
             group_commit_config.max_batch_bytes / 1_000_000,
             group_commit_config.max_wait_time_ms,
@@ -480,6 +481,12 @@ impl WalManager {
         partitions
     }
 
+    /// Get reference to the GroupCommitWal instance (v2.2.10)
+    /// Needed for setting commit callbacks for async response delivery (CRITICAL FIX #7)
+    pub fn group_commit_wal(&self) -> &Arc<GroupCommitWal> {
+        &self.group_commit_wal
+    }
+
     /// Get the record count for a partition from WAL (v1.3.53+: reads from GroupCommitWal)
     ///
     /// Returns the total number of records in the WAL for this partition.
@@ -595,7 +602,6 @@ impl WalManager {
 
         info!("Read {} bytes from segment file {:?}", data.len(), segment_info.file_path);
 
-        // Parse records from file
         let mut records = Vec::new();
         let mut offset = 0;
         let mut parse_errors = 0;
@@ -637,6 +643,7 @@ impl WalManager {
 
         info!("Read {} records from sealed segment {} ({} bytes, {} parse errors)",
               records.len(), segment_id, data.len(), parse_errors);
+
         Ok(records)
     }
 

@@ -161,7 +161,38 @@ impl RaftCluster {
         tokio::fs::create_dir_all(&meta_wal_dir).await
             .context("Failed to create metadata WAL directory")?;
 
-        let meta_wal_config = GroupCommitConfig::default();
+        // Use metadata-specific WAL config (Raft consensus log)
+        // CHRONIK_METADATA_WAL_PROFILE overrides for Raft metadata WAL
+        // CRITICAL: Raft always defaults to HIGH profile for consensus stability
+        // (prevents regression where changing data WAL profile affected Raft)
+        let meta_wal_config = if let Ok(profile) = std::env::var("CHRONIK_METADATA_WAL_PROFILE") {
+            match profile.to_lowercase().as_str() {
+                "low" | "small" | "container" => {
+                    tracing::warn!("Using LOW profile for Raft metadata WAL (not recommended)");
+                    GroupCommitConfig::low_resource()
+                }
+                "medium" | "balanced" => {
+                    tracing::info!("Using MEDIUM profile for Raft metadata WAL");
+                    GroupCommitConfig::medium_resource()
+                }
+                "high" | "aggressive" | "dedicated" => {
+                    tracing::info!("Using HIGH profile for Raft metadata WAL");
+                    GroupCommitConfig::high_resource()
+                }
+                "ultra" | "maximum" | "throughput" => {
+                    tracing::info!("Using ULTRA profile for Raft metadata WAL");
+                    GroupCommitConfig::ultra_resource()
+                }
+                _ => {
+                    tracing::warn!("Unknown CHRONIK_METADATA_WAL_PROFILE '{}', using HIGH", profile);
+                    GroupCommitConfig::high_resource()
+                }
+            }
+        } else {
+            // Always default to HIGH for Raft metadata (stable consensus)
+            tracing::info!("Using HIGH profile for Raft metadata WAL (default for stability)");
+            GroupCommitConfig::high_resource()
+        };
 
         let meta_wal = Arc::new(GroupCommitWal::new(meta_wal_dir.clone(), meta_wal_config));
         let wal_storage = RaftWalStorage::new(meta_wal);

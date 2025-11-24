@@ -580,11 +580,27 @@ impl MetadataStore for WalMetadataStore {
     async fn create_topic_with_assignments(&self,
         topic_name: &str,
         config: TopicConfig,
-        _assignments: Vec<PartitionAssignment>,
-        _offsets: Vec<(u32, i64, i64)>
+        assignments: Vec<PartitionAssignment>,
+        offsets: Vec<(u32, i64, i64)>
     ) -> Result<TopicMetadata> {
-        // For now, just create topic (assignments will be handled separately)
-        self.create_topic(topic_name, config).await
+        // Create topic first
+        let topic_metadata = self.create_topic(topic_name, config).await?;
+
+        // Create partition assignments by emitting PartitionAssigned events
+        for assignment in assignments {
+            self.assign_partition(assignment).await?;
+        }
+
+        // Initialize partition offsets (high watermark and log start offset)
+        // Note: offsets are already initialized to (0, 0) in TopicCreated event handler,
+        // but we update them here in case caller provided different values
+        for (partition, high_watermark, log_start_offset) in offsets {
+            if high_watermark != 0 || log_start_offset != 0 {
+                self.update_partition_offset(topic_name, partition, high_watermark, log_start_offset).await?;
+            }
+        }
+
+        Ok(topic_metadata)
     }
 
     async fn commit_transactional_offsets(
