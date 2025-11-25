@@ -98,6 +98,18 @@ impl LeaderElector {
         partition: i32,
         reason: &str,
     ) -> Result<u64> {
+        // CRITICAL FIX v2.2.9: Skip leader election for internal topics
+        // Internal topics like "__chronik_metadata" and "__raft_metadata" are system topics
+        // that don't go through normal partition leader election. They're managed directly
+        // by the Raft leader and don't have replicas in the metadata store.
+        if topic.starts_with("__") {
+            debug!(
+                "Skipping election for internal topic {}-{}: internal topics don't use partition leader election (reason: {})",
+                topic, partition, reason
+            );
+            anyhow::bail!("Cannot trigger election for internal topic");
+        }
+
         // CRITICAL: Only Raft leader can propose partition leader changes
         if !self.raft_cluster.am_i_leader().await {
             debug!(

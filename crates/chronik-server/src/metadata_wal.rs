@@ -99,7 +99,14 @@ impl MetadataWal {
             GroupCommitConfig::high_resource()
         };
 
-        let wal = GroupCommitWal::new(wal_dir.clone(), config);
+        // CRITICAL: Metadata WAL needs a dummy callback to prevent timeout warnings
+        // Metadata writes are internal bookkeeping (high watermarks), not client produces
+        // So we don't need to notify anyone - just let the commit complete silently
+        let dummy_callback = |_topic: &str, _partition: i32, _min_offset: i64, _max_offset: i64| {
+            // NO-OP: Metadata commits don't need notifications
+        };
+
+        let wal = GroupCommitWal::with_callback(wal_dir.clone(), config, Arc::new(dummy_callback));
 
         info!(
             "Metadata WAL created successfully (topic='{}', partition={})",

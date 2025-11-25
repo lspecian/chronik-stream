@@ -194,7 +194,14 @@ impl RaftCluster {
             GroupCommitConfig::high_resource()
         };
 
-        let meta_wal = Arc::new(GroupCommitWal::new(meta_wal_dir.clone(), meta_wal_config));
+        // CRITICAL: Raft WAL needs a dummy callback to prevent timeout warnings
+        // Raft WAL writes are internal consensus operations, not client produces
+        // So we don't need to notify anyone - just let the commit complete silently
+        let dummy_callback = |_topic: &str, _partition: i32, _min_offset: i64, _max_offset: i64| {
+            // NO-OP: Raft commits don't need notifications
+        };
+
+        let meta_wal = Arc::new(GroupCommitWal::with_callback(meta_wal_dir.clone(), meta_wal_config, Arc::new(dummy_callback)));
         let wal_storage = RaftWalStorage::new(meta_wal);
 
         // Recover existing Raft log from WAL (if any)

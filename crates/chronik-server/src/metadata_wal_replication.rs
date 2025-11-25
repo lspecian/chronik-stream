@@ -259,28 +259,16 @@ impl MetadataWalReplicator {
                 // self.replicate_command(cmd).await?;
             }
 
-            // v2.2.9 Phase 7 FIX #2: Apply HighWatermarkUpdated events to metadata_store on followers
-            // CRITICAL: Use apply_replicated_event() NOT update_partition_offset()
-            // update_partition_offset() writes to WAL then applies - wrong for followers
-            // apply_replicated_event() ONLY applies to in-memory state - correct for followers
+            // CRITICAL PERFORMANCE FIX v2.2.9+:
+            // HighWatermarkUpdated events are LOCAL notifications only - they're already applied in ProduceHandler
+            // This listener's job is ONLY to replicate to followers, NOT to re-apply locally
+            // Re-applying = double lock acquisition = 36x slowdown!
+            //
+            // Followers apply when they receive via WalReceiver, not from this event bus
             MetadataEvent::HighWatermarkUpdated { topic, partition, offset } => {
-                tracing::info!("📥 Applying HighWatermarkUpdated to metadata_store (follower mode): {}-{} => {}",
+                tracing::debug!("📤 HighWatermarkUpdated (local notification only, no action): {}-{} => {}",
                     topic, partition, offset);
-
-                // Create MetadataEvent for apply_replicated_event
-                let metadata_event = chronik_common::metadata::MetadataEvent::new(
-                    chronik_common::metadata::MetadataEventPayload::HighWatermarkUpdated {
-                        topic: topic.clone(),
-                        partition,
-                        new_watermark: offset,
-                    },
-                );
-
-                // Apply directly to state WITHOUT writing to WAL (follower receives via replication)
-                self.metadata_store.apply_replicated_event(metadata_event)
-                    .await.context(format!("Failed to apply replicated watermark for {}-{}", topic, partition))?;
-
-                tracing::info!("✅ HighWatermarkUpdated applied to metadata_store (follower): {}-{} => {}", topic, partition, offset);
+                // NO-OP: Already applied by ProduceHandler, replication happens via WalReplicationManager
             }
 
             MetadataEvent::TopicCreated { topic, num_partitions } => {

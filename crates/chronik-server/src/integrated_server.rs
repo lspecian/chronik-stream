@@ -1257,145 +1257,23 @@ impl IntegratedKafkaServer {
                     let produce_sem = produce_semaphore.clone();
                     let control_sem = control_semaphore.clone();
 
-                    // CRITICAL FIX (v1.3.60): Channel-based concurrent request processing with response ordering
-                    // Split socket into read/write halves for concurrent operation
-                    let (socket_reader, mut socket_writer) = socket.into_split();
-
-                    // Elastic response channel capacity for burst traffic handling
-                    // PERF FIX: Increased from 10K to 1M to handle high-throughput benchmarks
-                    // With 128 concurrent producers sending continuously, 10K was too small
-                    // Channel now carries (sequence_number, correlation_id, response_data)
-                    // CRITICAL: Small buffer (1000) provides back-pressure when TCP buffer fills
-                    // This prevents unbounded memory growth and ensures flow control
-                    let (response_tx, mut response_rx) = tokio::sync::mpsc::channel::<(u64, i32, Vec<u8>)>(1_000);
-
-                    // Spawn response writer task with ordering guarantee
-                    // CRITICAL: Responses MUST be sent in request order (Kafka protocol requirement)
-                    // v2.2.7 MILESTONE 1: NON-BLOCKING I/O - eliminates TCP backpressure deadlock
-                    // See docs/HIGH_THROUGHPUT_ARCHITECTURE.md for design details
-                    tokio::spawn(async move {
-                        use std::collections::{BTreeMap, VecDeque};
-                        use tokio::io::AsyncWriteExt;
-                        use std::io::ErrorKind;
-
-                        // Buffer for out-of-order responses
-                        let mut pending_responses: BTreeMap<u64, (i32, Vec<u8>)> = BTreeMap::new();
-                        let mut next_sequence: u64 = 0;
-
-                        // Write queue: responses ready to send (in order)
-                        let mut write_queue: VecDeque<Vec<u8>> = VecDeque::with_capacity(1000);
-                        let mut current_write: Option<(Vec<u8>, usize)> = None; // (buffer, offset for partial writes)
-
-                        // v2.2.9 Phase 7 DEBUG: Track socket writer activity
-                        let mut responses_received = 0u64;
-                        let mut responses_queued = 0u64;
-                        let mut socket_writable_count = 0u64;
-                        let mut bytes_written_total = 0u64;
-
-                        loop {
-                            tokio::select! {
-                                // Receive new responses from request handlers
-                                Some((sequence, _correlation_id, response_data)) = response_rx.recv() => {
-                                    responses_received += 1;
-                                    tracing::info!(
-                                        "[SOCKET WRITER {}] Received response #{}, sequence={}, size={} bytes (pending={}, queue={})",
-                                        addr, responses_received, sequence, response_data.len(), pending_responses.len(), write_queue.len()
-                                    );
-                                    pending_responses.insert(sequence, (_correlation_id, response_data));
-
-                                    // Move consecutive responses to write queue
-                                    let mut moved = 0;
-                                    while let Some((_corr_id, resp_data)) = pending_responses.remove(&next_sequence) {
-                                        write_queue.push_back(resp_data);
-                                        next_sequence += 1;
-                                        moved += 1;
-                                        responses_queued += 1;
-                                    }
-                                    if moved > 0 {
-                                        tracing::info!(
-                                            "[SOCKET WRITER {}] Moved {} responses to write queue (queue now {} items)",
-                                            addr, moved, write_queue.len()
-                                        );
-                                    }
-                                }
-
-                                // Try to write when socket is ready (NON-BLOCKING - no deadlock!)
-                                Ok(()) = socket_writer.writable(), if current_write.is_some() || !write_queue.is_empty() => {
-                                    socket_writable_count += 1;
-                                    tracing::info!(
-                                        "[SOCKET WRITER {}] Socket writable #{} (queue={}, current_write={})",
-                                        addr, socket_writable_count, write_queue.len(), current_write.is_some()
-                                    );
-                                    // Get buffer to write (either partial write or next from queue)
-                                    let (buffer, offset) = if let Some((buf, off)) = current_write.take() {
-                                        (buf, off)
-                                    } else if let Some(buf) = write_queue.pop_front() {
-                                        (buf, 0)
-                                    } else {
-                                        continue;
-                                    };
-
-                                    // Non-blocking write (may write partial data)
-                                    match socket_writer.try_write(&buffer[offset..]) {
-                                        Ok(n) => {
-                                            bytes_written_total += n as u64;
-                                            let new_offset = offset + n;
-                                            tracing::info!(
-                                                "[SOCKET WRITER {}] Wrote {} bytes (offset {} -> {}, buffer_size={}, total_written={})",
-                                                addr, n, offset, new_offset, buffer.len(), bytes_written_total
-                                            );
-                                            if new_offset < buffer.len() {
-                                                // Partial write - save state for next iteration
-                                                tracing::info!(
-                                                    "[SOCKET WRITER {}] Partial write, {} bytes remaining",
-                                                    addr, buffer.len() - new_offset
-                                                );
-                                                current_write = Some((buffer, new_offset));
-                                            } else {
-                                                tracing::info!(
-                                                    "[SOCKET WRITER {}] Complete write, buffer done",
-                                                    addr
-                                                );
-                                            }
-                                            // else: complete write, buffer dropped
-                                        }
-                                        Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
-                                            // Socket not ready yet, save state and wait
-                                            tracing::warn!(
-                                                "[SOCKET WRITER {}] WouldBlock on write (buffer={}, offset={})",
-                                                addr, buffer.len(), offset
-                                            );
-                                            current_write = Some((buffer, offset));
-                                        }
-                                        Err(e) => {
-                                            error!("[SOCKET WRITER {}] Socket write error: {}", addr, e);
-                                            return;
-                                        }
-                                    }
-                                }
-
-                                // Channel closed and all writes complete
-                                else => {
-                                    if write_queue.is_empty() && current_write.is_none() {
-                                        // Flush any remaining buffered data
-                                        let _ = socket_writer.flush().await;
-                                        return;
-                                    }
-                                }
-                            }
-                        }
-                    });
+                    // CRITICAL FIX (v2.2.13): Split socket for concurrent read/write without async channel
+                    // Problem: Arc<Mutex<socket>> causes deadlock between read loop and write tasks
+                    // Solution: Split socket into read/write halves, clone write-half for direct writes
+                    // Benefits: No async channel complexity, no SOCKET WRITER task, concurrent operations
+                    let (socket_reader, socket_writer) = socket.into_split();
+                    let socket_writer = Arc::new(tokio::sync::Mutex::new(socket_writer));
 
                     // Spawn a task to handle this connection with proper error handling
                     tokio::spawn(async move {
                         let mut request_buffer = vec![0; 65536];
                         let mut socket_reader = socket_reader;
-                        let mut request_sequence: u64 = 0; // Sequence number for request ordering
 
                         loop {
                             // Read the size header (4 bytes)
                             let mut size_buf = [0u8; 4];
-                            match socket_reader.read_exact(&mut size_buf).await {
+                            let read_result = socket_reader.read_exact(&mut size_buf).await;
+                            match read_result {
                                 Ok(_) => {},
                                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                                     debug!("Connection closed by {}", addr);
@@ -1432,7 +1310,11 @@ impl IntegratedKafkaServer {
                                 // Try to recover instead of breaking connection
                                 // Clear the socket buffer and continue
                                 let mut discard_buf = vec![0u8; 1024];
-                                while let Ok(n) = socket_reader.read(&mut discard_buf).await {
+                                loop {
+                                    let n = match socket_reader.read(&mut discard_buf).await {
+                                        Ok(n) => n,
+                                        Err(_) => break,
+                                    };
                                     if n == 0 { break; }
                                 }
 
@@ -1446,7 +1328,8 @@ impl IntegratedKafkaServer {
                             }
 
                             // Read the request body
-                            match socket_reader.read_exact(&mut request_buffer[..request_size]).await {
+                            let body_read_result = socket_reader.read_exact(&mut request_buffer[..request_size]).await;
+                            match body_read_result {
                                 Ok(_) => {},
                                 Err(e) => {
                                     error!("Error reading request body from {}: {}", addr, e);
@@ -1481,20 +1364,16 @@ impl IntegratedKafkaServer {
                                 0
                             };
 
-                            // CRITICAL FIX (v1.3.60): Spawn request handler as separate task with sequence number
-                            // This enables concurrent request processing while preserving response order
-                            // Copy request data and sequence number, then spawn handler
+                            // CRITICAL FIX (v2.2.13): Process request and write response directly to socket write-half
+                            // Socket split: read-half for reading, write-half cloned for concurrent writes
+                            // Copy request data, then spawn handler
                             let request_data = request_buffer[..request_size].to_vec();
                             let handler_clone = kafka_handler.clone();
-                            let response_sender = response_tx.clone();
+                            let socket_writer_clone = socket_writer.clone();
                             let produce_sem_clone = produce_sem.clone();
                             let control_sem_clone = control_sem.clone();
                             let error_handler_clone = error_handler.clone();
                             let addr_clone = addr;
-                            let sequence = request_sequence; // Capture sequence number for this request
-
-                            // Increment sequence for next request
-                            request_sequence += 1;
 
                             tokio::spawn(async move {
                                 // CRITICAL FIX (v2.2.11): Select semaphore based on API key
@@ -1550,9 +1429,9 @@ impl IntegratedKafkaServer {
                                     full_response.extend_from_slice(&response.body);
 
                                     // DETAILED LOGGING FOR DEBUGGING
-                                    tracing::info!(
-                                        "[RESPONSE PIPELINE] Step 1: Built response for API {:?}, correlation_id={}, sequence={}, total_size={} bytes (header={}, body={})",
-                                        response.api_key, response.header.correlation_id, sequence, full_response.len(), header_bytes.len(), response.body.len()
+                                    tracing::debug!(
+                                        "[DIRECT WRITE] Built response for API {:?}, correlation_id={}, total_size={} bytes (header={}, body={})",
+                                        response.api_key, response.header.correlation_id, full_response.len(), header_bytes.len(), response.body.len()
                                     );
 
                                     // CRITICAL DEBUGGING: Log full OffsetCommit response bytes
@@ -1581,21 +1460,30 @@ impl IntegratedKafkaServer {
                                         }
                                     }
 
-                                    // Measure channel send delay to detect backpressure
-                                    let send_start = std::time::Instant::now();
-                                    // Send response with sequence number for ordering
-                                    if let Err(e) = response_sender.send((sequence, response.header.correlation_id, full_response.clone())).await {
-                                        error!("Failed to send response to writer for addr={}: {}", addr_clone, e);
-                                    } else {
-                                        tracing::info!(
-                                            "[RESPONSE PIPELINE] Step 2: Sent to channel for API {:?}, correlation_id={}, sequence={}",
-                                            response.api_key, response.header.correlation_id, sequence
-                                        );
+                                    // CRITICAL FIX (v2.2.13): Write response directly to socket write-half (no channel)
+                                    // Socket is split: write-half is exclusive for writing, no contention with read loop
+                                    let write_start = std::time::Instant::now();
+                                    let write_result = {
+                                        let mut writer_guard = socket_writer_clone.lock().await;
+                                        writer_guard.write_all(&full_response).await
+                                    };
+                                    let write_duration = write_start.elapsed();
+
+                                    match write_result {
+                                        Ok(_) => {
+                                            tracing::debug!(
+                                                "[DIRECT WRITE] Successfully wrote response for API {:?}, correlation_id={}, size={} bytes, latency={}ms",
+                                                response.api_key, response.header.correlation_id, full_response.len(), write_duration.as_millis()
+                                            );
+                                        }
+                                        Err(e) => {
+                                            error!("Failed to write response to socket for addr={}: {}", addr_clone, e);
+                                        }
                                     }
-                                    let send_duration = send_start.elapsed();
-                                    if send_duration.as_millis() > 10 {
-                                        warn!("Response channel send took {}ms (sequence={}, correlation_id={}) - channel backpressure detected",
-                                              send_duration.as_millis(), sequence, response.header.correlation_id);
+
+                                    if write_duration.as_millis() > 100 {
+                                        warn!("Direct socket write took {}ms (correlation_id={}) - slow write detected",
+                                              write_duration.as_millis(), response.header.correlation_id);
                                     }
                                 }
                                 Err(e) => {
@@ -1626,16 +1514,28 @@ impl IntegratedKafkaServer {
                                                 api_version,
                                             );
 
-                                            // Measure channel send delay for error responses too
-                                            let send_start = std::time::Instant::now();
-                                            // Send error response with sequence number for ordering
-                                            if let Err(e) = response_sender.send((sequence, correlation_id, error_response)).await {
-                                                error!("Failed to send error response: {}", e);
+                                            // CRITICAL FIX (v2.2.13): Write error response directly to socket write-half (no channel)
+                                            let write_start = std::time::Instant::now();
+                                            let write_result = {
+                                                let mut writer_guard = socket_writer_clone.lock().await;
+                                                writer_guard.write_all(&error_response).await
+                                            };
+                                            let write_duration = write_start.elapsed();
+
+                                            match write_result {
+                                                Ok(_) => {
+                                                    tracing::debug!(
+                                                        "[DIRECT WRITE] Successfully wrote error response, correlation_id={}, size={} bytes",
+                                                        correlation_id, error_response.len()
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    error!("Failed to write error response: {}", e);
+                                                }
                                             }
-                                            let send_duration = send_start.elapsed();
-                                            if send_duration.as_millis() > 10 {
-                                                warn!("Error response channel send took {}ms (correlation_id={}) - channel backpressure detected",
-                                                      send_duration.as_millis(), correlation_id);
+
+                                            if write_duration.as_millis() > 100 {
+                                                warn!("Error response socket write took {}ms - slow write detected", write_duration.as_millis());
                                             }
                                         }
                                         ErrorRecovery::CloseConnection => {
