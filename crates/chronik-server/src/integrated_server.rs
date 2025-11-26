@@ -286,7 +286,7 @@ impl IntegratedKafkaServer {
                     None,                                // No ISR tracker for metadata
                     None,                                // No ACK tracker for metadata
                     config.cluster_config.clone().map(Arc::new), // v2.2.9 Phase 7 FIX #6: NEED cluster_config to find followers!
-                    None,                                // No metadata store needed for metadata WAL replication
+                    Some(wal_metadata_store.clone() as Arc<dyn chronik_common::metadata::MetadataStore>), // CRITICAL FIX: NEED metadata_store to determine leader partitions for replication!
                 ),
                 metadata_event_bus.clone(),              // v2.2.7 EVENT-DRIVEN: Use shared event bus
                 wal_metadata_store.clone(),              // v2.2.9 Phase 7 FIX: Pass metadata_store so followers can apply events
@@ -535,7 +535,17 @@ impl IntegratedKafkaServer {
 
         // Create callback closure that notifies ResponsePipeline when batches commit
         let response_pipeline_clone = response_pipeline.clone();
+        let partition_states_for_callback = produce_handler_inner.partition_states.clone();
         let commit_callback: chronik_wal::group_commit::CommitCallback = Arc::new(move |topic: &str, partition: i32, min_offset: i64, max_offset: i64| {
+            // CRITICAL BUG FIX #8 (v2.2.11): Update in-memory high watermark after WAL batch commit
+            // This makes messages visible to consumers by updating PartitionState.high_watermark
+            let new_watermark = max_offset + 1; // High watermark is the next offset to be written
+            if let Some(state) = partition_states_for_callback.get(&(topic.to_string(), partition)) {
+                state.high_watermark.store(new_watermark as u64, std::sync::atomic::Ordering::Release);
+                debug!("✅ WAL_CALLBACK: Updated high watermark {}-{} = {}", topic, partition, new_watermark);
+            }
+
+            // Notify ResponsePipeline for async response delivery
             response_pipeline_clone.notify_batch_committed(topic, partition, min_offset, max_offset);
         });
 
@@ -1264,17 +1274,25 @@ impl IntegratedKafkaServer {
                     let (socket_reader, socket_writer) = socket.into_split();
                     let socket_writer = Arc::new(tokio::sync::Mutex::new(socket_writer));
 
+                    debug!("🔵 DIAGNOSTIC: About to spawn connection handler task for {}", addr);
                     // Spawn a task to handle this connection with proper error handling
                     tokio::spawn(async move {
+                        debug!("🔵 DIAGNOSTIC: Connection handler task started for {}", addr);
                         let mut request_buffer = vec![0; 65536];
                         let mut socket_reader = socket_reader;
 
+                        debug!("🔵 DIAGNOSTIC: About to enter request loop for {}", addr);
                         loop {
                             // Read the size header (4 bytes)
                             let mut size_buf = [0u8; 4];
+                            debug!("🔵 DIAGNOSTIC: Waiting for request size header from {}", addr);
                             let read_result = socket_reader.read_exact(&mut size_buf).await;
+                            debug!("🔵 DIAGNOSTIC: read_exact returned: {:?}",
+                                  read_result.as_ref().map(|_| "Ok(4 bytes)").map_err(|e| format!("Err: {}", e)));
                             match read_result {
-                                Ok(_) => {},
+                                Ok(_) => {
+                                    debug!("🔵 DIAGNOSTIC: Successfully read size header: {:?}", size_buf);
+                                },
                                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                                     debug!("Connection closed by {}", addr);
                                     break;

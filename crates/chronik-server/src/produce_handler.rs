@@ -362,11 +362,11 @@ struct BufferedBatch {
 }
 
 /// Partition state for tracking offsets and segments
-struct PartitionState {
+pub(crate) struct PartitionState {
     /// Next offset to assign
     next_offset: AtomicU64,
     /// High watermark (replicated offset)
-    high_watermark: AtomicU64,
+    pub(crate) high_watermark: AtomicU64,
     /// Log start offset
     log_start_offset: AtomicU64,
     /// Current segment writer
@@ -437,7 +437,7 @@ pub struct ProduceHandler {
     metadata_store: Arc<dyn MetadataStore>,
     // PERFORMANCE (v2.2.7 - P2): Use DashMap instead of RwLock<HashMap> for lock-free partition access
     // This eliminates lock contention with 128 concurrent producers (10-15% throughput gain)
-    partition_states: Arc<DashMap<(String, i32), Arc<PartitionState>>>,
+    pub(crate) partition_states: Arc<DashMap<(String, i32), Arc<PartitionState>>>,
     producer_info: Arc<RwLock<HashMap<i64, ProducerInfo>>>,
     metrics: Arc<ProduceMetrics>,
     running: Arc<AtomicBool>,
@@ -977,7 +977,7 @@ impl ProduceHandler {
             leader_elector: None,  // v2.2.7 Phase 5: Initialize as None (set via set_leader_elector)
             event_bus: None,  // v2.2.7.2: Initialize as None (set via set_event_bus)
             leadership_cache: Arc::new(DashMap::new()),  // Optimization #4: Empty cache, populated on first access
-            pipelined_pool: Arc::new(PipelinedConnectionPool::new(1000)),  // v2.2.9: Async pipelined connection pool
+            pipelined_pool: Arc::new(PipelinedConnectionPool::new(10000)),  // v2.2.9: Async pipelined connection pool (capacity increased from 1000 → 10000 to prevent channel blocking)
             response_pipeline: None,  // v2.2.10: Initialize as None (set via set_response_pipeline) - CRITICAL FIX #7
         })
     }
@@ -1048,6 +1048,16 @@ impl ProduceHandler {
     pub fn set_response_pipeline(&mut self, pipeline: Arc<crate::response_pipeline::ResponsePipeline>) {
         info!("Setting ResponsePipeline for ProduceHandler - enables async acks=1 responses (150x+ improvement)");
         self.response_pipeline = Some(pipeline);
+    }
+
+    /// Update high watermark from WAL callback (v2.2.11)
+    /// CRITICAL BUG FIX #8: Updates in-memory high watermark to make messages visible to consumers
+    /// Called from GroupCommitWal callback after successful fsync
+    pub fn update_high_watermark_from_wal(&self, topic: &str, partition: i32, new_watermark: i64) {
+        if let Some(state) = self.partition_states.get(&(topic.to_string(), partition)) {
+            state.high_watermark.store(new_watermark as u64, std::sync::atomic::Ordering::Release);
+            debug!("Updated high watermark: {}-{} = {}", topic, partition, new_watermark);
+        }
     }
 
     /// Emit high watermark update event (v2.2.7.2)
@@ -1976,7 +1986,12 @@ impl ProduceHandler {
         // v2.2.0: Store serialized WAL data for replication (zero-copy optimization)
         let serialized_for_replication: Option<Vec<u8>>;
 
+        // DIAGNOSTIC: Verify wal_manager state at runtime
+        debug!("🔍 DIAGNOSTIC: wal_manager present: {}, topic: {}, partition: {}",
+              self.wal_manager.is_some(), topic, partition);
+
         if let Some(ref wal_mgr) = self.wal_manager {
+            debug!("✅ WAL_MGR_FOUND: Entering WAL write path for topic={} partition={}", topic, partition);
             use chronik_storage::canonical_record::CanonicalRecord;
 
             // PERFORMANCE OPTIMIZATION (v2.2.7): Skip wire bytes preservation if no replication
@@ -2045,6 +2060,7 @@ impl ProduceHandler {
 
                                 // Write to WAL with acks=0 (fire-and-forget, no blocking!)
                                 // Background group commit will trigger callback when fsync completes
+                                debug!("📝 CALLING WAL (async path): topic={} partition={} base_offset={}", topic, partition, base_offset);
                                 if let Err(e) = wal_mgr.append_canonical_with_acks(
                                     topic.to_string(),
                                     partition,
@@ -2087,6 +2103,8 @@ impl ProduceHandler {
                                 // SYNCHRONOUS PATH: Original blocking behavior (acks=0 or no response_pipeline)
                                 // - acks=0: Already fast (fire-and-forget)
                                 // - acks=1/all: Blocks on fsync (fallback mode)
+                                debug!("📝 CALLING WAL (sync path): topic={} partition={} base_offset={} acks={}",
+                                      topic, partition, base_offset, acks);
                                 if let Err(e) = wal_mgr.append_canonical_with_acks(
                                     topic.to_string(),
                                     partition,
@@ -2117,6 +2135,8 @@ impl ProduceHandler {
                 }
             }
         } else {
+            error!("❌ WAL_MGR_NONE: wal_manager is None! topic={} partition={} - WAL WRITES SKIPPED!",
+                   topic, partition);
             serialized_for_replication = None;
         }
 
