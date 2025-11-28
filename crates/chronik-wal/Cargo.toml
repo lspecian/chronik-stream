@@ -12,7 +12,8 @@ wal = ["dep:memmap2"]
 wal-encryption = ["wal", "dep:ring"]
 wal-compression = ["wal", "dep:zstd"]
 # async-io feature enables io_uring on Linux (via target-specific dep), crossbeam on all platforms
-async-io = ["dep:crossbeam", "dep:tokio-uring"]
+# Note: tokio-uring is enabled via conditional compilation, not feature flag (it's Linux-only)
+async-io = ["dep:crossbeam"]
 raft-storage = ["dep:chronik-raft", "dep:raft", "dep:protobuf"]
 
 [dependencies]
@@ -45,8 +46,10 @@ zstd = { version = "0.13", optional = true }
 crossbeam = { version = "0.8", optional = true }
 
 # Linux-only: tokio-uring for kernel-level async I/O
+# Not optional - if on Linux and async-io feature is enabled, io_uring code is used
+# Code gates usage with #[cfg(all(target_os = "linux", feature = "async-io"))]
 [target.'cfg(target_os = "linux")'.dependencies]
-tokio-uring = { version = "0.4", optional = true }
+tokio-uring = "0.4"
 
 # Local dependencies
 chronik-common = { path = "../chronik-common" }
