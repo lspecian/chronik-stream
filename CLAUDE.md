@@ -163,287 +163,32 @@ See [tests/cluster/README.md](tests/cluster/README.md) for details.
 
 ## Layered Storage Architecture with Full Disaster Recovery
 
-**CRITICAL**: Chronik implements a unique 3-tier layered storage system that stores BOTH raw message data AND search indexes in object storage (S3/GCS/Azure). **NEW in v1.3.65**: Metadata (topics, partitions, offsets) is also backed up to object storage for complete disaster recovery.
+Chronik implements a 3-tier storage system for infinite retention with automatic disaster recovery (v1.3.65+):
 
-### The 3 Tiers (Always Active by Default)
+**Tier 1 (Hot - WAL)**: `<1ms` latency, local disk, GroupCommitWal with bincode
+**Tier 2 (Warm - Segments)**: `1-10ms` latency, S3/GCS/Azure/local, raw message data
+**Tier 3 (Cold - Tantivy)**: `100-500ms` latency, S3/GCS/Azure/local, searchable indexes
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│              Chronik 3-Tier Seamless Storage                     │
-│                   (Infinite Retention Design)                    │
-├─────────────────────────────────────────────────────────────────┤
-│  Tier 1: WAL (Hot - Local Disk)                                 │
-│  ├─ Location: ./data/wal/{topic}/{partition}/wal_{p}_{id}.log   │
-│  ├─ Data: GroupCommitWal (bincode CanonicalRecords)             │
-│  ├─ Latency: <1ms (in-memory buffer)                            │
-│  └─ Retention: Until sealed (256MB or 30min threshold)          │
-│        ↓ Background WalIndexer (every 30s)                       │
-│                                                                   │
-│  Tier 2: Raw Segments in S3 (Warm - Object Storage)             │
-│  ├─ Location: s3://.../segments/{topic}/{partition}/{min}-{max} │
-│  ├─ Data: Bincode Vec<CanonicalRecord> (with wire bytes)        │
-│  ├─ Latency: 50-200ms (S3 download + LRU cache)                 │
-│  ├─ Retention: Unlimited (cheap object storage)                 │
-│  └─ Purpose: Message consumption after local WAL deletion        │
-│        ↓ PLUS ↓                                                  │
-│                                                                   │
-│  Tier 3: Tantivy Indexes in S3 (Cold - Searchable)              │
-│  ├─ Location: s3://.../indexes/{topic}/partition-{p}/segment... │
-│  ├─ Data: Compressed tar.gz Tantivy search indexes              │
-│  ├─ Latency: 100-500ms (S3 + decompress + search)               │
-│  ├─ Retention: Unlimited                                         │
-│  └─ Purpose: Full-text search, timestamp range queries          │
-│                                                                   │
-│  Consumer Fetch Flow (Automatic Fallback):                      │
-│    Phase 1: Try WAL buffer (hot, in-memory) → μs latency        │
-│    Phase 2 MISS: Download raw segment from S3 → cache → serve   │
-│    Phase 3 MISS: Search Tantivy index → fetch → serve           │
-│                                                                   │
-│  Local Disk Cleanup:                                             │
-│    - WAL files DELETED after upload to S3 (both raw + index)    │
-│    - Tier 2 uses SegmentCache (LRU) to avoid repeated downloads │
-│    - Old messages still accessible from S3 indefinitely          │
-└─────────────────────────────────────────────────────────────────┘
-```
+### Object Store Configuration
 
-### Object Store Configuration (Tier 3)
+| Backend | Key Environment Variables |
+|---------|---------------------------|
+| **S3** (default) | `S3_BUCKET`, `S3_REGION`, `S3_ENDPOINT` (for MinIO), `S3_ACCESS_KEY`, `S3_SECRET_KEY` |
+| **GCS** | `GCS_BUCKET`, `GCS_PROJECT_ID`, `GCS_PREFIX` |
+| **Azure** | `AZURE_ACCOUNT_NAME`, `AZURE_CONTAINER`, `AZURE_USE_EMULATOR` |
+| **Local** | `LOCAL_STORAGE_PATH=/data/segments` (default if no backend set) |
 
-Configure where Tantivy archives are stored via environment variables:
+### Data Flow
 
-**S3-Compatible (MinIO, Wasabi, DigitalOcean Spaces, etc.)**:
-```bash
-OBJECT_STORE_BACKEND=s3
-S3_ENDPOINT=http://minio:9000           # Custom endpoint (MinIO, etc.)
-S3_REGION=us-east-1                     # AWS region
-S3_BUCKET=chronik-storage               # Bucket name
-S3_ACCESS_KEY=minioadmin                # Access key
-S3_SECRET_KEY=minioadmin                # Secret key
-S3_PATH_STYLE=true                      # Required for MinIO (path-style URLs)
-S3_DISABLE_SSL=false                    # Set true for local HTTP MinIO
-S3_PREFIX=chronik/                      # Optional prefix for all keys
-```
+**Write**: Producer → WAL (fsync) → Segments (background) → Tantivy (indexer, every 30s)
+**Read**: Try WAL → Try Segments (cached) → Try Tantivy (S3 download) → Metadata fallback
+**Metadata DR**: WAL metadata auto-uploads to S3/GCS/Azure every 60s (local: persists on disk)
 
-**Local Filesystem** (default if no env vars set):
-```bash
-OBJECT_STORE_BACKEND=local
-LOCAL_STORAGE_PATH=/data/segments       # Path for Tantivy archives
-```
+**Disaster Recovery (v1.3.65+)**: Automatic metadata + data backup to S3/GCS/Azure. Complete cluster recovery from object storage on cold start. See [docs/DISASTER_RECOVERY.md](docs/DISASTER_RECOVERY.md).
 
-**Google Cloud Storage**:
-```bash
-OBJECT_STORE_BACKEND=gcs
-GCS_BUCKET=chronik-storage              # GCS bucket name
-GCS_PROJECT_ID=my-project               # GCP project ID
-GCS_PREFIX=chronik/                     # Optional prefix
-```
+**vs. Kafka Tiered Storage**: Chronik Tier 3 provides full-text search on archived data (Tantivy indexes), not just offset-based retrieval. Query old messages by content without scanning.
 
-**Azure Blob Storage**:
-```bash
-OBJECT_STORE_BACKEND=azure
-AZURE_ACCOUNT_NAME=myaccount            # Storage account name
-AZURE_CONTAINER=chronik-storage         # Container name
-AZURE_USE_EMULATOR=false                # Use Azurite emulator for local dev
-```
-
-### How Layered Storage Works
-
-**Write Path** (Automatic):
-```
-Producer → WAL (Tier 1, immediate) → Segments (Tier 2, seconds) → Tantivy Archives (Tier 3, minutes)
-            ↓                           ↓                              ↓
-        Durable fsync          Background flush              WalIndexer background thread
-                                                             (uploads to object store)
-```
-
-**Read Path** (3-Phase Fetch with Automatic Fallback):
-```
-Consumer Request
-    ↓
-Phase 1: Try WAL buffer (hot, in-memory)
-    ↓ MISS
-Phase 2: Try segment files (warm, local disk)
-    ↓ MISS
-Phase 3: Try Tantivy archives (cold, object store - S3/GCS/Azure/Local)
-    ↓ MISS
-Fallback: Reconstruct from metadata
-```
-
-**Performance Characteristics**:
-- **Tier 1 (WAL)**: < 1ms latency, seconds retention
-- **Tier 2 (Segments)**: 1-10ms latency, minutes-hours retention
-- **Tier 3 (Tantivy)**: 100-500ms latency, unlimited retention (configurable)
-
-### Disaster Recovery (v1.3.65+)
-
-**CRITICAL NEW FEATURE**: Chronik now backs up **both data AND metadata** to remote object storage, enabling complete disaster recovery.
-
-**How It Works:**
-- **Local filesystem (default)**: Metadata already persists locally to `./data/wal/__meta/` and survives restarts. **No additional backup needed.**
-- **S3/GCS/Azure**: Metadata uploader **automatically activates** to copy metadata to remote storage every 60s. Provides protection against complete node loss.
-
-**Object Store Backends:**
-- ✅ **S3** (AWS, MinIO, Wasabi, etc.) - Automatic metadata DR
-- ✅ **Google Cloud Storage** - Automatic metadata DR
-- ✅ **Azure Blob Storage** - Automatic metadata DR
-- ✅ **Local filesystem** (default) - Metadata persists locally, survives restarts
-
-**What Gets Backed Up:**
-1. **Message Data** (Already in v1.3.64):
-   - Tier 2: Raw segments → `s3://.../segments/`
-   - Tier 3: Tantivy indexes → `s3://.../indexes/`
-
-2. **Metadata** (NEW in v1.3.65):
-   - Metadata WAL → `s3://.../metadata-wal/`
-   - Metadata snapshots → `s3://.../metadata-snapshots/`
-   - Includes: topics, partitions, high watermarks, consumer offsets, consumer groups
-
-**Automatic Recovery on Cold Start (with S3):**
-```bash
-# Scenario: Complete node loss (EC2 terminated, disk gone)
-
-# Step 1: Provision new node with same S3 bucket
-export OBJECT_STORE_BACKEND=s3
-export S3_BUCKET=chronik-prod  # Same bucket as before
-export S3_REGION=us-west-2
-
-# Step 2: Start Chronik (automatic recovery happens)
-cargo run --bin chronik-server -- standalone
-
-# What happens automatically:
-# 1. Detects empty local WAL
-# 2. Downloads latest metadata snapshot from S3
-# 3. Downloads metadata WAL segments from S3
-# 4. Replays events to restore:
-#    - ✅ All topics and partitions
-#    - ✅ High watermarks
-#    - ✅ Consumer offsets
-#    - ✅ Consumer group state
-# 5. Server starts normally
-
-# Step 3: Verify (everything should be restored)
-kafka-topics --list --bootstrap-server localhost:9092
-kafka-console-consumer --topic my-topic --from-beginning --bootstrap-server localhost:9092
-```
-
-**Configuration:**
-```bash
-# Enable metadata DR (default: enabled)
-CHRONIK_METADATA_DR=true  # Already enabled by default
-
-# Change upload interval (default: 60s)
-CHRONIK_METADATA_UPLOAD_INTERVAL=120 cargo run --bin chronik-server
-```
-
-**See [docs/DISASTER_RECOVERY.md](docs/DISASTER_RECOVERY.md) for complete DR guide.**
-
-### Key Differentiators vs Kafka Tiered Storage
-
-| Feature | Kafka Tiered Storage | Chronik Layered Storage |
-|---------|---------------------|-------------------------|
-| **Hot Storage** | Local disk | WAL + Segments (local) |
-| **Cold Storage** | S3 (raw data) | Tantivy archives (S3/GCS/Azure) |
-| **Auto-archival** | ✅ Yes | ✅ Yes (WalIndexer) |
-| **Query by Offset** | ✅ Yes | ✅ Yes |
-| **Full-text Search** | ❌ NO | ✅ **YES** (Tantivy) |
-| **Query by Content** | ❌ NO | ✅ **YES** (search API) |
-| **Compression** | Minimal | High (tar.gz archives) |
-| **Read Archived Data** | Slow (S3 fetch) | Fast (indexed search) |
-
-**Unique Advantage**: Chronik's Tier 3 isn't just "cold storage" - it's a **searchable indexed archive**. You can query old data by content without scanning!
-
-### Data Lifecycle Example
-
-```bash
-# Minute 0: Producer sends message
-# → Immediately written to WAL (Tier 1)
-# → Available for consumption in < 1ms
-
-# Minute 1: Background flush
-# → Data moved to local segments (Tier 2)
-# → Still available for consumption in ~5ms
-
-# Minute 2: WalIndexer runs (every 30s by default)
-# → Data indexed by Tantivy
-# → Compressed tar.gz uploaded to S3/GCS/Azure
-# → Now in Tier 3 (searchable archive)
-# → Consumption from archive: ~200ms (includes S3 download + decompress + search)
-
-# Days later: Data still accessible
-# → Consumer requests old offset
-# → Phase 3 fetch: Download from S3, search index, return results
-# → Full-text search also available via Search API
-```
-
-### Configuration Examples
-
-**Example 1: MinIO for Development**
-```bash
-# Docker Compose setup
-OBJECT_STORE_BACKEND=s3
-S3_ENDPOINT=http://minio:9000
-S3_BUCKET=chronik-dev
-S3_ACCESS_KEY=minioadmin
-S3_SECRET_KEY=minioadmin
-S3_PATH_STYLE=true
-S3_DISABLE_SSL=true  # Local HTTP MinIO
-
-cargo run --bin chronik-server -- standalone
-```
-
-**Example 2: AWS S3 for Production**
-```bash
-# Production with real S3
-OBJECT_STORE_BACKEND=s3
-S3_REGION=us-west-2
-S3_BUCKET=chronik-prod-archives
-# Credentials from IAM role or ~/.aws/credentials
-
-cargo run --bin chronik-server -- standalone
-```
-
-**Example 3: Default Local Storage**
-```bash
-# No env vars = local filesystem for all tiers
-cargo run --bin chronik-server -- standalone
-# Tantivy archives stored in ./data/segments/
-```
-
-### Monitoring Layered Storage
-
-**Key Metrics**:
-- `fetch_wal_hit_rate` - % served from Tier 1 (should be high for recent data)
-- `fetch_segment_hit_rate` - % served from Tier 2
-- `fetch_tantivy_hit_rate` - % served from Tier 3
-- `wal_indexer_lag_seconds` - How far behind WalIndexer is
-- `tantivy_archive_size_bytes` - Total size in object store
-
-**Logs to Watch**:
-```bash
-# Check which tier is serving fetches
-RUST_LOG=chronik_server::fetch_handler=debug cargo run --bin chronik-server
-
-# Look for:
-# - "Serving from WAL buffer" (Tier 1)
-# - "Serving from local segment" (Tier 2)
-# - "Fetching from Tantivy archive" (Tier 3)
-```
-
-### Troubleshooting
-
-**Issue**: Tantivy archives not uploading to S3
-- Check `OBJECT_STORE_BACKEND` is set correctly
-- Verify S3 credentials and bucket access
-- Check logs: `RUST_LOG=chronik_storage::wal_indexer=debug`
-
-**Issue**: Slow Tier 3 fetches (> 1 second)
-- Check network latency to S3/GCS/Azure
-- Consider increasing `wal_indexing_interval_secs` for larger segments
-- Use local caching (WalIndexer supports local cache)
-
-**Issue**: Running out of local disk space
-- Tier 2 segments are automatically cleaned up after indexing
-- Configure retention: `segment_writer_config.retention_period_secs`
-- Tier 3 archives can be stored on unlimited object storage
+**Monitoring**: Key metrics: `fetch_*_hit_rate`, `wal_indexer_lag_seconds`. Logs: `RUST_LOG=chronik_server::fetch_handler=debug`
 
 ## Architecture Overview
 
@@ -520,8 +265,42 @@ match ApiKey::try_from(header.api_key)? {
 **WAL Integration** (MANDATORY):
 - `WalProduceHandler` wraps `ProduceHandler`
 - All produce requests write to WAL before in-memory state
-- `IntegratedKafkaServer::new()` always creates WAL components
+- `IntegratedKafkaServerBuilder` orchestrates WAL component initialization
 - Config flag `use_wal_metadata` controls metadata store type (default: true)
+
+**Builder Pattern for Server Initialization** (v2.2.8+):
+The `IntegratedKafkaServer` uses a 14-stage builder pattern to reduce complexity from 764 (30x over threshold) to <25 per function:
+
+```rust
+// Single-node mode
+let server = IntegratedKafkaServerBuilder::new(config)
+    .build()
+    .await?;
+
+// Cluster mode with Raft
+let server = IntegratedKafkaServerBuilder::new(config)
+    .with_raft_cluster(raft_cluster)
+    .build()
+    .await?;
+```
+
+**Builder Stages** (14 stages for separation of concerns):
+1. **Directories** - Data directory structure creation
+2. **Raft Cluster** - Single-node or multi-node consensus (optional)
+3. **Metadata WAL** - Event-sourced metadata persistence
+4. **Event Bus** - Metadata replication event channel
+5. **Metadata Store** - WalMetadataStore with recovery
+6. **Metadata Replication** - Background replication tasks
+7. **Storage Layer** - ObjectStore, StorageService, SegmentReader
+8. **WAL Manager** - Message WAL with group commit
+9. **ProduceHandler** - Message production with ISR tracking
+10. **WAL Recovery** - Watermark restoration from WAL
+11. **FetchHandler** - Message consumption
+12. **KafkaProtocolHandler** - Request routing
+13. **WalIndexer** - Background Tantivy indexing
+14. **MetadataUploader** - Disaster recovery (S3/GCS/Azure only)
+
+Each stage is independently testable with complexity <25. See [crates/chronik-server/src/integrated_server/builder.rs](crates/chronik-server/src/integrated_server/builder.rs) for implementation.
 
 **Metadata Store Abstraction**:
 ```rust
@@ -1275,9 +1054,44 @@ chronik-stream/
 6. **PROFESSIONAL STANDARDS** - Write code as if going to production tomorrow
 7. **ABSOLUTE OWNERSHIP** - NEVER say "beyond scope", "not my responsibility", or "separate issue". If you discover a problem while working, YOU OWN IT. Fix it completely.
 8. **END-TO-END VERIFICATION** - A fix is NOT complete until verified with real client testing (produce → crash → recover → consume). No excuses.
-7. **NEVER RELEASE WITHOUT TESTING** - CRITICAL: Do NOT commit, tag, or push releases without actual testing
-8. **NEVER CLAIM PRODUCTION-READY WITHOUT TESTING** - Do NOT claim anything is ready, fixed, or production-ready without verification
-9. **FIX FORWARD, NEVER REVERT** - CRITICAL: In this house, we NEVER revert commits, delete tags, or rollback releases. We ALWAYS fix forward with the next version. Every bug is an opportunity to learn and improve. Reverting hides problems; fixing forward solves them permanently.
+9. **NEVER RELEASE WITHOUT TESTING** - CRITICAL: Do NOT commit, tag, or push releases without actual testing
+10. **NEVER CLAIM PRODUCTION-READY WITHOUT TESTING** - Do NOT claim anything is ready, fixed, or production-ready without verification
+11. **FIX FORWARD, NEVER REVERT** - CRITICAL: In this house, we NEVER revert commits, delete tags, or rollback releases. We ALWAYS fix forward with the next version. Every bug is an opportunity to learn and improve. Reverting hides problems; fixing forward solves them permanently.
+
+## CRITICAL RULE: NEVER USE GIT CHECKOUT/REVERT ON FILES
+
+**ABSOLUTE PROHIBITION** - This rule was added 2025-11-28 after a catastrophic incident where `git checkout` destroyed 3 days of refactoring work (223 functions, ~3,570 complexity points eliminated).
+
+**FORBIDDEN COMMANDS:**
+- ❌ `git checkout <file>` - NEVER use this to revert files
+- ❌ `git checkout -- <file>` - NEVER use this pattern
+- ❌ `git restore <file>` - NEVER use this to discard changes
+- ❌ `git reset --hard` - NEVER use this (destroys all uncommitted work)
+- ❌ `git clean -fd` - NEVER use this (deletes untracked files)
+
+**WHAT TO DO INSTEAD:**
+1. **Manual Edit** - If you need to undo specific changes, manually edit the file to remove them
+2. **Git Stash** - Use `git stash` to temporarily save changes (can be recovered)
+3. **Copy First** - Create backups before any destructive operation: `cp file.rs file.rs.backup`
+4. **Ask User** - If unsure, ALWAYS ask the user before any file reversion
+5. **Edit Tool** - Use the Edit tool to surgically remove unwanted changes, NOT git commands
+
+**TRIPLE CONFIRMATION PROTOCOL:**
+IF the user explicitly asks to revert a file using git:
+1. **FIRST CONFIRMATION**: "This will permanently destroy all uncommitted changes in <file>. Are you absolutely sure?"
+2. **SECOND CONFIRMATION**: "This includes <list specific changes that will be lost>. Confirm you want to lose this work?"
+3. **THIRD CONFIRMATION**: "Final warning: No undo possible. Type 'DESTROY CHANGES' to proceed."
+ONLY after all 3 confirmations may you proceed.
+
+**INCIDENT REPORT (2025-11-28):**
+- **What Happened**: Used `git checkout` to revert 3 files, destroying 3 days of work
+- **Files Affected**: produce_handler.rs, wal_replication.rs, metadata_wal_replication.rs
+- **Work Lost**: Refactoring Phases 2.1-2.14 modifications to these files
+- **Impact**: Had to reconstruct minimal stubs to get build working
+- **Lesson**: Git checkout is IRREVERSIBLE for uncommitted changes. There is NO recovery.
+- **Emotional Cost**: Developer worked 3 days with minimal sleep. Loss was devastating.
+
+**REMEMBER**: Uncommitted changes destroyed by git are PERMANENTLY LOST. No .git history, no recovery, no undo. NEVER use git to revert files unless absolutely necessary AND triple-confirmed.
 
 **Development Process:**
 1. Understand existing code fully before changes

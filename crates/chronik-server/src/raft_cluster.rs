@@ -127,15 +127,12 @@ impl RaftCluster {
     ///
     /// # Returns
     /// RaftCluster ready for metadata operations
-    pub async fn bootstrap(node_id: u64, peers: Vec<(u64, String)>, data_dir: PathBuf) -> Result<Self> {
-        tracing::info!(
-            "Bootstrapping Raft cluster: node_id={}, peers={:?}",
-            node_id,
-            peers
-        );
-
-        // Create Raft configuration
-        let config = Config {
+    /// Create Raft configuration
+    ///
+    /// Builds Raft config with election/heartbeat timeouts.
+    /// Complexity: < 5 (simple config struct creation)
+    fn create_raft_config(node_id: u64) -> raft::Config {
+        raft::Config {
             id: node_id,
             // v2.2.8 FIX: Increase election timeout to prevent startup race conditions
             // With election_tick=10 (~1 second), nodes can timeout before gRPC connections
@@ -146,16 +143,18 @@ impl RaftCluster {
             max_size_per_msg: 1024 * 1024,
             max_inflight_msgs: 256,
             ..Default::default()
-        };
-
-        // CRITICAL FIX: Build list of all nodes (self + peers) for voter configuration
-        let mut all_nodes = vec![node_id];
-        for (peer_id, _) in &peers {
-            all_nodes.push(*peer_id);
         }
+    }
 
-        tracing::info!("Initializing Raft cluster with voters: {:?}", all_nodes);
-
+    /// Initialize WAL-backed storage for Raft log
+    ///
+    /// Creates WAL directory, configures profile, recovers existing state,
+    /// and initializes voter configuration if needed.
+    /// Complexity: < 30 (WAL creation + recovery + voter initialization)
+    async fn initialize_wal_storage(
+        data_dir: &PathBuf,
+        all_nodes: &[u64],
+    ) -> Result<RaftWalStorage> {
         // Create WAL-backed persistent storage for Raft log
         let meta_wal_dir = data_dir.join("wal").join("__meta");
         tokio::fs::create_dir_all(&meta_wal_dir).await
@@ -205,7 +204,7 @@ impl RaftCluster {
         let wal_storage = RaftWalStorage::new(meta_wal);
 
         // Recover existing Raft log from WAL (if any)
-        wal_storage.recover(&data_dir).await
+        wal_storage.recover(data_dir).await
             .context("Failed to recover Raft log from WAL")?;
 
         tracing::info!("✓ Raft WAL storage initialized (persistent)");
@@ -228,7 +227,7 @@ impl RaftCluster {
             wal_storage.set_raft_state(RaftState {
                 hard_state: HardState::default(),
                 conf_state: ConfState {
-                    voters: all_nodes.clone(),
+                    voters: all_nodes.to_vec(),
                     learners: vec![],
                     ..Default::default()
                 },
@@ -245,25 +244,34 @@ impl RaftCluster {
             );
         }
 
+        Ok(wal_storage)
+    }
+
+    /// Create Raft node with WAL-backed storage
+    ///
+    /// Creates slog logger and RawNode.
+    /// Complexity: < 5 (simple node creation)
+    fn create_raft_node(
+        config: &raft::Config,
+        wal_storage: RaftWalStorage,
+    ) -> Result<RawNode<RaftWalStorage>> {
         // Create logger for Raft (it uses slog)
         let logger = slog::Logger::root(slog_stdlog::StdLog.fuse(), slog::o!());
 
-        // Clone storage for later persistence operations
-        let storage_for_async = wal_storage.clone();
-
         // Create Raft node with WAL-backed storage
-        let raft_node = RawNode::new(&config, wal_storage, &logger)
-            .context("Failed to create Raft node")?;
+        RawNode::new(config, wal_storage, &logger)
+            .context("Failed to create Raft node")
+    }
 
-        // Create state machine (v2.2.7 DEADLOCK FIX: ArcSwap for lock-free access)
-        // ArcSwap stores Arc<T> internally, so we wrap: Arc<ArcSwap<MetadataStateMachine>>
-        let state_machine = Arc::new(ArcSwap::new(Arc::new(MetadataStateMachine::new())));
-
-        // Create gRPC transport
+    /// Setup gRPC transport and register peers
+    ///
+    /// Creates gRPC transport and adds all peers.
+    /// Complexity: < 10 (peer registration loop)
+    async fn setup_grpc_transport(peers: &[(u64, String)]) -> Result<Arc<GrpcTransport>> {
         let transport = Arc::new(GrpcTransport::new());
 
         // Register peers with gRPC transport
-        for (peer_id, peer_addr) in &peers {
+        for (peer_id, peer_addr) in peers {
             // Convert Raft address (e.g., "0.0.0.0:5001") to gRPC URL (e.g., "http://localhost:5001")
             let grpc_url = if peer_addr.starts_with("http") {
                 peer_addr.clone()
@@ -277,8 +285,17 @@ impl RaftCluster {
             tracing::info!("✓ Registered peer {} in gRPC transport", peer_id);
         }
 
-        tracing::info!("✓ Raft cluster initialized with {} voters and gRPC transport", all_nodes.len());
+        Ok(transport)
+    }
 
+    /// Start background message sender task
+    ///
+    /// Spawns tokio task that receives messages from channel and sends via gRPC.
+    /// Uses concurrent per-message tasks with retry + exponential backoff.
+    /// Complexity: < 25 (spawn task + retry loop)
+    fn start_background_message_sender(
+        transport: Arc<GrpcTransport>,
+    ) -> mpsc::UnboundedSender<(u64, Message)> {
         // Create channel for async message sending
         // CRITICAL: This allows us to take_messages() from Ready (satisfying Raft),
         // then send to channel (non-blocking), while a background task does actual gRPC sends
@@ -350,7 +367,23 @@ impl RaftCluster {
         });
 
         tracing::info!("✓ Raft message sender task started");
+        message_sender
+    }
 
+    /// Create channels and notification caches
+    ///
+    /// Creates broadcast channels for heartbeats/leader changes,
+    /// and notification maps for event-driven coordination.
+    /// Complexity: < 5 (simple channel/map creation)
+    fn create_channels_and_caches() -> (
+        mpsc::UnboundedSender<Message>,
+        Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<Message>>>,
+        tokio::sync::broadcast::Sender<crate::leader_heartbeat::LeaderHeartbeat>,
+        tokio::sync::broadcast::Sender<crate::leader_heartbeat::LeaderChangeEvent>,
+        Arc<DashMap<String, Arc<Notify>>>,
+        Arc<DashMap<i32, Arc<Notify>>>,
+        Arc<DashMap<String, Arc<Notify>>>,
+    ) {
         // v2.2.7 DEADLOCK FIX: Create channel for incoming Raft messages from gRPC
         // This decouples gRPC message reception from Raft processing (prevents deadlock)
         let (incoming_message_sender, incoming_message_receiver) = mpsc::unbounded_channel::<Message>();
@@ -363,6 +396,72 @@ impl RaftCluster {
         // Capacity: 16 leader changes (more than enough for typical cluster behavior)
         let (leader_change_sender, _) = tokio::sync::broadcast::channel(16);
 
+        // Create notification maps for event-driven coordination
+        let pending_topics = Arc::new(DashMap::new());
+        let pending_brokers = Arc::new(DashMap::new());
+        let pending_partitions = Arc::new(DashMap::new());
+
+        (
+            incoming_message_sender.clone(),
+            Arc::new(tokio::sync::Mutex::new(incoming_message_receiver)),
+            heartbeat_sender,
+            leader_change_sender,
+            pending_topics,
+            pending_brokers,
+            pending_partitions,
+        )
+    }
+
+    /// Bootstrap a Raft cluster (refactored for maintainability)
+    ///
+    /// **Refactored**: Reduced from 255 lines (~70-90 complexity) to ~70 lines (<25 complexity)
+    /// Complexity: < 25 (simple orchestration of extracted helpers)
+    pub async fn bootstrap(node_id: u64, peers: Vec<(u64, String)>, data_dir: PathBuf) -> Result<Self> {
+        tracing::info!(
+            "Bootstrapping Raft cluster: node_id={}, peers={:?}",
+            node_id,
+            peers
+        );
+
+        // Phase 1: Create Raft configuration
+        let config = Self::create_raft_config(node_id);
+
+        // Phase 2: Build list of all nodes (self + peers) for voter configuration
+        let mut all_nodes = vec![node_id];
+        for (peer_id, _) in &peers {
+            all_nodes.push(*peer_id);
+        }
+        tracing::info!("Initializing Raft cluster with voters: {:?}", all_nodes);
+
+        // Phase 3: Initialize WAL storage + recover state + initialize voters
+        let wal_storage = Self::initialize_wal_storage(&data_dir, &all_nodes).await?;
+        let storage_for_async = wal_storage.clone();
+
+        // Phase 4: Create Raft node
+        let raft_node = Self::create_raft_node(&config, wal_storage)?;
+
+        // Phase 5: Create state machine (v2.2.7 DEADLOCK FIX: ArcSwap for lock-free access)
+        let state_machine = Arc::new(ArcSwap::new(Arc::new(MetadataStateMachine::new())));
+
+        // Phase 6: Setup gRPC transport and register peers
+        let transport = Self::setup_grpc_transport(&peers).await?;
+        tracing::info!("✓ Raft cluster initialized with {} voters and gRPC transport", all_nodes.len());
+
+        // Phase 7: Start background message sender task
+        let message_sender = Self::start_background_message_sender(transport.clone());
+
+        // Phase 8: Create channels and notification caches
+        let (
+            incoming_message_sender,
+            incoming_message_receiver,
+            heartbeat_sender,
+            leader_change_sender,
+            pending_topics,
+            pending_brokers,
+            pending_partitions,
+        ) = Self::create_channels_and_caches();
+
+        // Phase 9: Construct and return RaftCluster
         Ok(Self {
             node_id,
             state_machine,
@@ -371,12 +470,12 @@ impl RaftCluster {
             transport,
             grpc_server_handle: Arc::new(tokio::sync::Mutex::new(None)),
             message_sender,
-            incoming_message_sender: incoming_message_sender.clone(), // v2.2.7 DEADLOCK FIX
-            incoming_message_receiver: Arc::new(tokio::sync::Mutex::new(incoming_message_receiver)), // v2.2.7 DEADLOCK FIX (PART 2)
+            incoming_message_sender, // v2.2.7 DEADLOCK FIX
+            incoming_message_receiver, // v2.2.7 DEADLOCK FIX (PART 2)
             last_snapshot_index: Arc::new(RwLock::new(0)), // SNAPSHOT STORM FIX (v2.2.7)
-            pending_topics: Arc::new(DashMap::new()), // v2.2.7 EVENT-DRIVEN NOTIFICATION
-            pending_brokers: Arc::new(DashMap::new()), // v2.2.7 EVENT-DRIVEN NOTIFICATION
-            pending_partitions: Arc::new(DashMap::new()), // v2.2.7 EVENT-DRIVEN NOTIFICATION (P1)
+            pending_topics, // v2.2.7 EVENT-DRIVEN NOTIFICATION
+            pending_brokers, // v2.2.7 EVENT-DRIVEN NOTIFICATION
+            pending_partitions, // v2.2.7 EVENT-DRIVEN NOTIFICATION (P1)
             heartbeat_sender, // v2.2.7 Phase 3: Leader lease heartbeats
             leader_change_sender, // v2.2.7 Phase 2: WAL replication leader changes
             cached_leader_id: Arc::new(AtomicU64::new(raft::INVALID_ID)), // v2.2.7 LOCK CONTENTION FIX
@@ -2008,7 +2107,8 @@ impl RaftCluster {
                 // Then immediately send to channel (non-blocking) - background task handles actual sends
                 if !ready.messages().is_empty() {
                     let messages = ready.take_messages();
-                    tracing::info!("Raft ready: {} unpersisted messages to send", messages.len());
+                    // v2.2.14: Changed from info to debug (was logging 259 times = 3MB logs)
+                    tracing::debug!("Raft ready: {} unpersisted messages to send", messages.len());
 
                     for msg in messages {
                         let peer_id = msg.to;
@@ -2277,7 +2377,8 @@ impl RaftCluster {
                 let lock_released_at = std::time::Instant::now();
                 let total_lock_hold_ms = lock_released_at.duration_since(lock_acquired_at).as_millis();
 
-                tracing::info!(
+                // v2.2.14: Changed from info to debug (was logging 250 times = 3MB logs)
+                tracing::debug!(
                     "🔒 Raft lock metrics: total={}ms (includes {}ms I/O)",
                     total_lock_hold_ms,
                     io_duration_ms
@@ -2567,7 +2668,7 @@ pub struct RaftClusterConfig {
 /// This function bootstraps a Raft cluster and starts the integrated Kafka server
 /// with Raft metadata coordination.
 pub async fn run_raft_cluster(config: RaftClusterConfig) -> Result<()> {
-    use crate::integrated_server::{IntegratedKafkaServer, IntegratedServerConfig};
+    use crate::integrated_server::{IntegratedKafkaServer, IntegratedServerConfig, IntegratedKafkaServerBuilder};
     use std::net::SocketAddr;
     
     tracing::info!(
@@ -2659,8 +2760,13 @@ pub async fn run_raft_cluster(config: RaftClusterConfig) -> Result<()> {
         cluster_config: None,  // TODO(Phase 3): Wire RaftCluster to cluster_config
     };
 
-    // Step 3: Create and start Kafka server with Raft cluster
-    let server = IntegratedKafkaServer::new(server_config.clone(), Some(raft_cluster.clone())).await?;
+    // Step 3: Create and start Kafka server with Raft cluster using builder pattern
+    tracing::info!("Creating IntegratedKafkaServer with builder (14-stage initialization)...");
+    let server = IntegratedKafkaServerBuilder::new(server_config.clone())
+        .with_raft_cluster(raft_cluster.clone())
+        .build()
+        .await?;
+    tracing::info!("IntegratedKafkaServer created successfully via builder");
 
     // Step 3.5: Register broker NOW (after Raft message loop started)
     // ARCHITECTURAL FIX: Multi-node broker registration happens here, AFTER:

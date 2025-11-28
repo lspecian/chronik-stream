@@ -82,23 +82,12 @@ impl RaftWalStorage {
         }
     }
 
-    /// Recover Raft log from WAL segments (async, called once during bootstrap)
+    /// Load snapshot metadata if available
     ///
-    /// Scans WAL files in wal/__meta/__raft_metadata/0/ directory and reconstructs:
-    /// 1. In-memory Raft log entries (Vec<Entry>)
-    /// 2. HardState (term, vote, commit)
-    /// 3. ConfState (voters, learners)
-    pub async fn recover(&self, data_dir: &Path) -> Result<()> {
-        use std::fs;
-        use std::io::Read;
-        use protobuf::Message;
-
-        info!("Starting Raft WAL recovery from {:?}", data_dir);
-
-        // Store data_dir for snapshot operations
-        *self.data_dir.write().unwrap() = data_dir.to_path_buf();
-
-        // Phase 5: Load latest snapshot first (if available)
+    /// Complexity: < 10 (simple snapshot loading + metadata extraction)
+    ///
+    /// Returns: (snapshot_option, snapshot_index)
+    async fn load_snapshot_metadata(&self) -> Result<(Option<Snapshot>, u64)> {
         let snapshot_opt = self.load_latest_snapshot().await?;
         let snapshot_index = if let Some(ref snapshot) = snapshot_opt {
             let metadata = snapshot.get_metadata();
@@ -108,16 +97,24 @@ impl RaftWalStorage {
             info!("No snapshot found - will recover from WAL only");
             0
         };
+        Ok((snapshot_opt, snapshot_index))
+    }
 
-        // WAL path for Raft metadata: wal/__meta/__raft_metadata/0/
+    /// Scan and sort WAL files from Raft metadata directory
+    ///
+    /// Complexity: < 15 (directory scan + sort)
+    ///
+    /// Returns: Sorted vector of WAL file paths
+    fn scan_wal_files(data_dir: &Path) -> Result<Vec<PathBuf>> {
+        use std::fs;
+
         let wal_dir = data_dir.join("wal/__meta/__raft_metadata/0");
 
         if !wal_dir.exists() {
             info!("No Raft WAL directory found - starting with empty state");
-            return Ok(());
+            return Ok(Vec::new());
         }
 
-        // Scan all WAL segment files (wal_*.log)
         let mut wal_files = Vec::new();
         for entry in fs::read_dir(&wal_dir)? {
             let entry = entry?;
@@ -129,18 +126,155 @@ impl RaftWalStorage {
 
         if wal_files.is_empty() {
             info!("No WAL files found - starting with empty state");
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         // Sort files by name (wal_0_0.log, wal_0_1.log, etc.)
         wal_files.sort();
+
+        Ok(wal_files)
+    }
+
+    /// Process recovered entries (filter, deduplicate, trim)
+    ///
+    /// Complexity: < 25 (sort + filter + dedup + trim logic)
+    ///
+    /// Returns: processed entries
+    fn process_recovered_entries(
+        mut entries: Vec<Entry>,
+        snapshot_index: u64,
+    ) -> Vec<Entry> {
+        if entries.is_empty() {
+            return entries;
+        }
+
+        // Sort entries by index
+        entries.sort_by_key(|e| e.index);
+
+        // Filter out entries covered by snapshot
+        if snapshot_index > 0 {
+            let entries_before_filter = entries.len();
+            entries.retain(|e| e.index > snapshot_index);
+
+            if entries_before_filter > entries.len() {
+                info!(
+                    "Filtered {} entries covered by snapshot (index <= {})",
+                    entries_before_filter - entries.len(),
+                    snapshot_index
+                );
+            }
+        }
+
+        // CRITICAL FIX (v2.2.7): Deduplicate entries by index
+        if !entries.is_empty() {
+            let entries_before_dedup = entries.len();
+            let mut deduped = Vec::new();
+            let mut last_index = 0u64;
+
+            for entry in entries {
+                if entry.index != last_index {
+                    deduped.push(entry.clone());
+                    last_index = entry.index;
+                } else if entry.term > deduped.last().unwrap().term {
+                    deduped.pop();
+                    deduped.push(entry.clone());
+                }
+            }
+
+            entries = deduped;
+
+            if entries_before_dedup > entries.len() {
+                info!(
+                    "Deduplicated {} conflicting entries (kept highest term for each index)",
+                    entries_before_dedup - entries.len()
+                );
+            }
+        }
+
+        // Trim to prevent memory explosion
+        if !entries.is_empty() {
+            let first_idx = entries.first().map(|e| e.index).unwrap_or(1);
+            let last_idx = entries.last().map(|e| e.index).unwrap_or(0);
+
+            info!("✓ Recovered {} Raft entries (index {}-{})", entries.len(), first_idx, last_idx);
+
+            const MAX_UNSTABLE_ENTRIES: usize = 50_000;
+            if entries.len() > MAX_UNSTABLE_ENTRIES {
+                entries.truncate(MAX_UNSTABLE_ENTRIES);
+
+                let new_last_idx = entries.last().map(|e| e.index).unwrap_or(last_idx);
+                info!(
+                    "Trimmed recovered entries to first {}K, new range: [{}, {}] (dropped {} newer entries)",
+                    MAX_UNSTABLE_ENTRIES / 1000,
+                    first_idx,
+                    new_last_idx,
+                    entries.len().saturating_sub(MAX_UNSTABLE_ENTRIES)
+                );
+            }
+
+            // Ensure at least ONE entry exists
+            if entries.is_empty() {
+                warn!(
+                    "Recovered 0 entries - creating dummy entry at index {} to prevent Raft panic",
+                    first_idx
+                );
+                entries.push(Entry {
+                    entry_type: raft::eraftpb::EntryType::EntryNormal as i32,
+                    term: 1,
+                    index: first_idx,
+                    data: vec![],
+                    context: vec![],
+                    sync_log: false,
+                });
+            }
+        }
+
+        entries
+    }
+
+    /// Restore Raft state (HardState + ConfState)
+    ///
+    /// Complexity: < 10 (simple state restoration)
+    fn restore_raft_state(
+        &self,
+        hard_state: Option<HardState>,
+        conf_state: Option<ConfState>,
+    ) {
+        if let Some(hs) = hard_state {
+            info!("✓ Recovered HardState: term={}, vote={}, commit={}", hs.term, hs.vote, hs.commit);
+            let mut state = self.raft_state.write().unwrap();
+            state.hard_state = hs;
+        } else {
+            info!("No HardState recovered - starting with default");
+        }
+
+        if let Some(cs) = conf_state {
+            info!("✓ Recovered ConfState: voters={:?}, learners={:?}", cs.voters, cs.learners);
+            let mut state = self.raft_state.write().unwrap();
+            state.conf_state = cs;
+        } else {
+            info!("No ConfState recovered - starting with default");
+        }
+    }
+
+    /// Parse WAL records from files and extract Raft state
+    ///
+    /// Complexity: < 25 (file reading + record parsing loop)
+    ///
+    /// Returns: (entries, hard_state, conf_state)
+    fn parse_wal_records(
+        wal_files: &[PathBuf],
+    ) -> Result<(Vec<Entry>, Option<HardState>, Option<ConfState>)> {
+        use std::fs;
+        use std::io::Read;
+        use protobuf::Message;
 
         let mut recovered_entries: Vec<Entry> = Vec::new();
         let mut recovered_hard_state: Option<HardState> = None;
         let mut recovered_conf_state: Option<ConfState> = None;
 
         // Read each WAL file and deserialize records
-        for wal_file in &wal_files {
+        for wal_file in wal_files {
             debug!("Reading Raft WAL file: {:?}", wal_file);
 
             let mut file = fs::File::open(wal_file)?;
@@ -211,147 +345,54 @@ impl RaftWalStorage {
             }
         }
 
-        // Restore in-memory state
-        if !recovered_entries.is_empty() {
-            // Sort entries by index
-            recovered_entries.sort_by_key(|e| e.index);
+        Ok((recovered_entries, recovered_hard_state, recovered_conf_state))
+    }
 
-            // Phase 5: Filter out entries covered by snapshot
-            if snapshot_index > 0 {
-                let entries_before_filter = recovered_entries.len();
-                recovered_entries.retain(|e| e.index > snapshot_index);
+    /// Recover Raft log from WAL segments (async, called once during bootstrap)
+    ///
+    /// Scans WAL files in wal/__meta/__raft_metadata/0/ directory and reconstructs:
+    /// 1. In-memory Raft log entries (Vec<Entry>)
+    /// 2. HardState (term, vote, commit)
+    /// 3. ConfState (voters, learners)
+    pub async fn recover(&self, data_dir: &Path) -> Result<()> {
+        info!("Starting Raft WAL recovery from {:?}", data_dir);
 
-                if entries_before_filter > recovered_entries.len() {
-                    info!(
-                        "Filtered {} entries covered by snapshot (index <= {})",
-                        entries_before_filter - recovered_entries.len(),
-                        snapshot_index
-                    );
-                }
-            }
+        // Store data_dir for snapshot operations
+        *self.data_dir.write().unwrap() = data_dir.to_path_buf();
 
-            // CRITICAL FIX (v2.2.7): Deduplicate entries by index
-            // During runtime, Raft may write multiple entries at the same index (conflict resolution).
-            // All versions get persisted to WAL, but on recovery we must keep only the latest (highest term).
-            // Without deduplication, log.len() overcounts, causing last_index() mismatch and Compacted errors.
-            if !recovered_entries.is_empty() {
-                let entries_before_dedup = recovered_entries.len();
-                let mut deduped = Vec::new();
-                let mut last_index = 0u64;
+        // Phase 1: Load snapshot metadata (extracted helper)
+        let (_snapshot_opt, snapshot_index) = self.load_snapshot_metadata().await?;
 
-                for entry in recovered_entries {
-                    if entry.index != last_index {
-                        // New index - add it
-                        deduped.push(entry.clone());
-                        last_index = entry.index;
-                    } else {
-                        // Duplicate index - replace with newer term (keep highest term)
-                        if entry.term > deduped.last().unwrap().term {
-                            deduped.pop();
-                            deduped.push(entry.clone());
-                        }
-                    }
-                }
+        // Phase 2: Scan WAL files (extracted helper)
+        let wal_files = Self::scan_wal_files(data_dir)?;
+        if wal_files.is_empty() {
+            return Ok(());
+        }
 
-                recovered_entries = deduped;
+        // Phase 3: Parse WAL records (extracted helper)
+        let (recovered_entries, recovered_hard_state, recovered_conf_state) =
+            Self::parse_wal_records(&wal_files)?;
 
-                if entries_before_dedup > recovered_entries.len() {
-                    info!(
-                        "Deduplicated {} conflicting entries (kept highest term for each index)",
-                        entries_before_dedup - recovered_entries.len()
-                    );
-                }
-            }
+        // Phase 4: Process recovered entries (extracted helper)
+        let processed_entries = Self::process_recovered_entries(recovered_entries, snapshot_index);
 
-            if !recovered_entries.is_empty() {
-                let first_idx = recovered_entries.first().map(|e| e.index).unwrap_or(1);
-                let last_idx = recovered_entries.last().map(|e| e.index).unwrap_or(0);
-
-                info!("✓ Recovered {} Raft entries (index {}-{})", recovered_entries.len(), first_idx, last_idx);
-
-                // CRITICAL FIX (v2.2.7): Trim recovered entries to prevent memory explosion
-                // During recovery, we may have 100K+ entries in WAL. We MUST trim immediately
-                // to prevent Raft from trying to access entries that will be trimmed later.
-                //
-                // Keep only FIRST 50K entries (oldest, closest to snapshot) to ensure:
-                // 1. first_index stays at snapshot_index + 1 (no gaps)
-                // 2. Entries immediately after snapshot are in memory
-                // 3. Newer entries can be accessed via WAL fallback
-                // 4. Memory usage is bounded
-                //
-                // CRITICAL: Must keep at least ONE entry to prevent Raft from thinking
-                // everything is compacted (last_index >= first_index is required by Raft).
-                const MAX_UNSTABLE_ENTRIES: usize = 50_000;
-                if recovered_entries.len() > MAX_UNSTABLE_ENTRIES {
-                    // Keep FIRST 50K entries, drop the rest (newest ones)
-                    recovered_entries.truncate(MAX_UNSTABLE_ENTRIES);
-
-                    let new_last_idx = recovered_entries.last().map(|e| e.index).unwrap_or(last_idx);
-                    info!(
-                        "Trimmed recovered entries to first {}K, new range: [{}, {}] (dropped {} newer entries)",
-                        MAX_UNSTABLE_ENTRIES / 1000,
-                        first_idx,
-                        new_last_idx,
-                        recovered_entries.len().saturating_sub(MAX_UNSTABLE_ENTRIES)
-                    );
-                }
-
-                // CRITICAL: Ensure we have at least ONE entry in the log after recovery
-                // If log is empty, Raft will think everything is compacted when first_index > committed
-                if recovered_entries.is_empty() {
-                    warn!(
-                        "Recovered 0 entries - creating dummy entry at index {} to prevent Raft panic \
-                         (Raft requires last_index >= first_index invariant)",
-                        first_idx
-                    );
-                    // Create a minimal dummy entry to satisfy Raft's invariant
-                    let dummy_entry = Entry {
-                        entry_type: raft::eraftpb::EntryType::EntryNormal as i32,
-                        term: 1,
-                        index: first_idx,
-                        data: vec![],
-                        context: vec![],
-                        sync_log: false,
-                    };
-                    recovered_entries.push(dummy_entry);
-                }
-
-                // Update in-memory log
-                *self.entries.write().unwrap() = recovered_entries.clone();
-                *self.first_index.write().unwrap() = recovered_entries.first().map(|e| e.index).unwrap_or(first_idx);
-            } else {
-                // All entries were covered by snapshot
-                info!("All WAL entries covered by snapshot - starting with empty log after snapshot");
-                *self.first_index.write().unwrap() = snapshot_index + 1;
-            }
+        // Update in-memory state
+        if !processed_entries.is_empty() {
+            let first_idx = processed_entries.first().map(|e| e.index).unwrap_or(1);
+            *self.entries.write().unwrap() = processed_entries.clone();
+            *self.first_index.write().unwrap() = first_idx;
         } else {
+            // All entries were covered by snapshot or no entries at all
             if snapshot_index > 0 {
-                info!("No Raft entries recovered - using snapshot state (first_index={})", snapshot_index + 1);
+                info!("No Raft entries after processing - using snapshot state (first_index={})", snapshot_index + 1);
                 *self.first_index.write().unwrap() = snapshot_index + 1;
             } else {
-                info!("No Raft entries recovered - starting with empty log");
+                info!("No Raft entries after processing - starting with empty log");
             }
         }
 
-        // Restore HardState
-        if let Some(hs) = recovered_hard_state {
-            info!("✓ Recovered HardState: term={}, vote={}, commit={}", hs.term, hs.vote, hs.commit);
-
-            let mut state = self.raft_state.write().unwrap();
-            state.hard_state = hs;
-        } else {
-            info!("No HardState recovered - starting with default");
-        }
-
-        // Restore ConfState
-        if let Some(cs) = recovered_conf_state {
-            info!("✓ Recovered ConfState: voters={:?}, learners={:?}", cs.voters, cs.learners);
-
-            let mut state = self.raft_state.write().unwrap();
-            state.conf_state = cs;
-        } else {
-            info!("No ConfState recovered - starting with default");
-        }
+        // Phase 5: Restore Raft state (extracted helper)
+        self.restore_raft_state(recovered_hard_state, recovered_conf_state);
 
         info!("Raft WAL recovery complete");
         Ok(())

@@ -9,9 +9,13 @@
 //! - All major Kafka API implementations
 
 pub mod compression;
+pub mod create_topics;  // Phase 2.4 Part 2: Refactored CreateTopics handler
+pub mod describe_configs;  // Phase 2.4 Part 3: Refactored DescribeConfigs handler
 pub mod error_codes;
+pub mod fetch_response;  // Phase 2.4 Part 1: Refactored Fetch response encoding
 pub mod frame;
 pub mod handler;
+pub mod handlers;
 pub mod kafka_protocol;
 pub mod metadata_fix;
 pub mod parser;

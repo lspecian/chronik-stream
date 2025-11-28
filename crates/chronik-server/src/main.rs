@@ -22,12 +22,14 @@ mod response_pipeline;     // v2.2.10: Async response delivery for acks=1 (elimi
 mod storage;
 mod consumer_group;
 mod fetch_handler;
+mod fetch;  // Phase 2.2: Extracted fetch modules
 mod handler;
 mod offset_storage;
 mod coordinator_manager;
 mod wal_integration;
 mod metadata_dr;
 mod wal_replication;  // v2.2.0: PostgreSQL-style WAL streaming
+mod replication;  // Phase 2.3: Extracted replication modules (connection_state, frame_reader, record_processor)
 // v2.2.7 Phase 2: Raft for metadata coordination only (NOT data replication)
 mod raft_metadata;
 mod raft_cluster;
@@ -57,8 +59,9 @@ mod leader_heartbeat;
 mod quorum_recovery;
 
 mod cli;
+mod cluster;  // Phase 1.2: Cluster mode refactoring (complexity reduction from 288 → <25)
 
-use integrated_server::{IntegratedKafkaServer, IntegratedServerConfig};
+use integrated_server::{IntegratedKafkaServer, IntegratedServerConfig, IntegratedKafkaServerBuilder};
 use chronik_wal::compaction::{WalCompactor, CompactionConfig, CompactionStrategy};
 use chronik_wal::config::{WalConfig, CompressionType};
 use chronik_storage::object_store::{ObjectStoreConfig, StorageBackend, AuthConfig, S3Credentials};
@@ -573,307 +576,83 @@ async fn run_start_command(
 
 /// Run in cluster mode (with Raft + WAL replication)
 /// Phase 1: CLI Redesign & Unified Config - IMPLEMENTED
+/// Run in cluster mode with Raft coordination
+///
+/// Orchestrates cluster startup using extracted modules.
+/// Refactored from 335-line monolithic function to focused orchestration.
+/// Complexity: < 25 (now purely orchestration)
 async fn run_cluster_mode(
     cli: &Cli,
     config: ClusterConfig,
     bind: String,
     advertise: Option<String>,
 ) -> Result<()> {
+    use cluster::*;
+
     info!("Starting Chronik in CLUSTER mode (node_id={})", config.node_id);
     info!("Cluster peers: {} nodes", config.peers.len());
-
-    // Get this node's configuration
-    let this_node = config.this_node()
-        .ok_or_else(|| anyhow::anyhow!("Node ID {} not found in cluster config", config.node_id))?;
-
-    // Parse advertise address (use cluster config or CLI override)
-    let (advertised_host, advertised_port) = if let Some(adv) = advertise.as_deref() {
-        parse_advertise_addr(Some(adv), &bind, 9092)?
-    } else {
-        // Extract from cluster config
-        parse_kafka_addr(&this_node.kafka)?
-    };
 
     // Parse object store configuration
     let object_store_config = parse_object_store_config_from_env();
 
-    // Bootstrap Raft cluster
-    info!("Bootstrapping Raft cluster...");
-    let raft_peers: Vec<(u64, String)> = config.peer_nodes()
-        .iter()
-        .map(|peer| (peer.id, peer.raft.clone()))
-        .collect();
+    // Phase 1: Configuration parsing and validation
+    let init_config = ClusterInitConfig::from_cli_and_config(cli, config.clone(), &bind, advertise.as_deref())?;
 
-    // FIX: Use config.data_dir from TOML, not cli.data_dir (CLI default)
-    let data_dir = PathBuf::from(&config.data_dir);
-    let raft_cluster = Arc::new(
-        crate::raft_cluster::RaftCluster::bootstrap(
-            config.node_id,
-            raft_peers,
-            data_dir.clone(),
-        ).await?
-    );
-    info!("Raft cluster bootstrapped successfully");
+    // Phase 2: Bootstrap Raft cluster
+    let raft_cluster = bootstrap_raft_cluster(&init_config).await?;
 
-    // CRITICAL FIX: Start Raft gRPC server to listen for peer messages
-    // Use bind address (where to listen), not advertise address
-    let raft_bind_addr = config.bind.as_ref()
-        .map(|b| b.raft.clone())
-        .or_else(|| config.advertise.as_ref().map(|a| a.raft.clone()))
-        .unwrap_or_else(|| "0.0.0.0:5001".to_string());
+    // Phase 3: Start Raft gRPC server
+    start_raft_grpc_server(raft_cluster.clone(), &init_config.raft_bind_addr).await?;
 
-    info!("Starting Raft gRPC server on {}...", raft_bind_addr);
-    raft_cluster.clone().start_grpc_server(raft_bind_addr.clone()).await?;
-    info!("Raft gRPC server started successfully");
+    // Phase 4: Create IntegratedKafkaServer with builder pattern
+    let server = create_integrated_server(&init_config, raft_cluster.clone(), object_store_config).await?;
 
-    // v2.2.8 FIX: Pre-warm connections AFTER gRPC server starts
-    // This prevents chicken-and-egg problem during cluster startup
-    // Spawn in background so it doesn't block message loop startup
-    let cluster_for_prewarm = raft_cluster.clone();
-    tokio::spawn(async move {
-        cluster_for_prewarm.pre_warm_connections().await;
-    });
+    // Phase 5: Start Kafka protocol listener BEFORE leader election
+    // CRITICAL FIX v2.2.9: Avoid cold-start deadlock
+    let server_task = start_kafka_listener(server.clone(), init_config.kafka_bind_addr.clone()).await?;
+    log_listener_status(&init_config);
 
-    // BUG FIX (2025-11-18): DO NOT start message loop here! IntegratedKafkaServer::new() already starts it.
-    // Starting it twice causes concurrent ready()/advance() calls on the same RaftNode, violating raft-rs invariant.
-    // Previous code: raft_cluster.clone().start_message_loop();
-    // This caused panic: "assertion failed: rd_record.number == rd.number"
-    // See docs/RAFT_ELECTION_STORM_BUG.md for full analysis
-    info!("Raft message loop will be started by IntegratedKafkaServer");
+    // Phase 5.5: Start Raft message processing loop
+    // CRITICAL FIX: Required for leader election to occur
+    // Without this, all nodes remain followers with leader_id=INVALID_ID
+    info!("Starting Raft message processing loop...");
+    raft_cluster.clone().start_message_loop();
+    info!("✓ Raft message loop started - leader election can now occur");
 
-    // Create IntegratedKafkaServer config with cluster config
-    let server_config = IntegratedServerConfig {
-        node_id: config.node_id as i32,
-        advertised_host: advertised_host.clone(),  // Clone for later use in broker registration
-        advertised_port,
-        data_dir: config.data_dir.clone(),  // FIX: Use TOML config data_dir, not CLI default
-        enable_indexing: cfg!(feature = "search"),
-        enable_compression: true,
-        auto_create_topics: true,
-        num_partitions: 3,  // Default to 3 partitions for better parallelism (configurable via --num-partitions)
-        replication_factor: config.replication_factor as u32,
-        enable_wal_indexing: true,
-        wal_indexing_interval_secs: 30,
-        object_store_config,
-        enable_metadata_dr: true,
-        metadata_upload_interval_secs: 60,
-        cluster_config: Some(config.clone()),  // Phase 2 auto-discovery activates here!
-    };
+    // Phase 6: Broker registration and partition assignment (leader only)
+    register_brokers_and_assign_partitions(server.clone(), raft_cluster.clone(), &init_config).await?;
 
-    // Create server with Raft cluster
-    info!("Initializing IntegratedKafkaServer...");
-    let server = IntegratedKafkaServer::new(server_config, Some(raft_cluster.clone())).await?;
-    info!("IntegratedKafkaServer initialized successfully");
-
-    // ========================================
-    // CRITICAL FIX v2.2.9: Start Kafka protocol listener BEFORE leader election wait
-    // ========================================
-    // This fixes the cold-start deadlock where followers wait for leader
-    // election but need Kafka/WAL listeners running to participate.
-    //
-    // Original bug: Followers waited for election with no listeners →
-    //              couldn't replicate data → couldn't elect leader → deadlock
-    //
-    // Fix: Start Kafka listener FIRST, then wait for leader election
-    // Note: WalReceiver already started in IntegratedKafkaServer::new() as background task
-    // ========================================
-
-    // Parse Kafka bind address from cluster config (needed early for listener startup)
-    let kafka_addr = config.bind.as_ref()
-        .map(|b| b.kafka.clone())
-        .unwrap_or_else(|| this_node.kafka.clone());
-
-    info!("Starting Kafka protocol listener before leader election...");
-    info!("  (WalReceiver already running as background task from IntegratedKafkaServer::new())");
-
-    // Start Kafka protocol listener on ALL nodes (not just leader)
-    let kafka_addr_for_task = kafka_addr.clone();
-    let server_for_task = server.clone();
-    let server_task = tokio::spawn(async move {
-        server_for_task.run(&kafka_addr_for_task).await
-    });
-
-    // Small delay to ensure TCP listener is bound before proceeding
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
-    info!("✓ Kafka protocol listener started on {}", kafka_addr);
-    info!("✓ All TCP listeners now running:");
-    info!("  - Raft gRPC: {}", raft_bind_addr);
-    info!("  - Kafka protocol: {}", kafka_addr);
-    if let Some(wal_cfg) = config.bind.as_ref() {
-        info!("  - WAL replication: {} (background task)", wal_cfg.wal);
-    }
-
-    // NOW it's safe to wait for leader election - all nodes can communicate
-    // ARCHITECTURAL FIX v2.2.7: Register broker NOW with actual peer configs from TOML
-    // Multi-node broker registration happens here, AFTER:
-    // 1. Raft message loop started (leader election can proceed)
-    // 2. gRPC server started (nodes can communicate)
-    // 3. IntegratedServer created (metadata store ready)
-    // 4. TCP listeners started (nodes can replicate) <- NEW in v2.2.9
-    info!("Waiting for Raft leader election (max 10s)...");
-
-    // Wait for leader election (max 10 seconds)
-    let mut election_attempts = 0;
-    let max_election_wait = 100; // 100 * 100ms = 10 seconds
-    let mut is_leader = false;
-    while election_attempts < max_election_wait {
-        let (has_leader, leader_id, state) = raft_cluster.is_leader_ready().await;
-        if has_leader {
-            is_leader = leader_id == config.node_id;
-            info!("✓ Raft leader elected: leader_id={}, this_node={}, is_leader={}, state={}",
-                leader_id, config.node_id, is_leader, state);
-            break;
-        }
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        election_attempts += 1;
-    }
-
-    // v2.2.7 FIX: Use actual peer configs from TOML instead of hardcoded IDs
-    // CRITICAL: Cannot block main thread waiting for Raft proposals - must yield to message loop!
-    if !is_leader {
-        info!("This node is a follower - skipping broker registration (will receive via Raft replication)");
-    } else {
-        // Leader registers ALL brokers from config (in background task)
-        use chronik_common::metadata::traits::BrokerMetadata;
-        info!("This node is the Raft leader - spawning broker registration task");
-        let metadata_store = server.metadata_store();
-        let peers_clone = config.peers.clone();
-
-        // v2.2.7 CRITICAL FIX: Signal when broker registration completes so partition assignment can proceed
-        let (broker_reg_tx, broker_reg_rx) = tokio::sync::oneshot::channel();
-
-        tokio::spawn(async move {
-            info!("Background task: Registering {} brokers from config", peers_clone.len());
-
-            for peer in &peers_clone {
-                // v2.2.7 FIX: Parse actual Kafka address from config instead of hardcoded calculation
-                let (host, port) = if let Some(colon_pos) = peer.kafka.rfind(':') {
-                    let host = peer.kafka[..colon_pos].to_string();
-                    let port = peer.kafka[colon_pos+1..].parse::<i32>()
-                        .unwrap_or_else(|_| {
-                            tracing::warn!("Failed to parse Kafka port from '{}', using default 9092", peer.kafka);
-                            9092
-                        });
-                    (host, port)
-                } else {
-                    tracing::warn!("Invalid Kafka address format '{}', using defaults", peer.kafka);
-                    (peer.kafka.clone(), 9092)
-                };
-
-                let broker_metadata = BrokerMetadata {
-                    broker_id: peer.id as i32,
-                    host,
-                    port,
-                    rack: None,
-                    status: chronik_common::metadata::traits::BrokerStatus::Online,
-                    created_at: chrono::Utc::now(),
-                    updated_at: chrono::Utc::now(),
-                };
-
-                match metadata_store.register_broker(broker_metadata.clone()).await {
-                    Ok(_) => {
-                        tracing::info!("✅ Successfully registered broker {} ({}) via Raft", peer.id, peer.kafka);
-                    }
-                    Err(e) => {
-                        tracing::error!("❌ Failed to register broker {} ({}): {:?}", peer.id, peer.kafka, e);
-                    }
-                }
-            }
-
-            tracing::info!("✓ Broker registration task completed");
-            let _ = broker_reg_tx.send(()); // Signal completion (ignore error if receiver dropped)
-        });
-
-        info!("Broker registration task spawned - will complete in background");
-
-        // v2.2.7 CRITICAL ARCHITECTURAL FIX: Partition assignment MUST happen AFTER:
-        // 1. Raft message loop started (line 628)
-        // 2. Raft leader elected (line 676)
-        // 3. Brokers registered (above)
-        // This fixes "No Raft leader elected" errors that prevented partition assignment.
-        info!("Waiting for broker registration to complete before partition assignment...");
-        let server_clone = server.clone();
-        let config_clone = config.clone();
-        tokio::spawn(async move {
-            // Wait for broker registration to complete
-            if let Ok(_) = broker_reg_rx.await {
-                info!("Broker registration completed - starting partition assignment");
-
-                // Perform partition assignment for existing topics
-                if let Err(e) = server_clone.assign_existing_partitions(&config_clone).await {
-                    tracing::error!("❌ Failed to assign existing partitions: {:?}", e);
-                } else {
-                    tracing::info!("✅ Partition assignment completed successfully");
-                }
-            } else {
-                tracing::warn!("⚠️ Broker registration task dropped before completing - skipping partition assignment");
-            }
-        });
-    }
-
-    // Initialize monitoring
-    let metrics_port = 13000 + (config.node_id as u16);  // 13001, 13002, 13003, etc.
-    let _metrics_registry = init_monitoring(
-        "chronik-server",
-        metrics_port,
-        None,
-    ).await?;
-
-    // Parse Kafka bind address from cluster config
-    // CRITICAL: Use bind address (where to listen), not advertise address
-    let kafka_addr = config.bind.as_ref()
-        .map(|b| b.kafka.clone())
-        .unwrap_or_else(|| this_node.kafka.clone());  // Fallback to advertise if bind not specified
-
-    info!("Kafka protocol listening on {}", kafka_addr);
-    info!("WAL receiver auto-started on {}", config.bind.as_ref().map(|b| b.wal.as_str()).unwrap_or(&this_node.wal));
-    info!("Raft consensus on {}", raft_bind_addr);
+    // Phase 7: Initialize monitoring
+    let metrics_port = 13000 + (init_config.node_id as u16);
+    let _metrics_registry = init_monitoring("chronik-server", metrics_port, None).await?;
     info!("Metrics endpoint available at http://{}:{}/metrics", bind, metrics_port);
 
-    // Start search API if search feature is compiled
-    #[cfg(feature = "search")]
-    {
-        let search_port = 6000 + (config.node_id as u16);
-        info!("Starting Search API on port {}", search_port);
-        let search_bind = bind.clone();
-        let wal_indexer = server.get_wal_indexer();
-        let index_base_path = format!("{}/tantivy_indexes", cli.data_dir.to_string_lossy());
+    // Phase 8: Start Search API (if feature enabled)
+    start_search_api(
+        server.clone(),
+        bind.clone(),
+        init_config.node_id,
+        cli.data_dir.to_string_lossy().to_string(),
+    ).await?;
 
-        tokio::spawn(async move {
-            use chronik_search::api::SearchApi;
-            use std::sync::Arc;
+    // Phase 9: Start Admin API
+    start_admin_api(
+        raft_cluster.clone(),
+        server.metadata_store().clone(),
+        init_config.node_id,
+        &bind
+    ).await?;
 
-            let search_api = Arc::new(SearchApi::new_with_wal_indexer(wal_indexer, index_base_path).unwrap());
-            let app = search_api.router();
-            let addr = format!("{}:{}", search_bind, search_port);
-            info!("Search API listening on http://{}", addr);
-
-            let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-            chronik_search::serve_app(listener, app).await.unwrap()
-        });
-
-        info!("Search API available at http://{}:{}", bind, search_port);
-    }
-
-    // v2.2.7: Start Admin API HTTP server for cluster management
-    let admin_port = 10000 + (config.node_id as u16);  // 10001, 10002, 10003, etc.
-    info!("Starting Admin API on port {}", admin_port);
-    let admin_api_key = std::env::var("CHRONIK_ADMIN_API_KEY").ok();
-    admin_api::start_admin_api(raft_cluster.clone(), admin_port, admin_api_key).await?;
-    info!("Admin API available at http://{}:{}/admin", bind, admin_port);
-
-    // v2.2.7 Priority 2 Step 3: Start Partition Rebalancer
-    info!("Starting Partition Rebalancer (RF={})", config.replication_factor);
+    // Phase 10: Start Partition Rebalancer
+    info!("Starting Partition Rebalancer (RF={})", init_config.replication_factor);
     let _rebalancer = partition_rebalancer::PartitionRebalancer::new(
         raft_cluster.clone(),
         server.metadata_store().clone(),
-        config.replication_factor,
+        init_config.replication_factor as usize,
     ).await;
     info!("✓ Partition Rebalancer started (will check every 30s for membership changes)");
 
-    // Wait for server task completion or shutdown signals
-    // NOTE: server_task was already started at line 679 before leader election
+    // Phase 11: Wait for shutdown signals
     tokio::select! {
         result = server_task => {
             match result {
@@ -901,7 +680,7 @@ async fn run_cluster_mode(
         }
     }
 
-    info!("Shutting down cluster node {}...", config.node_id);
+    info!("Shutting down cluster node {}...", init_config.node_id);
     server.shutdown().await?;
 
     Ok(())
@@ -940,7 +719,12 @@ async fn run_single_node_mode(
         cluster_config: None,
     };
 
-    let server = IntegratedKafkaServer::new(config, None).await?;
+    // Create server using builder pattern (single-node mode, no Raft cluster)
+    info!("Initializing single-node IntegratedKafkaServer with builder...");
+    let server = IntegratedKafkaServerBuilder::new(config)
+        .build()
+        .await?;
+    info!("Single-node server initialized successfully");
 
     // Initialize monitoring
     let _metrics_registry = init_monitoring(

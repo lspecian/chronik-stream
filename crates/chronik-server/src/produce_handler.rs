@@ -1037,6 +1037,82 @@ impl ProduceHandler {
         self.leader_elector = Some(elector);
     }
 
+    /// Start metadata event listener background task (v2.2.14 refactoring)
+    ///
+    /// This method starts a background task that listens for metadata events from the event bus.
+    /// Primary use case: Listen for HighWatermarkUpdated events for < 10ms watermark replication
+    /// via metadata WAL (v2.2.7.2).
+    ///
+    /// Required for the refactored builder pattern.
+    pub fn start_metadata_event_listener(self: Arc<Self>) {
+        // Only start if we have an event bus
+        let event_bus = match &self.event_bus {
+            Some(bus) => Arc::clone(bus),
+            None => {
+                debug!("No event bus configured - metadata event listener not started");
+                return;
+            }
+        };
+
+        info!("Starting ProduceHandler metadata event listener for < 10ms watermark replication");
+
+        let handler = Arc::clone(&self);
+        tokio::spawn(async move {
+            let mut rx = event_bus.subscribe();
+
+            loop {
+                match rx.recv().await {
+                    Ok(event) => {
+                        // Handle metadata events
+                        use crate::metadata_events::MetadataEvent;
+                        match event {
+                            MetadataEvent::HighWatermarkUpdated { topic, partition, offset } => {
+                                // Update local watermark cache if needed
+                                debug!(
+                                    "Received HighWatermarkUpdated event: {}-{} → offset {}",
+                                    topic, partition, offset
+                                );
+                                // The ProduceHandler may want to update its local state here
+                                // For now, we just log it as the primary purpose is metadata WAL replication
+                            }
+                            MetadataEvent::PartitionAssigned { topic, partition, replicas, leader } => {
+                                debug!(
+                                    "Received PartitionAssigned event: {}-{} → leader {}, replicas {:?}",
+                                    topic, partition, leader, replicas
+                                );
+                                // Could update partition_states or leadership_cache here if needed
+                            }
+                            MetadataEvent::LeaderChanged { topic, partition, new_leader } => {
+                                debug!(
+                                    "Received LeaderChanged event: {}-{} → new leader {}",
+                                    topic, partition, new_leader
+                                );
+                                // Could invalidate leadership_cache entry here
+                            }
+                            _ => {
+                                // Other events (TopicCreated, TopicDeleted, ISRUpdated) logged but not acted upon
+                                debug!("Received metadata event: {:?}", event);
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+                        warn!(
+                            "ProduceHandler metadata event listener lagged by {} events - may have missed some",
+                            count
+                        );
+                        // Continue listening - lagging is not fatal
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        info!("Metadata event bus closed - stopping ProduceHandler event listener");
+                        break;
+                    }
+                }
+            }
+        });
+
+        info!("✅ ProduceHandler metadata event listener started successfully");
+    }
+
     /// Set the metadata event bus for high watermark replication (v2.2.7.2)
     pub fn set_event_bus(&mut self, event_bus: Arc<crate::metadata_events::MetadataEventBus>) {
         info!("Setting MetadataEventBus for ProduceHandler - enables < 10ms watermark replication");

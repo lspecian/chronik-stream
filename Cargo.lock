@@ -1102,6 +1102,7 @@ dependencies = [
  "bincode",
  "bytes",
  "chrono",
+ "dashmap 5.5.3",
  "parking_lot",
  "prometheus",
  "serde",

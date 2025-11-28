@@ -16,7 +16,7 @@
 //! - Producer/consumer operations should succeed using discovered brokers
 
 use chronik_config::ClusterConfig;
-use chronik_server::integrated_server::{IntegratedKafkaServer, IntegratedServerConfig};
+use chronik_server::integrated_server::{IntegratedKafkaServer, IntegratedServerConfig, IntegratedKafkaServerBuilder};
 use chronik_server::raft_cluster::RaftCluster;
 use std::sync::Arc;
 use std::path::PathBuf;
@@ -212,15 +212,24 @@ async fn test_3_node_broker_metadata_synchronization() -> anyhow::Result<()> {
 
     assert!(leader_elected, "Raft leader election failed after 30 seconds");
 
-    // Start integrated Kafka servers with Raft coordination
-    info!("Starting IntegratedKafkaServer for Node 1...");
-    let server_1 = IntegratedKafkaServer::new(server_config_1, Some(raft_cluster_1.clone())).await?;
+    // Start integrated Kafka servers with Raft coordination using builder pattern
+    info!("Starting IntegratedKafkaServer for Node 1 with builder...");
+    let server_1 = IntegratedKafkaServerBuilder::new(server_config_1)
+        .with_raft_cluster(raft_cluster_1.clone())
+        .build()
+        .await?;
 
-    info!("Starting IntegratedKafkaServer for Node 2...");
-    let server_2 = IntegratedKafkaServer::new(server_config_2, Some(raft_cluster_2.clone())).await?;
+    info!("Starting IntegratedKafkaServer for Node 2 with builder...");
+    let server_2 = IntegratedKafkaServerBuilder::new(server_config_2)
+        .with_raft_cluster(raft_cluster_2.clone())
+        .build()
+        .await?;
 
-    info!("Starting IntegratedKafkaServer for Node 3...");
-    let server_3 = IntegratedKafkaServer::new(server_config_3, Some(raft_cluster_3.clone())).await?;
+    info!("Starting IntegratedKafkaServer for Node 3 with builder...");
+    let server_3 = IntegratedKafkaServerBuilder::new(server_config_3)
+        .with_raft_cluster(raft_cluster_3.clone())
+        .build()
+        .await?;
 
     // Start server TCP listeners
     info!("Starting Kafka protocol listeners...");

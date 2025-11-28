@@ -10,8 +10,7 @@ use crate::parser::{
     ApiKey, RequestHeader, ResponseHeader, VersionRange,
     parse_request_header_with_correlation,
     supported_api_versions,
-    Encoder, Decoder,
-    is_flexible_version
+    Encoder
 };
 
 // Consumer group state management
@@ -970,145 +969,9 @@ impl ProtocolHandler {
     
     /// Encode JoinGroup response
     pub fn encode_join_group_response(&self, buf: &mut BytesMut, response: &crate::join_group_types::JoinGroupResponse, version: i16) -> Result<()> {
-        let start_len = buf.len();
-        let mut encoder = Encoder::new(buf);
-
-        // v9+ uses flexible/compact format (rdkafka with broker.version.fallback expects non-flexible v5-v8)
-        let flexible = version >= 9;
-
-        tracing::debug!("JoinGroup v{} response encoding START: error={}, gen={}, protocol={:?}, leader={}, member_id={}, members={}",
-            version, response.error_code, response.generation_id, response.protocol_name, response.leader, response.member_id, response.members.len());
-
-        // Field 1: ThrottleTimeMs (v2+)
-        if version >= 2 {
-            encoder.write_i32(response.throttle_time_ms);
-            tracing::debug!("  [1] ThrottleTimeMs: {}", response.throttle_time_ms);
-        }
-
-        // Field 2: ErrorCode (v0+)
-        encoder.write_i16(response.error_code);
-        tracing::debug!("  [2] ErrorCode: {}", response.error_code);
-
-        // Field 3: GenerationId (v0+)
-        encoder.write_i32(response.generation_id);
-        tracing::debug!("  [3] GenerationId: {}", response.generation_id);
-
-        // Field 4: ProtocolType (v7+)
-        if version >= 7 {
-            // v9+ flexible format requires non-nullable strings (convert None to empty string)
-            if version >= 9 && flexible {
-                let value = response.protocol_type.as_deref().unwrap_or("");
-                encoder.write_compact_string(Some(value));
-                tracing::debug!("  [4] ProtocolType (compact, non-null): {:?}", value);
-            } else if flexible {
-                encoder.write_compact_string(response.protocol_type.as_deref());
-                tracing::debug!("  [4] ProtocolType (compact): {:?}", response.protocol_type);
-            } else {
-                encoder.write_string(response.protocol_type.as_deref());
-                tracing::debug!("  [4] ProtocolType: {:?}", response.protocol_type);
-            }
-        }
-
-        // Field 5: ProtocolName (v0+)
-        // v9+ flexible format requires non-nullable strings (convert None to empty string)
-        if version >= 9 && flexible {
-            let value = response.protocol_name.as_deref().unwrap_or("");
-            encoder.write_compact_string(Some(value));
-            tracing::debug!("  [5] ProtocolName (compact, non-null): {:?}", value);
-        } else if flexible {
-            encoder.write_compact_string(response.protocol_name.as_deref());
-            tracing::debug!("  [5] ProtocolName (compact): {:?}", response.protocol_name);
-        } else {
-            encoder.write_string(response.protocol_name.as_deref());
-            tracing::debug!("  [5] ProtocolName: {:?}", response.protocol_name);
-        }
-
-        // Field 6: Leader (v0+)
-        if flexible {
-            encoder.write_compact_string(Some(&response.leader));
-            tracing::debug!("  [6] Leader (compact): {}", response.leader);
-        } else {
-            encoder.write_string(Some(&response.leader));
-            tracing::debug!("  [6] Leader: {}", response.leader);
-        }
-
-        // Field 7: SkipAssignment (v9+)
-        if version >= 9 {
-            encoder.write_bool(false);
-            tracing::debug!("  [7] SkipAssignment: false");
-        }
-
-        // Field 8: MemberId (v0+)
-        if flexible {
-            encoder.write_compact_string(Some(&response.member_id));
-            tracing::debug!("  [8] MemberId (compact): {}", response.member_id);
-        } else {
-            encoder.write_string(Some(&response.member_id));
-            tracing::debug!("  [8] MemberId: {}", response.member_id);
-        }
-
-        // Field 9: Members array (v0+)
-        if flexible {
-            encoder.write_compact_array_len(response.members.len());
-            tracing::debug!("  [9] Members array (compact): {} members", response.members.len());
-        } else {
-            encoder.write_i32(response.members.len() as i32);
-            tracing::debug!("  [9] Members array: {} members", response.members.len());
-        }
-
-        let before_members = encoder.position();
-        tracing::warn!("  Before encoding members: buf_len={}, version={}, flexible={}, member_count={}, member_id={}", before_members, version, flexible, response.members.len(), response.member_id);
-
-        for (idx, member) in response.members.iter().enumerate() {
-            let member_start = encoder.position();
-            tracing::warn!("    Member[{}] START: buf_len={}, id={}, instance_id={:?}", idx, member_start, member.member_id, member.group_instance_id);
-
-            if flexible {
-                encoder.write_compact_string(Some(&member.member_id));
-            } else {
-                encoder.write_string(Some(&member.member_id));
-            }
-            let after_member_id = encoder.position();
-            tracing::warn!("      After member_id: buf_len={}, bytes_written={}", after_member_id, after_member_id - member_start);
-
-            if version >= 5 {
-                if flexible {
-                    encoder.write_compact_string(member.group_instance_id.as_deref());
-                } else {
-                    encoder.write_string(member.group_instance_id.as_deref());
-                }
-                let after_instance_id = encoder.position();
-                tracing::warn!("      After group_instance_id: buf_len={}, bytes_written={}", after_instance_id, after_instance_id - after_member_id);
-            }
-
-            if flexible {
-                encoder.write_compact_bytes(Some(&member.metadata));
-                // Tagged fields at member level
-                encoder.write_tagged_fields();
-            } else {
-                tracing::warn!("      Member[{}] metadata: len={}, first_16_bytes={:02x?}",
-                    idx, member.metadata.len(), &member.metadata[..member.metadata.len().min(16)]);
-                encoder.write_bytes(Some(&member.metadata));
-            }
-
-            let member_end = encoder.position();
-            let member_bytes = member_end - member_start;
-            tracing::warn!("    Member[{}] END: buf_len={}, total_member_bytes={}", idx, member_end, member_bytes);
-        }
-
-        let after_members = encoder.position();
-        tracing::warn!("  After encoding members: buf_len={}, total_member_section_bytes={}", after_members, after_members - before_members);
-
-        // Tagged fields at response level (flexible versions only)
-        if flexible {
-            encoder.write_tagged_fields();
-            tracing::debug!("  Tagged fields (response level): 0");
-        }
-
-        let response_bytes = &buf[start_len..];
-        tracing::debug!("JoinGroup v{} response encoded {} bytes: {:02x?}", version, response_bytes.len(), response_bytes);
-
-        Ok(())
+        // Delegate to focused encoder module (Phase 2.1 refactoring: 199 complexity → <25)
+        use crate::handlers::join_group::JoinGroupResponseEncoder;
+        JoinGroupResponseEncoder::encode(buf, response, version)
     }
     
     /// Encode SyncGroup response
@@ -1583,133 +1446,41 @@ impl ProtocolHandler {
     }
     
     /// Encode Fetch response
+    /// Encode Fetch response using refactored modules (Phase 2.4)
+    ///
+    /// Complexity: < 25 (orchestrates version-specific encoding via extracted modules)
+    ///
+    /// **Refactored from 287-line monolithic function to focused orchestration.**
+    /// Uses dedicated modules for version fields, topic/partition encoding, and tagged fields.
     pub fn encode_fetch_response(&self, buf: &mut BytesMut, response: &crate::types::FetchResponse, version: i16) -> Result<()> {
+        use crate::fetch_response::{
+            VersionFieldsEncoder, TopicEncoder, TaggedFieldsEncoder
+        };
+
         let initial_len = buf.len();
         let mut encoder = Encoder::new(buf);
         let flexible = version >= 12;
 
         tracing::debug!("Encoding Fetch response v{} (flexible={})", version, flexible);
 
-        // Throttle time (v1+)
-        if version >= 1 {
-            encoder.write_i32(response.throttle_time_ms);
-            tracing::trace!("  throttle_time_ms: {}", response.throttle_time_ms);
-        }
+        // Phase 1: Encode version-specific header fields
+        VersionFieldsEncoder::encode_throttle_time(&mut encoder, response.throttle_time_ms, version);
+        VersionFieldsEncoder::encode_error_and_session(
+            &mut encoder,
+            response.error_code,
+            response.session_id,
+            version,
+        );
 
-        // Error code and session ID (v7+)
-        if version >= 7 {
-            encoder.write_i16(response.error_code);
-            encoder.write_i32(response.session_id);
-            tracing::trace!("  error_code: {}, session_id: {}", response.error_code, response.session_id);
-        }
-
-        // Topics array
-        if flexible {
-            encoder.write_unsigned_varint((response.topics.len() + 1) as u32);
-        } else {
-            encoder.write_i32(response.topics.len() as i32);
-        }
-        tracing::debug!("  Topics count: {}", response.topics.len());
+        // Phase 2: Encode topics array
+        TopicEncoder::encode_topics_array_header(&mut encoder, response.topics.len(), flexible);
 
         for topic in &response.topics {
-            // Topic name
-            if flexible {
-                encoder.write_compact_string(Some(&topic.name));
-            } else {
-                encoder.write_string(Some(&topic.name));
-            }
-            tracing::trace!("    Topic: {}", topic.name);
-
-            // Partitions array
-            if flexible {
-                encoder.write_unsigned_varint((topic.partitions.len() + 1) as u32);
-            } else {
-                encoder.write_i32(topic.partitions.len() as i32);
-            }
-            tracing::trace!("    Partitions count: {}", topic.partitions.len());
-
-            for partition in &topic.partitions {
-                encoder.write_i32(partition.partition);
-                encoder.write_i16(partition.error_code);
-                encoder.write_i64(partition.high_watermark);
-
-                tracing::trace!("      Partition {}: error={}, hw={}",
-                    partition.partition, partition.error_code, partition.high_watermark);
-
-                if version >= 4 {
-                    encoder.write_i64(partition.last_stable_offset);
-
-                    if version >= 5 {
-                        encoder.write_i64(partition.log_start_offset);
-                        tracing::trace!("        lso={}, log_start={}",
-                            partition.last_stable_offset, partition.log_start_offset);
-                    }
-
-                    // Aborted transactions
-                    if let Some(ref aborted) = partition.aborted {
-                        if flexible {
-                            encoder.write_unsigned_varint((aborted.len() + 1) as u32);
-                        } else {
-                            encoder.write_i32(aborted.len() as i32);
-                        }
-                        for txn in aborted {
-                            encoder.write_i64(txn.producer_id);
-                            encoder.write_i64(txn.first_offset);
-                            if flexible {
-                                encoder.write_unsigned_varint(0); // Tagged fields
-                            }
-                        }
-                    } else {
-                        if flexible {
-                            encoder.write_unsigned_varint(1); // 0 + 1 for compact encoding
-                        } else {
-                            encoder.write_i32(0);
-                        }
-                    }
-                }
-
-                if version >= 11 {
-                    encoder.write_i32(partition.preferred_read_replica);
-                    tracing::trace!("        preferred_read_replica={}", partition.preferred_read_replica);
-                }
-
-                // Records
-                let records_len = partition.records.len();
-                if records_len == 0 {
-                    // Empty records
-                    tracing::trace!("        Records: empty (0 bytes)");
-                    if flexible {
-                        // CRITICAL FIX: Compact encoding - 1 = empty (0 bytes), NOT 0 (which is null)
-                        encoder.write_unsigned_varint(1); // Empty array (0 bytes)
-                    } else {
-                        encoder.write_i32(0); // Empty byte array
-                    }
-                } else {
-                    tracing::debug!("        Records: {} bytes", records_len);
-                    if flexible {
-                        encoder.write_unsigned_varint((records_len + 1) as u32);
-                    } else {
-                        encoder.write_i32(records_len as i32);
-                    }
-                    encoder.write_raw_bytes(&partition.records);
-                }
-
-                // Tagged fields for partition (v12+)
-                if flexible {
-                    encoder.write_unsigned_varint(0);
-                }
-            }
-
-            // Tagged fields for topic (v12+)
-            if flexible {
-                encoder.write_unsigned_varint(0);
-            }
+            TopicEncoder::encode_topic(&mut encoder, topic, version, flexible);
         }
 
-        // Tagged fields at response level (v12+)
-        if flexible {
-            encoder.write_unsigned_varint(0);
-        }
+        // Phase 3: Encode response-level tagged fields (v12+)
+        TaggedFieldsEncoder::encode_response_tagged_fields(&mut encoder, flexible);
 
         let total_encoded = buf.len() - initial_len;
         tracing::info!("Encoded Fetch response v{}: {} bytes total", version, total_encoded);
@@ -2077,293 +1848,114 @@ impl ProtocolHandler {
     }
     
     /// Handle Metadata request
+    /// Handle Kafka Metadata API request (v0-v13)
+    ///
+    /// Complexity: < 25 (now purely orchestration, delegates to focused modules)
     pub async fn handle_metadata(
         &self,
         header: RequestHeader,
         body: &mut Bytes,
     ) -> Result<Response> {
-        use crate::types::{MetadataRequest, MetadataResponse, MetadataBroker};
-        use crate::parser::Decoder;
-        
+        use crate::handlers::metadata::{MetadataRequestParser, BrokerRetriever, BrokerValidator, MetadataResponseBuilder};
+
         tracing::debug!("handle_metadata called with v{}", header.api_version);
-        tracing::debug!("Handling metadata request v{}", header.api_version);
-        
-        let mut decoder = Decoder::new(body);
-        let flexible = header.api_version >= 9;
-        
-        // Parse metadata request
-        tracing::debug!("Parsing metadata request, flexible={}", flexible);
-        let topics = if header.api_version >= 1 {
-            let topic_count = if flexible {
-                // Compact array
-                let count = match decoder.read_unsigned_varint() {
-                    Ok(c) => c as i32,
-                    Err(e) => {
-                        tracing::debug!("Failed to read topic count varint: {:?}", e);
-                        return Err(e);
-                    }
-                };
-                tracing::debug!("Topic count varint read: {}", count);
-                if count == 0 {
-                    -1  // Null array
-                } else {
-                    count - 1  // Compact arrays use +1 encoding
-                }
-            } else {
-                decoder.read_i32()?
-            };
-            
-            tracing::debug!("Topic count decoded: {}", topic_count);
-            if topic_count < 0 {
-                None // All topics
-            } else {
-                let mut topic_names = Vec::with_capacity(topic_count as usize);
-                for i in 0..topic_count {
-                    tracing::trace!("Reading topic {}/{}", i+1, topic_count);
-                    
-                    // v10+ includes topic_id (UUID) before name
-                    if header.api_version >= 10 {
-                        // Skip the 16-byte UUID
-                        let mut topic_id = [0u8; 16];
-                        for j in 0..16 {
-                            topic_id[j] = decoder.read_i8()? as u8;
-                        }
-                        tracing::trace!("Topic {} ID: {:02x?}", i, &topic_id);
-                    }
-                    
-                    let name = if flexible {
-                        decoder.read_compact_string()?
-                    } else {
-                        decoder.read_string()?
-                    };
-                    
-                    
-                    if let Some(name) = name {
-                        topic_names.push(name);
-                    }
-                    
-                    if flexible {
-                        // Skip tagged fields for each topic
-                        let tagged_count = decoder.read_unsigned_varint()?;
-                    }
-                }
-                Some(topic_names)
-            }
-        } else {
-            // v0 gets all topics
-            None
-        };
-        
-        let allow_auto_topic_creation = if header.api_version >= 4 {
-            let val = decoder.read_bool()?;
-            val
-        } else {
-            true
-        };
-        
-        // include_cluster_authorized_operations was removed in v11
-        let include_cluster_authorized_operations = if header.api_version >= 8 && header.api_version <= 10 {
-            let val = decoder.read_bool()?;
-            val
-        } else {
-            false
-        };
-        
-        let include_topic_authorized_operations = if header.api_version >= 8 {
-            let val = decoder.read_bool()?;
-            val
-        } else {
-            false
-        };
-        
-        if flexible {
-            // Skip tagged fields at the end
-            // librdkafka v2.11.1 quirk: First Metadata request may be missing tagged fields
-            if decoder.has_remaining() {
-                match decoder.read_unsigned_varint() {
-                    Ok(_) => {
-                        // Tagged fields read and ignored
-                    }
-                    Err(e) => {
-                        return Err(e);
-                    }
-                }
-            } else {
-                // No tagged fields
-            }
-        }
-        
-        let _request = MetadataRequest {
-            topics,
-            allow_auto_topic_creation,
-            include_cluster_authorized_operations,
-            include_topic_authorized_operations,
-        };
-        
-        // Create response with topics from metadata store
-        tracing::info!("Creating metadata response - topics requested: {:?}, auto_create: {}", 
-            _request.topics, _request.allow_auto_topic_creation);
-        
-        // Handle auto-topic creation if enabled
-        if _request.allow_auto_topic_creation {
-            if let Some(requested_topics) = &_request.topics {
-                // Check which topics don't exist and create them
+        tracing::info!("Handling metadata request v{}", header.api_version);
+
+        // Phase 1: Parse metadata request
+        let request = MetadataRequestParser::parse(&header, body)?;
+        tracing::info!("Creating metadata response - topics requested: {:?}, auto_create: {}",
+            request.topics, request.allow_auto_topic_creation);
+
+        // Phase 2: Handle auto-topic creation if enabled
+        if request.allow_auto_topic_creation {
+            if let Some(requested_topics) = &request.topics {
                 self.auto_create_topics(requested_topics).await?;
             }
         }
-        
-        // Get topics from metadata store (including newly created ones)
-        let mut topics = match self.get_topics_from_metadata(&_request.topics).await {
+
+        // Phase 3: Get topics from metadata store (including newly created ones)
+        let mut topics = match self.get_topics_from_metadata(&request.topics).await {
             Ok(topics) => topics,
             Err(e) => {
                 tracing::error!("Failed to get topics from metadata: {:?}", e);
                 vec![]
             }
         };
-        
-        // CRITICAL FIX: Ensure at least one topic exists for clients to connect
-        // Without this, Kafka clients cannot establish connections as they require
-        // at least one topic in metadata responses
-        if topics.is_empty() && _request.allow_auto_topic_creation {
-            tracing::info!("No topics exist, creating default topic 'chronik-default' for client compatibility");
-            
-            // Create a default topic
-            if let Err(e) = self.auto_create_topics(&["chronik-default".to_string()]).await {
-                tracing::error!("Failed to auto-create default topic: {:?}", e);
-            }
-            
-            // Try to get topics again after creating default
-            topics = match self.get_topics_from_metadata(&_request.topics).await {
-                Ok(topics) => topics,
-                Err(e) => {
-                    tracing::error!("Failed to get topics after creating default: {:?}", e);
-                    
-                    // As a last resort, return a fake topic so clients can at least connect
-                    vec![crate::types::MetadataTopic {
-                        error_code: 0,
-                        name: "chronik-default".to_string(),
-                        is_internal: false,
-                        partitions: vec![crate::types::MetadataPartition {
-                            error_code: 0,
-                            partition_index: 0,
-                            leader_id: self.broker_id,
-                            leader_epoch: 0,
-                            replica_nodes: vec![self.broker_id],
-                            isr_nodes: vec![self.broker_id],
-                            offline_replicas: vec![],
-                        }],
-                    }]
-                }
-            };
-        }
-        
-        // Get brokers from metadata store
-        let brokers = if let Some(metadata_store) = &self.metadata_store {
-            match metadata_store.list_brokers().await {
-                Ok(broker_metas) => {
-                    tracing::info!("Got {} brokers from metadata store (before filter)", broker_metas.len());
-                    for b in &broker_metas {
-                        tracing::info!("  BEFORE FILTER - Broker {}: {}:{} (status: {:?})",
-                            b.broker_id, b.host, b.port, b.status);
-                    }
 
-                    // Filter out broker 0 with 0.0.0.0 - this is a phantom broker
-                    let brokers: Vec<MetadataBroker> = broker_metas.into_iter()
-                        .filter(|b| !(b.broker_id == 0 && b.host == "0.0.0.0"))
-                        .map(|b| MetadataBroker {
-                            node_id: b.broker_id,
-                            host: b.host,
-                            port: b.port,
-                            rack: b.rack,
-                        }).collect();
-                    tracing::info!("Got {} brokers from metadata store (after filter)", brokers.len());
-                    for b in &brokers {
-                        tracing::info!("  AFTER FILTER - Broker {}: {}:{}", b.node_id, b.host, b.port);
-                    }
-                    brokers
-                }
-                Err(e) => {
-                    tracing::error!("Failed to get brokers from metadata: {:?}", e);
-                    // Fallback to current broker if we can't get from metadata store
-                    tracing::warn!("Using fallback broker: {}:{} (node_id={})",
-                        self.advertised_host, self.advertised_port, self.broker_id);
-                    vec![MetadataBroker {
-                        node_id: self.broker_id,
-                        host: self.advertised_host.clone(),
-                        port: self.advertised_port,
-                        rack: None,
-                    }]
-                }
-            }
-        } else {
-            tracing::warn!("No metadata store available, using default broker");
-            tracing::warn!("Using default broker: {}:{} (node_id={})",
-                self.advertised_host, self.advertised_port, self.broker_id);
-            // No metadata store, use current broker
-            vec![MetadataBroker {
-                node_id: self.broker_id,
-                host: self.advertised_host.clone(),
-                port: self.advertised_port,
-                rack: None,
-            }]
-        };
-        
-        // CRITICAL VALIDATION: Ensure broker list is not empty and hosts are valid
-        // This prevents the AdminClient "No resolvable bootstrap urls" error
-        if brokers.is_empty() {
-            tracing::error!("CRITICAL: Metadata response has NO brokers - AdminClient will fail!");
-            tracing::error!("This will cause 'No resolvable bootstrap urls' error in Java clients");
-            return Err(Error::Internal("Metadata response must include at least one broker".into()));
+        // Phase 4: Ensure at least one topic exists for client compatibility
+        // CRITICAL FIX: Kafka clients require at least one topic in metadata responses
+        if topics.is_empty() && request.allow_auto_topic_creation {
+            topics = self.ensure_default_topic_exists(&request.topics).await?;
         }
 
-        for broker in &brokers {
-            if broker.host.is_empty() {
-                tracing::error!("CRITICAL: Broker {} has EMPTY host - AdminClient will fail!", broker.node_id);
-                return Err(Error::Internal(format!("Broker {} has empty host field", broker.node_id)));
-            }
-            if broker.host == "0.0.0.0" {
-                tracing::error!("CRITICAL: Broker {} has 0.0.0.0 host - clients cannot connect!", broker.node_id);
-                return Err(Error::Internal(format!("Broker {} has invalid host 0.0.0.0", broker.node_id)));
-            }
-            if broker.node_id < 0 {
-                tracing::error!("CRITICAL: Broker has invalid node_id {} - clients will reject!", broker.node_id);
-                return Err(Error::Internal(format!("Broker has invalid node_id {}", broker.node_id)));
-            }
-        }
+        // Phase 5: Get brokers from metadata store with fallback
+        let brokers = BrokerRetriever::get_brokers(
+            self.metadata_store.clone(),
+            self.broker_id,
+            self.advertised_host.clone(),
+            self.advertised_port,
+        )
+        .await?;
 
-        let response = MetadataResponse {
-            throttle_time_ms: 0,
+        // Phase 6: Validate broker list (prevents client connection errors)
+        BrokerValidator::validate(&brokers)?;
+
+        // Phase 7: Build metadata response
+        let response = MetadataResponseBuilder::build(
             brokers,
-            cluster_id: Some("chronik-stream".to_string()),
-            controller_id: self.broker_id, // Use actual broker ID
             topics,
-            cluster_authorized_operations: if header.api_version >= 8 { Some(-2147483648) } else { None },
-        };
-        tracing::info!("Metadata response has {} topics and {} brokers",
-                      response.topics.len(), response.brokers.len());
-        
-        // Debug: Log broker details
-        for (i, broker) in response.brokers.iter().enumerate() {
-            tracing::debug!("  Broker {}: id={}, host={}, port={}", 
-                           i, broker.node_id, broker.host, broker.port);
-        }
+            self.broker_id,
+            header.api_version,
+        );
 
+        // Phase 8: Encode response
         let mut body_buf = BytesMut::new();
         tracing::info!("About to encode metadata response with {} brokers", response.brokers.len());
-        // Encode the response body (without correlation ID)
-        match self.encode_metadata_response(&mut body_buf, &response, header.api_version) {
-            Ok(_) => {
-                // Response encoded successfully
-                tracing::debug!("Metadata response body encoded, length={}, first 32 bytes: {:02x?}",
-                    body_buf.len(),
-                    &body_buf[..body_buf.len().min(32)]);
-            }
+        MetadataResponseBuilder::encode(&mut body_buf, &response, header.api_version)?;
+        tracing::debug!("Metadata response body encoded, length={}, first 32 bytes: {:02x?}",
+            body_buf.len(),
+            &body_buf[..body_buf.len().min(32)]);
+
+        Ok(Self::make_response(&header, ApiKey::Metadata, body_buf.freeze()))
+    }
+
+    /// Ensure at least one default topic exists for client compatibility
+    ///
+    /// Complexity: < 15 (auto-create default topic with fallback)
+    async fn ensure_default_topic_exists(
+        &self,
+        requested_topics: &Option<Vec<String>>,
+    ) -> Result<Vec<crate::types::MetadataTopic>> {
+        tracing::info!("No topics exist, creating default topic 'chronik-default' for client compatibility");
+
+        // Create a default topic
+        if let Err(e) = self.auto_create_topics(&["chronik-default".to_string()]).await {
+            tracing::error!("Failed to auto-create default topic: {:?}", e);
+        }
+
+        // Try to get topics again after creating default
+        match self.get_topics_from_metadata(requested_topics).await {
+            Ok(topics) => Ok(topics),
             Err(e) => {
-                return Err(e);
+                tracing::error!("Failed to get topics after creating default: {:?}", e);
+
+                // As a last resort, return a fake topic so clients can at least connect
+                Ok(vec![crate::types::MetadataTopic {
+                    error_code: 0,
+                    name: "chronik-default".to_string(),
+                    is_internal: false,
+                    partitions: vec![crate::types::MetadataPartition {
+                        error_code: 0,
+                        partition_index: 0,
+                        leader_id: self.broker_id,
+                        leader_epoch: 0,
+                        replica_nodes: vec![self.broker_id],
+                        isr_nodes: vec![self.broker_id],
+                        offline_replicas: vec![],
+                    }],
+                }])
             }
         }
-        
-        Ok(Self::make_response(&header, ApiKey::Metadata, body_buf.freeze()))
     }
     
     /// Parse a produce request from bytes
@@ -2792,166 +2384,56 @@ impl ProtocolHandler {
     }
 
     /// Handle DescribeConfigs request
+    ///
+    /// Refactored into focused modules (Phase 2.4 Part 3):
+    /// - request_parser: Parse request body
+    /// - config_provider: Get topic/broker configs
+    /// - response_encoder: Encode response
+    ///
+    /// Complexity: < 25 (down from ~186)
     async fn handle_describe_configs(
         &self,
         header: RequestHeader,
         body: &mut Bytes,
     ) -> Result<Response> {
-        use crate::types::{
-            DescribeConfigsResult,
-            ConfigResource
-        };
-        use crate::parser::Decoder;
+        use crate::describe_configs::{RequestParser, ConfigProvider, ResponseEncoder};
+        use crate::types::DescribeConfigsResult;
+        use crate::parser::{Decoder, Encoder};
 
         tracing::debug!("Handling DescribeConfigs request v{}", header.api_version);
-        tracing::debug!("Request body has {} bytes", body.len());
 
+        // Phase 1: Parse request
         let mut decoder = Decoder::new(body);
-
-        // Determine encoding type (v4+ uses compact/flexible encoding)
-        let use_compact = header.api_version >= 4;
-        // Note: DescribeConfigs does NOT have client_id in body (unlike CreateTopics)
-
-        // Parse resources array - use compact array for v4+
-        let resource_count = if use_compact {
-            let compact_len = decoder.read_unsigned_varint()?;
-            if compact_len == 0 {
-                0  // NULL array
-            } else {
-                (compact_len - 1) as usize
-            }
-        } else {
-            decoder.read_i32()? as usize
-        };
-        tracing::debug!("Resource count: {}", resource_count);
-        let mut resources = Vec::with_capacity(resource_count);
-        
-        for i in 0..resource_count {
-            let resource_type = decoder.read_i8()?;
-            tracing::debug!("Resource {}: type = {}", i, resource_type);
-
-            // Resource name - use compact string for v4+
-            let resource_name = if use_compact {
-                decoder.read_compact_string()?.unwrap_or_else(|| String::new())
-            } else {
-                decoder.read_string()?.unwrap_or_else(|| String::new())
-            };
-            tracing::debug!("Resource {}: name = '{}'", i, resource_name);
-
-            // Configuration keys (v1+) - use compact array/strings for v4+
-            let configuration_keys = if header.api_version >= 1 {
-                if use_compact {
-                    let compact_len = decoder.read_unsigned_varint()?;
-                    if compact_len == 0 {
-                        None
-                    } else {
-                        let key_count = (compact_len - 1) as usize;
-                        let mut keys = Vec::with_capacity(key_count);
-                        for _ in 0..key_count {
-                            if let Some(key) = decoder.read_compact_string()? {
-                                keys.push(key);
-                            }
-                        }
-                        Some(keys)
-                    }
-                } else {
-                    let key_count = decoder.read_i32()?;
-                    if key_count < 0 {
-                        None
-                    } else {
-                        let mut keys = Vec::with_capacity(key_count as usize);
-                        for _ in 0..key_count {
-                            if let Some(key) = decoder.read_string()? {
-                                keys.push(key);
-                            }
-                        }
-                        Some(keys)
-                    }
-                }
-            } else {
-                None
-            };
-
-            // CRITICAL: Skip per-resource tagged fields for v4+ (flexible protocol)
-            if use_compact {
-                let tag_count = decoder.read_unsigned_varint()?;
-                for _ in 0..tag_count {
-                    let _tag_id = decoder.read_unsigned_varint()?;
-                    let tag_size = decoder.read_unsigned_varint()? as usize;
-                    decoder.advance(tag_size)?;
-                }
-            }
-
-            resources.push(ConfigResource {
-                resource_type,
-                resource_name,
-                configuration_keys,
-            });
-        }
-        
-        // Include synonyms (v1+) - ALWAYS in main body, even for v4+
-        let include_synonyms = if header.api_version >= 1 {
-            decoder.read_bool()?
-        } else {
-            false
-        };
-
-        // Include documentation (v3+) - ALWAYS in main body, even for v4+
-        let include_documentation = if header.api_version >= 3 {
-            decoder.read_bool()?
-        } else {
-            false
-        };
-
-        tracing::debug!("DescribeConfigs v{}: include_synonyms={}, include_documentation={}",
-            header.api_version, include_synonyms, include_documentation);
-
-        // For v4+, parse tagged fields at request level (after all main body fields)
-        if use_compact {
-            let tag_count = decoder.read_unsigned_varint()?;
-            tracing::debug!("DescribeConfigs v{}: parsing {} request-level tagged fields", header.api_version, tag_count);
-
-            for _ in 0..tag_count {
-                let tag_id = decoder.read_unsigned_varint()?;
-                let tag_size = decoder.read_unsigned_varint()? as usize;
-                tracing::debug!("DescribeConfigs v{}: skipping tagged field {} ({} bytes)",
-                    header.api_version, tag_id, tag_size);
-                decoder.skip(tag_size)?;
-            }
-        }
-
-        let (final_include_synonyms, final_include_documentation) = (include_synonyms, include_documentation);
+        let request = RequestParser::parse(&mut decoder, header.api_version)?;
 
         tracing::info!("DescribeConfigs v{}: processing {} resources (include_synonyms={}, include_documentation={})",
-            header.api_version, resources.len(), final_include_synonyms, final_include_documentation);
+            header.api_version, request.resources.len(), request.include_synonyms, request.include_documentation);
 
-        // Process each resource
+        // Phase 2: Process each resource
         let mut results = Vec::new();
 
-        for resource in resources {
+        for resource in request.resources {
             tracing::debug!("DescribeConfigs: processing resource_type={}, resource_name={}",
                 resource.resource_type, resource.resource_name);
 
             let configs = match resource.resource_type {
                 2 => {
                     // Topic configs
-                    tracing::debug!("DescribeConfigs: fetching topic configs for '{}'", resource.resource_name);
-                    self.get_topic_configs(
+                    ConfigProvider::get_topic_configs(
                         &resource.resource_name,
                         &resource.configuration_keys,
-                        final_include_synonyms,
-                        final_include_documentation,
+                        request.include_synonyms,
+                        request.include_documentation,
                         header.api_version,
                     ).await?
                 },
                 4 => {
                     // Broker configs
-                    tracing::debug!("DescribeConfigs: fetching broker configs for '{}'", resource.resource_name);
-                    self.get_broker_configs(
+                    ConfigProvider::get_broker_configs(
                         &resource.resource_name,
                         &resource.configuration_keys,
-                        final_include_synonyms,
-                        final_include_documentation,
+                        request.include_synonyms,
+                        request.include_documentation,
                         header.api_version,
                     ).await?
                 },
@@ -2967,9 +2449,6 @@ impl ProtocolHandler {
                     continue;
                 }
             };
-            
-            tracing::debug!("DescribeConfigs: resource {} returned {} config entries",
-                resource.resource_name, configs.len());
 
             results.push(DescribeConfigsResult {
                 error_code: 0,
@@ -2980,298 +2459,16 @@ impl ProtocolHandler {
             });
         }
 
-        tracing::info!("DescribeConfigs v{}: returning {} results", header.api_version, results.len());
-
-        let response = DescribeConfigsResponse {
-            throttle_time_ms: 0,
-            results,
-        };
-
+        // Phase 3: Encode response
         let mut body_buf = BytesMut::new();
+        let mut encoder = Encoder::new(&mut body_buf);
 
-        // Encode the response body (without correlation ID)
-        self.encode_describe_configs_response(&mut body_buf, &response, header.api_version)?;
+        ResponseEncoder::encode(&mut encoder, 0, results, header.api_version)?;
 
         tracing::info!("DescribeConfigs v{}: encoded response size = {} bytes",
             header.api_version, body_buf.len());
-        if body_buf.len() <= 100 {
-            tracing::debug!("DescribeConfigs v{}: response bytes: {:02x?}",
-                header.api_version, &body_buf[..]);
-        } else {
-            tracing::debug!("DescribeConfigs v{}: first 100 bytes: {:02x?}",
-                header.api_version, &body_buf[..100]);
-        }
 
         Ok(Self::make_response(&header, ApiKey::DescribeConfigs, body_buf.freeze()))
-    }
-    
-    /// Get topic configurations
-    async fn get_topic_configs(
-        &self,
-        _topic_name: &str,
-        configuration_keys: &Option<Vec<String>>,
-        include_synonyms: bool,
-        include_documentation: bool,
-        api_version: i16,
-    ) -> Result<Vec<ConfigEntry>> {
-        let mut configs = Vec::new();
-        
-        // Default topic configurations
-        let all_configs = vec![
-            ("retention.ms", "604800000", "The minimum age of a log file to be eligible for deletion", config_type::LONG),
-            ("segment.ms", "604800000", "The time after which Kafka will force the log to roll", config_type::LONG),
-            ("segment.bytes", "1073741824", "The segment file size for the log", config_type::LONG),
-            ("min.insync.replicas", "1", "Minimum number of replicas that must acknowledge a write", config_type::INT),
-            ("compression.type", "producer", "The compression type for a topic", config_type::STRING),
-            ("cleanup.policy", "delete", "The retention policy to use on log segments", config_type::STRING),
-            ("max.message.bytes", "1048588", "The maximum size of a message", config_type::INT),
-        ];
-        
-        for (name, default_value, doc, config_type_val) in all_configs {
-            // Check if we should include this config
-            if let Some(keys) = configuration_keys {
-                if !keys.contains(&name.to_string()) {
-                    continue;
-                }
-            }
-            
-            let mut synonyms = Vec::new();
-            if include_synonyms {
-                synonyms.push(ConfigSynonym {
-                    name: name.to_string(),
-                    value: Some(default_value.to_string()),
-                    source: config_source::DEFAULT_CONFIG,
-                });
-            }
-            
-            configs.push(ConfigEntry {
-                name: name.to_string(),
-                value: Some(default_value.to_string()),
-                read_only: false,
-                is_default: true,
-                config_source: config_source::DEFAULT_CONFIG,
-                is_sensitive: false,
-                synonyms,
-                config_type: if api_version >= 3 { Some(config_type_val) } else { None },
-                documentation: if include_documentation && api_version >= 3 {
-                    Some(doc.to_string())
-                } else {
-                    None
-                },
-            });
-        }
-        
-        Ok(configs)
-    }
-    
-    /// Get broker configurations
-    async fn get_broker_configs(
-        &self,
-        _broker_id: &str,
-        configuration_keys: &Option<Vec<String>>,
-        include_synonyms: bool,
-        include_documentation: bool,
-        api_version: i16,
-    ) -> Result<Vec<ConfigEntry>> {
-        let mut configs = Vec::new();
-
-        // Default broker configurations
-        let all_configs = vec![
-            ("default.replication.factor", "1", "Default replication factor for automatically created topics", config_type::INT),
-            ("log.retention.hours", "168", "The number of hours to keep a log file", config_type::INT),
-            ("log.segment.bytes", "1073741824", "The maximum size of a single log file", config_type::LONG),
-            ("num.network.threads", "8", "The number of threads for network requests", config_type::INT),
-            ("num.io.threads", "8", "The number of threads for I/O", config_type::INT),
-            ("socket.send.buffer.bytes", "102400", "The SO_SNDBUF buffer size", config_type::INT),
-            ("socket.receive.buffer.bytes", "102400", "The SO_RCVBUF buffer size", config_type::INT),
-        ];
-
-        for (name, default_value, doc, config_type_val) in all_configs {
-            // Check if we should include this config
-            if let Some(keys) = configuration_keys {
-                if !keys.contains(&name.to_string()) {
-                    continue;
-                }
-            }
-
-            // Build synonyms if requested (v1+)
-            let mut synonyms = Vec::new();
-            if include_synonyms {
-                synonyms.push(ConfigSynonym {
-                    name: name.to_string(),
-                    value: Some(default_value.to_string()),
-                    source: config_source::STATIC_BROKER_CONFIG,
-                });
-            }
-
-            configs.push(ConfigEntry {
-                name: name.to_string(),
-                value: Some(default_value.to_string()),
-                read_only: true,
-                is_default: true,
-                config_source: config_source::STATIC_BROKER_CONFIG,
-                is_sensitive: false,
-                synonyms,
-                config_type: if api_version >= 3 { Some(config_type_val) } else { None },
-                documentation: if include_documentation && api_version >= 3 {
-                    Some(doc.to_string())
-                } else {
-                    None
-                },
-            });
-        }
-
-        Ok(configs)
-    }
-    
-    /// Encode DescribeConfigs response
-    fn encode_describe_configs_response(
-        &self,
-        buf: &mut BytesMut,
-        response: &DescribeConfigsResponse,
-        version: i16,
-    ) -> Result<()> {
-        let mut encoder = Encoder::new(buf);
-
-        // Check if we need to use compact encoding (v4+)
-        let use_compact = version >= 4;
-
-        // Throttle time ms (v0+)
-        encoder.write_i32(response.throttle_time_ms);
-
-        // Results array
-        if use_compact {
-            // Compact array: length + 1
-            encoder.write_unsigned_varint((response.results.len() + 1) as u32);
-        } else {
-            encoder.write_i32(response.results.len() as i32);
-        }
-
-        for result in &response.results {
-            // Error code
-            encoder.write_i16(result.error_code);
-
-            // Error message
-            if use_compact {
-                encoder.write_compact_string(result.error_message.as_deref());
-            } else {
-                encoder.write_string(result.error_message.as_deref());
-            }
-
-            // Resource type
-            encoder.write_i8(result.resource_type);
-
-            // Resource name
-            if use_compact {
-                encoder.write_compact_string(Some(&result.resource_name));
-            } else {
-                encoder.write_string(Some(&result.resource_name));
-            }
-
-            // Configs array
-            if use_compact {
-                encoder.write_unsigned_varint((result.configs.len() + 1) as u32);
-            } else {
-                encoder.write_i32(result.configs.len() as i32);
-            }
-
-            for config in &result.configs {
-                // Config name
-                if use_compact {
-                    encoder.write_compact_string(Some(&config.name));
-                } else {
-                    encoder.write_string(Some(&config.name));
-                }
-
-                // Config value
-                if use_compact {
-                    encoder.write_compact_string(config.value.as_deref());
-                } else {
-                    encoder.write_string(config.value.as_deref());
-                }
-
-                // Read only
-                encoder.write_bool(config.read_only);
-
-                // Is default (v0) OR config source (v1+)
-                if version >= 1 {
-                    encoder.write_i8(config.config_source);
-                } else {
-                    encoder.write_bool(config.is_default);
-                }
-
-                // Is sensitive
-                encoder.write_bool(config.is_sensitive);
-
-                // Synonyms (v1+ only)
-                if version >= 1 {
-                    if use_compact {
-                        encoder.write_unsigned_varint((config.synonyms.len() + 1) as u32);
-                    } else {
-                        encoder.write_i32(config.synonyms.len() as i32);
-                    }
-
-                    for synonym in &config.synonyms {
-                        // Synonym name
-                        if use_compact {
-                            encoder.write_compact_string(Some(&synonym.name));
-                        } else {
-                            encoder.write_string(Some(&synonym.name));
-                        }
-
-                        // Synonym value
-                        if use_compact {
-                            encoder.write_compact_string(synonym.value.as_deref());
-                        } else {
-                            encoder.write_string(synonym.value.as_deref());
-                        }
-
-                        // Synonym source
-                        encoder.write_i8(synonym.source);
-
-                        // Tagged fields for each synonym (v4+)
-                        if use_compact {
-                            encoder.write_unsigned_varint(0); // No tagged fields for the synonym
-                        }
-                    }
-                }
-
-                // Config type (v3+)
-                if version >= 3 {
-                    if let Some(config_type) = config.config_type {
-                        encoder.write_i8(config_type);
-                    } else {
-                        encoder.write_i8(config_type::UNKNOWN);
-                    }
-                }
-
-                // Documentation (v3+)
-                if version >= 3 {
-                    if use_compact {
-                        encoder.write_compact_string(config.documentation.as_deref());
-                    } else {
-                        encoder.write_string(config.documentation.as_deref());
-                    }
-                }
-
-                // Tagged fields for each config entry (v4+)
-                if use_compact {
-                    encoder.write_unsigned_varint(0); // No tagged fields for the config
-                }
-            }
-
-            // Tagged fields for compact encoding (v4+)
-            if use_compact {
-                encoder.write_unsigned_varint(0); // No tagged fields for the result
-            }
-        }
-
-        // Tagged fields for compact encoding (v4+)
-        if use_compact {
-            encoder.write_unsigned_varint(0); // No tagged fields for the response
-        }
-
-        Ok(())
     }
 
     /// Handle DescribeLogDirs request (API 35)
@@ -3525,371 +2722,67 @@ impl ProtocolHandler {
     }
     
     /// Handle CreateTopics request
+    /// Handle CreateTopics request using refactored modules (Phase 2.4 Part 2)
+    ///
+    /// Complexity: < 20 (orchestrates parsing, validation, creation, and encoding)
+    ///
+    /// **Refactored from 260-line monolithic function to focused orchestration.**
+    /// Uses dedicated modules for request parsing, topic validation, topic creation, and response encoding.
     async fn handle_create_topics(
         &self,
         header: RequestHeader,
         body: &mut Bytes,
     ) -> Result<Response> {
-        use crate::create_topics_types::{
-            CreateTopicsRequest, CreateTopicsResponse, CreateTopicResponse,
-            error_codes
-        };
+        use crate::create_topics::*;
+        use crate::create_topics_types::CreateTopicsResponse;
         use crate::parser::Decoder;
 
         tracing::debug!("Handling CreateTopics request v{}", header.api_version);
 
-        // Debug: print the first few bytes of the request body
-        let body_bytes = body.to_vec();
-        let _debug_bytes = &body_bytes[..body_bytes.len().min(20)];
-
         let mut decoder = Decoder::new(body);
 
-        // Determine if we should use compact encoding (v5+)
-        let use_compact = header.api_version >= 5;
-        // Note: CreateTopics does NOT have client_id in body (it's only in the header)
+        // Phase 1: Parse request using RequestParser
+        let request = RequestParser::parse(&mut decoder, header.api_version)?;
 
-        // Parse topic count - use compact array for v5+
-        let topic_count = if use_compact {
-            let compact_len = decoder.read_unsigned_varint()?;
-            if compact_len == 0 {
-                // For CreateTopics, NULL array is not allowed
-                return Err(Error::Protocol("CreateTopics compact array cannot be null".into()));
-            }
-            let actual_len = compact_len - 1;
-            if actual_len > 1000 {  // Reasonable limit for topic count
-                return Err(Error::Protocol("CreateTopics topic count too large".into()));
-            }
-            actual_len as usize
-        } else {
-            let len = decoder.read_i32()?;
-            if len < 0 || len > 1000 {
-                return Err(Error::Protocol("CreateTopics topic count invalid".into()));
-            }
-            len as usize
-        };
-        let mut topics = Vec::with_capacity(topic_count);
+        tracing::debug!("Parsed {} topics, timeout={}ms, validate_only={}",
+            request.topics.len(), request.timeout_ms, request.validate_only);
 
-        for _ in 0..topic_count {
-            // Topic name - use compact string for v5+
-            let name = if use_compact {
-                decoder.read_compact_string()?
-                    .ok_or_else(|| Error::Protocol("Topic name cannot be null".into()))?
-            } else {
-                decoder.read_string()?
-                    .ok_or_else(|| Error::Protocol("Topic name cannot be null".into()))?
-            };
-            
-            // Number of partitions
-            let num_partitions = decoder.read_i32()?;
-            
-            // Replication factor
-            let replication_factor = decoder.read_i16()?;
-            
-            // Replica assignments - use compact array for v5+
-            let assignment_count = if use_compact {
-                (decoder.read_unsigned_varint()? as i32 - 1) as usize
-            } else {
-                decoder.read_i32()? as usize
-            };
-            let mut replica_assignments = Vec::new();
-
-            if assignment_count > 0 {
-                for _ in 0..assignment_count {
-                    let partition_index = decoder.read_i32()?;
-                    let broker_count = if use_compact {
-                        (decoder.read_unsigned_varint()? as i32 - 1) as usize
-                    } else {
-                        decoder.read_i32()? as usize
-                    };
-                    let mut broker_ids = Vec::with_capacity(broker_count);
-
-                    for _ in 0..broker_count {
-                        broker_ids.push(decoder.read_i32()?);
-                    }
-
-                    replica_assignments.push(crate::create_topics_types::ReplicaAssignment {
-                        partition_index,
-                        broker_ids,
-                    });
-
-                    // Handle tagged fields for each replica assignment in compact format (v5+)
-                    if use_compact {
-                        let num_tagged_fields = decoder.read_unsigned_varint()?;
-                        for _ in 0..num_tagged_fields {
-                            let _tag_id = decoder.read_unsigned_varint()?;
-                            let tag_size = decoder.read_unsigned_varint()? as usize;
-                            decoder.advance(tag_size)?;
-                        }
-                    }
-                }
-            }
-
-            // Configs - use compact array for v5+
-            let config_count = if use_compact {
-                (decoder.read_unsigned_varint()? as i32 - 1) as usize
-            } else {
-                decoder.read_i32()? as usize
-            };
-            let mut configs = std::collections::HashMap::new();
-
-            for _ in 0..config_count {
-                let key = if use_compact {
-                    decoder.read_compact_string()?
-                        .ok_or_else(|| Error::Protocol("Config key cannot be null".into()))?
-                } else {
-                    decoder.read_string()?
-                        .ok_or_else(|| Error::Protocol("Config key cannot be null".into()))?
-                };
-                let value = if use_compact {
-                    decoder.read_compact_string()?
-                        .ok_or_else(|| Error::Protocol("Config value cannot be null".into()))?
-                } else {
-                    decoder.read_string()?
-                        .ok_or_else(|| Error::Protocol("Config value cannot be null".into()))?
-                };
-                configs.insert(key, value);
-
-                // Handle tagged fields for each config in compact format (v5+)
-                if use_compact {
-                    let num_tagged_fields = decoder.read_unsigned_varint()?;
-                    for _ in 0..num_tagged_fields {
-                        let _tag_id = decoder.read_unsigned_varint()?;
-                        let tag_size = decoder.read_unsigned_varint()? as usize;
-                        decoder.advance(tag_size)?;
-                    }
-                }
-            }
-
-            // Handle tagged fields for each topic in compact format (v5+)
-            if use_compact {
-                let num_tagged_fields = decoder.read_unsigned_varint()?;
-                for _ in 0..num_tagged_fields {
-                    let _tag_id = decoder.read_unsigned_varint()?;
-                    let tag_size = decoder.read_unsigned_varint()? as usize;
-                    decoder.advance(tag_size)?;
-                }
-            }
-
-            topics.push(crate::create_topics_types::CreateTopicRequest {
-                name,
-                num_partitions,
-                replication_factor,
-                replica_assignments,
-                configs,
-            });
-        }
-        
-        // Timeout
-        let timeout_ms = decoder.read_i32()?;
-        
-        // Validate only (v1+)
-        let validate_only = if header.api_version >= 1 {
-            decoder.read_bool()?
-        } else {
-            false
-        };
-
-        // Tagged fields for compact encoding (v5+)
-        if use_compact {
-            // Read and skip tagged fields at the end of the request
-            let num_tagged_fields = decoder.read_unsigned_varint()?;
-            for _ in 0..num_tagged_fields {
-                let _tag_id = decoder.read_unsigned_varint()?;
-                let tag_size = decoder.read_unsigned_varint()? as usize;
-                decoder.advance(tag_size)?;
-            }
-        }
-
-        let request = CreateTopicsRequest {
-            topics,
-            timeout_ms,
-            validate_only,
-        };
-        
-        // Create response
-        let mut response_topics = Vec::new();
-        
+        // Phase 2: Process each topic (validation + creation)
+        let mut response_topics = Vec::with_capacity(request.topics.len());
         for topic in request.topics {
-            // Validate topic name
-            let error_code = if !Self::is_valid_topic_name(&topic.name) {
-                error_codes::INVALID_TOPIC_EXCEPTION
-            } else if topic.num_partitions <= 0 {
-                tracing::warn!("CreateTopics: Invalid partition count {} for topic '{}'",
-                    topic.num_partitions, topic.name);
-                error_codes::INVALID_PARTITIONS
-            } else if topic.num_partitions > 10000 {
-                tracing::warn!("CreateTopics: Partition count {} exceeds limit 10000 for topic '{}'",
-                    topic.num_partitions, topic.name);
-                error_codes::INVALID_PARTITIONS
-            } else if topic.replication_factor <= 0 {
-                error_codes::INVALID_REPLICATION_FACTOR
-            } else if let Err(e) = self.validate_topic_configs(&topic.configs, topic.replication_factor) {
-                tracing::error!("Invalid topic configuration: {}", e);
-                error_codes::INVALID_CONFIG
-            } else {
-                // Check replication factor against available brokers
-                match self.validate_replication_factor(&topic).await {
-                    Ok(_) => {
-                        if validate_only {
-                            // Just validating, don't create
-                            error_codes::NONE
-                        } else {
-                            // Actually create the topic in metadata store
-                            match self.create_topic_in_metadata(&topic).await {
-                                Ok(_) => {
-                                    tracing::info!("CreateTopics: Created topic '{}' with {} partitions, replication factor {}",
-                                        topic.name, topic.num_partitions, topic.replication_factor);
-                                    error_codes::NONE
-                                }
-                                Err(e) => {
-                                    tracing::error!("Failed to create topic '{}': {:?}", topic.name, e);
-                                    match e {
-                                        Error::Internal(msg) if msg.contains("already exists") => error_codes::TOPIC_ALREADY_EXISTS,
-                                        _ => error_codes::INVALID_REQUEST,
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!("Replication factor validation failed: {}", e);
-                        error_codes::INVALID_REPLICATION_FACTOR
-                    }
-                }
-            };
-            
-            let error_message = match error_code {
-                error_codes::INVALID_TOPIC_EXCEPTION => Some("Invalid topic name".to_string()),
-                error_codes::INVALID_PARTITIONS => Some("Invalid number of partitions".to_string()),
-                error_codes::INVALID_REPLICATION_FACTOR => Some("Invalid replication factor".to_string()),
-                error_codes::INVALID_CONFIG => Some("Invalid topic configuration".to_string()),
-                _ => None,
-            };
-            
-            response_topics.push(CreateTopicResponse {
-                name: topic.name,
-                error_code,
-                error_message,
-                num_partitions: if header.api_version >= 5 { topic.num_partitions } else { -1 },
-                replication_factor: if header.api_version >= 5 { topic.replication_factor } else { -1 },
-                configs: Vec::new(), // TODO: Return actual configs
-            });
+            let topic_response = TopicCreator::process_topic(
+                self,
+                topic,
+                request.validate_only,
+                header.api_version,
+            ).await;
+            response_topics.push(topic_response);
         }
 
+        // Phase 3: Build response
         let response = CreateTopicsResponse {
             throttle_time_ms: 0,
             topics: response_topics,
         };
 
+        // Phase 4: Encode response using ResponseEncoder
         let mut body_buf = BytesMut::new();
-        self.encode_create_topics_response(&mut body_buf, &response, header.api_version)?;
+        ResponseEncoder::encode(&mut body_buf, &response, header.api_version)?;
 
         Ok(Self::make_response(&header, ApiKey::CreateTopics, body_buf.freeze()))
     }
     
-    /// Encode CreateTopics response
+    /// Encode CreateTopics response using refactored module (Phase 2.4 Part 2)
+    ///
+    /// Complexity: < 5 (delegation to ResponseEncoder)
     fn encode_create_topics_response(
         &self,
         buf: &mut BytesMut,
         response: &crate::create_topics_types::CreateTopicsResponse,
         version: i16,
     ) -> Result<()> {
-        use crate::parser::Encoder;
-        let mut encoder = Encoder::new(buf);
-
-        // Determine if we should use compact encoding (v5+)
-        let use_compact = version >= 5;
-
-        tracing::debug!("Encoding CreateTopics response v{}, use_compact={}, topics_len={}",
-                 version, use_compact, response.topics.len());
-        tracing::debug!("Encoding CreateTopics response v{}, use_compact={}", version, use_compact);
-
-        // Throttle time (v2+)
-        if version >= 2 {
-            encoder.write_i32(response.throttle_time_ms);
-        }
-
-        // Topics array - use compact array for v5+
-        if use_compact {
-            encoder.write_compact_array_len(response.topics.len());
-        } else {
-            encoder.write_i32(response.topics.len() as i32);
-        }
-
-        for topic in &response.topics {
-            // Topic name - use compact string for v5+
-            if use_compact {
-                encoder.write_compact_string(Some(&topic.name));
-            } else {
-                encoder.write_string(Some(&topic.name));
-            }
-
-            // Topic ID (v7+) - UUID field added in version 7
-            if version >= 7 {
-                // For now, write all zeros as a placeholder UUID (16 bytes)
-                // Real implementation would store actual topic IDs
-                // UUID is written as raw 16 bytes, not length-prefixed
-                let uuid_bytes = [0u8; 16];
-                encoder.write_raw_bytes(&uuid_bytes);
-            }
-
-            // Error code
-            encoder.write_i16(topic.error_code);
-
-            // Error message (v1+)
-            if version >= 1 {
-                if use_compact {
-                    encoder.write_compact_string(topic.error_message.as_deref());
-                } else {
-                    encoder.write_string(topic.error_message.as_deref());
-                }
-            }
-
-            // Detailed topic info (v5+)
-            if version >= 5 {
-                encoder.write_i32(topic.num_partitions);
-                encoder.write_i16(topic.replication_factor);
-
-                // Configs array - use compact array for v5+
-                if use_compact {
-                    encoder.write_compact_array_len(topic.configs.len());
-                } else {
-                    encoder.write_i32(topic.configs.len() as i32);
-                }
-
-                for config in &topic.configs {
-                    // Config name and value - use compact strings for v5+
-                    if use_compact {
-                        encoder.write_compact_string(Some(&config.name));
-                        encoder.write_compact_string(config.value.as_deref());
-                    } else {
-                        encoder.write_string(Some(&config.name));
-                        encoder.write_string(config.value.as_deref());
-                    }
-
-                    encoder.write_bool(config.read_only);
-                    encoder.write_i8(config.config_source);
-                    encoder.write_bool(config.is_sensitive);
-
-                    // Tagged fields for config (v5+)
-                    if use_compact {
-                        encoder.write_unsigned_varint(0); // Empty tagged fields
-                    }
-                }
-
-                // Tagged fields for topic (v5+)
-                if use_compact {
-                    encoder.write_unsigned_varint(0); // Empty tagged fields
-                }
-            }
-        }
-
-        // Tagged fields for response (v5+)
-        if use_compact {
-            encoder.write_unsigned_varint(0); // Empty tagged fields
-        }
-
-        Ok(())
+        use crate::create_topics::ResponseEncoder;
+        ResponseEncoder::encode(buf, response, version)
     }
 
     /// Handle DeleteTopics request
@@ -5330,232 +4223,6 @@ impl ProtocolHandler {
         Ok(Self::make_response(&header, ApiKey::DescribeCluster, body_bytes))
     }
 
-
-    /// Encode Metadata response
-    fn encode_metadata_response(
-        &self,
-        buf: &mut BytesMut,
-        response: &crate::types::MetadataResponse,
-        version: i16,
-    ) -> Result<()> {
-        let mut encoder = Encoder::new(buf);
-
-        // Validate and log metadata response structure
-        tracing::info!("Encoding metadata response v{} with {} topics, {} brokers, throttle_time: {}",
-                      version, response.topics.len(), response.brokers.len(), response.throttle_time_ms);
-
-        // Log broker details
-        for (i, broker) in response.brokers.iter().enumerate() {
-            tracing::debug!("  Broker[{}]: node_id={}, host={}, port={}, rack={:?}",
-                          i, broker.node_id, broker.host, broker.port, broker.rack);
-        }
-
-        // Log topic details
-        for (i, topic) in response.topics.iter().enumerate() {
-            tracing::debug!("  Topic[{}]: name={}, error_code={}, partitions={}, is_internal={}",
-                          i, &topic.name,
-                          topic.error_code, topic.partitions.len(), topic.is_internal);
-
-            // Sample first partition if exists
-            if let Some(partition) = topic.partitions.first() {
-                tracing::debug!("    Partition[0]: index={}, leader={}, replicas={:?}, isr={:?}, error_code={}",
-                              partition.partition_index, partition.leader_id,
-                              partition.replica_nodes, partition.isr_nodes, partition.error_code);
-            }
-        }
-
-        // Validate response has required fields
-        if response.brokers.is_empty() {
-            tracing::warn!("Metadata response has no brokers - this may cause client issues");
-        }
-        if response.cluster_id.is_none() && version >= 2 {
-            tracing::warn!("Metadata response missing cluster_id for v{} - clients may reject", version);
-        }
-        
-        // Check if this is a flexible/compact version (v9+)
-        let flexible = version >= 9;
-        
-        // Throttle time (v3+ always, regardless of flexible)
-        if version >= 3 {
-            tracing::debug!("Writing throttle_time_ms={} for v{}", response.throttle_time_ms, version);
-            encoder.write_i32(response.throttle_time_ms);
-        } else {
-            tracing::debug!("NOT writing throttle_time for v{} (only for v3+)", version);
-        }
-
-        // Brokers array
-        tracing::debug!("About to encode {} brokers", response.brokers.len());
-
-        // Get buffer position before writing
-        let buffer_before = encoder.debug_buffer().len();
-
-        if flexible {
-            encoder.write_compact_array_len(response.brokers.len());
-        } else {
-            encoder.write_i32(response.brokers.len() as i32);
-        }
-
-        let buffer_after = encoder.debug_buffer().len();
-        tracing::debug!("Metadata response buffer: before={}, after={}, size={}",
-                 buffer_before, buffer_after, buffer_after - buffer_before);
-        let debug_buf = encoder.debug_buffer();
-        tracing::debug!("Metadata response bytes: {:02x?}",
-                 &debug_buf[buffer_before..buffer_after]);
-
-        for broker in &response.brokers {
-            encoder.write_i32(broker.node_id);
-
-            if flexible {
-                encoder.write_compact_string(Some(&broker.host));
-            } else {
-                encoder.write_string(Some(&broker.host));
-            }
-
-            encoder.write_i32(broker.port);
-
-            if version >= 1 {
-                if flexible {
-                    encoder.write_compact_string(broker.rack.as_deref());
-                } else {
-                    encoder.write_string(broker.rack.as_deref());
-                }
-            }
-
-            if flexible {
-                encoder.write_tagged_fields();
-            }
-        }
-
-        // Cluster ID comes after brokers for v2+
-        if version >= 2 {
-            tracing::debug!("Writing cluster_id {:?} at position {}", response.cluster_id, encoder.position());
-            if flexible {
-                encoder.write_compact_string(response.cluster_id.as_deref());
-            } else {
-                encoder.write_string(response.cluster_id.as_deref());
-            }
-        }
-
-        // Controller ID comes after cluster_id for v2+, or directly after brokers for v1
-        if version >= 1 {
-            tracing::debug!("Writing controller_id {} at position {}", response.controller_id, encoder.position());
-            encoder.write_i32(response.controller_id);
-        }
-
-        // Topics array
-        if flexible {
-            encoder.write_compact_array_len(response.topics.len());
-        } else {
-            encoder.write_i32(response.topics.len() as i32);
-        }
-        
-        for topic in &response.topics {
-            encoder.write_i16(topic.error_code);
-            
-            if flexible {
-                encoder.write_compact_string(Some(&topic.name));
-            } else {
-                encoder.write_string(Some(&topic.name));
-            }
-            
-            // Topic ID (v10+) - UUID (16 bytes)
-            if version >= 10 {
-                // For now, use a null UUID (all zeros)
-                encoder.write_raw_bytes(&[0u8; 16]);
-            }
-            
-            if version >= 1 {
-                encoder.write_bool(topic.is_internal);
-            }
-            
-            // Partitions array
-            if flexible {
-                encoder.write_compact_array_len(topic.partitions.len());
-            } else {
-                encoder.write_i32(topic.partitions.len() as i32);
-            }
-            
-            for partition in &topic.partitions {
-                encoder.write_i16(partition.error_code);
-                encoder.write_i32(partition.partition_index);
-                encoder.write_i32(partition.leader_id);
-                
-                if version >= 7 {
-                    encoder.write_i32(partition.leader_epoch);
-                }
-                
-                // Replica nodes
-                if flexible {
-                    encoder.write_compact_array_len(partition.replica_nodes.len());
-                } else {
-                    encoder.write_i32(partition.replica_nodes.len() as i32);
-                }
-                for replica in &partition.replica_nodes {
-                    encoder.write_i32(*replica);
-                }
-                
-                // ISR nodes
-                if flexible {
-                    encoder.write_compact_array_len(partition.isr_nodes.len());
-                } else {
-                    encoder.write_i32(partition.isr_nodes.len() as i32);
-                }
-                for isr in &partition.isr_nodes {
-                    encoder.write_i32(*isr);
-                }
-                
-                if version >= 5 {
-                    // Offline replicas
-                    if flexible {
-                        encoder.write_compact_array_len(partition.offline_replicas.len());
-                    } else {
-                        encoder.write_i32(partition.offline_replicas.len() as i32);
-                    }
-                    for offline in &partition.offline_replicas {
-                        encoder.write_i32(*offline);
-                    }
-                }
-                
-                if flexible {
-                    encoder.write_tagged_fields();
-                }
-            }
-
-            // Topic authorized operations (v8+)
-            // Note: This was NOT removed in v11 (only cluster_authorized_operations was removed)
-            if version >= 8 {
-                encoder.write_i32(-2147483648); // INT32_MIN means "null"
-            }
-
-            if flexible {
-                encoder.write_tagged_fields();
-            }
-        }
-
-        // Cluster authorized operations (v8-v10 only, removed in v11+)
-        // KIP-430: cluster_authorized_operations was removed starting from v11
-        if version >= 8 && version <= 10 {
-            if let Some(ops) = response.cluster_authorized_operations {
-                encoder.write_i32(ops);
-            } else {
-                encoder.write_i32(-2147483648); // INT32_MIN means "null"
-            }
-        }
-
-        if flexible {
-            encoder.write_tagged_fields();
-        }
-
-        // Log final encoded size for debugging
-        let final_buffer = encoder.debug_buffer();
-        let final_size = final_buffer.len();
-        tracing::info!("Metadata response v{} encoded successfully: {} bytes", version, final_size);
-        tracing::debug!("Final metadata response body: first 32 bytes: {:02x?}",
-            &final_buffer[..final_buffer.len().min(32)]);
-
-        Ok(())
-    }
-    
     /// Handle JoinGroup request
     async fn handle_join_group(
         &self,
@@ -6573,7 +5240,7 @@ impl ProtocolHandler {
     }
     
     /// Create a topic in the metadata store
-    async fn create_topic_in_metadata(&self, topic: &crate::create_topics_types::CreateTopicRequest) -> Result<()> {
+    pub async fn create_topic_in_metadata(&self, topic: &crate::create_topics_types::CreateTopicRequest) -> Result<()> {
         if let Some(metadata_store) = &self.metadata_store {
             use chronik_common::metadata::traits::{TopicConfig, PartitionAssignment};
             
@@ -6695,7 +5362,7 @@ impl ProtocolHandler {
     }
     
     /// Validate topic configurations
-    async fn validate_replication_factor(&self, topic: &crate::create_topics_types::CreateTopicRequest) -> Result<()> {
+    pub async fn validate_replication_factor(&self, topic: &crate::create_topics_types::CreateTopicRequest) -> Result<()> {
         if let Some(metadata_store) = &self.metadata_store {
             let brokers = metadata_store.list_brokers().await
                 .map_err(|e| Error::Internal(format!("Failed to list brokers: {}", e)))?;

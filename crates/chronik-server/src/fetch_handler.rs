@@ -245,8 +245,375 @@ impl FetchHandler {
             topics: response_topics,
         })
     }
-    
+
+    // ============================================================================
+    // Phase 2.13 Helper Methods - fetch_partition() Extraction
+    // ============================================================================
+
+    /// Validate topic and partition existence
+    ///
+    /// Returns None if valid, Some(error_response) if invalid
+    ///
+    /// Complexity: < 15 (two metadata checks + error construction)
+    async fn validate_topic_and_partition(
+        &self,
+        topic: &str,
+        partition: i32,
+    ) -> Result<Option<FetchResponsePartition>> {
+        // Check topic exists
+        let topic_metadata = match self.metadata_store.get_topic(topic).await? {
+            Some(meta) => meta,
+            None => {
+                return Ok(Some(FetchResponsePartition {
+                    partition,
+                    error_code: 3, // UNKNOWN_TOPIC_OR_PARTITION
+                    high_watermark: -1,
+                    last_stable_offset: -1,
+                    log_start_offset: -1,
+                    aborted: None,
+                    preferred_read_replica: -1,
+                    records: vec![],
+                }));
+            }
+        };
+
+        // Check partition in range
+        if partition < 0 || partition >= topic_metadata.config.partition_count as i32 {
+            return Ok(Some(FetchResponsePartition {
+                partition,
+                error_code: 3, // UNKNOWN_TOPIC_OR_PARTITION
+                high_watermark: -1,
+                last_stable_offset: -1,
+                log_start_offset: -1,
+                aborted: None,
+                preferred_read_replica: -1,
+                records: vec![],
+            }));
+        }
+
+        Ok(None) // Valid
+    }
+
+    /// Get high watermark for partition with ProduceHandler + metadata_store fallback
+    ///
+    /// v2.2.9 FIX: Fallback to metadata_store on followers where ProduceHandler is empty
+    ///
+    /// Complexity: < 20 (ProduceHandler query + fallback path + logging)
+    async fn get_high_watermark_for_fetch(
+        &self,
+        topic: &str,
+        partition: i32,
+        fetch_offset: i64,
+    ) -> Result<i64> {
+        // Try ProduceHandler first (source of truth on leaders)
+        let mut high_watermark = if let Some(ref produce_handler) = self.produce_handler {
+            produce_handler.get_high_watermark(topic, partition).await
+                .unwrap_or_else(|e| {
+                    tracing::warn!(
+                        "Failed to get high watermark from ProduceHandler for {}-{}: {}, defaulting to 0",
+                        topic, partition, e
+                    );
+                    0
+                })
+        } else {
+            0
+        };
+
+        // v2.2.9 FIX: Fallback to metadata_store on followers
+        if high_watermark == 0 {
+            if let Ok(Some((meta_hwm, _log_start))) = self.metadata_store.get_partition_offset(topic, partition as u32).await {
+                if meta_hwm > 0 {
+                    tracing::info!(
+                        "📊 WATERMARK FALLBACK: Using metadata_store for {}-{}: {} (ProduceHandler returned 0)",
+                        topic, partition, meta_hwm
+                    );
+                    high_watermark = meta_hwm;
+                }
+            }
+        }
+
+        // v2.2.7.2: Log watermark details for debugging
+        info!(
+            "📊 WATERMARK: topic={}, partition={}, high_watermark={}, fetch_offset={}, gap={} (from ProduceHandler)",
+            topic, partition, high_watermark, fetch_offset, high_watermark - fetch_offset
+        );
+
+        Ok(high_watermark)
+    }
+
+    /// Validate fetch_offset is within valid range
+    ///
+    /// Returns None if valid, Some(error_response) if out of range
+    ///
+    /// Complexity: < 10 (simple range check + error construction)
+    fn check_offset_range(
+        &self,
+        partition: i32,
+        fetch_offset: i64,
+        log_start_offset: i64,
+        high_watermark: i64,
+    ) -> Option<FetchResponsePartition> {
+        if fetch_offset < log_start_offset {
+            Some(FetchResponsePartition {
+                partition,
+                error_code: 1, // OFFSET_OUT_OF_RANGE
+                high_watermark,
+                last_stable_offset: high_watermark,
+                log_start_offset,
+                aborted: None,
+                preferred_read_replica: -1,
+                records: vec![],
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Fetch data when available (fetch_offset < high_watermark)
+    ///
+    /// Tries fetch_raw_bytes() first (CRC-preserving), falls back to fetch_records()
+    ///
+    /// Complexity: < 25 (timeout handling + raw bytes path + fallback path + encoding)
+    async fn fetch_data_available_path(
+        &self,
+        topic: &str,
+        partition: i32,
+        fetch_offset: i64,
+        high_watermark: i64,
+        log_start_offset: i64,
+        max_bytes: i32,
+        max_wait_ms: i32,
+        fetch_start: Instant,
+    ) -> Result<FetchResponsePartition> {
+        // v2.2.7.2: Log data available path
+        info!(
+            "✅ DATA AVAILABLE: topic={}, partition={}, fetch_offset={}, high_watermark={}, available={}",
+            topic, partition, fetch_offset, high_watermark, high_watermark - fetch_offset
+        );
+
+        // Data is available, fetch it
+        let fetch_timeout = if max_wait_ms > 0 {
+            Duration::from_millis(max_wait_ms as u64)
+        } else {
+            Duration::from_secs(30) // Default timeout
+        };
+
+        // CRITICAL CRC FIX v1.3.32: Try to fetch raw Kafka bytes first to preserve CRC
+        info!("📦 FETCH RAW: Trying raw bytes (CRC-preserving) for {}-{}", topic, partition);
+        let raw_bytes_result = timeout(fetch_timeout, async {
+            self.fetch_raw_bytes(
+                topic,
+                partition,
+                fetch_offset,
+                high_watermark,
+                max_bytes,
+            ).await
+        }).await;
+
+        let records_bytes = match raw_bytes_result {
+            Ok(Ok(Some(raw_bytes))) => {
+                tracing::info!("✓ CRC-PRESERVED: Fetched {} bytes of raw Kafka data for {}-{}",
+                    raw_bytes.len(), topic, partition);
+
+                // HEX DUMP: Outgoing raw bytes to consumer
+                if raw_bytes.len() >= 61 {
+                    let hex_first_64: String = raw_bytes.iter().take(64).map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
+                    tracing::debug!("FETCH OUTGOING (first 64 bytes): {}", hex_first_64);
+                }
+
+                raw_bytes
+            }
+            Ok(Ok(None)) | Ok(Err(_)) | Err(_) => {
+                // Fall back to parsed records (will recompute CRC)
+                tracing::warn!("⚠ CRC-RECOMPUTED: No raw bytes available, falling back to parsed records for {}-{}",
+                    topic, partition);
+
+                let fetch_result = timeout(fetch_timeout, async {
+                    self.fetch_records(
+                        topic,
+                        partition,
+                        fetch_offset,
+                        high_watermark,
+                        max_bytes,
+                    ).await
+                }).await;
+
+                let records = match fetch_result {
+                    Ok(Ok(recs)) => {
+                        tracing::info!("Fetched {} records from {}-{}", recs.len(), topic, partition);
+                        recs
+                    },
+                    Ok(Err(e)) => {
+                        tracing::warn!("Error fetching records from {}-{}: {:?}", topic, partition, e);
+                        vec![]
+                    }
+                    Err(_) => {
+                        tracing::warn!("Fetch timeout after {}ms for {}-{}", max_wait_ms, topic, partition);
+                        vec![]
+                    }
+                };
+
+                // Encode the records - will recompute CRC
+                self.encode_kafka_records(&records, 0)?
+            }
+        };
+
+        // v2.2.7.2: Log successful fetch completion
+        let fetch_elapsed = fetch_start.elapsed();
+        info!(
+            "✅ FETCH SUCCESS: topic={}, partition={}, offset={}, bytes={}, elapsed={:?}",
+            topic, partition, fetch_offset, records_bytes.len(), fetch_elapsed
+        );
+
+        Ok(self.build_success_response(partition, high_watermark, log_start_offset, records_bytes))
+    }
+
+    /// Handle fetch when no data available (fetch_offset >= high_watermark)
+    ///
+    /// Implements wait logic with polling or immediate empty response
+    ///
+    /// Complexity: < 25 (polling loop + timeout handling + response construction)
+    async fn fetch_no_data_path(
+        &self,
+        topic: &str,
+        partition: i32,
+        fetch_offset: i64,
+        high_watermark: i64,
+        log_start_offset: i64,
+        max_bytes: i32,
+        max_wait_ms: i32,
+        min_bytes: i32,
+    ) -> Result<FetchResponsePartition> {
+        // v2.2.7.2: Log no data available case
+        info!(
+            "⏸️  NO DATA: topic={}, partition={}, fetch_offset={}, high_watermark={} (waiting...)",
+            topic, partition, fetch_offset, high_watermark
+        );
+
+        // No data available yet - implement wait logic
+        if max_wait_ms > 0 && min_bytes > 0 {
+            // Wait for new data or timeout
+            let start_time = Instant::now();
+            let wait_duration = Duration::from_millis(max_wait_ms as u64);
+
+            // Try to wait for data with timeout
+            let result = timeout(wait_duration, async {
+                // Poll for new data periodically
+                let poll_interval = Duration::from_millis(10);
+                let mut accumulated_bytes = 0;
+
+                while start_time.elapsed() < wait_duration {
+                    // Check if new data is available
+                    if let Ok(new_segments) = self.metadata_store.list_segments(topic, Some(partition as u32)).await {
+                        let new_high_watermark = new_segments.iter()
+                            .map(|s| s.end_offset + 1)
+                            .max()
+                            .unwrap_or(high_watermark);
+
+                        if new_high_watermark > fetch_offset {
+                            // New data available, fetch it
+                            if let Ok(records) = self.fetch_records(
+                                topic,
+                                partition,
+                                fetch_offset,
+                                new_high_watermark,
+                                max_bytes,
+                            ).await {
+                                // Calculate approximate bytes
+                                accumulated_bytes = records.iter()
+                                    .map(|r| r.value.len() + r.key.as_ref().map(|k| k.len()).unwrap_or(0))
+                                    .sum();
+
+                                if accumulated_bytes >= min_bytes as usize {
+                                    return Ok((records, new_high_watermark));
+                                }
+                            }
+                        }
+                    }
+
+                    tokio::time::sleep(poll_interval).await;
+                }
+
+                Err::<(Vec<chronik_storage::Record>, i64), Error>(
+                    Error::Internal("Timeout waiting for min_bytes".into())
+                )
+            }).await;
+
+            match result {
+                Ok(Ok((records, new_hw))) => {
+                    // Got enough data within timeout
+                    let records_bytes = self.encode_kafka_records(&records, 0)?;
+
+                    return Ok(self.build_success_response(partition, new_hw, log_start_offset, records_bytes));
+                }
+                _ => {
+                    // Timeout or error - return empty response with proper empty batch
+                    let empty_records = self.encode_kafka_records(&[], 0)?;
+
+                    return Ok(self.build_success_response(partition, high_watermark, log_start_offset, empty_records));
+                }
+            }
+        } else {
+            // No wait requested, return empty immediately with proper empty batch
+            let empty_records = self.encode_kafka_records(&[], 0)?;
+
+            Ok(self.build_success_response(partition, high_watermark, log_start_offset, empty_records))
+        }
+    }
+
+    /// Build error FetchResponsePartition
+    ///
+    /// Complexity: < 5 (simple struct construction)
+    fn build_error_response(
+        &self,
+        partition: i32,
+        error_code: i16,
+        high_watermark: i64,
+    ) -> FetchResponsePartition {
+        FetchResponsePartition {
+            partition,
+            error_code,
+            high_watermark,
+            last_stable_offset: high_watermark,
+            log_start_offset: 0,
+            aborted: None,
+            preferred_read_replica: -1,
+            records: vec![],
+        }
+    }
+
+    /// Build success FetchResponsePartition
+    ///
+    /// Complexity: < 5 (simple struct construction)
+    fn build_success_response(
+        &self,
+        partition: i32,
+        high_watermark: i64,
+        log_start_offset: i64,
+        records: Vec<u8>,
+    ) -> FetchResponsePartition {
+        FetchResponsePartition {
+            partition,
+            error_code: 0,
+            high_watermark,
+            last_stable_offset: high_watermark,
+            log_start_offset,
+            aborted: None,
+            preferred_read_replica: -1,
+            records,
+        }
+    }
+
+    // ============================================================================
+    // Main fetch_partition() Function (Refactored)
+    // ============================================================================
+
     /// Fetch data from a specific partition
+    ///
+    /// Refactored in Phase 2.13 to reduce from 299 lines to 51 lines (82.9% reduction)
+    /// Orchestrates 5 helper methods for clean separation of concerns
+    ///
+    /// Complexity: < 20 (validation calls + routing logic)
     async fn fetch_partition(
         &self,
         topic: &str,
@@ -263,372 +630,456 @@ impl FetchHandler {
             topic, partition, fetch_offset, max_bytes, max_wait_ms, min_bytes
         );
 
-
-        // First check if topic exists
-        let topic_metadata = match self.metadata_store.get_topic(topic).await? {
-            Some(meta) => meta,
-            None => {
-                return Ok(FetchResponsePartition {
-                    partition,
-                    error_code: 3, // UNKNOWN_TOPIC_OR_PARTITION
-                    high_watermark: -1,
-                    last_stable_offset: -1,
-                    log_start_offset: -1,
-                    aborted: None,
-                    preferred_read_replica: -1,
-                    records: vec![],
-                });
-            }
-        };
-        
-        // Check partition exists
-        if partition < 0 || partition >= topic_metadata.config.partition_count as i32 {
-            return Ok(FetchResponsePartition {
-                partition,
-                error_code: 3, // UNKNOWN_TOPIC_OR_PARTITION
-                high_watermark: -1,
-                last_stable_offset: -1,
-                log_start_offset: -1,
-                aborted: None,
-                preferred_read_replica: -1,
-                records: vec![],
-            });
+        // Phase 1: Validate topic and partition existence
+        if let Some(error_response) = self.validate_topic_and_partition(topic, partition).await? {
+            return Ok(error_response);
         }
-        
-        // NEW ARCHITECTURE (v1.3.39+): Get high watermark from ProduceHandler (source of truth)
-        // This is the next offset that will be assigned = current high watermark
-        // v2.2.9 FIX: Fallback to metadata_store on followers where ProduceHandler.partition_states is empty
-        let mut high_watermark = if let Some(ref produce_handler) = self.produce_handler {
-            produce_handler.get_high_watermark(topic, partition).await
-                .unwrap_or_else(|e| {
-                    tracing::warn!("Failed to get high watermark from ProduceHandler for {}-{}: {}, defaulting to 0", topic, partition, e);
-                    0
-                })
-        } else {
-            0
-        };
 
-        // v2.2.9 FIX: On followers, ProduceHandler.partition_states may be empty for non-leader partitions
-        // Fallback to metadata_store which has replicated high watermarks via HighWatermarkUpdated events
-        if high_watermark == 0 {
-            if let Ok(Some((meta_hwm, _log_start))) = self.metadata_store.get_partition_offset(topic, partition as u32).await {
-                if meta_hwm > 0 {
-                    tracing::info!(
-                        "📊 WATERMARK FALLBACK: Using metadata_store for {}-{}: {} (ProduceHandler returned 0)",
-                        topic, partition, meta_hwm
-                    );
-                    high_watermark = meta_hwm;
-                }
-            }
-        }
-        
-        // v2.2.7.2: Log watermark details for debugging
-        info!(
-            "📊 WATERMARK: topic={}, partition={}, high_watermark={}, fetch_offset={}, gap={} (from ProduceHandler)",
-            topic, partition, high_watermark, fetch_offset, high_watermark - fetch_offset
-        );
+        // Phase 2: Get high watermark from ProduceHandler with metadata_store fallback
+        let high_watermark = self.get_high_watermark_for_fetch(topic, partition, fetch_offset).await?;
 
         // Log start offset is always 0 in NEW architecture (WAL-based)
         let log_start_offset = 0;
 
-        // Check if offset is out of range
-        if fetch_offset < log_start_offset {
-            return Ok(FetchResponsePartition {
-                partition,
-                error_code: 1, // OFFSET_OUT_OF_RANGE
-                high_watermark,
-                last_stable_offset: high_watermark,
-                log_start_offset,
-                aborted: None,
-                preferred_read_replica: -1,
-                records: vec![],
-            });
+        // Phase 3: Validate fetch_offset is within valid range
+        if let Some(error_response) = self.check_offset_range(partition, fetch_offset, log_start_offset, high_watermark) {
+            return Ok(error_response);
         }
-        
-        // If we have data available (fetch_offset < high_watermark), fetch it
+
+        // Phase 4-5: Route to data available or no data path
         if fetch_offset < high_watermark {
-            // v2.2.7.2: Log data available path
-            info!(
-                "✅ DATA AVAILABLE: topic={}, partition={}, fetch_offset={}, high_watermark={}, available={}",
-                topic, partition, fetch_offset, high_watermark, high_watermark - fetch_offset
-            );
-
-            // Data is available, fetch it
-            let fetch_timeout = if max_wait_ms > 0 {
-                Duration::from_millis(max_wait_ms as u64)
-            } else {
-                Duration::from_secs(30) // Default timeout
-            };
-
-            // CRITICAL CRC FIX v1.3.32: Try to fetch raw Kafka bytes first to preserve CRC
-            info!("📦 FETCH RAW: Trying raw bytes (CRC-preserving) for {}-{}", topic, partition);
-            let raw_bytes_result = timeout(fetch_timeout, async {
-                self.fetch_raw_bytes(
-                    topic,
-                    partition,
-                    fetch_offset,
-                    high_watermark,
-                    max_bytes,
-                ).await
-            }).await;
-
-            let records_bytes = match raw_bytes_result {
-                Ok(Ok(Some(raw_bytes))) => {
-                    tracing::info!("✓ CRC-PRESERVED: Fetched {} bytes of raw Kafka data for {}-{}",
-                        raw_bytes.len(), topic, partition);
-
-                    // HEX DUMP: Outgoing raw bytes to consumer
-                    if raw_bytes.len() >= 61 {
-                        let hex_first_64: String = raw_bytes.iter().take(64).map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
-                        tracing::debug!("FETCH OUTGOING (first 64 bytes): {}", hex_first_64);
-                    }
-
-                    raw_bytes
-                }
-                Ok(Ok(None)) | Ok(Err(_)) | Err(_) => {
-                    // Fall back to parsed records (will recompute CRC)
-                    tracing::warn!("⚠ CRC-RECOMPUTED: No raw bytes available, falling back to parsed records for {}-{}",
-                        topic, partition);
-
-                    let fetch_result = timeout(fetch_timeout, async {
-                        self.fetch_records(
-                            topic,
-                            partition,
-                            fetch_offset,
-                            high_watermark,
-                            max_bytes,
-                        ).await
-                    }).await;
-
-                    let records = match fetch_result {
-                        Ok(Ok(recs)) => {
-                            tracing::info!("Fetched {} records from {}-{}", recs.len(), topic, partition);
-                            recs
-                        },
-                        Ok(Err(e)) => {
-                            tracing::warn!("Error fetching records from {}-{}: {:?}", topic, partition, e);
-                            vec![]
-                        }
-                        Err(_) => {
-                            tracing::warn!("Fetch timeout after {}ms for {}-{}", max_wait_ms, topic, partition);
-                            vec![]
-                        }
-                    };
-
-                    // Encode the records - will recompute CRC
-                    self.encode_kafka_records(&records, 0)?
-                }
-            };
-
-            // v2.2.7.2: Log successful fetch completion
-            let fetch_elapsed = fetch_start.elapsed();
-            info!(
-                "✅ FETCH SUCCESS: topic={}, partition={}, offset={}, bytes={}, elapsed={:?}",
-                topic, partition, fetch_offset, records_bytes.len(), fetch_elapsed
-            );
-
-            return Ok(FetchResponsePartition {
+            // Data available - fetch and return
+            self.fetch_data_available_path(
+                topic,
                 partition,
-                error_code: 0,
+                fetch_offset,
                 high_watermark,
-                last_stable_offset: high_watermark,
                 log_start_offset,
-                aborted: None,
-                preferred_read_replica: -1,
-                records: records_bytes,
-            });
+                max_bytes,
+                max_wait_ms,
+                fetch_start,
+            )
+            .await
+        } else {
+            // No data available - wait or return empty
+            self.fetch_no_data_path(
+                topic,
+                partition,
+                fetch_offset,
+                high_watermark,
+                log_start_offset,
+                max_bytes,
+                max_wait_ms,
+                min_bytes,
+            )
+            .await
         }
-
-        // No data available yet (fetch_offset >= high_watermark)
-        if fetch_offset >= high_watermark {
-            // v2.2.7.2: Log no data available case
-            info!(
-                "⏸️  NO DATA: topic={}, partition={}, fetch_offset={}, high_watermark={} (waiting...)",
-                topic, partition, fetch_offset, high_watermark
-            );
-            // No data available yet - implement wait logic
-            if max_wait_ms > 0 && min_bytes > 0 {
-                // Wait for new data or timeout
-                let start_time = Instant::now();
-                let wait_duration = Duration::from_millis(max_wait_ms as u64);
-                
-                // Try to wait for data with timeout
-                let result = timeout(wait_duration, async {
-                    // Poll for new data periodically
-                    let poll_interval = Duration::from_millis(10);
-                    let mut accumulated_bytes = 0;
-                    
-                    while start_time.elapsed() < wait_duration {
-                        // Check if new data is available
-                        if let Ok(new_segments) = self.metadata_store.list_segments(topic, Some(partition as u32)).await {
-                            let new_high_watermark = new_segments.iter()
-                                .map(|s| s.end_offset + 1)
-                                .max()
-                                .unwrap_or(high_watermark);
-                            
-                            if new_high_watermark > fetch_offset {
-                                // New data available, fetch it
-                                if let Ok(records) = self.fetch_records(
-                                    topic,
-                                    partition,
-                                    fetch_offset,
-                                    new_high_watermark,
-                                    max_bytes,
-                                ).await {
-                                    // Calculate approximate bytes
-                                    accumulated_bytes = records.iter()
-                                        .map(|r| r.value.len() + r.key.as_ref().map(|k| k.len()).unwrap_or(0))
-                                        .sum();
-                                    
-                                    if accumulated_bytes >= min_bytes as usize {
-                                        return Ok((records, new_high_watermark));
-                                    }
-                                }
-                            }
-                        }
-                        
-                        tokio::time::sleep(poll_interval).await;
-                    }
-                    
-                    Err::<(Vec<chronik_storage::Record>, i64), Error>(
-                        Error::Internal("Timeout waiting for min_bytes".into())
-                    )
-                }).await;
-                
-                match result {
-                    Ok(Ok((records, new_hw))) => {
-                        // Got enough data within timeout
-                        let records_bytes = self.encode_kafka_records(&records, 0)?;
-                        
-                        return Ok(FetchResponsePartition {
-                            partition,
-                            error_code: 0,
-                            high_watermark: new_hw,
-                            last_stable_offset: new_hw,
-                            log_start_offset,
-                            aborted: None,
-                            preferred_read_replica: -1,
-                            records: records_bytes,
-                        });
-                    }
-                    _ => {
-                        // Timeout or error - return empty response with proper empty batch
-                        let empty_records = self.encode_kafka_records(&[], 0)?;
-                        
-                        return Ok(FetchResponsePartition {
-                            partition,
-                            error_code: 0,
-                            high_watermark,
-                            last_stable_offset: high_watermark,
-                            log_start_offset,
-                            aborted: None,
-                            preferred_read_replica: -1,
-                            records: empty_records,
-                        });
-                    }
-                }
-            } else {
-                // No wait requested, return empty immediately with proper empty batch
-                let empty_records = self.encode_kafka_records(&[], 0)?;
-                
-                return Ok(FetchResponsePartition {
-                    partition,
-                    error_code: 0,
-                    high_watermark,
-                    last_stable_offset: high_watermark,
-                    log_start_offset,
-                    aborted: None,
-                    preferred_read_replica: -1,
-                    records: empty_records,
-                });
-            }
-        }
-        
-        // Should not reach here - all cases should have returned above
-        unreachable!("Fetch handler logic error")
     }
     
-    /// Fetch records with proper priority: Buffer → WAL → Segments
-    async fn fetch_records(
+    /// Try fetching raw bytes from Tantivy (Phase 4 for fetch_raw_bytes)
+    ///
+    /// Complexity: < 20 (Tantivy fetch delegation)
+    ///
+    /// Returns: Optional raw batch bytes from Tantivy
+    async fn try_fetch_raw_from_tantivy(
         &self,
         topic: &str,
         partition: i32,
         fetch_offset: i64,
         high_watermark: i64,
         max_bytes: i32,
-    ) -> Result<Vec<chronik_storage::Record>> {
-        info!(
-            "fetch_records called - topic: {}, partition: {}, fetch_offset: {}, high_watermark: {}",
-            topic, partition, fetch_offset, high_watermark
-        );
-        
-        let mut records = Vec::new();
-        let mut bytes_fetched = 0usize;
-        
-        // PHASE 1: Try in-memory buffer first (fastest path)
-        // CRITICAL v1.3.32: Decode records from raw batches to preserve CRC
-        // v1.3.48: Also track buffer min_offset to detect gaps from trimming
-        let (buffer_highest_offset, buffer_min_offset) = {
-            let state = self.state.read().await;
-            if let Some(buffer) = state.buffers.get(&(topic.to_string(), partition)) {
-                info!(
-                    "FETCH→BUFFER: Checking buffer for {}-{}, buffer has {} batches, min_offset={}",
-                    topic, partition, buffer.batch_metadata.len(), buffer.min_offset_in_buffer
-                );
-
-                let mut buffer_max_offset = -1i64;
-                let buffer_min = buffer.min_offset_in_buffer;
-
-                for (batch_idx, metadata) in buffer.batch_metadata.iter().enumerate() {
-                    if metadata.last_offset >= fetch_offset && metadata.base_offset < high_watermark {
-                        // Decode records from raw batch
-                        let raw_batch = &buffer.raw_batches[batch_idx];
-                        match self.decode_records_from_raw_batch(raw_batch, fetch_offset, high_watermark) {
-                            Ok(batch_records) => {
-                                for record in batch_records {
-                                    let record_size = record.value.len() +
-                                        record.key.as_ref().map(|k| k.len()).unwrap_or(0) + 24;
-
-                                    if bytes_fetched + record_size > max_bytes as usize && !records.is_empty() {
-                                        break;
-                                    }
-
-                                    debug!(
-                                        "FETCH→BUFFER: Found record at offset {} in buffer",
-                                        record.offset
-                                    );
-
-                                    records.push(record.clone());
-                                    bytes_fetched += record_size;
-                                    buffer_max_offset = buffer_max_offset.max(record.offset);
-                                }
-                            }
-                            Err(e) => {
-                                tracing::error!("Failed to decode batch from buffer: {}", e);
-                                continue;
-                            }
-                        }
-                    }
-                }
-
-                if !records.is_empty() {
-                    info!(
-                        "FETCH→BUFFER: Fetched {} records from buffer for {}-{}, highest offset: {}",
-                        records.len(), topic, partition, buffer_max_offset
-                    );
-                }
-                (buffer_max_offset, buffer_min)
-            } else {
-                (-1i64, -1i64)
-            }
+    ) -> Result<Option<Vec<u8>>> {
+        let segment_index = match &self.segment_index {
+            Some(idx) => idx,
+            None => return Ok(None),
         };
 
-        // If we got records from buffer, check if we need more from WAL/segments
-        if !records.is_empty() && bytes_fetched >= max_bytes as usize {
-            // We have enough data from buffer alone
+        tracing::info!("RAW→TANTIVY: Checking Tantivy segment index for {}-{}", topic, partition);
+
+        match self.fetch_from_tantivy(
+            segment_index,
+            topic,
+            partition,
+            fetch_offset,
+            high_watermark,
+            max_bytes,
+        ).await {
+            Ok(Some(bytes)) => {
+                tracing::info!(
+                    "RAW→TANTIVY: Returning {} bytes from Tantivy segments",
+                    bytes.len()
+                );
+                Ok(Some(bytes))
+            }
+            Ok(None) => {
+                tracing::info!("RAW→TANTIVY: No matching Tantivy segments found");
+                Ok(None)
+            }
+            Err(e) => {
+                tracing::warn!("RAW→TANTIVY: Error fetching from Tantivy: {}", e);
+                Ok(None)
+            }
+        }
+    }
+
+    /// Try fetching raw bytes from segments (Phase 3 for fetch_raw_bytes)
+    ///
+    /// Complexity: < 25 (segment iteration + batch header parsing + filtering)
+    ///
+    /// Returns: Optional raw batch bytes from segments
+    async fn try_fetch_raw_from_segments(
+        &self,
+        topic: &str,
+        partition: i32,
+        fetch_offset: i64,
+        high_watermark: i64,
+        max_bytes: i32,
+    ) -> Result<Option<Vec<u8>>> {
+        tracing::info!("RAW→SEGMENTS: Buffer and WAL empty or no match, trying segments");
+        let segments = self.get_segments_for_range(topic, partition, fetch_offset, high_watermark).await?;
+
+        if segments.is_empty() {
+            tracing::info!("RAW→SEGMENTS: No segments found for range");
+            return Ok(None);
+        }
+
+        let mut combined_bytes = Vec::new();
+        for segment_info in &segments {
+            // Read segment and extract raw_kafka_batches
+            let segment_data = self.object_store.get(&segment_info.object_key).await?;
+            let segment = Segment::deserialize(segment_data)?;
+
+            tracing::info!(
+                "RAW→SEGMENT: Segment {} has {} bytes of raw_kafka_batches",
+                segment_info.segment_id, segment.raw_kafka_batches.len()
+            );
+
+            if segment.raw_kafka_batches.is_empty() {
+                // Segment doesn't have raw bytes (v1 format or indexed-only)
+                // Cannot preserve CRC, need to fall back to parsed records
+                tracing::warn!(
+                    "RAW→SEGMENT: Segment {} has no raw_kafka_batches, cannot preserve CRC",
+                    segment_info.segment_id
+                );
+                return Ok(None);
+            }
+
+            // CRITICAL FIX: Parse batch headers to filter by offset range
+            // We must ONLY include batches that overlap [fetch_offset, high_watermark)
+            // Otherwise we return wrong batches and clients see CRC errors!
+            let mut cursor_pos = 0;
+
+            while cursor_pos < segment.raw_kafka_batches.len() {
+                let batch_start = cursor_pos;
+
+                // Read batch header (minimum 61 bytes for v2 format)
+                if (segment.raw_kafka_batches.len() - batch_start) < 61 {
+                    // Not enough bytes for a valid batch
+                    break;
+                }
+
+                // Parse JUST the header to get offsets (without decoding records)
+                // Use manual big-endian byte parsing to avoid any trait complications
+                let base_offset = i64::from_be_bytes([
+                    segment.raw_kafka_batches[batch_start],
+                    segment.raw_kafka_batches[batch_start + 1],
+                    segment.raw_kafka_batches[batch_start + 2],
+                    segment.raw_kafka_batches[batch_start + 3],
+                    segment.raw_kafka_batches[batch_start + 4],
+                    segment.raw_kafka_batches[batch_start + 5],
+                    segment.raw_kafka_batches[batch_start + 6],
+                    segment.raw_kafka_batches[batch_start + 7],
+                ]);
+
+                let batch_length = i32::from_be_bytes([
+                    segment.raw_kafka_batches[batch_start + 8],
+                    segment.raw_kafka_batches[batch_start + 9],
+                    segment.raw_kafka_batches[batch_start + 10],
+                    segment.raw_kafka_batches[batch_start + 11],
+                ]);
+
+                // Read last_offset_delta at offset 23 (after base_offset, batch_length, partition_leader_epoch, magic, crc, attributes)
+                let last_offset_delta = i32::from_be_bytes([
+                    segment.raw_kafka_batches[batch_start + 23],
+                    segment.raw_kafka_batches[batch_start + 24],
+                    segment.raw_kafka_batches[batch_start + 25],
+                    segment.raw_kafka_batches[batch_start + 26],
+                ]);
+                let last_offset = base_offset + last_offset_delta as i64;
+
+                // Total batch size is: 12 bytes (base_offset + batch_length) + batch_length
+                let total_batch_size = 12 + batch_length as usize;
+
+                tracing::debug!(
+                    "RAW→BATCH: Found batch at offset {}, base_offset={}, last_offset={}, size={}",
+                    batch_start, base_offset, last_offset, total_batch_size
+                );
+
+                // Check if this batch overlaps with requested range [fetch_offset, high_watermark)
+                if last_offset >= fetch_offset && base_offset < high_watermark {
+                    // This batch is in range, include it
+                    if combined_bytes.len() + total_batch_size > max_bytes as usize && !combined_bytes.is_empty() {
+                        // Would exceed max_bytes, stop here
+                        break;
+                    }
+
+                    let batch_bytes = &segment.raw_kafka_batches[batch_start..batch_start + total_batch_size];
+                    combined_bytes.extend_from_slice(batch_bytes);
+
+                    tracing::info!(
+                        "RAW→BATCH: Including {} bytes from batch {}-{}",
+                        total_batch_size, base_offset, last_offset
+                    );
+                } else {
+                    tracing::debug!(
+                        "RAW→BATCH: Skipping batch {}-{} (outside range {}-{})",
+                        base_offset, last_offset, fetch_offset, high_watermark
+                    );
+                }
+
+                // Move to next batch
+                cursor_pos = batch_start + total_batch_size;
+            }
+        }
+
+        if !combined_bytes.is_empty() {
+            tracing::info!(
+                "RAW→SEGMENTS: Returning {} bytes of raw Kafka data from {} segments",
+                combined_bytes.len(), segments.len()
+            );
+            Ok(Some(combined_bytes))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Try fetching raw bytes from WAL (Phase 2 for fetch_raw_bytes)
+    ///
+    /// Complexity: < 15 (WAL fetch delegation)
+    ///
+    /// Returns: Optional raw batch bytes from WAL
+    async fn try_fetch_raw_from_wal(
+        &self,
+        topic: &str,
+        partition: i32,
+        fetch_offset: i64,
+        high_watermark: i64,
+        max_bytes: i32,
+    ) -> Result<Option<Vec<u8>>> {
+        tracing::info!("RAW→WAL: Buffer empty or no match, trying WAL");
+
+        if let Some(wal_manager) = self.wal_manager.as_ref() {
+            let raw_bytes_from_wal = self.fetch_raw_bytes_from_wal(
+                wal_manager,
+                topic,
+                partition,
+                fetch_offset,
+                high_watermark,
+                max_bytes,
+            ).await?;
+
+            if let Some(bytes) = raw_bytes_from_wal {
+                tracing::info!(
+                    "RAW→WAL: Returning {} bytes of raw Kafka data from WAL",
+                    bytes.len()
+                );
+                return Ok(Some(bytes));
+            }
+            tracing::info!("RAW→WAL: No raw bytes found in WAL");
+        }
+
+        Ok(None)
+    }
+
+    /// Try fetching raw bytes from buffer (Phase 1 for fetch_raw_bytes)
+    ///
+    /// Complexity: < 20 (buffer lookup + byte concatenation)
+    ///
+    /// Returns: Optional raw batch bytes from buffer
+    async fn try_fetch_raw_from_buffer(
+        &self,
+        topic: &str,
+        partition: i32,
+        fetch_offset: i64,
+        high_watermark: i64,
+        max_bytes: i32,
+    ) -> Option<Vec<u8>> {
+        let state = self.state.read().await;
+        let buffer = state.buffers.get(&(topic.to_string(), partition))?;
+
+        tracing::info!(
+            "RAW→BUFFER: Checking buffer for {}-{}, buffer has {} batches",
+            topic, partition, buffer.batch_metadata.len()
+        );
+
+        let mut combined_bytes = Vec::new();
+        for (batch_idx, metadata) in buffer.batch_metadata.iter().enumerate() {
+            // Check if this batch overlaps with requested range
+            if metadata.last_offset >= fetch_offset && metadata.base_offset < high_watermark {
+                let raw_batch = &buffer.raw_batches[batch_idx];
+
+                if combined_bytes.len() + raw_batch.len() > max_bytes as usize && !combined_bytes.is_empty() {
+                    break;
+                }
+
+                tracing::info!(
+                    "RAW→BUFFER: Adding {} bytes from batch at offsets {}-{}",
+                    raw_batch.len(), metadata.base_offset, metadata.last_offset
+                );
+                combined_bytes.extend_from_slice(raw_batch);
+            }
+        }
+
+        if !combined_bytes.is_empty() {
+            tracing::info!(
+                "RAW→BUFFER: Returning {} bytes of raw Kafka data from buffer",
+                combined_bytes.len()
+            );
+            Some(combined_bytes)
+        } else {
+            None
+        }
+    }
+
+    /// Try fetching records from Tantivy archives (Phase 4 - cold storage)
+    ///
+    /// Complexity: < 25 (Tantivy fetch + merge + sort)
+    ///
+    /// Returns: updated records vector with Tantivy records merged in
+    async fn try_fetch_from_tantivy_phase(
+        &self,
+        topic: &str,
+        partition: i32,
+        fetch_offset: i64,
+        high_watermark: i64,
+        max_bytes: i32,
+        mut records: Vec<chronik_storage::Record>,
+    ) -> Result<Vec<chronik_storage::Record>> {
+        if self.segment_index.is_none() {
             return Ok(records);
         }
 
+        info!(
+            "FETCH→TANTIVY: Trying Tantivy archives for {}-{} (have {} records so far)",
+            topic, partition, records.len()
+        );
+
+        // Try to get records via Tantivy fetch (will download tar.gz, search index, return results)
+        // This is a fallback for very old archived data
+        match self.fetch_from_tantivy_for_records(
+            topic,
+            partition,
+            fetch_offset,
+            high_watermark,
+            max_bytes
+        ).await {
+            Ok(tantivy_records) if !tantivy_records.is_empty() => {
+                info!(
+                    "FETCH→TANTIVY: Successfully fetched {} records from Tantivy archives for {}-{}",
+                    tantivy_records.len(), topic, partition
+                );
+
+                // Merge Tantivy records with existing records
+                for t_rec in tantivy_records {
+                    if !records.iter().any(|r| r.offset == t_rec.offset) {
+                        records.push(t_rec);
+                    }
+                }
+
+                // Sort by offset to maintain order
+                records.sort_by_key(|r| r.offset);
+            }
+            Ok(_) => {
+                debug!(
+                    "FETCH→TANTIVY: No records found in Tantivy archives for {}-{} at offset {}",
+                    topic, partition, fetch_offset
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "FETCH→TANTIVY: Failed to fetch from Tantivy archives for {}-{}: {}",
+                    topic, partition, e
+                );
+            }
+        }
+
+        Ok(records)
+    }
+
+    /// Try fetching records from S3 raw segments (Phase 3 - warm storage)
+    ///
+    /// Complexity: < 25 (S3 fetch + merge + sort)
+    ///
+    /// Returns: updated records vector with S3 records merged in
+    async fn try_fetch_from_s3_phase(
+        &self,
+        topic: &str,
+        partition: i32,
+        fetch_offset: i64,
+        high_watermark: i64,
+        max_bytes: i32,
+        mut records: Vec<chronik_storage::Record>,
+    ) -> Result<Vec<chronik_storage::Record>> {
+        info!(
+            "FETCH→S3_RAW_SEGMENTS: Trying to download raw segment from S3 for {}-{} (have {} records so far)",
+            topic, partition, records.len()
+        );
+
+        match self.fetch_from_s3_raw_segments(
+            topic,
+            partition,
+            fetch_offset,
+            high_watermark,
+            max_bytes
+        ).await {
+            Ok(s3_records) if !s3_records.is_empty() => {
+                info!(
+                    "FETCH→S3_RAW_SEGMENTS: Successfully fetched {} records from S3 for {}-{}",
+                    s3_records.len(), topic, partition
+                );
+
+                // Merge S3 records with existing records
+                for s3_rec in s3_records {
+                    if !records.iter().any(|r| r.offset == s3_rec.offset) {
+                        records.push(s3_rec);
+                    }
+                }
+
+                // Sort by offset to maintain order
+                records.sort_by_key(|r| r.offset);
+            }
+            Ok(_) => {
+                debug!(
+                    "FETCH→S3_RAW_SEGMENTS: No records found in S3 raw segments for {}-{} at offset {}",
+                    topic, partition, fetch_offset
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "FETCH→S3_RAW_SEGMENTS: Failed to fetch from S3 for {}-{}: {} - will try legacy segments",
+                    topic, partition, e
+                );
+            }
+        }
+
+        Ok(records)
+    }
+
+    /// Try fetching records from WAL (Phase 2 - fallback for trimmed buffer)
+    ///
+    /// Complexity: < 25 (gap detection + WAL fetch + merge)
+    ///
+    /// Returns: updated records vector with WAL records merged in
+    async fn try_fetch_from_wal_phase(
+        &self,
+        topic: &str,
+        partition: i32,
+        fetch_offset: i64,
+        max_bytes: i32,
+        mut records: Vec<chronik_storage::Record>,
+        buffer_highest_offset: i64,
+        buffer_min_offset: i64,
+    ) -> Result<Vec<chronik_storage::Record>> {
         // v1.3.48: Improved WAL fallback logic to detect buffer gaps from trimming
         // Check if we need to read from WAL for missing data
         let need_earlier_records = records.is_empty() ||
@@ -637,7 +1088,7 @@ impl FetchHandler {
         // NEW (v1.3.48): Detect if fetch_offset is before buffer's min_offset (trimmed region)
         let fetch_in_trimmed_region = buffer_min_offset >= 0 && fetch_offset < buffer_min_offset;
 
-        // PHASE 2: Try WAL for any missing records or to continue the fetch
+        // Try WAL for any missing records or to continue the fetch
         // WAL should have records that were trimmed from buffer
         if let Some(wal_manager) = &self.wal_manager {
             // Try WAL if:
@@ -668,11 +1119,6 @@ impl FetchHandler {
                             }
                             // Sort by offset to maintain order
                             records.sort_by_key(|r| r.offset);
-
-                            // If we now have enough data, return
-                            if records.len() > 0 && bytes_fetched >= max_bytes as usize {
-                                return Ok(records);
-                            }
                         } else {
                             debug!(
                                 "FETCH→WAL: No records found in WAL for {}-{} at offset {}",
@@ -689,104 +1135,153 @@ impl FetchHandler {
                 }
             }
         }
-        
-        // PHASE 3: Try downloading raw segments from S3 (Tier 2: warm storage)
-        // This is the NEW v1.3.64 flow where sealed WAL segments are uploaded to S3
-        if records.is_empty() || need_earlier_records {
-            info!(
-                "FETCH→S3_RAW_SEGMENTS: Trying to download raw segment from S3 for {}-{} (have {} records so far)",
-                topic, partition, records.len()
-            );
 
-            match self.fetch_from_s3_raw_segments(
-                topic,
-                partition,
-                fetch_offset,
-                high_watermark,
-                max_bytes
-            ).await {
-                Ok(s3_records) if !s3_records.is_empty() => {
-                    info!(
-                        "FETCH→S3_RAW_SEGMENTS: Successfully fetched {} records from S3 for {}-{}",
-                        s3_records.len(), topic, partition
-                    );
+        Ok(records)
+    }
 
-                    // Merge S3 records with existing records
-                    for s3_rec in s3_records {
-                        if !records.iter().any(|r| r.offset == s3_rec.offset) {
-                            records.push(s3_rec);
+    /// Try fetching records from in-memory buffer (Phase 1 - hottest path)
+    ///
+    /// Complexity: < 25 (buffer lookup + batch decode loop)
+    ///
+    /// Returns: (records, bytes_fetched, buffer_highest_offset, buffer_min_offset)
+    async fn fetch_from_buffer(
+        &self,
+        topic: &str,
+        partition: i32,
+        fetch_offset: i64,
+        high_watermark: i64,
+        max_bytes: i32,
+    ) -> Result<(Vec<chronik_storage::Record>, usize, i64, i64)> {
+        let state = self.state.read().await;
+        let buffer = match state.buffers.get(&(topic.to_string(), partition)) {
+            Some(b) => b,
+            None => return Ok((vec![], 0, -1, -1)),
+        };
+
+        info!(
+            "FETCH→BUFFER: Checking buffer for {}-{}, buffer has {} batches, min_offset={}",
+            topic, partition, buffer.batch_metadata.len(), buffer.min_offset_in_buffer
+        );
+
+        let mut records = Vec::new();
+        let mut bytes_fetched = 0usize;
+        let mut buffer_max_offset = -1i64;
+        let buffer_min = buffer.min_offset_in_buffer;
+
+        for (batch_idx, metadata) in buffer.batch_metadata.iter().enumerate() {
+            if metadata.last_offset >= fetch_offset && metadata.base_offset < high_watermark {
+                // Decode records from raw batch
+                let raw_batch = &buffer.raw_batches[batch_idx];
+                match self.decode_records_from_raw_batch(raw_batch, fetch_offset, high_watermark) {
+                    Ok(batch_records) => {
+                        for record in batch_records {
+                            let record_size = record.value.len() +
+                                record.key.as_ref().map(|k| k.len()).unwrap_or(0) + 24;
+
+                            if bytes_fetched + record_size > max_bytes as usize && !records.is_empty() {
+                                break;
+                            }
+
+                            debug!(
+                                "FETCH→BUFFER: Found record at offset {} in buffer",
+                                record.offset
+                            );
+
+                            records.push(record.clone());
+                            bytes_fetched += record_size;
+                            buffer_max_offset = buffer_max_offset.max(record.offset);
                         }
                     }
-
-                    // Sort by offset to maintain order
-                    records.sort_by_key(|r| r.offset);
-
-                    // If we now have enough data, return
-                    if !records.is_empty() {
-                        return Ok(records);
+                    Err(e) => {
+                        tracing::error!("Failed to decode batch from buffer: {}", e);
+                        continue;
                     }
-                }
-                Ok(_) => {
-                    debug!(
-                        "FETCH→S3_RAW_SEGMENTS: No records found in S3 raw segments for {}-{} at offset {}",
-                        topic, partition, fetch_offset
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        "FETCH→S3_RAW_SEGMENTS: Failed to fetch from S3 for {}-{}: {} - will try legacy segments",
-                        topic, partition, e
-                    );
                 }
             }
         }
 
-        // PHASE 4: Try Tantivy archives (cold storage) as final fallback
-        // This provides searchable indexed archives for very old data
-        if (records.is_empty() || need_earlier_records) && self.segment_index.is_some() {
+        if !records.is_empty() {
             info!(
-                "FETCH→TANTIVY: Trying Tantivy archives for {}-{} (have {} records so far)",
-                topic, partition, records.len()
+                "FETCH→BUFFER: Fetched {} records from buffer for {}-{}, highest offset: {}",
+                records.len(), topic, partition, buffer_max_offset
             );
+        }
 
-            // Try to get records via Tantivy fetch (will download tar.gz, search index, return results)
-            // This is a fallback for very old archived data
-            match self.fetch_from_tantivy_for_records(
+        Ok((records, bytes_fetched, buffer_max_offset, buffer_min))
+    }
+
+    /// Fetch records with proper priority: Buffer → WAL → Segments
+    async fn fetch_records(
+        &self,
+        topic: &str,
+        partition: i32,
+        fetch_offset: i64,
+        high_watermark: i64,
+        max_bytes: i32,
+    ) -> Result<Vec<chronik_storage::Record>> {
+        info!(
+            "fetch_records called - topic: {}, partition: {}, fetch_offset: {}, high_watermark: {}",
+            topic, partition, fetch_offset, high_watermark
+        );
+
+        // PHASE 1: Try in-memory buffer first (fastest path - extracted helper)
+        let (mut records, mut bytes_fetched, buffer_highest_offset, buffer_min_offset) =
+            self.fetch_from_buffer(topic, partition, fetch_offset, high_watermark, max_bytes).await?;
+
+        // If we got records from buffer, check if we need more from WAL/segments
+        if !records.is_empty() && bytes_fetched >= max_bytes as usize {
+            // We have enough data from buffer alone
+            return Ok(records);
+        }
+
+        // PHASE 2: Try WAL for missing records or trimmed buffer gaps (extracted helper)
+        records = self.try_fetch_from_wal_phase(
+            topic,
+            partition,
+            fetch_offset,
+            max_bytes,
+            records,
+            buffer_highest_offset,
+            buffer_min_offset
+        ).await?;
+
+        // If we now have enough data after WAL, return
+        if !records.is_empty() && bytes_fetched >= max_bytes as usize {
+            return Ok(records);
+        }
+
+        // PHASE 3: Try downloading raw segments from S3 (Tier 2: warm storage - extracted helper)
+        // This is the NEW v1.3.64 flow where sealed WAL segments are uploaded to S3
+        let need_earlier_records = records.is_empty() ||
+            (buffer_highest_offset >= 0 && fetch_offset < buffer_highest_offset);
+
+        if records.is_empty() || need_earlier_records {
+            records = self.try_fetch_from_s3_phase(
                 topic,
                 partition,
                 fetch_offset,
                 high_watermark,
-                max_bytes
-            ).await {
-                Ok(tantivy_records) if !tantivy_records.is_empty() => {
-                    info!(
-                        "FETCH→TANTIVY: Successfully fetched {} records from Tantivy archives for {}-{}",
-                        tantivy_records.len(), topic, partition
-                    );
+                max_bytes,
+                records
+            ).await?;
 
-                    // Merge Tantivy records with existing records
-                    for t_rec in tantivy_records {
-                        if !records.iter().any(|r| r.offset == t_rec.offset) {
-                            records.push(t_rec);
-                        }
-                    }
-
-                    // Sort by offset to maintain order
-                    records.sort_by_key(|r| r.offset);
-                }
-                Ok(_) => {
-                    debug!(
-                        "FETCH→TANTIVY: No records found in Tantivy archives for {}-{} at offset {}",
-                        topic, partition, fetch_offset
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        "FETCH→TANTIVY: Failed to fetch from Tantivy archives for {}-{}: {}",
-                        topic, partition, e
-                    );
-                }
+            // If we now have enough data, return
+            if !records.is_empty() {
+                return Ok(records);
             }
+        }
+
+        // PHASE 4: Try Tantivy archives (cold storage - extracted helper)
+        // This provides searchable indexed archives for very old data
+        if records.is_empty() || need_earlier_records {
+            records = self.try_fetch_from_tantivy_phase(
+                topic,
+                partition,
+                fetch_offset,
+                high_watermark,
+                max_bytes,
+                records
+            ).await?;
         }
 
         Ok(records)
@@ -1235,210 +1730,23 @@ impl FetchHandler {
             topic, partition, fetch_offset, high_watermark
         );
 
-        // PHASE 1: Try buffer first (raw bytes already available)
-        {
-            let state = self.state.read().await;
-            if let Some(buffer) = state.buffers.get(&(topic.to_string(), partition)) {
-                tracing::info!(
-                    "RAW→BUFFER: Checking buffer for {}-{}, buffer has {} batches",
-                    topic, partition, buffer.batch_metadata.len()
-                );
-
-                let mut combined_bytes = Vec::new();
-                for (batch_idx, metadata) in buffer.batch_metadata.iter().enumerate() {
-                    // Check if this batch overlaps with requested range
-                    if metadata.last_offset >= fetch_offset && metadata.base_offset < high_watermark {
-                        let raw_batch = &buffer.raw_batches[batch_idx];
-
-                        if combined_bytes.len() + raw_batch.len() > max_bytes as usize && !combined_bytes.is_empty() {
-                            break;
-                        }
-
-                        tracing::info!(
-                            "RAW→BUFFER: Adding {} bytes from batch at offsets {}-{}",
-                            raw_batch.len(), metadata.base_offset, metadata.last_offset
-                        );
-                        combined_bytes.extend_from_slice(raw_batch);
-                    }
-                }
-
-                if !combined_bytes.is_empty() {
-                    tracing::info!(
-                        "RAW→BUFFER: Returning {} bytes of raw Kafka data from buffer",
-                        combined_bytes.len()
-                    );
-                    return Ok(Some(combined_bytes));
-                }
-            }
+        // PHASE 1: Try buffer first (raw bytes already available - extracted helper)
+        if let Some(bytes) = self.try_fetch_raw_from_buffer(topic, partition, fetch_offset, high_watermark, max_bytes).await {
+            return Ok(Some(bytes));
         }
 
-        // PHASE 2: Try WAL (NEW: fetch compressed_records_wire_bytes from CanonicalRecord)
-        tracing::info!("RAW→WAL: Buffer empty or no match, trying WAL");
-        if let Some(wal_manager) = self.wal_manager.as_ref() {
-            let raw_bytes_from_wal = self.fetch_raw_bytes_from_wal(
-                wal_manager,
-                topic,
-                partition,
-                fetch_offset,
-                high_watermark,
-                max_bytes,
-            ).await?;
-
-            if let Some(bytes) = raw_bytes_from_wal {
-                tracing::info!(
-                    "RAW→WAL: Returning {} bytes of raw Kafka data from WAL",
-                    bytes.len()
-                );
-                return Ok(Some(bytes));
-            }
-            tracing::info!("RAW→WAL: No raw bytes found in WAL");
+        // PHASE 2: Try WAL (extracted helper)
+        if let Some(bytes) = self.try_fetch_raw_from_wal(topic, partition, fetch_offset, high_watermark, max_bytes).await? {
+            return Ok(Some(bytes));
         }
 
-        // PHASE 3: Try segments (read raw_kafka_batches section)
-        tracing::info!("RAW→SEGMENTS: Buffer and WAL empty or no match, trying segments");
-        let segments = self.get_segments_for_range(topic, partition, fetch_offset, high_watermark).await?;
-
-        if segments.is_empty() {
-            tracing::info!("RAW→SEGMENTS: No segments found for range");
-            return Ok(None);
+        // PHASE 3: Try segments (extracted helper)
+        if let Some(bytes) = self.try_fetch_raw_from_segments(topic, partition, fetch_offset, high_watermark, max_bytes).await? {
+            return Ok(Some(bytes));
         }
 
-        let mut combined_bytes = Vec::new();
-        for segment_info in &segments {
-            // Read segment and extract raw_kafka_batches
-            let segment_data = self.object_store.get(&segment_info.object_key).await?;
-            let segment = Segment::deserialize(segment_data)?;
-
-            tracing::info!(
-                "RAW→SEGMENT: Segment {} has {} bytes of raw_kafka_batches",
-                segment_info.segment_id, segment.raw_kafka_batches.len()
-            );
-
-            if segment.raw_kafka_batches.is_empty() {
-                // Segment doesn't have raw bytes (v1 format or indexed-only)
-                // Cannot preserve CRC, need to fall back to parsed records
-                tracing::warn!(
-                    "RAW→SEGMENT: Segment {} has no raw_kafka_batches, cannot preserve CRC",
-                    segment_info.segment_id
-                );
-                return Ok(None);
-            }
-
-            // CRITICAL FIX: Parse batch headers to filter by offset range
-            // We must ONLY include batches that overlap [fetch_offset, high_watermark)
-            // Otherwise we return wrong batches and clients see CRC errors!
-            let mut cursor_pos = 0;
-
-            while cursor_pos < segment.raw_kafka_batches.len() {
-                let batch_start = cursor_pos;
-
-                // Read batch header (minimum 61 bytes for v2 format)
-                if (segment.raw_kafka_batches.len() - batch_start) < 61 {
-                    // Not enough bytes for a valid batch
-                    break;
-                }
-
-                // Parse JUST the header to get offsets (without decoding records)
-                // Use manual big-endian byte parsing to avoid any trait complications
-                let base_offset = i64::from_be_bytes([
-                    segment.raw_kafka_batches[batch_start],
-                    segment.raw_kafka_batches[batch_start + 1],
-                    segment.raw_kafka_batches[batch_start + 2],
-                    segment.raw_kafka_batches[batch_start + 3],
-                    segment.raw_kafka_batches[batch_start + 4],
-                    segment.raw_kafka_batches[batch_start + 5],
-                    segment.raw_kafka_batches[batch_start + 6],
-                    segment.raw_kafka_batches[batch_start + 7],
-                ]);
-
-                let batch_length = i32::from_be_bytes([
-                    segment.raw_kafka_batches[batch_start + 8],
-                    segment.raw_kafka_batches[batch_start + 9],
-                    segment.raw_kafka_batches[batch_start + 10],
-                    segment.raw_kafka_batches[batch_start + 11],
-                ]);
-
-                // Read last_offset_delta at offset 23 (after base_offset, batch_length, partition_leader_epoch, magic, crc, attributes)
-                let last_offset_delta = i32::from_be_bytes([
-                    segment.raw_kafka_batches[batch_start + 23],
-                    segment.raw_kafka_batches[batch_start + 24],
-                    segment.raw_kafka_batches[batch_start + 25],
-                    segment.raw_kafka_batches[batch_start + 26],
-                ]);
-                let last_offset = base_offset + last_offset_delta as i64;
-
-                // Total batch size is: 12 bytes (base_offset + batch_length) + batch_length
-                let total_batch_size = 12 + batch_length as usize;
-
-                tracing::debug!(
-                    "RAW→BATCH: Found batch at offset {}, base_offset={}, last_offset={}, size={}",
-                    batch_start, base_offset, last_offset, total_batch_size
-                );
-
-                // Check if this batch overlaps with requested range [fetch_offset, high_watermark)
-                if last_offset >= fetch_offset && base_offset < high_watermark {
-                    // This batch is in range, include it
-                    if combined_bytes.len() + total_batch_size > max_bytes as usize && !combined_bytes.is_empty() {
-                        // Would exceed max_bytes, stop here
-                        break;
-                    }
-
-                    let batch_bytes = &segment.raw_kafka_batches[batch_start..batch_start + total_batch_size];
-                    combined_bytes.extend_from_slice(batch_bytes);
-
-                    tracing::info!(
-                        "RAW→BATCH: Including {} bytes from batch {}-{}",
-                        total_batch_size, base_offset, last_offset
-                    );
-                } else {
-                    tracing::debug!(
-                        "RAW→BATCH: Skipping batch {}-{} (outside range {}-{})",
-                        base_offset, last_offset, fetch_offset, high_watermark
-                    );
-                }
-
-                // Move to next batch
-                cursor_pos = batch_start + total_batch_size;
-            }
-        }
-
-        if !combined_bytes.is_empty() {
-            tracing::info!(
-                "RAW→SEGMENTS: Returning {} bytes of raw Kafka data from {} segments",
-                combined_bytes.len(), segments.len()
-            );
-            return Ok(Some(combined_bytes));
-        }
-
-        // PHASE 3: Try Tantivy segments (warm storage)
-        if let Some(ref segment_index) = self.segment_index {
-            tracing::info!("RAW→TANTIVY: Checking Tantivy segment index for {}-{}", topic, partition);
-
-            match self.fetch_from_tantivy(
-                segment_index,
-                topic,
-                partition,
-                fetch_offset,
-                high_watermark,
-                max_bytes,
-            ).await {
-                Ok(Some(bytes)) => {
-                    tracing::info!(
-                        "RAW→TANTIVY: Returning {} bytes from Tantivy segments",
-                        bytes.len()
-                    );
-                    return Ok(Some(bytes));
-                }
-                Ok(None) => {
-                    tracing::info!("RAW→TANTIVY: No matching Tantivy segments found");
-                }
-                Err(e) => {
-                    tracing::warn!("RAW→TANTIVY: Error fetching from Tantivy: {}", e);
-                }
-            }
-        }
-
-        Ok(None)
+        // PHASE 4: Try Tantivy segments (extracted helper)
+        self.try_fetch_raw_from_tantivy(topic, partition, fetch_offset, high_watermark, max_bytes).await
     }
 
     /// Fetch records from Tantivy archives (cold storage) - for consumption
@@ -1748,295 +2056,26 @@ impl FetchHandler {
         tracing::info!("Fetching from segment {} (offsets {}-{}) with key: {}",
             segment_info.segment_id, start_offset, end_offset, segment_info.object_key);
 
-        // Debug: Log the full path being accessed
-        tracing::warn!("SEGMENT→READ: Attempting to read segment from object store with key: {}",
-            segment_info.object_key);
+        // Phase 1: Read and parse segment from object store (complexity < 10)
+        use crate::fetch::{SegmentReader, IndexedRecordDecoder, RawKafkaBatchDecoder, RecordFilter};
 
-        // Read segment from storage using the correct Segment format (CHRN magic bytes)
-        let segment_data = match self.object_store.get(&segment_info.object_key).await {
-            Ok(data) => {
-                tracing::info!("SEGMENT→READ: Successfully read segment {} ({} bytes)",
-                    segment_info.object_key, data.len());
-                data
-            }
-            Err(e) => {
-                tracing::error!("SEGMENT→READ: Failed to read segment {}: {:?}",
-                    segment_info.object_key, e);
-
-                // Try to understand where the file should be
-                tracing::error!("SEGMENT→DEBUG: The segment file was expected at key: {}",
-                    segment_info.object_key);
-                tracing::error!("SEGMENT→DEBUG: This typically maps to: ./data/segments/{}",
-                    segment_info.object_key);
-
-                return Err(e.into());
-            }
+        let seg_info = crate::fetch::segment_reader::SegmentInfo {
+            segment_id: segment_info.segment_id.clone(),
+            object_key: segment_info.object_key.clone(),
         };
-        
-        // Parse using the Segment format - this is what SegmentWriter creates
-        let segment = Segment::deserialize(segment_data)?;
-        
-        tracing::info!("Successfully parsed segment v{} with {} records, raw_kafka: {} bytes, indexed: {} bytes", 
-            segment.header.version,
-            segment.metadata.record_count, 
-            segment.raw_kafka_batches.len(),
-            segment.indexed_records.len());
-        
-        // CRITICAL FIX v1.3.23: Multi-batch decode with v3 length prefixes
-        // v3 format: Each batch is prefixed with u32 length
-        // v2 format: Batches concatenated without length (only first batch readable - BUG!)
-        // This fixes the multi-batch bug where only first batch was deserialized
-        let mut all_records = Vec::new();
-        let mut batch_count = 0;
-        let mut cursor_pos = 0;
-        let total_len = segment.indexed_records.len();
 
-        // Check segment version to determine format
-        let is_v3_format = segment.header.version >= 3;
+        let segment = SegmentReader::read_segment(&self.object_store, &seg_info).await?;
 
-        tracing::info!(
-            "SEGMENT→DECODE: Starting multi-batch decode from indexed_records ({} bytes, v{} format)",
-            total_len, segment.header.version
-        );
+        // Phase 2: Decode records (prefer raw Kafka batches if available, otherwise indexed)
+        // Complexity < 20 for Kafka decoder, < 25 for indexed decoder
+        let all_records = if !segment.raw_kafka_batches.is_empty() {
+            RawKafkaBatchDecoder::decode_raw_kafka_batches(&segment)?
+        } else {
+            IndexedRecordDecoder::decode_indexed_records(&segment)?
+        };
 
-        while cursor_pos < total_len {
-            // v3 format: Read length prefix first
-            let batch_data_start = if is_v3_format {
-                // Need at least 4 bytes for length prefix
-                if cursor_pos + 4 > total_len {
-                    tracing::info!("SEGMENT→DECODE: Not enough bytes for length prefix at position {}", cursor_pos);
-                    break;
-                }
-
-                // Read u32 length prefix (big-endian)
-                let batch_len = u32::from_be_bytes([
-                    segment.indexed_records[cursor_pos],
-                    segment.indexed_records[cursor_pos + 1],
-                    segment.indexed_records[cursor_pos + 2],
-                    segment.indexed_records[cursor_pos + 3],
-                ]) as usize;
-
-                tracing::debug!("SEGMENT→V3: Batch {} has length prefix {} bytes", batch_count + 1, batch_len);
-
-                // Move cursor past length prefix
-                cursor_pos + 4
-            } else {
-                // v2 format: No length prefix, try to decode from current position
-                cursor_pos
-            };
-
-            // Calculate end position for this batch
-            let batch_data_end = if is_v3_format {
-                let batch_len = u32::from_be_bytes([
-                    segment.indexed_records[cursor_pos],
-                    segment.indexed_records[cursor_pos + 1],
-                    segment.indexed_records[cursor_pos + 2],
-                    segment.indexed_records[cursor_pos + 3],
-                ]) as usize;
-                batch_data_start + batch_len
-            } else {
-                total_len  // For v2, decode will determine the end
-            };
-
-            // Ensure we have enough data
-            if batch_data_end > total_len {
-                tracing::error!(
-                    "SEGMENT→ERROR: Batch extends beyond segment bounds (pos={}, end={}, total={})",
-                    batch_data_start, batch_data_end, total_len
-                );
-                break;
-            }
-
-            // Decode the batch
-            match RecordBatch::decode(&segment.indexed_records[batch_data_start..batch_data_end]) {
-                Ok((batch, bytes_consumed)) => {
-                    let batch_records = batch.records.len();
-                    tracing::info!(
-                        "SEGMENT→BATCH {}: Decoded {} records, {} bytes at position {}",
-                        batch_count + 1,
-                        batch_records,
-                        if is_v3_format { batch_data_end - batch_data_start } else { bytes_consumed },
-                        cursor_pos
-                    );
-
-                    all_records.extend(batch.records);
-
-                    // Advance cursor
-                    if is_v3_format {
-                        // v3: Move to next length prefix
-                        cursor_pos = batch_data_end;
-                    } else {
-                        // v2: Use bytes_consumed from decode
-                        cursor_pos += bytes_consumed;
-
-                        // Safety check for v2 format
-                        if bytes_consumed == 0 {
-                            tracing::error!("SEGMENT→ERROR: Zero bytes consumed in v2 format, breaking");
-                            break;
-                        }
-                    }
-
-                    batch_count += 1;
-                }
-                Err(e) => {
-                    if is_v3_format {
-                        // v3: Length prefix told us exact size, decode should not fail
-                        tracing::error!(
-                            "SEGMENT→ERROR: Failed to decode v3 batch {} at position {}: {}",
-                            batch_count + 1, cursor_pos, e
-                        );
-                        break;
-                    } else {
-                        // v2: Expected to fail after last batch (no length prefix to know when to stop)
-                        tracing::info!(
-                            "SEGMENT→DECODE: Finished v2 format at position {} ({} bytes remaining): {}",
-                            cursor_pos,
-                            total_len - cursor_pos,
-                            e
-                        );
-                        break;
-                    }
-                }
-            }
-        }
-
-        tracing::info!(
-            "SEGMENT→COMPLETE: Decoded {} batches with {} total records from indexed_records",
-            batch_count,
-            all_records.len()
-        );
-
-        // CRITICAL FIX: Adjust record offsets if they're stored as relative offsets
-        // Records in indexed_records may be stored with relative offsets (0, 1, 2...)
-        // Need to adjust them to absolute partition offsets by adding base_offset
-        let base_offset = segment.metadata.base_offset;
-        if base_offset > 0 && !all_records.is_empty() {
-            // Check if offsets need adjustment (if first record offset is small, likely relative)
-            let first_offset = all_records[0].offset;
-            if first_offset < base_offset {
-                tracing::info!(
-                    "SEGMENT→ADJUST: Adjusting {} record offsets by base_offset={} (first record offset was {})",
-                    all_records.len(),
-                    base_offset,
-                    first_offset
-                );
-                for record in &mut all_records {
-                    record.offset += base_offset;
-                }
-            }
-        }
-
-        if !segment.raw_kafka_batches.is_empty() {
-            // ALWAYS prefer raw Kafka batches when available (preserves CRC from original produce request)
-            // Dual storage (v2) has both indexed + raw, but raw has correct CRC
-            tracing::info!("Using raw Kafka batches for fetch (CRC-preserving format, {} bytes)", segment.raw_kafka_batches.len());
-            all_records.clear();  // Clear any indexed records, use raw instead
-
-            let mut cursor_pos = 0;
-            let total_len = segment.raw_kafka_batches.len();
-            let mut batch_count = 0;
-            let mut current_absolute_offset = segment.metadata.base_offset;
-
-            tracing::info!(
-                "SEGMENT→KAFKA: Starting multi-batch decode from raw_kafka_batches ({} bytes, base_offset={})",
-                total_len,
-                current_absolute_offset
-            );
-
-            while cursor_pos < total_len {
-                // Kafka batches are self-describing - decode will use batch_length from header
-                match KafkaRecordBatch::decode(&segment.raw_kafka_batches[cursor_pos..]) {
-                    Ok((kafka_batch, bytes_consumed)) => {
-                        // CRITICAL: Use segment metadata's base_offset, NOT client's base_offset from Kafka batch header
-                        // The client's base_offset in the Kafka batch header is often incorrect (e.g., 1 instead of 0)
-                        // We must use the segment's actual offsets which are tracked server-side
-                        let records: Vec<Record> = kafka_batch.records.into_iter().enumerate().map(|(i, kr)| {
-                            Record {
-                                offset: current_absolute_offset + i as i64,
-                                timestamp: kafka_batch.header.base_timestamp + kr.timestamp_delta,
-                                key: kr.key.map(|k| k.to_vec()),
-                                value: kr.value.map(|v| v.to_vec()).unwrap_or_default(),
-                                headers: kr.headers.into_iter().map(|h| {
-                                    (h.key, h.value.map(|v| v.to_vec()).unwrap_or_default())
-                                }).collect(),
-                            }
-                        }).collect();
-
-                        let batch_records = records.len();
-                        tracing::debug!(
-                            "Decoded batch {}: {} records (offsets {}-{})",
-                            batch_count + 1,
-                            batch_records,
-                            current_absolute_offset,
-                            current_absolute_offset + batch_records as i64 - 1
-                        );
-
-                        // Increment absolute offset for next batch
-                        current_absolute_offset += batch_records as i64;
-
-                        all_records.extend(records);
-
-                        // Advance cursor using bytes_consumed from Kafka decode
-                        cursor_pos += bytes_consumed;
-
-                        // Safety check
-                        if bytes_consumed == 0 {
-                            tracing::error!("SEGMENT→KAFKA: Zero bytes consumed, breaking to avoid infinite loop");
-                            break;
-                        }
-
-                        batch_count += 1;
-                    }
-                    Err(e) => {
-                        // Expected to fail when we run out of complete batches
-                        tracing::info!(
-                            "SEGMENT→KAFKA: Finished decoding at position {} ({} bytes remaining): {}",
-                            cursor_pos,
-                            total_len - cursor_pos,
-                            e
-                        );
-                        break;
-                    }
-                }
-            }
-
-            tracing::info!(
-                "SEGMENT→KAFKA: Decoded {} batches with {} total records from raw_kafka_batches",
-                batch_count,
-                all_records.len()
-            );
-        }
-
-        // If still no records after trying both indexed and raw formats, return empty
-        if all_records.is_empty() {
-            tracing::warn!("SEGMENT→EMPTY: No records decoded from segment");
-            return Ok(vec![]);
-        }
-
-        let record_batch = RecordBatch { records: all_records };
-
-        // Filter records by offset range
-        let mut filtered_records = Vec::new();
-        let mut bytes_fetched = 0;
-
-        for record in record_batch.records {
-            if record.offset >= start_offset && record.offset < end_offset {
-                let record_size = record.value.len() +
-                    record.key.as_ref().map(|k| k.len()).unwrap_or(0) + 24;
-
-                if bytes_fetched + record_size > max_bytes as usize && !filtered_records.is_empty() {
-                    break;
-                }
-
-                filtered_records.push(record);
-                bytes_fetched += record_size;
-            }
-        }
-        
-        tracing::info!("Returning {} records after filtering for offset range {}-{}", 
-            filtered_records.len(), start_offset, end_offset);
-        
-        Ok(filtered_records)
+        // Phase 3: Filter by offset range and max_bytes (complexity < 10)
+        Ok(RecordFilter::filter_by_range(all_records, start_offset, end_offset, max_bytes))
     }
     
     /// Fetch raw Kafka batch data from a segment (for compatibility)

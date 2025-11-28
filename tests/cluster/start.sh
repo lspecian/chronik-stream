@@ -44,23 +44,24 @@ mkdir -p "$SCRIPT_DIR"/logs
 # v2.2.9 fix #1: debug + ultra + 1000s of partitions = 180K log lines/sec → crash
 # v2.2.9 fix #2: Tantivy INFO logs (commits, GC) create 18K logs/commit with 3000 partitions
 # v2.2.9 fix #3: Protocol/produce handler logs create 21K logs/metadata request with 3000 partitions
+# v2.2.14 fix #4: Connection closed logs at debug = 50MB/sec → disk full
 # Use 'high' profile for good performance without excessive logging
 echo -e "${GREEN}Starting Node 1...${NC}"
-RUST_LOG=info,chronik_wal::group_commit=warn,tantivy=warn,chronik_protocol::handler=warn,chronik_server::produce_handler=warn,chronik_server::kafka_handler=warn,chronik_storage::kafka_records=warn CHRONIK_WAL_PROFILE=high "$BINARY" start --config "$SCRIPT_DIR/node1.toml" \
+RUST_LOG=info,chronik_server::integrated_server::server=warn,chronik_wal::group_commit=warn,tantivy=warn CHRONIK_WAL_PROFILE=high "$BINARY" start --config "$SCRIPT_DIR/node1.toml" \
     > "$SCRIPT_DIR/logs/node1.log" 2>&1 &
 echo $! > "$SCRIPT_DIR/data/node1.pid"
 
 sleep 2
 
 echo -e "${GREEN}Starting Node 2...${NC}"
-RUST_LOG=info,chronik_wal::group_commit=warn,tantivy=warn,chronik_protocol::handler=warn,chronik_server::produce_handler=warn,chronik_server::kafka_handler=warn,chronik_storage::kafka_records=warn CHRONIK_WAL_PROFILE=high "$BINARY" start --config "$SCRIPT_DIR/node2.toml" \
+RUST_LOG=info,chronik_server::integrated_server::server=warn,chronik_wal::group_commit=warn,tantivy=warn CHRONIK_WAL_PROFILE=high "$BINARY" start --config "$SCRIPT_DIR/node2.toml" \
     > "$SCRIPT_DIR/logs/node2.log" 2>&1 &
 echo $! > "$SCRIPT_DIR/data/node2.pid"
 
 sleep 2
 
 echo -e "${GREEN}Starting Node 3...${NC}"
-RUST_LOG=info,chronik_wal::group_commit=warn,tantivy=warn,chronik_protocol::handler=warn,chronik_server::produce_handler=warn,chronik_server::kafka_handler=warn,chronik_storage::kafka_records=warn CHRONIK_WAL_PROFILE=high "$BINARY" start --config "$SCRIPT_DIR/node3.toml" \
+RUST_LOG=info,chronik_server::integrated_server::server=warn,chronik_wal::group_commit=warn,tantivy=warn CHRONIK_WAL_PROFILE=high "$BINARY" start --config "$SCRIPT_DIR/node3.toml" \
     > "$SCRIPT_DIR/logs/node3.log" 2>&1 &
 echo $! > "$SCRIPT_DIR/data/node3.pid"
 

@@ -28,11 +28,13 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 
 use crate::raft_cluster::RaftCluster;
+use chronik_common::metadata::traits::MetadataStore;
 
 /// Admin API state shared across handlers
 #[derive(Clone)]
 pub struct AdminApiState {
     pub raft_cluster: Arc<RaftCluster>,
+    pub metadata_store: Arc<dyn MetadataStore>,
     pub api_key: Option<String>,
 }
 
@@ -303,8 +305,14 @@ async fn handle_status(
         }
     }).collect();
 
-    // Get all partition assignments
-    let partitions = state.raft_cluster.get_all_partition_info();
+    // Get all partition assignments from metadata store (not Raft - v2.2.13 fix)
+    let partitions = match collect_partition_info_from_metadata(state.metadata_store.clone()).await {
+        Ok(parts) => parts,
+        Err(e) => {
+            warn!("Failed to collect partition info from metadata store: {:?}", e);
+            Vec::new()
+        }
+    };
 
     Ok(Json(ClusterStatusResponse {
         node_id,
@@ -313,6 +321,44 @@ async fn handle_status(
         nodes,
         partitions,
     }))
+}
+
+/// Helper function to collect all partition information from metadata store
+///
+/// Queries metadata store for all topics and their partition assignments,
+/// converting them to PartitionInfo format for the admin API.
+async fn collect_partition_info_from_metadata(
+    metadata_store: Arc<dyn MetadataStore>,
+) -> Result<Vec<PartitionInfo>> {
+    let mut all_partitions = Vec::new();
+
+    // List all topics
+    let topics = metadata_store.list_topics().await
+        .map_err(|e| anyhow::anyhow!("Failed to list topics: {:?}", e))?;
+
+    // For each topic, get partition assignments
+    for topic_meta in topics {
+        match metadata_store.get_partition_assignments(&topic_meta.name).await {
+            Ok(assignments) => {
+                for assignment in assignments {
+                    all_partitions.push(PartitionInfo {
+                        topic: assignment.topic.clone(),
+                        partition: assignment.partition as i32,
+                        leader: Some(assignment.leader_id),
+                        replicas: assignment.replicas.clone(),
+                        // TODO: Query actual ISR from ISR tracker
+                        // For now, assume all replicas are in-sync
+                        isr: assignment.replicas.clone(),
+                    });
+                }
+            }
+            Err(e) => {
+                warn!("Failed to get partition assignments for topic {}: {:?}", topic_meta.name, e);
+            }
+        }
+    }
+
+    Ok(all_partitions)
 }
 
 /// Authentication middleware
@@ -380,6 +426,7 @@ pub fn create_admin_router(state: AdminApiState) -> Router {
 /// Both must be set to enable TLS. If only one is set, TLS is disabled with a warning.
 pub async fn start_admin_api(
     raft_cluster: Arc<RaftCluster>,
+    metadata_store: Arc<dyn MetadataStore>,
     port: u16,
     api_key: Option<String>,
 ) -> Result<()> {
@@ -397,6 +444,7 @@ pub async fn start_admin_api(
 
     let state = AdminApiState {
         raft_cluster,
+        metadata_store,
         api_key: effective_key,
     };
 
