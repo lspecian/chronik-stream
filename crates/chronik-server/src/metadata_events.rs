@@ -54,6 +54,15 @@ pub enum MetadataEvent {
     TopicDeleted {
         topic: String,
     },
+
+    /// Broker registered (v2.2.9)
+    /// CRITICAL FIX: This was missing, causing followers to not receive broker metadata
+    BrokerRegistered {
+        broker_id: i32,
+        host: String,
+        port: i32,
+        rack: Option<String>,
+    },
 }
 
 /// Event bus for metadata changes

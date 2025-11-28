@@ -283,6 +283,49 @@ impl MetadataWalReplicator {
                 tracing::info!("📡 Replicating TopicDeleted: {}", topic);
                 // TODO: Implement when DeleteTopic command is added
             }
+
+            // v2.2.15 CRITICAL FIX: Replicate BrokerRegistered events to followers
+            // Without this, followers don't know about brokers and return fallback metadata
+            // This was the root cause of cluster mode client timeouts!
+            MetadataEvent::BrokerRegistered { broker_id, host, port, rack } => {
+                tracing::info!("📡 Replicating BrokerRegistered to followers: broker_id={}, {}:{}",
+                    broker_id, host, port);
+
+                // Create BrokerMetadata for serialization
+                use chronik_common::metadata::traits::{BrokerMetadata, BrokerStatus};
+                let broker_metadata = BrokerMetadata {
+                    broker_id,
+                    host: host.clone(),
+                    port,
+                    rack: rack.clone(),
+                    status: BrokerStatus::Online,
+                    created_at: chrono::Utc::now(),
+                    updated_at: chrono::Utc::now(),
+                };
+
+                // Create MetadataEvent for replication (same format as WAL writes)
+                let metadata_event = chronik_common::metadata::MetadataEvent::new(
+                    chronik_common::metadata::MetadataEventPayload::BrokerRegistered {
+                        metadata: broker_metadata,
+                    },
+                );
+
+                // Serialize and broadcast to followers
+                match metadata_event.to_bytes() {
+                    Ok(data) => {
+                        self.replication_mgr.broadcast_metadata(
+                            self.wal.topic_name().to_string(),  // "__chronik_metadata"
+                            self.wal.partition(),                // 0
+                            0,  // dummy offset (event-based)
+                            data,
+                        ).await;
+                        tracing::info!("✅ BrokerRegistered broadcast to followers: broker_id={}", broker_id);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to serialize BrokerRegistered for broker {}: {}", broker_id, e);
+                    }
+                }
+            }
         }
 
         Ok(())

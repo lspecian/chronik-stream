@@ -2339,7 +2339,7 @@ impl RaftCluster {
                 // Then immediately send to channel (non-blocking) - background task handles actual sends
                 if !ready.persisted_messages().is_empty() {
                     let persisted_msgs = ready.take_persisted_messages();
-                    tracing::info!("Raft ready: {} persisted messages to send", persisted_msgs.len());
+                    tracing::debug!("Raft ready: {} persisted messages to send", persisted_msgs.len());
 
                     for msg in persisted_msgs {
                         let peer_id = msg.to;

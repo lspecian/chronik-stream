@@ -8,16 +8,16 @@
 
 A high-performance streaming platform built in Rust that implements core Kafka wire protocol functionality with comprehensive Write-Ahead Log (WAL) durability and automatic recovery.
 
-**Latest Release: v2.2.8** - Critical watermark idempotence fix for 100% message consumption success. See [CHANGELOG.md](CHANGELOG.md) for full release history.
+**Latest Release: v2.2.9** - Cluster performance parity with standalone (178k msg/s). See [CHANGELOG.md](CHANGELOG.md) for full release history.
 
-## ✨ What's New in v2.2.8
+## ✨ What's New in v2.2.9
 
-🔧 **Critical Bug Fix**: Watermark idempotence prevents message loss during producer retries
-📡 **Metadata Replication**: Sub-10ms watermark propagation via event-based replication
-📊 **100% Consumption**: Proven success with proper client configuration (all cluster brokers)
-📚 **Documentation**: Comprehensive investigation and root cause analysis
+⚡ **Cluster Performance**: Cluster mode now matches standalone throughput (178k msg/s, 0.18% difference)
+🔧 **Broker Metadata Fix**: Added BrokerRegistered event for proper follower metadata replication
+📡 **Full Distribution**: Messages distributed across all nodes with RF=3 replication
+✅ **Verified**: Produce, replicate, and consume working with 100% message delivery
 
-**Upgrade Recommendation**: All users should upgrade to v2.2.8 for improved reliability.
+**Upgrade Recommendation**: All users should upgrade to v2.2.9 for full cluster performance.
 
 ## 🚀 Features
 
@@ -496,7 +496,7 @@ All images support both **linux/amd64** and **linux/arm64** architectures:
 
 | Image | Tags | Description |
 |-------|------|-------------|
-| `ghcr.io/lspecian/chronik-stream` | `latest`, `v2.2.8`, `2.2` | Chronik server with full KSQL support |
+| `ghcr.io/lspecian/chronik-stream` | `latest`, `v2.2.9`, `2.2` | Chronik server with full KSQL support |
 
 ### Supported Platforms
 

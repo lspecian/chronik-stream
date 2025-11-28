@@ -302,7 +302,17 @@ impl IntegratedKafkaServerBuilder {
                     offset: *new_watermark,
                 })
             }
-            _ => None, // Skip other event types
+            // v2.2.15 CRITICAL FIX: Replicate BrokerRegistered events to followers
+            // Without this, followers don't know about brokers and return fallback metadata
+            MetadataEventPayload::BrokerRegistered { metadata } => {
+                Some(ServerEvent::BrokerRegistered {
+                    broker_id: metadata.broker_id,
+                    host: metadata.host.clone(),
+                    port: metadata.port,
+                    rack: metadata.rack.clone(),
+                })
+            }
+            _ => None, // Skip other event types (e.g., OffsetUpdated)
         };
 
         // Publish to event bus if relevant

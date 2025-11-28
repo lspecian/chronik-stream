@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Chronik Stream is a high-performance Kafka-compatible streaming platform written in Rust that implements the Kafka wire protocol with comprehensive Write-Ahead Log (WAL) durability and automatic recovery. Current version: v2.2.7.
+Chronik Stream is a high-performance Kafka-compatible streaming platform written in Rust that implements the Kafka wire protocol with comprehensive Write-Ahead Log (WAL) durability and automatic recovery. Current version: v2.2.9.
 
 **Key Differentiators:**
 - Full Kafka protocol compatibility tested with real clients (kafka-python, confluent-kafka, KSQL, Apache Flink)
@@ -1123,3 +1123,4 @@ ONLY after all 3 confirmations may you proceed.
 - Java client testing location: `ksql/confluent-7.5.0/` contains KSQLDB and Java Kafka libraries
 - Test BEFORE committing, tagging, or pushing any release
 - **DO THINGS PROPERLY** - There is no point in doing things halfway or incorrectly. Properly is the normal, it's how you do things.
+- **NEVER CHANGE WAL PROFILE WITHOUT ASKING** - The `CHRONIK_WAL_PROFILE` environment variable controls WAL batch intervals (low=2ms, medium=10ms, high=50ms, ultra=100ms). When comparing standalone vs cluster performance, ensure BOTH use the SAME profile. The cluster start script (`tests/cluster/start.sh`) sets `CHRONIK_WAL_PROFILE=high`. Do NOT change it without explicit user permission. If you need to test with a different profile, ASK FIRST.
