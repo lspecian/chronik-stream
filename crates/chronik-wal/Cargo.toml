@@ -7,11 +7,12 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-default = ["raft-storage", "async-io"]  # io_uring enabled (both bugs fixed)
+default = ["raft-storage", "async-io"]  # io_uring enabled on Linux only
 wal = ["dep:memmap2"]
 wal-encryption = ["wal", "dep:ring"]
 wal-compression = ["wal", "dep:zstd"]
-async-io = ["dep:tokio-uring", "dep:crossbeam"]
+# async-io feature enables io_uring on Linux (via target-specific dep), crossbeam on all platforms
+async-io = ["dep:crossbeam", "dep:tokio-uring"]
 raft-storage = ["dep:chronik-raft", "dep:raft", "dep:protobuf"]
 
 [dependencies]
@@ -41,8 +42,11 @@ libc = "0.2"  # v2.2.7: For I/O priority control (ioprio_set syscall)
 memmap2 = { version = "0.9", optional = true }
 ring = { version = "0.17", optional = true }
 zstd = { version = "0.13", optional = true }
-tokio-uring = { version = "0.4", optional = true }
 crossbeam = { version = "0.8", optional = true }
+
+# Linux-only: tokio-uring for kernel-level async I/O
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio-uring = { version = "0.4", optional = true }
 
 # Local dependencies
 chronik-common = { path = "../chronik-common" }

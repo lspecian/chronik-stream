@@ -493,52 +493,20 @@ impl IntegratedKafkaServerBuilder {
     }
 
     /// Stage 9: Initialize ProduceHandler with all dependencies and wiring
-    /// Complexity: < 25 (configuration, creation, and multiple wiring steps)
+    /// Complexity: < 25 (orchestrates initialization using extracted helpers)
     async fn init_produce_handler(&mut self) -> Result<()> {
         info!("Stage 9: Initializing ProduceHandler with dependencies");
 
-        let object_store = self.object_store.as_ref()
-            .context("object_store not initialized")?;
-        let metadata_store = self.metadata_store.as_ref()
-            .context("metadata_store not initialized")?;
-        let wal_manager = self.wal_manager.as_ref()
-            .context("wal_manager not initialized")?;
-        let metadata_event_bus = self.metadata_event_bus.as_ref()
-            .context("metadata_event_bus not initialized")?;
-        let storage_config = self.storage_config.as_ref()
-            .context("storage_config not initialized")?;
+        let object_store = self.object_store.as_ref().context("object_store not initialized")?;
+        let metadata_store = self.metadata_store.as_ref().context("metadata_store not initialized")?;
+        let wal_manager = self.wal_manager.as_ref().context("wal_manager not initialized")?;
+        let metadata_event_bus = self.metadata_event_bus.as_ref().context("metadata_event_bus not initialized")?;
+        let storage_config = self.storage_config.as_ref().context("storage_config not initialized")?;
 
-        // Configure produce handler with proper indexer config
-        let indexer_config = chronik_search::realtime_indexer::RealtimeIndexerConfig {
-            index_base_path: PathBuf::from(format!("{}/index", self.config.data_dir)),
-            ..Default::default()
-        };
+        // Step 1: Build configuration
+        let produce_config = self.create_produce_handler_config(storage_config);
 
-        let flush_profile = ProduceFlushProfile::auto_select();
-        let produce_config = ProduceHandlerConfig {
-            node_id: self.config.node_id,
-            storage_config: storage_config.clone(),
-            indexer_config,
-            enable_indexing: self.config.enable_indexing,
-            enable_idempotence: true,
-            enable_transactions: false, // Start without transactions
-            max_in_flight_requests: 5,
-            batch_size: 16384,
-            linger_ms: flush_profile.linger_ms(),
-            compression_type: if self.config.enable_compression {
-                chronik_storage::kafka_records::CompressionType::Snappy
-            } else {
-                chronik_storage::kafka_records::CompressionType::None
-            },
-            request_timeout_ms: 120000,  // 120 seconds
-            buffer_memory: flush_profile.buffer_memory(),
-            auto_create_topics_enable: self.config.auto_create_topics,
-            num_partitions: self.config.num_partitions,
-            default_replication_factor: self.config.replication_factor,
-            flush_profile,
-        };
-
-        // Initialize produce handler with inline WAL support
+        // Step 2: Create ProduceHandler with WAL support
         let mut produce_handler_inner = ProduceHandler::new_with_wal(
             produce_config,
             object_store.clone(),
@@ -546,114 +514,162 @@ impl IntegratedKafkaServerBuilder {
             wal_manager.clone(),
         ).await?;
 
-        // Wire RaftCluster to ProduceHandler for partition metadata
-        if let Some(ref cluster) = self.raft_cluster_for_metadata {
-            info!("Setting RaftCluster for ProduceHandler");
-            produce_handler_inner.set_raft_cluster(Arc::clone(cluster));
-        }
-
-        // Wire MetadataEventBus to ProduceHandler for < 10ms watermark replication
-        info!("Setting MetadataEventBus for ProduceHandler");
+        // Step 3: Wire event bus and ISR tracker
         produce_handler_inner.set_event_bus(metadata_event_bus.clone());
-
-        // Create ISR ACK tracker for acks=-1 quorum support
-        // CRITICAL: Must be created on ALL nodes (leader + followers)
         let isr_ack_tracker = crate::isr_ack_tracker::IsrAckTracker::new();
-        info!("Created IsrAckTracker for acks=-1 quorum tracking");
         produce_handler_inner.set_isr_ack_tracker(isr_ack_tracker.clone());
+        info!("✅ EventBus and IsrAckTracker wired");
 
-        // Create leader elector if Raft clustering is enabled
-        let leader_elector_for_produce = if let Some(ref raft) = self.raft_cluster_for_metadata {
-            info!("Creating LeaderElector for event-driven elections");
-            let elector = Arc::new(
-                crate::leader_election::LeaderElector::new(raft.clone(), metadata_store.clone())
-            );
-            info!("✓ LeaderElector ready (event-driven mode)");
-            Some(elector)
-        } else {
-            None
+        // Step 4: Wire Raft dependencies (cluster mode only)
+        let leader_elector = self.wire_raft_dependencies(&mut produce_handler_inner, &isr_ack_tracker, metadata_store);
+
+        // Step 5: Setup response pipeline with WAL callback
+        let response_pipeline = self.setup_response_pipeline(&mut produce_handler_inner, wal_manager);
+
+        // Step 6: Finalize and start background tasks
+        let (produce_handler_base, wal_handler) = self.finalize_produce_handler(produce_handler_inner, wal_manager).await;
+
+        // Store all components
+        self.produce_handler_base = Some(produce_handler_base);
+        self.wal_produce_handler = Some(wal_handler);
+        self.isr_ack_tracker = Some(isr_ack_tracker);
+        self.response_pipeline = Some(response_pipeline);
+        self.leader_elector = leader_elector;
+
+        info!("✅ ProduceHandler initialized with all dependencies and wiring");
+        Ok(())
+    }
+
+    /// Helper: Build ProduceHandler configuration
+    fn create_produce_handler_config(&self, storage_config: &IngestStorageConfig) -> ProduceHandlerConfig {
+        let indexer_config = chronik_search::realtime_indexer::RealtimeIndexerConfig {
+            index_base_path: PathBuf::from(format!("{}/index", self.config.data_dir)),
+            ..Default::default()
         };
 
-        // Wire leader elector to ProduceHandler for heartbeat recording
-        if let Some(ref elector) = leader_elector_for_produce {
-            produce_handler_inner.set_leader_elector(elector.clone());
-        }
-
-        // CRITICAL INTEGRATION FIX (v2.2.14): Create and wire WalReplicationManager for DATA messages
-        // This enables the replica cache (6.2x speedup) and ISR-aware replication
-        if let Some(ref raft) = self.raft_cluster_for_metadata {
-            info!("Creating WalReplicationManager for data message replication");
-            let data_wal_repl_manager = crate::wal_replication::WalReplicationManager::new_with_dependencies(
-                Vec::new(),  // Empty for auto-discovery from cluster config
-                Some(raft.clone()),
-                None,  // No separate ISR tracker (use IsrAckTracker instead)
-                Some(isr_ack_tracker.clone()),  // ISR+ACK tracker for data replication
-                self.config.cluster_config.clone().map(Arc::new),
-                Some(metadata_store.clone()),  // CRITICAL: Enables replica cache with metadata lookups
-            );
-
-            // Wire to ProduceHandler - THIS WAS MISSING and caused 2.65x regression!
-            produce_handler_inner.set_wal_replication_manager(data_wal_repl_manager);
-            info!("✅ Data WAL replication manager wired to ProduceHandler (replica cache enabled)");
+        let flush_profile = ProduceFlushProfile::auto_select();
+        let compression_type = if self.config.enable_compression {
+            chronik_storage::kafka_records::CompressionType::Snappy
         } else {
-            info!("⚠️  Raft clustering disabled - WAL replication manager not created (single-node mode)");
-        }
+            chronik_storage::kafka_records::CompressionType::None
+        };
 
-        // Wire ResponsePipeline for async acks=1 responses (v2.2.10 CRITICAL FIX #7)
-        info!("Setting up ResponsePipeline for async acks=1 responses");
+        ProduceHandlerConfig {
+            node_id: self.config.node_id,
+            storage_config: storage_config.clone(),
+            indexer_config,
+            enable_indexing: self.config.enable_indexing,
+            enable_idempotence: true,
+            enable_transactions: false,
+            max_in_flight_requests: 5,
+            batch_size: 16384,
+            linger_ms: flush_profile.linger_ms(),
+            compression_type,
+            request_timeout_ms: 120000,
+            buffer_memory: flush_profile.buffer_memory(),
+            auto_create_topics_enable: self.config.auto_create_topics,
+            num_partitions: self.config.num_partitions,
+            default_replication_factor: self.config.replication_factor,
+            flush_profile,
+        }
+    }
+
+    /// Helper: Wire Raft-related dependencies to ProduceHandler
+    fn wire_raft_dependencies(
+        &self,
+        produce_handler: &mut crate::produce_handler::ProduceHandler,
+        isr_ack_tracker: &Arc<crate::isr_ack_tracker::IsrAckTracker>,
+        metadata_store: &Arc<dyn MetadataStore>,
+    ) -> Option<Arc<crate::leader_election::LeaderElector>> {
+        let raft_cluster = match self.raft_cluster_for_metadata.as_ref() {
+            Some(c) => c,
+            None => {
+                info!("⚠️  Raft clustering disabled - single-node mode");
+                return None;
+            }
+        };
+
+        // Wire RaftCluster
+        produce_handler.set_raft_cluster(Arc::clone(raft_cluster));
+
+        // Create and wire LeaderElector
+        let elector = Arc::new(crate::leader_election::LeaderElector::new(
+            raft_cluster.clone(),
+            metadata_store.clone(),
+        ));
+        produce_handler.set_leader_elector(elector.clone());
+        info!("✓ LeaderElector ready (event-driven mode)");
+
+        // Create and wire WalReplicationManager for data messages
+        let data_wal_repl_manager = crate::wal_replication::WalReplicationManager::new_with_dependencies(
+            Vec::new(),
+            Some(raft_cluster.clone()),
+            None,
+            Some(isr_ack_tracker.clone()),
+            self.config.cluster_config.clone().map(Arc::new),
+            Some(metadata_store.clone()),
+        );
+        produce_handler.set_wal_replication_manager(data_wal_repl_manager);
+        info!("✅ Data WAL replication manager wired (replica cache enabled)");
+
+        Some(elector)
+    }
+
+    /// Helper: Setup ResponsePipeline with WAL commit callback
+    fn setup_response_pipeline(
+        &self,
+        produce_handler: &mut crate::produce_handler::ProduceHandler,
+        wal_manager: &Arc<WalManager>,
+    ) -> Arc<crate::response_pipeline::ResponsePipeline> {
         let response_pipeline = Arc::new(crate::response_pipeline::ResponsePipeline::new());
 
-        // Create callback closure that notifies ResponsePipeline when batches commit
+        // Create commit callback for WAL batches
         let response_pipeline_clone = response_pipeline.clone();
-        let partition_states_for_callback = produce_handler_inner.partition_states.clone();
+        let partition_states = produce_handler.partition_states.clone();
         let commit_callback: chronik_wal::group_commit::CommitCallback = Arc::new(
             move |topic: &str, partition: i32, min_offset: i64, max_offset: i64| {
-                // CRITICAL BUG FIX #8 (v2.2.11): Update in-memory high watermark after WAL batch commit
-                let new_watermark = max_offset + 1; // High watermark is the next offset to be written
-                if let Some(state) = partition_states_for_callback.get(&(topic.to_string(), partition)) {
+                // Update in-memory high watermark
+                let new_watermark = max_offset + 1;
+                if let Some(state) = partition_states.get(&(topic.to_string(), partition)) {
                     state.high_watermark.store(new_watermark as u64, Ordering::Release);
                     debug!("✅ WAL_CALLBACK: Updated high watermark {}-{} = {}", topic, partition, new_watermark);
                 }
-
-                // Notify ResponsePipeline for async response delivery
+                // Notify ResponsePipeline
                 response_pipeline_clone.notify_batch_committed(topic, partition, min_offset, max_offset);
             }
         );
 
-        // Wire callback to GroupCommitWal
         wal_manager.group_commit_wal().set_commit_callback(commit_callback);
-        info!("✅ ResponsePipeline callback wired to GroupCommitWal");
+        produce_handler.set_response_pipeline(response_pipeline.clone());
+        info!("✅ ResponsePipeline wired to GroupCommitWal and ProduceHandler");
 
-        // Wire ResponsePipeline to ProduceHandler
-        produce_handler_inner.set_response_pipeline(response_pipeline.clone());
-        info!("✅ ResponsePipeline wired to ProduceHandler");
+        response_pipeline
+    }
 
-        // Wrap in Arc and start background tasks
+    /// Helper: Finalize ProduceHandler - wrap in Arc and start background tasks
+    async fn finalize_produce_handler(
+        &self,
+        produce_handler_inner: crate::produce_handler::ProduceHandler,
+        wal_manager: &Arc<WalManager>,
+    ) -> (Arc<crate::produce_handler::ProduceHandler>, Arc<WalProduceHandler>) {
         let produce_handler_base = Arc::new(produce_handler_inner);
-        produce_handler_base.clone().start_metadata_event_listener();
-        info!("✅ ProduceHandler metadata event listener started");
 
+        // Start background tasks
+        produce_handler_base.clone().start_metadata_event_listener();
         produce_handler_base.start_background_tasks().await;
         info!("✅ ProduceHandler background tasks started");
 
         // Wrap with WalProduceHandler for backward compatibility
         let wal_handler = Arc::new(WalProduceHandler::new_passthrough(
             wal_manager.clone(),
-            produce_handler_base.clone()
+            produce_handler_base.clone(),
         ));
 
-        self.produce_handler_base = Some(produce_handler_base);
-        self.wal_produce_handler = Some(wal_handler);
-        self.isr_ack_tracker = Some(isr_ack_tracker);
-        self.response_pipeline = Some(response_pipeline);
-        self.leader_elector = leader_elector_for_produce;
-
-        info!("✅ ProduceHandler initialized with all dependencies and wiring");
-        Ok(())
+        (produce_handler_base, wal_handler)
     }
 
     /// Stage 10: WAL recovery and watermark restoration
-    /// Complexity: < 25 (WAL replay and metadata restoration logic)
+    /// Complexity: < 25 (orchestrates recovery using extracted helpers)
     async fn recover_wal_watermarks(&mut self) -> Result<()> {
         info!("Stage 10: Recovering WAL watermarks");
 
@@ -665,7 +681,6 @@ impl IntegratedKafkaServerBuilder {
             .context("metadata_store not initialized")?;
 
         // CRITICAL FIX (v1.3.52): Clear all partition buffers before WAL recovery
-        // This prevents duplicate messages by ensuring we start with clean in-memory state.
         info!("Clearing all partition buffers before WAL recovery...");
         if let Err(e) = produce_handler_base.clear_all_buffers().await {
             warn!("Failed to clear partition buffers: {}. Recovery may have duplicates.", e);
@@ -674,99 +689,108 @@ impl IntegratedKafkaServerBuilder {
         // Replay WAL to restore high watermarks after crash
         let recovered_partitions = wal_manager.get_partitions();
         if !recovered_partitions.is_empty() {
-            info!("Replaying WAL to restore high watermarks for {} partitions...", recovered_partitions.len());
-
-            for tp in recovered_partitions {
-                // Read all WAL records to find highest offset
-                match wal_manager.read_from(&tp.topic, tp.partition, 0, usize::MAX).await {
-                    Ok(records) if !records.is_empty() => {
-                        use chronik_wal::record::WalRecord;
-                        use chronik_storage::CanonicalRecord;
-
-                        let mut max_offset: i64 = -1;
-
-                        // Find max offset across all records (handle both V1 and V2 formats)
-                        for record in &records {
-                            match record {
-                                WalRecord::V1 { offset, .. } => {
-                                    if *offset > max_offset {
-                                        max_offset = *offset;
-                                    }
-                                },
-                                WalRecord::V2 { canonical_data, .. } => {
-                                    // Deserialize CanonicalRecord to get offsets
-                                    if let Ok(canonical) = bincode::deserialize::<CanonicalRecord>(canonical_data) {
-                                        let last_offset = canonical.last_offset();
-                                        if last_offset > max_offset {
-                                            max_offset = last_offset;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        if max_offset >= 0 {
-                            // High watermark is max_offset + 1 (next offset to be written)
-                            let high_watermark = (max_offset + 1) as u64;
-
-                            // Restore partition state
-                            if let Err(e) = produce_handler_base.restore_partition_state(&tp.topic, tp.partition, high_watermark).await {
-                                warn!("Failed to restore partition state for {}-{}: {}", tp.topic, tp.partition, e);
-                            } else {
-                                info!("Restored {}-{}: {} records, high watermark = {}",
-                                      tp.topic, tp.partition, records.len(), high_watermark);
-                            }
-                        }
-                    },
-                    Ok(_) => {
-                        // No records, nothing to restore
-                    },
-                    Err(e) => {
-                        warn!("Failed to read WAL for {}-{}: {}", tp.topic, tp.partition, e);
-                    }
-                }
-            }
-
-            info!("WAL replay complete");
+            Self::recover_partitions_from_wal(produce_handler_base, wal_manager, &recovered_partitions).await;
         } else {
-            // WAL is empty (e.g., after deletion or fresh start with persisted segments)
-            // Restore partition states from metadata store instead
-            info!("WAL is empty, attempting to restore partition states from metadata store...");
-
-            match metadata_store.list_topics().await {
-                Ok(topics) => {
-                    for topic_meta in topics {
-                        let partition_count = topic_meta.config.partition_count as i32;
-                        for partition_id in 0..partition_count {
-                            // Get high watermark from metadata store
-                            match metadata_store.get_partition_offset(&topic_meta.name, partition_id as u32).await {
-                                Ok(Some((high_watermark, _log_start_offset))) if high_watermark > 0 => {
-                                    // Restore partition state
-                                    if let Err(e) = produce_handler_base.restore_partition_state(&topic_meta.name, partition_id, high_watermark as u64).await {
-                                        warn!("Failed to restore partition state from metadata for {}-{}: {}", topic_meta.name, partition_id, e);
-                                    } else {
-                                        info!("Restored {}-{} from metadata store: high watermark = {}", topic_meta.name, partition_id, high_watermark);
-                                    }
-                                }
-                                Ok(_) => {
-                                    // No offset data or hwm=0, nothing to restore
-                                }
-                                Err(e) => {
-                                    warn!("Failed to get partition offset from metadata for {}-{}: {}", topic_meta.name, partition_id, e);
-                                }
-                            }
-                        }
-                    }
-                    info!("Metadata store recovery complete");
-                }
-                Err(e) => {
-                    warn!("Failed to list topics from metadata store: {}", e);
-                }
-            }
+            // WAL is empty - restore from metadata store instead
+            Self::recover_partitions_from_metadata(produce_handler_base, metadata_store).await;
         }
 
         info!("✅ WAL watermark recovery complete");
         Ok(())
+    }
+
+    /// Helper: Find maximum offset from WAL records (handles V1 and V2 formats)
+    fn find_max_offset_in_records(records: &[chronik_wal::record::WalRecord]) -> i64 {
+        use chronik_wal::record::WalRecord;
+        use chronik_storage::CanonicalRecord;
+
+        let mut max_offset: i64 = -1;
+
+        for record in records {
+            let offset = match record {
+                WalRecord::V1 { offset, .. } => *offset,
+                WalRecord::V2 { canonical_data, .. } => {
+                    bincode::deserialize::<CanonicalRecord>(canonical_data)
+                        .map(|c| c.last_offset())
+                        .unwrap_or(-1)
+                }
+            };
+            if offset > max_offset {
+                max_offset = offset;
+            }
+        }
+        max_offset
+    }
+
+    /// Helper: Recover partitions from WAL records
+    async fn recover_partitions_from_wal(
+        produce_handler: &Arc<crate::produce_handler::ProduceHandler>,
+        wal_manager: &Arc<WalManager>,
+        partitions: &[chronik_wal::manager::TopicPartition],
+    ) {
+        info!("Replaying WAL to restore high watermarks for {} partitions...", partitions.len());
+
+        for tp in partitions {
+            match wal_manager.read_from(&tp.topic, tp.partition, 0, usize::MAX).await {
+                Ok(records) if !records.is_empty() => {
+                    let max_offset = Self::find_max_offset_in_records(&records);
+                    if max_offset >= 0 {
+                        let high_watermark = (max_offset + 1) as u64;
+                        match produce_handler.restore_partition_state(&tp.topic, tp.partition, high_watermark).await {
+                            Ok(_) => info!("Restored {}-{}: {} records, high watermark = {}",
+                                          tp.topic, tp.partition, records.len(), high_watermark),
+                            Err(e) => warn!("Failed to restore partition state for {}-{}: {}", tp.topic, tp.partition, e),
+                        }
+                    }
+                }
+                Ok(_) => {} // No records, nothing to restore
+                Err(e) => warn!("Failed to read WAL for {}-{}: {}", tp.topic, tp.partition, e),
+            }
+        }
+        info!("WAL replay complete");
+    }
+
+    /// Helper: Recover partitions from metadata store (fallback when WAL is empty)
+    async fn recover_partitions_from_metadata(
+        produce_handler: &Arc<crate::produce_handler::ProduceHandler>,
+        metadata_store: &Arc<dyn MetadataStore>,
+    ) {
+        info!("WAL is empty, attempting to restore partition states from metadata store...");
+
+        let topics = match metadata_store.list_topics().await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("Failed to list topics from metadata store: {}", e);
+                return;
+            }
+        };
+
+        for topic_meta in topics {
+            let partition_count = topic_meta.config.partition_count as i32;
+            for partition_id in 0..partition_count {
+                Self::restore_partition_from_metadata(produce_handler, metadata_store, &topic_meta.name, partition_id).await;
+            }
+        }
+        info!("Metadata store recovery complete");
+    }
+
+    /// Helper: Restore single partition from metadata store
+    async fn restore_partition_from_metadata(
+        produce_handler: &Arc<crate::produce_handler::ProduceHandler>,
+        metadata_store: &Arc<dyn MetadataStore>,
+        topic: &str,
+        partition_id: i32,
+    ) {
+        match metadata_store.get_partition_offset(topic, partition_id as u32).await {
+            Ok(Some((high_watermark, _log_start_offset))) if high_watermark > 0 => {
+                match produce_handler.restore_partition_state(topic, partition_id, high_watermark as u64).await {
+                    Ok(_) => info!("Restored {}-{} from metadata store: high watermark = {}", topic, partition_id, high_watermark),
+                    Err(e) => warn!("Failed to restore partition state from metadata for {}-{}: {}", topic, partition_id, e),
+                }
+            }
+            Ok(_) => {} // No offset data or hwm=0, nothing to restore
+            Err(e) => warn!("Failed to get partition offset from metadata for {}-{}: {}", topic, partition_id, e),
+        }
     }
 
     /// Stage 11: Initialize FetchHandler
