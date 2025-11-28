@@ -21,7 +21,7 @@ members = [
 exclude = ["tests"]
 
 [workspace.package]
-version = "2.2.11"
+version = "2.2.12"
 edition = "2021"
 authors = ["Chronik Stream Contributors"]
 license = "Apache-2.0"
