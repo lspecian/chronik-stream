@@ -35,11 +35,7 @@ jobs:
             target: aarch64-unknown-linux-musl
             artifact: chronik-server-linux-arm64
             use_cross: true
-          # macOS builds (native)
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            artifact: chronik-server-darwin-amd64
-            use_cross: false
+          # macOS build (ARM only - Intel is deprecated)
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact: chronik-server-darwin-arm64
@@ -226,7 +222,6 @@ jobs:
             #### Binary Downloads
             - Linux AMD64: `chronik-server-linux-amd64.tar.gz`
             - Linux ARM64: `chronik-server-linux-arm64.tar.gz`
-            - macOS AMD64: `chronik-server-darwin-amd64.tar.gz`
             - macOS ARM64: `chronik-server-darwin-arm64.tar.gz`
             
             ### Verification
