@@ -7,12 +7,13 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-default = ["raft-storage", "async-io"]  # io_uring enabled on Linux only
+# async-io removed from default - causes macOS build failures (tokio-uring is Linux-only)
+default = ["raft-storage"]
 wal = ["dep:memmap2"]
 wal-encryption = ["wal", "dep:ring"]
 wal-compression = ["wal", "dep:zstd"]
 # async-io feature enables io_uring on Linux (via target-specific dep), crossbeam on all platforms
-# Note: tokio-uring is enabled via conditional compilation, not feature flag (it's Linux-only)
+# Only enable on Linux production builds for io_uring optimization
 async-io = ["dep:crossbeam"]
 raft-storage = ["dep:chronik-raft", "dep:raft", "dep:protobuf"]
 
