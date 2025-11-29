@@ -31,7 +31,7 @@ use parking_lot::RwLock;
 use std::path::{Path, PathBuf};
 use tracing::{info, debug, warn};
 use anyhow::{Result, Context};
-use protobuf::Message;
+use prost::Message;
 
 use crate::group_commit::GroupCommitWal;
 use crate::record::WalRecord;
@@ -267,7 +267,7 @@ impl RaftWalStorage {
     ) -> Result<(Vec<Entry>, Option<HardState>, Option<ConfState>)> {
         use std::fs;
         use std::io::Read;
-        use protobuf::Message;
+        use prost::Message;
 
         let mut recovered_entries: Vec<Entry> = Vec::new();
         let mut recovered_hard_state: Option<HardState> = None;
@@ -308,31 +308,28 @@ impl RaftWalStorage {
                                 debug!("Skipping empty canonical_data at offset {}", offset);
                             }
                             // Try to parse as Entry first (most common)
-                            // Use merge_from_bytes (implemented) not parse_from_bytes (unimplemented!)
-                            else {
-                                let mut entry = Entry::default();
-                                if entry.merge_from_bytes(data).is_ok() && entry.index > 0 {
+                            // Use prost::Message::decode
+                            else if let Ok(entry) = Entry::decode(data) {
+                                if entry.index > 0 {
                                     debug!("Recovered Raft entry: index={}, term={}", entry.index, entry.term);
                                     recovered_entries.push(entry);
                                 }
-                                // Try to parse as HardState
-                                else {
-                                    let mut hs = HardState::default();
-                                    if hs.merge_from_bytes(data).is_ok() && (hs.term > 0 || hs.vote > 0 || hs.commit > 0) {
-                                        debug!("Recovered HardState: term={}, vote={}, commit={}", hs.term, hs.vote, hs.commit);
-                                        recovered_hard_state = Some(hs);
-                                    }
-                                    // Try to parse as ConfState
-                                    else {
-                                        let mut cs = ConfState::default();
-                                        if cs.merge_from_bytes(data).is_ok() && !cs.voters.is_empty() {
-                                            debug!("Recovered ConfState: voters={:?}", cs.voters);
-                                            recovered_conf_state = Some(cs);
-                                        } else {
-                                            debug!("Skipping unknown protobuf record at offset {} (len={})", offset, data.len());
-                                        }
-                                    }
+                            }
+                            // Try to parse as HardState
+                            else if let Ok(hs) = HardState::decode(data) {
+                                if hs.term > 0 || hs.vote > 0 || hs.commit > 0 {
+                                    debug!("Recovered HardState: term={}, vote={}, commit={}", hs.term, hs.vote, hs.commit);
+                                    recovered_hard_state = Some(hs);
                                 }
+                            }
+                            // Try to parse as ConfState
+                            else if let Ok(cs) = ConfState::decode(data) {
+                                if !cs.voters.is_empty() {
+                                    debug!("Recovered ConfState: voters={:?}", cs.voters);
+                                    recovered_conf_state = Some(cs);
+                                }
+                            } else {
+                                debug!("Skipping unknown prost record at offset {} (len={})", offset, data.len());
                             }
                         }
                     }
@@ -496,8 +493,7 @@ impl RaftWalStorage {
 
         // Then, persist to WAL (async) - entries stay in memory for conflict resolution
         for entry in entries {
-            let entry_bytes = entry.write_to_bytes()
-                .context("Failed to encode Raft entry")?;
+            let entry_bytes = entry.encode_to_vec();
 
             let wal_record = WalRecord::new_v2(
                 RAFT_TOPIC.to_string(),
@@ -529,8 +525,7 @@ impl RaftWalStorage {
         }
 
         // Persist to WAL
-        let hs_bytes = hs.write_to_bytes()
-            .context("Failed to encode HardState")?;
+        let hs_bytes = hs.encode_to_vec();
 
         let wal_record = WalRecord::new_v2(
             RAFT_TOPIC.to_string(),
@@ -561,8 +556,7 @@ impl RaftWalStorage {
         }
 
         // Persist to WAL
-        let cs_bytes = cs.write_to_bytes()
-            .context("Failed to encode ConfState")?;
+        let cs_bytes = cs.encode_to_vec();
 
         let wal_record = WalRecord::new_v2(
             RAFT_TOPIC.to_string(),
@@ -625,7 +619,7 @@ impl RaftWalStorage {
     /// Snapshot file format: {data_dir}/wal/__meta/__raft_metadata/snapshots/snapshot_{index}_{term}.snap
     pub async fn save_snapshot(&self, snapshot: &raft::prelude::Snapshot) -> Result<()> {
         use std::fs;
-        use protobuf::Message;
+        use prost::Message;
 
         let metadata = snapshot.get_metadata();
         let index = metadata.index;
@@ -644,9 +638,8 @@ impl RaftWalStorage {
         // Snapshot filename: snapshot_{index}_{term}.snap
         let snapshot_file = snapshot_dir.join(format!("snapshot_{}_{}.snap", index, term));
 
-        // Serialize snapshot using protobuf
-        let snapshot_bytes = snapshot.write_to_bytes()
-            .context("Failed to serialize snapshot")?;
+        // Serialize snapshot using prost
+        let snapshot_bytes = snapshot.encode_to_vec();
 
         // Write to file with fsync
         fs::write(&snapshot_file, &snapshot_bytes)
@@ -672,7 +665,7 @@ impl RaftWalStorage {
     /// Returns Some(snapshot) if found, None if no snapshots exist
     pub async fn load_latest_snapshot(&self) -> Result<Option<raft::prelude::Snapshot>> {
         use std::fs;
-        use protobuf::Message;
+        use prost::Message;
 
         // Get data_dir
         let data_dir = self.data_dir.read().unwrap().clone();
@@ -710,8 +703,7 @@ impl RaftWalStorage {
         let snapshot_bytes = fs::read(latest_snapshot_file)
             .context("Failed to read snapshot file")?;
 
-        let mut snapshot = raft::prelude::Snapshot::default();
-        snapshot.merge_from_bytes(&snapshot_bytes)
+        let snapshot = raft::prelude::Snapshot::decode(snapshot_bytes.as_ref())
             .context("Failed to deserialize snapshot")?;
 
         let metadata = snapshot.get_metadata();
@@ -848,11 +840,12 @@ impl RaftWalStorage {
 
                         // Try to parse as Entry
                         if let Some(data) = record.get_canonical_data() {
-                            let mut entry = Entry::default();
-                            if entry.merge_from_bytes(data).is_ok() && entry.index > 0 {
-                                // Check if entry is in requested range [low, high)
-                                if entry.index >= low && entry.index < high {
-                                    found_entries.push(entry);
+                            if let Ok(entry) = Entry::decode(data) {
+                                if entry.index > 0 {
+                                    // Check if entry is in requested range [low, high)
+                                    if entry.index >= low && entry.index < high {
+                                        found_entries.push(entry);
+                                    }
                                 }
                             }
                         }
