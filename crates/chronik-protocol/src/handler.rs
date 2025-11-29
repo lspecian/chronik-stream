@@ -97,6 +97,8 @@ pub struct ProtocolHandler {
     advertised_host: String,
     /// Advertised port for this broker
     advertised_port: i32,
+    /// SASL authenticator for client authentication
+    sasl_authenticator: Arc<Mutex<crate::sasl::SaslAuthenticator>>,
 }
 
 impl ProtocolHandler {
@@ -163,9 +165,10 @@ impl ProtocolHandler {
             consumer_groups: Arc::new(Mutex::new(ConsumerGroupState::default())),
             advertised_host: "localhost".to_string(),
             advertised_port: 9092,
+            sasl_authenticator: Arc::new(Mutex::new(crate::sasl::SaslAuthenticator::new())),
         }
     }
-    
+
     /// Create a new protocol handler with metadata store
     pub fn with_metadata_store(metadata_store: Arc<dyn chronik_common::metadata::traits::MetadataStore>) -> Self {
         let versions = supported_api_versions();
@@ -176,9 +179,10 @@ impl ProtocolHandler {
             consumer_groups: Arc::new(Mutex::new(ConsumerGroupState::default())),
             advertised_host: "localhost".to_string(),
             advertised_port: 9092,
+            sasl_authenticator: Arc::new(Mutex::new(crate::sasl::SaslAuthenticator::new())),
         }
     }
-    
+
     /// Create a new protocol handler with metadata store and broker ID
     pub fn with_metadata_and_broker(
         metadata_store: Arc<dyn chronik_common::metadata::traits::MetadataStore>,
@@ -192,6 +196,7 @@ impl ProtocolHandler {
             consumer_groups: Arc::new(Mutex::new(ConsumerGroupState::default())),
             advertised_host: "localhost".to_string(),
             advertised_port: 9092,
+            sasl_authenticator: Arc::new(Mutex::new(crate::sasl::SaslAuthenticator::new())),
         }
     }
 
@@ -210,6 +215,7 @@ impl ProtocolHandler {
             consumer_groups: Arc::new(Mutex::new(ConsumerGroupState::default())),
             advertised_host,
             advertised_port,
+            sasl_authenticator: Arc::new(Mutex::new(crate::sasl::SaslAuthenticator::new())),
         }
     }
     
@@ -2301,35 +2307,54 @@ impl ProtocolHandler {
     ) -> Result<Response> {
         use crate::sasl_types::SaslHandshakeResponse;
         use crate::parser::Decoder;
-        
+
         tracing::debug!("Handling SASL handshake request v{}", header.api_version);
-        
+
         let mut decoder = Decoder::new(body);
-        
+
         // Parse mechanism
         let mechanism = decoder.read_string()?
             .ok_or_else(|| Error::Protocol("SASL mechanism cannot be null".into()))?;
-        
+
         tracing::info!("SASL handshake request for mechanism: {}", mechanism);
-        
-        // For now, we don't actually support SASL, but we can return a proper response
-        let response = SaslHandshakeResponse {
-            error_code: 33, // SASL_AUTHENTICATION_FAILED
-            mechanisms: vec![], // No supported mechanisms
+
+        // Use real SASL authenticator
+        let mut sasl = self.sasl_authenticator.lock().await;
+        let handshake_result = sasl.handle_handshake(header.api_version, &[mechanism.clone()]);
+
+        let response = match handshake_result {
+            Ok(sasl_response) => {
+                tracing::info!("SASL handshake successful, supported mechanisms: {:?}", sasl_response.enabled_mechanisms);
+                SaslHandshakeResponse {
+                    error_code: sasl_response.error_code,
+                    mechanisms: sasl_response.enabled_mechanisms,
+                }
+            }
+            Err(e) => {
+                tracing::warn!("SASL handshake failed for mechanism '{}': {:?}", mechanism, e);
+                SaslHandshakeResponse {
+                    error_code: 33, // SASL_AUTHENTICATION_FAILED
+                    mechanisms: vec![
+                        "PLAIN".to_string(),
+                        "SCRAM-SHA-256".to_string(),
+                        "SCRAM-SHA-512".to_string(),
+                    ],
+                }
+            }
         };
-        
+
         let mut body_buf = BytesMut::new();
-        
+
         let mut encoder = Encoder::new(&mut body_buf);
         // Error code
         encoder.write_i16(response.error_code);
-        
+
         // Mechanisms array
         encoder.write_i32(response.mechanisms.len() as i32);
         for mechanism in &response.mechanisms {
             encoder.write_string(Some(mechanism));
         }
-        
+
         Ok(Self::make_response(&header, ApiKey::SaslHandshake, body_buf.freeze()))
     }
 
@@ -2352,13 +2377,33 @@ impl ProtocolHandler {
 
         tracing::info!("SASL authenticate request with {} auth bytes", auth_bytes.len());
 
-        // For now, we accept any authentication attempt to allow KSQL to continue
-        // In a real implementation, this would validate credentials
-        let response = SaslAuthenticateResponse {
-            error_code: 0, // Success
-            error_message: None,
-            auth_bytes: vec![], // Empty response bytes
-            session_lifetime_ms: 3600000, // 1 hour
+        // Use real SASL authenticator
+        let mut sasl = self.sasl_authenticator.lock().await;
+        let auth_result = sasl.handle_authenticate(&auth_bytes);
+
+        let response = match auth_result {
+            Ok(sasl_response) => {
+                if sasl_response.error_code == 0 {
+                    tracing::info!("SASL authentication successful for user: {:?}", sasl.username());
+                } else {
+                    tracing::debug!("SASL authentication in progress (SCRAM challenge-response)");
+                }
+                SaslAuthenticateResponse {
+                    error_code: sasl_response.error_code,
+                    error_message: sasl_response.error_message,
+                    auth_bytes: sasl_response.auth_bytes.unwrap_or_default(),
+                    session_lifetime_ms: sasl_response.session_lifetime_ms.unwrap_or(3600000),
+                }
+            }
+            Err(e) => {
+                tracing::warn!("SASL authentication failed: {:?}", e);
+                SaslAuthenticateResponse {
+                    error_code: 58, // SASL_AUTHENTICATION_FAILED
+                    error_message: Some(format!("Authentication failed: {:?}", e)),
+                    auth_bytes: vec![],
+                    session_lifetime_ms: 0,
+                }
+            }
         };
 
         let mut body_buf = BytesMut::new();

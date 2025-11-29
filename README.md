@@ -612,10 +612,38 @@ See [BASELINE_PERFORMANCE.md](BASELINE_PERFORMANCE.md) for detailed benchmark me
 
 ## 🔒 Security
 
-- **SASL Authentication**: PLAIN, SCRAM-SHA-256/512
-- **TLS/SSL**: End-to-end encryption
-- **ACLs**: Topic and consumer group access control
-- **Audit Logging**: Track all administrative actions
+### SASL Authentication
+
+Chronik Stream supports SASL authentication with the following mechanisms:
+- **PLAIN** - Username/password authentication
+- **SCRAM-SHA-256** - Challenge-response authentication
+- **SCRAM-SHA-512** - Challenge-response authentication (stronger)
+
+**Default users** (for development/testing):
+| Username | Password |
+|----------|----------|
+| admin | admin123 |
+| user | user123 |
+| kafka | kafka-secret |
+
+```python
+# Python example with SASL/PLAIN
+from kafka import KafkaProducer
+
+producer = KafkaProducer(
+    bootstrap_servers='localhost:9092',
+    security_protocol='SASL_PLAINTEXT',
+    sasl_mechanism='PLAIN',
+    sasl_plain_username='admin',
+    sasl_plain_password='admin123'
+)
+```
+
+### Additional Security Features
+
+- **TLS/SSL**: End-to-end encryption (infrastructure in `chronik-auth` crate)
+- **ACLs**: Topic and consumer group access control framework
+- **Admin API**: Secured with API key authentication (cluster management)
 
 ## 📊 Monitoring
 
