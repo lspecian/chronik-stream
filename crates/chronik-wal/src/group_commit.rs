@@ -1204,6 +1204,46 @@ impl GroupCommitWal {
         Ok(())
     }
 
+    /// Seal segments that have been idle for longer than the threshold.
+    /// This ensures data gets indexed even if topics go quiet.
+    /// Returns the number of segments sealed.
+    pub async fn seal_stale_segments(&self, max_idle_secs: u64) -> usize {
+        let mut sealed_count = 0;
+        let threshold = Duration::from_secs(max_idle_secs);
+
+        for entry in self.partition_queues.iter() {
+            let ((topic, partition), queue) = entry.pair();
+
+            // Check segment age
+            let segment_age = {
+                let created_at = queue.segment_created_at.lock().await;
+                created_at.elapsed()
+            };
+
+            // Only seal if segment is older than threshold AND has data
+            let current_size = queue.segment_size_bytes.load(std::sync::atomic::Ordering::Relaxed);
+            if segment_age >= threshold && current_size > 0 {
+                let segment_id = queue.segment_id.load(std::sync::atomic::Ordering::Relaxed);
+                info!(
+                    "⏰ Sealing stale segment {}/{} segment_id={} (idle={:?}, size={})",
+                    topic, partition, segment_id, segment_age, current_size
+                );
+
+                if let Err(e) = Self::force_seal_segment(queue, &self.sealed_segments, &self.base_dir).await {
+                    error!("Failed to seal stale segment {}-{}: {}", topic, partition, e);
+                } else {
+                    sealed_count += 1;
+                }
+            }
+        }
+
+        if sealed_count > 0 {
+            info!("Sealed {} stale segments (idle > {}s)", sealed_count, max_idle_secs);
+        }
+
+        sealed_count
+    }
+
     /// Shutdown the group commit WAL
     pub async fn shutdown(&self) {
         info!("Shutting down group commit WAL...");

@@ -62,6 +62,12 @@ pub struct WalIndexerConfig {
 
     /// Enable auto-save for segment index
     pub segment_index_auto_save: bool,
+
+    /// v2.2.16: Force seal segments that have been idle longer than this (seconds)
+    /// This ensures low-volume topics still get indexed even if they don't
+    /// produce enough data to trigger size-based segment rotation.
+    /// Default: 30 seconds (same as indexer interval)
+    pub stale_segment_seal_secs: u64,
 }
 
 impl Default for WalIndexerConfig {
@@ -77,6 +83,7 @@ impl Default for WalIndexerConfig {
             max_concurrent_tasks: 4,
             segment_index_path: Some(PathBuf::from("./data/segment_index.json")),
             segment_index_auto_save: true,
+            stale_segment_seal_secs: 30, // v2.2.16: Seal stale segments after 30s
         }
     }
 }
@@ -149,6 +156,10 @@ pub struct WalIndexer {
     /// Prevents WalIndexer from starving the main runtime's accept loop under heavy load
     /// 2 worker threads are sufficient for sequential segment processing
     runtime: Arc<tokio::runtime::Runtime>,
+
+    /// v2.2.16: Cache of searchable topics (refreshed periodically)
+    /// Topics with config["searchable"] = "true" or CHRONIK_DEFAULT_SEARCHABLE=true
+    searchable_topics: Arc<RwLock<HashSet<String>>>,
 }
 
 impl WalIndexer {
@@ -193,7 +204,44 @@ impl WalIndexer {
             last_stats: Arc::new(RwLock::new(IndexingStats::default())),
             running: Arc::new(RwLock::new(false)),
             runtime: Arc::new(runtime),
+            searchable_topics: Arc::new(RwLock::new(HashSet::new())),
         }
+    }
+
+    /// v2.2.16: Refresh the searchable topics cache from metadata store
+    pub async fn refresh_searchable_topics(&self) -> Result<()> {
+        let topics = self.metadata_store.list_topics().await
+            .map_err(|e| Error::Internal(format!("Failed to list topics: {}", e)))?;
+
+        let mut searchable = HashSet::new();
+        for topic in topics {
+            if topic.config.is_searchable() {
+                info!(topic = %topic.name, "Topic marked as searchable");
+                searchable.insert(topic.name.clone());
+            }
+        }
+
+        let count = searchable.len();
+        *self.searchable_topics.write().await = searchable;
+        info!(count, "Refreshed searchable topics cache");
+        Ok(())
+    }
+
+    /// v2.2.16: Check if a topic should be indexed for search
+    pub async fn is_topic_searchable(&self, topic: &str) -> bool {
+        self.searchable_topics.read().await.contains(topic)
+    }
+
+    /// v2.2.16: Register a topic as searchable (called when topic created)
+    pub async fn register_searchable_topic(&self, topic: &str) {
+        info!(topic, "Registering searchable topic");
+        self.searchable_topics.write().await.insert(topic.to_string());
+    }
+
+    /// v2.2.16: Unregister a topic as searchable (called when topic deleted or config changed)
+    pub async fn unregister_searchable_topic(&self, topic: &str) {
+        info!(topic, "Unregistering searchable topic");
+        self.searchable_topics.write().await.remove(topic);
     }
 
     /// Get reference to segment index
@@ -322,6 +370,16 @@ impl WalIndexer {
     ) -> Result<IndexingStats> {
         let start_time = std::time::Instant::now();
         let mut stats = IndexingStats::default();
+
+        // v2.2.16: Force-seal stale segments before checking for sealed segments
+        // This ensures low-volume topics get indexed even if they don't produce
+        // enough data to trigger size-based segment rotation.
+        if config.stale_segment_seal_secs > 0 {
+            let sealed_count = wal_manager.seal_stale_segments(config.stale_segment_seal_secs).await;
+            if sealed_count > 0 {
+                debug!("Sealed {} stale segments before indexing", sealed_count);
+            }
+        }
 
         // Get list of sealed segments from WAL manager (v1.3.47+: direct call)
         let sealed_segments = wal_manager.get_sealed_segments();
@@ -476,32 +534,51 @@ impl WalIndexer {
             }
 
             // STEP 2: Create Tantivy index (Tier 3: cold storage with search)
-            match Self::create_tantivy_index(
-                config,
-                object_store,
-                segment_index,
-                &tp,
-                canonical_records,
-            ).await {
-                Ok(bytes_written) => {
-                    info!(
-                        topic = %tp.topic,
-                        partition = tp.partition,
-                        bytes = bytes_written,
-                        "Created Tantivy index"
-                    );
-                    stats.indexes_created += 1;
-                    stats.bytes_written += bytes_written;
+            // v2.2.16: Only index searchable topics
+            let is_searchable = {
+                // Check if topic is in searchable set by looking up metadata
+                // For performance, we check the env var directly here
+                // The WalIndexer.searchable_topics cache is used at a higher level
+                let topic_searchable_config = metadata_store.get_topic(&tp.topic).await
+                    .map(|opt| opt.map(|t| t.config.is_searchable()).unwrap_or(false))
+                    .unwrap_or(false);
+                topic_searchable_config
+            };
+
+            if is_searchable {
+                match Self::create_tantivy_index(
+                    config,
+                    object_store,
+                    segment_index,
+                    &tp,
+                    canonical_records,
+                ).await {
+                    Ok(bytes_written) => {
+                        info!(
+                            topic = %tp.topic,
+                            partition = tp.partition,
+                            bytes = bytes_written,
+                            "Created Tantivy index (searchable topic)"
+                        );
+                        stats.indexes_created += 1;
+                        stats.bytes_written += bytes_written;
+                    }
+                    Err(e) => {
+                        error!(
+                            topic = %tp.topic,
+                            partition = tp.partition,
+                            error = %e,
+                            "Failed to create Tantivy index"
+                        );
+                        stats.errors += 1;
+                    }
                 }
-                Err(e) => {
-                    error!(
-                        topic = %tp.topic,
-                        partition = tp.partition,
-                        error = %e,
-                        "Failed to create Tantivy index"
-                    );
-                    stats.errors += 1;
-                }
+            } else {
+                debug!(
+                    topic = %tp.topic,
+                    partition = tp.partition,
+                    "Skipping Tantivy index (non-searchable topic)"
+                );
             }
         }
 

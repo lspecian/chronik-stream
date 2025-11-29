@@ -46,6 +46,47 @@ impl Default for TopicConfig {
     }
 }
 
+impl TopicConfig {
+    /// Check if topic should be indexed for full-text search.
+    ///
+    /// Precedence (highest to lowest):
+    /// 1. Explicit topic config: `config["searchable"] = "true"/"false"`
+    /// 2. Environment default: `CHRONIK_DEFAULT_SEARCHABLE=true/false`
+    /// 3. Hardcoded default: `false` (maximum performance)
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use chronik_common::metadata::TopicConfig;
+    /// use std::collections::HashMap;
+    ///
+    /// // Default: not searchable
+    /// let config = TopicConfig::default();
+    /// assert!(!config.is_searchable());
+    ///
+    /// // Explicit searchable
+    /// let mut config = TopicConfig::default();
+    /// config.config.insert("searchable".to_string(), "true".to_string());
+    /// assert!(config.is_searchable());
+    /// ```
+    pub fn is_searchable(&self) -> bool {
+        // 1. Explicit config wins (case-insensitive)
+        if let Some(val) = self.config.get("searchable") {
+            return val.eq_ignore_ascii_case("true");
+        }
+        // 2. Fall back to environment default
+        std::env::var("CHRONIK_DEFAULT_SEARCHABLE")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)  // 3. Hardcoded default: false (max performance)
+    }
+
+    /// Create a searchable topic config
+    pub fn with_searchable(mut self, searchable: bool) -> Self {
+        self.config.insert("searchable".to_string(), searchable.to_string());
+        self
+    }
+}
+
 /// Topic metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TopicMetadata {

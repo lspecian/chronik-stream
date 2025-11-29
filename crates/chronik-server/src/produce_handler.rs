@@ -484,6 +484,10 @@ pub struct ProduceHandler {
     /// NEW (v2.2.10 - async responses): Expected 300,000+ msg/s @ <5ms p99 (150x+ improvement)
     /// This is the ACTUAL bottleneck - async pipelining (v2.2.9) only helps follower forwarding
     response_pipeline: Option<Arc<crate::response_pipeline::ResponsePipeline>>,
+    /// v2.2.16: Cache for topic searchability to avoid metadata store lookups on every produce
+    /// Key: topic name, Value: (is_searchable, last_updated)
+    /// TTL: 60 seconds to pick up config changes within reasonable time
+    searchable_topic_cache: Arc<DashMap<String, (bool, std::time::Instant)>>,
 }
 
 /// Replication request for ISR management
@@ -511,6 +515,50 @@ impl ProduceHandler {
     /// Get reference to Raft cluster (for request forwarding)
     pub fn get_raft_cluster(&self) -> &Option<Arc<RaftCluster>> {
         &self.raft_cluster
+    }
+
+    /// v2.2.16: Check if a topic is searchable (with caching).
+    /// Returns true if the topic has searchable: true in its config.
+    /// Uses a 60-second TTL cache to avoid hitting metadata store on every produce.
+    /// NOTE: Does NOT cache "topic not found" results to avoid race condition
+    /// with auto-topic creation.
+    async fn is_topic_searchable(&self, topic: &str) -> bool {
+        const CACHE_TTL_SECS: u64 = 60;
+
+        // Check cache first
+        if let Some(entry) = self.searchable_topic_cache.get(topic) {
+            let (is_searchable, last_updated) = *entry;
+            if last_updated.elapsed().as_secs() < CACHE_TTL_SECS {
+                return is_searchable;
+            }
+        }
+
+        // Cache miss or expired - query metadata store
+        match self.metadata_store.get_topic(topic).await {
+            Ok(Some(topic_meta)) => {
+                let is_searchable = topic_meta.config.is_searchable();
+                // Only cache when topic exists - avoids race with auto-create
+                self.searchable_topic_cache.insert(
+                    topic.to_string(),
+                    (is_searchable, std::time::Instant::now())
+                );
+                is_searchable
+            }
+            Ok(None) => {
+                // Topic doesn't exist yet - check CHRONIK_DEFAULT_SEARCHABLE
+                // This handles the auto-create case where we haven't persisted yet
+                // but the topic WILL be created with this default config.
+                debug!("Topic {} not found in metadata, checking CHRONIK_DEFAULT_SEARCHABLE", topic);
+                std::env::var("CHRONIK_DEFAULT_SEARCHABLE")
+                    .map(|v| v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false)
+                // Don't cache - next call may find the topic after auto-create
+            }
+            Err(e) => {
+                debug!("Failed to check topic searchability for {}: {}", topic, e);
+                false  // On error, assume not searchable (safe default)
+            }
+        }
     }
 
     /// Assign a partition to replica nodes (writes to metadata WAL)
@@ -979,6 +1027,7 @@ impl ProduceHandler {
             leadership_cache: Arc::new(DashMap::new()),  // Optimization #4: Empty cache, populated on first access
             pipelined_pool: Arc::new(PipelinedConnectionPool::new(10000)),  // v2.2.9: Async pipelined connection pool (capacity increased from 1000 → 10000 to prevent channel blocking)
             response_pipeline: None,  // v2.2.10: Initialize as None (set via set_response_pipeline) - CRITICAL FIX #7
+            searchable_topic_cache: Arc::new(DashMap::new()),  // v2.2.16: Cache for topic searchability
         })
     }
 
@@ -2160,6 +2209,19 @@ impl ProduceHandler {
                                         debug!("✅ ASYNC RESPONSE DELIVERED: topic={} partition={} latency={:?}, returning to client",
                                                topic, partition, wal_elapsed);
 
+                                        // v2.2.16 FIX: Call indexing BEFORE early return (async path)
+                                        // This ensures searchable topics are indexed even with acks=1 async responses
+                                        if self.config.enable_indexing {
+                                            let is_searchable = self.is_topic_searchable(topic).await;
+                                            debug!(
+                                                "v2.2.16: Realtime indexing check (async path) for topic {}: is_searchable={}",
+                                                topic, is_searchable
+                                            );
+                                            if is_searchable {
+                                                self.send_to_indexer(topic, partition, &records).await;
+                                            }
+                                        }
+
                                         // Reconstruct response to match function return type (5 fields only)
                                         return Ok(ProduceResponsePartition {
                                             index: pipeline_response.index,
@@ -2263,9 +2325,21 @@ impl ProduceHandler {
         self.metrics.records_produced.fetch_add(records.len() as u64, Ordering::Relaxed);
         self.metrics.bytes_produced.fetch_add(total_bytes, Ordering::Relaxed);
         
-        // Send to indexing pipeline if enabled
+        // Send to indexing pipeline if enabled AND topic is searchable (v2.2.16)
+        // This ensures we only index searchable topics in the realtime indexer,
+        // matching the WAL Indexer behavior and respecting opt-in searchability.
         if self.config.enable_indexing {
-            self.send_to_indexer(topic, partition, &records).await;
+            let is_searchable = self.is_topic_searchable(topic).await;
+            debug!(
+                "v2.2.16: Realtime indexing check for topic {}: enable_indexing={}, is_searchable={}, index_sender={}",
+                topic,
+                self.config.enable_indexing,
+                is_searchable,
+                self.index_sender.is_some()
+            );
+            if is_searchable {
+                self.send_to_indexer(topic, partition, &records).await;
+            }
         }
 
         // Handle acknowledgment modes
@@ -2842,6 +2916,7 @@ impl ProduceHandler {
     
     /// Send records to indexing pipeline
     async fn send_to_indexer(&self, topic: &str, partition: i32, records: &[ProduceRecord]) {
+        debug!("v2.2.16: send_to_indexer called for {} records on {}-{}", records.len(), topic, partition);
         if let Some(sender) = &self.index_sender {
             // Convert ProduceRecords to JsonDocuments
             for record in records {
@@ -3560,6 +3635,7 @@ impl Clone for ProduceHandler {
             leadership_cache: Arc::clone(&self.leadership_cache),  // Optimization #4
             pipelined_pool: Arc::clone(&self.pipelined_pool),  // v2.2.9: Async pipelined connection pool
             response_pipeline: self.response_pipeline.clone(),  // v2.2.10: Async response delivery (CRITICAL FIX #7)
+            searchable_topic_cache: Arc::clone(&self.searchable_topic_cache),  // v2.2.16: Share cache
         }
     }
 }

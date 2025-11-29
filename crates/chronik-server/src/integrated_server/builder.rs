@@ -889,6 +889,7 @@ impl IntegratedKafkaServerBuilder {
             max_concurrent_tasks: 4,
             segment_index_path: Some(PathBuf::from(format!("{}/segment_index.json", self.config.data_dir))),
             segment_index_auto_save: true,
+            stale_segment_seal_secs: 30, // v2.2.16: Seal stale segments after 30s idle
         };
 
         let wal_manager = wal_handler.wal_manager().clone();

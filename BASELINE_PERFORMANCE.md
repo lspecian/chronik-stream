@@ -1,17 +1,119 @@
 # Baseline Performance Results
 
-## Test Date: 2025-11-28 (v2.2.10)
+## Test Date: 2025-11-29 (v2.2.9 Searchable Feature)
 
 ### Test Configuration
 - **Concurrency**: 128 producers
 - **Message Size**: 256 bytes
 - **Duration**: 30 seconds
 - **Compression**: None
-- **Command**: `./target/release/chronik-bench -b localhost:9092 -c 128 -s 256 -d 30s --acks <1|all>`
+- **WAL Profile**: high (50ms batch interval)
+- **Command**: `./target/release/chronik-bench -c 128 -s 256 -d 30s -m produce`
 
 ---
 
-## v2.2.10 Benchmark Results
+## v2.2.9 Searchable vs Non-Searchable Benchmarks (2025-11-29)
+
+### Summary Table
+
+| Configuration | Throughput | p50 | p99 | Total Messages |
+|--------------|------------|-----|-----|----------------|
+| **Standalone Non-Searchable** | 197,793 msg/s | 0.58 ms | 0.59 ms | 6,922,860 |
+| **Standalone Searchable** | 192,064 msg/s | 0.59 ms | 2.15 ms | 5,762,217 |
+| **Cluster Non-Searchable** | 183,133 msg/s | 0.61 ms | 2.85 ms | 5,494,200 |
+| **Cluster Searchable** | 123,406 msg/s | 0.59 ms | 14.43 ms | 3,702,347 |
+
+### Performance Analysis
+
+#### Standalone vs Cluster
+
+| Metric | Standalone | Cluster | Ratio |
+|--------|----------:|--------:|------:|
+| Non-Searchable Throughput | 197,793 msg/s | 183,133 msg/s | 92.6% |
+| Searchable Throughput | 192,064 msg/s | 123,406 msg/s | 64.3% |
+
+**Key Finding**: The 3-node cluster achieves **92.6%** of standalone throughput for non-searchable topics.
+
+#### Searchable Indexing Impact
+
+| Configuration | Non-Searchable | Searchable | Overhead |
+|--------------|---------------:|-----------:|---------:|
+| Standalone | 197,793 msg/s | 192,064 msg/s | 2.9% |
+| Cluster | 183,133 msg/s | 123,406 msg/s | 32.6% |
+
+**Key Finding**:
+- Standalone searchable topics have minimal overhead (only 3%)
+- Cluster searchable topics have higher overhead (33%) due to combined indexing + replication costs
+
+#### Latency Impact
+
+| Configuration | p99 Non-Searchable | p99 Searchable | Increase |
+|--------------|-------------------:|---------------:|---------:|
+| Standalone | 0.59ms | 2.15ms | 3.6x |
+| Cluster | 2.85ms | 14.43ms | 5.1x |
+
+### Detailed Latency Breakdown
+
+#### Standalone Non-Searchable
+```
+p50:    0.58ms
+p90:    0.58ms
+p95:    0.59ms
+p99:    0.59ms
+p99.9:  0.64ms
+max:    5.40ms
+```
+
+#### Standalone Searchable
+```
+p50:    0.59ms
+p90:    1.03ms
+p95:    1.27ms
+p99:    2.15ms
+p99.9:  2.98ms
+max:    9.70ms
+```
+
+#### Cluster Non-Searchable (3 nodes, acks=1)
+```
+p50:    0.61ms
+p90:    1.01ms
+p95:    1.27ms
+p99:    2.85ms
+p99.9:  3.60ms
+max:   12.22ms
+```
+
+#### Cluster Searchable (3 nodes, acks=1)
+```
+p50:    0.59ms
+p90:    1.09ms
+p95:    1.64ms
+p99:   14.43ms
+p99.9: 17.38ms
+max:   23.21ms
+```
+
+### Recommendations
+
+1. **For maximum throughput**: Use standalone mode with non-searchable topics (~200K msg/s)
+
+2. **For searchable requirements**:
+   - Standalone mode maintains 97% throughput with searchable enabled
+   - Accept the 33% throughput reduction in cluster mode if search is required
+
+3. **For low-latency requirements**:
+   - Non-searchable topics maintain sub-1ms p99 in standalone
+   - Cluster non-searchable maintains sub-3ms p99
+   - Avoid searchable topics if p99 < 5ms is required
+
+4. **For high availability**:
+   - Cluster mode with non-searchable topics provides best balance
+   - 183K msg/s with 3-way replication and 2.85ms p99
+
+---
+
+## v2.2.10 Benchmark Results (2025-11-28)
 
 ### Summary Table
 
@@ -146,5 +248,5 @@
 
 ---
 
-**Build Version**: v2.2.10
+**Build Version**: v2.2.9
 **Test System**: Ubuntu Linux 6.11.0-28-generic

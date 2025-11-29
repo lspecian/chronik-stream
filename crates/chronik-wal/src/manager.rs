@@ -572,6 +572,16 @@ impl WalManager {
             .collect()
     }
 
+    /// Seal segments that have been idle for longer than the threshold.
+    /// This ensures data gets indexed even if topics go quiet.
+    /// Returns the number of segments sealed.
+    ///
+    /// v2.2.16: Added to fix the issue where low-volume topics never get
+    /// their data indexed because WAL segments never seal.
+    pub async fn seal_stale_segments(&self, max_idle_secs: u64) -> usize {
+        self.group_commit_wal.seal_stale_segments(max_idle_secs).await
+    }
+
     /// Read all records from a specific sealed segment (v1.3.62+: Now reads from sealed file)
     pub async fn read_segment(&self, segment_id: &str) -> Result<Vec<WalRecord>> {
         // Parse segment_id format: "topic:partition:segment_id"
