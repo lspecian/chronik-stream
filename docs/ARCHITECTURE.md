@@ -204,10 +204,17 @@ FetchHandler
 
 | Mode | Configuration | Throughput | p99 Latency |
 |------|---------------|------------|-------------|
-| Standalone | Non-searchable | ~198K msg/s | 0.59ms |
-| Standalone | Searchable | ~192K msg/s | 2.15ms |
-| Cluster (3 nodes) | Non-searchable, acks=1 | ~183K msg/s | 2.85ms |
-| Cluster (3 nodes) | Searchable, acks=1 | ~123K msg/s | 14.43ms |
+| **Standalone** | acks=1 | **309K msg/s** | 0.59ms |
+| **Standalone** | acks=all | **348K msg/s** | 0.56ms |
+| **Cluster (3 nodes)** | acks=1 | **188K msg/s** | 2.81ms |
+| **Cluster (3 nodes)** | acks=all | **166K msg/s** | 1.80ms |
+
+#### Searchable Topics Impact
+
+| Configuration | Non-Searchable | Searchable | Overhead |
+|--------------|---------------:|-----------:|---------:|
+| Standalone | 198K msg/s | 192K msg/s | 3% |
+| Cluster (3 nodes) | 183K msg/s | 123K msg/s | 33% |
 
 ### Resource Recommendations
 

@@ -497,7 +497,7 @@ All images support both **linux/amd64** and **linux/arm64** architectures:
 
 | Image | Tags | Description |
 |-------|------|-------------|
-| `ghcr.io/lspecian/chronik-stream` | `latest`, `v2.2.16`, `2.2` | Chronik server with full KSQL support |
+| `ghcr.io/lspecian/chronik-stream` | `latest`, `v2.2.17`, `2.2` | Chronik server with full KSQL support |
 
 ### Supported Platforms
 
@@ -595,21 +595,40 @@ chronik-stream/
 
 ## ⚡ Performance
 
-Chronik Stream is optimized for production workloads:
+Chronik Stream delivers exceptional performance across all deployment modes (128 concurrency, 256 byte messages):
 
-- **CPU Usage**: 0% idle (efficient resource utilization)
-- **Memory**: Efficient memory usage with zero-copy networking
-- **Latency**: < 10ms p99 produce latency with acks=1
-- **Throughput**: 39K+ messages/second (tested at 50K message scale)
+### Benchmarks
+
+| Mode | Configuration | Throughput | p99 Latency |
+|------|---------------|------------|-------------|
+| **Standalone** | acks=1 | **309K msg/s** | 0.59ms |
+| **Standalone** | acks=all | **348K msg/s** | 0.56ms |
+| **Cluster (3 nodes)** | acks=1 | **188K msg/s** | 2.81ms |
+| **Cluster (3 nodes)** | acks=all | **166K msg/s** | 1.80ms |
+
+#### Searchable Topics Impact
+
+| Configuration | Non-Searchable | Searchable | Overhead |
+|--------------|---------------:|-----------:|---------:|
+| Standalone | 198K msg/s | 192K msg/s | 3% |
+| Cluster (3 nodes) | 183K msg/s | 123K msg/s | 33% |
+
+### Key Performance Features
+
+- **High Throughput**: Up to 348K messages/second standalone, 188K cluster
+- **Low Latency**: Sub-millisecond p99 latency standalone, sub-3ms cluster
+- **Efficient Memory**: Zero-copy networking with minimal allocations
 - **Recovery**: 100% message recovery with zero duplicates
-- **Search**: Sub-second full-text search with Tantivy
-- **Storage**: Efficient compression (Snappy, LZ4, Zstd)
+- **Search**: Only 3% overhead for real-time Tantivy indexing (standalone)
+- **Compression**: Snappy, LZ4, Zstd for efficient storage
 
 ### WAL Performance
-- **Write Throughput**: 39,200 msgs/sec for acks=1 (50K message test)
+- **Write Throughput**: 300K+ msgs/sec with GroupCommitWal
 - **Recovery Speed**: Full recovery in seconds even for large datasets
 - **Zero Data Loss**: All acks modes (0, 1, -1) guaranteed durable
 - **Group Commit**: PostgreSQL-style batched fsync reduces I/O overhead
+
+See [BASELINE_PERFORMANCE.md](BASELINE_PERFORMANCE.md) for detailed benchmark methodology and results.
 
 ## 🔒 Security
 
