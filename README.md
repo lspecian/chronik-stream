@@ -29,7 +29,7 @@ A high-performance streaming platform built in Rust that implements core Kafka w
 - **Zero Message Loss**: WAL ensures durability for all acks modes (0, 1, -1) even during unexpected shutdowns
 - **Automatic Recovery**: WAL records are automatically replayed on startup to restore state with 100% accuracy
 - **Real Client Testing**: Tested with kafka-python, confluent-kafka, KSQL, and Apache Flink
-- **Stress Tested**: Verified at scale with 50K+ messages, zero duplicates, 39K+ msgs/sec throughput
+- **Stress Tested**: Verified at scale with millions of messages, zero duplicates, 300K+ msgs/sec throughput
 - **Transactional APIs**: Full support for Kafka transactions (InitProducerId, AddPartitionsToTxn, EndTxn)
 - **High Performance**: Async architecture with zero-copy networking optimizations
 - **Multi-Architecture**: Native support for x86_64 and ARM64 (Apple Silicon, AWS Graviton)
@@ -434,61 +434,41 @@ AZURE_CONTAINER              Container name
 
 Chronik Stream provides two layers of performance tuning for different workloads:
 
-### Producer Flush Profiles
-
-Control when buffered messages become visible to consumers. **Default changed to HighThroughput in v2.1.0** based on benchmark results.
-
-**High-Throughput** - Production deployments (DEFAULT as of v2.1.0)
-```bash
-./chronik-server ...  # No env var needed - optimal for most workloads
-```
-- Settings: 100 batches / 500ms flush / 128MB buffer
-- Performance: **27,700 msg/s** throughput, **3.94ms p99 latency**
-- Use for: Production deployments, data pipelines, ETL, batch processing
-- **Why default**: 93% faster than previous Balanced profile with better latency!
-
-**Low-Latency** - Real-time applications
-```bash
-CHRONIK_PRODUCE_PROFILE=low-latency ./chronik-server ...
-```
-- Settings: 1 batch / 10ms flush / 16MB buffer
-- Target: < 20ms p99 latency
-- Use for: Real-time analytics, instant messaging, live dashboards (when sub-20ms critical)
-
-**Balanced** - Legacy compatibility
-```bash
-CHRONIK_PRODUCE_PROFILE=balanced ./chronik-server ...
-```
-- Settings: 10 batches / 100ms flush / 32MB buffer
-- Performance: 14,300 msg/s, 7.72ms p99 latency
-- Use for: Compatibility with older configurations (not recommended for new deployments)
-
-**Extreme** - Experimental maximum batching
-```bash
-CHRONIK_PRODUCE_PROFILE=extreme ./chronik-server ...
-```
-- Settings: 500 batches / 2000ms flush / 512MB buffer
-- Performance: ~27,700 msg/s (same as HighThroughput - hits fsync hardware limit)
-- Use for: Bulk ingestion experiments, data migrations
-
 ### WAL Performance Profiles
 
-The Write-Ahead Log automatically detects system resources (CPU, memory, Docker/K8s limits) and selects an appropriate profile. Override with:
+The Write-Ahead Log is the primary performance lever. It automatically detects system resources (CPU, memory, Docker/K8s limits) and selects an appropriate profile. Override with:
 
 ```bash
-CHRONIK_WAL_PROFILE=low        # Containers, small VMs (≤1 CPU, <512MB)
-CHRONIK_WAL_PROFILE=medium     # Typical servers (2-4 CPUs, 512MB-4GB)
-CHRONIK_WAL_PROFILE=high       # Dedicated servers (4-16 CPUs, 4-16GB)
-CHRONIK_WAL_PROFILE=ultra      # Maximum throughput (16+ CPUs, 16GB+)
+CHRONIK_WAL_PROFILE=low        # Containers, small VMs (≤1 CPU, <512MB) - 2ms batch
+CHRONIK_WAL_PROFILE=medium     # Typical servers (2-4 CPUs, 512MB-4GB) - 10ms batch
+CHRONIK_WAL_PROFILE=high       # Dedicated servers (4-16 CPUs, 4-16GB) - 50ms batch
+CHRONIK_WAL_PROFILE=ultra      # Maximum throughput (16+ CPUs, 16GB+) - 100ms batch
+```
+
+**Benchmark results use `high` profile** - see [BASELINE_PERFORMANCE.md](BASELINE_PERFORMANCE.md) for detailed methodology.
+
+### Producer Flush Profiles
+
+Control when buffered messages become visible to consumers:
+
+| Profile | Batches | Flush Interval | Buffer | Use Case |
+|---------|---------|----------------|--------|----------|
+| `low-latency` | 1 | 10ms | 16MB | Real-time analytics, instant messaging |
+| `balanced` | 10 | 100ms | 32MB | General-purpose workloads |
+| `high-throughput` (default) | 100 | 500ms | 128MB | Data pipelines, ETL, batch processing |
+| `extreme` | 500 | 2000ms | 512MB | Bulk ingestion, data migrations |
+
+```bash
+# Set producer profile
+CHRONIK_PRODUCE_PROFILE=low-latency ./chronik-server start
 ```
 
 ### Benchmarking
 
-Test performance profiles with your workload:
+Run the built-in benchmark tool:
 ```bash
 cargo build --release
-python3 tests/test_profiles_quick.py  # Quick 10K message test
-python3 tests/test_produce_profiles.py  # Comprehensive benchmark
+./target/release/chronik-bench -c 128 -s 256 -d 30s -m produce
 ```
 
 ## 📦 Docker Images
