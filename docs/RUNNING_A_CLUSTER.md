@@ -26,16 +26,18 @@ cargo build --release --bin chronik-server
 ./target/release/chronik-server version
 ```
 
-### Step 2: Use Example Configs
+### Step 2: Use Test Configs
 
-Chronik provides pre-configured examples for local testing:
+Chronik provides pre-configured test cluster setup:
 
 ```bash
-# View the example configs
-ls -la config/examples/cluster/
-# chronik-cluster-node1.toml
-# chronik-cluster-node2.toml
-# chronik-cluster-node3.toml
+# View the test cluster configs
+ls -la tests/cluster/
+# node1.toml
+# node2.toml
+# node3.toml
+# start.sh  (starts all 3 nodes)
+# stop.sh   (stops all 3 nodes)
 ```
 
 Each config file defines a complete cluster with 3 nodes on different ports:
@@ -45,24 +47,33 @@ Each config file defines a complete cluster with 3 nodes on different ports:
 
 ### Step 3: Start the Cluster
 
-Open 3 terminal windows and run one node in each:
+**Recommended (uses start script):**
+```bash
+./tests/cluster/start.sh
+# Starts all 3 nodes, cleans data directories
+# Logs available at tests/cluster/logs/node*.log
+```
+
+**Or manually** (open 3 terminal windows):
 
 **Terminal 1 - Node 1:**
 ```bash
-./target/release/chronik-server start \
-  --config config/examples/cluster/chronik-cluster-node1.toml
+./target/release/chronik-server start --config tests/cluster/node1.toml
 ```
 
 **Terminal 2 - Node 2:**
 ```bash
-./target/release/chronik-server start \
-  --config config/examples/cluster/chronik-cluster-node2.toml
+./target/release/chronik-server start --config tests/cluster/node2.toml
 ```
 
 **Terminal 3 - Node 3:**
 ```bash
-./target/release/chronik-server start \
-  --config config/examples/cluster/chronik-cluster-node3.toml
+./target/release/chronik-server start --config tests/cluster/node3.toml
+```
+
+**To stop:**
+```bash
+./tests/cluster/stop.sh
 ```
 
 ### Step 4: Verify Cluster
@@ -72,8 +83,7 @@ Open 3 terminal windows and run one node in each:
 export CHRONIK_ADMIN_API_KEY=<key-from-logs>
 
 # Check cluster status
-./target/release/chronik-server cluster status \
-  --config config/examples/cluster/chronik-cluster-node1.toml
+./target/release/chronik-server cluster status --config tests/cluster/node1.toml
 ```
 
 **Expected output:**
@@ -602,4 +612,3 @@ echo 'export CHRONIK_ADMIN_API_KEY=your-secure-key' >> ~/.bashrc
 - [ADMIN_API_SECURITY.md](ADMIN_API_SECURITY.md) - Secure the admin API with TLS
 - [DISASTER_RECOVERY.md](DISASTER_RECOVERY.md) - Configure S3 backups for metadata and data
 - [TESTING_NODE_REMOVAL.md](TESTING_NODE_REMOVAL.md) - Test node removal scenarios
-- [PRIORITY4_COMPLETE.md](PRIORITY4_COMPLETE.md) - Node removal implementation details

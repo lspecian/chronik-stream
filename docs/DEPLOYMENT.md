@@ -31,22 +31,22 @@
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/chronik-stream.git
+git clone https://github.com/lspecian/chronik-stream.git
 cd chronik-stream
 
 # Build the project
-cargo build --release --package chronik-all-in-one
+cargo build --release --bin chronik-server
 
-# Binary will be at ./target/release/chronik
+# Binary will be at ./target/release/chronik-server
 ```
 
 ### Using Pre-built Binaries
 
 ```bash
 # Download the latest release
-wget https://github.com/yourusername/chronik-stream/releases/latest/download/chronik-linux-amd64
-chmod +x chronik-linux-amd64
-sudo mv chronik-linux-amd64 /usr/local/bin/chronik
+wget https://github.com/lspecian/chronik-stream/releases/latest/download/chronik-server-linux-amd64
+chmod +x chronik-server-linux-amd64
+sudo mv chronik-server-linux-amd64 /usr/local/bin/chronik-server
 ```
 
 ### Using Docker
@@ -176,20 +176,14 @@ access_key = "myaccesskey"
 ### Basic Usage
 
 ```bash
-# Start with default settings
-chronik start
+# Start single-node (default)
+chronik-server start
 
-# Start with integrated mode (recommended)
-chronik integrated
+# Start with configuration file (enables cluster mode if configured)
+chronik-server start --config /etc/chronik/chronik.toml
 
-# Specify configuration file
-chronik integrated --config /etc/chronik/chronik.toml
-
-# Override specific settings
-chronik integrated \
-  --kafka-port 9092 \
-  --data-dir /var/lib/chronik \
-  --log-level debug
+# Specify data directory and advertised address
+chronik-server start --data-dir /var/lib/chronik --advertise hostname:9092
 ```
 
 ### Systemd Service
@@ -206,7 +200,7 @@ Documentation=https://github.com/yourusername/chronik-stream
 Type=simple
 User=chronik
 Group=chronik
-ExecStart=/usr/local/bin/chronik integrated --config /etc/chronik/chronik.toml
+ExecStart=/usr/local/bin/chronik-server start --config /etc/chronik/chronik.toml
 Restart=on-failure
 RestartSec=10
 StandardOutput=journal
@@ -241,27 +235,27 @@ sudo systemctl status chronik
 ### Dockerfile
 
 ```dockerfile
-FROM rust:1.70 as builder
+FROM rust:1.75 as builder
 WORKDIR /app
 COPY . .
-RUN cargo build --release --package chronik-all-in-one
+RUN cargo build --release --bin chronik-server
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/target/release/chronik /usr/local/bin/chronik
+COPY --from=builder /app/target/release/chronik-server /usr/local/bin/chronik-server
 RUN useradd -m -u 1000 chronik
 
 USER chronik
-EXPOSE 9092 3000 9090
+EXPOSE 9092 9090
 
 VOLUME ["/data"]
 ENV CHRONIK_DATA_DIR=/data
 
-ENTRYPOINT ["chronik"]
-CMD ["integrated"]
+ENTRYPOINT ["chronik-server"]
+CMD ["start"]
 ```
 
 ### Docker Compose
@@ -594,10 +588,10 @@ curl http://localhost:9090/metrics | grep chronik_
 
 ```bash
 # Enable debug logging
-RUST_LOG=debug,chronik=trace chronik integrated
+RUST_LOG=debug,chronik=trace chronik-server start
 
 # Enable protocol debugging
-RUST_LOG=chronik_protocol=trace chronik integrated
+RUST_LOG=chronik_protocol=trace chronik-server start
 ```
 
 ### Recovery Procedures
@@ -607,8 +601,8 @@ RUST_LOG=chronik_protocol=trace chronik integrated
 # Stop server
 sudo systemctl stop chronik
 
-# Run recovery tool
-chronik recover --data-dir /var/lib/chronik/data
+# WAL recovery is automatic on startup
+chronik-server start --data-dir /var/lib/chronik/data
 
 # Restart server
 sudo systemctl start chronik
@@ -625,9 +619,7 @@ kafkactl --brokers localhost:9092 reset offset my-group --topic my-topic --parti
 
 ## Support
 
-- GitHub Issues: https://github.com/yourusername/chronik-stream/issues
-- Documentation: https://chronik-stream.io/docs
-- Community Discord: https://discord.gg/chronik-stream
+- GitHub Issues: https://github.com/lspecian/chronik-stream/issues
 
 ## License
 

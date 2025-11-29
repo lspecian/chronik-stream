@@ -1,10 +1,8 @@
-# Build Instructions for v0.7.0 Release
-
-Due to resource constraints on the current system, the build needs to be completed on a machine with sufficient memory (at least 8GB RAM recommended).
+# Build Instructions
 
 ## Prerequisites
 
-1. Install Rust:
+1. Install Rust (1.70+):
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source $HOME/.cargo/env
@@ -15,23 +13,27 @@ source $HOME/.cargo/env
 # macOS
 brew install cmake openssl
 
-# Linux
+# Linux (Ubuntu/Debian)
 sudo apt-get install build-essential cmake libssl-dev pkg-config
 ```
 
 ## Build Commands
 
-### Option 1: Native Build (Fastest)
+### Quick Build
 ```bash
 # Clone the repository
 git clone https://github.com/lspecian/chronik-stream.git
 cd chronik-stream
-git checkout v0.7.0
 
 # Build release binary
 cargo build --release --bin chronik-server
 
 # Binary will be at: target/release/chronik-server
+```
+
+### With Benchmark Tool
+```bash
+cargo build --release --bin chronik-server --bin chronik-bench
 ```
 
 ### Option 2: Cross-Platform Build

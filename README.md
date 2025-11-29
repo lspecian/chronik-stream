@@ -8,20 +8,21 @@
 
 A high-performance streaming platform built in Rust that implements core Kafka wire protocol functionality with comprehensive Write-Ahead Log (WAL) durability and automatic recovery.
 
-**Latest Release: v2.2.9** - Cluster performance parity with standalone (178k msg/s). See [CHANGELOG.md](CHANGELOG.md) for full release history.
+**Latest Release: v2.2.16** - Searchable topics with real-time Tantivy indexing. See [CHANGELOG.md](CHANGELOG.md) for full release history.
 
-## ✨ What's New in v2.2.9
+## ✨ What's New in v2.2.16
 
-⚡ **Cluster Performance**: Cluster mode now matches standalone throughput (178k msg/s, 0.18% difference)
-🔧 **Broker Metadata Fix**: Added BrokerRegistered event for proper follower metadata replication
-📡 **Full Distribution**: Messages distributed across all nodes with RF=3 replication
-✅ **Verified**: Produce, replicate, and consume working with 100% message delivery
+🔍 **Searchable Topics**: Opt-in real-time full-text indexing with Tantivy for instant message search
+⚡ **Minimal Overhead**: Only 3% throughput overhead in standalone mode (192K vs 198K msg/s)
+🎛️ **Per-Topic Control**: Enable searchable per-topic or server-wide via `CHRONIK_DEFAULT_SEARCHABLE`
+📊 **Comprehensive Benchmarks**: Standalone 198K msg/s, Cluster 183K msg/s (non-searchable baseline)
 
-**Upgrade Recommendation**: All users should upgrade to v2.2.9 for full cluster performance.
+**Upgrade Recommendation**: All users should upgrade to v2.2.16 for searchable topics support.
 
 ## 🚀 Features
 
 - **Kafka Wire Protocol**: Full Kafka wire protocol with consumer group and transactional support
+- **Searchable Topics**: Opt-in real-time full-text search with Tantivy (3% overhead) - see [docs/SEARCHABLE_TOPICS.md](docs/SEARCHABLE_TOPICS.md)
 - **Full Compression Support**: All Kafka compression codecs (Gzip, Snappy, LZ4, Zstd) - see [COMPRESSION_SUPPORT.md](COMPRESSION_SUPPORT.md)
 - **WAL-based Metadata**: ChronikMetaLog provides event-sourced metadata persistence
 - **GroupCommitWal**: PostgreSQL-style group commit with per-partition background workers and batched fsync
@@ -496,7 +497,7 @@ All images support both **linux/amd64** and **linux/arm64** architectures:
 
 | Image | Tags | Description |
 |-------|------|-------------|
-| `ghcr.io/lspecian/chronik-stream` | `latest`, `v2.2.9`, `2.2` | Chronik server with full KSQL support |
+| `ghcr.io/lspecian/chronik-stream` | `latest`, `v2.2.16`, `2.2` | Chronik server with full KSQL support |
 
 ### Supported Platforms
 
@@ -575,16 +576,17 @@ chronik-stream/
 │   ├── chronik-server/      # Main server binary (unified)
 │   ├── chronik-protocol/    # Kafka wire protocol implementation
 │   ├── chronik-storage/     # Storage abstraction layer
-│   ├── chronik-search/      # Search engine integration
+│   ├── chronik-search/      # Search engine integration (Tantivy)
 │   ├── chronik-query/       # Query processing
 │   ├── chronik-common/      # Shared utilities
 │   ├── chronik-auth/        # Authentication & authorization
 │   ├── chronik-monitoring/  # Metrics & observability
 │   ├── chronik-config/      # Configuration management
 │   ├── chronik-backup/      # Backup functionality
-│   ├── chronik-benchmarks/  # Performance benchmarks
-│   ├── chronik-cli/         # Command line interface
-│   └── chronik-wal/         # Write-Ahead Log & metadata store
+│   ├── chronik-bench/       # Performance benchmarking tool
+│   ├── chronik-wal/         # Write-Ahead Log & metadata store
+│   ├── chronik-raft/        # Raft consensus implementation
+│   └── chronik-raft-bridge/ # Raft integration bridge
 ├── tests/                   # Integration tests
 ├── Dockerfile              # Multi-arch Docker build
 ├── docker-compose.yml      # Local development setup
@@ -646,6 +648,7 @@ Apache License 2.0. See [LICENSE](LICENSE) for details.
 ### Getting Started
 - [CHANGELOG.md](CHANGELOG.md) - Detailed release history
 - [docs/RUNNING_A_CLUSTER.md](docs/RUNNING_A_CLUSTER.md) - **Complete cluster setup guide (v2.2.0+)**
+- [docs/SEARCHABLE_TOPICS.md](docs/SEARCHABLE_TOPICS.md) - **Searchable topics with real-time indexing (v2.2.16+)**
 - [docs/KSQL_INTEGRATION_GUIDE.md](docs/KSQL_INTEGRATION_GUIDE.md) - KSQL setup and usage
 
 ### v2.2.8 Release (Critical Fixes)
@@ -655,6 +658,7 @@ Apache License 2.0. See [LICENSE](LICENSE) for details.
 - [docs/WATERMARK_REPLICATION_TEST_RESULTS_v2.2.7.2.md](docs/WATERMARK_REPLICATION_TEST_RESULTS_v2.2.7.2.md) - Test results and findings
 
 ### Operations & Performance
+- [BASELINE_PERFORMANCE.md](BASELINE_PERFORMANCE.md) - **Performance benchmarks (standalone vs cluster, searchable vs non-searchable)**
 - [docs/WAL_AUTO_TUNING.md](docs/WAL_AUTO_TUNING.md) - WAL performance auto-tuning guide
 - [docs/DISASTER_RECOVERY.md](docs/DISASTER_RECOVERY.md) - Disaster recovery and backup strategies
 - [docs/ADMIN_API_SECURITY.md](docs/ADMIN_API_SECURITY.md) - Admin API security configuration

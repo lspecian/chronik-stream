@@ -64,21 +64,17 @@ docker-compose down
 
 ## Operational Modes
 
-The Docker image supports all chronik-server operational modes:
+The Docker image supports single-node and cluster modes:
 
 ```bash
-# Standalone mode (default)
+# Single-node mode (default)
 docker run chronik-server:latest
 
-# Explicitly set mode
-docker run chronik-server:latest chronik-server standalone
+# With advertised address (required for Docker networking)
+docker run -e CHRONIK_ADVERTISED_ADDR=hostname:9092 chronik-server:latest
 
-# All components mode
-docker run chronik-server:latest chronik-server all
-
-# Future: Distributed modes
-docker run chronik-server:latest chronik-server ingest --controller-url <url>
-docker run chronik-server:latest chronik-server search --storage-url <url>
+# Cluster mode (with config file)
+docker run -v ./cluster.toml:/config.toml chronik-server:latest chronik-server start --config /config.toml
 ```
 
 ## Environment Variables
@@ -185,10 +181,10 @@ If you were using the old `chronik` or `chronik-ingest` images:
    **New**: `docker run chronik-server:latest`
 
 2. **Old**: `docker run chronik-ingest`
-   **New**: `docker run chronik-server:latest standalone`
+   **New**: `docker run chronik-server:latest`
 
 3. **Old**: Multiple containers for different components
-   **New**: Single container with `chronik-server all`
+   **New**: Single container per node (cluster mode via config file)
 
 ## Development
 

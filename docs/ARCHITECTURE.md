@@ -2,366 +2,303 @@
 
 ## Overview
 
-Chronik Stream is a Kafka-compatible distributed streaming platform built in Rust, designed for high performance, reliability, and operational excellence. The system provides full Kafka wire protocol compatibility while offering enhanced features for modern streaming workloads.
+Chronik Stream is a Kafka-compatible distributed streaming platform built in Rust. It provides full Kafka wire protocol compatibility with multi-node clustering via Raft consensus, WAL-based durability, and optional real-time full-text search.
 
-## System Architecture
+**Current Version:** v2.2.9+
 
-### Component Hierarchy
+## Crate Structure
 
 ```
 chronik-stream/
-├── chronik-all-in-one/        # Integrated server with all components
-│   ├── integrated_server.rs   # Main server implementation
-│   ├── error_handler.rs       # Comprehensive error handling
-│   ├── storage.rs             # Embedded storage layer
-│   └── kafka_server.rs        # Legacy Kafka protocol handler
-│
-├── chronik-ingest/            # Production ingestion components
-│   ├── kafka_handler.rs       # Complete Kafka protocol handler
-│   ├── produce_handler.rs     # Message production with persistence
-│   ├── fetch_handler.rs       # Message consumption
-│   ├── consumer_group.rs      # Consumer group coordination
-│   └── storage.rs             # Storage service configuration
-│
-├── chronik-protocol/          # Wire protocol implementation
-│   ├── parser.rs              # Request/response parsing
-│   ├── handler.rs             # Protocol handlers
-│   └── kafka_protocol.rs      # Kafka protocol definitions
-│
-├── chronik-storage/           # Persistence layer
-│   ├── segment_writer.rs      # Segment file writing
-│   ├── segment_reader.rs      # Segment file reading
-│   ├── object_store/          # Object storage abstraction
-│   └── kafka_records.rs       # Kafka record format support
-│
-├── chronik-search/            # Search and indexing
-│   └── realtime_indexer.rs    # Real-time Tantivy indexing
-│
-└── chronik-common/            # Shared components
-    └── metadata/              # Metadata management
-        ├── traits.rs          # MetadataStore trait
-        └── memory.rs          # In-memory implementation
+├── chronik-server/          # Main server binary (standalone + cluster modes)
+├── chronik-protocol/        # Kafka wire protocol implementation
+├── chronik-wal/             # Write-ahead log with group commit
+├── chronik-storage/         # Segment storage, object store abstraction
+├── chronik-raft/            # Raft consensus implementation (OpenRaft)
+├── chronik-raft-bridge/     # Bridge between Raft and server components
+├── chronik-search/          # Real-time Tantivy indexing
+├── chronik-common/          # Shared types, metadata traits
+├── chronik-config/          # Configuration management
+├── chronik-auth/            # SASL, TLS authentication
+├── chronik-monitoring/      # Prometheus metrics, tracing
+├── chronik-query/           # Query processing
+├── chronik-backup/          # Backup functionality
+└── chronik-bench/           # Performance benchmarks
 ```
 
 ## Core Components
 
-### 1. Integrated Server (chronik-all-in-one)
+### 1. Server (`chronik-server`)
 
-The integrated server is the main entry point that combines all components into a single deployable unit.
+Single binary supporting two operational modes:
 
-**Key Features:**
-- Single binary deployment
-- Full Kafka wire protocol support
-- Embedded storage with persistence
-- Consumer group management
-- Compression support (Snappy, Gzip, LZ4, Zstd)
-- Error handling and recovery
-
-**Architecture:**
-```rust
-IntegratedKafkaServer
-├── KafkaProtocolHandler (from chronik-ingest)
-│   ├── ProduceHandler
-│   ├── FetchHandler
-│   └── GroupManager
-├── Storage Layer
-│   ├── SegmentWriter
-│   ├── SegmentReader
-│   └── ObjectStore
-└── Metadata Store
-    └── InMemoryMetadataStore
+**Standalone Mode** (default):
+```bash
+./chronik-server start --advertise localhost:9092
 ```
 
-### 2. Protocol Layer (chronik-protocol)
-
-Implements the complete Kafka wire protocol with support for all major APIs.
-
-**Supported APIs:**
-- Produce (0) - v0-v9
-- Fetch (1) - v0-v11
-- ListOffsets (2) - v0-v5
-- Metadata (3) - v0-v9
-- OffsetCommit (8) - v0-v7
-- OffsetFetch (9) - v0-v5
-- FindCoordinator (10) - v0-v3
-- JoinGroup (11) - v0-v5
-- Heartbeat (12) - v0-v3
-- LeaveGroup (13) - v0-v3
-- SyncGroup (14) - v0-v3
-- ListGroups (16) - v0-v2
-- ApiVersions (18) - v0-v3
-- CreateTopics (19) - v0-v5
-- InitProducerId (22) - v0-v4
-
-### 3. Storage Layer (chronik-storage)
-
-Provides persistent storage with support for multiple backends.
-
-**Features:**
-- Segment-based storage (similar to Kafka)
-- Object store abstraction (S3, GCS, Azure, Local)
-- Compression support
-- Efficient binary format
-- Concurrent reads/writes
-- Automatic segment rotation
-
-**Storage Format:**
-```
-Segment File Structure:
-├── Header (metadata, compression, version)
-├── Index (offset → file position mapping)
-├── Records (compressed batches)
-└── Footer (checksums, statistics)
+**Cluster Mode** (3+ nodes with Raft):
+```bash
+./chronik-server start --config cluster.toml
 ```
 
-### 4. Ingestion Pipeline (chronik-ingest)
+The server uses a 14-stage builder pattern (`IntegratedKafkaServerBuilder`) for initialization, handling WAL recovery, Raft cluster setup, metadata replication, and handler initialization.
 
-Handles message production with high throughput and reliability.
+### 2. Kafka Protocol (`chronik-protocol`)
 
-**Components:**
-- **ProduceHandler**: Manages message writes
-- **FetchHandler**: Manages message reads
-- **GroupManager**: Consumer group coordination
-- **SegmentWriter**: Efficient disk writes
-- **Replication**: Future support for data replication
+Full Kafka wire protocol implementation with 19+ supported APIs:
 
-### 5. Search Integration (chronik-search)
+| API | Versions | Status |
+|-----|----------|--------|
+| Produce (0) | v0-v9 | Full support |
+| Fetch (1) | v0-v13 | Full support |
+| ListOffsets (2) | v0-v5 | Full support |
+| Metadata (3) | v0-v12 | Full support |
+| OffsetCommit (8) | v0-v7 | Full support |
+| OffsetFetch (9) | v0-v5 | Full support |
+| FindCoordinator (10) | v0-v3 | Full support |
+| JoinGroup (11) | v0-v5 | Full support |
+| Heartbeat (12) | v0-v3 | Full support |
+| LeaveGroup (13) | v0-v3 | Full support |
+| SyncGroup (14) | v0-v3 | Full support |
+| ApiVersions (18) | v0-v3 | Full support |
+| CreateTopics (19) | v0-v5 | Full support |
+| DeleteTopics (20) | v0-v4 | Full support |
+| InitProducerId (22) | v0-v4 | Full support |
 
-Optional real-time search capabilities using Tantivy.
+### 3. Write-Ahead Log (`chronik-wal`)
 
-**Features:**
-- Real-time indexing of messages
-- Full-text search
-- Field-based queries
-- Configurable indexing policies
+Mandatory durability layer providing zero message loss guarantee:
+
+- **GroupCommitWal**: Batched fsync for high throughput
+- **WalRecord V2**: Includes Kafka CRC-32C for data integrity
+- **Automatic Recovery**: Replays WAL on startup
+- **Configurable Profiles**: `low`, `medium`, `high`, `ultra`
+
+```
+Write Path:
+Producer → WalProduceHandler → GroupCommitWal (fsync) → ProduceHandler → Storage
+```
+
+### 4. Storage Layer (`chronik-storage`)
+
+3-tier storage architecture:
+
+| Tier | Latency | Backend | Purpose |
+|------|---------|---------|---------|
+| Hot (WAL) | <1ms | Local disk | Recent messages, durability |
+| Warm (Segments) | 1-10ms | S3/GCS/Azure/Local | Raw message data |
+| Cold (Tantivy) | 100-500ms | S3/GCS/Azure/Local | Searchable indexes |
+
+### 5. Raft Clustering (`chronik-raft`)
+
+Multi-node replication using OpenRaft:
+
+- **Multi-Raft Design**: One Raft group per partition
+- **Quorum-Based Replication**: Survives minority failures
+- **Automatic Leader Election**: <1 second failover
+- **Zero-Downtime Operations**: Node addition/removal without service interruption
+
+```
+Cluster Configuration:
+┌─────────────────────────────────────────────────────┐
+│  Node 1: kafka=9092, wal=9291, raft=5001           │
+│  Node 2: kafka=9093, wal=9292, raft=5002           │
+│  Node 3: kafka=9094, wal=9293, raft=5003           │
+│                                                     │
+│  Replication Factor: 3                              │
+│  Min In-Sync Replicas: 2                           │
+│  Quorum: 2/3 (tolerates 1 failure)                 │
+└─────────────────────────────────────────────────────┘
+```
+
+### 6. Real-Time Search (`chronik-search`)
+
+Optional Tantivy integration for full-text search:
+
+- **Real-time Indexing**: Messages indexed during produce path
+- **Searchable Topics**: Per-topic configuration
+- **Performance**: ~3% overhead standalone, ~33% cluster
 
 ## Data Flow
 
-### Message Production Flow
+### Message Production
 
 ```
-Client → Kafka Protocol → ProduceHandler → SegmentWriter → ObjectStore
-                                         ↓
-                                    IndexWriter → Tantivy Index
+Client
+   │
+   ▼
+Protocol Handler (parse request)
+   │
+   ▼
+WalProduceHandler (WAL write + fsync)
+   │
+   ▼
+ProduceHandler (in-memory state, ISR tracking)
+   │
+   ├─► SegmentWriter (warm storage)
+   │
+   └─► WalIndexer (if searchable topic)
+         │
+         ▼
+       Tantivy Index
 ```
 
-1. Client sends Produce request
-2. Protocol layer parses request
-3. ProduceHandler validates and batches messages
-4. SegmentWriter persists to storage
-5. Optional: IndexWriter updates search index
-6. Response sent to client with offsets
-
-### Message Consumption Flow
+### Message Consumption
 
 ```
-Client → Kafka Protocol → FetchHandler → SegmentReader → ObjectStore
-                                       ↓
-                                  GroupManager → Offset Management
+Client
+   │
+   ▼
+Protocol Handler (parse request)
+   │
+   ▼
+FetchHandler
+   │
+   ├─► Try WAL (hot)
+   ├─► Try Segments (warm, cached)
+   └─► Try Tantivy (cold)
 ```
 
-1. Client sends Fetch request
-2. Protocol layer parses request
-3. FetchHandler retrieves messages from storage
-4. GroupManager tracks consumer offsets
-5. Response sent with messages
+## Deployment Architectures
 
-## Deployment Architecture
+### Standalone (Single Node)
 
-### Single Node Deployment
-
-```yaml
-chronik-all-in-one
-├── Port 9092: Kafka Protocol
-├── Port 3000: Admin API (optional)
-├── Storage: Local filesystem
-└── Metadata: In-memory
+```
+┌─────────────────────────────────┐
+│  chronik-server                 │
+│  ├─ Port 9092: Kafka Protocol   │
+│  ├─ Storage: ./data             │
+│  └─ WAL: GroupCommitWal         │
+└─────────────────────────────────┘
 ```
 
-### Multi-Node Deployment (Future)
+### Cluster (3+ Nodes)
 
-```yaml
-Node 1 (Controller)
-├── Metadata management
-├── Cluster coordination
-└── Leader election
-
-Node 2-N (Brokers)
-├── Message storage
-├── Client connections
-└── Replication
+```
+┌─────────────────────────────────┐
+│  Node 1 (Leader)                │
+│  ├─ Kafka: 9092                 │
+│  ├─ WAL Replication: 9291       │
+│  └─ Raft Consensus: 5001        │
+└─────────────────────────────────┘
+         ↕
+┌─────────────────────────────────┐
+│  Node 2 (Follower)              │
+│  ├─ Kafka: 9093                 │
+│  ├─ WAL Replication: 9292       │
+│  └─ Raft Consensus: 5002        │
+└─────────────────────────────────┘
+         ↕
+┌─────────────────────────────────┐
+│  Node 3 (Follower)              │
+│  ├─ Kafka: 9094                 │
+│  ├─ WAL Replication: 9293       │
+│  └─ Raft Consensus: 5003        │
+└─────────────────────────────────┘
 ```
 
-## Performance Characteristics
+## Performance
 
-### Throughput
-- **Write**: 100K+ messages/sec per node
-- **Read**: 200K+ messages/sec per node
-- **Latency**: < 10ms p99 for small messages
+### Benchmarks (128 concurrency, 256 byte messages)
 
-### Resource Usage
-- **Memory**: 512MB - 8GB recommended
-- **CPU**: 2-8 cores recommended
-- **Storage**: Depends on retention policy
-- **Network**: 1-10 Gbps recommended
+| Mode | Configuration | Throughput | p99 Latency |
+|------|---------------|------------|-------------|
+| Standalone | Non-searchable | ~198K msg/s | 0.59ms |
+| Standalone | Searchable | ~192K msg/s | 2.15ms |
+| Cluster (3 nodes) | Non-searchable, acks=1 | ~183K msg/s | 2.85ms |
+| Cluster (3 nodes) | Searchable, acks=1 | ~123K msg/s | 14.43ms |
 
-## Reliability Features
+### Resource Recommendations
 
-### Error Handling
-- Comprehensive error codes matching Kafka protocol
-- Automatic retry with exponential backoff
-- Connection pooling and management
-- Graceful degradation
+| Deployment | Memory | CPU | Network |
+|------------|--------|-----|---------|
+| Development | 512MB | 2 cores | 1 Gbps |
+| Production (standalone) | 4-8GB | 4-8 cores | 10 Gbps |
+| Production (cluster) | 8-16GB per node | 8-16 cores | 10 Gbps |
 
-### Data Durability
-- Synchronous writes to disk
-- Configurable fsync policies
-- Checksums for data integrity
-- Segment-based recovery
+## Reliability
 
-### High Availability (Future)
-- Multi-node replication
-- Automatic failover
-- Leader election via Raft
-- Rack-aware placement
+### Durability Guarantees
+
+- **WAL Persistence**: All messages written to WAL before acknowledgment
+- **Fsync on Commit**: Configurable sync intervals via `CHRONIK_WAL_PROFILE`
+- **CRC-32C Checksums**: Kafka protocol-level data integrity
+- **Automatic Recovery**: WAL replay on startup
+
+### Fault Tolerance (Cluster Mode)
+
+- **Replication Factor 3**: Survives 1 node failure
+- **Quorum Writes**: Majority must acknowledge
+- **Leader Election**: <1 second automatic failover
+- **ISR Tracking**: In-sync replica management
+
+### Disaster Recovery
+
+- **Metadata Backup**: Automatic upload to S3/GCS/Azure
+- **Cold Start Recovery**: Restore from object storage
+- **Snapshot-Based**: Periodic Raft snapshots
 
 ## Configuration
 
-### Server Configuration
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CHRONIK_ADVERTISED_ADDR` | (required) | Address advertised to clients |
+| `CHRONIK_DATA_DIR` | `./data` | Data directory |
+| `CHRONIK_WAL_PROFILE` | auto | `low`/`medium`/`high`/`ultra` |
+| `CHRONIK_DEFAULT_SEARCHABLE` | `false` | Enable search for new topics |
+| `CHRONIK_ADMIN_API_KEY` | (generated) | Admin API authentication |
+
+### Cluster Configuration (TOML)
 
 ```toml
-[server]
-node_id = 0
-advertised_host = "localhost"
-advertised_port = 9092
-data_dir = "./data"
+enabled = true
+node_id = 1
+replication_factor = 3
+min_insync_replicas = 2
 
-[storage]
-backend = "local"  # or "s3", "gcs", "azure"
-compression = "snappy"
-segment_size_mb = 256
-segment_age_ms = 30000
-retention_ms = 604800000  # 7 days
+[bind]
+kafka = "0.0.0.0:9092"
+wal = "0.0.0.0:9291"
+raft = "0.0.0.0:5001"
 
-[producer]
-enable_idempotence = true
-enable_transactions = false
-max_in_flight_requests = 5
-batch_size = 16384
-linger_ms = 10
+[advertise]
+kafka = "localhost:9092"
+wal = "localhost:9291"
+raft = "localhost:5001"
 
-[consumer]
-auto_create_topics = true
-num_partitions = 3
-replication_factor = 1
+[[peers]]
+id = 1
+kafka = "localhost:9092"
+wal = "localhost:9291"
+raft = "localhost:5001"
 ```
 
-### Client Configuration
+## Client Compatibility
 
-```properties
-# Producer
-bootstrap.servers=localhost:9092
-acks=1
-compression.type=snappy
-batch.size=16384
-
-# Consumer
-bootstrap.servers=localhost:9092
-group.id=my-consumer-group
-enable.auto.commit=true
-auto.offset.reset=earliest
-```
-
-## Monitoring & Operations
-
-### Metrics
-- Message throughput (msgs/sec, bytes/sec)
-- Storage usage and growth
-- Consumer lag
-- Connection count
-- Error rates
-
-### Health Checks
-- `/health` - Basic health status
-- `/ready` - Readiness probe
-- `/metrics` - Prometheus metrics
-
-### Admin Operations
-- Topic creation/deletion
-- Consumer group management
-- Offset management
-- Configuration updates
-
-## Security (Future)
-
-### Authentication
-- SASL/PLAIN
-- SASL/SCRAM
-- mTLS
-
-### Authorization
-- ACL-based permissions
-- Role-based access control
-
-### Encryption
-- TLS for client connections
-- Encryption at rest
+Tested with:
+- kafka-python
+- confluent-kafka (Python)
+- KSQLDB
+- Apache Flink
+- Java Kafka clients
 
 ## Comparison with Apache Kafka
 
-### Advantages
-- Single binary deployment
-- Lower memory footprint
-- Built-in search capabilities
-- Simpler operations
-- Native cloud storage support
+| Feature | Chronik | Kafka |
+|---------|---------|-------|
+| Deployment | Single binary | JVM + ZK/KRaft |
+| Memory | 512MB-8GB | 4GB+ recommended |
+| Clustering | Raft (built-in) | KRaft/ZooKeeper |
+| Full-text Search | Built-in (Tantivy) | External (Elasticsearch) |
+| Object Storage | Native S3/GCS/Azure | Tiered storage (limited) |
+| Protocol | Kafka wire protocol | Kafka wire protocol |
 
-### Trade-offs
-- Limited ecosystem (no Kafka Connect, Streams)
-- Single-node limitation (currently)
-- No ZooKeeper/KRaft support
-- Limited security features (currently)
+## See Also
 
-## Future Roadmap
-
-### Near Term
-- [ ] Complete controller APIs
-- [ ] Full produce/fetch cycle
-- [ ] Consumer group persistence
-- [ ] Docker/Kubernetes support
-
-### Medium Term
-- [ ] Multi-node replication
-- [ ] Transactions support
-- [ ] Exactly-once semantics
-- [ ] Schema registry
-
-### Long Term
-- [ ] Kafka Streams compatibility
-- [ ] Kafka Connect compatibility
-- [ ] Multi-region support
-- [ ] Tiered storage
-
-## Development Guidelines
-
-### Code Organization
-- Keep protocol handling separate from business logic
-- Use traits for abstraction
-- Prefer composition over inheritance
-- Write comprehensive tests
-
-### Testing Strategy
-- Unit tests for components
-- Integration tests for protocols
-- Performance benchmarks
-- Chaos testing for reliability
-
-### Performance Optimization
-- Use async/await for I/O
-- Batch operations when possible
-- Memory pooling for allocations
-- Zero-copy where applicable
-
-## Conclusion
-
-Chronik Stream provides a modern, efficient implementation of the Kafka protocol with a focus on operational simplicity and performance. The architecture is designed to be extensible, allowing for future enhancements while maintaining compatibility with the Kafka ecosystem.
+- [RUNNING_A_CLUSTER.md](RUNNING_A_CLUSTER.md) - Cluster deployment guide
+- [DISASTER_RECOVERY.md](DISASTER_RECOVERY.md) - Backup and recovery
+- [SEARCHABLE_TOPICS.md](SEARCHABLE_TOPICS.md) - Full-text search feature
+- [wal/](wal/) - WAL implementation details
