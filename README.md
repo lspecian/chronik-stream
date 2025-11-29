@@ -453,14 +453,14 @@ Control when buffered messages become visible to consumers:
 
 | Profile | Batches | Flush Interval | Buffer | Use Case |
 |---------|---------|----------------|--------|----------|
-| `low-latency` | 1 | 10ms | 16MB | Real-time analytics, instant messaging |
+| `low-latency` (default) | 1 | 10ms | 16MB | Real-time analytics, instant messaging |
 | `balanced` | 10 | 100ms | 32MB | General-purpose workloads |
-| `high-throughput` (default) | 100 | 500ms | 128MB | Data pipelines, ETL, batch processing |
+| `high-throughput` | 100 | 500ms | 128MB | Data pipelines, ETL, batch processing |
 | `extreme` | 500 | 2000ms | 512MB | Bulk ingestion, data migrations |
 
 ```bash
-# Set producer profile
-CHRONIK_PRODUCE_PROFILE=low-latency ./chronik-server start
+# Set producer profile (low-latency is default, use high-throughput for batch workloads)
+CHRONIK_PRODUCE_PROFILE=high-throughput ./chronik-server start
 ```
 
 ### Benchmarking
