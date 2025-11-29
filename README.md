@@ -619,12 +619,18 @@ Chronik Stream supports SASL authentication with the following mechanisms:
 - **SCRAM-SHA-256** - Challenge-response authentication
 - **SCRAM-SHA-512** - Challenge-response authentication (stronger)
 
-**Default users** (for development/testing):
-| Username | Password |
-|----------|----------|
-| admin | admin123 |
-| user | user123 |
-| kafka | kafka-secret |
+**Configuration:**
+```bash
+# Production: Configure custom users
+CHRONIK_SASL_USERS='myuser:securepass123,kafka-app:app-secret' ./chronik-server start
+
+# Production: Disable all default users
+CHRONIK_SASL_NO_DEFAULTS=1 ./chronik-server start
+
+# Development only: Default test users (NOT for production!)
+# - admin/admin123, user/user123, kafka/kafka-secret
+# These are used if no CHRONIK_SASL_* env vars are set
+```
 
 ```python
 # Python example with SASL/PLAIN
@@ -634,8 +640,8 @@ producer = KafkaProducer(
     bootstrap_servers='localhost:9092',
     security_protocol='SASL_PLAINTEXT',
     sasl_mechanism='PLAIN',
-    sasl_plain_username='admin',
-    sasl_plain_password='admin123'
+    sasl_plain_username='myuser',
+    sasl_plain_password='securepass123'
 )
 ```
 
@@ -644,6 +650,8 @@ producer = KafkaProducer(
 - **TLS/SSL**: End-to-end encryption (infrastructure in `chronik-auth` crate)
 - **ACLs**: Topic and consumer group access control framework
 - **Admin API**: Secured with API key authentication (cluster management)
+
+> ⚠️ **Security Note**: Default test users are for development only. Always set `CHRONIK_SASL_USERS` or `CHRONIK_SASL_NO_DEFAULTS=1` in production.
 
 ## 📊 Monitoring
 

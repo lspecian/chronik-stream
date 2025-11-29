@@ -96,13 +96,71 @@ pub struct SaslAuthenticator {
 
 impl SaslAuthenticator {
     /// Create a new SASL authenticator
+    ///
+    /// SECURITY WARNING: By default, this creates test users with known passwords.
+    /// For production, use `new_from_env()` or `new_empty()` and add users explicitly.
     pub fn new() -> Self {
+        // Check if we should skip default users (production mode)
+        if std::env::var("CHRONIK_SASL_NO_DEFAULTS").is_ok() {
+            return Self::new_empty();
+        }
+
+        // Check for custom users from environment
+        if let Ok(users_config) = std::env::var("CHRONIK_SASL_USERS") {
+            return Self::new_from_config(&users_config);
+        }
+
+        // Default users for development/testing ONLY
+        warn!("⚠️  SECURITY WARNING: Using default SASL users (admin/admin123, user/user123, kafka/kafka-secret)");
+        warn!("⚠️  Set CHRONIK_SASL_USERS='user1:pass1,user2:pass2' for custom users");
+        warn!("⚠️  Set CHRONIK_SASL_NO_DEFAULTS=1 to disable default users in production");
+
         let mut users = HashMap::new();
-        // Add some default users for testing
         users.insert("admin".to_string(), "admin123".to_string());
         users.insert("user".to_string(), "user123".to_string());
         users.insert("kafka".to_string(), "kafka-secret".to_string());
 
+        Self {
+            supported_mechanisms: vec![
+                SaslMechanism::Plain,
+                SaslMechanism::ScramSha256,
+                SaslMechanism::ScramSha512,
+            ],
+            users,
+            state: SaslState::Initial,
+            scram_state: None,
+        }
+    }
+
+    /// Create a new SASL authenticator with NO default users (for production)
+    pub fn new_empty() -> Self {
+        info!("SASL authenticator created with no users - add users via add_user() or CHRONIK_SASL_USERS env var");
+        Self {
+            supported_mechanisms: vec![
+                SaslMechanism::Plain,
+                SaslMechanism::ScramSha256,
+                SaslMechanism::ScramSha512,
+            ],
+            users: HashMap::new(),
+            state: SaslState::Initial,
+            scram_state: None,
+        }
+    }
+
+    /// Create a new SASL authenticator from config string
+    /// Format: "user1:pass1,user2:pass2"
+    pub fn new_from_config(config: &str) -> Self {
+        let mut users = HashMap::new();
+        for pair in config.split(',') {
+            let parts: Vec<&str> = pair.trim().splitn(2, ':').collect();
+            if parts.len() == 2 {
+                users.insert(parts[0].to_string(), parts[1].to_string());
+                info!("SASL user configured: {}", parts[0]);
+            }
+        }
+        if users.is_empty() {
+            warn!("CHRONIK_SASL_USERS provided but no valid users parsed");
+        }
         Self {
             supported_mechanisms: vec![
                 SaslMechanism::Plain,
@@ -429,5 +487,34 @@ mod tests {
 
         let result = auth.handle_handshake(1, &["UNKNOWN".to_string()]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_custom_users_from_config() {
+        let mut auth = SaslAuthenticator::new_from_config("myuser:mypass,other:secret");
+
+        // Handshake
+        auth.handle_handshake(1, &["PLAIN".to_string()]).unwrap();
+
+        // Authenticate with custom user
+        let auth_bytes = format!("\0myuser\0mypass").into_bytes();
+        let response = auth.handle_authenticate(&auth_bytes).unwrap();
+        assert_eq!(response.error_code, 0);
+        assert!(auth.is_authenticated());
+        assert_eq!(auth.username(), Some("myuser"));
+    }
+
+    #[test]
+    fn test_empty_authenticator_rejects_all() {
+        let mut auth = SaslAuthenticator::new_empty();
+
+        // Handshake should work
+        auth.handle_handshake(1, &["PLAIN".to_string()]).unwrap();
+
+        // But authentication should fail (no users configured)
+        let auth_bytes = format!("\0admin\0admin123").into_bytes();
+        let result = auth.handle_authenticate(&auth_bytes);
+        assert!(result.is_err());
+        assert!(!auth.is_authenticated());
     }
 }
