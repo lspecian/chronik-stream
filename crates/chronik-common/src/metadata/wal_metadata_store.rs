@@ -133,8 +133,30 @@ impl MetadataState {
             }
 
             MetadataEventPayload::TopicDeleted { name } => {
+                // Remove topic metadata
                 let mut topics = self.topics.write().await;
                 topics.remove(name);
+                drop(topics);
+
+                // Remove all partition assignments for this topic
+                // v2.2.14: DashMap provides retain() for lock-free concurrent removal
+                self.partition_assignments.retain(|k, _| k.0 != *name);
+
+                // Remove partition offsets for this topic
+                let mut offsets = self.partition_offsets.write().await;
+                offsets.retain(|k, _| k.0 != *name);
+                drop(offsets);
+
+                // Remove consumer offsets for this topic
+                let mut consumer_offsets = self.consumer_offsets.write().await;
+                consumer_offsets.retain(|k, _| k.1 != *name);
+                drop(consumer_offsets);
+
+                // Remove segments for this topic
+                let mut segments = self.segments.write().await;
+                segments.retain(|k, _| k.0 != *name);
+
+                tracing::info!("🗑️ Topic '{}' deleted with all associated data", name);
                 Ok(())
             }
 

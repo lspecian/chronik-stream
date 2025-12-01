@@ -58,7 +58,7 @@ impl SegmentReader {
         // Parse using the Segment format - this is what SegmentWriter creates
         let segment = Segment::deserialize(segment_data)?;
 
-        tracing::info!("Successfully parsed segment v{} with {} records, raw_kafka: {} bytes, indexed: {} bytes",
+        tracing::trace!("Successfully parsed segment v{} with {} records, raw_kafka: {} bytes, indexed: {} bytes",
             segment.header.version,
             segment.metadata.record_count,
             segment.raw_kafka_batches.len(),

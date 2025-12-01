@@ -8,16 +8,21 @@
 
 A high-performance streaming platform built in Rust that implements core Kafka wire protocol functionality with comprehensive Write-Ahead Log (WAL) durability and automatic recovery.
 
-**Latest Release: v2.2.17** - Major codebase cleanup. See [CHANGELOG.md](CHANGELOG.md) for full release history.
+**Latest Release: v2.2.18** - Performance fix for hot-path logging. See [CHANGELOG.md](CHANGELOG.md) for full release history.
 
-## ✨ What's New in v2.2.17
+## ✨ What's New in v2.2.18
 
-🧹 **Major Cleanup**: Removed 547 obsolete files (~170K lines) for a leaner codebase
-📚 **Updated Docs**: Reduced docs from 246 to 19 essential files, updated for current CLI
-🔧 **Simplified Scripts**: Reduced from 26 to 5 essential build/health scripts
-📦 **Removed Obsolete Crates**: chronik-admin, chronik-benchmarks, chronik-cli (functionality integrated)
+🚀 **Performance Fix**: Reduced hot-path logging from INFO to TRACE level
+📈 **+168% Throughput**: 146K → 391K msg/s (default logging, no RUST_LOG override needed)
+⚡ **99% Lower p99 Latency**: 46ms → 0.5ms by eliminating per-request logging overhead
 
-**Upgrade Recommendation**: All users should upgrade to v2.2.17 for the cleanest codebase.
+**Fixed Logs** (changed from `info!` to `trace!`):
+- Produce request logging in kafka_handler
+- PARTITION_DEBUG logging in produce_handler
+- PRODUCE→BUFFER logging in produce_handler
+- Fetch result logging in fetch_handler
+
+**Upgrade Recommendation**: All users should upgrade to v2.2.18 for optimal performance.
 
 ## 🚀 Features
 

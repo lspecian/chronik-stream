@@ -462,7 +462,7 @@ mod tests {
             path: "/tmp/test_compaction".to_string(),
         };
 
-        let store = Arc::new(ObjectStoreFactory::create(config).await.unwrap());
+        let store: Arc<dyn ObjectStore> = Arc::from(ObjectStoreFactory::create(config).await.unwrap());
 
         let config = CompactionConfig {
             strategy: CompactionStrategy::TimeBasedRetention {

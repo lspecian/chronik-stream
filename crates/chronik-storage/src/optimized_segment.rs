@@ -12,6 +12,7 @@ use crate::Record;
 use crate::chronik_segment::BloomFilter;
 use bytes::{Bytes, BytesMut, BufMut};
 use anyhow::{Result, anyhow};
+use crc32fast::Hasher;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -19,9 +20,12 @@ use parking_lot::RwLock;
 // crossbeam_channel - not used in this version
 use rayon;
 use zstd::stream::{encode_all as zstd_encode, decode_all as zstd_decode};
+use lz4_flex::frame::{FrameEncoder, FrameDecoder};
+use snap::raw::{Encoder as SnappyEncoder, Decoder as SnappyDecoder};
 use byteorder::{BigEndian, ReadBytesExt};
 use memmap2::{Mmap, MmapOptions};
 use std::fs::File;
+use std::io::{Read, Write};
 use std::path::Path;
 use tracing::{info, instrument};
 
@@ -217,11 +221,42 @@ impl OptimizedTansuSegment {
         
         let time_index_data = bincode::serialize(&time_index)?;
         let bloom_data = bincode::serialize(&bloom)?;
-        
+
+        // Calculate column checksums and compression ratios
+        let mut column_checksums = BTreeMap::new();
+        let mut compression_ratios = BTreeMap::new();
+
+        // Original sizes for compression ratio calculation
+        let original_sizes: Vec<(&str, usize)> = vec![
+            ("offsets", offsets.len() * 8),
+            ("timestamps", timestamps.len() * 8),
+            ("keys", keys_data.len()),
+            ("values", values_data.len()),
+            ("headers", headers_data.len()),
+            ("key_offsets", key_offsets.len() * 4),
+            ("value_offsets", value_offsets.len() * 4),
+        ];
+
+        for (name, data) in &columns_data {
+            // Calculate CRC32 checksum for each column
+            let mut hasher = Hasher::new();
+            hasher.update(data);
+            column_checksums.insert(name.to_string(), hasher.finalize());
+
+            // Calculate compression ratio
+            if let Some((_, original_size)) = original_sizes.iter().find(|(n, _)| n == name) {
+                if *original_size > 0 {
+                    let ratio = 1.0 - (data.len() as f64 / *original_size as f64);
+                    compression_ratios.insert(name.to_string(), ratio);
+                }
+            }
+        }
+
+        // Create footer with checksums (file_checksum calculated after serialization)
         let footer = SegmentFooter {
-            column_checksums: BTreeMap::new(), // TODO: Calculate checksums
-            file_checksum: 0, // TODO: Calculate file checksum
-            compression_ratios: BTreeMap::new(), // TODO: Calculate compression ratios
+            column_checksums,
+            file_checksum: 0, // Placeholder - calculated over full output
+            compression_ratios,
         };
         let footer_data = bincode::serialize(&footer)?;
         
@@ -276,32 +311,43 @@ impl OptimizedTansuSegment {
             footer_offset,
         };
         
-        // Build output
+        // Build output (except footer - we need to calculate file checksum first)
         let mut output = BytesMut::new();
-        
+
         // Write header
         let header_bytes = bincode::serialize(&header)?;
         assert_eq!(header_bytes.len(), header_size, "Header size calculation was incorrect");
         output.put_slice(&header_bytes);
-        
+
         // Write columns
         for (_, data) in columns_data {
             output.put_slice(&data);
         }
-        
+
         // Write time index
         output.put_slice(&time_index_data);
-        
+
         // Write bloom filter
         output.put_slice(&bloom_data);
-        
+
+        // Calculate file checksum over everything before the footer
+        let mut file_hasher = Hasher::new();
+        file_hasher.update(&output);
+        let file_checksum = file_hasher.finalize();
+
+        // Create final footer with file checksum
+        let final_footer = SegmentFooter {
+            column_checksums: footer.column_checksums,
+            file_checksum,
+            compression_ratios: footer.compression_ratios,
+        };
+        let final_footer_data = bincode::serialize(&final_footer)?;
+
         // Write footer
-        output.put_slice(&footer_data);
+        output.put_slice(&final_footer_data);
 
-        // Header is already written correctly, no need to re-serialize
-
-        info!("Built optimized segment: {} records, {} bytes", 
-              sorted_records.len(), output.len());
+        info!("Built optimized segment: {} records, {} bytes, file_checksum=0x{:08x}",
+              sorted_records.len(), output.len(), file_checksum);
 
         Ok((header, output.freeze().to_vec()))
     }
@@ -311,15 +357,19 @@ impl OptimizedTansuSegment {
         match compression {
             CompressionType::None => Ok(data.to_vec()),
             CompressionType::Zstd => {
-                zstd_encode(data, 3).map_err(|e| anyhow!("Compression error: {}", e))
+                zstd_encode(data, 3).map_err(|e| anyhow!("Zstd compression error: {}", e))
             },
             CompressionType::Lz4 => {
-                // TODO: Implement LZ4 compression
-                Ok(data.to_vec())
+                let mut encoder = FrameEncoder::new(Vec::new());
+                encoder.write_all(data)
+                    .map_err(|e| anyhow!("LZ4 compression write error: {}", e))?;
+                encoder.finish()
+                    .map_err(|e| anyhow!("LZ4 compression finish error: {}", e))
             },
             CompressionType::Snappy => {
-                // TODO: Implement Snappy compression
-                Ok(data.to_vec())
+                let mut encoder = SnappyEncoder::new();
+                encoder.compress_vec(data)
+                    .map_err(|e| anyhow!("Snappy compression error: {}", e))
             },
         }
     }
@@ -547,15 +597,19 @@ impl OptimizedTansuSegment {
         match compression {
             CompressionType::None => Ok(data.to_vec()),
             CompressionType::Zstd => {
-                zstd_decode(data).map_err(|e| anyhow!("Decompression error: {}", e))
+                zstd_decode(data).map_err(|e| anyhow!("Zstd decompression error: {}", e))
             },
             CompressionType::Lz4 => {
-                // TODO: Implement LZ4 decompression
-                Ok(data.to_vec())
+                let mut decoder = FrameDecoder::new(data);
+                let mut decompressed = Vec::new();
+                decoder.read_to_end(&mut decompressed)
+                    .map_err(|e| anyhow!("LZ4 decompression error: {}", e))?;
+                Ok(decompressed)
             },
             CompressionType::Snappy => {
-                // TODO: Implement Snappy decompression
-                Ok(data.to_vec())
+                let mut decoder = SnappyDecoder::new();
+                decoder.decompress_vec(data)
+                    .map_err(|e| anyhow!("Snappy decompression error: {}", e))
             },
         }
     }
@@ -635,9 +689,9 @@ mod tests {
     #[test]
     fn test_compression_ratio() {
         let records = create_test_records();
-        
+
         // Build with compression
-        let (compressed_header, compressed_data) = 
+        let (compressed_header, compressed_data) =
             OptimizedTansuSegment::build(records.clone()).unwrap();
 
         // Build without compression (simulate)
@@ -647,8 +701,87 @@ mod tests {
 
         let compression_ratio = 1.0 - (compressed_data.len() as f64 / uncompressed_size as f64);
         println!("Compression ratio: {:.2}%", compression_ratio * 100.0);
-        
+
         // Should achieve reasonable compression
         assert!(compression_ratio > 0.3); // At least 30% compression
+    }
+
+    #[test]
+    fn test_lz4_compression_roundtrip() {
+        let test_data = b"Hello, this is test data for LZ4 compression!".repeat(100);
+
+        // Compress
+        let compressed = OptimizedTansuSegment::compress_data(&test_data, CompressionType::Lz4)
+            .expect("LZ4 compression should succeed");
+
+        // Decompress
+        let decompressed = OptimizedTansuSegment::decompress_data(&compressed, CompressionType::Lz4)
+            .expect("LZ4 decompression should succeed");
+
+        assert_eq!(test_data.to_vec(), decompressed);
+
+        // Verify compression actually happened (repeated data should compress well)
+        println!("LZ4: {} -> {} bytes ({:.1}% reduction)",
+            test_data.len(), compressed.len(),
+            (1.0 - compressed.len() as f64 / test_data.len() as f64) * 100.0);
+        assert!(compressed.len() < test_data.len(), "LZ4 should compress repeated data");
+    }
+
+    #[test]
+    fn test_snappy_compression_roundtrip() {
+        let test_data = b"Hello, this is test data for Snappy compression!".repeat(100);
+
+        // Compress
+        let compressed = OptimizedTansuSegment::compress_data(&test_data, CompressionType::Snappy)
+            .expect("Snappy compression should succeed");
+
+        // Decompress
+        let decompressed = OptimizedTansuSegment::decompress_data(&compressed, CompressionType::Snappy)
+            .expect("Snappy decompression should succeed");
+
+        assert_eq!(test_data.to_vec(), decompressed);
+
+        // Verify compression actually happened
+        println!("Snappy: {} -> {} bytes ({:.1}% reduction)",
+            test_data.len(), compressed.len(),
+            (1.0 - compressed.len() as f64 / test_data.len() as f64) * 100.0);
+        assert!(compressed.len() < test_data.len(), "Snappy should compress repeated data");
+    }
+
+    #[test]
+    fn test_zstd_compression_roundtrip() {
+        let test_data = b"Hello, this is test data for Zstd compression!".repeat(100);
+
+        // Compress
+        let compressed = OptimizedTansuSegment::compress_data(&test_data, CompressionType::Zstd)
+            .expect("Zstd compression should succeed");
+
+        // Decompress
+        let decompressed = OptimizedTansuSegment::decompress_data(&compressed, CompressionType::Zstd)
+            .expect("Zstd decompression should succeed");
+
+        assert_eq!(test_data.to_vec(), decompressed);
+
+        // Verify compression actually happened
+        println!("Zstd: {} -> {} bytes ({:.1}% reduction)",
+            test_data.len(), compressed.len(),
+            (1.0 - compressed.len() as f64 / test_data.len() as f64) * 100.0);
+        assert!(compressed.len() < test_data.len(), "Zstd should compress repeated data");
+    }
+
+    #[test]
+    fn test_no_compression_roundtrip() {
+        let test_data = b"Hello, this is test data for no compression!";
+
+        // "Compress" with no compression
+        let compressed = OptimizedTansuSegment::compress_data(test_data, CompressionType::None)
+            .expect("No compression should succeed");
+
+        // "Decompress" with no compression
+        let decompressed = OptimizedTansuSegment::decompress_data(&compressed, CompressionType::None)
+            .expect("No decompression should succeed");
+
+        assert_eq!(test_data.to_vec(), decompressed);
+        assert_eq!(compressed.len(), test_data.len(), "No compression should not change size");
     }
 }

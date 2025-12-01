@@ -102,6 +102,8 @@ impl KafkaEncodable for DeletableTopicResult {
 /// Error codes for DeleteTopics
 pub mod error_codes {
     pub const NONE: i16 = 0;
+    pub const UNKNOWN_SERVER_ERROR: i16 = -1;
+    pub const UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
     pub const REQUEST_TIMED_OUT: i16 = 7;
     pub const INVALID_TOPIC_EXCEPTION: i16 = 17;
     pub const TOPIC_AUTHORIZATION_FAILED: i16 = 29;

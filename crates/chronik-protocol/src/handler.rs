@@ -2849,19 +2849,79 @@ impl ProtocolHandler {
 
         tracing::info!("DeleteTopics request: {:?}", request);
 
-        // Build response - for now, return NOT_CONTROLLER error for all topics
-        // since we don't actually implement topic deletion yet
+        // Build response
         let mut responses = Vec::new();
-        for topic_name in &request.topic_names {
-            responses.push(DeletableTopicResult {
-                name: topic_name.clone(),
-                error_code: error_codes::NOT_CONTROLLER,
-                error_message: if header.api_version >= 5 {
-                    Some("Topic deletion not implemented".to_string())
-                } else {
-                    None
-                },
-            });
+
+        // Check if we have a metadata store
+        if let Some(ref metadata_store) = self.metadata_store {
+            for topic_name in &request.topic_names {
+                // Check if topic exists
+                match metadata_store.get_topic(topic_name).await {
+                    Ok(Some(_)) => {
+                        // Topic exists, delete it
+                        match metadata_store.delete_topic(topic_name).await {
+                            Ok(()) => {
+                                tracing::info!("🗑️ Successfully deleted topic '{}'", topic_name);
+                                responses.push(DeletableTopicResult {
+                                    name: topic_name.clone(),
+                                    error_code: error_codes::NONE,
+                                    error_message: None,
+                                });
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to delete topic '{}': {}", topic_name, e);
+                                responses.push(DeletableTopicResult {
+                                    name: topic_name.clone(),
+                                    error_code: error_codes::UNKNOWN_SERVER_ERROR,
+                                    error_message: if header.api_version >= 5 {
+                                        Some(format!("Delete failed: {}", e))
+                                    } else {
+                                        None
+                                    },
+                                });
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        // Topic doesn't exist
+                        tracing::warn!("DeleteTopics: topic '{}' not found", topic_name);
+                        responses.push(DeletableTopicResult {
+                            name: topic_name.clone(),
+                            error_code: error_codes::UNKNOWN_TOPIC_OR_PARTITION,
+                            error_message: if header.api_version >= 5 {
+                                Some(format!("Topic '{}' does not exist", topic_name))
+                            } else {
+                                None
+                            },
+                        });
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to get topic '{}': {}", topic_name, e);
+                        responses.push(DeletableTopicResult {
+                            name: topic_name.clone(),
+                            error_code: error_codes::UNKNOWN_SERVER_ERROR,
+                            error_message: if header.api_version >= 5 {
+                                Some(format!("Failed to check topic: {}", e))
+                            } else {
+                                None
+                            },
+                        });
+                    }
+                }
+            }
+        } else {
+            // No metadata store available
+            for topic_name in &request.topic_names {
+                responses.push(DeletableTopicResult {
+                    name: topic_name.clone(),
+                    error_code: error_codes::NOT_CONTROLLER,
+                    error_message: if header.api_version >= 5 {
+                        Some("No metadata store available".to_string())
+                    } else {
+                        None
+                    },
+                });
+            }
         }
 
         let response = DeleteTopicsResponse {
@@ -2920,6 +2980,9 @@ impl ProtocolHandler {
     }
 
     /// Handle AlterConfigs request
+    ///
+    /// AlterConfigs REPLACES the entire configuration for a resource with the provided configs.
+    /// (Unlike IncrementalAlterConfigs which modifies individual config entries)
     async fn handle_alter_configs(
         &self,
         header: RequestHeader,
@@ -2938,10 +3001,13 @@ impl ProtocolHandler {
 
         tracing::info!("AlterConfigs request: {:?}", request);
 
-        // Build response - return success for all resources
-        // We accept the configs but don't persist them (read-only for now)
+        // Build response
         let mut resources = Vec::new();
+
         for resource in &request.resources {
+            let mut error_code = error_codes::NONE;
+            let mut error_message: Option<String> = None;
+
             // Log the config changes requested
             tracing::info!("AlterConfigs for {} '{}': {} configs",
                 match resource.resource_type {
@@ -2953,9 +3019,110 @@ impl ProtocolHandler {
                 resource.configs.len()
             );
 
+            // Only apply changes if not validate_only
+            if !request.validate_only {
+                match resource.resource_type {
+                    2 => {
+                        // Topic configuration - resource_type 2
+                        if let Some(metadata_store) = &self.metadata_store {
+                            match metadata_store.get_topic(&resource.resource_name).await {
+                                Ok(Some(topic)) => {
+                                    // AlterConfigs REPLACES config, so start with a fresh config
+                                    // but preserve structural fields that shouldn't change via config
+                                    let mut new_config = chronik_common::metadata::TopicConfig {
+                                        partition_count: topic.config.partition_count,
+                                        replication_factor: topic.config.replication_factor,
+                                        retention_ms: None, // Will be set from configs if provided
+                                        segment_bytes: 1024 * 1024 * 1024, // Default 1GB, may be overridden
+                                        config: std::collections::HashMap::new(),
+                                    };
+
+                                    // Apply all provided configs
+                                    for cfg in &resource.configs {
+                                        if let Some(value) = &cfg.value {
+                                            match cfg.name.as_str() {
+                                                "retention.ms" => {
+                                                    match value.parse::<i64>() {
+                                                        Ok(ms) if ms >= -1 => {
+                                                            new_config.retention_ms = if ms == -1 { None } else { Some(ms) };
+                                                        }
+                                                        Ok(_) => {
+                                                            error_code = error_codes::INVALID_CONFIG;
+                                                            error_message = Some(format!("Invalid value for retention.ms: {}", value));
+                                                        }
+                                                        Err(_) => {
+                                                            error_code = error_codes::INVALID_CONFIG;
+                                                            error_message = Some(format!("Cannot parse retention.ms: {}", value));
+                                                        }
+                                                    }
+                                                }
+                                                "segment.bytes" => {
+                                                    match value.parse::<i64>() {
+                                                        Ok(bytes) if bytes > 0 => {
+                                                            new_config.segment_bytes = bytes;
+                                                        }
+                                                        Ok(_) => {
+                                                            error_code = error_codes::INVALID_CONFIG;
+                                                            error_message = Some(format!("segment.bytes must be positive: {}", value));
+                                                        }
+                                                        Err(_) => {
+                                                            error_code = error_codes::INVALID_CONFIG;
+                                                            error_message = Some(format!("Cannot parse segment.bytes: {}", value));
+                                                        }
+                                                    }
+                                                }
+                                                _ => {
+                                                    // Store in generic config map
+                                                    new_config.config.insert(cfg.name.clone(), value.clone());
+                                                }
+                                            }
+                                        }
+                                        // If value is None, the config is not set (removed)
+                                    }
+
+                                    // Persist if no validation errors
+                                    if error_code == error_codes::NONE {
+                                        match metadata_store.update_topic(&resource.resource_name, new_config).await {
+                                            Ok(_) => {
+                                                tracing::info!("✅ Successfully updated configuration for topic '{}'", resource.resource_name);
+                                            }
+                                            Err(e) => {
+                                                tracing::error!("Failed to persist topic config: {}", e);
+                                                error_code = error_codes::INVALID_REQUEST;
+                                                error_message = Some(format!("Failed to persist configuration: {}", e));
+                                            }
+                                        }
+                                    }
+                                }
+                                Ok(None) => {
+                                    error_code = error_codes::UNKNOWN_TOPIC_OR_PARTITION;
+                                    error_message = Some(format!("Topic '{}' does not exist", resource.resource_name));
+                                }
+                                Err(e) => {
+                                    tracing::error!("Failed to get topic metadata: {}", e);
+                                    error_code = error_codes::INVALID_REQUEST;
+                                    error_message = Some(format!("Failed to get topic metadata: {}", e));
+                                }
+                            }
+                        } else {
+                            tracing::warn!("No metadata store configured, configs not persisted");
+                        }
+                    }
+                    4 => {
+                        // Broker configuration - resource_type 4
+                        tracing::info!("Broker configuration updates accepted but not persisted (not implemented)");
+                        // Return success - broker configs are accepted but not persisted
+                    }
+                    _ => {
+                        error_code = error_codes::INVALID_REQUEST;
+                        error_message = Some(format!("Unsupported resource type: {}", resource.resource_type));
+                    }
+                }
+            }
+
             resources.push(AlterConfigsResourceResponse {
-                error_code: 0, // SUCCESS - pretend we applied the configs
-                error_message: None,
+                error_code,
+                error_message,
                 resource_type: resource.resource_type,
                 resource_name: resource.resource_name.clone(),
             });

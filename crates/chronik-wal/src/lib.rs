@@ -25,7 +25,6 @@ pub mod io_priority; // I/O priority control for WAL vs Tantivy
 pub mod io_uring_thread; // Dedicated io_uring thread (hybrid tokio + tokio-uring)
 
 // Future-ready modules
-pub mod replication;
 pub mod audit;
 pub mod streaming;
 

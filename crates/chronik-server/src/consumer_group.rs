@@ -737,6 +737,28 @@ impl GroupManager {
     
     /// Persist group state to metadata store
     async fn persist_group(&self, group: &ConsumerGroup) -> Result<()> {
+        // Convert group.members (HashMap<String, GroupMember>) to Vec<chronik_common::metadata::GroupMember>
+        let members: Vec<chronik_common::metadata::GroupMember> = group.members.iter()
+            .map(|(member_id, member)| {
+                // Serialize subscription as metadata (first protocol's metadata if available)
+                let metadata = member.protocols.first()
+                    .map(|(_, data)| data.clone())
+                    .unwrap_or_default();
+
+                // Serialize assignment to wire format
+                // Format: array of (topic, partitions) pairs
+                let assignment = Self::serialize_assignment(&member.assignment);
+
+                chronik_common::metadata::GroupMember {
+                    member_id: member_id.clone(),
+                    client_id: member.client_id.clone(),
+                    client_host: member.client_host.clone(),
+                    metadata,
+                    assignment,
+                }
+            })
+            .collect();
+
         let metadata = ConsumerGroupMetadata {
             group_id: group.group_id.clone(),
             state: group.state.as_str().to_string(),
@@ -745,16 +767,48 @@ impl GroupManager {
             generation_id: group.generation_id,
             leader_id: group.leader_id.clone(),
             leader: group.leader_id.clone().unwrap_or_default(),
-            members: Vec::new(), // TODO: convert group.members to metadata format
+            members,
             created_at: chrono::Utc::now(), // This should be preserved from initial creation
             updated_at: chrono::Utc::now(),
         };
-        
+
         // Distributed lock removed - using metadata store directly
         self.metadata_store.update_consumer_group(metadata).await
             .map_err(|e| Error::Storage(format!("Failed to persist group metadata: {}", e)))?;
-        
+
         Ok(())
+    }
+
+    /// Serialize assignment to wire format for persistence
+    ///
+    /// Format matches Kafka ConsumerGroupAssignment:
+    /// - Version (2 bytes): 0
+    /// - Assignment count (4 bytes)
+    /// - For each topic: topic name length + topic name + partition count + partition IDs
+    fn serialize_assignment(assignment: &HashMap<String, Vec<i32>>) -> Vec<u8> {
+        let mut buf = Vec::new();
+
+        // Version (short) - 0 for basic format
+        buf.extend_from_slice(&0i16.to_be_bytes());
+
+        // Assignment count (int)
+        buf.extend_from_slice(&(assignment.len() as i32).to_be_bytes());
+
+        for (topic, partitions) in assignment {
+            // Topic name (string: length + bytes)
+            buf.extend_from_slice(&(topic.len() as i16).to_be_bytes());
+            buf.extend_from_slice(topic.as_bytes());
+
+            // Partition count
+            buf.extend_from_slice(&(partitions.len() as i32).to_be_bytes());
+
+            // Partition IDs
+            for partition in partitions {
+                buf.extend_from_slice(&partition.to_be_bytes());
+            }
+        }
+
+        buf
     }
     
     /// Join a consumer group with KIP-848 support
@@ -1216,10 +1270,16 @@ impl GroupManager {
                 );
                 
                 for partition in 0..partition_count {
+                    // Get partition leader from metadata store
+                    let leader = self.metadata_store.get_partition_leader(topic, partition)
+                        .await
+                        .ok()
+                        .flatten();
+
                     partitions.push(PartitionInfo {
                         topic: topic.clone(),
                         partition: partition as i32,
-                        leader: None, // TODO: Get from partition assignments
+                        leader,
                     });
                 }
             } else {
@@ -1482,17 +1542,73 @@ impl GroupManager {
         drop(groups);
         
         // Fetch offsets from metadata store
-        // For now, return empty list since we need to implement batch consumer offset fetching
-        let offsets: Vec<TopicPartitionOffset> = Vec::new();
-        // TODO: Implement batch consumer offset fetching from metadata store
-        
-        // Convert to response format
-        Ok(offsets.into_iter().map(|o| TopicPartitionOffset {
-            topic: o.topic,
-            partition: o.partition as i32,
-            offset: o.offset,
-            metadata: o.metadata,
-        }).collect())
+        let mut offsets: Vec<TopicPartitionOffset> = Vec::new();
+
+        // Get list of topics to query
+        let topics_to_query: Vec<String> = match topics {
+            Some(t) => t,
+            None => {
+                // No topics specified - get all topics from metadata store
+                match self.metadata_store.list_topics().await {
+                    Ok(all_topics) => all_topics.into_iter().map(|t| t.name).collect(),
+                    Err(e) => {
+                        tracing::warn!("Failed to list topics for offset fetch: {}", e);
+                        return Ok(Vec::new());
+                    }
+                }
+            }
+        };
+
+        // For each topic, get partition count and fetch offsets
+        for topic in topics_to_query {
+            let partition_count = match self.metadata_store.get_topic(&topic).await {
+                Ok(Some(topic_meta)) => topic_meta.config.partition_count,
+                Ok(None) => {
+                    tracing::debug!("Topic {} not found, skipping", topic);
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to get topic {}: {}", topic, e);
+                    continue;
+                }
+            };
+
+            // Fetch offset for each partition
+            for partition in 0..partition_count {
+                match self.metadata_store.get_consumer_offset(&group_id, &topic, partition).await {
+                    Ok(Some(offset)) => {
+                        offsets.push(TopicPartitionOffset {
+                            topic: topic.clone(),
+                            partition: partition as i32,
+                            offset: offset.offset,
+                            metadata: offset.metadata,
+                        });
+                    }
+                    Ok(None) => {
+                        // No committed offset for this partition - this is normal
+                        // Return -1 to indicate no offset committed
+                        offsets.push(TopicPartitionOffset {
+                            topic: topic.clone(),
+                            partition: partition as i32,
+                            offset: -1,
+                            metadata: None,
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to get offset for {}/{}: {}", topic, partition, e);
+                        // Still include the partition with -1 offset
+                        offsets.push(TopicPartitionOffset {
+                            topic: topic.clone(),
+                            partition: partition as i32,
+                            offset: -1,
+                            metadata: None,
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok(offsets)
     }
     
     /// Start background task to check expired members

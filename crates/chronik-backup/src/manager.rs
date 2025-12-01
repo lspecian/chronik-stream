@@ -1,15 +1,16 @@
 //! Backup manager implementation
 
 use crate::{
-    BackupError, Result, BackupMetadata, MetadataBackup, CompressionType,
-    EncryptionConfig, compression, encryption,
+    encryption::{KeyManager, MemoryKeyManager},
+    BackupError, CompressionType, EncryptionConfig, MetadataBackup, Result,
+    compression, encryption, BackupMetadata,
 };
 use chronik_storage::object_store::ObjectStore;
-use std::sync::Arc;
 use chrono::Utc;
+use sha2::{Digest, Sha256};
+use std::sync::Arc;
 use tokio::sync::Semaphore;
-use tracing::{info, debug};
-use sha2::{Sha256, Digest};
+use tracing::{debug, info};
 
 /// Backup configuration
 #[derive(Debug, Clone)]
@@ -51,6 +52,8 @@ pub struct BackupManager {
     config: BackupConfig,
     /// Semaphore for limiting parallel operations
     semaphore: Arc<Semaphore>,
+    /// Key manager for encryption
+    key_manager: Arc<dyn KeyManager>,
 }
 
 impl BackupManager {
@@ -60,13 +63,29 @@ impl BackupManager {
         backup_store: Arc<dyn ObjectStore>,
         config: BackupConfig,
     ) -> Self {
+        Self::with_key_manager(
+            object_store,
+            backup_store,
+            config,
+            Arc::new(MemoryKeyManager::new()),
+        )
+    }
+
+    /// Create a new backup manager with a custom key manager
+    pub fn with_key_manager(
+        object_store: Arc<dyn ObjectStore>,
+        backup_store: Arc<dyn ObjectStore>,
+        config: BackupConfig,
+        key_manager: Arc<dyn KeyManager>,
+    ) -> Self {
         let semaphore = Arc::new(Semaphore::new(config.parallel_workers));
-        
+
         Self {
             object_store,
             backup_store,
             config,
             semaphore,
+            key_manager,
         }
     }
     
@@ -204,7 +223,7 @@ impl BackupManager {
         
         // Optionally encrypt
         let data = if let Some(encryption) = &self.config.encryption {
-            encryption::encrypt(&data, encryption)?
+            encryption::encrypt(&data, encryption, self.key_manager.as_ref())?
         } else {
             data
         };

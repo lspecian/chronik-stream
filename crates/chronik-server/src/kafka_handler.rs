@@ -351,7 +351,7 @@ impl KafkaProtocolHandler {
             .collect();
 
         if !topic_names.is_empty() {
-            tracing::info!("Produce request for topics: {:?}", topic_names);
+            tracing::trace!("Produce request for topics: {:?}", topic_names);
 
             // Check which topics don't exist and create them
             if let Err(e) = self.auto_create_topics(&topic_names).await {

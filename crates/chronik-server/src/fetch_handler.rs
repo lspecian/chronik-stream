@@ -440,7 +440,7 @@ impl FetchHandler {
 
                 let records = match fetch_result {
                     Ok(Ok(recs)) => {
-                        tracing::info!("Fetched {} records from {}-{}", recs.len(), topic, partition);
+                        tracing::trace!("Fetched {} records from {}-{}", recs.len(), topic, partition);
                         recs
                     },
                     Ok(Err(e)) => {
@@ -1341,7 +1341,7 @@ impl FetchHandler {
             // V1 records are skipped (legacy format from pre-v1.3.36)
         }
 
-        info!("WAL returned {} records starting from offset {} for {}-{}",
+        tracing::trace!("WAL returned {} records starting from offset {} for {}-{}",
             records.len(), fetch_offset, topic, partition);
 
         Ok(records)
@@ -2094,7 +2094,7 @@ impl FetchHandler {
         // Parse using the Segment format
         let segment = Segment::deserialize(segment_data)?;
         
-        tracing::info!("Segment v{}: raw_kafka_batches={} bytes, indexed_records={} bytes",
+        tracing::trace!("Segment v{}: raw_kafka_batches={} bytes, indexed_records={} bytes",
             segment.header.version, segment.raw_kafka_batches.len(), segment.indexed_records.len());
         
         // Check if this is a v2 segment with raw Kafka batches

@@ -42,7 +42,7 @@ impl RecordFilter {
             }
         }
 
-        tracing::info!("Returning {} records after filtering for offset range {}-{}",
+        tracing::trace!("Returning {} records after filtering for offset range {}-{}",
             filtered_records.len(), start_offset, end_offset);
 
         filtered_records

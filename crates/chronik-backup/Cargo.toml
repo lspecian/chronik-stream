@@ -51,6 +51,11 @@ rayon = "1.10"
 rand = "0.8"
 pbkdf2 = "0.12"
 argon2 = "0.5"
+aes-gcm = "0.10"
+chacha20poly1305 = "0.10"
+hmac = "0.12"
+aes = "0.8"
+ctr = "0.9"
 
 # Tracing
 tracing = { workspace = true }

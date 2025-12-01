@@ -1357,12 +1357,12 @@ impl ProduceHandler {
             .map(|t| (t.name.clone(), t.partitions.iter().map(|p| p.index).collect()))
             .collect();
 
-        // PARTITION_DEBUG: Log which partitions client is requesting
+        // PARTITION_DEBUG: Log which partitions client is requesting (trace level - hot path)
         for topic in &request.topics {
-            info!("PARTITION_DEBUG: PRODUCE topic={} partition_count={}",
+            tracing::trace!("PARTITION_DEBUG: PRODUCE topic={} partition_count={}",
                 topic.name, topic.partitions.len());
             for partition_data in &topic.partitions {
-                info!("PARTITION_DEBUG:   partition={} records_bytes={}",
+                tracing::trace!("PARTITION_DEBUG:   partition={} records_bytes={}",
                     partition_data.index, partition_data.records.len());
             }
         }
@@ -2686,7 +2686,7 @@ impl ProduceHandler {
             let high_watermark = partition_state.high_watermark.load(Ordering::Relaxed) as i64;
             let record_count = records.len() as i32;
 
-            tracing::info!("PRODUCE→BUFFER: Storing raw batch for {}-{}, base_offset={}, last_offset={}, record_count={}, high_watermark={}",
+            tracing::trace!("PRODUCE→BUFFER: Storing raw batch for {}-{}, base_offset={}, last_offset={}, record_count={}, high_watermark={}",
                 topic, partition, base_offset, last_offset, record_count, high_watermark);
 
             if let Err(e) = fetch_handler.update_buffer_with_raw_batch(
@@ -2700,7 +2700,7 @@ impl ProduceHandler {
             ).await {
                 warn!("Failed to update fetch handler buffer: {:?}", e);
             } else {
-                tracing::info!("PRODUCE→BUFFER: Successfully stored raw batch for {}-{}", topic, partition);
+                tracing::trace!("PRODUCE→BUFFER: Successfully stored raw batch for {}-{}", topic, partition);
             }
         }
 

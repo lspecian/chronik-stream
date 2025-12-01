@@ -23,7 +23,6 @@ mod storage;
 mod consumer_group;
 mod fetch_handler;
 mod fetch;  // Phase 2.2: Extracted fetch modules
-mod handler;
 mod offset_storage;
 mod coordinator_manager;
 mod wal_integration;

@@ -4,6 +4,7 @@ use std::io::Read;
 use bytes::{Bytes, BytesMut, BufMut};
 use chronik_common::types::SegmentMetadata;
 use chronik_common::{Result, Error};
+use crc32fast::Hasher;
 use serde::{Deserialize, Serialize};
 
 /// Magic bytes for segment file format
@@ -34,6 +35,7 @@ pub struct SegmentHeader {
 }
 
 /// A Chronik Stream segment combining Kafka data with search index.
+#[derive(Debug)]
 pub struct Segment {
     pub header: SegmentHeader,
     pub metadata: SegmentMetadata,
@@ -55,13 +57,56 @@ pub struct SegmentBuilder {
 }
 
 impl Segment {
+    /// Calculate CRC32 checksum of segment data (excluding the checksum field itself).
+    ///
+    /// The checksum covers:
+    /// - Header fields: magic, version, metadata_size, raw_kafka_size, indexed_data_size, index_size
+    /// - Metadata bytes
+    /// - Raw Kafka batch data
+    /// - Indexed records data
+    /// - Index data
+    fn calculate_checksum(
+        metadata_bytes: &[u8],
+        raw_kafka_batches: &[u8],
+        indexed_records: &[u8],
+        index_data: &[u8],
+        header: &SegmentHeader,
+    ) -> u32 {
+        let mut hasher = Hasher::new();
+
+        // Hash header fields (excluding checksum)
+        hasher.update(&header.magic);
+        hasher.update(&header.version.to_be_bytes());
+        hasher.update(&(metadata_bytes.len() as u32).to_be_bytes());
+        hasher.update(&(raw_kafka_batches.len() as u64).to_be_bytes());
+        hasher.update(&(indexed_records.len() as u64).to_be_bytes());
+        hasher.update(&(index_data.len() as u64).to_be_bytes());
+
+        // Hash data sections
+        hasher.update(metadata_bytes);
+        hasher.update(raw_kafka_batches);
+        hasher.update(indexed_records);
+        hasher.update(index_data);
+
+        hasher.finalize()
+    }
+
     /// Serialize the segment to bytes for storage
     pub fn serialize(&self) -> Result<Bytes> {
         let mut buf = BytesMut::new();
-        
+
         // Serialize metadata first to get its size
         let metadata_bytes = serde_json::to_vec(&self.metadata)?;
-        
+
+        // Calculate checksum over all data
+        let checksum = Self::calculate_checksum(
+            &metadata_bytes,
+            &self.raw_kafka_batches,
+            &self.indexed_records,
+            &self.index_data,
+            &self.header,
+        );
+
         // Write header
         buf.put_slice(&self.header.magic);
         buf.put_u16(self.header.version);
@@ -69,20 +114,20 @@ impl Segment {
         buf.put_u64(self.raw_kafka_batches.len() as u64);
         buf.put_u64(self.indexed_records.len() as u64);
         buf.put_u64(self.index_data.len() as u64);
-        buf.put_u32(self.header.checksum);
-        
+        buf.put_u32(checksum);
+
         // Write metadata
         buf.put_slice(&metadata_bytes);
-        
+
         // Write raw Kafka batches
         buf.put_slice(&self.raw_kafka_batches);
-        
+
         // Write indexed records
         buf.put_slice(&self.indexed_records);
-        
+
         // Write index data
         buf.put_slice(&self.index_data);
-        
+
         Ok(buf.freeze())
     }
     
@@ -197,7 +242,26 @@ impl Segment {
             
             (raw_kafka_batches, indexed_records, index_data)
         };
-        
+
+        // Verify checksum for v2+ segments (v1 segments didn't have proper checksums)
+        if version >= 2 && checksum != 0 {
+            let metadata_bytes = &data[metadata_start..metadata_end];
+            let expected_checksum = Self::calculate_checksum(
+                metadata_bytes,
+                &raw_kafka_batches,
+                &indexed_records,
+                &index_data,
+                &header,
+            );
+
+            if checksum != expected_checksum {
+                return Err(Error::InvalidSegment(format!(
+                    "Checksum mismatch: expected 0x{:08x}, got 0x{:08x}",
+                    expected_checksum, checksum
+                )));
+            }
+        }
+
         Ok(Segment {
             header,
             metadata,
@@ -268,23 +332,30 @@ impl SegmentBuilder {
     pub fn build(self) -> Result<Segment> {
         let metadata = self.metadata
             .ok_or_else(|| Error::InvalidSegment("Metadata not set".into()))?;
-        
+
+        let raw_kafka_batches = self.raw_kafka_batches.freeze();
+        let indexed_records = self.indexed_records.freeze();
+        let index_data = self.index_data.freeze();
+
+        // Pre-calculate metadata size for checksum
+        let metadata_bytes = serde_json::to_vec(&metadata)?;
+
         let header = SegmentHeader {
             magic: *b"CHRN",
             version: SEGMENT_VERSION,
-            metadata_size: 0, // Will be calculated during serialization
-            raw_kafka_size: self.raw_kafka_batches.len() as u64,
-            indexed_data_size: self.indexed_records.len() as u64,
-            index_size: self.index_data.len() as u64,
-            checksum: 0, // TODO: Calculate CRC32
+            metadata_size: metadata_bytes.len() as u32,
+            raw_kafka_size: raw_kafka_batches.len() as u64,
+            indexed_data_size: indexed_records.len() as u64,
+            index_size: index_data.len() as u64,
+            checksum: 0, // Placeholder - actual checksum calculated during serialize()
         };
-        
+
         Ok(Segment {
             header,
             metadata,
-            raw_kafka_batches: self.raw_kafka_batches.freeze(),
-            indexed_records: self.indexed_records.freeze(),
-            index_data: self.index_data.freeze(),
+            raw_kafka_batches,
+            indexed_records,
+            index_data,
         })
     }
 }
@@ -293,7 +364,7 @@ impl SegmentBuilder {
 mod tests {
     use super::*;
     use chronik_common::types::{SegmentId, TopicPartition};
-    
+
     #[test]
     fn test_header_serialization() {
         let header = SegmentHeader {
@@ -305,7 +376,7 @@ mod tests {
             index_size: 500,
             checksum: 0,
         };
-        
+
         let mut buf = BytesMut::new();
         buf.put_slice(&header.magic);
         buf.put_u16(header.version);
@@ -314,9 +385,90 @@ mod tests {
         buf.put_u64(header.indexed_data_size);
         buf.put_u64(header.index_size);
         buf.put_u32(header.checksum);
-        
+
         let data = buf.freeze();
         assert_eq!(data.len(), 38); // 4 + 2 + 4 + 8 + 8 + 8 + 4
         assert_eq!(&data[0..4], b"CHRN");
+    }
+
+    #[test]
+    fn test_segment_checksum_roundtrip() {
+        // Create a segment with test data
+        let metadata = SegmentMetadata {
+            id: SegmentId::new(),
+            topic_partition: TopicPartition {
+                topic: "test-topic".to_string(),
+                partition: 0,
+            },
+            base_offset: 0,
+            last_offset: 99,
+            timestamp_min: 1000,
+            timestamp_max: 1999,
+            record_count: 100,
+            size_bytes: 5000,
+            object_key: "segments/test-topic/partition-00000/segment.chrn".to_string(),
+            created_at: chrono::Utc::now(),
+        };
+
+        let mut builder = SegmentBuilder::new();
+        builder = builder.with_metadata(metadata);
+        builder.add_raw_kafka_batch(b"test kafka batch data");
+        builder.add_indexed_record(b"test indexed record");
+        builder.add_index_data(b"test index data");
+
+        let segment = builder.build().unwrap();
+
+        // Serialize and deserialize
+        let serialized = segment.serialize().unwrap();
+        let deserialized = Segment::deserialize(serialized).unwrap();
+
+        // Verify data integrity
+        assert_eq!(deserialized.metadata.topic_partition.topic, "test-topic");
+        assert_eq!(&deserialized.raw_kafka_batches[..], b"test kafka batch data");
+        // indexed_record has length prefix in v3
+        assert_eq!(&deserialized.indexed_records[4..], b"test indexed record");
+        assert_eq!(&deserialized.index_data[..], b"test index data");
+
+        // Verify checksum is non-zero
+        assert_ne!(deserialized.header.checksum, 0);
+    }
+
+    #[test]
+    fn test_segment_checksum_corruption_detection() {
+        // Create a segment
+        let metadata = SegmentMetadata {
+            id: SegmentId::new(),
+            topic_partition: TopicPartition {
+                topic: "test-topic".to_string(),
+                partition: 0,
+            },
+            base_offset: 0,
+            last_offset: 99,
+            timestamp_min: 1000,
+            timestamp_max: 1999,
+            record_count: 100,
+            size_bytes: 5000,
+            object_key: "segments/test-topic/partition-00000/segment.chrn".to_string(),
+            created_at: chrono::Utc::now(),
+        };
+
+        let mut builder = SegmentBuilder::new();
+        builder = builder.with_metadata(metadata);
+        builder.add_raw_kafka_batch(b"test kafka batch data with some extra content for testing");
+
+        let segment = builder.build().unwrap();
+        let mut serialized = segment.serialize().unwrap().to_vec();
+
+        // Corrupt a byte in the raw_kafka_batches section (near the end of the file)
+        // The data section starts after header (38 bytes) + metadata JSON
+        // Let's corrupt near the end where the data definitely is
+        let corruption_index = serialized.len() - 10;
+        serialized[corruption_index] ^= 0xFF;
+
+        // Deserialize should fail with checksum mismatch
+        let result = Segment::deserialize(Bytes::from(serialized));
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Checksum mismatch"), "Expected checksum mismatch error, got: {}", err_msg);
     }
 }

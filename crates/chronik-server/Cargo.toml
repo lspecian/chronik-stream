@@ -19,7 +19,6 @@ chronik-storage = { path = "../chronik-storage" }
 chronik-wal = { path = "../chronik-wal" }
 # chronik-ingest removed - code moved directly into chronik-server
 chronik-monitoring = { path = "../chronik-monitoring" }
-chronik-auth = { path = "../chronik-auth" }
 chronik-config = { path = "../chronik-config" }  # Required for cluster configuration
 
 # Optional components (feature-gated)
