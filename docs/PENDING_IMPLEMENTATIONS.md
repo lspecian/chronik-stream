@@ -2,14 +2,14 @@
 
 This document catalogs all TODOs, stubs, and incomplete implementations in the Chronik Stream codebase. Items are categorized by priority and include implementation requirements.
 
-**Last Updated**: 2025-11-30
-**Version**: v2.2.20
+**Last Updated**: 2025-12-01
+**Version**: v2.2.18
 
 ---
 
 ## Completion Status
 
-### ✅ Phase 0: Dead Code Cleanup - COMPLETE
+### ✅ Phase 0: Dead Code Cleanup - COMPLETE (v2.2.17)
 - Removed ~10,405 lines of dead code across 22 files + 1 crate
 - See commit: "Major codebase cleanup: remove obsolete files and update docs"
 
@@ -27,7 +27,13 @@ This document catalogs all TODOs, stubs, and incomplete implementations in the C
   - File checksum over all content before footer
   - Compression ratio tracking
 
-### ✅ Phase 2: Security - COMPLETE (v2.2.19)
+### ✅ Phase 1b: Hot-Path Logging Fix - COMPLETE (v2.2.18)
+- **Performance Fix**: Changed INFO logs to TRACE in hot paths
+  - +168% throughput improvement (146K → 391K msg/s)
+  - 99% lower p99 latency (46ms → 0.5ms)
+- **Files Fixed**: kafka_handler.rs, produce_handler.rs, fetch_handler.rs, segment_reader.rs, record_filter.rs
+
+### ✅ Phase 2: Security - COMPLETE (v2.2.18)
 - **Backup Encryption**: Implemented in `chronik-backup/src/encryption.rs`
   - AES-256-GCM: AEAD encryption with authentication tag
   - ChaCha20-Poly1305: Alternative AEAD cipher
@@ -38,7 +44,7 @@ This document catalogs all TODOs, stubs, and incomplete implementations in the C
   - AAD (Additional Authenticated Data) support
   - 14 comprehensive tests for all encryption modes
 
-### ✅ Phase 3: Topic Deletion - COMPLETE (v2.2.20)
+### ✅ Phase 3: Topic Deletion - COMPLETE (v2.2.18)
 - **Topic Deletion**: Implemented full Kafka-compatible topic deletion
   - `delete_topic()` in `WalMetadataStore` cleans up all associated data:
     - Topic metadata removal
@@ -51,7 +57,7 @@ This document catalogs all TODOs, stubs, and incomplete implementations in the C
   - `TopicDeleted` event published to event bus for cluster replication
   - Tested with Python kafka-python client
 
-### ✅ Phase 3b: API Completeness - COMPLETE (v2.2.21)
+### ✅ Phase 3b: API Completeness - COMPLETE (v2.2.18)
 - **Configuration Updates (AlterConfigs/IncrementalAlterConfigs)**:
   - `handle_alter_configs()` now persists config changes to metadata store
   - Applies retention.ms, segment.bytes, and custom configs

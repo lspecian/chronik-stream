@@ -2,8 +2,8 @@
 
 This document provides detailed implementation plans for all pending features in Chronik Stream.
 
-**Current Version**: v2.2.21
-**Last Updated**: 2025-11-30
+**Current Version**: v2.2.18
+**Last Updated**: 2025-12-01
 
 ---
 
@@ -11,11 +11,12 @@ This document provides detailed implementation plans for all pending features in
 
 | Phase | Description | Version | Status |
 |-------|-------------|---------|--------|
-| Phase 0 | Dead Code Cleanup (~10,405 lines) | - | ✅ Complete |
+| Phase 0 | Dead Code Cleanup (~10,405 lines) | v2.2.17 | ✅ Complete |
 | Phase 1 | Data Integrity (CRC32, LZ4/Snappy) | v2.2.18 | ✅ Complete |
-| Phase 2 | Security (Backup Encryption) | v2.2.19 | ✅ Complete |
-| Phase 3 | Topic Deletion | v2.2.20 | ✅ Complete |
-| Phase 3b | API Completeness (AlterConfigs, Consumer Groups) | v2.2.21 | ✅ Complete |
+| Phase 1b | Hot-Path Logging Fix (+168% throughput) | v2.2.18 | ✅ Complete |
+| Phase 2 | Security (Backup Encryption) | v2.2.18 | ✅ Complete |
+| Phase 3 | Topic Deletion | v2.2.18 | ✅ Complete |
+| Phase 3b | API Completeness (AlterConfigs, Consumer Groups) | v2.2.18 | ✅ Complete |
 
 ---
 
