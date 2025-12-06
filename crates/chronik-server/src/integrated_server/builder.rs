@@ -68,6 +68,7 @@ pub struct IntegratedKafkaServerBuilder {
     wal_produce_handler: Option<Arc<WalProduceHandler>>,
     fetch_handler: Option<Arc<FetchHandler>>,
     isr_ack_tracker: Option<Arc<crate::isr_ack_tracker::IsrAckTracker>>,
+    isr_tracker: Option<Arc<crate::isr_tracker::IsrTracker>>,
     response_pipeline: Option<Arc<crate::response_pipeline::ResponsePipeline>>,
     kafka_handler: Option<Arc<KafkaProtocolHandler>>,
     wal_indexer: Option<Arc<WalIndexer>>,
@@ -102,6 +103,7 @@ impl IntegratedKafkaServerBuilder {
             wal_produce_handler: None,
             fetch_handler: None,
             isr_ack_tracker: None,
+            isr_tracker: None,
             response_pipeline: None,
             kafka_handler: None,
             wal_indexer: None,
@@ -514,14 +516,15 @@ impl IntegratedKafkaServerBuilder {
             wal_manager.clone(),
         ).await?;
 
-        // Step 3: Wire event bus and ISR tracker
+        // Step 3: Wire event bus and ISR trackers
         produce_handler_inner.set_event_bus(metadata_event_bus.clone());
         let isr_ack_tracker = crate::isr_ack_tracker::IsrAckTracker::new();
+        let isr_tracker = Arc::new(crate::isr_tracker::IsrTracker::default());
         produce_handler_inner.set_isr_ack_tracker(isr_ack_tracker.clone());
-        info!("✅ EventBus and IsrAckTracker wired");
+        info!("✅ EventBus, IsrAckTracker, and IsrTracker wired");
 
         // Step 4: Wire Raft dependencies (cluster mode only)
-        let leader_elector = self.wire_raft_dependencies(&mut produce_handler_inner, &isr_ack_tracker, metadata_store);
+        let leader_elector = self.wire_raft_dependencies(&mut produce_handler_inner, &isr_ack_tracker, &isr_tracker, metadata_store);
 
         // Step 5: Setup response pipeline with WAL callback
         let response_pipeline = self.setup_response_pipeline(&mut produce_handler_inner, wal_manager);
@@ -533,6 +536,7 @@ impl IntegratedKafkaServerBuilder {
         self.produce_handler_base = Some(produce_handler_base);
         self.wal_produce_handler = Some(wal_handler);
         self.isr_ack_tracker = Some(isr_ack_tracker);
+        self.isr_tracker = Some(isr_tracker);
         self.response_pipeline = Some(response_pipeline);
         self.leader_elector = leader_elector;
 
@@ -579,6 +583,7 @@ impl IntegratedKafkaServerBuilder {
         &self,
         produce_handler: &mut crate::produce_handler::ProduceHandler,
         isr_ack_tracker: &Arc<crate::isr_ack_tracker::IsrAckTracker>,
+        isr_tracker: &Arc<crate::isr_tracker::IsrTracker>,
         metadata_store: &Arc<dyn MetadataStore>,
     ) -> Option<Arc<crate::leader_election::LeaderElector>> {
         let raft_cluster = match self.raft_cluster_for_metadata.as_ref() {
@@ -604,7 +609,7 @@ impl IntegratedKafkaServerBuilder {
         let data_wal_repl_manager = crate::wal_replication::WalReplicationManager::new_with_dependencies(
             Vec::new(),
             Some(raft_cluster.clone()),
-            None,
+            Some(isr_tracker.clone()),
             Some(isr_ack_tracker.clone()),
             self.config.cluster_config.clone().map(Arc::new),
             Some(metadata_store.clone()),
@@ -1118,6 +1123,7 @@ impl IntegratedKafkaServerBuilder {
         let wal_indexer = self.wal_indexer.unwrap();
         let metadata_uploader = self.metadata_uploader;
         let leader_elector = self.leader_elector;
+        let isr_tracker = self.isr_tracker;
 
         let server = IntegratedKafkaServer::new_from_components(
             self.config,
@@ -1126,6 +1132,7 @@ impl IntegratedKafkaServerBuilder {
             wal_indexer,
             metadata_uploader,
             leader_elector,
+            isr_tracker,
         );
 
         info!("🎉 IntegratedKafkaServer build complete!");

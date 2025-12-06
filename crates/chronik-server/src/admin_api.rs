@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
+use crate::isr_tracker::IsrTracker;
 use crate::raft_cluster::RaftCluster;
 use chronik_common::metadata::traits::MetadataStore;
 
@@ -36,6 +37,8 @@ pub struct AdminApiState {
     pub raft_cluster: Arc<RaftCluster>,
     pub metadata_store: Arc<dyn MetadataStore>,
     pub api_key: Option<String>,
+    /// v2.2.22: ISR tracker for accurate in-sync replica queries
+    pub isr_tracker: Option<Arc<IsrTracker>>,
 }
 
 /// Request to add a new node to the cluster
@@ -314,7 +317,11 @@ async fn handle_status(
     }).collect();
 
     // Get all partition assignments from metadata store (not Raft - v2.2.13 fix)
-    let partitions = match collect_partition_info_from_metadata(state.metadata_store.clone()).await {
+    // v2.2.22: Pass isr_tracker for accurate ISR queries
+    let partitions = match collect_partition_info_from_metadata(
+        state.metadata_store.clone(),
+        state.isr_tracker.clone(),
+    ).await {
         Ok(parts) => parts,
         Err(e) => {
             warn!("Failed to collect partition info from metadata store: {:?}", e);
@@ -439,8 +446,11 @@ async fn handle_rebalance(
 ///
 /// Queries metadata store for all topics and their partition assignments,
 /// converting them to PartitionInfo format for the admin API.
+///
+/// v2.2.22: Uses IsrTracker (if available) for accurate ISR queries
 async fn collect_partition_info_from_metadata(
     metadata_store: Arc<dyn MetadataStore>,
+    isr_tracker: Option<Arc<IsrTracker>>,
 ) -> Result<Vec<PartitionInfo>> {
     let mut all_partitions = Vec::new();
 
@@ -453,18 +463,48 @@ async fn collect_partition_info_from_metadata(
         match metadata_store.get_partition_assignments(&topic_meta.name).await {
             Ok(assignments) => {
                 for assignment in assignments {
+                    // v2.2.22: Use IsrTracker for accurate ISR if available
+                    let isr = if let Some(ref tracker) = isr_tracker {
+                        // Get leader high watermark for ISR calculation
+                        let leader_offset = metadata_store
+                            .get_partition_offset(&assignment.topic, assignment.partition)
+                            .await
+                            .ok()
+                            .flatten()
+                            .map(|(hw, _)| hw)  // Extract high watermark from (hw, log_start_offset) tuple
+                            .unwrap_or(0);
+
+                        // Get ISR from tracker - includes replicas that have caught up
+                        let tracked_isr = tracker.get_isr(
+                            &assignment.topic,
+                            assignment.partition as i32,
+                            leader_offset,
+                            &assignment.replicas,
+                        );
+
+                        // If tracker has data, use it; otherwise fall back to all replicas
+                        // (on cluster startup before any ACKs, ISR = replicas is correct)
+                        if tracked_isr.is_empty() {
+                            assignment.replicas.clone()
+                        } else {
+                            // Always include leader in ISR (leader is always in-sync with itself)
+                            let mut isr_with_leader = tracked_isr;
+                            if !isr_with_leader.contains(&assignment.leader_id) {
+                                isr_with_leader.insert(0, assignment.leader_id);
+                            }
+                            isr_with_leader
+                        }
+                    } else {
+                        // No tracker available - fall back to ISR = replicas
+                        assignment.replicas.clone()
+                    };
+
                     all_partitions.push(PartitionInfo {
                         topic: assignment.topic.clone(),
                         partition: assignment.partition as i32,
                         leader: Some(assignment.leader_id),
                         replicas: assignment.replicas.clone(),
-                        // NOTE: ISR tracking requires a heartbeat protocol where followers
-                        // report their log end offsets to the leader. The IsrTracker module
-                        // exists but isn't wired up because followers don't currently report
-                        // offsets back. For now, ISR = replicas (all replicas assumed in-sync).
-                        // This is acceptable for most use cases where cluster health is good.
-                        // See docs/KNOWN_ISSUES.md for full details.
-                        isr: assignment.replicas.clone(),
+                        isr,
                     });
                 }
             }
@@ -541,11 +581,17 @@ pub fn create_admin_router(state: AdminApiState) -> Router {
 /// - `CHRONIK_ADMIN_TLS_KEY` - Path to TLS private key file (PEM format)
 ///
 /// Both must be set to enable TLS. If only one is set, TLS is disabled with a warning.
+///
+/// # ISR Tracker (v2.2.22)
+///
+/// Optional ISR tracker for accurate in-sync replica queries. If provided,
+/// the cluster status endpoint will show actual ISR based on follower acknowledgements.
 pub async fn start_admin_api(
     raft_cluster: Arc<RaftCluster>,
     metadata_store: Arc<dyn MetadataStore>,
     port: u16,
     api_key: Option<String>,
+    isr_tracker: Option<Arc<IsrTracker>>,
 ) -> Result<()> {
     let effective_key = match api_key.or_else(|| std::env::var("CHRONIK_ADMIN_API_KEY").ok()) {
         Some(key) => {
@@ -563,6 +609,7 @@ pub async fn start_admin_api(
         raft_cluster,
         metadata_store,
         api_key: effective_key,
+        isr_tracker,
     };
 
     let app = create_admin_router(state);

@@ -635,11 +635,14 @@ async fn run_cluster_mode(
     ).await?;
 
     // Phase 9: Start Admin API
+    // v2.2.22: ISR tracker for accurate in-sync replica queries
+    // The IsrTracker is updated when followers send WAL ACKs back to the leader
     start_admin_api(
         raft_cluster.clone(),
         server.metadata_store().clone(),
         init_config.node_id,
-        &bind
+        &bind,
+        server.isr_tracker(),  // v2.2.22: Wire up ISR tracker from builder
     ).await?;
 
     // Phase 10: Start Partition Rebalancer

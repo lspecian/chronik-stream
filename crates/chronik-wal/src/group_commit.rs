@@ -1281,6 +1281,20 @@ impl GroupCommitWal {
         info!("Group commit WAL shutdown complete");
     }
 
+    /// Get current segment state for a topic/partition (for checkpointing)
+    ///
+    /// Returns (segment_id, position) where:
+    /// - segment_id: Current WAL segment number
+    /// - position: Current byte position within the segment (unflushed buffer size)
+    pub fn get_segment_state(&self, topic: &str, partition: i32) -> Option<(u64, u64)> {
+        self.partition_queues.get(&(topic.to_string(), partition))
+            .map(|queue| {
+                let segment_id = queue.segment_id.load(std::sync::atomic::Ordering::Relaxed);
+                let position = queue.segment_size_bytes.load(std::sync::atomic::Ordering::Relaxed);
+                (segment_id, position)
+            })
+    }
+
     /// Get the base directory for WAL files
     pub fn base_dir(&self) -> &Path {
         &self.base_dir

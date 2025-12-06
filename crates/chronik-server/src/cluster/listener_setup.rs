@@ -86,11 +86,14 @@ pub async fn start_search_api(
 ///
 /// Starts the admin REST API for cluster management operations.
 /// Complexity: < 10 (simple API server startup)
+///
+/// v2.2.22: Added isr_tracker parameter for accurate ISR queries
 pub async fn start_admin_api(
     raft_cluster: Arc<RaftCluster>,
     metadata_store: Arc<dyn chronik_common::metadata::traits::MetadataStore>,
     node_id: u64,
     bind: &str,
+    isr_tracker: Option<Arc<crate::isr_tracker::IsrTracker>>,
 ) -> Result<()> {
     use crate::admin_api;
 
@@ -98,7 +101,7 @@ pub async fn start_admin_api(
     info!("Starting Admin API on port {}", admin_port);
 
     let admin_api_key = std::env::var("CHRONIK_ADMIN_API_KEY").ok();
-    admin_api::start_admin_api(raft_cluster, metadata_store, admin_port, admin_api_key).await?;
+    admin_api::start_admin_api(raft_cluster, metadata_store, admin_port, admin_api_key, isr_tracker).await?;
 
     info!("✓ Admin API available at http://{}:{}/admin", bind, admin_port);
     Ok(())

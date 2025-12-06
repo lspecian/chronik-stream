@@ -1844,7 +1844,7 @@ impl GroupManager {
                 };
 
                 // Commit to metadata store
-                info!("DEBUG: Committing offset for group={} topic={} partition={} offset={}",
+                debug!("Committing offset for group={} topic={} partition={} offset={}",
                       request.group_id, topic.name, partition.partition_index, partition.committed_offset);
 
                 if let Err(e) = self.metadata_store.commit_offset(consumer_offset).await {
@@ -1919,7 +1919,7 @@ impl GroupManager {
 
                 // Fetch offset for each requested partition
                 for partition_id in partitions {
-                    info!("DEBUG: Fetching offset for group={} topic={} partition={}",
+                    debug!("Fetching offset for group={} topic={} partition={}",
                           request.group_id, topic_request.name, partition_id);
 
                     match self.metadata_store.get_consumer_offset(&request.group_id, &topic_request.name, partition_id as u32).await {

@@ -742,12 +742,14 @@ impl WalReplicationManager {
                             let (read_half, write_half) = stream.into_split();
 
                             // Spawn ACK reader task for this follower (v2.2.7 Phase 4)
+                            // v2.2.22: Also pass isr_tracker for admin API ISR queries
                             if let Some(ref ack_tracker) = self.isr_ack_tracker {
                                 let tracker = Arc::clone(ack_tracker);
+                                let isr_tracker_clone = self.isr_tracker.clone();
                                 let shutdown = Arc::clone(&self.shutdown);
                                 let addr = follower_addr.clone();
                                 tokio::spawn(async move {
-                                    if let Err(e) = Self::run_ack_reader(read_half, tracker, shutdown, addr.clone()).await {
+                                    if let Err(e) = Self::run_ack_reader(read_half, tracker, isr_tracker_clone, shutdown, addr.clone()).await {
                                         error!("ACK reader for {} failed: {}", addr, e);
                                     }
                                 });
@@ -806,9 +808,12 @@ impl WalReplicationManager {
     ///
     /// This is the CRITICAL missing piece that completes acks=-1 support.
     /// Followers send ACKs after successful WAL writes, and this task reads them.
+    ///
+    /// v2.2.22: Also updates IsrTracker for admin API ISR queries
     async fn run_ack_reader(
         mut read_half: OwnedReadHalf,
         isr_ack_tracker: Arc<IsrAckTracker>,
+        isr_tracker: Option<Arc<IsrTracker>>,
         shutdown: Arc<AtomicBool>,
         follower_addr: String,
     ) -> Result<()> {
@@ -915,6 +920,22 @@ impl WalReplicationManager {
                             ack_msg.offset,
                             ack_msg.node_id,
                         );
+
+                        // v2.2.22: Also update IsrTracker for admin API ISR queries
+                        // This tracks the last acknowledged offset from each follower
+                        if let Some(ref tracker) = isr_tracker {
+                            tracker.update_follower_offset(
+                                ack_msg.node_id,
+                                &ack_msg.topic,
+                                ack_msg.partition,
+                                ack_msg.offset,
+                            );
+                            debug!(
+                                "ISR tracker updated: node {} acknowledged {}-{} offset {}",
+                                ack_msg.node_id, ack_msg.topic, ack_msg.partition, ack_msg.offset
+                            );
+                        }
+
                         info!(
                             "✅ ACK recorded in tracker: {}-{} offset {} node {}",
                             ack_msg.topic, ack_msg.partition, ack_msg.offset, ack_msg.node_id
@@ -1428,12 +1449,14 @@ impl WalReplicationManager {
                     let (read_half, write_half) = stream.into_split();
 
                     // Spawn ACK reader task if ISR ACK tracker is available
+                    // v2.2.22: Also pass isr_tracker for admin API ISR queries
                     if let Some(ref ack_tracker) = self.isr_ack_tracker {
                         let tracker = Arc::clone(ack_tracker);
+                        let isr_tracker_clone = self.isr_tracker.clone();
                         let shutdown = Arc::clone(&self.shutdown);
                         let addr = follower_addr.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = Self::run_ack_reader(read_half, tracker, shutdown, addr.clone()).await {
+                            if let Err(e) = Self::run_ack_reader(read_half, tracker, isr_tracker_clone, shutdown, addr.clone()).await {
                                 error!("ACK reader for {} failed: {}", addr, e);
                             }
                         });

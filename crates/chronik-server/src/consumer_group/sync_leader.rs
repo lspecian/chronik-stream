@@ -8,7 +8,7 @@ use crate::consumer_group::assignment::{decode_assignment, encode_assignment};
 use chronik_common::Result;
 use std::collections::HashMap;
 use tokio::sync::oneshot;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Leader assignment coordinator
 ///
@@ -120,9 +120,9 @@ impl LeaderAssignment {
                         .map(|m| m.member_epoch)
                         .unwrap_or(0);
 
-                    // DEBUG: Log assignment details
+                    // Log assignment details for monitoring
                     for (topic, partitions) in assignment {
-                        info!(
+                        debug!(
                             group_id = %group.group_id,
                             member_id = %mid,
                             topic = %topic,
@@ -171,9 +171,9 @@ impl LeaderAssignment {
             .map(|m| m.member_epoch)
             .unwrap_or(0);
 
-        // DEBUG: Log leader's assignment details
+        // Log leader's assignment details for monitoring
         for (topic, partitions) in &leader_assignment {
-            info!(
+            debug!(
                 group_id = %group.group_id,
                 member_id = %member_id,
                 topic = %topic,

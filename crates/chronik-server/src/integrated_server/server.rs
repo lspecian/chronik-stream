@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use tokio::net::TcpListener;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::io::IoSlice;
-use tracing::{info, error, debug, warn};
+use tracing::{info, error, debug, warn, trace};
 use crate::error_handler::{ErrorHandler, ErrorCode, ErrorRecovery, ServerError};
 
 // Use the local server components (moved from chronik-ingest)
@@ -100,6 +100,8 @@ pub struct IntegratedKafkaServer {
     metadata_uploader: Option<Arc<chronik_common::metadata::MetadataUploader>>,
     /// v2.2.7 Phase 5: Leader election per partition
     leader_elector: Option<Arc<crate::leader_election::LeaderElector>>,
+    /// v2.2.22: ISR tracker for admin API (tracks follower offsets from WAL ACKs)
+    isr_tracker: Option<Arc<crate::isr_tracker::IsrTracker>>,
 }
 
 impl Clone for IntegratedKafkaServer {
@@ -111,6 +113,7 @@ impl Clone for IntegratedKafkaServer {
             wal_indexer: self.wal_indexer.clone(),
             metadata_uploader: self.metadata_uploader.clone(),
             leader_elector: self.leader_elector.clone(),
+            isr_tracker: self.isr_tracker.clone(),
         }
     }
 }
@@ -125,6 +128,7 @@ impl IntegratedKafkaServer {
         wal_indexer: Arc<WalIndexer>,
         metadata_uploader: Option<Arc<chronik_common::metadata::MetadataUploader>>,
         leader_elector: Option<Arc<crate::leader_election::LeaderElector>>,
+        isr_tracker: Option<Arc<crate::isr_tracker::IsrTracker>>,
     ) -> Self {
         Self {
             config,
@@ -133,6 +137,7 @@ impl IntegratedKafkaServer {
             wal_indexer,
             metadata_uploader,
             leader_elector,
+            isr_tracker,
         }
     }
 
@@ -293,6 +298,12 @@ impl IntegratedKafkaServer {
         self.metadata_store.clone()
     }
 
+    /// Get the ISR tracker for admin API (v2.2.22)
+    /// Returns None if running in single-node mode (ISR tracking only meaningful in clusters)
+    pub fn isr_tracker(&self) -> Option<Arc<crate::isr_tracker::IsrTracker>> {
+        self.isr_tracker.clone()
+    }
+
     // ========================================================================
     // Phase 2.14: run() Helper Methods - Connection and Request Processing
     // ========================================================================
@@ -322,7 +333,7 @@ impl IntegratedKafkaServer {
     async fn handle_connection_accept(
         listener: &TcpListener
     ) -> Result<(tokio::net::TcpStream, std::net::SocketAddr)> {
-        debug!("DEBUG: Before listener.accept() - waiting for connection...");
+        trace!("Before listener.accept() - waiting for connection...");
 
         match listener.accept().await {
             Ok((socket, addr)) => {
@@ -687,7 +698,7 @@ impl IntegratedKafkaServer {
 
         let (produce_semaphore, control_semaphore) = Self::setup_connection_semaphores();
 
-        debug!("DEBUG: Entering accept loop - ready to accept connections");
+        trace!("Entering accept loop - ready to accept connections");
         loop {
             match Self::handle_connection_accept(&listener).await {
                 Ok((socket, addr)) => {

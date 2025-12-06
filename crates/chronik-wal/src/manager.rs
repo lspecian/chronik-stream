@@ -521,13 +521,35 @@ impl WalManager {
     }
     
     /// Read next record after the given offset
+    ///
+    /// Returns the first record with base_offset >= offset + 1.
+    /// This provides an iterator-like API for walking through WAL records.
+    ///
+    /// Note: For fully streaming reads that don't load files into memory,
+    /// a more advanced implementation with file cursors would be needed.
+    /// This version reuses read_from with max_records=1 for simplicity.
     #[instrument(skip(self), fields(
         offset = offset,
         found_record = tracing::field::Empty
     ))]
     pub async fn read_next(&self, offset: i64) -> Result<Option<WalRecord>> {
-        // TODO: Implement streaming read
-        debug!("WAL read_next not yet implemented");
+        // Read from offset + 1 to get the next record after the given offset
+        // We look across all partitions (this is a simple implementation)
+        // A more efficient version would track partition state
+
+        let partitions = self.get_partitions();
+
+        for tp in partitions {
+            // Read records starting from offset + 1
+            let records = self.read_from(&tp.topic, tp.partition, offset + 1, 1).await?;
+
+            if let Some(record) = records.into_iter().next() {
+                debug!("Found next record after offset {}", offset);
+                return Ok(Some(record));
+            }
+        }
+
+        debug!("No more records after offset {}", offset);
         Ok(None)
     }
 
@@ -682,6 +704,17 @@ impl WalManager {
     /// Remove archived segment after S3 upload (v1.3.62+)
     pub fn remove_segment(&self, topic: &str, partition: i32, segment_id: u64) -> Result<()> {
         self.group_commit_wal.remove_segment(topic, partition, segment_id)
+    }
+
+    /// Get current segment state for a topic/partition (for checkpointing)
+    ///
+    /// Returns (segment_id, position) where:
+    /// - segment_id: Current WAL segment number
+    /// - position: Current byte position within the segment
+    ///
+    /// Returns None if the partition doesn't exist in the WAL.
+    pub fn get_segment_state(&self, topic: &str, partition: i32) -> Option<(u64, u64)> {
+        self.group_commit_wal.get_segment_state(topic, partition)
     }
 }
 

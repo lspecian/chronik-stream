@@ -8,7 +8,7 @@ use bytes::{BufMut, BytesMut};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::super::wal_replication::{WalReplicationRecord, WalAckMessage};
 use super::super::raft_cluster::RaftCluster;
@@ -149,11 +149,11 @@ impl RecordProcessor {
                 warn!("❌ Failed to update watermark for {}-{} to {}: {}",
                     record.topic, record.partition, new_watermark, e);
             } else {
-                info!("✅ v2.2.9 Phase 7 DEBUG: Updated watermark for {}-{} to {}",
+                debug!("Updated watermark for {}-{} to {}",
                     record.topic, record.partition, new_watermark);
             }
         } else {
-            warn!("⚠️ v2.2.9 Phase 7 DEBUG: produce_handler is None! Cannot update watermark for {}-{}",
+            debug!("produce_handler is None, cannot update watermark for {}-{}",
                 record.topic, record.partition);
         }
 
@@ -312,8 +312,8 @@ impl RecordProcessor {
 
             // v2.2.7 Phase 4: Send ACK back to leader for acks=-1 support
             if let Some(ref _tracker) = isr_ack_tracker {
-                info!(
-                    "🔍 DEBUG: Preparing to send ACK for {}-{} offset {} from node {}",
+                debug!(
+                    "Preparing to send ACK for {}-{} offset {} from node {}",
                     record.topic, record.partition, record.base_offset, node_id
                 );
 
@@ -340,8 +340,8 @@ impl RecordProcessor {
                     );
                 }
             } else {
-                warn!(
-                    "⚠️ DEBUG: No ISR ACK tracker configured - ACKs will NOT be sent for {}-{} offset {}",
+                debug!(
+                    "No ISR ACK tracker configured, ACKs not sent for {}-{} offset {}",
                     record.topic, record.partition, record.base_offset
                 );
             }

@@ -5488,8 +5488,8 @@ impl ProtocolHandler {
                     .is_none() {
                     let broker_metadata = chronik_common::metadata::BrokerMetadata {
                         broker_id: self.broker_id,
-                        host: "localhost".to_string(), // TODO: Get from config
-                        port: 9092, // TODO: Get from config
+                        host: self.advertised_host.clone(),
+                        port: self.advertised_port,
                         rack: None,
                         status: chronik_common::metadata::BrokerStatus::Online,
                         created_at: chronik_common::Utc::now(),

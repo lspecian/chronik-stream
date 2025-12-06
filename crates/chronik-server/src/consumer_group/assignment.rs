@@ -41,12 +41,12 @@ pub fn encode_assignment(assignment: &HashMap<String, Vec<i32>>) -> Vec<u8> {
     // User data (empty)
     bytes.write_i32::<BigEndian>(0).unwrap();
 
-    // DEBUG: Log hex dump of assignment bytes
+    // Log hex dump for debugging (trace level)
     let hex_str = bytes.iter()
         .map(|b| format!("{:02x}", b))
         .collect::<Vec<_>>()
         .join(" ");
-    tracing::info!(
+    tracing::trace!(
         assignment_hex = %hex_str,
         assignment_len = bytes.len(),
         "Encoded assignment bytes (hex dump)"
