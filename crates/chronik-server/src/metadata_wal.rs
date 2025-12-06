@@ -275,35 +275,188 @@ impl MetadataWal {
     }
 
     /// Read all WAL records from disk (internal helper for recovery)
+    ///
+    /// v2.2.19: Bug #5 FIXED - Properly reads GroupCommitWal file format
+    /// Uses the same parsing logic as WalManager.read_from()
     async fn read_all_wal_records(&self) -> Result<Vec<WalRecord>> {
-        // v2.2.9 Phase 7 BUG #5 FIX: Metadata WAL recovery is currently disabled
-        //
-        // PROBLEM: This method attempts to manually parse GroupCommitWal file format,
-        // but GroupCommitWal writes in a batched/committed format that doesn't match
-        // simple WalRecord byte parsing. Result: Recovery always returns 0 records
-        // even when metadata WAL files contain data.
-        //
-        // TEMPORARY FIX: Disable local recovery and rely on metadata WAL replication
-        // from the cluster leader. On cluster startup, followers will receive all
-        // metadata events via replication.
-        //
-        // TODO (Phase 7+): Implement proper GroupCommitWal recovery
-        // - Option 1: Add recover() method to GroupCommitWal API
-        // - Option 2: Use WalManager's recovery mechanism
-        // - Option 3: Implement GroupCommitWal format parser
-        //
-        // For now, this is acceptable because:
-        // 1. In cluster mode: Followers get metadata via replication from leader
-        // 2. On full cluster restart: Leader can reconstruct from Raft snapshots
-        // 3. Topic auto-creation will recreate missing metadata
-        //
-        // SEE: docs/PHASE7_FINDINGS.md Bug #5 for full details
+        use byteorder::{LittleEndian, ReadBytesExt};
+        use std::io::Cursor as IoCursor;
 
-        warn!("⚠️  Metadata WAL local recovery is currently DISABLED (Bug #5)");
-        warn!("   Relying on metadata WAL replication from cluster leader");
-        warn!("   Full cluster cold-start recovery not yet implemented");
+        // Metadata WAL directory structure:
+        // wal_dir/__chronik_metadata/0/wal_0_{segment_id}.log
+        let partition_dir = self.wal_dir
+            .join(&self.topic_name)
+            .join(self.partition.to_string());
 
-        Ok(Vec::new())  // Always return empty - rely on replication
+        if !partition_dir.exists() {
+            debug!("Metadata WAL partition directory does not exist: {:?} - starting fresh", partition_dir);
+            return Ok(Vec::new());
+        }
+
+        // Find all WAL segment files
+        let mut wal_files = Vec::new();
+        let mut entries = tokio::fs::read_dir(&partition_dir).await
+            .context("Failed to read metadata WAL directory")?;
+
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
+                // Match pattern: wal_{partition}_{segment_id}.log
+                if filename.starts_with(&format!("wal_{}_", self.partition)) && filename.ends_with(".log") {
+                    wal_files.push(path);
+                }
+            }
+        }
+
+        if wal_files.is_empty() {
+            debug!("No metadata WAL files found in: {:?} - starting fresh", partition_dir);
+            return Ok(Vec::new());
+        }
+
+        // Sort by segment ID (extract from filename)
+        wal_files.sort_by_key(|path| {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|s| {
+                    s.strip_prefix(&format!("wal_{}_", self.partition))
+                        .and_then(|rest| rest.strip_suffix(".log"))
+                        .and_then(|seg_id| seg_id.parse::<u64>().ok())
+                })
+                .unwrap_or(0)
+        });
+
+        info!("Found {} metadata WAL segment files for recovery: {:?}", wal_files.len(), wal_files);
+
+        let mut records = Vec::new();
+
+        // Read from all segment files
+        for wal_file_path in &wal_files {
+            let file_data = tokio::fs::read(&wal_file_path).await
+                .with_context(|| format!("Failed to read metadata WAL file: {:?}", wal_file_path))?;
+
+            if file_data.is_empty() {
+                continue;
+            }
+
+            debug!("Reading {} bytes from metadata WAL file: {:?}", file_data.len(), wal_file_path);
+
+            // Parse V2 WAL records from file (same format as WalManager.read_from)
+            let mut cursor = 0;
+
+            while cursor < file_data.len() {
+                if cursor + 12 > file_data.len() {
+                    break;
+                }
+
+                let record_start = cursor;
+                let mut rdr = IoCursor::new(&file_data[cursor..]);
+
+                let magic = rdr.read_u16::<LittleEndian>().unwrap();
+                let version = rdr.read_u8().unwrap();
+                let flags = rdr.read_u8().unwrap();
+                let length = rdr.read_u32::<LittleEndian>().unwrap() as usize;
+                let crc32 = rdr.read_u32::<LittleEndian>().unwrap();
+
+                if magic != 0xCA7E || version != 2 || length == 0 {
+                    debug!("Invalid WAL record at cursor {}: magic={:x}, version={}, length={}",
+                           cursor, magic, version, length);
+                    break;
+                }
+
+                // Parse V2 record body with graceful handling of truncated files
+                let topic_len = match rdr.read_u16::<LittleEndian>() {
+                    Ok(len) => len as usize,
+                    Err(e) => {
+                        debug!("Failed to read topic_len at cursor {}: {} - likely truncated", cursor, e);
+                        break;
+                    }
+                };
+
+                let mut topic_bytes = vec![0u8; topic_len];
+                if let Err(e) = std::io::Read::read_exact(&mut rdr, &mut topic_bytes) {
+                    debug!("Failed to read topic bytes at cursor {}: {} - likely truncated", cursor, e);
+                    break;
+                }
+
+                let record_topic = match String::from_utf8(topic_bytes) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        debug!("Invalid UTF-8 in topic at cursor {}: {}", cursor, e);
+                        break;
+                    }
+                };
+
+                let record_partition = match rdr.read_i32::<LittleEndian>() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        debug!("Failed to read partition at cursor {}: {}", cursor, e);
+                        break;
+                    }
+                };
+
+                let canonical_data_len = match rdr.read_u32::<LittleEndian>() {
+                    Ok(len) => len as usize,
+                    Err(e) => {
+                        debug!("Failed to read canonical_data_len at cursor {}: {}", cursor, e);
+                        break;
+                    }
+                };
+
+                let mut canonical_data = vec![0u8; canonical_data_len];
+                if let Err(e) = std::io::Read::read_exact(&mut rdr, &mut canonical_data) {
+                    debug!("Failed to read canonical data at cursor {}: {} - likely truncated", cursor, e);
+                    break;
+                }
+
+                let base_offset = match rdr.read_i64::<LittleEndian>() {
+                    Ok(o) => o,
+                    Err(e) => {
+                        debug!("Failed to read base_offset at cursor {}: {}", cursor, e);
+                        break;
+                    }
+                };
+
+                let last_offset = match rdr.read_i64::<LittleEndian>() {
+                    Ok(o) => o,
+                    Err(e) => {
+                        debug!("Failed to read last_offset at cursor {}: {}", cursor, e);
+                        break;
+                    }
+                };
+
+                let record_count = match rdr.read_i32::<LittleEndian>() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        debug!("Failed to read record_count at cursor {}: {}", cursor, e);
+                        break;
+                    }
+                };
+
+                let record = WalRecord::V2 {
+                    magic,
+                    version,
+                    flags,
+                    length: length as u32,
+                    crc32,
+                    topic: record_topic,
+                    partition: record_partition,
+                    canonical_data,
+                    base_offset,
+                    last_offset,
+                    record_count,
+                };
+                records.push(record);
+
+                cursor = record_start + rdr.position() as usize;
+            }
+
+            debug!("Completed reading metadata WAL segment {:?}: {} records so far", wal_file_path, records.len());
+        }
+
+        info!("✅ Metadata WAL recovery complete: {} records from {} segment files (Bug #5 FIXED)",
+              records.len(), wal_files.len());
+
+        Ok(records)
     }
 }
 

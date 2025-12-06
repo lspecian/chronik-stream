@@ -107,12 +107,22 @@ impl CheckpointManager {
         partition: i32,
         offset: i64,
     ) -> Result<()> {
+        let timestamp = chrono::Utc::now().timestamp_millis();
+
+        // Calculate CRC over checkpoint data (offset + timestamp)
+        // Note: segment_id/position are placeholders for future seek optimization
+        // when checkpoint loading is wired up to WAL recovery
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&offset.to_le_bytes());
+        hasher.update(&timestamp.to_le_bytes());
+        let crc = hasher.finalize();
+
         let checkpoint = Checkpoint {
             offset,
-            segment_id: 0, // TODO: Get from segment
-            position: 0,    // TODO: Get actual position
-            crc: 0,        // TODO: Calculate CRC
-            timestamp: chrono::Utc::now().timestamp_millis(),
+            segment_id: 0, // Placeholder: will be set when checkpoint-based seek is implemented
+            position: 0,   // Placeholder: will be set when checkpoint-based seek is implemented
+            crc,
+            timestamp,
         };
         
         let checkpoint_path = self.data_dir

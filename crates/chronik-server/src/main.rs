@@ -1130,8 +1130,91 @@ async fn handle_cluster_command(_cli: &Cli, action: ClusterAction) -> Result<()>
             Ok(())
         }
 
-        ClusterAction::Rebalance { config: _config } => {
-            println!("Rebalance partitions - TODO: Priority 3", );
+        ClusterAction::Rebalance { config } => {
+            println!("Triggering partition rebalance...\n");
+
+            // Load cluster config
+            let cluster_config = load_cluster_config_from_file(&config, None)?;
+
+            // Create HTTP client
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()?;
+
+            // Find leader by querying health endpoint on each peer
+            let mut leader_url = None;
+            let mut tried_nodes = Vec::new();
+
+            for peer in cluster_config.peer_nodes() {
+                let admin_port = 10000 + peer.id;
+                let health_url = format!("http://localhost:{}/admin/health", admin_port);
+
+                tried_nodes.push((peer.id, admin_port));
+
+                match client.get(&health_url).send().await {
+                    Ok(response) => {
+                        if response.status().is_success() {
+                            if let Ok(health) = response.json::<admin_api::HealthResponse>().await {
+                                if health.is_leader {
+                                    println!("✓ Found leader: node {} (port {})\n", peer.id, admin_port);
+                                    leader_url = Some(format!("http://localhost:{}/admin/rebalance", admin_port));
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        // Node is down, continue
+                    }
+                }
+            }
+
+            let admin_url = leader_url.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Could not find cluster leader. Tried nodes: {:?}\n\
+                     Make sure at least one node is running and has elected a leader.",
+                    tried_nodes
+                )
+            })?;
+
+            println!("Sending rebalance request to leader...");
+
+            // Get API key from environment
+            let api_key = std::env::var("CHRONIK_ADMIN_API_KEY").ok();
+
+            // Send request to leader with API key
+            let mut request_builder = client.post(&admin_url);
+
+            if let Some(key) = api_key {
+                request_builder = request_builder.header("X-API-Key", key);
+            }
+
+            let response = request_builder
+                .send()
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to send request to leader: {}", e))?;
+
+            // Parse response
+            if response.status().is_success() {
+                let resp: admin_api::RebalanceResponse = response.json().await?;
+
+                if resp.success {
+                    println!("✓ {}", resp.message);
+                    println!("\nRebalanced {} topics.", resp.topics_rebalanced);
+                    println!("\nMonitor cluster status with: chronik-server cluster status --config {}", config.display());
+                } else {
+                    eprintln!("✗ Rebalance failed: {}", resp.message);
+                    std::process::exit(1);
+                }
+            } else if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+                eprintln!("✗ Authentication failed. Set CHRONIK_ADMIN_API_KEY environment variable.");
+                std::process::exit(1);
+            } else {
+                let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+                eprintln!("✗ Failed to rebalance: {}", error_text);
+                std::process::exit(1);
+            }
+
             Ok(())
         }
     }

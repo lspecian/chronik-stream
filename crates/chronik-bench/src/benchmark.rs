@@ -572,23 +572,382 @@ impl BenchmarkRunner {
     }
 
     /// Run round-trip benchmark (produce + consume)
+    ///
+    /// Measures end-to-end latency by embedding timestamps in messages during
+    /// produce and calculating the difference when consuming.
     async fn run_roundtrip_benchmark(&self) -> Result<BenchmarkResults> {
-        // TODO: Implement round-trip benchmark
-        // This would involve:
-        // 1. Embedding timestamps in messages during produce
-        // 2. Consuming messages and calculating end-to-end latency
-        // 3. Correlating produce and consume operations
-        anyhow::bail!("Round-trip benchmark not yet implemented");
+        let producer = self
+            .producer
+            .as_ref()
+            .context("Producer not initialized")?;
+        let consumer = self
+            .consumer
+            .as_ref()
+            .context("Consumer not initialized")?;
+
+        info!("Starting round-trip benchmark...");
+
+        // Subscribe to topic
+        consumer
+            .subscribe(&[&self.args.topic])
+            .context("Failed to subscribe to topic")?;
+
+        // Wait a bit for consumer to be ready
+        sleep(Duration::from_millis(500)).await;
+
+        // Shared state
+        let messages_sent = Arc::new(AtomicU64::new(0));
+        let messages_received = Arc::new(AtomicU64::new(0));
+        let messages_failed = Arc::new(AtomicU64::new(0));
+        let bytes_sent = Arc::new(AtomicU64::new(0));
+        let latency_histogram = Arc::new(Mutex::new(
+            Histogram::<u64>::new_with_bounds(1, 60_000_000, 3)
+                .context("Failed to create histogram")?,
+        ));
+        let running = Arc::new(AtomicBool::new(true));
+
+        // Start periodic reporter
+        let reporter_handle = {
+            let messages_sent = Arc::clone(&messages_sent);
+            let messages_received = Arc::clone(&messages_received);
+            let running = Arc::clone(&running);
+            let interval_secs = self.args.report_interval_secs;
+            let latency_histogram = Arc::clone(&latency_histogram);
+
+            tokio::spawn(async move {
+                let mut ticker = interval(Duration::from_secs(interval_secs));
+
+                while running.load(Ordering::Relaxed) {
+                    ticker.tick().await;
+
+                    let sent = messages_sent.load(Ordering::Relaxed);
+                    let received = messages_received.load(Ordering::Relaxed);
+
+                    // Get latency stats
+                    let histogram = latency_histogram.lock().await;
+                    let p99 = histogram.value_at_quantile(0.99) as f64 / 1000.0;
+
+                    info!(
+                        "Sent: {:>8} | Received: {:>8} | In-flight: {:>6} | E2E p99: {:>6.1} ms",
+                        sent, received, sent.saturating_sub(received), p99
+                    );
+                }
+            })
+        };
+
+        // Consumer loop runs inline after producers complete
+        // We can't spawn it separately because StreamConsumer doesn't implement Clone
+
+        // Start producer tasks
+        let start_time = Instant::now();
+        let mut producer_handles = vec![];
+
+        for task_id in 0..self.args.concurrency {
+            let producer = producer.clone();
+            let topic = self.args.topic.clone();
+            let message_size = self.args.message_size;
+            let key_pattern = self.args.key_pattern;
+            let messages_sent = Arc::clone(&messages_sent);
+            let messages_failed = Arc::clone(&messages_failed);
+            let bytes_sent = Arc::clone(&bytes_sent);
+            let running = Arc::clone(&running);
+            let duration = self.args.duration;
+            let message_count = self.args.message_count;
+            let rate_limit = self.args.rate_limit;
+
+            let handle = tokio::spawn(async move {
+                let mut local_count = 0u64;
+                let task_start = Instant::now();
+
+                loop {
+                    // Check termination conditions
+                    if duration.as_secs() > 0 && task_start.elapsed() >= duration {
+                        break;
+                    }
+                    if message_count > 0 && messages_sent.load(Ordering::Relaxed) >= message_count {
+                        break;
+                    }
+                    if !running.load(Ordering::Relaxed) {
+                        break;
+                    }
+
+                    // Rate limiting
+                    if rate_limit > 0 {
+                        let target_interval = Duration::from_secs_f64(1.0 / (rate_limit as f64));
+                        sleep(target_interval).await;
+                    }
+
+                    // Generate key
+                    let key = generate_key(key_pattern, task_id as u64 + local_count);
+
+                    // Generate payload with timestamp in first 8 bytes
+                    let now_us = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_micros() as u64;
+
+                    let mut payload = vec![0u8; message_size.max(8)];
+                    payload[0..8].copy_from_slice(&now_us.to_le_bytes());
+                    // Fill rest with pattern
+                    for i in 8..payload.len() {
+                        payload[i] = (local_count % 256) as u8;
+                    }
+
+                    // Send message
+                    let record = FutureRecord::to(&topic).payload(&payload).key(&key);
+
+                    match producer.send(record, Timeout::Never).await {
+                        Ok(_) => {
+                            messages_sent.fetch_add(1, Ordering::Relaxed);
+                            bytes_sent.fetch_add(payload.len() as u64, Ordering::Relaxed);
+                        }
+                        Err((err, _)) => {
+                            error!("Failed to send message: {}", err);
+                            messages_failed.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+
+                    local_count += 1;
+                }
+            });
+
+            producer_handles.push(handle);
+        }
+
+        // Wait for all producer tasks
+        for handle in producer_handles {
+            handle.await?;
+        }
+
+        // Flush producer
+        info!("Flushing producer...");
+        let _ = producer.flush(Timeout::After(Duration::from_secs(30)));
+
+        // Now consume all messages to measure end-to-end latency
+        let sent = messages_sent.load(Ordering::Relaxed);
+        info!("Waiting to consume all {} messages...", sent);
+
+        let consume_start = Instant::now();
+        let consume_timeout = Duration::from_secs(60);
+
+        while messages_received.load(Ordering::Relaxed) < sent {
+            if consume_start.elapsed() > consume_timeout {
+                warn!("Consume timeout - received {} of {} messages",
+                      messages_received.load(Ordering::Relaxed), sent);
+                break;
+            }
+
+            match tokio::time::timeout(Duration::from_millis(100), consumer.recv()).await {
+                Ok(Ok(message)) => {
+                    // Extract timestamp from payload (first 8 bytes = microseconds since epoch)
+                    if let Some(payload) = message.payload() {
+                        if payload.len() >= 8 {
+                            let mut timestamp_bytes = [0u8; 8];
+                            timestamp_bytes.copy_from_slice(&payload[0..8]);
+                            let send_timestamp_us = u64::from_le_bytes(timestamp_bytes);
+
+                            let now_us = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_micros() as u64;
+
+                            let e2e_latency_us = now_us.saturating_sub(send_timestamp_us);
+
+                            // Record latency
+                            if let Ok(mut histogram) = latency_histogram.try_lock() {
+                                // Clamp to histogram bounds
+                                let clamped = e2e_latency_us.min(60_000_000);
+                                let _ = histogram.record(clamped);
+                            }
+                        }
+                    }
+                    messages_received.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(Err(e)) => {
+                    warn!("Consumer error: {}", e);
+                }
+                Err(_) => {
+                    // Timeout - continue checking
+                }
+            }
+        }
+
+        // Signal to stop reporter
+        running.store(false, Ordering::Relaxed);
+        reporter_handle.abort();
+
+        let elapsed = start_time.elapsed();
+
+        // Build results
+        let total_messages = messages_sent.load(Ordering::Relaxed);
+        let failed_messages = messages_failed.load(Ordering::Relaxed);
+        let total_bytes = bytes_sent.load(Ordering::Relaxed);
+        let received = messages_received.load(Ordering::Relaxed);
+
+        info!("Round-trip complete: sent={}, received={}", total_messages, received);
+
+        let histogram = latency_histogram.lock().await;
+
+        Ok(BenchmarkResults {
+            mode: self.args.mode,
+            duration: elapsed,
+            total_messages,
+            failed_messages,
+            total_bytes,
+            latency_p50_us: histogram.value_at_quantile(0.50),
+            latency_p90_us: histogram.value_at_quantile(0.90),
+            latency_p95_us: histogram.value_at_quantile(0.95),
+            latency_p99_us: histogram.value_at_quantile(0.99),
+            latency_p999_us: histogram.value_at_quantile(0.999),
+            latency_max_us: histogram.max(),
+            message_size: self.args.message_size,
+            concurrency: self.args.concurrency,
+            compression: self.args.compression,
+        })
     }
 
     /// Run metadata benchmark
+    ///
+    /// Measures performance of metadata operations like topic creation,
+    /// deletion, and metadata queries.
     async fn run_metadata_benchmark(&self) -> Result<BenchmarkResults> {
-        // TODO: Implement metadata benchmark
-        // This would involve:
-        // 1. Topic creation/deletion operations
-        // 2. Metadata queries
-        // 3. Consumer group operations
-        anyhow::bail!("Metadata benchmark not yet implemented");
+        let admin = self
+            .admin
+            .as_ref()
+            .context("Admin client not initialized")?;
+
+        info!("Starting metadata benchmark...");
+
+        // Shared state
+        let ops_completed = Arc::new(AtomicU64::new(0));
+        let ops_failed = Arc::new(AtomicU64::new(0));
+        let latency_histogram = Arc::new(Mutex::new(
+            Histogram::<u64>::new_with_bounds(1, 60_000_000, 3)
+                .context("Failed to create histogram")?,
+        ));
+
+        let start_time = Instant::now();
+        let duration = self.args.duration;
+        let mut topic_counter = 0u64;
+
+        // Run metadata operations for the duration
+        while duration.as_secs() == 0 || start_time.elapsed() < duration {
+            let topic_name = format!("{}-meta-bench-{}", self.args.topic, topic_counter);
+            topic_counter += 1;
+
+            // Create topic
+            let op_start = Instant::now();
+            let new_topic = NewTopic::new(
+                &topic_name,
+                1, // Single partition for metadata benchmark
+                TopicReplication::Fixed(1),
+            );
+
+            match admin.create_topics(&[new_topic], &AdminOptions::new()).await {
+                Ok(results) => {
+                    let mut success = true;
+                    for result in results {
+                        if let Err((_, err)) = result {
+                            if !err.to_string().contains("already exists") {
+                                warn!("Failed to create topic: {}", err);
+                                success = false;
+                            }
+                        }
+                    }
+                    if success {
+                        let latency_us = op_start.elapsed().as_micros() as u64;
+                        ops_completed.fetch_add(1, Ordering::Relaxed);
+                        if let Ok(mut histogram) = latency_histogram.try_lock() {
+                            let _ = histogram.record(latency_us.min(60_000_000));
+                        }
+                    } else {
+                        ops_failed.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                Err(e) => {
+                    error!("Create topic error: {}", e);
+                    ops_failed.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+
+            // Delete topic
+            let op_start = Instant::now();
+            match admin.delete_topics(&[&topic_name], &AdminOptions::new()).await {
+                Ok(results) => {
+                    let mut success = true;
+                    for result in results {
+                        if let Err((_, err)) = result {
+                            warn!("Failed to delete topic: {}", err);
+                            success = false;
+                        }
+                    }
+                    if success {
+                        let latency_us = op_start.elapsed().as_micros() as u64;
+                        ops_completed.fetch_add(1, Ordering::Relaxed);
+                        if let Ok(mut histogram) = latency_histogram.try_lock() {
+                            let _ = histogram.record(latency_us.min(60_000_000));
+                        }
+                    } else {
+                        ops_failed.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                Err(e) => {
+                    error!("Delete topic error: {}", e);
+                    ops_failed.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+
+            // Rate limiting for metadata ops (they can be expensive)
+            if self.args.rate_limit > 0 {
+                let target_interval = Duration::from_secs_f64(1.0 / (self.args.rate_limit as f64));
+                sleep(target_interval).await;
+            } else {
+                // Small delay to prevent overwhelming the server
+                sleep(Duration::from_millis(10)).await;
+            }
+
+            // Log progress periodically
+            if topic_counter % 10 == 0 {
+                let completed = ops_completed.load(Ordering::Relaxed);
+                let failed = ops_failed.load(Ordering::Relaxed);
+                let histogram = latency_histogram.lock().await;
+                let p99 = histogram.value_at_quantile(0.99) as f64 / 1000.0;
+                info!(
+                    "Metadata ops: {:>6} completed | {:>4} failed | p99: {:>6.1} ms",
+                    completed, failed, p99
+                );
+            }
+
+            // Check duration limit
+            if duration.as_secs() > 0 && start_time.elapsed() >= duration {
+                break;
+            }
+        }
+
+        let elapsed = start_time.elapsed();
+        let total_ops = ops_completed.load(Ordering::Relaxed);
+        let failed_ops = ops_failed.load(Ordering::Relaxed);
+
+        info!("Metadata benchmark complete: {} ops in {:?}", total_ops, elapsed);
+
+        let histogram = latency_histogram.lock().await;
+
+        Ok(BenchmarkResults {
+            mode: self.args.mode,
+            duration: elapsed,
+            total_messages: total_ops, // Reusing field for operation count
+            failed_messages: failed_ops,
+            total_bytes: 0,
+            latency_p50_us: histogram.value_at_quantile(0.50),
+            latency_p90_us: histogram.value_at_quantile(0.90),
+            latency_p95_us: histogram.value_at_quantile(0.95),
+            latency_p99_us: histogram.value_at_quantile(0.99),
+            latency_p999_us: histogram.value_at_quantile(0.999),
+            latency_max_us: histogram.max(),
+            message_size: 0,
+            concurrency: 1, // Metadata ops are sequential
+            compression: self.args.compression,
+        })
     }
 }
 

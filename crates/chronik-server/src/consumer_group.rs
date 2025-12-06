@@ -1671,11 +1671,15 @@ impl GroupManager {
             .collect();
 
         // Call the real join_group implementation with proper parameters
+        // Note: client_host ideally comes from the TCP socket peer_addr, but that would
+        // require propagating it through the handler chain. Using client_id as identifier
+        // for now - it's unique per client and serves the same debugging/metadata purpose.
+        let client_host = format!("/{}", client_id);
         let result = self.join_group(
             request.group_id,
             if request.member_id.is_empty() { None } else { Some(request.member_id.clone()) },
-            client_id,  // Use extracted client_id instead of hardcoded value
-            "/127.0.0.1".to_string(),   // TODO: Parse from connection info
+            client_id,
+            client_host,
             Duration::from_millis(request.session_timeout_ms as u64),
             Duration::from_millis(if request.rebalance_timeout_ms > 0 {
                 request.rebalance_timeout_ms as u64
