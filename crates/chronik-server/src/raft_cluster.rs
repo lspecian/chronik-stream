@@ -2758,6 +2758,7 @@ pub async fn run_raft_cluster(config: RaftClusterConfig) -> Result<()> {
         enable_metadata_dr: false,
         metadata_upload_interval_secs: 60,
         cluster_config: None,  // TODO(Phase 3): Wire RaftCluster to cluster_config
+        tls_config: None,  // TLS configured via env vars
     };
 
     // Step 3: Create and start Kafka server with Raft cluster using builder pattern

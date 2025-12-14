@@ -1,34 +1,59 @@
-//! HTTP Admin API for Cluster Management (v2.2.7+)
+//! HTTP Admin API for Cluster Management (v2.2.7+) and Schema Registry
 //!
 //! Provides REST endpoints for managing cluster membership:
 //! - POST /admin/add-node - Add new node to cluster
-//! - POST /admin/remove-node - Remove node from cluster (TODO: Priority 4)
-//! - GET /admin/status - Get cluster status (TODO: Priority 3)
+//! - POST /admin/remove-node - Remove node from cluster
+//! - GET /admin/status - Get cluster status
+//!
+//! And Confluent-compatible Schema Registry API:
+//! - POST /subjects/{subject}/versions - Register a schema
+//! - GET /schemas/ids/{id} - Get schema by ID
+//! - GET /subjects/{subject}/versions/latest - Get latest schema
+//! - GET /subjects - List all subjects
+//! - DELETE /subjects/{subject} - Delete a subject
 //!
 //! This API is only available when running in cluster mode.
 //!
 //! ## Authentication
 //!
+//! ### Admin API
+//!
 //! The admin API requires API key authentication via the `X-API-Key` header.
 //! Configure the API key via the `CHRONIK_ADMIN_API_KEY` environment variable.
-//! If not set, a random key is generated at startup (check logs).
+//! If not set, authentication is disabled (INSECURE - for development only).
+//!
+//! ### Schema Registry (Confluent-compatible)
+//!
+//! Schema Registry supports optional HTTP Basic Auth (like Confluent):
+//! - `CHRONIK_SCHEMA_REGISTRY_AUTH_ENABLED=true` - Enable authentication
+//! - `CHRONIK_SCHEMA_REGISTRY_USERS=admin:secret,readonly:pass` - Define users
+//!
+//! When enabled, clients must provide `Authorization: Basic <base64>` header.
+//! Example: `curl -u admin:secret http://localhost:10001/subjects`
+//!
+//! By default, authentication is disabled (Confluent-compatible default).
 
 use anyhow::Result;
 use axum::{
     body::Body,
-    extract::State,
+    extract::{Path, State},
     http::{HeaderMap, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post, put},
     Json, Router, Server,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::isr_tracker::IsrTracker;
 use crate::raft_cluster::RaftCluster;
+use crate::schema_registry::{
+    CompatibilityConfig, CompatibilityLevel, GetSchemaResponse, GetSubjectVersionResponse,
+    RegisterSchemaRequest, RegisterSchemaResponse, SchemaRegistry, SchemaRegistryConfig,
+    SchemaRegistryError, SchemaType, SchemaVersionRef,
+};
 use chronik_common::metadata::traits::MetadataStore;
 
 /// Admin API state shared across handlers
@@ -39,6 +64,8 @@ pub struct AdminApiState {
     pub api_key: Option<String>,
     /// v2.2.22: ISR tracker for accurate in-sync replica queries
     pub isr_tracker: Option<Arc<IsrTracker>>,
+    /// Phase 5: Schema Registry for Confluent-compatible schema management
+    pub schema_registry: Arc<SchemaRegistry>,
 }
 
 /// Request to add a new node to the cluster
@@ -517,7 +544,221 @@ async fn collect_partition_info_from_metadata(
     Ok(all_partitions)
 }
 
-/// Authentication middleware
+// =============================================================================
+// Schema Registry HTTP Handlers (Confluent-compatible REST API)
+// =============================================================================
+
+/// Schema Registry error response
+#[derive(Debug, Serialize)]
+struct SchemaErrorResponse {
+    error_code: u32,
+    message: String,
+}
+
+impl From<SchemaRegistryError> for (StatusCode, Json<SchemaErrorResponse>) {
+    fn from(err: SchemaRegistryError) -> Self {
+        let (code, status) = match &err {
+            SchemaRegistryError::SchemaNotFound(_) => (40403, StatusCode::NOT_FOUND),
+            SchemaRegistryError::SubjectNotFound(_) => (40401, StatusCode::NOT_FOUND),
+            SchemaRegistryError::VersionNotFound(_, _) => (40402, StatusCode::NOT_FOUND),
+            SchemaRegistryError::InvalidSchema(_) => (42201, StatusCode::UNPROCESSABLE_ENTITY),
+            SchemaRegistryError::Incompatible(_) => (409, StatusCode::CONFLICT),
+            SchemaRegistryError::SubjectAlreadyExists(_) => (409, StatusCode::CONFLICT),
+        };
+
+        (
+            status,
+            Json(SchemaErrorResponse {
+                error_code: code,
+                message: err.to_string(),
+            }),
+        )
+    }
+}
+
+/// POST /subjects/{subject}/versions - Register a new schema under a subject
+async fn handle_register_schema(
+    State(state): State<AdminApiState>,
+    Path(subject): Path<String>,
+    Json(req): Json<RegisterSchemaRequest>,
+) -> Result<Json<RegisterSchemaResponse>, (StatusCode, Json<SchemaErrorResponse>)> {
+    debug!("Schema Registry: Registering schema for subject '{}'", subject);
+
+    let schema_type = req.schema_type;
+    let references = req.references;
+
+    match state
+        .schema_registry
+        .register_schema(&subject, &req.schema, schema_type, references)
+        .await
+    {
+        Ok(id) => {
+            info!("Schema Registry: Registered schema ID {} for subject '{}'", id, subject);
+            Ok(Json(RegisterSchemaResponse { id }))
+        }
+        Err(e) => {
+            warn!("Schema Registry: Failed to register schema for '{}': {}", subject, e);
+            Err(e.into())
+        }
+    }
+}
+
+/// GET /schemas/ids/{id} - Get schema by global ID
+async fn handle_get_schema_by_id(
+    State(state): State<AdminApiState>,
+    Path(id): Path<u32>,
+) -> Result<Json<GetSchemaResponse>, (StatusCode, Json<SchemaErrorResponse>)> {
+    debug!("Schema Registry: Getting schema by ID {}", id);
+
+    match state.schema_registry.get_schema(id).await {
+        Some(schema) => Ok(Json(GetSchemaResponse {
+            schema: schema.schema,
+            schema_type: schema.schema_type,
+            references: schema.references,
+        })),
+        None => Err(SchemaRegistryError::SchemaNotFound(id).into()),
+    }
+}
+
+/// GET /subjects/{subject}/versions/{version} - Get schema by subject and version
+async fn handle_get_subject_version(
+    State(state): State<AdminApiState>,
+    Path((subject, version_str)): Path<(String, String)>,
+) -> Result<Json<GetSubjectVersionResponse>, (StatusCode, Json<SchemaErrorResponse>)> {
+    debug!("Schema Registry: Getting subject '{}' version '{}'", subject, version_str);
+
+    let version_ref = version_str
+        .parse::<SchemaVersionRef>()
+        .map_err(|_| SchemaRegistryError::InvalidSchema("Invalid version".to_string()))?;
+
+    match state.schema_registry.get_schema_by_subject(&subject, version_ref).await {
+        Some(sv) => Ok(Json(GetSubjectVersionResponse {
+            subject: subject.clone(),
+            version: sv.version,
+            id: sv.schema_id,
+            schema: sv.schema,
+            schema_type: sv.schema_type,
+        })),
+        None => {
+            match version_ref {
+                SchemaVersionRef::Latest => Err(SchemaRegistryError::SubjectNotFound(subject).into()),
+                SchemaVersionRef::Version(v) => Err(SchemaRegistryError::VersionNotFound(subject, v).into()),
+            }
+        }
+    }
+}
+
+/// GET /subjects - List all subjects
+async fn handle_list_subjects(
+    State(state): State<AdminApiState>,
+) -> Json<Vec<String>> {
+    debug!("Schema Registry: Listing all subjects");
+    let subjects = state.schema_registry.list_subjects().await;
+    Json(subjects)
+}
+
+/// GET /subjects/{subject}/versions - List all versions for a subject
+async fn handle_list_versions(
+    State(state): State<AdminApiState>,
+    Path(subject): Path<String>,
+) -> Result<Json<Vec<u32>>, (StatusCode, Json<SchemaErrorResponse>)> {
+    debug!("Schema Registry: Listing versions for subject '{}'", subject);
+
+    match state.schema_registry.list_versions(&subject).await {
+        Some(versions) => Ok(Json(versions)),
+        None => Err(SchemaRegistryError::SubjectNotFound(subject).into()),
+    }
+}
+
+/// DELETE /subjects/{subject} - Delete a subject and all its versions
+async fn handle_delete_subject(
+    State(state): State<AdminApiState>,
+    Path(subject): Path<String>,
+) -> Result<Json<Vec<u32>>, (StatusCode, Json<SchemaErrorResponse>)> {
+    debug!("Schema Registry: Deleting subject '{}'", subject);
+
+    match state.schema_registry.delete_subject(&subject, false).await {
+        Ok(versions) => {
+            info!("Schema Registry: Deleted subject '{}' ({} versions)", subject, versions.len());
+            Ok(Json(versions))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// DELETE /subjects/{subject}/versions/{version} - Delete a specific version
+async fn handle_delete_version(
+    State(state): State<AdminApiState>,
+    Path((subject, version)): Path<(String, u32)>,
+) -> Result<Json<u32>, (StatusCode, Json<SchemaErrorResponse>)> {
+    debug!("Schema Registry: Deleting subject '{}' version {}", subject, version);
+
+    match state.schema_registry.delete_version(&subject, version, false).await {
+        Ok(v) => {
+            info!("Schema Registry: Deleted version {} of subject '{}'", v, subject);
+            Ok(Json(v))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// GET /config - Get global compatibility level
+async fn handle_get_global_config(
+    State(state): State<AdminApiState>,
+) -> Json<CompatibilityConfig> {
+    debug!("Schema Registry: Getting global compatibility config");
+    let level = state.schema_registry.get_compatibility(None).await;
+    Json(CompatibilityConfig {
+        compatibility_level: level,
+    })
+}
+
+/// PUT /config - Set global compatibility level
+async fn handle_set_global_config(
+    State(state): State<AdminApiState>,
+    Json(config): Json<CompatibilityConfig>,
+) -> Result<Json<CompatibilityConfig>, (StatusCode, Json<SchemaErrorResponse>)> {
+    debug!("Schema Registry: Setting global compatibility to {:?}", config.compatibility_level);
+
+    match state.schema_registry.set_compatibility(None, config.compatibility_level).await {
+        Ok(()) => {
+            info!("Schema Registry: Set global compatibility to {:?}", config.compatibility_level);
+            Ok(Json(config))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// GET /config/{subject} - Get subject-specific compatibility level
+async fn handle_get_subject_config(
+    State(state): State<AdminApiState>,
+    Path(subject): Path<String>,
+) -> Json<CompatibilityConfig> {
+    debug!("Schema Registry: Getting compatibility config for subject '{}'", subject);
+    let level = state.schema_registry.get_compatibility(Some(&subject)).await;
+    Json(CompatibilityConfig {
+        compatibility_level: level,
+    })
+}
+
+/// PUT /config/{subject} - Set subject-specific compatibility level
+async fn handle_set_subject_config(
+    State(state): State<AdminApiState>,
+    Path(subject): Path<String>,
+    Json(config): Json<CompatibilityConfig>,
+) -> Result<Json<CompatibilityConfig>, (StatusCode, Json<SchemaErrorResponse>)> {
+    debug!("Schema Registry: Setting compatibility for subject '{}' to {:?}", subject, config.compatibility_level);
+
+    match state.schema_registry.set_compatibility(Some(&subject), config.compatibility_level).await {
+        Ok(()) => {
+            info!("Schema Registry: Set compatibility for '{}' to {:?}", subject, config.compatibility_level);
+            Ok(Json(config))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Authentication middleware for Admin API (X-API-Key header)
 async fn auth_middleware(
     State(state): State<AdminApiState>,
     headers: HeaderMap,
@@ -547,8 +788,109 @@ async fn auth_middleware(
     }
 }
 
+/// HTTP Basic Auth middleware for Schema Registry (Confluent-compatible)
+///
+/// Validates credentials from `Authorization: Basic <base64>` header.
+/// If auth is disabled via config, requests pass through without validation.
+async fn schema_registry_auth_middleware(
+    State(state): State<AdminApiState>,
+    headers: HeaderMap,
+    request: Request<Body>,
+    next: Next<Body>,
+) -> Result<Response, StatusCode> {
+    // Skip auth if not required
+    if !state.schema_registry.is_auth_required() {
+        return Ok(next.run(request).await);
+    }
+
+    // Get Authorization header
+    let auth_header = headers
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok());
+
+    let Some(auth_value) = auth_header else {
+        warn!("Schema Registry: No Authorization header provided");
+        return Err(StatusCode::UNAUTHORIZED);
+    };
+
+    // Parse Basic auth: "Basic <base64(username:password)>"
+    if !auth_value.starts_with("Basic ") {
+        warn!("Schema Registry: Invalid Authorization scheme (expected Basic)");
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    let encoded = &auth_value[6..]; // Skip "Basic "
+    let decoded = match base64_decode(encoded) {
+        Ok(bytes) => match String::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(_) => {
+                warn!("Schema Registry: Invalid UTF-8 in credentials");
+                return Err(StatusCode::UNAUTHORIZED);
+            }
+        },
+        Err(_) => {
+            warn!("Schema Registry: Invalid base64 encoding");
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    };
+
+    // Split into username:password
+    let parts: Vec<&str> = decoded.splitn(2, ':').collect();
+    if parts.len() != 2 {
+        warn!("Schema Registry: Invalid credentials format (expected username:password)");
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    let (username, password) = (parts[0], parts[1]);
+
+    // Validate credentials
+    if state.schema_registry.validate_credentials(username, password) {
+        debug!("Schema Registry: User '{}' authenticated successfully", username);
+        Ok(next.run(request).await)
+    } else {
+        warn!("Schema Registry: Invalid credentials for user '{}'", username);
+        Err(StatusCode::UNAUTHORIZED)
+    }
+}
+
+/// Simple base64 decoder (no external dependency)
+fn base64_decode(input: &str) -> Result<Vec<u8>, &'static str> {
+    const DECODE_TABLE: [i8; 256] = {
+        let mut table = [-1i8; 256];
+        let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut i = 0;
+        while i < 64 {
+            table[alphabet[i] as usize] = i as i8;
+            i += 1;
+        }
+        table
+    };
+
+    let input = input.trim_end_matches('=');
+    let mut output = Vec::with_capacity(input.len() * 3 / 4);
+    let mut buffer = 0u32;
+    let mut bits = 0u32;
+
+    for &byte in input.as_bytes() {
+        let value = DECODE_TABLE[byte as usize];
+        if value < 0 {
+            return Err("Invalid base64 character");
+        }
+        buffer = (buffer << 6) | (value as u32);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            output.push((buffer >> bits) as u8);
+            buffer &= (1 << bits) - 1;
+        }
+    }
+
+    Ok(output)
+}
+
 /// Create the admin API router
 pub fn create_admin_router(state: AdminApiState) -> Router {
+    // Admin routes require authentication
     let protected_routes = Router::new()
         .route("/admin/add-node", post(handle_add_node))
         .route("/admin/remove-node", post(handle_node_removal))
@@ -556,12 +898,34 @@ pub fn create_admin_router(state: AdminApiState) -> Router {
         .route("/admin/rebalance", post(handle_rebalance))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 
+    // Health check is public
     let public_routes = Router::new()
         .route("/admin/health", get(handle_health));
+
+    // Schema Registry routes (Confluent-compatible)
+    // HTTP Basic Auth is optional, enabled via CHRONIK_SCHEMA_REGISTRY_AUTH_ENABLED
+    let schema_registry_routes = Router::new()
+        // Subject management
+        .route("/subjects", get(handle_list_subjects))
+        .route("/subjects/:subject/versions", get(handle_list_versions))
+        .route("/subjects/:subject/versions", post(handle_register_schema))
+        .route("/subjects/:subject/versions/:version", get(handle_get_subject_version))
+        .route("/subjects/:subject/versions/:version", delete(handle_delete_version))
+        .route("/subjects/:subject", delete(handle_delete_subject))
+        // Schema by ID
+        .route("/schemas/ids/:id", get(handle_get_schema_by_id))
+        // Compatibility configuration
+        .route("/config", get(handle_get_global_config))
+        .route("/config", put(handle_set_global_config))
+        .route("/config/:subject", get(handle_get_subject_config))
+        .route("/config/:subject", put(handle_set_subject_config))
+        // Apply HTTP Basic Auth middleware (no-op if auth not enabled)
+        .layer(middleware::from_fn_with_state(state.clone(), schema_registry_auth_middleware));
 
     Router::new()
         .merge(protected_routes)
         .merge(public_routes)
+        .merge(schema_registry_routes)
         .with_state(state)
 }
 
@@ -586,12 +950,18 @@ pub fn create_admin_router(state: AdminApiState) -> Router {
 ///
 /// Optional ISR tracker for accurate in-sync replica queries. If provided,
 /// the cluster status endpoint will show actual ISR based on follower acknowledgements.
+///
+/// # Schema Registry (Phase 5)
+///
+/// The Schema Registry is always enabled and provides Confluent-compatible REST API
+/// for schema management. Schema Registry routes do NOT require authentication.
 pub async fn start_admin_api(
     raft_cluster: Arc<RaftCluster>,
     metadata_store: Arc<dyn MetadataStore>,
     port: u16,
     api_key: Option<String>,
     isr_tracker: Option<Arc<IsrTracker>>,
+    schema_registry: Arc<SchemaRegistry>,
 ) -> Result<()> {
     let effective_key = match api_key.or_else(|| std::env::var("CHRONIK_ADMIN_API_KEY").ok()) {
         Some(key) => {
@@ -610,6 +980,7 @@ pub async fn start_admin_api(
         metadata_store,
         api_key: effective_key,
         isr_tracker,
+        schema_registry,
     };
 
     let app = create_admin_router(state);
@@ -623,7 +994,8 @@ pub async fn start_admin_api(
         warn!("⚠ Admin API will run over HTTP. To enable TLS, add axum-server dependency.");
     }
 
-    info!("Starting Admin API HTTP server on {}", addr);
+    info!("Starting Admin API + Schema Registry HTTP server on {}", addr);
+    info!("Schema Registry endpoints available at /subjects, /schemas/ids, /config");
 
     tokio::spawn(async move {
         if let Err(e) = Server::bind(&addr)

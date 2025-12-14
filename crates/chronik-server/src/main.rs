@@ -59,6 +59,9 @@ mod quorum_recovery;
 
 mod cli;
 mod cluster;  // Phase 1.2: Cluster mode refactoring (complexity reduction from 288 → <25)
+mod tls;  // Phase 5: TLS encryption for Kafka protocol connections
+mod acl;  // Phase 5: Access Control Lists for authorization
+mod schema_registry;  // Phase 5: Confluent-compatible Schema Registry
 
 use integrated_server::{IntegratedKafkaServer, IntegratedServerConfig, IntegratedKafkaServerBuilder};
 use chronik_wal::compaction::{WalCompactor, CompactionConfig, CompactionStrategy};
@@ -634,15 +637,20 @@ async fn run_cluster_mode(
         cli.data_dir.to_string_lossy().to_string(),
     ).await?;
 
-    // Phase 9: Start Admin API
+    // Phase 9: Start Admin API + Schema Registry
     // v2.2.22: ISR tracker for accurate in-sync replica queries
     // The IsrTracker is updated when followers send WAL ACKs back to the leader
+    // Phase 5: Schema Registry for Confluent-compatible schema management
+    let schema_registry = Arc::new(schema_registry::SchemaRegistry::new(
+        schema_registry::SchemaRegistryConfig::from_env()
+    ));
     start_admin_api(
         raft_cluster.clone(),
         server.metadata_store().clone(),
         init_config.node_id,
         &bind,
         server.isr_tracker(),  // v2.2.22: Wire up ISR tracker from builder
+        schema_registry,       // Phase 5: Schema Registry
     ).await?;
 
     // Phase 10: Start Partition Rebalancer
@@ -719,6 +727,7 @@ async fn run_single_node_mode(
         enable_metadata_dr: true,
         metadata_upload_interval_secs: 60,
         cluster_config: None,
+        tls_config: None, // TLS configured via env vars
     };
 
     // Create server using builder pattern (single-node mode, no Raft cluster)

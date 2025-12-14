@@ -2,8 +2,8 @@
 
 This document catalogs all TODOs, stubs, and incomplete implementations in the Chronik Stream codebase. Items are categorized by priority and include implementation requirements.
 
-**Last Updated**: 2025-12-01
-**Version**: v2.2.18
+**Last Updated**: 2025-12-08
+**Version**: v2.2.20
 
 ---
 
@@ -57,7 +57,7 @@ This document catalogs all TODOs, stubs, and incomplete implementations in the C
   - `TopicDeleted` event published to event bus for cluster replication
   - Tested with Python kafka-python client
 
-### ✅ Phase 3b: API Completeness - COMPLETE (v2.2.18)
+### ✅ Phase 3b: API Completeness - COMPLETE (v2.2.19)
 - **Configuration Updates (AlterConfigs/IncrementalAlterConfigs)**:
   - `handle_alter_configs()` now persists config changes to metadata store
   - Applies retention.ms, segment.bytes, and custom configs
@@ -69,6 +69,23 @@ This document catalogs all TODOs, stubs, and incomplete implementations in the C
   - Serializes member assignment to Kafka wire format
   - Partition leader lookup via `metadata_store.get_partition_leader()`
   - Batch offset fetching fetches all topics/partitions in one operation
+
+### ✅ Phase 4: Performance Optimizations - COMPLETE (v2.2.20)
+- **Segment Cache Layer**: Already implemented in `chronik-storage/src/segment_cache.rs`
+  - LRU eviction with configurable max entries and size
+  - TTL-based cache invalidation
+  - Warmup capabilities for hot segments
+  - Cache stats tracking (hit rate, memory usage)
+- **Vector Search HNSW**: Upgraded from brute-force O(n) to real HNSW O(log n)
+  - Uses `instant-distance` crate for HNSW graph
+  - Supports Euclidean, Cosine, and Inner Product distance metrics
+  - Configurable M, ef_construction, and ef_search parameters
+  - Serialization/deserialization for persistence
+  - Fallback to brute-force if index not built
+- **Benchmarks**: Enhanced with vector search benchmarks
+  - HNSW vs brute-force search comparison (1K, 10K, 50K vectors)
+  - HNSW index build time benchmarks
+  - Added to existing segment comparison benchmarks
 
 ---
 
@@ -448,137 +465,69 @@ Dependencies:
 
 ## Priority 4: Performance & Features
 
-### 12. Vector Search HNSW (chronik-storage/src/vector_search.rs)
+### ~~12. Vector Search HNSW (chronik-storage/src/vector_search.rs)~~ ✅ IMPLEMENTED
 
-**Status**: Uses brute-force O(n) search instead of HNSW O(log n)
+**Status**: ✅ **COMPLETE** - Upgraded to real HNSW using `instant-distance` crate (v2.2.20)
 
-**Implementation Requirements**:
-```
-1. HNSW algorithm implementation:
-   - Multi-layer graph structure
-   - Entry point selection
-   - Greedy search with backtracking
-   - Neighbor selection during insert
-
-2. Consider using existing crate:
-   hnsw_rs = "0.2"  # Pure Rust HNSW implementation
-
-   Or instant-distance which is battle-tested.
-
-3. If implementing from scratch:
-   struct HnswGraph {
-       layers: Vec<HashMap<u64, Vec<u64>>>,  // node -> neighbors per layer
-       vectors: HashMap<u64, Vec<f32>>,       // node -> vector
-       entry_point: Option<u64>,
-       max_layer: usize,
-       ef_construction: usize,  // build-time accuracy
-       ef_search: usize,        // query-time accuracy
-   }
-
-4. Persistence:
-   - Serialize graph structure
-   - Incremental updates without full rebuild
-   - Memory-mapped for large indexes
-
-Use case: Semantic search over message embeddings
-Current brute-force works for <10K vectors, HNSW needed for scale.
-```
-
-**Effort Estimate**: 3-5 days (or 1 day with hnsw_rs crate)
+**Implementation**:
+- Added `instant-distance = "0.6"` dependency
+- `RealHnswIndex` struct with HnswMap for O(log n) search
+- Supports Euclidean, Cosine, and Inner Product distance metrics
+- Configurable parameters (M=16, ef_construction=200, ef_search=50)
+- Point wrappers: `EuclideanPoint`, `CosinePoint`, `DotProductPoint`
+- Serialization via bincode for persistence
+- Brute-force fallback when index not built
+- 8 comprehensive tests including all distance metrics
 
 ---
 
-### 13. Segment Cache Layer (chronik-storage/src/segment_reader.rs:31)
+### ~~13. Segment Cache Layer (chronik-storage/src/segment_cache.rs)~~ ✅ IMPLEMENTED
 
-**Status**: No caching, every read goes to storage
+**Status**: ✅ **COMPLETE** - Already implemented in `chronik-storage/src/segment_cache.rs`
 
-**Implementation Requirements**:
-```
-1. Cache structure:
-   struct SegmentCache {
-       entries: LruCache<CacheKey, CachedSegment>,
-       max_size_bytes: usize,
-       current_size: AtomicUsize,
-       hit_count: AtomicU64,
-       miss_count: AtomicU64,
-   }
-
-   struct CacheKey {
-       topic: String,
-       partition: i32,
-       base_offset: i64,
-   }
-
-   struct CachedSegment {
-       data: Bytes,
-       loaded_at: Instant,
-       access_count: u64,
-   }
-
-2. Eviction policy:
-   - LRU by default
-   - Size-based limits
-   - TTL for stale data
-
-3. Integration:
-   - Check cache before storage read
-   - Populate cache after storage read
-   - Invalidate on segment rotation
-
-4. Metrics:
-   - Hit rate tracking
-   - Memory usage
-   - Eviction counts
-
-Dependencies:
-- lru crate already available
-- SegmentReader has storage_service field
-```
-
-**Effort Estimate**: 1-2 days
+**Implementation**:
+- `SegmentCache` struct with LRU eviction
+- `SegmentCacheConfig` for max_entries, max_size_bytes, TTL, warmup options
+- `CacheStats` for hit rate, miss rate, eviction count, memory tracking
+- `EvictionPolicy` enum (Lru, Lfu, Ttl)
+- `CachedSegmentReader` wrapper for cached access
+- Background eviction task for TTL enforcement
+- Integration with `SegmentReader`
+- Comprehensive test coverage
 
 ---
 
-### 14. Benchmarks (chronik-bench/src/benchmark.rs)
+### ~~14. Benchmarks~~ ✅ IMPLEMENTED
 
-| Line | Item |
-|------|------|
-| 576 | Round-trip benchmark |
-| 586 | Metadata benchmark |
+**Status**: ✅ **COMPLETE** - Comprehensive benchmark suite available
 
-**Implementation Requirements**:
+**Implementation**:
+- **chronik-bench** binary (`crates/chronik-bench/`):
+  - Produce benchmark mode
+  - Consume benchmark mode
+  - Round-trip benchmark mode (end-to-end latency)
+  - Metadata benchmark mode (topic create/delete)
+  - HDR histogram for latency tracking (p50, p90, p95, p99, p999)
+  - Progress reporting with rates and latencies
+  - Configurable concurrency, compression, rate limiting
+
+- **Storage benchmarks** (`crates/chronik-storage/benches/segment_comparison.rs`):
+  - Segment build performance
+  - Time range query performance
+  - Bloom filter performance
+  - Storage efficiency comparison
+  - **NEW in v2.2.20**: Vector search benchmarks
+    - HNSW vs brute-force search (1K, 10K, 50K vectors)
+    - HNSW index build time
+
+**Running benchmarks**:
+```bash
+# Run storage benchmarks
+cargo bench -p chronik-storage
+
+# Run Kafka protocol benchmarks
+cargo run --bin chronik-bench -- --mode round-trip --topic bench-test
 ```
-1. Round-trip benchmark:
-   - Produce N messages
-   - Immediately consume them
-   - Measure end-to-end latency
-   - Report p50, p95, p99
-
-2. Metadata benchmark:
-   - Create/delete topics
-   - Describe topics
-   - List groups
-   - Measure API latencies
-
-3. Implementation:
-   async fn benchmark_roundtrip(&self, config: &BenchmarkConfig) -> BenchmarkResult {
-       let producer = KafkaProducer::new(config)?;
-       let consumer = KafkaConsumer::new(config)?;
-
-       let mut latencies = Vec::new();
-       for i in 0..config.message_count {
-           let start = Instant::now();
-           let key = format!("key-{}", i);
-           producer.send(&config.topic, &key, &self.payload).await?;
-           consumer.poll_until(&key).await?;
-           latencies.push(start.elapsed());
-       }
-
-       BenchmarkResult::from_latencies(latencies)
-   }
-```
-
-**Effort Estimate**: 1 day
 
 ---
 
@@ -623,12 +572,12 @@ Many TODOs in the original analysis are in dead code. The actual pending work in
 | Segment checksums | P2 | ✅ **COMPLETE** (v2.2.18) |
 | LZ4/Snappy compression | P2 | ✅ **COMPLETE** (v2.2.18) |
 | Backup encryption | P1 | ✅ **COMPLETE** (v2.2.19) |
-| Topic deletion | P3 | ✅ **COMPLETE** (v2.2.20) |
-| Consumer group improvements | P3 | ✅ **COMPLETE** (v2.2.21) |
-| Configuration updates | P3 | ✅ **COMPLETE** (v2.2.21) |
-| Segment cache | P4 | Not started |
-| Vector search HNSW | P4 | Brute force only |
-| Benchmarks | P4 | Incomplete |
+| Topic deletion | P3 | ✅ **COMPLETE** (v2.2.18) |
+| Consumer group improvements | P3 | ✅ **COMPLETE** (v2.2.19) |
+| Configuration updates | P3 | ✅ **COMPLETE** (v2.2.19) |
+| Segment cache | P4 | ✅ **COMPLETE** (v2.2.20) |
+| Vector search HNSW | P4 | ✅ **COMPLETE** (v2.2.20) |
+| Benchmarks | P4 | ✅ **COMPLETE** (v2.2.20) |
 
 ---
 
@@ -652,14 +601,16 @@ Many TODOs in the original analysis are in dead code. The actual pending work in
 7. ~~Configuration updates (P3, 2-3 days)~~ - Done
 8. ~~Consumer group improvements (P3, 1 day)~~ - Done
 
-### Phase 4: Performance (if needed)
-9. Segment cache (P4, 1-2 days)
-10. Vector search HNSW (P4, 3-5 days)
+### ~~Phase 4: Performance~~ - ✅ COMPLETE (v2.2.20)
+9. ~~Segment cache (P4, 1-2 days)~~ - Done (already existed)
+10. ~~Vector search HNSW (P4, 3-5 days)~~ - Done (upgraded to instant-distance)
+11. ~~Benchmarks (P4)~~ - Done (added vector search benchmarks)
 
 ### Phase 5: Enterprise Features (if needed)
-11. TLS for Kafka Protocol (2-3 days)
-12. ACL Authorization System (3-5 days)
-13. Schema Registry (5-7 days)
+12. TLS for Kafka Protocol (2-3 days)
+13. ACL Authorization System (3-5 days)
+14. Schema Registry (5-7 days)
+15. GSSAPI/Kerberos Authentication (5-7 days)
 
 ---
 

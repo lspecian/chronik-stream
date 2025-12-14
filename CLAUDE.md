@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Chronik Stream is a high-performance Kafka-compatible streaming platform written in Rust that implements the Kafka wire protocol with comprehensive Write-Ahead Log (WAL) durability and automatic recovery. Current version: v2.2.9.
+Chronik Stream is a high-performance Kafka-compatible streaming platform written in Rust that implements the Kafka wire protocol with comprehensive Write-Ahead Log (WAL) durability and automatic recovery. Current version: v2.2.21.
 
 **Key Differentiators:**
 - Full Kafka protocol compatibility tested with real clients (kafka-python, confluent-kafka, KSQL, Apache Flink)
@@ -684,6 +684,47 @@ curl -X POST http://localhost:10001/admin/remove-node \
 
 See [docs/ADMIN_API_SECURITY.md](docs/ADMIN_API_SECURITY.md) for details.
 
+### Schema Registry (v2.2.20+)
+
+Chronik includes a Confluent-compatible Schema Registry for managing Avro, JSON Schema, and Protobuf schemas.
+
+**Key Features:**
+- Full Confluent Schema Registry REST API compatibility
+- Avro, JSON Schema, and Protobuf support
+- Schema compatibility checking (BACKWARD, FORWARD, FULL, NONE)
+- Optional HTTP Basic Auth (Confluent-compatible)
+- Runs on Admin API port (`10000 + node_id`)
+
+#### Quick Start
+
+```bash
+# Register a schema
+curl -X POST http://localhost:10001/subjects/user-value/versions \
+  -H "Content-Type: application/json" \
+  -d '{"schema": "{\"type\": \"record\", \"name\": \"User\", \"fields\": [{\"name\": \"id\", \"type\": \"long\"}]}"}'
+
+# List subjects
+curl http://localhost:10001/subjects
+
+# Get schema by ID
+curl http://localhost:10001/schemas/ids/1
+```
+
+#### Authentication
+
+Schema Registry supports optional HTTP Basic Auth:
+
+```bash
+# Enable with environment variables
+export CHRONIK_SCHEMA_REGISTRY_AUTH_ENABLED=true
+export CHRONIK_SCHEMA_REGISTRY_USERS="admin:secret123,readonly:viewonly"
+
+# Usage with curl
+curl -u admin:secret123 http://localhost:10001/subjects
+```
+
+**See [docs/SCHEMA_REGISTRY.md](docs/SCHEMA_REGISTRY.md) for full documentation.**
+
 #### Testing
 
 Comprehensive test suite for node management:
@@ -921,6 +962,8 @@ Key environment variables:
 - `CHRONIK_ADMIN_API_KEY` - API key for admin API authentication (Priority 2, **REQUIRED for production**)
 - `CHRONIK_ADMIN_TLS_CERT` - Path to TLS certificate for admin API (Priority 2, optional)
 - `CHRONIK_ADMIN_TLS_KEY` - Path to TLS private key for admin API (Priority 2, optional)
+- `CHRONIK_SCHEMA_REGISTRY_AUTH_ENABLED` - Enable HTTP Basic Auth for Schema Registry (default: `false`)
+- `CHRONIK_SCHEMA_REGISTRY_USERS` - Comma-separated `user:pass` pairs for Schema Registry auth
 
 ## CRC and Checksum Architecture
 

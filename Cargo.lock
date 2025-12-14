@@ -963,7 +963,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-backup"
-version = "2.2.19"
+version = "2.2.20"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -1031,7 +1031,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-common"
-version = "2.2.19"
+version = "2.2.20"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1053,7 +1053,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-config"
-version = "2.2.19"
+version = "2.2.20"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1078,7 +1078,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-monitoring"
-version = "2.2.19"
+version = "2.2.20"
 dependencies = [
  "anyhow",
  "axum",
@@ -1100,7 +1100,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-protocol"
-version = "2.2.19"
+version = "2.2.20"
 dependencies = [
  "anyhow",
  "base64 0.21.7",
@@ -1124,7 +1124,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-query"
-version = "2.2.19"
+version = "2.2.20"
 dependencies = [
  "anyhow",
  "axum",
@@ -1149,7 +1149,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-raft"
-version = "2.2.19"
+version = "2.2.20"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1179,7 +1179,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-raft-bridge"
-version = "2.2.19"
+version = "2.2.20"
 dependencies = [
  "bytes",
  "prost",
@@ -1188,7 +1188,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-search"
-version = "2.2.19"
+version = "2.2.20"
 dependencies = [
  "anyhow",
  "axum",
@@ -1222,7 +1222,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-server"
-version = "2.2.19"
+version = "2.2.20"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1255,6 +1255,8 @@ dependencies = [
  "prost",
  "raft",
  "reqwest",
+ "rustls 0.23.34",
+ "rustls-pemfile 2.2.0",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -1265,6 +1267,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-rustls 0.26.4",
  "tokio-util",
  "toml 0.8.23",
  "tonic",
@@ -1277,7 +1280,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-storage"
-version = "2.2.19"
+version = "2.2.20"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1301,6 +1304,7 @@ dependencies = [
  "flate2",
  "futures",
  "hex",
+ "instant-distance",
  "libc",
  "lz4_flex",
  "md5",
@@ -1323,7 +1327,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-wal"
-version = "2.2.19"
+version = "2.2.20"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2910,6 +2914,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "instant-distance"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8c619cdaa30bb84088963968bee12a45ea5fbbf355f2c021bcd15589f5ca494a"
+dependencies = [
+ "num_cpus",
+ "ordered-float 3.9.2",
+ "parking_lot",
+ "rand 0.8.5",
+ "rayon",
+]
+
+[[package]]
 name = "io-uring"
 version = "0.5.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3463,6 +3480,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "num_cpus"
+version = "1.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "91df4bbde75afed763b708b7eee1e8e7651e02d97f6d5dd763e89367e957b23b"
+dependencies = [
+ "hermit-abi",
+ "libc",
+]
+
+[[package]]
 name = "num_enum"
 version = "0.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3675,12 +3702,21 @@ dependencies = [
  "glob",
  "once_cell",
  "opentelemetry",
- "ordered-float",
+ "ordered-float 4.6.0",
  "percent-encoding",
  "rand 0.8.5",
  "thiserror 1.0.69",
  "tokio",
  "tokio-stream",
+]
+
+[[package]]
+name = "ordered-float"
+version = "3.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1e1c390732d15f1d48471625cd92d154e66db2c56645e29a9cd26f4699f72dc"
+dependencies = [
+ "num-traits",
 ]
 
 [[package]]
@@ -4569,7 +4605,7 @@ dependencies = [
  "pin-project-lite",
  "rustls 0.21.12",
  "rustls-native-certs 0.6.3",
- "rustls-pemfile",
+ "rustls-pemfile 1.0.4",
  "serde",
  "serde_json",
  "serde_urlencoded",
@@ -4736,6 +4772,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6a9586e9ee2b4f8fab52a0048ca7334d7024eef48e2cb9407e3497bb7cab7fa7"
 dependencies = [
  "aws-lc-rs",
+ "log",
  "once_cell",
  "rustls-pki-types",
  "rustls-webpki 0.103.8",
@@ -4750,7 +4787,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a9aace74cb666635c918e9c12bc0d348266037aa8eb599b5cba565709a8dff00"
 dependencies = [
  "openssl-probe",
- "rustls-pemfile",
+ "rustls-pemfile 1.0.4",
  "schannel",
  "security-framework 2.11.1",
 ]
@@ -4774,6 +4811,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c74cae0a4cf6ccbbf5f359f08efdf8ee7e1dc532573bf0db71968cb56b1448c"
 dependencies = [
  "base64 0.21.7",
+]
+
+[[package]]
+name = "rustls-pemfile"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dce314e5fee3f39953d46bb63bb8a46d40c2f8fb7cc5a3b6cab2bde9721d6e50"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]

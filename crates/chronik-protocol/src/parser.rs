@@ -671,6 +671,7 @@ pub fn is_flexible_version(api_key: ApiKey, api_version: i16) -> bool {
         ApiKey::DescribeGroups => api_version >= 5,
         ApiKey::ListGroups => api_version >= 3,
         ApiKey::SaslHandshake => api_version >= 1,
+        ApiKey::SaslAuthenticate => api_version >= 2,  // v2+ uses flexible encoding
         ApiKey::ApiVersions => api_version >= 3,
         ApiKey::CreateTopics => api_version >= 5,
         ApiKey::DeleteTopics => api_version >= 4,
@@ -740,7 +741,7 @@ pub fn supported_api_versions() -> HashMap<ApiKey, VersionRange> {
     versions.insert(ApiKey::OffsetForLeaderEpoch, VersionRange { min: 0, max: 0 });
     versions.insert(ApiKey::AlterReplicaLogDirs, VersionRange { min: 0, max: 0 });
     versions.insert(ApiKey::DescribeLogDirs, VersionRange { min: 0, max: 0 });
-    versions.insert(ApiKey::SaslAuthenticate, VersionRange { min: 0, max: 0 });
+    versions.insert(ApiKey::SaslAuthenticate, VersionRange { min: 0, max: 2 });
     versions.insert(ApiKey::CreatePartitions, VersionRange { min: 0, max: 0 });
     versions.insert(ApiKey::CreateDelegationToken, VersionRange { min: 0, max: 0 });
     versions.insert(ApiKey::RenewDelegationToken, VersionRange { min: 0, max: 0 });

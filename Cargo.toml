@@ -18,7 +18,7 @@ members = [
 exclude = ["tests"]
 
 [workspace.package]
-version = "2.2.19"
+version = "2.2.21"
 edition = "2021"
 authors = ["Chronik Stream Contributors"]
 license = "Apache-2.0"
@@ -104,6 +104,11 @@ clap = { version = "4.4", features = ["derive", "env"] }
 
 # Build dependencies
 tonic-build = "0.9"
+
+# TLS for Kafka Protocol
+tokio-rustls = "0.26"
+rustls = "0.23"
+rustls-pemfile = "2.1"
 
 # Testing
 proptest = "1.4"

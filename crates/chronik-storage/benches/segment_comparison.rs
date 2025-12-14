@@ -5,7 +5,8 @@ use chronik_storage::{
     Record, RecordBatch,
     ChronikSegment, ChronikSegmentBuilder,
     OptimizedTansuSegment,
-    CompressionType
+    CompressionType,
+    VectorIndex,  // Trait for vector search
 };
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -220,11 +221,127 @@ fn bench_storage_efficiency(_c: &mut Criterion) {
     }
 }
 
+/// Benchmark vector search operations (brute force vs HNSW)
+fn bench_vector_search(c: &mut Criterion) {
+    use chronik_storage::{RealHnswIndex, HnswConfig, DistanceMetric};
+
+    let mut group = c.benchmark_group("vector_search");
+
+    for vector_count in [1000, 10000, 50000].iter() {
+        let dimensions = 128;
+
+        // Generate random vectors
+        let vectors: Vec<(u64, Vec<f32>)> = (0..*vector_count)
+            .map(|i| {
+                let vec: Vec<f32> = (0..dimensions)
+                    .map(|j| ((i * 7 + j) % 256) as f32 / 256.0)
+                    .collect();
+                (i as u64, vec)
+            })
+            .collect();
+
+        // Build HNSW index
+        let config = HnswConfig {
+            dimensions,
+            metric: DistanceMetric::Euclidean,
+            m: 16,
+            ef_construction: 200,
+            ef_search: 50,
+        };
+        let mut hnsw_index = RealHnswIndex::new(config.clone());
+        for (id, vec) in &vectors {
+            hnsw_index.add_vector(*id, vec).unwrap();
+        }
+        hnsw_index.build().unwrap();
+
+        // Query vector
+        let query: Vec<f32> = (0..dimensions).map(|i| (i % 128) as f32 / 128.0).collect();
+
+        group.bench_with_input(
+            BenchmarkId::new("HNSW_search", vector_count),
+            vector_count,
+            |b, _| {
+                b.iter(|| {
+                    let results = hnsw_index.search(black_box(&query), 10).unwrap();
+                    black_box(results)
+                });
+            },
+        );
+
+        // Brute force search (without building)
+        let mut brute_index = RealHnswIndex::new(config);
+        for (id, vec) in &vectors {
+            brute_index.add_vector(*id, vec).unwrap();
+        }
+        // Don't build - will use brute force fallback
+
+        group.bench_with_input(
+            BenchmarkId::new("BruteForce_search", vector_count),
+            vector_count,
+            |b, _| {
+                b.iter(|| {
+                    let results = brute_index.search(black_box(&query), 10).unwrap();
+                    black_box(results)
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+/// Benchmark HNSW index build time
+fn bench_hnsw_build(c: &mut Criterion) {
+    use chronik_storage::{RealHnswIndex, HnswConfig, DistanceMetric};
+
+    let mut group = c.benchmark_group("hnsw_build");
+
+    for vector_count in [1000, 5000, 10000].iter() {
+        let dimensions = 128;
+
+        // Generate random vectors
+        let vectors: Vec<(u64, Vec<f32>)> = (0..*vector_count)
+            .map(|i| {
+                let vec: Vec<f32> = (0..dimensions)
+                    .map(|j| ((i * 7 + j) % 256) as f32 / 256.0)
+                    .collect();
+                (i as u64, vec)
+            })
+            .collect();
+
+        group.bench_with_input(
+            BenchmarkId::new("build", vector_count),
+            vector_count,
+            |b, _| {
+                b.iter(|| {
+                    let config = HnswConfig {
+                        dimensions,
+                        metric: DistanceMetric::Euclidean,
+                        m: 16,
+                        ef_construction: 200,
+                        ef_search: 50,
+                    };
+                    let mut index = RealHnswIndex::new(config);
+                    for (id, vec) in &vectors {
+                        index.add_vector(*id, vec).unwrap();
+                    }
+                    index.build().unwrap();
+                    black_box(index)
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_segment_build,
     bench_time_range_query,
     bench_bloom_filter,
-    bench_storage_efficiency
+    bench_storage_efficiency,
+    bench_vector_search,
+    bench_hnsw_build
 );
 criterion_main!(benches);

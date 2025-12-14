@@ -130,6 +130,8 @@ impl KafkaProtocolHandler {
             ApiKey::OffsetCommit => self.handle_offset_commit_request(header, buf).await,
             ApiKey::OffsetFetch => self.handle_offset_fetch_request(header, buf).await,
             ApiKey::CreateTopics => self.handle_create_topics_request(header, buf, request_bytes).await,
+            ApiKey::SaslHandshake => self.handle_sasl_handshake_request(header, buf).await,
+            ApiKey::SaslAuthenticate => self.handle_sasl_authenticate_request(header, buf).await,
             _ => self.handle_default_request(request_bytes, header.api_key, header.api_version).await,
         }
     }
@@ -1248,6 +1250,141 @@ impl KafkaProtocolHandler {
             body,
             is_flexible: false,  // We don't know the exact version, but basic response works
             api_key: ApiKey::CreateTopics,
+            throttle_time_ms: None,
+        })
+    }
+
+    // ========================================================================
+    // SASL Authentication Handlers (Phase 5: Enterprise Features)
+    // ========================================================================
+
+    /// Handle SaslHandshake API request (API key 17)
+    ///
+    /// This is the first step in SASL authentication. The client sends the
+    /// mechanism it wants to use, and we respond with supported mechanisms.
+    #[instrument(skip(self, buf))]
+    async fn handle_sasl_handshake_request(
+        &self,
+        header: chronik_protocol::parser::RequestHeader,
+        mut buf: Bytes,
+    ) -> Result<Response> {
+        use chronik_protocol::parser::{Decoder, ResponseHeader};
+        use chronik_protocol::sasl::{SaslMechanism, encode_sasl_handshake_response, SaslHandshakeResponse};
+
+        tracing::info!("SaslHandshake v{} request received", header.api_version);
+
+        // Parse the requested mechanism
+        let mut decoder = Decoder::new(&mut buf);
+        let mechanism = if header.api_version >= 1 {
+            // v1+ uses compact strings
+            decoder.read_compact_string()?.unwrap_or_default()
+        } else {
+            // v0 uses regular strings
+            decoder.read_string()?.unwrap_or_default()
+        };
+
+        tracing::info!("Client requested SASL mechanism: {}", mechanism);
+
+        // Check if we support this mechanism
+        let supported_mechanisms = vec![
+            "PLAIN".to_string(),
+            "SCRAM-SHA-256".to_string(),
+            "SCRAM-SHA-512".to_string(),
+        ];
+
+        let error_code = if SaslMechanism::from_str(&mechanism).is_some() {
+            0 // Success
+        } else {
+            33 // UNSUPPORTED_SASL_MECHANISM
+        };
+
+        // Build response
+        let response = SaslHandshakeResponse {
+            error_code,
+            enabled_mechanisms: supported_mechanisms,
+        };
+
+        let body = encode_sasl_handshake_response(&response);
+
+        tracing::info!("SaslHandshake response: error_code={}, mechanisms={:?}",
+            error_code, response.enabled_mechanisms);
+
+        Ok(Response {
+            header: ResponseHeader {
+                correlation_id: header.correlation_id,
+            },
+            body,
+            is_flexible: header.api_version >= 1,
+            api_key: ApiKey::SaslHandshake,
+            throttle_time_ms: None,
+        })
+    }
+
+    /// Handle SaslAuthenticate API request (API key 36)
+    ///
+    /// This is the second step in SASL authentication. The client sends
+    /// authentication credentials based on the chosen mechanism.
+    #[instrument(skip(self, buf))]
+    async fn handle_sasl_authenticate_request(
+        &self,
+        header: chronik_protocol::parser::RequestHeader,
+        mut buf: Bytes,
+    ) -> Result<Response> {
+        use chronik_protocol::parser::{Decoder, ResponseHeader};
+        use chronik_protocol::sasl::{SaslAuthenticator, encode_sasl_authenticate_response, SaslAuthenticateResponse};
+
+        tracing::info!("SaslAuthenticate v{} request received", header.api_version);
+
+        // Parse the auth bytes
+        let mut decoder = Decoder::new(&mut buf);
+        let auth_bytes_opt = if header.api_version >= 2 {
+            // v2+ uses compact bytes
+            decoder.read_compact_bytes()?
+        } else {
+            // v0-v1 uses regular bytes
+            decoder.read_bytes()?
+        };
+
+        let auth_bytes = auth_bytes_opt.unwrap_or_default();
+        tracing::debug!("SaslAuthenticate auth_bytes len: {}", auth_bytes.len());
+
+        // Create a temporary authenticator for this request
+        // NOTE: In a full implementation, this would be per-connection state
+        // tracked in the connection handler. For now, we create a new one per request.
+        let mut authenticator = SaslAuthenticator::new();
+
+        // Force the authenticator into HandshakeComplete state for PLAIN
+        // (since we're stateless, we assume PLAIN was negotiated)
+        let _ = authenticator.handle_handshake(header.api_version, &["PLAIN".to_string()]);
+
+        // Attempt authentication
+        let response = match authenticator.handle_authenticate(&auth_bytes) {
+            Ok(auth_response) => {
+                tracing::info!("SASL authentication successful for user: {:?}", authenticator.username());
+                auth_response
+            }
+            Err(e) => {
+                tracing::warn!("SASL authentication failed: {}", e);
+                SaslAuthenticateResponse {
+                    error_code: 31, // SASL_AUTHENTICATION_FAILED
+                    error_message: Some(format!("{}", e)),
+                    auth_bytes: None,
+                    session_lifetime_ms: None,
+                }
+            }
+        };
+
+        let body = encode_sasl_authenticate_response(&response);
+
+        tracing::info!("SaslAuthenticate response: error_code={}", response.error_code);
+
+        Ok(Response {
+            header: ResponseHeader {
+                correlation_id: header.correlation_id,
+            },
+            body,
+            is_flexible: header.api_version >= 2,
+            api_key: ApiKey::SaslAuthenticate,
             throttle_time_ms: None,
         })
     }

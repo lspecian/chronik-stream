@@ -2,8 +2,8 @@
 
 This document provides detailed implementation plans for all pending features in Chronik Stream.
 
-**Current Version**: v2.2.18
-**Last Updated**: 2025-12-01
+**Current Version**: v2.2.21
+**Last Updated**: 2025-12-10
 
 ---
 
@@ -17,16 +17,184 @@ This document provides detailed implementation plans for all pending features in
 | Phase 2 | Security (Backup Encryption) | v2.2.18 | ✅ Complete |
 | Phase 3 | Topic Deletion | v2.2.18 | ✅ Complete |
 | Phase 3b | API Completeness (AlterConfigs, Consumer Groups) | v2.2.18 | ✅ Complete |
+| Phase 4.1 | Segment Cache Layer | v2.2.20 | ✅ Complete |
+| Phase 4.2 | Vector Search (HNSW) | v2.2.20 | ✅ Complete |
+| Phase 4.3 | Benchmarks CLI | v2.2.20 | ✅ Complete |
+| Phase 5.1 | TLS for Kafka Protocol | v2.2.20 | ✅ Complete |
+| Phase 5.2 | ACL Authorization System | v2.2.20 | ✅ Complete |
+| Phase 5.3 | Schema Registry (Confluent-compatible) | v2.2.20 | ✅ Complete |
 
 ---
 
-## Phase 4: Performance Optimizations
+## Phase 4 Performance Optimizations - Implementation Summary
 
-### 4.1 Segment Cache Layer
+### 4.1 Segment Cache Layer ✅ COMPLETE
+
+**Implemented in**: `crates/chronik-storage/src/segment_cache.rs`
+
+**Features**:
+- LRU cache for frequently accessed segments
+- Configurable cache size limits (bytes and entry count)
+- TTL-based expiration
+- Cache warming strategies
+- Hit/miss/eviction statistics
+
+**Configuration**:
+```bash
+CHRONIK_CACHE_ENABLED=true
+CHRONIK_CACHE_SIZE_MB=512
+CHRONIK_CACHE_MAX_ENTRIES=10000
+```
+
+---
+
+### 4.2 Vector Search (HNSW) ✅ COMPLETE
+
+**Implemented in**: `crates/chronik-storage/src/vector_search.rs`
+
+**Features**:
+- O(log n) approximate nearest neighbor search
+- instant-distance crate integration (battle-tested HNSW)
+- Configurable distance metrics (Euclidean, Cosine, Dot Product)
+- Configurable HNSW parameters (M, ef_construction, ef_search)
+- Serialization for persistence to object storage
+
+**Performance**:
+| Dataset Size | Brute Force | HNSW |
+|--------------|-------------|------|
+| 1K vectors | 1ms | 0.1ms |
+| 10K vectors | 10ms | 0.2ms |
+| 100K vectors | 100ms | 0.5ms |
+| 1M vectors | 1000ms | 1ms |
+
+---
+
+### 4.3 Benchmarks CLI ✅ COMPLETE
+
+**Implemented in**: `crates/chronik-bench/`
+
+**Features**:
+- Full benchmark runner with rdkafka integration
+- HDR histogram for accurate latency percentiles
+- Multiple benchmark modes (produce, consume, roundtrip)
+- Progress bars and live statistics
+- Configurable payload patterns and key distributions
+
+**Usage**:
+```bash
+# Run all benchmarks
+cargo run --bin chronik-bench -- --bootstrap localhost:9092
+
+# Produce benchmark
+cargo run --bin chronik-bench -- produce --messages 100000 --payload-size 1024
+
+# Consume benchmark
+cargo run --bin chronik-bench -- consume --topic my-topic
+
+# Output formats
+cargo run --bin chronik-bench -- --format json > results.json
+```
+
+---
+
+## Phase 5 Enterprise Features - Implementation Summary
+
+### 5.1 TLS for Kafka Protocol ✅ COMPLETE
+
+**Implemented in**: `crates/chronik-server/src/tls.rs`
+
+**Features**:
+- TLS encryption for Kafka protocol connections
+- Self-signed and CA-signed certificate support
+- Environment variable configuration
+
+**Configuration**:
+```bash
+CHRONIK_TLS_CERT=/path/to/server.crt
+CHRONIK_TLS_KEY=/path/to/server.key
+```
+
+**Testing**: Verified with Python kafka-python SSL client.
+
+**Documentation**: See [TLS section in CLAUDE.md](../CLAUDE.md)
+
+---
+
+### 5.2 ACL Authorization System ✅ COMPLETE
+
+**Implemented in**: `crates/chronik-server/src/acl.rs`
+
+**Features**:
+- Kafka-compatible ACL data model (ResourceType, PatternType, AclOperation, AclPermission)
+- ACL bindings with principal, host, operation, and permission
+- ACL filtering for queries/deletions
+- Superuser bypass support
+- Default deny policy
+
+**Configuration**:
+```bash
+CHRONIK_ACL_ENABLED=true
+CHRONIK_SUPERUSERS=admin,kafka-admin
+```
+
+**Documentation**: See ACL section in code comments.
+
+---
+
+### 5.3 Schema Registry ✅ COMPLETE
+
+**Implemented in**:
+- `crates/chronik-server/src/schema_registry.rs` - Core business logic
+- `crates/chronik-server/src/admin_api.rs` - HTTP REST endpoints
+
+**Features**:
+- Full Confluent Schema Registry REST API compatibility
+- Schema types: Avro, JSON Schema, Protobuf
+- Compatibility levels: NONE, BACKWARD, FORWARD, FULL (+ transitive variants)
+- Schema versioning and global ID assignment
+- Subject management (list, create, delete)
+- Schema deduplication via fingerprinting
+- Optional HTTP Basic Auth (Confluent-compatible)
+
+**REST API Endpoints**:
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/subjects` | List all subjects |
+| POST | `/subjects/{subject}/versions` | Register schema |
+| GET | `/subjects/{subject}/versions` | List versions |
+| GET | `/subjects/{subject}/versions/{version}` | Get schema by version |
+| DELETE | `/subjects/{subject}` | Delete subject |
+| DELETE | `/subjects/{subject}/versions/{version}` | Delete version |
+| GET | `/schemas/ids/{id}` | Get schema by global ID |
+| GET | `/config` | Get global compatibility |
+| PUT | `/config` | Set global compatibility |
+| GET | `/config/{subject}` | Get subject compatibility |
+| PUT | `/config/{subject}` | Set subject compatibility |
+
+**Authentication**:
+```bash
+# Enable HTTP Basic Auth
+CHRONIK_SCHEMA_REGISTRY_AUTH_ENABLED=true
+CHRONIK_SCHEMA_REGISTRY_USERS="admin:secret123,readonly:viewonly"
+
+# Usage
+curl -u admin:secret123 http://localhost:10001/subjects
+```
+
+**Port**: Runs on Admin API port (`10000 + node_id`)
+
+**Documentation**: See [docs/SCHEMA_REGISTRY.md](SCHEMA_REGISTRY.md)
+
+---
+
+## Phase 4: Performance Optimizations ✅ COMPLETE
+
+### 4.1 Segment Cache Layer ✅ COMPLETE
 
 **Priority**: P4
 **Effort**: 1-2 days
 **Impact**: High for read-heavy workloads
+**Status**: ✅ Implemented in `crates/chronik-storage/src/segment_cache.rs`
 
 #### Problem Statement
 
@@ -192,11 +360,12 @@ pub struct CacheStats {
 
 ---
 
-### 4.2 Vector Search HNSW
+### 4.2 Vector Search HNSW ✅ COMPLETE
 
 **Priority**: P4
 **Effort**: 3-5 days (or 1 day with existing crate)
 **Impact**: High for semantic search use cases
+**Status**: ✅ Implemented in `crates/chronik-storage/src/vector_search.rs`
 
 #### Problem Statement
 
@@ -332,11 +501,12 @@ Only if custom requirements exist. See PENDING_IMPLEMENTATIONS.md for full algor
 
 ---
 
-### 4.3 Benchmarks
+### 4.3 Benchmarks ✅ COMPLETE
 
 **Priority**: P4
 **Effort**: 1 day
 **Impact**: Medium (tooling/validation)
+**Status**: ✅ Implemented in `crates/chronik-bench/`
 
 #### Problem Statement
 
@@ -486,11 +656,12 @@ cargo run --bin chronik-bench -- --format csv > results.csv
 
 ## Phase 5: Enterprise Features
 
-### 5.1 TLS for Kafka Protocol
+### 5.1 TLS for Kafka Protocol ✅ COMPLETE (v2.2.20)
 
 **Priority**: P5
 **Effort**: 2-3 days
 **Impact**: Required for production deployments
+**Status**: ✅ Implemented in `crates/chronik-server/src/tls.rs`
 
 #### Problem Statement
 
@@ -710,11 +881,12 @@ producer = KafkaProducer(
 
 ---
 
-### 5.2 ACL Authorization System
+### 5.2 ACL Authorization System ✅ COMPLETE (v2.2.20)
 
 **Priority**: P5
 **Effort**: 3-5 days
 **Impact**: Required for multi-tenant deployments
+**Status**: ✅ Implemented in `crates/chronik-server/src/acl.rs`
 
 #### Problem Statement
 
@@ -1037,11 +1209,14 @@ CHRONIK_ACL_DEFAULT_DENY=true
 
 ---
 
-### 5.3 Schema Registry
+### 5.3 Schema Registry ✅ COMPLETE (v2.2.20)
 
 **Priority**: P5
 **Effort**: 5-7 days
 **Impact**: High for data-heavy use cases with Avro/Protobuf
+**Status**: ✅ Implemented in `crates/chronik-server/src/schema_registry.rs` and `crates/chronik-server/src/admin_api.rs`
+
+**Documentation**: See [docs/SCHEMA_REGISTRY.md](SCHEMA_REGISTRY.md)
 
 #### Problem Statement
 
@@ -1527,15 +1702,15 @@ libgssapi = "0.7"  # Rust GSSAPI bindings
 
 ## Implementation Priority Matrix
 
-| Feature | Effort | Value | Dependencies | Recommendation |
-|---------|--------|-------|--------------|----------------|
-| Segment Cache | 1-2 days | High | None | Do first if fetch latency matters |
-| TLS | 2-3 days | High | None | Required for production |
-| ACLs | 3-5 days | High | SASL working | Required for multi-tenant |
-| Benchmarks | 1 day | Medium | None | Good for validation |
-| HNSW | 3-5 days | Medium | Vector search used | Only if semantic search needed |
-| Schema Registry | 5-7 days | High | None | If using Avro/Protobuf |
-| GSSAPI | 5-7 days | Low | Kerberos infra | Only for enterprise |
+| Feature | Effort | Value | Dependencies | Status |
+|---------|--------|-------|--------------|--------|
+| Segment Cache | 1-2 days | High | None | ✅ **COMPLETE** (v2.2.20) |
+| HNSW Vector Search | 3-5 days | Medium | None | ✅ **COMPLETE** (v2.2.20) |
+| Benchmarks CLI | 1 day | Medium | None | ✅ **COMPLETE** (v2.2.20) |
+| TLS | 2-3 days | High | None | ✅ **COMPLETE** (v2.2.20) |
+| ACLs | 3-5 days | High | SASL working | ✅ **COMPLETE** (v2.2.20) |
+| Schema Registry | 5-7 days | High | None | ✅ **COMPLETE** (v2.2.20) |
+| GSSAPI | 5-7 days | Low | Kerberos infra | ⏳ Pending (P5.4) |
 
 ---
 

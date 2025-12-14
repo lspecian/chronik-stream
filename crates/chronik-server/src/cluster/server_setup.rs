@@ -40,6 +40,7 @@ pub async fn create_integrated_server(
         enable_metadata_dr: true,
         metadata_upload_interval_secs: 60,
         cluster_config: Some(init_config.cluster_config.clone()),
+        tls_config: None, // TLS configured via env vars
     };
 
     info!("Initializing IntegratedKafkaServer with builder (14-stage initialization)...");
@@ -102,6 +103,7 @@ mod tests {
             enable_metadata_dr: true,
             metadata_upload_interval_secs: 60,
             cluster_config: Some(init_config.cluster_config.clone()),
+            tls_config: None,
         };
 
         assert_eq!(server_config.node_id, 1);

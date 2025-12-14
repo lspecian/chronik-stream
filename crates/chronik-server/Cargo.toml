@@ -79,6 +79,11 @@ arc-swap = "1.7"  # Lock-free atomic pointer swapping for metadata state machine
 # Socket configuration
 socket2 = "0.5"
 
+# TLS for Kafka Protocol
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+
 # Force vendored OpenSSL for musl builds
 openssl = { workspace = true }
 

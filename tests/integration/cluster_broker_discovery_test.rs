@@ -82,6 +82,7 @@ fn create_node_config(
         enable_metadata_dr: false,
         metadata_upload_interval_secs: 60,
         cluster_config: Some(cluster_config.clone()),
+        tls_config: None,
     };
 
     (server_config, cluster_config)

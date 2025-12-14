@@ -1,17 +1,58 @@
 # Admin API Security Guide
 
-**Version**: v2.6.0
+**Version**: v2.2.20
 **Status**: Production-Ready with Authentication
 
 ---
 
 ## Overview
 
-The Chronik Admin API provides cluster management endpoints for adding/removing nodes and querying cluster status. **This API has powerful capabilities and MUST be secured in production.**
+The Chronik Admin API provides:
+1. **Cluster management endpoints** for adding/removing nodes and querying cluster status
+2. **Schema Registry endpoints** for Confluent-compatible schema management
+
+Both services share the same port (`10000 + node_id`) but use **different authentication methods**:
+
+| Service | Auth Method | Header | Environment Variable |
+|---------|-------------|--------|---------------------|
+| Admin API | API Key | `X-API-Key` | `CHRONIK_ADMIN_API_KEY` |
+| Schema Registry | HTTP Basic | `Authorization: Basic` | `CHRONIK_SCHEMA_REGISTRY_USERS` |
 
 ---
 
-## Authentication
+## Schema Registry Authentication
+
+The Schema Registry supports optional HTTP Basic Auth (Confluent-compatible).
+
+### Enable Authentication
+
+```bash
+export CHRONIK_SCHEMA_REGISTRY_AUTH_ENABLED=true
+export CHRONIK_SCHEMA_REGISTRY_USERS="admin:secret123,readonly:viewonly"
+```
+
+### Usage
+
+```bash
+# With curl -u flag
+curl -u admin:secret123 http://localhost:10001/subjects
+
+# Without credentials (returns 401 when auth enabled)
+curl http://localhost:10001/subjects
+```
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CHRONIK_SCHEMA_REGISTRY_AUTH_ENABLED` | `false` | Enable HTTP Basic Auth |
+| `CHRONIK_SCHEMA_REGISTRY_USERS` | (none) | Comma-separated `user:pass` pairs |
+
+**See [Schema Registry Guide](SCHEMA_REGISTRY.md) for full documentation.**
+
+---
+
+## Admin API Authentication
 
 ### API Key Authentication
 

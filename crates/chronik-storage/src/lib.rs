@@ -49,7 +49,8 @@ pub use optimized_segment::{
 };
 pub use vector_search::{
     VectorIndex, VectorIndexData, DistanceMetric, HybridSearchRequest, VectorQuery,
-    FusionMethod, HybridSearchResult, HnswIndex, VectorIndexFactory, ScoreFusion
+    FusionMethod, HybridSearchResult, HnswIndex, RealHnswIndex, HnswConfig, HnswStats,
+    VectorIndexFactory, ScoreFusion
 };
 pub use extended_segment::{
     ExtendedTansuSegment, ExtendedSegmentMetadata, ExtendedSegmentBuilder,

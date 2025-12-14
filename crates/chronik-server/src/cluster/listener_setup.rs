@@ -88,22 +88,25 @@ pub async fn start_search_api(
 /// Complexity: < 10 (simple API server startup)
 ///
 /// v2.2.22: Added isr_tracker parameter for accurate ISR queries
+/// Phase 5: Added schema_registry parameter for Schema Registry API
 pub async fn start_admin_api(
     raft_cluster: Arc<RaftCluster>,
     metadata_store: Arc<dyn chronik_common::metadata::traits::MetadataStore>,
     node_id: u64,
     bind: &str,
     isr_tracker: Option<Arc<crate::isr_tracker::IsrTracker>>,
+    schema_registry: Arc<crate::schema_registry::SchemaRegistry>,
 ) -> Result<()> {
     use crate::admin_api;
 
     let admin_port = 10000 + (node_id as u16);
-    info!("Starting Admin API on port {}", admin_port);
+    info!("Starting Admin API + Schema Registry on port {}", admin_port);
 
     let admin_api_key = std::env::var("CHRONIK_ADMIN_API_KEY").ok();
-    admin_api::start_admin_api(raft_cluster, metadata_store, admin_port, admin_api_key, isr_tracker).await?;
+    admin_api::start_admin_api(raft_cluster, metadata_store, admin_port, admin_api_key, isr_tracker, schema_registry).await?;
 
     info!("✓ Admin API available at http://{}:{}/admin", bind, admin_port);
+    info!("✓ Schema Registry available at http://{}:{}/subjects", bind, admin_port);
     Ok(())
 }
 

@@ -12,6 +12,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::io::IoSlice;
 use tracing::{info, error, debug, warn, trace};
 use crate::error_handler::{ErrorHandler, ErrorCode, ErrorRecovery, ServerError};
+use crate::tls::{TlsConfig, TlsConnectionAcceptor, MaybeTlsReadHalf, MaybeTlsWriteHalf};
 
 // Use the local server components (moved from chronik-ingest)
 use crate::kafka_handler::KafkaProtocolHandler;
@@ -67,6 +68,8 @@ pub struct IntegratedServerConfig {
     pub metadata_upload_interval_secs: u64,
     /// Optional cluster configuration for Raft clustering
     pub cluster_config: Option<chronik_config::ClusterConfig>,
+    /// Optional TLS configuration for encrypted connections
+    pub tls_config: Option<TlsConfig>,
 }
 
 impl Default for IntegratedServerConfig {
@@ -87,6 +90,7 @@ impl Default for IntegratedServerConfig {
             enable_metadata_dr: true, // Enable metadata DR by default
             metadata_upload_interval_secs: 60, // Upload metadata every minute
             cluster_config: None, // No clustering by default (standalone mode)
+            tls_config: None, // TLS disabled by default, set via env vars
         }
     }
 }
@@ -692,6 +696,15 @@ impl IntegratedKafkaServer {
     ///
     /// Complexity: < 20 (clean orchestration using helper methods)
     pub async fn run(&self, bind_addr: &str) -> Result<()> {
+        // Check for TLS configuration from environment or config
+        let tls_config = self.config.tls_config.clone().or_else(TlsConfig::from_env);
+
+        if tls_config.is_some() {
+            info!("TLS configuration detected - starting secure listener");
+            return self.run_with_tls(bind_addr, tls_config.as_ref()).await;
+        }
+
+        // Plain TCP mode (original implementation)
         let listener = TcpListener::bind(bind_addr).await?;
         info!("Integrated Kafka server listening on {}", bind_addr);
         info!("Ready to accept Kafka client connections");
@@ -791,6 +804,273 @@ impl IntegratedKafkaServer {
                 }
             }
         }
+    }
+
+    /// Run the Kafka server with TLS encryption
+    ///
+    /// This method is called when TLS configuration is detected.
+    async fn run_with_tls(&self, bind_addr: &str, tls_config: Option<&TlsConfig>) -> Result<()> {
+        let acceptor = TlsConnectionAcceptor::bind(bind_addr, tls_config).await?;
+
+        if acceptor.is_tls_enabled() {
+            info!("Integrated Kafka server (TLS) listening on {}", bind_addr);
+            info!("Ready to accept encrypted Kafka client connections");
+        } else {
+            info!("Integrated Kafka server listening on {}", bind_addr);
+            info!("Ready to accept Kafka client connections");
+        }
+
+        let (produce_semaphore, control_semaphore) = Self::setup_connection_semaphores();
+
+        loop {
+            match acceptor.accept().await {
+                Ok((stream, addr)) => {
+                    let is_tls = stream.is_tls();
+
+                    // Set TCP_NODELAY
+                    if let Err(e) = stream.set_nodelay(true) {
+                        error!("Failed to set TCP_NODELAY for {}: {}", addr, e);
+                    }
+
+                    // Split the stream into read and write halves
+                    let (socket_reader, socket_writer) = stream.into_split();
+                    let socket_writer = Arc::new(tokio::sync::Mutex::new(socket_writer));
+
+                    let kafka_handler = self.kafka_handler.clone();
+                    let error_handler = Arc::new(ErrorHandler::new());
+                    let produce_sem = produce_semaphore.clone();
+                    let control_sem = control_semaphore.clone();
+
+                    debug!("New {} connection from {}", if is_tls { "TLS" } else { "TCP" }, addr);
+
+                    // Spawn a task to handle this connection
+                    tokio::spawn(async move {
+                        let mut request_buffer = vec![0; 65536];
+                        let mut socket_reader = socket_reader;
+
+                        loop {
+                            // Read request frame (TLS-aware)
+                            let request_size = match Self::read_request_frame_tls(&mut socket_reader, &mut request_buffer, addr).await {
+                                Ok(Some(size)) => size,
+                                Ok(None) => continue,
+                                Err(_) => break,
+                            };
+
+                            let (_api_key, _api_version, correlation_id) = Self::parse_request_metadata(&request_buffer, request_size);
+
+                            let request_data = request_buffer[..request_size].to_vec();
+                            let handler_clone = kafka_handler.clone();
+                            let socket_writer_clone = socket_writer.clone();
+                            let produce_sem_clone = produce_sem.clone();
+                            let control_sem_clone = control_sem.clone();
+                            let error_handler_clone = error_handler.clone();
+                            let addr_clone = addr;
+
+                            tokio::spawn(async move {
+                                let semaphore_clone = Self::select_semaphore_for_request(
+                                    &request_data,
+                                    &produce_sem_clone,
+                                    &control_sem_clone
+                                );
+
+                                let _permit = match semaphore_clone.acquire_owned().await {
+                                    Ok(p) => p,
+                                    Err(_) => {
+                                        error!("Failed to acquire semaphore for request");
+                                        return;
+                                    }
+                                };
+
+                                match handler_clone.handle_request(&request_data).await {
+                                    Ok(response) => {
+                                        if let Err(e) = Self::build_and_write_response_tls(response, &socket_writer_clone, addr_clone).await {
+                                            error!("Failed to build/write response: {}", e);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        Self::handle_request_error_recovery_tls(
+                                            e,
+                                            &error_handler_clone,
+                                            correlation_id,
+                                            &request_data,
+                                            &socket_writer_clone,
+                                            addr_clone
+                                        ).await;
+                                    }
+                                }
+                            });
+                        }
+
+                        debug!("Connection handler for {} terminated", addr);
+                    });
+                }
+                Err(e) => {
+                    // TLS handshake failures are expected for non-TLS clients
+                    debug!("Connection accept failed: {}", e);
+                }
+            }
+        }
+    }
+
+    /// Read request frame from a TLS-aware stream
+    async fn read_request_frame_tls(
+        socket_reader: &mut MaybeTlsReadHalf,
+        request_buffer: &mut Vec<u8>,
+        addr: std::net::SocketAddr,
+    ) -> Result<Option<usize>> {
+        use tokio::io::AsyncReadExt;
+
+        // Read the size header (4 bytes)
+        let mut size_buf = [0u8; 4];
+
+        match socket_reader.read_exact(&mut size_buf).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                debug!("Connection closed by {}", addr);
+                return Ok(None);
+            }
+            Err(e) => {
+                crate::error_handler::handle_connection_error(e, addr).await;
+                return Ok(None);
+            }
+        }
+
+        let request_size = i32::from_be_bytes(size_buf) as usize;
+
+        // Check for suspicious size values
+        if request_size > 100_000_000 {
+            let size_str = String::from_utf8_lossy(&size_buf);
+            warn!("Suspicious request size {} from {} - might be protocol mismatch. Bytes: '{}'",
+                  request_size, addr, size_str);
+
+            let mut discard_buf = vec![0u8; 1024];
+            let _ = socket_reader.read(&mut discard_buf).await;
+            return Ok(None);
+        }
+
+        if request_size == 0 || request_size > 10_000_000 {
+            error!("Invalid request size {} from {}", request_size, addr);
+
+            let mut discard_buf = vec![0u8; 1024];
+            loop {
+                let n = match socket_reader.read(&mut discard_buf).await {
+                    Ok(n) => n,
+                    Err(_) => break,
+                };
+                if n == 0 { break; }
+            }
+            return Ok(None);
+        }
+
+        // Resize buffer if needed
+        if request_buffer.len() < request_size {
+            request_buffer.resize(request_size, 0);
+        }
+
+        // Read the request body
+        match socket_reader.read_exact(&mut request_buffer[..request_size]).await {
+            Ok(_) => Ok(Some(request_size)),
+            Err(e) => {
+                error!("Error reading request body from {}: {}", addr, e);
+                Ok(None)
+            }
+        }
+    }
+
+    /// Build and write response to a TLS-aware stream
+    async fn build_and_write_response_tls(
+        response: chronik_protocol::handler::Response,
+        socket_writer: &Arc<tokio::sync::Mutex<MaybeTlsWriteHalf>>,
+        addr: std::net::SocketAddr,
+    ) -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+
+        // Build complete response with size header
+        let mut header_bytes = Vec::new();
+        header_bytes.extend_from_slice(&response.header.correlation_id.to_be_bytes());
+
+        if response.is_flexible && response.api_key != chronik_protocol::parser::ApiKey::ApiVersions {
+            header_bytes.push(0);
+        }
+
+        let mut full_response = Vec::with_capacity(header_bytes.len() + response.body.len() + 4);
+        let size = (header_bytes.len() + response.body.len()) as i32;
+        full_response.extend_from_slice(&size.to_be_bytes());
+        full_response.extend_from_slice(&header_bytes);
+        full_response.extend_from_slice(&response.body);
+
+        tracing::debug!(
+            "[TLS WRITE] Built response for API {:?}, correlation_id={}, size={} bytes",
+            response.api_key, response.header.correlation_id, full_response.len()
+        );
+
+        // Write response
+        let write_start = std::time::Instant::now();
+        let write_result = {
+            let mut writer_guard = socket_writer.lock().await;
+            writer_guard.write_all(&full_response).await
+        };
+        let write_duration = write_start.elapsed();
+
+        match write_result {
+            Ok(_) => {
+                tracing::debug!(
+                    "[TLS WRITE] Wrote response, latency={}ms",
+                    write_duration.as_millis()
+                );
+            }
+            Err(e) => {
+                error!("Failed to write TLS response to {}: {}", addr, e);
+                return Err(anyhow::anyhow!("TLS write failed: {}", e));
+            }
+        }
+
+        if write_duration.as_millis() > 100 {
+            warn!("TLS write took {}ms - slow write detected", write_duration.as_millis());
+        }
+
+        Ok(())
+    }
+
+    /// Handle request errors for TLS connections
+    async fn handle_request_error_recovery_tls(
+        error: chronik_common::Error,
+        _error_handler: &Arc<ErrorHandler>,
+        correlation_id: i32,
+        request_data: &[u8],
+        socket_writer: &Arc<tokio::sync::Mutex<MaybeTlsWriteHalf>>,
+        addr: std::net::SocketAddr,
+    ) -> ErrorRecovery {
+        use tokio::io::AsyncWriteExt;
+
+        // Build error response
+        let api_key = if request_data.len() >= 2 {
+            i16::from_be_bytes([request_data[0], request_data[1]])
+        } else {
+            -1
+        };
+
+        debug!("Handling TLS request error for API {} (correlation_id={}): {:?}",
+               api_key, correlation_id, error);
+
+        // Build a minimal error response (correlation_id + error code)
+        // Format: [size:4][correlation_id:4][error_code:2]
+        let mut error_response = Vec::with_capacity(10);
+        error_response.extend_from_slice(&6i32.to_be_bytes()); // size = 6 (corr_id + error_code)
+        error_response.extend_from_slice(&correlation_id.to_be_bytes());
+        error_response.extend_from_slice(&(-1i16).to_be_bytes()); // UNKNOWN_SERVER_ERROR = -1
+
+        let write_result = {
+            let mut writer_guard = socket_writer.lock().await;
+            writer_guard.write_all(&error_response).await
+        };
+
+        if let Err(e) = write_result {
+            error!("Failed to write TLS error response to {}: {}", addr, e);
+        }
+
+        // Return a simple recovery strategy
+        ErrorRecovery::Retry
     }
 
     /// Flush all partition buffers to ensure data durability before shutdown
