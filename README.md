@@ -68,99 +68,90 @@ curl -X POST http://localhost:6092/_sql \
 - **Container Ready**: Docker deployment with proper network configuration
 - **Simplified Operations**: Single-process architecture reduces operational complexity
 
-## 🏗️ Architecture - 4-Tier Seamless Storage
+## 🏗️ Architecture - Modular Feature System
 
-Chronik implements a unique 4-tier storage system with automatic failover that provides **infinite retention** and **sub-millisecond SQL queries**:
+Chronik is **pure Kafka by default** with optional features that can be independently enabled per topic:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│              Chronik 4-Tier Seamless Storage                     │
-│        (Infinite Retention + Sub-Second SQL Design)              │
+│                    Chronik Streaming Platform                   │
 ├─────────────────────────────────────────────────────────────────┤
-│  Tier 0: Hot Buffer (Instant - In-Memory) ⚡ NEW in v2.2.22     │
-│  ├─ Location: In-memory Arrow RecordBatches                     │
-│  ├─ SQL Table: {topic}_hot                                      │
-│  ├─ Latency: 0-1ms (zero-copy Arrow queries)                    │
-│  ├─ Retention: Until flushed to Parquet (configurable)          │
-│  └─ Use Case: Real-time dashboards, live monitoring             │
-│        ↓ Background Parquet Writer                               │
-│                                                                   │
-│  Tier 1: WAL (Hot - Local Disk)                                 │
-│  ├─ Location: ./data/wal/{topic}/{partition}/                   │
-│  ├─ Latency: <1ms (in-memory buffer)                            │
-│  └─ Retention: Until sealed (250MB or 30min by default)         │
-│        ↓ Background WalIndexer (every 30s)                       │
-│                                                                   │
-│  Tier 2: Parquet Files (Warm - Local/S3)                        │
-│  ├─ Location: ./data/columnar/ or s3://bucket/columnar/         │
-│  ├─ SQL Table: {topic}_cold                                     │
-│  ├─ Latency: 1-10ms local, 50-200ms S3                          │
-│  └─ Use Case: Historical analytics, time-range queries          │
-│        ↓ PLUS ↓                                                  │
-│                                                                   │
-│  Tier 3: Tantivy Indexes (Cold - Searchable)                    │
-│  ├─ Location: s3://bucket/indexes/{topic}/partition-{p}/...     │
-│  ├─ Latency: 100-500ms (download + decompress + search)         │
-│  └─ Use Case: Full-text search WITHOUT downloading raw data     │
-│                                                                   │
-│  SQL Query Flow (Unified View):                                 │
-│    SELECT * FROM my_topic  →  UNION(hot, cold) automatically    │
-│    SELECT * FROM my_topic_hot  →  Only in-memory (0-1ms)        │
-│    SELECT * FROM my_topic_cold →  Only Parquet files            │
-│                                                                   │
-│  Consumer Fetch Flow (Automatic Fallback):                      │
-│    Phase 1: Try WAL buffer (hot, in-memory) → μs latency        │
-│    Phase 2: Try local WAL (warm, local disk) → ms latency       │
-│    Phase 3: Download raw segment from S3 → 50-200ms latency     │
-│    Phase 4: Search Tantivy index → 100-500ms latency            │
+│  BASE LAYER (always on) - Pure Kafka Compatible                │
+│  ├─ Kafka Protocol (produce, consume, consumer groups)         │
+│  ├─ WAL Durability (zero message loss, automatic recovery)     │
+│  └─ Standard Kafka fetch/produce at wire-protocol level        │
+├─────────────────────────────────────────────────────────────────┤
+│  OPTIONAL FEATURES (per-topic, independent toggles)             │
+│                                                                  │
+│  ┌─────────────────────────┐    ┌─────────────────────────┐     │
+│  │  columnar.enabled=true  │    │  searchable.enabled=true│     │
+│  ├─────────────────────────┤    ├─────────────────────────┤     │
+│  │ Format: Parquet files   │    │ Format: Tantivy indexes │     │
+│  │ Hot: Arrow MemTable     │    │ Hot: In-memory index    │     │
+│  │ Cold: Parquet on S3     │    │ Cold: Tantivy on S3     │     │
+│  │ API: /_sql endpoint     │    │ API: /_search endpoint  │     │
+│  │ Latency: 0-10ms         │    │ Latency: 1-500ms        │     │
+│  └─────────────────────────┘    └─────────────────────────┘     │
+│              ↓                           ↓                      │
+│         Can enable BOTH → SQL + Search on same topic            │
+├─────────────────────────────────────────────────────────────────┤
+│  STORAGE TIER (applies to enabled features)                     │
+│  ├─ Local (default) - fast queries, bounded disk               │
+│  └─ S3/GCS/Azure (opt-in) - unlimited retention                │
 └─────────────────────────────────────────────────────────────────┘
-
-    ┌─────────────────┐
-    │   Kafka Client  │  (kafka-python, Java clients, KSQL, etc.)
-    │  (Any Language) │
-    └────────┬────────┘
-             │
-             ▼
-    ┌────────────────────────────────────────┐
-    │         Chronik Server                  │
-    │  ┌──────────────┐  ┌─────────────────┐ │
-    │  │ Kafka Proto  │  │ ChronikMetaLog  │ │
-    │  │ Handler      │  │ (WAL Metadata)  │ │
-    │  │ (Port 9092)  │  │                 │ │
-    │  └──────────────┘  └─────────────────┘ │
-    │  ┌──────────────┐  ┌─────────────────┐ │
-    │  │   Search     │  │  Storage Mgr    │ │
-    │  │  (Tantivy)   │  │  (3-Tier)       │ │
-    │  └──────────────┘  └─────────────────┘ │
-    └───────────┬────────────────────────────┘
-                │
-                ▼
-    ┌───────────────────────────┐
-    │    Object Storage         │
-    │  (S3/GCS/Azure/Local)     │
-    │  • Raw segments (Tier 2)  │
-    │  • Tantivy indexes (Tier 3)│
-    └───────────────────────────┘
 ```
 
-### Key Differentiators vs Kafka Tiered Storage
+### Topic Configuration Examples
 
-| Feature | Kafka Tiered Storage | Chronik Layered Storage |
-|---------|---------------------|-------------------------|
-| **Hot Buffer SQL** | ❌ NO | ✅ **0-1ms** queries via in-memory Arrow |
-| **Columnar Analytics** | ❌ NO | ✅ **DataFusion SQL** over Parquet files |
-| **Hot Storage** | Local disk | WAL + Hot Buffer + Segments (local) |
-| **Cold Storage** | S3 (raw data) | S3 Parquet files + Tantivy indexes |
-| **Auto-archival** | ✅ Yes | ✅ Yes (WalIndexer background task) |
-| **Query by Offset** | ✅ Yes | ✅ Yes (download from S3 as needed) |
-| **SQL Queries** | ❌ NO | ✅ **YES** (`SELECT * FROM topic WHERE ...`) |
-| **Full-text Search** | ❌ NO | ✅ **YES** (Tantivy indexes, no download!) |
-| **Local Disk** | Grows forever | Bounded (old WAL deleted after S3 upload) |
+```bash
+# Pure Kafka - no extras, just streaming
+kafka-topics.sh --create --topic logs
 
-**Unique Advantages**:
-- **Sub-millisecond SQL**: Query `{topic}_hot` for instant results on live data
-- **Searchable Archives**: Query old data by content without downloading raw data
-- **Unified Views**: Automatic hot/cold UNION - one query spans all time ranges
+# SQL analytics - enables /_sql queries
+kafka-topics.sh --create --topic orders \
+  --config columnar.enabled=true
+
+# Full-text search - enables /_search queries
+kafka-topics.sh --create --topic documents \
+  --config searchable.enabled=true
+
+# Both SQL + Search on same topic
+kafka-topics.sh --create --topic events \
+  --config columnar.enabled=true \
+  --config searchable.enabled=true
+
+# With S3 archival for unlimited retention
+kafka-topics.sh --create --topic audit \
+  --config columnar.enabled=true \
+  --config searchable.enabled=true \
+  --config storage.s3.enabled=true \
+  --config retention.ms=-1
+```
+
+### Hot/Cold is About Latency, Not Format
+
+Both Parquet (SQL) and Tantivy (Search) have hot and cold tiers:
+
+| Feature | Hot (In-Memory) | Cold (S3/Disk) |
+|---------|-----------------|----------------|
+| **Columnar (SQL)** | Arrow MemTable: 0-1ms | Parquet files: 1-200ms |
+| **Searchable** | Memory index: 1-10ms | Tantivy S3: 100-500ms |
+
+The system automatically queries hot first, falls back to cold seamlessly.
+
+### Key Differentiators vs Kafka
+
+| Feature | Apache Kafka | Chronik |
+|---------|--------------|---------|
+| **Pure Kafka mode** | ✅ Yes | ✅ Yes (default) |
+| **SQL Queries** | ❌ NO | ✅ `columnar.enabled=true` |
+| **Full-text Search** | ❌ NO | ✅ `searchable.enabled=true` |
+| **Hot Buffer SQL** | ❌ NO | ✅ 0-1ms via Arrow |
+| **Tiered Storage** | ✅ S3 (raw) | ✅ S3 (Parquet + Tantivy) |
+| **Unlimited Retention** | ✅ Yes | ✅ Yes |
+| **Local Disk** | Grows forever | Bounded (S3 offload) |
+
+**The key insight**: Features are orthogonal. Enable what you need, pay only for what you use.
 
 ## ⚡ Quick Start
 
