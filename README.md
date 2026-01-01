@@ -8,77 +8,111 @@
 
 A high-performance streaming platform built in Rust that implements core Kafka wire protocol functionality with comprehensive Write-Ahead Log (WAL) durability and automatic recovery.
 
-**Latest Release: v2.2.21** - Vendored Raft crate with prost 0.12 compatibility. See [CHANGELOG.md](CHANGELOG.md) for full release history.
+**Latest Release: v2.2.22** - Hot Buffer SQL with sub-millisecond query latency. See [CHANGELOG.md](CHANGELOG.md) for full release history.
 
-## ✨ What's New in v2.2.21
+## ✨ What's New in v2.2.22
 
-🔧 **Vendored Raft**: Vendored TiKV raft crate with prost 0.12 compatibility (no external dependency)
-🚀 **Unified API Fixes**: Fixed /health route conflicts and port allocation in cluster mode
-📦 **Dependency Cleanup**: Removed dependency on external tikv/raft-rs crate
+⚡ **Hot Buffer SQL**: Query recent data in **0-1ms** via in-memory Arrow tables (vs 30-60s for Parquet)
+🔍 **Columnar Storage**: DataFusion 44 integration for SQL queries over Parquet files
+☁️ **S3 Parquet Upload**: Optional cloud storage for Parquet files (S3/GCS/Azure)
+🧠 **Vector Search**: HNSW-based semantic search with embedding providers (OpenAI, custom)
+🌐 **Unified API**: REST endpoints for SQL (`/_sql`), search (`/_search`), and admin operations
 
-**Key Changes:**
-- Vendored `crates/raft/` and `crates/raft-proto/` with prost 0.12 codegen
-- Fixed Unified API port conflict (now uses 6091 + node_id)
-- Fixed duplicate /health route when Search API merged with Unified API
-- All 3-node cluster tests passing end-to-end
+**Key Features:**
+- **Sub-second SQL latency**: Query `{topic}_hot` for 0ms latency, `{topic}_cold` for Parquet, `{topic}` for unified view
+- **Load tested**: 10K+ msg/s production with P99 SQL latency <20ms under load
+- **Schema compatibility**: Automatic UNION of hot (MemTable) and cold (Parquet) tables
+- **11 hurl integration tests** for hot/cold SQL functionality
 
-**Upgrade Recommendation**: All cluster users should upgrade for improved stability.
+**Quick Example:**
+```bash
+# Query recent data (sub-millisecond)
+curl -X POST http://localhost:6092/_sql \
+  -H "Content-Type: application/json" \
+  -d '{"query": "SELECT COUNT(*) FROM my_topic_hot"}'
+
+# Query all data (hot + cold unified view)
+curl -X POST http://localhost:6092/_sql \
+  -H "Content-Type: application/json" \
+  -d '{"query": "SELECT * FROM my_topic WHERE _offset > 1000 LIMIT 10"}'
+```
 
 ## 🚀 Features
 
+### Core Streaming
 - **Kafka Wire Protocol**: Full Kafka wire protocol with consumer group and transactional support
-- **Searchable Topics**: Opt-in real-time full-text search with Tantivy (3% overhead) - see [docs/SEARCHABLE_TOPICS.md](docs/SEARCHABLE_TOPICS.md)
-- **Full Compression Support**: All Kafka compression codecs (Gzip, Snappy, LZ4, Zstd) - see [COMPRESSION_SUPPORT.md](COMPRESSION_SUPPORT.md)
-- **WAL-based Metadata**: ChronikMetaLog provides event-sourced metadata persistence
-- **GroupCommitWal**: PostgreSQL-style group commit with per-partition background workers and batched fsync
 - **Zero Message Loss**: WAL ensures durability for all acks modes (0, 1, -1) even during unexpected shutdowns
 - **Automatic Recovery**: WAL records are automatically replayed on startup to restore state with 100% accuracy
+- **Transactional APIs**: Full support for Kafka transactions (InitProducerId, AddPartitionsToTxn, EndTxn)
+- **Full Compression Support**: All Kafka compression codecs (Gzip, Snappy, LZ4, Zstd) - see [COMPRESSION_SUPPORT.md](COMPRESSION_SUPPORT.md)
+
+### SQL & Columnar Storage (v2.2.22+)
+- **Hot Buffer SQL**: Query recent data in **0-1ms** via in-memory Arrow tables - sub-second latency for live data
+- **Columnar Storage**: DataFusion 44 SQL engine for analytics over Parquet files
+- **Unified Views**: Automatic UNION of hot (MemTable) and cold (Parquet) data - seamless time-range queries
+- **S3/GCS/Azure Upload**: Optional cloud storage for Parquet files with local-first defaults
+- **10K+ msg/s under load**: Load tested with concurrent producers and SQL queries, P99 <20ms
+
+### Search & Analytics
+- **Searchable Topics**: Opt-in real-time full-text search with Tantivy (3% overhead) - see [docs/SEARCHABLE_TOPICS.md](docs/SEARCHABLE_TOPICS.md)
+- **Vector Search**: HNSW-based semantic search with embedding providers (OpenAI, custom)
+- **Unified REST API**: Single endpoint for SQL (`/_sql`), search (`/_search`), and admin ops
+
+### Operations
+- **WAL-based Metadata**: ChronikMetaLog provides event-sourced metadata persistence
+- **GroupCommitWal**: PostgreSQL-style group commit with per-partition background workers and batched fsync
 - **Real Client Testing**: Tested with kafka-python, confluent-kafka, KSQL, and Apache Flink
 - **Stress Tested**: Verified at scale with millions of messages, zero duplicates, 300K+ msgs/sec throughput
-- **Transactional APIs**: Full support for Kafka transactions (InitProducerId, AddPartitionsToTxn, EndTxn)
 - **High Performance**: Async architecture with zero-copy networking optimizations
 - **Multi-Architecture**: Native support for x86_64 and ARM64 (Apple Silicon, AWS Graviton)
 - **Container Ready**: Docker deployment with proper network configuration
 - **Simplified Operations**: Single-process architecture reduces operational complexity
 
-## 🏗️ Architecture - 3-Tier Seamless Storage
+## 🏗️ Architecture - 4-Tier Seamless Storage
 
-Chronik implements a unique 3-tier storage system with automatic failover that provides **infinite retention** without requiring infinite local disk:
+Chronik implements a unique 4-tier storage system with automatic failover that provides **infinite retention** and **sub-millisecond SQL queries**:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│              Chronik 3-Tier Seamless Storage                     │
-│                   (Infinite Retention Design)                    │
+│              Chronik 4-Tier Seamless Storage                     │
+│        (Infinite Retention + Sub-Second SQL Design)              │
 ├─────────────────────────────────────────────────────────────────┤
+│  Tier 0: Hot Buffer (Instant - In-Memory) ⚡ NEW in v2.2.22     │
+│  ├─ Location: In-memory Arrow RecordBatches                     │
+│  ├─ SQL Table: {topic}_hot                                      │
+│  ├─ Latency: 0-1ms (zero-copy Arrow queries)                    │
+│  ├─ Retention: Until flushed to Parquet (configurable)          │
+│  └─ Use Case: Real-time dashboards, live monitoring             │
+│        ↓ Background Parquet Writer                               │
+│                                                                   │
 │  Tier 1: WAL (Hot - Local Disk)                                 │
 │  ├─ Location: ./data/wal/{topic}/{partition}/                   │
 │  ├─ Latency: <1ms (in-memory buffer)                            │
 │  └─ Retention: Until sealed (250MB or 30min by default)         │
 │        ↓ Background WalIndexer (every 30s)                       │
 │                                                                   │
-│  Tier 2: Raw Segments in S3 (Warm - Object Storage)             │
-│  ├─ Location: s3://bucket/segments/{topic}/{partition}/{range}  │
-│  ├─ Latency: 50-200ms (download + deserialize)                  │
-│  ├─ Retention: Unlimited (cheap object storage)                 │
-│  └─ Purpose: Message consumption after local WAL deletion        │
+│  Tier 2: Parquet Files (Warm - Local/S3)                        │
+│  ├─ Location: ./data/columnar/ or s3://bucket/columnar/         │
+│  ├─ SQL Table: {topic}_cold                                     │
+│  ├─ Latency: 1-10ms local, 50-200ms S3                          │
+│  └─ Use Case: Historical analytics, time-range queries          │
 │        ↓ PLUS ↓                                                  │
 │                                                                   │
-│  Tier 3: Tantivy Indexes in S3 (Cold - Searchable)              │
+│  Tier 3: Tantivy Indexes (Cold - Searchable)                    │
 │  ├─ Location: s3://bucket/indexes/{topic}/partition-{p}/...     │
 │  ├─ Latency: 100-500ms (download + decompress + search)         │
-│  ├─ Retention: Unlimited                                         │
-│  └─ Purpose: Full-text search WITHOUT downloading raw data       │
+│  └─ Use Case: Full-text search WITHOUT downloading raw data     │
+│                                                                   │
+│  SQL Query Flow (Unified View):                                 │
+│    SELECT * FROM my_topic  →  UNION(hot, cold) automatically    │
+│    SELECT * FROM my_topic_hot  →  Only in-memory (0-1ms)        │
+│    SELECT * FROM my_topic_cold →  Only Parquet files            │
 │                                                                   │
 │  Consumer Fetch Flow (Automatic Fallback):                      │
 │    Phase 1: Try WAL buffer (hot, in-memory) → μs latency        │
 │    Phase 2: Try local WAL (warm, local disk) → ms latency       │
 │    Phase 3: Download raw segment from S3 → 50-200ms latency     │
 │    Phase 4: Search Tantivy index → 100-500ms latency            │
-│                                                                   │
-│  Local Disk Cleanup:                                             │
-│    - WAL files DELETED after successful upload to S3             │
-│    - Old messages still accessible from S3 indefinitely          │
-│    - No infinite local disk space required!                      │
 └─────────────────────────────────────────────────────────────────┘
 
     ┌─────────────────┐
@@ -113,14 +147,20 @@ Chronik implements a unique 3-tier storage system with automatic failover that p
 
 | Feature | Kafka Tiered Storage | Chronik Layered Storage |
 |---------|---------------------|-------------------------|
-| **Hot Storage** | Local disk | WAL + Segments (local) |
-| **Cold Storage** | S3 (raw data) | S3 raw segments + Tantivy indexes |
+| **Hot Buffer SQL** | ❌ NO | ✅ **0-1ms** queries via in-memory Arrow |
+| **Columnar Analytics** | ❌ NO | ✅ **DataFusion SQL** over Parquet files |
+| **Hot Storage** | Local disk | WAL + Hot Buffer + Segments (local) |
+| **Cold Storage** | S3 (raw data) | S3 Parquet files + Tantivy indexes |
 | **Auto-archival** | ✅ Yes | ✅ Yes (WalIndexer background task) |
 | **Query by Offset** | ✅ Yes | ✅ Yes (download from S3 as needed) |
+| **SQL Queries** | ❌ NO | ✅ **YES** (`SELECT * FROM topic WHERE ...`) |
 | **Full-text Search** | ❌ NO | ✅ **YES** (Tantivy indexes, no download!) |
 | **Local Disk** | Grows forever | Bounded (old WAL deleted after S3 upload) |
 
-**Unique Advantage**: Chronik's Tier 3 isn't just "cold storage" - it's a **searchable indexed archive**. You can query old data by content or timestamp range without downloading or scanning raw data!
+**Unique Advantages**:
+- **Sub-millisecond SQL**: Query `{topic}_hot` for instant results on live data
+- **Searchable Archives**: Query old data by content without downloading raw data
+- **Unified Views**: Automatic hot/cold UNION - one query spans all time ranges
 
 ## ⚡ Quick Start
 
@@ -277,6 +317,47 @@ ksql.service.id=ksql_service_1
 
 For detailed KSQL setup and usage examples, see [docs/KSQL_INTEGRATION_GUIDE.md](docs/KSQL_INTEGRATION_GUIDE.md).
 
+## 🔍 SQL API (v2.2.22+)
+
+Query your Kafka topics directly with SQL - no external database required:
+
+```bash
+# Create a columnar-enabled topic
+curl -X POST http://localhost:6092/topics \
+  -H "Content-Type: application/json" \
+  -d '{"name": "orders", "partitions": 3, "config": {"columnar.enabled": "true"}}'
+
+# Produce some data (via Kafka client)
+# ... produce messages to 'orders' topic ...
+
+# Query recent data (0-1ms latency from hot buffer)
+curl -X POST http://localhost:6092/_sql \
+  -H "Content-Type: application/json" \
+  -d '{"query": "SELECT COUNT(*) FROM orders_hot"}'
+
+# Query all data (hot + cold unified view)
+curl -X POST http://localhost:6092/_sql \
+  -H "Content-Type: application/json" \
+  -d '{"query": "SELECT * FROM orders WHERE _offset > 1000 LIMIT 10"}'
+
+# Aggregations
+curl -X POST http://localhost:6092/_sql \
+  -H "Content-Type: application/json" \
+  -d '{"query": "SELECT _partition, COUNT(*) as cnt FROM orders GROUP BY _partition"}'
+
+# Describe table schema
+curl http://localhost:6092/_sql/describe/orders
+```
+
+**Available Tables per Topic:**
+| Table | Description | Latency |
+|-------|-------------|---------|
+| `{topic}_hot` | In-memory Arrow buffer (recent data) | 0-1ms |
+| `{topic}_cold` | Parquet files (historical data) | 1-10ms |
+| `{topic}` | Unified view (hot + cold UNION) | 1-10ms |
+
+For detailed SQL syntax and examples, see [docs/COLUMNAR_STORAGE_GUIDE.md](docs/COLUMNAR_STORAGE_GUIDE.md).
+
 ## 🎯 Operational Modes
 
 The unified `chronik-server` binary supports two deployment modes via the `start` command:
@@ -411,6 +492,16 @@ CHRONIK_WAL_PROFILE          WAL performance: low/medium/high/ultra (auto-detect
 CHRONIK_PRODUCE_PROFILE      Producer flush: low-latency/balanced/high-throughput
 CHRONIK_WAL_ROTATION_SIZE    WAL segment size: 100KB/250MB (default)/1GB
 
+# Hot Buffer SQL (v2.2.22+)
+CHRONIK_HOT_BUFFER_ENABLED   Enable sub-second SQL queries (default: true)
+CHRONIK_HOT_BUFFER_MAX_RECORDS  Max records per partition in hot buffer (default: 100000)
+CHRONIK_HOT_BUFFER_REFRESH_MS   Hot buffer refresh interval in ms (default: 1000)
+
+# Columnar Storage (v2.2.22+)
+CHRONIK_COLUMNAR_USE_OBJECT_STORE  Upload Parquet to S3/GCS/Azure (default: false)
+CHRONIK_COLUMNAR_S3_PREFIX   Object storage prefix (default: columnar)
+CHRONIK_COLUMNAR_KEEP_LOCAL  Keep local Parquet copies for fast queries (default: true)
+
 # Cluster Management (v2.2.0+)
 CHRONIK_ADMIN_API_KEY        Admin API authentication key (REQUIRED for production clusters)
 
@@ -482,7 +573,7 @@ All images support both **linux/amd64** and **linux/arm64** architectures:
 
 | Image | Tags | Description |
 |-------|------|-------------|
-| `ghcr.io/lspecian/chronik-stream` | `latest`, `v2.2.17`, `2.2` | Chronik server with full KSQL support |
+| `ghcr.io/lspecian/chronik-stream` | `latest`, `v2.2.22`, `2.2` | Chronik server with SQL, search, and KSQL support |
 
 ### Supported Platforms
 
@@ -561,6 +652,8 @@ chronik-stream/
 │   ├── chronik-server/      # Main server binary (unified)
 │   ├── chronik-protocol/    # Kafka wire protocol implementation
 │   ├── chronik-storage/     # Storage abstraction layer
+│   ├── chronik-columnar/    # Columnar storage & SQL (DataFusion) [v2.2.22+]
+│   ├── chronik-embeddings/  # Vector embeddings & HNSW search [v2.2.22+]
 │   ├── chronik-search/      # Search engine integration (Tantivy)
 │   ├── chronik-query/       # Query processing
 │   ├── chronik-common/      # Shared utilities
@@ -604,6 +697,7 @@ Chronik Stream delivers exceptional performance across all deployment modes (128
 
 - **High Throughput**: Up to 348K messages/second standalone, 188K cluster
 - **Low Latency**: Sub-millisecond p99 latency standalone, sub-3ms cluster
+- **SQL Query Latency**: 0-1ms for hot buffer, <20ms P99 under 10K msg/s load
 - **Efficient Memory**: Zero-copy networking with minimal allocations
 - **Recovery**: 100% message recovery with zero duplicates
 - **Search**: Only 3% overhead for real-time Tantivy indexing (standalone)
@@ -692,6 +786,10 @@ Apache License 2.0. See [LICENSE](LICENSE) for details.
 - [docs/RUNNING_A_CLUSTER.md](docs/RUNNING_A_CLUSTER.md) - **Complete cluster setup guide (v2.2.0+)**
 - [docs/SEARCHABLE_TOPICS.md](docs/SEARCHABLE_TOPICS.md) - **Searchable topics with real-time indexing (v2.2.16+)**
 - [docs/KSQL_INTEGRATION_GUIDE.md](docs/KSQL_INTEGRATION_GUIDE.md) - KSQL setup and usage
+
+### SQL & Columnar Storage (v2.2.22+)
+- [docs/COLUMNAR_STORAGE_GUIDE.md](docs/COLUMNAR_STORAGE_GUIDE.md) - **Hot buffer SQL & Parquet storage guide**
+- [docs/API_REFERENCE.md](docs/API_REFERENCE.md) - Unified REST API reference (`/_sql`, `/_search`, admin)
 
 ### v2.2.8 Release (Critical Fixes)
 - [docs/WATERMARK_IDEMPOTENCE_FIX_v2.2.7.md](docs/WATERMARK_IDEMPOTENCE_FIX_v2.2.7.md) - Watermark idempotence fix details
