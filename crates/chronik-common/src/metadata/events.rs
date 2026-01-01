@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use super::{
-    TopicConfig, SegmentMetadata, BrokerMetadata, BrokerStatus,
+    TopicConfig, SegmentMetadata, ParquetSegmentMetadata, BrokerMetadata, BrokerStatus,
     PartitionAssignment, ConsumerGroupMetadata, ConsumerOffset,
 };
 
@@ -127,13 +127,23 @@ pub enum MetadataEventPayload {
         name: String,
     },
 
-    // Segment events
+    // Segment events (Tantivy indexes)
     SegmentCreated {
         metadata: SegmentMetadata,
     },
     SegmentDeleted {
         topic: String,
         partition: u32,
+        segment_id: String,
+    },
+
+    // Parquet segment events (columnar storage for SQL queries)
+    ParquetSegmentCreated {
+        metadata: ParquetSegmentMetadata,
+    },
+    ParquetSegmentDeleted {
+        topic: String,
+        partition: i32,
         segment_id: String,
     },
 
@@ -355,6 +365,8 @@ impl EventLog {
                 MetadataEventPayload::TopicDeleted { name } => name == topic,
                 MetadataEventPayload::SegmentCreated { metadata } => metadata.topic == topic,
                 MetadataEventPayload::SegmentDeleted { topic: t, .. } => t == topic,
+                MetadataEventPayload::ParquetSegmentCreated { metadata } => metadata.topic == topic,
+                MetadataEventPayload::ParquetSegmentDeleted { topic: t, .. } => t == topic,
                 MetadataEventPayload::PartitionAssigned { assignment } => assignment.topic == topic,
                 MetadataEventPayload::PartitionReassigned { topic: t, .. } => t == topic,
                 MetadataEventPayload::OffsetCommitted { offset } => offset.topic == topic,

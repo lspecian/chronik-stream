@@ -8,13 +8,13 @@ license.workspace = true
 [dependencies]
 chronik-common = { path = "../chronik-common" }
 
-# Tracing
+# Tracing - use http-proto instead of tonic to avoid tonic version conflicts
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-tracing-opentelemetry = "0.22"
-opentelemetry = { version = "0.21", features = ["trace", "metrics"] }
-opentelemetry-otlp = { version = "0.14", features = ["tonic", "metrics"] }
-opentelemetry_sdk = { version = "0.21", features = ["rt-tokio"] }
+tracing-opentelemetry = "0.23"
+opentelemetry = { version = "0.22", features = ["trace", "metrics"] }
+opentelemetry-otlp = { version = "0.15", default-features = false, features = ["http-proto", "metrics", "trace"] }
+opentelemetry_sdk = { version = "0.22", features = ["rt-tokio"] }
 
 # HTTP server for metrics endpoint
 axum = { workspace = true }

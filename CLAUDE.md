@@ -4,13 +4,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Chronik Stream is a high-performance Kafka-compatible streaming platform written in Rust that implements the Kafka wire protocol with comprehensive Write-Ahead Log (WAL) durability and automatic recovery. Current version: v2.2.21.
+Chronik Stream is a high-performance Kafka-compatible streaming platform written in Rust that implements the Kafka wire protocol with comprehensive Write-Ahead Log (WAL) durability and automatic recovery. Current version: v2.2.22.
 
 **Key Differentiators:**
 - Full Kafka protocol compatibility tested with real clients (kafka-python, confluent-kafka, KSQL, Apache Flink)
 - WAL-based metadata store (ChronikMetaLog) for event-sourced metadata persistence
 - Zero message loss guarantee through WAL persistence and automatic recovery
 - Single unified binary (`chronik-server`) with multiple operational modes
+- **Per-topic columnar storage** (Arrow/Parquet) with SQL queries via DataFusion
+- **Per-topic vector search** (HNSW + embeddings) for semantic search
+- **Unified API on port 6092** for SQL, vector search, admin, and Elasticsearch-compatible endpoints
 
 ## Build & Test Commands
 
@@ -947,6 +950,155 @@ The benchmark measures:
 
 See GroupCommitWal configuration in `chronik-wal/src/group_commit.rs` for WAL-level tuning via `CHRONIK_WAL_PROFILE`.
 
+## Columnar Storage & SQL Queries (v2.2.22+)
+
+Chronik supports optional per-topic columnar storage using Apache Arrow and Parquet, enabling SQL queries via DataFusion.
+
+### Enabling Columnar Storage
+
+```bash
+# Create topic with columnar storage
+kafka-topics.sh --create --topic orders \
+  --bootstrap-server localhost:9092 \
+  --config columnar.enabled=true \
+  --config columnar.format=parquet \
+  --config columnar.compression=zstd
+```
+
+### SQL Query API (Port 6092)
+
+```bash
+# Execute SQL query
+curl -X POST http://localhost:6092/_sql \
+  -H "Content-Type: application/json" \
+  -d '{"query": "SELECT * FROM orders WHERE amount > 50 LIMIT 10"}'
+
+# Explain query plan
+curl -X POST http://localhost:6092/_sql/explain \
+  -H "Content-Type: application/json" \
+  -d '{"query": "SELECT COUNT(*) FROM orders"}'
+
+# List tables
+curl http://localhost:6092/_sql/tables
+
+# Describe schema
+curl http://localhost:6092/_sql/describe/orders
+```
+
+### Configuration Options
+
+| Config Key | Values | Default | Description |
+|------------|--------|---------|-------------|
+| `columnar.enabled` | `true`, `false` | `false` | Enable columnar storage |
+| `columnar.format` | `parquet`, `arrow` | `parquet` | Storage format |
+| `columnar.compression` | `zstd`, `snappy`, `lz4`, `none` | `zstd` | Compression codec |
+| `columnar.partitioning` | `none`, `hourly`, `daily` | `daily` | Time partitioning |
+
+**See [docs/COLUMNAR_STORAGE_GUIDE.md](docs/COLUMNAR_STORAGE_GUIDE.md) for full documentation.**
+
+## Vector Search & Semantic Queries (v2.2.22+)
+
+Chronik supports optional per-topic vector search using HNSW indexes and embeddings for semantic search.
+
+### Enabling Vector Search
+
+```bash
+# Create topic with vector search
+kafka-topics.sh --create --topic logs \
+  --bootstrap-server localhost:9092 \
+  --config vector.enabled=true \
+  --config vector.embedding.provider=openai \
+  --config vector.embedding.model=text-embedding-3-small \
+  --config vector.field=value
+
+# Set OpenAI API key
+export OPENAI_API_KEY="sk-..."
+```
+
+### Vector Search API (Port 6092)
+
+```bash
+# Semantic search by text
+curl -X POST http://localhost:6092/_vector/logs/search \
+  -H "Content-Type: application/json" \
+  -d '{"query": "database connection errors", "k": 10}'
+
+# Hybrid search (vector + full-text)
+curl -X POST http://localhost:6092/_vector/logs/hybrid \
+  -H "Content-Type: application/json" \
+  -d '{"query": "connection timeout", "k": 10, "vector_weight": 0.7}'
+
+# Get index stats
+curl http://localhost:6092/_vector/logs/stats
+
+# List vector-enabled topics
+curl http://localhost:6092/_vector/topics
+```
+
+### Configuration Options
+
+| Config Key | Values | Default | Description |
+|------------|--------|---------|-------------|
+| `vector.enabled` | `true`, `false` | `false` | Enable vector search |
+| `vector.embedding.provider` | `openai`, `external` | `openai` | Embedding provider |
+| `vector.embedding.model` | model name | `text-embedding-3-small` | Model to use |
+| `vector.field` | `value`, `key`, `$.json.path` | `value` | Field to embed |
+| `vector.index.metric` | `cosine`, `euclidean`, `dot` | `cosine` | Distance metric |
+
+**See [docs/VECTOR_SEARCH_GUIDE.md](docs/VECTOR_SEARCH_GUIDE.md) for full documentation.**
+
+## Unified API (Port 6092)
+
+The Unified API provides a single endpoint for all query and admin operations:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                   Unified API (Port 6092)                    │
+├─────────────────────────────────────────────────────────────┤
+│  /_sql/*           SQL queries (DataFusion)                 │
+│  /_vector/*        Vector search (HNSW + embeddings)        │
+│  /_search/*        Full-text search (Elasticsearch-compat)  │
+│  /admin/*          Cluster management                       │
+│  /subjects/*       Schema Registry (Confluent-compatible)   │
+│  /health           Health check                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Key Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/_sql` | POST | Execute SQL query |
+| `/_sql/tables` | GET | List queryable topics |
+| `/_vector/{topic}/search` | POST | Semantic search |
+| `/_vector/{topic}/hybrid` | POST | Hybrid vector + text search |
+| `/_search` | POST | Elasticsearch-compatible search |
+| `/admin/status` | GET | Cluster status |
+| `/subjects` | GET | List Schema Registry subjects |
+| `/health` | GET | Health check |
+
+### Background Processing
+
+**All columnar/vector processing happens AFTER produce in the WalIndexer background pipeline:**
+
+```
+Producer → WAL (fsync) → Response  (~2-10ms)
+               │
+               ▼ (background, async)
+          WalIndexer
+               │
+    ┌──────────┼──────────┐
+    ▼          ▼          ▼
+ Tantivy    Parquet    Embeddings
+ (search)   (SQL)      (vector)
+```
+
+**Query availability latency**:
+- Kafka Fetch: Immediate
+- Full-text search: 30-60s
+- SQL queries: 30-60s
+- Vector search: 30-90s (includes embedding API)
+
 ## Environment Variables
 
 Key environment variables:
@@ -964,6 +1116,17 @@ Key environment variables:
 - `CHRONIK_ADMIN_TLS_KEY` - Path to TLS private key for admin API (Priority 2, optional)
 - `CHRONIK_SCHEMA_REGISTRY_AUTH_ENABLED` - Enable HTTP Basic Auth for Schema Registry (default: `false`)
 - `CHRONIK_SCHEMA_REGISTRY_USERS` - Comma-separated `user:pass` pairs for Schema Registry auth
+- `CHRONIK_UNIFIED_API_PORT` - Unified API port (default: 6092)
+- `OPENAI_API_KEY` - OpenAI API key for vector embeddings
+- `CHRONIK_EMBEDDING_PROVIDER` - Default embedding provider: `openai`, `external`
+- `CHRONIK_COLUMNAR_FORMAT` - Default columnar format: `parquet`, `arrow`
+- `CHRONIK_COLUMNAR_COMPRESSION` - Default compression: `zstd`, `snappy`, `lz4`, `none`
+- `CHRONIK_HOT_BUFFER_ENABLED` - Enable hot buffer for sub-second SQL query latency (default: `true`)
+- `CHRONIK_HOT_BUFFER_MAX_RECORDS` - Max records per partition in hot buffer (default: `100000`)
+- `CHRONIK_HOT_BUFFER_REFRESH_MS` - Hot buffer refresh interval in ms (default: `1000`)
+- `CHRONIK_COLUMNAR_USE_OBJECT_STORE` - Enable S3/GCS/Azure for Parquet files (default: `false`, local-first)
+- `CHRONIK_COLUMNAR_S3_PREFIX` - Prefix for Parquet files in object storage (default: `columnar`)
+- `CHRONIK_COLUMNAR_KEEP_LOCAL` - Keep local copy when uploading to object storage (default: `true`)
 
 ## CRC and Checksum Architecture
 
@@ -1069,20 +1232,28 @@ Runs on self-hosted runner. Tests skip integration by default (`--lib --bins`).
 ```
 chronik-stream/
 ├── crates/
-│   ├── chronik-server/      # Main binary - integrated Kafka server
+│   ├── chronik-server/      # Main binary - integrated Kafka server + Unified API
 │   ├── chronik-protocol/    # Kafka wire protocol (19 APIs)
-│   ├── chronik-wal/          # WAL with recovery, compaction, checkpointing
-│   ├── chronik-storage/     # Storage layer, segment I/O, object store
+│   ├── chronik-wal/         # WAL with recovery, compaction, checkpointing
+│   ├── chronik-storage/     # Storage layer, segment I/O, object store, WalIndexer
 │   ├── chronik-common/      # Shared types, metadata traits
-│   ├── chronik-search/      # Optional Tantivy search integration
+│   ├── chronik-columnar/    # Arrow/Parquet columnar storage, SQL via DataFusion
+│   ├── chronik-embeddings/  # Embedding providers (OpenAI, external)
+│   ├── chronik-search/      # Tantivy full-text search integration
 │   ├── chronik-query/       # Query processing
 │   ├── chronik-monitoring/  # Prometheus metrics, tracing
 │   ├── chronik-auth/        # SASL, TLS, ACLs
 │   ├── chronik-backup/      # Backup functionality
 │   ├── chronik-config/      # Configuration management
 │   ├── chronik-cli/         # CLI tools
-│   └── chronik-benchmarks/  # Performance benchmarks
+│   ├── chronik-raft/        # Raft consensus for clustering
+│   ├── chronik-raft-bridge/ # Raft integration bridge
+│   ├── chronik-benchmarks/  # Performance benchmarks
+│   ├── raft/                # Vendored TiKV raft (prost 0.12 compatible)
+│   └── raft-proto/          # Vendored raft-proto (prost codegen)
 ├── tests/integration/       # Integration tests (WAL, Kafka clients, etc.)
+├── tests/cluster/           # Local cluster test scripts
+├── docs/                    # Documentation (guides, roadmaps)
 └── .github/workflows/       # CI/CD pipelines
 ```
 

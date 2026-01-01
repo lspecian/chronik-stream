@@ -24,13 +24,13 @@ use tracing_subscriber::{
 pub struct TracingConfig {
     /// OTLP endpoint
     pub otlp_endpoint: String,
-    
+
     /// Service version
     pub service_version: String,
-    
+
     /// Sampling ratio (0.0-1.0)
     pub sampling_ratio: f64,
-    
+
     /// Log level filter
     pub log_level: String,
 }
@@ -50,15 +50,15 @@ impl Default for TracingConfig {
 pub fn init_tracing(service_name: &str, config: TracingConfig) -> Result<()> {
     // Set global propagator
     global::set_text_map_propagator(TraceContextPropagator::new());
-    
-    // Create OTLP tracer
+
+    // Create OTLP tracer using HTTP transport (avoids tonic version conflicts)
     let tracer = opentelemetry_otlp::new_pipeline()
         .tracing()
         .with_exporter(
             opentelemetry_otlp::new_exporter()
-                .tonic()
+                .http()
                 .with_endpoint(&config.otlp_endpoint)
-                .with_protocol(Protocol::Grpc)
+                .with_protocol(Protocol::HttpBinary)
         )
         .with_trace_config(
             trace::config()
@@ -70,28 +70,28 @@ pub fn init_tracing(service_name: &str, config: TracingConfig) -> Result<()> {
                 ]))
         )
         .install_batch(runtime::Tokio)?;
-    
+
     // Create telemetry layer
     let telemetry = tracing_opentelemetry::layer().with_tracer(tracer);
-    
+
     // Create fmt layer for console output
     let fmt_layer = fmt::layer()
         .with_target(true)
         .with_thread_ids(true)
         .with_file(true)
         .with_line_number(true);
-    
+
     // Create env filter
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(&config.log_level));
-    
+
     // Build subscriber
     tracing_subscriber::registry()
         .with(filter)
         .with(fmt_layer)
         .with(telemetry)
         .init();
-    
+
     Ok(())
 }
 

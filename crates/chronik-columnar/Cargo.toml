@@ -1,0 +1,88 @@
+[package]
+name = "chronik-columnar"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Columnar storage (Arrow/Parquet) and SQL query support for Chronik Stream"
+
+[dependencies]
+# Internal dependencies
+chronik-common = { path = "../chronik-common" }
+chronik-wal = { path = "../chronik-wal" }
+chronik-embeddings = { path = "../chronik-embeddings" }
+chronik-monitoring = { path = "../chronik-monitoring" }
+
+# Arrow ecosystem
+arrow = { version = "54", default-features = false, features = ["ffi", "prettyprint"] }
+arrow-schema = "54"
+arrow-array = "54"
+arrow-buffer = "54"
+arrow-cast = "54"
+arrow-json = "54"
+parquet = { version = "54", features = ["snap", "zstd", "lz4", "async"] }
+
+# SQL query engine
+datafusion = "44"
+datafusion-common = "44"
+datafusion-expr = "44"
+
+# Arrow Flight for streaming (optional feature)
+arrow-flight = { version = "54", features = ["flight-sql-experimental"], optional = true }
+arrow-ipc = { version = "54", optional = true }
+tonic = { workspace = true, optional = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+bytes = { workspace = true }
+bincode = "1.3"
+
+# Compression (reuse from storage)
+zstd = "0.13"
+
+# Async
+tokio = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Tracing
+tracing = { workspace = true }
+
+# Utils
+chrono = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = "6.0"
+num_cpus = "1.16"
+base64 = "0.22"
+
+# Vector search - HNSW algorithm for O(log n) ANN search
+instant-distance = "0.6"
+
+[dev-dependencies]
+tempfile = "3.8"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "parquet_conversion"
+harness = false
+
+[[bench]]
+name = "sql_query"
+harness = false
+
+[[bench]]
+name = "vector_search"
+harness = false
+
+[features]
+default = []
+# Note: Full FlightService gRPC trait requires tonic 0.12+ (arrow-flight dependency)
+# which conflicts with workspace tonic 0.9 (opentelemetry-otlp).
+# The flight feature provides types and utilities; full gRPC service pending workspace upgrade.
+flight = []

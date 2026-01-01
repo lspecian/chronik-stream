@@ -66,7 +66,7 @@ impl MetricsServer {
             .route("/ready", get(ready_handler))
             .layer(TraceLayer::new_for_http())
             .with_state(self.registry);
-        
+
         let addr = SocketAddr::from(([0, 0, 0, 0], self.port));
         tracing::info!("Metrics server listening on {}", addr);
 

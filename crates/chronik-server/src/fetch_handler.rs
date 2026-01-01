@@ -2587,6 +2587,7 @@ impl FetchHandler {
     }
 }
 
-#[cfg(test)]
-#[path = "fetch_handler_test.rs"]
-mod fetch_handler_test;
+// TODO: Create fetch_handler_test.rs when tests are needed
+// #[cfg(test)]
+// #[path = "fetch_handler_test.rs"]
+// mod fetch_handler_test;

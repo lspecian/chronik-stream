@@ -1,7 +1,11 @@
 # Vector Search Integration - Missing Components
 
+> **NOTE**: This document has been incorporated into the unified roadmap.
+> See [ADVANCED_STORAGE_ROADMAP.md](ADVANCED_STORAGE_ROADMAP.md) for the complete implementation plan
+> that combines **Columnar Storage (Arrow/Parquet)** + **Vector Search** as per-topic options.
+
 **Status**: Library implemented, NOT integrated with Kafka protocol
-**Current Version**: v2.2.20
+**Target Version**: v2.3.0 (combined with columnar storage)
 
 ---
 

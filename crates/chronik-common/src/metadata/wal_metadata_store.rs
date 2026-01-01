@@ -65,6 +65,8 @@ struct MetadataState {
     partition_assignments: DashMap<(String, u32), PartitionAssignment>,
     segments: RwLock<HashMap<(String, String), SegmentMetadata>>,
     partition_offsets: RwLock<HashMap<(String, u32), (i64, i64)>>,
+    // Parquet segments for columnar storage (keyed by topic-partition, segment_id)
+    parquet_segments: RwLock<HashMap<(String, i32, String), ParquetSegmentMetadata>>,
 }
 
 impl MetadataState {
@@ -78,6 +80,7 @@ impl MetadataState {
             partition_assignments: DashMap::new(),
             segments: RwLock::new(HashMap::new()),
             partition_offsets: RwLock::new(HashMap::new()),
+            parquet_segments: RwLock::new(HashMap::new()),
         }
     }
 
@@ -152,9 +155,14 @@ impl MetadataState {
                 consumer_offsets.retain(|k, _| k.1 != *name);
                 drop(consumer_offsets);
 
-                // Remove segments for this topic
+                // Remove Tantivy segments for this topic
                 let mut segments = self.segments.write().await;
                 segments.retain(|k, _| k.0 != *name);
+                drop(segments);
+
+                // Remove Parquet segments for this topic
+                let mut parquet_segments = self.parquet_segments.write().await;
+                parquet_segments.retain(|k, _| k.0 != *name);
 
                 tracing::info!("🗑️ Topic '{}' deleted with all associated data", name);
                 Ok(())
@@ -229,6 +237,34 @@ impl MetadataState {
                 let mut segments = self.segments.write().await;
                 let key = (topic.clone(), segment_id.clone());
                 segments.remove(&key);
+                Ok(())
+            }
+
+            MetadataEventPayload::ParquetSegmentCreated { metadata } => {
+                let mut parquet_segments = self.parquet_segments.write().await;
+                let key = (metadata.topic.clone(), metadata.partition, metadata.segment_id.clone());
+                parquet_segments.insert(key, metadata.clone());
+                tracing::debug!(
+                    topic = %metadata.topic,
+                    partition = metadata.partition,
+                    segment_id = %metadata.segment_id,
+                    min_offset = metadata.min_offset,
+                    max_offset = metadata.max_offset,
+                    "Parquet segment created"
+                );
+                Ok(())
+            }
+
+            MetadataEventPayload::ParquetSegmentDeleted { topic, partition, segment_id } => {
+                let mut parquet_segments = self.parquet_segments.write().await;
+                let key = (topic.clone(), *partition, segment_id.clone());
+                parquet_segments.remove(&key);
+                tracing::debug!(
+                    topic = %topic,
+                    partition = partition,
+                    segment_id = %segment_id,
+                    "Parquet segment deleted"
+                );
                 Ok(())
             }
 
@@ -434,6 +470,54 @@ impl MetadataStore for WalMetadataStore {
             MetadataEventPayload::SegmentDeleted {
                 topic: topic.to_string(),
                 partition: 0, // Will be looked up from segment metadata
+                segment_id: segment_id.to_string(),
+            },
+            self.node_id,
+        );
+
+        self.write_and_apply(event).await
+    }
+
+    async fn persist_parquet_segment(&self, metadata: ParquetSegmentMetadata) -> Result<()> {
+        let event = MetadataEvent::new_with_node(
+            MetadataEventPayload::ParquetSegmentCreated {
+                metadata: metadata.clone(),
+            },
+            self.node_id,
+        );
+
+        self.write_and_apply(event).await
+    }
+
+    async fn get_parquet_segment(&self, topic: &str, partition: i32, segment_id: &str) -> Result<Option<ParquetSegmentMetadata>> {
+        let parquet_segments = self.state.parquet_segments.read().await;
+        let key = (topic.to_string(), partition, segment_id.to_string());
+        Ok(parquet_segments.get(&key).cloned())
+    }
+
+    async fn list_parquet_segments(&self, topic: &str, partition: Option<i32>) -> Result<Vec<ParquetSegmentMetadata>> {
+        let parquet_segments = self.state.parquet_segments.read().await;
+        Ok(parquet_segments.values()
+            .filter(|s| s.topic == topic && (partition.is_none() || s.partition == partition.unwrap()))
+            .cloned()
+            .collect())
+    }
+
+    async fn get_parquet_paths(&self, topic: &str) -> Result<Vec<String>> {
+        let parquet_segments = self.state.parquet_segments.read().await;
+        let mut paths: Vec<String> = parquet_segments.values()
+            .filter(|s| s.topic == topic)
+            .map(|s| s.object_store_path.clone())
+            .collect();
+        paths.sort();
+        Ok(paths)
+    }
+
+    async fn delete_parquet_segment(&self, topic: &str, partition: i32, segment_id: &str) -> Result<()> {
+        let event = MetadataEvent::new_with_node(
+            MetadataEventPayload::ParquetSegmentDeleted {
+                topic: topic.to_string(),
+                partition,
                 segment_id: segment_id.to_string(),
             },
             self.node_id,

@@ -8,21 +8,21 @@
 
 A high-performance streaming platform built in Rust that implements core Kafka wire protocol functionality with comprehensive Write-Ahead Log (WAL) durability and automatic recovery.
 
-**Latest Release: v2.2.18** - Performance fix for hot-path logging. See [CHANGELOG.md](CHANGELOG.md) for full release history.
+**Latest Release: v2.2.21** - Vendored Raft crate with prost 0.12 compatibility. See [CHANGELOG.md](CHANGELOG.md) for full release history.
 
-## ✨ What's New in v2.2.18
+## ✨ What's New in v2.2.21
 
-🚀 **Performance Fix**: Reduced hot-path logging from INFO to TRACE level
-📈 **+168% Throughput**: 146K → 391K msg/s (default logging, no RUST_LOG override needed)
-⚡ **99% Lower p99 Latency**: 46ms → 0.5ms by eliminating per-request logging overhead
+🔧 **Vendored Raft**: Vendored TiKV raft crate with prost 0.12 compatibility (no external dependency)
+🚀 **Unified API Fixes**: Fixed /health route conflicts and port allocation in cluster mode
+📦 **Dependency Cleanup**: Removed dependency on external tikv/raft-rs crate
 
-**Fixed Logs** (changed from `info!` to `trace!`):
-- Produce request logging in kafka_handler
-- PARTITION_DEBUG logging in produce_handler
-- PRODUCE→BUFFER logging in produce_handler
-- Fetch result logging in fetch_handler
+**Key Changes:**
+- Vendored `crates/raft/` and `crates/raft-proto/` with prost 0.12 codegen
+- Fixed Unified API port conflict (now uses 6091 + node_id)
+- Fixed duplicate /health route when Search API merged with Unified API
+- All 3-node cluster tests passing end-to-end
 
-**Upgrade Recommendation**: All users should upgrade to v2.2.18 for optimal performance.
+**Upgrade Recommendation**: All cluster users should upgrade for improved stability.
 
 ## 🚀 Features
 
@@ -571,7 +571,9 @@ chronik-stream/
 │   ├── chronik-bench/       # Performance benchmarking tool
 │   ├── chronik-wal/         # Write-Ahead Log & metadata store
 │   ├── chronik-raft/        # Raft consensus implementation
-│   └── chronik-raft-bridge/ # Raft integration bridge
+│   ├── chronik-raft-bridge/ # Raft integration bridge
+│   ├── raft/                # Vendored TiKV raft (prost 0.12)
+│   └── raft-proto/          # Vendored raft-proto (prost codegen)
 ├── tests/                   # Integration tests
 ├── Dockerfile              # Multi-arch Docker build
 ├── docker-compose.yml      # Local development setup

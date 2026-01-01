@@ -124,6 +124,16 @@ pub struct UnifiedMetrics {
     pub total_partitions: AtomicUsize,
     pub total_consumer_groups: AtomicUsize,
     pub active_connections: AtomicUsize,
+
+    // ========== Embedding Metrics (v2.2.22 Phase 4) ==========
+    pub embedding_latency_sum_ms: AtomicU64,   // Sum for histogram
+    pub embedding_latency_count: AtomicU64,    // Count for average
+    pub embedding_queue_depth: AtomicUsize,    // Current queue depth (gauge)
+    pub embedding_requests_total: AtomicU64,   // Total embedding requests
+    pub embedding_errors_total: AtomicU64,     // Total embedding errors
+    pub embedding_tokens_total: AtomicU64,     // Total tokens processed (approx)
+    pub embedding_messages_total: AtomicU64,   // Total messages embedded
+    pub embedding_vectors_total: AtomicU64,    // Total vectors generated
 }
 
 impl Default for UnifiedMetrics {
@@ -238,6 +248,16 @@ impl UnifiedMetrics {
             total_partitions: AtomicUsize::new(0),
             total_consumer_groups: AtomicUsize::new(0),
             active_connections: AtomicUsize::new(0),
+
+            // Embedding (v2.2.22)
+            embedding_latency_sum_ms: AtomicU64::new(0),
+            embedding_latency_count: AtomicU64::new(0),
+            embedding_queue_depth: AtomicUsize::new(0),
+            embedding_requests_total: AtomicU64::new(0),
+            embedding_errors_total: AtomicU64::new(0),
+            embedding_tokens_total: AtomicU64::new(0),
+            embedding_messages_total: AtomicU64::new(0),
+            embedding_vectors_total: AtomicU64::new(0),
         }
     }
 
@@ -581,6 +601,42 @@ impl UnifiedMetrics {
         output.push_str(&format!("chronik_state_count{{type=\"active_connections\"}} {}\n",
             self.active_connections.load(Ordering::Relaxed)));
 
+        // ========== Embedding Metrics (v2.2.22) ==========
+        let emb_count = self.embedding_latency_count.load(Ordering::Relaxed);
+        let emb_sum = self.embedding_latency_sum_ms.load(Ordering::Relaxed);
+        let emb_avg = if emb_count > 0 { emb_sum / emb_count } else { 0 };
+
+        output.push_str("# HELP chronik_embedding_latency_ms Embedding API latency in milliseconds\n");
+        output.push_str("# TYPE chronik_embedding_latency_ms gauge\n");
+        output.push_str(&format!("chronik_embedding_latency_ms{{type=\"average\"}} {}\n", emb_avg));
+
+        output.push_str("# HELP chronik_embedding_queue_depth Current embedding queue depth\n");
+        output.push_str("# TYPE chronik_embedding_queue_depth gauge\n");
+        output.push_str(&format!("chronik_embedding_queue_depth {}\n",
+            self.embedding_queue_depth.load(Ordering::Relaxed)));
+
+        output.push_str("# HELP chronik_embedding_requests_total Total embedding API requests\n");
+        output.push_str("# TYPE chronik_embedding_requests_total counter\n");
+        output.push_str(&format!("chronik_embedding_requests_total{{result=\"success\"}} {}\n",
+            self.embedding_requests_total.load(Ordering::Relaxed)));
+        output.push_str(&format!("chronik_embedding_requests_total{{result=\"error\"}} {}\n",
+            self.embedding_errors_total.load(Ordering::Relaxed)));
+
+        output.push_str("# HELP chronik_embedding_tokens_total Total tokens processed for embeddings\n");
+        output.push_str("# TYPE chronik_embedding_tokens_total counter\n");
+        output.push_str(&format!("chronik_embedding_tokens_total {}\n",
+            self.embedding_tokens_total.load(Ordering::Relaxed)));
+
+        output.push_str("# HELP chronik_embedding_messages_total Total messages embedded\n");
+        output.push_str("# TYPE chronik_embedding_messages_total counter\n");
+        output.push_str(&format!("chronik_embedding_messages_total {}\n",
+            self.embedding_messages_total.load(Ordering::Relaxed)));
+
+        output.push_str("# HELP chronik_embedding_vectors_total Total vectors generated\n");
+        output.push_str("# TYPE chronik_embedding_vectors_total counter\n");
+        output.push_str(&format!("chronik_embedding_vectors_total {}\n",
+            self.embedding_vectors_total.load(Ordering::Relaxed)));
+
         output
     }
 }
@@ -785,5 +841,60 @@ impl MetricsRecorder {
         let metrics = global_metrics();
         metrics.metadata_total_segments.store(segments, Ordering::Relaxed);
         metrics.metadata_memory_usage_bytes.store(memory_bytes, Ordering::Relaxed);
+    }
+
+    // ========== Embedding Metrics (v2.2.22) ==========
+
+    /// Record embedding API request latency
+    /// Call this after each embedding API call completes
+    pub fn record_embedding_latency(duration: std::time::Duration) {
+        let ms = duration.as_millis() as u64;
+        let metrics = global_metrics();
+        metrics.embedding_latency_sum_ms.fetch_add(ms, Ordering::Relaxed);
+        metrics.embedding_latency_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Update embedding queue depth (current number of pending requests)
+    /// Call this when enqueueing or completing embedding requests
+    pub fn update_embedding_queue_depth(depth: usize) {
+        global_metrics().embedding_queue_depth.store(depth, Ordering::Relaxed);
+    }
+
+    /// Increment embedding queue depth by 1
+    pub fn increment_embedding_queue() {
+        global_metrics().embedding_queue_depth.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Decrement embedding queue depth by 1
+    pub fn decrement_embedding_queue() {
+        let metrics = global_metrics();
+        // Use saturating subtraction to avoid underflow
+        let current = metrics.embedding_queue_depth.load(Ordering::Relaxed);
+        if current > 0 {
+            metrics.embedding_queue_depth.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Record embedding request result
+    /// Call this after each embedding request completes
+    /// - success: whether the request succeeded
+    /// - messages: number of messages that were embedded
+    /// - vectors: number of vectors generated
+    /// - tokens: approximate number of tokens processed
+    pub fn record_embedding_request(success: bool, messages: u64, vectors: u64, tokens: u64) {
+        let metrics = global_metrics();
+        if success {
+            metrics.embedding_requests_total.fetch_add(1, Ordering::Relaxed);
+            metrics.embedding_messages_total.fetch_add(messages, Ordering::Relaxed);
+            metrics.embedding_vectors_total.fetch_add(vectors, Ordering::Relaxed);
+            metrics.embedding_tokens_total.fetch_add(tokens, Ordering::Relaxed);
+        } else {
+            metrics.embedding_errors_total.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Record embedding error without request context
+    pub fn record_embedding_error() {
+        global_metrics().embedding_errors_total.fetch_add(1, Ordering::Relaxed);
     }
 }

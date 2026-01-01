@@ -1,3 +1,4 @@
 mod unit_tests;
 mod rotation_load_test;
-mod async_io_bench;
+// TODO: Re-enable when async_io module is implemented
+// mod async_io_bench;

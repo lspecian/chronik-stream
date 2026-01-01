@@ -9,6 +9,8 @@ license.workspace = true
 chronik-common = { path = "../chronik-common" }
 chronik-protocol = { path = "../chronik-protocol" }
 chronik-wal = { path = "../chronik-wal" }
+chronik-columnar = { path = "../chronik-columnar" }
+chronik-embeddings = { path = "../chronik-embeddings" }
 
 # Storage backends
 opendal = { workspace = true }
@@ -71,6 +73,7 @@ tracing = { workspace = true }
 tempfile = "3.8"
 criterion = { workspace = true }
 tokio = { workspace = true }
+walkdir = "2.4"
 
 [[bench]]
 name = "segment_comparison"

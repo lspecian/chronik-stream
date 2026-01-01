@@ -125,7 +125,7 @@ mod tests {
                 timestamp: 0,
             },
             indexed_records: vec![],
-            raw_kafka_batches: vec![],
+            raw_kafka_batches: bytes::Bytes::new(),
         };
 
         let result = RawKafkaBatchDecoder::decode_raw_kafka_batches(&segment);

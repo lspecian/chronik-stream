@@ -420,28 +420,56 @@ impl SearchApi {
         self.index_base_path.as_deref()
     }
 
-    /// Create router for the API
+    /// Create router for the API (standalone mode)
     pub fn router(self: Arc<Self>) -> Router {
         Router::new()
-            // Health check
+            // Health check - only for standalone mode
             .route("/health", get(health_check))
             .route("/metrics", get(metrics_handler))
-            
+
             // Search endpoints
             .route("/_search", get(search_all).post(search_all))
             .route("/:index/_search", get(search_index).post(search_index))
-            
+
             // Document endpoints
             .route("/:index/_doc/:id", post(index_document).put(index_document))
             .route("/:index/_doc/:id", get(get_document))
             .route("/:index/_doc/:id", delete(delete_document))
-            
+
             // Index management
             .route("/:index", put(create_index))
             .route("/:index", delete(delete_index))
             .route("/:index/_mapping", get(get_mapping))
             .route("/_cat/indices", get(cat_indices))
-            
+
+            .layer(CorsLayer::permissive())
+            .with_state(self)
+    }
+
+    /// Create router for embedding in another API (no /health to avoid conflicts)
+    ///
+    /// Use this method when the Search API is being merged into a unified API
+    /// that already has its own /health endpoint.
+    pub fn router_for_embedding(self: Arc<Self>) -> Router {
+        Router::new()
+            // Note: No /health here - the parent API provides it
+            .route("/metrics", get(metrics_handler))
+
+            // Search endpoints
+            .route("/_search", get(search_all).post(search_all))
+            .route("/:index/_search", get(search_index).post(search_index))
+
+            // Document endpoints
+            .route("/:index/_doc/:id", post(index_document).put(index_document))
+            .route("/:index/_doc/:id", get(get_document))
+            .route("/:index/_doc/:id", delete(delete_document))
+
+            // Index management
+            .route("/:index", put(create_index))
+            .route("/:index", delete(delete_index))
+            .route("/:index/_mapping", get(get_mapping))
+            .route("/_cat/indices", get(cat_indices))
+
             .layer(CorsLayer::permissive())
             .with_state(self)
     }

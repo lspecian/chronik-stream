@@ -938,7 +938,7 @@ impl RaftCluster {
         let context = format!("{}|{}|{}", kafka_addr, wal_addr, raft_addr);
         tracing::debug!("ConfChangeV2 context: {}", context);
 
-        cc.set_context(context.into_bytes());
+        cc.set_context(context.into_bytes().into());
 
         // STEP 4: Propose ConfChange via Raft
         // CRITICAL: propose_conf_change takes the ConfChangeV2 directly, NOT serialized bytes
@@ -1062,7 +1062,7 @@ impl RaftCluster {
         cc.set_changes(vec![change].into());
 
         // No context needed for removal
-        cc.set_context(vec![]);
+        cc.set_context(bytes::Bytes::new());
 
         // STEP 7: Propose ConfChange via Raft
         let mut raft = self.raft_node.lock().await;

@@ -4,7 +4,11 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use super::traits::*;
+use super::traits::{
+    BrokerMetadata, BrokerStatus, ConsumerGroupMetadata, ConsumerOffset, MetadataError,
+    MetadataStore, ParquetSegmentMetadata, PartitionAssignment, Result, SegmentMetadata,
+    TopicConfig, TopicMetadata,
+};
 
 /// In-memory implementation of MetadataStore for testing
 pub struct InMemoryMetadataStore {
@@ -15,6 +19,7 @@ pub struct InMemoryMetadataStore {
     partition_assignments: Arc<RwLock<HashMap<(String, u32), PartitionAssignment>>>,
     segments: Arc<RwLock<HashMap<(String, String), SegmentMetadata>>>,
     partition_offsets: Arc<RwLock<HashMap<(String, u32), (i64, i64)>>>,
+    parquet_segments: Arc<RwLock<HashMap<(String, i32, String), ParquetSegmentMetadata>>>,
 }
 
 impl InMemoryMetadataStore {
@@ -27,6 +32,7 @@ impl InMemoryMetadataStore {
             partition_assignments: Arc::new(RwLock::new(HashMap::new())),
             segments: Arc::new(RwLock::new(HashMap::new())),
             partition_offsets: Arc::new(RwLock::new(HashMap::new())),
+            parquet_segments: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
@@ -447,6 +453,74 @@ impl MetadataStore for InMemoryMetadataStore {
         _new_producer_epoch: i16,
     ) -> Result<()> {
         // Stub implementation for in-memory store
+        Ok(())
+    }
+
+    // Parquet segment operations (columnar storage for SQL queries)
+    async fn persist_parquet_segment(&self, metadata: ParquetSegmentMetadata) -> Result<()> {
+        let mut parquet_segments = self.parquet_segments.write().await;
+        let key = (metadata.topic.clone(), metadata.partition, metadata.segment_id.clone());
+        tracing::info!(
+            "Persisting Parquet segment metadata: topic={}, partition={}, segment_id={}, offsets={}-{}",
+            metadata.topic, metadata.partition, metadata.segment_id, metadata.min_offset, metadata.max_offset
+        );
+        parquet_segments.insert(key, metadata);
+        Ok(())
+    }
+
+    async fn get_parquet_segment(
+        &self,
+        topic: &str,
+        partition: i32,
+        segment_id: &str,
+    ) -> Result<Option<ParquetSegmentMetadata>> {
+        let parquet_segments = self.parquet_segments.read().await;
+        let key = (topic.to_string(), partition, segment_id.to_string());
+        Ok(parquet_segments.get(&key).cloned())
+    }
+
+    async fn list_parquet_segments(
+        &self,
+        topic: &str,
+        partition: Option<i32>,
+    ) -> Result<Vec<ParquetSegmentMetadata>> {
+        let parquet_segments = self.parquet_segments.read().await;
+        let result: Vec<_> = parquet_segments
+            .values()
+            .filter(|s| s.topic == topic && (partition.is_none() || s.partition == partition.unwrap()))
+            .cloned()
+            .collect();
+        tracing::info!(
+            "Listing Parquet segments for topic={}, partition={:?}: found {} segments",
+            topic, partition, result.len()
+        );
+        Ok(result)
+    }
+
+    async fn get_parquet_paths(&self, topic: &str) -> Result<Vec<String>> {
+        let parquet_segments = self.parquet_segments.read().await;
+        let paths: Vec<String> = parquet_segments
+            .values()
+            .filter(|s| s.topic == topic)
+            .map(|s| s.object_store_path.clone())
+            .collect();
+        Ok(paths)
+    }
+
+    async fn delete_parquet_segment(
+        &self,
+        topic: &str,
+        partition: i32,
+        segment_id: &str,
+    ) -> Result<()> {
+        let mut parquet_segments = self.parquet_segments.write().await;
+        let key = (topic.to_string(), partition, segment_id.to_string());
+        parquet_segments.remove(&key).ok_or_else(|| {
+            MetadataError::NotFound(format!(
+                "Parquet segment {}/{}/{} not found",
+                topic, partition, segment_id
+            ))
+        })?;
         Ok(())
     }
 }

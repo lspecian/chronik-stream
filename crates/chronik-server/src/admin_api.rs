@@ -994,6 +994,11 @@ pub async fn start_admin_api(
         warn!("⚠ Admin API will run over HTTP. To enable TLS, add axum-server dependency.");
     }
 
+    // Deprecation warning for v2.2.22+ unified API
+    warn!("⚠ DEPRECATED: Admin API running on separate port {}", port);
+    warn!("⚠ In v2.2.22+, use the Unified API on port 6092 (CHRONIK_UNIFIED_API_PORT) instead.");
+    warn!("⚠ The separate admin port (10000+node_id) will be removed in a future version.");
+
     info!("Starting Admin API + Schema Registry HTTP server on {}", addr);
     info!("Schema Registry endpoints available at /subjects, /schemas/ids, /config");
 

@@ -5,21 +5,24 @@
 ## Quick Start
 
 ```bash
+# From project root
+cd tests/cluster
+
 # Start cluster
-./cluster-local/start.sh
+./start.sh
 
 # Test with kafka-python
-python3 test_node_ready.py
+python3 ../../test_node_ready.py
 
 # Stop cluster
-./cluster-local/stop.sh
+./stop.sh
 ```
 
 ## What This Does
 
 - **Starts 3 nodes** on localhost ports 9092, 9093, 9094
 - **Clean data** on every start (fresh cluster)
-- **Logs to files** in `cluster-local/logs/`
+- **Logs to files** in `logs/`
 - **Easy cleanup** with stop.sh
 
 ## Files
@@ -48,11 +51,11 @@ localhost:9092,localhost:9093,localhost:9094
 ## Logs
 
 ```bash
-# Tail all logs
-tail -f cluster-local/logs/node*.log
+# Tail all logs (from tests/cluster directory)
+tail -f logs/node*.log
 
 # Check specific node
-cat cluster-local/logs/node1.log
+cat logs/node1.log
 ```
 
 ## DO NOT

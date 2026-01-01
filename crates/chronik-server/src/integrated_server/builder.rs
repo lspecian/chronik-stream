@@ -883,6 +883,26 @@ impl IntegratedKafkaServerBuilder {
         let storage_config = self.storage_config.as_ref()
             .context("storage_config not initialized")?;
 
+        // v2.2.23: Read S3 upload configuration from environment variables
+        // These follow the local-first design: S3 upload is opt-in
+        let columnar_use_object_store = std::env::var("CHRONIK_COLUMNAR_USE_OBJECT_STORE")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false);
+        let columnar_s3_prefix = std::env::var("CHRONIK_COLUMNAR_S3_PREFIX")
+            .unwrap_or_else(|_| "columnar".to_string());
+        let columnar_keep_local = std::env::var("CHRONIK_COLUMNAR_KEEP_LOCAL")
+            .map(|v| v.to_lowercase() != "false")
+            .unwrap_or(true); // Default: keep local copies
+
+        // If object storage is enabled for columnar, use the same config as Tantivy indexes
+        // but with a different prefix. Users can override with separate bucket via
+        // CHRONIK_COLUMNAR_S3_BUCKET environment variable in the future if needed.
+        let columnar_object_store = if columnar_use_object_store {
+            Some(storage_config.object_store_config.clone())
+        } else {
+            None
+        };
+
         let indexer_config = WalIndexerConfig {
             interval_secs: self.config.wal_indexing_interval_secs,
             min_segment_age_secs: 10,
@@ -895,6 +915,13 @@ impl IntegratedKafkaServerBuilder {
             segment_index_path: Some(PathBuf::from(format!("{}/segment_index.json", self.config.data_dir))),
             segment_index_auto_save: true,
             stale_segment_seal_secs: 30, // v2.2.16: Seal stale segments after 30s idle
+            columnar_base_path: format!("{}/columnar", self.config.data_dir), // v2.2.21: Parquet files
+            columnar_use_object_store, // v2.2.23: Enable S3 upload for Parquet files
+            columnar_object_store, // v2.2.23: Object store config for Parquet files
+            columnar_s3_prefix, // v2.2.23: Prefix for Parquet files in object storage
+            columnar_keep_local, // v2.2.23: Keep local copy of Parquet files
+            vector_base_path: format!("{}/vectors", self.config.data_dir), // v2.2.22: Vector embeddings
+            vector_snapshot_interval_secs: 300, // v2.2.22: Snapshot vector indexes every 5 minutes
         };
 
         let wal_manager = wal_handler.wal_manager().clone();

@@ -46,6 +46,8 @@ mod isr_ack_tracker;
 mod leader_election;
 // v2.2.7: HTTP Admin API for cluster management
 mod admin_api;
+// v2.2.22: Unified API (SQL, Vector Search, Admin on single port)
+mod unified_api;
 // v2.2.7 Priority 2 Step 3: Automatic partition rebalancing
 mod partition_rebalancer;
 // v2.2.7 Phase 1: Leader-forwarding RPC for metadata queries
@@ -68,6 +70,7 @@ use chronik_wal::compaction::{WalCompactor, CompactionConfig, CompactionStrategy
 use chronik_wal::config::{WalConfig, CompressionType};
 use chronik_storage::object_store::{ObjectStoreConfig, StorageBackend, AuthConfig, S3Credentials};
 use chronik_config::{ClusterConfig, NodeConfig};
+use chronik_columnar::ColumnarQueryEngine;
 use serde_json;
 
 #[derive(Parser, Debug, Clone)]
@@ -629,13 +632,8 @@ async fn run_cluster_mode(
     let _metrics_registry = init_monitoring("chronik-server", metrics_port, None).await?;
     info!("Metrics endpoint available at http://{}:{}/metrics", bind, metrics_port);
 
-    // Phase 8: Start Search API (if feature enabled)
-    start_search_api(
-        server.clone(),
-        bind.clone(),
-        init_config.node_id,
-        cli.data_dir.to_string_lossy().to_string(),
-    ).await?;
+    // Phase 8: Search API is now included in Unified API (Phase 9.5)
+    // Legacy standalone Search API removed to avoid duplicate metrics registration
 
     // Phase 9: Start Admin API + Schema Registry
     // v2.2.22: ISR tracker for accurate in-sync replica queries
@@ -650,8 +648,103 @@ async fn run_cluster_mode(
         init_config.node_id,
         &bind,
         server.isr_tracker(),  // v2.2.22: Wire up ISR tracker from builder
-        schema_registry,       // Phase 5: Schema Registry
+        schema_registry.clone(),  // Phase 5: Schema Registry (clone for unified API)
     ).await?;
+
+    // Phase 9.5: Start Unified API (v2.2.22)
+    // Consolidates all HTTP APIs on port 6092:
+    // - SQL endpoints: /_sql, /_sql/explain, /_sql/tables
+    // - Vector search: /_vector/:topic/search, /_vector/:topic/hybrid
+    // - Search API: /_search, /:index/_search (Elasticsearch-compatible)
+    // - Admin API: /admin/status, /admin/add-node, /admin/remove-node
+    // - Schema Registry: /subjects/*, /schemas/*, /config/*
+    let wal_indexer = server.get_wal_indexer();
+    let vector_index_manager = wal_indexer.vector_index_manager().clone();
+
+    // Create search router for unified API (Elasticsearch-compatible search)
+    // CRITICAL FIX v2.2.22: Use init_config.data_dir (from cluster TOML config)
+    // instead of cli.data_dir (CLI default), so SearchApi finds indices
+    // created by RealtimeIndexer at {data_dir}/index/
+    #[cfg(feature = "search")]
+    let search_router = {
+        let index_base_path = format!("{}/tantivy_indexes", init_config.data_dir.to_string_lossy());
+        info!("Search API index base path: {}", index_base_path);
+        match unified_api::search_handler::create_search_api(wal_indexer.clone(), &index_base_path) {
+            Ok(search_api) => {
+                info!("✓ Search API integrated into Unified API");
+                Some(unified_api::search_handler::search_router(search_api))
+            }
+            Err(e) => {
+                warn!("Failed to create Search API for unified API: {}", e);
+                None
+            }
+        }
+    };
+    #[cfg(not(feature = "search"))]
+    let search_router: Option<axum::Router> = None;
+
+    // Create admin router for unified API (cluster management + Schema Registry)
+    let admin_router = unified_api::create_admin_router_for_unified_api(
+        raft_cluster.clone(),
+        server.metadata_store().clone(),
+        None, // Uses CHRONIK_ADMIN_API_KEY env var
+        server.isr_tracker(),
+        schema_registry.clone(),
+    );
+    info!("✓ Admin API + Schema Registry integrated into Unified API");
+
+    // v2.2.22: Create ColumnarQueryEngine for SQL queries over Parquet data
+    // The engine starts empty - topics are registered on-demand when SQL queries
+    // reference them. The SQL handler uses metadata_store.get_parquet_paths() to
+    // find Parquet files and registers them as DataFusion tables.
+    let columnar_query_engine = Arc::new(ColumnarQueryEngine::new());
+    info!("✓ Columnar Query Engine initialized for SQL queries");
+
+    let mut unified_api_config = unified_api::UnifiedApiConfig::default();
+    // Use node-specific port to avoid conflicts in cluster mode (6091 + node_id)
+    unified_api_config.port = 6091 + init_config.node_id as u16;
+    unified_api_config.bind_addr = bind.clone();
+    // v2.2.23: Create hot buffer for sub-second SQL queries on recent data
+    let hot_buffer = if std::env::var("CHRONIK_HOT_BUFFER_ENABLED")
+        .map(|v| v.to_lowercase() == "true" || v == "1")
+        .unwrap_or(true) // Enabled by default
+    {
+        let wal_manager = wal_indexer.wal_manager().clone();
+        let hot_buffer_config = chronik_columnar::HotBufferConfig {
+            enabled: true,
+            max_records_per_partition: std::env::var("CHRONIK_HOT_BUFFER_MAX_RECORDS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(100_000),
+            refresh_interval_ms: std::env::var("CHRONIK_HOT_BUFFER_REFRESH_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1000),
+        };
+        info!("Creating hot buffer with max_records={}, refresh_interval={}ms",
+              hot_buffer_config.max_records_per_partition,
+              hot_buffer_config.refresh_interval_ms);
+        Some(Arc::new(chronik_columnar::HotDataBuffer::new(
+            wal_manager,
+            hot_buffer_config,
+        )))
+    } else {
+        info!("Hot buffer disabled via CHRONIK_HOT_BUFFER_ENABLED=false");
+        None
+    };
+
+    let _unified_api_handle = unified_api::start_unified_api_full(
+        server.metadata_store().clone(),
+        Some(columnar_query_engine),
+        Some(vector_index_manager),
+        None, // TODO: Create embedding provider from config
+        search_router,
+        Some(admin_router),
+        hot_buffer,
+        unified_api_config.clone(),
+    ).await?;
+    info!("✓ Unified API started on port {} (SQL, Vector, Search, Admin, Schema Registry)",
+          unified_api_config.port);
 
     // Phase 10: Start Partition Rebalancer
     info!("Starting Partition Rebalancer (RF={})", init_config.replication_factor);
@@ -770,6 +863,31 @@ async fn run_single_node_mode(
         });
 
         info!("Search API available at http://{}:6092", bind);
+    }
+
+    // v2.2.22: Start Unified API (SQL + Vector Search)
+    // When search feature is enabled, use port 6093 to avoid conflict
+    // Eventually, search endpoints will be migrated into unified API (Phase 6.2)
+    #[cfg(feature = "search")]
+    let unified_port = 6093;
+    #[cfg(not(feature = "search"))]
+    let unified_port = 6092;
+
+    {
+        let wal_indexer = server.get_wal_indexer();
+        let vector_index_manager = wal_indexer.vector_index_manager().clone();
+        let mut unified_config = unified_api::UnifiedApiConfig::default();
+        unified_config.port = unified_port;
+        unified_config.bind_addr = bind.clone();
+
+        let _unified_handle = unified_api::start_unified_api(
+            server.metadata_store().clone(),
+            None, // TODO: Create ColumnarQueryEngine once Parquet files exist
+            Some(vector_index_manager),
+            None, // TODO: Create embedding provider from config
+            unified_config,
+        ).await?;
+        info!("Unified API (SQL + Vector) available at http://{}:{}", bind, unified_port);
     }
 
     // Start server with signal handling

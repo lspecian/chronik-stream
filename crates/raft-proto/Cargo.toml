@@ -1,0 +1,24 @@
+[package]
+name = "raft-proto"
+version = "0.7.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Protocol definitions for Raft - vendored for prost 0.12 compatibility"
+# Vendored from: https://github.com/tikv/raft-rs v0.7.0
+# Modified to use prost 0.12 directly with protobuf-style accessor methods
+
+# Keep out of workspace - used via [patch]
+[workspace]
+
+[features]
+default = []
+# Feature flag for compatibility with raft crate's feature requirements
+prost-codec = []
+
+[dependencies]
+bytes = "1.5"
+prost = "0.12"
+lazy_static = "1.4"
+
+[build-dependencies]
+prost-build = "0.12"

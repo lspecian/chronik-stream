@@ -7,8 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-# CRITICAL: This crate ONLY depends on raft (prost 0.11), NOT prost 0.13
-# This ensures we only see prost 0.11's Message trait
+# Uses vendored raft crate with prost 0.12 (via workspace [patch] section)
 raft = { version = "0.7", default-features = false, features = ["prost-codec"] }
 bytes = { workspace = true }
-prost = "0.11"  # Explicitly use 0.11 to match raft
+prost = { workspace = true }  # Use workspace prost 0.12

@@ -62,6 +62,7 @@ pub use wal_indexer::{
 };
 pub use segment_index::{
     SegmentIndex, SegmentMetadata as SegmentIndexMetadata, TopicPartition as SegmentIndexTopicPartition, IndexStats,
+    ParquetSegmentMetadata, ParquetIndexStats, CombinedIndexStats,
 };
 pub use segment_compaction::{
     SegmentCompactor, CompactionConfig, CompactionStrategy, CompactionStats,

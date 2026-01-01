@@ -489,6 +489,7 @@ mod tests {
             bind: None,
             advertise: None,
             gossip: None,
+            auto_recover: true,
         };
 
         assert!(config.validate_config().is_ok());
@@ -506,6 +507,7 @@ mod tests {
             bind: None,
             advertise: None,
             gossip: None,
+            auto_recover: true,
         };
 
         assert!(config.validate_config().is_err());
@@ -542,6 +544,7 @@ mod tests {
             bind: None,
             advertise: None,
             gossip: None,
+            auto_recover: true,
         };
 
         assert!(config.validate_config().is_err());
@@ -578,6 +581,7 @@ mod tests {
             bind: None,
             advertise: None,
             gossip: None,
+            auto_recover: true,
         };
 
         assert!(config.validate_config().is_err());
@@ -595,6 +599,7 @@ mod tests {
             bind: None,
             advertise: None,
             gossip: None,
+            auto_recover: true,
         };
 
         assert!(config.validate_config().is_err());
@@ -612,6 +617,7 @@ mod tests {
             bind: None,
             advertise: None,
             gossip: None,
+            auto_recover: true,
         };
 
         assert!(config.validate_config().is_err());
@@ -629,6 +635,7 @@ mod tests {
             bind: None,
             advertise: None,
             gossip: None,
+            auto_recover: true,
         };
 
         let this_node = config.this_node().unwrap();
@@ -648,6 +655,7 @@ mod tests {
             bind: None,
             advertise: None,
             gossip: None,
+            auto_recover: true,
         };
 
         let peers = config.peer_nodes();
@@ -667,6 +675,7 @@ mod tests {
             bind: None,
             advertise: None,
             gossip: None,
+            auto_recover: true,
         };
 
         let addrs = config.raft_peer_addrs();
@@ -704,6 +713,7 @@ mod tests {
             bind: None,
             advertise: None,
             gossip: None,
+            auto_recover: true,
         };
 
         assert!(config.validate().is_err());

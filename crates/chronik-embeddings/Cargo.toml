@@ -1,0 +1,42 @@
+[package]
+name = "chronik-embeddings"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Embedding providers for vector search in Chronik Stream"
+
+[dependencies]
+# Internal dependencies
+chronik-common = { path = "../chronik-common" }
+
+# HTTP client for API providers
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Async
+tokio = { workspace = true }
+async-trait = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Tracing
+tracing = { workspace = true }
+
+# Optional: Local model support (ONNX Runtime)
+# Note: ort 2.0 is still in RC, disable for now
+# ort = { version = "2.0.0-rc.10", optional = true }
+# tokenizers = { version = "0.20", optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+wiremock = "0.6"
+
+[features]
+default = []
+# local-models = ["ort", "tokenizers"]  # Disabled until ort 2.0 stable

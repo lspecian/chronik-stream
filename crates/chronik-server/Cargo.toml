@@ -21,6 +21,10 @@ chronik-wal = { path = "../chronik-wal" }
 chronik-monitoring = { path = "../chronik-monitoring" }
 chronik-config = { path = "../chronik-config" }  # Required for cluster configuration
 
+# v2.2.22: Columnar storage and embeddings for Unified API
+chronik-columnar = { path = "../chronik-columnar" }
+chronik-embeddings = { path = "../chronik-embeddings" }
+
 # Optional components (feature-gated)
 chronik-search = { path = "../chronik-search", optional = true }
 chronik-query = { path = "../chronik-query", optional = true }

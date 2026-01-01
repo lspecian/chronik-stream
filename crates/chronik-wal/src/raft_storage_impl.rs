@@ -222,8 +222,8 @@ impl RaftWalStorage {
                     entry_type: raft::eraftpb::EntryType::EntryNormal as i32,
                     term: 1,
                     index: first_idx,
-                    data: vec![],
-                    context: vec![],
+                    data: bytes::Bytes::new(),
+                    context: bytes::Bytes::new(),
                     sync_log: false,
                 });
             }
@@ -605,7 +605,7 @@ impl RaftWalStorage {
 
         // Create snapshot
         let mut snapshot = Snapshot::default();
-        snapshot.set_data(state_machine_data);
+        snapshot.set_data(state_machine_data.into());
         snapshot.set_metadata(snapshot_metadata);
 
         info!("✓ Created snapshot: index={}, term={}, data_size={} bytes",

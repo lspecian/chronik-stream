@@ -85,6 +85,107 @@ impl TopicConfig {
         self.config.insert("searchable".to_string(), searchable.to_string());
         self
     }
+
+    /// Check if topic should store data in columnar (Parquet) format.
+    ///
+    /// Precedence (highest to lowest):
+    /// 1. Explicit topic config: `config["columnar.enabled"] = "true"/"false"`
+    /// 2. Environment default: `CHRONIK_DEFAULT_COLUMNAR=true/false`
+    /// 3. Hardcoded default: `false` (maximum performance)
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use chronik_common::metadata::TopicConfig;
+    /// use std::collections::HashMap;
+    ///
+    /// // Default: not columnar
+    /// let config = TopicConfig::default();
+    /// assert!(!config.is_columnar_enabled());
+    ///
+    /// // Explicit columnar
+    /// let mut config = TopicConfig::default();
+    /// config.config.insert("columnar.enabled".to_string(), "true".to_string());
+    /// assert!(config.is_columnar_enabled());
+    /// ```
+    pub fn is_columnar_enabled(&self) -> bool {
+        // 1. Explicit config wins (case-insensitive)
+        if let Some(val) = self.config.get("columnar.enabled") {
+            return val.eq_ignore_ascii_case("true");
+        }
+        // 2. Fall back to environment default
+        std::env::var("CHRONIK_DEFAULT_COLUMNAR")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)  // 3. Hardcoded default: false (max performance)
+    }
+
+    /// Get the columnar format (parquet or arrow).
+    /// Defaults to "parquet".
+    pub fn columnar_format(&self) -> &str {
+        self.config.get("columnar.format").map(|s| s.as_str()).unwrap_or("parquet")
+    }
+
+    /// Get the columnar compression codec.
+    /// Defaults to "zstd".
+    pub fn columnar_compression(&self) -> &str {
+        self.config.get("columnar.compression").map(|s| s.as_str()).unwrap_or("zstd")
+    }
+
+    /// Get the columnar row group size.
+    /// Defaults to 65536.
+    pub fn columnar_row_group_size(&self) -> usize {
+        self.config.get("columnar.row_group_size")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(65536)
+    }
+
+    /// Get the columnar partitioning strategy (none, hourly, daily).
+    /// Defaults to "hourly".
+    pub fn columnar_partitioning(&self) -> &str {
+        self.config.get("columnar.partitioning").map(|s| s.as_str()).unwrap_or("hourly")
+    }
+
+    /// Create a columnar-enabled topic config
+    pub fn with_columnar(mut self, enabled: bool) -> Self {
+        self.config.insert("columnar.enabled".to_string(), enabled.to_string());
+        self
+    }
+
+    /// Check if topic has vector search enabled.
+    ///
+    /// Precedence (highest to lowest):
+    /// 1. Explicit topic config: `config["vector.enabled"] = "true"/"false"`
+    /// 2. Hardcoded default: `false`
+    pub fn is_vector_enabled(&self) -> bool {
+        self.config.get("vector.enabled")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    }
+
+    /// Get the vector embedding provider (openai, external, local).
+    pub fn vector_embedding_provider(&self) -> Option<&str> {
+        self.config.get("vector.embedding.provider").map(|s| s.as_str())
+    }
+
+    /// Get the vector embedding model.
+    pub fn vector_embedding_model(&self) -> Option<&str> {
+        self.config.get("vector.embedding.model").map(|s| s.as_str())
+    }
+
+    /// Get the vector embedding dimensions.
+    pub fn vector_embedding_dimensions(&self) -> Option<usize> {
+        self.config.get("vector.embedding.dimensions")
+            .and_then(|s| s.parse().ok())
+    }
+
+    /// Create a vector-enabled topic config
+    pub fn with_vector(mut self, provider: &str, model: &str, dimensions: usize) -> Self {
+        self.config.insert("vector.enabled".to_string(), "true".to_string());
+        self.config.insert("vector.embedding.provider".to_string(), provider.to_string());
+        self.config.insert("vector.embedding.model".to_string(), model.to_string());
+        self.config.insert("vector.embedding.dimensions".to_string(), dimensions.to_string());
+        self
+    }
 }
 
 /// Topic metadata
@@ -97,7 +198,7 @@ pub struct TopicMetadata {
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
-/// Segment metadata
+/// Segment metadata (Tantivy indexes)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SegmentMetadata {
     pub segment_id: String,
@@ -109,6 +210,45 @@ pub struct SegmentMetadata {
     pub record_count: i64,
     pub path: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Parquet segment metadata (columnar storage for SQL queries)
+///
+/// Used by the WalIndexer to track Parquet files for DataFusion SQL queries.
+/// Each Parquet segment represents a range of Kafka messages converted to
+/// columnar format for efficient analytics.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ParquetSegmentMetadata {
+    /// Unique segment ID (format: topic-partition-min_offset-max_offset-timestamp)
+    pub segment_id: String,
+    /// Topic name
+    pub topic: String,
+    /// Partition number
+    pub partition: i32,
+    /// Minimum offset in this segment (inclusive)
+    pub min_offset: i64,
+    /// Maximum offset in this segment (inclusive)
+    pub max_offset: i64,
+    /// Number of records (rows) in this segment
+    pub record_count: usize,
+    /// Number of row groups in this Parquet file
+    pub row_group_count: usize,
+    /// Minimum timestamp in this segment (milliseconds)
+    pub min_timestamp: i64,
+    /// Maximum timestamp in this segment (milliseconds)
+    pub max_timestamp: i64,
+    /// Object store path (e.g., "parquet/topic/partition=0/2024/01/01/segment.parquet")
+    pub object_store_path: String,
+    /// Size in bytes (Parquet file size)
+    pub size_bytes: u64,
+    /// Creation timestamp (when segment was created)
+    pub created_at: i64,
+    /// Compression codec used (zstd, snappy, gzip, etc.)
+    pub compression: String,
+    /// Time partition key if time-partitioned (e.g., "2024-01-01-12" for hourly)
+    pub time_partition_key: Option<String>,
+    /// Parquet file schema fingerprint (for schema evolution tracking)
+    pub schema_fingerprint: Option<String>,
 }
 
 /// Broker metadata
@@ -187,12 +327,19 @@ pub trait MetadataStore: Send + Sync {
     async fn update_topic(&self, name: &str, config: TopicConfig) -> Result<TopicMetadata>;
     async fn delete_topic(&self, name: &str) -> Result<()>;
     
-    // Segment operations
+    // Segment operations (Tantivy indexes)
     async fn persist_segment_metadata(&self, metadata: SegmentMetadata) -> Result<()>;
     async fn get_segment_metadata(&self, topic: &str, segment_id: &str) -> Result<Option<SegmentMetadata>>;
     async fn list_segments(&self, topic: &str, partition: Option<u32>) -> Result<Vec<SegmentMetadata>>;
     async fn delete_segment(&self, topic: &str, segment_id: &str) -> Result<()>;
-    
+
+    // Parquet segment operations (columnar storage for SQL queries)
+    async fn persist_parquet_segment(&self, metadata: ParquetSegmentMetadata) -> Result<()>;
+    async fn get_parquet_segment(&self, topic: &str, partition: i32, segment_id: &str) -> Result<Option<ParquetSegmentMetadata>>;
+    async fn list_parquet_segments(&self, topic: &str, partition: Option<i32>) -> Result<Vec<ParquetSegmentMetadata>>;
+    async fn get_parquet_paths(&self, topic: &str) -> Result<Vec<String>>;
+    async fn delete_parquet_segment(&self, topic: &str, partition: i32, segment_id: &str) -> Result<()>;
+
     // Broker operations
     async fn register_broker(&self, metadata: BrokerMetadata) -> Result<()>;
     async fn get_broker(&self, broker_id: i32) -> Result<Option<BrokerMetadata>>;
