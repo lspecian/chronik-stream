@@ -334,10 +334,18 @@ impl TopicValidator {
             }
         }
 
-        // If vector is enabled, require provider
+        // If vector is enabled without per-topic provider, check for server-wide provider
         if vector_enabled && !configs.contains_key("vector.embedding.provider") {
-            error!("vector.enabled=true requires vector.embedding.provider");
-            return Err(error_codes::INVALID_CONFIG);
+            // Allow if server-wide embedding provider is configured
+            let has_server_provider = std::env::var("OPENAI_API_KEY").is_ok()
+                || std::env::var("CHRONIK_EMBEDDING_ENDPOINT").is_ok()
+                || std::env::var("CHRONIK_EMBEDDING_PROVIDER").is_ok();
+
+            if !has_server_provider {
+                error!("vector.enabled=true requires either vector.embedding.provider in topic config or server-wide provider (OPENAI_API_KEY or CHRONIK_EMBEDDING_PROVIDER)");
+                return Err(error_codes::INVALID_CONFIG);
+            }
+            debug!("Using server-wide embedding provider for vector-enabled topic");
         }
 
         Ok(())
@@ -576,11 +584,21 @@ mod tests {
     }
 
     #[test]
-    fn test_vector_enabled_requires_provider() {
+    fn test_vector_enabled_requires_provider_or_server_default() {
+        // Clear any existing provider env vars for this test
+        std::env::remove_var("OPENAI_API_KEY");
+        std::env::remove_var("CHRONIK_EMBEDDING_ENDPOINT");
+        std::env::remove_var("CHRONIK_EMBEDDING_PROVIDER");
+
         let mut configs = HashMap::new();
         configs.insert("vector.enabled".to_string(), "true".to_string());
-        // Missing vector.embedding.provider
+        // Missing vector.embedding.provider AND no server-wide provider
         assert!(TopicValidator::validate_configs(&configs, 1).is_err());
+
+        // But with server-wide provider, it should succeed
+        std::env::set_var("OPENAI_API_KEY", "sk-test");
+        assert!(TopicValidator::validate_configs(&configs, 1).is_ok());
+        std::env::remove_var("OPENAI_API_KEY");
     }
 
     #[test]

@@ -272,6 +272,12 @@ async fn search_tantivy_index(
         .map_err(|e| Error::Internal(format!("Failed to create index reader: {}", e)))?;
     let searcher = reader.searcher();
 
+    // Handle size=0: return empty hits (caller just wants count)
+    // Tantivy's TopDocs collector panics if limit is 0
+    if request.size == 0 {
+        return Ok(Vec::new());
+    }
+
     // Build query - for WAL indices, we'll do a match_all by default
     // since we don't have the schema mapping readily available
     let schema = index.schema();
@@ -347,14 +353,20 @@ async fn search_in_index(
     state: &crate::api::IndexState,
     request: &SearchRequest,
 ) -> Result<Vec<Hit>> {
+    // Handle size=0: return empty hits (caller just wants count)
+    // Tantivy's TopDocs collector panics if limit is 0
+    if request.size == 0 {
+        return Ok(Vec::new());
+    }
+
     let searcher = state.reader.searcher();
-    
+
     // Build Tantivy query from Elasticsearch query DSL
     let query = match &request.query {
         Some(query_dsl) => build_tantivy_query(query_dsl, &state.schema)?,
         None => Box::new(AllQuery),
     };
-    
+
     // Execute search
     let top_docs = searcher.search(&*query, &TopDocs::with_limit(request.size).and_offset(request.from))
         .map_err(|e| Error::Internal(format!("Search failed: {}", e)))?;

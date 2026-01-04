@@ -45,21 +45,21 @@ mkdir -p "$SCRIPT_DIR"/logs
 # CHRONIK_DEFAULT_COLUMNAR=true enables Parquet file creation for SQL analytics
 
 echo -e "${GREEN}Starting Node 1...${NC}"
-CHRONIK_DEFAULT_SEARCHABLE=true CHRONIK_DEFAULT_COLUMNAR=true RUST_LOG=info,chronik_server::integrated_server::server=warn,chronik_wal::group_commit=warn,tantivy=warn "$BINARY" start --config "$SCRIPT_DIR/node1.toml" \
+OPENAI_API_KEY="${OPENAI_API_KEY:-}" CHRONIK_EMBEDDING_PROVIDER=openai CHRONIK_DEFAULT_SEARCHABLE=true CHRONIK_DEFAULT_COLUMNAR=true RUST_LOG=info,chronik_server::integrated_server::server=warn,chronik_wal::group_commit=warn,tantivy=warn "$BINARY" start --config "$SCRIPT_DIR/node1.toml" \
     > "$SCRIPT_DIR/logs/node1.log" 2>&1 &
 echo $! > "$SCRIPT_DIR/data/node1.pid"
 
 sleep 2
 
 echo -e "${GREEN}Starting Node 2...${NC}"
-CHRONIK_DEFAULT_SEARCHABLE=true CHRONIK_DEFAULT_COLUMNAR=true RUST_LOG=info,chronik_server::integrated_server::server=warn,chronik_wal::group_commit=warn,tantivy=warn "$BINARY" start --config "$SCRIPT_DIR/node2.toml" \
+OPENAI_API_KEY="${OPENAI_API_KEY:-}" CHRONIK_EMBEDDING_PROVIDER=openai CHRONIK_DEFAULT_SEARCHABLE=true CHRONIK_DEFAULT_COLUMNAR=true RUST_LOG=info,chronik_server::integrated_server::server=warn,chronik_wal::group_commit=warn,tantivy=warn "$BINARY" start --config "$SCRIPT_DIR/node2.toml" \
     > "$SCRIPT_DIR/logs/node2.log" 2>&1 &
 echo $! > "$SCRIPT_DIR/data/node2.pid"
 
 sleep 2
 
 echo -e "${GREEN}Starting Node 3...${NC}"
-CHRONIK_DEFAULT_SEARCHABLE=true CHRONIK_DEFAULT_COLUMNAR=true RUST_LOG=info,chronik_server::integrated_server::server=warn,chronik_wal::group_commit=warn,tantivy=warn "$BINARY" start --config "$SCRIPT_DIR/node3.toml" \
+OPENAI_API_KEY="${OPENAI_API_KEY:-}" CHRONIK_EMBEDDING_PROVIDER=openai CHRONIK_DEFAULT_SEARCHABLE=true CHRONIK_DEFAULT_COLUMNAR=true RUST_LOG=info,chronik_server::integrated_server::server=warn,chronik_wal::group_commit=warn,tantivy=warn "$BINARY" start --config "$SCRIPT_DIR/node3.toml" \
     > "$SCRIPT_DIR/logs/node3.log" 2>&1 &
 echo $! > "$SCRIPT_DIR/data/node3.pid"
 

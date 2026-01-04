@@ -494,6 +494,83 @@ fn parse_advertise_addr(advertise: Option<&str>, bind: &str, default_port: u16) 
     }
 }
 
+/// Try to create an embedding provider from environment variables.
+///
+/// Checks for:
+/// - CHRONIK_EMBEDDING_PROVIDER: "openai" (default), "external", or "local"
+/// - OPENAI_API_KEY: Required for OpenAI provider
+/// - CHRONIK_EMBEDDING_MODEL: Model name (default: text-embedding-3-small)
+/// - CHRONIK_EMBEDDING_DIMENSIONS: Vector dimensions (default: 1536)
+/// - CHRONIK_EMBEDDING_ENDPOINT: Required for external provider
+///
+/// Returns None with a log message if provider cannot be created (e.g., missing API key).
+fn try_create_embedding_provider() -> Option<Arc<dyn chronik_embeddings::EmbeddingProvider>> {
+    use chronik_embeddings::{VectorSearchConfig, EmbeddingModelConfig};
+    use chronik_embeddings::config::EmbeddingProvider as ProviderType;
+
+    // Check if embedding is explicitly disabled
+    if std::env::var("CHRONIK_EMBEDDING_ENABLED")
+        .map(|v| v.to_lowercase() == "false" || v == "0")
+        .unwrap_or(false)
+    {
+        info!("Embedding provider disabled via CHRONIK_EMBEDDING_ENABLED=false");
+        return None;
+    }
+
+    // Determine provider type
+    let provider_type = std::env::var("CHRONIK_EMBEDDING_PROVIDER")
+        .unwrap_or_else(|_| "openai".to_string());
+
+    let provider_enum = match provider_type.to_lowercase().as_str() {
+        "openai" => ProviderType::OpenAI,
+        "external" => ProviderType::External,
+        "local" => ProviderType::Local,
+        other => {
+            warn!("Unknown embedding provider '{}', defaulting to OpenAI", other);
+            ProviderType::OpenAI
+        }
+    };
+
+    // Build model config from environment
+    let model = std::env::var("CHRONIK_EMBEDDING_MODEL")
+        .unwrap_or_else(|_| "text-embedding-3-small".to_string());
+
+    let dimensions = std::env::var("CHRONIK_EMBEDDING_DIMENSIONS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1536);
+
+    let endpoint = std::env::var("CHRONIK_EMBEDDING_ENDPOINT").ok();
+
+    let model_config = EmbeddingModelConfig {
+        provider: provider_enum.clone(),
+        model,
+        dimensions,
+        endpoint,
+    };
+
+    // Try to create the provider
+    match chronik_embeddings::factory::create_provider_from_model_config(&model_config) {
+        Ok(provider) => {
+            info!("✓ Embedding provider initialized: {} (model: {}, dimensions: {})",
+                  provider.name(), model_config.model, provider.dimensions());
+            Some(provider)
+        }
+        Err(e) => {
+            // Log appropriate message based on error
+            if e.to_string().contains("OPENAI_API_KEY") {
+                info!("Embedding provider not configured: OPENAI_API_KEY not set");
+                info!("  Set OPENAI_API_KEY to enable vector search with text queries");
+            } else if e.to_string().contains("endpoint") {
+                info!("Embedding provider not configured: CHRONIK_EMBEDDING_ENDPOINT required for external provider");
+            } else {
+                warn!("Failed to create embedding provider: {}", e);
+            }
+            None
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -737,7 +814,7 @@ async fn run_cluster_mode(
         server.metadata_store().clone(),
         Some(columnar_query_engine),
         Some(vector_index_manager),
-        None, // TODO: Create embedding provider from config
+        try_create_embedding_provider(),
         search_router,
         Some(admin_router),
         hot_buffer,
@@ -880,11 +957,48 @@ async fn run_single_node_mode(
         unified_config.port = unified_port;
         unified_config.bind_addr = bind.clone();
 
-        let _unified_handle = unified_api::start_unified_api(
+        // v2.2.23: Create ColumnarQueryEngine for SQL queries in single-node mode
+        // This enables /_sql endpoints for querying Parquet data
+        let columnar_query_engine = Arc::new(ColumnarQueryEngine::new());
+        info!("✓ Columnar Query Engine initialized for SQL queries");
+
+        // v2.2.23: Create hot buffer for sub-second SQL queries on recent data
+        let hot_buffer = if std::env::var("CHRONIK_HOT_BUFFER_ENABLED")
+            .map(|v| v.to_lowercase() == "true" || v == "1")
+            .unwrap_or(true) // Enabled by default
+        {
+            let wal_manager = wal_indexer.wal_manager().clone();
+            let hot_buffer_config = chronik_columnar::HotBufferConfig {
+                enabled: true,
+                max_records_per_partition: std::env::var("CHRONIK_HOT_BUFFER_MAX_RECORDS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(100_000),
+                refresh_interval_ms: std::env::var("CHRONIK_HOT_BUFFER_REFRESH_MS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(1000),
+            };
+            info!("Creating hot buffer with max_records={}, refresh_interval={}ms",
+                  hot_buffer_config.max_records_per_partition,
+                  hot_buffer_config.refresh_interval_ms);
+            Some(Arc::new(chronik_columnar::HotDataBuffer::new(
+                wal_manager,
+                hot_buffer_config,
+            )))
+        } else {
+            info!("Hot buffer disabled via CHRONIK_HOT_BUFFER_ENABLED=false");
+            None
+        };
+
+        let _unified_handle = unified_api::start_unified_api_full(
             server.metadata_store().clone(),
-            None, // TODO: Create ColumnarQueryEngine once Parquet files exist
+            Some(columnar_query_engine),
             Some(vector_index_manager),
-            None, // TODO: Create embedding provider from config
+            try_create_embedding_provider(),
+            None, // search_router - already started separately on 6092
+            None, // admin_router - not needed in single-node mode
+            hot_buffer,
             unified_config,
         ).await?;
         info!("Unified API (SQL + Vector) available at http://{}:{}", bind, unified_port);

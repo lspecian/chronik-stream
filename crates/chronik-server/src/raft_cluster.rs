@@ -1387,8 +1387,16 @@ impl RaftCluster {
     /// v2.2.7 LOCK CONTENTION FIX: Now uses cached value (lock-free atomic read)
     /// Updated by Raft message loop when leadership changes
     ///
+    /// v2.2.23 RACE FIX: In single-node mode, return true immediately to avoid race condition
+    /// where CreateTopics comes in before Raft message loop's first tick updates the cache.
+    /// With no peers, this node is always the leader by definition.
+    ///
     /// Returns true only if THIS node is currently the Raft leader.
     pub async fn am_i_leader(&self) -> bool {
+        // v2.2.23: Single-node mode is always leader (avoids startup race condition)
+        if self.is_single_node() {
+            return true;
+        }
         // v2.2.7: Lock-free read from cached atomic (no raft_node lock needed!)
         self.cached_is_leader.load(Ordering::Relaxed)
     }
@@ -1398,8 +1406,14 @@ impl RaftCluster {
     /// v2.2.7 LOCK CONTENTION FIX: Now uses cached value (lock-free atomic read)
     /// Updated by Raft message loop when leader changes
     ///
+    /// v2.2.23 RACE FIX: In single-node mode, return self.node_id immediately.
+    ///
     /// Returns the node ID of the current Raft leader, or None if no leader elected.
     pub async fn get_leader_id(&self) -> Option<u64> {
+        // v2.2.23: Single-node mode is always leader
+        if self.is_single_node() {
+            return Some(self.node_id);
+        }
         // v2.2.7: Lock-free read from cached atomic (no raft_node lock needed!)
         let leader_id = self.cached_leader_id.load(Ordering::Relaxed);
 

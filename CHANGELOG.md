@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.2.23] - 2026-01-04
+
+### Fixed
+- **Search API: Fix panic when `size=0` in search requests**
+  - Tantivy's TopDocs collector requires `limit > 0`, causing node crashes on `size=0` queries
+  - Added guard to return empty hits array when `size=0` (Elasticsearch-compatible behavior)
+  - Fixes: `search_tantivy_index()` and `search_in_index()` in `chronik-search/src/handlers.rs`
+
+- **Broker self-registration race condition fix**
+  - CreateTopics could fail with "no online brokers" during startup before broker registered itself
+  - ProtocolHandler now self-registers broker if no online brokers found during validation
+  - Allows `replication_factor=1` in standalone mode even before registration completes
+
+- **Single-node Raft leader race condition fix**
+  - `am_i_leader()` and `get_leader_id()` could return incorrect values before first Raft tick
+  - Single-node mode now returns `true`/`self.node_id` immediately (always leader by definition)
+
+### Improved
+- **Vector topic validation now accepts server-wide embedding provider**
+  - Topics with `vector.enabled=true` no longer require per-topic `vector.embedding.provider`
+  - Accepts server-wide configuration via `OPENAI_API_KEY` or `CHRONIK_EMBEDDING_PROVIDER`
+  - Reduces configuration burden for users with single embedding provider
+
+- **Embedding provider initialization from environment**
+  - New `try_create_embedding_provider()` function for robust provider setup
+  - Supports `CHRONIK_EMBEDDING_PROVIDER` (openai/external/local)
+  - Configurable model, dimensions, and endpoint via environment variables
+
 ## [2.1.0] - 2025-10-29
 
 ### 🚀 Performance - MAJOR BREAKTHROUGH

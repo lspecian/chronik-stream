@@ -5574,24 +5574,64 @@ impl ProtocolHandler {
     }
     
     /// Validate topic configurations
+    ///
+    /// v2.2.23: Self-registers broker if no online brokers found (fixes race condition on startup)
     pub async fn validate_replication_factor(&self, topic: &crate::create_topics_types::CreateTopicRequest) -> Result<()> {
         if let Some(metadata_store) = &self.metadata_store {
             let brokers = metadata_store.list_brokers().await
                 .map_err(|e| Error::Internal(format!("Failed to list brokers: {}", e)))?;
-            
-            let online_brokers: Vec<_> = brokers.iter()
+
+            let mut online_broker_count = brokers.iter()
                 .filter(|b| b.status == chronik_common::metadata::BrokerStatus::Online)
-                .collect();
-            
-            if online_brokers.is_empty() {
+                .count();
+
+            // v2.2.23: Self-register this broker if no online brokers found (startup race condition fix)
+            if online_broker_count == 0 {
+                tracing::warn!("No online brokers found during replication validation, registering broker {}", self.broker_id);
+
+                // Check if broker already registered but not online
+                if metadata_store.get_broker(self.broker_id).await
+                    .map_err(|e| Error::Internal(format!("Failed to get broker: {:?}", e)))?
+                    .is_none()
+                {
+                    let broker_metadata = chronik_common::metadata::BrokerMetadata {
+                        broker_id: self.broker_id,
+                        host: self.advertised_host.clone(),
+                        port: self.advertised_port,
+                        rack: None,
+                        status: chronik_common::metadata::BrokerStatus::Online,
+                        created_at: chronik_common::Utc::now(),
+                        updated_at: chronik_common::Utc::now(),
+                    };
+                    metadata_store.register_broker(broker_metadata).await
+                        .map_err(|e| Error::Internal(format!("Failed to register broker: {:?}", e)))?;
+
+                    tracing::info!("Self-registered broker {} for replication validation", self.broker_id);
+                }
+
+                // Recount online brokers after self-registration
+                let brokers_updated = metadata_store.list_brokers().await
+                    .map_err(|e| Error::Internal(format!("Failed to list brokers: {}", e)))?;
+                online_broker_count = brokers_updated.iter()
+                    .filter(|b| b.status == chronik_common::metadata::BrokerStatus::Online)
+                    .count();
+
+                // In single-node/standalone mode, allow replication_factor=1 even if self-registration didn't show up yet
+                if online_broker_count == 0 && topic.replication_factor == 1 {
+                    tracing::debug!("Allowing replication_factor=1 in standalone mode");
+                    return Ok(());
+                }
+            }
+
+            if online_broker_count == 0 {
                 return Err(Error::Protocol("No online brokers available".into()));
             }
-            
-            if topic.replication_factor as usize > online_brokers.len() {
+
+            if topic.replication_factor as usize > online_broker_count {
                 return Err(Error::Protocol(format!(
-                    "Replication factor {} exceeds available brokers {}", 
-                    topic.replication_factor, 
-                    online_brokers.len()
+                    "Replication factor {} exceeds available brokers {}",
+                    topic.replication_factor,
+                    online_broker_count
                 )));
             }
         }
@@ -5839,27 +5879,61 @@ impl ProtocolHandler {
                         config: config_map,
                     };
                     
-                    // Get broker ID for assignment
+                    // Get broker ID for assignment - use owned broker IDs to avoid lifetime issues
                     let brokers = metadata_store.list_brokers().await
                         .map_err(|e| Error::Internal(format!("Failed to list brokers: {:?}", e)))?;
-                    
-                    let online_brokers: Vec<_> = brokers.iter()
+
+                    let mut online_broker_ids: Vec<i32> = brokers.iter()
                         .filter(|b| b.status == chronik_common::metadata::BrokerStatus::Online)
+                        .map(|b| b.broker_id)
                         .collect();
-                    
-                    if online_brokers.is_empty() {
-                        tracing::warn!("No online brokers available for auto-topic creation");
+
+                    // v2.2.23: Self-register this broker if no online brokers found (startup race condition fix)
+                    if online_broker_ids.is_empty() {
+                        tracing::warn!("No online brokers found for auto-topic creation, registering broker {}", self.broker_id);
+
+                        // Check if broker already registered but not online
+                        if metadata_store.get_broker(self.broker_id).await
+                            .map_err(|e| Error::Internal(format!("Failed to get broker: {:?}", e)))?
+                            .is_none()
+                        {
+                            let broker_metadata = chronik_common::metadata::BrokerMetadata {
+                                broker_id: self.broker_id,
+                                host: self.advertised_host.clone(),
+                                port: self.advertised_port,
+                                rack: None,
+                                status: chronik_common::metadata::BrokerStatus::Online,
+                                created_at: chronik_common::Utc::now(),
+                                updated_at: chronik_common::Utc::now(),
+                            };
+                            metadata_store.register_broker(broker_metadata).await
+                                .map_err(|e| Error::Internal(format!("Failed to register broker: {:?}", e)))?;
+
+                            tracing::info!("Self-registered broker {} for auto-topic creation", self.broker_id);
+                        }
+
+                        // Recount online brokers after self-registration
+                        let brokers_updated = metadata_store.list_brokers().await
+                            .map_err(|e| Error::Internal(format!("Failed to list brokers: {:?}", e)))?;
+                        online_broker_ids = brokers_updated.iter()
+                            .filter(|b| b.status == chronik_common::metadata::BrokerStatus::Online)
+                            .map(|b| b.broker_id)
+                            .collect();
+                    }
+
+                    if online_broker_ids.is_empty() {
+                        tracing::warn!("No online brokers available for auto-topic creation even after self-registration");
                         continue;
                     }
 
                     // Build list of all replica node IDs (for cluster mode)
-                    let all_replicas: Vec<u64> = online_brokers.iter().map(|b| b.broker_id as u64).collect();
+                    let all_replicas: Vec<u64> = online_broker_ids.iter().map(|&id| id as u64).collect();
 
                     // Create assignments for all partitions
                     let mut assignments = Vec::new();
                     for partition in 0..default_num_partitions {
-                        let broker_index = (partition as usize) % online_brokers.len();
-                        let broker_id = online_brokers[broker_index].broker_id;
+                        let broker_index = (partition as usize) % online_broker_ids.len();
+                        let broker_id = online_broker_ids[broker_index];
 
                         assignments.push(chronik_common::metadata::PartitionAssignment {
                             topic: topic_name.clone(),
