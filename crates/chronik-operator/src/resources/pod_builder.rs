@@ -773,10 +773,7 @@ mod tests {
 
         // Check env vars
         let env = container.env.as_ref().unwrap();
-        let advertised = env
-            .iter()
-            .find(|e| e.name == "CHRONIK_ADVERTISE")
-            .unwrap();
+        let advertised = env.iter().find(|e| e.name == "CHRONIK_ADVERTISE").unwrap();
         assert_eq!(
             advertised.value.as_deref(),
             Some("my-chronik.default.svc.cluster.local")
