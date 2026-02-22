@@ -24,8 +24,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain with components
+      - name: Install Rust toolchain
         run: |
+          if ! command -v rustup &> /dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+            echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
           rustup update stable
           rustup default stable
           rustup component add rustfmt clippy
@@ -46,9 +51,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
       - name: Unit tests
         run: cargo test -p chronik-operator --lib
 
@@ -61,9 +63,6 @@ jobs:
     needs: test
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
 
       - name: Build release binary
         run: cargo build --release --bin chronik-operator
