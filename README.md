@@ -8,34 +8,32 @@
 
 A high-performance streaming platform built in Rust that implements core Kafka wire protocol functionality with comprehensive Write-Ahead Log (WAL) durability and automatic recovery.
 
-**Latest Release: v2.2.22** - Hot Buffer SQL with sub-millisecond query latency. See [CHANGELOG.md](CHANGELOG.md) for full release history.
+**Latest Release: v2.2.25** - Bare metal performance validated at 837K msg/s. See [CHANGELOG.md](CHANGELOG.md) for full release history.
 
-## ✨ What's New in v2.2.22
+## What's New in v2.2.25
 
-⚡ **Hot Buffer SQL**: Query recent data in **0-1ms** via in-memory Arrow tables (vs 30-60s for Parquet)
-🔍 **Columnar Storage**: DataFusion 44 integration for SQL queries over Parquet files
-☁️ **S3 Parquet Upload**: Optional cloud storage for Parquet files (S3/GCS/Azure)
-🧠 **Vector Search**: HNSW-based semantic search with embedding providers (OpenAI, custom)
-🌐 **Unified API**: REST endpoints for SQL (`/_sql`), search (`/_search`), and admin operations
+**Performance & Stability:**
+- **837K msg/s** sustained throughput on 3-node bare metal cluster (256B messages, acks=all)
+- **411 MB/s** aggregate throughput with 1KB messages through full HTTP pipeline
+- **Zero data loss** across 1B+ messages in stress testing
+- Fixed closed-socket spin loop that caused 100% CPU after client disconnections
+- Kubernetes Operator released (chronik-operator v0.1.0)
 
-**Key Features:**
-- **Sub-second SQL latency**: Query `{topic}_hot` for 0ms latency, `{topic}_cold` for Parquet, `{topic}` for unified view
-- **Load tested**: 10K+ msg/s production with P99 SQL latency <20ms under load
-- **Schema compatibility**: Automatic UNION of hot (MemTable) and cold (Parquet) tables
-- **11 hurl integration tests** for hot/cold SQL functionality
+**Bare metal load test results (3x Dell Xeon E5-2667v4, 256GB RAM each):**
 
-**Quick Example:**
-```bash
-# Query recent data (sub-millisecond)
-curl -X POST http://localhost:6092/_sql \
-  -H "Content-Type: application/json" \
-  -d '{"query": "SELECT COUNT(*) FROM my_topic_hot"}'
+| Configuration | Messages/sec | Throughput | Errors |
+|---------------|-------------|------------|--------|
+| 12 ingestors, 256B msgs, acks=all | **837,284 msg/s** | 245 MB/s | 0.00% |
+| 36 ingestors, 1KB msgs, acks=all | 420,609 msg/s | **411 MB/s** | 0.00% |
 
-# Query all data (hot + cold unified view)
-curl -X POST http://localhost:6092/_sql \
-  -H "Content-Type: application/json" \
-  -d '{"query": "SELECT * FROM my_topic WHERE _offset > 1000 LIMIT 10"}'
-```
+See [BARE_METAL_PERFORMANCE.md](BARE_METAL_PERFORMANCE.md) for full methodology and results.
+
+## Previous Highlights (v2.2.22)
+
+- **Hot Buffer SQL**: Query recent data in **0-1ms** via in-memory Arrow tables
+- **Columnar Storage**: DataFusion 44 integration for SQL queries over Parquet files
+- **Vector Search**: HNSW-based semantic search with embedding providers
+- **Unified API**: REST endpoints for SQL (`/_sql`), search (`/_search`), and admin operations
 
 ## 🚀 Features
 
@@ -62,7 +60,7 @@ curl -X POST http://localhost:6092/_sql \
 - **WAL-based Metadata**: ChronikMetaLog provides event-sourced metadata persistence
 - **GroupCommitWal**: PostgreSQL-style group commit with per-partition background workers and batched fsync
 - **Real Client Testing**: Tested with kafka-python, confluent-kafka, KSQL, and Apache Flink
-- **Stress Tested**: Verified at scale with millions of messages, zero duplicates, 300K+ msgs/sec throughput
+- **Stress Tested**: Verified at scale with 1B+ messages, zero data loss, 837K msgs/sec on bare metal cluster
 - **High Performance**: Async architecture with zero-copy networking optimizations
 - **Multi-Architecture**: Native support for x86_64 and ARM64 (Apple Silicon, AWS Graviton)
 - **Container Ready**: Docker deployment with proper network configuration
@@ -564,7 +562,7 @@ All images support both **linux/amd64** and **linux/arm64** architectures:
 
 | Image | Tags | Description |
 |-------|------|-------------|
-| `ghcr.io/lspecian/chronik-stream` | `latest`, `v2.2.22`, `2.2` | Chronik server with SQL, search, and KSQL support |
+| `ghcr.io/lspecian/chronik-stream` | `latest`, `v2.2.25`, `2.2` | Chronik server with SQL, search, and KSQL support |
 
 ### Supported Platforms
 
@@ -664,11 +662,25 @@ chronik-stream/
 └── .github/workflows/      # CI/CD pipelines
 ```
 
-## ⚡ Performance
+## Performance
 
-Chronik Stream delivers exceptional performance across all deployment modes (128 concurrency, 256 byte messages):
+### Bare Metal Cluster (v2.2.25)
 
-### Benchmarks
+Tested on 3x Dell Xeon E5-2667v4 (32 cores, 256GB RAM, 1GbE) running a 3-node Raft cluster with full replication (acks=all). Traffic flows through a realistic HTTP ingestor pipeline with k6 load generators simulating thousands of concurrent users.
+
+| Configuration | Messages/sec | Throughput | Errors |
+|---------------|-------------|------------|--------|
+| 12 ingestors, 256B messages | **837,284 msg/s** | 245 MB/s | 0.00% |
+| 12 ingestors, 1KB messages | 270,000 msg/s | 270 MB/s | 0.00% |
+| 36 ingestors, 1KB messages | 420,609 msg/s | **411 MB/s** | 0.00% |
+
+- **Zero data loss** across 1B+ messages
+- CPU returns to idle within seconds of load completion
+- Cluster never exceeded 80% CPU utilization (I/O bound, not CPU bound)
+
+See [BARE_METAL_PERFORMANCE.md](BARE_METAL_PERFORMANCE.md) for full test methodology, architecture diagrams, and bottleneck analysis.
+
+### Single-Node Benchmarks
 
 | Mode | Configuration | Throughput | p99 Latency |
 |------|---------------|------------|-------------|
@@ -677,30 +689,16 @@ Chronik Stream delivers exceptional performance across all deployment modes (128
 | **Cluster (3 nodes)** | acks=1 | **188K msg/s** | 2.81ms |
 | **Cluster (3 nodes)** | acks=all | **166K msg/s** | 1.80ms |
 
-#### Searchable Topics Impact
-
-| Configuration | Non-Searchable | Searchable | Overhead |
-|--------------|---------------:|-----------:|---------:|
-| Standalone | 198K msg/s | 192K msg/s | 3% |
-| Cluster (3 nodes) | 183K msg/s | 123K msg/s | 33% |
-
 ### Key Performance Features
 
-- **High Throughput**: Up to 348K messages/second standalone, 188K cluster
+- **High Throughput**: 837K msg/s cluster (bare metal), 348K msg/s standalone
 - **Low Latency**: Sub-millisecond p99 latency standalone, sub-3ms cluster
 - **SQL Query Latency**: 0-1ms for hot buffer, <20ms P99 under 10K msg/s load
-- **Efficient Memory**: Zero-copy networking with minimal allocations
-- **Recovery**: 100% message recovery with zero duplicates
-- **Search**: Only 3% overhead for real-time Tantivy indexing (standalone)
-- **Compression**: Snappy, LZ4, Zstd for efficient storage
-
-### WAL Performance
-- **Write Throughput**: 300K+ msgs/sec with GroupCommitWal
-- **Recovery Speed**: Full recovery in seconds even for large datasets
-- **Zero Data Loss**: All acks modes (0, 1, -1) guaranteed durable
+- **Zero Data Loss**: All acks modes (0, 1, -1) guaranteed durable with WAL
 - **Group Commit**: PostgreSQL-style batched fsync reduces I/O overhead
+- **Recovery**: Full WAL recovery in seconds even for large datasets
 
-See [BASELINE_PERFORMANCE.md](BASELINE_PERFORMANCE.md) for detailed benchmark methodology and results.
+See [BASELINE_PERFORMANCE.md](BASELINE_PERFORMANCE.md) for single-node benchmark methodology.
 
 ## 🔒 Security
 

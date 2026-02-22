@@ -738,7 +738,7 @@ impl IntegratedKafkaServer {
                             // Read request frame
                             let request_size = match Self::read_request_frame(&mut socket_reader, &mut request_buffer, addr).await {
                                 Ok(Some(size)) => size,
-                                Ok(None) => continue, // Skip this request (error or protocol mismatch)
+                                Ok(None) => break, // Connection closed or unrecoverable error - exit loop
                                 Err(_) => break, // Fatal error, close connection
                             };
 
@@ -852,7 +852,7 @@ impl IntegratedKafkaServer {
                             // Read request frame (TLS-aware)
                             let request_size = match Self::read_request_frame_tls(&mut socket_reader, &mut request_buffer, addr).await {
                                 Ok(Some(size)) => size,
-                                Ok(None) => continue,
+                                Ok(None) => break, // Connection closed or unrecoverable error - exit loop
                                 Err(_) => break,
                             };
 
