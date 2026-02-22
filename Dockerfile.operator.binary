@@ -11,8 +11,8 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-# Create non-root user
-RUN useradd -m -u 1000 operator
+# Create non-root user (use -g to add to existing group if it exists)
+RUN groupadd -f -g 1000 operator && useradd -m -u 1000 -g operator operator
 
 # Copy the pre-built binary for the target architecture
 # Expects binaries in artifacts/linux/{amd64,arm64}/chronik-operator
