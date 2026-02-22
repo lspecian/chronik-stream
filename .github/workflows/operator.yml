@@ -10,6 +10,8 @@ on:
     branches: [main]
     paths:
       - 'crates/chronik-operator/**'
+      - 'charts/chronik-operator/**'
+      - '.github/workflows/operator.yml'
 
 env:
   CARGO_TERM_COLOR: always
@@ -22,10 +24,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      - name: Install Rust toolchain with components
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup component add rustfmt clippy
 
       - name: Check formatting
         run: cargo fmt -p chronik-operator -- --check
