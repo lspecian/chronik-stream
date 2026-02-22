@@ -301,13 +301,19 @@ impl<T: Storage> RaftLog<T> {
         if self.committed >= to_commit {
             return;
         }
-        if self.last_index() < to_commit {
-            fatal!(
+        let last = self.last_index();
+        if last < to_commit {
+            // During node bootstrap the log may be empty (last_index=0) while peers
+            // already have entries. Clamp to last_index instead of panicking so the
+            // node can catch up via snapshot or append.
+            warn!(
                 self.unstable.logger,
-                "to_commit {} is out of range [last_index {}]",
+                "to_commit {} is out of range [last_index {}], clamping",
                 to_commit,
-                self.last_index()
-            )
+                last;
+            );
+            self.committed = last;
+            return;
         }
         self.committed = to_commit;
     }

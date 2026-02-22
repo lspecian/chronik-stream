@@ -1,0 +1,346 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: chronik-perf-dashboard
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+data:
+  chronik-perf.json: |
+    {
+      "annotations": { "list": [] },
+      "editable": true,
+      "fiscalYearStartMonth": 0,
+      "graphTooltip": 1,
+      "links": [],
+      "panels": [
+        {
+          "collapsed": false,
+          "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+          "title": "Throughput",
+          "type": "row"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "palette-classic" },
+              "custom": { "lineWidth": 2, "fillOpacity": 15 },
+              "unit": "ops"
+            }
+          },
+          "gridPos": { "h": 8, "w": 8, "x": 0, "y": 1 },
+          "options": { "legend": { "displayMode": "table", "calcs": ["max", "mean", "lastNotNull"] } },
+          "targets": [
+            {
+              "expr": "sum(rate(chronik_perf_ingestor_produced_total[30s]))",
+              "legendFormat": "Ingestor → Kafka (msg/s)"
+            }
+          ],
+          "title": "Ingestor Produce Rate",
+          "type": "timeseries"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "palette-classic" },
+              "custom": { "lineWidth": 2, "fillOpacity": 15 },
+              "unit": "ops"
+            }
+          },
+          "gridPos": { "h": 8, "w": 8, "x": 8, "y": 1 },
+          "options": { "legend": { "displayMode": "table", "calcs": ["max", "mean", "lastNotNull"] } },
+          "targets": [
+            {
+              "expr": "sum(rate(chronik_perf_consumer_consumed_total[30s]))",
+              "legendFormat": "Consumer ← Kafka (msg/s)"
+            }
+          ],
+          "title": "Consumer Consume Rate",
+          "type": "timeseries"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "palette-classic" },
+              "custom": { "lineWidth": 2, "fillOpacity": 15 },
+              "unit": "ops"
+            }
+          },
+          "gridPos": { "h": 8, "w": 8, "x": 16, "y": 1 },
+          "options": { "legend": { "displayMode": "table", "calcs": ["max", "mean", "lastNotNull"] } },
+          "targets": [
+            {
+              "expr": "rate(chronik_produce_requests_total{result=\"success\"}[30s])",
+              "legendFormat": "Chronik produce req/s"
+            },
+            {
+              "expr": "rate(chronik_fetch_requests_total{result=\"success\"}[30s])",
+              "legendFormat": "Chronik fetch req/s"
+            }
+          ],
+          "title": "Chronik Server Request Rate",
+          "type": "timeseries"
+        },
+        {
+          "collapsed": false,
+          "gridPos": { "h": 1, "w": 24, "x": 0, "y": 9 },
+          "title": "Totals & Lag",
+          "type": "row"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "fieldConfig": {
+            "defaults": { "unit": "short", "thresholds": { "steps": [{"color": "green", "value": null}] } }
+          },
+          "gridPos": { "h": 5, "w": 6, "x": 0, "y": 10 },
+          "options": { "colorMode": "background", "textMode": "value_and_name" },
+          "targets": [
+            {
+              "expr": "sum(chronik_perf_ingestor_produced_total)",
+              "legendFormat": "Total Produced"
+            }
+          ],
+          "title": "Total Produced",
+          "type": "stat"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "fieldConfig": {
+            "defaults": { "unit": "short", "thresholds": { "steps": [{"color": "blue", "value": null}] } }
+          },
+          "gridPos": { "h": 5, "w": 6, "x": 6, "y": 10 },
+          "options": { "colorMode": "background", "textMode": "value_and_name" },
+          "targets": [
+            {
+              "expr": "sum(chronik_perf_consumer_consumed_total)",
+              "legendFormat": "Total Consumed"
+            }
+          ],
+          "title": "Total Consumed",
+          "type": "stat"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "thresholds": {
+                "steps": [
+                  {"color": "green", "value": null},
+                  {"color": "yellow", "value": 10000},
+                  {"color": "red", "value": 100000}
+                ]
+              }
+            }
+          },
+          "gridPos": { "h": 5, "w": 6, "x": 12, "y": 10 },
+          "options": { "colorMode": "background", "textMode": "value_and_name" },
+          "targets": [
+            {
+              "expr": "sum(chronik_perf_ingestor_produced_total) - sum(chronik_perf_consumer_consumed_total)",
+              "legendFormat": "Produce-Consume Lag"
+            }
+          ],
+          "title": "Producer-Consumer Lag",
+          "type": "stat"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "thresholds": {
+                "steps": [
+                  {"color": "green", "value": null},
+                  {"color": "red", "value": 1}
+                ]
+              }
+            }
+          },
+          "gridPos": { "h": 5, "w": 6, "x": 18, "y": 10 },
+          "options": { "colorMode": "background", "textMode": "value_and_name" },
+          "targets": [
+            {
+              "expr": "sum(chronik_perf_ingestor_errors_total)",
+              "legendFormat": "Ingestor Errors"
+            },
+            {
+              "expr": "sum(chronik_perf_consumer_errors_total)",
+              "legendFormat": "Consumer Errors"
+            }
+          ],
+          "title": "Errors",
+          "type": "stat"
+        },
+        {
+          "collapsed": false,
+          "gridPos": { "h": 1, "w": 24, "x": 0, "y": 15 },
+          "title": "Chronik Server Internals",
+          "type": "row"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "palette-classic" },
+              "custom": { "lineWidth": 2, "fillOpacity": 15 },
+              "unit": "ops"
+            }
+          },
+          "gridPos": { "h": 8, "w": 8, "x": 0, "y": 16 },
+          "options": { "legend": { "displayMode": "table", "calcs": ["max", "mean", "lastNotNull"] } },
+          "targets": [
+            {
+              "expr": "rate(chronik_wal_writes_total{result=\"success\"}[30s])",
+              "legendFormat": "WAL writes/s"
+            },
+            {
+              "expr": "rate(chronik_wal_writes_total{result=\"error\"}[30s])",
+              "legendFormat": "WAL errors/s"
+            }
+          ],
+          "title": "WAL Write Rate",
+          "type": "timeseries"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "palette-classic" },
+              "custom": { "lineWidth": 2, "fillOpacity": 15 },
+              "unit": "Bps"
+            }
+          },
+          "gridPos": { "h": 8, "w": 8, "x": 8, "y": 16 },
+          "options": { "legend": { "displayMode": "table", "calcs": ["max", "mean", "lastNotNull"] } },
+          "targets": [
+            {
+              "expr": "rate(chronik_bytes_produced_total[30s])",
+              "legendFormat": "Bytes produced/s"
+            },
+            {
+              "expr": "rate(chronik_bytes_fetched_total[30s])",
+              "legendFormat": "Bytes fetched/s"
+            }
+          ],
+          "title": "Chronik Throughput (bytes/s)",
+          "type": "timeseries"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "palette-classic" },
+              "custom": { "lineWidth": 2, "fillOpacity": 15 },
+              "unit": "short"
+            }
+          },
+          "gridPos": { "h": 8, "w": 8, "x": 16, "y": 16 },
+          "options": { "legend": { "displayMode": "table", "calcs": ["max", "mean", "lastNotNull"] } },
+          "targets": [
+            {
+              "expr": "chronik_active_connections",
+              "legendFormat": "Active connections"
+            },
+            {
+              "expr": "rate(chronik_messages_received_total[30s])",
+              "legendFormat": "Messages received/s"
+            }
+          ],
+          "title": "Connections & Messages",
+          "type": "timeseries"
+        },
+        {
+          "collapsed": false,
+          "gridPos": { "h": 1, "w": 24, "x": 0, "y": 24 },
+          "title": "Resources",
+          "type": "row"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "palette-classic" },
+              "custom": { "lineWidth": 2, "fillOpacity": 15 },
+              "unit": "short"
+            }
+          },
+          "gridPos": { "h": 8, "w": 8, "x": 0, "y": 25 },
+          "options": { "legend": { "displayMode": "table", "calcs": ["max", "mean", "lastNotNull"] } },
+          "targets": [
+            {
+              "expr": "sum(rate(container_cpu_usage_seconds_total{namespace=\"chronik-perf\", container!=\"\"}[1m])) by (pod)",
+              "legendFormat": "{{ pod }}"
+            }
+          ],
+          "title": "CPU Usage by Pod (cores)",
+          "type": "timeseries"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "palette-classic" },
+              "custom": { "lineWidth": 2, "fillOpacity": 15 },
+              "unit": "bytes"
+            }
+          },
+          "gridPos": { "h": 8, "w": 8, "x": 8, "y": 25 },
+          "options": { "legend": { "displayMode": "table", "calcs": ["max", "mean", "lastNotNull"] } },
+          "targets": [
+            {
+              "expr": "sum(container_memory_working_set_bytes{namespace=\"chronik-perf\", container!=\"\"}) by (pod)",
+              "legendFormat": "{{ pod }}"
+            }
+          ],
+          "title": "Memory Usage by Pod",
+          "type": "timeseries"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "palette-classic" },
+              "custom": { "lineWidth": 2, "fillOpacity": 15 },
+              "unit": "Bps"
+            }
+          },
+          "gridPos": { "h": 8, "w": 8, "x": 16, "y": 25 },
+          "options": { "legend": { "displayMode": "table", "calcs": ["max", "mean", "lastNotNull"] } },
+          "targets": [
+            {
+              "expr": "sum(rate(container_network_receive_bytes_total{namespace=\"chronik-perf\"}[1m])) by (pod)",
+              "legendFormat": "{{ pod }} rx"
+            },
+            {
+              "expr": "sum(rate(container_network_transmit_bytes_total{namespace=\"chronik-perf\"}[1m])) by (pod)",
+              "legendFormat": "{{ pod }} tx"
+            }
+          ],
+          "title": "Network I/O by Pod",
+          "type": "timeseries"
+        }
+      ],
+      "refresh": "5s",
+      "schemaVersion": 39,
+      "templating": {
+        "list": [
+          {
+            "current": { "selected": false, "text": "Prometheus", "value": "prometheus" },
+            "hide": 0,
+            "includeAll": false,
+            "label": "Datasource",
+            "name": "DS_PROMETHEUS",
+            "options": [],
+            "query": "prometheus",
+            "type": "datasource"
+          }
+        ]
+      },
+      "time": { "from": "now-15m", "to": "now" },
+      "title": "Chronik Performance Load Test",
+      "uid": "chronik-perf-load-test"
+    }

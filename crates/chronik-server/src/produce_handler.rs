@@ -1352,9 +1352,19 @@ impl ProduceHandler {
         let acks = request.acks;
         let timeout_ms = request.timeout_ms as u64;
 
+        // Calculate metrics from request before it's consumed
+        let mut total_bytes: u64 = 0;
+        let mut total_partitions: u64 = 0;
+
         // Clone topic names for error handling
         let topic_names: Vec<(String, Vec<i32>)> = request.topics.iter()
-            .map(|t| (t.name.clone(), t.partitions.iter().map(|p| p.index).collect()))
+            .map(|t| {
+                for p in &t.partitions {
+                    total_bytes += p.records.len() as u64;
+                    total_partitions += 1;
+                }
+                (t.name.clone(), t.partitions.iter().map(|p| p.index).collect())
+            })
             .collect();
 
         // PARTITION_DEBUG: Log which partitions client is requesting (trace level - hot path)
@@ -1376,10 +1386,12 @@ impl ProduceHandler {
         match result {
             Ok(Ok(topics)) => {
                 response_topics = topics;
+                MetricsRecorder::record_produce(true, total_bytes, total_partitions);
             }
             Ok(Err(e)) => {
                 error!("Produce request processing failed: {}", e);
                 self.metrics.produce_errors.fetch_add(1, Ordering::Relaxed);
+                MetricsRecorder::record_produce(false, 0, 0);
                 
                 // Return error response for all topics in the request
                 let error_topics = topic_names.iter().map(|(topic_name, partitions)| {

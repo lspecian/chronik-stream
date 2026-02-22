@@ -1,0 +1,192 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: chroniktopics.chronik.io
+spec:
+  group: chronik.io
+  names:
+    categories: []
+    kind: ChronikTopic
+    plural: chroniktopics
+    shortNames:
+    - ctopic
+    singular: chroniktopic
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.partitions
+      name: Partitions
+      type: integer
+    - jsonPath: .spec.replicationFactor
+      name: RF
+      type: integer
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for ChronikTopicSpec via `CustomResource`
+        properties:
+          spec:
+            description: Spec for declarative topic management.
+            properties:
+              clusterRef:
+                description: Reference to the target Chronik cluster or standalone.
+                properties:
+                  kind:
+                    description: Kind of the referenced resource. Defaults to "ChronikCluster".
+                    nullable: true
+                    type: string
+                  name:
+                    description: Name of the ChronikCluster or ChronikStandalone resource.
+                    type: string
+                required:
+                - name
+                type: object
+              columnar:
+                description: Columnar storage configuration.
+                nullable: true
+                properties:
+                  compression:
+                    default: zstd
+                    description: 'Compression codec: zstd, snappy, lz4, none.'
+                    type: string
+                  enabled:
+                    default: false
+                    description: Enable columnar storage.
+                    type: boolean
+                  format:
+                    default: parquet
+                    description: 'Storage format: parquet or arrow.'
+                    type: string
+                  partitioning:
+                    default: daily
+                    description: 'Time partitioning: none, hourly, daily.'
+                    type: string
+                type: object
+              config:
+                additionalProperties:
+                  type: string
+                description: Kafka-compatible topic configuration entries.
+                nullable: true
+                type: object
+              deletionPolicy:
+                description: 'What happens when the CR is deleted: "delete" (default) or "retain".'
+                nullable: true
+                type: string
+              partitions:
+                default: 1
+                description: Number of partitions.
+                format: int32
+                type: integer
+              replicationFactor:
+                default: 3
+                description: Replication factor (capped at cluster replicas).
+                format: int32
+                type: integer
+              searchable:
+                default: false
+                description: Enable Tantivy full-text indexing.
+                type: boolean
+              topicName:
+                description: Topic name. Defaults to metadata.name if omitted.
+                nullable: true
+                type: string
+              vectorSearch:
+                description: Vector search configuration for this topic.
+                nullable: true
+                properties:
+                  embeddingModel:
+                    default: text-embedding-3-small
+                    description: Embedding model.
+                    type: string
+                  embeddingProvider:
+                    default: openai
+                    description: 'Embedding provider: openai, external.'
+                    type: string
+                  enabled:
+                    default: false
+                    description: Enable vector search on this topic.
+                    type: boolean
+                  field:
+                    default: value
+                    description: 'Field to embed: value, key, or JSON path (e.g., "$.content").'
+                    type: string
+                  indexMetric:
+                    default: cosine
+                    description: 'Distance metric: cosine, euclidean, dot.'
+                    type: string
+                type: object
+            required:
+            - clusterRef
+            type: object
+          status:
+            description: Status for ChronikTopic.
+            nullable: true
+            properties:
+              conditions:
+                default: []
+                description: Status conditions.
+                items:
+                  description: Kubernetes-style condition for status reporting.
+                  properties:
+                    lastTransitionTime:
+                      description: Last transition time (ISO 8601 string).
+                      nullable: true
+                      type: string
+                    message:
+                      description: Human-readable message.
+                      nullable: true
+                      type: string
+                    reason:
+                      description: Machine-readable reason (e.g., "PodRunning").
+                      nullable: true
+                      type: string
+                    status:
+                      description: 'Status: "True", "False", or "Unknown".'
+                      type: string
+                    type:
+                      description: Condition type (e.g., "Ready", "ClusterReady", "LeaderElected").
+                      type: string
+                  required:
+                  - status
+                  - type
+                  type: object
+                type: array
+              currentPartitions:
+                description: Current partition count (from cluster).
+                format: int32
+                nullable: true
+                type: integer
+              currentReplicationFactor:
+                description: Current replication factor.
+                format: int32
+                nullable: true
+                type: integer
+              observedGeneration:
+                description: Last observed generation.
+                format: int64
+                nullable: true
+                type: integer
+              phase:
+                description: 'Current phase: Pending, Creating, Ready, Updating, Error.'
+                nullable: true
+                type: string
+              topicId:
+                description: Internal topic ID from Chronik.
+                nullable: true
+                type: string
+            type: object
+        required:
+        - spec
+        title: ChronikTopic
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

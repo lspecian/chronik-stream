@@ -1,0 +1,59 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ingestor
+  namespace: chronik-perf
+  labels:
+    app: ingestor
+spec:
+  replicas: 12
+  selector:
+    matchLabels:
+      app: ingestor
+  template:
+    metadata:
+      labels:
+        app: ingestor
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics/prometheus"
+    spec:
+      containers:
+        - name: ingestor
+          image: chronik-perf:latest
+          imagePullPolicy: Never
+          args: ["ingestor"]
+          env:
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              value: "chronik-cluster-1.chronik-perf.svc.cluster.local:9092,chronik-cluster-2.chronik-perf.svc.cluster.local:9092,chronik-cluster-3.chronik-perf.svc.cluster.local:9092"
+            - name: KAFKA_TOPIC
+              value: "perf-test"
+            - name: LISTEN_PORT
+              value: "8080"
+            - name: KAFKA_ACKS
+              value: "all"
+            - name: RUST_LOG
+              value: "info"
+          ports:
+            - containerPort: 8080
+              name: http
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: "2"
+              memory: "2Gi"
+            limits:
+              cpu: "8"
+              memory: "8Gi"

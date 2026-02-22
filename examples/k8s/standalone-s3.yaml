@@ -1,0 +1,40 @@
+# Chronik standalone with S3 tiered storage, columnar, and vector search.
+apiVersion: chronik.io/v1alpha1
+kind: ChronikStandalone
+metadata:
+  name: chronik-s3
+  namespace: default
+spec:
+  image: ghcr.io/chronik-stream/chronik-server:latest
+  resources:
+    requests:
+      cpu: "1"
+      memory: "2Gi"
+    limits:
+      cpu: "4"
+      memory: "8Gi"
+  storage:
+    size: "100Gi"
+    storageClass: gp3
+  walProfile: high
+  produceProfile: high-throughput
+  logLevel: info
+  objectStore:
+    backend: s3
+    bucket: my-chronik-data
+    region: us-east-1
+    credentialsSecret: chronik-s3-credentials
+  columnarEnabled: true
+  vectorSearch:
+    enabled: true
+    provider: openai
+    model: text-embedding-3-small
+    apiKeySecret:
+      name: chronik-openai-key
+      key: api-key
+  serviceType: LoadBalancer
+  env:
+    - name: CHRONIK_HOT_BUFFER_ENABLED
+      value: "true"
+    - name: CHRONIK_COLUMNAR_COMPRESSION
+      value: zstd

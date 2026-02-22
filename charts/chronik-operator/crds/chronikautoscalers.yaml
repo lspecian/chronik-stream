@@ -1,0 +1,207 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: chronikautoscalers.chronik.io
+spec:
+  group: chronik.io
+  names:
+    categories: []
+    kind: ChronikAutoScaler
+    plural: chronikautoscalers
+    shortNames:
+    - cas
+    singular: chronikautoscaler
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.clusterRef.name
+      name: Cluster
+      type: string
+    - jsonPath: .status.currentReplicas
+      name: Current
+      type: integer
+    - jsonPath: .status.desiredReplicas
+      name: Desired
+      type: integer
+    - jsonPath: .status.active
+      name: Active
+      type: boolean
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for ChronikAutoScalerSpec via `CustomResource`
+        properties:
+          spec:
+            description: |-
+              Spec for operator-managed broker autoscaling.
+
+              Targets **broker infrastructure** metrics (CPU, memory, disk, produce throughput). Does NOT scale based on consumer lag — consumer lag means the consumer application needs more instances, not the broker cluster.
+            properties:
+              clusterRef:
+                description: Reference to the target ChronikCluster.
+                properties:
+                  name:
+                    description: Name of the ChronikCluster resource.
+                    type: string
+                required:
+                - name
+                type: object
+              maxReplicas:
+                default: 9
+                description: Maximum replicas.
+                format: int32
+                type: integer
+              metrics:
+                default: []
+                description: Scaling metrics and thresholds.
+                items:
+                  description: A scaling metric definition.
+                  properties:
+                    metricType:
+                      description: 'Metric type: cpu, memory, disk, produce_throughput.'
+                      enum:
+                      - cpu
+                      - memory
+                      - disk
+                      - produce_throughput
+                      type: string
+                    targetValue:
+                      description: Target value (percentage for cpu/memory/disk, msgs/sec for throughput).
+                      format: uint64
+                      minimum: 0.0
+                      type: integer
+                    tolerancePercent:
+                      default: 10
+                      description: Tolerance percentage — don't scale if within this range of the target.
+                      format: uint32
+                      minimum: 0.0
+                      type: integer
+                  required:
+                  - metricType
+                  - targetValue
+                  type: object
+                type: array
+              minReplicas:
+                default: 3
+                description: Minimum replicas (never below 3 for Raft quorum).
+                format: int32
+                type: integer
+              scaleDownCooldownSecs:
+                default: 1800
+                description: Cooldown after scale-down in seconds.
+                format: uint64
+                minimum: 0.0
+                type: integer
+              scaleDownStabilizationCount:
+                default: 6
+                description: Number of consecutive reconcile cycles a metric must be under threshold before scale-down.
+                format: uint32
+                minimum: 0.0
+                type: integer
+              scaleUpCooldownSecs:
+                default: 600
+                description: Cooldown after scale-up in seconds.
+                format: uint64
+                minimum: 0.0
+                type: integer
+              scaleUpStabilizationCount:
+                default: 3
+                description: Number of consecutive reconcile cycles a metric must exceed threshold before scale-up.
+                format: uint32
+                minimum: 0.0
+                type: integer
+            required:
+            - clusterRef
+            type: object
+          status:
+            description: Status for ChronikAutoScaler.
+            nullable: true
+            properties:
+              active:
+                default: false
+                description: Whether autoscaling is active.
+                type: boolean
+              conditions:
+                default: []
+                description: Status conditions.
+                items:
+                  description: Kubernetes-style condition for status reporting.
+                  properties:
+                    lastTransitionTime:
+                      description: Last transition time (ISO 8601 string).
+                      nullable: true
+                      type: string
+                    message:
+                      description: Human-readable message.
+                      nullable: true
+                      type: string
+                    reason:
+                      description: Machine-readable reason (e.g., "PodRunning").
+                      nullable: true
+                      type: string
+                    status:
+                      description: 'Status: "True", "False", or "Unknown".'
+                      type: string
+                    type:
+                      description: Condition type (e.g., "Ready", "ClusterReady", "LeaderElected").
+                      type: string
+                  required:
+                  - status
+                  - type
+                  type: object
+                type: array
+              currentMetrics:
+                default: []
+                description: Current metric values.
+                items:
+                  description: Current value of a scaling metric.
+                  properties:
+                    currentValue:
+                      description: Current average value across all brokers.
+                      format: uint64
+                      minimum: 0.0
+                      type: integer
+                    metricType:
+                      description: Metric type.
+                      enum:
+                      - cpu
+                      - memory
+                      - disk
+                      - produce_throughput
+                      type: string
+                  required:
+                  - currentValue
+                  - metricType
+                  type: object
+                type: array
+              currentReplicas:
+                description: Current replica count.
+                format: int32
+                nullable: true
+                type: integer
+              desiredReplicas:
+                description: Desired replica count.
+                format: int32
+                nullable: true
+                type: integer
+              lastScaleDirection:
+                description: 'Direction of last scale event: "up", "down", or "none".'
+                nullable: true
+                type: string
+              lastScaleTime:
+                description: Last scale event time (ISO 8601 string).
+                nullable: true
+                type: string
+            type: object
+        required:
+        - spec
+        title: ChronikAutoScaler
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

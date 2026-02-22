@@ -16,11 +16,13 @@ members = [
     "crates/chronik-raft",
     "crates/chronik-columnar",
     "crates/chronik-embeddings",
+    "crates/chronik-operator",
+    "crates/chronik-perf",
 ]
 exclude = ["tests"]
 
 [workspace.package]
-version = "2.2.23"
+version = "2.2.24"
 edition = "2021"
 authors = ["Chronik Stream Contributors"]
 license = "Apache-2.0"

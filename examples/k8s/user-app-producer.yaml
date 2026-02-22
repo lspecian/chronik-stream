@@ -1,0 +1,36 @@
+# Application producer user with write ACLs on specific topics.
+apiVersion: chronik.io/v1alpha1
+kind: ChronikUser
+metadata:
+  name: app-producer
+  namespace: default
+spec:
+  clusterRef:
+    name: chronik-cluster
+  authentication:
+    type: sasl-scram-sha-256
+  authorization:
+    acls:
+      - resource:
+          type: topic
+          name: orders
+          patternType: literal
+        operations:
+          - Write
+          - Describe
+        effect: Allow
+      - resource:
+          type: topic
+          name: events
+          patternType: literal
+        operations:
+          - Write
+          - Describe
+        effect: Allow
+      - resource:
+          type: group
+          name: app-producer-group
+          patternType: literal
+        operations:
+          - Read
+        effect: Allow

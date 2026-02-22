@@ -1,0 +1,72 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k6-load-test-script
+  namespace: chronik-perf
+data:
+  load-test.js: |
+    import http from 'k6/http';
+    import { check, sleep } from 'k6';
+    import { Rate, Trend, Counter } from 'k6/metrics';
+
+    const produceErrors = new Rate('produce_errors');
+    const produceLatency = new Trend('produce_latency', true);
+    const batchLatency = new Trend('batch_latency', true);
+    const messagesProduced = new Counter('messages_produced');
+
+    const BASE_URL = __ENV.INGESTOR_URL || 'http://ingestor.chronik-perf.svc.cluster.local:8080';
+
+    export const options = {
+      stages: [
+        { duration: '30s', target: 50 },
+        { duration: '1m',  target: 200 },
+        { duration: '1m',  target: 500 },
+        { duration: '1m',  target: 200 },
+        { duration: '30s', target: 0 },
+      ],
+      thresholds: {
+        http_req_duration: ['p(95)<200'],
+        produce_errors: ['rate<0.01'],
+      },
+    };
+
+    function randomPayload(size) {
+      const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+      let result = '';
+      for (let i = 0; i < size; i++) {
+        result += chars.charAt(Math.floor(Math.random() * chars.length));
+      }
+      return result;
+    }
+
+    export default function () {
+      const headers = { 'Content-Type': 'application/json' };
+      const iteration = __ITER;
+
+      if (iteration % 3 === 0) {
+        const payload = JSON.stringify({
+          key: `k6-key-${__VU}-${iteration}`,
+          value: randomPayload(1024),
+        });
+        const res = http.post(`${BASE_URL}/produce`, payload, { headers });
+        const ok = check(res, { 'produce 200': (r) => r.status === 200 });
+        produceErrors.add(!ok);
+        produceLatency.add(res.timings.duration);
+        if (ok) messagesProduced.add(1);
+      } else {
+        const batch = [];
+        for (let i = 0; i < 10; i++) {
+          batch.push({
+            key: `k6-batch-${__VU}-${iteration}-${i}`,
+            value: randomPayload(1024),
+          });
+        }
+        const res = http.post(`${BASE_URL}/produce/batch`, JSON.stringify(batch), { headers });
+        const ok = check(res, { 'batch 200': (r) => r.status === 200 });
+        produceErrors.add(!ok);
+        batchLatency.add(res.timings.duration);
+        if (ok) messagesProduced.add(10);
+      }
+
+      sleep(0.01);
+    }

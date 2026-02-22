@@ -1,0 +1,16 @@
+# Basic topic with 6 partitions.
+apiVersion: chronik.io/v1alpha1
+kind: ChronikTopic
+metadata:
+  name: orders
+  namespace: default
+spec:
+  clusterRef:
+    name: chronik-cluster
+  topicName: orders
+  partitions: 6
+  replicationFactor: 3
+  config:
+    retention.ms: "604800000"
+    cleanup.policy: delete
+  deletionPolicy: delete

@@ -1,0 +1,18 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: chronik-cluster
+  namespace: chronik-perf
+  labels:
+    release: kube-prometheus-stack
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: chronik-cluster
+  namespaceSelector:
+    matchNames:
+      - chronik-perf
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics
+      interval: 10s

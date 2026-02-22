@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: chronik-bench-metrics
+  namespace: chronik-perf
+  labels:
+    app: chronik-bench
+spec:
+  selector:
+    app.kubernetes.io/instance: chronik-cluster
+  ports:
+    - name: metrics
+      port: 13092
+      targetPort: 13092

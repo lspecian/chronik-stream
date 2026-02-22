@@ -1,0 +1,19 @@
+# Basic single-node Chronik deployment.
+# Minimal configuration — most fields use defaults.
+apiVersion: chronik.io/v1alpha1
+kind: ChronikStandalone
+metadata:
+  name: my-chronik
+  namespace: default
+spec:
+  image: ghcr.io/chronik-stream/chronik-server:latest
+  resources:
+    requests:
+      cpu: "500m"
+      memory: "1Gi"
+    limits:
+      cpu: "2"
+      memory: "4Gi"
+  storage:
+    size: "50Gi"
+    storageClass: standard

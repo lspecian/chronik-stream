@@ -1,0 +1,46 @@
+# Default values for chronik-operator
+
+replicaCount: 1
+
+image:
+  repository: ghcr.io/chronik-stream/chronik-operator
+  # Defaults to Chart.appVersion if empty
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  # If not set, a name is generated from the release
+  name: ""
+
+leaderElection:
+  enabled: true
+
+metrics:
+  enabled: true
+  port: 8080
+  serviceMonitor:
+    enabled: false
+    namespace: ""
+    interval: 30s
+
+logLevel: info
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 256Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}

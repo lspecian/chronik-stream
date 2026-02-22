@@ -1,0 +1,43 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "chronik-operator.fullname" . }}
+  labels:
+    {{- include "chronik-operator.labels" . | nindent 4 }}
+rules:
+  # Chronik CRDs
+  - apiGroups: ["chronik.io"]
+    resources:
+      - chronikstandalones
+      - chronikclusters
+      - chroniktopics
+      - chronikusers
+      - chronikautoscalers
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["chronik.io"]
+    resources:
+      - chronikstandalones/status
+      - chronikclusters/status
+      - chroniktopics/status
+      - chronikusers/status
+      - chronikautoscalers/status
+    verbs: ["get", "update", "patch"]
+  # Core resources managed by the operator
+  - apiGroups: [""]
+    resources: ["pods", "services", "configmaps", "persistentvolumeclaims", "secrets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+  # PodDisruptionBudgets
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Leader election (Lease objects)
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update", "patch"]
+  # Metrics API (for autoscaler)
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["pods"]
+    verbs: ["get", "list"]

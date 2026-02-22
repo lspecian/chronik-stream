@@ -1,0 +1,191 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: chronikusers.chronik.io
+spec:
+  group: chronik.io
+  names:
+    categories: []
+    kind: ChronikUser
+    plural: chronikusers
+    shortNames:
+    - cuser
+    singular: chronikuser
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.authentication.type
+      name: Auth
+      type: string
+    - jsonPath: .status.aclCount
+      name: ACLs
+      type: integer
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for ChronikUserSpec via `CustomResource`
+        properties:
+          spec:
+            description: Spec for declarative user and ACL management.
+            properties:
+              authentication:
+                description: Authentication configuration.
+                properties:
+                  passwordSecret:
+                    description: Secret to store/read the password. Operator creates this if it doesn't exist.
+                    nullable: true
+                    properties:
+                      key:
+                        description: Key within the Secret.
+                        type: string
+                      name:
+                        description: Secret name.
+                        type: string
+                    required:
+                    - key
+                    - name
+                    type: object
+                  type:
+                    default: sasl-scram-sha-256
+                    description: 'Authentication type: sasl-scram-sha-256, sasl-scram-sha-512, sasl-plain, tls.'
+                    type: string
+                type: object
+              authorization:
+                description: Authorization (ACL) configuration.
+                nullable: true
+                properties:
+                  acls:
+                    default: []
+                    description: List of ACL rules.
+                    items:
+                      description: A single ACL rule.
+                      properties:
+                        effect:
+                          default: Allow
+                          description: 'Effect: Allow or Deny.'
+                          type: string
+                        operations:
+                          description: 'Allowed operations: Read, Write, Create, Delete, Alter, Describe, All.'
+                          items:
+                            type: string
+                          type: array
+                        resource:
+                          description: Resource this ACL applies to.
+                          properties:
+                            name:
+                              description: Resource name or prefix.
+                              type: string
+                            patternType:
+                              default: literal
+                              description: 'Pattern type: literal or prefixed.'
+                              type: string
+                            type:
+                              description: 'Resource type: topic, group, cluster, transactionalId.'
+                              type: string
+                          required:
+                          - name
+                          - type
+                          type: object
+                      required:
+                      - operations
+                      - resource
+                      type: object
+                    type: array
+                type: object
+              clusterRef:
+                description: Reference to the target Chronik cluster.
+                properties:
+                  kind:
+                    description: Kind of the referenced resource. Defaults to "ChronikCluster".
+                    nullable: true
+                    type: string
+                  name:
+                    description: Name of the ChronikCluster or ChronikStandalone resource.
+                    type: string
+                required:
+                - name
+                type: object
+              schemaRegistry:
+                description: Schema Registry access.
+                nullable: true
+                properties:
+                  enabled:
+                    default: false
+                    description: Enable Schema Registry access.
+                    type: boolean
+                  role:
+                    default: readwrite
+                    description: 'Role: readonly, readwrite.'
+                    type: string
+                type: object
+            required:
+            - authentication
+            - clusterRef
+            type: object
+          status:
+            description: Status for ChronikUser.
+            nullable: true
+            properties:
+              aclCount:
+                description: Number of ACL rules applied.
+                format: int32
+                nullable: true
+                type: integer
+              conditions:
+                default: []
+                description: Status conditions.
+                items:
+                  description: Kubernetes-style condition for status reporting.
+                  properties:
+                    lastTransitionTime:
+                      description: Last transition time (ISO 8601 string).
+                      nullable: true
+                      type: string
+                    message:
+                      description: Human-readable message.
+                      nullable: true
+                      type: string
+                    reason:
+                      description: Machine-readable reason (e.g., "PodRunning").
+                      nullable: true
+                      type: string
+                    status:
+                      description: 'Status: "True", "False", or "Unknown".'
+                      type: string
+                    type:
+                      description: Condition type (e.g., "Ready", "ClusterReady", "LeaderElected").
+                      type: string
+                  required:
+                  - status
+                  - type
+                  type: object
+                type: array
+              credentialsSecret:
+                description: Name of the Secret containing credentials.
+                nullable: true
+                type: string
+              observedGeneration:
+                description: Last observed generation.
+                format: int64
+                nullable: true
+                type: integer
+              phase:
+                description: 'Current phase: Pending, Ready, Error.'
+                nullable: true
+                type: string
+            type: object
+        required:
+        - spec
+        title: ChronikUser
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

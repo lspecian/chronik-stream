@@ -1,0 +1,17 @@
+apiVersion: v2
+name: chronik-operator
+description: Kubernetes operator for Chronik Stream
+type: application
+version: 0.1.0
+appVersion: "2.2.24"
+kubeVersion: ">=1.26.0-0"
+home: https://github.com/chronik-stream/chronik-stream
+sources:
+  - https://github.com/chronik-stream/chronik-stream
+keywords:
+  - chronik
+  - kafka
+  - streaming
+  - operator
+maintainers:
+  - name: Chronik Stream

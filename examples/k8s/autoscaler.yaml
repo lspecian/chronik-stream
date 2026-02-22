@@ -1,0 +1,26 @@
+# Autoscaler for a ChronikCluster. Scales between 3 and 9 nodes
+# based on CPU, disk, and produce throughput.
+apiVersion: chronik.io/v1alpha1
+kind: ChronikAutoScaler
+metadata:
+  name: chronik-autoscaler
+  namespace: default
+spec:
+  clusterRef:
+    name: chronik-cluster
+  minReplicas: 3
+  maxReplicas: 9
+  metrics:
+    - metricType: cpu
+      targetValue: 70
+      tolerancePercent: 10
+    - metricType: disk
+      targetValue: 75
+      tolerancePercent: 5
+    - metricType: produce_throughput
+      targetValue: 50000
+      tolerancePercent: 15
+  scaleUpCooldownSecs: 600
+  scaleDownCooldownSecs: 1800
+  scaleUpStabilizationCount: 3
+  scaleDownStabilizationCount: 6

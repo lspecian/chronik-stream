@@ -113,3 +113,9 @@ test*.log
 .env.hetzner
 test-cluster*
 .env*
+
+# Docker build artifacts
+artifacts/
+
+# Perf test binaries (built locally, imported to K8s nodes)
+tests/k8s-perf/chronik-perf

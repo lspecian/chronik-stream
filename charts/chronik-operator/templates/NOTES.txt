@@ -1,0 +1,25 @@
+Chronik Operator has been installed.
+
+1. Check the operator is running:
+
+   kubectl get pods -l app.kubernetes.io/name={{ include "chronik-operator.name" . }}
+
+2. Apply a ChronikStandalone resource:
+
+   kubectl apply -f - <<EOF
+   apiVersion: chronik.io/v1alpha1
+   kind: ChronikStandalone
+   metadata:
+     name: my-chronik
+   spec:
+     image: ghcr.io/chronik-stream/chronik-server:latest
+     storage:
+       size: 50Gi
+   EOF
+
+3. Check its status:
+
+   kubectl get chronikstandalones
+
+For full documentation, visit:
+  https://github.com/chronik-stream/chronik-stream/tree/main/docs

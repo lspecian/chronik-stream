@@ -1,0 +1,27 @@
+apiVersion: chronik.io/v1alpha1
+kind: ChronikStandalone
+metadata:
+  name: chronik-bench
+  namespace: chronik-perf
+spec:
+  image: chronik-server:perf-v3
+  imagePullPolicy: Never
+  kafkaPort: 9092
+  unifiedApiPort: 6092
+  walProfile: high
+  produceProfile: high-throughput
+  logLevel: info
+  resources:
+    requests:
+      cpu: "4"
+      memory: "16Gi"
+    limits:
+      cpu: "16"
+      memory: "64Gi"
+  storage:
+    size: 100Gi
+    storageClass: standard
+  serviceType: ClusterIP
+  env:
+    - name: CHRONIK_UNIFIED_API_PORT
+      value: "6093"

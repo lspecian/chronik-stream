@@ -1,0 +1,75 @@
+# 5-node production Chronik cluster with full features.
+apiVersion: chronik.io/v1alpha1
+kind: ChronikCluster
+metadata:
+  name: chronik-prod
+  namespace: chronik
+spec:
+  replicas: 5
+  image: ghcr.io/chronik-stream/chronik-server:2.2.23
+  imagePullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: "2"
+      memory: "4Gi"
+    limits:
+      cpu: "8"
+      memory: "16Gi"
+  storage:
+    size: "500Gi"
+    storageClass: gp3-encrypted
+    accessModes:
+      - ReadWriteOnce
+  replicationFactor: 3
+  minInsyncReplicas: 2
+  walProfile: high
+  produceProfile: high-throughput
+  logLevel: info
+  adminApiKeySecret:
+    name: chronik-admin-key
+    key: api-key
+  objectStore:
+    backend: s3
+    bucket: chronik-prod-data
+    region: us-east-1
+    credentialsSecret: chronik-s3-credentials
+    prefix: prod
+  antiAffinity: required
+  antiAffinityTopologyKey: kubernetes.io/hostname
+  podDisruptionBudget:
+    maxUnavailable: 1
+  updateStrategy:
+    maxUnavailable: 1
+    restartDelaySecs: 60
+  columnarEnabled: true
+  vectorSearch:
+    enabled: true
+    provider: openai
+    model: text-embedding-3-small
+    apiKeySecret:
+      name: chronik-openai-key
+      key: api-key
+  schemaRegistry:
+    enabled: true
+    authEnabled: true
+    credentialsSecret: chronik-schema-registry-creds
+  listeners:
+    - name: internal
+      port: 9092
+      type: internal
+    - name: external
+      port: 9094
+      type: nodeport
+      nodePortBase: 30092
+  nodeSelector:
+    workload-type: streaming
+  tolerations:
+    - key: dedicated
+      operator: Equal
+      value: chronik
+      effect: NoSchedule
+  env:
+    - name: CHRONIK_HOT_BUFFER_ENABLED
+      value: "true"
+    - name: CHRONIK_SNAPSHOT_COMPRESSION
+      value: zstd

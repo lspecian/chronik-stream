@@ -1,0 +1,22 @@
+apiVersion: k6.io/v1alpha1
+kind: TestRun
+metadata:
+  name: k6-chronik-max-load
+  namespace: chronik-perf
+spec:
+  parallelism: 6
+  script:
+    configMap:
+      name: k6-max-load-test-script
+      file: max-load-test.js
+  runner:
+    env:
+      - name: INGESTOR_URL
+        value: "http://ingestor.chronik-perf.svc.cluster.local:8080"
+    resources:
+      requests:
+        cpu: "2"
+        memory: "2Gi"
+      limits:
+        cpu: "4"
+        memory: "4Gi"

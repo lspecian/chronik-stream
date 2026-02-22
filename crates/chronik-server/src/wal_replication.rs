@@ -1014,8 +1014,42 @@ impl WalReplicationManager {
     /// Called when this node becomes the cluster leader
     ///
     /// Automatically discovers followers from cluster config and establishes connections.
+    /// Also registers all brokers in metadata store (fixes race condition where broker
+    /// registration runs before leader election completes).
     async fn on_became_leader(&self, config: &ClusterConfig) {
         info!("Discovering cluster followers from configuration...");
+
+        // Register all brokers from cluster config into metadata store.
+        // This fixes the race condition where the initial broker_registration task
+        // decides it's a follower (before election), then becomes leader later,
+        // leaving the metadata store with 0 brokers registered.
+        if let Some(ref metadata_store) = self.metadata_store {
+            info!("Registering {} brokers from cluster config into metadata store", config.peers.len());
+            for peer in &config.peers {
+                let (host, port) = if let Some(colon_pos) = peer.kafka.rfind(':') {
+                    let h = peer.kafka[..colon_pos].to_string();
+                    let p = peer.kafka[colon_pos + 1..].parse::<i32>().unwrap_or(9092);
+                    (h, p)
+                } else {
+                    (peer.kafka.clone(), 9092)
+                };
+
+                let broker = chronik_common::metadata::traits::BrokerMetadata {
+                    broker_id: peer.id as i32,
+                    host: host.clone(),
+                    port,
+                    rack: None,
+                    status: chronik_common::metadata::traits::BrokerStatus::Online,
+                    created_at: chrono::Utc::now(),
+                    updated_at: chrono::Utc::now(),
+                };
+
+                match metadata_store.register_broker(broker).await {
+                    Ok(_) => info!("Registered broker {} ({}:{}) in metadata store", peer.id, host, port),
+                    Err(e) => error!("Failed to register broker {} ({}:{}): {:?}", peer.id, host, port, e),
+                }
+            }
+        }
 
         // Get list of peer nodes (already filters out self)
         let peer_wal_addresses: Vec<String> = config.peer_nodes()

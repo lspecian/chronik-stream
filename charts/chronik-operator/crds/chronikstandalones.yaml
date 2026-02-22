@@ -1,0 +1,331 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: chronikstandalones.chronik.io
+spec:
+  group: chronik.io
+  names:
+    categories: []
+    kind: ChronikStandalone
+    plural: chronikstandalones
+    shortNames:
+    - csa
+    singular: chronikstandalone
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.healthy
+      name: Healthy
+      type: boolean
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for ChronikStandaloneSpec via `CustomResource`
+        properties:
+          spec:
+            description: Spec for a single-node Chronik deployment.
+            properties:
+              columnarEnabled:
+                default: false
+                description: Enable columnar storage (Arrow/Parquet).
+                type: boolean
+              env:
+                default: []
+                description: Extra environment variables.
+                items:
+                  description: Environment variable definition.
+                  properties:
+                    name:
+                      description: Variable name.
+                      type: string
+                    value:
+                      description: Variable value (plain text).
+                      nullable: true
+                      type: string
+                    valueFromSecret:
+                      description: Value from a Secret key reference.
+                      nullable: true
+                      properties:
+                        key:
+                          description: Key within the Secret.
+                          type: string
+                        name:
+                          description: Secret name.
+                          type: string
+                      required:
+                      - key
+                      - name
+                      type: object
+                  required:
+                  - name
+                  type: object
+                type: array
+              image:
+                default: ghcr.io/chronik-stream/chronik-server:latest
+                description: Container image for Chronik server.
+                type: string
+              imagePullPolicy:
+                default: IfNotPresent
+                description: Image pull policy.
+                type: string
+              imagePullSecrets:
+                default: []
+                description: Image pull secrets.
+                items:
+                  description: Image pull secret reference.
+                  properties:
+                    name:
+                      type: string
+                  required:
+                  - name
+                  type: object
+                type: array
+              kafkaPort:
+                default: 9092
+                description: Kafka protocol port.
+                format: int32
+                type: integer
+              logLevel:
+                default: info
+                description: 'Log level: trace, debug, info, warn, error.'
+                type: string
+              metricsPort:
+                description: Metrics endpoint port.
+                format: int32
+                nullable: true
+                type: integer
+              nodeSelector:
+                additionalProperties:
+                  type: string
+                description: Node selector for Pod scheduling.
+                nullable: true
+                type: object
+              objectStore:
+                description: Object store configuration for tiered storage.
+                nullable: true
+                properties:
+                  backend:
+                    description: 'Backend type: s3, gcs, azure, local.'
+                    type: string
+                  bucket:
+                    description: Bucket or container name.
+                    nullable: true
+                    type: string
+                  credentialsSecret:
+                    description: Secret name containing access credentials.
+                    nullable: true
+                    type: string
+                  endpoint:
+                    description: Endpoint override (e.g., for MinIO).
+                    nullable: true
+                    type: string
+                  prefix:
+                    description: Prefix for object keys.
+                    nullable: true
+                    type: string
+                  region:
+                    description: Region (S3/GCS).
+                    nullable: true
+                    type: string
+                required:
+                - backend
+                type: object
+              produceProfile:
+                default: balanced
+                description: 'Produce handler flush profile: low-latency, balanced, high-throughput.'
+                type: string
+              resources:
+                description: Resource requests and limits.
+                nullable: true
+                properties:
+                  limits:
+                    description: Resource limits.
+                    nullable: true
+                    properties:
+                      cpu:
+                        description: CPU (e.g., "500m", "2").
+                        nullable: true
+                        type: string
+                      memory:
+                        description: Memory (e.g., "1Gi", "4Gi").
+                        nullable: true
+                        type: string
+                    type: object
+                  requests:
+                    description: Resource requests.
+                    nullable: true
+                    properties:
+                      cpu:
+                        description: CPU (e.g., "500m", "2").
+                        nullable: true
+                        type: string
+                      memory:
+                        description: Memory (e.g., "1Gi", "4Gi").
+                        nullable: true
+                        type: string
+                    type: object
+                type: object
+              serviceAnnotations:
+                additionalProperties:
+                  type: string
+                description: Annotations for the Service.
+                nullable: true
+                type: object
+              serviceType:
+                default: ClusterIP
+                description: 'Kubernetes Service type: ClusterIP, NodePort, LoadBalancer.'
+                type: string
+              storage:
+                description: Persistent storage configuration.
+                nullable: true
+                properties:
+                  accessModes:
+                    default:
+                    - ReadWriteOnce
+                    description: Access modes. Defaults to `["ReadWriteOnce"]`.
+                    items:
+                      type: string
+                    type: array
+                  size:
+                    default: 50Gi
+                    description: Storage size (e.g., "50Gi", "100Gi").
+                    type: string
+                  storageClass:
+                    default: standard
+                    description: Kubernetes StorageClass name.
+                    type: string
+                type: object
+              tolerations:
+                default: []
+                description: Pod tolerations.
+                items:
+                  description: Toleration for Pod scheduling.
+                  properties:
+                    effect:
+                      nullable: true
+                      type: string
+                    key:
+                      nullable: true
+                      type: string
+                    operator:
+                      nullable: true
+                      type: string
+                    toleration_seconds:
+                      format: int64
+                      nullable: true
+                      type: integer
+                    value:
+                      nullable: true
+                      type: string
+                  type: object
+                type: array
+              unifiedApiPort:
+                default: 6092
+                description: Unified API port (SQL, vector, search).
+                format: int32
+                type: integer
+              vectorSearch:
+                description: Vector search configuration.
+                nullable: true
+                properties:
+                  apiKeySecret:
+                    description: Secret reference for embedding API key.
+                    nullable: true
+                    properties:
+                      key:
+                        description: Key within the Secret.
+                        type: string
+                      name:
+                        description: Secret name.
+                        type: string
+                    required:
+                    - key
+                    - name
+                    type: object
+                  enabled:
+                    default: false
+                    description: Enable vector search.
+                    type: boolean
+                  model:
+                    default: text-embedding-3-small
+                    description: Embedding model name (e.g., "text-embedding-3-small").
+                    type: string
+                  provider:
+                    default: openai
+                    description: Embedding provider.
+                    type: string
+                type: object
+              walProfile:
+                default: medium
+                description: 'WAL commit profile: low, medium, high, ultra.'
+                type: string
+            type: object
+          status:
+            description: Status for ChronikStandalone.
+            nullable: true
+            properties:
+              conditions:
+                default: []
+                description: Status conditions.
+                items:
+                  description: Kubernetes-style condition for status reporting.
+                  properties:
+                    lastTransitionTime:
+                      description: Last transition time (ISO 8601 string).
+                      nullable: true
+                      type: string
+                    message:
+                      description: Human-readable message.
+                      nullable: true
+                      type: string
+                    reason:
+                      description: Machine-readable reason (e.g., "PodRunning").
+                      nullable: true
+                      type: string
+                    status:
+                      description: 'Status: "True", "False", or "Unknown".'
+                      type: string
+                    type:
+                      description: Condition type (e.g., "Ready", "ClusterReady", "LeaderElected").
+                      type: string
+                  required:
+                  - status
+                  - type
+                  type: object
+                type: array
+              healthy:
+                default: false
+                description: Whether the instance is healthy.
+                type: boolean
+              kafkaAddress:
+                description: Kafka bootstrap address.
+                nullable: true
+                type: string
+              observedGeneration:
+                description: Last observed generation of the spec.
+                format: int64
+                nullable: true
+                type: integer
+              phase:
+                description: 'Current phase: Pending, Running, Failed.'
+                nullable: true
+                type: string
+              unifiedApiAddress:
+                description: Unified API address.
+                nullable: true
+                type: string
+            type: object
+        required:
+        - spec
+        title: ChronikStandalone
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

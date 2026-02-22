@@ -1,0 +1,59 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: consumer
+  namespace: chronik-perf
+  labels:
+    app: consumer
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: consumer
+  template:
+    metadata:
+      labels:
+        app: consumer
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8081"
+        prometheus.io/path: "/metrics/prometheus"
+    spec:
+      containers:
+        - name: consumer
+          image: chronik-perf:latest
+          imagePullPolicy: Never
+          args: ["consumer"]
+          env:
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              value: "chronik-cluster-1.chronik-perf.svc.cluster.local:9092,chronik-cluster-2.chronik-perf.svc.cluster.local:9092,chronik-cluster-3.chronik-perf.svc.cluster.local:9092"
+            - name: KAFKA_TOPIC
+              value: "perf-test"
+            - name: CONSUMER_GROUP
+              value: "perf-consumer"
+            - name: LISTEN_PORT
+              value: "8081"
+            - name: RUST_LOG
+              value: "info"
+          ports:
+            - containerPort: 8081
+              name: http
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8081
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8081
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: "2"
+              memory: "2Gi"
+            limits:
+              cpu: "4"
+              memory: "4Gi"

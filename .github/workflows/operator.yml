@@ -1,0 +1,80 @@
+name: Operator CI
+
+on:
+  pull_request:
+    paths:
+      - 'crates/chronik-operator/**'
+      - 'charts/chronik-operator/**'
+      - '.github/workflows/operator.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'crates/chronik-operator/**'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  check:
+    name: Check & Lint
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check formatting
+        run: cargo fmt -p chronik-operator -- --check
+
+      - name: Clippy
+        run: cargo clippy -p chronik-operator -- -D warnings
+
+      - name: Check
+        run: cargo check -p chronik-operator
+
+  test:
+    name: Tests
+    runs-on: self-hosted
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unit tests
+        run: cargo test -p chronik-operator --lib
+
+      - name: Integration tests
+        run: cargo test -p chronik-operator --tests
+
+  build:
+    name: Release Build
+    runs-on: self-hosted
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build release binary
+        run: cargo build --release --bin chronik-operator
+
+      - name: Verify CRD generation
+        run: cargo run --release --bin chronik-operator -- crd-gen > /dev/null
+
+  helm-lint:
+    name: Helm Lint
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Helm lint
+        run: |
+          if command -v helm &> /dev/null; then
+            helm lint charts/chronik-operator/
+          else
+            echo "Helm not installed, skipping lint"
+          fi
+
+      - name: Helm template
+        run: |
+          if command -v helm &> /dev/null; then
+            helm template test charts/chronik-operator/ > /dev/null
+          else
+            echo "Helm not installed, skipping template"
+          fi

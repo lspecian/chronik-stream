@@ -1,0 +1,28 @@
+# Topic with columnar storage (SQL queries) and vector search.
+apiVersion: chronik.io/v1alpha1
+kind: ChronikTopic
+metadata:
+  name: events
+  namespace: default
+spec:
+  clusterRef:
+    name: chronik-cluster
+  topicName: events
+  partitions: 12
+  replicationFactor: 3
+  config:
+    retention.ms: "-1"
+    cleanup.policy: compact
+  columnar:
+    enabled: true
+    format: parquet
+    compression: zstd
+    partitioning: daily
+  vectorSearch:
+    enabled: true
+    embeddingProvider: openai
+    embeddingModel: text-embedding-3-small
+    field: value
+    indexMetric: cosine
+  searchable: true
+  deletionPolicy: retain

@@ -1,0 +1,48 @@
+[package]
+name = "chronik-operator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Kubernetes operator for Chronik Stream"
+
+[[bin]]
+name = "chronik-operator"
+path = "src/main.rs"
+
+[dependencies]
+# Kubernetes
+kube = { version = "0.87", features = ["runtime", "derive", "client"] }
+k8s-openapi = { version = "0.20", features = ["v1_28"] }
+schemars = "0.8"
+
+# Async
+tokio = { workspace = true }
+futures = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = "0.9"
+toml = "0.8"
+
+# HTTP client (for Chronik Admin API)
+reqwest = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Observability
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+prometheus = { workspace = true }
+
+# CLI
+clap = { workspace = true }
+
+# Utilities
+uuid = { workspace = true }
+rand = "0.8"
+
+[dev-dependencies]
+tempfile = { workspace = true }

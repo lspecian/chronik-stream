@@ -1,0 +1,22 @@
+apiVersion: k6.io/v1alpha1
+kind: TestRun
+metadata:
+  name: k6-chronik-stress
+  namespace: chronik-perf
+spec:
+  parallelism: 8
+  script:
+    configMap:
+      name: k6-stress-test-script
+      file: stress-test.js
+  runner:
+    env:
+      - name: INGESTOR_URL
+        value: "http://ingestor.chronik-perf.svc.cluster.local:8080"
+    resources:
+      requests:
+        cpu: "4"
+        memory: "4Gi"
+      limits:
+        cpu: "8"
+        memory: "8Gi"

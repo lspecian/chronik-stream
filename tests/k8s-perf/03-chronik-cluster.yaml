@@ -1,0 +1,32 @@
+apiVersion: chronik.io/v1alpha1
+kind: ChronikCluster
+metadata:
+  name: chronik-cluster
+  namespace: chronik-perf
+spec:
+  replicas: 3
+  image: chronik-server:perf-v5-iouring
+  imagePullPolicy: Never
+  walProfile: high
+  produceProfile: extreme
+  logLevel: info
+  metricsPort: 13092
+  replicationFactor: 3
+  minInsyncReplicas: 2
+  antiAffinity: required
+  antiAffinityTopologyKey: kubernetes.io/hostname
+  resources:
+    requests:
+      cpu: "4"
+      memory: "16Gi"
+    limits:
+      cpu: "32"
+      memory: "64Gi"
+  storage:
+    size: 100Gi
+    storageClass: standard
+  podDisruptionBudget:
+    maxUnavailable: 1
+  env:
+    - name: CHRONIK_UNIFIED_API_PORT
+      value: "6093"

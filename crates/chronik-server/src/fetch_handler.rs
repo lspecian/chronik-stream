@@ -2,6 +2,7 @@
 
 use chronik_common::{Result, Error};
 use chronik_common::metadata::traits::MetadataStore;
+use chronik_monitoring::MetricsRecorder;
 use chronik_protocol::{FetchRequest, FetchResponse, FetchResponseTopic, FetchResponsePartition};
 use chronik_storage::{SegmentReader, RecordBatch, Record, Segment, ObjectStoreTrait, SegmentIndex};
 use chronik_storage::kafka_records::{KafkaRecordBatch, KafkaRecord, RecordHeader as KafkaRecordHeader, CompressionType};
@@ -237,6 +238,15 @@ impl FetchHandler {
             });
         }
         
+        // Record fetch metrics
+        let mut fetched_bytes: u64 = 0;
+        for t in &response_topics {
+            for p in &t.partitions {
+                fetched_bytes += p.records.len() as u64;
+            }
+        }
+        MetricsRecorder::record_fetch(true, fetched_bytes);
+
         Ok(FetchResponse {
             header: chronik_protocol::parser::ResponseHeader { correlation_id },
             throttle_time_ms: 0,

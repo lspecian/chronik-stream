@@ -1,0 +1,15 @@
+apiVersion: k6.io/v1alpha1
+kind: TestRun
+metadata:
+  name: k6-chronik-load
+  namespace: chronik-perf
+spec:
+  parallelism: 3
+  script:
+    configMap:
+      name: k6-load-test-script
+      file: load-test.js
+  runner:
+    env:
+      - name: INGESTOR_URL
+        value: "http://ingestor.chronik-perf.svc.cluster.local:8080"

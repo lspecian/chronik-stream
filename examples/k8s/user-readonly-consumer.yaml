@@ -1,0 +1,28 @@
+# Read-only consumer user.
+apiVersion: chronik.io/v1alpha1
+kind: ChronikUser
+metadata:
+  name: readonly-consumer
+  namespace: default
+spec:
+  clusterRef:
+    name: chronik-cluster
+  authentication:
+    type: sasl-scram-sha-256
+  authorization:
+    acls:
+      - resource:
+          type: topic
+          name: "*"
+          patternType: literal
+        operations:
+          - Read
+          - Describe
+        effect: Allow
+      - resource:
+          type: group
+          name: readonly-
+          patternType: prefixed
+        operations:
+          - Read
+        effect: Allow

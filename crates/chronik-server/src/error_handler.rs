@@ -384,6 +384,61 @@ impl ErrorHandler {
                     response.push(0x00); // no tagged fields
                 }
             }
+            // SyncGroup (API key 14)
+            14 => {
+                // SyncGroup response format:
+                // v1+: throttle_time_ms (i32)
+                // v0+: error_code (i16)
+                // v5+: protocol_type (string), protocol_name (string)
+                // v0+: assignment (bytes)
+                // v4+: tagged_fields
+                if api_version >= 1 {
+                    response.extend_from_slice(&0i32.to_be_bytes()); // throttle_time_ms
+                }
+                response.extend_from_slice(&error_code.to_i16().to_be_bytes());
+                if api_version >= 5 {
+                    if api_version >= 4 {
+                        // compact empty strings (length 0 encoded as varint 1)
+                        response.push(1); // protocol_type: empty
+                        response.push(1); // protocol_name: empty
+                    } else {
+                        response.extend_from_slice(&0i16.to_be_bytes()); // protocol_type: empty
+                        response.extend_from_slice(&0i16.to_be_bytes()); // protocol_name: empty
+                    }
+                }
+                if api_version >= 4 {
+                    response.push(1); // compact bytes: empty assignment (length 0 encoded as varint 1)
+                } else {
+                    response.extend_from_slice(&(-1i32).to_be_bytes()); // standard bytes: null assignment
+                }
+                if api_version >= 4 {
+                    response.push(0x00); // tagged fields: none
+                }
+            }
+            // Heartbeat (API key 12)
+            12 => {
+                if api_version >= 1 {
+                    response.extend_from_slice(&0i32.to_be_bytes()); // throttle_time_ms
+                }
+                response.extend_from_slice(&error_code.to_i16().to_be_bytes());
+                if api_version >= 4 {
+                    response.push(0x00); // tagged fields
+                }
+            }
+            // LeaveGroup (API key 13)
+            13 => {
+                if api_version >= 1 {
+                    response.extend_from_slice(&0i32.to_be_bytes()); // throttle_time_ms
+                }
+                response.extend_from_slice(&error_code.to_i16().to_be_bytes());
+                if api_version >= 3 {
+                    // members array (empty for error)
+                    response.push(1); // compact array: 0 elements (encoded as varint 1)
+                }
+                if api_version >= 4 {
+                    response.push(0x00); // tagged fields
+                }
+            }
             _ => {
                 // Generic error response
                 response.extend_from_slice(&error_code.to_i16().to_be_bytes());

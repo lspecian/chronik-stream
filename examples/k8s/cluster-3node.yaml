@@ -1,0 +1,27 @@
+# 3-node Chronik Raft cluster — minimum production setup.
+apiVersion: chronik.io/v1alpha1
+kind: ChronikCluster
+metadata:
+  name: chronik-cluster
+  namespace: default
+spec:
+  replicas: 3
+  image: ghcr.io/chronik-stream/chronik-server:latest
+  resources:
+    requests:
+      cpu: "1"
+      memory: "2Gi"
+    limits:
+      cpu: "4"
+      memory: "8Gi"
+  storage:
+    size: "100Gi"
+    storageClass: gp3
+  replicationFactor: 3
+  minInsyncReplicas: 2
+  adminApiKeySecret:
+    name: chronik-admin-key
+    key: api-key
+  antiAffinity: preferred
+  podDisruptionBudget:
+    maxUnavailable: 1

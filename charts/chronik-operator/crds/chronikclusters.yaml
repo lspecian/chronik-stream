@@ -1,0 +1,542 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: chronikclusters.chronik.io
+spec:
+  group: chronik.io
+  names:
+    categories: []
+    kind: ChronikCluster
+    plural: chronikclusters
+    shortNames:
+    - ccl
+    singular: chronikcluster
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.readyNodes
+      name: Ready
+      type: string
+    - jsonPath: .status.desiredNodes
+      name: Desired
+      type: string
+    - jsonPath: .status.leaderNodeId
+      name: Leader
+      type: integer
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for ChronikClusterSpec via `CustomResource`
+        properties:
+          spec:
+            description: Spec for a multi-node Chronik Raft cluster.
+            properties:
+              adminApiKeySecret:
+                description: Secret containing the admin API key.
+                nullable: true
+                properties:
+                  key:
+                    description: Key within the Secret.
+                    type: string
+                  name:
+                    description: Secret name.
+                    type: string
+                required:
+                - key
+                - name
+                type: object
+              antiAffinity:
+                default: preferred
+                description: 'Anti-affinity mode: "preferred" or "required".'
+                type: string
+              antiAffinityTopologyKey:
+                default: kubernetes.io/hostname
+                description: Topology key for anti-affinity.
+                type: string
+              autoRecover:
+                default: true
+                description: Enable automatic quorum recovery.
+                type: boolean
+              columnarEnabled:
+                default: false
+                description: Enable columnar storage.
+                type: boolean
+              env:
+                default: []
+                description: Extra environment variables.
+                items:
+                  description: Environment variable definition.
+                  properties:
+                    name:
+                      description: Variable name.
+                      type: string
+                    value:
+                      description: Variable value (plain text).
+                      nullable: true
+                      type: string
+                    valueFromSecret:
+                      description: Value from a Secret key reference.
+                      nullable: true
+                      properties:
+                        key:
+                          description: Key within the Secret.
+                          type: string
+                        name:
+                          description: Secret name.
+                          type: string
+                      required:
+                      - key
+                      - name
+                      type: object
+                  required:
+                  - name
+                  type: object
+                type: array
+              image:
+                default: ghcr.io/chronik-stream/chronik-server:latest
+                description: Container image for Chronik server.
+                type: string
+              imagePullPolicy:
+                default: IfNotPresent
+                description: Image pull policy.
+                type: string
+              imagePullSecrets:
+                default: []
+                description: Image pull secrets.
+                items:
+                  description: Image pull secret reference.
+                  properties:
+                    name:
+                      type: string
+                  required:
+                  - name
+                  type: object
+                type: array
+              listeners:
+                default: []
+                description: Named listeners (Strimzi-inspired). Each defines a Kafka access point.
+                items:
+                  description: Listener configuration for cluster nodes (inspired by Strimzi).
+                  properties:
+                    name:
+                      description: Listener name (e.g., "internal", "external").
+                      type: string
+                    nodePortBase:
+                      description: Base NodePort (for nodeport type). Node N gets nodePortBase + N - 1.
+                      format: int32
+                      nullable: true
+                      type: integer
+                    port:
+                      description: Port number.
+                      format: int32
+                      type: integer
+                    tls:
+                      default: false
+                      description: Enable TLS for this listener.
+                      type: boolean
+                    tlsSecret:
+                      description: TLS certificate secret name.
+                      nullable: true
+                      type: string
+                    type:
+                      description: 'Listener type: internal, nodeport, loadbalancer, ingress.'
+                      enum:
+                      - internal
+                      - nodeport
+                      - loadbalancer
+                      - ingress
+                      type: string
+                  required:
+                  - name
+                  - port
+                  - type
+                  type: object
+                type: array
+              logLevel:
+                default: info
+                description: Log level.
+                type: string
+              metricsPort:
+                description: Metrics endpoint port.
+                format: int32
+                nullable: true
+                type: integer
+              minInsyncReplicas:
+                default: 2
+                description: Minimum in-sync replicas for writes.
+                format: int32
+                type: integer
+              nodeSelector:
+                additionalProperties:
+                  type: string
+                description: Node selector for Pod scheduling.
+                nullable: true
+                type: object
+              objectStore:
+                description: Object store for tiered storage.
+                nullable: true
+                properties:
+                  backend:
+                    description: 'Backend type: s3, gcs, azure, local.'
+                    type: string
+                  bucket:
+                    description: Bucket or container name.
+                    nullable: true
+                    type: string
+                  credentialsSecret:
+                    description: Secret name containing access credentials.
+                    nullable: true
+                    type: string
+                  endpoint:
+                    description: Endpoint override (e.g., for MinIO).
+                    nullable: true
+                    type: string
+                  prefix:
+                    description: Prefix for object keys.
+                    nullable: true
+                    type: string
+                  region:
+                    description: Region (S3/GCS).
+                    nullable: true
+                    type: string
+                required:
+                - backend
+                type: object
+              podDisruptionBudget:
+                description: Pod Disruption Budget configuration.
+                nullable: true
+                properties:
+                  maxUnavailable:
+                    default: 1
+                    description: Maximum number of pods that can be unavailable during voluntary disruptions.
+                    format: int32
+                    type: integer
+                type: object
+              produceProfile:
+                default: balanced
+                description: Produce handler flush profile.
+                type: string
+              raftPort:
+                default: 5001
+                description: Raft consensus port (internal, same on each Pod).
+                format: int32
+                type: integer
+              replicas:
+                default: 3
+                description: Number of cluster nodes (minimum 3 for Raft quorum).
+                format: int32
+                type: integer
+              replicationFactor:
+                default: 3
+                description: Replication factor for partitions.
+                format: int32
+                type: integer
+              resources:
+                description: Resource requests and limits per node.
+                nullable: true
+                properties:
+                  limits:
+                    description: Resource limits.
+                    nullable: true
+                    properties:
+                      cpu:
+                        description: CPU (e.g., "500m", "2").
+                        nullable: true
+                        type: string
+                      memory:
+                        description: Memory (e.g., "1Gi", "4Gi").
+                        nullable: true
+                        type: string
+                    type: object
+                  requests:
+                    description: Resource requests.
+                    nullable: true
+                    properties:
+                      cpu:
+                        description: CPU (e.g., "500m", "2").
+                        nullable: true
+                        type: string
+                      memory:
+                        description: Memory (e.g., "1Gi", "4Gi").
+                        nullable: true
+                        type: string
+                    type: object
+                type: object
+              schemaRegistry:
+                description: Schema Registry configuration.
+                nullable: true
+                properties:
+                  authEnabled:
+                    default: false
+                    description: Enable HTTP Basic Auth for Schema Registry.
+                    type: boolean
+                  credentialsSecret:
+                    description: Secret containing user credentials for Schema Registry.
+                    nullable: true
+                    type: string
+                  enabled:
+                    default: false
+                    description: Enable Schema Registry.
+                    type: boolean
+                type: object
+              storage:
+                description: Persistent storage configuration per node.
+                nullable: true
+                properties:
+                  accessModes:
+                    default:
+                    - ReadWriteOnce
+                    description: Access modes. Defaults to `["ReadWriteOnce"]`.
+                    items:
+                      type: string
+                    type: array
+                  size:
+                    default: 50Gi
+                    description: Storage size (e.g., "50Gi", "100Gi").
+                    type: string
+                  storageClass:
+                    default: standard
+                    description: Kubernetes StorageClass name.
+                    type: string
+                type: object
+              tolerations:
+                default: []
+                description: Pod tolerations.
+                items:
+                  description: Toleration for Pod scheduling.
+                  properties:
+                    effect:
+                      nullable: true
+                      type: string
+                    key:
+                      nullable: true
+                      type: string
+                    operator:
+                      nullable: true
+                      type: string
+                    toleration_seconds:
+                      format: int64
+                      nullable: true
+                      type: integer
+                    value:
+                      nullable: true
+                      type: string
+                  type: object
+                type: array
+              unifiedApiPort:
+                default: 6092
+                description: Unified API port.
+                format: int32
+                type: integer
+              updateStrategy:
+                description: Rolling update strategy.
+                nullable: true
+                properties:
+                  maxUnavailable:
+                    default: 1
+                    description: Maximum number of nodes unavailable during rolling update.
+                    format: int32
+                    type: integer
+                  restartDelaySecs:
+                    default: 30
+                    description: Delay in seconds between node restarts.
+                    format: uint64
+                    minimum: 0.0
+                    type: integer
+                type: object
+              vectorSearch:
+                description: Vector search configuration.
+                nullable: true
+                properties:
+                  apiKeySecret:
+                    description: Secret reference for embedding API key.
+                    nullable: true
+                    properties:
+                      key:
+                        description: Key within the Secret.
+                        type: string
+                      name:
+                        description: Secret name.
+                        type: string
+                    required:
+                    - key
+                    - name
+                    type: object
+                  enabled:
+                    default: false
+                    description: Enable vector search.
+                    type: boolean
+                  model:
+                    default: text-embedding-3-small
+                    description: Embedding model name (e.g., "text-embedding-3-small").
+                    type: string
+                  provider:
+                    default: openai
+                    description: Embedding provider.
+                    type: string
+                type: object
+              walPort:
+                default: 9291
+                description: WAL replication port (internal, same on each Pod).
+                format: int32
+                type: integer
+              walProfile:
+                default: medium
+                description: WAL commit profile.
+                type: string
+            type: object
+          status:
+            description: Status for ChronikCluster.
+            nullable: true
+            properties:
+              conditions:
+                default: []
+                description: Status conditions.
+                items:
+                  description: Kubernetes-style condition for status reporting.
+                  properties:
+                    lastTransitionTime:
+                      description: Last transition time (ISO 8601 string).
+                      nullable: true
+                      type: string
+                    message:
+                      description: Human-readable message.
+                      nullable: true
+                      type: string
+                    reason:
+                      description: Machine-readable reason (e.g., "PodRunning").
+                      nullable: true
+                      type: string
+                    status:
+                      description: 'Status: "True", "False", or "Unknown".'
+                      type: string
+                    type:
+                      description: Condition type (e.g., "Ready", "ClusterReady", "LeaderElected").
+                      type: string
+                  required:
+                  - status
+                  - type
+                  type: object
+                type: array
+              desiredNodes:
+                default: 0
+                description: Desired number of nodes.
+                format: int32
+                type: integer
+              headlessService:
+                description: Headless Service DNS name.
+                nullable: true
+                type: string
+              leaderNodeId:
+                description: Current Raft leader node ID.
+                format: int64
+                nullable: true
+                type: integer
+              listeners:
+                default: []
+                description: Per-listener connection info.
+                items:
+                  description: Listener status — reported in CR status so users know how to connect.
+                  properties:
+                    bootstrapServers:
+                      description: Bootstrap servers string (e.g., "cluster.ns.svc:9092").
+                      type: string
+                    name:
+                      description: Listener name.
+                      type: string
+                    type:
+                      description: Listener type.
+                      enum:
+                      - internal
+                      - nodeport
+                      - loadbalancer
+                      - ingress
+                      type: string
+                  required:
+                  - bootstrapServers
+                  - name
+                  - type
+                  type: object
+                type: array
+              nodes:
+                default: []
+                description: Per-node status.
+                items:
+                  description: Status of a single cluster node.
+                  properties:
+                    isLeader:
+                      default: false
+                      description: Whether this node is the Raft leader.
+                      type: boolean
+                    nodeId:
+                      description: Node ID.
+                      format: int64
+                      type: integer
+                    phase:
+                      description: 'Node phase: Pending, Running, Failed.'
+                      nullable: true
+                      type: string
+                    podIp:
+                      description: Pod IP address.
+                      nullable: true
+                      type: string
+                    podName:
+                      description: Pod name.
+                      type: string
+                    ready:
+                      default: false
+                      description: Whether the node is ready.
+                      type: boolean
+                  required:
+                  - nodeId
+                  - podName
+                  type: object
+                type: array
+              observedGeneration:
+                description: Last observed generation.
+                format: int64
+                nullable: true
+                type: integer
+              partitionSummary:
+                description: Partition summary.
+                nullable: true
+                properties:
+                  inSyncPartitions:
+                    format: int32
+                    type: integer
+                  totalPartitions:
+                    format: int32
+                    type: integer
+                  underReplicatedPartitions:
+                    format: int32
+                    type: integer
+                required:
+                - inSyncPartitions
+                - totalPartitions
+                - underReplicatedPartitions
+                type: object
+              phase:
+                description: 'Current phase: Pending, Bootstrapping, Running, Scaling, Updating, Degraded, Failed.'
+                nullable: true
+                type: string
+              readyNodes:
+                default: 0
+                description: Number of ready nodes.
+                format: int32
+                type: integer
+            type: object
+        required:
+        - spec
+        title: ChronikCluster
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

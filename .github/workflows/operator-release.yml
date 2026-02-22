@@ -1,0 +1,288 @@
+name: Operator Release
+
+on:
+  push:
+    tags:
+      - 'operator-v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Operator version tag (e.g., operator-v0.1.0)'
+        required: true
+        type: string
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ghcr.io/chronik-stream/chronik-operator
+  CARGO_TERM_COLOR: always
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
+
+jobs:
+  # Build operator binary for Linux amd64 and arm64
+  build-binaries:
+    name: Build Operator Binary (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            artifact: chronik-operator-linux-amd64
+            use_cross: true
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            artifact: chronik-operator-linux-arm64
+            use_cross: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-operator-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install cross
+        if: matrix.use_cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build with cross
+        if: matrix.use_cross
+        env:
+          RUSTC_WRAPPER: ""
+        run: cross build --release --target ${{ matrix.target }} --bin chronik-operator
+
+      - name: Package binary
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/chronik-operator dist/
+          cd dist
+          tar -czf ${{ matrix.artifact }}.tar.gz chronik-operator
+          sha256sum ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}*
+          retention-days: 7
+
+  # Build and push multi-arch Docker image to GHCR
+  docker:
+    name: Build & Push Docker Image
+    needs: build-binaries
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Linux binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: chronik-operator-linux-*
+          path: artifacts-download
+
+      - name: Prepare artifacts for Docker
+        run: |
+          mkdir -p artifacts/linux/amd64
+          mkdir -p artifacts/linux/arm64
+
+          cd artifacts-download
+          tar -xzf chronik-operator-linux-amd64/chronik-operator-linux-amd64.tar.gz -C ../artifacts/linux/amd64/
+          tar -xzf chronik-operator-linux-arm64/chronik-operator-linux-arm64.tar.gz -C ../artifacts/linux/arm64/
+
+          chmod +x ../artifacts/linux/*/chronik-operator
+          ls -la ../artifacts/linux/*/
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Determine version tag
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${{ github.ref_name }}"
+          fi
+          # Strip 'operator-' prefix for Docker tag (operator-v0.1.0 -> v0.1.0)
+          VERSION="${TAG#operator-}"
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "Version: ${VERSION}"
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ steps.version.outputs.version }}
+            type=raw,value=latest
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile.operator.binary
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # Package and publish Helm chart as OCI artifact
+  helm:
+    name: Publish Helm Chart
+    needs: docker
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Determine version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${{ github.ref_name }}"
+          fi
+          VERSION="${TAG#operator-v}"
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Update Chart.yaml version
+        run: |
+          sed -i "s/^version:.*/version: ${{ steps.version.outputs.version }}/" charts/chronik-operator/Chart.yaml
+          sed -i "s/^appVersion:.*/appVersion: \"${{ steps.version.outputs.version }}\"/" charts/chronik-operator/Chart.yaml
+          cat charts/chronik-operator/Chart.yaml
+
+      - name: Helm lint
+        run: helm lint charts/chronik-operator/
+
+      - name: Package Helm chart
+        run: helm package charts/chronik-operator/ --destination dist/
+
+      - name: Log in to OCI registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ${{ env.REGISTRY }} --username ${{ github.actor }} --password-stdin
+
+      - name: Push Helm chart to GHCR
+        run: |
+          helm push dist/chronik-operator-${{ steps.version.outputs.version }}.tgz oci://${{ env.REGISTRY }}/chronik-stream/charts
+
+      - name: Upload chart artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: helm-chart
+          path: dist/*.tgz
+          retention-days: 7
+
+  # Create GitHub release with binaries and chart
+  release:
+    name: Create Release
+    needs: [build-binaries, docker, helm]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${{ github.ref_name }}"
+          fi
+          VERSION="${TAG#operator-}"
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: Chronik Operator ${{ steps.version.outputs.version }}
+          draft: false
+          prerelease: ${{ contains(steps.version.outputs.version, '-rc') || contains(steps.version.outputs.version, '-beta') }}
+          files: |
+            artifacts/**/*.tar.gz
+            artifacts/**/*.sha256
+            artifacts/**/*.tgz
+          body: |
+            ## Chronik Operator ${{ steps.version.outputs.version }}
+
+            Kubernetes operator for managing Chronik Stream clusters.
+
+            ### Installation
+
+            #### Helm (Recommended)
+            ```bash
+            # Add OCI registry
+            helm install chronik-operator \
+              oci://ghcr.io/chronik-stream/charts/chronik-operator \
+              --version ${{ steps.version.outputs.version }} \
+              --namespace chronik-system --create-namespace
+            ```
+
+            #### Docker Image
+            ```bash
+            docker pull ghcr.io/chronik-stream/chronik-operator:${{ steps.version.outputs.version }}
+            ```
+
+            #### Binary Downloads
+            - Linux AMD64: `chronik-operator-linux-amd64.tar.gz`
+            - Linux ARM64: `chronik-operator-linux-arm64.tar.gz`
+
+            ### Features
+            - **ChronikCluster** — Multi-node Raft clusters with automatic topology management
+            - **ChronikStandalone** — Single-node deployments
+            - **ChronikTopic** — Declarative topic management
+            - **ChronikUser** — SASL user management
+            - **ChronikAutoScaler** — Automatic scaling based on metrics
+            - **Leader Election** — HA operator with lease-based failover
+            - **CRD Generation** — `chronik-operator crd-gen` for schema export
+
+            ### Verification
+            All binaries include SHA256 checksums.
+          generate_release_notes: true
