@@ -13,7 +13,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ghcr.io/chronik-stream/chronik-operator
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/chronik-operator
   CARGO_TERM_COLOR: always
   RUSTC_WRAPPER: sccache
   SCCACHE_GHA_ENABLED: "true"
@@ -201,7 +201,7 @@ jobs:
 
       - name: Push Helm chart to GHCR
         run: |
-          helm push dist/chronik-operator-${{ steps.version.outputs.version }}.tgz oci://${{ env.REGISTRY }}/chronik-stream/charts
+          helm push dist/chronik-operator-${{ steps.version.outputs.version }}.tgz oci://${{ env.REGISTRY }}/${{ github.repository_owner }}/charts
 
       - name: Upload chart artifact
         uses: actions/upload-artifact@v4
