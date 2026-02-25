@@ -1,9 +1,9 @@
 # Chronik Phase 9 — Query Orchestrator + Ranking Plane
 
-**Project**: Multi-Topic Query Planning + Deterministic Ranking Infrastructure  
-**Target Version**: v2.4.0  
-**Start Date**: ___________  
-**Estimated Duration**: 4–6 weeks  
+> **STATUS: COMPLETE** — All tasks implemented and tested. Superseded by [ROADMAP_RELEVANCE_ENGINE.md](ROADMAP_RELEVANCE_ENGINE.md).
+
+**Project**: Multi-Topic Query Planning + Deterministic Ranking Infrastructure
+**Completion Date**: 2026-02-23  
 
 ---
 
@@ -142,102 +142,102 @@ Ranked Results + Explanations
 ## Phase 9.1 — Foundation & Crate Setup (Week 1)
 
 ### Tasks
-- [ ] Create crate `crates/chronik-query`
-- [ ] Add to workspace `Cargo.toml`
-- [ ] Define core modules:
+- [x] Create crate `crates/chronik-query`
+- [x] Add to workspace `Cargo.toml`
+- [x] Define core modules:
   - `query_plan.rs`
   - `capabilities.rs`
   - `candidate.rs`
   - `ranker.rs`
   - `profiles.rs`
-- [ ] Add shared types to `chronik-common`
-- [ ] Compile + unit test scaffold
+- [x] Add shared types to `chronik-common`
+- [x] Compile + unit test scaffold
 
 ---
 
 ## Phase 9.2 — Topic Capabilities & Discovery (Week 1)
 
 ### Tasks
-- [ ] Add `TopicCapabilities` struct
-- [ ] Implement detection logic from topic config
-- [ ] Cache capabilities in server state
-- [ ] Admin endpoint: `GET /_query/capabilities`
+- [x] Add `TopicCapabilities` struct
+- [x] Implement detection logic from topic config
+- [x] Cache capabilities in server state
+- [x] Admin endpoint: `GET /_query/capabilities`
 
 ---
 
 ## Phase 9.3 — Query Plan Engine (Week 2)
 
 ### Tasks
-- [ ] Implement `QueryPlanBuilder`
-- [ ] Execution nodes: TextNode, VectorNode, SqlNode, FetchNode
-- [ ] Parallel execution + timeouts
-- [ ] Normalize outputs into `Vec<Candidate>`
+- [x] Implement `QueryPlanBuilder`
+- [x] Execution nodes: TextNode, VectorNode, SqlNode, FetchNode
+- [x] Parallel execution + timeouts
+- [x] Normalize outputs into `Vec<Candidate>`
 
 ---
 
 ## Phase 9.4 — Candidate Normalization (Week 2)
 
 ### Tasks
-- [ ] Implement adapters for all backends
-- [ ] Deduplication logic
-- [ ] CandidateSet container
+- [x] Implement adapters for all backends
+- [x] Deduplication logic
+- [x] CandidateSet container
 
 ---
 
 ## Phase 9.5 — Ranking Plane v1 (Week 3)
 
 ### Tasks
-- [ ] Define `Ranker` trait
-- [ ] Implement `RuleRanker`
-- [ ] Feature extraction
-- [ ] Explanation generator
+- [x] Define `Ranker` trait
+- [x] Implement `RuleRanker`
+- [x] Feature extraction
+- [x] Explanation generator
 
 ---
 
 ## Phase 9.6 — Ranking Profiles (Week 3)
 
 ### Tasks
-- [ ] Define profile schema (YAML/JSON)
-- [ ] Hot reload
-- [ ] Built-in profiles
+- [x] Define profile schema (YAML/JSON)
+- [x] Hot reload
+- [x] Built-in profiles
 
 ---
 
 ## Phase 9.7 — Policy Overlay (Week 4)
 
 ### Tasks
-- [ ] PolicyEngine interface
-- [ ] Filters + enforcement
-- [ ] Logging
+- [x] PolicyEngine interface
+- [x] Filters + enforcement
+- [x] Logging
 
 ---
 
 ## Phase 9.8 — Unified API Integration (Week 4)
 
 ### Tasks
-- [ ] Add `query_handler.rs`
-- [ ] Mount `POST /_query`
-- [ ] Prometheus metrics
+- [x] Add `query_handler.rs`
+- [x] Mount `POST /_query`
+- [x] Prometheus metrics
 
 ---
 
 ## Phase 9.9 — Proof-of-Scale Harness (Week 5)
 
 ### Tasks
-- [ ] Synthetic data generator
-- [ ] Load harness (10M+ records)
-- [ ] Query benchmark
-- [ ] Failure injection
+- [x] Synthetic data generator
+- [x] Load harness (10M+ records)
+- [x] Query benchmark
+- [x] Failure injection
 
 ---
 
 ## Phase 9.10 — Testing & Documentation (Week 6)
 
 ### Tasks
-- [ ] End-to-end integration tests
-- [ ] Multi-topic tests
-- [ ] Profile reload tests
-- [ ] Docs
+- [x] End-to-end integration tests
+- [x] Multi-topic tests
+- [x] Profile reload tests
+- [x] Docs
 
 ---
 
