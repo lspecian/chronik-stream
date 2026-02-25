@@ -145,22 +145,31 @@ impl QueryExecutor {
         score: Option<Score>,
         doc_address: DocAddress,
     ) -> Result<SearchHit> {
+        use tantivy::schema::Value;
+
         let schema = self.index.schema();
         let mut fields = serde_json::Map::new();
-        
-        // Extract all field values
-        for field_value in doc.field_values() {
-            let field = field_value.field();
+
+        // Extract all field values (tantivy 0.24: field_values() yields (Field, OwnedValue))
+        for (field, value) in doc.field_values() {
             let field_name = schema.get_field_name(field);
-            
-            // Convert field value to JSON
-            // Note: In Tantivy 0.22, field values are handled differently
-            let value_str = format!("{:?}", field_value.value());
-            let json_value = serde_json::Value::String(value_str);
-            
+            // Convert OwnedValue to serde_json::Value using the Value trait
+            let json_value = if let Some(s) = value.as_str() {
+                serde_json::Value::String(s.to_string())
+            } else if let Some(n) = value.as_i64() {
+                serde_json::Value::Number(n.into())
+            } else if let Some(n) = value.as_u64() {
+                serde_json::Value::Number(n.into())
+            } else if let Some(f) = value.as_f64() {
+                serde_json::Number::from_f64(f)
+                    .map(serde_json::Value::Number)
+                    .unwrap_or(serde_json::Value::Null)
+            } else {
+                serde_json::Value::String(format!("{:?}", value))
+            };
             fields.insert(field_name.to_string(), json_value);
         }
-        
+
         Ok(SearchHit {
             doc_id: format!("{}:{}", doc_address.segment_ord, doc_address.doc_id),
             score,

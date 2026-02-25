@@ -1,0 +1,27 @@
+apiVersion: k6.io/v1alpha1
+kind: TestRun
+metadata:
+  name: k6-hybrid-lowvu
+  namespace: chronik-perf
+spec:
+  parallelism: 1
+  script:
+    configMap:
+      name: k6-vector-lowvu-script
+      file: vector-lowvu-test.js
+  runner:
+    image: grafana/k6:0.49.0
+    resources:
+      requests:
+        cpu: "1"
+        memory: "512Mi"
+      limits:
+        cpu: "4"
+        memory: "2Gi"
+    env:
+      - name: CHRONIK_URL
+        value: "http://chronik-query.chronik-perf.svc.cluster.local:6092"
+      - name: VECTOR_TOPIC
+        value: "query-bench-vector"
+      - name: TEST_TYPE
+        value: "hybrid"

@@ -520,4 +520,4 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release --bin chronik-bench
 
 ## License
 
-MIT OR Apache-2.0
+Apache-2.0

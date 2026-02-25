@@ -74,7 +74,7 @@ impl SqlHandler {
     /// - `{topic}`: Union view of hot + cold for seamless queries
     ///
     /// Table names are sanitized (replacing - and . with _) for SQL compatibility.
-    async fn ensure_topics_registered(
+    pub async fn ensure_topics_registered(
         state: &UnifiedApiState,
         engine: &chronik_columnar::ColumnarQueryEngine,
     ) {
@@ -105,14 +105,35 @@ impl SqlHandler {
             // Register COLD table (Parquet files)
             // ============================================================
             if !registered_set.contains(&cold_table_name) {
-                // Get Parquet paths for this topic
-                let paths = match state.metadata_store.get_parquet_paths(topic).await {
+                // Get Parquet paths for this topic from metadata store
+                let mut paths = match state.metadata_store.get_parquet_paths(topic).await {
                     Ok(paths) => paths,
                     Err(e) => {
                         debug!("No Parquet data for topic '{}': {}", topic, e);
                         Vec::new()
                     }
                 };
+
+                // v2.4.0: Filesystem fallback — scan columnar directory when metadata
+                // store has no paths yet (happens during initial indexing before
+                // WalIndexer persists parquet metadata)
+                if paths.is_empty() {
+                    let data_dir = std::env::var("CHRONIK_DATA_DIR").unwrap_or_else(|_| "./data".to_string());
+                    let columnar_dir = format!("{}/columnar/{}", data_dir, topic);
+                    let columnar_path = std::path::Path::new(&columnar_dir);
+                    if columnar_path.exists() {
+                        if let Ok(discovered) = discover_parquet_files(columnar_path) {
+                            if !discovered.is_empty() {
+                                debug!(
+                                    topic = %topic,
+                                    count = discovered.len(),
+                                    "Discovered Parquet files via filesystem fallback"
+                                );
+                                paths = discovered;
+                            }
+                        }
+                    }
+                }
 
                 if !paths.is_empty() {
                     // v2.2.22: Filter out non-existent files (stale entries from previous runs)
@@ -229,7 +250,7 @@ impl SqlHandler {
     }
 
     /// Sanitize topic name to be a valid SQL table name
-    fn sanitize_table_name(topic: &str) -> String {
+    pub fn sanitize_table_name(topic: &str) -> String {
         topic
             .chars()
             .map(|c| {
@@ -503,6 +524,26 @@ pub async fn describe_table(
             (StatusCode::NOT_FOUND, Json(error_response)).into_response()
         }
     }
+}
+
+/// Recursively discover all `.parquet` files under a directory.
+///
+/// Used as a fallback when the metadata store hasn't recorded parquet paths yet
+/// (e.g., during early indexing before WalIndexer persists metadata).
+fn discover_parquet_files(dir: &std::path::Path) -> std::io::Result<Vec<String>> {
+    let mut files = Vec::new();
+    if dir.is_dir() {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                files.extend(discover_parquet_files(&path)?);
+            } else if path.extension().map(|e| e == "parquet").unwrap_or(false) {
+                files.push(path.to_string_lossy().to_string());
+            }
+        }
+    }
+    Ok(files)
 }
 
 /// Convert an Arrow array value at a given index to JSON

@@ -134,6 +134,16 @@ pub struct UnifiedMetrics {
     pub embedding_tokens_total: AtomicU64,     // Total tokens processed (approx)
     pub embedding_messages_total: AtomicU64,   // Total messages embedded
     pub embedding_vectors_total: AtomicU64,    // Total vectors generated
+
+    // ========== Query Orchestrator Metrics (v2.4.0 Phase 9) ==========
+    pub query_requests_total: AtomicU64,       // Total /_query requests
+    pub query_errors_total: AtomicU64,         // Total /_query errors
+    pub query_latency_sum_ms: AtomicU64,       // Sum for latency histogram
+    pub query_latency_count: AtomicU64,        // Count for latency average
+    pub query_candidates_sum: AtomicU64,       // Sum of candidates per query
+    pub query_candidates_count: AtomicU64,     // Count for candidates average
+    pub query_planning_errors: AtomicU64,      // Planning errors
+    pub query_execution_errors: AtomicU64,     // Execution errors
 }
 
 impl Default for UnifiedMetrics {
@@ -258,6 +268,16 @@ impl UnifiedMetrics {
             embedding_tokens_total: AtomicU64::new(0),
             embedding_messages_total: AtomicU64::new(0),
             embedding_vectors_total: AtomicU64::new(0),
+
+            // Query Orchestrator (v2.4.0)
+            query_requests_total: AtomicU64::new(0),
+            query_errors_total: AtomicU64::new(0),
+            query_latency_sum_ms: AtomicU64::new(0),
+            query_latency_count: AtomicU64::new(0),
+            query_candidates_sum: AtomicU64::new(0),
+            query_candidates_count: AtomicU64::new(0),
+            query_planning_errors: AtomicU64::new(0),
+            query_execution_errors: AtomicU64::new(0),
         }
     }
 
@@ -637,6 +657,39 @@ impl UnifiedMetrics {
         output.push_str(&format!("chronik_embedding_vectors_total {}\n",
             self.embedding_vectors_total.load(Ordering::Relaxed)));
 
+        // ========== Query Orchestrator Metrics (v2.4.0 Phase 9) ==========
+        output.push_str("# HELP chronik_query_requests_total Total unified query requests\n");
+        output.push_str("# TYPE chronik_query_requests_total counter\n");
+        output.push_str(&format!("chronik_query_requests_total {}\n",
+            self.query_requests_total.load(Ordering::Relaxed)));
+
+        output.push_str("# HELP chronik_query_errors_total Total unified query errors\n");
+        output.push_str("# TYPE chronik_query_errors_total counter\n");
+        output.push_str(&format!("chronik_query_errors_total{{type=\"planning\"}} {}\n",
+            self.query_planning_errors.load(Ordering::Relaxed)));
+        output.push_str(&format!("chronik_query_errors_total{{type=\"execution\"}} {}\n",
+            self.query_execution_errors.load(Ordering::Relaxed)));
+
+        let q_count = self.query_latency_count.load(Ordering::Relaxed);
+        let q_sum = self.query_latency_sum_ms.load(Ordering::Relaxed);
+        let q_avg = if q_count > 0 { q_sum / q_count } else { 0 };
+
+        output.push_str("# HELP chronik_query_latency_ms Query latency in milliseconds\n");
+        output.push_str("# TYPE chronik_query_latency_ms gauge\n");
+        output.push_str(&format!("chronik_query_latency_ms{{stat=\"avg\"}} {}\n", q_avg));
+        output.push_str(&format!("chronik_query_latency_ms{{stat=\"count\"}} {}\n", q_count));
+        output.push_str(&format!("chronik_query_latency_ms{{stat=\"sum\"}} {}\n", q_sum));
+
+        let c_count = self.query_candidates_count.load(Ordering::Relaxed);
+        let c_sum = self.query_candidates_sum.load(Ordering::Relaxed);
+        let c_avg = if c_count > 0 { c_sum / c_count } else { 0 };
+
+        output.push_str("# HELP chronik_query_candidates_total Candidates collected per query\n");
+        output.push_str("# TYPE chronik_query_candidates_total gauge\n");
+        output.push_str(&format!("chronik_query_candidates_total{{stat=\"avg\"}} {}\n", c_avg));
+        output.push_str(&format!("chronik_query_candidates_total{{stat=\"count\"}} {}\n", c_count));
+        output.push_str(&format!("chronik_query_candidates_total{{stat=\"sum\"}} {}\n", c_sum));
+
         output
     }
 }
@@ -896,5 +949,38 @@ impl MetricsRecorder {
     /// Record embedding error without request context
     pub fn record_embedding_error() {
         global_metrics().embedding_errors_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    // ========== Query Orchestrator Metrics (v2.4.0 Phase 9) ==========
+
+    /// Record a /_query request
+    pub fn record_query_request() {
+        global_metrics().query_requests_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a /_query error
+    pub fn record_query_error(error_type: &str) {
+        let metrics = global_metrics();
+        metrics.query_errors_total.fetch_add(1, Ordering::Relaxed);
+        match error_type {
+            "planning" => metrics.query_planning_errors.fetch_add(1, Ordering::Relaxed),
+            "execution" => metrics.query_execution_errors.fetch_add(1, Ordering::Relaxed),
+            _ => metrics.query_errors_total.fetch_add(0, Ordering::Relaxed), // no-op, already counted
+        };
+    }
+
+    /// Record query latency
+    pub fn record_query_latency(duration: std::time::Duration) {
+        let ms = duration.as_millis() as u64;
+        let metrics = global_metrics();
+        metrics.query_latency_sum_ms.fetch_add(ms, Ordering::Relaxed);
+        metrics.query_latency_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record total candidates collected in a query
+    pub fn record_query_candidates(count: u64) {
+        let metrics = global_metrics();
+        metrics.query_candidates_sum.fetch_add(count, Ordering::Relaxed);
+        metrics.query_candidates_count.fetch_add(1, Ordering::Relaxed);
     }
 }

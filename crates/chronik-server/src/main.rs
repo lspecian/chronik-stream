@@ -738,22 +738,23 @@ async fn run_cluster_mode(
     let wal_indexer = server.get_wal_indexer();
     let vector_index_manager = wal_indexer.vector_index_manager().clone();
 
-    // Create search router for unified API (Elasticsearch-compatible search)
+    // Create search router + SearchApi for unified API (Elasticsearch-compatible search)
     // CRITICAL FIX v2.2.22: Use init_config.data_dir (from cluster TOML config)
     // instead of cli.data_dir (CLI default), so SearchApi finds indices
     // created by RealtimeIndexer at {data_dir}/index/
     #[cfg(feature = "search")]
-    let search_router = {
+    let (search_router, search_api_ref) = {
         let index_base_path = format!("{}/tantivy_indexes", init_config.data_dir.to_string_lossy());
         info!("Search API index base path: {}", index_base_path);
         match unified_api::search_handler::create_search_api(wal_indexer.clone(), &index_base_path) {
             Ok(search_api) => {
                 info!("✓ Search API integrated into Unified API");
-                Some(unified_api::search_handler::search_router(search_api))
+                let router = unified_api::search_handler::search_router(search_api.clone());
+                (Some(router), Some(search_api))
             }
             Err(e) => {
                 warn!("Failed to create Search API for unified API: {}", e);
-                None
+                (None, None)
             }
         }
     };
@@ -810,15 +811,30 @@ async fn run_cluster_mode(
         None
     };
 
-    let _unified_api_handle = unified_api::start_unified_api_full(
+    // Build UnifiedApiState manually to inject SearchApi for query orchestrator
+    let mut unified_state = unified_api::UnifiedApiState::new(
         server.metadata_store().clone(),
-        Some(columnar_query_engine),
-        Some(vector_index_manager),
-        try_create_embedding_provider(),
+        unified_api_config.clone(),
+    )
+    .with_query_engine(columnar_query_engine)
+    .with_vector_index_manager(vector_index_manager);
+    if let Some(provider) = try_create_embedding_provider() {
+        unified_state = unified_state.with_embedding_provider(provider);
+    }
+    if let Some(hb) = hot_buffer {
+        unified_state = unified_state.with_hot_buffer(hb);
+    }
+    // v2.4.0: Wire SearchApi into state for query orchestrator text search
+    #[cfg(feature = "search")]
+    if let Some(api) = search_api_ref {
+        unified_state = unified_state.with_search_api(api);
+        info!("✓ SearchApi wired into query orchestrator for text search");
+    }
+
+    let _unified_api_handle = unified_api::start_unified_api_with_state(
+        unified_state,
         search_router,
         Some(admin_router),
-        hot_buffer,
-        unified_api_config.clone(),
     ).await?;
     info!("✓ Unified API started on port {} (SQL, Vector, Search, Admin, Schema Registry)",
           unified_api_config.port);
@@ -918,54 +934,44 @@ async fn run_single_node_mode(
     info!("Kafka protocol listening on {}", kafka_addr);
     info!("Metrics endpoint available at http://{}:13092/metrics", bind);
 
-    // Start search API if search feature is compiled
+    // v2.4.0: Create SearchApi and integrate into Unified API
+    // SearchApi is shared between the search router (Elasticsearch-compatible endpoints)
+    // and the query orchestrator (/_query text search backend)
     #[cfg(feature = "search")]
-    {
-        info!("Starting Search API on port 6092");
-        let search_bind = bind.clone();
+    let (search_router, search_api_ref) = {
         let wal_indexer = server.get_wal_indexer();
         let index_base_path = format!("{}/tantivy_indexes", cli.data_dir.to_string_lossy());
-
-        tokio::spawn(async move {
-            use chronik_search::api::SearchApi;
-            use std::sync::Arc;
-
-            let search_api = Arc::new(SearchApi::new_with_wal_indexer(wal_indexer, index_base_path).unwrap());
-            let app = search_api.router();
-            let addr = format!("{}:6092", search_bind);
-            info!("Search API listening on http://{}", addr);
-
-            let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-            chronik_search::serve_app(listener, app).await.unwrap()
-        });
-
-        info!("Search API available at http://{}:6092", bind);
-    }
-
-    // v2.2.22: Start Unified API (SQL + Vector Search)
-    // When search feature is enabled, use port 6093 to avoid conflict
-    // Eventually, search endpoints will be migrated into unified API (Phase 6.2)
-    #[cfg(feature = "search")]
-    let unified_port = 6093;
+        info!("Search API index base path: {}", index_base_path);
+        match unified_api::search_handler::create_search_api(wal_indexer, &index_base_path) {
+            Ok(search_api) => {
+                info!("✓ Search API integrated into Unified API");
+                let router = unified_api::search_handler::search_router(search_api.clone());
+                (Some(router), Some(search_api))
+            }
+            Err(e) => {
+                warn!("Failed to create Search API: {}", e);
+                (None, None)
+            }
+        }
+    };
     #[cfg(not(feature = "search"))]
-    let unified_port = 6092;
+    let search_router: Option<axum::Router> = None;
 
     {
         let wal_indexer = server.get_wal_indexer();
         let vector_index_manager = wal_indexer.vector_index_manager().clone();
         let mut unified_config = unified_api::UnifiedApiConfig::default();
-        unified_config.port = unified_port;
+        unified_config.port = 6092;
         unified_config.bind_addr = bind.clone();
 
         // v2.2.23: Create ColumnarQueryEngine for SQL queries in single-node mode
-        // This enables /_sql endpoints for querying Parquet data
         let columnar_query_engine = Arc::new(ColumnarQueryEngine::new());
         info!("✓ Columnar Query Engine initialized for SQL queries");
 
         // v2.2.23: Create hot buffer for sub-second SQL queries on recent data
         let hot_buffer = if std::env::var("CHRONIK_HOT_BUFFER_ENABLED")
             .map(|v| v.to_lowercase() == "true" || v == "1")
-            .unwrap_or(true) // Enabled by default
+            .unwrap_or(true)
         {
             let wal_manager = wal_indexer.wal_manager().clone();
             let hot_buffer_config = chronik_columnar::HotBufferConfig {
@@ -991,17 +997,33 @@ async fn run_single_node_mode(
             None
         };
 
-        let _unified_handle = unified_api::start_unified_api_full(
+        // v2.4.0: Build UnifiedApiState manually to inject SearchApi for query orchestrator
+        let mut unified_state = unified_api::UnifiedApiState::new(
             server.metadata_store().clone(),
-            Some(columnar_query_engine),
-            Some(vector_index_manager),
-            try_create_embedding_provider(),
-            None, // search_router - already started separately on 6092
+            unified_config.clone(),
+        )
+        .with_query_engine(columnar_query_engine)
+        .with_vector_index_manager(vector_index_manager)
+        .with_wal_manager(wal_indexer.wal_manager().clone());
+
+        if let Some(provider) = try_create_embedding_provider() {
+            unified_state = unified_state.with_embedding_provider(provider);
+        }
+        if let Some(hb) = hot_buffer {
+            unified_state = unified_state.with_hot_buffer(hb);
+        }
+        #[cfg(feature = "search")]
+        if let Some(api) = search_api_ref {
+            unified_state = unified_state.with_search_api(api);
+            info!("✓ SearchApi wired into query orchestrator for text search");
+        }
+
+        let _unified_handle = unified_api::start_unified_api_with_state(
+            unified_state,
+            search_router,
             None, // admin_router - not needed in single-node mode
-            hot_buffer,
-            unified_config,
         ).await?;
-        info!("Unified API (SQL + Vector) available at http://{}:{}", bind, unified_port);
+        info!("Unified API available at http://{}:6092", bind);
     }
 
     // Start server with signal handling

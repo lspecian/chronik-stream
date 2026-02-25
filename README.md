@@ -8,32 +8,34 @@
 
 A high-performance streaming platform built in Rust that implements core Kafka wire protocol functionality with comprehensive Write-Ahead Log (WAL) durability and automatic recovery.
 
-**Latest Release: v2.2.25** - Bare metal performance validated at 837K msg/s. See [CHANGELOG.md](CHANGELOG.md) for full release history.
+**Latest Release: v2.3.0** - Query Orchestrator with multi-backend search, RRF ranking, and validated at 30K messages / 132K vectors on bare metal k8s. See [CHANGELOG.md](CHANGELOG.md) for full release history.
 
-## What's New in v2.2.25
+## What's New in v2.3.0
 
-**Performance & Stability:**
-- **837K msg/s** sustained throughput on 3-node bare metal cluster (256B messages, acks=all)
-- **411 MB/s** aggregate throughput with 1KB messages through full HTTP pipeline
-- **Zero data loss** across 1B+ messages in stress testing
-- Fixed closed-socket spin loop that caused 100% CPU after client disconnections
-- Kubernetes Operator released (chronik-operator v0.1.0)
+**Query Orchestrator & Multi-Backend Search (Phase 9):**
+- **Query Orchestrator** (`/_query` endpoint) — Fan-out queries across multiple topics and backends (text, vector, SQL, hybrid) in parallel, merge results with Reciprocal Rank Fusion (RRF)
+- **Ranking Profiles** — Configurable scoring strategies (BM25, vector similarity, hybrid RRF) with named profiles
+- **Multi-topic search** — Single query searches across multiple topics simultaneously
+- **OpenAI embeddings at scale** — Validated with `text-embedding-3-small` on 30K messages producing 132K vectors
+- **Performance on bare metal k8s** (3x Dell Xeon, 256GB RAM each):
 
-**Bare metal load test results (3x Dell Xeon E5-2667v4, 256GB RAM each):**
+| Query Type | p50 Latency | p99 Latency | Notes |
+|------------|-------------|-------------|-------|
+| Full-text (Tantivy BM25) | **3.4ms** | 8.2ms | Faster than Elasticsearch |
+| Vector (HNSW + OpenAI) | 372ms | 524ms | Dominated by embedding API |
+| Hybrid (text + vector RRF) | 376ms | 531ms | Best relevance quality |
+| SQL (DataFusion) | **5.9ms** | 12.1ms | 10-100x faster than ksqlDB |
+| Orchestrator (multi-topic) | 244ms | 680ms | 3-topic text fan-out |
 
-| Configuration | Messages/sec | Throughput | Errors |
-|---------------|-------------|------------|--------|
-| 12 ingestors, 256B msgs, acks=all | **837,284 msg/s** | 245 MB/s | 0.00% |
-| 36 ingestors, 1KB msgs, acks=all | 420,609 msg/s | **411 MB/s** | 0.00% |
+**Also in v2.3.0:**
+- Prometheus metrics for all query backends (vectors indexed, tokens processed, API calls)
+- k8s performance test suite (k6 load generators, Grafana dashboards)
+- Examples: log analysis pipeline, RAG chatbot
 
-See [BARE_METAL_PERFORMANCE.md](BARE_METAL_PERFORMANCE.md) for full methodology and results.
+## Previous Highlights
 
-## Previous Highlights (v2.2.22)
-
-- **Hot Buffer SQL**: Query recent data in **0-1ms** via in-memory Arrow tables
-- **Columnar Storage**: DataFusion 44 integration for SQL queries over Parquet files
-- **Vector Search**: HNSW-based semantic search with embedding providers
-- **Unified API**: REST endpoints for SQL (`/_sql`), search (`/_search`), and admin operations
+- **v2.2.25**: 837K msg/s bare metal cluster, fixed closed-socket spin loop, Kubernetes Operator
+- **v2.2.22**: Hot Buffer SQL (0-1ms), Columnar Storage (DataFusion), Vector Search (HNSW), Unified API
 
 ## 🚀 Features
 
@@ -54,7 +56,8 @@ See [BARE_METAL_PERFORMANCE.md](BARE_METAL_PERFORMANCE.md) for full methodology 
 ### Search & Analytics
 - **Searchable Topics**: Opt-in real-time full-text search with Tantivy (3% overhead) - see [docs/SEARCHABLE_TOPICS.md](docs/SEARCHABLE_TOPICS.md)
 - **Vector Search**: HNSW-based semantic search with embedding providers (OpenAI, custom)
-- **Unified REST API**: Single endpoint for SQL (`/_sql`), search (`/_search`), and admin ops
+- **Query Orchestrator** (v2.3.0+): Multi-topic, multi-backend fan-out with RRF ranking via `/_query` endpoint
+- **Unified REST API**: Single endpoint for SQL (`/_sql`), search (`/_search`), vector (`/_vector`), orchestrator (`/_query`), and admin ops
 
 ### Operations
 - **WAL-based Metadata**: ChronikMetaLog provides event-sourced metadata persistence
@@ -562,7 +565,7 @@ All images support both **linux/amd64** and **linux/arm64** architectures:
 
 | Image | Tags | Description |
 |-------|------|-------------|
-| `ghcr.io/lspecian/chronik-stream` | `latest`, `v2.2.25`, `2.2` | Chronik server with SQL, search, and KSQL support |
+| `ghcr.io/lspecian/chronik-stream` | `latest`, `v2.3.0`, `2.3` | Chronik server with SQL, search, query orchestrator, and KSQL support |
 
 ### Supported Platforms
 

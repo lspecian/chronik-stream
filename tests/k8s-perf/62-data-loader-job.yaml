@@ -1,0 +1,109 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: query-data-loader
+  namespace: chronik-perf
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: loader
+          image: python:3.12-slim
+          command:
+            - python3
+            - -c
+            - |
+              import json, time, random, string, sys
+
+              # pip install kafka-python inline
+              import subprocess
+              subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'kafka-python', '-q'])
+
+              from kafka import KafkaProducer
+
+              BOOTSTRAP = 'chronik-query.chronik-perf.svc.cluster.local:9092'
+              TOPIC = 'query-bench'
+              NUM_DOCS = 100000
+              BATCH_SIZE = 1000
+
+              categories = ['compute', 'storage', 'networking', 'security', 'billing',
+                            'monitoring', 'deployment', 'troubleshooting', 'api', 'database',
+                            'kubernetes', 'serverless', 'ml-platform', 'edge', 'compliance']
+
+              # Technical terms for realistic text search
+              terms = {
+                  'compute': ['instance', 'CPU', 'vCPU', 'memory', 'RAM', 'auto-scaling', 'container', 'Docker', 'serverless', 'GPU', 'NVIDIA', 'benchmark'],
+                  'storage': ['S3', 'object', 'block', 'SSD', 'IOPS', 'throughput', 'snapshot', 'backup', 'replication', 'durability', 'Parquet', 'compression'],
+                  'networking': ['VPC', 'subnet', 'firewall', 'load-balancer', 'CDN', 'DNS', 'TLS', 'proxy', 'gateway', 'ingress', 'latency', 'bandwidth'],
+                  'security': ['encryption', 'AES-256', 'TLS-1.3', 'IAM', 'RBAC', 'OAuth2', 'SAML', 'MFA', 'HSM', 'FIPS', 'compliance', 'audit'],
+                  'billing': ['pricing', 'cost', 'invoice', 'credit', 'reserved', 'spot', 'on-demand', 'budget', 'threshold', 'savings', 'forecast', 'optimization'],
+                  'monitoring': ['metrics', 'dashboard', 'alert', 'Prometheus', 'Grafana', 'logs', 'traces', 'SLO', 'uptime', 'latency', 'error-rate', 'anomaly'],
+                  'deployment': ['CI/CD', 'pipeline', 'Terraform', 'Helm', 'rolling-update', 'canary', 'blue-green', 'rollback', 'ArgoCD', 'GitOps', 'container-registry'],
+                  'troubleshooting': ['timeout', '502', '503', 'connection-refused', 'OOM', 'crash', 'memory-leak', 'deadlock', 'race-condition', 'stack-trace', 'core-dump'],
+                  'api': ['REST', 'GraphQL', 'gRPC', 'rate-limit', 'pagination', 'webhook', 'OAuth', 'bearer-token', 'API-key', 'versioning', 'deprecation', 'OpenAPI'],
+                  'database': ['PostgreSQL', 'MySQL', 'MongoDB', 'Redis', 'connection-pool', 'replication', 'failover', 'sharding', 'index', 'query-plan', 'vacuum', 'WAL'],
+                  'kubernetes': ['pod', 'deployment', 'service', 'ingress', 'ConfigMap', 'Secret', 'PVC', 'StatefulSet', 'DaemonSet', 'CronJob', 'HPA', 'node-affinity'],
+                  'serverless': ['Lambda', 'function', 'cold-start', 'warm-pool', 'event-driven', 'trigger', 'concurrency', 'timeout', 'runtime', 'layer', 'edge-function'],
+                  'ml-platform': ['PyTorch', 'TensorFlow', 'training', 'inference', 'model-registry', 'feature-store', 'pipeline', 'GPU', 'batch-prediction', 'A/B-testing'],
+                  'edge': ['CDN', 'edge-function', 'WebAssembly', 'cold-start', 'KV-store', 'routing', 'geolocation', 'cache', 'TTL', 'origin-shield', 'purge'],
+                  'compliance': ['SOC2', 'ISO-27001', 'HIPAA', 'GDPR', 'PCI-DSS', 'FedRAMP', 'data-residency', 'audit-log', 'retention', 'encryption', 'access-control'],
+              }
+
+              def gen_content(cat):
+                  t = terms.get(cat, terms['compute'])
+                  # Build 3-6 sentences with random technical terms
+                  sentences = []
+                  for _ in range(random.randint(3, 6)):
+                      chosen = random.sample(t, min(4, len(t)))
+                      templates = [
+                          f"Configure {chosen[0]} with {chosen[1]} for optimal performance.",
+                          f"When using {chosen[0]}, ensure {chosen[1]} is properly set up to avoid issues with {chosen[2]}.",
+                          f"The {chosen[0]} service supports {chosen[1]} and {chosen[2]} for enterprise workloads.",
+                          f"Troubleshooting {chosen[0]}: check {chosen[1]} configuration and verify {chosen[2]} settings.",
+                          f"Best practice: use {chosen[0]} with {chosen[1]} enabled. Monitor {chosen[2]} metrics for anomalies.",
+                      ]
+                      sentences.append(random.choice(templates))
+                  return ' '.join(sentences)
+
+              print(f"Connecting to {BOOTSTRAP}...")
+              producer = KafkaProducer(
+                  bootstrap_servers=BOOTSTRAP,
+                  value_serializer=lambda v: json.dumps(v).encode('utf-8'),
+                  api_version=(0, 10, 0),
+                  linger_ms=50,
+                  batch_size=65536,
+              )
+
+              start = time.time()
+              success = 0
+              for i in range(NUM_DOCS):
+                  cat = random.choice(categories)
+                  doc = {
+                      'id': f'doc-{i:06d}',
+                      'category': cat,
+                      'title': f'{cat.replace("-", " ").title()} Article {i}',
+                      'content': gen_content(cat),
+                      'severity': random.choice(['info', 'warning', 'critical']),
+                      'version': f'{random.randint(1,5)}.{random.randint(0,9)}.{random.randint(0,99)}',
+                  }
+                  producer.send(TOPIC, value=doc)
+                  success += 1
+                  if (i + 1) % BATCH_SIZE == 0:
+                      producer.flush()
+                      elapsed = time.time() - start
+                      rate = (i + 1) / elapsed
+                      print(f"  Produced {i+1}/{NUM_DOCS} ({rate:.0f} docs/s)")
+
+              producer.flush()
+              producer.close()
+              elapsed = time.time() - start
+              print(f"Done: {success}/{NUM_DOCS} documents in {elapsed:.1f}s ({success/elapsed:.0f} docs/s)")
+          resources:
+            requests:
+              cpu: "1"
+              memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "1Gi"

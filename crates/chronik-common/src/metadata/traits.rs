@@ -155,11 +155,17 @@ impl TopicConfig {
     ///
     /// Precedence (highest to lowest):
     /// 1. Explicit topic config: `config["vector.enabled"] = "true"/"false"`
-    /// 2. Hardcoded default: `false`
+    /// 2. Environment default: `CHRONIK_DEFAULT_VECTOR_ENABLED=true/false`
+    /// 3. Hardcoded default: `false`
     pub fn is_vector_enabled(&self) -> bool {
-        self.config.get("vector.enabled")
+        // 1. Explicit config wins (case-insensitive)
+        if let Some(val) = self.config.get("vector.enabled") {
+            return val.eq_ignore_ascii_case("true");
+        }
+        // 2. Fall back to environment default
+        std::env::var("CHRONIK_DEFAULT_VECTOR_ENABLED")
             .map(|v| v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
+            .unwrap_or(false) // 3. Hardcoded default: false
     }
 
     /// Get the vector embedding provider (openai, external, local).

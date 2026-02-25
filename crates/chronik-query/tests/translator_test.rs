@@ -1,6 +1,6 @@
 //! Comprehensive tests for the query translation layer.
 
-use chronik_query::{QueryTranslator, QueryInput, KafkaQuery, ValueQuery};
+use chronik_query::translator::{QueryTranslator, QueryInput, KafkaQuery, ValueQuery};
 use serde_json::json;
 use tantivy::schema::{Schema, TEXT, STORED, STRING, NumericOptions};
 
@@ -303,7 +303,7 @@ fn test_sql_simple_queries() {
     let sql = "SELECT * FROM messages WHERE timestamp BETWEEN 1000 AND 2000";
     let query = QueryInput::Sql(sql.to_string());
     let result = translator.translate(&query);
-    assert!(result.is_ok(), "SQL BETWEEN clause should translate");
+    assert!(result.is_ok(), "SQL BETWEEN clause should translate: {:?}", result.err());
 }
 
 #[test]
@@ -353,7 +353,7 @@ fn test_kafka_specific_query() {
         end_offset: Some(200),
         start_timestamp: Some(1000000),
         end_timestamp: Some(2000000),
-        key_pattern: Some("user:*"),
+        key_pattern: Some("user:*".to_string()),
         value_query: Some(ValueQuery::Text("error".to_string())),
         headers: vec![
             ("type".to_string(), "error".to_string()),

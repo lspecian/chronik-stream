@@ -119,3 +119,6 @@ artifacts/
 
 # Perf test binaries (built locally, imported to K8s nodes)
 tests/k8s-perf/chronik-perf
+
+# Downloaded datasets (large files, not for git)
+datasets/

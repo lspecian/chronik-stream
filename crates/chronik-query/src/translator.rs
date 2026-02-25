@@ -303,27 +303,32 @@ impl QueryTranslator {
             include_upper = false;
         }
         
-        // Create range query
-        match (lower_bound, upper_bound) {
-            (Some(lower), Some(upper)) => {
-                let lower_val = if include_lower { lower } else { lower + 1 };
-                let upper_val = if include_upper { upper } else { upper - 1 };
-                Ok(Box::new(RangeQuery::new_i64(field_name.to_string(), lower_val..upper_val+1)))
+        // Create range query using Bound<Term> (tantivy 0.24 API)
+        use std::ops::Bound;
+
+        let lower = match lower_bound {
+            Some(val) => {
+                let term = Term::from_field_i64(field, if include_lower { val } else { val + 1 });
+                Bound::Included(term)
             }
-            (Some(lower), None) => {
-                let lower_val = if include_lower { lower } else { lower + 1 };
-                Ok(Box::new(RangeQuery::new_i64(field_name.to_string(), lower_val..i64::MAX)))
+            None => Bound::Unbounded,
+        };
+
+        let upper = match upper_bound {
+            Some(val) => {
+                let term = Term::from_field_i64(field, if include_upper { val } else { val - 1 });
+                Bound::Included(term)
             }
-            (None, Some(upper)) => {
-                let upper_val = if include_upper { upper } else { upper - 1 };
-                Ok(Box::new(RangeQuery::new_i64(field_name.to_string(), i64::MIN..upper_val+1)))
-            }
-            (None, None) => {
-                Err(Error::InvalidInput("Range query must specify at least one bound".to_string()))
-            }
+            None => Bound::Unbounded,
+        };
+
+        if matches!((&lower, &upper), (Bound::Unbounded, Bound::Unbounded)) {
+            return Err(Error::InvalidInput("Range query must specify at least one bound".to_string()));
         }
+
+        Ok(Box::new(RangeQuery::new(lower, upper)))
     }
-    
+
     /// Create u64 range query
     fn create_u64_range_query(
         &self,
@@ -335,7 +340,7 @@ impl QueryTranslator {
         let mut upper_bound: Option<u64> = None;
         let mut include_lower = true;
         let mut include_upper = true;
-        
+
         // Parse bounds
         if let Some(gte) = range_obj.get("gte").and_then(|v| v.as_u64()) {
             lower_bound = Some(gte);
@@ -344,7 +349,7 @@ impl QueryTranslator {
             lower_bound = Some(gt);
             include_lower = false;
         }
-        
+
         if let Some(lte) = range_obj.get("lte").and_then(|v| v.as_u64()) {
             upper_bound = Some(lte);
             include_upper = true;
@@ -352,38 +357,90 @@ impl QueryTranslator {
             upper_bound = Some(lt);
             include_upper = false;
         }
-        
-        // Create range query
-        match (lower_bound, upper_bound) {
-            (Some(lower), Some(upper)) => {
-                let lower_val = if include_lower { lower } else { lower + 1 };
-                let upper_val = if include_upper { upper } else { upper - 1 };
-                Ok(Box::new(RangeQuery::new_u64(field_name.to_string(), lower_val..upper_val+1)))
+
+        // Create range query using Bound<Term> (tantivy 0.24 API)
+        use std::ops::Bound;
+
+        let lower = match lower_bound {
+            Some(val) => {
+                let term = Term::from_field_u64(field, if include_lower { val } else { val + 1 });
+                Bound::Included(term)
             }
-            (Some(lower), None) => {
-                let lower_val = if include_lower { lower } else { lower + 1 };
-                Ok(Box::new(RangeQuery::new_u64(field_name.to_string(), lower_val..u64::MAX)))
+            None => Bound::Unbounded,
+        };
+
+        let upper = match upper_bound {
+            Some(val) => {
+                let term = Term::from_field_u64(field, if include_upper { val } else { val - 1 });
+                Bound::Included(term)
             }
-            (None, Some(upper)) => {
-                let upper_val = if include_upper { upper } else { upper - 1 };
-                Ok(Box::new(RangeQuery::new_u64(field_name.to_string(), u64::MIN..upper_val+1)))
-            }
-            (None, None) => {
-                Err(Error::InvalidInput("Range query must specify at least one bound".to_string()))
-            }
+            None => Bound::Unbounded,
+        };
+
+        if matches!((&lower, &upper), (Bound::Unbounded, Bound::Unbounded)) {
+            return Err(Error::InvalidInput("Range query must specify at least one bound".to_string()));
         }
+
+        Ok(Box::new(RangeQuery::new(lower, upper)))
     }
     
     /// Create f64 range query
     fn create_f64_range_query(
         &self,
         field: Field,
-        field_name: &str,
+        _field_name: &str,
         range_obj: &serde_json::Map<String, Value>,
     ) -> Result<Box<dyn TantivyQuery>> {
-        // For now, convert to i64 range query
-        // In a full implementation, we'd handle floating point properly
-        self.create_i64_range_query(field, field_name, range_obj)
+        let mut lower_bound: Option<f64> = None;
+        let mut upper_bound: Option<f64> = None;
+        let mut include_lower = true;
+        let mut include_upper = true;
+
+        if let Some(gte) = range_obj.get("gte").and_then(|v| v.as_f64()) {
+            lower_bound = Some(gte);
+            include_lower = true;
+        } else if let Some(gt) = range_obj.get("gt").and_then(|v| v.as_f64()) {
+            lower_bound = Some(gt);
+            include_lower = false;
+        }
+
+        if let Some(lte) = range_obj.get("lte").and_then(|v| v.as_f64()) {
+            upper_bound = Some(lte);
+            include_upper = true;
+        } else if let Some(lt) = range_obj.get("lt").and_then(|v| v.as_f64()) {
+            upper_bound = Some(lt);
+            include_upper = false;
+        }
+
+        use std::ops::Bound;
+
+        let lower = match lower_bound {
+            Some(val) => {
+                if include_lower {
+                    Bound::Included(Term::from_field_f64(field, val))
+                } else {
+                    Bound::Excluded(Term::from_field_f64(field, val))
+                }
+            }
+            None => Bound::Unbounded,
+        };
+
+        let upper = match upper_bound {
+            Some(val) => {
+                if include_upper {
+                    Bound::Included(Term::from_field_f64(field, val))
+                } else {
+                    Bound::Excluded(Term::from_field_f64(field, val))
+                }
+            }
+            None => Bound::Unbounded,
+        };
+
+        if matches!((&lower, &upper), (Bound::Unbounded, Bound::Unbounded)) {
+            return Err(Error::InvalidInput("Range query must specify at least one bound".to_string()));
+        }
+
+        Ok(Box::new(RangeQuery::new(lower, upper)))
     }
     
     /// Create date range query
@@ -543,8 +600,8 @@ impl QueryTranslator {
         let field = self.get_field(field_name)?;
         
         // For exists query, we need to find documents where the field has any value
-        // This is a bit tricky in Tantivy, so we'll use a wildcard query
-        Ok(Box::new(RegexQuery::from_pattern(".*", field)
+        // Use ExistsQuery approach: match any content with a character class
+        Ok(Box::new(RegexQuery::from_pattern("[\\s\\S]+", field)
             .map_err(|e| Error::InvalidInput(format!("Failed to create exists query: {}", e)))?))
     }
     
@@ -631,10 +688,20 @@ impl QueryTranslator {
         let mut current_condition = Vec::new();
         let mut last_operator = "AND".to_string();
         
+        let mut in_between = false;
         while i < tokens.len() {
             let token = &tokens[i];
-            
-            if token.to_uppercase() == "AND" || token.to_uppercase() == "OR" {
+            let upper = token.to_uppercase();
+
+            // Track BETWEEN state: "field BETWEEN x AND y" — the AND is part of BETWEEN
+            if upper == "BETWEEN" {
+                in_between = true;
+                current_condition.push(token.clone());
+            } else if in_between && upper == "AND" {
+                // This AND belongs to BETWEEN...AND, not a boolean operator
+                current_condition.push(token.clone());
+                in_between = false;
+            } else if (upper == "AND" || upper == "OR") && !in_between {
                 // Process current condition
                 if !current_condition.is_empty() {
                     let sub_query = self.parse_sql_condition(&current_condition)?;
@@ -646,11 +713,11 @@ impl QueryTranslator {
                     subqueries.push((occur, sub_query));
                     current_condition.clear();
                 }
-                last_operator = token.to_uppercase();
+                last_operator = upper;
             } else {
                 current_condition.push(token.clone());
             }
-            
+
             i += 1;
         }
         
@@ -732,7 +799,10 @@ impl QueryTranslator {
         } else if let Ok(n) = token.parse::<i64>() {
             Ok(Value::Number(n.into()))
         } else if let Ok(f) = token.parse::<f64>() {
-            Ok(Value::Number(serde_json::Number::from_f64(f).unwrap()))
+            match serde_json::Number::from_f64(f) {
+                Some(n) => Ok(Value::Number(n)),
+                None => Err(Error::InvalidInput(format!("Invalid numeric value: {}", token))),
+            }
         } else if token.to_lowercase() == "true" {
             Ok(Value::Bool(true))
         } else if token.to_lowercase() == "false" {
@@ -845,14 +915,16 @@ impl QueryTranslator {
     }
     
     /// Convert SQL LIKE pattern to regex
+    ///
+    /// Note: tantivy 0.24 rejects `.*` as "empty match operators", so we use
+    /// `[\\s\\S]*` for `%` wildcards (matches 0+ of any char).
     fn sql_like_to_regex(&self, pattern: &str) -> String {
         let mut regex = String::new();
-        regex.push('^');
-        
+
         for ch in pattern.chars() {
             match ch {
-                '%' => regex.push_str(".*"),
-                '_' => regex.push('.'),
+                '%' => regex.push_str("[\\s\\S]*"),
+                '_' => regex.push_str("[\\s\\S]"),
                 '.' | '+' | '*' | '?' | '^' | '$' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\' => {
                     regex.push('\\');
                     regex.push(ch);
@@ -860,8 +932,7 @@ impl QueryTranslator {
                 _ => regex.push(ch),
             }
         }
-        
-        regex.push('$');
+
         regex
     }
     
@@ -1064,14 +1135,16 @@ impl QueryTranslator {
     }
     
     /// Convert wildcard pattern to regex
+    ///
+    /// Note: tantivy 0.24 rejects `.*` as "empty match operators", so we use
+    /// `[\\s\\S]+` for `*` wildcards (matches 1+ of any char including newlines).
     fn wildcard_to_regex(&self, pattern: &str) -> String {
         let mut regex = String::new();
-        regex.push('^');
-        
+
         for ch in pattern.chars() {
             match ch {
-                '*' => regex.push_str(".*"),
-                '?' => regex.push('.'),
+                '*' => regex.push_str("[\\s\\S]+"),
+                '?' => regex.push_str("[\\s\\S]"),
                 '.' | '+' | '^' | '$' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\' => {
                     regex.push('\\');
                     regex.push(ch);
@@ -1079,8 +1152,7 @@ impl QueryTranslator {
                 _ => regex.push(ch),
             }
         }
-        
-        regex.push('$');
+
         regex
     }
 }
@@ -1258,6 +1330,6 @@ mod tests {
         
         let query = QueryInput::Kafka(kafka_query);
         let result = translator.translate(&query);
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "Kafka query translation failed: {:?}", result.err());
     }
 }

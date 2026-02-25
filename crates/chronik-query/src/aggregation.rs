@@ -167,14 +167,14 @@ fn compute_aggregation(
         }
         AggregationFunction::Min => {
             if field.is_some() {
-                messages.iter().filter_map(|m| m.parsed_value).min_by(|a, b| a.partial_cmp(b).unwrap())
+                messages.iter().filter_map(|m| m.parsed_value).filter(|v| v.is_finite()).min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
             } else {
                 None
             }
         }
         AggregationFunction::Max => {
             if field.is_some() {
-                messages.iter().filter_map(|m| m.parsed_value).max_by(|a, b| a.partial_cmp(b).unwrap())
+                messages.iter().filter_map(|m| m.parsed_value).filter(|v| v.is_finite()).max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
             } else {
                 None
             }
@@ -226,7 +226,7 @@ impl AggregationEngine {
     pub async fn register_aggregation(&self, id: String, query: AggregationQuery) -> Result<()> {
         let mut aggregations = self.aggregations.write().await;
         
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
         let window_duration = match query.window {
             WindowType::Fixed(d) => d,
             WindowType::Sliding { size, .. } => size,
@@ -376,7 +376,7 @@ impl AggregationEngine {
         loop {
             interval.tick().await;
             
-            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
             let mut aggregations = self.aggregations.write().await;
             
             for (_, active) in aggregations.iter_mut() {

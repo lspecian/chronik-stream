@@ -1,0 +1,163 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: embedding-adapter-code
+  namespace: chronik-perf
+data:
+  adapter.py: |
+    """Load-balancing embedding adapter: round-robins across Ollama + multiple OpenAI-compat backends."""
+    import json, os, sys, threading
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+    from urllib.request import Request, urlopen
+
+    OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://ollama:11434")
+    OPENAI_BACKENDS = os.environ.get("OPENAI_BACKENDS", "")  # comma-separated URLs
+    OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "text-embedding-nomic-embed-text-v1.5")
+
+    backends = []
+    if OLLAMA_URL:
+        backends.append(("ollama", OLLAMA_URL))
+    for url in OPENAI_BACKENDS.split(","):
+        url = url.strip()
+        if url:
+            name = url.split("//")[-1].replace(":", "-").replace(".", "-")
+            backends.append(("openai:" + name, url))
+
+    counter_lock = threading.Lock()
+    request_counter = [0]
+
+    def call_ollama(texts, model):
+        payload = json.dumps({"model": model, "input": texts}).encode()
+        req = Request(f"{OLLAMA_URL}/api/embed", data=payload,
+                      headers={"Content-Type": "application/json"})
+        resp = urlopen(req, timeout=120)
+        data = json.loads(resp.read())
+        return data.get("embeddings", [])
+
+    def call_openai(url, texts):
+        payload = json.dumps({"model": OPENAI_MODEL, "input": texts}).encode()
+        req = Request(f"{url}/v1/embeddings", data=payload,
+                      headers={"Content-Type": "application/json"})
+        resp = urlopen(req, timeout=120)
+        data = json.loads(resp.read())
+        return [item["embedding"] for item in data.get("data", [])]
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length)) if length > 0 else {}
+            texts = body.get("texts", [])
+            model = body.get("model", "nomic-embed-text")
+
+            with counter_lock:
+                idx = request_counter[0] % len(backends) if backends else 0
+                request_counter[0] += 1
+
+            backend_name, backend_url = backends[idx] if backends else ("ollama", OLLAMA_URL)
+            errors = []
+
+            # Try primary backend, then fallback through all others
+            order = [idx] + [i for i in range(len(backends)) if i != idx]
+            for try_idx in order:
+                bname, burl = backends[try_idx]
+                try:
+                    if bname == "ollama":
+                        embeddings = call_ollama(texts, model)
+                    else:
+                        embeddings = call_openai(burl, texts)
+                    result = json.dumps({"embeddings": embeddings}).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(result)
+                    return
+                except Exception as e:
+                    errors.append(f"{bname}: {e}")
+
+            err = json.dumps({"error": "; ".join(errors)}).encode()
+            self.send_response(502)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(err)
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            info = {"status": "ok", "backends": [b[0] for b in backends],
+                    "requests_served": request_counter[0]}
+            self.wfile.write(json.dumps(info).encode())
+
+        def log_message(self, fmt, *args):
+            pass
+
+    if __name__ == "__main__":
+        port = int(os.environ.get("PORT", "8090"))
+        print(f"Embedding adapter on :{port} with {len(backends)} backends:", flush=True)
+        for name, url in backends:
+            print(f"  {name} -> {url}", flush=True)
+        HTTPServer(("0.0.0.0", port), Handler).serve_forever()
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: embedding-adapter
+  namespace: chronik-perf
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: embedding-adapter
+  template:
+    metadata:
+      labels:
+        app: embedding-adapter
+    spec:
+      containers:
+        - name: adapter
+          image: python:3.12-slim
+          command: ["python3", "/app/adapter.py"]
+          ports:
+            - containerPort: 8090
+          env:
+            - name: OLLAMA_URL
+              value: "http://ollama:11434"
+            - name: OPENAI_BACKENDS
+              value: "http://192.168.1.184:1234,http://192.168.1.6:11430"
+            - name: OPENAI_MODEL
+              value: "text-embedding-nomic-embed-text-v1.5"
+            - name: PORT
+              value: "8090"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+          volumeMounts:
+            - name: code
+              mountPath: /app
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8090
+            initialDelaySeconds: 2
+            periodSeconds: 5
+      volumes:
+        - name: code
+          configMap:
+            name: embedding-adapter-code
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: embedding-adapter
+  namespace: chronik-perf
+spec:
+  selector:
+    app: embedding-adapter
+  ports:
+    - port: 8090
+      targetPort: 8090
+  type: ClusterIP

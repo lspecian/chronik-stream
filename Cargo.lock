@@ -1884,6 +1884,7 @@ name = "chronik-query"
 version = "2.2.25"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum 0.6.20",
  "bytes",
  "chronik-common",
@@ -1893,6 +1894,7 @@ dependencies = [
  "prometheus",
  "serde",
  "serde_json",
+ "tantivy",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -2023,6 +2025,7 @@ dependencies = [
  "slog-stdlog",
  "socket2 0.5.10",
  "tabled",
+ "tantivy",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",

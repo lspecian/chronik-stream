@@ -1,0 +1,25 @@
+apiVersion: k6.io/v1alpha1
+kind: TestRun
+metadata:
+  name: k6-chronik-query
+  namespace: chronik-perf
+spec:
+  parallelism: 4
+  script:
+    configMap:
+      name: k6-query-test-script
+      file: query-test.js
+  runner:
+    image: grafana/k6:0.49.0
+    resources:
+      requests:
+        cpu: "1"
+        memory: "512Mi"
+      limits:
+        cpu: "4"
+        memory: "2Gi"
+    env:
+      - name: CHRONIK_URL
+        value: "http://chronik-query.chronik-perf.svc.cluster.local:6092"
+      - name: TOPIC
+        value: "query-bench"

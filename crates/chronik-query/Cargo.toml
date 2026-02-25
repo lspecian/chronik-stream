@@ -10,8 +10,11 @@ chronik-common = { path = "../chronik-common" }
 chronik-storage = { path = "../chronik-storage" }
 
 # Async runtime
-tokio = { workspace = true, features = ["fs", "sync"] }
+tokio = { workspace = true, features = ["fs", "sync", "time"] }
 tokio-stream = { workspace = true }
+
+# Async traits
+async-trait = { workspace = true }
 
 # API framework
 axum = { workspace = true }
@@ -23,6 +26,9 @@ tower-http = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 bytes = { workspace = true }
+
+# Search
+tantivy = { workspace = true }
 
 # Utils
 uuid = { workspace = true }
@@ -37,5 +43,6 @@ tracing = { workspace = true }
 prometheus = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 tokio-test = "0.4"
 tempfile = { workspace = true }

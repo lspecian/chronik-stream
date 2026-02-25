@@ -1,0 +1,44 @@
+apiVersion: chronik.io/v1alpha1
+kind: ChronikStandalone
+metadata:
+  name: chronik-query-bench
+  namespace: chronik-perf
+spec:
+  image: chronik-server:phase9-openai
+  imagePullPolicy: Never
+  kafkaPort: 9092
+  unifiedApiPort: 6092
+  walProfile: high
+  produceProfile: high-throughput
+  logLevel: info
+  resources:
+    requests:
+      cpu: "4"
+      memory: "16Gi"
+    limits:
+      cpu: "32"
+      memory: "64Gi"
+  storage:
+    size: 100Gi
+    storageClass: standard
+  serviceType: ClusterIP
+  env:
+    - name: CHRONIK_DEFAULT_SEARCHABLE
+      value: "true"
+    - name: CHRONIK_DEFAULT_VECTOR_ENABLED
+      value: "true"
+    - name: CHRONIK_UNIFIED_API_PORT
+      value: "6092"
+    - name: CHRONIK_EMBEDDING_ENABLED
+      value: "true"
+    - name: CHRONIK_EMBEDDING_PROVIDER
+      value: "openai"
+    - name: CHRONIK_EMBEDDING_MODEL
+      value: "text-embedding-3-small"
+    - name: CHRONIK_EMBEDDING_DIMENSIONS
+      value: "1536"
+    - name: OPENAI_API_KEY
+      valueFrom:
+        secretKeyRef:
+          name: chronik-secrets
+          key: openai-api-key

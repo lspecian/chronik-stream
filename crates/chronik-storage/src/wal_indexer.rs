@@ -409,6 +409,14 @@ impl WalIndexer {
     }
 
     /// Start the background indexing task
+    ///
+    /// CRITICAL v2.4.0: This method returns immediately and does NOT block on
+    /// loading segment indexes or vector indexes from disk. All heavy I/O
+    /// (segment index deserialization, HNSW index rebuild) is deferred to the
+    /// background task's warm-up phase. This ensures the server can bind to
+    /// Kafka and HTTP ports within seconds, even with hundreds of thousands of
+    /// messages in the WAL. Without this, liveness probes in k8s kill the pod
+    /// before it finishes loading large HNSW indexes.
     #[instrument(skip(self))]
     pub async fn start(&self) -> Result<()> {
         let mut running = self.running.write().await;
@@ -419,32 +427,10 @@ impl WalIndexer {
         *running = true;
         drop(running);
 
-        // Load segment index from disk if persistence is configured
-        if let Err(e) = self.segment_index.load().await {
-            warn!(error = %e, "Failed to load segment index, starting with empty index");
-        }
-
-        // v2.2.22: Load vector indexes from disk
-        match self.vector_index_manager.load_all_indexes().await {
-            Ok(count) => {
-                if count > 0 {
-                    info!(loaded = count, "Loaded vector indexes from disk");
-                }
-            }
-            Err(e) => {
-                warn!(error = %e, "Failed to load vector indexes, starting with empty indexes");
-            }
-        }
-
-        // v2.2.22: Start vector index snapshot task
-        let snapshot_interval = self.config.snapshot_interval_secs();
-        if snapshot_interval > 0 {
-            self.vector_index_manager.start_snapshot_task(snapshot_interval);
-        }
-
         info!(
             interval_secs = self.config.interval_secs,
-            "Starting WAL indexer background task on dedicated runtime"
+            "Starting WAL indexer background task on dedicated runtime \
+             (index loading deferred to background warm-up)"
         );
 
         let config = self.config.clone();
@@ -457,10 +443,49 @@ impl WalIndexer {
         let running = Arc::clone(&self.running);
         let runtime = Arc::clone(&self.runtime);
         let vector_index_manager = Arc::clone(&self.vector_index_manager);
+        let snapshot_interval = self.config.snapshot_interval_secs();
 
         // CRITICAL v2.2.10: Spawn on dedicated runtime, NOT main runtime
         // This guarantees accept loop can never be starved by indexing work
+        //
+        // v2.4.0: Segment index + vector index loading moved INTO this spawn
+        // block so server startup is never blocked by disk I/O or HNSW rebuild
         runtime.spawn(async move {
+            // === Warm-up phase: load persisted state from disk ===
+            // This runs in the background while the server is already accepting
+            // Kafka connections and HTTP requests on port 6092.
+            let warmup_start = std::time::Instant::now();
+            info!("WAL indexer warm-up: loading persisted indexes from disk...");
+
+            // Load segment index from disk if persistence is configured
+            if let Err(e) = segment_index.load().await {
+                warn!(error = %e, "Failed to load segment index, starting with empty index");
+            }
+
+            // v2.2.22: Load vector indexes from disk (includes HNSW rebuild)
+            match vector_index_manager.load_all_indexes().await {
+                Ok(count) => {
+                    if count > 0 {
+                        info!(loaded = count, "Loaded vector indexes from disk");
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "Failed to load vector indexes, starting with empty indexes");
+                }
+            }
+
+            // v2.2.22: Start vector index snapshot task
+            if snapshot_interval > 0 {
+                vector_index_manager.start_snapshot_task(snapshot_interval);
+            }
+
+            let warmup_elapsed = warmup_start.elapsed();
+            info!(
+                duration_ms = warmup_elapsed.as_millis() as u64,
+                "WAL indexer warm-up complete, entering periodic indexing loop"
+            );
+
+            // === Periodic indexing loop ===
             let mut interval_timer = interval(Duration::from_secs(config.interval_secs));
 
             loop {

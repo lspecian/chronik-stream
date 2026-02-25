@@ -1,0 +1,29 @@
+apiVersion: k6.io/v1alpha1
+kind: TestRun
+metadata:
+  name: k6-vector-search
+  namespace: chronik-perf
+spec:
+  parallelism: 4
+  script:
+    configMap:
+      name: k6-full-query-script
+      file: full-query-test.js
+  runner:
+    image: grafana/k6:0.49.0
+    resources:
+      requests:
+        cpu: "2"
+        memory: "1Gi"
+      limits:
+        cpu: "8"
+        memory: "4Gi"
+    env:
+      - name: CHRONIK_URL
+        value: "http://chronik-query.chronik-perf.svc.cluster.local:6092"
+      - name: TEXT_TOPIC
+        value: "query-bench"
+      - name: VECTOR_TOPIC
+        value: "query-bench-vector"
+      - name: TEST_MODE
+        value: "vector"

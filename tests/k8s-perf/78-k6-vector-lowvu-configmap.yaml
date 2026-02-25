@@ -1,0 +1,101 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k6-vector-lowvu-script
+  namespace: chronik-perf
+data:
+  vector-lowvu-test.js: |
+    import http from 'k6/http';
+    import { check, sleep } from 'k6';
+    import { Rate, Trend, Counter } from 'k6/metrics';
+
+    const vectorErrors = new Rate('vector_errors');
+    const vectorLatency = new Trend('vector_latency', true);
+    const vectorCompleted = new Counter('vector_completed');
+
+    const BASE_URL = __ENV.CHRONIK_URL || 'http://chronik-query.chronik-perf.svc.cluster.local:6092';
+    const VECTOR_TOPIC = __ENV.VECTOR_TOPIC || 'query-bench-vector';
+    const TEST_TYPE = __ENV.TEST_TYPE || 'vector';
+
+    export const options = (() => {
+      switch (TEST_TYPE) {
+        case 'vector':
+          return {
+            stages: [
+              { duration: '15s', target: 5 },
+              { duration: '30s', target: 15 },
+              { duration: '1m',  target: 30 },
+              { duration: '1m',  target: 50 },
+              { duration: '30s', target: 30 },
+              { duration: '15s', target: 0 },
+            ],
+            thresholds: { vector_errors: ['rate<0.10'] },
+          };
+        case 'hybrid':
+          return {
+            stages: [
+              { duration: '15s', target: 5 },
+              { duration: '30s', target: 15 },
+              { duration: '1m',  target: 30 },
+              { duration: '1m',  target: 50 },
+              { duration: '30s', target: 30 },
+              { duration: '15s', target: 0 },
+            ],
+            thresholds: { vector_errors: ['rate<0.10'] },
+          };
+        default:
+          return {
+            stages: [
+              { duration: '15s', target: 5 },
+              { duration: '30s', target: 10 },
+              { duration: '1m',  target: 20 },
+              { duration: '1m',  target: 30 },
+              { duration: '30s', target: 10 },
+              { duration: '15s', target: 0 },
+            ],
+            thresholds: { vector_errors: ['rate<0.10'] },
+          };
+      }
+    })();
+
+    const queries = [
+      'encryption', 'Kubernetes', 'pricing', 'timeout', 'PostgreSQL',
+      'monitoring', 'deployment', 'firewall', 'API', 'backup',
+      'connection timeout error', 'auto scaling configuration',
+      'load balancer setup', 'database connection pool',
+      'TLS certificate renewal', 'budget alert threshold',
+      'container deployment rollback', 'GPU instance types',
+      'rate limit exceeded', 'VPC subnet configuration',
+      'how to fix 502 error', 'configure auto scaling group',
+      'set up monitoring dashboard', 'enable encryption at rest',
+      'troubleshoot memory leak', 'optimize query performance',
+    ];
+
+    const headers = { 'Content-Type': 'application/json' };
+
+    export default function () {
+      const q = queries[Math.floor(Math.random() * queries.length)];
+      const k = Math.random() < 0.7 ? 5 : 10;
+
+      let res;
+      if (TEST_TYPE === 'hybrid') {
+        const vw = 0.5 + Math.random() * 0.4;
+        res = http.post(
+          `${BASE_URL}/_vector/${VECTOR_TOPIC}/hybrid`,
+          JSON.stringify({ query: q, k: k, vector_weight: vw, text_weight: 1.0 - vw }),
+          { headers, timeout: '30s' }
+        );
+      } else {
+        res = http.post(
+          `${BASE_URL}/_vector/${VECTOR_TOPIC}/search`,
+          JSON.stringify({ query: q, k: k }),
+          { headers, timeout: '30s' }
+        );
+      }
+
+      const ok = check(res, { 'status 200': (r) => r.status === 200 });
+      vectorErrors.add(!ok);
+      vectorLatency.add(res.timings.duration);
+      if (ok) vectorCompleted.add(1);
+      sleep(0.05);
+    }

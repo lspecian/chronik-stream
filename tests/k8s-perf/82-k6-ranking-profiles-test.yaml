@@ -1,0 +1,25 @@
+apiVersion: k6.io/v1alpha1
+kind: TestRun
+metadata:
+  name: k6-ranking-profiles
+  namespace: chronik-perf
+spec:
+  parallelism: 4
+  script:
+    configMap:
+      name: k6-ranking-profiles-script
+      file: ranking-profiles-test.js
+  runner:
+    image: grafana/k6:0.49.0
+    resources:
+      requests:
+        cpu: "2"
+        memory: "1Gi"
+      limits:
+        cpu: "8"
+        memory: "4Gi"
+    env:
+      - name: CHRONIK_URL
+        value: "http://chronik-query.chronik-perf.svc.cluster.local:6092"
+      - name: TEXT_TOPIC
+        value: "query-bench"

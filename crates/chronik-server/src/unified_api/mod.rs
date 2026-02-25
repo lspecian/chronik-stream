@@ -21,6 +21,7 @@
 pub mod sql_handler;
 pub mod vector_handler;
 pub mod admin_handler;
+pub mod query_handler;
 #[cfg(feature = "search")]
 pub mod search_handler;
 
@@ -130,6 +131,13 @@ pub struct UnifiedApiState {
     pub hot_buffer_config: HotBufferConfig,
     /// v2.2.23: Hot data buffer for sub-second SQL queries
     pub hot_buffer: Option<Arc<HotDataBuffer>>,
+    /// v2.4.0: SearchApi for full-text search via query orchestrator
+    #[cfg(feature = "search")]
+    pub search_api: Option<Arc<chronik_search::SearchApi>>,
+    /// v2.4.0: Shared profile store for ranking profiles (across all requests)
+    pub profile_store: Arc<chronik_query::profiles::ProfileStore>,
+    /// v2.4.0: Shared feature logger for query training data
+    pub feature_logger: Arc<chronik_query::features::FeatureLogger>,
 }
 
 impl UnifiedApiState {
@@ -147,6 +155,10 @@ impl UnifiedApiState {
             wal_manager: None,
             hot_buffer_config: HotBufferConfig::default(),
             hot_buffer: None,
+            #[cfg(feature = "search")]
+            search_api: None,
+            profile_store: Arc::new(chronik_query::profiles::ProfileStore::new()),
+            feature_logger: Arc::new(chronik_query::features::FeatureLogger::new()),
         }
     }
 
@@ -189,6 +201,16 @@ impl UnifiedApiState {
     /// directly from WAL before it's written to Parquet files.
     pub fn with_hot_buffer(mut self, buffer: Arc<HotDataBuffer>) -> Self {
         self.hot_buffer = Some(buffer);
+        self
+    }
+
+    /// v2.4.0: Set the SearchApi for full-text search
+    ///
+    /// When set, the query orchestrator's `execute_text()` will search
+    /// Tantivy indices (both in-memory and WAL-created) for matching documents.
+    #[cfg(feature = "search")]
+    pub fn with_search_api(mut self, api: Arc<chronik_search::SearchApi>) -> Self {
+        self.search_api = Some(api);
         self
     }
 }
@@ -248,7 +270,13 @@ pub fn create_router_full(
             .route("/_vector/topics", get(vector_handler::list_topics));
     }
 
-    // Add shared state for SQL/Vector endpoints
+    // Unified query endpoint (always enabled — orchestrates across all backends)
+    router = router
+        .route("/_query", post(query_handler::handle_query))
+        .route("/_query/capabilities", get(query_handler::handle_capabilities))
+        .route("/_query/profiles", get(query_handler::handle_profiles));
+
+    // Add shared state for SQL/Vector/Query endpoints
     let mut router = router.with_state(state);
 
     // Merge search router if provided
@@ -446,6 +474,7 @@ pub async fn start_unified_api_full(
     let addr: std::net::SocketAddr = format!("{}:{}", bind_addr, port).parse()?;
 
     info!("Starting Unified API HTTP server on {}", addr);
+    info!("  Query endpoints:  /_query, /_query/capabilities, /_query/profiles");
     info!("  SQL endpoints:    /_sql, /_sql/explain, /_sql/tables");
     info!("  Vector endpoints: /_vector/:topic/search, /_vector/:topic/stats, /_vector/:topic/hybrid");
     if search_enabled {
@@ -456,6 +485,58 @@ pub async fn start_unified_api_full(
         info!("  Schema Registry:  /subjects/*, /schemas/ids/*, /config/*");
     }
     info!("  Health endpoint:  /health");
+
+    let handle = tokio::spawn(async move {
+        if let Err(e) = axum::Server::bind(&addr)
+            .serve(app.into_make_service())
+            .await
+        {
+            tracing::error!("Unified API server error: {}", e);
+        }
+    });
+
+    Ok(handle)
+}
+
+/// Start the unified API HTTP server with a pre-built state.
+///
+/// Use this when you need to configure the state manually (e.g., to inject
+/// the SearchApi for the query orchestrator's text search).
+pub async fn start_unified_api_with_state(
+    state: UnifiedApiState,
+    search_router: Option<Router>,
+    admin_router: Option<Router>,
+) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+    let port = std::env::var("CHRONIK_UNIFIED_API_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(state.config.port);
+
+    let bind_addr = std::env::var("CHRONIK_UNIFIED_API_BIND")
+        .unwrap_or_else(|_| state.config.bind_addr.clone());
+
+    let search_enabled = search_router.is_some();
+    let admin_enabled = admin_router.is_some();
+
+    info!("Starting Unified API HTTP server on {}:{}", bind_addr, port);
+    info!("  Query endpoints:  /_query, /_query/capabilities, /_query/profiles");
+    if state.query_engine.is_some() {
+        info!("  SQL endpoints:    /_sql, /_sql/explain, /_sql/tables");
+    }
+    if state.vector_index_manager.is_some() {
+        info!("  Vector endpoints: /_vector/:topic/search, /_vector/:topic/stats, /_vector/:topic/hybrid");
+    }
+    if search_enabled {
+        info!("  Search endpoints: /_search, /:index/_search, /:index/_doc/:id");
+    }
+    if admin_enabled {
+        info!("  Admin endpoints:  /admin/status, /admin/add-node, /admin/remove-node");
+        info!("  Schema Registry:  /subjects/*, /schemas/ids/*, /config/*");
+    }
+    info!("  Health endpoint:  /health");
+
+    let app = create_router_full(state, search_router, admin_router);
+    let addr: std::net::SocketAddr = format!("{}:{}", bind_addr, port).parse()?;
 
     let handle = tokio::spawn(async move {
         if let Err(e) = axum::Server::bind(&addr)

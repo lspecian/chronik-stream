@@ -1,0 +1,166 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k6-full-query-script
+  namespace: chronik-perf
+data:
+  full-query-test.js: |
+    import http from 'k6/http';
+    import { check, sleep } from 'k6';
+    import { Rate, Trend, Counter } from 'k6/metrics';
+
+    const textErrors = new Rate('text_errors');
+    const textLatency = new Trend('text_latency', true);
+    const textCompleted = new Counter('text_completed');
+    const vectorErrors = new Rate('vector_errors');
+    const vectorLatency = new Trend('vector_latency', true);
+    const vectorCompleted = new Counter('vector_completed');
+    const hybridErrors = new Rate('hybrid_errors');
+    const hybridLatency = new Trend('hybrid_latency', true);
+    const hybridCompleted = new Counter('hybrid_completed');
+    const totalErrors = new Rate('total_errors');
+    const totalLatency = new Trend('total_latency', true);
+    const totalCompleted = new Counter('total_completed');
+
+    const BASE_URL = __ENV.CHRONIK_URL || 'http://chronik-query.chronik-perf.svc.cluster.local:6092';
+    const TEXT_TOPIC = __ENV.TEXT_TOPIC || 'query-bench';
+    const VECTOR_TOPIC = __ENV.VECTOR_TOPIC || 'query-bench-vector';
+    const TEST_MODE = __ENV.TEST_MODE || 'mixed';
+
+    export const options = (() => {
+      switch (TEST_MODE) {
+        case 'text-ceiling':
+          return {
+            stages: [
+              { duration: '15s', target: 100 },
+              { duration: '30s', target: 500 },
+              { duration: '1m',  target: 1000 },
+              { duration: '1m',  target: 2000 },
+              { duration: '1m',  target: 2000 },
+              { duration: '30s', target: 500 },
+              { duration: '15s', target: 0 },
+            ],
+            thresholds: { text_errors: ['rate<0.10'] },
+          };
+        case 'vector':
+          return {
+            stages: [
+              { duration: '15s', target: 10 },
+              { duration: '30s', target: 50 },
+              { duration: '1m',  target: 200 },
+              { duration: '1m',  target: 500 },
+              { duration: '30s', target: 200 },
+              { duration: '15s', target: 0 },
+            ],
+            thresholds: { vector_errors: ['rate<0.10'] },
+          };
+        case 'hybrid':
+          return {
+            stages: [
+              { duration: '15s', target: 10 },
+              { duration: '30s', target: 50 },
+              { duration: '1m',  target: 200 },
+              { duration: '1m',  target: 500 },
+              { duration: '30s', target: 200 },
+              { duration: '15s', target: 0 },
+            ],
+            thresholds: { hybrid_errors: ['rate<0.10'] },
+          };
+        default:
+          return {
+            stages: [
+              { duration: '15s', target: 20 },
+              { duration: '30s', target: 100 },
+              { duration: '1m',  target: 500 },
+              { duration: '1m',  target: 1000 },
+              { duration: '30s', target: 500 },
+              { duration: '15s', target: 0 },
+            ],
+            thresholds: { total_errors: ['rate<0.10'] },
+          };
+      }
+    })();
+
+    const queries = [
+      'encryption', 'Kubernetes', 'pricing', 'timeout', 'PostgreSQL',
+      'monitoring', 'deployment', 'firewall', 'API', 'backup',
+      'connection timeout error', 'auto scaling configuration',
+      'load balancer setup', 'database connection pool',
+      'TLS certificate renewal', 'budget alert threshold',
+      'container deployment rollback', 'GPU instance types',
+      'rate limit exceeded', 'VPC subnet configuration',
+      'how to fix 502 error', 'configure auto scaling group',
+      'set up monitoring dashboard', 'enable encryption at rest',
+      'troubleshoot memory leak', 'optimize query performance',
+      'Kubernetes pod scheduling', 'S3 object replication',
+      'OAuth2 authentication flow', 'Terraform infrastructure code',
+      'AES-256 FIPS 140-2 HSM', 'PyTorch TensorFlow training GPU',
+      'SOC2 ISO-27001 HIPAA compliance', 'gRPC REST GraphQL versioning',
+    ];
+
+    const profiles = ['relevance', 'freshness', 'default'];
+    const headers = { 'Content-Type': 'application/json' };
+
+    function textSearch() {
+      const q = queries[Math.floor(Math.random() * queries.length)];
+      const profile = profiles[Math.floor(Math.random() * profiles.length)];
+      const k = Math.random() < 0.7 ? 5 : (Math.random() < 0.5 ? 10 : 20);
+      const payload = JSON.stringify({
+        sources: [{ topic: TEXT_TOPIC, modes: ['text'] }],
+        q: { text: q }, k: k,
+        rank: { profile: profile },
+        result_format: 'merged',
+      });
+      const res = http.post(`${BASE_URL}/_query`, payload, { headers, timeout: '10s' });
+      const ok = check(res, { 'text 200': (r) => r.status === 200 });
+      textErrors.add(!ok); textLatency.add(res.timings.duration);
+      if (ok) textCompleted.add(1);
+      totalErrors.add(!ok); totalLatency.add(res.timings.duration);
+      if (ok) totalCompleted.add(1);
+    }
+
+    function vectorSearch() {
+      const q = queries[Math.floor(Math.random() * queries.length)];
+      const k = Math.random() < 0.7 ? 5 : 10;
+      const res = http.post(
+        `${BASE_URL}/_vector/${VECTOR_TOPIC}/search`,
+        JSON.stringify({ query: q, k: k }),
+        { headers, timeout: '30s' }
+      );
+      const ok = check(res, { 'vector 200': (r) => r.status === 200 });
+      vectorErrors.add(!ok); vectorLatency.add(res.timings.duration);
+      if (ok) vectorCompleted.add(1);
+      totalErrors.add(!ok); totalLatency.add(res.timings.duration);
+      if (ok) totalCompleted.add(1);
+    }
+
+    function hybridSearch() {
+      const q = queries[Math.floor(Math.random() * queries.length)];
+      const k = Math.random() < 0.7 ? 5 : 10;
+      const vw = 0.5 + Math.random() * 0.4;
+      const res = http.post(
+        `${BASE_URL}/_vector/${VECTOR_TOPIC}/hybrid`,
+        JSON.stringify({ query: q, k: k, vector_weight: vw, text_weight: 1.0 - vw }),
+        { headers, timeout: '30s' }
+      );
+      const ok = check(res, { 'hybrid 200': (r) => r.status === 200 });
+      hybridErrors.add(!ok); hybridLatency.add(res.timings.duration);
+      if (ok) hybridCompleted.add(1);
+      totalErrors.add(!ok); totalLatency.add(res.timings.duration);
+      if (ok) totalCompleted.add(1);
+    }
+
+    export default function () {
+      switch (TEST_MODE) {
+        case 'text-ceiling': textSearch(); break;
+        case 'vector': vectorSearch(); break;
+        case 'hybrid': hybridSearch(); break;
+        default:
+          const r = Math.random();
+          if (r < 0.6) textSearch();
+          else if (r < 0.8) vectorSearch();
+          else hybridSearch();
+          break;
+      }
+      sleep(0.01);
+    }

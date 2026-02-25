@@ -25,10 +25,13 @@ chronik-config = { path = "../chronik-config" }  # Required for cluster configur
 chronik-columnar = { path = "../chronik-columnar" }
 chronik-embeddings = { path = "../chronik-embeddings" }
 
+# Query orchestration (Phase 9)
+chronik-query = { path = "../chronik-query" }
+
 # Optional components (feature-gated)
 chronik-search = { path = "../chronik-search", optional = true }
-chronik-query = { path = "../chronik-query", optional = true }
 chronik-backup = { path = "../chronik-backup", optional = true }
+tantivy = { workspace = true, optional = true }  # Used by query_handler for text search
 
 # Raft consensus (v2.2.7 - metadata coordination only, NOT data replication)
 chronik-raft = { path = "../chronik-raft" }
@@ -99,7 +102,7 @@ tabled = "0.15"
 
 [features]
 default = ["search", "backup"]
-search = ["dep:chronik-search", "dep:chronik-query"]
+search = ["dep:chronik-search", "dep:tantivy"]
 backup = ["dep:chronik-backup"]
 full = ["search", "backup"]
 

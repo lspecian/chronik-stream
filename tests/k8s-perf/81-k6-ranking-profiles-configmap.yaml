@@ -1,0 +1,101 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k6-ranking-profiles-script
+  namespace: chronik-perf
+data:
+  ranking-profiles-test.js: |
+    import http from 'k6/http';
+    import { check, sleep } from 'k6';
+    import { Rate, Trend, Counter } from 'k6/metrics';
+
+    const relevanceErrors = new Rate('relevance_errors');
+    const relevanceLatency = new Trend('relevance_latency', true);
+    const relevanceCompleted = new Counter('relevance_completed');
+    const freshnessErrors = new Rate('freshness_errors');
+    const freshnessLatency = new Trend('freshness_latency', true);
+    const freshnessCompleted = new Counter('freshness_completed');
+    const defaultErrors = new Rate('default_errors');
+    const defaultLatency = new Trend('default_latency', true);
+    const defaultCompleted = new Counter('default_completed');
+    const totalErrors = new Rate('total_errors');
+    const totalLatency = new Trend('total_latency', true);
+
+    const BASE_URL = __ENV.CHRONIK_URL || 'http://chronik-query.chronik-perf.svc.cluster.local:6092';
+    const TOPIC = __ENV.TEXT_TOPIC || 'query-bench';
+
+    export const options = {
+      stages: [
+        { duration: '10s', target: 50 },
+        { duration: '30s', target: 200 },
+        { duration: '1m',  target: 500 },
+        { duration: '1m',  target: 500 },
+        { duration: '30s', target: 200 },
+        { duration: '10s', target: 0 },
+      ],
+      thresholds: {
+        total_errors: ['rate<0.05'],
+      },
+    };
+
+    const queries = [
+      'encryption', 'Kubernetes', 'pricing', 'timeout', 'PostgreSQL',
+      'monitoring', 'deployment', 'firewall', 'API', 'backup',
+      'connection timeout error', 'auto scaling configuration',
+      'load balancer setup', 'database connection pool',
+      'TLS certificate renewal', 'budget alert threshold',
+      'container deployment rollback', 'GPU instance types',
+      'how to fix 502 error', 'configure auto scaling group',
+      'set up monitoring dashboard', 'enable encryption at rest',
+      'troubleshoot memory leak', 'optimize query performance',
+    ];
+
+    const headers = { 'Content-Type': 'application/json' };
+
+    function queryWithProfile(profile) {
+      const q = queries[Math.floor(Math.random() * queries.length)];
+      const k = Math.random() < 0.7 ? 5 : 10;
+      const payload = JSON.stringify({
+        sources: [{ topic: TOPIC, modes: ['text'] }],
+        q: { text: q }, k: k,
+        rank: { profile: profile },
+        result_format: 'merged',
+      });
+      return http.post(`${BASE_URL}/_query`, payload, { headers, timeout: '10s' });
+    }
+
+    export default function () {
+      const r = Math.random();
+      let profile, res;
+
+      if (r < 0.34) {
+        profile = 'relevance';
+        res = queryWithProfile('relevance');
+        const ok = check(res, { 'relevance 200': (r) => r.status === 200 });
+        relevanceErrors.add(!ok);
+        relevanceLatency.add(res.timings.duration);
+        if (ok) relevanceCompleted.add(1);
+        totalErrors.add(!ok);
+        totalLatency.add(res.timings.duration);
+      } else if (r < 0.67) {
+        profile = 'freshness';
+        res = queryWithProfile('freshness');
+        const ok = check(res, { 'freshness 200': (r) => r.status === 200 });
+        freshnessErrors.add(!ok);
+        freshnessLatency.add(res.timings.duration);
+        if (ok) freshnessCompleted.add(1);
+        totalErrors.add(!ok);
+        totalLatency.add(res.timings.duration);
+      } else {
+        profile = 'default';
+        res = queryWithProfile('default');
+        const ok = check(res, { 'default 200': (r) => r.status === 200 });
+        defaultErrors.add(!ok);
+        defaultLatency.add(res.timings.duration);
+        if (ok) defaultCompleted.add(1);
+        totalErrors.add(!ok);
+        totalLatency.add(res.timings.duration);
+      }
+
+      sleep(0.01);
+    }

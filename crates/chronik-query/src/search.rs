@@ -191,7 +191,7 @@ impl SearchEngine {
         
         // Sort by score (descending) and timestamp (descending)
         all_hits.sort_by(|a, b| {
-            b.score.partial_cmp(&a.score).unwrap()
+            b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| b.timestamp.cmp(&a.timestamp))
         });
         
