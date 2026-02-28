@@ -571,6 +571,41 @@ fn try_create_embedding_provider() -> Option<Arc<dyn chronik_embeddings::Embeddi
     }
 }
 
+/// Create the query embedding cache if enabled (SV-1).
+///
+/// Reads configuration from environment variables:
+/// - `CHRONIK_EMBEDDING_CACHE_ENABLED` (default: `true`)
+/// - `CHRONIK_EMBEDDING_CACHE_MAX_ENTRIES` (default: `10000`)
+/// - `CHRONIK_EMBEDDING_CACHE_TTL_SECS` (default: `3600`)
+fn try_create_embedding_cache() -> Option<Arc<chronik_columnar::QueryEmbeddingCache>> {
+    let enabled = std::env::var("CHRONIK_EMBEDDING_CACHE_ENABLED")
+        .map(|v| v.to_lowercase() != "false" && v != "0")
+        .unwrap_or(true);
+
+    if !enabled {
+        info!("Embedding cache disabled via CHRONIK_EMBEDDING_CACHE_ENABLED=false");
+        return None;
+    }
+
+    let max_entries = std::env::var("CHRONIK_EMBEDDING_CACHE_MAX_ENTRIES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10_000);
+
+    let ttl_secs = std::env::var("CHRONIK_EMBEDDING_CACHE_TTL_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3600u64);
+
+    let cache = Arc::new(chronik_columnar::QueryEmbeddingCache::new(
+        max_entries,
+        std::time::Duration::from_secs(ttl_secs),
+    ));
+
+    info!("✓ Embedding cache initialized (max_entries={}, ttl={}s)", max_entries, ttl_secs);
+    Some(cache)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -817,12 +852,16 @@ async fn run_cluster_mode(
         unified_api_config.clone(),
     )
     .with_query_engine(columnar_query_engine)
-    .with_vector_index_manager(vector_index_manager);
+    .with_vector_index_manager(vector_index_manager)
+    .with_wal_indexer(wal_indexer.clone());
     if let Some(provider) = try_create_embedding_provider() {
         unified_state = unified_state.with_embedding_provider(provider);
     }
     if let Some(hb) = hot_buffer {
         unified_state = unified_state.with_hot_buffer(hb);
+    }
+    if let Some(cache) = try_create_embedding_cache() {
+        unified_state = unified_state.with_embedding_cache(cache);
     }
     // v2.4.0: Wire SearchApi into state for query orchestrator text search
     #[cfg(feature = "search")]
@@ -1004,13 +1043,17 @@ async fn run_single_node_mode(
         )
         .with_query_engine(columnar_query_engine)
         .with_vector_index_manager(vector_index_manager)
-        .with_wal_manager(wal_indexer.wal_manager().clone());
+        .with_wal_manager(wal_indexer.wal_manager().clone())
+        .with_wal_indexer(wal_indexer.clone());
 
         if let Some(provider) = try_create_embedding_provider() {
             unified_state = unified_state.with_embedding_provider(provider);
         }
         if let Some(hb) = hot_buffer {
             unified_state = unified_state.with_hot_buffer(hb);
+        }
+        if let Some(cache) = try_create_embedding_cache() {
+            unified_state = unified_state.with_embedding_cache(cache);
         }
         #[cfg(feature = "search")]
         if let Some(api) = search_api_ref {

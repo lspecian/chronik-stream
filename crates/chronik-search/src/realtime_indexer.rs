@@ -859,15 +859,20 @@ mod tests {
             sender.send(doc).await.unwrap();
         }
         
-        // Wait for processing
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        
+        // Wait for async processing with retry
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if indexer.metrics().documents_indexed >= 20 {
+                break;
+            }
+        }
+
         // Check metrics
         let metrics = indexer.metrics();
         assert_eq!(metrics.documents_indexed, 20);
         assert_eq!(metrics.documents_failed, 0);
         assert!(metrics.bytes_indexed > 0);
-        
+
         // Stop indexer
         indexer.stop().await.unwrap();
         drop(sender);
@@ -912,13 +917,18 @@ mod tests {
         };
         
         sender.send(doc1).await.unwrap();
-        
-        // Wait and check
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        
+
+        // Wait for async processing with retry
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if indexer.metrics().documents_indexed >= 1 {
+                break;
+            }
+        }
+
         let metrics = indexer.metrics();
         assert_eq!(metrics.documents_indexed, 1);
-        
+
         indexer.stop().await.unwrap();
         drop(sender);
         

@@ -1,0 +1,231 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k6-thunderbird-vector-script
+  namespace: chronik-perf
+data:
+  thunderbird-vector-test.js: |
+    import http from 'k6/http';
+    import { check, sleep } from 'k6';
+    import { Rate, Trend, Counter } from 'k6/metrics';
+
+    const vectorErrors = new Rate('vector_errors');
+    const vectorLatency = new Trend('vector_latency', true);
+    const vectorCompleted = new Counter('vector_completed');
+    const hybridErrors = new Rate('hybrid_errors');
+    const hybridLatency = new Trend('hybrid_latency', true);
+    const hybridCompleted = new Counter('hybrid_completed');
+    const textErrors = new Rate('text_errors');
+    const textLatency = new Trend('text_latency', true);
+    const textCompleted = new Counter('text_completed');
+    const totalErrors = new Rate('total_errors');
+    const totalLatency = new Trend('total_latency', true);
+    const totalCompleted = new Counter('total_completed');
+    // Ranking profile comparison metrics
+    const rankDefaultLatency = new Trend('rank_default_latency', true);
+    const rankRelevanceLatency = new Trend('rank_relevance_latency', true);
+    const rankDefaultErrors = new Rate('rank_default_errors');
+    const rankRelevanceErrors = new Rate('rank_relevance_errors');
+
+    const BASE_URL = __ENV.CHRONIK_URL || 'http://chronik-thunderbird.chronik-perf.svc.cluster.local:6092';
+    const VECTOR_TOPIC = __ENV.VECTOR_TOPIC || 'thunderbird-vector';
+    const TEXT_TOPIC = __ENV.TEXT_TOPIC || 'thunderbird';
+    const TEST_MODE = __ENV.TEST_MODE || 'mixed';
+
+    export const options = (() => {
+      switch (TEST_MODE) {
+        case 'vector':
+          return {
+            stages: [
+              { duration: '10s', target: 20 },
+              { duration: '30s', target: 50 },
+              { duration: '1m',  target: 100 },
+              { duration: '1m',  target: 100 },
+              { duration: '30s', target: 50 },
+              { duration: '10s', target: 0 },
+            ],
+            thresholds: { vector_errors: ['rate<0.05'] },
+          };
+        case 'hybrid':
+          return {
+            stages: [
+              { duration: '10s', target: 20 },
+              { duration: '30s', target: 50 },
+              { duration: '1m',  target: 100 },
+              { duration: '1m',  target: 100 },
+              { duration: '30s', target: 50 },
+              { duration: '10s', target: 0 },
+            ],
+            thresholds: { hybrid_errors: ['rate<0.05'] },
+          };
+        default: // mixed: 40% vector, 30% text, 30% hybrid
+          return {
+            stages: [
+              { duration: '10s', target: 20 },
+              { duration: '30s', target: 50 },
+              { duration: '1m',  target: 100 },
+              { duration: '1m',  target: 200 },
+              { duration: '1m',  target: 200 },
+              { duration: '30s', target: 100 },
+              { duration: '10s', target: 0 },
+            ],
+            thresholds: { total_errors: ['rate<0.05'] },
+          };
+      }
+    })();
+
+    // Semantic queries based on Thunderbird supercomputer log content
+    const vectorQueries = [
+      'disk failure causing data loss',
+      'network connectivity between nodes',
+      'memory allocation kernel panic',
+      'process scheduling delay on supercomputer',
+      'hardware error correctable ECC memory',
+      'NTP synchronization failure',
+      'SSH authentication failure publickey',
+      'file system mount error',
+      'TFTP client connection timeout',
+      'system startup initialization sequence',
+      'InfiniBand fabric topology change',
+      'node power management shutdown',
+      'kernel module license taint',
+      'postfix mail delivery warning',
+      'rsync backup synchronization error',
+    ];
+
+    // Text search queries (for hybrid and text-only modes)
+    const textQueries = [
+      'error', 'warning', 'failure', 'timeout', 'kernel',
+      'network interface down', 'disk I/O error',
+      'postfix warning', 'kernel panic', 'sshd',
+      'ECC memory', 'CPU ticks', 'DIMM',
+    ];
+
+    const headers = { 'Content-Type': 'application/json' };
+
+    // Pre-flight: check vector index loading status
+    export function setup() {
+      console.log('Checking vector index stats...');
+      const statsRes = http.get(`${BASE_URL}/_vector/${VECTOR_TOPIC}/stats`, { headers });
+      if (statsRes.status === 200) {
+        const stats = JSON.parse(statsRes.body);
+        console.log(`Vector stats: total_vectors=${stats.total_vectors}, loading=${stats.loading}`);
+        if (stats.loading) {
+          console.warn('WARNING: Vector indexes still loading — results may be incomplete');
+        }
+      } else {
+        console.warn(`Vector stats check failed: ${statsRes.status}`);
+      }
+      return {};
+    }
+
+    function rankingComparison() {
+      const q = vectorQueries[Math.floor(Math.random() * vectorQueries.length)];
+      const k = 10;
+      // Query with default profile
+      const defaultPayload = JSON.stringify({
+        sources: [{ topic: VECTOR_TOPIC, modes: ['text', 'vector'] }],
+        q: { text: q },
+        k: k,
+        result_format: 'merged',
+      });
+      const defRes = http.post(`${BASE_URL}/_query`, defaultPayload, { headers, timeout: '30s' });
+      const defOk = check(defRes, { 'rank_default 200': (r) => r.status === 200 });
+      rankDefaultErrors.add(!defOk);
+      rankDefaultLatency.add(defRes.timings.duration);
+      totalErrors.add(!defOk);
+      totalLatency.add(defRes.timings.duration);
+      if (defOk) totalCompleted.add(1);
+
+      // Query with relevance profile
+      const relevancePayload = JSON.stringify({
+        sources: [{ topic: VECTOR_TOPIC, modes: ['text', 'vector'] }],
+        q: { text: q },
+        k: k,
+        rank: { profile: 'relevance' },
+        result_format: 'merged',
+      });
+      const relRes = http.post(`${BASE_URL}/_query`, relevancePayload, { headers, timeout: '30s' });
+      const relOk = check(relRes, { 'rank_relevance 200': (r) => r.status === 200 });
+      rankRelevanceErrors.add(!relOk);
+      rankRelevanceLatency.add(relRes.timings.duration);
+      totalErrors.add(!relOk);
+      totalLatency.add(relRes.timings.duration);
+      if (relOk) totalCompleted.add(1);
+    }
+
+    function vectorSearch() {
+      const q = vectorQueries[Math.floor(Math.random() * vectorQueries.length)];
+      const k = Math.random() < 0.7 ? 10 : 20;
+      const payload = JSON.stringify({
+        sources: [{ topic: VECTOR_TOPIC, modes: ['vector'] }],
+        q: { text: q },
+        k: k,
+        result_format: 'merged',
+      });
+      const res = http.post(`${BASE_URL}/_query`, payload, { headers, timeout: '30s' });
+      const ok = check(res, { 'vector 200': (r) => r.status === 200 });
+      vectorErrors.add(!ok);
+      vectorLatency.add(res.timings.duration);
+      if (ok) vectorCompleted.add(1);
+      totalErrors.add(!ok);
+      totalLatency.add(res.timings.duration);
+      if (ok) totalCompleted.add(1);
+    }
+
+    function hybridSearch() {
+      const q = vectorQueries[Math.floor(Math.random() * vectorQueries.length)];
+      const k = 10;
+      const payload = JSON.stringify({
+        sources: [{ topic: VECTOR_TOPIC, modes: ['text', 'vector'] }],
+        q: { text: q },
+        k: k,
+        rank: { profile: 'relevance' },
+        result_format: 'merged',
+      });
+      const res = http.post(`${BASE_URL}/_query`, payload, { headers, timeout: '30s' });
+      const ok = check(res, { 'hybrid 200': (r) => r.status === 200 });
+      hybridErrors.add(!ok);
+      hybridLatency.add(res.timings.duration);
+      if (ok) hybridCompleted.add(1);
+      totalErrors.add(!ok);
+      totalLatency.add(res.timings.duration);
+      if (ok) totalCompleted.add(1);
+    }
+
+    function textSearch() {
+      const q = textQueries[Math.floor(Math.random() * textQueries.length)];
+      const k = 10;
+      const payload = JSON.stringify({
+        sources: [{ topic: TEXT_TOPIC, modes: ['text'] }],
+        q: { text: q },
+        k: k,
+        rank: { profile: 'relevance' },
+        result_format: 'merged',
+      });
+      const res = http.post(`${BASE_URL}/_query`, payload, { headers, timeout: '10s' });
+      const ok = check(res, { 'text 200': (r) => r.status === 200 });
+      textErrors.add(!ok);
+      textLatency.add(res.timings.duration);
+      if (ok) textCompleted.add(1);
+      totalErrors.add(!ok);
+      totalLatency.add(res.timings.duration);
+      if (ok) totalCompleted.add(1);
+    }
+
+    export default function () {
+      switch (TEST_MODE) {
+        case 'vector': vectorSearch(); break;
+        case 'hybrid': hybridSearch(); break;
+        case 'text': textSearch(); break;
+        case 'ranking': rankingComparison(); break;
+        default: // mixed: 35% vector, 25% text, 25% hybrid, 15% ranking comparison
+          const r = Math.random();
+          if (r < 0.35) vectorSearch();
+          else if (r < 0.60) textSearch();
+          else if (r < 0.85) hybridSearch();
+          else rankingComparison();
+          break;
+      }
+      sleep(0.05);
+    }

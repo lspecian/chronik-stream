@@ -1,7 +1,7 @@
 # Optimized Dockerfile using pre-built binaries
 # This avoids compilation entirely - just copies the right binary
 
-FROM debian:bookworm-slim
+FROM ubuntu:24.04
 
 # Automatically selects the right architecture
 ARG TARGETARCH
@@ -11,8 +11,8 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-# Create non-root user
-RUN useradd -m -u 1000 chronik
+# Create non-root user (UID 1001 to avoid conflict with ubuntu:24.04 default user)
+RUN useradd -m -u 1001 chronik || useradd -m chronik
 
 # Copy the pre-built binary for the target architecture
 # Expects binaries in artifacts/linux/{amd64,arm64}/chronik-server

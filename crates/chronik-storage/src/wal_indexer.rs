@@ -708,6 +708,9 @@ impl WalIndexer {
             }
         }
 
+        // Collect vector embedding work for concurrent processing after the main loop
+        let mut vector_work_items: Vec<(TopicPartition, Vec<CanonicalRecord>)> = Vec::new();
+
         // Process each topic-partition: upload raw segments + create Tantivy indexes
         for (tp, canonical_records) in tp_records {
             // STEP 1: Upload raw segment data to S3 (Tier 2: warm storage)
@@ -854,40 +857,108 @@ impl WalIndexer {
                 );
             }
 
-            // STEP 2c: Generate vector embeddings (vector-enabled topics only)
-            // v2.2.22: Async embedding generation for semantic search
+            // STEP 2c: Collect vector embedding work for concurrent processing
+            // v2.4.0: Defer embedding to run concurrently across partitions
             if let Some(records) = records_for_vector {
-                match Self::process_vector_embeddings(
-                    config,
-                    metadata_store,
-                    vector_index_manager,
-                    &tp,
-                    records,
-                ).await {
-                    Ok(embeddings_generated) => {
-                        info!(
-                            topic = %tp.topic,
-                            partition = tp.partition,
-                            embeddings = embeddings_generated,
-                            "Generated vector embeddings (vector-enabled topic)"
-                        );
-                    }
-                    Err(e) => {
-                        error!(
-                            topic = %tp.topic,
-                            partition = tp.partition,
-                            error = %e,
-                            "Failed to generate vector embeddings"
-                        );
-                        stats.errors += 1;
-                    }
-                }
+                vector_work_items.push((tp.clone(), records));
             } else {
                 debug!(
                     topic = %tp.topic,
                     partition = tp.partition,
                     "Skipping vector embeddings (non-vector topic)"
                 );
+            }
+        }
+
+        // STEP 3: Process all vector embeddings concurrently across partitions
+        // v2.4.0: Up to 3 partitions embed in parallel, reducing total wall-clock time
+        if !vector_work_items.is_empty() {
+            let max_partition_concurrency = std::env::var("CHRONIK_VECTOR_PARTITION_CONCURRENCY")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(3)
+                .max(1)
+                .min(8);
+
+            if vector_work_items.len() == 1 || max_partition_concurrency <= 1 {
+                // Serial: single partition or concurrency disabled
+                for (tp, records) in vector_work_items {
+                    match Self::process_vector_embeddings(
+                        config,
+                        metadata_store,
+                        vector_index_manager,
+                        &tp,
+                        records,
+                    ).await {
+                        Ok(embeddings_generated) => {
+                            info!(
+                                topic = %tp.topic,
+                                partition = tp.partition,
+                                embeddings = embeddings_generated,
+                                "Generated vector embeddings (vector-enabled topic)"
+                            );
+                        }
+                        Err(e) => {
+                            error!(
+                                topic = %tp.topic,
+                                partition = tp.partition,
+                                error = %e,
+                                "Failed to generate vector embeddings"
+                            );
+                            stats.errors += 1;
+                        }
+                    }
+                }
+            } else {
+                // Concurrent: multiple partitions embed in parallel
+                let semaphore = Arc::new(tokio::sync::Semaphore::new(max_partition_concurrency));
+                let mut join_set = tokio::task::JoinSet::new();
+
+                for (tp, records) in vector_work_items {
+                    let permit = semaphore.clone().acquire_owned().await
+                        .map_err(|e| Error::Internal(format!("Semaphore closed: {}", e)))?;
+                    let config = config.clone();
+                    let metadata_store = Arc::clone(metadata_store);
+                    let vector_index_manager = Arc::clone(vector_index_manager);
+
+                    join_set.spawn(async move {
+                        let result = Self::process_vector_embeddings(
+                            &config,
+                            &metadata_store,
+                            &vector_index_manager,
+                            &tp,
+                            records,
+                        ).await;
+                        drop(permit);
+                        (tp, result)
+                    });
+                }
+
+                while let Some(join_result) = join_set.join_next().await {
+                    match join_result {
+                        Ok((tp, Ok(embeddings_generated))) => {
+                            info!(
+                                topic = %tp.topic,
+                                partition = tp.partition,
+                                embeddings = embeddings_generated,
+                                "Generated vector embeddings (concurrent, vector-enabled topic)"
+                            );
+                        }
+                        Ok((tp, Err(e))) => {
+                            error!(
+                                topic = %tp.topic,
+                                partition = tp.partition,
+                                error = %e,
+                                "Failed to generate vector embeddings (concurrent)"
+                            );
+                            stats.errors += 1;
+                        }
+                        Err(e) => {
+                            error!(error = %e, "Vector embedding task panicked");
+                            stats.errors += 1;
+                        }
+                    }
+                }
             }
         }
 
@@ -1344,13 +1415,31 @@ impl WalIndexer {
     /// - `vector.field` = "value" (default) | "key" | JSON path like "$.message.text"
     /// - `vector.provider` = "openai" | "external" | "local"
     /// - `vector.model` = model name (e.g., "text-embedding-3-small")
-    #[instrument(skip(_config, metadata_store, vector_index_manager, canonical_records))]
+    #[instrument(skip(config, metadata_store, vector_index_manager, canonical_records))]
     async fn process_vector_embeddings(
+        config: &WalIndexerConfig,
+        metadata_store: &Arc<dyn MetadataStore>,
+        vector_index_manager: &Arc<VectorIndexManager>,
+        tp: &TopicPartition,
+        canonical_records: Vec<CanonicalRecord>,
+    ) -> Result<usize> {
+        Self::process_vector_embeddings_with_model(
+            config, metadata_store, vector_index_manager, tp, canonical_records, None,
+        ).await
+    }
+
+    /// Process vector embeddings with an optional model ID override.
+    ///
+    /// When `model_id` is Some, vectors are stored under that model's index
+    /// (enabling multi-model A/B testing and re-embedding). When None, the
+    /// default model is used.
+    async fn process_vector_embeddings_with_model(
         _config: &WalIndexerConfig,
         metadata_store: &Arc<dyn MetadataStore>,
         vector_index_manager: &Arc<VectorIndexManager>,
         tp: &TopicPartition,
         canonical_records: Vec<CanonicalRecord>,
+        model_id: Option<&str>,
     ) -> Result<usize> {
         if canonical_records.is_empty() {
             return Ok(0);
@@ -1431,15 +1520,16 @@ impl WalIndexer {
             vector_index_manager.register_topic(&tp.topic, hnsw_config).await;
         }
 
-        // Create embedding pipeline
-        let pipeline = EmbeddingPipeline::new(
+        // Create embedding pipeline with configured concurrency
+        let pipeline = EmbeddingPipeline::with_concurrency(
             provider,
             Arc::clone(vector_index_manager),
             vector_config.batch_size,
+            vector_config.embedding_concurrency,
         );
 
-        // Process messages through the pipeline
-        match pipeline.process_messages(&tp.topic, tp.partition, texts).await {
+        // Process messages through the pipeline (model-aware when specified)
+        match pipeline.process_messages_for_model(&tp.topic, tp.partition, texts, model_id).await {
             Ok(stats) => {
                 info!(
                     topic = %tp.topic,
@@ -1656,6 +1746,176 @@ impl WalIndexer {
             }
         }
     }
+
+    /// v2.3.1: Backfill vector embeddings from existing Tier 2 raw segments.
+    ///
+    /// When vector embedding is enabled after data is already loaded, existing
+    /// sealed segments have been processed (Tantivy/Parquet) and deleted from the WAL.
+    /// This method reads those segments from object store and feeds them through the
+    /// embedding pipeline, skipping offsets already in the HNSW index.
+    ///
+    /// Returns stats about the backfill operation.
+    pub async fn backfill_vector_embeddings(
+        &self,
+        topic: &str,
+        partition: Option<i32>,
+        model_id: Option<&str>,
+    ) -> Result<BackfillStats> {
+        let mut stats = BackfillStats::default();
+        stats.model_id = model_id.map(|s| s.to_string());
+        let start_time = std::time::Instant::now();
+
+        // 1. Verify topic exists and has vector enabled
+        let topic_meta = self.metadata_store.get_topic(topic).await
+            .map_err(|e| Error::Internal(format!("Failed to get topic: {}", e)))?
+            .ok_or_else(|| Error::Internal(format!("Topic '{}' not found", topic)))?;
+
+        if !topic_meta.config.is_vector_enabled() {
+            return Err(Error::Internal(format!(
+                "Topic '{}' does not have vector search enabled", topic
+            )));
+        }
+
+        info!(topic = %topic, partition = ?partition, "Starting vector embedding backfill");
+
+        // 2. List raw segments from metadata store
+        let segments = self.metadata_store.list_segments(topic, partition.map(|p| p as u32)).await
+            .map_err(|e| Error::Internal(format!("Failed to list segments: {}", e)))?;
+
+        if segments.is_empty() {
+            info!(topic = %topic, "No segments found for backfill");
+            stats.duration_secs = start_time.elapsed().as_secs();
+            return Ok(stats);
+        }
+
+        info!(
+            topic = %topic,
+            segment_count = segments.len(),
+            "Found segments for vector backfill"
+        );
+
+        // 3. Process each segment
+        for segment in &segments {
+            // Check if we should skip this partition
+            if let Some(p) = partition {
+                if segment.partition as i32 != p {
+                    continue;
+                }
+            }
+
+            // Check HNSW index last_offset to skip already-embedded segments
+            let tp = TopicPartition::new(topic.to_string(), segment.partition as i32);
+            let last_indexed_offset = self.vector_index_manager
+                .get_partition_stats(&tp.topic, tp.partition).await
+                .and_then(|s| s.last_offset)
+                .unwrap_or(-1);
+
+            if segment.end_offset <= last_indexed_offset {
+                debug!(
+                    topic = %topic,
+                    partition = segment.partition,
+                    segment_end = segment.end_offset,
+                    last_indexed = last_indexed_offset,
+                    "Skipping segment (already embedded)"
+                );
+                stats.skipped_segments += 1;
+                continue;
+            }
+
+            // Read raw segment from object store
+            let data = match self.object_store.get(&segment.path).await {
+                Ok(d) => d,
+                Err(e) => {
+                    warn!(
+                        topic = %topic,
+                        partition = segment.partition,
+                        path = %segment.path,
+                        error = %e,
+                        "Failed to read segment from object store, skipping"
+                    );
+                    stats.errors += 1;
+                    continue;
+                }
+            };
+
+            // Deserialize CanonicalRecords
+            let canonical_records: Vec<CanonicalRecord> = match bincode::deserialize(&data) {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(
+                        topic = %topic,
+                        partition = segment.partition,
+                        path = %segment.path,
+                        error = %e,
+                        "Failed to deserialize segment, skipping"
+                    );
+                    stats.errors += 1;
+                    continue;
+                }
+            };
+
+            if canonical_records.is_empty() {
+                continue;
+            }
+
+            // Run through the vector embedding pipeline
+            match Self::process_vector_embeddings_with_model(
+                &self.config,
+                &self.metadata_store,
+                &self.vector_index_manager,
+                &tp,
+                canonical_records,
+                model_id,
+            ).await {
+                Ok(embeddings_generated) => {
+                    info!(
+                        topic = %topic,
+                        partition = segment.partition,
+                        segment = %segment.segment_id,
+                        embeddings = embeddings_generated,
+                        "Backfill: generated embeddings for segment"
+                    );
+                    stats.vectors_generated += embeddings_generated;
+                    stats.segments_processed += 1;
+                }
+                Err(e) => {
+                    error!(
+                        topic = %topic,
+                        partition = segment.partition,
+                        segment = %segment.segment_id,
+                        error = %e,
+                        "Backfill: failed to generate embeddings for segment"
+                    );
+                    stats.errors += 1;
+                }
+            }
+        }
+
+        stats.duration_secs = start_time.elapsed().as_secs();
+        info!(
+            topic = %topic,
+            segments_processed = stats.segments_processed,
+            vectors_generated = stats.vectors_generated,
+            skipped = stats.skipped_segments,
+            errors = stats.errors,
+            duration_secs = stats.duration_secs,
+            "Vector embedding backfill complete"
+        );
+
+        Ok(stats)
+    }
+}
+
+/// Statistics for a vector embedding backfill operation
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct BackfillStats {
+    pub segments_processed: usize,
+    pub vectors_generated: usize,
+    pub skipped_segments: usize,
+    pub errors: usize,
+    pub duration_secs: u64,
+    /// Model ID used for this backfill (None = default model)
+    pub model_id: Option<String>,
 }
 
 #[cfg(test)]

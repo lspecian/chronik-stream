@@ -63,6 +63,9 @@ base64 = "0.22"
 # Vector search - HNSW algorithm for O(log n) ANN search
 instant-distance = "0.6"
 
+# VO-3: Half-precision float support for vector quantization
+half = "2.4"
+
 [dev-dependencies]
 tempfile = "3.8"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

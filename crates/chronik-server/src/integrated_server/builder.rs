@@ -1384,7 +1384,7 @@ mod tests {
         assert!(builder.kafka_handler.is_some());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_builder_init_wal_indexer() {
         let temp_dir = TempDir::new().unwrap();
         let config = IntegratedServerConfig {
@@ -1394,11 +1394,20 @@ mod tests {
 
         let mut builder = IntegratedKafkaServerBuilder::new(config);
         builder.init_directories().await.unwrap();
+        builder.init_raft_cluster().await.unwrap();
+        builder.init_metadata_wal().await.unwrap();
+        builder.init_event_bus().await.unwrap();
+        builder.init_metadata_store().await.unwrap();
         builder.init_storage().await.unwrap();
+        builder.init_wal_manager().await.unwrap();
+        builder.init_produce_handler().await.unwrap();
         builder.init_wal_indexer().await.unwrap();
 
         // Verify WalIndexer created
         assert!(builder.wal_indexer.is_some());
+
+        // Drop builder in blocking context (WalIndexer has its own tokio runtime)
+        tokio::task::spawn_blocking(move || drop(builder)).await.unwrap();
     }
 
     #[tokio::test]
@@ -1419,7 +1428,7 @@ mod tests {
         assert!(builder.metadata_uploader.is_none());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_builder_full_pipeline() {
         // Test the complete build() pipeline to ensure all stages work together
         let temp_dir = TempDir::new().unwrap();
@@ -1439,5 +1448,8 @@ mod tests {
         // Verify server is fully initialized
         let stats = server.get_stats().await.unwrap();
         assert_eq!(stats.node_id, 1);
+
+        // Drop server in blocking context (WalIndexer has its own tokio runtime)
+        tokio::task::spawn_blocking(move || drop(server)).await.unwrap();
     }
 }

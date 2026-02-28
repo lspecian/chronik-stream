@@ -122,3 +122,6 @@ tests/k8s-perf/chronik-perf
 
 # Downloaded datasets (large files, not for git)
 datasets/
+
+# K8s secrets (never commit API keys)
+tests/k8s-perf/95-openai-secret.yaml

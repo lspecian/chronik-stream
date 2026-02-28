@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -147,7 +149,8 @@ async fn apply(client: Client, csa: &ChronikStandalone) -> Result<Action, Operat
                 .or_else(|e| if is_not_found(&e) { Ok(()) } else { Err(e) })?;
         }
 
-        let pod = pod_builder::build_standalone_pod(&name, &namespace, spec, owner_ref.clone());
+        let spec_hash = compute_standalone_spec_hash(spec);
+        let pod = pod_builder::build_standalone_pod(&name, &namespace, spec, owner_ref.clone(), Some(&spec_hash));
         info!(name = %name, "Creating Pod");
         pod_api.create(&PostParams::default(), &pod).await?;
     }
@@ -247,62 +250,61 @@ async fn cleanup(_client: Client, csa: &ChronikStandalone) -> Result<Action, Ope
     Ok(Action::await_change())
 }
 
+/// Compute a deterministic hash of the standalone spec fields that affect pod config.
+fn compute_standalone_spec_hash(spec: &crate::crds::standalone::ChronikStandaloneSpec) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    spec.image.hash(&mut hasher);
+    spec.image_pull_policy.hash(&mut hasher);
+    spec.wal_profile.hash(&mut hasher);
+    spec.produce_profile.hash(&mut hasher);
+    spec.log_level.hash(&mut hasher);
+    spec.columnar_enabled.hash(&mut hasher);
+
+    // Sort env vars by name for deterministic hashing
+    let sorted_env: BTreeMap<_, _> = spec.env.iter()
+        .map(|e| (&e.name, (e.value.as_deref().unwrap_or(""), e.value_from_secret.as_ref())))
+        .collect();
+    for (name, (value, secret_ref)) in &sorted_env {
+        name.hash(&mut hasher);
+        value.hash(&mut hasher);
+        if let Some(sr) = secret_ref {
+            sr.name.hash(&mut hasher);
+            sr.key.hash(&mut hasher);
+        }
+    }
+
+    if let Some(ref res) = spec.resources {
+        format!("{:?}", res).hash(&mut hasher);
+    }
+    if let Some(ref vs) = spec.vector_search {
+        vs.enabled.hash(&mut hasher);
+        vs.provider.hash(&mut hasher);
+    }
+    if let Some(ref os) = spec.object_store {
+        format!("{:?}", os).hash(&mut hasher);
+    }
+
+    format!("{:016x}", hasher.finish())
+}
+
 /// Check if a Pod needs to be recreated due to spec changes.
 fn pod_needs_update(pod: &Pod, spec: &crate::crds::standalone::ChronikStandaloneSpec) -> bool {
-    let Some(pod_spec) = &pod.spec else {
+    let desired_hash = compute_standalone_spec_hash(spec);
+    let current_hash = pod
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get("chronik.io/spec-hash"))
+        .map(|s| s.as_str())
+        .unwrap_or("");
+
+    if desired_hash != current_hash {
+        info!(
+            desired = %desired_hash,
+            current = %current_hash,
+            "Spec hash mismatch, pod needs recreation"
+        );
         return true;
-    };
-
-    let Some(container) = pod_spec.containers.first() else {
-        return true;
-    };
-
-    // Check image change
-    if container.image.as_deref() != Some(&spec.image) {
-        return true;
-    }
-
-    // Check resource changes
-    if let Some(ref requested) = spec.resources {
-        let current_resources = &container.resources;
-        match current_resources {
-            Some(cr) => {
-                if let Some(ref req) = requested.requests {
-                    let cur_req = cr.requests.as_ref();
-                    if let Some(ref cpu) = req.cpu {
-                        if cur_req.and_then(|r| r.get("cpu")).map(|q| &q.0) != Some(cpu) {
-                            return true;
-                        }
-                    }
-                    if let Some(ref mem) = req.memory {
-                        if cur_req.and_then(|r| r.get("memory")).map(|q| &q.0) != Some(mem) {
-                            return true;
-                        }
-                    }
-                }
-            }
-            None if requested.requests.is_some() || requested.limits.is_some() => return true,
-            _ => {}
-        }
-    }
-
-    // Check env var changes (simplified — compare key env vars)
-    if let Some(env) = &container.env {
-        let find_env = |name: &str| -> Option<&str> {
-            env.iter()
-                .find(|e| e.name == name)
-                .and_then(|e| e.value.as_deref())
-        };
-
-        if find_env("CHRONIK_WAL_PROFILE") != Some(&spec.wal_profile) {
-            return true;
-        }
-        if find_env("CHRONIK_PRODUCE_PROFILE") != Some(&spec.produce_profile) {
-            return true;
-        }
-        if find_env("RUST_LOG") != Some(&spec.log_level) {
-            return true;
-        }
     }
 
     false

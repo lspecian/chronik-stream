@@ -108,24 +108,39 @@ impl RawKafkaBatchDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chronik_storage::SegmentMetadata;
+    use chronik_common::types::{SegmentId, SegmentMetadata, TopicPartition};
+    use chronik_storage::segment::SegmentHeader;
 
     #[test]
     fn test_empty_raw_batches_returns_empty() {
         let segment = Segment {
-            header: chronik_storage::SegmentHeader {
+            header: SegmentHeader {
                 magic: *b"CHRN",
                 version: 3,
+                metadata_size: 0,
+                raw_kafka_size: 0,
+                indexed_data_size: 0,
+                index_size: 0,
                 checksum: 0,
             },
             metadata: SegmentMetadata {
+                id: SegmentId::new(),
+                topic_partition: TopicPartition {
+                    topic: "test".to_string(),
+                    partition: 0,
+                },
                 base_offset: 0,
                 last_offset: 0,
+                timestamp_min: 0,
+                timestamp_max: 0,
+                size_bytes: 0,
                 record_count: 0,
-                timestamp: 0,
+                object_key: String::new(),
+                created_at: chrono::Utc::now(),
             },
-            indexed_records: vec![],
+            indexed_records: bytes::Bytes::new(),
             raw_kafka_batches: bytes::Bytes::new(),
+            index_data: bytes::Bytes::new(),
         };
 
         let result = RawKafkaBatchDecoder::decode_raw_kafka_batches(&segment);

@@ -36,6 +36,13 @@ pub struct VectorSearchRequest {
     /// Maximum offset filter
     #[serde(default)]
     pub max_offset: Option<i64>,
+    /// VO-4: Enable cross-encoder re-ranking (default: false)
+    /// When true, overretrieves candidates and re-ranks with cross-encoder
+    #[serde(default)]
+    pub rerank: bool,
+    /// VO-5: Embedding model to search (default: topic's active_model, fallback "default")
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 fn default_k() -> usize {
@@ -59,6 +66,9 @@ pub struct VectorSearchByVectorRequest {
     /// Maximum offset filter
     #[serde(default)]
     pub max_offset: Option<i64>,
+    /// VO-5: Embedding model to search (default: topic's active_model, fallback "default")
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 /// Vector search response
@@ -72,6 +82,12 @@ pub struct VectorSearchResponse {
     pub total_vectors: usize,
     /// Query execution time in milliseconds
     pub execution_time_ms: u64,
+    /// Whether results were re-ranked (VO-4)
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub reranked: bool,
+    /// VO-5: Model ID that was searched
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// Single search result item
@@ -131,7 +147,7 @@ impl VectorHandler {
         let service = VectorSearchService::new(
             std::sync::Arc::clone(index_manager),
             std::sync::Arc::clone(provider),
-        );
+        ).with_cache(state.embedding_cache.clone());
 
         service
             .search_by_text(topic, query, k, filters)
@@ -160,7 +176,7 @@ impl VectorHandler {
         let service = VectorSearchService::new(
             std::sync::Arc::clone(index_manager),
             std::sync::Arc::clone(provider),
-        );
+        ).with_cache(state.embedding_cache.clone());
 
         service
             .search_by_vector(topic, vector, k, filters)
@@ -194,13 +210,21 @@ fn build_filters(
     Some(filters)
 }
 
+/// Default overretrieval factor for re-ranking (fetch k * this many candidates)
+const DEFAULT_OVERRETRIEVAL_FACTOR: usize = 5;
+
 /// Search by text query endpoint
 pub async fn search(
     State(state): State<UnifiedApiState>,
     Path(topic): Path<String>,
     Json(request): Json<VectorSearchRequest>,
 ) -> impl IntoResponse {
-    info!(topic = %topic, query = %request.query, k = request.k, "Vector search by text");
+    let model_param = request.model.as_deref();
+    info!(
+        topic = %topic, query = %request.query, k = request.k,
+        rerank = request.rerank, model = ?model_param,
+        "Vector search by text"
+    );
 
     let start = std::time::Instant::now();
 
@@ -229,14 +253,47 @@ pub async fn search(
 
     let filters = build_filters(request.partitions, request.min_offset, request.max_offset);
 
+    // VO-4: Determine search k — overretrieve when re-ranking is requested
+    let rerank_enabled = request.rerank && state.reranker.is_some();
+    let search_k = if rerank_enabled {
+        request.k * DEFAULT_OVERRETRIEVAL_FACTOR
+    } else {
+        request.k
+    };
+
     let service = VectorSearchService::new(
         std::sync::Arc::clone(index_manager),
         std::sync::Arc::clone(provider),
-    );
+    ).with_cache(state.embedding_cache.clone());
 
-    match service.search_by_text(&topic, &request.query, request.k, filters).await {
-        Ok(results) => {
-            let total_vectors = service.get_vector_count(&topic).await;
+    // VO-5: Use model-specific search when model param provided
+    let search_result = if let Some(model_id) = model_param {
+        service.search_by_text_model(&topic, &request.query, search_k, filters, model_id).await
+    } else {
+        service.search_by_text(&topic, &request.query, search_k, filters).await
+    };
+
+    match search_result {
+        Ok(mut results) => {
+            // VO-5: Get vector count for the searched model
+            let total_vectors = if let Some(model_id) = model_param {
+                service.get_vector_count_for_model(&topic, model_id).await
+            } else {
+                service.get_vector_count(&topic).await
+            };
+            let mut reranked = false;
+
+            // VO-4: Apply cross-encoder re-ranking if enabled
+            if rerank_enabled {
+                if let Some(ref reranker) = state.reranker {
+                    results = apply_reranking(reranker.as_ref(), &request.query, results, request.k).await;
+                    reranked = true;
+                }
+            }
+
+            // Truncate to requested k (in case reranking wasn't applied)
+            results.truncate(request.k);
+
             let execution_time_ms = start.elapsed().as_millis() as u64;
 
             let response = VectorSearchResponse {
@@ -244,12 +301,16 @@ pub async fn search(
                 results: results.into_iter().map(Into::into).collect(),
                 total_vectors,
                 execution_time_ms,
+                reranked,
+                model: request.model.clone(),
             };
 
             info!(
                 topic = %topic,
                 results = response.count,
                 time_ms = execution_time_ms,
+                reranked = reranked,
+                model = ?model_param,
                 "Vector search completed"
             );
 
@@ -272,10 +333,12 @@ pub async fn search_by_vector(
     Path(topic): Path<String>,
     Json(request): Json<VectorSearchByVectorRequest>,
 ) -> impl IntoResponse {
+    let model_param = request.model.as_deref();
     info!(
         topic = %topic,
         vector_len = request.vector.len(),
         k = request.k,
+        model = ?model_param,
         "Vector search by vector"
     );
 
@@ -311,9 +374,20 @@ pub async fn search_by_vector(
         std::sync::Arc::clone(provider),
     );
 
-    match service.search_by_vector(&topic, &request.vector, request.k, filters).await {
+    // VO-5: Use model-specific search when model param provided
+    let search_result = if let Some(model_id) = model_param {
+        service.search_by_vector_model(&topic, &request.vector, request.k, filters, model_id).await
+    } else {
+        service.search_by_vector(&topic, &request.vector, request.k, filters).await
+    };
+
+    match search_result {
         Ok(results) => {
-            let total_vectors = service.get_vector_count(&topic).await;
+            let total_vectors = if let Some(model_id) = model_param {
+                service.get_vector_count_for_model(&topic, model_id).await
+            } else {
+                service.get_vector_count(&topic).await
+            };
             let execution_time_ms = start.elapsed().as_millis() as u64;
 
             let response = VectorSearchResponse {
@@ -321,6 +395,8 @@ pub async fn search_by_vector(
                 results: results.into_iter().map(Into::into).collect(),
                 total_vectors,
                 execution_time_ms,
+                reranked: false,
+                model: request.model.clone(),
             };
 
             info!(
@@ -350,7 +426,12 @@ pub struct TopicStatsResponse {
     pub total_vectors: usize,
     pub partition_count: usize,
     pub dimensions: usize,
+    /// Whether vector indexes are still loading from disk (warmup phase)
+    pub loading: bool,
     pub partitions: Vec<PartitionStats>,
+    /// VO-5: Model IDs with indexes for this topic
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
 }
 
 /// Per-partition statistics
@@ -385,6 +466,7 @@ pub async fn get_stats(
         total_vectors: stats.total_vectors,
         partition_count: stats.partition_count,
         dimensions: stats.dimensions,
+        loading: stats.loading,
         partitions: stats
             .partitions
             .into_iter()
@@ -393,6 +475,7 @@ pub async fn get_stats(
                 vector_count: ps.vector_count,
             })
             .collect(),
+        models: stats.models,
     };
 
     (StatusCode::OK, Json(response)).into_response()
@@ -425,6 +508,67 @@ pub async fn list_topics(State(state): State<UnifiedApiState>) -> impl IntoRespo
 
     let response = ListTopicsResponse { topics, count };
     (StatusCode::OK, Json(response)).into_response()
+}
+
+/// VO-4: Apply cross-encoder re-ranking to search results.
+///
+/// Takes overretrieved candidates, scores (query, document) pairs with the
+/// reranker, and returns results reordered by cross-encoder relevance score.
+async fn apply_reranking(
+    reranker: &dyn chronik_embeddings::reranker::RerankerProvider,
+    query: &str,
+    results: Vec<VectorSearchResult>,
+    top_k: usize,
+) -> Vec<VectorSearchResult> {
+    if results.is_empty() {
+        return results;
+    }
+
+    // Extract document texts for the reranker.
+    // Use text_preview if available, otherwise use "{topic}:{partition}:{offset}" as a fallback.
+    let doc_texts: Vec<String> = results
+        .iter()
+        .map(|r| {
+            r.text_preview
+                .clone()
+                .unwrap_or_else(|| format!("{}:{}:{}", r.topic, r.partition, r.offset))
+        })
+        .collect();
+
+    let doc_refs: Vec<&str> = doc_texts.iter().map(|s| s.as_str()).collect();
+
+    match reranker.rerank(query, &doc_refs, top_k).await {
+        Ok(rerank_results) => {
+            debug!(
+                candidates = results.len(),
+                reranked = rerank_results.len(),
+                "Re-ranking applied successfully"
+            );
+
+            // Build reranked results in reranker-determined order
+            let mut reranked: Vec<VectorSearchResult> = rerank_results
+                .into_iter()
+                .filter_map(|rr| {
+                    results.get(rr.index).map(|original| {
+                        // Replace score with reranker relevance score
+                        let mut result = original.clone();
+                        result.score = rr.relevance_score;
+                        result
+                    })
+                })
+                .collect();
+
+            reranked.truncate(top_k);
+            reranked
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Re-ranking failed, returning original results");
+            // Fallback: return original results truncated to top_k
+            let mut fallback = results;
+            fallback.truncate(top_k);
+            fallback
+        }
+    }
 }
 
 // ============================================================================
@@ -460,6 +604,12 @@ pub struct HybridSearchRequest {
     /// Maximum offset filter
     #[serde(default)]
     pub max_offset: Option<i64>,
+    /// VO-4: Enable cross-encoder re-ranking after RRF fusion (default: false)
+    #[serde(default)]
+    pub rerank: bool,
+    /// VO-5: Embedding model to search (default: topic's active_model, fallback "default")
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 fn default_vector_weight() -> f32 {
@@ -487,10 +637,16 @@ pub struct HybridSearchResponse {
     pub text_results_count: usize,
     /// Query execution time in milliseconds
     pub execution_time_ms: u64,
+    /// Whether results were re-ranked after fusion (VO-4)
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub reranked: bool,
+    /// VO-5: Model ID that was searched
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// Single hybrid search result item
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct HybridSearchResultItem {
     /// Partition number
     pub partition: i32,
@@ -591,16 +747,24 @@ pub async fn hybrid_search(
     let service = VectorSearchService::new(
         std::sync::Arc::clone(index_manager),
         std::sync::Arc::clone(provider),
-    );
+    ).with_cache(state.embedding_cache.clone());
 
-    let vector_results = match service
-        .search_by_text(&topic, &request.query, search_k, filters.clone())
-        .await
-    {
-        Ok(results) => results,
-        Err(e) => {
-            error!(topic = %topic, error = %e, "Vector search failed in hybrid");
-            Vec::new() // Continue with text search only
+    // VO-5: Use model-specific search when model param provided
+    let vector_results = if let Some(ref model_id) = request.model {
+        match service.search_by_text_model(&topic, &request.query, search_k, filters.clone(), model_id).await {
+            Ok(results) => results,
+            Err(e) => {
+                error!(topic = %topic, error = %e, "Vector search failed in hybrid");
+                Vec::new()
+            }
+        }
+    } else {
+        match service.search_by_text(&topic, &request.query, search_k, filters.clone()).await {
+            Ok(results) => results,
+            Err(e) => {
+                error!(topic = %topic, error = %e, "Vector search failed in hybrid");
+                Vec::new()
+            }
         }
     };
 
@@ -691,6 +855,21 @@ pub async fn hybrid_search(
     // Sort by score descending (higher = more relevant)
     results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
 
+    // VO-4: Apply cross-encoder re-ranking after RRF fusion if requested
+    let mut reranked = false;
+    if request.rerank {
+        if let Some(ref reranker) = state.reranker {
+            results = apply_hybrid_reranking(
+                reranker.as_ref(),
+                &request.query,
+                results,
+                request.k,
+            )
+            .await;
+            reranked = true;
+        }
+    }
+
     // Take top k
     results.truncate(request.k);
 
@@ -702,6 +881,7 @@ pub async fn hybrid_search(
         results = count,
         vector_results = vector_results_count,
         text_results = text_results_count,
+        reranked = reranked,
         time_ms = execution_time_ms,
         "Hybrid search completed"
     );
@@ -712,9 +892,137 @@ pub async fn hybrid_search(
         vector_results_count,
         text_results_count,
         execution_time_ms,
+        reranked,
+        model: request.model.clone(),
     };
 
     (StatusCode::OK, Json(response)).into_response()
+}
+
+/// VO-4: Apply re-ranking to hybrid search results after RRF fusion.
+///
+/// Takes fused results, sends document texts to the cross-encoder reranker,
+/// and reorders by relevance score.
+async fn apply_hybrid_reranking(
+    reranker: &dyn chronik_embeddings::reranker::RerankerProvider,
+    query: &str,
+    results: Vec<HybridSearchResultItem>,
+    top_k: usize,
+) -> Vec<HybridSearchResultItem> {
+    if results.is_empty() {
+        return results;
+    }
+
+    let doc_texts: Vec<String> = results
+        .iter()
+        .map(|r| {
+            r.text_preview
+                .clone()
+                .unwrap_or_else(|| format!("{}:{}", r.partition, r.offset))
+        })
+        .collect();
+
+    let doc_refs: Vec<&str> = doc_texts.iter().map(|s| s.as_str()).collect();
+
+    match reranker.rerank(query, &doc_refs, top_k).await {
+        Ok(rerank_results) => {
+            debug!(
+                candidates = results.len(),
+                reranked = rerank_results.len(),
+                "Hybrid re-ranking applied"
+            );
+
+            rerank_results
+                .into_iter()
+                .filter_map(|rr| {
+                    results.get(rr.index).map(|original| {
+                        let mut item = original.clone();
+                        item.score = rr.relevance_score;
+                        item
+                    })
+                })
+                .take(top_k)
+                .collect()
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Hybrid re-ranking failed, returning RRF results");
+            let mut fallback = results;
+            fallback.truncate(top_k);
+            fallback
+        }
+    }
+}
+
+// ============================================================================
+// Vector Embedding Backfill (v2.3.1)
+// ============================================================================
+
+/// Request body for vector embedding backfill
+#[derive(Debug, Deserialize)]
+pub struct BackfillRequest {
+    /// Specific partition to backfill (null = all partitions)
+    pub partition: Option<i32>,
+    /// Model ID to embed with (null = use active_model from topic config)
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+/// Response for vector embedding backfill
+#[derive(Debug, Serialize)]
+pub struct BackfillResponse {
+    pub topic: String,
+    pub segments_processed: usize,
+    pub vectors_generated: usize,
+    pub skipped_segments: usize,
+    pub errors: usize,
+    pub duration_secs: u64,
+    /// Model ID used for embedding
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+/// Backfill vector embeddings from existing Tier 2 segments.
+/// POST /_vector/:topic/backfill
+pub async fn backfill(
+    State(state): State<UnifiedApiState>,
+    Path(topic): Path<String>,
+    Json(request): Json<BackfillRequest>,
+) -> impl IntoResponse {
+    info!(topic = %topic, partition = ?request.partition, model = ?request.model, "Starting vector embedding backfill");
+
+    let wal_indexer = match &state.wal_indexer {
+        Some(w) => w,
+        None => {
+            let error_response = VectorErrorResponse {
+                error: "WalIndexer not available for backfill".to_string(),
+                error_type: "ServiceUnavailable".to_string(),
+            };
+            return (StatusCode::SERVICE_UNAVAILABLE, Json(error_response)).into_response();
+        }
+    };
+
+    match wal_indexer.backfill_vector_embeddings(&topic, request.partition, request.model.as_deref()).await {
+        Ok(stats) => {
+            let response = BackfillResponse {
+                topic,
+                segments_processed: stats.segments_processed,
+                vectors_generated: stats.vectors_generated,
+                skipped_segments: stats.skipped_segments,
+                errors: stats.errors,
+                duration_secs: stats.duration_secs,
+                model: stats.model_id,
+            };
+            (StatusCode::OK, Json(response)).into_response()
+        }
+        Err(e) => {
+            error!(topic = %topic, error = %e, "Vector backfill failed");
+            let error_response = VectorErrorResponse {
+                error: format!("Backfill failed: {}", e),
+                error_type: "InternalError".to_string(),
+            };
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(error_response)).into_response()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -852,5 +1160,84 @@ mod tests {
     fn test_rrf_score_zero_when_no_results() {
         let score = calculate_rrf_score(None, None, 0.5, 0.5, 60);
         assert!((score - 0.0).abs() < f32::EPSILON);
+    }
+
+    // ========== VO-4 Reranking Tests ==========
+
+    #[test]
+    fn test_search_request_rerank_default_false() {
+        let json = r#"{"query": "error logs"}"#;
+        let request: VectorSearchRequest = serde_json::from_str(json).unwrap();
+        assert!(!request.rerank);
+    }
+
+    #[test]
+    fn test_search_request_rerank_enabled() {
+        let json = r#"{"query": "error logs", "rerank": true}"#;
+        let request: VectorSearchRequest = serde_json::from_str(json).unwrap();
+        assert!(request.rerank);
+    }
+
+    #[test]
+    fn test_hybrid_search_request_rerank_default_false() {
+        let json = r#"{"query": "error logs"}"#;
+        let request: HybridSearchRequest = serde_json::from_str(json).unwrap();
+        assert!(!request.rerank);
+    }
+
+    #[test]
+    fn test_hybrid_search_request_rerank_enabled() {
+        let json = r#"{"query": "error logs", "rerank": true, "k": 5}"#;
+        let request: HybridSearchRequest = serde_json::from_str(json).unwrap();
+        assert!(request.rerank);
+        assert_eq!(request.k, 5);
+    }
+
+    #[tokio::test]
+    async fn test_apply_reranking_empty_results() {
+        use chronik_embeddings::reranker::NoOpReranker;
+        let reranker = NoOpReranker;
+        let results: Vec<VectorSearchResult> = Vec::new();
+        let reranked = apply_reranking(&reranker, "query", results, 10).await;
+        assert!(reranked.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_apply_reranking_with_noop() {
+        use chronik_columnar::VectorSearchResult;
+        use chronik_embeddings::reranker::NoOpReranker;
+        let reranker = NoOpReranker;
+
+        let results = vec![
+            VectorSearchResult {
+                topic: "logs".to_string(),
+                partition: 0,
+                offset: 10,
+                score: 0.1,
+                text_preview: Some("error in payment".to_string()),
+                embedding: None,
+            },
+            VectorSearchResult {
+                topic: "logs".to_string(),
+                partition: 0,
+                offset: 20,
+                score: 0.2,
+                text_preview: Some("connection timeout".to_string()),
+                embedding: None,
+            },
+            VectorSearchResult {
+                topic: "logs".to_string(),
+                partition: 0,
+                offset: 30,
+                score: 0.3,
+                text_preview: Some("disk full warning".to_string()),
+                embedding: None,
+            },
+        ];
+
+        let reranked = apply_reranking(&reranker, "payment error", results, 2).await;
+        assert_eq!(reranked.len(), 2);
+        // NoOp reranker returns in original order, scores decreasing
+        assert!(reranked[0].score > reranked[1].score);
     }
 }

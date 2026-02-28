@@ -183,14 +183,14 @@ mod tests {
                 timestamp: 0,
                 key: None,
                 value: vec![],
-                headers: vec![],
+                headers: std::collections::HashMap::new(),
             },
             Record {
                 offset: 1,
                 timestamp: 0,
                 key: None,
                 value: vec![],
-                headers: vec![],
+                headers: std::collections::HashMap::new(),
             },
         ];
 
@@ -208,7 +208,7 @@ mod tests {
                 timestamp: 0,
                 key: None,
                 value: vec![],
-                headers: vec![],
+                headers: std::collections::HashMap::new(),
             },
         ];
 

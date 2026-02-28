@@ -51,7 +51,12 @@ impl WalManager {
         // Initialize GroupCommitWal for zero-loss durability (v1.3.54+)
         // Default profile: low (optimized for latency). Override with CHRONIK_WAL_PROFILE env var
         // Note: Metadata WAL always uses HIGH profile via CHRONIK_METADATA_WAL_PROFILE
-        let group_commit_config = GroupCommitConfig::default();
+        let mut group_commit_config = GroupCommitConfig::default();
+
+        // Wire WalConfig rotation settings to GroupCommitConfig
+        if config.rotation.max_segment_size > 0 {
+            group_commit_config.rotation_size_bytes = config.rotation.max_segment_size;
+        }
         info!(
             "GroupCommitWal configured: batch_size={}, batch_MB={}, wait_ms={}, queue_depth={} (default: low, override with CHRONIK_WAL_PROFILE=low/medium/high/ultra)",
             group_commit_config.max_batch_size,
@@ -242,7 +247,9 @@ impl WalManager {
 
         if !partition_dir.exists() {
             debug!("Partition directory does not exist: {:?}", partition_dir);
-            return Ok(records);
+            return Err(WalError::SegmentNotFound(
+                format!("{}/{}", topic, partition)
+            ));
         }
 
         // Find all WAL segment files for this partition
@@ -809,10 +816,10 @@ mod tests {
         // Recover from disk
         let recovered_manager = WalManager::recover(&config).await.unwrap();
 
-        // Get recovery stats (v1.3.53+: returns empty, recovery happens internally)
+        // Recovery scans disk and finds all 3 partitions we wrote to
         let recovery_result = recovered_manager.get_recovery_result();
-        assert_eq!(recovery_result.partitions, 0);
-        assert_eq!(recovery_result.total_records, 0);
+        assert_eq!(recovery_result.partitions, 3);
+        assert_eq!(recovery_result.total_records, 0); // total_records not tracked, just partition existence
     }
 }
 

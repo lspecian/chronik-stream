@@ -89,8 +89,27 @@ impl MetadataState {
         match &event.payload {
             MetadataEventPayload::TopicCreated { name, config } => {
                 let mut topics = self.topics.write().await;
-                if topics.contains_key(name) {
-                    // Idempotent: Topic already exists from earlier event
+                if let Some(existing) = topics.get_mut(name) {
+                    // v2.3.1: Merge config from the new event into the existing topic.
+                    // In a Raft cluster, auto_create_topics() on a follower can race
+                    // with the real CreateTopics event from the leader. The auto-created
+                    // topic has a bare config, so we adopt any keys from the incoming
+                    // event that the existing topic doesn't have (e.g., vector.enabled,
+                    // searchable, columnar.enabled set by the real CreateTopics call).
+                    let mut merged = false;
+                    for (key, value) in &config.config {
+                        if !existing.config.config.contains_key(key) {
+                            existing.config.config.insert(key.clone(), value.clone());
+                            merged = true;
+                        }
+                    }
+                    if merged {
+                        existing.updated_at = event.timestamp;
+                        tracing::debug!(
+                            topic = %name,
+                            "Merged config keys from duplicate TopicCreated event"
+                        );
+                    }
                     return Ok(());
                 }
 

@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 chronik-common = { path = "../chronik-common" }
 chronik-storage = { path = "../chronik-storage" }
+chronik-embeddings = { path = "../chronik-embeddings" }
 
 # Async runtime
 tokio = { workspace = true, features = ["fs", "sync", "time"] }

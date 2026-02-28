@@ -100,9 +100,14 @@ fn create_local_provider(config: &EmbeddingModelConfig) -> Result<Arc<dyn Embedd
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    // Serialize tests that mutate OPENAI_API_KEY to avoid parallel env var races
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_create_openai_provider_no_api_key() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         // Clear any existing API key
         std::env::remove_var("OPENAI_API_KEY");
 
@@ -116,6 +121,7 @@ mod tests {
 
     #[test]
     fn test_create_openai_provider_with_api_key() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         std::env::set_var("OPENAI_API_KEY", "sk-test-key");
 
         let config = VectorSearchConfig::default();
@@ -174,6 +180,7 @@ mod tests {
 
     #[test]
     fn test_create_openai_with_custom_dimensions() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         std::env::set_var("OPENAI_API_KEY", "sk-test-key");
 
         let mut topic_config = HashMap::new();

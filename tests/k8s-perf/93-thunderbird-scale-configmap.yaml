@@ -1,0 +1,143 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k6-thunderbird-scale-script
+  namespace: chronik-perf
+data:
+  thunderbird-scale-test.js: |
+    import http from 'k6/http';
+    import { check, sleep } from 'k6';
+    import { Rate, Trend, Counter } from 'k6/metrics';
+
+    const textErrors = new Rate('text_errors');
+    const textLatency = new Trend('text_latency', true);
+    const textCompleted = new Counter('text_completed');
+    const sqlErrors = new Rate('sql_errors');
+    const sqlLatency = new Trend('sql_latency', true);
+    const sqlCompleted = new Counter('sql_completed');
+    const totalErrors = new Rate('total_errors');
+    const totalLatency = new Trend('total_latency', true);
+    const totalCompleted = new Counter('total_completed');
+
+    const BASE_URL = __ENV.CHRONIK_URL || 'http://chronik-thunderbird.chronik-perf.svc.cluster.local:6092';
+    const TOPIC = __ENV.TOPIC || 'thunderbird';
+    const TEST_MODE = __ENV.TEST_MODE || 'mixed';
+
+    export const options = (() => {
+      switch (TEST_MODE) {
+        case 'text':
+          return {
+            stages: [
+              { duration: '15s', target: 100 },
+              { duration: '30s', target: 500 },
+              { duration: '1m',  target: 1000 },
+              { duration: '1m',  target: 2000 },
+              { duration: '1m',  target: 2000 },
+              { duration: '30s', target: 500 },
+              { duration: '15s', target: 0 },
+            ],
+            thresholds: { text_errors: ['rate<0.05'], text_latency: ['p(50)<10', 'p(95)<50'] },
+          };
+        case 'sql':
+          return {
+            stages: [
+              { duration: '15s', target: 50 },
+              { duration: '30s', target: 200 },
+              { duration: '1m',  target: 500 },
+              { duration: '1m',  target: 500 },
+              { duration: '30s', target: 200 },
+              { duration: '15s', target: 0 },
+            ],
+            thresholds: { sql_errors: ['rate<0.05'], sql_latency: ['p(50)<100', 'p(95)<500'] },
+          };
+        default:
+          return {
+            stages: [
+              { duration: '15s', target: 50 },
+              { duration: '30s', target: 200 },
+              { duration: '1m',  target: 500 },
+              { duration: '1m',  target: 1000 },
+              { duration: '1m',  target: 1000 },
+              { duration: '30s', target: 500 },
+              { duration: '15s', target: 0 },
+            ],
+            thresholds: { total_errors: ['rate<0.05'] },
+          };
+      }
+    })();
+
+    const textQueries = [
+      'error', 'warning', 'failure', 'timeout', 'kernel',
+      'network interface down', 'disk I/O error', 'memory allocation failed',
+      'postfix warning', 'tftp client', 'kernel panic',
+      'sshd', 'postdrop', 'ntpd', 'rsync', 'gmetad',
+      'tbird-admin', 'aadmin1',
+      'ECC memory', 'CPU ticks', 'DIMM',
+      'synchronized to', 'topology change', 'startup succeeded',
+      'publickey', 'No such file or directory',
+    ];
+
+    const sqlQueries = [
+      // COUNT — core hot buffer performance
+      `SELECT COUNT(*) FROM ${TOPIC}_hot`,
+      // GROUP BY partition — data distribution
+      `SELECT _partition, COUNT(*) as cnt FROM ${TOPIC}_hot GROUP BY _partition ORDER BY cnt DESC`,
+      // SELECT with offset range
+      `SELECT _offset, _key, _timestamp FROM ${TOPIC}_hot WHERE _offset > 1000 AND _offset < 2000 LIMIT 50`,
+      // SELECT recent by timestamp
+      `SELECT _offset, _key FROM ${TOPIC}_hot ORDER BY _timestamp DESC LIMIT 20`,
+      // COUNT on cold table (Parquet)
+      `SELECT COUNT(*) FROM ${TOPIC}_cold`,
+      // COUNT on unified view
+      `SELECT COUNT(*) FROM ${TOPIC}`,
+      // GROUP BY partition on cold
+      `SELECT _partition, COUNT(*) as cnt FROM ${TOPIC}_cold GROUP BY _partition ORDER BY cnt DESC`,
+      // Offset range on cold
+      `SELECT _offset, _key, _timestamp FROM ${TOPIC}_cold WHERE _offset > 5000 AND _offset < 6000 LIMIT 50`,
+    ];
+
+    const headers = { 'Content-Type': 'application/json' };
+
+    function textSearch() {
+      const q = textQueries[Math.floor(Math.random() * textQueries.length)];
+      const k = Math.random() < 0.7 ? 10 : 20;
+      const payload = JSON.stringify({
+        sources: [{ topic: TOPIC, modes: ['text'] }],
+        q: { text: q },
+        k: k,
+        rank: { profile: 'relevance' },
+        result_format: 'merged',
+      });
+      const res = http.post(`${BASE_URL}/_query`, payload, { headers, timeout: '10s' });
+      const ok = check(res, { 'text 200': (r) => r.status === 200 });
+      textErrors.add(!ok);
+      textLatency.add(res.timings.duration);
+      if (ok) textCompleted.add(1);
+      totalErrors.add(!ok);
+      totalLatency.add(res.timings.duration);
+      if (ok) totalCompleted.add(1);
+    }
+
+    function sqlQuery() {
+      const q = sqlQueries[Math.floor(Math.random() * sqlQueries.length)];
+      const res = http.post(`${BASE_URL}/_sql`, JSON.stringify({ query: q }), { headers, timeout: '30s' });
+      const ok = check(res, { 'sql 200': (r) => r.status === 200 });
+      sqlErrors.add(!ok);
+      sqlLatency.add(res.timings.duration);
+      if (ok) sqlCompleted.add(1);
+      totalErrors.add(!ok);
+      totalLatency.add(res.timings.duration);
+      if (ok) totalCompleted.add(1);
+    }
+
+    export default function () {
+      switch (TEST_MODE) {
+        case 'text': textSearch(); break;
+        case 'sql': sqlQuery(); break;
+        default:
+          if (Math.random() < 0.6) textSearch();
+          else sqlQuery();
+          break;
+      }
+      sleep(0.01);
+    }

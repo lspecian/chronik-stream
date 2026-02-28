@@ -1,7 +1,7 @@
 # Optimized Dockerfile using pre-built operator binary
 # This avoids compilation entirely - just copies the right binary
 
-FROM debian:bookworm-slim
+FROM ubuntu:24.04
 
 # Automatically selects the right architecture
 ARG TARGETARCH
@@ -11,8 +11,8 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-# Create non-root user (use -g to add to existing group if it exists)
-RUN groupadd -f -g 1000 operator && useradd -m -u 1000 -g operator operator
+# Create non-root user
+RUN useradd -m -u 1002 -g operator operator
 
 # Copy the pre-built binary for the target architecture
 # Expects binaries in artifacts/linux/{amd64,arm64}/chronik-operator

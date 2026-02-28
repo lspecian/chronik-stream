@@ -432,7 +432,7 @@ pub struct ProduceHandler {
     config: ProduceHandlerConfig,
     storage: Arc<dyn ObjectStore>,
     indexer: Option<Arc<RealtimeIndexer>>,
-    json_pipeline: Arc<JsonPipeline>,
+    json_pipeline: Option<Arc<JsonPipeline>>,
     index_sender: Option<mpsc::Sender<JsonDocument>>,
     metadata_store: Arc<dyn MetadataStore>,
     // PERFORMANCE (v2.2.7 - P2): Use DashMap instead of RwLock<HashMap> for lock-free partition access
@@ -985,8 +985,12 @@ impl ProduceHandler {
             (None, None)
         };
         
-        // Create JSON pipeline for transformation
-        let json_pipeline = Arc::new(JsonPipeline::new(Default::default(), config.indexer_config.clone()).await?);
+        // Create JSON pipeline for transformation (only when indexing enabled)
+        let json_pipeline = if config.enable_indexing {
+            Some(Arc::new(JsonPipeline::new(Default::default(), config.indexer_config.clone()).await?))
+        } else {
+            None
+        };
         
         // P3 OPTIMIZATION (v2.2.7): Lock-free memory tracking
         let memory_limit_bytes = config.buffer_memory as u64;
@@ -3626,7 +3630,7 @@ impl Clone for ProduceHandler {
             config: self.config.clone(),
             storage: Arc::clone(&self.storage),
             indexer: self.indexer.clone(),
-            json_pipeline: Arc::clone(&self.json_pipeline),
+            json_pipeline: self.json_pipeline.clone(),
             index_sender: self.index_sender.clone(),
             metadata_store: Arc::clone(&self.metadata_store),
             partition_states: Arc::clone(&self.partition_states),
@@ -3694,13 +3698,14 @@ mod tests {
         metadata_store.create_topic("test-topic", topic_config).await.unwrap();
         
         let config = ProduceHandlerConfig {
-            node_id: 0,
+            node_id: 1, // Must match InMemoryMetadataStore's leader_id (hardcoded to 1)
             enable_indexing: false, // Disable for tests
+            auto_create_topics_enable: false, // Tests pre-create topics explicitly
             ..Default::default()
         };
-        
+
         let handler = ProduceHandler::new(config, storage, metadata_store).await.unwrap();
-        
+
         (handler, temp_dir)
     }
     
@@ -3880,11 +3885,11 @@ mod tests {
         
         let mut partitions = vec![];
         
-        // Create records for 3 partitions
+        // Create records for 3 partitions (sequence 0 for each — tracked per partition)
         for i in 0..3 {
             let records_data = create_test_record_batch(
                 1234,
-                i,
+                0, // Each partition starts at sequence 0
                 vec![(
                     &format!("key{}", i),
                     &format!("value{}", i),
@@ -4132,16 +4137,16 @@ mod tests {
         let metadata_store = Arc::new(InMemoryMetadataStore::new());
         
         let config = ProduceHandlerConfig {
-            node_id: 0,
+            node_id: 1, // Must match InMemoryMetadataStore's leader_id
             enable_indexing: false,
             auto_create_topics_enable: true,
             num_partitions: 5,
             default_replication_factor: 3,
             ..Default::default()
         };
-        
+
         let handler = ProduceHandler::new(config, storage, metadata_store.clone()).await.unwrap();
-        
+
         // Produce to non-existent topic
         let records_data = create_test_record_batch(
             1234,
@@ -4200,14 +4205,14 @@ mod tests {
         let metadata_store = Arc::new(InMemoryMetadataStore::new());
         
         let config = ProduceHandlerConfig {
-            node_id: 0,
+            node_id: 1, // Must match InMemoryMetadataStore's leader_id
             enable_indexing: false,
             auto_create_topics_enable: false, // Disabled
             ..Default::default()
         };
-        
+
         let handler = ProduceHandler::new(config, storage, metadata_store).await.unwrap();
-        
+
         let records_data = create_test_record_batch(
             1234,
             0,
@@ -4258,16 +4263,16 @@ mod tests {
         let metadata_store = Arc::new(InMemoryMetadataStore::new());
         
         let config = ProduceHandlerConfig {
-            node_id: 0,
+            node_id: 1, // Must match InMemoryMetadataStore's leader_id
             enable_indexing: false,
             auto_create_topics_enable: true,
             num_partitions: 3,
             default_replication_factor: 1,
             ..Default::default()
         };
-        
+
         let handler = Arc::new(ProduceHandler::new(config, storage, metadata_store).await.unwrap());
-        
+
         // Spawn multiple concurrent produce requests to the same non-existent topic
         let mut handles = vec![];
         
@@ -4351,12 +4356,12 @@ mod tests {
         let metadata_store = Arc::new(InMemoryMetadataStore::new());
         
         let config = ProduceHandlerConfig {
-            node_id: 0,
+            node_id: 1, // Must match InMemoryMetadataStore's leader_id
             enable_indexing: false,
             auto_create_topics_enable: true,
             ..Default::default()
         };
-        
+
         let handler = ProduceHandler::new(config, storage, metadata_store).await.unwrap();
 
         // Test various invalid topic names
@@ -4448,7 +4453,11 @@ mod tests {
         use std::sync::atomic::Ordering;
         
         let temp_dir = TempDir::new().unwrap();
-        let produce_config = ProduceHandlerConfig::default();
+        let produce_config = ProduceHandlerConfig {
+            node_id: 1, // Must match InMemoryMetadataStore's leader_id
+            enable_indexing: false,
+            ..ProduceHandlerConfig::default()
+        };
 
         let metadata_store = Arc::new(InMemoryMetadataStore::new());
 
@@ -4464,12 +4473,12 @@ mod tests {
             object_store,
             metadata_store.clone(),
         ).await.unwrap();
-        
+
         // Create topic
         let mut topic_config = TopicConfig::default();
         topic_config.partition_count = 1;
         metadata_store.create_topic("test-topic", topic_config).await.unwrap();
-        
+
         // Produce a message with acks=0
         let request = ProduceRequest {
             transactional_id: None,
@@ -4497,9 +4506,13 @@ mod tests {
     async fn test_high_watermark_update_acks_1() {
         use tempfile::TempDir;
         use std::sync::atomic::Ordering;
-        
+
         let temp_dir = TempDir::new().unwrap();
-        let produce_config = ProduceHandlerConfig::default();
+        let produce_config = ProduceHandlerConfig {
+            node_id: 1,
+            enable_indexing: false,
+            ..ProduceHandlerConfig::default()
+        };
 
         let metadata_store = Arc::new(InMemoryMetadataStore::new());
 
@@ -4548,9 +4561,13 @@ mod tests {
     async fn test_high_watermark_with_fetch_handler_integration() {
         use tempfile::TempDir;
         use std::sync::atomic::Ordering;
-        
+
         let temp_dir = TempDir::new().unwrap();
-        let produce_config = ProduceHandlerConfig::default();
+        let produce_config = ProduceHandlerConfig {
+            node_id: 1,
+            enable_indexing: false,
+            ..ProduceHandlerConfig::default()
+        };
 
         let metadata_store = Arc::new(InMemoryMetadataStore::new());
 

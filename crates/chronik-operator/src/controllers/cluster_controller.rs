@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -274,12 +276,14 @@ async fn apply(client: Client, cluster: &ChronikCluster) -> Result<Action, Opera
                     .or_else(|e| if is_not_found(&e) { Ok(()) } else { Err(e) })?;
             }
 
+            let spec_hash = compute_cluster_spec_hash(spec);
             let pod = pod_builder::build_cluster_node_pod(
                 &name,
                 &namespace,
                 node_id,
                 spec,
                 owner_ref.clone(),
+                Some(&spec_hash),
             );
             info!(name = %name, node_id, "Creating Pod");
             pod_api.create(&PostParams::default(), &pod).await?;
@@ -471,38 +475,67 @@ async fn cleanup(_client: Client, cluster: &ChronikCluster) -> Result<Action, Op
     Ok(Action::await_change())
 }
 
-/// Check if a cluster node Pod needs recreation.
-fn cluster_pod_needs_update(pod: &Pod, spec: &ChronikClusterSpec) -> bool {
-    let Some(pod_spec) = &pod.spec else {
-        return true;
-    };
+/// Compute a deterministic hash of the ChronikCluster spec fields that affect pod config.
+/// Used as a pod annotation to detect when the spec has changed and pods need recreation.
+fn compute_cluster_spec_hash(spec: &ChronikClusterSpec) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    spec.image.hash(&mut hasher);
+    spec.image_pull_policy.hash(&mut hasher);
+    spec.wal_profile.hash(&mut hasher);
+    spec.produce_profile.hash(&mut hasher);
+    spec.log_level.hash(&mut hasher);
+    spec.columnar_enabled.hash(&mut hasher);
 
-    let Some(container) = pod_spec.containers.first() else {
-        return true;
-    };
-
-    // Check image
-    if container.image.as_deref() != Some(&spec.image) {
-        return true;
+    // Sort env vars by name for deterministic hashing
+    let sorted_env: BTreeMap<_, _> = spec.env.iter()
+        .map(|e| (&e.name, (e.value.as_deref().unwrap_or(""), e.value_from_secret.as_ref())))
+        .collect();
+    for (name, (value, secret_ref)) in &sorted_env {
+        name.hash(&mut hasher);
+        value.hash(&mut hasher);
+        if let Some(sr) = secret_ref {
+            sr.name.hash(&mut hasher);
+            sr.key.hash(&mut hasher);
+        }
     }
 
-    // Check key env vars
-    if let Some(env) = &container.env {
-        let find_env = |name: &str| -> Option<&str> {
-            env.iter()
-                .find(|e| e.name == name)
-                .and_then(|e| e.value.as_deref())
-        };
+    // Include resources
+    if let Some(ref res) = spec.resources {
+        format!("{:?}", res).hash(&mut hasher);
+    }
 
-        if find_env("CHRONIK_WAL_PROFILE") != Some(&spec.wal_profile) {
-            return true;
-        }
-        if find_env("CHRONIK_PRODUCE_PROFILE") != Some(&spec.produce_profile) {
-            return true;
-        }
-        if find_env("RUST_LOG") != Some(&spec.log_level) {
-            return true;
-        }
+    // Include vector search config
+    if let Some(ref vs) = spec.vector_search {
+        vs.enabled.hash(&mut hasher);
+        vs.provider.hash(&mut hasher);
+    }
+
+    // Include object store config
+    if let Some(ref os) = spec.object_store {
+        format!("{:?}", os).hash(&mut hasher);
+    }
+
+    format!("{:016x}", hasher.finish())
+}
+
+/// Check if a cluster node Pod needs recreation by comparing spec hash annotation.
+fn cluster_pod_needs_update(pod: &Pod, spec: &ChronikClusterSpec) -> bool {
+    let desired_hash = compute_cluster_spec_hash(spec);
+    let current_hash = pod
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get("chronik.io/spec-hash"))
+        .map(|s| s.as_str())
+        .unwrap_or("");
+
+    if desired_hash != current_hash {
+        info!(
+            desired = %desired_hash,
+            current = %current_hash,
+            "Spec hash mismatch, pod needs recreation"
+        );
+        return true;
     }
 
     false
@@ -666,28 +699,22 @@ mod tests {
 
     #[test]
     fn test_cluster_pod_needs_update_image_change() {
+        // Spec matching the pod's current config
+        let matching_spec: ChronikClusterSpec =
+            serde_json::from_str(r#"{"image": "chronik:v2.2.22"}"#).unwrap();
+        let matching_hash = compute_cluster_spec_hash(&matching_spec);
+
         let pod = Pod {
+            metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+                annotations: Some(BTreeMap::from([
+                    ("chronik.io/spec-hash".to_string(), matching_hash),
+                ])),
+                ..Default::default()
+            },
             spec: Some(k8s_openapi::api::core::v1::PodSpec {
                 containers: vec![k8s_openapi::api::core::v1::Container {
                     name: "chronik-server".into(),
                     image: Some("chronik:v2.2.22".into()),
-                    env: Some(vec![
-                        k8s_openapi::api::core::v1::EnvVar {
-                            name: "CHRONIK_WAL_PROFILE".into(),
-                            value: Some("medium".into()),
-                            ..Default::default()
-                        },
-                        k8s_openapi::api::core::v1::EnvVar {
-                            name: "CHRONIK_PRODUCE_PROFILE".into(),
-                            value: Some("balanced".into()),
-                            ..Default::default()
-                        },
-                        k8s_openapi::api::core::v1::EnvVar {
-                            name: "RUST_LOG".into(),
-                            value: Some("info".into()),
-                            ..Default::default()
-                        },
-                    ]),
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -695,14 +722,57 @@ mod tests {
             ..Default::default()
         };
 
-        // Image changed
+        // Image changed → needs update
         let spec: ChronikClusterSpec =
             serde_json::from_str(r#"{"image": "chronik:v2.2.23"}"#).unwrap();
         assert!(cluster_pod_needs_update(&pod, &spec));
 
-        // No change
+        // No change → no update needed
         let spec: ChronikClusterSpec =
             serde_json::from_str(r#"{"image": "chronik:v2.2.22"}"#).unwrap();
         assert!(!cluster_pod_needs_update(&pod, &spec));
+    }
+
+    #[test]
+    fn test_cluster_pod_needs_update_env_change() {
+        // Spec with env vars
+        let spec_v1: ChronikClusterSpec =
+            serde_json::from_str(r#"{"image": "chronik:v2.3.0"}"#).unwrap();
+        let hash_v1 = compute_cluster_spec_hash(&spec_v1);
+
+        let pod = Pod {
+            metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+                annotations: Some(BTreeMap::from([
+                    ("chronik.io/spec-hash".to_string(), hash_v1),
+                ])),
+                ..Default::default()
+            },
+            spec: Some(k8s_openapi::api::core::v1::PodSpec {
+                containers: vec![k8s_openapi::api::core::v1::Container {
+                    name: "chronik-server".into(),
+                    image: Some("chronik:v2.3.0".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        // Same spec → no update
+        assert!(!cluster_pod_needs_update(&pod, &spec_v1));
+
+        // Pod without annotation → always needs update
+        let pod_no_annotation = Pod {
+            spec: Some(k8s_openapi::api::core::v1::PodSpec {
+                containers: vec![k8s_openapi::api::core::v1::Container {
+                    name: "chronik-server".into(),
+                    image: Some("chronik:v2.3.0".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(cluster_pod_needs_update(&pod_no_annotation, &spec_v1));
     }
 }

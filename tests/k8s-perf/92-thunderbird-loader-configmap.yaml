@@ -1,0 +1,103 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: thunderbird-loader-script
+  namespace: chronik-perf
+data:
+  thunderbird-loader.py: |
+    #!/usr/bin/env python3
+    """Thunderbird log loader for Chronik Stream SV-2a scale validation."""
+    import json, os, re, sys, time
+
+    try:
+        from kafka import KafkaProducer
+    except ImportError:
+        import subprocess
+        subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'kafka-python', '-q'])
+        from kafka import KafkaProducer
+
+    BOOTSTRAP = os.environ.get('BOOTSTRAP_SERVERS', 'localhost:9092')
+    TOPIC = os.environ.get('TOPIC', 'thunderbird')
+    LOG_FILE = os.environ.get('LOG_FILE', '/data/Thunderbird_full.log')
+    MAX_LINES = int(os.environ.get('MAX_LINES', '0'))
+    BATCH_SIZE = int(os.environ.get('BATCH_SIZE', '5000'))
+
+    LINE_PATTERN = re.compile(
+        r'^(\S+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(\w+)\s+(\d+)\s+([\d:]+)\s+(\S+)\s+(.+)'
+    )
+
+    def parse_line(line):
+        m = LINE_PATTERN.match(line)
+        if not m:
+            return None
+        rest = m.group(9)
+        colon_idx = rest.find(': ')
+        if colon_idx > 0:
+            component_raw = rest[:colon_idx].strip()
+            message = rest[colon_idx + 2:].strip()
+        else:
+            component_raw = rest.strip()
+            message = ''
+        bracket_idx = component_raw.find('[')
+        if bracket_idx > 0:
+            component = component_raw[:bracket_idx]
+        else:
+            component = component_raw
+        return {
+            'label': m.group(1),
+            'timestamp': int(m.group(2)),
+            'date': m.group(3),
+            'hostname': m.group(4),
+            'time': f'{m.group(5)} {m.group(6)} {m.group(7)}',
+            'source': m.group(8),
+            'component': component,
+            'message': message,
+        }
+
+    print(f'Thunderbird Log Loader')
+    print(f'  Bootstrap: {BOOTSTRAP}')
+    print(f'  Topic:     {TOPIC}')
+    print(f'  Log file:  {LOG_FILE}')
+    print(f'  Max lines: {MAX_LINES or "all"}')
+
+    if not os.path.exists(LOG_FILE):
+        print(f'ERROR: Log file not found: {LOG_FILE}')
+        sys.exit(1)
+
+    producer = KafkaProducer(
+        bootstrap_servers=BOOTSTRAP,
+        value_serializer=lambda v: json.dumps(v).encode('utf-8'),
+        key_serializer=lambda k: k.encode('utf-8') if k else None,
+        api_version=(0, 10, 0),
+        linger_ms=50,
+        batch_size=65536,
+        buffer_memory=134217728,
+        max_request_size=10485760,
+    )
+
+    start = time.time()
+    success = 0
+    parse_errors = 0
+
+    with open(LOG_FILE, 'r', encoding='utf-8', errors='replace') as f:
+        for line_no, raw_line in enumerate(f, 1):
+            if MAX_LINES > 0 and line_no > MAX_LINES:
+                break
+            doc = parse_line(raw_line.rstrip('\n'))
+            if doc is None:
+                parse_errors += 1
+                continue
+            producer.send(TOPIC, key=doc['hostname'], value=doc)
+            success += 1
+            if success % BATCH_SIZE == 0:
+                producer.flush()
+                elapsed = time.time() - start
+                rate = success / elapsed
+                pct = 100.0 * line_no / (MAX_LINES or 16601745)
+                print(f'  {success:>10,} produced | {rate:>8,.0f} msg/s | {pct:.1f}%')
+
+    producer.flush()
+    producer.close()
+    elapsed = time.time() - start
+    rate = success / elapsed if elapsed > 0 else 0
+    print(f'\nDone: {success:,} messages in {elapsed:.1f}s ({rate:,.0f} msg/s, {parse_errors} parse errors)')

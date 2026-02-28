@@ -128,11 +128,13 @@ mod wal_record_tests {
         }
 
         // Recalculate length and checksum after adding headers
+        // Must set length BEFORE computing checksum (checksum includes length)
         let new_length = record.calculate_length();
-        let new_crc32 = record.calculate_checksum();
-
-        if let WalRecord::V1 { ref mut length, ref mut crc32, .. } = record {
+        if let WalRecord::V1 { ref mut length, .. } = record {
             *length = new_length;
+        }
+        let new_crc32 = record.calculate_checksum();
+        if let WalRecord::V1 { ref mut crc32, .. } = record {
             *crc32 = new_crc32;
         }
 
@@ -380,7 +382,7 @@ mod wal_segment_tests {
         assert_eq!(sealed.size, total_size);
         assert_eq!(sealed.record_count, 2);
         assert_eq!(sealed.path, segment_path);
-        assert!(sealed.sealed_at > sealed.created_at);
+        assert!(sealed.sealed_at >= sealed.created_at); // Can be same millisecond on fast systems
 
         // Verify file was written
         assert!(segment_path.exists());
@@ -648,9 +650,9 @@ mod wal_manager_tests {
         // Second manager: recover from existing data
         let manager2 = WalManager::recover(&config).await.expect("Recovery should succeed");
         
-        // For now, recovery is a placeholder, but structure should be valid
+        // Recovery scans disk for partitions — should find the 1 partition we wrote to
         let recovery_result = manager2.get_recovery_result();
-        assert_eq!(recovery_result.partitions, 0); // TODO: Will be updated when recovery is implemented
+        assert_eq!(recovery_result.partitions, 1);
     }
 }
 

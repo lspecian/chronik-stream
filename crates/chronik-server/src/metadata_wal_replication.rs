@@ -363,11 +363,9 @@ mod tests {
     #[tokio::test]
     async fn test_metadata_wal_replicator_serialize() {
         // Test that we can serialize metadata commands correctly
-        let cmd = MetadataCommand::CreateTopic {
-            name: "test-topic".to_string(),
-            partition_count: 3,
-            replication_factor: 2,
-            config: HashMap::new(),
+        let cmd = MetadataCommand::AddNode {
+            node_id: 1,
+            address: "localhost:9092".to_string(),
         };
 
         let data = bincode::serialize(&cmd).unwrap();
@@ -376,10 +374,9 @@ mod tests {
         // Verify round-trip
         let cmd2: MetadataCommand = bincode::deserialize(&data).unwrap();
         match cmd2 {
-            MetadataCommand::CreateTopic { name, partition_count, replication_factor, .. } => {
-                assert_eq!(name, "test-topic");
-                assert_eq!(partition_count, 3);
-                assert_eq!(replication_factor, 2);
+            MetadataCommand::AddNode { node_id, address } => {
+                assert_eq!(node_id, 1);
+                assert_eq!(address, "localhost:9092");
             }
             _ => panic!("Unexpected command type"),
         }

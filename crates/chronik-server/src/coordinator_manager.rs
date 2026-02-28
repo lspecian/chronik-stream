@@ -587,6 +587,28 @@ mod tests {
         ) -> chronik_common::metadata::traits::Result<()> {
             unimplemented!()
         }
+
+        // Parquet segment operations (columnar storage for SQL queries)
+        async fn persist_parquet_segment(&self, _metadata: chronik_common::metadata::ParquetSegmentMetadata) -> chronik_common::metadata::traits::Result<()> {
+            Ok(())
+        }
+        async fn get_parquet_segment(&self, _topic: &str, _partition: i32, _segment_id: &str) -> chronik_common::metadata::traits::Result<Option<chronik_common::metadata::ParquetSegmentMetadata>> {
+            Ok(None)
+        }
+        async fn list_parquet_segments(&self, _topic: &str, _partition: Option<i32>) -> chronik_common::metadata::traits::Result<Vec<chronik_common::metadata::ParquetSegmentMetadata>> {
+            Ok(vec![])
+        }
+        async fn get_parquet_paths(&self, _topic: &str) -> chronik_common::metadata::traits::Result<Vec<String>> {
+            Ok(vec![])
+        }
+        async fn delete_parquet_segment(&self, _topic: &str, _partition: i32, _segment_id: &str) -> chronik_common::metadata::traits::Result<()> {
+            Ok(())
+        }
+
+        // Replicated event application
+        async fn apply_replicated_event(&self, _event: chronik_common::metadata::events::MetadataEvent) -> chronik_common::metadata::traits::Result<()> {
+            Ok(())
+        }
     }
     
     #[test]

@@ -5870,6 +5870,30 @@ impl ProtocolHandler {
                     config_map.insert("compression.type".to_string(), "none".to_string());
                     config_map.insert("cleanup.policy".to_string(), "delete".to_string());
                     config_map.insert("min.insync.replicas".to_string(), "1".to_string());
+
+                    // v2.3.1: Include searchable/columnar/vector defaults from env vars
+                    // so auto-created topics match the server's configured defaults.
+                    // Without this, auto-creation on a follower node creates a bare topic
+                    // that races with the real CreateTopics event, and the real event's
+                    // config is silently ignored by the idempotent check in apply_event().
+                    if std::env::var("CHRONIK_DEFAULT_SEARCHABLE")
+                        .map(|v| v.eq_ignore_ascii_case("true"))
+                        .unwrap_or(false)
+                    {
+                        config_map.insert("searchable".to_string(), "true".to_string());
+                    }
+                    if std::env::var("CHRONIK_DEFAULT_COLUMNAR")
+                        .map(|v| v.eq_ignore_ascii_case("true"))
+                        .unwrap_or(false)
+                    {
+                        config_map.insert("columnar.enabled".to_string(), "true".to_string());
+                    }
+                    if std::env::var("CHRONIK_DEFAULT_VECTOR_ENABLED")
+                        .map(|v| v.eq_ignore_ascii_case("true"))
+                        .unwrap_or(false)
+                    {
+                        config_map.insert("vector.enabled".to_string(), "true".to_string());
+                    }
                     
                     let config = chronik_common::metadata::TopicConfig {
                         partition_count: default_num_partitions,

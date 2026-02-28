@@ -1,0 +1,29 @@
+apiVersion: k6.io/v1alpha1
+kind: TestRun
+metadata:
+  name: k6-thunderbird-vector
+  namespace: chronik-perf
+spec:
+  parallelism: 4
+  script:
+    configMap:
+      name: k6-thunderbird-vector-script
+      file: thunderbird-vector-test.js
+  runner:
+    image: grafana/k6:0.49.0
+    resources:
+      requests:
+        cpu: "1"
+        memory: "512Mi"
+      limits:
+        cpu: "4"
+        memory: "2Gi"
+    env:
+      - name: CHRONIK_URL
+        value: "http://chronik-thunderbird.chronik-perf.svc.cluster.local:6092"
+      - name: VECTOR_TOPIC
+        value: "thunderbird-vector"
+      - name: TEXT_TOPIC
+        value: "thunderbird"
+      - name: TEST_MODE
+        value: "mixed"

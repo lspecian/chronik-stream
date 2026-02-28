@@ -63,6 +63,7 @@ mod tests {
     async fn test_create_integrated_server_config() {
         let temp_dir = TempDir::new().unwrap();
         let cluster_config = ClusterConfig {
+            enabled: true,
             node_id: 1,
             data_dir: temp_dir.path().to_string_lossy().to_string(),
             replication_factor: 3,
@@ -70,6 +71,8 @@ mod tests {
             peers: vec![],
             bind: None,
             advertise: None,
+            gossip: None,
+            auto_recover: true,
         };
 
         let init_config = ClusterInitConfig {
@@ -91,7 +94,7 @@ mod tests {
             node_id: init_config.node_id as i32,
             advertised_host: init_config.advertised_host.clone(),
             advertised_port: init_config.advertised_port,
-            data_dir: init_config.data_dir.clone(),
+            data_dir: init_config.data_dir.to_string_lossy().to_string(),
             enable_indexing: cfg!(feature = "search"),
             enable_compression: true,
             auto_create_topics: true,

@@ -25,6 +25,9 @@ pub struct QueryRequest {
     /// Result format: "merged" (single ranked list) or "grouped" (per-topic)
     #[serde(default)]
     pub result_format: ResultFormat,
+    /// VO-4: Enable cross-encoder re-ranking after RRF fusion (default: false)
+    #[serde(default)]
+    pub rerank: bool,
 }
 
 /// How results are organized in the response.

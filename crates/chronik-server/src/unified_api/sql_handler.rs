@@ -344,6 +344,15 @@ pub async fn execute_sql(
 ) -> impl IntoResponse {
     info!(query = %request.query, limit = request.limit, "Executing SQL query");
 
+    // Check if SQL engine is available before executing
+    if state.query_engine.is_none() {
+        let error_response = SqlErrorResponse {
+            error: "SQL query engine not available".to_string(),
+            error_type: "ServiceUnavailable".to_string(),
+        };
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(error_response)).into_response();
+    }
+
     match SqlHandler::execute(&state, &request.query, request.limit).await {
         Ok(response) => {
             info!(

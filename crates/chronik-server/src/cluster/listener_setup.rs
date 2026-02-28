@@ -133,6 +133,7 @@ mod tests {
         use std::path::PathBuf;
 
         let cluster_config = ClusterConfig {
+            enabled: true,
             node_id: 1,
             data_dir: "./data".to_string(),
             replication_factor: 3,
@@ -140,6 +141,8 @@ mod tests {
             peers: vec![],
             bind: None,
             advertise: None,
+            gossip: None,
+            auto_recover: true,
         };
 
         let init_config = ClusterInitConfig {

@@ -1,0 +1,57 @@
+apiVersion: chronik.io/v1alpha1
+kind: ChronikCluster
+metadata:
+  name: chronik-thunderbird
+  namespace: chronik-perf
+spec:
+  replicas: 3
+  image: chronik-server:vo1-throughput
+  imagePullPolicy: Never
+  walProfile: high
+  produceProfile: high-throughput
+  logLevel: info
+  replicationFactor: 3
+  minInsyncReplicas: 2
+  antiAffinity: required
+  antiAffinityTopologyKey: kubernetes.io/hostname
+  resources:
+    requests:
+      cpu: "4"
+      memory: "16Gi"
+    limits:
+      cpu: "16"
+      memory: "64Gi"
+  storage:
+    size: 200Gi
+    storageClass: standard
+  podDisruptionBudget:
+    maxUnavailable: 1
+  env:
+    - name: CHRONIK_DEFAULT_SEARCHABLE
+      value: "true"
+    - name: CHRONIK_DEFAULT_COLUMNAR
+      value: "true"
+    - name: CHRONIK_UNIFIED_API_PORT
+      value: "6092"
+    - name: CHRONIK_HOT_BUFFER_ENABLED
+      value: "true"
+    - name: CHRONIK_HOT_BUFFER_MAX_RECORDS
+      value: "500000"
+    - name: CHRONIK_EMBEDDING_CACHE_ENABLED
+      value: "true"
+    - name: CHRONIK_DEFAULT_VECTOR_ENABLED
+      value: "true"
+    # OPENAI_API_KEY: loaded from K8s Secret (see 95-openai-secret.yaml)
+    - name: OPENAI_API_KEY
+      valueFromSecret:
+        name: openai-api-key
+        key: api-key
+    - name: CHRONIK_EMBEDDING_PROVIDER
+      value: "openai"
+    - name: CHRONIK_EMBEDDING_MODEL
+      value: "text-embedding-3-small"
+    # VO-1: Embedding pipeline throughput optimization
+    - name: CHRONIK_EMBEDDING_CONCURRENCY
+      value: "4"
+    - name: CHRONIK_VECTOR_PARTITION_CONCURRENCY
+      value: "3"
