@@ -5,7 +5,7 @@ metadata:
   namespace: chronik-perf
 spec:
   replicas: 3
-  image: chronik-server:vo1-throughput
+  image: chronik-server:dv2b-runtime-fix
   imagePullPolicy: Never
   walProfile: high
   produceProfile: high-throughput
@@ -40,7 +40,7 @@ spec:
     - name: CHRONIK_EMBEDDING_CACHE_ENABLED
       value: "true"
     - name: CHRONIK_DEFAULT_VECTOR_ENABLED
-      value: "true"
+      value: "false"
     # OPENAI_API_KEY: loaded from K8s Secret (see 95-openai-secret.yaml)
     - name: OPENAI_API_KEY
       valueFromSecret:

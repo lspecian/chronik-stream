@@ -3,12 +3,41 @@
 //! Provides JSON extraction, binary decoding, and other utility functions.
 
 use anyhow::Result;
-use datafusion::arrow::array::{Array, ArrayRef, BinaryArray, StringArray};
+use datafusion::arrow::array::{Array, ArrayRef, BinaryArray, BinaryViewArray, LargeBinaryArray, StringArray};
 use datafusion::arrow::datatypes::DataType;
 use datafusion::logical_expr::{ColumnarValue, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility};
 use datafusion::prelude::SessionContext;
 use std::any::Any;
 use std::sync::Arc;
+
+/// Extract bytes from any binary-like Arrow array type at a given index.
+/// Handles BinaryArray, BinaryViewArray, and LargeBinaryArray.
+fn get_binary_value<'a>(arr: &'a dyn Array, idx: usize) -> Option<&'a [u8]> {
+    if arr.is_null(idx) {
+        return None;
+    }
+    if let Some(ba) = arr.as_any().downcast_ref::<BinaryArray>() {
+        Some(ba.value(idx))
+    } else if let Some(bva) = arr.as_any().downcast_ref::<BinaryViewArray>() {
+        Some(bva.value(idx))
+    } else if let Some(lba) = arr.as_any().downcast_ref::<LargeBinaryArray>() {
+        Some(lba.value(idx))
+    } else {
+        None
+    }
+}
+
+/// Get the length of any binary-like Arrow array.
+fn get_binary_len(arr: &dyn Array) -> Option<usize> {
+    if arr.as_any().downcast_ref::<BinaryArray>().is_some()
+        || arr.as_any().downcast_ref::<BinaryViewArray>().is_some()
+        || arr.as_any().downcast_ref::<LargeBinaryArray>().is_some()
+    {
+        Some(arr.len())
+    } else {
+        None
+    }
+}
 
 /// Register all custom UDFs with a SessionContext.
 pub fn register_udfs(ctx: &SessionContext) -> Result<()> {
@@ -33,7 +62,7 @@ impl JsonExtractUdf {
     fn new() -> Self {
         Self {
             signature: Signature::new(
-                TypeSignature::Exact(vec![DataType::Binary, DataType::Utf8]),
+                TypeSignature::Any(2),
                 Volatility::Immutable,
             ),
         }
@@ -60,10 +89,11 @@ impl ScalarUDFImpl for JsonExtractUdf {
     fn invoke(&self, args: &[ColumnarValue]) -> datafusion::error::Result<ColumnarValue> {
         let args = ColumnarValue::values_to_arrays(args)?;
 
-        let binary_array = args[0]
-            .as_any()
-            .downcast_ref::<BinaryArray>()
-            .ok_or_else(|| datafusion::error::DataFusionError::Internal("Expected binary array".to_string()))?;
+        let bin_arr = args[0].as_ref();
+        let len = get_binary_len(bin_arr)
+            .ok_or_else(|| datafusion::error::DataFusionError::Internal(
+                format!("Expected binary array, got {}", args[0].data_type())
+            ))?;
         let path_array = args[1]
             .as_any()
             .downcast_ref::<StringArray>()
@@ -71,17 +101,20 @@ impl ScalarUDFImpl for JsonExtractUdf {
 
         let mut builder = datafusion::arrow::array::StringBuilder::new();
 
-        for i in 0..binary_array.len() {
-            if binary_array.is_null(i) || path_array.is_null(i) {
+        for i in 0..len {
+            if path_array.is_null(i) {
                 builder.append_null();
                 continue;
             }
 
-            let json_bytes = binary_array.value(i);
-            let path = path_array.value(i);
-
-            match extract_json_value(json_bytes, path) {
-                Some(value) => builder.append_value(&value),
+            match get_binary_value(bin_arr, i) {
+                Some(json_bytes) => {
+                    let path = path_array.value(i);
+                    match extract_json_value(json_bytes, path) {
+                        Some(value) => builder.append_value(&value),
+                        None => builder.append_null(),
+                    }
+                }
                 None => builder.append_null(),
             }
         }
@@ -100,7 +133,7 @@ impl JsonExtractStringUdf {
     fn new() -> Self {
         Self {
             signature: Signature::new(
-                TypeSignature::Exact(vec![DataType::Binary, DataType::Utf8]),
+                TypeSignature::Any(2),
                 Volatility::Immutable,
             ),
         }
@@ -127,10 +160,11 @@ impl ScalarUDFImpl for JsonExtractStringUdf {
     fn invoke(&self, args: &[ColumnarValue]) -> datafusion::error::Result<ColumnarValue> {
         let args = ColumnarValue::values_to_arrays(args)?;
 
-        let binary_array = args[0]
-            .as_any()
-            .downcast_ref::<BinaryArray>()
-            .ok_or_else(|| datafusion::error::DataFusionError::Internal("Expected binary array".to_string()))?;
+        let bin_arr = args[0].as_ref();
+        let len = get_binary_len(bin_arr)
+            .ok_or_else(|| datafusion::error::DataFusionError::Internal(
+                format!("Expected binary array, got {}", args[0].data_type())
+            ))?;
         let path_array = args[1]
             .as_any()
             .downcast_ref::<StringArray>()
@@ -138,17 +172,20 @@ impl ScalarUDFImpl for JsonExtractStringUdf {
 
         let mut builder = datafusion::arrow::array::StringBuilder::new();
 
-        for i in 0..binary_array.len() {
-            if binary_array.is_null(i) || path_array.is_null(i) {
+        for i in 0..len {
+            if path_array.is_null(i) {
                 builder.append_null();
                 continue;
             }
 
-            let json_bytes = binary_array.value(i);
-            let path = path_array.value(i);
-
-            match extract_json_string(json_bytes, path) {
-                Some(value) => builder.append_value(&value),
+            match get_binary_value(bin_arr, i) {
+                Some(json_bytes) => {
+                    let path = path_array.value(i);
+                    match extract_json_string(json_bytes, path) {
+                        Some(value) => builder.append_value(&value),
+                        None => builder.append_null(),
+                    }
+                }
                 None => builder.append_null(),
             }
         }
@@ -167,7 +204,7 @@ impl JsonExtractIntUdf {
     fn new() -> Self {
         Self {
             signature: Signature::new(
-                TypeSignature::Exact(vec![DataType::Binary, DataType::Utf8]),
+                TypeSignature::Any(2),
                 Volatility::Immutable,
             ),
         }
@@ -194,10 +231,11 @@ impl ScalarUDFImpl for JsonExtractIntUdf {
     fn invoke(&self, args: &[ColumnarValue]) -> datafusion::error::Result<ColumnarValue> {
         let args = ColumnarValue::values_to_arrays(args)?;
 
-        let binary_array = args[0]
-            .as_any()
-            .downcast_ref::<BinaryArray>()
-            .ok_or_else(|| datafusion::error::DataFusionError::Internal("Expected binary array".to_string()))?;
+        let bin_arr = args[0].as_ref();
+        let len = get_binary_len(bin_arr)
+            .ok_or_else(|| datafusion::error::DataFusionError::Internal(
+                format!("Expected binary array, got {}", args[0].data_type())
+            ))?;
         let path_array = args[1]
             .as_any()
             .downcast_ref::<StringArray>()
@@ -205,17 +243,20 @@ impl ScalarUDFImpl for JsonExtractIntUdf {
 
         let mut builder = datafusion::arrow::array::Int64Builder::new();
 
-        for i in 0..binary_array.len() {
-            if binary_array.is_null(i) || path_array.is_null(i) {
+        for i in 0..len {
+            if path_array.is_null(i) {
                 builder.append_null();
                 continue;
             }
 
-            let json_bytes = binary_array.value(i);
-            let path = path_array.value(i);
-
-            match extract_json_int(json_bytes, path) {
-                Some(value) => builder.append_value(value),
+            match get_binary_value(bin_arr, i) {
+                Some(json_bytes) => {
+                    let path = path_array.value(i);
+                    match extract_json_int(json_bytes, path) {
+                        Some(value) => builder.append_value(value),
+                        None => builder.append_null(),
+                    }
+                }
                 None => builder.append_null(),
             }
         }
@@ -234,7 +275,7 @@ impl JsonExtractFloatUdf {
     fn new() -> Self {
         Self {
             signature: Signature::new(
-                TypeSignature::Exact(vec![DataType::Binary, DataType::Utf8]),
+                TypeSignature::Any(2),
                 Volatility::Immutable,
             ),
         }
@@ -261,10 +302,11 @@ impl ScalarUDFImpl for JsonExtractFloatUdf {
     fn invoke(&self, args: &[ColumnarValue]) -> datafusion::error::Result<ColumnarValue> {
         let args = ColumnarValue::values_to_arrays(args)?;
 
-        let binary_array = args[0]
-            .as_any()
-            .downcast_ref::<BinaryArray>()
-            .ok_or_else(|| datafusion::error::DataFusionError::Internal("Expected binary array".to_string()))?;
+        let bin_arr = args[0].as_ref();
+        let len = get_binary_len(bin_arr)
+            .ok_or_else(|| datafusion::error::DataFusionError::Internal(
+                format!("Expected binary array, got {}", args[0].data_type())
+            ))?;
         let path_array = args[1]
             .as_any()
             .downcast_ref::<StringArray>()
@@ -272,17 +314,20 @@ impl ScalarUDFImpl for JsonExtractFloatUdf {
 
         let mut builder = datafusion::arrow::array::Float64Builder::new();
 
-        for i in 0..binary_array.len() {
-            if binary_array.is_null(i) || path_array.is_null(i) {
+        for i in 0..len {
+            if path_array.is_null(i) {
                 builder.append_null();
                 continue;
             }
 
-            let json_bytes = binary_array.value(i);
-            let path = path_array.value(i);
-
-            match extract_json_float(json_bytes, path) {
-                Some(value) => builder.append_value(value),
+            match get_binary_value(bin_arr, i) {
+                Some(json_bytes) => {
+                    let path = path_array.value(i);
+                    match extract_json_float(json_bytes, path) {
+                        Some(value) => builder.append_value(value),
+                        None => builder.append_null(),
+                    }
+                }
                 None => builder.append_null(),
             }
         }
@@ -301,7 +346,7 @@ impl DecodeUtf8Udf {
     fn new() -> Self {
         Self {
             signature: Signature::new(
-                TypeSignature::Exact(vec![DataType::Binary]),
+                TypeSignature::Any(1),
                 Volatility::Immutable,
             ),
         }
@@ -328,23 +373,23 @@ impl ScalarUDFImpl for DecodeUtf8Udf {
     fn invoke(&self, args: &[ColumnarValue]) -> datafusion::error::Result<ColumnarValue> {
         let args = ColumnarValue::values_to_arrays(args)?;
 
-        let binary_array = args[0]
-            .as_any()
-            .downcast_ref::<BinaryArray>()
-            .ok_or_else(|| datafusion::error::DataFusionError::Internal("Expected binary array".to_string()))?;
+        let bin_arr = args[0].as_ref();
+        let len = get_binary_len(bin_arr)
+            .ok_or_else(|| datafusion::error::DataFusionError::Internal(
+                format!("Expected binary array, got {}", args[0].data_type())
+            ))?;
 
         let mut builder = datafusion::arrow::array::StringBuilder::new();
 
-        for i in 0..binary_array.len() {
-            if binary_array.is_null(i) {
-                builder.append_null();
-                continue;
-            }
-
-            let bytes = binary_array.value(i);
-            match std::str::from_utf8(bytes) {
-                Ok(s) => builder.append_value(s),
-                Err(_) => builder.append_null(),
+        for i in 0..len {
+            match get_binary_value(bin_arr, i) {
+                Some(bytes) => {
+                    match std::str::from_utf8(bytes) {
+                        Ok(s) => builder.append_value(s),
+                        Err(_) => builder.append_null(),
+                    }
+                }
+                None => builder.append_null(),
             }
         }
 

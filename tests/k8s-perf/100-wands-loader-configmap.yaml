@@ -1,0 +1,118 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: wands-loader-script
+  namespace: chronik-perf
+data:
+  wands-loader.py: |
+    #!/usr/bin/env python3
+    """WANDS product loader for Chronik Stream DV-1 search quality validation."""
+    import csv, json, os, sys, time
+
+    try:
+        from kafka import KafkaProducer
+        from kafka.admin import KafkaAdminClient, NewTopic
+    except ImportError:
+        import subprocess
+        subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'kafka-python', '-q'])
+        from kafka import KafkaProducer
+        from kafka.admin import KafkaAdminClient, NewTopic
+
+    BOOTSTRAP = os.environ.get('BOOTSTRAP_SERVERS', 'localhost:9092')
+    TOPIC = os.environ.get('TOPIC', 'wands')
+    DATA_DIR = os.environ.get('DATA_DIR', '/data')
+    BATCH_SIZE = int(os.environ.get('BATCH_SIZE', '1000'))
+
+    print('WANDS Product Loader (DV-1)')
+    print(f'  Bootstrap: {BOOTSTRAP}')
+    print(f'  Topic:     {TOPIC}')
+    print(f'  Data dir:  {DATA_DIR}')
+
+    products_path = os.path.join(DATA_DIR, 'product.csv')
+    if not os.path.exists(products_path):
+        print(f'ERROR: product.csv not found at {products_path}')
+        sys.exit(1)
+
+    # Step 1: Create topic with vector + columnar + text search
+    print(f'\nCreating topic "{TOPIC}" with vector + columnar + text...')
+    try:
+        admin = KafkaAdminClient(
+            bootstrap_servers=BOOTSTRAP,
+            api_version=(2, 5, 0),
+            request_timeout_ms=30000,
+        )
+        try:
+            admin.delete_topics([TOPIC])
+            time.sleep(3)
+        except:
+            pass
+
+        topic = NewTopic(
+            name=TOPIC,
+            num_partitions=3,
+            replication_factor=3,
+            topic_configs={
+                'searchable': 'true',
+                'vector.enabled': 'true',
+                'vector.provider': 'openai',
+                'vector.model': 'text-embedding-3-small',
+                'vector.field': '$.product_description',
+                'vector.dimensions': '1536',
+                'vector.hnsw.metric': 'cosine',
+                'columnar.enabled': 'true',
+                'columnar.format': 'parquet',
+                'columnar.compression': 'zstd',
+            }
+        )
+        admin.create_topics([topic])
+        admin.close()
+        print(f'  Created topic "{TOPIC}"')
+    except Exception as e:
+        print(f'  Warning: Topic creation: {e}')
+        print(f'  Will produce to auto-create')
+
+    time.sleep(5)
+
+    # Step 2: Parse product.csv and produce messages
+    print('\nLoading products...')
+
+    producer = KafkaProducer(
+        bootstrap_servers=BOOTSTRAP,
+        value_serializer=lambda v: json.dumps(v).encode('utf-8'),
+        key_serializer=lambda k: k.encode('utf-8') if k else None,
+        api_version=(0, 10, 0),
+        linger_ms=50,
+        batch_size=65536,
+    )
+
+    start = time.time()
+    count = 0
+
+    with open(products_path, 'r', encoding='utf-8') as f:
+        reader = csv.DictReader(f, delimiter='\t')
+        for row in reader:
+            # product_id first so it fits in 300-char text_preview
+            doc = {
+                'product_id': int(row.get('product_id', 0) or 0),
+                'product_name': row.get('product_name', ''),
+                'product_description': row.get('product_description', ''),
+                'product_class': row.get('product_class', ''),
+                'category_hierarchy': row.get('category hierarchy', ''),
+                'product_features': row.get('product_features', ''),
+                'average_rating': float(row.get('average_rating', 0) or 0),
+                'review_count': int(float(row.get('review_count', 0) or 0)),
+            }
+            producer.send(TOPIC, key=str(doc['product_id']), value=doc)
+            count += 1
+
+            if count % BATCH_SIZE == 0:
+                producer.flush()
+                elapsed = time.time() - start
+                rate = count / elapsed
+                print(f'  {count:>6,} products | {rate:>6,.0f} msg/s')
+
+    producer.flush()
+    producer.close()
+    elapsed = time.time() - start
+    rate = count / elapsed if elapsed > 0 else 0
+    print(f'\nDone: {count:,} products in {elapsed:.1f}s ({rate:,.0f} msg/s)')

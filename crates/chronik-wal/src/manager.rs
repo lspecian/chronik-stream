@@ -611,6 +611,12 @@ impl WalManager {
         self.group_commit_wal.seal_stale_segments(max_idle_secs).await
     }
 
+    /// Clean up all WAL state for a deleted topic.
+    /// Removes partition queues and sealed segments for the topic.
+    pub async fn cleanup_topic(&self, topic: &str) {
+        self.group_commit_wal.cleanup_topic(topic).await;
+    }
+
     /// Read all records from a specific sealed segment (v1.3.62+: Now reads from sealed file)
     pub async fn read_segment(&self, segment_id: &str) -> Result<Vec<WalRecord>> {
         // Parse segment_id format: "topic:partition:segment_id"

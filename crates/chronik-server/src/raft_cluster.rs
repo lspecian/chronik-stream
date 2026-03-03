@@ -1401,6 +1401,20 @@ impl RaftCluster {
         self.cached_is_leader.load(Ordering::Relaxed)
     }
 
+    /// Get a clone of the cached leadership flag (Arc<AtomicBool>).
+    ///
+    /// Used by subsystems like WalIndexer that need lock-free, dynamic leadership
+    /// checks without holding a reference to the full RaftCluster.
+    /// The AtomicBool is updated by the Raft message loop when leadership changes.
+    pub fn is_leader_flag(&self) -> Arc<AtomicBool> {
+        if self.is_single_node() {
+            // Single-node is always leader — return a permanently-true flag
+            Arc::new(AtomicBool::new(true))
+        } else {
+            self.cached_is_leader.clone()
+        }
+    }
+
     /// Get the current Raft leader ID (Phase 1.2)
     ///
     /// v2.2.7 LOCK CONTENTION FIX: Now uses cached value (lock-free atomic read)

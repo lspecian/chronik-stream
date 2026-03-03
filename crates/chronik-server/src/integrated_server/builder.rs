@@ -926,11 +926,18 @@ impl IntegratedKafkaServerBuilder {
 
         let wal_manager = wal_handler.wal_manager().clone();
 
+        // Extract leadership flag from RaftCluster for the WalIndexer.
+        // On followers, segment metadata persistence is skipped to prevent deadlock
+        // (writing to __chronik_metadata with acks=1 blocks on non-leader nodes).
+        let is_leader_flag = self.raft_cluster_for_metadata.as_ref()
+            .map(|rc| rc.is_leader_flag());
+
         let wal_indexer = Arc::new(WalIndexer::new(
             indexer_config,
             wal_manager,
             object_store.clone(),
             metadata_store.clone(),
+            is_leader_flag,
         ));
 
         // Start the background indexing task

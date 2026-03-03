@@ -90,6 +90,35 @@ impl MetadataState {
             MetadataEventPayload::TopicCreated { name, config } => {
                 let mut topics = self.topics.write().await;
                 if let Some(existing) = topics.get_mut(name) {
+                    // v2.3.2 CRITICAL FIX: If incoming partition count is HIGHER, this
+                    // is either a topic recreation with more partitions or an explicit
+                    // CreateTopics overriding an auto-created topic. Update the partition
+                    // count and add offsets for new partitions.
+                    //
+                    // NOTE: Only update when incoming > existing, never downgrade.
+                    // Auto-create events with fewer partitions must NOT overwrite
+                    // an explicit CreateTopics with more partitions.
+                    if config.partition_count > existing.config.partition_count {
+                        let old_count = existing.config.partition_count;
+                        tracing::info!(
+                            topic = %name,
+                            old_partitions = old_count,
+                            new_partitions = config.partition_count,
+                            "Topic partition count expanded - updating metadata"
+                        );
+                        existing.config = config.clone();
+                        existing.updated_at = event.timestamp;
+                        drop(topics);
+
+                        // Add partition offsets for new partitions only
+                        let mut offsets = self.partition_offsets.write().await;
+                        for partition in old_count..config.partition_count {
+                            let key = (name.clone(), partition);
+                            offsets.entry(key).or_insert((0, 0));
+                        }
+                        return Ok(());
+                    }
+
                     // v2.3.1: Merge config from the new event into the existing topic.
                     // In a Raft cluster, auto_create_topics() on a follower can race
                     // with the real CreateTopics event from the leader. The auto-created

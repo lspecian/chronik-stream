@@ -316,6 +316,19 @@ fn truncate_vec(vec: &[f32], dims: usize) -> Vec<f32> {
     }
 }
 
+/// Truncate a string to at most `max_bytes` bytes at a valid UTF-8 char boundary.
+fn truncate_to_char_boundary(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    // Walk backwards from max_bytes to find a valid char boundary
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 // ============================================================================
 // VO-3: Scalar Quantization
 // ============================================================================
@@ -1894,7 +1907,7 @@ impl EmbeddingPipeline {
                                 .map(|(emb_result, &offset)| VectorEntry {
                                     offset,
                                     vector: emb_result.vector,
-                                    text_preview: Some(emb_result.text[..emb_result.text.len().min(100)].to_string()),
+                                    text_preview: Some(truncate_to_char_boundary(&emb_result.text, 100).to_string()),
                                 })
                                 .collect();
                             let tokens_used = batch.total_tokens.unwrap_or(0);
@@ -2003,7 +2016,7 @@ impl EmbeddingPipeline {
                     .map(|(result, &offset)| VectorEntry {
                         offset,
                         vector: result.vector,
-                        text_preview: Some(result.text[..result.text.len().min(100)].to_string()),
+                        text_preview: Some(truncate_to_char_boundary(&result.text, 100).to_string()),
                     })
                     .collect();
 
@@ -2180,8 +2193,8 @@ impl VectorSearchFilters {
 pub struct VectorSearchService {
     /// Vector index manager
     index_manager: Arc<VectorIndexManager>,
-    /// Embedding provider for query embedding
-    provider: Arc<dyn EmbeddingProvider>,
+    /// Embedding provider for query embedding (None for index-only/raw-vector searches)
+    provider: Option<Arc<dyn EmbeddingProvider>>,
     /// Optional query embedding cache (SV-1: reduces repeated embedding API calls)
     embedding_cache: Option<Arc<crate::vector_cache::QueryEmbeddingCache>>,
 }
@@ -2194,7 +2207,19 @@ impl VectorSearchService {
     ) -> Self {
         Self {
             index_manager,
-            provider,
+            provider: Some(provider),
+            embedding_cache: None,
+        }
+    }
+
+    /// Create a search service for raw-vector searches only (no embedding provider needed).
+    ///
+    /// This supports `search_by_vector`, `search_by_vector_model`, `get_vector_count`,
+    /// and other methods that don't require query-time embedding.
+    pub fn new_index_only(index_manager: Arc<VectorIndexManager>) -> Self {
+        Self {
+            index_manager,
+            provider: None,
             embedding_cache: None,
         }
     }
@@ -2244,7 +2269,9 @@ impl VectorSearchService {
         }
 
         // Cache miss — call embedding provider
-        let embedding_result = self.provider.embed(query_text).await?;
+        let provider = self.provider.as_ref()
+            .ok_or_else(|| anyhow!("Embedding provider not configured (use search_by_vector for raw vectors)"))?;
+        let embedding_result = provider.embed(query_text).await?;
         let query_vector = embedding_result.vector;
 
         // Store in cache for future queries
@@ -2357,14 +2384,14 @@ impl VectorSearchService {
         self.get_vector_count(topic).await > 0
     }
 
-    /// Get the embedding provider name
+    /// Get the embedding provider name (returns "none" if no provider configured)
     pub fn provider_name(&self) -> &str {
-        self.provider.name()
+        self.provider.as_ref().map(|p| p.name()).unwrap_or("none")
     }
 
-    /// Get the embedding dimensions
+    /// Get the embedding dimensions (returns 0 if no provider configured)
     pub fn dimensions(&self) -> usize {
-        self.provider.dimensions()
+        self.provider.as_ref().map(|p| p.dimensions()).unwrap_or(0)
     }
 
     /// VO-5: Search by text query against a specific model's index.
@@ -2388,7 +2415,9 @@ impl VectorSearchService {
         }
 
         // Cache miss — call embedding provider
-        let embedding_result = self.provider.embed(query_text).await?;
+        let provider = self.provider.as_ref()
+            .ok_or_else(|| anyhow!("Embedding provider not configured (use search_by_vector_model for raw vectors)"))?;
+        let embedding_result = provider.embed(query_text).await?;
         let query_vector = embedding_result.vector;
 
         // Store in cache for future queries

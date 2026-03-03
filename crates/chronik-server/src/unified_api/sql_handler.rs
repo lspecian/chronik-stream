@@ -592,12 +592,46 @@ fn arrow_value_to_json(
             arr.value(row_idx),
         ));
     }
+    if let Some(arr) = column.as_any().downcast_ref::<BinaryViewArray>() {
+        return serde_json::Value::String(base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            arr.value(row_idx),
+        ));
+    }
+    if let Some(arr) = column.as_any().downcast_ref::<LargeBinaryArray>() {
+        return serde_json::Value::String(base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            arr.value(row_idx),
+        ));
+    }
+    if let Some(arr) = column.as_any().downcast_ref::<StringViewArray>() {
+        return serde_json::Value::String(arr.value(row_idx).to_string());
+    }
+    if let Some(arr) = column.as_any().downcast_ref::<LargeStringArray>() {
+        return serde_json::Value::String(arr.value(row_idx).to_string());
+    }
+    if let Some(arr) = column.as_any().downcast_ref::<Int8Array>() {
+        return serde_json::Value::Number(arr.value(row_idx).into());
+    }
+    if let Some(arr) = column.as_any().downcast_ref::<Int16Array>() {
+        return serde_json::Value::Number(arr.value(row_idx).into());
+    }
+    if let Some(arr) = column.as_any().downcast_ref::<UInt32Array>() {
+        return serde_json::Value::Number(arr.value(row_idx).into());
+    }
+    if let Some(arr) = column.as_any().downcast_ref::<UInt64Array>() {
+        return serde_json::Value::Number(arr.value(row_idx).into());
+    }
     if let Some(arr) = column.as_any().downcast_ref::<TimestampMillisecondArray>() {
         return serde_json::Value::Number(arr.value(row_idx).into());
     }
 
-    // Fallback: convert to debug string
-    serde_json::Value::String(format!("{:?}", column))
+    // Fallback: try to use Arrow's display format for the specific row
+    use chronik_columnar::datafusion::arrow::util::display::ArrayFormatter;
+    if let Ok(formatter) = ArrayFormatter::try_new(column.as_ref(), &Default::default()) {
+        return serde_json::Value::String(formatter.value(row_idx).to_string());
+    }
+    serde_json::Value::String(format!("unsupported_type:{}", column.data_type()))
 }
 
 #[cfg(test)]

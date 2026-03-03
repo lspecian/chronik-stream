@@ -1,0 +1,282 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sentiment-llm-script
+  namespace: chronik-perf
+data:
+  sentiment-llm-labeler.py: |
+    #!/usr/bin/env python3
+    """
+    DV-3 Option B: LLM-Based Sentiment Labeling
+    =============================================
+    Consumes Amazon reviews, classifies them using an LLM (Ollama or OpenAI),
+    and produces enriched messages with rich category labels.
+
+    Supports two backends:
+      - ollama:  Local Ollama server (GPU or CPU, free, on-cluster)
+      - openai:  OpenAI GPT-4o-mini API (highest quality, ~$0.15/1M tokens)
+
+    Category labels:
+      complaint, praise, feature_request, comparison, quality_issue,
+      shipping_issue, value_assessment, safety_concern
+    """
+    import json, os, sys, time
+
+    try:
+        import requests
+    except ImportError:
+        import subprocess
+        subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'requests', '-q'])
+        import requests
+
+    try:
+        from kafka import KafkaConsumer, KafkaProducer
+        from kafka.admin import KafkaAdminClient, NewTopic
+    except ImportError:
+        import subprocess
+        subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'kafka-python', '-q'])
+        from kafka import KafkaConsumer, KafkaProducer
+        from kafka.admin import KafkaAdminClient, NewTopic
+
+    BOOTSTRAP = os.environ.get('BOOTSTRAP_SERVERS', 'localhost:9092')
+    SOURCE_TOPIC = os.environ.get('SOURCE_TOPIC', 'amazon-appliances')
+    DEST_TOPIC = os.environ.get('DEST_TOPIC', 'amazon-appliances-llm-labeled')
+    MAX_RECORDS = int(os.environ.get('MAX_RECORDS', '10000'))
+    BATCH_SIZE = int(os.environ.get('BATCH_SIZE', '100'))
+    CONSUMER_TIMEOUT = int(os.environ.get('CONSUMER_TIMEOUT_MS', '30000'))
+    NUM_PARTITIONS = int(os.environ.get('NUM_PARTITIONS', '6'))
+
+    # LLM backend configuration
+    LLM_BACKEND = os.environ.get('LLM_BACKEND', 'ollama')  # ollama or openai
+    OLLAMA_URL = os.environ.get('OLLAMA_URL', 'http://ollama-gpu.chronik-perf.svc.cluster.local:11434')
+    OLLAMA_MODEL = os.environ.get('OLLAMA_MODEL', 'phi3:mini')
+    OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY', '')
+    OPENAI_MODEL = os.environ.get('OPENAI_MODEL', 'gpt-4o-mini')
+
+    CATEGORIES = [
+        'complaint', 'praise', 'feature_request', 'comparison',
+        'quality_issue', 'shipping_issue', 'value_assessment', 'safety_concern',
+    ]
+
+    PROMPT_TEMPLATE = """Classify this product review into one or more categories.
+    Categories: {categories}
+
+    Review (rating {rating}/5): "{text}"
+
+    Respond with ONLY a JSON array of matching category names, e.g. ["complaint", "quality_issue"].
+    If none match, respond with [].
+    """
+
+    print('DV-3b: LLM-Based Sentiment Labeler')
+    print(f'  Bootstrap:    {BOOTSTRAP}')
+    print(f'  Source topic: {SOURCE_TOPIC}')
+    print(f'  Dest topic:   {DEST_TOPIC}')
+    print(f'  LLM backend:  {LLM_BACKEND}')
+    print(f'  Max records:  {MAX_RECORDS}')
+    if LLM_BACKEND == 'ollama':
+        print(f'  Ollama URL:   {OLLAMA_URL}')
+        print(f'  Ollama model: {OLLAMA_MODEL}')
+    else:
+        print(f'  OpenAI model: {OPENAI_MODEL}')
+
+    # ── LLM Classification ─────────────────────────────────────────────
+
+    def classify_ollama(review_text, rating):
+        """Classify via local Ollama server."""
+        prompt = PROMPT_TEMPLATE.format(
+            categories=', '.join(CATEGORIES),
+            rating=rating,
+            text=review_text[:500],  # Truncate for efficiency
+        )
+        try:
+            r = requests.post(
+                f'{OLLAMA_URL}/api/generate',
+                json={
+                    'model': OLLAMA_MODEL,
+                    'prompt': prompt,
+                    'stream': False,
+                    'options': {'temperature': 0.1, 'num_predict': 100},
+                },
+                timeout=30,
+            )
+            if r.status_code != 200:
+                return []
+            response_text = r.json().get('response', '').strip()
+            return parse_categories(response_text)
+        except Exception:
+            return []
+
+    def classify_openai(review_text, rating):
+        """Classify via OpenAI API."""
+        prompt = PROMPT_TEMPLATE.format(
+            categories=', '.join(CATEGORIES),
+            rating=rating,
+            text=review_text[:500],
+        )
+        try:
+            r = requests.post(
+                'https://api.openai.com/v1/chat/completions',
+                headers={
+                    'Authorization': f'Bearer {OPENAI_API_KEY}',
+                    'Content-Type': 'application/json',
+                },
+                json={
+                    'model': OPENAI_MODEL,
+                    'messages': [{'role': 'user', 'content': prompt}],
+                    'temperature': 0.1,
+                    'max_tokens': 100,
+                },
+                timeout=30,
+            )
+            if r.status_code != 200:
+                return []
+            content = r.json()['choices'][0]['message']['content'].strip()
+            return parse_categories(content)
+        except Exception:
+            return []
+
+    def parse_categories(text):
+        """Parse LLM response into category list."""
+        try:
+            # Try direct JSON parse
+            cats = json.loads(text)
+            if isinstance(cats, list):
+                return [c for c in cats if c in CATEGORIES]
+        except json.JSONDecodeError:
+            pass
+        # Fallback: find category names in text
+        found = []
+        for cat in CATEGORIES:
+            if cat in text.lower():
+                found.append(cat)
+        return found
+
+    classify_fn = classify_ollama if LLM_BACKEND == 'ollama' else classify_openai
+
+    # ── Create destination topic ───────────────────────────────────────
+
+    print(f'\nCreating destination topic "{DEST_TOPIC}"...')
+    try:
+        admin = KafkaAdminClient(
+            bootstrap_servers=BOOTSTRAP,
+            api_version=(2, 5, 0),
+            request_timeout_ms=30000,
+        )
+        try:
+            admin.delete_topics([DEST_TOPIC])
+            time.sleep(3)
+        except:
+            pass
+
+        topic = NewTopic(
+            name=DEST_TOPIC,
+            num_partitions=NUM_PARTITIONS,
+            replication_factor=3,
+            topic_configs={
+                'searchable': 'true',
+                'columnar.enabled': 'true',
+                'columnar.format': 'parquet',
+                'columnar.compression': 'zstd',
+            }
+        )
+        admin.create_topics([topic])
+        admin.close()
+        print(f'  Created topic "{DEST_TOPIC}"')
+    except Exception as e:
+        print(f'  Warning: Topic creation: {e}')
+
+    time.sleep(5)
+
+    # ── Consume, classify, produce ─────────────────────────────────────
+
+    consumer = KafkaConsumer(
+        SOURCE_TOPIC,
+        bootstrap_servers=BOOTSTRAP,
+        api_version=(0, 10, 0),
+        auto_offset_reset='earliest',
+        consumer_timeout_ms=CONSUMER_TIMEOUT,
+        value_deserializer=lambda v: json.loads(v.decode('utf-8')),
+        key_deserializer=lambda k: k.decode('utf-8') if k else None,
+        group_id=f'sentiment-llm-labeler-{DEST_TOPIC}',
+        max_poll_records=100,
+    )
+
+    producer = KafkaProducer(
+        bootstrap_servers=BOOTSTRAP,
+        value_serializer=lambda v: json.dumps(v).encode('utf-8'),
+        key_serializer=lambda k: k.encode('utf-8') if k else None,
+        api_version=(0, 10, 0),
+        linger_ms=50,
+        batch_size=65536,
+    )
+
+    start = time.time()
+    count = 0
+    llm_errors = 0
+    category_counts = {}
+    total_llm_ms = 0
+
+    print('\nClassifying reviews via LLM...')
+    try:
+        for msg in consumer:
+            review = msg.value
+            text = review.get('text', '') or review.get('title', '')
+            rating = review.get('rating', 0)
+
+            # Sentiment from rating (same as Option A)
+            if rating <= 2.0:
+                sentiment = 'negative'
+            elif rating == 3.0:
+                sentiment = 'neutral'
+            else:
+                sentiment = 'positive'
+
+            # LLM classification
+            llm_start = time.time()
+            categories = classify_fn(text, rating)
+            llm_ms = (time.time() - llm_start) * 1000
+            total_llm_ms += llm_ms
+
+            if not categories and text:
+                llm_errors += 1
+
+            # Enrich
+            review['sentiment'] = sentiment
+            review['llm_categories'] = categories
+            review['llm_model'] = OLLAMA_MODEL if LLM_BACKEND == 'ollama' else OPENAI_MODEL
+
+            producer.send(DEST_TOPIC, key=msg.key, value=review)
+            count += 1
+
+            for cat in categories:
+                category_counts[cat] = category_counts.get(cat, 0) + 1
+
+            if count % BATCH_SIZE == 0:
+                producer.flush()
+                elapsed = time.time() - start
+                rate = count / elapsed
+                avg_llm = total_llm_ms / count if count > 0 else 0
+                pct = f' ({100.0 * count / MAX_RECORDS:.1f}%)' if MAX_RECORDS > 0 else ''
+                print(f'  {count:>8,} classified | {rate:>6,.1f} msg/s | avg LLM: {avg_llm:.0f}ms{pct}')
+
+            if MAX_RECORDS > 0 and count >= MAX_RECORDS:
+                break
+    except Exception as e:
+        print(f'  Consumer finished: {e}')
+
+    producer.flush()
+    producer.close()
+    consumer.close()
+
+    elapsed = time.time() - start
+    rate = count / elapsed if elapsed > 0 else 0
+    avg_llm = total_llm_ms / count if count > 0 else 0
+
+    print(f'\nDone: {count:,} reviews classified in {elapsed:.1f}s ({rate:,.1f} msg/s)')
+    print(f'  Avg LLM latency: {avg_llm:.0f}ms')
+    print(f'  LLM errors: {llm_errors}')
+
+    print(f'\nCategory distribution:')
+    for cat, cnt in sorted(category_counts.items(), key=lambda x: -x[1]):
+        pct = 100.0 * cnt / count if count > 0 else 0
+        print(f'  {cat:<20} {cnt:>8,} ({pct:.1f}%)')

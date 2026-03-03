@@ -1,0 +1,176 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: amazon-loader-script
+  namespace: chronik-perf
+data:
+  amazon-loader.py: |
+    #!/usr/bin/env python3
+    """
+    Generic Amazon Reviews 2023 loader for Chronik Stream.
+    Works with any category (Appliances, Grocery, Electronics, etc.)
+    by setting DATA_FILE and TOPIC environment variables.
+
+    DV-2a: Appliances (602K)  — DATA_FILE=Appliances.jsonl
+    DV-2b: Grocery (5.1M)     — DATA_FILE=Grocery_and_Gourmet_Food.jsonl
+    DV-2c: Electronics (10M+) — DATA_FILE=Electronics.jsonl, MAX_RECORDS=10000000
+
+    Supports both .jsonl and .jsonl.gz files (auto-detected).
+    """
+    import gzip, json, os, sys, time
+
+    try:
+        from kafka import KafkaProducer
+        from kafka.admin import KafkaAdminClient, NewTopic
+    except ImportError:
+        import subprocess
+        subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'kafka-python-ng', '-q'])
+        from kafka import KafkaProducer
+        from kafka.admin import KafkaAdminClient, NewTopic
+
+    BOOTSTRAP = os.environ.get('BOOTSTRAP_SERVERS', 'localhost:9092')
+    TOPIC = os.environ.get('TOPIC', 'amazon-appliances')
+    DATA_FILE = os.environ.get('DATA_FILE', '/data/Appliances.jsonl')
+    MAX_RECORDS = int(os.environ.get('MAX_RECORDS', '0'))
+    BATCH_SIZE = int(os.environ.get('BATCH_SIZE', '5000'))
+    NUM_PARTITIONS = int(os.environ.get('NUM_PARTITIONS', '6'))
+    ENABLE_VECTOR = os.environ.get('ENABLE_VECTOR', 'false').lower() == 'true'
+
+    print('Amazon Reviews Loader (DV-2)')
+    print(f'  Bootstrap:  {BOOTSTRAP}')
+    print(f'  Topic:      {TOPIC}')
+    print(f'  Data file:  {DATA_FILE}')
+    print(f'  Max records: {MAX_RECORDS or "all"}')
+    print(f'  Partitions: {NUM_PARTITIONS}')
+    print(f'  Vector:     {ENABLE_VECTOR}')
+
+    if not os.path.exists(DATA_FILE):
+        print(f'ERROR: Data file not found: {DATA_FILE}')
+        sys.exit(1)
+
+    # Step 1: Create topic with columnar + text search (optional vector)
+    print(f'\nCreating topic "{TOPIC}"...')
+    topic_configs = {
+        'searchable': 'true',
+        'columnar.enabled': 'true',
+        'columnar.format': 'parquet',
+        'columnar.compression': 'zstd',
+        'vector.enabled': 'false',
+    }
+    if ENABLE_VECTOR:
+        topic_configs.update({
+            'vector.enabled': 'true',
+            'vector.provider': 'openai',
+            'vector.model': 'text-embedding-3-small',
+            'vector.field': '$.text',
+            'vector.dimensions': '1536',
+            'vector.hnsw.metric': 'cosine',
+        })
+
+    SKIP_TOPIC = os.environ.get('SKIP_TOPIC_CREATE', 'false').lower() == 'true'
+    if SKIP_TOPIC:
+        print('  Skipping topic creation (SKIP_TOPIC_CREATE=true)')
+    else:
+        try:
+            admin = KafkaAdminClient(
+                bootstrap_servers=BOOTSTRAP,
+                api_version=(2, 5, 0),
+                request_timeout_ms=30000,
+            )
+            topic = NewTopic(
+                name=TOPIC,
+                num_partitions=NUM_PARTITIONS,
+                replication_factor=3,
+                topic_configs=topic_configs,
+            )
+            admin.create_topics([topic])
+            admin.close()
+            features = 'text + columnar'
+            if ENABLE_VECTOR:
+                features += ' + vector'
+            print(f'  Created topic "{TOPIC}" ({features})')
+        except Exception as e:
+            err_str = str(e)
+            if 'already exists' in err_str.lower() or 'TopicAlreadyExists' in err_str:
+                print(f'  Topic "{TOPIC}" already exists - proceeding')
+            else:
+                print(f'  Warning: Topic creation: {e}')
+                print(f'  Will produce to auto-create')
+
+    time.sleep(3)
+
+    # Step 2: Stream JSONL.gz and produce
+    print('\nLoading reviews...')
+
+    import threading
+    send_errors = {'count': 0, 'last': ''}
+    lock = threading.Lock()
+
+    def on_error(exc):
+        with lock:
+            send_errors['count'] += 1
+            send_errors['last'] = str(exc)
+
+    producer = KafkaProducer(
+        bootstrap_servers=BOOTSTRAP,
+        value_serializer=lambda v: json.dumps(v).encode('utf-8'),
+        key_serializer=lambda k: k.encode('utf-8') if k else None,
+        api_version=(0, 10, 0),
+        acks=0,  # Use fire-and-forget for bulk loading (acks=1 causes timeouts at 2M+ scale)
+        retries=3,
+        retry_backoff_ms=200,
+        linger_ms=50,
+        batch_size=65536,
+        buffer_memory=134217728,
+        max_request_size=10485760,
+        request_timeout_ms=30000,
+    )
+
+    start = time.time()
+    sent = 0
+    parse_errors = 0
+
+    open_fn = gzip.open if DATA_FILE.endswith('.gz') else open
+    with open_fn(DATA_FILE, 'rt', encoding='utf-8') as f:
+        for line_no, line in enumerate(f, 1):
+            if MAX_RECORDS > 0 and sent >= MAX_RECORDS:
+                break
+            try:
+                record = json.loads(line.strip())
+                doc = {
+                    'rating': record.get('rating', 0),
+                    'title': record.get('title', ''),
+                    'text': record.get('text', ''),
+                    'asin': record.get('asin', ''),
+                    'parent_asin': record.get('parent_asin', ''),
+                    'user_id': record.get('user_id', ''),
+                    'timestamp': record.get('timestamp', 0),
+                    'verified_purchase': record.get('verified_purchase', False),
+                    'helpful_vote': record.get('helpful_vote', 0),
+                }
+                future = producer.send(TOPIC, key=doc['asin'], value=doc)
+                future.add_errback(on_error)
+                sent += 1
+            except Exception as e:
+                parse_errors += 1
+
+            if sent > 0 and sent % BATCH_SIZE == 0:
+                producer.flush()
+                elapsed = time.time() - start
+                rate = sent / elapsed
+                pct = f' ({100.0 * sent / MAX_RECORDS:.1f}%)' if MAX_RECORDS > 0 else ''
+                errs = f' | {send_errors["count"]} send errors' if send_errors['count'] > 0 else ''
+                print(f'  {sent:>10,} sent | {rate:>8,.0f} msg/s{pct}{errs}')
+
+    producer.flush()
+    producer.close()
+    elapsed = time.time() - start
+    rate = sent / elapsed if elapsed > 0 else 0
+    delivered = sent - send_errors['count']
+    print(f'\nDone: {sent:,} sent, {delivered:,} delivered in {elapsed:.1f}s ({rate:,.0f} msg/s)')
+    print(f'  Parse errors: {parse_errors}, Send errors: {send_errors["count"]}')
+    if send_errors['count'] > 0:
+        print(f'  Last send error: {send_errors["last"]}')
+    if send_errors['count'] > sent * 0.05:
+        print(f'ERROR: >5% send failure rate ({send_errors["count"]}/{sent})')
+        sys.exit(1)

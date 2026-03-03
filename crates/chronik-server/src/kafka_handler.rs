@@ -132,6 +132,7 @@ impl KafkaProtocolHandler {
             ApiKey::CreateTopics => self.handle_create_topics_request(header, buf, request_bytes).await,
             ApiKey::SaslHandshake => self.handle_sasl_handshake_request(header, buf).await,
             ApiKey::SaslAuthenticate => self.handle_sasl_authenticate_request(header, buf).await,
+            ApiKey::DeleteTopics => self.handle_delete_topics_request(request_bytes).await,
             _ => self.handle_default_request(request_bytes, header.api_key, header.api_version).await,
         }
     }
@@ -669,6 +670,40 @@ impl KafkaProtocolHandler {
     ) -> Result<Response> {
         tracing::info!("Delegating API {:?} v{} to protocol_handler", api_key, api_version);
         self.protocol_handler.handle_request(request_bytes).await
+    }
+
+    /// Handle DeleteTopics API request
+    ///
+    /// Delegates to protocol handler for metadata deletion, then cleans up
+    /// GroupCommitWal partition queues and sealed segments for deleted topics.
+    #[instrument(skip(self, request_bytes))]
+    async fn handle_delete_topics_request(
+        &self,
+        request_bytes: &[u8],
+    ) -> Result<Response> {
+        use chronik_protocol::parser::{Decoder, KafkaDecodable};
+
+        // Parse request to extract topic names for WAL cleanup
+        let mut buf = bytes::Bytes::copy_from_slice(request_bytes);
+        let header = chronik_protocol::parser::parse_request_header(&mut buf)?;
+        let mut decoder = Decoder::new(&mut buf);
+        let topic_names = match chronik_protocol::delete_topics_types::DeleteTopicsRequest::decode(
+            &mut decoder, header.api_version
+        ) {
+            Ok(req) => req.topic_names,
+            Err(_) => vec![], // If parsing fails, still delegate to protocol handler
+        };
+
+        // Delegate to protocol handler for actual metadata deletion
+        let response = self.protocol_handler.handle_request(request_bytes).await?;
+
+        // Clean up GroupCommitWal state for deleted topics
+        let wal_manager = self.wal_handler.wal_manager();
+        for topic_name in &topic_names {
+            wal_manager.cleanup_topic(topic_name).await;
+        }
+
+        Ok(response)
     }
 
     /// Handle CreateTopics API request

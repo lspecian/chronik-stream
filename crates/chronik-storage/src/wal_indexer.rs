@@ -32,6 +32,7 @@ use chronik_columnar::{
 };
 use chronik_embeddings::{VectorSearchConfig, create_provider};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::RwLock;
 use tokio::time::{interval, Duration};
 use tracing::{info, warn, error, debug, instrument};
@@ -226,15 +227,27 @@ pub struct WalIndexer {
     /// v2.2.22: Vector index manager for HNSW indexes per topic-partition
     /// Used by the embedding pipeline to store and search embeddings
     vector_index_manager: Arc<VectorIndexManager>,
+
+    /// Leadership flag — shared with RaftCluster's cached_is_leader.
+    /// On followers, segment metadata persistence is skipped to avoid deadlock
+    /// (writing to __chronik_metadata with acks=1 blocks forever on non-leaders).
+    /// Standalone/single-node: always true. Updated atomically by Raft on failover.
+    is_leader: Arc<AtomicBool>,
 }
 
 impl WalIndexer {
     /// Create a new WAL indexer
+    ///
+    /// `is_leader` is a shared atomic flag from RaftCluster indicating whether
+    /// this node is the current leader. Followers skip segment metadata persistence
+    /// to avoid deadlocking on __chronik_metadata writes. Pass `None` for standalone
+    /// mode (defaults to always-true).
     pub fn new(
         config: WalIndexerConfig,
         wal_manager: Arc<WalManager>,
         object_store: Arc<dyn ObjectStore>,
         metadata_store: Arc<dyn MetadataStore>,
+        is_leader: Option<Arc<AtomicBool>>,
     ) -> Self {
         // Create segment index with persistence
         let segment_index = if let Some(ref path) = config.segment_index_path {
@@ -282,6 +295,7 @@ impl WalIndexer {
             columnar_topics: Arc::new(RwLock::new(HashSet::new())),
             vector_topics: Arc::new(RwLock::new(HashSet::new())),
             vector_index_manager,
+            is_leader: is_leader.unwrap_or_else(|| Arc::new(AtomicBool::new(true))),
         }
     }
 
@@ -443,6 +457,7 @@ impl WalIndexer {
         let running = Arc::clone(&self.running);
         let runtime = Arc::clone(&self.runtime);
         let vector_index_manager = Arc::clone(&self.vector_index_manager);
+        let is_leader = Arc::clone(&self.is_leader);
         let snapshot_interval = self.config.snapshot_interval_secs();
 
         // CRITICAL v2.2.10: Spawn on dedicated runtime, NOT main runtime
@@ -509,6 +524,7 @@ impl WalIndexer {
                     &metadata_store,
                     &indexing_in_progress,
                     &vector_index_manager,
+                    &is_leader,
                 ).await {
                     Ok(stats) => {
                         if stats.segments_processed > 0 {
@@ -560,11 +576,12 @@ impl WalIndexer {
             &self.metadata_store,
             &self.indexing_in_progress,
             &self.vector_index_manager,
+            &self.is_leader,
         ).await
     }
 
     /// Index sealed segments (internal implementation)
-    #[instrument(skip(config, wal_manager, object_store, segment_index, metadata_store, indexing_in_progress, vector_index_manager))]
+    #[instrument(skip(config, wal_manager, object_store, segment_index, metadata_store, indexing_in_progress, vector_index_manager, is_leader))]
     async fn index_sealed_segments_internal(
         config: &WalIndexerConfig,
         wal_manager: &Arc<WalManager>,
@@ -573,6 +590,7 @@ impl WalIndexer {
         metadata_store: &Arc<dyn MetadataStore>,
         indexing_in_progress: &Arc<RwLock<HashSet<String>>>,
         vector_index_manager: &Arc<VectorIndexManager>,
+        is_leader: &Arc<AtomicBool>,
     ) -> Result<IndexingStats> {
         let start_time = std::time::Instant::now();
         let mut stats = IndexingStats::default();
@@ -635,6 +653,7 @@ impl WalIndexer {
                 vector_index_manager,
                 segment_id,
                 &mut stats,
+                is_leader,
             ).await {
                 Ok(_) => {
                     debug!(segment = %segment_id, "Successfully indexed segment");
@@ -659,7 +678,7 @@ impl WalIndexer {
     }
 
     /// Index a single sealed WAL segment
-    #[instrument(skip(config, wal_manager, object_store, segment_index, metadata_store, vector_index_manager, stats))]
+    #[instrument(skip(config, wal_manager, object_store, segment_index, metadata_store, vector_index_manager, stats, is_leader))]
     async fn index_segment(
         config: &WalIndexerConfig,
         wal_manager: &Arc<WalManager>,
@@ -669,6 +688,7 @@ impl WalIndexer {
         vector_index_manager: &Arc<VectorIndexManager>,
         segment_id: &str,
         stats: &mut IndexingStats,
+        is_leader: &Arc<AtomicBool>,
     ) -> Result<()> {
         info!(segment = %segment_id, "Indexing WAL segment");
 
@@ -720,6 +740,7 @@ impl WalIndexer {
                 metadata_store,
                 &tp,
                 &canonical_records,
+                is_leader,
             ).await {
                 Ok(segment_bytes) => {
                     info!(
@@ -977,12 +998,13 @@ impl WalIndexer {
     ///
     /// This stores the actual CanonicalRecords (bincode-serialized) so consumers can
     /// fetch messages from S3 when they're no longer in local WAL/segments.
-    #[instrument(skip(object_store, metadata_store, canonical_records))]
+    #[instrument(skip(object_store, metadata_store, canonical_records, is_leader))]
     async fn upload_raw_segment(
         object_store: &Arc<dyn ObjectStore>,
         metadata_store: &Arc<dyn MetadataStore>,
         tp: &TopicPartition,
         canonical_records: &[CanonicalRecord],
+        is_leader: &Arc<AtomicBool>,
     ) -> Result<u64> {
         if canonical_records.is_empty() {
             return Ok(0);
@@ -1028,31 +1050,45 @@ impl WalIndexer {
             "Uploaded raw segment data to S3"
         );
 
-        // Register segment metadata in the metadata store
-        // This allows high watermarks to be restored on startup
-        let segment_id = format!("{}-{}", min_offset, max_offset);
-        let segment_metadata = MetadataSegmentMetadata {
-            segment_id,
-            topic: tp.topic.clone(),
-            partition: tp.partition as u32,
-            start_offset: min_offset,
-            end_offset: max_offset,
-            size: data_size as i64,
-            record_count: canonical_records.iter().map(|r| r.records.len() as i64).sum(),
-            path: object_key.clone(),
-            created_at: chrono::Utc::now(),
-        };
+        // Register segment metadata in the metadata store for disaster recovery.
+        // This allows high watermarks to be restored on startup.
+        // Only persist on leader — followers don't own __chronik_metadata partition.
+        if is_leader.load(Ordering::Relaxed) {
+            let segment_id = format!("{}-{}", min_offset, max_offset);
+            let segment_metadata = MetadataSegmentMetadata {
+                segment_id,
+                topic: tp.topic.clone(),
+                partition: tp.partition as u32,
+                start_offset: min_offset,
+                end_offset: max_offset,
+                size: data_size as i64,
+                record_count: canonical_records.iter().map(|r| r.records.len() as i64).sum(),
+                path: object_key.clone(),
+                created_at: chrono::Utc::now(),
+            };
 
-        metadata_store.persist_segment_metadata(segment_metadata).await
-            .map_err(|e| Error::Internal(format!("Failed to register segment metadata: {}", e)))?;
-
-        info!(
-            topic = %tp.topic,
-            partition = tp.partition,
-            min_offset = min_offset,
-            max_offset = max_offset,
-            "Registered segment metadata"
-        );
+            match metadata_store.persist_segment_metadata(segment_metadata).await {
+                Ok(()) => {
+                    debug!(
+                        topic = %tp.topic,
+                        partition = tp.partition,
+                        min_offset = min_offset,
+                        max_offset = max_offset,
+                        "Registered segment metadata"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        topic = %tp.topic,
+                        partition = tp.partition,
+                        min_offset = min_offset,
+                        max_offset = max_offset,
+                        error = %e,
+                        "Failed to register segment metadata (non-fatal, S3 upload succeeded)"
+                    );
+                }
+            }
+        }
 
         Ok(data_size)
     }
@@ -1366,8 +1402,7 @@ impl WalIndexer {
         segment_index.add_parquet_segment(parquet_metadata.clone()).await
             .map_err(|e| Error::Internal(format!("Failed to register Parquet segment: {}", e)))?;
 
-        // v2.2.22: Also persist to metadata store for SQL handler access
-        // The SQL handler uses metadata_store.get_parquet_paths() to discover tables
+        // Persist Parquet segment metadata for SQL handler discovery
         let common_metadata = chronik_common::metadata::ParquetSegmentMetadata {
             segment_id: parquet_metadata.segment_id,
             topic: parquet_metadata.topic,
@@ -1391,7 +1426,7 @@ impl WalIndexer {
                 topic = %tp.topic,
                 partition = tp.partition,
                 error = %e,
-                "Failed to persist Parquet segment to metadata store (SQL queries may not see this segment)"
+                "Failed to persist Parquet segment metadata (non-fatal)"
             );
         }
 

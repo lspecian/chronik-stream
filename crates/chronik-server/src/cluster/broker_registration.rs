@@ -56,7 +56,23 @@ pub async fn register_brokers_and_assign_partitions(
     let is_leader = wait_for_leader_election(raft_cluster, init_config.node_id).await?;
 
     if !is_leader {
-        info!("This node is a follower - skipping broker registration (will receive via Raft replication)");
+        info!("This node is a follower - registering brokers locally from config");
+        // CRITICAL FIX: Followers must populate their broker list from cluster config.
+        // The leader broadcasts BrokerRegistered events via replication, but followers
+        // may miss them due to timing (leader registers before followers connect) and
+        // because apply_replicated_event() doesn't write to local WAL (so broker info
+        // is lost on restart). By registering locally, followers always have the full
+        // broker list for Metadata responses.
+        let metadata_store = server.metadata_store();
+        for peer in &init_config.cluster_config.peers {
+            let (host, port) = parse_kafka_address(&peer.kafka);
+            let broker_metadata = create_broker_metadata(peer.id, host, port);
+            match metadata_store.register_broker(broker_metadata).await {
+                Ok(_) => info!("✅ Follower registered broker {} ({}) locally", peer.id, peer.kafka),
+                Err(e) => warn!("Failed to register broker {} locally: {:?}", peer.id, e),
+            }
+        }
+        info!("✅ Follower broker registration complete ({} brokers)", init_config.cluster_config.peers.len());
         return Ok(());
     }
 

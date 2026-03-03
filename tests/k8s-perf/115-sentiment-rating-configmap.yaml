@@ -1,0 +1,221 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sentiment-rating-script
+  namespace: chronik-perf
+data:
+  sentiment-rating-labeler.py: |
+    #!/usr/bin/env python3
+    """
+    DV-3 Option A: Rating-Based Sentiment Labeling
+    ================================================
+    Consumes Amazon reviews from a source topic, derives sentiment labels
+    from star ratings, and produces enriched messages to a labeled topic.
+
+    Label mapping:
+      1-2 stars → negative
+      3 stars   → neutral
+      4-5 stars → positive
+
+    Additional derived labels:
+      - has_complaint: text contains complaint keywords
+      - has_praise:    text contains praise keywords
+      - is_detailed:   review text > 100 words
+
+    Zero cost — no API calls, no GPU, pure Python.
+    """
+    import json, os, re, sys, time
+
+    try:
+        from kafka import KafkaConsumer, KafkaProducer
+        from kafka.admin import KafkaAdminClient, NewTopic
+    except ImportError:
+        import subprocess
+        subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'kafka-python', '-q'])
+        from kafka import KafkaConsumer, KafkaProducer
+        from kafka.admin import KafkaAdminClient, NewTopic
+
+    BOOTSTRAP = os.environ.get('BOOTSTRAP_SERVERS', 'localhost:9092')
+    SOURCE_TOPIC = os.environ.get('SOURCE_TOPIC', 'amazon-appliances')
+    DEST_TOPIC = os.environ.get('DEST_TOPIC', 'amazon-appliances-labeled')
+    MAX_RECORDS = int(os.environ.get('MAX_RECORDS', '0'))
+    BATCH_SIZE = int(os.environ.get('BATCH_SIZE', '5000'))
+    CONSUMER_TIMEOUT = int(os.environ.get('CONSUMER_TIMEOUT_MS', '30000'))
+    NUM_PARTITIONS = int(os.environ.get('NUM_PARTITIONS', '6'))
+
+    # Keyword patterns for basic NLP classification
+    COMPLAINT_KEYWORDS = re.compile(
+        r'\b(broke|broken|defective|terrible|awful|worst|waste|junk|garbage|'
+        r'horrible|useless|disappointed|fail|failed|failure|refund|return|'
+        r'stopped working|does not work|doesn\'t work|never worked|poor quality|'
+        r'fell apart|cheap|flimsy|dangerous|fire hazard|overheated|leaked)\b',
+        re.IGNORECASE
+    )
+
+    PRAISE_KEYWORDS = re.compile(
+        r'\b(amazing|excellent|perfect|wonderful|fantastic|outstanding|love|'
+        r'great|awesome|incredible|best|highly recommend|works perfectly|'
+        r'well made|high quality|sturdy|durable|reliable|exceeded|impressed)\b',
+        re.IGNORECASE
+    )
+
+    COMPARISON_KEYWORDS = re.compile(
+        r'\b(better than|worse than|compared to|instead of|switched from|'
+        r'upgrade from|replacement for|alternative to|similar to|unlike)\b',
+        re.IGNORECASE
+    )
+
+    FEATURE_REQUEST_KEYWORDS = re.compile(
+        r'\b(wish it|wish they|should have|could have|would be nice|'
+        r'missing|lacks|needs|if only|hoped for|expected)\b',
+        re.IGNORECASE
+    )
+
+    print('DV-3a: Rating-Based Sentiment Labeler')
+    print(f'  Bootstrap:    {BOOTSTRAP}')
+    print(f'  Source topic: {SOURCE_TOPIC}')
+    print(f'  Dest topic:   {DEST_TOPIC}')
+    print(f'  Max records:  {MAX_RECORDS or "all"}')
+
+    # Step 1: Create labeled destination topic
+    print(f'\nCreating destination topic "{DEST_TOPIC}"...')
+    try:
+        admin = KafkaAdminClient(
+            bootstrap_servers=BOOTSTRAP,
+            api_version=(2, 5, 0),
+            request_timeout_ms=30000,
+        )
+        try:
+            admin.delete_topics([DEST_TOPIC])
+            time.sleep(3)
+        except:
+            pass
+
+        topic = NewTopic(
+            name=DEST_TOPIC,
+            num_partitions=NUM_PARTITIONS,
+            replication_factor=3,
+            topic_configs={
+                'searchable': 'true',
+                'columnar.enabled': 'true',
+                'columnar.format': 'parquet',
+                'columnar.compression': 'zstd',
+            }
+        )
+        admin.create_topics([topic])
+        admin.close()
+        print(f'  Created topic "{DEST_TOPIC}"')
+    except Exception as e:
+        print(f'  Warning: Topic creation: {e}')
+
+    time.sleep(5)
+
+    # Step 2: Consume, label, produce
+    def label_review(review):
+        """Derive labels from rating + text analysis."""
+        rating = review.get('rating', 0)
+        text = review.get('text', '') or ''
+        title = review.get('title', '') or ''
+        full_text = f'{title} {text}'
+
+        # Sentiment from rating
+        if rating <= 2.0:
+            sentiment = 'negative'
+        elif rating == 3.0:
+            sentiment = 'neutral'
+        else:
+            sentiment = 'positive'
+
+        # Keyword-based categories
+        categories = []
+        if COMPLAINT_KEYWORDS.search(full_text):
+            categories.append('complaint')
+        if PRAISE_KEYWORDS.search(full_text):
+            categories.append('praise')
+        if COMPARISON_KEYWORDS.search(full_text):
+            categories.append('comparison')
+        if FEATURE_REQUEST_KEYWORDS.search(full_text):
+            categories.append('feature_request')
+
+        # Text features
+        word_count = len(full_text.split())
+        is_detailed = word_count > 100
+
+        # Enrich the original review
+        review['sentiment'] = sentiment
+        review['categories'] = categories
+        review['word_count'] = word_count
+        review['is_detailed'] = is_detailed
+        return review
+
+    consumer = KafkaConsumer(
+        SOURCE_TOPIC,
+        bootstrap_servers=BOOTSTRAP,
+        api_version=(0, 10, 0),
+        auto_offset_reset='earliest',
+        consumer_timeout_ms=CONSUMER_TIMEOUT,
+        value_deserializer=lambda v: json.loads(v.decode('utf-8')),
+        key_deserializer=lambda k: k.decode('utf-8') if k else None,
+        group_id=f'sentiment-labeler-{DEST_TOPIC}',
+        max_poll_records=500,
+    )
+
+    producer = KafkaProducer(
+        bootstrap_servers=BOOTSTRAP,
+        value_serializer=lambda v: json.dumps(v).encode('utf-8'),
+        key_serializer=lambda k: k.encode('utf-8') if k else None,
+        api_version=(0, 10, 0),
+        linger_ms=50,
+        batch_size=65536,
+        buffer_memory=134217728,
+    )
+
+    start = time.time()
+    count = 0
+    sentiment_counts = {'positive': 0, 'neutral': 0, 'negative': 0}
+    category_counts = {}
+
+    print('\nLabeling reviews...')
+    try:
+        for msg in consumer:
+            review = msg.value
+            labeled = label_review(review)
+
+            producer.send(DEST_TOPIC, key=msg.key, value=labeled)
+            count += 1
+
+            # Track distribution
+            sentiment_counts[labeled['sentiment']] = sentiment_counts.get(labeled['sentiment'], 0) + 1
+            for cat in labeled.get('categories', []):
+                category_counts[cat] = category_counts.get(cat, 0) + 1
+
+            if count % BATCH_SIZE == 0:
+                producer.flush()
+                elapsed = time.time() - start
+                rate = count / elapsed
+                pct = f' ({100.0 * count / MAX_RECORDS:.1f}%)' if MAX_RECORDS > 0 else ''
+                print(f'  {count:>10,} labeled | {rate:>8,.0f} msg/s{pct}')
+
+            if MAX_RECORDS > 0 and count >= MAX_RECORDS:
+                break
+    except Exception as e:
+        print(f'  Consumer finished: {e}')
+
+    producer.flush()
+    producer.close()
+    consumer.close()
+
+    elapsed = time.time() - start
+    rate = count / elapsed if elapsed > 0 else 0
+
+    # Print summary
+    print(f'\nDone: {count:,} reviews labeled in {elapsed:.1f}s ({rate:,.0f} msg/s)')
+    print(f'\nSentiment distribution:')
+    for sent, cnt in sorted(sentiment_counts.items()):
+        pct = 100.0 * cnt / count if count > 0 else 0
+        print(f'  {sent:<10} {cnt:>10,} ({pct:.1f}%)')
+
+    print(f'\nCategory distribution:')
+    for cat, cnt in sorted(category_counts.items(), key=lambda x: -x[1]):
+        pct = 100.0 * cnt / count if count > 0 else 0
+        print(f'  {cat:<20} {cnt:>10,} ({pct:.1f}%)')

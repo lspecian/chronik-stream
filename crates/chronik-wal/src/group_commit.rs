@@ -388,6 +388,15 @@ pub struct GroupCommitWal {
     /// Enables async response delivery for acks=1 without blocking on fsync
     /// Wrapped in Arc<RwLock<>> for interior mutability (can be set after construction)
     commit_callback: Arc<RwLock<Option<CommitCallback>>>,
+
+    /// v2.4.0: Runtime handle captured at construction time.
+    /// Commit workers are ALWAYS spawned on this handle's runtime, regardless
+    /// of which runtime initiates the first write to a partition.
+    /// This prevents deadlock when WalIndexer (on its dedicated 2-thread runtime)
+    /// writes to __chronik_metadata — without this, the commit worker would be
+    /// spawned on the WalIndexer's runtime and starve when those 2 threads are
+    /// saturated with Tantivy/Parquet/embedding work.
+    runtime_handle: tokio::runtime::Handle,
 }
 
 impl GroupCommitWal {
@@ -415,6 +424,7 @@ impl GroupCommitWal {
             #[cfg(all(target_os = "linux", feature = "async-io"))]
             io_uring_handle,
             commit_callback: Arc::new(RwLock::new(None)),  // v2.2.10: Interior mutability for async responses
+            runtime_handle: tokio::runtime::Handle::current(),
         };
 
         // Discover existing sealed segments from filesystem
@@ -451,6 +461,7 @@ impl GroupCommitWal {
             #[cfg(all(target_os = "linux", feature = "async-io"))]
             io_uring_handle,
             commit_callback: Arc::new(RwLock::new(Some(callback))),  // v2.2.10: Interior mutability for async responses
+            runtime_handle: tokio::runtime::Handle::current(),
         };
 
         // Discover existing sealed segments from filesystem
@@ -516,9 +527,12 @@ impl GroupCommitWal {
                                                             if let Ok(metadata) = file_entry.metadata() {
                                                                 let size_bytes = metadata.len();
 
-                                                                // Only consider sealed segments (>= rotation size or not the highest segment_id)
-                                                                // For now, consider all segments except segment_0 as potentially sealed
-                                                                if segment_id > 0 || size_bytes >= self.config.rotation_size_bytes {
+                                                                // Consider a segment sealed if:
+                                                                // - segment_id > 0 (not the first segment), OR
+                                                                // - size >= rotation threshold, OR
+                                                                // - segment has data (size > 0) — covers recovered
+                                                                //   segments from topics with a single segment
+                                                                if segment_id > 0 || size_bytes >= self.config.rotation_size_bytes || size_bytes > 0 {
                                                                     let sealed_key = format!("{}:{}:{}", topic_name, partition, segment_id);
                                                                     self.sealed_segments.insert(
                                                                         sealed_key,
@@ -722,9 +736,27 @@ impl GroupCommitWal {
         let partition_dir = self.base_dir.join(topic).join(partition.to_string());
         tokio::fs::create_dir_all(&partition_dir).await?;
 
-        // Use partition-specific naming for consistency with rotation
+        // Scan existing WAL files to find the next available segment_id.
+        // After recovery, discover_sealed_segments() marks existing segments as sealed,
+        // so we must start a NEW segment to avoid overwriting sealed data.
+        let mut next_segment_id: u64 = 0;
+        let prefix = format!("wal_{}_", partition);
+        if let Ok(mut entries) = tokio::fs::read_dir(&partition_dir).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                if let Some(name) = entry.file_name().to_str() {
+                    if name.starts_with(&prefix) && name.ends_with(".log") {
+                        if let Some(seg_str) = name.strip_prefix(&prefix).and_then(|s| s.strip_suffix(".log")) {
+                            if let Ok(seg_id) = seg_str.parse::<u64>() {
+                                next_segment_id = next_segment_id.max(seg_id + 1);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Format: wal_{partition}_{segment_id}.log
-        let wal_path = partition_dir.join(format!("wal_{}_0.log", partition));
+        let wal_path = partition_dir.join(format!("wal_{}_{}.log", partition, next_segment_id));
 
         let partition_key = format!("{}:{}", topic, partition);
         let writer = WalWriter::create(
@@ -741,7 +773,7 @@ impl GroupCommitWal {
             last_fsync: Mutex::new(Instant::now()),
             write_notify: Arc::new(Notify::new()),
             metrics: Arc::new(CommitMetrics::default()),
-            segment_id: Arc::new(AtomicU64::new(0)),
+            segment_id: Arc::new(AtomicU64::new(next_segment_id)),
             segment_created_at: Arc::new(Mutex::new(Instant::now())),
             segment_size_bytes: Arc::new(AtomicU64::new(0)),
             topic: topic.to_string(),
@@ -753,7 +785,12 @@ impl GroupCommitWal {
 
         self.partition_queues.insert(key, queue.clone());
 
-        info!("Created commit queue for {}-{}", topic, partition);
+        if next_segment_id > 0 {
+            info!("Created commit queue for {}-{} (segment_id={}, skipping {} existing segments)",
+                topic, partition, next_segment_id, next_segment_id);
+        } else {
+            info!("Created commit queue for {}-{}", topic, partition);
+        }
 
         Ok(queue)
     }
@@ -764,13 +801,20 @@ impl GroupCommitWal {
         let shutdown = self.shutdown.clone();
         let sealed_segments = self.sealed_segments.clone();
         let base_dir = self.base_dir.clone();
+        let partition_queues = self.partition_queues.clone();
         #[cfg(all(target_os = "linux", feature = "async-io"))]
         let io_uring_handle = self.io_uring_handle.clone();
         let commit_callback = self.commit_callback.clone();  // v2.2.10: For async response delivery
 
-        info!("🚀 WORKER_SPAWN: Starting partition committer background task");
+        info!("🚀 WORKER_SPAWN: Starting partition committer on construction-time runtime (prevents WalIndexer starvation)");
 
-        tokio::spawn(async move {
+        // v2.4.0: CRITICAL — spawn on the runtime captured at construction time,
+        // NOT tokio::spawn() which uses the *current* runtime.
+        // Without this, if a WalIndexer thread (on its dedicated 2-thread runtime)
+        // triggers the first write to __chronik_metadata, the commit worker would
+        // be spawned on the WalIndexer's runtime. When those 2 threads are saturated
+        // with Tantivy/Parquet/S3 work, the commit worker starves → deadlock.
+        self.runtime_handle.spawn(async move {
             info!("✅ WORKER_STARTED: Partition committer task is running");
 
             // v2.2.7: Set high I/O priority for WAL thread to prevent Tantivy from blocking it
@@ -781,52 +825,53 @@ impl GroupCommitWal {
             let mut interval = tokio::time::interval(Duration::from_millis(config.max_wait_time_ms));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+            let worker_key = (queue.topic.clone(), queue.partition);
+
             debug!("WORKER_CONFIG: max_wait_time_ms={}, max_batch_size={}, max_batch_bytes={}",
                 config.max_wait_time_ms, config.max_batch_size, config.max_batch_bytes);
 
             loop {
+                // Check if partition queue was removed (topic deleted)
+                if !partition_queues.contains_key(&worker_key) {
+                    info!("🛑 WORKER_EXIT: Partition queue removed (topic deleted), committer exiting: {}:{}",
+                        queue.topic, queue.partition);
+                    return;
+                }
                 // v2.2.9 fix: Changed hot-path logs from debug! to trace! to prevent log bomb
                 // With 1000s of partitions, these logs fire 10x/sec per partition = 180K lines/sec
                 trace!("🔄 WORKER_LOOP: Waiting for interval tick (PostgreSQL-style wait queue)");
 
-                // POSTGRESQL-STYLE WAIT QUEUE (v2.2.11 - FIX for acks=1 batching)
+                // HYBRID COMMIT STRATEGY (v2.4.0 — fixes deadlock under load)
                 //
-                // PROBLEM (v2.2.10): Adaptive batching failed because:
-                //   - Every write calls write_notify.notify_one()
-                //   - Worker wakes up, checks queue length
-                //   - Writes arrive spaced (1-4ms apart due to network/client pipelining)
-                //   - Queue rarely reaches MIN_BATCH_SIZE before tick
-                //   - Result: batch_size=1, throughput stuck at ~10K msg/s
+                // History:
+                //   v2.2.10: Notify-only → batch_size=1, stuck at ~10K msg/s
+                //   v2.2.11: Interval-only (PostgreSQL-style) → great batching but
+                //            DEADLOCKS under high indexing load because the tokio
+                //            runtime delays the interval tick when saturated with
+                //            WalIndexer work (Tantivy, Parquet, S3 uploads).
+                //            Callers block on oneshot rx.await forever.
                 //
-                // SOLUTION (v2.2.11): PostgreSQL wait queue approach:
-                //   - IGNORE write notifications entirely
-                //   - ONLY commit on interval tick (50ms for MEDIUM profile)
-                //   - Let writes naturally accumulate during interval
-                //   - All accumulated writes committed together in one batch
-                //
-                // With 128 concurrent clients at 50ms interval:
-                //   - ~64-128 writes accumulate naturally
-                //   - Single fsync commits entire batch
-                //   - Expected throughput: 40K-60K msg/s
-                //
-                // This matches PostgreSQL commit_delay behavior:
-                //   - PostgreSQL waits commit_delay microseconds
-                //   - If commit_siblings backends waiting, one commits for all
-                //   - Chronik: All clients wait on oneshot channel, worker commits for all
+                // FIX (v2.4.0): Hybrid approach — use BOTH interval AND notify:
+                //   - interval.tick(): Ensures regular commits at configured rate
+                //   - write_notify: Ensures no write waits forever when runtime is busy
+                //   - commit_batch handles empty queue gracefully (returns immediately)
+                //   - High-throughput topics: interval fires first, batches stay large
+                //   - Low-throughput topics (e.g. __chronik_metadata): notify ensures
+                //     writes complete promptly instead of waiting for delayed tick
                 tokio::select! {
                     _ = interval.tick() => {
-                        trace!("⏰ WORKER_TICK: Interval tick fired - committing all accumulated writes");
-                        // Fall through to commit
+                        trace!("⏰ WORKER_TICK: Interval tick fired");
+                    }
+                    _ = queue.write_notify.notified() => {
+                        trace!("🔔 WORKER_NOTIFY: Write notification received");
                     }
                     _ = shutdown.notified() => {
                         info!("🛑 WORKER_SHUTDOWN: Partition committer shutting down");
-                        return;  // Exit worker entirely
+                        return;
                     }
-                    // NOTE: write_notify branch REMOVED - we ignore notifications and only commit on tick
-                    // This allows natural write accumulation without synchronization
                 }
 
-                // Commit batch (triggered ONLY by interval tick)
+                // Commit batch (triggered by interval tick OR write notification)
                 trace!("📝 WORKER_COMMIT: Committing accumulated writes");
                 if let Err(e) = Self::commit_batch(
                     &queue,
@@ -1242,6 +1287,52 @@ impl GroupCommitWal {
         }
 
         sealed_count
+    }
+
+    /// Clean up all partition queues and sealed segments for a deleted topic.
+    /// Called when a topic is deleted via the Kafka DeleteTopics API.
+    /// Removes partition_queues entries (commit workers will exit on next loop)
+    /// and removes sealed_segments entries for the topic.
+    pub async fn cleanup_topic(&self, topic: &str) {
+        // Collect partition IDs for this topic
+        let partitions: Vec<i32> = self.partition_queues
+            .iter()
+            .filter_map(|entry| {
+                let ((t, p), _) = entry.pair();
+                if t == topic { Some(*p) } else { None }
+            })
+            .collect();
+
+        // Remove partition queues (commit workers check for removal and exit)
+        for partition in &partitions {
+            let key = (topic.to_string(), *partition);
+            if self.partition_queues.remove(&key).is_some() {
+                info!("Cleaned up partition queue for deleted topic: {}:{}", topic, partition);
+            }
+        }
+
+        // Remove sealed segments for this topic
+        let sealed_keys: Vec<String> = self.sealed_segments
+            .iter()
+            .filter_map(|entry| {
+                if entry.value().topic == topic {
+                    Some(entry.key().clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for key in &sealed_keys {
+            self.sealed_segments.remove(key);
+        }
+
+        if !partitions.is_empty() || !sealed_keys.is_empty() {
+            info!(
+                "Topic '{}' cleanup: removed {} partition queues, {} sealed segments",
+                topic, partitions.len(), sealed_keys.len()
+            );
+        }
     }
 
     /// Shutdown the group commit WAL

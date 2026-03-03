@@ -233,29 +233,33 @@ impl Default for EmbeddingModelConfig {
 
 impl EmbeddingModelConfig {
     /// Parse from topic config.
+    ///
+    /// Accepts both short-form (`vector.provider`) and long-form (`vector.embedding.provider`)
+    /// keys. Short-form takes priority if both are present.
     pub fn from_topic_config(config: &HashMap<String, String>) -> Result<Self> {
         let mut result = Self::default();
 
-        // vector.provider
-        if let Some(v) = config.get("vector.provider") {
+        // vector.provider (short-form) or vector.embedding.provider (long-form)
+        if let Some(v) = config.get("vector.provider").or_else(|| config.get("vector.embedding.provider")) {
             result.provider = v.parse()?;
         }
 
-        // vector.model
-        if let Some(v) = config.get("vector.model") {
+        // vector.model (short-form) or vector.embedding.model (long-form)
+        if let Some(v) = config.get("vector.model").or_else(|| config.get("vector.embedding.model")) {
             result.model = v.clone();
             // Auto-detect dimensions for known models
             result.dimensions = known_model_dimensions(&result.model)
                 .unwrap_or(result.dimensions);
         }
 
-        // vector.endpoint
-        if let Some(v) = config.get("vector.endpoint") {
+        // vector.endpoint (short-form) or vector.embedding.endpoint (long-form)
+        if let Some(v) = config.get("vector.endpoint").or_else(|| config.get("vector.embedding.endpoint")) {
             result.endpoint = Some(v.clone());
         }
 
-        // vector.dimensions (override auto-detection)
-        if let Some(v) = config.get("vector.dimensions") {
+        // vector.dimensions (short-form) or vector.embedding.dimensions (long-form)
+        // Overrides auto-detection from model
+        if let Some(v) = config.get("vector.dimensions").or_else(|| config.get("vector.embedding.dimensions")) {
             result.dimensions = v.parse()
                 .map_err(|_| anyhow!("Invalid dimensions: {}", v))?;
         }

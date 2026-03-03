@@ -64,6 +64,11 @@ impl ColumnarQueryEngine {
 
         let ctx = SessionContext::new_with_config(session_config);
 
+        // Register custom UDFs (json_extract_int, decode_utf8, etc.)
+        if let Err(e) = crate::udfs::register_udfs(&ctx) {
+            tracing::warn!("Failed to register custom UDFs: {}", e);
+        }
+
         Self { ctx, config }
     }
 

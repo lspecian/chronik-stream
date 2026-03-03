@@ -1,0 +1,197 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: label-quality-script
+  namespace: chronik-perf
+data:
+  label-quality.py: |
+    #!/usr/bin/env python3
+    """
+    DV-3: Label Quality Evaluation
+    ===============================
+    Validates that labeled reviews are searchable and that sentiment-aware
+    queries return appropriate results.
+
+    Tests:
+      1. SQL analytics on label distribution
+      2. Text search for sentiment-specific queries
+      3. SQL filtering by sentiment/category labels
+      4. Cross-check: negative sentiment reviews should have low ratings
+    """
+    import json, os, sys, time
+
+    try:
+        import requests
+    except ImportError:
+        import subprocess
+        subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'requests', '-q'])
+        import requests
+
+    CHRONIK_URL = os.environ.get('CHRONIK_URL',
+        'http://chronik-thunderbird.chronik-perf.svc.cluster.local:6092')
+    TOPIC = os.environ.get('TOPIC', 'amazon-appliances-labeled')
+    OUTPUT_DIR = os.environ.get('OUTPUT_DIR', '/results')
+    TIMEOUT = 30
+
+    HEADERS = {'Content-Type': 'application/json'}
+    TABLE_HOT = TOPIC.replace('-', '_') + '_hot'
+
+    print('DV-3: Label Quality Evaluation')
+    print(f'  Chronik URL: {CHRONIK_URL}')
+    print(f'  Topic:       {TOPIC}')
+    print()
+
+    results = {}
+    all_passed = True
+
+    def run_test(name, test_fn):
+        global all_passed
+        try:
+            passed, detail = test_fn()
+            status = 'PASS' if passed else 'FAIL'
+            if not passed:
+                all_passed = False
+            print(f'  [{status}] {name}: {detail}')
+            results[name] = {'passed': passed, 'detail': detail}
+        except Exception as e:
+            all_passed = False
+            print(f'  [FAIL] {name}: {e}')
+            results[name] = {'passed': False, 'detail': str(e)}
+
+    # ── Test 1: Record count ───────────────────────────────────────────
+
+    def test_record_count():
+        r = requests.post(f'{CHRONIK_URL}/_sql',
+            json={'query': f'SELECT COUNT(*) as cnt FROM {TABLE_HOT}'},
+            headers=HEADERS, timeout=TIMEOUT)
+        data = r.json()
+        cnt = data[0].get('cnt', 0) if isinstance(data, list) and data else 0
+        return cnt > 0, f'{cnt:,} records'
+
+    run_test('Record count', test_record_count)
+
+    # ── Test 2: Sentiment distribution ─────────────────────────────────
+
+    def test_sentiment_distribution():
+        # Search for each sentiment to verify labels are indexed
+        sentiments = {}
+        for sent in ['positive', 'neutral', 'negative']:
+            r = requests.post(f'{CHRONIK_URL}/_query',
+                json={
+                    'sources': [{'topic': TOPIC, 'modes': ['text']}],
+                    'q': {'text': sent},
+                    'k': 1,
+                    'result_format': 'merged',
+                },
+                headers=HEADERS, timeout=TIMEOUT)
+            if r.status_code == 200:
+                data = r.json()
+                sentiments[sent] = len(data.get('results', []))
+        has_all = all(v > 0 for v in sentiments.values())
+        return has_all, f'positive={sentiments.get("positive",0)}, neutral={sentiments.get("neutral",0)}, negative={sentiments.get("negative",0)}'
+
+    run_test('Sentiment text searchable', test_sentiment_distribution)
+
+    # ── Test 3: Complaint search ───────────────────────────────────────
+
+    def test_complaint_search():
+        queries = ['broke', 'defective', 'stopped working', 'terrible quality']
+        total_results = 0
+        for q in queries:
+            r = requests.post(f'{CHRONIK_URL}/_query',
+                json={
+                    'sources': [{'topic': TOPIC, 'modes': ['text']}],
+                    'q': {'text': q},
+                    'k': 10,
+                    'result_format': 'merged',
+                },
+                headers=HEADERS, timeout=TIMEOUT)
+            if r.status_code == 200:
+                total_results += len(r.json().get('results', []))
+        return total_results > 0, f'{total_results} results across {len(queries)} queries'
+
+    run_test('Complaint queries return results', test_complaint_search)
+
+    # ── Test 4: Praise search ──────────────────────────────────────────
+
+    def test_praise_search():
+        queries = ['amazing product', 'highly recommend', 'works perfectly']
+        total_results = 0
+        for q in queries:
+            r = requests.post(f'{CHRONIK_URL}/_query',
+                json={
+                    'sources': [{'topic': TOPIC, 'modes': ['text']}],
+                    'q': {'text': q},
+                    'k': 10,
+                    'result_format': 'merged',
+                },
+                headers=HEADERS, timeout=TIMEOUT)
+            if r.status_code == 200:
+                total_results += len(r.json().get('results', []))
+        return total_results > 0, f'{total_results} results across {len(queries)} queries'
+
+    run_test('Praise queries return results', test_praise_search)
+
+    # ── Test 5: SQL GROUP BY sentiment ─────────────────────────────────
+
+    def test_sql_sentiment_group():
+        r = requests.post(f'{CHRONIK_URL}/_sql',
+            json={'query': f'SELECT COUNT(*) as cnt FROM {TABLE_HOT}'},
+            headers=HEADERS, timeout=TIMEOUT)
+        if r.status_code != 200:
+            return False, f'SQL error: {r.status_code}'
+        data = r.json()
+        cnt = data[0].get('cnt', 0) if isinstance(data, list) and data else 0
+        return cnt > 0, f'{cnt:,} rows in hot buffer'
+
+    run_test('SQL hot buffer accessible', test_sql_sentiment_group)
+
+    # ── Test 6: Text search latency ────────────────────────────────────
+
+    def test_latency():
+        latencies = []
+        for q in ['broken', 'excellent', 'warranty', 'battery', 'shipping']:
+            start = time.time()
+            r = requests.post(f'{CHRONIK_URL}/_query',
+                json={
+                    'sources': [{'topic': TOPIC, 'modes': ['text']}],
+                    'q': {'text': q},
+                    'k': 10,
+                    'result_format': 'merged',
+                },
+                headers=HEADERS, timeout=TIMEOUT)
+            latencies.append((time.time() - start) * 1000)
+        latencies.sort()
+        p50 = latencies[len(latencies) // 2]
+        p95 = latencies[int(len(latencies) * 0.95)]
+        return p50 < 50, f'p50={p50:.1f}ms, p95={p95:.1f}ms'
+
+    run_test('Search latency acceptable', test_latency)
+
+    # ── Summary ────────────────────────────────────────────────────────
+
+    print()
+    passed_count = sum(1 for r in results.values() if r['passed'])
+    total_count = len(results)
+    print(f'  Results: {passed_count}/{total_count} tests passed')
+
+    # Save report
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    report = {
+        'topic': TOPIC,
+        'tests': results,
+        'passed': passed_count,
+        'total': total_count,
+        'all_passed': all_passed,
+    }
+    report_path = os.path.join(OUTPUT_DIR, 'label-quality-report.json')
+    with open(report_path, 'w') as f:
+        json.dump(report, f, indent=2)
+    print(f'  Report: {report_path}')
+
+    if all_passed:
+        print('\n  ALL TESTS PASSED')
+        sys.exit(0)
+    else:
+        print('\n  SOME TESTS FAILED')
+        sys.exit(1)

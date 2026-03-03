@@ -155,7 +155,7 @@ impl VectorHandler {
             .map_err(|e| format!("Search failed: {}", e))
     }
 
-    /// Search by raw vector
+    /// Search by raw vector (does not require embedding provider)
     pub async fn search_by_vector(
         state: &UnifiedApiState,
         topic: &str,
@@ -168,15 +168,9 @@ impl VectorHandler {
             .as_ref()
             .ok_or("Vector index manager not available")?;
 
-        let provider = state
-            .embedding_provider
-            .as_ref()
-            .ok_or("Embedding provider not configured")?;
-
-        let service = VectorSearchService::new(
+        let service = VectorSearchService::new_index_only(
             std::sync::Arc::clone(index_manager),
-            std::sync::Arc::clone(provider),
-        ).with_cache(state.embedding_cache.clone());
+        );
 
         service
             .search_by_vector(topic, vector, k, filters)
@@ -344,7 +338,7 @@ pub async fn search_by_vector(
 
     let start = std::time::Instant::now();
 
-    // Check if vector search is available
+    // Check if vector search is available (no embedding provider needed for raw vector search)
     let index_manager = match &state.vector_index_manager {
         Some(m) => m,
         None => {
@@ -356,22 +350,10 @@ pub async fn search_by_vector(
         }
     };
 
-    let provider = match &state.embedding_provider {
-        Some(p) => p,
-        None => {
-            let error_response = VectorErrorResponse {
-                error: "Embedding provider not configured".to_string(),
-                error_type: "ServiceUnavailable".to_string(),
-            };
-            return (StatusCode::SERVICE_UNAVAILABLE, Json(error_response)).into_response();
-        }
-    };
-
     let filters = build_filters(request.partitions, request.min_offset, request.max_offset);
 
-    let service = VectorSearchService::new(
+    let service = VectorSearchService::new_index_only(
         std::sync::Arc::clone(index_manager),
-        std::sync::Arc::clone(provider),
     );
 
     // VO-5: Use model-specific search when model param provided
@@ -489,21 +471,37 @@ pub struct ListTopicsResponse {
 }
 
 /// List all topics with vector indexes
+///
+/// Returns topics from two sources:
+/// 1. Topics with active vector indexes (already have embeddings)
+/// 2. Topics configured with vector.enabled=true in metadata (may still be indexing)
 pub async fn list_topics(State(state): State<UnifiedApiState>) -> impl IntoResponse {
     debug!("Listing vector-enabled topics");
 
-    let index_manager = match &state.vector_index_manager {
-        Some(m) => m,
-        None => {
-            let error_response = VectorErrorResponse {
-                error: "Vector search not available".to_string(),
-                error_type: "ServiceUnavailable".to_string(),
-            };
-            return (StatusCode::SERVICE_UNAVAILABLE, Json(error_response)).into_response();
-        }
-    };
+    let mut all_topics = std::collections::BTreeSet::new();
 
-    let topics = index_manager.list_topics().await;
+    // Source 1: Topics with active vector indexes
+    if let Some(ref index_manager) = state.vector_index_manager {
+        for topic in index_manager.list_topics().await {
+            all_topics.insert(topic);
+        }
+    }
+
+    // Source 2: Topics configured with vector.enabled=true in metadata
+    match state.metadata_store.list_topics().await {
+        Ok(topics_meta) => {
+            for topic_meta in &topics_meta {
+                if topic_meta.config.is_vector_enabled() {
+                    all_topics.insert(topic_meta.name.clone());
+                }
+            }
+        }
+        Err(e) => {
+            debug!("Failed to list topics from metadata store: {}", e);
+        }
+    }
+
+    let topics: Vec<String> = all_topics.into_iter().collect();
     let count = topics.len();
 
     let response = ListTopicsResponse { topics, count };

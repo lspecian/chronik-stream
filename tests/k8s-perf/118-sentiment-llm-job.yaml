@@ -1,0 +1,61 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: sentiment-llm-labeler
+  namespace: chronik-perf
+spec:
+  backoffLimit: 1
+  # LLM classification is slow (~50-500ms/review) — 4 hours for 10K-100K
+  activeDeadlineSeconds: 14400
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: labeler
+          image: python:3.12-slim
+          env:
+            - name: BOOTSTRAP_SERVERS
+              value: "chronik-thunderbird.chronik-perf.svc.cluster.local:9092"
+            - name: SOURCE_TOPIC
+              value: "amazon-appliances"
+            - name: DEST_TOPIC
+              value: "amazon-appliances-llm-labeled"
+            - name: MAX_RECORDS
+              value: "10000"
+            - name: BATCH_SIZE
+              value: "100"
+            - name: CONSUMER_TIMEOUT_MS
+              value: "30000"
+            - name: NUM_PARTITIONS
+              value: "6"
+            # LLM backend: ollama (default, on-cluster GPU) or openai
+            - name: LLM_BACKEND
+              value: "ollama"
+            - name: OLLAMA_URL
+              value: "http://ollama-gpu.chronik-perf.svc.cluster.local:11434"
+            - name: OLLAMA_MODEL
+              value: "phi3:mini"
+            # Uncomment for OpenAI backend:
+            # - name: LLM_BACKEND
+            #   value: "openai"
+            # - name: OPENAI_MODEL
+            #   value: "gpt-4o-mini"
+          envFrom:
+            - secretRef:
+                name: openai-api-key
+                optional: true
+          command: ["python3", "/scripts/sentiment-llm-labeler.py"]
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+          resources:
+            requests:
+              cpu: "1"
+              memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "1Gi"
+      volumes:
+        - name: script
+          configMap:
+            name: sentiment-llm-script

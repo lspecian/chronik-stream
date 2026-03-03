@@ -270,7 +270,7 @@ def main():
         env["RUST_LOG"] = "info,chronik_storage::wal_indexer=debug"
         env["CHRONIK_DATA_DIR"] = DATA_DIR
         env["CHRONIK_UNIFIED_API_PORT"] = str(UNIFIED_API_PORT)
-        # Server-wide embedding provider for query-time embedding
+        # Server-wide embedding provider for text search and hybrid search (query-time embedding)
         env["CHRONIK_EMBEDDING_PROVIDER"] = "external"
         env["CHRONIK_EMBEDDING_ENDPOINT"] = f"http://localhost:{MOCK_EMBED_PORT}/embed"
         env["CHRONIK_EMBEDDING_DIMENSIONS"] = str(EMBED_DIMS)
@@ -305,11 +305,6 @@ def main():
             replication_factor=1,
             topic_configs={
                 "vector.enabled": "true",
-                # Validator keys (vector.embedding.* naming)
-                "vector.embedding.provider": "external",
-                "vector.embedding.endpoint": f"http://localhost:{MOCK_EMBED_PORT}/embed",
-                "vector.embedding.dimensions": str(EMBED_DIMS),
-                # Config parser keys (vector.* naming)
                 "vector.provider": "external",
                 "vector.endpoint": f"http://localhost:{MOCK_EMBED_PORT}/embed",
                 "vector.dimensions": str(EMBED_DIMS),

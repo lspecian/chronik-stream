@@ -1,0 +1,161 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k6-amazon-scale-script
+  namespace: chronik-perf
+data:
+  amazon-scale-test.js: |
+    /**
+     * DV-2a: Amazon Appliances Scale Benchmark (2.1M reviews)
+     * ========================================================
+     * Tests text search + SQL query performance at 2.1M real ecommerce documents.
+     *
+     * Success criteria:
+     *   - Text search p50 < 15ms
+     *   - SQL COUNT p50 < 20ms
+     *   - Error rate < 5%
+     */
+    import http from 'k6/http';
+    import { check, sleep } from 'k6';
+    import { Rate, Trend, Counter } from 'k6/metrics';
+
+    // Custom metrics per mode
+    const textErrors = new Rate('text_errors');
+    const textLatency = new Trend('text_latency', true);
+    const textCompleted = new Counter('text_completed');
+
+    const sqlErrors = new Rate('sql_errors');
+    const sqlLatency = new Trend('sql_latency', true);
+    const sqlCompleted = new Counter('sql_completed');
+
+    const totalErrors = new Rate('total_errors');
+    const totalLatency = new Trend('total_latency', true);
+
+    const BASE_URL = __ENV.CHRONIK_URL ||
+        'http://chronik-thunderbird.chronik-perf.svc.cluster.local:6092';
+    const TOPIC = __ENV.TOPIC || 'amazon-appliances';
+    const TEST_MODE = __ENV.TEST_MODE || 'mixed';
+    const TABLE_HOT = TOPIC.replace(/-/g, '_') + '_hot';
+    const TABLE_COLD = TOPIC.replace(/-/g, '_') + '_cold';
+
+    export const options = {
+        stages: [
+            { duration: '15s', target: 50 },    // Warm up
+            { duration: '30s', target: 200 },   // Ramp
+            { duration: '1m',  target: 500 },   // Medium load
+            { duration: '1m',  target: 1000 },  // Peak load
+            { duration: '1m',  target: 1000 },  // Sustain peak
+            { duration: '30s', target: 500 },   // Ramp down
+            { duration: '15s', target: 0 },     // Cool down
+        ],
+        thresholds: {
+            text_errors:  ['rate<0.05'],
+            text_latency: ['p(50)<15', 'p(95)<200'],
+            sql_errors:   ['rate<0.05'],
+            sql_latency:  ['p(50)<50', 'p(95)<500'],
+            total_errors: ['rate<0.05'],
+        },
+    };
+
+    // Real appliance review text search queries
+    const textQueries = [
+        'blender not working',
+        'dishwasher leaking water',
+        'refrigerator noise',
+        'microwave sparking',
+        'toaster oven heating element',
+        'coffee maker dripping',
+        'washing machine vibrating',
+        'dryer not heating',
+        'air conditioner compressor',
+        'vacuum cleaner suction',
+        'garbage disposal jammed',
+        'food processor blade',
+        'ice maker stopped',
+        'water filter replacement',
+        'energy efficient',
+        'stainless steel rust',
+        'warranty claim',
+        'installation problem',
+        'delivery damaged',
+        'customer service terrible',
+    ];
+
+    // SQL queries using available raw columns (_topic, _partition, _offset, _timestamp, _key, _value)
+    // Mix of light (filtered/range) and heavy (full-scan) queries weighted by frequency.
+    // Realistic workloads are ~80% filtered lookups, ~20% analytical full-scans.
+    const lightSqlQueries = [
+        // Partition-filtered COUNT (scans ~500K rows instead of 6.5M)
+        `SELECT COUNT(*) as cnt FROM ${TABLE_HOT} WHERE _partition = ${Math.floor(Math.random() * 12)}`,
+        // Offset range query (narrow)
+        `SELECT _offset, CAST(_key AS VARCHAR) as k, _timestamp FROM ${TABLE_HOT} WHERE _offset > 100 AND _offset < 200 LIMIT 50`,
+        // Timestamp range
+        `SELECT COUNT(*) as cnt FROM ${TABLE_HOT} WHERE _offset BETWEEN 50000 AND 100000`,
+        // COUNT on cold (Tantivy — uses metadata, fast)
+        `SELECT COUNT(*) as cnt FROM ${TABLE_COLD}`,
+        // Partition-filtered cold COUNT
+        `SELECT COUNT(*) as cnt FROM ${TABLE_COLD} WHERE _partition = ${Math.floor(Math.random() * 12)}`,
+        // Narrow offset lookup
+        `SELECT _offset, _key, _timestamp FROM ${TABLE_HOT} WHERE _partition = 0 AND _offset BETWEEN 0 AND 100 LIMIT 20`,
+    ];
+    const heavySqlQueries = [
+        // COUNT on hot buffer (full scan 6.5M rows)
+        `SELECT COUNT(*) as cnt FROM ${TABLE_HOT}`,
+        // Partition distribution (full scan + GROUP BY)
+        `SELECT _partition, COUNT(*) as cnt FROM ${TABLE_HOT} GROUP BY _partition ORDER BY cnt DESC`,
+        // Max offset per partition (full scan + GROUP BY)
+        `SELECT _partition, MAX(_offset) as max_off, MIN(_offset) as min_off FROM ${TABLE_HOT} GROUP BY _partition`,
+        // Count by partition cold (full scan)
+        `SELECT _partition, COUNT(*) as cnt FROM ${TABLE_COLD} GROUP BY _partition ORDER BY _partition`,
+    ];
+
+    const headers = { 'Content-Type': 'application/json' };
+
+    function textSearch() {
+        const q = textQueries[Math.floor(Math.random() * textQueries.length)];
+        const size = Math.random() < 0.7 ? 10 : 20;
+        const payload = JSON.stringify({
+            index: TOPIC,
+            query: { match: { _all: q } },
+            size: size,
+        });
+        const res = http.post(`${BASE_URL}/_search`, payload,
+            { headers, timeout: '10s' });
+        const ok = check(res, { 'text 200': (r) => r.status === 200 });
+        textErrors.add(!ok);
+        textLatency.add(res.timings.duration);
+        textCompleted.add(1);
+        totalErrors.add(!ok);
+        totalLatency.add(res.timings.duration);
+    }
+
+    function sqlQuery() {
+        // 90% light (filtered/range), 10% heavy (full-scan analytical)
+        const pool = Math.random() < 0.9 ? lightSqlQueries : heavySqlQueries;
+        const q = pool[Math.floor(Math.random() * pool.length)];
+        const res = http.post(`${BASE_URL}/_sql`,
+            JSON.stringify({ query: q }),
+            { headers, timeout: '30s' });
+        const ok = check(res, { 'sql 200': (r) => r.status === 200 });
+        sqlErrors.add(!ok);
+        sqlLatency.add(res.timings.duration);
+        sqlCompleted.add(1);
+        totalErrors.add(!ok);
+        totalLatency.add(res.timings.duration);
+    }
+
+    export default function () {
+        if (TEST_MODE === 'text') {
+            textSearch();
+        } else if (TEST_MODE === 'sql') {
+            sqlQuery();
+        } else {
+            // Mixed mode: 60% text, 40% SQL
+            if (Math.random() < 0.6) {
+                textSearch();
+            } else {
+                sqlQuery();
+            }
+        }
+        sleep(0.01);
+    }

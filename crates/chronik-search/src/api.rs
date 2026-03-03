@@ -102,6 +102,9 @@ pub struct FieldMapping {
 /// Search request (Elasticsearch compatible)
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SearchRequest {
+    /// Optional index/topic name to restrict search to a specific topic
+    #[serde(default)]
+    pub index: Option<String>,
     #[serde(default)]
     pub query: Option<QueryDsl>,
     #[serde(default = "default_size")]
