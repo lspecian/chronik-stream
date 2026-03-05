@@ -404,8 +404,29 @@ impl WalMetadataStore {
         Ok(())
     }
 
-    /// Apply event from replication (follower mode)
+    /// Apply event from replication (follower mode).
+    ///
+    /// Persists the event to the follower's local metadata WAL before applying
+    /// to in-memory state. This ensures replicated metadata (TopicCreated,
+    /// TopicUpdated, PartitionAssigned, etc.) survives pod restarts.
+    ///
+    /// NOTE: We intentionally do NOT publish to the event bus here — that would
+    /// cause infinite replication loops (leader → follower → leader → ...).
     pub async fn apply_replicated_event(&self, event: MetadataEvent) -> Result<()> {
+        // 1. Persist to local WAL for durability across restarts
+        let bytes = event.to_bytes()
+            .map_err(|e| MetadataError::StorageError(
+                format!("Failed to serialize replicated event: {}", e),
+            ))?;
+        if let Err(e) = (self.wal_append)(bytes).await {
+            tracing::warn!(
+                "Failed to persist replicated metadata event to local WAL: {}. \
+                 Event will be applied to in-memory state but may be lost on restart.",
+                e
+            );
+        }
+
+        // 2. Apply to in-memory state
         self.state.apply_event(&event).await
     }
 
@@ -416,6 +437,52 @@ impl WalMetadataStore {
             self.state.apply_event(&event).await?;
         }
         Ok(())
+    }
+
+    /// Re-broadcast all topic metadata via the event bus.
+    ///
+    /// Called by the leader after startup once metadata replication is wired up.
+    /// This ensures followers receive TopicCreated events for topics that were
+    /// created in previous pod lifecycles. Without this, followers that restart
+    /// would lose topic metadata (since replicated events weren't persisted to
+    /// their local WAL before the apply_replicated_event fix).
+    ///
+    /// Safe to call multiple times — followers' apply_replicated_event is
+    /// idempotent (creates topic only if it doesn't exist).
+    pub async fn broadcast_all_topics(&self) -> usize {
+        let publish_fn = match self.event_bus_publish {
+            Some(ref f) => f,
+            None => {
+                tracing::warn!("Cannot broadcast topics: event bus not wired up");
+                return 0;
+            }
+        };
+
+        let topics = self.state.topics.read().await;
+        let mut count = 0;
+        for (name, meta) in topics.iter() {
+            // Skip internal topics — they're managed separately
+            if name.starts_with("__") {
+                continue;
+            }
+
+            let event = MetadataEvent::new_with_node(
+                MetadataEventPayload::TopicCreated {
+                    name: name.clone(),
+                    config: meta.config.clone(),
+                },
+                self.node_id,
+            );
+            let subscribers = publish_fn(event);
+            count += 1;
+            tracing::info!(
+                topic = %name,
+                subscribers,
+                "Re-broadcast TopicCreated to followers"
+            );
+        }
+        tracing::info!(topics_broadcast = count, "Metadata re-broadcast complete");
+        count
     }
 }
 

@@ -8,7 +8,7 @@
 
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Json,
 };
@@ -20,7 +20,7 @@ use chronik_columnar::{VectorSearchFilters, VectorSearchResult, VectorSearchServ
 use super::UnifiedApiState;
 
 /// Text-based vector search request
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VectorSearchRequest {
     /// Text query to search for (will be embedded)
     pub query: String,
@@ -50,7 +50,7 @@ fn default_k() -> usize {
 }
 
 /// Raw vector search request
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VectorSearchByVectorRequest {
     /// Query embedding vector
     pub vector: Vec<f32>,
@@ -72,7 +72,7 @@ pub struct VectorSearchByVectorRequest {
 }
 
 /// Vector search response
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VectorSearchResponse {
     /// Search results
     pub results: Vec<VectorSearchResultItem>,
@@ -83,15 +83,15 @@ pub struct VectorSearchResponse {
     /// Query execution time in milliseconds
     pub execution_time_ms: u64,
     /// Whether results were re-ranked (VO-4)
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub reranked: bool,
     /// VO-5: Model ID that was searched
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
 }
 
 /// Single search result item
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VectorSearchResultItem {
     /// Partition number
     pub partition: i32,
@@ -207,12 +207,32 @@ fn build_filters(
 /// Default overretrieval factor for re-ranking (fetch k * this many candidates)
 const DEFAULT_OVERRETRIEVAL_FACTOR: usize = 5;
 
+/// Check if this request should fan out to peer nodes in cluster mode.
+///
+/// Returns true if:
+/// - A query router is configured (cluster mode)
+/// - The request is NOT a forwarded request (no infinite loops)
+/// - Not all partitions for the topic are local (remote data exists)
+///
+/// Side effect: refreshes the partition map from metadata store.
+async fn needs_fan_out(state: &UnifiedApiState, headers: &HeaderMap, topic: &str) -> bool {
+    if let Some(ref router) = state.query_router {
+        if !super::query_router::is_forwarded_request(headers) {
+            router.refresh_partition_map(state.metadata_store.as_ref(), topic).await;
+            return !router.all_partitions_local(topic).await;
+        }
+    }
+    false
+}
+
 /// Search by text query endpoint
 pub async fn search(
     State(state): State<UnifiedApiState>,
+    headers: HeaderMap,
     Path(topic): Path<String>,
     Json(request): Json<VectorSearchRequest>,
 ) -> impl IntoResponse {
+    let fan_out_request = request.clone();
     let model_param = request.model.as_deref();
     info!(
         topic = %topic, query = %request.query, k = request.k,
@@ -299,6 +319,19 @@ pub async fn search(
                 model: request.model.clone(),
             };
 
+            // Distributed fan-out: merge results from peer nodes
+            let response = if needs_fan_out(&state, &headers, &topic).await {
+                let router = state.query_router.as_ref().unwrap();
+                let nodes = router.nodes_for_topic(&topic).await;
+                let peers: Vec<VectorSearchResponse> = router
+                    .fan_out_post(&format!("/_vector/{}/search", topic), &fan_out_request, &nodes)
+                    .await;
+                debug!(topic = %topic, peer_count = peers.len(), "Merging vector search from peers");
+                super::query_router::merge_vector_responses(response, peers, fan_out_request.k)
+            } else {
+                response
+            };
+
             info!(
                 topic = %topic,
                 results = response.count,
@@ -324,9 +357,11 @@ pub async fn search(
 /// Search by raw vector endpoint
 pub async fn search_by_vector(
     State(state): State<UnifiedApiState>,
+    headers: HeaderMap,
     Path(topic): Path<String>,
     Json(request): Json<VectorSearchByVectorRequest>,
 ) -> impl IntoResponse {
+    let fan_out_request = request.clone();
     let model_param = request.model.as_deref();
     info!(
         topic = %topic,
@@ -379,6 +414,19 @@ pub async fn search_by_vector(
                 execution_time_ms,
                 reranked: false,
                 model: request.model.clone(),
+            };
+
+            // Distributed fan-out: merge results from peer nodes
+            let response = if needs_fan_out(&state, &headers, &topic).await {
+                let router = state.query_router.as_ref().unwrap();
+                let nodes = router.nodes_for_topic(&topic).await;
+                let peers: Vec<VectorSearchResponse> = router
+                    .fan_out_post(&format!("/_vector/{}/search_by_vector", topic), &fan_out_request, &nodes)
+                    .await;
+                debug!(topic = %topic, peer_count = peers.len(), "Merging vector-by-vector search from peers");
+                super::query_router::merge_vector_responses(response, peers, fan_out_request.k)
+            } else {
+                response
             };
 
             info!(
@@ -574,7 +622,7 @@ async fn apply_reranking(
 // ============================================================================
 
 /// Hybrid search request combining vector and text search
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HybridSearchRequest {
     /// Text query for both vector embedding and full-text search
     pub query: String,
@@ -623,7 +671,7 @@ fn default_rrf_k() -> usize {
 }
 
 /// Hybrid search response
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HybridSearchResponse {
     /// Fused search results
     pub results: Vec<HybridSearchResultItem>,
@@ -636,15 +684,15 @@ pub struct HybridSearchResponse {
     /// Query execution time in milliseconds
     pub execution_time_ms: u64,
     /// Whether results were re-ranked after fusion (VO-4)
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub reranked: bool,
     /// VO-5: Model ID that was searched
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
 }
 
 /// Single hybrid search result item
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HybridSearchResultItem {
     /// Partition number
     pub partition: i32,
@@ -699,9 +747,11 @@ fn calculate_rrf_score(
 /// providing the best of both worlds: semantic understanding and keyword matching.
 pub async fn hybrid_search(
     State(state): State<UnifiedApiState>,
+    headers: HeaderMap,
     Path(topic): Path<String>,
     Json(request): Json<HybridSearchRequest>,
 ) -> impl IntoResponse {
+    let fan_out_request = request.clone();
     info!(
         topic = %topic,
         query = %request.query,
@@ -768,11 +818,49 @@ pub async fn hybrid_search(
 
     let vector_results_count = vector_results.len();
 
-    // Step 2: Text search (using Tantivy via search API if available)
-    // For now, we'll simulate text search results. In production, this would
-    // call into the chronik-search crate's SearchApi.
-    // TODO: Integrate with actual full-text search when search endpoints are migrated
-    let text_results: Vec<(i32, i64)> = Vec::new(); // (partition, offset) pairs
+    // Step 2: Text search via Tantivy (BM25)
+    // VO-4.8: Wire real Tantivy results into hybrid RRF fusion
+    let text_results: Vec<(i32, i64, Option<String>)> = {
+        #[cfg(feature = "search")]
+        {
+            let mut results = Vec::new();
+            if let Some(ref search_api) = state.search_api {
+                // Search in-memory indices
+                if let Some(index_state) = search_api.indices.get(&topic) {
+                    match search_tantivy_for_hybrid(&topic, &index_state, &request.query, search_k) {
+                        Ok(hits) => results.extend(hits),
+                        Err(e) => {
+                            debug!(topic = %topic, error = %e, "In-memory text search failed in hybrid");
+                        }
+                    }
+                }
+                // Search WAL-created indices on disk
+                if let Some(base_path) = search_api.get_index_base_path() {
+                    match search_wal_tantivy_for_hybrid(base_path, &topic, &request.query, search_k) {
+                        Ok(hits) => results.extend(hits),
+                        Err(e) => {
+                            debug!(topic = %topic, error = %e, "WAL text search failed in hybrid");
+                        }
+                    }
+                    // Also check real-time indices at sibling directory
+                    let realtime_path = base_path.replace("tantivy_indexes", "index");
+                    match search_wal_tantivy_for_hybrid(&realtime_path, &topic, &request.query, search_k) {
+                        Ok(hits) => results.extend(hits),
+                        Err(e) => {
+                            debug!(topic = %topic, error = %e, "Real-time text search failed in hybrid");
+                        }
+                    }
+                }
+                // Sort by score (carried implicitly by insertion order from TopDocs) and deduplicate
+                results.truncate(search_k);
+            }
+            results
+        }
+        #[cfg(not(feature = "search"))]
+        {
+            Vec::new()
+        }
+    };
     let text_results_count = text_results.len();
 
     // Step 3: Build a map of all unique (partition, offset) pairs
@@ -808,20 +896,24 @@ pub async fn hybrid_search(
     }
 
     // Add/update text results
-    for (rank, (partition, offset)) in text_results.iter().enumerate() {
+    for (rank, (partition, offset, preview)) in text_results.iter().enumerate() {
         let key = DocKey {
             partition: *partition,
             offset: *offset,
         };
         if let Some(info) = doc_map.get_mut(&key) {
             info.text_rank = Some(rank + 1);
+            // Prefer text preview from BM25 if vector didn't have one
+            if info.text_preview.is_none() {
+                info.text_preview = preview.clone();
+            }
         } else {
             doc_map.insert(
                 key,
                 DocInfo {
                     vector_rank: None,
                     text_rank: Some(rank + 1),
-                    text_preview: None,
+                    text_preview: preview.clone(),
                 },
             );
         }
@@ -894,6 +986,19 @@ pub async fn hybrid_search(
         model: request.model.clone(),
     };
 
+    // Distributed fan-out: merge results from peer nodes
+    let response = if needs_fan_out(&state, &headers, &topic).await {
+        let router = state.query_router.as_ref().unwrap();
+        let nodes = router.nodes_for_topic(&topic).await;
+        let peers: Vec<HybridSearchResponse> = router
+            .fan_out_post(&format!("/_vector/{}/hybrid", topic), &fan_out_request, &nodes)
+            .await;
+        debug!(topic = %topic, peer_count = peers.len(), "Merging hybrid search from peers");
+        super::query_router::merge_hybrid_responses(response, peers, fan_out_request.k)
+    } else {
+        response
+    };
+
     (StatusCode::OK, Json(response)).into_response()
 }
 
@@ -949,6 +1054,208 @@ async fn apply_hybrid_reranking(
             fallback
         }
     }
+}
+
+// ============================================================================
+// VO-4.8: Tantivy BM25 helpers for hybrid search
+// ============================================================================
+
+/// Search a Tantivy in-memory IndexState and return (partition, offset, text_preview) tuples.
+///
+/// Used by hybrid search to get BM25 text results for RRF fusion with vector results.
+#[cfg(feature = "search")]
+fn search_tantivy_for_hybrid(
+    topic: &str,
+    state: &chronik_search::api::IndexState,
+    query_text: &str,
+    k: usize,
+) -> Result<Vec<(i32, i64, Option<String>)>, String> {
+    use tantivy::collector::TopDocs;
+    use tantivy::query::QueryParser;
+    use tantivy::schema::{FieldType, Value};
+
+    let searcher = state.reader.searcher();
+
+    let text_fields: Vec<_> = state.schema.fields()
+        .filter_map(|(field, entry)| {
+            match entry.field_type() {
+                FieldType::Str(_) | FieldType::JsonObject(_) => Some(field),
+                _ => None,
+            }
+        })
+        .collect();
+
+    if text_fields.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let query_parser = QueryParser::for_index(&state.index, text_fields);
+    let parsed_query = query_parser.parse_query(query_text)
+        .map_err(|e| format!("Query parse failed: {}", e))?;
+
+    let top_docs = searcher.search(&*parsed_query, &TopDocs::with_limit(k))
+        .map_err(|e| format!("Search failed: {}", e))?;
+
+    let mut results = Vec::new();
+    for (_score, doc_address) in &top_docs {
+        let doc: tantivy::TantivyDocument = match searcher.doc(*doc_address) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+
+        let offset_field = state.schema.get_field("offset").ok()
+            .or_else(|| state.schema.get_field("_offset").ok());
+        let partition_field = state.schema.get_field("partition").ok()
+            .or_else(|| state.schema.get_field("_partition").ok());
+
+        let offset = offset_field
+            .and_then(|f| doc.get_all(f).next().and_then(|v| v.as_i64()))
+            .unwrap_or(results.len() as i64);
+        let partition = partition_field
+            .and_then(|f| doc.get_all(f).next().and_then(|v| v.as_i64()))
+            .unwrap_or(0) as i32;
+
+        let preview = state.schema.get_field("_value").ok()
+            .and_then(|f| doc.get_all(f).next().and_then(|v| v.as_str().map(|s| s.to_string())))
+            .or_else(|| {
+                state.schema.get_field("_json_content").ok()
+                    .and_then(|f| doc.get_all(f).next().and_then(|v| v.as_str().map(|s| s.to_string())))
+            })
+            .or_else(|| {
+                state.schema.get_field("_content").ok()
+                    .and_then(|f| doc.get_all(f).next().and_then(|v| v.as_str().map(|s| s.to_string())))
+            })
+            .map(|text| {
+                if text.len() > 300 { format!("{}...", &text[..300]) } else { text }
+            });
+
+        results.push((partition, offset, preview));
+    }
+
+    Ok(results)
+}
+
+/// Search WAL-created Tantivy indices on disk for a specific topic.
+///
+/// Returns (partition, offset, text_preview) tuples for hybrid RRF fusion.
+/// WAL indices are stored as `{base_path}/{topic}-{partition}/` directories.
+#[cfg(feature = "search")]
+fn search_wal_tantivy_for_hybrid(
+    base_path: &str,
+    topic: &str,
+    query_text: &str,
+    k: usize,
+) -> Result<Vec<(i32, i64, Option<String>)>, String> {
+    use std::path::Path;
+    use tantivy::collector::TopDocs;
+    use tantivy::query::QueryParser;
+    use tantivy::schema::{FieldType, Value};
+    use tantivy::Index;
+
+    let base = Path::new(base_path);
+    if !base.exists() {
+        return Ok(vec![]);
+    }
+
+    let entries = std::fs::read_dir(base)
+        .map_err(|e| format!("Failed to read index directory: {}", e))?;
+
+    let mut all_results = Vec::new();
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let dir_name = path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+
+        if !dir_name.starts_with(topic) {
+            continue;
+        }
+        let suffix = &dir_name[topic.len()..];
+        if !suffix.is_empty() && !suffix.starts_with('-') {
+            continue;
+        }
+
+        let index = match Index::open_in_dir(&path) {
+            Ok(idx) => idx,
+            Err(_) => continue,
+        };
+
+        let reader = match index.reader() {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let searcher = reader.searcher();
+        let schema = index.schema();
+
+        let text_fields: Vec<_> = schema.fields()
+            .filter_map(|(field, entry)| {
+                match entry.field_type() {
+                    FieldType::Str(_) | FieldType::JsonObject(_) => Some(field),
+                    _ => None,
+                }
+            })
+            .collect();
+
+        if text_fields.is_empty() {
+            continue;
+        }
+
+        let query_parser = QueryParser::for_index(&index, text_fields);
+        let parsed_query = match query_parser.parse_query(query_text) {
+            Ok(q) => q,
+            Err(_) => continue,
+        };
+
+        let top_docs = match searcher.search(&*parsed_query, &TopDocs::with_limit(k)) {
+            Ok(docs) => docs,
+            Err(_) => continue,
+        };
+
+        let dir_partition: i32 = suffix.strip_prefix('-')
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(0);
+
+        for (_score, doc_address) in &top_docs {
+            let doc: tantivy::TantivyDocument = match searcher.doc(*doc_address) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+
+            let offset_field = schema.get_field("offset").ok()
+                .or_else(|| schema.get_field("_offset").ok());
+
+            let offset = offset_field
+                .and_then(|f| doc.get_all(f).next().and_then(|v| v.as_i64()))
+                .unwrap_or(all_results.len() as i64);
+
+            let preview = schema.get_field("_value").ok()
+                .and_then(|f| doc.get_all(f).next().and_then(|v| v.as_str().map(|s| s.to_string())))
+                .or_else(|| {
+                    schema.get_field("_json_content").ok()
+                        .and_then(|f| doc.get_all(f).next().and_then(|v| v.as_str().map(|s| s.to_string())))
+                })
+                .or_else(|| {
+                    schema.get_field("_content").ok()
+                        .and_then(|f| doc.get_all(f).next().and_then(|v| v.as_str().map(|s| s.to_string())))
+                })
+                .map(|text| {
+                    if text.len() > 300 { format!("{}...", &text[..300]) } else { text }
+                });
+
+            all_results.push((dir_partition, offset, preview));
+        }
+    }
+
+    Ok(all_results)
 }
 
 // ============================================================================

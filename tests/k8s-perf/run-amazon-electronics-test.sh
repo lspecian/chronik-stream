@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 #
-# DV-2c: Amazon Electronics Scale Validation (10-20M reviews)
+# DV-2c: Amazon Electronics Scale Validation (43.9M reviews)
 # ============================================================
 #
-# Maximum scale test. Loads first 10M Electronics reviews.
+# Maximum scale test. Loads ALL Electronics reviews (~43.9M).
 #
 # Usage:
-#   ./run-amazon-electronics-test.sh                 # Full run (10M)
+#   ./run-amazon-electronics-test.sh                 # Full run (all 43.9M)
 #   ./run-amazon-electronics-test.sh --skip-build
 #   ./run-amazon-electronics-test.sh --skip-deploy
 #   ./run-amazon-electronics-test.sh --skip-load
 #   ./run-amazon-electronics-test.sh --quick         # 1M records
-#   ./run-amazon-electronics-test.sh --max 20000000  # 20M records
+#   ./run-amazon-electronics-test.sh --max 10000000  # 10M records
 #
 set -euo pipefail
 
@@ -30,7 +30,7 @@ DOWNLOAD_URL="https://huggingface.co/datasets/McAuley-Lab/Amazon-Reviews-2023/re
 SKIP_BUILD=false
 SKIP_DEPLOY=false
 SKIP_LOAD=false
-MAX_RECORDS=10000000
+MAX_RECORDS=0
 
 for arg in "$@"; do
     case "$arg" in
@@ -57,9 +57,13 @@ DIM='\033[2m'
 BOLD='\033[1m'
 END='\033[0m'
 
-echo -e "${BOLD}DV-2c: Amazon Electronics Scale Validation (${MAX_RECORDS})${END}"
+DISPLAY_COUNT="${MAX_RECORDS}"
+if [ "$MAX_RECORDS" -eq 0 ]; then
+    DISPLAY_COUNT="all (~43.9M)"
+fi
+echo -e "${BOLD}DV-2c: Amazon Electronics Scale Validation (${DISPLAY_COUNT})${END}"
 echo -e "${DIM}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${END}"
-echo -e "  Dataset:  Amazon Reviews 2023 — Electronics (43.9M total, loading ${MAX_RECORDS})"
+echo -e "  Dataset:  Amazon Reviews 2023 — Electronics (43.9M total, loading ${DISPLAY_COUNT})"
 echo -e "  Results:  $RESULTS_DIR"
 mkdir -p "$RESULTS_DIR"
 
@@ -122,18 +126,26 @@ sleep 15
 # ── Phase 3: Load Data ────────────────────────────────────────────────
 
 if [ "$SKIP_LOAD" = false ]; then
-    echo -e "\n${BLUE}Phase 3: Load Electronics reviews (${MAX_RECORDS})${END}"
-    echo -e "  ${DIM}At ~3.5K msg/s this will take ~$((MAX_RECORDS / 3500 / 60)) minutes${END}"
+    echo -e "\n${BLUE}Phase 3: Load Electronics reviews (${DISPLAY_COUNT})${END}"
+    if [ "$MAX_RECORDS" -gt 0 ]; then
+        echo -e "  ${DIM}At ~14K msg/s this will take ~$((MAX_RECORDS / 14000 / 60)) minutes${END}"
+    else
+        echo -e "  ${DIM}Loading all ~43.9M reviews at ~14K msg/s — ~52 minutes${END}"
+    fi
     kubectl delete job amazon-electronics-loader -n "$NAMESPACE" 2>/dev/null || true
     sleep 3
     kubectl apply -f "$SCRIPT_DIR/105-amazon-loader-configmap.yaml"
 
-    cat "$SCRIPT_DIR/110-amazon-electronics-loader-job.yaml" | \
-        sed "s/value: \"10000000\"/value: \"${MAX_RECORDS}\"/" | \
-        kubectl apply -f -
+    if [ "$MAX_RECORDS" -gt 0 ]; then
+        cat "$SCRIPT_DIR/110-amazon-electronics-loader-job.yaml" | \
+            sed "s/value: \"0\"/value: \"${MAX_RECORDS}\"/" | \
+            kubectl apply -f -
+    else
+        kubectl apply -f "$SCRIPT_DIR/110-amazon-electronics-loader-job.yaml"
+    fi
 
     LOAD_START=$(date +%s)
-    for i in $(seq 1 5400); do  # Up to 3 hours
+    for i in $(seq 1 10800); do  # Up to 6 hours
         STATUS=$(kubectl get job amazon-electronics-loader -n "$NAMESPACE" \
             -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' 2>/dev/null || echo "")
         FAILED=$(kubectl get job amazon-electronics-loader -n "$NAMESPACE" \
@@ -168,8 +180,8 @@ for i in $(seq 1 900); do
     [ $((i % 60)) -eq 0 ] && echo -e "  ${DIM}Indexing... ${i}s${END}"
     sleep 1
 done
-echo -e "  ${DIM}Waiting 300s for full index at 10M+ scale...${END}"
-sleep 300
+echo -e "  ${DIM}Waiting 600s for full index at 43.9M scale...${END}"
+sleep 600
 
 SQL_PROBE=$(kubectl exec "${CLUSTER_NAME}-1" -n "$NAMESPACE" -- \
     curl -sf http://localhost:6092/_sql -H 'Content-Type: application/json' \
@@ -193,7 +205,7 @@ done
 echo -e "\n${BLUE}Phase 6: k6 benchmark${END}"
 kubectl delete testrun k6-amazon-electronics-scale -n "$NAMESPACE" 2>/dev/null || true
 sleep 3
-kubectl apply -f "$SCRIPT_DIR/107-amazon-scale-configmap.yaml"
+kubectl apply -f "$SCRIPT_DIR/113-amazon-electronics-scale-configmap.yaml"
 kubectl apply -f "$SCRIPT_DIR/112-amazon-electronics-scale-test.yaml"
 
 for i in $(seq 1 150); do
@@ -217,10 +229,10 @@ for nid in 1 2 3; do
 done
 
 echo -e "\n${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${END}"
-echo -e "${BOLD}  DV-2c: Amazon Electronics Scale Results (${MAX_RECORDS})${END}"
+echo -e "${BOLD}  DV-2c: Amazon Electronics Scale Results (${DISPLAY_COUNT})${END}"
 echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${END}"
 echo -e "\n  ${CYAN}Success Criteria:${END}"
-echo -e "    Text search p50 < 20ms at ${MAX_RECORDS} docs"
+echo -e "    Text search p50 < 20ms at ${DISPLAY_COUNT} docs"
 echo -e "    SQL COUNT p50 < 100ms"
 echo -e "    Error rate < 5%"
 echo -e "    System stable under sustained load"

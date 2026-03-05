@@ -1,0 +1,157 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k6-amazon-electronics-scale-script
+  namespace: chronik-perf
+data:
+  amazon-electronics-scale-test.js: |
+    /**
+     * DV-2c: Amazon Electronics Scale Benchmark (43.9M reviews)
+     * ==========================================================
+     * Tests text search + SQL query performance at 43.9M real ecommerce documents.
+     *
+     * Success criteria (from roadmap):
+     *   - Text search p50 < 20ms
+     *   - SQL COUNT p50 < 100ms
+     *   - Error rate < 5%
+     */
+    import http from 'k6/http';
+    import { check, sleep } from 'k6';
+    import { Rate, Trend, Counter } from 'k6/metrics';
+
+    // Custom metrics per mode
+    const textErrors = new Rate('text_errors');
+    const textLatency = new Trend('text_latency', true);
+    const textCompleted = new Counter('text_completed');
+
+    const sqlErrors = new Rate('sql_errors');
+    const sqlLatency = new Trend('sql_latency', true);
+    const sqlCompleted = new Counter('sql_completed');
+
+    const totalErrors = new Rate('total_errors');
+    const totalLatency = new Trend('total_latency', true);
+
+    const BASE_URL = __ENV.CHRONIK_URL ||
+        'http://chronik-thunderbird.chronik-perf.svc.cluster.local:6092';
+    const TOPIC = __ENV.TOPIC || 'amazon-electronics';
+    const TEST_MODE = __ENV.TEST_MODE || 'mixed';
+    const TABLE_HOT = TOPIC.replace(/-/g, '_') + '_hot';
+    const TABLE_COLD = TOPIC.replace(/-/g, '_') + '_cold';
+
+    export const options = {
+        stages: [
+            { duration: '15s', target: 25 },    // Warm up
+            { duration: '30s', target: 100 },   // Ramp
+            { duration: '1m',  target: 200 },   // Medium load
+            { duration: '1m',  target: 500 },   // Peak load
+            { duration: '1m',  target: 500 },   // Sustain peak
+            { duration: '30s', target: 200 },   // Ramp down
+            { duration: '15s', target: 0 },     // Cool down
+        ],
+        thresholds: {
+            text_errors:  ['rate<0.05'],
+            text_latency: ['p(50)<500', 'p(95)<2000'],
+            sql_errors:   ['rate<0.05'],
+            sql_latency:  ['p(50)<300', 'p(95)<3000'],
+            total_errors: ['rate<0.05'],
+        },
+    };
+
+    // Electronics-relevant text search queries
+    const textQueries = [
+        'battery life terrible',
+        'screen cracked after drop',
+        'bluetooth connection issues',
+        'charger stopped working',
+        'speaker quality poor',
+        'camera blurry photos',
+        'keyboard not responsive',
+        'mouse double clicking',
+        'headphones one side',
+        'USB port loose',
+        'wifi keeps disconnecting',
+        'monitor flickering',
+        'laptop overheating',
+        'tablet slow performance',
+        'remote control broken',
+        'cable fraying',
+        'warranty claim denied',
+        'cheap plastic build',
+        'excellent sound quality',
+        'great value for money',
+    ];
+
+    // SQL queries — 24 partitions for Electronics
+    // Light queries: hot buffer only (cached RecordBatch, ~20ms)
+    const lightSqlQueries = [
+        // Partition-filtered COUNT on hot buffer
+        `SELECT COUNT(*) as cnt FROM ${TABLE_HOT} WHERE _partition = ${Math.floor(Math.random() * 24)}`,
+        // Offset range query (narrow)
+        `SELECT _offset, CAST(_key AS VARCHAR) as k, _timestamp FROM ${TABLE_HOT} WHERE _offset > 100 AND _offset < 200 LIMIT 50`,
+        // Offset BETWEEN range
+        `SELECT COUNT(*) as cnt FROM ${TABLE_HOT} WHERE _offset BETWEEN 50000 AND 100000`,
+        // Narrow offset lookup
+        `SELECT _offset, _key, _timestamp FROM ${TABLE_HOT} WHERE _partition = 0 AND _offset BETWEEN 0 AND 100 LIMIT 20`,
+        // Multi-partition COUNT on hot buffer
+        `SELECT COUNT(*) as cnt FROM ${TABLE_HOT} WHERE _partition IN (${Math.floor(Math.random() * 24)}, ${Math.floor(Math.random() * 24)})`,
+        // Partition GROUP BY on hot buffer
+        `SELECT _partition, MAX(_offset) as max_off FROM ${TABLE_HOT} WHERE _partition = ${Math.floor(Math.random() * 24)} GROUP BY _partition`,
+    ];
+    // Heavy queries (10%): multi-partition aggregations on hot buffer
+    const heavySqlQueries = [
+        // 3-partition COUNT on hot buffer
+        `SELECT COUNT(*) as cnt FROM ${TABLE_HOT} WHERE _partition IN (${Math.floor(Math.random() * 24)}, ${Math.floor(Math.random() * 24)}, ${Math.floor(Math.random() * 24)})`,
+        // Full hot buffer COUNT (all partitions)
+        `SELECT COUNT(*) as cnt FROM ${TABLE_HOT}`,
+    ];
+
+    const headers = { 'Content-Type': 'application/json' };
+
+    function textSearch() {
+        const q = textQueries[Math.floor(Math.random() * textQueries.length)];
+        const size = Math.random() < 0.7 ? 10 : 20;
+        const payload = JSON.stringify({
+            index: TOPIC,
+            query: { match: { _all: q } },
+            size: size,
+        });
+        const res = http.post(`${BASE_URL}/_search`, payload,
+            { headers, timeout: '10s' });
+        const ok = check(res, { 'text 200': (r) => r.status === 200 });
+        textErrors.add(!ok);
+        textLatency.add(res.timings.duration);
+        textCompleted.add(1);
+        totalErrors.add(!ok);
+        totalLatency.add(res.timings.duration);
+    }
+
+    function sqlQuery() {
+        // 90% light (filtered/range), 10% heavy (full-scan analytical)
+        const pool = Math.random() < 0.9 ? lightSqlQueries : heavySqlQueries;
+        const q = pool[Math.floor(Math.random() * pool.length)];
+        const res = http.post(`${BASE_URL}/_sql`,
+            JSON.stringify({ query: q }),
+            { headers, timeout: '30s' });
+        const ok = check(res, { 'sql 200': (r) => r.status === 200 });
+        sqlErrors.add(!ok);
+        sqlLatency.add(res.timings.duration);
+        sqlCompleted.add(1);
+        totalErrors.add(!ok);
+        totalLatency.add(res.timings.duration);
+    }
+
+    export default function () {
+        if (TEST_MODE === 'text') {
+            textSearch();
+        } else if (TEST_MODE === 'sql') {
+            sqlQuery();
+        } else {
+            // Mixed mode: 60% text, 40% SQL
+            if (Math.random() < 0.6) {
+                textSearch();
+            } else {
+                sqlQuery();
+            }
+        }
+        sleep(0.01);
+    }

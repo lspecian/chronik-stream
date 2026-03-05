@@ -5,8 +5,8 @@ metadata:
   namespace: chronik-perf
 spec:
   backoffLimit: 1
-  # 480 queries x 4 modes = ~1920 requests, allow 1 hour
-  activeDeadlineSeconds: 3600
+  # 480 queries x 5 modes = ~2400 requests, allow 1.5 hours
+  activeDeadlineSeconds: 5400
   template:
     spec:
       restartPolicy: Never

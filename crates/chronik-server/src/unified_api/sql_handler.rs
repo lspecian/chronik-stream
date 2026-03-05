@@ -8,7 +8,7 @@
 
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Json,
 };
@@ -20,7 +20,7 @@ use tracing::{debug, error, info, warn};
 use super::UnifiedApiState;
 
 /// SQL query request
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SqlRequest {
     /// SQL query to execute
     pub query: String,
@@ -41,7 +41,7 @@ fn default_timeout() -> u64 {
 }
 
 /// SQL query response
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SqlResponse {
     /// Column names
     pub columns: Vec<String>,
@@ -340,8 +340,10 @@ impl SqlHandler {
 /// Execute SQL query endpoint
 pub async fn execute_sql(
     State(state): State<UnifiedApiState>,
+    headers: HeaderMap,
     Json(request): Json<SqlRequest>,
 ) -> impl IntoResponse {
+    let fan_out_request = request.clone();
     info!(query = %request.query, limit = request.limit, "Executing SQL query");
 
     // Check if SQL engine is available before executing
@@ -355,6 +357,36 @@ pub async fn execute_sql(
 
     match SqlHandler::execute(&state, &request.query, request.limit).await {
         Ok(response) => {
+            // Distributed fan-out: merge SQL results from all peer nodes
+            let response = if let Some(ref router) = state.query_router {
+                if !super::query_router::is_forwarded_request(&headers) {
+                    // Check if all data is local (RF=N) — skip fan-out if so
+                    // Only refresh partition map if not yet populated (avoids RwLock contention)
+                    if !router.has_partition_map().await {
+                        router.refresh_all_partition_maps(state.metadata_store.as_ref()).await;
+                    }
+                    if router.all_topics_local().await {
+                        debug!("All partitions local (RF=N), skipping SQL fan-out");
+                        response
+                    } else {
+                        let all_peers = router.all_peers();
+                        if !all_peers.is_empty() {
+                            let peers: Vec<SqlResponse> = router
+                                .fan_out_post("/_sql", &fan_out_request, &all_peers)
+                                .await;
+                            debug!(peer_count = peers.len(), "Merging SQL results from peers");
+                            super::query_router::merge_sql_responses(response, peers, fan_out_request.limit)
+                        } else {
+                            response
+                        }
+                    }
+                } else {
+                    response
+                }
+            } else {
+                response
+            };
+
             info!(
                 rows = response.row_count,
                 time_ms = response.execution_time_ms,

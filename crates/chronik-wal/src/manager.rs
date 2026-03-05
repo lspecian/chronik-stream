@@ -426,8 +426,145 @@ impl WalManager {
         info!("WAL read completed: found {} total records from {} segment files", records.len(), wal_files.len());
         Ok(records)
     }
-    
-    
+
+    /// Get the maximum offset for a partition by scanning only WAL record headers.
+    /// This is dramatically more memory-efficient than `read_from` with `usize::MAX`
+    /// because it skips `canonical_data` (the bulk of each record) entirely.
+    /// Memory usage: ~120MB per partition (one segment file) vs ~1.5GB with full read.
+    pub async fn get_max_offset_for_partition(
+        &self,
+        topic: &str,
+        partition: i32,
+    ) -> Result<Option<i64>> {
+        let partition_dir = self.config.data_dir
+            .join(topic)
+            .join(partition.to_string());
+
+        if !partition_dir.exists() {
+            return Ok(None);
+        }
+
+        // Find all WAL segment files for this partition
+        let mut wal_files = Vec::new();
+        let mut entries = tokio::fs::read_dir(&partition_dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
+                if filename.starts_with(&format!("wal_{}_", partition)) && filename.ends_with(".log") {
+                    wal_files.push(path);
+                }
+            }
+        }
+
+        if wal_files.is_empty() {
+            return Ok(None);
+        }
+
+        // Sort by segment ID (ascending) so the last file has the highest offsets
+        wal_files.sort_by_key(|path| {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|s| {
+                    s.strip_prefix(&format!("wal_{}_", partition))
+                        .and_then(|rest| rest.strip_suffix(".log"))
+                        .and_then(|seg_id| seg_id.parse::<u64>().ok())
+                })
+                .unwrap_or(0)
+        });
+
+        // Scan segment files in REVERSE order (most recent first).
+        // Stop as soon as we find a valid last_offset.
+        let mut global_max_offset: i64 = -1;
+
+        for wal_file_path in wal_files.iter().rev() {
+            let file_data = tokio::fs::read(&wal_file_path).await?;
+            if file_data.is_empty() {
+                continue;
+            }
+
+            // Scan record headers WITHOUT allocating canonical_data
+            let mut cursor = 0;
+            let mut found_any = false;
+
+            while cursor < file_data.len() {
+                use byteorder::{LittleEndian, ReadBytesExt};
+                use std::io::Cursor as IoCursor;
+
+                if cursor + 12 > file_data.len() {
+                    break;
+                }
+
+                let record_start = cursor;
+                let mut rdr = IoCursor::new(&file_data[cursor..]);
+
+                let magic = rdr.read_u16::<LittleEndian>().unwrap();
+                let version = rdr.read_u8().unwrap();
+                let _flags = rdr.read_u8().unwrap();
+                let _length = rdr.read_u32::<LittleEndian>().unwrap();
+                let _crc32 = rdr.read_u32::<LittleEndian>().unwrap();
+
+                if magic != 0xCA7E || version != 2 {
+                    break;
+                }
+
+                // Read topic_len and skip topic bytes
+                let topic_len = match rdr.read_u16::<LittleEndian>() {
+                    Ok(len) => len as usize,
+                    Err(_) => break,
+                };
+                // Skip topic bytes
+                let new_pos = rdr.position() as usize + topic_len;
+                if new_pos > file_data.len() - cursor { break; }
+                rdr.set_position(new_pos as u64);
+
+                // Skip partition (i32)
+                if rdr.read_i32::<LittleEndian>().is_err() { break; }
+
+                // Read canonical_data_len and SKIP the data (key optimization)
+                let canonical_data_len = match rdr.read_u32::<LittleEndian>() {
+                    Ok(len) => len as usize,
+                    Err(_) => break,
+                };
+                let skip_pos = rdr.position() as usize + canonical_data_len;
+                if skip_pos > file_data.len() - cursor { break; }
+                rdr.set_position(skip_pos as u64);
+
+                // Read base_offset and last_offset
+                let _base_offset = match rdr.read_i64::<LittleEndian>() {
+                    Ok(o) => o,
+                    Err(_) => break,
+                };
+                let last_offset = match rdr.read_i64::<LittleEndian>() {
+                    Ok(o) => o,
+                    Err(_) => break,
+                };
+
+                // Skip record_count
+                if rdr.read_i32::<LittleEndian>().is_err() { break; }
+
+                if last_offset > global_max_offset {
+                    global_max_offset = last_offset;
+                }
+                found_any = true;
+
+                cursor = record_start + rdr.position() as usize;
+            }
+
+            // If we found records in this (most recent) segment, we're done
+            if found_any {
+                break;
+            }
+        }
+
+        if global_max_offset >= 0 {
+            debug!("Max offset for {}-{}: {} (scanned {} segment files)",
+                   topic, partition, global_max_offset, wal_files.len());
+            Ok(Some(global_max_offset))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Get recovery statistics (v1.3.53+: scans GroupCommitWal directory structure for partitions)
     pub fn get_recovery_result(&self) -> RecoveryResult {
         let partitions_list = self.get_partitions();

@@ -22,6 +22,7 @@ pub mod sql_handler;
 pub mod vector_handler;
 pub mod admin_handler;
 pub mod query_handler;
+pub mod query_router;
 #[cfg(feature = "search")]
 pub mod search_handler;
 
@@ -146,6 +147,9 @@ pub struct UnifiedApiState {
     pub wal_indexer: Option<Arc<WalIndexer>>,
     /// VO-4: Optional reranker provider for cross-encoder re-ranking after HNSW retrieval
     pub reranker: Option<Arc<dyn RerankerProvider>>,
+    /// Distributed query router for cluster-mode scatter-gather fan-out.
+    /// None in single-node mode — queries execute locally only.
+    pub query_router: Option<Arc<query_router::QueryRouter>>,
 }
 
 impl UnifiedApiState {
@@ -170,6 +174,7 @@ impl UnifiedApiState {
             embedding_cache: None,
             wal_indexer: None,
             reranker: None,
+            query_router: None,
         }
     }
 
@@ -238,6 +243,15 @@ impl UnifiedApiState {
     /// scores them with a cross-encoder, and returns top-k.
     pub fn with_reranker(mut self, reranker: Arc<dyn RerankerProvider>) -> Self {
         self.reranker = Some(reranker);
+        self
+    }
+
+    /// Set the distributed query router for cluster-mode fan-out.
+    ///
+    /// When set, query endpoints automatically fan out to peer nodes
+    /// and merge results. See docs/DISTRIBUTED_QUERY_LAYER.md.
+    pub fn with_query_router(mut self, router: Arc<query_router::QueryRouter>) -> Self {
+        self.query_router = Some(router);
         self
     }
 
@@ -754,13 +768,14 @@ mod tests {
 
         let app = create_router(state);
 
-        // Should return SERVICE_UNAVAILABLE without vector manager
+        // Returns OK with empty topics list when no vector manager configured
+        // (list_topics gracefully handles missing vector_index_manager)
         let response = app
             .oneshot(Request::builder().uri("/_vector/topics").body(Body::empty()).unwrap())
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

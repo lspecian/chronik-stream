@@ -28,6 +28,7 @@ use chronik_columnar::{
     PartitioningStrategy,
     converter::{RecordBatchConverter, KafkaRecord},
     schema::kafka_message_schema,
+    HotDataBuffer,
     VectorIndexManager, VectorIndexConfig, HnswIndexConfig, EmbeddingPipeline,
 };
 use chronik_embeddings::{VectorSearchConfig, create_provider};
@@ -233,6 +234,11 @@ pub struct WalIndexer {
     /// (writing to __chronik_metadata with acks=1 blocks forever on non-leaders).
     /// Standalone/single-node: always true. Updated atomically by Raft on failover.
     is_leader: Arc<AtomicBool>,
+
+    /// v2.4.1: Optional HotDataBuffer reference for set_flushed_offset() callback.
+    /// After Parquet files are created, we notify the hot buffer so it stops reading
+    /// already-persisted records from WAL, reducing memory usage.
+    hot_buffer: Arc<RwLock<Option<Arc<HotDataBuffer>>>>,
 }
 
 impl WalIndexer {
@@ -296,7 +302,15 @@ impl WalIndexer {
             vector_topics: Arc::new(RwLock::new(HashSet::new())),
             vector_index_manager,
             is_leader: is_leader.unwrap_or_else(|| Arc::new(AtomicBool::new(true))),
+            hot_buffer: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// v2.4.1: Set the HotDataBuffer reference for flushed offset notifications.
+    /// Called from main.rs after both WalIndexer and HotDataBuffer are created.
+    pub async fn set_hot_buffer(&self, buffer: Arc<HotDataBuffer>) {
+        *self.hot_buffer.write().await = Some(buffer);
+        info!("HotDataBuffer wired to WalIndexer for flushed offset notifications");
     }
 
     /// v2.2.16: Refresh the searchable topics cache from metadata store
@@ -458,6 +472,7 @@ impl WalIndexer {
         let runtime = Arc::clone(&self.runtime);
         let vector_index_manager = Arc::clone(&self.vector_index_manager);
         let is_leader = Arc::clone(&self.is_leader);
+        let hot_buffer = Arc::clone(&self.hot_buffer);
         let snapshot_interval = self.config.snapshot_interval_secs();
 
         // CRITICAL v2.2.10: Spawn on dedicated runtime, NOT main runtime
@@ -525,6 +540,7 @@ impl WalIndexer {
                     &indexing_in_progress,
                     &vector_index_manager,
                     &is_leader,
+                    &hot_buffer,
                 ).await {
                     Ok(stats) => {
                         if stats.segments_processed > 0 {
@@ -577,11 +593,12 @@ impl WalIndexer {
             &self.indexing_in_progress,
             &self.vector_index_manager,
             &self.is_leader,
+            &self.hot_buffer,
         ).await
     }
 
     /// Index sealed segments (internal implementation)
-    #[instrument(skip(config, wal_manager, object_store, segment_index, metadata_store, indexing_in_progress, vector_index_manager, is_leader))]
+    #[instrument(skip(config, wal_manager, object_store, segment_index, metadata_store, indexing_in_progress, vector_index_manager, is_leader, hot_buffer))]
     async fn index_sealed_segments_internal(
         config: &WalIndexerConfig,
         wal_manager: &Arc<WalManager>,
@@ -591,6 +608,7 @@ impl WalIndexer {
         indexing_in_progress: &Arc<RwLock<HashSet<String>>>,
         vector_index_manager: &Arc<VectorIndexManager>,
         is_leader: &Arc<AtomicBool>,
+        hot_buffer: &Arc<RwLock<Option<Arc<HotDataBuffer>>>>,
     ) -> Result<IndexingStats> {
         let start_time = std::time::Instant::now();
         let mut stats = IndexingStats::default();
@@ -654,6 +672,7 @@ impl WalIndexer {
                 segment_id,
                 &mut stats,
                 is_leader,
+                hot_buffer,
             ).await {
                 Ok(_) => {
                     debug!(segment = %segment_id, "Successfully indexed segment");
@@ -678,7 +697,7 @@ impl WalIndexer {
     }
 
     /// Index a single sealed WAL segment
-    #[instrument(skip(config, wal_manager, object_store, segment_index, metadata_store, vector_index_manager, stats, is_leader))]
+    #[instrument(skip(config, wal_manager, object_store, segment_index, metadata_store, vector_index_manager, stats, is_leader, hot_buffer))]
     async fn index_segment(
         config: &WalIndexerConfig,
         wal_manager: &Arc<WalManager>,
@@ -689,6 +708,7 @@ impl WalIndexer {
         segment_id: &str,
         stats: &mut IndexingStats,
         is_leader: &Arc<AtomicBool>,
+        hot_buffer: &Arc<RwLock<Option<Arc<HotDataBuffer>>>>,
     ) -> Result<()> {
         info!(segment = %segment_id, "Indexing WAL segment");
 
@@ -770,16 +790,16 @@ impl WalIndexer {
             // v2.2.21: Only create Parquet files for columnar-enabled topics
             // v2.2.22: Only generate embeddings for vector-enabled topics
             let (is_searchable, is_columnar, is_vector) = {
-                // Check if topic is in searchable set by looking up metadata
-                // For performance, we check the config directly here
-                let topic_config = metadata_store.get_topic(&tp.topic).await
-                    .map(|opt| opt.map(|t| (
-                        t.config.is_searchable(),
-                        t.config.is_columnar_enabled(),
-                        t.config.is_vector_enabled(),
-                    )).unwrap_or((false, false, false)))
-                    .unwrap_or((false, false, false));
-                topic_config
+                // Look up topic config from metadata store. If topic not yet in metadata
+                // (e.g., follower node hasn't received TopicCreated event yet), fall back
+                // to a default TopicConfig which respects env var defaults like
+                // CHRONIK_DEFAULT_VECTOR_ENABLED, CHRONIK_DEFAULT_COLUMNAR, etc.
+                let config = metadata_store.get_topic(&tp.topic).await
+                    .ok()
+                    .flatten()
+                    .map(|t| t.config)
+                    .unwrap_or_default();
+                (config.is_searchable(), config.is_columnar_enabled(), config.is_vector_enabled())
             };
 
             // Clone records for each processing step that needs them
@@ -851,14 +871,23 @@ impl WalIndexer {
                     &tp,
                     records,
                 ).await {
-                    Ok(bytes_written) => {
+                    Ok((bytes_written, max_offset)) => {
                         info!(
                             topic = %tp.topic,
                             partition = tp.partition,
                             bytes = bytes_written,
+                            max_offset = max_offset,
                             "Created Parquet file (columnar-enabled topic)"
                         );
                         stats.bytes_written += bytes_written;
+
+                        // v2.4.1: Notify hot buffer that records up to max_offset
+                        // are now in Parquet, so they can be skipped in WAL reads.
+                        if max_offset >= 0 {
+                            if let Some(hb) = hot_buffer.read().await.as_ref() {
+                                hb.set_flushed_offset(&tp.topic, tp.partition, max_offset);
+                            }
+                        }
                     }
                     Err(e) => {
                         error!(
@@ -1210,6 +1239,7 @@ impl WalIndexer {
     /// Uses time-based partitioning (hourly by default) for efficient query pruning.
     /// Registers the new Parquet segment with the SegmentIndex for SQL query planning.
     #[instrument(skip(config, object_store, metadata_store, segment_index, canonical_records))]
+    /// Returns (bytes_written, max_offset) on success.
     async fn create_parquet_segment(
         config: &WalIndexerConfig,
         object_store: &Arc<dyn ObjectStore>,
@@ -1217,9 +1247,9 @@ impl WalIndexer {
         segment_index: &Arc<SegmentIndex>,
         tp: &TopicPartition,
         canonical_records: Vec<CanonicalRecord>,
-    ) -> Result<u64> {
+    ) -> Result<(u64, i64)> {
         if canonical_records.is_empty() {
-            return Ok(0);
+            return Ok((0, -1));
         }
 
         // Get topic config to read columnar settings
@@ -1263,7 +1293,7 @@ impl WalIndexer {
                 partition = tp.partition,
                 "No records to write to Parquet"
             );
-            return Ok(0);
+            return Ok((0, -1));
         }
 
         // Calculate offset and timestamp ranges for naming
@@ -1438,7 +1468,7 @@ impl WalIndexer {
             "Registered Parquet segment in index and metadata store"
         );
 
-        Ok(bytes_written)
+        Ok((bytes_written, max_offset))
     }
 
     /// v2.2.22: Process vector embeddings for CanonicalRecords
@@ -2170,7 +2200,7 @@ mod tests {
         // 7. Create TopicPartition and call create_parquet_segment
         let tp = TopicPartition::new("test-columnar-topic".to_string(), 0);
 
-        let records_written = WalIndexer::create_parquet_segment(
+        let (bytes_written, max_offset) = WalIndexer::create_parquet_segment(
             &indexer_config,
             &object_store,
             &metadata_store,
@@ -2179,8 +2209,9 @@ mod tests {
             records,
         ).await.unwrap();
 
-        // 8. Verify bytes were written (create_parquet_segment returns bytes, not record count)
-        assert!(records_written > 0, "Expected bytes to be written to Parquet file");
+        // 8. Verify bytes were written (create_parquet_segment returns (bytes, max_offset))
+        assert!(bytes_written > 0, "Expected bytes to be written to Parquet file");
+        assert!(max_offset >= 0, "Expected valid max_offset from Parquet segment");
 
         // 9. Verify Parquet segment was registered in SegmentIndex
         let parquet_paths = segment_index.get_parquet_paths("test-columnar-topic").await.unwrap();

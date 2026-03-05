@@ -368,8 +368,37 @@ impl IntegratedKafkaServerBuilder {
 
         info!("✅ Metadata replication initialized with event listener");
 
-        // Note: WAL replication manager is stored in the replicator, not separately here
-        // The builder doesn't need to store it as a separate field for metadata replication
+        // Re-broadcast all topic metadata to followers after a delay.
+        // After restart, followers may have lost topic metadata that was only in
+        // in-memory state (from before the apply_replicated_event WAL persistence
+        // fix). This re-publishes TopicCreated events to the event bus so the
+        // MetadataWalReplicator sends them to followers.
+        //
+        // We delay 45 seconds because WAL replication connections are established
+        // after Raft election (~20-30s), and we need followers to be connected
+        // before broadcasting. The broadcast repeats at 60s intervals to handle
+        // late-joining followers or transient network issues.
+        let broadcast_store = wal_metadata_store.clone();
+        tokio::spawn(async move {
+            // Initial delay: wait for Raft election + WAL replication setup
+            tokio::time::sleep(std::time::Duration::from_secs(45)).await;
+            let count = broadcast_store.broadcast_all_topics().await;
+            if count > 0 {
+                tracing::info!(
+                    topics_broadcast = count,
+                    "Re-broadcast topic metadata for follower sync"
+                );
+            }
+            // Second broadcast at 120s for late joiners
+            tokio::time::sleep(std::time::Duration::from_secs(75)).await;
+            let count = broadcast_store.broadcast_all_topics().await;
+            if count > 0 {
+                tracing::info!(
+                    topics_broadcast = count,
+                    "Re-broadcast topic metadata (second pass)"
+                );
+            }
+        });
 
         Ok(())
     }
@@ -728,6 +757,10 @@ impl IntegratedKafkaServerBuilder {
     }
 
     /// Helper: Recover partitions from WAL records
+    /// v2.4.1: Uses get_max_offset_for_partition instead of loading all records with usize::MAX.
+    /// This reduces memory from ~1.5GB per partition to ~120MB (reads only last segment file,
+    /// skips canonical_data). Critical for large datasets (43.9M+ records) where loading
+    /// all WAL records caused OOM during startup.
     async fn recover_partitions_from_wal(
         produce_handler: &Arc<crate::produce_handler::ProduceHandler>,
         wal_manager: &Arc<WalManager>,
@@ -736,19 +769,16 @@ impl IntegratedKafkaServerBuilder {
         info!("Replaying WAL to restore high watermarks for {} partitions...", partitions.len());
 
         for tp in partitions {
-            match wal_manager.read_from(&tp.topic, tp.partition, 0, usize::MAX).await {
-                Ok(records) if !records.is_empty() => {
-                    let max_offset = Self::find_max_offset_in_records(&records);
-                    if max_offset >= 0 {
-                        let high_watermark = (max_offset + 1) as u64;
-                        match produce_handler.restore_partition_state(&tp.topic, tp.partition, high_watermark).await {
-                            Ok(_) => info!("Restored {}-{}: {} records, high watermark = {}",
-                                          tp.topic, tp.partition, records.len(), high_watermark),
-                            Err(e) => warn!("Failed to restore partition state for {}-{}: {}", tp.topic, tp.partition, e),
-                        }
+            match wal_manager.get_max_offset_for_partition(&tp.topic, tp.partition).await {
+                Ok(Some(max_offset)) => {
+                    let high_watermark = (max_offset + 1) as u64;
+                    match produce_handler.restore_partition_state(&tp.topic, tp.partition, high_watermark).await {
+                        Ok(_) => info!("Restored {}-{}: high watermark = {}",
+                                      tp.topic, tp.partition, high_watermark),
+                        Err(e) => warn!("Failed to restore partition state for {}-{}: {}", tp.topic, tp.partition, e),
                     }
                 }
-                Ok(_) => {} // No records, nothing to restore
+                Ok(None) => {} // No records, nothing to restore
                 Err(e) => warn!("Failed to read WAL for {}-{}: {}", tp.topic, tp.partition, e),
             }
         }

@@ -232,11 +232,18 @@ Existing stubs:
 - [x] **VO-4.5**: Integrated in vector_handler.rs: `search()` endpoint overretrieves k×5 candidates when `rerank: true`, calls reranker, returns top-k. `apply_reranking()` helper with graceful fallback on error.
 - [x] **VO-4.6**: Integrated in orchestrator.rs: `QueryOrchestrator::with_reranker()` builder, `apply_reranking()` after RRF merge reorders entries by cross-encoder scores.
 - [x] **VO-4.7**: `FusionMethod::VectorRerank` in vector_search.rs already handles score fusion correctly (prioritizes vector score). Re-ranking happens at handler/orchestrator layer.
-- [ ] **VO-4.8**: Fix text search gap — wire Tantivy results into hybrid search RRF (deferred — requires SearchApi integration)
+- [x] **VO-4.8**: Wire Tantivy BM25 results into hybrid search RRF — searches in-memory indices, WAL-created indices, and real-time indices via SearchApi. Text results carry (partition, offset, text_preview) for full RRF fusion.
 - [x] **VO-4.9**: Opt-in control: per-query `rerank: true` in VectorSearchRequest, HybridSearchRequest, and QueryRequest. Per-topic via `vector.reranker.enabled`.
 - [x] **VO-4.10**: `cargo check --workspace` passes (273 pre-existing warnings, 0 new)
 - [x] **VO-4.11**: `cargo test --workspace --lib --bins` passes (884 tests, 0 failures — 13 new reranker+handler tests)
 - [ ] **VO-4.12**: DV-1 WANDS: Run 480 queries with/without reranking, compare NDCG@10
+  - Interim results (2026-03-04, vector index NOT fully loaded):
+    - BM25 NDCG@10 = 0.5883 (fan-out working, beats ES baseline)
+    - Client hybrid NDCG@10 = 0.6028 (client-side RRF)
+    - Server hybrid NDCG@10 = 0.1474 (low due to 458/480 empty vector results — index loading)
+    - Fixed QueryRouter port bug (was using 6091+node_id, now reads CHRONIK_UNIFIED_API_PORT)
+    - Fixed VO-4.8 (text_results was Vec::new(), now searches Tantivy)
+    - Re-run needed once vector indices fully loaded on all 3 nodes
 
 ### Files to Modify
 
@@ -405,9 +412,9 @@ Update this section at the end of each work session to enable seamless continuat
   - `QueryRequest`: `rerank: bool` field for opt-in per-query control
   - 13 new tests (7 reranker + 6 handler), 884 total passing
 - Branch: `fix/workspace-tests-all-passing`
-**Next step**: VO-5 (Multi-Model Embedding Support) or VO-4.8 (wire Tantivy into hybrid search)
+**Next step**: VO-4.12 (DV-1 WANDS evaluation with server-side hybrid + reranking) — VO-4.8 COMPLETE
 **Blockers**: None
-**Build status**: 884 tests passing, 0 failures
+**Build status**: 914 tests passing, 0 failures
 
 ### Environment
 

@@ -5,7 +5,7 @@ metadata:
   namespace: chronik-perf
 spec:
   replicas: 3
-  image: chronik-server:dv2b-runtime-fix
+  image: chronik-server:sql-opt
   imagePullPolicy: Never
   walProfile: high
   produceProfile: high-throughput
@@ -20,7 +20,7 @@ spec:
       memory: "16Gi"
     limits:
       cpu: "16"
-      memory: "64Gi"
+      memory: "128Gi"
   storage:
     size: 200Gi
     storageClass: standard
@@ -55,3 +55,6 @@ spec:
       value: "4"
     - name: CHRONIK_VECTOR_PARTITION_CONCURRENCY
       value: "3"
+    # DV-2c: Increase query timeout for 43.9M scale fan-out
+    - name: CHRONIK_QUERY_TIMEOUT_SECS
+      value: "30"

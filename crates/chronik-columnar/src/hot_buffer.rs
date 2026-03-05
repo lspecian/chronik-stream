@@ -28,6 +28,7 @@
 //! ```
 
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
 use dashmap::DashMap;
@@ -228,17 +229,32 @@ impl HotDataBuffer {
     /// Get the hot data as a MemTable for DataFusion
     ///
     /// Returns None if the topic-partition has no hot data or hot buffer is disabled.
+    /// Uses cached RecordBatch when available and fresh (within refresh_interval_ms).
     pub async fn get_mem_table(&self, topic: &str, partition: i32) -> Result<Option<MemTable>> {
         if !self.config.enabled {
             return Ok(None);
         }
 
         let tp = TopicPartition::new(topic, partition);
+        let now_ms = Self::current_time_ms();
 
-        // Get the flushed offset (data already in Parquet)
+        // Check cache first — return cached batch if fresh
+        if let Some(cached) = self.cache.get(&tp) {
+            if now_ms.saturating_sub(cached.last_refresh_ms) < self.config.refresh_interval_ms {
+                let schema = Arc::new(Self::hot_buffer_schema());
+                let mem_table = MemTable::try_new(schema, vec![vec![cached.batch.clone()]])?;
+                trace!(
+                    "Cache hit for {}-{}: {} records, age={}ms",
+                    topic, partition, cached.record_count,
+                    now_ms.saturating_sub(cached.last_refresh_ms)
+                );
+                return Ok(Some(mem_table));
+            }
+        }
+
+        // Cache miss or stale — read from WAL
         let flushed_offset = self.flushed_offsets.get(&tp).map(|v| *v).unwrap_or(0);
 
-        // Read recent records from WAL starting from flushed offset
         let wal_records = self
             .wal_manager
             .read_from(topic, partition, flushed_offset, self.config.max_records_per_partition)
@@ -250,29 +266,34 @@ impl HotDataBuffer {
                 "No hot data for {}-{} (flushed_offset={})",
                 topic, partition, flushed_offset
             );
+            // Cache empty result to avoid repeated WAL reads
+            self.cache.remove(&tp);
             return Ok(None);
         }
 
-        // Convert WAL records to simple HotRecord format
         let hot_records = self.wal_records_to_hot_records(topic, partition, &wal_records)?;
 
         if hot_records.is_empty() {
+            self.cache.remove(&tp);
             return Ok(None);
         }
 
-        // Convert to Arrow RecordBatch using DataFusion's arrow types
         let batch = self.records_to_batch(&hot_records)?;
 
+        // Store in cache
+        let cached = CachedBatch {
+            batch: batch.clone(),
+            min_offset: hot_records.first().map(|r| r.offset).unwrap_or(0),
+            max_offset: hot_records.last().map(|r| r.offset).unwrap_or(0),
+            record_count: hot_records.len(),
+            last_refresh_ms: now_ms,
+        };
         debug!(
-            "Created hot buffer for {}-{}: {} records, offsets {}..{}",
-            topic,
-            partition,
-            hot_records.len(),
-            hot_records.first().map(|r| r.offset).unwrap_or(0),
-            hot_records.last().map(|r| r.offset).unwrap_or(0),
+            "Cache refresh for {}-{}: {} records, offsets {}..{}",
+            topic, partition, cached.record_count, cached.min_offset, cached.max_offset,
         );
+        self.cache.insert(tp, cached);
 
-        // Create MemTable from the batch
         let schema = Arc::new(Self::hot_buffer_schema());
         let mem_table = MemTable::try_new(schema, vec![vec![batch]])?;
 
@@ -282,13 +303,12 @@ impl HotDataBuffer {
     /// Get hot data for all partitions of a topic
     ///
     /// Returns a combined MemTable containing data from all partitions.
+    /// Uses cached RecordBatch per partition when available and fresh.
     pub async fn get_topic_mem_table(&self, topic: &str) -> Result<Option<MemTable>> {
         if !self.config.enabled {
             return Ok(None);
         }
 
-        // Get all partitions for this topic from WAL manager
-        // Filter the global partition list by topic name
         let all_partitions = self.wal_manager.get_partitions();
         let partitions: Vec<i32> = all_partitions
             .into_iter()
@@ -300,10 +320,25 @@ impl HotDataBuffer {
             return Ok(None);
         }
 
+        let now_ms = Self::current_time_ms();
         let mut all_batches: Vec<RecordBatch> = Vec::new();
+        let mut cache_hits = 0u32;
+        let mut cache_misses = 0u32;
 
         for partition in partitions {
             let tp = TopicPartition::new(topic, partition);
+
+            // Check cache first
+            if let Some(cached) = self.cache.get(&tp) {
+                if now_ms.saturating_sub(cached.last_refresh_ms) < self.config.refresh_interval_ms {
+                    all_batches.push(cached.batch.clone());
+                    cache_hits += 1;
+                    continue;
+                }
+            }
+
+            // Cache miss or stale — read from WAL
+            cache_misses += 1;
             let flushed_offset = self.flushed_offsets.get(&tp).map(|v| *v).unwrap_or(0);
 
             let wal_records = self
@@ -322,12 +357,28 @@ impl HotDataBuffer {
             }
 
             let batch = self.records_to_batch(&hot_records)?;
+
+            // Update cache
+            let cached = CachedBatch {
+                batch: batch.clone(),
+                min_offset: hot_records.first().map(|r| r.offset).unwrap_or(0),
+                max_offset: hot_records.last().map(|r| r.offset).unwrap_or(0),
+                record_count: hot_records.len(),
+                last_refresh_ms: now_ms,
+            };
+            self.cache.insert(tp, cached);
+
             all_batches.push(batch);
         }
 
         if all_batches.is_empty() {
             return Ok(None);
         }
+
+        debug!(
+            "Topic {} hot buffer: {} cache hits, {} misses, {} total batches",
+            topic, cache_hits, cache_misses, all_batches.len()
+        );
 
         let schema = Arc::new(Self::hot_buffer_schema());
         let mem_table = MemTable::try_new(schema, vec![all_batches])?;
@@ -339,16 +390,27 @@ impl HotDataBuffer {
     ///
     /// Called by WalIndexer when Parquet files are created.
     /// Records up to this offset are in Parquet and don't need to be in hot buffer.
+    /// Invalidates the cached RecordBatch so the next query re-reads with the new offset range.
     pub fn set_flushed_offset(&self, topic: &str, partition: i32, offset: i64) {
         let tp = TopicPartition::new(topic, partition);
-        self.flushed_offsets.insert(tp, offset);
-        debug!("Set flushed offset for {}-{}: {}", topic, partition, offset);
+        self.flushed_offsets.insert(tp.clone(), offset);
+        // Invalidate cache — flushed offset changed, cached batch covers wrong range
+        self.cache.remove(&tp);
+        debug!("Set flushed offset for {}-{}: {} (cache invalidated)", topic, partition, offset);
     }
 
     /// Get the flushed offset for a topic-partition
     pub fn get_flushed_offset(&self, topic: &str, partition: i32) -> i64 {
         let tp = TopicPartition::new(topic, partition);
         self.flushed_offsets.get(&tp).map(|v| *v).unwrap_or(0)
+    }
+
+    /// Get current time in milliseconds since Unix epoch
+    fn current_time_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
     }
 
     /// Convert HotRecords to Arrow RecordBatch using DataFusion's arrow types

@@ -5,8 +5,8 @@ metadata:
   namespace: chronik-perf
 spec:
   backoffLimit: 3
-  # 10-20M records — 4-hour timeout
-  activeDeadlineSeconds: 14400
+  # 43.9M records — 8-hour timeout
+  activeDeadlineSeconds: 28800
   template:
     spec:
       restartPolicy: OnFailure
@@ -23,7 +23,7 @@ spec:
             - name: DATA_FILE
               value: "/data/Electronics.jsonl"
             - name: MAX_RECORDS
-              value: "10000000"
+              value: "0"
             - name: BATCH_SIZE
               value: "5000"
             - name: NUM_PARTITIONS

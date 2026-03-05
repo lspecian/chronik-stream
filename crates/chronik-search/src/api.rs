@@ -100,7 +100,7 @@ pub struct FieldMapping {
 }
 
 /// Search request (Elasticsearch compatible)
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchRequest {
     /// Optional index/topic name to restrict search to a specific topic
     #[serde(default)]
@@ -169,7 +169,7 @@ fn default_number_of_fragments() -> usize {
 }
 
 /// Query DSL (Elasticsearch compatible)
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QueryDsl {
     Match(MatchQuery),
@@ -182,25 +182,25 @@ pub enum QueryDsl {
     GeoPolygon(GeoPolygonQuery),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MatchQuery {
     #[serde(flatten)]
     pub field_value: HashMap<String, serde_json::Value>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TermQueryDsl {
     #[serde(flatten)]
     pub field_value: HashMap<String, serde_json::Value>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RangeQueryDsl {
     #[serde(flatten)]
     pub field_range: HashMap<String, RangeClause>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RangeClause {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gte: Option<serde_json::Value>,
@@ -212,7 +212,7 @@ pub struct RangeClause {
     pub lt: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BoolQuery {
     #[serde(default)]
     pub must: Vec<QueryDsl>,
@@ -224,10 +224,10 @@ pub struct BoolQuery {
     pub filter: Vec<QueryDsl>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MatchAllQuery {}
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeoDistanceQuery {
     pub field: String,
     pub distance: String,
@@ -237,34 +237,34 @@ pub struct GeoDistanceQuery {
     pub distance_type: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeoBoundingBoxQuery {
     pub field: String,
     pub top_left: serde_json::Value,
     pub bottom_right: serde_json::Value,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeoPolygonQuery {
     pub field: String,
     pub points: Vec<serde_json::Value>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum SortClause {
     Field(String),
     Object(HashMap<String, SortOrder>),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SortOrder {
     Asc,
     Desc,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum SourceFilter {
     Bool(bool),
@@ -272,7 +272,7 @@ pub enum SourceFilter {
 }
 
 /// Search response (Elasticsearch compatible)
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResponse {
     pub took: u64,
     pub timed_out: bool,
@@ -282,7 +282,7 @@ pub struct SearchResponse {
     pub aggregations: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShardInfo {
     pub total: u32,
     pub successful: u32,
@@ -290,20 +290,20 @@ pub struct ShardInfo {
     pub failed: u32,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HitsInfo {
     pub total: TotalHits,
     pub max_score: Option<f32>,
     pub hits: Vec<Hit>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TotalHits {
     pub value: u64,
     pub relation: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Hit {
     pub _index: String,
     pub _id: String,
