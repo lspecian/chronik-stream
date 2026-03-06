@@ -10,6 +10,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Schema};
 use std::sync::Arc;
 
+use crate::json_schema::{InferredJsonSchema, JsonFieldType};
 use crate::schema::kafka_message_schema;
 
 /// A minimal representation of a Kafka record for conversion.
@@ -145,6 +146,125 @@ impl RecordBatchConverter {
 
         RecordBatch::try_new(Arc::new(self.schema.clone()), columns)
             .map_err(|e| anyhow!("Failed to create RecordBatch: {}", e))
+    }
+
+    /// Convert records to RecordBatch with additional JSON-extracted columns.
+    ///
+    /// Parses each record's `value` as JSON and extracts fields according to
+    /// the provided `InferredJsonSchema`. Non-JSON values produce null columns.
+    pub fn convert_with_json(
+        &self,
+        records: &[KafkaRecord],
+        json_schema: &InferredJsonSchema,
+    ) -> Result<RecordBatch> {
+        if records.is_empty() {
+            return Err(anyhow!("Cannot convert empty record batch"));
+        }
+
+        // Build base batch first (standard Kafka columns)
+        let base_batch = self.convert(records)?;
+
+        if json_schema.fields.is_empty() {
+            return Ok(base_batch);
+        }
+
+        // Parse all values as JSON upfront
+        let parsed: Vec<Option<serde_json::Map<String, serde_json::Value>>> = records
+            .iter()
+            .map(|r| {
+                serde_json::from_slice::<serde_json::Value>(&r.value)
+                    .ok()
+                    .and_then(|v| v.as_object().cloned())
+            })
+            .collect();
+
+        // Build extra columns from JSON fields
+        let mut extra_columns: Vec<(String, ArrayRef)> = Vec::new();
+
+        for field in &json_schema.fields {
+            let array: ArrayRef = match field.field_type {
+                JsonFieldType::String | JsonFieldType::Object | JsonFieldType::Array => {
+                    let arr: StringArray = parsed
+                        .iter()
+                        .map(|obj| {
+                            obj.as_ref().and_then(|o| o.get(&field.name)).and_then(|v| {
+                                match v {
+                                    serde_json::Value::String(s) => Some(s.clone()),
+                                    serde_json::Value::Null => None,
+                                    other => Some(other.to_string()),
+                                }
+                            })
+                        })
+                        .collect();
+                    Arc::new(arr)
+                }
+                JsonFieldType::Int64 => {
+                    let arr: Int64Array = parsed
+                        .iter()
+                        .map(|obj| {
+                            obj.as_ref()
+                                .and_then(|o| o.get(&field.name))
+                                .and_then(|v| v.as_i64())
+                        })
+                        .collect();
+                    Arc::new(arr)
+                }
+                JsonFieldType::Float64 => {
+                    use arrow_array::Float64Array;
+                    let arr: Float64Array = parsed
+                        .iter()
+                        .map(|obj| {
+                            obj.as_ref()
+                                .and_then(|o| o.get(&field.name))
+                                .and_then(|v| v.as_f64())
+                        })
+                        .collect();
+                    Arc::new(arr)
+                }
+                JsonFieldType::Boolean => {
+                    use arrow_array::BooleanArray;
+                    let arr: BooleanArray = parsed
+                        .iter()
+                        .map(|obj| {
+                            obj.as_ref()
+                                .and_then(|o| o.get(&field.name))
+                                .and_then(|v| v.as_bool())
+                        })
+                        .collect();
+                    Arc::new(arr)
+                }
+            };
+            extra_columns.push((field.name.clone(), array));
+        }
+
+        // Build extended schema = base schema + JSON fields
+        let mut all_fields: Vec<arrow_schema::FieldRef> =
+            base_batch.schema().fields().iter().cloned().collect();
+        for (name, _) in &extra_columns {
+            let field_def = json_schema
+                .fields
+                .iter()
+                .find(|f| f.name == *name)
+                .unwrap();
+            all_fields.push(Arc::new(arrow_schema::Field::new(
+                name,
+                field_def.field_type.to_arrow_type(),
+                true, // JSON fields are always nullable (value might not be JSON)
+            )));
+        }
+
+        let extended_schema = Arc::new(Schema::new(all_fields));
+
+        // Combine base columns + extra columns
+        let mut all_columns: Vec<ArrayRef> = (0..base_batch.num_columns())
+            .map(|i| base_batch.column(i).clone())
+            .collect();
+        for (_, col) in extra_columns {
+            all_columns.push(col);
+        }
+
+        RecordBatch::try_new(extended_schema, all_columns)
+            .map_err(|e| anyhow!("Failed to create extended RecordBatch: {}", e))
     }
 
     /// Build the headers array as a Map type.
@@ -376,6 +496,105 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("dimension mismatch"));
+    }
+
+    #[test]
+    fn test_convert_with_json_basic() {
+        let converter = RecordBatchConverter::new();
+        let records = vec![
+            KafkaRecord {
+                topic: "test".to_string(),
+                partition: 0,
+                offset: 0,
+                timestamp_ms: 1000,
+                timestamp_type: 0,
+                key: None,
+                value: br#"{"name":"Alice","age":30,"score":9.5}"#.to_vec(),
+                headers: vec![],
+                embedding: None,
+            },
+            KafkaRecord {
+                topic: "test".to_string(),
+                partition: 0,
+                offset: 1,
+                timestamp_ms: 1001,
+                timestamp_type: 0,
+                key: None,
+                value: br#"{"name":"Bob","age":25,"score":8.0}"#.to_vec(),
+                headers: vec![],
+                embedding: None,
+            },
+        ];
+
+        let values: Vec<&[u8]> = records.iter().map(|r| r.value.as_slice()).collect();
+        let json_schema = InferredJsonSchema::infer(&values, 64).unwrap();
+
+        let batch = converter.convert_with_json(&records, &json_schema).unwrap();
+
+        // 8 base + 3 JSON columns
+        assert_eq!(batch.num_rows(), 2);
+        assert!(batch.num_columns() > 8);
+
+        // Verify JSON columns exist
+        assert!(batch.column_by_name("name").is_some());
+        assert!(batch.column_by_name("age").is_some());
+        assert!(batch.column_by_name("score").is_some());
+
+        // Verify values
+        let name_col = batch.column_by_name("name").unwrap()
+            .as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(name_col.value(0), "Alice");
+        assert_eq!(name_col.value(1), "Bob");
+
+        let age_col = batch.column_by_name("age").unwrap()
+            .as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(age_col.value(0), 30);
+        assert_eq!(age_col.value(1), 25);
+    }
+
+    #[test]
+    fn test_convert_with_json_null_values() {
+        let converter = RecordBatchConverter::new();
+        let records = vec![
+            KafkaRecord {
+                topic: "test".to_string(),
+                partition: 0,
+                offset: 0,
+                timestamp_ms: 1000,
+                timestamp_type: 0,
+                key: None,
+                value: br#"{"name":"Alice"}"#.to_vec(), // missing "age"
+                headers: vec![],
+                embedding: None,
+            },
+            KafkaRecord {
+                topic: "test".to_string(),
+                partition: 0,
+                offset: 1,
+                timestamp_ms: 1001,
+                timestamp_type: 0,
+                key: None,
+                value: b"not json at all".to_vec(), // not JSON
+                headers: vec![],
+                embedding: None,
+            },
+        ];
+
+        let json_values = vec![br#"{"name":"Alice","age":30}"#.as_ref()];
+        let json_schema = InferredJsonSchema::infer(&json_values, 64).unwrap();
+
+        let batch = converter.convert_with_json(&records, &json_schema).unwrap();
+        assert_eq!(batch.num_rows(), 2);
+
+        let name_col = batch.column_by_name("name").unwrap()
+            .as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(name_col.value(0), "Alice");
+        assert!(name_col.is_null(1)); // not JSON → null
+
+        let age_col = batch.column_by_name("age").unwrap()
+            .as_any().downcast_ref::<Int64Array>().unwrap();
+        assert!(age_col.is_null(0)); // missing field → null
+        assert!(age_col.is_null(1)); // not JSON → null
     }
 
     #[test]

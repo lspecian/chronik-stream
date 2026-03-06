@@ -209,16 +209,44 @@ const DEFAULT_OVERRETRIEVAL_FACTOR: usize = 5;
 
 /// Check if this request should fan out to peer nodes in cluster mode.
 ///
+/// For vector search, we check whether this node has HNSW indexes for ALL
+/// partitions of the topic — not just whether it has partition replicas.
+/// With RF=3 (replication factor = node count), all nodes have all partition
+/// data, but only the node that ran WalIndexer has HNSW vector indexes.
+///
 /// Returns true if:
 /// - A query router is configured (cluster mode)
 /// - The request is NOT a forwarded request (no infinite loops)
-/// - Not all partitions for the topic are local (remote data exists)
+/// - This node does NOT have vector indexes for all expected partitions
 ///
 /// Side effect: refreshes the partition map from metadata store.
 async fn needs_fan_out(state: &UnifiedApiState, headers: &HeaderMap, topic: &str) -> bool {
     if let Some(ref router) = state.query_router {
         if !super::query_router::is_forwarded_request(headers) {
             router.refresh_partition_map(state.metadata_store.as_ref(), topic).await;
+
+            // Vector-aware check: do we have HNSW indexes for all partitions?
+            if let Some(ref index_manager) = state.vector_index_manager {
+                let local_vector_partitions = index_manager.partitions_with_vectors(topic).await;
+                let partition_count = state.metadata_store
+                    .get_topic(topic).await
+                    .ok()
+                    .flatten()
+                    .map(|t| t.config.partition_count as usize)
+                    .unwrap_or(0);
+
+                if partition_count > 0 && local_vector_partitions.len() < partition_count {
+                    debug!(
+                        topic = %topic,
+                        local_vector_partitions = local_vector_partitions.len(),
+                        expected = partition_count,
+                        "Vector fan-out needed: not all partitions have local HNSW indexes"
+                    );
+                    return true;
+                }
+            }
+
+            // Fallback to partition-based check
             return !router.all_partitions_local(topic).await;
         }
     }

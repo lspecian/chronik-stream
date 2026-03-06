@@ -492,6 +492,8 @@ struct PartitionIndex {
     cosine_index: Option<HnswMap<CosinePoint, u64>>,
     /// Built HNSW index for Dot Product distance
     dot_index: Option<HnswMap<DotProductPoint, u64>>,
+    /// Offsets that already have vectors (dedup across multiple loads/re-ingests)
+    known_offsets: std::collections::HashSet<u64>,
 }
 
 /// Thresholds for triggering HNSW rebuild
@@ -519,6 +521,7 @@ impl PartitionIndex {
             euclidean_index: None,
             cosine_index: None,
             dot_index: None,
+            known_offsets: std::collections::HashSet::new(),
         }
     }
 
@@ -533,6 +536,11 @@ impl PartitionIndex {
                 self.config.dimensions,
                 vector.len()
             ));
+        }
+
+        // Dedup: skip if we already have a vector for this offset
+        if !self.known_offsets.insert(offset as u64) {
+            return Ok(());
         }
 
         // VO-3: If uint8 quantization and quantizer exists, also store quantized copy
@@ -599,6 +607,11 @@ impl PartitionIndex {
         // Merge pending into built (f32 and quantized)
         self.built_vectors.append(&mut self.pending_vectors);
         self.quantized_built.append(&mut self.quantized_pending);
+
+        // Ensure known_offsets is complete after merge
+        for (id, _) in &self.built_vectors {
+            self.known_offsets.insert(*id);
+        }
 
         // VO-6: Determine HNSW build dimensions (truncated for Matryoshka or full)
         let build_dims = self.config.effective_search_dims();
@@ -1362,6 +1375,20 @@ impl VectorIndexManager {
         models.sort();
         stats.models = models;
         stats
+    }
+
+    /// Get partition IDs that have >0 vectors locally for a given topic.
+    pub async fn partitions_with_vectors(&self, topic: &str) -> Vec<i32> {
+        let indexes = self.indexes.read().await;
+        let mut partitions = std::collections::HashSet::new();
+        for (key, index) in indexes.iter() {
+            if key.topic == topic && index.vector_count() > 0 {
+                partitions.insert(key.partition);
+            }
+        }
+        let mut result: Vec<i32> = partitions.into_iter().collect();
+        result.sort();
+        result
     }
 
     /// VO-5: Get statistics for a specific model's indexes within a topic.
@@ -3386,5 +3413,98 @@ mod tests {
         assert_eq!(results.len(), 2);
         // With adaptive, offset 0 should rank first (exact match at full dims)
         assert_eq!(results[0].0, 0, "Offset 0 should be closest at full dims");
+    }
+
+    #[test]
+    fn test_partition_index_dedup() {
+        let config = HnswIndexConfig {
+            dimensions: 3,
+            ..Default::default()
+        };
+        let mut index = PartitionIndex::new(config);
+
+        // Add vector for offset 42
+        index.add_vector(42, vec![1.0, 0.0, 0.0]).unwrap();
+        assert_eq!(index.vector_count(), 1);
+
+        // Add same offset again — should be deduplicated
+        index.add_vector(42, vec![0.0, 1.0, 0.0]).unwrap();
+        assert_eq!(index.vector_count(), 1, "Duplicate offset should be skipped");
+
+        // Different offset should be added
+        index.add_vector(43, vec![0.0, 0.0, 1.0]).unwrap();
+        assert_eq!(index.vector_count(), 2);
+    }
+
+    #[test]
+    fn test_partition_index_dedup_across_build() {
+        let config = HnswIndexConfig {
+            dimensions: 2,
+            ..Default::default()
+        };
+        let mut index = PartitionIndex::new(config);
+
+        // Add 100+ vectors to trigger first build
+        for i in 0..150 {
+            index.add_vector(i, vec![i as f32, 0.0]).unwrap();
+        }
+        assert_eq!(index.vector_count(), 150);
+
+        // Build HNSW (merges pending into built)
+        index.build().unwrap();
+        assert_eq!(index.vector_count(), 150);
+
+        // Try adding duplicates of already-built offsets
+        index.add_vector(0, vec![999.0, 999.0]).unwrap();
+        index.add_vector(50, vec![999.0, 999.0]).unwrap();
+        index.add_vector(149, vec![999.0, 999.0]).unwrap();
+        assert_eq!(index.vector_count(), 150, "Duplicates of built vectors should be skipped");
+
+        // New offset should still work
+        index.add_vector(150, vec![150.0, 0.0]).unwrap();
+        assert_eq!(index.vector_count(), 151);
+    }
+
+    #[tokio::test]
+    async fn test_partitions_with_vectors() {
+        let manager = VectorIndexManager::new(VectorIndexConfig::default());
+        let config = HnswIndexConfig {
+            dimensions: 2,
+            ..Default::default()
+        };
+        manager.register_topic("test", config).await;
+
+        // Initially no partitions have vectors
+        let partitions = manager.partitions_with_vectors("test").await;
+        assert!(partitions.is_empty());
+
+        // Add vectors to partition 0 only
+        manager
+            .add_vectors("test", 0, vec![VectorEntry {
+                offset: 0,
+                vector: vec![1.0, 0.0],
+                text_preview: None,
+            }])
+            .await
+            .unwrap();
+
+        let partitions = manager.partitions_with_vectors("test").await;
+        assert_eq!(partitions, vec![0]);
+
+        // Add vectors to partition 2 (skip 1)
+        manager
+            .add_vectors("test", 2, vec![VectorEntry {
+                offset: 0,
+                vector: vec![0.0, 1.0],
+                text_preview: None,
+            }])
+            .await
+            .unwrap();
+
+        let partitions = manager.partitions_with_vectors("test").await;
+        assert_eq!(partitions, vec![0, 2]);
+
+        // Partition 1 should NOT be in the list
+        assert!(!partitions.contains(&1));
     }
 }

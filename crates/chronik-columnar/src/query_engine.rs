@@ -223,6 +223,22 @@ impl ColumnarQueryEngine {
         Ok(())
     }
 
+    /// Register a custom TableProvider (e.g., PartitionedMemTable with filter pushdown).
+    pub fn register_table_provider(
+        &self,
+        table_name: &str,
+        provider: Arc<dyn datafusion::catalog::TableProvider>,
+    ) -> Result<()> {
+        debug!("Registering table provider '{}' for hot buffer", table_name);
+
+        self.ctx
+            .register_table(table_name, provider)
+            .map_err(|e| anyhow!("Failed to register table provider '{}': {}", table_name, e))?;
+
+        debug!("Successfully registered table provider '{}'", table_name);
+        Ok(())
+    }
+
     /// Check if a table is registered (v2.2.23)
     pub async fn table_exists(&self, table_name: &str) -> bool {
         self.ctx.table_provider(table_name).await.is_ok()

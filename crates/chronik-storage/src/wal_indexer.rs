@@ -27,6 +27,7 @@ use chronik_columnar::{
     CompressionCodec,
     PartitioningStrategy,
     converter::{RecordBatchConverter, KafkaRecord},
+    json_schema::InferredJsonSchema,
     schema::kafka_message_schema,
     HotDataBuffer,
     VectorIndexManager, VectorIndexConfig, HnswIndexConfig, EmbeddingPipeline,
@@ -1256,7 +1257,7 @@ impl WalIndexer {
         let topic_config = metadata_store.get_topic(&tp.topic).await
             .map_err(|e| Error::Internal(format!("Failed to get topic config: {}", e)))?;
 
-        let columnar_config = if let Some(topic) = topic_config {
+        let columnar_config = if let Some(ref topic) = topic_config {
             Self::build_columnar_config(&topic.config)
         } else {
             ColumnarConfig::default()
@@ -1302,13 +1303,58 @@ impl WalIndexer {
         let min_timestamp = kafka_records.iter().map(|r| r.timestamp_ms).min().unwrap_or(0);
         let max_timestamp = kafka_records.iter().map(|r| r.timestamp_ms).max().unwrap_or(0);
 
-        // Convert to Arrow RecordBatch
+        // Check if topic has JSON schema for columnar extraction
+        let json_schema = if let Some(ref tc) = topic_config {
+            if let Some(schema_str) = tc.config.json_schema() {
+                InferredJsonSchema::from_config_string(schema_str)
+            } else {
+                // First time: infer schema from sample values and persist
+                let sample_values: Vec<&[u8]> = kafka_records
+                    .iter()
+                    .take(100)
+                    .map(|r| r.value.as_slice())
+                    .collect();
+                if let Some(inferred) = InferredJsonSchema::infer(&sample_values, 64) {
+                    let config_str = inferred.to_config_string();
+                    debug!(
+                        topic = %tp.topic,
+                        schema = %config_str,
+                        "Inferred JSON schema for columnar storage"
+                    );
+                    // Persist to topic config (best-effort, don't block on failure)
+                    let mut updated_config = tc.config.clone();
+                    updated_config.config.insert(
+                        "columnar.json_schema".to_string(),
+                        config_str,
+                    );
+                    if let Err(e) = metadata_store.update_topic(&tp.topic, updated_config).await {
+                        warn!(
+                            topic = %tp.topic,
+                            error = %e,
+                            "Failed to persist inferred JSON schema (will re-infer next time)"
+                        );
+                    }
+                    Some(inferred)
+                } else {
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Convert to Arrow RecordBatch (with JSON columns if schema available)
         let converter = RecordBatchConverter::new();
-        let batch = converter.convert(&kafka_records)
-            .map_err(|e| Error::Internal(format!("Failed to convert to RecordBatch: {}", e)))?;
+        let batch = if let Some(ref js) = json_schema {
+            converter.convert_with_json(&kafka_records, js)
+                .map_err(|e| Error::Internal(format!("Failed to convert to RecordBatch: {}", e)))?
+        } else {
+            converter.convert(&kafka_records)
+                .map_err(|e| Error::Internal(format!("Failed to convert to RecordBatch: {}", e)))?
+        };
 
         // Create Parquet writer and write to bytes
-        let schema = kafka_message_schema();
+        let schema = (*batch.schema()).clone();
         let writer = ParquetSegmentWriter::new(schema, columnar_config.clone());
         let (parquet_bytes, stats) = writer.write_to_bytes(&[batch])
             .map_err(|e| Error::Internal(format!("Failed to write Parquet: {}", e)))?;
@@ -2233,6 +2279,152 @@ mod tests {
             }
         }
         assert!(found_parquet, "Expected to find a Parquet file in object store path");
+    }
+
+    // v2.4.1: Test that JSON columns appear in Parquet output
+    #[tokio::test]
+    async fn test_create_parquet_segment_with_json_columns() {
+        use crate::object_store::{LocalBackend, ObjectStoreConfig, StorageBackend, ObjectStore};
+        use chronik_common::metadata::{InMemoryMetadataStore, TopicConfig};
+        use tempfile::tempdir;
+        use std::collections::HashMap;
+
+        let temp_dir = tempdir().unwrap();
+        let object_store_path = temp_dir.path().join("parquet");
+        std::fs::create_dir_all(&object_store_path).unwrap();
+
+        let config = ObjectStoreConfig {
+            backend: StorageBackend::Local { path: object_store_path.to_string_lossy().to_string() },
+            ..Default::default()
+        };
+        let object_store: Arc<dyn ObjectStore> = Arc::new(LocalBackend::new(config).await.unwrap());
+
+        let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+        let mut topic_config_map = HashMap::new();
+        topic_config_map.insert("columnar.enabled".to_string(), "true".to_string());
+
+        let topic_config = TopicConfig {
+            partition_count: 1,
+            replication_factor: 1,
+            retention_ms: None,
+            segment_bytes: 1024 * 1024 * 1024,
+            config: topic_config_map,
+        };
+        metadata_store.create_topic("json-test-topic", topic_config).await.unwrap();
+
+        let segment_index = Arc::new(SegmentIndex::new());
+        let indexer_config = WalIndexerConfig {
+            columnar_base_path: object_store_path.to_string_lossy().to_string(),
+            ..Default::default()
+        };
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        // Create JSON records with typed fields
+        let records = vec![
+            CanonicalRecord {
+                base_offset: 0,
+                partition_leader_epoch: 0,
+                producer_id: -1,
+                producer_epoch: -1,
+                base_sequence: -1,
+                is_transactional: false,
+                is_control: false,
+                compression: crate::canonical_record::CompressionType::None,
+                timestamp_type: TimestampType::CreateTime,
+                base_timestamp: now,
+                max_timestamp: now + 200,
+                records: vec![
+                    CanonicalRecordEntry {
+                        offset: 0,
+                        timestamp: now,
+                        key: Some(b"k0".to_vec()),
+                        value: Some(br#"{"user_id":1,"name":"Alice","score":9.5,"active":true}"#.to_vec()),
+                        headers: vec![],
+                        attributes: 0,
+                    },
+                    CanonicalRecordEntry {
+                        offset: 1,
+                        timestamp: now + 100,
+                        key: Some(b"k1".to_vec()),
+                        value: Some(br#"{"user_id":2,"name":"Bob","score":8.0,"active":false}"#.to_vec()),
+                        headers: vec![],
+                        attributes: 0,
+                    },
+                    CanonicalRecordEntry {
+                        offset: 2,
+                        timestamp: now + 200,
+                        key: Some(b"k2".to_vec()),
+                        value: Some(br#"{"user_id":3,"name":"Charlie","score":7.2,"active":true}"#.to_vec()),
+                        headers: vec![],
+                        attributes: 0,
+                    },
+                ],
+                compressed_records_wire_bytes: None,
+                original_v1_wire_format: None,
+                original_v2_wire_format: None,
+            },
+        ];
+
+        let tp = TopicPartition::new("json-test-topic".to_string(), 0);
+        let (bytes_written, max_offset) = WalIndexer::create_parquet_segment(
+            &indexer_config,
+            &object_store,
+            &metadata_store,
+            &segment_index,
+            &tp,
+            records,
+        ).await.unwrap();
+
+        assert!(bytes_written > 0);
+        assert_eq!(max_offset, 2);
+
+        // Verify JSON schema was persisted to topic config
+        let updated_topic = metadata_store.get_topic("json-test-topic").await.unwrap().unwrap();
+        let schema_str = updated_topic.config.json_schema()
+            .expect("JSON schema should have been persisted to topic config");
+        assert!(schema_str.contains("user_id"));
+        assert!(schema_str.contains("name"));
+        assert!(schema_str.contains("score"));
+        assert!(schema_str.contains("active"));
+
+        // Verify the Parquet file has JSON columns by reading it
+        let mut parquet_path = None;
+        for entry in walkdir::WalkDir::new(&object_store_path)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            if entry.path().extension().map(|e| e == "parquet").unwrap_or(false) {
+                parquet_path = Some(entry.path().to_path_buf());
+                break;
+            }
+        }
+        let parquet_path = parquet_path.expect("Should find Parquet file");
+
+        // Read the Parquet file schema — this is the critical verification
+        let reader = chronik_columnar::ParquetSegmentReader::new(Default::default());
+        let schema = reader.read_schema(&parquet_path).unwrap();
+        let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+
+        // Base columns should be present
+        assert!(field_names.contains(&"_topic"), "Missing _topic column");
+        assert!(field_names.contains(&"_partition"), "Missing _partition column");
+        assert!(field_names.contains(&"_offset"), "Missing _offset column");
+        assert!(field_names.contains(&"_value"), "Missing _value column");
+
+        // JSON-inferred columns should also be present
+        assert!(field_names.contains(&"user_id"), "Missing user_id JSON column, fields: {:?}", field_names);
+        assert!(field_names.contains(&"name"), "Missing name JSON column, fields: {:?}", field_names);
+        assert!(field_names.contains(&"score"), "Missing score JSON column, fields: {:?}", field_names);
+        assert!(field_names.contains(&"active"), "Missing active JSON column, fields: {:?}", field_names);
+
+        // Verify row count from Parquet metadata
+        let metadata = reader.read_metadata(&parquet_path).unwrap();
+        let total_rows: i64 = metadata.row_groups().iter().map(|rg| rg.num_rows()).sum();
+        assert_eq!(total_rows, 3, "Expected 3 rows in Parquet file");
     }
 
     // v2.2.22: Vector text extraction tests

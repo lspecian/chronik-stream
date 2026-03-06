@@ -45,6 +45,7 @@ pub mod topic_query;
 pub mod vector_index;
 pub mod vector_cache;
 pub mod hot_buffer;
+pub mod json_schema;
 
 #[cfg(feature = "flight")]
 pub mod flight;
@@ -64,6 +65,7 @@ pub use vector_index::{
 };
 pub use vector_cache::QueryEmbeddingCache;
 pub use hot_buffer::{HotDataBuffer, HotBufferConfig, HotBufferStats};
+pub use json_schema::InferredJsonSchema;
 
 // v2.2.22: Re-export datafusion for unified API
 pub use datafusion;

@@ -166,8 +166,8 @@ impl SqlHandler {
             if !registered_set.contains(&hot_table_name) {
                 if let Some(hot_buffer) = &state.hot_buffer {
                     match hot_buffer.get_topic_mem_table(topic).await {
-                        Ok(Some(mem_table)) => {
-                            if let Err(e) = engine.register_memory_table(&hot_table_name, mem_table) {
+                        Ok(Some(partitioned_table)) => {
+                            if let Err(e) = engine.register_table_provider(&hot_table_name, std::sync::Arc::new(partitioned_table)) {
                                 debug!("Failed to register hot table '{}': {}", hot_table_name, e);
                             } else {
                                 info!(

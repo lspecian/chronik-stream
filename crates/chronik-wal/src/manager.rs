@@ -285,9 +285,12 @@ impl WalManager {
 
         debug!("Found {} WAL segment files for {}/{}: {:?}", wal_files.len(), topic, partition, wal_files);
 
-        // Read from all segment files until we have enough records
+        // Read from all segment files until we have enough individual messages.
+        // Note: max_records counts individual Kafka messages, NOT WAL batch records.
+        // Each WAL batch may contain 100-2000 messages (via record_count field).
+        let mut total_message_count: usize = 0;
         for wal_file_path in &wal_files {
-            if records.len() >= max_records {
+            if total_message_count >= max_records {
                 break;
             }
 
@@ -302,7 +305,7 @@ impl WalManager {
             let mut cursor = 0;
             let mut skipped_batches = 0;
 
-            while cursor < file_data.len() && records.len() < max_records {
+            while cursor < file_data.len() && total_message_count < max_records {
                 use byteorder::{LittleEndian, ReadBytesExt};
                 use std::io::Cursor as IoCursor;
 
@@ -414,6 +417,7 @@ impl WalManager {
                         last_offset,
                         record_count,
                     };
+                    total_message_count += record_count.max(1) as usize;
                     records.push(record);
                 }
 
