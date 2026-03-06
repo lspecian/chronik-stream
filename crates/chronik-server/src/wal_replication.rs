@@ -2352,6 +2352,7 @@ mod tests {
         ClusterConfig {
             enabled: true,
             node_id,
+            data_dir: "/tmp/test-data".to_string(),
             replication_factor: 3,
             min_insync_replicas: 2,
             peers: vec![
@@ -2383,11 +2384,12 @@ mod tests {
             bind: None,
             advertise: None,
             gossip: None,
+            auto_recover: true,
         }
     }
 
-    #[test]
-    fn test_auto_discover_followers_from_cluster_config() {
+    #[tokio::test]
+    async fn test_auto_discover_followers_from_cluster_config() {
         let cluster = create_test_cluster_config(1);
         let manager = WalReplicationManager::new_with_dependencies(
             vec![],  // Empty - should trigger auto-discovery
@@ -2404,8 +2406,8 @@ mod tests {
         assert!(manager.followers.contains(&"node3.example.com:9291".to_string()));
     }
 
-    #[test]
-    fn test_manual_followers_override_auto_discovery() {
+    #[tokio::test]
+    async fn test_manual_followers_override_auto_discovery() {
         let cluster = create_test_cluster_config(1);
         let manual_followers = vec!["custom.host:9291".to_string()];
 
@@ -2422,8 +2424,8 @@ mod tests {
         assert_eq!(manager.followers, manual_followers);
     }
 
-    #[test]
-    fn test_no_replication_without_config_or_manual() {
+    #[tokio::test]
+    async fn test_no_replication_without_config_or_manual() {
         let manager = WalReplicationManager::new_with_dependencies(
             vec![],  // Empty
             None,
@@ -2437,8 +2439,8 @@ mod tests {
         assert!(manager.followers.is_empty());
     }
 
-    #[test]
-    fn test_auto_discovery_filters_self() {
+    #[tokio::test]
+    async fn test_auto_discovery_filters_self() {
         // Test all three nodes to ensure each filters itself correctly
         for node_id in 1..=3 {
             let cluster = create_test_cluster_config(node_id);

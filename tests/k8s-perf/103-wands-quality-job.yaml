@@ -1,0 +1,63 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: wands-quality
+  namespace: chronik-perf
+spec:
+  backoffLimit: 1
+  # 480 queries x 5 modes = ~2400 requests, allow 1.5 hours
+  activeDeadlineSeconds: 5400
+  template:
+    spec:
+      restartPolicy: Never
+      # Pin to dell-1 where the dataset CSVs are
+      nodeSelector:
+        kubernetes.io/hostname: dell-1
+      containers:
+        - name: evaluator
+          image: python:3.12-slim
+          env:
+            - name: CHRONIK_URL
+              value: "http://chronik-thunderbird.chronik-perf.svc.cluster.local:6092"
+            - name: TOPIC
+              value: "wands"
+            - name: DATA_DIR
+              value: "/data"
+            - name: OUTPUT_DIR
+              value: "/results"
+            - name: K
+              value: "10"
+            - name: REQUEST_TIMEOUT
+              value: "30"
+            - name: CHRONIK_NODES
+              value: "http://chronik-thunderbird-1.chronik-perf.svc.cluster.local:6092,http://chronik-thunderbird-2.chronik-perf.svc.cluster.local:6092,http://chronik-thunderbird-3.chronik-perf.svc.cluster.local:6092"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          command: ["python3", "-u", "/scripts/wands-quality.py"]
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+            - name: dataset
+              mountPath: /data
+              readOnly: true
+            - name: results
+              mountPath: /results
+          resources:
+            requests:
+              cpu: "2"
+              memory: "1Gi"
+            limits:
+              cpu: "4"
+              memory: "2Gi"
+      volumes:
+        - name: script
+          configMap:
+            name: wands-quality-script
+        - name: dataset
+          hostPath:
+            path: /home/ubuntu/datasets/WANDS/dataset
+            type: Directory
+        - name: results
+          hostPath:
+            path: /home/ubuntu/datasets/WANDS/results
+            type: DirectoryOrCreate

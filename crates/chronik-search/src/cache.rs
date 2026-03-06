@@ -229,6 +229,7 @@ mod tests {
     #[test]
     fn test_cache_key_generation() {
         let request = SearchRequest {
+            index: None,
             query: None,
             size: 10,
             from: 0,

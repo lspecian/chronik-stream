@@ -348,8 +348,9 @@ impl WalCompactor {
         // Sort by offset to maintain order (V1 only, V2 doesn't have offset)
         compacted_records.sort_by_key(|r| r.get_offset().unwrap_or(i64::MAX));
 
-        // Apply retention ratio if needed
-        self.apply_retention_ratio(compacted_records)
+        // Key-based compaction already produces the minimal set (one record per key).
+        // Don't apply retention_ratio here — it would incorrectly discard deduplicated records.
+        Ok(compacted_records)
     }
 
     /// Time-based compaction: remove old records

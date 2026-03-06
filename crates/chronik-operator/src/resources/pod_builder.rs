@@ -17,6 +17,7 @@ pub fn build_standalone_pod(
     namespace: &str,
     spec: &ChronikStandaloneSpec,
     owner_ref: k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference,
+    spec_hash: Option<&str>,
 ) -> Pod {
     let labels = standalone_labels(name, &spec.image);
     let pvc_name = format!("{name}-data");
@@ -260,11 +261,19 @@ pub fn build_standalone_pod(
             )
         };
 
+    // v2.3.1: Annotations include spec hash for change detection
+    let annotations = spec_hash.map(|h| {
+        let mut map = BTreeMap::new();
+        map.insert("chronik.io/spec-hash".to_string(), h.to_string());
+        map
+    });
+
     Pod {
         metadata: ObjectMeta {
             name: Some(name.into()),
             namespace: Some(namespace.into()),
             labels: Some(labels),
+            annotations,
             owner_references: Some(vec![owner_ref]),
             ..Default::default()
         },
@@ -323,6 +332,7 @@ pub fn build_cluster_node_pod(
     node_id: u64,
     spec: &crate::crds::cluster::ChronikClusterSpec,
     owner_ref: k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference,
+    spec_hash: Option<&str>,
 ) -> Pod {
     let pod_name = format!("{cluster_name}-{node_id}");
     let labels = cluster_node_labels(cluster_name, node_id, &spec.image);
@@ -612,11 +622,19 @@ pub fn build_cluster_node_pod(
         &spec.anti_affinity_topology_key,
     );
 
+    // v2.3.1: Annotations include spec hash for change detection
+    let annotations = spec_hash.map(|h| {
+        let mut map = BTreeMap::new();
+        map.insert("chronik.io/spec-hash".to_string(), h.to_string());
+        map
+    });
+
     Pod {
         metadata: ObjectMeta {
             name: Some(pod_name),
             namespace: Some(namespace.into()),
             labels: Some(labels),
+            annotations,
             owner_references: Some(vec![owner_ref]),
             ..Default::default()
         },
@@ -756,7 +774,7 @@ mod tests {
     #[test]
     fn test_build_standalone_pod_basic() {
         let spec: ChronikStandaloneSpec = serde_json::from_str("{}").unwrap();
-        let pod = build_standalone_pod("my-chronik", "default", &spec, test_owner_ref());
+        let pod = build_standalone_pod("my-chronik", "default", &spec, test_owner_ref(), None);
 
         assert_eq!(pod.metadata.name.as_deref(), Some("my-chronik"));
         assert_eq!(pod.metadata.namespace.as_deref(), Some("default"));
@@ -792,7 +810,7 @@ mod tests {
             r#"{"resources": {"requests": {"cpu": "500m", "memory": "1Gi"}, "limits": {"cpu": "2", "memory": "4Gi"}}}"#,
         )
         .unwrap();
-        let pod = build_standalone_pod("test", "ns", &spec, test_owner_ref());
+        let pod = build_standalone_pod("test", "ns", &spec, test_owner_ref(), None);
 
         let container = &pod.spec.as_ref().unwrap().containers[0];
         let resources = container.resources.as_ref().unwrap();
@@ -805,7 +823,7 @@ mod tests {
     fn test_build_standalone_pod_ports() {
         let spec: ChronikStandaloneSpec =
             serde_json::from_str(r#"{"kafkaPort": 9093, "unifiedApiPort": 6093}"#).unwrap();
-        let pod = build_standalone_pod("test", "ns", &spec, test_owner_ref());
+        let pod = build_standalone_pod("test", "ns", &spec, test_owner_ref(), None);
 
         let ports = pod.spec.as_ref().unwrap().containers[0]
             .ports
@@ -828,7 +846,7 @@ mod tests {
     #[test]
     fn test_standalone_pod_has_owner_ref() {
         let spec: ChronikStandaloneSpec = serde_json::from_str("{}").unwrap();
-        let pod = build_standalone_pod("test", "ns", &spec, test_owner_ref());
+        let pod = build_standalone_pod("test", "ns", &spec, test_owner_ref(), None);
         let refs = pod.metadata.owner_references.as_ref().unwrap();
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].kind, "ChronikStandalone");
@@ -838,7 +856,7 @@ mod tests {
     #[test]
     fn test_standalone_pod_probes() {
         let spec: ChronikStandaloneSpec = serde_json::from_str("{}").unwrap();
-        let pod = build_standalone_pod("test", "ns", &spec, test_owner_ref());
+        let pod = build_standalone_pod("test", "ns", &spec, test_owner_ref(), None);
 
         let container = &pod.spec.as_ref().unwrap().containers[0];
         let liveness = container.liveness_probe.as_ref().unwrap();
@@ -852,7 +870,7 @@ mod tests {
     #[test]
     fn test_standalone_pod_volume_mount() {
         let spec: ChronikStandaloneSpec = serde_json::from_str("{}").unwrap();
-        let pod = build_standalone_pod("test", "ns", &spec, test_owner_ref());
+        let pod = build_standalone_pod("test", "ns", &spec, test_owner_ref(), None);
 
         let container = &pod.spec.as_ref().unwrap().containers[0];
         let mounts = container.volume_mounts.as_ref().unwrap();
@@ -884,7 +902,7 @@ mod tests {
             block_owner_deletion: Some(true),
         };
 
-        let pod = build_cluster_node_pod("my-cluster", "default", 1, &spec, owner);
+        let pod = build_cluster_node_pod("my-cluster", "default", 1, &spec, owner, None);
 
         assert_eq!(pod.metadata.name.as_deref(), Some("my-cluster-1"));
         assert_eq!(pod.metadata.namespace.as_deref(), Some("default"));

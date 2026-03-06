@@ -22,10 +22,37 @@ pub struct VectorSearchConfig {
     pub hnsw: HnswConfig,
 
     /// Batch size for embedding API calls.
+    /// OpenAI supports up to 2048 texts per call; 256 balances latency and throughput.
     pub batch_size: usize,
+
+    /// Number of concurrent in-flight embedding batches.
+    /// Higher values increase throughput but also API rate limit pressure.
+    pub embedding_concurrency: usize,
 
     /// Maximum embedding retries on failure.
     pub max_retries: u32,
+
+    /// Vector quantization mode (VO-3). Controls memory vs. recall trade-off.
+    pub quantization: QuantizationMode,
+
+    /// Re-ranker configuration (VO-4). Cross-encoder re-ranking for quality improvement.
+    pub reranker: crate::reranker::RerankerConfig,
+
+    /// VO-5: Active model ID for search. When a search request doesn't specify a model,
+    /// this model's index is used. Default: `"default"` (uses the topic's primary model).
+    pub active_model: String,
+
+    /// VO-6: Number of dimensions used for HNSW graph search.
+    /// When less than `embedding.dimensions`, vectors are stored at full dimensionality
+    /// but the HNSW graph is built on truncated (Matryoshka) dimensions for faster search.
+    /// Default: 0 (use full `embedding.dimensions`).
+    pub search_dimensions: usize,
+
+    /// VO-6: Enable adaptive two-phase retrieval.
+    /// Phase 1: Search HNSW at `search_dimensions` for k×3 candidates.
+    /// Phase 2: Re-score candidates using full-dimension vectors, return top-k.
+    /// Only effective when `search_dimensions < embedding.dimensions`.
+    pub adaptive_retrieval: bool,
 }
 
 impl Default for VectorSearchConfig {
@@ -35,8 +62,14 @@ impl Default for VectorSearchConfig {
             embedding: EmbeddingModelConfig::default(),
             field: "value".to_string(),
             hnsw: HnswConfig::default(),
-            batch_size: 32,
+            batch_size: 256,
+            embedding_concurrency: 4,
             max_retries: 3,
+            quantization: QuantizationMode::F32,
+            reranker: crate::reranker::RerankerConfig::default(),
+            active_model: "default".to_string(),
+            search_dimensions: 0, // 0 = use full embedding.dimensions
+            adaptive_retrieval: false,
         }
     }
 }
@@ -71,15 +104,59 @@ impl VectorSearchConfig {
         if let Some(v) = config.get("vector.batch_size") {
             result.batch_size = v.parse()
                 .map_err(|_| anyhow!("Invalid batch_size: {}", v))?;
-            if result.batch_size < 1 || result.batch_size > 1000 {
-                return Err(anyhow!("batch_size must be 1-1000, got {}", result.batch_size));
+            if result.batch_size < 1 || result.batch_size > 2048 {
+                return Err(anyhow!("batch_size must be 1-2048, got {}", result.batch_size));
             }
+        }
+
+        // vector.embedding_concurrency (or CHRONIK_EMBEDDING_CONCURRENCY env var)
+        if let Some(v) = config.get("vector.embedding_concurrency") {
+            result.embedding_concurrency = v.parse()
+                .map_err(|_| anyhow!("Invalid embedding_concurrency: {}", v))?;
+        }
+        if let Ok(v) = std::env::var("CHRONIK_EMBEDDING_CONCURRENCY") {
+            if let Ok(c) = v.parse::<usize>() {
+                result.embedding_concurrency = c;
+            }
+        }
+        if result.embedding_concurrency < 1 || result.embedding_concurrency > 32 {
+            return Err(anyhow!("embedding_concurrency must be 1-32, got {}", result.embedding_concurrency));
         }
 
         // vector.max_retries
         if let Some(v) = config.get("vector.max_retries") {
             result.max_retries = v.parse()
                 .map_err(|_| anyhow!("Invalid max_retries: {}", v))?;
+        }
+
+        // vector.quantization (VO-3)
+        if let Some(v) = config.get("vector.quantization") {
+            result.quantization = v.parse()?;
+        }
+
+        // vector.reranker.* (VO-4)
+        result.reranker = crate::reranker::RerankerConfig::from_topic_config(config)?;
+
+        // vector.active_model (VO-5)
+        if let Some(v) = config.get("vector.active_model") {
+            result.active_model = v.clone();
+        }
+
+        // vector.search_dimensions (VO-6) — 0 means use full embedding.dimensions
+        if let Some(v) = config.get("vector.search_dimensions") {
+            result.search_dimensions = v.parse()
+                .map_err(|_| anyhow!("Invalid search_dimensions: {}", v))?;
+            if result.search_dimensions > 0 && result.search_dimensions > result.embedding.dimensions {
+                return Err(anyhow!(
+                    "search_dimensions ({}) cannot exceed embedding dimensions ({})",
+                    result.search_dimensions, result.embedding.dimensions
+                ));
+            }
+        }
+
+        // vector.adaptive_retrieval (VO-6)
+        if let Some(v) = config.get("vector.adaptive_retrieval") {
+            result.adaptive_retrieval = v.eq_ignore_ascii_case("true");
         }
 
         Ok(result)
@@ -107,11 +184,22 @@ impl VectorSearchConfig {
             "vector.endpoint",
             "vector.dimensions",
             "vector.batch_size",
+            "vector.embedding_concurrency",
             "vector.max_retries",
             "vector.hnsw.m",
             "vector.hnsw.ef_construction",
             "vector.hnsw.ef_search",
             "vector.hnsw.metric",
+            "vector.quantization",
+            "vector.reranker.enabled",
+            "vector.reranker.provider",
+            "vector.reranker.model",
+            "vector.reranker.endpoint",
+            "vector.reranker.api_key",
+            "vector.reranker.overretrieval_factor",
+            "vector.active_model",
+            "vector.search_dimensions",
+            "vector.adaptive_retrieval",
         ]
     }
 }
@@ -145,29 +233,33 @@ impl Default for EmbeddingModelConfig {
 
 impl EmbeddingModelConfig {
     /// Parse from topic config.
+    ///
+    /// Accepts both short-form (`vector.provider`) and long-form (`vector.embedding.provider`)
+    /// keys. Short-form takes priority if both are present.
     pub fn from_topic_config(config: &HashMap<String, String>) -> Result<Self> {
         let mut result = Self::default();
 
-        // vector.provider
-        if let Some(v) = config.get("vector.provider") {
+        // vector.provider (short-form) or vector.embedding.provider (long-form)
+        if let Some(v) = config.get("vector.provider").or_else(|| config.get("vector.embedding.provider")) {
             result.provider = v.parse()?;
         }
 
-        // vector.model
-        if let Some(v) = config.get("vector.model") {
+        // vector.model (short-form) or vector.embedding.model (long-form)
+        if let Some(v) = config.get("vector.model").or_else(|| config.get("vector.embedding.model")) {
             result.model = v.clone();
             // Auto-detect dimensions for known models
             result.dimensions = known_model_dimensions(&result.model)
                 .unwrap_or(result.dimensions);
         }
 
-        // vector.endpoint
-        if let Some(v) = config.get("vector.endpoint") {
+        // vector.endpoint (short-form) or vector.embedding.endpoint (long-form)
+        if let Some(v) = config.get("vector.endpoint").or_else(|| config.get("vector.embedding.endpoint")) {
             result.endpoint = Some(v.clone());
         }
 
-        // vector.dimensions (override auto-detection)
-        if let Some(v) = config.get("vector.dimensions") {
+        // vector.dimensions (short-form) or vector.embedding.dimensions (long-form)
+        // Overrides auto-detection from model
+        if let Some(v) = config.get("vector.dimensions").or_else(|| config.get("vector.embedding.dimensions")) {
             result.dimensions = v.parse()
                 .map_err(|_| anyhow!("Invalid dimensions: {}", v))?;
         }
@@ -235,6 +327,61 @@ impl std::fmt::Display for EmbeddingProvider {
             Self::External => write!(f, "external"),
             Self::Local => write!(f, "local"),
         }
+    }
+}
+
+/// Vector quantization mode (VO-3).
+///
+/// Controls how vectors are stored in memory and on disk.
+/// Lower precision reduces memory but may decrease recall slightly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum QuantizationMode {
+    /// Full 32-bit float (6,144 bytes per 1536-dim vector). No quality loss.
+    #[default]
+    F32,
+    /// Half-precision 16-bit float (3,072 bytes per 1536-dim vector). ~99.9% recall.
+    F16,
+    /// 8-bit unsigned int with scalar quantization (1,536 bytes per 1536-dim vector). ~97-98% recall.
+    Uint8,
+}
+
+impl std::str::FromStr for QuantizationMode {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.to_lowercase().as_str() {
+            "f32" | "float32" | "none" => Ok(Self::F32),
+            "f16" | "float16" | "half" => Ok(Self::F16),
+            "uint8" | "u8" | "int8" | "sq8" => Ok(Self::Uint8),
+            _ => Err(anyhow!("Invalid quantization: {}. Valid: f32, f16, uint8", s)),
+        }
+    }
+}
+
+impl std::fmt::Display for QuantizationMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::F32 => write!(f, "f32"),
+            Self::F16 => write!(f, "f16"),
+            Self::Uint8 => write!(f, "uint8"),
+        }
+    }
+}
+
+impl QuantizationMode {
+    /// Bytes per scalar element.
+    pub fn bytes_per_element(&self) -> usize {
+        match self {
+            Self::F32 => 4,
+            Self::F16 => 2,
+            Self::Uint8 => 1,
+        }
+    }
+
+    /// Bytes per vector at the given dimensionality.
+    pub fn bytes_per_vector(&self, dimensions: usize) -> usize {
+        dimensions * self.bytes_per_element()
     }
 }
 
@@ -385,6 +532,36 @@ mod tests {
         assert!(!config.enabled);
         assert_eq!(config.field, "value");
         assert_eq!(config.embedding.provider, EmbeddingProvider::OpenAI);
+        // VO-1: Verify new defaults
+        assert_eq!(config.batch_size, 256);
+        assert_eq!(config.embedding_concurrency, 4);
+    }
+
+    #[test]
+    fn test_batch_size_range() {
+        // Max allowed is 2048
+        let mut topic_config = HashMap::new();
+        topic_config.insert("vector.batch_size".to_string(), "2048".to_string());
+        let config = VectorSearchConfig::from_topic_config(&topic_config).unwrap();
+        assert_eq!(config.batch_size, 2048);
+
+        // Over max should fail
+        let mut topic_config = HashMap::new();
+        topic_config.insert("vector.batch_size".to_string(), "2049".to_string());
+        assert!(VectorSearchConfig::from_topic_config(&topic_config).is_err());
+    }
+
+    #[test]
+    fn test_embedding_concurrency_config() {
+        let mut topic_config = HashMap::new();
+        topic_config.insert("vector.embedding_concurrency".to_string(), "8".to_string());
+        let config = VectorSearchConfig::from_topic_config(&topic_config).unwrap();
+        assert_eq!(config.embedding_concurrency, 8);
+
+        // Over max (32) should fail
+        let mut topic_config = HashMap::new();
+        topic_config.insert("vector.embedding_concurrency".to_string(), "33".to_string());
+        assert!(VectorSearchConfig::from_topic_config(&topic_config).is_err());
     }
 
     #[test]
@@ -437,6 +614,32 @@ mod tests {
     }
 
     #[test]
+    fn test_quantization_mode_parsing() {
+        assert_eq!("f32".parse::<QuantizationMode>().unwrap(), QuantizationMode::F32);
+        assert_eq!("none".parse::<QuantizationMode>().unwrap(), QuantizationMode::F32);
+        assert_eq!("f16".parse::<QuantizationMode>().unwrap(), QuantizationMode::F16);
+        assert_eq!("half".parse::<QuantizationMode>().unwrap(), QuantizationMode::F16);
+        assert_eq!("uint8".parse::<QuantizationMode>().unwrap(), QuantizationMode::Uint8);
+        assert_eq!("sq8".parse::<QuantizationMode>().unwrap(), QuantizationMode::Uint8);
+        assert!("invalid".parse::<QuantizationMode>().is_err());
+    }
+
+    #[test]
+    fn test_quantization_config_from_topic() {
+        let mut topic_config = HashMap::new();
+        topic_config.insert("vector.quantization".to_string(), "uint8".to_string());
+        let config = VectorSearchConfig::from_topic_config(&topic_config).unwrap();
+        assert_eq!(config.quantization, QuantizationMode::Uint8);
+    }
+
+    #[test]
+    fn test_quantization_bytes_per_vector() {
+        assert_eq!(QuantizationMode::F32.bytes_per_vector(1536), 6144);
+        assert_eq!(QuantizationMode::F16.bytes_per_vector(1536), 3072);
+        assert_eq!(QuantizationMode::Uint8.bytes_per_vector(1536), 1536);
+    }
+
+    #[test]
     fn test_validate_hnsw() {
         let mut config = HnswConfig::default();
         assert!(config.validate().is_ok());
@@ -447,5 +650,45 @@ mod tests {
         config.m = 16;
         config.ef_construction = 10; // Less than m
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_active_model_default() {
+        let config = VectorSearchConfig::default();
+        assert_eq!(config.active_model, "default");
+    }
+
+    #[test]
+    fn test_active_model_from_topic_config() {
+        let mut topic_config = HashMap::new();
+        topic_config.insert("vector.active_model".to_string(), "text-embedding-3-large".to_string());
+        let config = VectorSearchConfig::from_topic_config(&topic_config).unwrap();
+        assert_eq!(config.active_model, "text-embedding-3-large");
+    }
+
+    #[test]
+    fn test_search_dimensions_default() {
+        let config = VectorSearchConfig::default();
+        assert_eq!(config.search_dimensions, 0);
+        assert!(!config.adaptive_retrieval);
+    }
+
+    #[test]
+    fn test_search_dimensions_from_topic_config() {
+        let mut topic_config = HashMap::new();
+        topic_config.insert("vector.search_dimensions".to_string(), "512".to_string());
+        topic_config.insert("vector.adaptive_retrieval".to_string(), "true".to_string());
+        let config = VectorSearchConfig::from_topic_config(&topic_config).unwrap();
+        assert_eq!(config.search_dimensions, 512);
+        assert!(config.adaptive_retrieval);
+    }
+
+    #[test]
+    fn test_search_dimensions_exceeds_embedding_dims() {
+        let mut topic_config = HashMap::new();
+        // Default embedding dims = 1536
+        topic_config.insert("vector.search_dimensions".to_string(), "2000".to_string());
+        let result = VectorSearchConfig::from_topic_config(&topic_config);
+        assert!(result.is_err());
     }
 }

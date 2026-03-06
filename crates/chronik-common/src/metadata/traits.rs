@@ -184,6 +184,20 @@ impl TopicConfig {
             .and_then(|s| s.parse().ok())
     }
 
+    /// Get the inferred JSON schema config string (if set).
+    ///
+    /// Format: "field1:type1,field2:type2?" where ? indicates nullable.
+    /// Types: string, int64, float64, boolean, object, array.
+    pub fn json_schema(&self) -> Option<&str> {
+        self.config.get("columnar.json_schema").map(|s| s.as_str())
+    }
+
+    /// Set the inferred JSON schema config string.
+    pub fn with_json_schema(mut self, schema_str: &str) -> Self {
+        self.config.insert("columnar.json_schema".to_string(), schema_str.to_string());
+        self
+    }
+
     /// Create a vector-enabled topic config
     pub fn with_vector(mut self, provider: &str, model: &str, dimensions: usize) -> Self {
         self.config.insert("vector.enabled".to_string(), "true".to_string());

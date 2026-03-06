@@ -112,18 +112,17 @@ impl WalRecord {
 
     /// Update length and checksum fields
     fn update_length_and_checksum(&mut self) {
+        // Set length FIRST so calculate_checksum hashes the correct length value
         let length = self.calculate_length();
-        let crc32 = self.calculate_checksum();
-
         match self {
-            WalRecord::V1 { length: l, crc32: c, .. } => {
-                *l = length;
-                *c = crc32;
-            }
-            WalRecord::V2 { length: l, crc32: c, .. } => {
-                *l = length;
-                *c = crc32;
-            }
+            WalRecord::V1 { length: l, .. } => *l = length,
+            WalRecord::V2 { length: l, .. } => *l = length,
+        }
+
+        let crc32 = self.calculate_checksum();
+        match self {
+            WalRecord::V1 { crc32: c, .. } => *c = crc32,
+            WalRecord::V2 { crc32: c, .. } => *c = crc32,
         }
     }
 

@@ -274,14 +274,68 @@ impl MetadataWalReplicator {
             MetadataEvent::TopicCreated { topic, num_partitions } => {
                 tracing::info!("📡 Replicating TopicCreated: {} with {} partitions",
                     topic, num_partitions);
-                // Topics are created via separate CreateTopic command
-                // Partitions are assigned via PartitionAssigned events
-                // So we don't need to replicate this event directly
+
+                // v2.3.2 CRITICAL FIX: Replicate TopicCreated events to followers.
+                // Without this, followers don't know about newly created topics and their
+                // partition counts. When a topic is deleted and recreated with a different
+                // partition count, followers keep stale metadata and return
+                // UnknownTopicOrPartitionError for new partitions.
+                if let Ok(Some(topic_meta)) = self.metadata_store.get_topic(&topic).await {
+                    let metadata_event = chronik_common::metadata::MetadataEvent::new(
+                        chronik_common::metadata::MetadataEventPayload::TopicCreated {
+                            name: topic.clone(),
+                            config: topic_meta.config,
+                        },
+                    );
+
+                    match metadata_event.to_bytes() {
+                        Ok(data) => {
+                            self.replication_mgr.broadcast_metadata(
+                                self.wal.topic_name().to_string(),
+                                self.wal.partition(),
+                                0,
+                                data,
+                            ).await;
+                            tracing::info!("✅ TopicCreated broadcast to followers: {} ({} partitions)",
+                                topic, num_partitions);
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to serialize TopicCreated for {}: {}", topic, e);
+                        }
+                    }
+                } else {
+                    tracing::warn!("TopicCreated event for {} but topic not found in store", topic);
+                }
             }
 
             MetadataEvent::TopicDeleted { topic } => {
                 tracing::info!("📡 Replicating TopicDeleted: {}", topic);
-                // TODO: Implement when DeleteTopic command is added
+
+                // v2.3.2 CRITICAL FIX: Replicate TopicDeleted events to followers.
+                // Without this, followers keep stale topic metadata after deletion.
+                // When the same topic name is recreated with a different partition count,
+                // the idempotency check in apply_event() blocks the update, leaving
+                // followers with the old partition count.
+                let metadata_event = chronik_common::metadata::MetadataEvent::new(
+                    chronik_common::metadata::MetadataEventPayload::TopicDeleted {
+                        name: topic.clone(),
+                    },
+                );
+
+                match metadata_event.to_bytes() {
+                    Ok(data) => {
+                        self.replication_mgr.broadcast_metadata(
+                            self.wal.topic_name().to_string(),
+                            self.wal.partition(),
+                            0,
+                            data,
+                        ).await;
+                        tracing::info!("✅ TopicDeleted broadcast to followers: {}", topic);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to serialize TopicDeleted for {}: {}", topic, e);
+                    }
+                }
             }
 
             // v2.2.15 CRITICAL FIX: Replicate BrokerRegistered events to followers
@@ -363,11 +417,9 @@ mod tests {
     #[tokio::test]
     async fn test_metadata_wal_replicator_serialize() {
         // Test that we can serialize metadata commands correctly
-        let cmd = MetadataCommand::CreateTopic {
-            name: "test-topic".to_string(),
-            partition_count: 3,
-            replication_factor: 2,
-            config: HashMap::new(),
+        let cmd = MetadataCommand::AddNode {
+            node_id: 1,
+            address: "localhost:9092".to_string(),
         };
 
         let data = bincode::serialize(&cmd).unwrap();
@@ -376,10 +428,9 @@ mod tests {
         // Verify round-trip
         let cmd2: MetadataCommand = bincode::deserialize(&data).unwrap();
         match cmd2 {
-            MetadataCommand::CreateTopic { name, partition_count, replication_factor, .. } => {
-                assert_eq!(name, "test-topic");
-                assert_eq!(partition_count, 3);
-                assert_eq!(replication_factor, 2);
+            MetadataCommand::AddNode { node_id, address } => {
+                assert_eq!(node_id, 1);
+                assert_eq!(address, "localhost:9092");
             }
             _ => panic!("Unexpected command type"),
         }

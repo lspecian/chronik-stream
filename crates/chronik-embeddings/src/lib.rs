@@ -37,16 +37,18 @@ pub mod provider;
 pub mod openai;
 pub mod external;
 pub mod factory;
+pub mod reranker;
 
 #[cfg(feature = "local-models")]
 pub mod local;
 
 // Re-exports
-pub use config::{VectorSearchConfig, EmbeddingModelConfig, HnswConfig};
+pub use config::{VectorSearchConfig, EmbeddingModelConfig, HnswConfig, QuantizationMode};
 pub use provider::{EmbeddingProvider, EmbeddingBatch, EmbeddingResult};
 pub use openai::OpenAIProvider;
 pub use external::ExternalProvider;
 pub use factory::{create_provider, create_provider_from_model_config};
+pub use reranker::{RerankerProvider, RerankerConfig, RerankResult, create_reranker};
 
 #[cfg(feature = "local-models")]
 pub use local::LocalProvider;

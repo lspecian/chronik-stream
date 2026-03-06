@@ -89,8 +89,56 @@ impl MetadataState {
         match &event.payload {
             MetadataEventPayload::TopicCreated { name, config } => {
                 let mut topics = self.topics.write().await;
-                if topics.contains_key(name) {
-                    // Idempotent: Topic already exists from earlier event
+                if let Some(existing) = topics.get_mut(name) {
+                    // v2.3.2 CRITICAL FIX: If incoming partition count is HIGHER, this
+                    // is either a topic recreation with more partitions or an explicit
+                    // CreateTopics overriding an auto-created topic. Update the partition
+                    // count and add offsets for new partitions.
+                    //
+                    // NOTE: Only update when incoming > existing, never downgrade.
+                    // Auto-create events with fewer partitions must NOT overwrite
+                    // an explicit CreateTopics with more partitions.
+                    if config.partition_count > existing.config.partition_count {
+                        let old_count = existing.config.partition_count;
+                        tracing::info!(
+                            topic = %name,
+                            old_partitions = old_count,
+                            new_partitions = config.partition_count,
+                            "Topic partition count expanded - updating metadata"
+                        );
+                        existing.config = config.clone();
+                        existing.updated_at = event.timestamp;
+                        drop(topics);
+
+                        // Add partition offsets for new partitions only
+                        let mut offsets = self.partition_offsets.write().await;
+                        for partition in old_count..config.partition_count {
+                            let key = (name.clone(), partition);
+                            offsets.entry(key).or_insert((0, 0));
+                        }
+                        return Ok(());
+                    }
+
+                    // v2.3.1: Merge config from the new event into the existing topic.
+                    // In a Raft cluster, auto_create_topics() on a follower can race
+                    // with the real CreateTopics event from the leader. The auto-created
+                    // topic has a bare config, so we adopt any keys from the incoming
+                    // event that the existing topic doesn't have (e.g., vector.enabled,
+                    // searchable, columnar.enabled set by the real CreateTopics call).
+                    let mut merged = false;
+                    for (key, value) in &config.config {
+                        if !existing.config.config.contains_key(key) {
+                            existing.config.config.insert(key.clone(), value.clone());
+                            merged = true;
+                        }
+                    }
+                    if merged {
+                        existing.updated_at = event.timestamp;
+                        tracing::debug!(
+                            topic = %name,
+                            "Merged config keys from duplicate TopicCreated event"
+                        );
+                    }
                     return Ok(());
                 }
 
@@ -356,8 +404,29 @@ impl WalMetadataStore {
         Ok(())
     }
 
-    /// Apply event from replication (follower mode)
+    /// Apply event from replication (follower mode).
+    ///
+    /// Persists the event to the follower's local metadata WAL before applying
+    /// to in-memory state. This ensures replicated metadata (TopicCreated,
+    /// TopicUpdated, PartitionAssigned, etc.) survives pod restarts.
+    ///
+    /// NOTE: We intentionally do NOT publish to the event bus here — that would
+    /// cause infinite replication loops (leader → follower → leader → ...).
     pub async fn apply_replicated_event(&self, event: MetadataEvent) -> Result<()> {
+        // 1. Persist to local WAL for durability across restarts
+        let bytes = event.to_bytes()
+            .map_err(|e| MetadataError::StorageError(
+                format!("Failed to serialize replicated event: {}", e),
+            ))?;
+        if let Err(e) = (self.wal_append)(bytes).await {
+            tracing::warn!(
+                "Failed to persist replicated metadata event to local WAL: {}. \
+                 Event will be applied to in-memory state but may be lost on restart.",
+                e
+            );
+        }
+
+        // 2. Apply to in-memory state
         self.state.apply_event(&event).await
     }
 
@@ -368,6 +437,52 @@ impl WalMetadataStore {
             self.state.apply_event(&event).await?;
         }
         Ok(())
+    }
+
+    /// Re-broadcast all topic metadata via the event bus.
+    ///
+    /// Called by the leader after startup once metadata replication is wired up.
+    /// This ensures followers receive TopicCreated events for topics that were
+    /// created in previous pod lifecycles. Without this, followers that restart
+    /// would lose topic metadata (since replicated events weren't persisted to
+    /// their local WAL before the apply_replicated_event fix).
+    ///
+    /// Safe to call multiple times — followers' apply_replicated_event is
+    /// idempotent (creates topic only if it doesn't exist).
+    pub async fn broadcast_all_topics(&self) -> usize {
+        let publish_fn = match self.event_bus_publish {
+            Some(ref f) => f,
+            None => {
+                tracing::warn!("Cannot broadcast topics: event bus not wired up");
+                return 0;
+            }
+        };
+
+        let topics = self.state.topics.read().await;
+        let mut count = 0;
+        for (name, meta) in topics.iter() {
+            // Skip internal topics — they're managed separately
+            if name.starts_with("__") {
+                continue;
+            }
+
+            let event = MetadataEvent::new_with_node(
+                MetadataEventPayload::TopicCreated {
+                    name: name.clone(),
+                    config: meta.config.clone(),
+                },
+                self.node_id,
+            );
+            let subscribers = publish_fn(event);
+            count += 1;
+            tracing::info!(
+                topic = %name,
+                subscribers,
+                "Re-broadcast TopicCreated to followers"
+            );
+        }
+        tracing::info!(topics_broadcast = count, "Metadata re-broadcast complete");
+        count
     }
 }
 

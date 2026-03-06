@@ -27,11 +27,14 @@ use chronik_columnar::{
     CompressionCodec,
     PartitioningStrategy,
     converter::{RecordBatchConverter, KafkaRecord},
+    json_schema::InferredJsonSchema,
     schema::kafka_message_schema,
+    HotDataBuffer,
     VectorIndexManager, VectorIndexConfig, HnswIndexConfig, EmbeddingPipeline,
 };
 use chronik_embeddings::{VectorSearchConfig, create_provider};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::RwLock;
 use tokio::time::{interval, Duration};
 use tracing::{info, warn, error, debug, instrument};
@@ -226,15 +229,32 @@ pub struct WalIndexer {
     /// v2.2.22: Vector index manager for HNSW indexes per topic-partition
     /// Used by the embedding pipeline to store and search embeddings
     vector_index_manager: Arc<VectorIndexManager>,
+
+    /// Leadership flag — shared with RaftCluster's cached_is_leader.
+    /// On followers, segment metadata persistence is skipped to avoid deadlock
+    /// (writing to __chronik_metadata with acks=1 blocks forever on non-leaders).
+    /// Standalone/single-node: always true. Updated atomically by Raft on failover.
+    is_leader: Arc<AtomicBool>,
+
+    /// v2.4.1: Optional HotDataBuffer reference for set_flushed_offset() callback.
+    /// After Parquet files are created, we notify the hot buffer so it stops reading
+    /// already-persisted records from WAL, reducing memory usage.
+    hot_buffer: Arc<RwLock<Option<Arc<HotDataBuffer>>>>,
 }
 
 impl WalIndexer {
     /// Create a new WAL indexer
+    ///
+    /// `is_leader` is a shared atomic flag from RaftCluster indicating whether
+    /// this node is the current leader. Followers skip segment metadata persistence
+    /// to avoid deadlocking on __chronik_metadata writes. Pass `None` for standalone
+    /// mode (defaults to always-true).
     pub fn new(
         config: WalIndexerConfig,
         wal_manager: Arc<WalManager>,
         object_store: Arc<dyn ObjectStore>,
         metadata_store: Arc<dyn MetadataStore>,
+        is_leader: Option<Arc<AtomicBool>>,
     ) -> Self {
         // Create segment index with persistence
         let segment_index = if let Some(ref path) = config.segment_index_path {
@@ -282,7 +302,16 @@ impl WalIndexer {
             columnar_topics: Arc::new(RwLock::new(HashSet::new())),
             vector_topics: Arc::new(RwLock::new(HashSet::new())),
             vector_index_manager,
+            is_leader: is_leader.unwrap_or_else(|| Arc::new(AtomicBool::new(true))),
+            hot_buffer: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// v2.4.1: Set the HotDataBuffer reference for flushed offset notifications.
+    /// Called from main.rs after both WalIndexer and HotDataBuffer are created.
+    pub async fn set_hot_buffer(&self, buffer: Arc<HotDataBuffer>) {
+        *self.hot_buffer.write().await = Some(buffer);
+        info!("HotDataBuffer wired to WalIndexer for flushed offset notifications");
     }
 
     /// v2.2.16: Refresh the searchable topics cache from metadata store
@@ -443,6 +472,8 @@ impl WalIndexer {
         let running = Arc::clone(&self.running);
         let runtime = Arc::clone(&self.runtime);
         let vector_index_manager = Arc::clone(&self.vector_index_manager);
+        let is_leader = Arc::clone(&self.is_leader);
+        let hot_buffer = Arc::clone(&self.hot_buffer);
         let snapshot_interval = self.config.snapshot_interval_secs();
 
         // CRITICAL v2.2.10: Spawn on dedicated runtime, NOT main runtime
@@ -509,6 +540,8 @@ impl WalIndexer {
                     &metadata_store,
                     &indexing_in_progress,
                     &vector_index_manager,
+                    &is_leader,
+                    &hot_buffer,
                 ).await {
                     Ok(stats) => {
                         if stats.segments_processed > 0 {
@@ -560,11 +593,13 @@ impl WalIndexer {
             &self.metadata_store,
             &self.indexing_in_progress,
             &self.vector_index_manager,
+            &self.is_leader,
+            &self.hot_buffer,
         ).await
     }
 
     /// Index sealed segments (internal implementation)
-    #[instrument(skip(config, wal_manager, object_store, segment_index, metadata_store, indexing_in_progress, vector_index_manager))]
+    #[instrument(skip(config, wal_manager, object_store, segment_index, metadata_store, indexing_in_progress, vector_index_manager, is_leader, hot_buffer))]
     async fn index_sealed_segments_internal(
         config: &WalIndexerConfig,
         wal_manager: &Arc<WalManager>,
@@ -573,6 +608,8 @@ impl WalIndexer {
         metadata_store: &Arc<dyn MetadataStore>,
         indexing_in_progress: &Arc<RwLock<HashSet<String>>>,
         vector_index_manager: &Arc<VectorIndexManager>,
+        is_leader: &Arc<AtomicBool>,
+        hot_buffer: &Arc<RwLock<Option<Arc<HotDataBuffer>>>>,
     ) -> Result<IndexingStats> {
         let start_time = std::time::Instant::now();
         let mut stats = IndexingStats::default();
@@ -635,6 +672,8 @@ impl WalIndexer {
                 vector_index_manager,
                 segment_id,
                 &mut stats,
+                is_leader,
+                hot_buffer,
             ).await {
                 Ok(_) => {
                     debug!(segment = %segment_id, "Successfully indexed segment");
@@ -659,7 +698,7 @@ impl WalIndexer {
     }
 
     /// Index a single sealed WAL segment
-    #[instrument(skip(config, wal_manager, object_store, segment_index, metadata_store, vector_index_manager, stats))]
+    #[instrument(skip(config, wal_manager, object_store, segment_index, metadata_store, vector_index_manager, stats, is_leader, hot_buffer))]
     async fn index_segment(
         config: &WalIndexerConfig,
         wal_manager: &Arc<WalManager>,
@@ -669,6 +708,8 @@ impl WalIndexer {
         vector_index_manager: &Arc<VectorIndexManager>,
         segment_id: &str,
         stats: &mut IndexingStats,
+        is_leader: &Arc<AtomicBool>,
+        hot_buffer: &Arc<RwLock<Option<Arc<HotDataBuffer>>>>,
     ) -> Result<()> {
         info!(segment = %segment_id, "Indexing WAL segment");
 
@@ -708,6 +749,9 @@ impl WalIndexer {
             }
         }
 
+        // Collect vector embedding work for concurrent processing after the main loop
+        let mut vector_work_items: Vec<(TopicPartition, Vec<CanonicalRecord>)> = Vec::new();
+
         // Process each topic-partition: upload raw segments + create Tantivy indexes
         for (tp, canonical_records) in tp_records {
             // STEP 1: Upload raw segment data to S3 (Tier 2: warm storage)
@@ -717,6 +761,7 @@ impl WalIndexer {
                 metadata_store,
                 &tp,
                 &canonical_records,
+                is_leader,
             ).await {
                 Ok(segment_bytes) => {
                     info!(
@@ -746,16 +791,16 @@ impl WalIndexer {
             // v2.2.21: Only create Parquet files for columnar-enabled topics
             // v2.2.22: Only generate embeddings for vector-enabled topics
             let (is_searchable, is_columnar, is_vector) = {
-                // Check if topic is in searchable set by looking up metadata
-                // For performance, we check the config directly here
-                let topic_config = metadata_store.get_topic(&tp.topic).await
-                    .map(|opt| opt.map(|t| (
-                        t.config.is_searchable(),
-                        t.config.is_columnar_enabled(),
-                        t.config.is_vector_enabled(),
-                    )).unwrap_or((false, false, false)))
-                    .unwrap_or((false, false, false));
-                topic_config
+                // Look up topic config from metadata store. If topic not yet in metadata
+                // (e.g., follower node hasn't received TopicCreated event yet), fall back
+                // to a default TopicConfig which respects env var defaults like
+                // CHRONIK_DEFAULT_VECTOR_ENABLED, CHRONIK_DEFAULT_COLUMNAR, etc.
+                let config = metadata_store.get_topic(&tp.topic).await
+                    .ok()
+                    .flatten()
+                    .map(|t| t.config)
+                    .unwrap_or_default();
+                (config.is_searchable(), config.is_columnar_enabled(), config.is_vector_enabled())
             };
 
             // Clone records for each processing step that needs them
@@ -827,14 +872,23 @@ impl WalIndexer {
                     &tp,
                     records,
                 ).await {
-                    Ok(bytes_written) => {
+                    Ok((bytes_written, max_offset)) => {
                         info!(
                             topic = %tp.topic,
                             partition = tp.partition,
                             bytes = bytes_written,
+                            max_offset = max_offset,
                             "Created Parquet file (columnar-enabled topic)"
                         );
                         stats.bytes_written += bytes_written;
+
+                        // v2.4.1: Notify hot buffer that records up to max_offset
+                        // are now in Parquet, so they can be skipped in WAL reads.
+                        if max_offset >= 0 {
+                            if let Some(hb) = hot_buffer.read().await.as_ref() {
+                                hb.set_flushed_offset(&tp.topic, tp.partition, max_offset);
+                            }
+                        }
                     }
                     Err(e) => {
                         error!(
@@ -854,40 +908,108 @@ impl WalIndexer {
                 );
             }
 
-            // STEP 2c: Generate vector embeddings (vector-enabled topics only)
-            // v2.2.22: Async embedding generation for semantic search
+            // STEP 2c: Collect vector embedding work for concurrent processing
+            // v2.4.0: Defer embedding to run concurrently across partitions
             if let Some(records) = records_for_vector {
-                match Self::process_vector_embeddings(
-                    config,
-                    metadata_store,
-                    vector_index_manager,
-                    &tp,
-                    records,
-                ).await {
-                    Ok(embeddings_generated) => {
-                        info!(
-                            topic = %tp.topic,
-                            partition = tp.partition,
-                            embeddings = embeddings_generated,
-                            "Generated vector embeddings (vector-enabled topic)"
-                        );
-                    }
-                    Err(e) => {
-                        error!(
-                            topic = %tp.topic,
-                            partition = tp.partition,
-                            error = %e,
-                            "Failed to generate vector embeddings"
-                        );
-                        stats.errors += 1;
-                    }
-                }
+                vector_work_items.push((tp.clone(), records));
             } else {
                 debug!(
                     topic = %tp.topic,
                     partition = tp.partition,
                     "Skipping vector embeddings (non-vector topic)"
                 );
+            }
+        }
+
+        // STEP 3: Process all vector embeddings concurrently across partitions
+        // v2.4.0: Up to 3 partitions embed in parallel, reducing total wall-clock time
+        if !vector_work_items.is_empty() {
+            let max_partition_concurrency = std::env::var("CHRONIK_VECTOR_PARTITION_CONCURRENCY")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(3)
+                .max(1)
+                .min(8);
+
+            if vector_work_items.len() == 1 || max_partition_concurrency <= 1 {
+                // Serial: single partition or concurrency disabled
+                for (tp, records) in vector_work_items {
+                    match Self::process_vector_embeddings(
+                        config,
+                        metadata_store,
+                        vector_index_manager,
+                        &tp,
+                        records,
+                    ).await {
+                        Ok(embeddings_generated) => {
+                            info!(
+                                topic = %tp.topic,
+                                partition = tp.partition,
+                                embeddings = embeddings_generated,
+                                "Generated vector embeddings (vector-enabled topic)"
+                            );
+                        }
+                        Err(e) => {
+                            error!(
+                                topic = %tp.topic,
+                                partition = tp.partition,
+                                error = %e,
+                                "Failed to generate vector embeddings"
+                            );
+                            stats.errors += 1;
+                        }
+                    }
+                }
+            } else {
+                // Concurrent: multiple partitions embed in parallel
+                let semaphore = Arc::new(tokio::sync::Semaphore::new(max_partition_concurrency));
+                let mut join_set = tokio::task::JoinSet::new();
+
+                for (tp, records) in vector_work_items {
+                    let permit = semaphore.clone().acquire_owned().await
+                        .map_err(|e| Error::Internal(format!("Semaphore closed: {}", e)))?;
+                    let config = config.clone();
+                    let metadata_store = Arc::clone(metadata_store);
+                    let vector_index_manager = Arc::clone(vector_index_manager);
+
+                    join_set.spawn(async move {
+                        let result = Self::process_vector_embeddings(
+                            &config,
+                            &metadata_store,
+                            &vector_index_manager,
+                            &tp,
+                            records,
+                        ).await;
+                        drop(permit);
+                        (tp, result)
+                    });
+                }
+
+                while let Some(join_result) = join_set.join_next().await {
+                    match join_result {
+                        Ok((tp, Ok(embeddings_generated))) => {
+                            info!(
+                                topic = %tp.topic,
+                                partition = tp.partition,
+                                embeddings = embeddings_generated,
+                                "Generated vector embeddings (concurrent, vector-enabled topic)"
+                            );
+                        }
+                        Ok((tp, Err(e))) => {
+                            error!(
+                                topic = %tp.topic,
+                                partition = tp.partition,
+                                error = %e,
+                                "Failed to generate vector embeddings (concurrent)"
+                            );
+                            stats.errors += 1;
+                        }
+                        Err(e) => {
+                            error!(error = %e, "Vector embedding task panicked");
+                            stats.errors += 1;
+                        }
+                    }
+                }
             }
         }
 
@@ -906,12 +1028,13 @@ impl WalIndexer {
     ///
     /// This stores the actual CanonicalRecords (bincode-serialized) so consumers can
     /// fetch messages from S3 when they're no longer in local WAL/segments.
-    #[instrument(skip(object_store, metadata_store, canonical_records))]
+    #[instrument(skip(object_store, metadata_store, canonical_records, is_leader))]
     async fn upload_raw_segment(
         object_store: &Arc<dyn ObjectStore>,
         metadata_store: &Arc<dyn MetadataStore>,
         tp: &TopicPartition,
         canonical_records: &[CanonicalRecord],
+        is_leader: &Arc<AtomicBool>,
     ) -> Result<u64> {
         if canonical_records.is_empty() {
             return Ok(0);
@@ -957,31 +1080,45 @@ impl WalIndexer {
             "Uploaded raw segment data to S3"
         );
 
-        // Register segment metadata in the metadata store
-        // This allows high watermarks to be restored on startup
-        let segment_id = format!("{}-{}", min_offset, max_offset);
-        let segment_metadata = MetadataSegmentMetadata {
-            segment_id,
-            topic: tp.topic.clone(),
-            partition: tp.partition as u32,
-            start_offset: min_offset,
-            end_offset: max_offset,
-            size: data_size as i64,
-            record_count: canonical_records.iter().map(|r| r.records.len() as i64).sum(),
-            path: object_key.clone(),
-            created_at: chrono::Utc::now(),
-        };
+        // Register segment metadata in the metadata store for disaster recovery.
+        // This allows high watermarks to be restored on startup.
+        // Only persist on leader — followers don't own __chronik_metadata partition.
+        if is_leader.load(Ordering::Relaxed) {
+            let segment_id = format!("{}-{}", min_offset, max_offset);
+            let segment_metadata = MetadataSegmentMetadata {
+                segment_id,
+                topic: tp.topic.clone(),
+                partition: tp.partition as u32,
+                start_offset: min_offset,
+                end_offset: max_offset,
+                size: data_size as i64,
+                record_count: canonical_records.iter().map(|r| r.records.len() as i64).sum(),
+                path: object_key.clone(),
+                created_at: chrono::Utc::now(),
+            };
 
-        metadata_store.persist_segment_metadata(segment_metadata).await
-            .map_err(|e| Error::Internal(format!("Failed to register segment metadata: {}", e)))?;
-
-        info!(
-            topic = %tp.topic,
-            partition = tp.partition,
-            min_offset = min_offset,
-            max_offset = max_offset,
-            "Registered segment metadata"
-        );
+            match metadata_store.persist_segment_metadata(segment_metadata).await {
+                Ok(()) => {
+                    debug!(
+                        topic = %tp.topic,
+                        partition = tp.partition,
+                        min_offset = min_offset,
+                        max_offset = max_offset,
+                        "Registered segment metadata"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        topic = %tp.topic,
+                        partition = tp.partition,
+                        min_offset = min_offset,
+                        max_offset = max_offset,
+                        error = %e,
+                        "Failed to register segment metadata (non-fatal, S3 upload succeeded)"
+                    );
+                }
+            }
+        }
 
         Ok(data_size)
     }
@@ -1103,6 +1240,7 @@ impl WalIndexer {
     /// Uses time-based partitioning (hourly by default) for efficient query pruning.
     /// Registers the new Parquet segment with the SegmentIndex for SQL query planning.
     #[instrument(skip(config, object_store, metadata_store, segment_index, canonical_records))]
+    /// Returns (bytes_written, max_offset) on success.
     async fn create_parquet_segment(
         config: &WalIndexerConfig,
         object_store: &Arc<dyn ObjectStore>,
@@ -1110,16 +1248,16 @@ impl WalIndexer {
         segment_index: &Arc<SegmentIndex>,
         tp: &TopicPartition,
         canonical_records: Vec<CanonicalRecord>,
-    ) -> Result<u64> {
+    ) -> Result<(u64, i64)> {
         if canonical_records.is_empty() {
-            return Ok(0);
+            return Ok((0, -1));
         }
 
         // Get topic config to read columnar settings
         let topic_config = metadata_store.get_topic(&tp.topic).await
             .map_err(|e| Error::Internal(format!("Failed to get topic config: {}", e)))?;
 
-        let columnar_config = if let Some(topic) = topic_config {
+        let columnar_config = if let Some(ref topic) = topic_config {
             Self::build_columnar_config(&topic.config)
         } else {
             ColumnarConfig::default()
@@ -1156,7 +1294,7 @@ impl WalIndexer {
                 partition = tp.partition,
                 "No records to write to Parquet"
             );
-            return Ok(0);
+            return Ok((0, -1));
         }
 
         // Calculate offset and timestamp ranges for naming
@@ -1165,13 +1303,58 @@ impl WalIndexer {
         let min_timestamp = kafka_records.iter().map(|r| r.timestamp_ms).min().unwrap_or(0);
         let max_timestamp = kafka_records.iter().map(|r| r.timestamp_ms).max().unwrap_or(0);
 
-        // Convert to Arrow RecordBatch
+        // Check if topic has JSON schema for columnar extraction
+        let json_schema = if let Some(ref tc) = topic_config {
+            if let Some(schema_str) = tc.config.json_schema() {
+                InferredJsonSchema::from_config_string(schema_str)
+            } else {
+                // First time: infer schema from sample values and persist
+                let sample_values: Vec<&[u8]> = kafka_records
+                    .iter()
+                    .take(100)
+                    .map(|r| r.value.as_slice())
+                    .collect();
+                if let Some(inferred) = InferredJsonSchema::infer(&sample_values, 64) {
+                    let config_str = inferred.to_config_string();
+                    debug!(
+                        topic = %tp.topic,
+                        schema = %config_str,
+                        "Inferred JSON schema for columnar storage"
+                    );
+                    // Persist to topic config (best-effort, don't block on failure)
+                    let mut updated_config = tc.config.clone();
+                    updated_config.config.insert(
+                        "columnar.json_schema".to_string(),
+                        config_str,
+                    );
+                    if let Err(e) = metadata_store.update_topic(&tp.topic, updated_config).await {
+                        warn!(
+                            topic = %tp.topic,
+                            error = %e,
+                            "Failed to persist inferred JSON schema (will re-infer next time)"
+                        );
+                    }
+                    Some(inferred)
+                } else {
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Convert to Arrow RecordBatch (with JSON columns if schema available)
         let converter = RecordBatchConverter::new();
-        let batch = converter.convert(&kafka_records)
-            .map_err(|e| Error::Internal(format!("Failed to convert to RecordBatch: {}", e)))?;
+        let batch = if let Some(ref js) = json_schema {
+            converter.convert_with_json(&kafka_records, js)
+                .map_err(|e| Error::Internal(format!("Failed to convert to RecordBatch: {}", e)))?
+        } else {
+            converter.convert(&kafka_records)
+                .map_err(|e| Error::Internal(format!("Failed to convert to RecordBatch: {}", e)))?
+        };
 
         // Create Parquet writer and write to bytes
-        let schema = kafka_message_schema();
+        let schema = (*batch.schema()).clone();
         let writer = ParquetSegmentWriter::new(schema, columnar_config.clone());
         let (parquet_bytes, stats) = writer.write_to_bytes(&[batch])
             .map_err(|e| Error::Internal(format!("Failed to write Parquet: {}", e)))?;
@@ -1295,8 +1478,7 @@ impl WalIndexer {
         segment_index.add_parquet_segment(parquet_metadata.clone()).await
             .map_err(|e| Error::Internal(format!("Failed to register Parquet segment: {}", e)))?;
 
-        // v2.2.22: Also persist to metadata store for SQL handler access
-        // The SQL handler uses metadata_store.get_parquet_paths() to discover tables
+        // Persist Parquet segment metadata for SQL handler discovery
         let common_metadata = chronik_common::metadata::ParquetSegmentMetadata {
             segment_id: parquet_metadata.segment_id,
             topic: parquet_metadata.topic,
@@ -1320,7 +1502,7 @@ impl WalIndexer {
                 topic = %tp.topic,
                 partition = tp.partition,
                 error = %e,
-                "Failed to persist Parquet segment to metadata store (SQL queries may not see this segment)"
+                "Failed to persist Parquet segment metadata (non-fatal)"
             );
         }
 
@@ -1332,7 +1514,7 @@ impl WalIndexer {
             "Registered Parquet segment in index and metadata store"
         );
 
-        Ok(bytes_written)
+        Ok((bytes_written, max_offset))
     }
 
     /// v2.2.22: Process vector embeddings for CanonicalRecords
@@ -1344,13 +1526,31 @@ impl WalIndexer {
     /// - `vector.field` = "value" (default) | "key" | JSON path like "$.message.text"
     /// - `vector.provider` = "openai" | "external" | "local"
     /// - `vector.model` = model name (e.g., "text-embedding-3-small")
-    #[instrument(skip(_config, metadata_store, vector_index_manager, canonical_records))]
+    #[instrument(skip(config, metadata_store, vector_index_manager, canonical_records))]
     async fn process_vector_embeddings(
+        config: &WalIndexerConfig,
+        metadata_store: &Arc<dyn MetadataStore>,
+        vector_index_manager: &Arc<VectorIndexManager>,
+        tp: &TopicPartition,
+        canonical_records: Vec<CanonicalRecord>,
+    ) -> Result<usize> {
+        Self::process_vector_embeddings_with_model(
+            config, metadata_store, vector_index_manager, tp, canonical_records, None,
+        ).await
+    }
+
+    /// Process vector embeddings with an optional model ID override.
+    ///
+    /// When `model_id` is Some, vectors are stored under that model's index
+    /// (enabling multi-model A/B testing and re-embedding). When None, the
+    /// default model is used.
+    async fn process_vector_embeddings_with_model(
         _config: &WalIndexerConfig,
         metadata_store: &Arc<dyn MetadataStore>,
         vector_index_manager: &Arc<VectorIndexManager>,
         tp: &TopicPartition,
         canonical_records: Vec<CanonicalRecord>,
+        model_id: Option<&str>,
     ) -> Result<usize> {
         if canonical_records.is_empty() {
             return Ok(0);
@@ -1431,15 +1631,16 @@ impl WalIndexer {
             vector_index_manager.register_topic(&tp.topic, hnsw_config).await;
         }
 
-        // Create embedding pipeline
-        let pipeline = EmbeddingPipeline::new(
+        // Create embedding pipeline with configured concurrency
+        let pipeline = EmbeddingPipeline::with_concurrency(
             provider,
             Arc::clone(vector_index_manager),
             vector_config.batch_size,
+            vector_config.embedding_concurrency,
         );
 
-        // Process messages through the pipeline
-        match pipeline.process_messages(&tp.topic, tp.partition, texts).await {
+        // Process messages through the pipeline (model-aware when specified)
+        match pipeline.process_messages_for_model(&tp.topic, tp.partition, texts, model_id).await {
             Ok(stats) => {
                 info!(
                     topic = %tp.topic,
@@ -1656,6 +1857,176 @@ impl WalIndexer {
             }
         }
     }
+
+    /// v2.3.1: Backfill vector embeddings from existing Tier 2 raw segments.
+    ///
+    /// When vector embedding is enabled after data is already loaded, existing
+    /// sealed segments have been processed (Tantivy/Parquet) and deleted from the WAL.
+    /// This method reads those segments from object store and feeds them through the
+    /// embedding pipeline, skipping offsets already in the HNSW index.
+    ///
+    /// Returns stats about the backfill operation.
+    pub async fn backfill_vector_embeddings(
+        &self,
+        topic: &str,
+        partition: Option<i32>,
+        model_id: Option<&str>,
+    ) -> Result<BackfillStats> {
+        let mut stats = BackfillStats::default();
+        stats.model_id = model_id.map(|s| s.to_string());
+        let start_time = std::time::Instant::now();
+
+        // 1. Verify topic exists and has vector enabled
+        let topic_meta = self.metadata_store.get_topic(topic).await
+            .map_err(|e| Error::Internal(format!("Failed to get topic: {}", e)))?
+            .ok_or_else(|| Error::Internal(format!("Topic '{}' not found", topic)))?;
+
+        if !topic_meta.config.is_vector_enabled() {
+            return Err(Error::Internal(format!(
+                "Topic '{}' does not have vector search enabled", topic
+            )));
+        }
+
+        info!(topic = %topic, partition = ?partition, "Starting vector embedding backfill");
+
+        // 2. List raw segments from metadata store
+        let segments = self.metadata_store.list_segments(topic, partition.map(|p| p as u32)).await
+            .map_err(|e| Error::Internal(format!("Failed to list segments: {}", e)))?;
+
+        if segments.is_empty() {
+            info!(topic = %topic, "No segments found for backfill");
+            stats.duration_secs = start_time.elapsed().as_secs();
+            return Ok(stats);
+        }
+
+        info!(
+            topic = %topic,
+            segment_count = segments.len(),
+            "Found segments for vector backfill"
+        );
+
+        // 3. Process each segment
+        for segment in &segments {
+            // Check if we should skip this partition
+            if let Some(p) = partition {
+                if segment.partition as i32 != p {
+                    continue;
+                }
+            }
+
+            // Check HNSW index last_offset to skip already-embedded segments
+            let tp = TopicPartition::new(topic.to_string(), segment.partition as i32);
+            let last_indexed_offset = self.vector_index_manager
+                .get_partition_stats(&tp.topic, tp.partition).await
+                .and_then(|s| s.last_offset)
+                .unwrap_or(-1);
+
+            if segment.end_offset <= last_indexed_offset {
+                debug!(
+                    topic = %topic,
+                    partition = segment.partition,
+                    segment_end = segment.end_offset,
+                    last_indexed = last_indexed_offset,
+                    "Skipping segment (already embedded)"
+                );
+                stats.skipped_segments += 1;
+                continue;
+            }
+
+            // Read raw segment from object store
+            let data = match self.object_store.get(&segment.path).await {
+                Ok(d) => d,
+                Err(e) => {
+                    warn!(
+                        topic = %topic,
+                        partition = segment.partition,
+                        path = %segment.path,
+                        error = %e,
+                        "Failed to read segment from object store, skipping"
+                    );
+                    stats.errors += 1;
+                    continue;
+                }
+            };
+
+            // Deserialize CanonicalRecords
+            let canonical_records: Vec<CanonicalRecord> = match bincode::deserialize(&data) {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(
+                        topic = %topic,
+                        partition = segment.partition,
+                        path = %segment.path,
+                        error = %e,
+                        "Failed to deserialize segment, skipping"
+                    );
+                    stats.errors += 1;
+                    continue;
+                }
+            };
+
+            if canonical_records.is_empty() {
+                continue;
+            }
+
+            // Run through the vector embedding pipeline
+            match Self::process_vector_embeddings_with_model(
+                &self.config,
+                &self.metadata_store,
+                &self.vector_index_manager,
+                &tp,
+                canonical_records,
+                model_id,
+            ).await {
+                Ok(embeddings_generated) => {
+                    info!(
+                        topic = %topic,
+                        partition = segment.partition,
+                        segment = %segment.segment_id,
+                        embeddings = embeddings_generated,
+                        "Backfill: generated embeddings for segment"
+                    );
+                    stats.vectors_generated += embeddings_generated;
+                    stats.segments_processed += 1;
+                }
+                Err(e) => {
+                    error!(
+                        topic = %topic,
+                        partition = segment.partition,
+                        segment = %segment.segment_id,
+                        error = %e,
+                        "Backfill: failed to generate embeddings for segment"
+                    );
+                    stats.errors += 1;
+                }
+            }
+        }
+
+        stats.duration_secs = start_time.elapsed().as_secs();
+        info!(
+            topic = %topic,
+            segments_processed = stats.segments_processed,
+            vectors_generated = stats.vectors_generated,
+            skipped = stats.skipped_segments,
+            errors = stats.errors,
+            duration_secs = stats.duration_secs,
+            "Vector embedding backfill complete"
+        );
+
+        Ok(stats)
+    }
+}
+
+/// Statistics for a vector embedding backfill operation
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct BackfillStats {
+    pub segments_processed: usize,
+    pub vectors_generated: usize,
+    pub skipped_segments: usize,
+    pub errors: usize,
+    pub duration_secs: u64,
+    /// Model ID used for this backfill (None = default model)
+    pub model_id: Option<String>,
 }
 
 #[cfg(test)]
@@ -1875,7 +2246,7 @@ mod tests {
         // 7. Create TopicPartition and call create_parquet_segment
         let tp = TopicPartition::new("test-columnar-topic".to_string(), 0);
 
-        let records_written = WalIndexer::create_parquet_segment(
+        let (bytes_written, max_offset) = WalIndexer::create_parquet_segment(
             &indexer_config,
             &object_store,
             &metadata_store,
@@ -1884,8 +2255,9 @@ mod tests {
             records,
         ).await.unwrap();
 
-        // 8. Verify bytes were written (create_parquet_segment returns bytes, not record count)
-        assert!(records_written > 0, "Expected bytes to be written to Parquet file");
+        // 8. Verify bytes were written (create_parquet_segment returns (bytes, max_offset))
+        assert!(bytes_written > 0, "Expected bytes to be written to Parquet file");
+        assert!(max_offset >= 0, "Expected valid max_offset from Parquet segment");
 
         // 9. Verify Parquet segment was registered in SegmentIndex
         let parquet_paths = segment_index.get_parquet_paths("test-columnar-topic").await.unwrap();
@@ -1907,6 +2279,152 @@ mod tests {
             }
         }
         assert!(found_parquet, "Expected to find a Parquet file in object store path");
+    }
+
+    // v2.4.1: Test that JSON columns appear in Parquet output
+    #[tokio::test]
+    async fn test_create_parquet_segment_with_json_columns() {
+        use crate::object_store::{LocalBackend, ObjectStoreConfig, StorageBackend, ObjectStore};
+        use chronik_common::metadata::{InMemoryMetadataStore, TopicConfig};
+        use tempfile::tempdir;
+        use std::collections::HashMap;
+
+        let temp_dir = tempdir().unwrap();
+        let object_store_path = temp_dir.path().join("parquet");
+        std::fs::create_dir_all(&object_store_path).unwrap();
+
+        let config = ObjectStoreConfig {
+            backend: StorageBackend::Local { path: object_store_path.to_string_lossy().to_string() },
+            ..Default::default()
+        };
+        let object_store: Arc<dyn ObjectStore> = Arc::new(LocalBackend::new(config).await.unwrap());
+
+        let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+        let mut topic_config_map = HashMap::new();
+        topic_config_map.insert("columnar.enabled".to_string(), "true".to_string());
+
+        let topic_config = TopicConfig {
+            partition_count: 1,
+            replication_factor: 1,
+            retention_ms: None,
+            segment_bytes: 1024 * 1024 * 1024,
+            config: topic_config_map,
+        };
+        metadata_store.create_topic("json-test-topic", topic_config).await.unwrap();
+
+        let segment_index = Arc::new(SegmentIndex::new());
+        let indexer_config = WalIndexerConfig {
+            columnar_base_path: object_store_path.to_string_lossy().to_string(),
+            ..Default::default()
+        };
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        // Create JSON records with typed fields
+        let records = vec![
+            CanonicalRecord {
+                base_offset: 0,
+                partition_leader_epoch: 0,
+                producer_id: -1,
+                producer_epoch: -1,
+                base_sequence: -1,
+                is_transactional: false,
+                is_control: false,
+                compression: crate::canonical_record::CompressionType::None,
+                timestamp_type: TimestampType::CreateTime,
+                base_timestamp: now,
+                max_timestamp: now + 200,
+                records: vec![
+                    CanonicalRecordEntry {
+                        offset: 0,
+                        timestamp: now,
+                        key: Some(b"k0".to_vec()),
+                        value: Some(br#"{"user_id":1,"name":"Alice","score":9.5,"active":true}"#.to_vec()),
+                        headers: vec![],
+                        attributes: 0,
+                    },
+                    CanonicalRecordEntry {
+                        offset: 1,
+                        timestamp: now + 100,
+                        key: Some(b"k1".to_vec()),
+                        value: Some(br#"{"user_id":2,"name":"Bob","score":8.0,"active":false}"#.to_vec()),
+                        headers: vec![],
+                        attributes: 0,
+                    },
+                    CanonicalRecordEntry {
+                        offset: 2,
+                        timestamp: now + 200,
+                        key: Some(b"k2".to_vec()),
+                        value: Some(br#"{"user_id":3,"name":"Charlie","score":7.2,"active":true}"#.to_vec()),
+                        headers: vec![],
+                        attributes: 0,
+                    },
+                ],
+                compressed_records_wire_bytes: None,
+                original_v1_wire_format: None,
+                original_v2_wire_format: None,
+            },
+        ];
+
+        let tp = TopicPartition::new("json-test-topic".to_string(), 0);
+        let (bytes_written, max_offset) = WalIndexer::create_parquet_segment(
+            &indexer_config,
+            &object_store,
+            &metadata_store,
+            &segment_index,
+            &tp,
+            records,
+        ).await.unwrap();
+
+        assert!(bytes_written > 0);
+        assert_eq!(max_offset, 2);
+
+        // Verify JSON schema was persisted to topic config
+        let updated_topic = metadata_store.get_topic("json-test-topic").await.unwrap().unwrap();
+        let schema_str = updated_topic.config.json_schema()
+            .expect("JSON schema should have been persisted to topic config");
+        assert!(schema_str.contains("user_id"));
+        assert!(schema_str.contains("name"));
+        assert!(schema_str.contains("score"));
+        assert!(schema_str.contains("active"));
+
+        // Verify the Parquet file has JSON columns by reading it
+        let mut parquet_path = None;
+        for entry in walkdir::WalkDir::new(&object_store_path)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            if entry.path().extension().map(|e| e == "parquet").unwrap_or(false) {
+                parquet_path = Some(entry.path().to_path_buf());
+                break;
+            }
+        }
+        let parquet_path = parquet_path.expect("Should find Parquet file");
+
+        // Read the Parquet file schema — this is the critical verification
+        let reader = chronik_columnar::ParquetSegmentReader::new(Default::default());
+        let schema = reader.read_schema(&parquet_path).unwrap();
+        let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+
+        // Base columns should be present
+        assert!(field_names.contains(&"_topic"), "Missing _topic column");
+        assert!(field_names.contains(&"_partition"), "Missing _partition column");
+        assert!(field_names.contains(&"_offset"), "Missing _offset column");
+        assert!(field_names.contains(&"_value"), "Missing _value column");
+
+        // JSON-inferred columns should also be present
+        assert!(field_names.contains(&"user_id"), "Missing user_id JSON column, fields: {:?}", field_names);
+        assert!(field_names.contains(&"name"), "Missing name JSON column, fields: {:?}", field_names);
+        assert!(field_names.contains(&"score"), "Missing score JSON column, fields: {:?}", field_names);
+        assert!(field_names.contains(&"active"), "Missing active JSON column, fields: {:?}", field_names);
+
+        // Verify row count from Parquet metadata
+        let metadata = reader.read_metadata(&parquet_path).unwrap();
+        let total_rows: i64 = metadata.row_groups().iter().map(|rg| rg.num_rows()).sum();
+        assert_eq!(total_rows, 3, "Expected 3 rows in Parquet file");
     }
 
     // v2.2.22: Vector text extraction tests

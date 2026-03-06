@@ -244,7 +244,13 @@ impl JsonPipelineBuilder {
         self.indexer_config.num_indexing_threads = threads;
         self
     }
-    
+
+    /// Set the index base path
+    pub fn index_base_path(mut self, path: std::path::PathBuf) -> Self {
+        self.indexer_config.index_base_path = path;
+        self
+    }
+
     /// Build the pipeline
     pub async fn build(self) -> Result<JsonPipeline> {
         JsonPipeline::new(self.pipeline_config, self.indexer_config).await
@@ -278,10 +284,11 @@ mod tests {
     #[tokio::test]
     async fn test_json_pipeline_basic() {
         let temp_dir = TempDir::new().unwrap();
-        
+
         let pipeline = JsonPipelineBuilder::new()
             .channel_buffer_size(100)
             .batch_size(5)
+            .index_base_path(temp_dir.path().to_path_buf())
             .build()
             .await
             .unwrap();
@@ -307,25 +314,31 @@ mod tests {
         };
         
         pipeline.process_batch("test-topic", 0, &batch).await.unwrap();
-        
-        // Wait for processing
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        
+
         let stats = pipeline.stats().await;
         assert_eq!(stats.messages_processed, 2);
         assert_eq!(stats.parse_errors, 0);
-        
+
+        // Wait for async indexer to process documents
+        for _ in 0..20 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            if pipeline.indexer_metrics().documents_indexed > 0 {
+                break;
+            }
+        }
+
         let indexer_metrics = pipeline.indexer_metrics();
         assert!(indexer_metrics.documents_indexed > 0);
-        
+
         pipeline.shutdown().await.unwrap();
     }
     
     #[tokio::test]
     async fn test_json_pipeline_with_non_json() {
         let temp_dir = TempDir::new().unwrap();
-        
+
         let pipeline = JsonPipelineBuilder::new()
+            .index_base_path(temp_dir.path().to_path_buf())
             .build()
             .await
             .unwrap();
@@ -357,9 +370,10 @@ mod tests {
     #[tokio::test]
     async fn test_json_pipeline_with_key_parsing() {
         let temp_dir = TempDir::new().unwrap();
-        
+
         let pipeline = JsonPipelineBuilder::new()
             .parse_keys_as_json(true)
+            .index_base_path(temp_dir.path().to_path_buf())
             .build()
             .await
             .unwrap();

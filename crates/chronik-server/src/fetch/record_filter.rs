@@ -59,7 +59,7 @@ mod tests {
             timestamp: 0,
             key: None,
             value: vec![0u8; value_size],
-            headers: vec![],
+            headers: std::collections::HashMap::new(),
         }
     }
 

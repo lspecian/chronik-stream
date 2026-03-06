@@ -774,6 +774,8 @@ mod tests {
             enabled: true,
             port: 8081,
             default_compatibility: CompatibilityLevel::Backward,
+            auth_enabled: false,
+            users: HashMap::new(),
         })
     }
 

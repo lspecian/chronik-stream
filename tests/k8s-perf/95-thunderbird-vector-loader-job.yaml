@@ -1,0 +1,105 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: thunderbird-vector-loader
+  namespace: chronik-perf
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: 7200
+  template:
+    spec:
+      restartPolicy: OnFailure
+      # Pin to dell-1 where the dataset is copied via hostPath
+      nodeSelector:
+        kubernetes.io/hostname: dell-1
+      containers:
+        - name: loader
+          image: python:3.12-slim
+          command:
+            - python3
+            - -c
+            - |
+              import json, time, sys, subprocess, os
+              subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'kafka-python', '-q'])
+
+              from kafka import KafkaProducer
+              from kafka.admin import KafkaAdminClient, NewTopic
+
+              BOOTSTRAP = os.environ.get('BOOTSTRAP_SERVERS', 'chronik-thunderbird.chronik-perf.svc.cluster.local:9092')
+              TOPIC = os.environ.get('TOPIC', 'thunderbird-vector')
+
+              # Step 1: Create vector-enabled topic
+              print(f"Creating vector-enabled topic '{TOPIC}'...")
+              try:
+                  admin = KafkaAdminClient(
+                      bootstrap_servers=BOOTSTRAP,
+                      api_version=(2, 5, 0),
+                      request_timeout_ms=30000,
+                  )
+                  try:
+                      admin.delete_topics([TOPIC])
+                      time.sleep(3)
+                  except:
+                      pass
+
+                  topic = NewTopic(
+                      name=TOPIC,
+                      num_partitions=3,
+                      replication_factor=3,
+                      topic_configs={
+                          'searchable': 'true',
+                          'vector.enabled': 'true',
+                          'vector.provider': 'openai',
+                          'vector.model': 'text-embedding-3-small',
+                          'vector.field': 'value',
+                          'vector.dimensions': '1536',
+                          'vector.hnsw.metric': 'cosine',
+                          'columnar.enabled': 'true',
+                      }
+                  )
+                  admin.create_topics([topic])
+                  admin.close()
+                  print(f"  Created topic '{TOPIC}' with vector + text + columnar config")
+              except Exception as e:
+                  print(f"  Warning: Topic creation: {e}")
+                  print(f"  Will produce to auto-create")
+
+              time.sleep(5)
+
+              # Step 2: Run the standard loader script with overridden TOPIC and MAX_LINES
+              print(f"\nLoading data via standard loader...")
+              os.environ['BOOTSTRAP_SERVERS'] = BOOTSTRAP
+              os.environ['TOPIC'] = TOPIC
+              exec(open('/scripts/thunderbird-loader.py').read())
+          env:
+            - name: BOOTSTRAP_SERVERS
+              value: "chronik-thunderbird.chronik-perf.svc.cluster.local:9092"
+            - name: TOPIC
+              value: "thunderbird-vector"
+            - name: LOG_FILE
+              value: "/data/Thunderbird_full.log"
+            - name: MAX_LINES
+              value: "1000000"
+            - name: BATCH_SIZE
+              value: "5000"
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+            - name: dataset
+              mountPath: /data
+              readOnly: true
+          resources:
+            requests:
+              cpu: "2"
+              memory: "1Gi"
+            limits:
+              cpu: "4"
+              memory: "2Gi"
+      volumes:
+        - name: script
+          configMap:
+            name: thunderbird-loader-script
+        - name: dataset
+          hostPath:
+            path: /home/ubuntu/datasets/thunderbird/Thunderbird
+            type: Directory

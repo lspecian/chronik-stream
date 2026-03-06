@@ -571,6 +571,41 @@ fn try_create_embedding_provider() -> Option<Arc<dyn chronik_embeddings::Embeddi
     }
 }
 
+/// Create the query embedding cache if enabled (SV-1).
+///
+/// Reads configuration from environment variables:
+/// - `CHRONIK_EMBEDDING_CACHE_ENABLED` (default: `true`)
+/// - `CHRONIK_EMBEDDING_CACHE_MAX_ENTRIES` (default: `10000`)
+/// - `CHRONIK_EMBEDDING_CACHE_TTL_SECS` (default: `3600`)
+fn try_create_embedding_cache() -> Option<Arc<chronik_columnar::QueryEmbeddingCache>> {
+    let enabled = std::env::var("CHRONIK_EMBEDDING_CACHE_ENABLED")
+        .map(|v| v.to_lowercase() != "false" && v != "0")
+        .unwrap_or(true);
+
+    if !enabled {
+        info!("Embedding cache disabled via CHRONIK_EMBEDDING_CACHE_ENABLED=false");
+        return None;
+    }
+
+    let max_entries = std::env::var("CHRONIK_EMBEDDING_CACHE_MAX_ENTRIES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10_000);
+
+    let ttl_secs = std::env::var("CHRONIK_EMBEDDING_CACHE_TTL_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3600u64);
+
+    let cache = Arc::new(chronik_columnar::QueryEmbeddingCache::new(
+        max_entries,
+        std::time::Duration::from_secs(ttl_secs),
+    ));
+
+    info!("✓ Embedding cache initialized (max_entries={}, ttl={}s)", max_entries, ttl_secs);
+    Some(cache)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -817,19 +852,42 @@ async fn run_cluster_mode(
         unified_api_config.clone(),
     )
     .with_query_engine(columnar_query_engine)
-    .with_vector_index_manager(vector_index_manager);
+    .with_vector_index_manager(vector_index_manager)
+    .with_wal_indexer(wal_indexer.clone());
     if let Some(provider) = try_create_embedding_provider() {
         unified_state = unified_state.with_embedding_provider(provider);
     }
-    if let Some(hb) = hot_buffer {
-        unified_state = unified_state.with_hot_buffer(hb);
+    if let Some(ref hb) = hot_buffer {
+        // v2.4.1: Wire hot buffer to WalIndexer for flushed offset notifications
+        wal_indexer.set_hot_buffer(hb.clone()).await;
+        unified_state = unified_state.with_hot_buffer(hb.clone());
     }
+    if let Some(cache) = try_create_embedding_cache() {
+        unified_state = unified_state.with_embedding_cache(cache);
+    }
+    // Distributed query router for cluster-mode scatter-gather fan-out
+    let query_router = Arc::new(unified_api::query_router::QueryRouter::new(&init_config.cluster_config));
+    unified_state = unified_state.with_query_router(query_router.clone());
+    info!("✓ QueryRouter initialized for distributed query fan-out ({} peers)", init_config.cluster_config.peers.len() - 1);
     // v2.4.0: Wire SearchApi into state for query orchestrator text search
     #[cfg(feature = "search")]
-    if let Some(api) = search_api_ref {
-        unified_state = unified_state.with_search_api(api);
+    if let Some(ref api) = search_api_ref {
+        unified_state = unified_state.with_search_api(api.clone());
         info!("✓ SearchApi wired into query orchestrator for text search");
     }
+
+    // Replace search router with fan-out version for distributed queries
+    #[cfg(feature = "search")]
+    let search_router = if let Some(ref api) = search_api_ref {
+        let fanout_router = unified_api::search_handler::search_router_with_fanout(
+            api.clone(),
+            query_router.clone(),
+        );
+        info!("✓ Search router upgraded to fan-out mode for distributed queries");
+        Some(fanout_router)
+    } else {
+        search_router
+    };
 
     let _unified_api_handle = unified_api::start_unified_api_with_state(
         unified_state,
@@ -1004,13 +1062,19 @@ async fn run_single_node_mode(
         )
         .with_query_engine(columnar_query_engine)
         .with_vector_index_manager(vector_index_manager)
-        .with_wal_manager(wal_indexer.wal_manager().clone());
+        .with_wal_manager(wal_indexer.wal_manager().clone())
+        .with_wal_indexer(wal_indexer.clone());
 
         if let Some(provider) = try_create_embedding_provider() {
             unified_state = unified_state.with_embedding_provider(provider);
         }
-        if let Some(hb) = hot_buffer {
-            unified_state = unified_state.with_hot_buffer(hb);
+        if let Some(ref hb) = hot_buffer {
+            // v2.4.1: Wire hot buffer to WalIndexer for flushed offset notifications
+            wal_indexer.set_hot_buffer(hb.clone()).await;
+            unified_state = unified_state.with_hot_buffer(hb.clone());
+        }
+        if let Some(cache) = try_create_embedding_cache() {
+            unified_state = unified_state.with_embedding_cache(cache);
         }
         #[cfg(feature = "search")]
         if let Some(api) = search_api_ref {

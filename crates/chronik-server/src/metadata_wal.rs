@@ -475,11 +475,9 @@ mod tests {
         assert_eq!(wal.partition(), 0);
 
         // Test append
-        let cmd = MetadataCommand::CreateTopic {
-            name: "test-topic".to_string(),
-            partition_count: 3,
-            replication_factor: 2,
-            config: HashMap::new(),
+        let cmd = MetadataCommand::AddNode {
+            node_id: 1,
+            address: "localhost:9092".to_string(),
         };
 
         let offset = wal.append(&cmd).await.unwrap();

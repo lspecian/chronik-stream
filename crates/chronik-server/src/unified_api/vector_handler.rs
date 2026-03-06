@@ -8,7 +8,7 @@
 
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Json,
 };
@@ -20,7 +20,7 @@ use chronik_columnar::{VectorSearchFilters, VectorSearchResult, VectorSearchServ
 use super::UnifiedApiState;
 
 /// Text-based vector search request
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VectorSearchRequest {
     /// Text query to search for (will be embedded)
     pub query: String,
@@ -36,6 +36,13 @@ pub struct VectorSearchRequest {
     /// Maximum offset filter
     #[serde(default)]
     pub max_offset: Option<i64>,
+    /// VO-4: Enable cross-encoder re-ranking (default: false)
+    /// When true, overretrieves candidates and re-ranks with cross-encoder
+    #[serde(default)]
+    pub rerank: bool,
+    /// VO-5: Embedding model to search (default: topic's active_model, fallback "default")
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 fn default_k() -> usize {
@@ -43,7 +50,7 @@ fn default_k() -> usize {
 }
 
 /// Raw vector search request
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VectorSearchByVectorRequest {
     /// Query embedding vector
     pub vector: Vec<f32>,
@@ -59,10 +66,13 @@ pub struct VectorSearchByVectorRequest {
     /// Maximum offset filter
     #[serde(default)]
     pub max_offset: Option<i64>,
+    /// VO-5: Embedding model to search (default: topic's active_model, fallback "default")
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 /// Vector search response
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VectorSearchResponse {
     /// Search results
     pub results: Vec<VectorSearchResultItem>,
@@ -72,10 +82,16 @@ pub struct VectorSearchResponse {
     pub total_vectors: usize,
     /// Query execution time in milliseconds
     pub execution_time_ms: u64,
+    /// Whether results were re-ranked (VO-4)
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reranked: bool,
+    /// VO-5: Model ID that was searched
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// Single search result item
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VectorSearchResultItem {
     /// Partition number
     pub partition: i32,
@@ -131,7 +147,7 @@ impl VectorHandler {
         let service = VectorSearchService::new(
             std::sync::Arc::clone(index_manager),
             std::sync::Arc::clone(provider),
-        );
+        ).with_cache(state.embedding_cache.clone());
 
         service
             .search_by_text(topic, query, k, filters)
@@ -139,7 +155,7 @@ impl VectorHandler {
             .map_err(|e| format!("Search failed: {}", e))
     }
 
-    /// Search by raw vector
+    /// Search by raw vector (does not require embedding provider)
     pub async fn search_by_vector(
         state: &UnifiedApiState,
         topic: &str,
@@ -152,14 +168,8 @@ impl VectorHandler {
             .as_ref()
             .ok_or("Vector index manager not available")?;
 
-        let provider = state
-            .embedding_provider
-            .as_ref()
-            .ok_or("Embedding provider not configured")?;
-
-        let service = VectorSearchService::new(
+        let service = VectorSearchService::new_index_only(
             std::sync::Arc::clone(index_manager),
-            std::sync::Arc::clone(provider),
         );
 
         service
@@ -194,13 +204,69 @@ fn build_filters(
     Some(filters)
 }
 
+/// Default overretrieval factor for re-ranking (fetch k * this many candidates)
+const DEFAULT_OVERRETRIEVAL_FACTOR: usize = 5;
+
+/// Check if this request should fan out to peer nodes in cluster mode.
+///
+/// For vector search, we check whether this node has HNSW indexes for ALL
+/// partitions of the topic — not just whether it has partition replicas.
+/// With RF=3 (replication factor = node count), all nodes have all partition
+/// data, but only the node that ran WalIndexer has HNSW vector indexes.
+///
+/// Returns true if:
+/// - A query router is configured (cluster mode)
+/// - The request is NOT a forwarded request (no infinite loops)
+/// - This node does NOT have vector indexes for all expected partitions
+///
+/// Side effect: refreshes the partition map from metadata store.
+async fn needs_fan_out(state: &UnifiedApiState, headers: &HeaderMap, topic: &str) -> bool {
+    if let Some(ref router) = state.query_router {
+        if !super::query_router::is_forwarded_request(headers) {
+            router.refresh_partition_map(state.metadata_store.as_ref(), topic).await;
+
+            // Vector-aware check: do we have HNSW indexes for all partitions?
+            if let Some(ref index_manager) = state.vector_index_manager {
+                let local_vector_partitions = index_manager.partitions_with_vectors(topic).await;
+                let partition_count = state.metadata_store
+                    .get_topic(topic).await
+                    .ok()
+                    .flatten()
+                    .map(|t| t.config.partition_count as usize)
+                    .unwrap_or(0);
+
+                if partition_count > 0 && local_vector_partitions.len() < partition_count {
+                    debug!(
+                        topic = %topic,
+                        local_vector_partitions = local_vector_partitions.len(),
+                        expected = partition_count,
+                        "Vector fan-out needed: not all partitions have local HNSW indexes"
+                    );
+                    return true;
+                }
+            }
+
+            // Fallback to partition-based check
+            return !router.all_partitions_local(topic).await;
+        }
+    }
+    false
+}
+
 /// Search by text query endpoint
 pub async fn search(
     State(state): State<UnifiedApiState>,
+    headers: HeaderMap,
     Path(topic): Path<String>,
     Json(request): Json<VectorSearchRequest>,
 ) -> impl IntoResponse {
-    info!(topic = %topic, query = %request.query, k = request.k, "Vector search by text");
+    let fan_out_request = request.clone();
+    let model_param = request.model.as_deref();
+    info!(
+        topic = %topic, query = %request.query, k = request.k,
+        rerank = request.rerank, model = ?model_param,
+        "Vector search by text"
+    );
 
     let start = std::time::Instant::now();
 
@@ -229,14 +295,47 @@ pub async fn search(
 
     let filters = build_filters(request.partitions, request.min_offset, request.max_offset);
 
+    // VO-4: Determine search k — overretrieve when re-ranking is requested
+    let rerank_enabled = request.rerank && state.reranker.is_some();
+    let search_k = if rerank_enabled {
+        request.k * DEFAULT_OVERRETRIEVAL_FACTOR
+    } else {
+        request.k
+    };
+
     let service = VectorSearchService::new(
         std::sync::Arc::clone(index_manager),
         std::sync::Arc::clone(provider),
-    );
+    ).with_cache(state.embedding_cache.clone());
 
-    match service.search_by_text(&topic, &request.query, request.k, filters).await {
-        Ok(results) => {
-            let total_vectors = service.get_vector_count(&topic).await;
+    // VO-5: Use model-specific search when model param provided
+    let search_result = if let Some(model_id) = model_param {
+        service.search_by_text_model(&topic, &request.query, search_k, filters, model_id).await
+    } else {
+        service.search_by_text(&topic, &request.query, search_k, filters).await
+    };
+
+    match search_result {
+        Ok(mut results) => {
+            // VO-5: Get vector count for the searched model
+            let total_vectors = if let Some(model_id) = model_param {
+                service.get_vector_count_for_model(&topic, model_id).await
+            } else {
+                service.get_vector_count(&topic).await
+            };
+            let mut reranked = false;
+
+            // VO-4: Apply cross-encoder re-ranking if enabled
+            if rerank_enabled {
+                if let Some(ref reranker) = state.reranker {
+                    results = apply_reranking(reranker.as_ref(), &request.query, results, request.k).await;
+                    reranked = true;
+                }
+            }
+
+            // Truncate to requested k (in case reranking wasn't applied)
+            results.truncate(request.k);
+
             let execution_time_ms = start.elapsed().as_millis() as u64;
 
             let response = VectorSearchResponse {
@@ -244,12 +343,29 @@ pub async fn search(
                 results: results.into_iter().map(Into::into).collect(),
                 total_vectors,
                 execution_time_ms,
+                reranked,
+                model: request.model.clone(),
+            };
+
+            // Distributed fan-out: merge results from peer nodes
+            let response = if needs_fan_out(&state, &headers, &topic).await {
+                let router = state.query_router.as_ref().unwrap();
+                let nodes = router.nodes_for_topic(&topic).await;
+                let peers: Vec<VectorSearchResponse> = router
+                    .fan_out_post(&format!("/_vector/{}/search", topic), &fan_out_request, &nodes)
+                    .await;
+                debug!(topic = %topic, peer_count = peers.len(), "Merging vector search from peers");
+                super::query_router::merge_vector_responses(response, peers, fan_out_request.k)
+            } else {
+                response
             };
 
             info!(
                 topic = %topic,
                 results = response.count,
                 time_ms = execution_time_ms,
+                reranked = reranked,
+                model = ?model_param,
                 "Vector search completed"
             );
 
@@ -269,19 +385,23 @@ pub async fn search(
 /// Search by raw vector endpoint
 pub async fn search_by_vector(
     State(state): State<UnifiedApiState>,
+    headers: HeaderMap,
     Path(topic): Path<String>,
     Json(request): Json<VectorSearchByVectorRequest>,
 ) -> impl IntoResponse {
+    let fan_out_request = request.clone();
+    let model_param = request.model.as_deref();
     info!(
         topic = %topic,
         vector_len = request.vector.len(),
         k = request.k,
+        model = ?model_param,
         "Vector search by vector"
     );
 
     let start = std::time::Instant::now();
 
-    // Check if vector search is available
+    // Check if vector search is available (no embedding provider needed for raw vector search)
     let index_manager = match &state.vector_index_manager {
         Some(m) => m,
         None => {
@@ -293,27 +413,26 @@ pub async fn search_by_vector(
         }
     };
 
-    let provider = match &state.embedding_provider {
-        Some(p) => p,
-        None => {
-            let error_response = VectorErrorResponse {
-                error: "Embedding provider not configured".to_string(),
-                error_type: "ServiceUnavailable".to_string(),
-            };
-            return (StatusCode::SERVICE_UNAVAILABLE, Json(error_response)).into_response();
-        }
-    };
-
     let filters = build_filters(request.partitions, request.min_offset, request.max_offset);
 
-    let service = VectorSearchService::new(
+    let service = VectorSearchService::new_index_only(
         std::sync::Arc::clone(index_manager),
-        std::sync::Arc::clone(provider),
     );
 
-    match service.search_by_vector(&topic, &request.vector, request.k, filters).await {
+    // VO-5: Use model-specific search when model param provided
+    let search_result = if let Some(model_id) = model_param {
+        service.search_by_vector_model(&topic, &request.vector, request.k, filters, model_id).await
+    } else {
+        service.search_by_vector(&topic, &request.vector, request.k, filters).await
+    };
+
+    match search_result {
         Ok(results) => {
-            let total_vectors = service.get_vector_count(&topic).await;
+            let total_vectors = if let Some(model_id) = model_param {
+                service.get_vector_count_for_model(&topic, model_id).await
+            } else {
+                service.get_vector_count(&topic).await
+            };
             let execution_time_ms = start.elapsed().as_millis() as u64;
 
             let response = VectorSearchResponse {
@@ -321,6 +440,21 @@ pub async fn search_by_vector(
                 results: results.into_iter().map(Into::into).collect(),
                 total_vectors,
                 execution_time_ms,
+                reranked: false,
+                model: request.model.clone(),
+            };
+
+            // Distributed fan-out: merge results from peer nodes
+            let response = if needs_fan_out(&state, &headers, &topic).await {
+                let router = state.query_router.as_ref().unwrap();
+                let nodes = router.nodes_for_topic(&topic).await;
+                let peers: Vec<VectorSearchResponse> = router
+                    .fan_out_post(&format!("/_vector/{}/search_by_vector", topic), &fan_out_request, &nodes)
+                    .await;
+                debug!(topic = %topic, peer_count = peers.len(), "Merging vector-by-vector search from peers");
+                super::query_router::merge_vector_responses(response, peers, fan_out_request.k)
+            } else {
+                response
             };
 
             info!(
@@ -350,7 +484,12 @@ pub struct TopicStatsResponse {
     pub total_vectors: usize,
     pub partition_count: usize,
     pub dimensions: usize,
+    /// Whether vector indexes are still loading from disk (warmup phase)
+    pub loading: bool,
     pub partitions: Vec<PartitionStats>,
+    /// VO-5: Model IDs with indexes for this topic
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
 }
 
 /// Per-partition statistics
@@ -385,6 +524,7 @@ pub async fn get_stats(
         total_vectors: stats.total_vectors,
         partition_count: stats.partition_count,
         dimensions: stats.dimensions,
+        loading: stats.loading,
         partitions: stats
             .partitions
             .into_iter()
@@ -393,6 +533,7 @@ pub async fn get_stats(
                 vector_count: ps.vector_count,
             })
             .collect(),
+        models: stats.models,
     };
 
     (StatusCode::OK, Json(response)).into_response()
@@ -406,25 +547,102 @@ pub struct ListTopicsResponse {
 }
 
 /// List all topics with vector indexes
+///
+/// Returns topics from two sources:
+/// 1. Topics with active vector indexes (already have embeddings)
+/// 2. Topics configured with vector.enabled=true in metadata (may still be indexing)
 pub async fn list_topics(State(state): State<UnifiedApiState>) -> impl IntoResponse {
     debug!("Listing vector-enabled topics");
 
-    let index_manager = match &state.vector_index_manager {
-        Some(m) => m,
-        None => {
-            let error_response = VectorErrorResponse {
-                error: "Vector search not available".to_string(),
-                error_type: "ServiceUnavailable".to_string(),
-            };
-            return (StatusCode::SERVICE_UNAVAILABLE, Json(error_response)).into_response();
-        }
-    };
+    let mut all_topics = std::collections::BTreeSet::new();
 
-    let topics = index_manager.list_topics().await;
+    // Source 1: Topics with active vector indexes
+    if let Some(ref index_manager) = state.vector_index_manager {
+        for topic in index_manager.list_topics().await {
+            all_topics.insert(topic);
+        }
+    }
+
+    // Source 2: Topics configured with vector.enabled=true in metadata
+    match state.metadata_store.list_topics().await {
+        Ok(topics_meta) => {
+            for topic_meta in &topics_meta {
+                if topic_meta.config.is_vector_enabled() {
+                    all_topics.insert(topic_meta.name.clone());
+                }
+            }
+        }
+        Err(e) => {
+            debug!("Failed to list topics from metadata store: {}", e);
+        }
+    }
+
+    let topics: Vec<String> = all_topics.into_iter().collect();
     let count = topics.len();
 
     let response = ListTopicsResponse { topics, count };
     (StatusCode::OK, Json(response)).into_response()
+}
+
+/// VO-4: Apply cross-encoder re-ranking to search results.
+///
+/// Takes overretrieved candidates, scores (query, document) pairs with the
+/// reranker, and returns results reordered by cross-encoder relevance score.
+async fn apply_reranking(
+    reranker: &dyn chronik_embeddings::reranker::RerankerProvider,
+    query: &str,
+    results: Vec<VectorSearchResult>,
+    top_k: usize,
+) -> Vec<VectorSearchResult> {
+    if results.is_empty() {
+        return results;
+    }
+
+    // Extract document texts for the reranker.
+    // Use text_preview if available, otherwise use "{topic}:{partition}:{offset}" as a fallback.
+    let doc_texts: Vec<String> = results
+        .iter()
+        .map(|r| {
+            r.text_preview
+                .clone()
+                .unwrap_or_else(|| format!("{}:{}:{}", r.topic, r.partition, r.offset))
+        })
+        .collect();
+
+    let doc_refs: Vec<&str> = doc_texts.iter().map(|s| s.as_str()).collect();
+
+    match reranker.rerank(query, &doc_refs, top_k).await {
+        Ok(rerank_results) => {
+            debug!(
+                candidates = results.len(),
+                reranked = rerank_results.len(),
+                "Re-ranking applied successfully"
+            );
+
+            // Build reranked results in reranker-determined order
+            let mut reranked: Vec<VectorSearchResult> = rerank_results
+                .into_iter()
+                .filter_map(|rr| {
+                    results.get(rr.index).map(|original| {
+                        // Replace score with reranker relevance score
+                        let mut result = original.clone();
+                        result.score = rr.relevance_score;
+                        result
+                    })
+                })
+                .collect();
+
+            reranked.truncate(top_k);
+            reranked
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Re-ranking failed, returning original results");
+            // Fallback: return original results truncated to top_k
+            let mut fallback = results;
+            fallback.truncate(top_k);
+            fallback
+        }
+    }
 }
 
 // ============================================================================
@@ -432,7 +650,7 @@ pub async fn list_topics(State(state): State<UnifiedApiState>) -> impl IntoRespo
 // ============================================================================
 
 /// Hybrid search request combining vector and text search
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HybridSearchRequest {
     /// Text query for both vector embedding and full-text search
     pub query: String,
@@ -460,6 +678,12 @@ pub struct HybridSearchRequest {
     /// Maximum offset filter
     #[serde(default)]
     pub max_offset: Option<i64>,
+    /// VO-4: Enable cross-encoder re-ranking after RRF fusion (default: false)
+    #[serde(default)]
+    pub rerank: bool,
+    /// VO-5: Embedding model to search (default: topic's active_model, fallback "default")
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 fn default_vector_weight() -> f32 {
@@ -475,7 +699,7 @@ fn default_rrf_k() -> usize {
 }
 
 /// Hybrid search response
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HybridSearchResponse {
     /// Fused search results
     pub results: Vec<HybridSearchResultItem>,
@@ -487,10 +711,16 @@ pub struct HybridSearchResponse {
     pub text_results_count: usize,
     /// Query execution time in milliseconds
     pub execution_time_ms: u64,
+    /// Whether results were re-ranked after fusion (VO-4)
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reranked: bool,
+    /// VO-5: Model ID that was searched
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// Single hybrid search result item
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HybridSearchResultItem {
     /// Partition number
     pub partition: i32,
@@ -545,9 +775,11 @@ fn calculate_rrf_score(
 /// providing the best of both worlds: semantic understanding and keyword matching.
 pub async fn hybrid_search(
     State(state): State<UnifiedApiState>,
+    headers: HeaderMap,
     Path(topic): Path<String>,
     Json(request): Json<HybridSearchRequest>,
 ) -> impl IntoResponse {
+    let fan_out_request = request.clone();
     info!(
         topic = %topic,
         query = %request.query,
@@ -591,26 +823,72 @@ pub async fn hybrid_search(
     let service = VectorSearchService::new(
         std::sync::Arc::clone(index_manager),
         std::sync::Arc::clone(provider),
-    );
+    ).with_cache(state.embedding_cache.clone());
 
-    let vector_results = match service
-        .search_by_text(&topic, &request.query, search_k, filters.clone())
-        .await
-    {
-        Ok(results) => results,
-        Err(e) => {
-            error!(topic = %topic, error = %e, "Vector search failed in hybrid");
-            Vec::new() // Continue with text search only
+    // VO-5: Use model-specific search when model param provided
+    let vector_results = if let Some(ref model_id) = request.model {
+        match service.search_by_text_model(&topic, &request.query, search_k, filters.clone(), model_id).await {
+            Ok(results) => results,
+            Err(e) => {
+                error!(topic = %topic, error = %e, "Vector search failed in hybrid");
+                Vec::new()
+            }
+        }
+    } else {
+        match service.search_by_text(&topic, &request.query, search_k, filters.clone()).await {
+            Ok(results) => results,
+            Err(e) => {
+                error!(topic = %topic, error = %e, "Vector search failed in hybrid");
+                Vec::new()
+            }
         }
     };
 
     let vector_results_count = vector_results.len();
 
-    // Step 2: Text search (using Tantivy via search API if available)
-    // For now, we'll simulate text search results. In production, this would
-    // call into the chronik-search crate's SearchApi.
-    // TODO: Integrate with actual full-text search when search endpoints are migrated
-    let text_results: Vec<(i32, i64)> = Vec::new(); // (partition, offset) pairs
+    // Step 2: Text search via Tantivy (BM25)
+    // VO-4.8: Wire real Tantivy results into hybrid RRF fusion
+    let text_results: Vec<(i32, i64, Option<String>)> = {
+        #[cfg(feature = "search")]
+        {
+            let mut results = Vec::new();
+            if let Some(ref search_api) = state.search_api {
+                // Search in-memory indices
+                if let Some(index_state) = search_api.indices.get(&topic) {
+                    match search_tantivy_for_hybrid(&topic, &index_state, &request.query, search_k) {
+                        Ok(hits) => results.extend(hits),
+                        Err(e) => {
+                            debug!(topic = %topic, error = %e, "In-memory text search failed in hybrid");
+                        }
+                    }
+                }
+                // Search WAL-created indices on disk
+                if let Some(base_path) = search_api.get_index_base_path() {
+                    match search_wal_tantivy_for_hybrid(base_path, &topic, &request.query, search_k) {
+                        Ok(hits) => results.extend(hits),
+                        Err(e) => {
+                            debug!(topic = %topic, error = %e, "WAL text search failed in hybrid");
+                        }
+                    }
+                    // Also check real-time indices at sibling directory
+                    let realtime_path = base_path.replace("tantivy_indexes", "index");
+                    match search_wal_tantivy_for_hybrid(&realtime_path, &topic, &request.query, search_k) {
+                        Ok(hits) => results.extend(hits),
+                        Err(e) => {
+                            debug!(topic = %topic, error = %e, "Real-time text search failed in hybrid");
+                        }
+                    }
+                }
+                // Sort by score (carried implicitly by insertion order from TopDocs) and deduplicate
+                results.truncate(search_k);
+            }
+            results
+        }
+        #[cfg(not(feature = "search"))]
+        {
+            Vec::new()
+        }
+    };
     let text_results_count = text_results.len();
 
     // Step 3: Build a map of all unique (partition, offset) pairs
@@ -646,20 +924,24 @@ pub async fn hybrid_search(
     }
 
     // Add/update text results
-    for (rank, (partition, offset)) in text_results.iter().enumerate() {
+    for (rank, (partition, offset, preview)) in text_results.iter().enumerate() {
         let key = DocKey {
             partition: *partition,
             offset: *offset,
         };
         if let Some(info) = doc_map.get_mut(&key) {
             info.text_rank = Some(rank + 1);
+            // Prefer text preview from BM25 if vector didn't have one
+            if info.text_preview.is_none() {
+                info.text_preview = preview.clone();
+            }
         } else {
             doc_map.insert(
                 key,
                 DocInfo {
                     vector_rank: None,
                     text_rank: Some(rank + 1),
-                    text_preview: None,
+                    text_preview: preview.clone(),
                 },
             );
         }
@@ -691,6 +973,21 @@ pub async fn hybrid_search(
     // Sort by score descending (higher = more relevant)
     results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
 
+    // VO-4: Apply cross-encoder re-ranking after RRF fusion if requested
+    let mut reranked = false;
+    if request.rerank {
+        if let Some(ref reranker) = state.reranker {
+            results = apply_hybrid_reranking(
+                reranker.as_ref(),
+                &request.query,
+                results,
+                request.k,
+            )
+            .await;
+            reranked = true;
+        }
+    }
+
     // Take top k
     results.truncate(request.k);
 
@@ -702,6 +999,7 @@ pub async fn hybrid_search(
         results = count,
         vector_results = vector_results_count,
         text_results = text_results_count,
+        reranked = reranked,
         time_ms = execution_time_ms,
         "Hybrid search completed"
     );
@@ -712,9 +1010,352 @@ pub async fn hybrid_search(
         vector_results_count,
         text_results_count,
         execution_time_ms,
+        reranked,
+        model: request.model.clone(),
+    };
+
+    // Distributed fan-out: merge results from peer nodes
+    let response = if needs_fan_out(&state, &headers, &topic).await {
+        let router = state.query_router.as_ref().unwrap();
+        let nodes = router.nodes_for_topic(&topic).await;
+        let peers: Vec<HybridSearchResponse> = router
+            .fan_out_post(&format!("/_vector/{}/hybrid", topic), &fan_out_request, &nodes)
+            .await;
+        debug!(topic = %topic, peer_count = peers.len(), "Merging hybrid search from peers");
+        super::query_router::merge_hybrid_responses(response, peers, fan_out_request.k)
+    } else {
+        response
     };
 
     (StatusCode::OK, Json(response)).into_response()
+}
+
+/// VO-4: Apply re-ranking to hybrid search results after RRF fusion.
+///
+/// Takes fused results, sends document texts to the cross-encoder reranker,
+/// and reorders by relevance score.
+async fn apply_hybrid_reranking(
+    reranker: &dyn chronik_embeddings::reranker::RerankerProvider,
+    query: &str,
+    results: Vec<HybridSearchResultItem>,
+    top_k: usize,
+) -> Vec<HybridSearchResultItem> {
+    if results.is_empty() {
+        return results;
+    }
+
+    let doc_texts: Vec<String> = results
+        .iter()
+        .map(|r| {
+            r.text_preview
+                .clone()
+                .unwrap_or_else(|| format!("{}:{}", r.partition, r.offset))
+        })
+        .collect();
+
+    let doc_refs: Vec<&str> = doc_texts.iter().map(|s| s.as_str()).collect();
+
+    match reranker.rerank(query, &doc_refs, top_k).await {
+        Ok(rerank_results) => {
+            debug!(
+                candidates = results.len(),
+                reranked = rerank_results.len(),
+                "Hybrid re-ranking applied"
+            );
+
+            rerank_results
+                .into_iter()
+                .filter_map(|rr| {
+                    results.get(rr.index).map(|original| {
+                        let mut item = original.clone();
+                        item.score = rr.relevance_score;
+                        item
+                    })
+                })
+                .take(top_k)
+                .collect()
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Hybrid re-ranking failed, returning RRF results");
+            let mut fallback = results;
+            fallback.truncate(top_k);
+            fallback
+        }
+    }
+}
+
+// ============================================================================
+// VO-4.8: Tantivy BM25 helpers for hybrid search
+// ============================================================================
+
+/// Search a Tantivy in-memory IndexState and return (partition, offset, text_preview) tuples.
+///
+/// Used by hybrid search to get BM25 text results for RRF fusion with vector results.
+#[cfg(feature = "search")]
+fn search_tantivy_for_hybrid(
+    topic: &str,
+    state: &chronik_search::api::IndexState,
+    query_text: &str,
+    k: usize,
+) -> Result<Vec<(i32, i64, Option<String>)>, String> {
+    use tantivy::collector::TopDocs;
+    use tantivy::query::QueryParser;
+    use tantivy::schema::{FieldType, Value};
+
+    let searcher = state.reader.searcher();
+
+    let text_fields: Vec<_> = state.schema.fields()
+        .filter_map(|(field, entry)| {
+            match entry.field_type() {
+                FieldType::Str(_) | FieldType::JsonObject(_) => Some(field),
+                _ => None,
+            }
+        })
+        .collect();
+
+    if text_fields.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let query_parser = QueryParser::for_index(&state.index, text_fields);
+    let parsed_query = query_parser.parse_query(query_text)
+        .map_err(|e| format!("Query parse failed: {}", e))?;
+
+    let top_docs = searcher.search(&*parsed_query, &TopDocs::with_limit(k))
+        .map_err(|e| format!("Search failed: {}", e))?;
+
+    let mut results = Vec::new();
+    for (_score, doc_address) in &top_docs {
+        let doc: tantivy::TantivyDocument = match searcher.doc(*doc_address) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+
+        let offset_field = state.schema.get_field("offset").ok()
+            .or_else(|| state.schema.get_field("_offset").ok());
+        let partition_field = state.schema.get_field("partition").ok()
+            .or_else(|| state.schema.get_field("_partition").ok());
+
+        let offset = offset_field
+            .and_then(|f| doc.get_all(f).next().and_then(|v| v.as_i64()))
+            .unwrap_or(results.len() as i64);
+        let partition = partition_field
+            .and_then(|f| doc.get_all(f).next().and_then(|v| v.as_i64()))
+            .unwrap_or(0) as i32;
+
+        let preview = state.schema.get_field("_value").ok()
+            .and_then(|f| doc.get_all(f).next().and_then(|v| v.as_str().map(|s| s.to_string())))
+            .or_else(|| {
+                state.schema.get_field("_json_content").ok()
+                    .and_then(|f| doc.get_all(f).next().and_then(|v| v.as_str().map(|s| s.to_string())))
+            })
+            .or_else(|| {
+                state.schema.get_field("_content").ok()
+                    .and_then(|f| doc.get_all(f).next().and_then(|v| v.as_str().map(|s| s.to_string())))
+            })
+            .map(|text| {
+                if text.len() > 300 { format!("{}...", &text[..300]) } else { text }
+            });
+
+        results.push((partition, offset, preview));
+    }
+
+    Ok(results)
+}
+
+/// Search WAL-created Tantivy indices on disk for a specific topic.
+///
+/// Returns (partition, offset, text_preview) tuples for hybrid RRF fusion.
+/// WAL indices are stored as `{base_path}/{topic}-{partition}/` directories.
+#[cfg(feature = "search")]
+fn search_wal_tantivy_for_hybrid(
+    base_path: &str,
+    topic: &str,
+    query_text: &str,
+    k: usize,
+) -> Result<Vec<(i32, i64, Option<String>)>, String> {
+    use std::path::Path;
+    use tantivy::collector::TopDocs;
+    use tantivy::query::QueryParser;
+    use tantivy::schema::{FieldType, Value};
+    use tantivy::Index;
+
+    let base = Path::new(base_path);
+    if !base.exists() {
+        return Ok(vec![]);
+    }
+
+    let entries = std::fs::read_dir(base)
+        .map_err(|e| format!("Failed to read index directory: {}", e))?;
+
+    let mut all_results = Vec::new();
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let dir_name = path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+
+        if !dir_name.starts_with(topic) {
+            continue;
+        }
+        let suffix = &dir_name[topic.len()..];
+        if !suffix.is_empty() && !suffix.starts_with('-') {
+            continue;
+        }
+
+        let index = match Index::open_in_dir(&path) {
+            Ok(idx) => idx,
+            Err(_) => continue,
+        };
+
+        let reader = match index.reader() {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let searcher = reader.searcher();
+        let schema = index.schema();
+
+        let text_fields: Vec<_> = schema.fields()
+            .filter_map(|(field, entry)| {
+                match entry.field_type() {
+                    FieldType::Str(_) | FieldType::JsonObject(_) => Some(field),
+                    _ => None,
+                }
+            })
+            .collect();
+
+        if text_fields.is_empty() {
+            continue;
+        }
+
+        let query_parser = QueryParser::for_index(&index, text_fields);
+        let parsed_query = match query_parser.parse_query(query_text) {
+            Ok(q) => q,
+            Err(_) => continue,
+        };
+
+        let top_docs = match searcher.search(&*parsed_query, &TopDocs::with_limit(k)) {
+            Ok(docs) => docs,
+            Err(_) => continue,
+        };
+
+        let dir_partition: i32 = suffix.strip_prefix('-')
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(0);
+
+        for (_score, doc_address) in &top_docs {
+            let doc: tantivy::TantivyDocument = match searcher.doc(*doc_address) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+
+            let offset_field = schema.get_field("offset").ok()
+                .or_else(|| schema.get_field("_offset").ok());
+
+            let offset = offset_field
+                .and_then(|f| doc.get_all(f).next().and_then(|v| v.as_i64()))
+                .unwrap_or(all_results.len() as i64);
+
+            let preview = schema.get_field("_value").ok()
+                .and_then(|f| doc.get_all(f).next().and_then(|v| v.as_str().map(|s| s.to_string())))
+                .or_else(|| {
+                    schema.get_field("_json_content").ok()
+                        .and_then(|f| doc.get_all(f).next().and_then(|v| v.as_str().map(|s| s.to_string())))
+                })
+                .or_else(|| {
+                    schema.get_field("_content").ok()
+                        .and_then(|f| doc.get_all(f).next().and_then(|v| v.as_str().map(|s| s.to_string())))
+                })
+                .map(|text| {
+                    if text.len() > 300 { format!("{}...", &text[..300]) } else { text }
+                });
+
+            all_results.push((dir_partition, offset, preview));
+        }
+    }
+
+    Ok(all_results)
+}
+
+// ============================================================================
+// Vector Embedding Backfill (v2.3.1)
+// ============================================================================
+
+/// Request body for vector embedding backfill
+#[derive(Debug, Deserialize)]
+pub struct BackfillRequest {
+    /// Specific partition to backfill (null = all partitions)
+    pub partition: Option<i32>,
+    /// Model ID to embed with (null = use active_model from topic config)
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+/// Response for vector embedding backfill
+#[derive(Debug, Serialize)]
+pub struct BackfillResponse {
+    pub topic: String,
+    pub segments_processed: usize,
+    pub vectors_generated: usize,
+    pub skipped_segments: usize,
+    pub errors: usize,
+    pub duration_secs: u64,
+    /// Model ID used for embedding
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+/// Backfill vector embeddings from existing Tier 2 segments.
+/// POST /_vector/:topic/backfill
+pub async fn backfill(
+    State(state): State<UnifiedApiState>,
+    Path(topic): Path<String>,
+    Json(request): Json<BackfillRequest>,
+) -> impl IntoResponse {
+    info!(topic = %topic, partition = ?request.partition, model = ?request.model, "Starting vector embedding backfill");
+
+    let wal_indexer = match &state.wal_indexer {
+        Some(w) => w,
+        None => {
+            let error_response = VectorErrorResponse {
+                error: "WalIndexer not available for backfill".to_string(),
+                error_type: "ServiceUnavailable".to_string(),
+            };
+            return (StatusCode::SERVICE_UNAVAILABLE, Json(error_response)).into_response();
+        }
+    };
+
+    match wal_indexer.backfill_vector_embeddings(&topic, request.partition, request.model.as_deref()).await {
+        Ok(stats) => {
+            let response = BackfillResponse {
+                topic,
+                segments_processed: stats.segments_processed,
+                vectors_generated: stats.vectors_generated,
+                skipped_segments: stats.skipped_segments,
+                errors: stats.errors,
+                duration_secs: stats.duration_secs,
+                model: stats.model_id,
+            };
+            (StatusCode::OK, Json(response)).into_response()
+        }
+        Err(e) => {
+            error!(topic = %topic, error = %e, "Vector backfill failed");
+            let error_response = VectorErrorResponse {
+                error: format!("Backfill failed: {}", e),
+                error_type: "InternalError".to_string(),
+            };
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(error_response)).into_response()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -852,5 +1493,84 @@ mod tests {
     fn test_rrf_score_zero_when_no_results() {
         let score = calculate_rrf_score(None, None, 0.5, 0.5, 60);
         assert!((score - 0.0).abs() < f32::EPSILON);
+    }
+
+    // ========== VO-4 Reranking Tests ==========
+
+    #[test]
+    fn test_search_request_rerank_default_false() {
+        let json = r#"{"query": "error logs"}"#;
+        let request: VectorSearchRequest = serde_json::from_str(json).unwrap();
+        assert!(!request.rerank);
+    }
+
+    #[test]
+    fn test_search_request_rerank_enabled() {
+        let json = r#"{"query": "error logs", "rerank": true}"#;
+        let request: VectorSearchRequest = serde_json::from_str(json).unwrap();
+        assert!(request.rerank);
+    }
+
+    #[test]
+    fn test_hybrid_search_request_rerank_default_false() {
+        let json = r#"{"query": "error logs"}"#;
+        let request: HybridSearchRequest = serde_json::from_str(json).unwrap();
+        assert!(!request.rerank);
+    }
+
+    #[test]
+    fn test_hybrid_search_request_rerank_enabled() {
+        let json = r#"{"query": "error logs", "rerank": true, "k": 5}"#;
+        let request: HybridSearchRequest = serde_json::from_str(json).unwrap();
+        assert!(request.rerank);
+        assert_eq!(request.k, 5);
+    }
+
+    #[tokio::test]
+    async fn test_apply_reranking_empty_results() {
+        use chronik_embeddings::reranker::NoOpReranker;
+        let reranker = NoOpReranker;
+        let results: Vec<VectorSearchResult> = Vec::new();
+        let reranked = apply_reranking(&reranker, "query", results, 10).await;
+        assert!(reranked.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_apply_reranking_with_noop() {
+        use chronik_columnar::VectorSearchResult;
+        use chronik_embeddings::reranker::NoOpReranker;
+        let reranker = NoOpReranker;
+
+        let results = vec![
+            VectorSearchResult {
+                topic: "logs".to_string(),
+                partition: 0,
+                offset: 10,
+                score: 0.1,
+                text_preview: Some("error in payment".to_string()),
+                embedding: None,
+            },
+            VectorSearchResult {
+                topic: "logs".to_string(),
+                partition: 0,
+                offset: 20,
+                score: 0.2,
+                text_preview: Some("connection timeout".to_string()),
+                embedding: None,
+            },
+            VectorSearchResult {
+                topic: "logs".to_string(),
+                partition: 0,
+                offset: 30,
+                score: 0.3,
+                text_preview: Some("disk full warning".to_string()),
+                embedding: None,
+            },
+        ];
+
+        let reranked = apply_reranking(&reranker, "payment error", results, 2).await;
+        assert_eq!(reranked.len(), 2);
+        // NoOp reranker returns in original order, scores decreasing
+        assert!(reranked[0].score > reranked[1].score);
     }
 }

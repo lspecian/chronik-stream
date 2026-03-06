@@ -27,7 +27,9 @@
 //! CHRONIK_HOT_BUFFER_REFRESH_MS=1000        # default: 1000ms
 //! ```
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
 use dashmap::DashMap;
@@ -39,8 +41,14 @@ use datafusion::arrow::array::{
     ArrayRef, BinaryBuilder, Int32Array, Int64Array, Int8Array, RecordBatch, StringBuilder,
     TimestampMillisecondBuilder,
 };
-use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-use datafusion::datasource::MemTable;
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use datafusion::catalog::Session;
+use datafusion::datasource::{MemTable, TableProvider, TableType};
+use datafusion::logical_expr::{Operator, TableProviderFilterPushDown};
+use datafusion::error::Result as DFResult;
+use datafusion::physical_plan::memory::MemoryExec;
+use datafusion::physical_plan::ExecutionPlan;
+use datafusion::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use chronik_wal::{WalManager, WalRecord};
@@ -110,7 +118,9 @@ struct CanonicalRecord {
 pub struct HotBufferConfig {
     /// Whether hot buffer is enabled
     pub enabled: bool,
-    /// Maximum records to include in hot buffer per partition
+    /// Maximum individual Kafka messages to include in hot buffer per partition.
+    /// Each WAL batch may contain 100-2000 messages. This limit applies to
+    /// the total message count, not the number of WAL batches.
     pub max_records_per_partition: usize,
     /// Refresh interval in milliseconds (how often to check for new records)
     pub refresh_interval_ms: u64,
@@ -176,10 +186,153 @@ struct HotRecord {
     value: Vec<u8>,
 }
 
+// ============================================================================
+// PartitionedMemTable: custom TableProvider with _partition filter pushdown
+// ============================================================================
+
+/// A partition-aware in-memory table that supports `_partition` filter pushdown.
+///
+/// Unlike DataFusion's MemTable which stores all batches in a flat list,
+/// this stores per-partition RecordBatches and only scans partitions that
+/// match `WHERE _partition = N` or `WHERE _partition IN (...)` predicates.
+///
+/// At 43.9M records across 24 partitions (~1.8M per partition), this reduces
+/// scan size by ~24x for single-partition queries.
+#[derive(Debug)]
+pub struct PartitionedMemTable {
+    schema: SchemaRef,
+    partition_batches: HashMap<i32, RecordBatch>,
+}
+
+impl PartitionedMemTable {
+    /// Create a new partitioned mem table from per-partition batches.
+    pub fn new(schema: SchemaRef, partition_batches: HashMap<i32, RecordBatch>) -> Self {
+        Self { schema, partition_batches }
+    }
+}
+
+#[async_trait::async_trait]
+impl TableProvider for PartitionedMemTable {
+    fn as_any(&self) -> &dyn std::any::Any { self }
+
+    fn schema(&self) -> SchemaRef { self.schema.clone() }
+
+    fn table_type(&self) -> TableType { TableType::Temporary }
+
+    async fn scan(
+        &self,
+        _state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        _limit: Option<usize>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        // Extract _partition = N from filters
+        let target_partitions = extract_partition_filters(filters);
+
+        let batches: Vec<RecordBatch> = if target_partitions.is_empty() {
+            // No partition filter — scan all
+            self.partition_batches.values().cloned().collect()
+        } else {
+            target_partitions.iter()
+                .filter_map(|p| self.partition_batches.get(p))
+                .cloned()
+                .collect()
+        };
+
+        debug!(
+            "PartitionedMemTable scan: {} target partitions, {} of {} batches selected",
+            if target_partitions.is_empty() { "all".to_string() } else { format!("{:?}", target_partitions) },
+            batches.len(),
+            self.partition_batches.len()
+        );
+
+        MemoryExec::try_new(
+            &[batches],
+            self.schema.clone(),
+            projection.cloned(),
+        ).map(|e| Arc::new(e) as Arc<dyn ExecutionPlan>)
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DFResult<Vec<TableProviderFilterPushDown>> {
+        // Return Inexact for all filters — DataFusion still applies them post-scan
+        // but our scan() uses them for partition pruning (loading fewer batches).
+        // Using Exact would skip post-scan filtering, which is risky if our
+        // extract_partition_filters misses an edge case.
+        Ok(filters.iter().map(|_| TableProviderFilterPushDown::Inexact).collect())
+    }
+}
+
+/// Extract partition IDs from WHERE _partition = N or WHERE _partition IN (a, b, c).
+fn extract_partition_filters(filters: &[Expr]) -> Vec<i32> {
+    let mut partitions = Vec::new();
+    for filter in filters {
+        match filter {
+            Expr::BinaryExpr(binary) => {
+                if let (Expr::Column(col), Expr::Literal(lit)) = (binary.left.as_ref(), binary.right.as_ref()) {
+                    if col.name == "_partition" && binary.op == Operator::Eq {
+                        if let Some(val) = scalar_to_i32(lit) {
+                            partitions.push(val);
+                        }
+                    }
+                }
+                // Also handle N = _partition (reversed)
+                if let (Expr::Literal(lit), Expr::Column(col)) = (binary.left.as_ref(), binary.right.as_ref()) {
+                    if col.name == "_partition" && binary.op == Operator::Eq {
+                        if let Some(val) = scalar_to_i32(lit) {
+                            partitions.push(val);
+                        }
+                    }
+                }
+            }
+            Expr::InList(in_list) => {
+                if let Expr::Column(col) = &*in_list.expr {
+                    if col.name == "_partition" && !in_list.negated {
+                        for val in &in_list.list {
+                            if let Expr::Literal(lit) = val {
+                                if let Some(v) = scalar_to_i32(lit) {
+                                    partitions.push(v);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    partitions
+}
+
+/// Convert a DataFusion ScalarValue to i32 (handles Int32, Int64, UInt32 etc.)
+fn scalar_to_i32(scalar: &datafusion::scalar::ScalarValue) -> Option<i32> {
+    use datafusion::scalar::ScalarValue;
+    match scalar {
+        ScalarValue::Int32(Some(v)) => Some(*v),
+        ScalarValue::Int64(Some(v)) => Some(*v as i32),
+        ScalarValue::UInt32(Some(v)) => Some(*v as i32),
+        ScalarValue::Int16(Some(v)) => Some(*v as i32),
+        ScalarValue::Int8(Some(v)) => Some(*v as i32),
+        _ => None,
+    }
+}
+
+// ============================================================================
+// HotDataBuffer
+// ============================================================================
+
 /// Hot Data Buffer for in-memory SQL queries
 ///
 /// Reads recent records from WAL and converts them to Arrow format
 /// for immediate SQL querying before Parquet files are created.
+///
+/// **JSON columns**: When the WalIndexer infers a JSON schema for a topic,
+/// Parquet files include typed JSON columns (e.g., `name`, `age`).
+/// The hot buffer provides base columns only (`_value` as binary).
+/// Users can query `{topic}_cold` for typed columns, or use
+/// `json_extract()` UDFs on `{topic}_hot` for the same data.
 pub struct HotDataBuffer {
     /// WAL manager to read recent records from
     wal_manager: Arc<WalManager>,
@@ -228,17 +381,32 @@ impl HotDataBuffer {
     /// Get the hot data as a MemTable for DataFusion
     ///
     /// Returns None if the topic-partition has no hot data or hot buffer is disabled.
+    /// Uses cached RecordBatch when available and fresh (within refresh_interval_ms).
     pub async fn get_mem_table(&self, topic: &str, partition: i32) -> Result<Option<MemTable>> {
         if !self.config.enabled {
             return Ok(None);
         }
 
         let tp = TopicPartition::new(topic, partition);
+        let now_ms = Self::current_time_ms();
 
-        // Get the flushed offset (data already in Parquet)
+        // Check cache first — return cached batch if fresh
+        if let Some(cached) = self.cache.get(&tp) {
+            if now_ms.saturating_sub(cached.last_refresh_ms) < self.config.refresh_interval_ms {
+                let schema = Arc::new(Self::hot_buffer_schema());
+                let mem_table = MemTable::try_new(schema, vec![vec![cached.batch.clone()]])?;
+                trace!(
+                    "Cache hit for {}-{}: {} records, age={}ms",
+                    topic, partition, cached.record_count,
+                    now_ms.saturating_sub(cached.last_refresh_ms)
+                );
+                return Ok(Some(mem_table));
+            }
+        }
+
+        // Cache miss or stale — read from WAL
         let flushed_offset = self.flushed_offsets.get(&tp).map(|v| *v).unwrap_or(0);
 
-        // Read recent records from WAL starting from flushed offset
         let wal_records = self
             .wal_manager
             .read_from(topic, partition, flushed_offset, self.config.max_records_per_partition)
@@ -250,29 +418,34 @@ impl HotDataBuffer {
                 "No hot data for {}-{} (flushed_offset={})",
                 topic, partition, flushed_offset
             );
+            // Cache empty result to avoid repeated WAL reads
+            self.cache.remove(&tp);
             return Ok(None);
         }
 
-        // Convert WAL records to simple HotRecord format
         let hot_records = self.wal_records_to_hot_records(topic, partition, &wal_records)?;
 
         if hot_records.is_empty() {
+            self.cache.remove(&tp);
             return Ok(None);
         }
 
-        // Convert to Arrow RecordBatch using DataFusion's arrow types
         let batch = self.records_to_batch(&hot_records)?;
 
+        // Store in cache
+        let cached = CachedBatch {
+            batch: batch.clone(),
+            min_offset: hot_records.first().map(|r| r.offset).unwrap_or(0),
+            max_offset: hot_records.last().map(|r| r.offset).unwrap_or(0),
+            record_count: hot_records.len(),
+            last_refresh_ms: now_ms,
+        };
         debug!(
-            "Created hot buffer for {}-{}: {} records, offsets {}..{}",
-            topic,
-            partition,
-            hot_records.len(),
-            hot_records.first().map(|r| r.offset).unwrap_or(0),
-            hot_records.last().map(|r| r.offset).unwrap_or(0),
+            "Cache refresh for {}-{}: {} records, offsets {}..{}",
+            topic, partition, cached.record_count, cached.min_offset, cached.max_offset,
         );
+        self.cache.insert(tp, cached);
 
-        // Create MemTable from the batch
         let schema = Arc::new(Self::hot_buffer_schema());
         let mem_table = MemTable::try_new(schema, vec![vec![batch]])?;
 
@@ -282,13 +455,12 @@ impl HotDataBuffer {
     /// Get hot data for all partitions of a topic
     ///
     /// Returns a combined MemTable containing data from all partitions.
-    pub async fn get_topic_mem_table(&self, topic: &str) -> Result<Option<MemTable>> {
+    /// Uses cached RecordBatch per partition when available and fresh.
+    pub async fn get_topic_mem_table(&self, topic: &str) -> Result<Option<PartitionedMemTable>> {
         if !self.config.enabled {
             return Ok(None);
         }
 
-        // Get all partitions for this topic from WAL manager
-        // Filter the global partition list by topic name
         let all_partitions = self.wal_manager.get_partitions();
         let partitions: Vec<i32> = all_partitions
             .into_iter()
@@ -300,10 +472,25 @@ impl HotDataBuffer {
             return Ok(None);
         }
 
-        let mut all_batches: Vec<RecordBatch> = Vec::new();
+        let now_ms = Self::current_time_ms();
+        let mut partition_batches: HashMap<i32, RecordBatch> = HashMap::new();
+        let mut cache_hits = 0u32;
+        let mut cache_misses = 0u32;
 
         for partition in partitions {
             let tp = TopicPartition::new(topic, partition);
+
+            // Check cache first
+            if let Some(cached) = self.cache.get(&tp) {
+                if now_ms.saturating_sub(cached.last_refresh_ms) < self.config.refresh_interval_ms {
+                    partition_batches.insert(partition, cached.batch.clone());
+                    cache_hits += 1;
+                    continue;
+                }
+            }
+
+            // Cache miss or stale — read from WAL
+            cache_misses += 1;
             let flushed_offset = self.flushed_offsets.get(&tp).map(|v| *v).unwrap_or(0);
 
             let wal_records = self
@@ -322,33 +509,60 @@ impl HotDataBuffer {
             }
 
             let batch = self.records_to_batch(&hot_records)?;
-            all_batches.push(batch);
+
+            // Update cache
+            let cached = CachedBatch {
+                batch: batch.clone(),
+                min_offset: hot_records.first().map(|r| r.offset).unwrap_or(0),
+                max_offset: hot_records.last().map(|r| r.offset).unwrap_or(0),
+                record_count: hot_records.len(),
+                last_refresh_ms: now_ms,
+            };
+            self.cache.insert(tp, cached);
+
+            partition_batches.insert(partition, batch);
         }
 
-        if all_batches.is_empty() {
+        if partition_batches.is_empty() {
             return Ok(None);
         }
 
-        let schema = Arc::new(Self::hot_buffer_schema());
-        let mem_table = MemTable::try_new(schema, vec![all_batches])?;
+        debug!(
+            "Topic {} hot buffer: {} cache hits, {} misses, {} total partitions",
+            topic, cache_hits, cache_misses, partition_batches.len()
+        );
 
-        Ok(Some(mem_table))
+        let schema = Arc::new(Self::hot_buffer_schema());
+        let table = PartitionedMemTable::new(schema, partition_batches);
+
+        Ok(Some(table))
     }
 
     /// Set the flushed offset for a topic-partition
     ///
     /// Called by WalIndexer when Parquet files are created.
     /// Records up to this offset are in Parquet and don't need to be in hot buffer.
+    /// Invalidates the cached RecordBatch so the next query re-reads with the new offset range.
     pub fn set_flushed_offset(&self, topic: &str, partition: i32, offset: i64) {
         let tp = TopicPartition::new(topic, partition);
-        self.flushed_offsets.insert(tp, offset);
-        debug!("Set flushed offset for {}-{}: {}", topic, partition, offset);
+        self.flushed_offsets.insert(tp.clone(), offset);
+        // Invalidate cache — flushed offset changed, cached batch covers wrong range
+        self.cache.remove(&tp);
+        debug!("Set flushed offset for {}-{}: {} (cache invalidated)", topic, partition, offset);
     }
 
     /// Get the flushed offset for a topic-partition
     pub fn get_flushed_offset(&self, topic: &str, partition: i32) -> i64 {
         let tp = TopicPartition::new(topic, partition);
         self.flushed_offsets.get(&tp).map(|v| *v).unwrap_or(0)
+    }
+
+    /// Get current time in milliseconds since Unix epoch
+    fn current_time_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
     }
 
     /// Convert HotRecords to Arrow RecordBatch using DataFusion's arrow types
@@ -565,5 +779,133 @@ mod tests {
         assert!(schema.field_with_name("_timestamp").is_ok());
         assert!(schema.field_with_name("_key").is_ok());
         assert!(schema.field_with_name("_value").is_ok());
+    }
+
+    /// Helper: create a RecordBatch with N rows for a given partition
+    fn make_batch(schema: &SchemaRef, partition: i32, num_rows: usize) -> RecordBatch {
+        use datafusion::arrow::array::{StringBuilder, BinaryBuilder, Int32Array, Int64Array, Int8Array, TimestampMillisecondBuilder};
+        let mut topic_b = StringBuilder::new();
+        let mut part_b = Int32Array::builder(num_rows);
+        let mut off_b = Int64Array::builder(num_rows);
+        let mut ts_b = TimestampMillisecondBuilder::new().with_timezone("UTC");
+        let mut tstype_b = Int8Array::builder(num_rows);
+        let mut key_b = BinaryBuilder::new();
+        let mut val_b = BinaryBuilder::new();
+        for i in 0..num_rows {
+            topic_b.append_value("test");
+            part_b.append_value(partition);
+            off_b.append_value(i as i64);
+            ts_b.append_value(1000 + i as i64);
+            tstype_b.append_value(0);
+            key_b.append_value(format!("k{}", i).as_bytes());
+            val_b.append_value(format!("v{}", i).as_bytes());
+        }
+        RecordBatch::try_new(schema.clone(), vec![
+            Arc::new(topic_b.finish()),
+            Arc::new(part_b.finish()),
+            Arc::new(off_b.finish()),
+            Arc::new(ts_b.finish()),
+            Arc::new(tstype_b.finish()),
+            Arc::new(key_b.finish()),
+            Arc::new(val_b.finish()),
+        ]).unwrap()
+    }
+
+    #[test]
+    fn test_extract_partition_filters_eq() {
+        use datafusion::prelude::col;
+        use datafusion::prelude::lit;
+        let filters = vec![col("_partition").eq(lit(2i32))];
+        let result = extract_partition_filters(&filters);
+        assert_eq!(result, vec![2]);
+    }
+
+    #[test]
+    fn test_extract_partition_filters_in_list() {
+        use datafusion::logical_expr::Expr;
+        use datafusion::prelude::{col, lit};
+        let in_list = Expr::InList(datafusion::logical_expr::expr::InList::new(
+            Box::new(col("_partition")),
+            vec![lit(0i32), lit(3i32), lit(7i32)],
+            false,
+        ));
+        let result = extract_partition_filters(&[in_list]);
+        assert_eq!(result, vec![0, 3, 7]);
+    }
+
+    #[test]
+    fn test_extract_partition_filters_no_match() {
+        use datafusion::prelude::{col, lit};
+        // Filter on a non-partition column
+        let filters = vec![col("_offset").eq(lit(42i64))];
+        let result = extract_partition_filters(&filters);
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_partitioned_mem_table_scan_all() {
+        let schema = Arc::new(HotDataBuffer::hot_buffer_schema());
+        let mut batches = HashMap::new();
+        batches.insert(0, make_batch(&schema, 0, 100));
+        batches.insert(1, make_batch(&schema, 1, 200));
+        batches.insert(2, make_batch(&schema, 2, 300));
+        let table = PartitionedMemTable::new(schema, batches);
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        let plan = table.scan(&ctx.state(), None, &[], None).await.unwrap();
+        let results = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await.unwrap();
+        let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 600); // 100 + 200 + 300
+    }
+
+    #[tokio::test]
+    async fn test_partitioned_mem_table_scan_single_partition() {
+        use datafusion::prelude::{col, lit};
+        let schema = Arc::new(HotDataBuffer::hot_buffer_schema());
+        let mut batches = HashMap::new();
+        batches.insert(0, make_batch(&schema, 0, 100));
+        batches.insert(1, make_batch(&schema, 1, 200));
+        batches.insert(2, make_batch(&schema, 2, 300));
+        let table = PartitionedMemTable::new(schema, batches);
+
+        let filters = vec![col("_partition").eq(lit(1i32))];
+        let ctx = datafusion::prelude::SessionContext::new();
+        let plan = table.scan(&ctx.state(), None, &filters, None).await.unwrap();
+        let results = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await.unwrap();
+        let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 200); // Only partition 1
+    }
+
+    #[tokio::test]
+    async fn test_partitioned_mem_table_scan_missing_partition() {
+        use datafusion::prelude::{col, lit};
+        let schema = Arc::new(HotDataBuffer::hot_buffer_schema());
+        let mut batches = HashMap::new();
+        batches.insert(0, make_batch(&schema, 0, 100));
+        let table = PartitionedMemTable::new(schema, batches);
+
+        let filters = vec![col("_partition").eq(lit(99i32))];
+        let ctx = datafusion::prelude::SessionContext::new();
+        let plan = table.scan(&ctx.state(), None, &filters, None).await.unwrap();
+        let results = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await.unwrap();
+        let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 0); // Non-existent partition
+    }
+
+    #[test]
+    fn test_supports_filters_pushdown() {
+        use datafusion::prelude::{col, lit};
+        let schema = Arc::new(HotDataBuffer::hot_buffer_schema());
+        let table = PartitionedMemTable::new(schema, HashMap::new());
+
+        let partition_filter = col("_partition").eq(lit(1i32));
+        let other_filter = col("_offset").eq(lit(42i64));
+        let filters: Vec<&Expr> = vec![&partition_filter, &other_filter];
+
+        let result = table.supports_filters_pushdown(&filters).unwrap();
+        // All filters return Inexact — scan() uses them for pruning but
+        // DataFusion still applies them post-scan for correctness
+        assert_eq!(result[0], TableProviderFilterPushDown::Inexact);
+        assert_eq!(result[1], TableProviderFilterPushDown::Inexact);
     }
 }

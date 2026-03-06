@@ -5540,16 +5540,66 @@ impl ProtocolHandler {
             }
             
             // Create topic atomically with all assignments and offsets
-            let topic_metadata = metadata_store.create_topic_with_assignments(
+            match metadata_store.create_topic_with_assignments(
                 &topic.name,
-                config,
-                assignments,
-                offsets,
-            ).await
-                .map_err(|e| Error::Internal(format!("Failed to create topic: {:?}", e)))?;
-            
-            tracing::info!("Successfully created topic '{}' with ID {} and {} partitions atomically across {} brokers", 
-                topic.name, topic_metadata.id, topic.num_partitions, broker_count);
+                config.clone(),
+                assignments.clone(),
+                offsets.clone(),
+            ).await {
+                Ok(topic_metadata) => {
+                    tracing::info!("Successfully created topic '{}' with ID {} and {} partitions atomically across {} brokers",
+                        topic.name, topic_metadata.id, topic.num_partitions, broker_count);
+                }
+                Err(e) => {
+                    let err_msg = format!("{:?}", e);
+                    if err_msg.contains("already exists") || err_msg.contains("AlreadyExists") {
+                        // v2.3.2 CRITICAL FIX: Topic may have been auto-created with default
+                        // partition count (e.g., 3) by a Metadata request before the explicit
+                        // CreateTopics request arrived. Check if we need to expand partitions.
+                        if let Ok(Some(existing)) = metadata_store.get_topic(&topic.name).await {
+                            let existing_count = existing.config.partition_count;
+                            let requested_count = topic.num_partitions as u32;
+                            if existing_count < requested_count {
+                                tracing::info!(
+                                    "Topic '{}' exists with {} partitions, expanding to {} (explicit CreateTopics overrides auto-create)",
+                                    topic.name, existing_count, requested_count
+                                );
+                                // Update topic config with new partition count and configs
+                                if let Err(update_err) = metadata_store.update_topic(&topic.name, config).await {
+                                    tracing::warn!("Failed to update topic config: {:?}", update_err);
+                                }
+                                // Add partition assignments for the new partitions
+                                for assignment in &assignments {
+                                    if assignment.partition >= existing_count {
+                                        if let Err(assign_err) = metadata_store.assign_partition(assignment.clone()).await {
+                                            tracing::warn!("Failed to assign partition {}: {:?}", assignment.partition, assign_err);
+                                        }
+                                    }
+                                }
+                                // Initialize offsets for new partitions
+                                for &(partition, hwm, lso) in &offsets {
+                                    if partition >= existing_count {
+                                        if let Err(offset_err) = metadata_store.update_partition_offset(&topic.name, partition, hwm, lso).await {
+                                            tracing::warn!("Failed to init offset for partition {}: {:?}", partition, offset_err);
+                                        }
+                                    }
+                                }
+                                tracing::info!("✅ Expanded topic '{}' from {} to {} partitions",
+                                    topic.name, existing_count, requested_count);
+                            } else {
+                                // Same or more partitions already - update configs only
+                                tracing::info!("Topic '{}' already exists with {} partitions (requested {}), updating config",
+                                    topic.name, existing_count, requested_count);
+                                if let Err(update_err) = metadata_store.update_topic(&topic.name, config).await {
+                                    tracing::warn!("Failed to update topic config: {:?}", update_err);
+                                }
+                            }
+                        }
+                    } else {
+                        return Err(Error::Internal(format!("Failed to create topic: {:?}", e)));
+                    }
+                }
+            }
             
             Ok(())
         } else {
@@ -5753,11 +5803,22 @@ impl ProtocolHandler {
                 let mut sorted_assignments = assignments;
                 sorted_assignments.sort_by_key(|a| a.partition);
 
-                tracing::info!("METADATA→PARTITIONS: topic={} partition_count={} assignments_count={}",
-                              topic_meta.name, topic_meta.config.partition_count, sorted_assignments.len());
+                // v2.3.2 FIX: Use the ACTUAL number of partitions, which is the max of
+                // partition_count (from TopicConfig, may be stale on followers) and the
+                // actual number of PartitionAssignment entries (replicated via Raft).
+                // This handles the case where auto_create_topics(3) runs first, then
+                // CreateTopics(6) expands partitions - the TopicUpdated event isn't
+                // replicated but PartitionAssigned events ARE, so assignments > partition_count.
+                let effective_partition_count = std::cmp::max(
+                    topic_meta.config.partition_count,
+                    sorted_assignments.len() as u32,
+                );
 
-                // Create partitions for ALL partition_count, using assignments where available
-                for partition_id in 0..topic_meta.config.partition_count {
+                tracing::info!("METADATA→PARTITIONS: topic={} partition_count={} assignments_count={} effective={}",
+                              topic_meta.name, topic_meta.config.partition_count, sorted_assignments.len(), effective_partition_count);
+
+                // Create partitions for ALL effective partitions, using assignments where available
+                for partition_id in 0..effective_partition_count {
                     // Get leader for this partition (queries the leader-flagged assignment)
                     let leader_id = match metadata_store.get_partition_leader(&topic_meta.name, partition_id).await {
                         Ok(Some(leader)) => {
@@ -5870,6 +5931,30 @@ impl ProtocolHandler {
                     config_map.insert("compression.type".to_string(), "none".to_string());
                     config_map.insert("cleanup.policy".to_string(), "delete".to_string());
                     config_map.insert("min.insync.replicas".to_string(), "1".to_string());
+
+                    // v2.3.1: Include searchable/columnar/vector defaults from env vars
+                    // so auto-created topics match the server's configured defaults.
+                    // Without this, auto-creation on a follower node creates a bare topic
+                    // that races with the real CreateTopics event, and the real event's
+                    // config is silently ignored by the idempotent check in apply_event().
+                    if std::env::var("CHRONIK_DEFAULT_SEARCHABLE")
+                        .map(|v| v.eq_ignore_ascii_case("true"))
+                        .unwrap_or(false)
+                    {
+                        config_map.insert("searchable".to_string(), "true".to_string());
+                    }
+                    if std::env::var("CHRONIK_DEFAULT_COLUMNAR")
+                        .map(|v| v.eq_ignore_ascii_case("true"))
+                        .unwrap_or(false)
+                    {
+                        config_map.insert("columnar.enabled".to_string(), "true".to_string());
+                    }
+                    if std::env::var("CHRONIK_DEFAULT_VECTOR_ENABLED")
+                        .map(|v| v.eq_ignore_ascii_case("true"))
+                        .unwrap_or(false)
+                    {
+                        config_map.insert("vector.enabled".to_string(), "true".to_string());
+                    }
                     
                     let config = chronik_common::metadata::TopicConfig {
                         partition_count: default_num_partitions,

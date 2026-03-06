@@ -64,6 +64,11 @@ impl ColumnarQueryEngine {
 
         let ctx = SessionContext::new_with_config(session_config);
 
+        // Register custom UDFs (json_extract_int, decode_utf8, etc.)
+        if let Err(e) = crate::udfs::register_udfs(&ctx) {
+            tracing::warn!("Failed to register custom UDFs: {}", e);
+        }
+
         Self { ctx, config }
     }
 
@@ -215,6 +220,22 @@ impl ColumnarQueryEngine {
             .map_err(|e| anyhow!("Failed to register memory table '{}': {}", table_name, e))?;
 
         debug!("Successfully registered memory table '{}'", table_name);
+        Ok(())
+    }
+
+    /// Register a custom TableProvider (e.g., PartitionedMemTable with filter pushdown).
+    pub fn register_table_provider(
+        &self,
+        table_name: &str,
+        provider: Arc<dyn datafusion::catalog::TableProvider>,
+    ) -> Result<()> {
+        debug!("Registering table provider '{}' for hot buffer", table_name);
+
+        self.ctx
+            .register_table(table_name, provider)
+            .map_err(|e| anyhow!("Failed to register table provider '{}': {}", table_name, e))?;
+
+        debug!("Successfully registered table provider '{}'", table_name);
         Ok(())
     }
 

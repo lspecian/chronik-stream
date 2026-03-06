@@ -22,6 +22,7 @@ pub mod sql_handler;
 pub mod vector_handler;
 pub mod admin_handler;
 pub mod query_handler;
+pub mod query_router;
 #[cfg(feature = "search")]
 pub mod search_handler;
 
@@ -40,7 +41,9 @@ use chronik_columnar::{
     ColumnarQueryEngine, HotDataBuffer, QueryEngineConfig, VectorIndexManager, VectorSearchService,
 };
 use chronik_common::metadata::traits::MetadataStore;
+use chronik_storage::wal_indexer::WalIndexer;
 use chronik_embeddings::EmbeddingProvider;
+use chronik_embeddings::reranker::RerankerProvider;
 
 pub use sql_handler::{SqlHandler, SqlRequest, SqlResponse};
 pub use vector_handler::{
@@ -138,6 +141,15 @@ pub struct UnifiedApiState {
     pub profile_store: Arc<chronik_query::profiles::ProfileStore>,
     /// v2.4.0: Shared feature logger for query training data
     pub feature_logger: Arc<chronik_query::features::FeatureLogger>,
+    /// v2.4.1: Query embedding cache (SV-1) — shared across all vector search requests
+    pub embedding_cache: Option<Arc<chronik_columnar::QueryEmbeddingCache>>,
+    /// v2.3.1: WalIndexer for vector embedding backfill
+    pub wal_indexer: Option<Arc<WalIndexer>>,
+    /// VO-4: Optional reranker provider for cross-encoder re-ranking after HNSW retrieval
+    pub reranker: Option<Arc<dyn RerankerProvider>>,
+    /// Distributed query router for cluster-mode scatter-gather fan-out.
+    /// None in single-node mode — queries execute locally only.
+    pub query_router: Option<Arc<query_router::QueryRouter>>,
 }
 
 impl UnifiedApiState {
@@ -159,7 +171,17 @@ impl UnifiedApiState {
             search_api: None,
             profile_store: Arc::new(chronik_query::profiles::ProfileStore::new()),
             feature_logger: Arc::new(chronik_query::features::FeatureLogger::new()),
+            embedding_cache: None,
+            wal_indexer: None,
+            reranker: None,
+            query_router: None,
         }
+    }
+
+    /// Set the WalIndexer for vector backfill support
+    pub fn with_wal_indexer(mut self, indexer: Arc<WalIndexer>) -> Self {
+        self.wal_indexer = Some(indexer);
+        self
     }
 
     /// Set the query engine
@@ -211,6 +233,34 @@ impl UnifiedApiState {
     #[cfg(feature = "search")]
     pub fn with_search_api(mut self, api: Arc<chronik_search::SearchApi>) -> Self {
         self.search_api = Some(api);
+        self
+    }
+
+    /// VO-4: Set the reranker provider for cross-encoder re-ranking.
+    ///
+    /// When set, vector search endpoints can apply re-ranking to improve
+    /// result quality. Overretrieves k * overretrieval_factor candidates,
+    /// scores them with a cross-encoder, and returns top-k.
+    pub fn with_reranker(mut self, reranker: Arc<dyn RerankerProvider>) -> Self {
+        self.reranker = Some(reranker);
+        self
+    }
+
+    /// Set the distributed query router for cluster-mode fan-out.
+    ///
+    /// When set, query endpoints automatically fan out to peer nodes
+    /// and merge results. See docs/DISTRIBUTED_QUERY_LAYER.md.
+    pub fn with_query_router(mut self, router: Arc<query_router::QueryRouter>) -> Self {
+        self.query_router = Some(router);
+        self
+    }
+
+    /// v2.4.1: Set the query embedding cache (SV-1).
+    ///
+    /// When set, vector search queries check the cache before calling the
+    /// embedding provider, reducing repeated query latency from ~372ms to ~1-5ms.
+    pub fn with_embedding_cache(mut self, cache: Arc<chronik_columnar::QueryEmbeddingCache>) -> Self {
+        self.embedding_cache = Some(cache);
         self
     }
 }
@@ -267,7 +317,8 @@ pub fn create_router_full(
             .route("/_vector/:topic/search_by_vector", post(vector_handler::search_by_vector))
             .route("/_vector/:topic/hybrid", post(vector_handler::hybrid_search))
             .route("/_vector/:topic/stats", get(vector_handler::get_stats))
-            .route("/_vector/topics", get(vector_handler::list_topics));
+            .route("/_vector/topics", get(vector_handler::list_topics))
+            .route("/_vector/:topic/backfill", post(vector_handler::backfill));
     }
 
     // Unified query endpoint (always enabled — orchestrates across all backends)
@@ -295,7 +346,7 @@ pub fn create_router_full(
 }
 
 /// Health check response
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct HealthResponse {
     pub status: String,
     pub version: String,
@@ -604,8 +655,8 @@ mod tests {
         assert_eq!(config.query_timeout_secs, 60);
     }
 
-    #[test]
-    fn test_unified_api_state_builder() {
+    #[tokio::test]
+    async fn test_unified_api_state_builder() {
         let metadata_store = create_mock_metadata_store();
         let config = UnifiedApiConfig::default();
 
@@ -636,7 +687,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         // Parse response body
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
         let health: HealthResponse = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(health.status, "ok");
@@ -717,13 +768,14 @@ mod tests {
 
         let app = create_router(state);
 
-        // Should return SERVICE_UNAVAILABLE without vector manager
+        // Returns OK with empty topics list when no vector manager configured
+        // (list_topics gracefully handles missing vector_index_manager)
         let response = app
             .oneshot(Request::builder().uri("/_vector/topics").body(Body::empty()).unwrap())
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

@@ -26,8 +26,9 @@ pub use sync_leader::LeaderAssignment;
 pub use sync_response::SyncResponseBuilder;
 
 /// Consumer group state
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum GroupState {
+    #[default]
     Empty,
     Stable,
     PreparingRebalance,
@@ -122,12 +123,34 @@ impl GroupMember {
     }
 }
 
+impl Default for GroupMember {
+    fn default() -> Self {
+        Self {
+            member_id: String::new(),
+            client_id: String::new(),
+            client_host: String::new(),
+            session_timeout: Duration::default(),
+            rebalance_timeout: Duration::default(),
+            subscription: Vec::new(),
+            assignment: HashMap::new(),
+            last_heartbeat: Instant::now(),
+            owned_partitions: HashMap::new(),
+            target_assignment: None,
+            member_epoch: 0,
+            is_leaving: false,
+            protocols: Vec::new(),
+            user_data: None,
+        }
+    }
+}
+
 /// Partition assignment strategy
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum AssignmentStrategy {
     Range,
     RoundRobin,
     Sticky,
+    #[default]
     CooperativeSticky, // KIP-848
 }
 
@@ -549,6 +572,30 @@ impl ConsumerGroup {
                     warn!(member_id = %member_id, "Failed to send JoinGroup response - receiver dropped");
                 }
             }
+        }
+    }
+}
+
+impl Default for ConsumerGroup {
+    fn default() -> Self {
+        Self {
+            group_id: String::new(),
+            state: GroupState::default(),
+            generation_id: 0,
+            protocol_type: String::new(),
+            protocol: None,
+            leader_id: None,
+            members: HashMap::new(),
+            group_epoch: 0,
+            assignment_strategy: AssignmentStrategy::default(),
+            pending_members: HashSet::new(),
+            rebalance_start_time: None,
+            expected_members_count: 0,
+            previous_member_count: 0,
+            static_members: HashMap::new(),
+            last_persisted: None,
+            pending_join_futures: Arc::new(Mutex::new(HashMap::new())),
+            pending_sync_futures: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -2439,7 +2486,14 @@ mod tests {
         let group_id = manager.get_or_create_group("test-group".to_string(), "consumer".to_string()).await.unwrap();
         assert_eq!(group_id, "test-group");
         
-        // Join group
+        // Join group - subscription metadata must be valid Kafka protocol:
+        // version:i16(0) + topic_count:i32(1) + topic_len:i16(10) + "test-topic"
+        let mut subscription = Vec::new();
+        subscription.extend_from_slice(&0i16.to_be_bytes()); // version 0
+        subscription.extend_from_slice(&1i32.to_be_bytes()); // 1 topic
+        subscription.extend_from_slice(&10i16.to_be_bytes()); // topic name length
+        subscription.extend_from_slice(b"test-topic"); // topic name
+
         let join_response = manager.join_group(
             "test-group".to_string(),
             None,
@@ -2448,14 +2502,25 @@ mod tests {
             Duration::from_secs(30),
             Duration::from_secs(300),
             "consumer".to_string(),
-            vec![("range".to_string(), vec![])],
+            vec![("range".to_string(), subscription)],
             None,
         ).await.unwrap();
         
         assert_eq!(join_response.error_code, 0);
         assert!(!join_response.member_id.is_empty());
-        assert_eq!(join_response.generation_id, 1);
-        
+        // First join completes without rebalance (Empty → CompletingRebalance), generation starts at 0
+        assert_eq!(join_response.generation_id, 0);
+
+        // SyncGroup (required before heartbeat — transitions CompletingRebalance → Stable)
+        let sync_response = manager.sync_group(
+            "test-group".to_string(),
+            join_response.generation_id,
+            join_response.member_id.clone(),
+            join_response.member_epoch,
+            Some(vec![]), // Leader sends empty assignments for this test
+        ).await.unwrap();
+        assert_eq!(sync_response.error_code, 0);
+
         // Heartbeat
         let heartbeat_response = manager.heartbeat(
             "test-group".to_string(),

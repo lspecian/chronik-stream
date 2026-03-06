@@ -8,7 +8,7 @@
 
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Json,
 };
@@ -20,7 +20,7 @@ use tracing::{debug, error, info, warn};
 use super::UnifiedApiState;
 
 /// SQL query request
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SqlRequest {
     /// SQL query to execute
     pub query: String,
@@ -41,7 +41,7 @@ fn default_timeout() -> u64 {
 }
 
 /// SQL query response
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SqlResponse {
     /// Column names
     pub columns: Vec<String>,
@@ -166,8 +166,8 @@ impl SqlHandler {
             if !registered_set.contains(&hot_table_name) {
                 if let Some(hot_buffer) = &state.hot_buffer {
                     match hot_buffer.get_topic_mem_table(topic).await {
-                        Ok(Some(mem_table)) => {
-                            if let Err(e) = engine.register_memory_table(&hot_table_name, mem_table) {
+                        Ok(Some(partitioned_table)) => {
+                            if let Err(e) = engine.register_table_provider(&hot_table_name, std::sync::Arc::new(partitioned_table)) {
                                 debug!("Failed to register hot table '{}': {}", hot_table_name, e);
                             } else {
                                 info!(
@@ -340,12 +340,53 @@ impl SqlHandler {
 /// Execute SQL query endpoint
 pub async fn execute_sql(
     State(state): State<UnifiedApiState>,
+    headers: HeaderMap,
     Json(request): Json<SqlRequest>,
 ) -> impl IntoResponse {
+    let fan_out_request = request.clone();
     info!(query = %request.query, limit = request.limit, "Executing SQL query");
+
+    // Check if SQL engine is available before executing
+    if state.query_engine.is_none() {
+        let error_response = SqlErrorResponse {
+            error: "SQL query engine not available".to_string(),
+            error_type: "ServiceUnavailable".to_string(),
+        };
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(error_response)).into_response();
+    }
 
     match SqlHandler::execute(&state, &request.query, request.limit).await {
         Ok(response) => {
+            // Distributed fan-out: merge SQL results from all peer nodes
+            let response = if let Some(ref router) = state.query_router {
+                if !super::query_router::is_forwarded_request(&headers) {
+                    // Check if all data is local (RF=N) — skip fan-out if so
+                    // Only refresh partition map if not yet populated (avoids RwLock contention)
+                    if !router.has_partition_map().await {
+                        router.refresh_all_partition_maps(state.metadata_store.as_ref()).await;
+                    }
+                    if router.all_topics_local().await {
+                        debug!("All partitions local (RF=N), skipping SQL fan-out");
+                        response
+                    } else {
+                        let all_peers = router.all_peers();
+                        if !all_peers.is_empty() {
+                            let peers: Vec<SqlResponse> = router
+                                .fan_out_post("/_sql", &fan_out_request, &all_peers)
+                                .await;
+                            debug!(peer_count = peers.len(), "Merging SQL results from peers");
+                            super::query_router::merge_sql_responses(response, peers, fan_out_request.limit)
+                        } else {
+                            response
+                        }
+                    }
+                } else {
+                    response
+                }
+            } else {
+                response
+            };
+
             info!(
                 rows = response.row_count,
                 time_ms = response.execution_time_ms,
@@ -583,12 +624,46 @@ fn arrow_value_to_json(
             arr.value(row_idx),
         ));
     }
+    if let Some(arr) = column.as_any().downcast_ref::<BinaryViewArray>() {
+        return serde_json::Value::String(base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            arr.value(row_idx),
+        ));
+    }
+    if let Some(arr) = column.as_any().downcast_ref::<LargeBinaryArray>() {
+        return serde_json::Value::String(base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            arr.value(row_idx),
+        ));
+    }
+    if let Some(arr) = column.as_any().downcast_ref::<StringViewArray>() {
+        return serde_json::Value::String(arr.value(row_idx).to_string());
+    }
+    if let Some(arr) = column.as_any().downcast_ref::<LargeStringArray>() {
+        return serde_json::Value::String(arr.value(row_idx).to_string());
+    }
+    if let Some(arr) = column.as_any().downcast_ref::<Int8Array>() {
+        return serde_json::Value::Number(arr.value(row_idx).into());
+    }
+    if let Some(arr) = column.as_any().downcast_ref::<Int16Array>() {
+        return serde_json::Value::Number(arr.value(row_idx).into());
+    }
+    if let Some(arr) = column.as_any().downcast_ref::<UInt32Array>() {
+        return serde_json::Value::Number(arr.value(row_idx).into());
+    }
+    if let Some(arr) = column.as_any().downcast_ref::<UInt64Array>() {
+        return serde_json::Value::Number(arr.value(row_idx).into());
+    }
     if let Some(arr) = column.as_any().downcast_ref::<TimestampMillisecondArray>() {
         return serde_json::Value::Number(arr.value(row_idx).into());
     }
 
-    // Fallback: convert to debug string
-    serde_json::Value::String(format!("{:?}", column))
+    // Fallback: try to use Arrow's display format for the specific row
+    use chronik_columnar::datafusion::arrow::util::display::ArrayFormatter;
+    if let Ok(formatter) = ArrayFormatter::try_new(column.as_ref(), &Default::default()) {
+        return serde_json::Value::String(formatter.value(row_idx).to_string());
+    }
+    serde_json::Value::String(format!("unsupported_type:{}", column.data_type()))
 }
 
 #[cfg(test)]

@@ -486,6 +486,10 @@ pub enum AclError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // Serialize ACL tests that mutate CHRONIK_ACL_ENABLED env var
+    static ACL_ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     fn create_test_binding(principal: &str, operation: AclOperation) -> AclBinding {
         AclBinding {
@@ -501,6 +505,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_acl_store_disabled_by_default() {
+        let _lock = ACL_ENV_MUTEX.lock().unwrap();
+        std::env::remove_var("CHRONIK_ACL_ENABLED");
         let store = AclStore::new();
         assert!(!store.is_enabled());
 
@@ -520,6 +526,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_acl_create_and_describe() {
+        let _lock = ACL_ENV_MUTEX.lock().unwrap();
         std::env::set_var("CHRONIK_ACL_ENABLED", "true");
         let store = AclStore::new();
 
@@ -573,6 +580,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_authorization_deny_takes_precedence() {
+        let _lock = ACL_ENV_MUTEX.lock().unwrap();
         std::env::set_var("CHRONIK_ACL_ENABLED", "true");
         std::env::set_var("CHRONIK_ACL_ALLOW_IF_NO_ACL", "false");
         let store = AclStore::new();

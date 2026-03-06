@@ -1,0 +1,27 @@
+apiVersion: k6.io/v1alpha1
+kind: TestRun
+metadata:
+  name: k6-thunderbird-scale
+  namespace: chronik-perf
+spec:
+  parallelism: 4
+  script:
+    configMap:
+      name: k6-thunderbird-scale-script
+      file: thunderbird-scale-test.js
+  runner:
+    image: grafana/k6:0.49.0
+    resources:
+      requests:
+        cpu: "1"
+        memory: "512Mi"
+      limits:
+        cpu: "4"
+        memory: "2Gi"
+    env:
+      - name: CHRONIK_URL
+        value: "http://chronik-thunderbird.chronik-perf.svc.cluster.local:6092"
+      - name: TOPIC
+        value: "thunderbird"
+      - name: TEST_MODE
+        value: "mixed"

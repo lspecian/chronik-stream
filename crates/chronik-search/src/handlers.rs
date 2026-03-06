@@ -110,6 +110,11 @@ pub async fn search_all(
         }
     }
 
+    // Filter by index/topic name if specified in request body
+    if let Some(ref index_filter) = request.index {
+        all_hits.retain(|hit| hit._index == *index_filter);
+    }
+
     // Sort and limit results
     all_hits.sort_by(|a, b| b._score.partial_cmp(&a._score).unwrap());
     all_hits.truncate(request.size);
@@ -163,7 +168,7 @@ pub async fn search_index(
     // Execute aggregations if present
     let aggregations = if let Some(aggs) = request.aggs.as_ref().or(request.aggregations.as_ref()) {
         let query = match &request.query {
-            Some(query_dsl) => build_tantivy_query(query_dsl, &state.schema)
+            Some(query_dsl) => build_tantivy_query(query_dsl, &state.schema, Some(&state.index))
                 .map_err(|e| search_error(e))?,
             None => Box::new(AllQuery),
         };
@@ -283,7 +288,7 @@ async fn search_tantivy_index(
     let schema = index.schema();
     let query: Box<dyn TantivyQuery> = if let Some(query_dsl) = &request.query {
         // Try to build query, fall back to match_all if schema mismatch
-        match build_tantivy_query(query_dsl, &schema) {
+        match build_tantivy_query(query_dsl, &schema, Some(index)) {
             Ok(q) => q,
             Err(e) => {
                 debug!("Could not build query for index {}: {}, using match_all", index_name, e);
@@ -363,7 +368,7 @@ async fn search_in_index(
 
     // Build Tantivy query from Elasticsearch query DSL
     let query = match &request.query {
-        Some(query_dsl) => build_tantivy_query(query_dsl, &state.schema)?,
+        Some(query_dsl) => build_tantivy_query(query_dsl, &state.schema, Some(&state.index))?,
         None => Box::new(AllQuery),
     };
 
@@ -430,23 +435,77 @@ async fn search_in_index(
 fn build_tantivy_query(
     query_dsl: &QueryDsl,
     schema: &tantivy::schema::Schema,
+    index: Option<&tantivy::Index>,
 ) -> Result<Box<dyn TantivyQuery>> {
     match query_dsl {
         QueryDsl::MatchAll(_) => Ok(Box::new(AllQuery)),
-        
+
         QueryDsl::Match(match_query) => {
             // Get the field and value from the match query
             let (field_name, value) = match_query.field_value.iter().next()
                 .ok_or_else(|| Error::InvalidInput("Match query must specify a field".to_string()))?;
-            
-            let field = schema.get_field(field_name)
-                .map_err(|_| Error::InvalidInput(format!("Field {} not found", field_name)))?;
-            
-            // Use query parser for text fields
-            let query_parser = QueryParser::for_index(&tantivy::Index::create_in_ram(schema.clone()), vec![field]);
-            let query = query_parser.parse_query(&value.to_string())
-                .map_err(|e| Error::InvalidInput(format!("Invalid query: {}", e)))?;
-            
+
+            // Handle _all meta-field: search across all TEXT and JSON fields
+            let fields = if field_name == "_all" {
+                schema.fields()
+                    .filter_map(|(field, entry)| {
+                        match entry.field_type() {
+                            FieldType::Str(_) | FieldType::JsonObject(_) => Some(field),
+                            _ => None,
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                let field = schema.get_field(field_name)
+                    .map_err(|_| Error::InvalidInput(format!("Field {} not found", field_name)))?;
+                vec![field]
+            };
+
+            if fields.is_empty() {
+                return Ok(Box::new(AllQuery));
+            }
+
+            // Use the real index for QueryParser when available (proper tokenizers),
+            // fall back to temporary in-memory index
+            let tmp_index;
+            let idx = match index {
+                Some(i) => i,
+                None => {
+                    tmp_index = tantivy::Index::create_in_ram(schema.clone());
+                    &tmp_index
+                }
+            };
+            // Extract raw query text (avoid JSON quoting from value.to_string())
+            let query_text = match value.as_str() {
+                Some(s) => s.to_string(),
+                None => value.to_string(),
+            };
+
+            // For multi-word queries, split into individual terms and combine with OR.
+            // Tantivy's QueryParser doesn't handle multi-word queries well for JSON fields
+            // — terms in different JSON paths (e.g., color="turquoise", class="pillows")
+            // won't match when parsed as a single query string.
+            let words: Vec<&str> = query_text.split_whitespace().collect();
+            let query: Box<dyn TantivyQuery> = if words.len() <= 1 {
+                let query_parser = QueryParser::for_index(idx, fields.clone());
+                query_parser.parse_query(&query_text)
+                    .map_err(|e| Error::InvalidInput(format!("Invalid query: {}", e)))?
+            } else {
+                // Create per-word sub-queries and OR them together
+                let mut sub_queries: Vec<(Occur, Box<dyn TantivyQuery>)> = Vec::new();
+                let query_parser = QueryParser::for_index(idx, fields.clone());
+                for word in &words {
+                    if let Ok(sub_q) = query_parser.parse_query(word) {
+                        sub_queries.push((Occur::Should, sub_q));
+                    }
+                }
+                if sub_queries.is_empty() {
+                    Box::new(AllQuery)
+                } else {
+                    Box::new(BooleanQuery::new(sub_queries))
+                }
+            };
+
             Ok(query)
         },
         
@@ -513,31 +572,31 @@ fn build_tantivy_query(
         
         QueryDsl::Bool(bool_query) => {
             let mut clauses = Vec::new();
-            
+
             // Add must clauses
             for clause in &bool_query.must {
-                let sub_query = build_tantivy_query(clause, schema)?;
+                let sub_query = build_tantivy_query(clause, schema, index)?;
                 clauses.push((Occur::Must, sub_query));
             }
-            
+
             // Add should clauses
             for clause in &bool_query.should {
-                let sub_query = build_tantivy_query(clause, schema)?;
+                let sub_query = build_tantivy_query(clause, schema, index)?;
                 clauses.push((Occur::Should, sub_query));
             }
-            
+
             // Add must_not clauses
             for clause in &bool_query.must_not {
-                let sub_query = build_tantivy_query(clause, schema)?;
+                let sub_query = build_tantivy_query(clause, schema, index)?;
                 clauses.push((Occur::MustNot, sub_query));
             }
-            
+
             // Add filter clauses (similar to must but don't affect scoring)
             for clause in &bool_query.filter {
-                let sub_query = build_tantivy_query(clause, schema)?;
+                let sub_query = build_tantivy_query(clause, schema, index)?;
                 clauses.push((Occur::Must, sub_query));
             }
-            
+
             Ok(Box::new(BooleanQuery::new(clauses)))
         },
         

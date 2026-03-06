@@ -243,13 +243,20 @@ impl TopicValidator {
 
     /// Validate vector search configuration keys
     ///
+    /// Accepts both short-form (`vector.*`) and long-form (`vector.embedding.*`) keys
+    /// for provider, model, dimensions, and endpoint. The short form is canonical
+    /// and matches the runtime config parser in `chronik-embeddings`.
+    ///
     /// Supported keys:
     /// - vector.enabled: "true" | "false"
-    /// - vector.embedding.provider: "openai" | "local" | "external"
-    /// - vector.embedding.model: model name string
-    /// - vector.embedding.dimensions: positive integer (auto-detected from model if omitted)
-    /// - vector.embedding.endpoint: URL for external provider
+    /// - vector.provider / vector.embedding.provider: "openai" | "local" | "external"
+    /// - vector.model / vector.embedding.model: model name string
+    /// - vector.dimensions / vector.embedding.dimensions: positive integer (1-4096)
+    /// - vector.endpoint / vector.embedding.endpoint: URL for external provider
     /// - vector.field: "value" | "key" | JSON path (e.g., "$.message.text")
+    /// - vector.batch_size: positive integer (1-2048)
+    /// - vector.quantization: "f32" | "f16" | "int8" | "binary"
+    /// - vector.active_model: model ID string
     /// - vector.index.type: "hnsw" | "flat"
     /// - vector.index.m: positive integer (HNSW M parameter, default 16)
     /// - vector.index.ef_construction: positive integer (default 200)
@@ -273,39 +280,55 @@ impl TopicValidator {
                     }
                     debug!("Vector search enabled for topic");
                 }
-                "vector.embedding.provider" => {
+                // Accept both short-form (vector.provider) and long-form (vector.embedding.provider)
+                "vector.provider" | "vector.embedding.provider" => {
                     if !["openai", "local", "external"].contains(&value.as_str()) {
-                        error!("Invalid vector.embedding.provider value: {} (expected openai/local/external)", value);
+                        error!("Invalid {} value: {} (expected openai/local/external)", key, value);
                         return Err(error_codes::INVALID_CONFIG);
                     }
                 }
-                "vector.embedding.model" => {
-                    // Model name validation - just check non-empty
+                "vector.model" | "vector.embedding.model" => {
                     if value.trim().is_empty() {
-                        error!("Invalid vector.embedding.model value: empty");
+                        error!("Invalid {} value: empty", key);
                         return Err(error_codes::INVALID_CONFIG);
                     }
-                    // Validate dimensions match known models
                     Self::validate_model_dimensions(configs)?;
                 }
-                "vector.embedding.dimensions" => {
+                "vector.dimensions" | "vector.embedding.dimensions" => {
                     let dims = value.parse::<usize>().unwrap_or(0);
                     if dims == 0 || dims > 4096 {
-                        error!("Invalid vector.embedding.dimensions value: {} (expected 1-4096)", value);
+                        error!("Invalid {} value: {} (expected 1-4096)", key, value);
                         return Err(error_codes::INVALID_CONFIG);
                     }
                 }
-                "vector.embedding.endpoint" => {
-                    // URL validation - basic check
+                "vector.endpoint" | "vector.embedding.endpoint" => {
                     if !value.starts_with("http://") && !value.starts_with("https://") {
-                        error!("Invalid vector.embedding.endpoint value: {} (expected http:// or https:// URL)", value);
+                        error!("Invalid {} value: {} (expected http:// or https:// URL)", key, value);
                         return Err(error_codes::INVALID_CONFIG);
                     }
                 }
                 "vector.field" => {
-                    // Field path - must be "value", "key", or start with "$."
                     if !["value", "key"].contains(&value.as_str()) && !value.starts_with("$.") {
                         error!("Invalid vector.field value: {} (expected 'value', 'key', or JSON path like '$.field')", value);
+                        return Err(error_codes::INVALID_CONFIG);
+                    }
+                }
+                "vector.batch_size" => {
+                    let size = value.parse::<usize>().unwrap_or(0);
+                    if size == 0 || size > 2048 {
+                        error!("Invalid vector.batch_size value: {} (expected 1-2048)", value);
+                        return Err(error_codes::INVALID_CONFIG);
+                    }
+                }
+                "vector.quantization" => {
+                    if !["f32", "f16", "int8", "binary"].contains(&value.as_str()) {
+                        error!("Invalid vector.quantization value: {} (expected f32/f16/int8/binary)", value);
+                        return Err(error_codes::INVALID_CONFIG);
+                    }
+                }
+                "vector.active_model" => {
+                    if value.trim().is_empty() {
+                        error!("Invalid vector.active_model value: empty");
                         return Err(error_codes::INVALID_CONFIG);
                     }
                 }
@@ -321,11 +344,34 @@ impl TopicValidator {
                         return Err(error_codes::INVALID_CONFIG);
                     }
                 }
-                "vector.index.metric" => {
+                "vector.index.metric" | "vector.hnsw.metric" => {
                     if !["cosine", "euclidean", "dot"].contains(&value.as_str()) {
-                        error!("Invalid vector.index.metric value: {} (expected cosine/euclidean/dot)", value);
+                        error!("Invalid {} value: {} (expected cosine/euclidean/dot)", key, value);
                         return Err(error_codes::INVALID_CONFIG);
                     }
+                }
+                "vector.hnsw.m" | "vector.hnsw.ef_construction" | "vector.hnsw.ef_search" => {
+                    if value.parse::<usize>().map(|v| v > 0).unwrap_or(false) == false {
+                        error!("Invalid {} value: {} (expected positive integer)", key, value);
+                        return Err(error_codes::INVALID_CONFIG);
+                    }
+                }
+                "vector.embedding_concurrency" | "vector.max_retries"
+                | "vector.search_dimensions" => {
+                    if value.parse::<usize>().is_err() {
+                        error!("Invalid {} value: {} (expected integer)", key, value);
+                        return Err(error_codes::INVALID_CONFIG);
+                    }
+                }
+                "vector.adaptive_retrieval" => {
+                    if !Self::is_valid_bool(value) {
+                        error!("Invalid vector.adaptive_retrieval value: {} (expected 'true' or 'false')", value);
+                        return Err(error_codes::INVALID_CONFIG);
+                    }
+                }
+                // Reranker config keys
+                k if k.starts_with("vector.reranker.") => {
+                    // Reranker keys validated by runtime config parser
                 }
                 _ => {
                     warn!("Unknown vector config key: {}", key);
@@ -335,14 +381,17 @@ impl TopicValidator {
         }
 
         // If vector is enabled without per-topic provider, check for server-wide provider
-        if vector_enabled && !configs.contains_key("vector.embedding.provider") {
-            // Allow if server-wide embedding provider is configured
+        // Accept both short-form (vector.provider) and long-form (vector.embedding.provider)
+        let has_topic_provider = configs.contains_key("vector.provider")
+            || configs.contains_key("vector.embedding.provider");
+
+        if vector_enabled && !has_topic_provider {
             let has_server_provider = std::env::var("OPENAI_API_KEY").is_ok()
                 || std::env::var("CHRONIK_EMBEDDING_ENDPOINT").is_ok()
                 || std::env::var("CHRONIK_EMBEDDING_PROVIDER").is_ok();
 
             if !has_server_provider {
-                error!("vector.enabled=true requires either vector.embedding.provider in topic config or server-wide provider (OPENAI_API_KEY or CHRONIK_EMBEDDING_PROVIDER)");
+                error!("vector.enabled=true requires either vector.provider in topic config or server-wide provider (OPENAI_API_KEY or CHRONIK_EMBEDDING_PROVIDER)");
                 return Err(error_codes::INVALID_CONFIG);
             }
             debug!("Using server-wide embedding provider for vector-enabled topic");
@@ -351,14 +400,18 @@ impl TopicValidator {
         Ok(())
     }
 
-    /// Validate that embedding dimensions match known model dimensions
+    /// Validate that embedding dimensions match known model dimensions.
+    /// Accepts both short-form (vector.model) and long-form (vector.embedding.model).
     fn validate_model_dimensions(configs: &HashMap<String, String>) -> Result<(), i16> {
-        let model = match configs.get("vector.embedding.model") {
+        let model = configs.get("vector.model")
+            .or_else(|| configs.get("vector.embedding.model"));
+        let model = match model {
             Some(m) => m.as_str(),
             None => return Ok(()), // No model specified, skip validation
         };
 
-        let explicit_dims = configs.get("vector.embedding.dimensions")
+        let explicit_dims = configs.get("vector.dimensions")
+            .or_else(|| configs.get("vector.embedding.dimensions"))
             .and_then(|v| v.parse::<usize>().ok());
 
         // Known model dimensions

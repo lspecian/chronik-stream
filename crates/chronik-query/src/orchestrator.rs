@@ -93,6 +93,8 @@ pub struct QueryOrchestrator {
     ranker: Box<dyn Ranker>,
     profiles: Arc<ProfileStore>,
     feature_logger: Option<Arc<FeatureLogger>>,
+    /// VO-4: Optional cross-encoder reranker applied after RRF fusion
+    reranker: Option<Arc<dyn chronik_embeddings::reranker::RerankerProvider>>,
 }
 
 impl QueryOrchestrator {
@@ -104,6 +106,7 @@ impl QueryOrchestrator {
             ranker: Box::new(RuleRanker),
             profiles,
             feature_logger: None,
+            reranker: None,
         }
     }
 
@@ -122,6 +125,12 @@ impl QueryOrchestrator {
     /// Enable feature logging.
     pub fn with_feature_logger(mut self, logger: Arc<FeatureLogger>) -> Self {
         self.feature_logger = Some(logger);
+        self
+    }
+
+    /// VO-4: Set a cross-encoder reranker to apply after RRF fusion.
+    pub fn with_reranker(mut self, reranker: Arc<dyn chronik_embeddings::reranker::RerankerProvider>) -> Self {
+        self.reranker = Some(reranker);
         self
     }
 
@@ -149,6 +158,23 @@ impl QueryOrchestrator {
 
         // RRF merge
         let mut entries = self.merger.merge(candidate_set, plan.k * 2);
+
+        // VO-4: Apply cross-encoder re-ranking if enabled and reranker is available
+        if request.rerank {
+            if let Some(ref reranker) = self.reranker {
+                let query_text = request
+                    .q
+                    .semantic
+                    .as_deref()
+                    .or(request.q.text.as_deref())
+                    .unwrap_or("");
+
+                if !query_text.is_empty() {
+                    self.apply_reranking(reranker.as_ref(), query_text, &mut entries, plan.k)
+                        .await;
+                }
+            }
+        }
 
         // Get ranking profile
         let profile_name = request
@@ -207,6 +233,76 @@ impl QueryOrchestrator {
         }
 
         Ok(response)
+    }
+
+    /// VO-4: Apply cross-encoder re-ranking to merged entries.
+    ///
+    /// Takes the RRF-merged entries, extracts text_preview from each,
+    /// sends them to the reranker, and reorders entries by relevance score.
+    async fn apply_reranking(
+        &self,
+        reranker: &dyn chronik_embeddings::reranker::RerankerProvider,
+        query: &str,
+        entries: &mut Vec<crate::candidate::CandidateEntry>,
+        top_k: usize,
+    ) {
+        if entries.is_empty() {
+            return;
+        }
+
+        // Extract document texts for reranking
+        let doc_texts: Vec<String> = entries
+            .iter()
+            .map(|e| {
+                e.primary
+                    .text_preview
+                    .clone()
+                    .unwrap_or_else(|| format!("{}:{}:{}", e.primary.topic, e.primary.partition, e.primary.offset))
+            })
+            .collect();
+
+        let doc_refs: Vec<&str> = doc_texts.iter().map(|s| s.as_str()).collect();
+
+        match reranker.rerank(query, &doc_refs, top_k).await {
+            Ok(rerank_results) => {
+                tracing::debug!(
+                    candidates = entries.len(),
+                    reranked = rerank_results.len(),
+                    "Orchestrator re-ranking applied"
+                );
+
+                // Collect reranked indices in order
+                let rerank_indices: Vec<usize> = rerank_results
+                    .into_iter()
+                    .map(|rr| rr.index)
+                    .collect();
+
+                if !rerank_indices.is_empty() {
+                    // Move all entries into a lookup map, reorder by reranker output
+                    let original = std::mem::take(entries);
+                    let mut lookup: HashMap<usize, crate::candidate::CandidateEntry> =
+                        original.into_iter().enumerate().collect();
+
+                    let mut result = Vec::with_capacity(rerank_indices.len());
+                    for &idx in &rerank_indices {
+                        if let Some(entry) = lookup.remove(&idx) {
+                            result.push(entry);
+                        }
+                    }
+
+                    // Append remaining entries (not selected by reranker) in original order
+                    let mut remaining: Vec<(usize, crate::candidate::CandidateEntry)> =
+                        lookup.into_iter().collect();
+                    remaining.sort_by_key(|(idx, _)| *idx);
+                    result.extend(remaining.into_iter().map(|(_, e)| e));
+
+                    *entries = result;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Orchestrator re-ranking failed, keeping RRF order");
+            }
+        }
     }
 
     /// Execute all plan nodes in parallel, collecting candidates and stats.
@@ -436,6 +532,7 @@ mod tests {
             rank: None,
             timeout_ms: None,
             result_format: ResultFormat::Merged,
+            rerank: false,
         }
     }
 
@@ -539,6 +636,7 @@ mod tests {
             rank: None,
             timeout_ms: None,
             result_format: ResultFormat::Merged,
+            rerank: false,
         };
 
         let plan = make_plan(vec![QueryMode::Text, QueryMode::Sql]);

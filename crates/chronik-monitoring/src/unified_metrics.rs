@@ -134,6 +134,22 @@ pub struct UnifiedMetrics {
     pub embedding_tokens_total: AtomicU64,     // Total tokens processed (approx)
     pub embedding_messages_total: AtomicU64,   // Total messages embedded
     pub embedding_vectors_total: AtomicU64,    // Total vectors generated
+    // VO-1: Pipeline throughput metrics
+    pub embedding_batch_size: AtomicUsize,         // Configured batch size (gauge)
+    pub embedding_concurrency: AtomicUsize,        // Configured concurrency (gauge)
+    pub embedding_inflight_partitions: AtomicUsize, // Partitions currently embedding (gauge)
+    // VO-2: Incremental HNSW metrics
+    pub vector_pending_count: AtomicUsize,            // Vectors in pending tier (gauge)
+    pub vector_built_count: AtomicUsize,              // Vectors in built HNSW tier (gauge)
+    // VO-3: Vector memory metric
+    pub vector_memory_bytes: AtomicUsize,             // Total vector memory (f32 + quantized)
+
+    // ========== Embedding Cache Metrics (v2.4.1 SV-1) ==========
+    pub embedding_cache_hits: AtomicU64,
+    pub embedding_cache_misses: AtomicU64,
+    pub embedding_cache_evictions: AtomicU64,
+    pub embedding_cache_size: AtomicUsize,
+    pub embedding_cache_memory_bytes: AtomicUsize,
 
     // ========== Query Orchestrator Metrics (v2.4.0 Phase 9) ==========
     pub query_requests_total: AtomicU64,       // Total /_query requests
@@ -268,6 +284,20 @@ impl UnifiedMetrics {
             embedding_tokens_total: AtomicU64::new(0),
             embedding_messages_total: AtomicU64::new(0),
             embedding_vectors_total: AtomicU64::new(0),
+            // VO-1: Pipeline throughput
+            embedding_batch_size: AtomicUsize::new(256),
+            embedding_concurrency: AtomicUsize::new(4),
+            embedding_inflight_partitions: AtomicUsize::new(0),
+            vector_pending_count: AtomicUsize::new(0),
+            vector_built_count: AtomicUsize::new(0),
+            vector_memory_bytes: AtomicUsize::new(0),
+
+            // Embedding Cache (v2.4.1 SV-1)
+            embedding_cache_hits: AtomicU64::new(0),
+            embedding_cache_misses: AtomicU64::new(0),
+            embedding_cache_evictions: AtomicU64::new(0),
+            embedding_cache_size: AtomicUsize::new(0),
+            embedding_cache_memory_bytes: AtomicUsize::new(0),
 
             // Query Orchestrator (v2.4.0)
             query_requests_total: AtomicU64::new(0),
@@ -657,6 +687,70 @@ impl UnifiedMetrics {
         output.push_str(&format!("chronik_embedding_vectors_total {}\n",
             self.embedding_vectors_total.load(Ordering::Relaxed)));
 
+        // VO-1: Pipeline throughput gauges
+        output.push_str("# HELP chronik_embedding_batch_size Configured embedding batch size\n");
+        output.push_str("# TYPE chronik_embedding_batch_size gauge\n");
+        output.push_str(&format!("chronik_embedding_batch_size {}\n",
+            self.embedding_batch_size.load(Ordering::Relaxed)));
+
+        output.push_str("# HELP chronik_embedding_concurrency Configured embedding concurrency\n");
+        output.push_str("# TYPE chronik_embedding_concurrency gauge\n");
+        output.push_str(&format!("chronik_embedding_concurrency {}\n",
+            self.embedding_concurrency.load(Ordering::Relaxed)));
+
+        output.push_str("# HELP chronik_embedding_inflight_partitions Partitions currently running vector embedding\n");
+        output.push_str("# TYPE chronik_embedding_inflight_partitions gauge\n");
+        output.push_str(&format!("chronik_embedding_inflight_partitions {}\n",
+            self.embedding_inflight_partitions.load(Ordering::Relaxed)));
+
+        // VO-2: Incremental HNSW metrics
+        output.push_str("# HELP chronik_vector_pending_count Vectors in pending tier (not yet in HNSW)\n");
+        output.push_str("# TYPE chronik_vector_pending_count gauge\n");
+        output.push_str(&format!("chronik_vector_pending_count {}\n",
+            self.vector_pending_count.load(Ordering::Relaxed)));
+
+        output.push_str("# HELP chronik_vector_built_count Vectors in built HNSW tier\n");
+        output.push_str("# TYPE chronik_vector_built_count gauge\n");
+        output.push_str(&format!("chronik_vector_built_count {}\n",
+            self.vector_built_count.load(Ordering::Relaxed)));
+
+        // VO-3: Vector memory metric
+        output.push_str("# HELP chronik_vector_memory_bytes Total vector memory usage in bytes\n");
+        output.push_str("# TYPE chronik_vector_memory_bytes gauge\n");
+        output.push_str(&format!("chronik_vector_memory_bytes {}\n",
+            self.vector_memory_bytes.load(Ordering::Relaxed)));
+
+        // ========== Embedding Cache Metrics (v2.4.1 SV-1) ==========
+        let cache_hits = self.embedding_cache_hits.load(Ordering::Relaxed);
+        let cache_misses = self.embedding_cache_misses.load(Ordering::Relaxed);
+        let cache_total = cache_hits + cache_misses;
+        let cache_hit_rate = if cache_total > 0 {
+            cache_hits as f64 / cache_total as f64
+        } else {
+            0.0
+        };
+
+        output.push_str("# HELP chronik_embedding_cache_operations_total Embedding cache operations\n");
+        output.push_str("# TYPE chronik_embedding_cache_operations_total counter\n");
+        output.push_str(&format!("chronik_embedding_cache_operations_total{{operation=\"hit\"}} {}\n", cache_hits));
+        output.push_str(&format!("chronik_embedding_cache_operations_total{{operation=\"miss\"}} {}\n", cache_misses));
+        output.push_str(&format!("chronik_embedding_cache_operations_total{{operation=\"eviction\"}} {}\n",
+            self.embedding_cache_evictions.load(Ordering::Relaxed)));
+
+        output.push_str("# HELP chronik_embedding_cache_hit_rate Embedding cache hit rate (0.0 to 1.0)\n");
+        output.push_str("# TYPE chronik_embedding_cache_hit_rate gauge\n");
+        output.push_str(&format!("chronik_embedding_cache_hit_rate {:.4}\n", cache_hit_rate));
+
+        output.push_str("# HELP chronik_embedding_cache_size Current number of cached embeddings\n");
+        output.push_str("# TYPE chronik_embedding_cache_size gauge\n");
+        output.push_str(&format!("chronik_embedding_cache_size {}\n",
+            self.embedding_cache_size.load(Ordering::Relaxed)));
+
+        output.push_str("# HELP chronik_embedding_cache_memory_bytes Estimated embedding cache memory usage\n");
+        output.push_str("# TYPE chronik_embedding_cache_memory_bytes gauge\n");
+        output.push_str(&format!("chronik_embedding_cache_memory_bytes {}\n",
+            self.embedding_cache_memory_bytes.load(Ordering::Relaxed)));
+
         // ========== Query Orchestrator Metrics (v2.4.0 Phase 9) ==========
         output.push_str("# HELP chronik_query_requests_total Total unified query requests\n");
         output.push_str("# TYPE chronik_query_requests_total counter\n");
@@ -949,6 +1043,65 @@ impl MetricsRecorder {
     /// Record embedding error without request context
     pub fn record_embedding_error() {
         global_metrics().embedding_errors_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// VO-1: Update embedding pipeline configuration gauges
+    pub fn update_embedding_pipeline_config(batch_size: usize, concurrency: usize) {
+        let metrics = global_metrics();
+        metrics.embedding_batch_size.store(batch_size, Ordering::Relaxed);
+        metrics.embedding_concurrency.store(concurrency, Ordering::Relaxed);
+    }
+
+    /// VO-1: Track in-flight partition embedding count
+    pub fn increment_embedding_partitions() {
+        global_metrics().embedding_inflight_partitions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// VO-1: Track in-flight partition embedding count
+    pub fn decrement_embedding_partitions() {
+        let metrics = global_metrics();
+        let current = metrics.embedding_inflight_partitions.load(Ordering::Relaxed);
+        if current > 0 {
+            metrics.embedding_inflight_partitions.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    // ========== VO-2: Incremental HNSW Metrics ==========
+
+    /// Update vector index tier counts (called after add_vectors or build)
+    pub fn update_vector_index_counts(pending: usize, built: usize) {
+        let metrics = global_metrics();
+        metrics.vector_pending_count.store(pending, Ordering::Relaxed);
+        metrics.vector_built_count.store(built, Ordering::Relaxed);
+    }
+
+    // ========== VO-3: Vector Memory Metrics ==========
+
+    /// Update total vector memory usage across all partitions.
+    pub fn update_vector_memory_bytes(bytes: usize) {
+        let metrics = global_metrics();
+        metrics.vector_memory_bytes.store(bytes, Ordering::Relaxed);
+    }
+
+    // ========== Embedding Cache Metrics (v2.4.1 SV-1) ==========
+
+    /// Record an embedding cache hit or miss.
+    /// Call with "hit", "miss", or "eviction".
+    pub fn record_embedding_cache_operation(operation: &str) {
+        let metrics = global_metrics();
+        match operation {
+            "hit" => { metrics.embedding_cache_hits.fetch_add(1, Ordering::Relaxed); }
+            "miss" => { metrics.embedding_cache_misses.fetch_add(1, Ordering::Relaxed); }
+            "eviction" => { metrics.embedding_cache_evictions.fetch_add(1, Ordering::Relaxed); }
+            _ => {}
+        }
+    }
+
+    /// Update current embedding cache size and memory usage.
+    pub fn update_embedding_cache_size(size: usize, memory_bytes: usize) {
+        let metrics = global_metrics();
+        metrics.embedding_cache_size.store(size, Ordering::Relaxed);
+        metrics.embedding_cache_memory_bytes.store(memory_bytes, Ordering::Relaxed);
     }
 
     // ========== Query Orchestrator Metrics (v2.4.0 Phase 9) ==========

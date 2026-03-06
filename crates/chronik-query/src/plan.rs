@@ -246,6 +246,7 @@ mod tests {
             rank: None,
             timeout_ms: None,
             result_format: ResultFormat::Merged,
+            rerank: false,
         };
 
         let plan = QueryPlanner::plan(&request, &make_caps()).unwrap();
@@ -272,6 +273,7 @@ mod tests {
             rank: None,
             timeout_ms: None,
             result_format: ResultFormat::Merged,
+            rerank: false,
         };
 
         let plan = QueryPlanner::plan(&request, &make_caps()).unwrap();
@@ -304,6 +306,7 @@ mod tests {
             rank: None,
             timeout_ms: None,
             result_format: ResultFormat::Merged,
+            rerank: false,
         };
 
         let plan = QueryPlanner::plan(&request, &make_caps()).unwrap();
@@ -325,6 +328,7 @@ mod tests {
             rank: None,
             timeout_ms: None,
             result_format: ResultFormat::Merged,
+            rerank: false,
         };
 
         let result = QueryPlanner::plan(&request, &make_caps());
@@ -349,6 +353,7 @@ mod tests {
             rank: None,
             timeout_ms: None,
             result_format: ResultFormat::Merged,
+            rerank: false,
         };
 
         let result = QueryPlanner::plan(&request, &make_caps());

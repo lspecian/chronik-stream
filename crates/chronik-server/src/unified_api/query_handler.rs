@@ -103,12 +103,32 @@ impl BackendAdapter for ServerBackendAdapter {
         let provider = self.state.embedding_provider.as_ref()
             .ok_or_else(|| BackendError::NotAvailable("Embedding provider not configured".into()))?;
 
-        // Embed query text
-        let embedding_result = provider.embed(query).await
-            .map_err(|e| BackendError::ExecutionFailed(format!("Embedding failed: {}", e)))?;
+        // Embed query text (with cache check)
+        let cache_key = query.trim().to_lowercase();
+        let query_vector = if let Some(ref cache) = self.state.embedding_cache {
+            if let Some(cached) = cache.get(&cache_key).await {
+                chronik_monitoring::MetricsRecorder::record_embedding_cache_operation("hit");
+                cached
+            } else {
+                chronik_monitoring::MetricsRecorder::record_embedding_cache_operation("miss");
+                let result = provider.embed(query).await
+                    .map_err(|e| BackendError::ExecutionFailed(format!("Embedding failed: {}", e)))?;
+                let vector = result.vector;
+                cache.insert(cache_key, vector.clone()).await;
+                chronik_monitoring::MetricsRecorder::update_embedding_cache_size(
+                    cache.size().await,
+                    cache.memory_bytes().await,
+                );
+                vector
+            }
+        } else {
+            let result = provider.embed(query).await
+                .map_err(|e| BackendError::ExecutionFailed(format!("Embedding failed: {}", e)))?;
+            result.vector
+        };
 
         // Search across all partitions of the topic
-        let raw_results = manager.search_topic(topic, &embedding_result.vector, k).await
+        let raw_results = manager.search_topic(topic, &query_vector, k).await
             .map_err(|e| BackendError::ExecutionFailed(format!("Vector search failed: {}", e)))?;
 
         // Convert to candidates

@@ -1401,6 +1401,20 @@ impl RaftCluster {
         self.cached_is_leader.load(Ordering::Relaxed)
     }
 
+    /// Get a clone of the cached leadership flag (Arc<AtomicBool>).
+    ///
+    /// Used by subsystems like WalIndexer that need lock-free, dynamic leadership
+    /// checks without holding a reference to the full RaftCluster.
+    /// The AtomicBool is updated by the Raft message loop when leadership changes.
+    pub fn is_leader_flag(&self) -> Arc<AtomicBool> {
+        if self.is_single_node() {
+            // Single-node is always leader — return a permanently-true flag
+            Arc::new(AtomicBool::new(true))
+        } else {
+            self.cached_is_leader.clone()
+        }
+    }
+
     /// Get the current Raft leader ID (Phase 1.2)
     ///
     /// v2.2.7 LOCK CONTENTION FIX: Now uses cached value (lock-free atomic read)
@@ -2642,15 +2656,16 @@ mod tests {
     async fn test_metadata_queries() {
         let cluster = RaftCluster::bootstrap(1, vec![], PathBuf::from("/tmp/raft-test2")).await.unwrap();
 
-        // Initially no partition assignments
+        // v2.2.9: Partition assignments moved to WalMetadataStore.
+        // Raft state machine only manages cluster membership (nodes, brokers).
+        // These stub methods return None since partition data is in WAL now.
         assert_eq!(cluster.get_partition_replicas("test", 0), None);
         assert_eq!(cluster.get_partition_leader("test", 0), None);
 
-        // Propose partition assignment
-        cluster.propose(MetadataCommand::AssignPartition {
-            topic: "test".to_string(),
-            partition: 0,
-            replicas: vec![1, 2, 3],
+        // Propose a valid cluster membership command (AddNode)
+        cluster.propose(MetadataCommand::AddNode {
+            node_id: 4,
+            address: "localhost:9095".to_string(),
         }).await.unwrap();
 
         // Note: In real usage, this would require Raft consensus and applying
@@ -2658,11 +2673,11 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(not(feature = "raft"))]
-    async fn test_raft_disabled() {
-        let result = RaftCluster::bootstrap(1, vec![], PathBuf::from("/tmp/raft-test3")).await;
-        assert!(result.is_err(), "RaftCluster should fail when Raft feature is not enabled");
-        // Note: Can't check error message without Debug trait on RaftCluster
+    async fn test_raft_bootstrap_single_node() {
+        // Raft is always compiled in — verify single-node bootstrap works
+        let temp = tempfile::TempDir::new().unwrap();
+        let result = RaftCluster::bootstrap(1, vec![], temp.path().to_path_buf()).await;
+        assert!(result.is_ok(), "Single-node Raft bootstrap should succeed");
     }
 }
 
