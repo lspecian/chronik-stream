@@ -150,7 +150,13 @@ async fn apply(client: Client, csa: &ChronikStandalone) -> Result<Action, Operat
         }
 
         let spec_hash = compute_standalone_spec_hash(spec);
-        let pod = pod_builder::build_standalone_pod(&name, &namespace, spec, owner_ref.clone(), Some(&spec_hash));
+        let pod = pod_builder::build_standalone_pod(
+            &name,
+            &namespace,
+            spec,
+            owner_ref.clone(),
+            Some(&spec_hash),
+        );
         info!(name = %name, "Creating Pod");
         pod_api.create(&PostParams::default(), &pod).await?;
     }
@@ -261,8 +267,18 @@ fn compute_standalone_spec_hash(spec: &crate::crds::standalone::ChronikStandalon
     spec.columnar_enabled.hash(&mut hasher);
 
     // Sort env vars by name for deterministic hashing
-    let sorted_env: BTreeMap<_, _> = spec.env.iter()
-        .map(|e| (&e.name, (e.value.as_deref().unwrap_or(""), e.value_from_secret.as_ref())))
+    let sorted_env: BTreeMap<_, _> = spec
+        .env
+        .iter()
+        .map(|e| {
+            (
+                &e.name,
+                (
+                    e.value.as_deref().unwrap_or(""),
+                    e.value_from_secret.as_ref(),
+                ),
+            )
+        })
         .collect();
     for (name, (value, secret_ref)) in &sorted_env {
         name.hash(&mut hasher);

@@ -487,8 +487,18 @@ fn compute_cluster_spec_hash(spec: &ChronikClusterSpec) -> String {
     spec.columnar_enabled.hash(&mut hasher);
 
     // Sort env vars by name for deterministic hashing
-    let sorted_env: BTreeMap<_, _> = spec.env.iter()
-        .map(|e| (&e.name, (e.value.as_deref().unwrap_or(""), e.value_from_secret.as_ref())))
+    let sorted_env: BTreeMap<_, _> = spec
+        .env
+        .iter()
+        .map(|e| {
+            (
+                &e.name,
+                (
+                    e.value.as_deref().unwrap_or(""),
+                    e.value_from_secret.as_ref(),
+                ),
+            )
+        })
         .collect();
     for (name, (value, secret_ref)) in &sorted_env {
         name.hash(&mut hasher);
@@ -706,9 +716,10 @@ mod tests {
 
         let pod = Pod {
             metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
-                annotations: Some(BTreeMap::from([
-                    ("chronik.io/spec-hash".to_string(), matching_hash),
-                ])),
+                annotations: Some(BTreeMap::from([(
+                    "chronik.io/spec-hash".to_string(),
+                    matching_hash,
+                )])),
                 ..Default::default()
             },
             spec: Some(k8s_openapi::api::core::v1::PodSpec {
@@ -742,9 +753,10 @@ mod tests {
 
         let pod = Pod {
             metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
-                annotations: Some(BTreeMap::from([
-                    ("chronik.io/spec-hash".to_string(), hash_v1),
-                ])),
+                annotations: Some(BTreeMap::from([(
+                    "chronik.io/spec-hash".to_string(),
+                    hash_v1,
+                )])),
                 ..Default::default()
             },
             spec: Some(k8s_openapi::api::core::v1::PodSpec {
