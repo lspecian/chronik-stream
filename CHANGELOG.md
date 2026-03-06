@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.4.1] - 2026-03-06
+
+### Fixed
+
+- **acks=1 timeout at bulk scale** — ResponsePipeline rewritten with partition-bucketed storage (`DashMap<(topic, partition), BTreeMap<offset, ...>>`) for O(log n) callback cost instead of O(n). Commit callback made async via `tokio::spawn` to unblock GroupCommitWal worker. Cleanup interval reduced from 10s to 2s. Validated: 50K records with acks=1, zero timeouts, 137 msg/s.
+- **Vector fan-out broken with RF=3** — Vector search routing changed from `nodes_for_topic()` to `all_peers()`. With RF=3 and 3 nodes, partition-based routing returned empty (all partitions local) so fan-out never happened. Affects search, search_by_vector, and hybrid endpoints.
+- **Vector index purge + known_offsets persistence** — `known_offsets` HashSet now persisted in `PartitionIndexSnapshot` (backward compatible via `#[serde(default)]`). Added `DELETE /_vector/:topic/index` admin endpoint to clear stale vectors and delete snapshot files.
+
 ## [2.4.0] - 2026-03-06
 
 ### Added
