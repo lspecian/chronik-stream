@@ -348,9 +348,12 @@ pub async fn search(
             };
 
             // Distributed fan-out: merge results from peer nodes
+            // Use all_peers() instead of nodes_for_topic() because with RF=3 and 3 nodes,
+            // partition-based routing returns empty (all partitions are local), but vector
+            // indexes are per-node and may differ.
             let response = if needs_fan_out(&state, &headers, &topic).await {
                 let router = state.query_router.as_ref().unwrap();
-                let nodes = router.nodes_for_topic(&topic).await;
+                let nodes = router.all_peers();
                 let peers: Vec<VectorSearchResponse> = router
                     .fan_out_post(&format!("/_vector/{}/search", topic), &fan_out_request, &nodes)
                     .await;
@@ -445,9 +448,10 @@ pub async fn search_by_vector(
             };
 
             // Distributed fan-out: merge results from peer nodes
+            // Use all_peers() — vector indexes are per-node, not partition-based
             let response = if needs_fan_out(&state, &headers, &topic).await {
                 let router = state.query_router.as_ref().unwrap();
-                let nodes = router.nodes_for_topic(&topic).await;
+                let nodes = router.all_peers();
                 let peers: Vec<VectorSearchResponse> = router
                     .fan_out_post(&format!("/_vector/{}/search_by_vector", topic), &fan_out_request, &nodes)
                     .await;
@@ -1015,9 +1019,10 @@ pub async fn hybrid_search(
     };
 
     // Distributed fan-out: merge results from peer nodes
+    // Use all_peers() — vector indexes are per-node, not partition-based
     let response = if needs_fan_out(&state, &headers, &topic).await {
         let router = state.query_router.as_ref().unwrap();
-        let nodes = router.nodes_for_topic(&topic).await;
+        let nodes = router.all_peers();
         let peers: Vec<HybridSearchResponse> = router
             .fan_out_post(&format!("/_vector/{}/hybrid", topic), &fan_out_request, &nodes)
             .await;
@@ -1354,6 +1359,71 @@ pub async fn backfill(
                 error_type: "InternalError".to_string(),
             };
             (StatusCode::INTERNAL_SERVER_ERROR, Json(error_response)).into_response()
+        }
+    }
+}
+
+/// Request body for clearing vector indexes
+#[derive(Debug, Deserialize)]
+pub struct ClearVectorIndexRequest {
+    /// Partition to clear. If None, clears all partitions.
+    pub partition: Option<i32>,
+}
+
+/// Response for clearing vector indexes
+#[derive(Debug, Serialize)]
+pub struct ClearVectorIndexResponse {
+    pub topic: String,
+    pub partition: Option<i32>,
+    pub vectors_cleared: usize,
+    pub snapshots_deleted: bool,
+}
+
+/// DELETE /_vector/:topic/index — Clear vector index and delete snapshots
+pub async fn clear_vector_index(
+    State(state): State<UnifiedApiState>,
+    Path(topic): Path<String>,
+    body: Option<Json<ClearVectorIndexRequest>>,
+) -> impl IntoResponse {
+    let partition = body.and_then(|b| b.partition);
+
+    let index_manager = match state.vector_index_manager {
+        Some(ref mgr) => mgr,
+        None => {
+            return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+                "error": "Vector search not enabled"
+            }))).into_response();
+        }
+    };
+
+    let result = if let Some(p) = partition {
+        info!(topic = %topic, partition = p, "Clearing vector index for partition");
+        index_manager.clear_partition_with_snapshot(&topic, p).await
+    } else {
+        info!(topic = %topic, "Clearing all vector indexes for topic");
+        index_manager.clear_topic_with_snapshots(&topic).await
+    };
+
+    match result {
+        Ok(vectors_cleared) => {
+            info!(
+                topic = %topic,
+                partition = ?partition,
+                vectors_cleared = vectors_cleared,
+                "Vector index cleared"
+            );
+            Json(ClearVectorIndexResponse {
+                topic,
+                partition,
+                vectors_cleared,
+                snapshots_deleted: true,
+            }).into_response()
+        }
+        Err(e) => {
+            error!(topic = %topic, error = %e, "Failed to clear vector index");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "error": format!("Failed to clear vector index: {}", e)
+            }))).into_response()
         }
     }
 }

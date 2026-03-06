@@ -30,7 +30,7 @@ use axum::{
     extract::State,
     http::StatusCode,
     response::IntoResponse,
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -318,7 +318,8 @@ pub fn create_router_full(
             .route("/_vector/:topic/hybrid", post(vector_handler::hybrid_search))
             .route("/_vector/:topic/stats", get(vector_handler::get_stats))
             .route("/_vector/topics", get(vector_handler::list_topics))
-            .route("/_vector/:topic/backfill", post(vector_handler::backfill));
+            .route("/_vector/:topic/backfill", post(vector_handler::backfill))
+            .route("/_vector/:topic/index", delete(vector_handler::clear_vector_index));
     }
 
     // Unified query endpoint (always enabled — orchestrates across all backends)

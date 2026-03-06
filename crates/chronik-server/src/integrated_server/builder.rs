@@ -657,19 +657,26 @@ impl IntegratedKafkaServerBuilder {
     ) -> Arc<crate::response_pipeline::ResponsePipeline> {
         let response_pipeline = Arc::new(crate::response_pipeline::ResponsePipeline::new());
 
-        // Create commit callback for WAL batches
+        // Create commit callback for WAL batches.
+        // The ResponsePipeline notification is spawned async to avoid blocking
+        // the GroupCommitWal worker thread (which caused acks=1 timeouts at scale).
         let response_pipeline_clone = response_pipeline.clone();
         let partition_states = produce_handler.partition_states.clone();
+        let callback_handle = tokio::runtime::Handle::current();
         let commit_callback: chronik_wal::group_commit::CommitCallback = Arc::new(
             move |topic: &str, partition: i32, min_offset: i64, max_offset: i64| {
-                // Update in-memory high watermark
+                // Update in-memory high watermark (fast, O(1), stays synchronous)
                 let new_watermark = max_offset + 1;
                 if let Some(state) = partition_states.get(&(topic.to_string(), partition)) {
                     state.high_watermark.store(new_watermark as u64, Ordering::Release);
                     debug!("✅ WAL_CALLBACK: Updated high watermark {}-{} = {}", topic, partition, new_watermark);
                 }
-                // Notify ResponsePipeline
-                response_pipeline_clone.notify_batch_committed(topic, partition, min_offset, max_offset);
+                // Notify ResponsePipeline asynchronously to avoid blocking the worker
+                let pipeline = response_pipeline_clone.clone();
+                let topic = topic.to_string();
+                callback_handle.spawn(async move {
+                    pipeline.notify_batch_committed(&topic, partition, min_offset, max_offset);
+                });
             }
         );
 

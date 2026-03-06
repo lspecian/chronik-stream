@@ -4,23 +4,6 @@
 /// with acks=1 or acks=-1. It eliminates the 168x performance bottleneck caused by
 /// synchronous blocking on WAL fsync operations.
 ///
-/// ## Problem
-///
-/// Previously, every acks=1 request blocked waiting for WAL fsync:
-/// ```text
-/// Client → ProduceHandler → WAL.append_and_wait() → BLOCK 50ms → Return
-/// Result: Only 20 req/s per connection (1000ms / 50ms)
-/// ```
-///
-/// ## Solution
-///
-/// The ResponsePipeline decouples request handling from WAL fsync completion:
-/// ```text
-/// Client → ProduceHandler → WAL.append(acks=0) → Register Response → Return IMMEDIATELY
-///     ↓
-/// GroupCommit Worker → fsync batch → Trigger Callbacks → ResponsePipeline → Send Responses
-/// ```
-///
 /// ## Architecture
 ///
 /// ```text
@@ -39,30 +22,30 @@
 /// │     └─ ResponsePipeline receives notification                   │
 /// │                                                                 │
 /// │  3. RESPONSE DELIVERY                                           │
-/// │     ├─ Find all pending responses in offset range               │
+/// │     ├─ O(1) bucket lookup by (topic, partition)                 │
+/// │     ├─ O(log n) range scan in BTreeMap for offset range         │
 /// │     ├─ Send success response via oneshot channel                │
 /// │     └─ Kafka client receives ProduceResponse                    │
 /// │                                                                 │
-/// │  4. TIMEOUT CLEANUP (background task, every 10s)                │
-/// │     ├─ Scan for responses older than 30s                        │
+/// │  4. TIMEOUT CLEANUP (background task, every 2s)                 │
+/// │     ├─ Scan buckets for responses older than 30s                │
 /// │     └─ Send timeout errors                                      │
 /// │                                                                 │
 /// └─────────────────────────────────────────────────────────────────┘
 /// ```
 ///
-/// ## Performance Impact
+/// ## v2.4.1 Performance Fix
 ///
-/// **Before (v2.2.8):**
-/// - acks=0: 370,451 msg/s ✅
-/// - acks=1: 2,197 msg/s ❌ (168x slower!)
-///
-/// **After (v2.2.10 - this module):**
-/// - acks=0: 370,000+ msg/s ✅ (no change)
-/// - acks=1: 300,000-350,000 msg/s ✅ (150x+ improvement!)
-/// - acks=all: 200,000-300,000 msg/s ✅ (100x+ improvement!)
+/// Storage changed from flat `DashMap<ResponseKey, PendingResponse>` to
+/// partition-bucketed `DashMap<(topic, partition), BTreeMap<offset, response>>`.
+/// This changes `notify_batch_committed()` from O(n) over ALL pending entries
+/// to O(1) bucket lookup + O(log n + k) range scan within one partition.
+/// Under bulk load (280+ req/sec), this prevents cascading timeouts.
 
 use dashmap::DashMap;
+use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -70,15 +53,6 @@ use tokio::time::interval;
 use tracing::{debug, warn, error, info};
 
 use chronik_protocol::produce_types::ProduceResponsePartition;
-use chronik_common::{Error, Result};
-
-/// Key for indexing pending responses
-#[derive(Debug, Clone, Hash, Eq, PartialEq)]
-pub struct ResponseKey {
-    pub topic: String,
-    pub partition: i32,
-    pub base_offset: i64,
-}
 
 /// A pending response waiting for WAL fsync confirmation
 #[derive(Debug)]
@@ -105,7 +79,7 @@ pub struct ResponsePipelineConfig {
     /// Timeout for pending responses (default: 30 seconds)
     pub response_timeout: Duration,
 
-    /// Cleanup interval (default: 10 seconds)
+    /// Cleanup interval (default: 2 seconds)
     pub cleanup_interval: Duration,
 
     /// Enable detailed metrics (default: true)
@@ -116,7 +90,7 @@ impl Default for ResponsePipelineConfig {
     fn default() -> Self {
         Self {
             response_timeout: Duration::from_secs(30),
-            cleanup_interval: Duration::from_secs(10),
+            cleanup_interval: Duration::from_secs(2),
             enable_metrics: true,
         }
     }
@@ -126,47 +100,52 @@ impl Default for ResponsePipelineConfig {
 #[derive(Debug, Default)]
 pub struct ResponsePipelineMetrics {
     /// Total responses registered
-    pub registered: std::sync::atomic::AtomicU64,
+    pub registered: AtomicU64,
 
     /// Total responses successfully delivered
-    pub delivered: std::sync::atomic::AtomicU64,
+    pub delivered: AtomicU64,
 
     /// Total responses timed out
-    pub timeouts: std::sync::atomic::AtomicU64,
+    pub timeouts: AtomicU64,
 
     /// Total responses dropped (caller gone)
-    pub dropped: std::sync::atomic::AtomicU64,
+    pub dropped: AtomicU64,
 
     /// Current pending count
-    pub pending_count: std::sync::atomic::AtomicU64,
+    pub pending_count: AtomicU64,
 }
 
 impl ResponsePipelineMetrics {
     pub fn registered(&self) -> u64 {
-        self.registered.load(std::sync::atomic::Ordering::Relaxed)
+        self.registered.load(Ordering::Relaxed)
     }
 
     pub fn delivered(&self) -> u64 {
-        self.delivered.load(std::sync::atomic::Ordering::Relaxed)
+        self.delivered.load(Ordering::Relaxed)
     }
 
     pub fn timeouts(&self) -> u64 {
-        self.timeouts.load(std::sync::atomic::Ordering::Relaxed)
+        self.timeouts.load(Ordering::Relaxed)
     }
 
     pub fn dropped(&self) -> u64 {
-        self.dropped.load(std::sync::atomic::Ordering::Relaxed)
+        self.dropped.load(Ordering::Relaxed)
     }
 
     pub fn pending_count(&self) -> u64 {
-        self.pending_count.load(std::sync::atomic::Ordering::Relaxed)
+        self.pending_count.load(Ordering::Relaxed)
     }
 }
 
-/// Async response pipeline for WAL batch commits
+/// Partition bucket key: (topic, partition)
+type BucketKey = (String, i32);
+
+/// Async response pipeline for WAL batch commits.
+///
+/// Uses partition-bucketed storage for O(log n) lookups instead of O(n) scans.
 pub struct ResponsePipeline {
-    /// Pending responses indexed by (topic, partition, base_offset)
-    pending: Arc<DashMap<ResponseKey, PendingResponse>>,
+    /// Pending responses bucketed by (topic, partition), sorted by base_offset
+    pending: Arc<DashMap<BucketKey, BTreeMap<i64, PendingResponse>>>,
 
     /// Configuration
     config: ResponsePipelineConfig,
@@ -186,7 +165,7 @@ impl ResponsePipeline {
 
     /// Create a new ResponsePipeline with custom configuration
     pub fn with_config(config: ResponsePipelineConfig) -> Self {
-        let pending = Arc::new(DashMap::<ResponseKey, PendingResponse>::new());
+        let pending = Arc::new(DashMap::<BucketKey, BTreeMap<i64, PendingResponse>>::new());
         let metrics = Arc::new(ResponsePipelineMetrics::default());
 
         // Spawn background cleanup task
@@ -203,49 +182,71 @@ impl ResponsePipeline {
                     interval.tick().await;
 
                     let now = Instant::now();
-                    let mut timed_out = Vec::new();
+                    let mut timed_out_count = 0u64;
+                    let mut dropped_count = 0u64;
 
-                    // Find timed out responses
-                    for entry in pending.iter() {
-                        let key = entry.key();
-                        let response = entry.value();
+                    // Iterate over each partition bucket
+                    let bucket_keys: Vec<BucketKey> = pending.iter()
+                        .map(|entry| entry.key().clone())
+                        .collect();
 
-                        if now.duration_since(response.registered_at) > timeout {
-                            timed_out.push(key.clone());
+                    for bucket_key in bucket_keys {
+                        let mut stale_offsets = Vec::new();
+
+                        // Find stale entries in this bucket
+                        if let Some(bucket) = pending.get(&bucket_key) {
+                            for (offset, response) in bucket.iter() {
+                                if now.duration_since(response.registered_at) > timeout {
+                                    stale_offsets.push(*offset);
+                                }
+                            }
+                        }
+
+                        if stale_offsets.is_empty() {
+                            continue;
+                        }
+
+                        // Remove and notify stale entries
+                        if let Some(mut bucket) = pending.get_mut(&bucket_key) {
+                            for offset in stale_offsets {
+                                if let Some(response) = bucket.remove(&offset) {
+                                    warn!(
+                                        "Response timeout: topic={} partition={} base_offset={} last_offset={} age={:?}",
+                                        response.topic, response.partition, offset,
+                                        response.last_offset, now.duration_since(response.registered_at)
+                                    );
+
+                                    let error_response = ProduceResponsePartition {
+                                        index: response.partition,
+                                        error_code: 7, // REQUEST_TIMED_OUT
+                                        base_offset: -1,
+                                        log_append_time: -1,
+                                        log_start_offset: -1,
+                                        record_errors: Some(vec![]),
+                                        error_message: Some("WAL fsync timeout".to_string()),
+                                    };
+
+                                    if response.response_tx.send(error_response).is_err() {
+                                        dropped_count += 1;
+                                    } else {
+                                        timed_out_count += 1;
+                                    }
+
+                                    metrics.pending_count.fetch_sub(1, Ordering::Relaxed);
+                                }
+                            }
+
+                            // Remove empty bucket
+                            if bucket.is_empty() {
+                                drop(bucket);
+                                pending.remove(&bucket_key);
+                            }
                         }
                     }
 
-                    // Remove and notify
-                    for key in timed_out {
-                        if let Some((_, response)) = pending.remove(&key) {
-                            warn!(
-                                "Response timeout: topic={} partition={} base_offset={} last_offset={} age={:?}",
-                                response.topic,
-                                response.partition,
-                                key.base_offset,
-                                response.last_offset,
-                                now.duration_since(response.registered_at)
-                            );
-
-                            // Send timeout error
-                            let error_response = ProduceResponsePartition {
-                                index: response.partition,
-                                error_code: 7, // REQUEST_TIMED_OUT
-                                base_offset: -1,
-                                log_append_time: -1,
-                                log_start_offset: -1,
-                                record_errors: Some(vec![]),
-                                error_message: Some("WAL fsync timeout".to_string()),
-                            };
-
-                            if response.response_tx.send(error_response).is_err() {
-                                metrics.dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            } else {
-                                metrics.timeouts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            }
-
-                            metrics.pending_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                        }
+                    if timed_out_count > 0 || dropped_count > 0 {
+                        metrics.timeouts.fetch_add(timed_out_count, Ordering::Relaxed);
+                        metrics.dropped.fetch_add(dropped_count, Ordering::Relaxed);
                     }
                 }
             }))
@@ -260,13 +261,6 @@ impl ResponsePipeline {
     }
 
     /// Register a pending response for a produce request
-    ///
-    /// # Arguments
-    /// * `topic` - Topic name
-    /// * `partition` - Partition ID
-    /// * `base_offset` - Base offset of the batch
-    /// * `last_offset` - Last offset of the batch
-    /// * `response_tx` - Channel to send response when fsync completes
     pub fn register(
         &self,
         topic: String,
@@ -275,12 +269,6 @@ impl ResponsePipeline {
         last_offset: i64,
         response_tx: oneshot::Sender<ProduceResponsePartition>,
     ) {
-        let key = ResponseKey {
-            topic: topic.clone(),
-            partition,
-            base_offset,
-        };
-
         let response = PendingResponse {
             response_tx,
             registered_at: Instant::now(),
@@ -294,23 +282,22 @@ impl ResponsePipeline {
             topic, partition, base_offset, last_offset
         );
 
-        self.pending.insert(key, response);
+        let bucket_key = (topic, partition);
+        self.pending
+            .entry(bucket_key)
+            .or_insert_with(BTreeMap::new)
+            .insert(base_offset, response);
 
         if self.config.enable_metrics {
-            self.metrics.registered.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            self.metrics.pending_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.metrics.registered.fetch_add(1, Ordering::Relaxed);
+            self.metrics.pending_count.fetch_add(1, Ordering::Relaxed);
         }
     }
 
-    /// Notify that a WAL batch has been committed successfully
+    /// Notify that a WAL batch has been committed successfully.
     ///
-    /// This triggers response delivery for all pending requests in the offset range.
-    ///
-    /// # Arguments
-    /// * `topic` - Topic name
-    /// * `partition` - Partition ID
-    /// * `min_offset` - Minimum offset committed (inclusive)
-    /// * `max_offset` - Maximum offset committed (inclusive)
+    /// Uses O(1) bucket lookup + O(log n) BTreeMap range scan instead of
+    /// O(n) scan over all pending entries.
     pub fn notify_batch_committed(
         &self,
         topic: &str,
@@ -318,57 +305,53 @@ impl ResponsePipeline {
         min_offset: i64,
         max_offset: i64,
     ) {
-        info!(
-            "🔔 BATCH_COMMIT_CALLBACK: topic={} partition={} offsets={}..={} pending_count={}",
-            topic, partition, min_offset, max_offset, self.pending.len()
-        );
+        let bucket_key = (topic.to_string(), partition);
 
-        let mut delivered = 0;
-        let mut dropped = 0;
-
-        // Find all pending responses in this offset range
-        let mut to_notify = Vec::new();
-
-        for entry in self.pending.iter() {
-            let key = entry.key();
-            let response = entry.value();
-
-            // Check if this response is for the committed range
-            if key.topic == topic
-                && key.partition == partition
-                && key.base_offset >= min_offset
-                && response.last_offset <= max_offset
-            {
-                to_notify.push(key.clone());
+        let mut bucket = match self.pending.get_mut(&bucket_key) {
+            Some(b) => b,
+            None => {
+                debug!(
+                    "BATCH_COMMIT_CALLBACK: no pending responses for topic={} partition={}",
+                    topic, partition
+                );
+                return;
             }
-        }
+        };
 
-        // Remove and send responses
-        for key in to_notify {
-            if let Some((_, response)) = self.pending.remove(&key) {
+        let mut delivered = 0u64;
+        let mut dropped = 0u64;
+
+        // Collect offsets in the committed range.
+        // BTreeMap range gives us O(log n + k) instead of O(n).
+        let offsets_in_range: Vec<i64> = bucket
+            .range(min_offset..=max_offset)
+            .filter(|(_, resp)| resp.last_offset <= max_offset)
+            .map(|(offset, _)| *offset)
+            .collect();
+
+        for offset in offsets_in_range {
+            if let Some(response) = bucket.remove(&offset) {
                 let latency = response.registered_at.elapsed();
 
                 debug!(
                     "Delivering async response: topic={} partition={} base_offset={} latency={:?}",
-                    response.topic, response.partition, key.base_offset, latency
+                    response.topic, response.partition, offset, latency
                 );
 
-                // Build success response
                 let success_response = ProduceResponsePartition {
                     index: response.partition,
                     error_code: 0, // NO_ERROR
-                    base_offset: key.base_offset,
+                    base_offset: offset,
                     log_append_time: -1,
                     log_start_offset: -1,
                     record_errors: Some(vec![]),
                     error_message: None,
                 };
 
-                // Send to waiting caller
                 if response.response_tx.send(success_response).is_err() {
                     warn!(
                         "Caller dropped for response: topic={} partition={} base_offset={}",
-                        response.topic, response.partition, key.base_offset
+                        topic, partition, offset
                     );
                     dropped += 1;
                 } else {
@@ -376,34 +359,33 @@ impl ResponsePipeline {
                 }
 
                 if self.config.enable_metrics {
-                    self.metrics.pending_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    self.metrics.pending_count.fetch_sub(1, Ordering::Relaxed);
                 }
             }
         }
 
-        if self.config.enable_metrics && delivered > 0 {
-            self.metrics.delivered.fetch_add(delivered, std::sync::atomic::Ordering::Relaxed);
-            self.metrics.dropped.fetch_add(dropped, std::sync::atomic::Ordering::Relaxed);
+        // Clean up empty bucket
+        if bucket.is_empty() {
+            drop(bucket);
+            self.pending.remove(&bucket_key);
+        }
+
+        if self.config.enable_metrics && (delivered > 0 || dropped > 0) {
+            self.metrics.delivered.fetch_add(delivered, Ordering::Relaxed);
+            self.metrics.dropped.fetch_add(dropped, Ordering::Relaxed);
         }
 
         if delivered > 0 || dropped > 0 {
-            info!(
+            debug!(
                 "Batch commit responses: topic={} partition={} delivered={} dropped={}",
                 topic, partition, delivered, dropped
             );
         }
     }
 
-    /// Notify that a WAL batch commit failed
+    /// Notify that a WAL batch commit failed.
     ///
-    /// This sends error responses for all pending requests in the offset range.
-    ///
-    /// # Arguments
-    /// * `topic` - Topic name
-    /// * `partition` - Partition ID
-    /// * `min_offset` - Minimum offset in failed batch
-    /// * `max_offset` - Maximum offset in failed batch
-    /// * `error_message` - Error message to send
+    /// Uses O(1) bucket lookup + O(log n) range scan.
     pub fn notify_batch_failed(
         &self,
         topic: &str,
@@ -417,25 +399,21 @@ impl ResponsePipeline {
             topic, partition, min_offset, max_offset, error_message
         );
 
-        // Find all pending responses in this offset range
-        let mut to_notify = Vec::new();
+        let bucket_key = (topic.to_string(), partition);
 
-        for entry in self.pending.iter() {
-            let key = entry.key();
-            let response = entry.value();
+        let mut bucket = match self.pending.get_mut(&bucket_key) {
+            Some(b) => b,
+            None => return,
+        };
 
-            if key.topic == topic
-                && key.partition == partition
-                && key.base_offset >= min_offset
-                && response.last_offset <= max_offset
-            {
-                to_notify.push(key.clone());
-            }
-        }
+        let offsets_in_range: Vec<i64> = bucket
+            .range(min_offset..=max_offset)
+            .filter(|(_, resp)| resp.last_offset <= max_offset)
+            .map(|(offset, _)| *offset)
+            .collect();
 
-        // Remove and send error responses
-        for key in to_notify {
-            if let Some((_, response)) = self.pending.remove(&key) {
+        for offset in offsets_in_range {
+            if let Some(response) = bucket.remove(&offset) {
                 let error_response = ProduceResponsePartition {
                     index: response.partition,
                     error_code: 1, // UNKNOWN_SERVER_ERROR
@@ -449,9 +427,14 @@ impl ResponsePipeline {
                 let _ = response.response_tx.send(error_response);
 
                 if self.config.enable_metrics {
-                    self.metrics.pending_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    self.metrics.pending_count.fetch_sub(1, Ordering::Relaxed);
                 }
             }
+        }
+
+        if bucket.is_empty() {
+            drop(bucket);
+            self.pending.remove(&bucket_key);
         }
     }
 
@@ -462,24 +445,25 @@ impl ResponsePipeline {
 
     /// Get current pending count
     pub fn pending_count(&self) -> usize {
-        self.pending.len()
+        self.pending.iter().map(|entry| entry.value().len()).sum()
     }
 }
 
 impl Drop for ResponsePipeline {
     fn drop(&mut self) {
-        // Cancel cleanup task
         if let Some(handle) = self.cleanup_handle.take() {
             handle.abort();
         }
 
-        // Notify all pending responses of shutdown
         for entry in self.pending.iter() {
-            let key = entry.key();
-            warn!(
-                "ResponsePipeline dropping with pending response: topic={} partition={} base_offset={}",
-                key.topic, key.partition, key.base_offset
-            );
+            let (topic, partition) = entry.key();
+            let count = entry.value().len();
+            if count > 0 {
+                warn!(
+                    "ResponsePipeline dropping with {} pending responses: topic={} partition={}",
+                    count, topic, partition
+                );
+            }
         }
     }
 }
@@ -552,6 +536,80 @@ mod tests {
         let response = rx.await.unwrap();
         assert_eq!(response.error_code, 1); // UNKNOWN_SERVER_ERROR
         assert_eq!(response.error_message, Some("Disk error".to_string()));
+
+        assert_eq!(pipeline.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_response_pipeline_multi_partition() {
+        let pipeline = ResponsePipeline::new();
+
+        // Register responses across 24 partitions
+        let mut receivers = Vec::new();
+        for partition in 0..24 {
+            for batch in 0..10 {
+                let (tx, rx) = oneshot::channel();
+                let base_offset = (batch * 100) as i64;
+                let last_offset = base_offset + 99;
+                pipeline.register("topic".to_string(), partition, base_offset, last_offset, tx);
+                receivers.push((partition, base_offset, rx));
+            }
+        }
+
+        assert_eq!(pipeline.pending_count(), 240);
+
+        // Commit all batches for each partition
+        for partition in 0..24 {
+            pipeline.notify_batch_committed("topic", partition, 0, 999);
+        }
+
+        // All should be delivered
+        for (partition, base_offset, rx) in receivers {
+            let response = rx.await.unwrap();
+            assert_eq!(response.error_code, 0, "Failed for partition={} offset={}", partition, base_offset);
+            assert_eq!(response.base_offset, base_offset);
+        }
+
+        assert_eq!(pipeline.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_response_pipeline_partial_commit() {
+        let pipeline = ResponsePipeline::new();
+
+        let (tx1, rx1) = oneshot::channel();
+        let (tx2, rx2) = oneshot::channel();
+        let (tx3, _rx3) = oneshot::channel();
+
+        // Register 3 batches: offsets 0-99, 100-199, 200-299
+        pipeline.register("topic".to_string(), 0, 0, 99, tx1);
+        pipeline.register("topic".to_string(), 0, 100, 199, tx2);
+        pipeline.register("topic".to_string(), 0, 200, 299, tx3);
+
+        assert_eq!(pipeline.pending_count(), 3);
+
+        // Only commit first two batches
+        pipeline.notify_batch_committed("topic", 0, 0, 199);
+
+        let r1 = rx1.await.unwrap();
+        assert_eq!(r1.error_code, 0);
+        assert_eq!(r1.base_offset, 0);
+
+        let r2 = rx2.await.unwrap();
+        assert_eq!(r2.error_code, 0);
+        assert_eq!(r2.base_offset, 100);
+
+        // Third batch still pending
+        assert_eq!(pipeline.pending_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_no_pending_for_topic() {
+        let pipeline = ResponsePipeline::new();
+
+        // Should not panic when notifying for non-existent topic
+        pipeline.notify_batch_committed("nonexistent", 0, 0, 100);
+        pipeline.notify_batch_failed("nonexistent", 0, 0, 100, "error");
 
         assert_eq!(pipeline.pending_count(), 0);
     }

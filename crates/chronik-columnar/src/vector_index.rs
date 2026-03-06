@@ -1436,6 +1436,68 @@ impl VectorIndexManager {
         debug!("Cleared all vector indexes for topic '{}'", topic);
     }
 
+    /// Clear a partition's index and delete its snapshot file from disk.
+    /// Returns the number of vectors that were cleared.
+    pub async fn clear_partition_with_snapshot(&self, topic: &str, partition: i32) -> Result<usize> {
+        // Get vector count before clearing
+        let count = {
+            let indexes = self.indexes.read().await;
+            let key = TopicPartitionKey::new(topic, partition);
+            indexes.get(&key).map(|idx| idx.vector_count()).unwrap_or(0)
+        };
+
+        // Clear in-memory
+        self.clear_partition(topic, partition).await;
+
+        // Delete snapshot files (both default and named models)
+        let topic_dir = self.config.base_path.join(topic);
+        if topic_dir.exists() {
+            let prefix = format!("{}.", partition);
+            let prefix_named = format!("{}_", partition);
+            let mut entries = fs::read_dir(&topic_dir).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if (name.starts_with(&prefix) || name.starts_with(&prefix_named)) && name.ends_with(".idx") {
+                    fs::remove_file(entry.path()).await?;
+                    info!("Deleted vector snapshot: {}", entry.path().display());
+                }
+            }
+        }
+
+        Ok(count)
+    }
+
+    /// Clear all indexes for a topic and delete all snapshot files.
+    /// Returns the total number of vectors that were cleared.
+    pub async fn clear_topic_with_snapshots(&self, topic: &str) -> Result<usize> {
+        // Count vectors before clearing
+        let count = {
+            let indexes = self.indexes.read().await;
+            indexes.iter()
+                .filter(|(k, _)| k.topic == topic)
+                .map(|(_, idx)| idx.vector_count())
+                .sum()
+        };
+
+        // Clear in-memory
+        self.clear_topic(topic).await;
+
+        // Delete snapshot directory
+        let topic_dir = self.config.base_path.join(topic);
+        if topic_dir.exists() {
+            let mut entries = fs::read_dir(&topic_dir).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.ends_with(".idx") {
+                    fs::remove_file(entry.path()).await?;
+                    info!("Deleted vector snapshot: {}", entry.path().display());
+                }
+            }
+        }
+
+        Ok(count)
+    }
+
     // ========================================================================
     // Persistence Methods (Phase 5.3 + VO-5)
     // ========================================================================
@@ -1515,6 +1577,8 @@ impl VectorIndexManager {
                 quantizer: index.quantizer.clone(),
                 // VO-5: Include model ID
                 model_id: index.model_id.clone(),
+                // Persist dedup set so known_offsets survives restarts
+                known_offsets: index.known_offsets.iter().copied().collect(),
             }
         };
 
@@ -1586,6 +1650,15 @@ impl VectorIndexManager {
         index.last_offset = snapshot.last_offset;
         // VO-3: Restore quantizer from snapshot (if present)
         index.quantizer = snapshot.quantizer;
+        // Restore known_offsets from snapshot, or reconstruct from vectors for old snapshots
+        if !snapshot.known_offsets.is_empty() {
+            index.known_offsets = snapshot.known_offsets.into_iter().collect();
+        } else {
+            // Backward compat: reconstruct from vector IDs
+            for (id, _) in &index.built_vectors {
+                index.known_offsets.insert(*id);
+            }
+        }
 
         // Rebuild the HNSW index after loading vectors (also trains quantizer for uint8)
         if vector_count > 0 {
@@ -1795,6 +1868,10 @@ pub struct PartitionIndexSnapshot {
     /// VO-5: Embedding model ID that produced these vectors
     #[serde(default = "default_model_id")]
     pub model_id: String,
+    /// Offsets that have been indexed (dedup across restarts).
+    /// Backward compat: old snapshots without this field get it reconstructed from vectors.
+    #[serde(default)]
+    pub known_offsets: Vec<u64>,
 }
 
 fn default_model_id() -> String {
