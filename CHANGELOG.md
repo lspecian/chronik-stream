@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.4.0] - 2026-03-06
+
+### Added
+
+- **Automatic JSON column inference** — Messages with JSON values get typed columns (Int64, Float64, Boolean, Utf8) auto-inferred from a sample of records and persisted to Parquet files. Query with standard SQL without UDFs: `SELECT user_id, city, AVG(score) FROM topic GROUP BY city`
+  - New `InferredJsonSchema` in `chronik-columnar/src/json_schema.rs`
+  - Schema stored in topic config (`columnar.json_schema`) for reuse across segments
+  - WalIndexer auto-triggers inference on first Parquet segment creation
+
+- **DataFusion partition pruning** — Custom `PartitionedMemTable` implementation that extracts `_partition` predicates and only scans matching partitions. `WHERE _partition = 0` completes in 6ms on 500K rows instead of scanning all partitions.
+  - `PartitionedMemTable` with per-partition `HashMap<i32, RecordBatch>`
+  - Supports `_partition = N` equality and `_partition IN (a, b, c)` filters
+
+- **HNSW vector dedup** — `known_offsets: HashSet<u64>` in `PartitionIndex` prevents duplicate vectors from multiple WAL loads
+  - `partitions_with_vectors()` method on `VectorIndexManager` for vector-aware routing
+  - Vector handler uses actual HNSW index existence for fan-out decisions
+
+- **Vector optimization phases VO-1 through VO-6** — Scalar quantization (4x memory reduction), Matryoshka dimension truncation, query embedding cache, vector index snapshots
+
+### Fixed
+
+- **MAX_RECORDS counts individual messages, not WAL batches** — Hot buffer `max_records` now uses the `record_count` field from WAL V2 headers to count individual Kafka messages. Previously counted WAL batch records (each containing 100-2000 messages), so the limit never triggered.
+
+- **GroupCommitWal deadlock** — Commit workers now always spawn on the main tokio runtime via captured `Handle::current()`. Previously, `tokio::spawn()` could spawn on the WalIndexer's 2-thread runtime, causing starvation when Tantivy/Parquet work saturated those threads.
+
+- **WAL recovery OOM at 43M+ records** — `recover_partitions_from_wal` loaded ALL WAL records to find high watermarks. Added `get_max_offset_for_partition()` that reads only the last segment header, reducing memory from ~1.5GB to ~120MB per partition.
+
+- **HotDataBuffer `set_flushed_offset` never called** — WalIndexer now holds a reference to HotDataBuffer and calls `set_flushed_offset()` after Parquet creation, trimming persisted data from the hot buffer.
+
+- **RecordBatch caching in HotDataBuffer** — Wired up existing `CachedBatch` cache that was never populated. Single-query latency dropped from 170s (cold WAL read) to 15ms (cached) — 11,000x improvement.
+
+- **BM25 multi-word query bug** — `serde_json::Value::to_string()` wrapped queries in JSON quotes, causing Tantivy to interpret them as phrase queries. Fixed by splitting into per-word OR sub-queries. BM25 empty rate dropped from 69% to 0.2%.
+
+- **WalIndexer env var fallback bypass** — Topic config `unwrap_or((false,false,false))` hard-coded indexing flags to false, bypassing env var defaults. Fixed to use `TopicConfig::default()`.
+
+- **Metadata replication not persisted to local WAL** — Follower nodes lost topic metadata after restart. Fixed by writing to local WAL before applying to state.
+
+### Validated
+
+- **DV-1 (WANDS)**: BM25 NDCG@10 = 0.5927 (exceeds Elasticsearch ~0.50-0.56), Hybrid NDCG@10 = 0.6095
+- **DV-2a (Amazon Appliances, 2.1M)**: Text search 2.8ms p50, 0.00% errors at 1000 VUs
+- **DV-2b (Amazon Grocery, 14.3M)**: Text search 8.67ms p50, 0.00% errors, GroupCommitWal deadlock resolved
+- **DV-2c (Amazon Electronics, 43.9M)**: Text 112ms p50, SQL 185ms p50, 0.00% errors, 134K requests
+- **940 tests passing** (`cargo test --workspace --lib --bins`)
+
 ## [2.2.23] - 2026-01-04
 
 ### Fixed

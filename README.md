@@ -8,32 +8,49 @@
 
 A high-performance streaming platform built in Rust that implements core Kafka wire protocol functionality with comprehensive Write-Ahead Log (WAL) durability and automatic recovery.
 
-**Latest Release: v2.3.0** - Query Orchestrator with multi-backend search, RRF ranking, and validated at 30K messages / 132K vectors on bare metal k8s. See [CHANGELOG.md](CHANGELOG.md) for full release history.
+**Latest Release: v2.4.0** — Validated at **43.9M records** with BM25 search quality exceeding Elasticsearch, zero-error SQL at scale, and automatic JSON column inference. See [CHANGELOG.md](CHANGELOG.md) for full release history.
 
-## What's New in v2.3.0
+## What's New in v2.4.0
 
-**Query Orchestrator & Multi-Backend Search (Phase 9):**
-- **Query Orchestrator** (`/_query` endpoint) — Fan-out queries across multiple topics and backends (text, vector, SQL, hybrid) in parallel, merge results with Reciprocal Rank Fusion (RRF)
-- **Ranking Profiles** — Configurable scoring strategies (BM25, vector similarity, hybrid RRF) with named profiles
-- **Multi-topic search** — Single query searches across multiple topics simultaneously
-- **OpenAI embeddings at scale** — Validated with `text-embedding-3-small` on 30K messages producing 132K vectors
-- **Performance on bare metal k8s** (3x Dell Xeon, 256GB RAM each):
+**Dataset Validation — Search Quality & Scale (DV-1 through DV-2c):**
 
-| Query Type | p50 Latency | p99 Latency | Notes |
-|------------|-------------|-------------|-------|
-| Full-text (Tantivy BM25) | **3.4ms** | 8.2ms | Faster than Elasticsearch |
-| Vector (HNSW + OpenAI) | 372ms | 524ms | Dominated by embedding API |
-| Hybrid (text + vector RRF) | 376ms | 531ms | Best relevance quality |
-| SQL (DataFusion) | **5.9ms** | 12.1ms | 10-100x faster than ksqlDB |
-| Orchestrator (multi-topic) | 244ms | 680ms | 3-topic text fan-out |
+Chronik's search and query engine has been validated against real-world datasets on a 3-node bare metal k8s cluster (Dell Xeon, 256GB RAM each):
 
-**Also in v2.3.0:**
-- Prometheus metrics for all query backends (vectors indexed, tokens processed, API calls)
-- k8s performance test suite (k6 load generators, Grafana dashboards)
-- Examples: log analysis pipeline, RAG chatbot
+| Validation | Dataset | Records | Key Result |
+|------------|---------|---------|------------|
+| **DV-1** | WANDS (Wayfair) | 42,994 products, 480 queries | BM25 NDCG@10 = **0.5927** (exceeds Elasticsearch) |
+| **DV-2a** | Amazon Appliances | 2.1M reviews | Text search **2.8ms** p50 at 1000 VUs |
+| **DV-2b** | Amazon Grocery | 14.3M reviews | Stable at scale, **0.00%** text errors |
+| **DV-2c** | Amazon Electronics | 43.9M reviews | SQL **185ms** p50, text **112ms** p50, **0.00%** errors |
+
+**Search Quality (WANDS benchmark):**
+
+| System | NDCG@10 | vs Elasticsearch |
+|--------|---------|-----------------|
+| Elasticsearch BM25 | ~0.50-0.56 | baseline |
+| **Chronik BM25** (Tantivy) | **0.5927** | **+6-18% better** |
+| Elasticsearch Hybrid | ~0.58-0.65 | baseline |
+| **Chronik Hybrid** (RRF) | **0.6095** | **within range** |
+
+See [docs/DATASET_VALIDATION_REPORT.md](docs/DATASET_VALIDATION_REPORT.md) for full methodology, per-query breakdowns, and bugs found/fixed.
+
+**Foundational Infrastructure Fixes:**
+- **Automatic JSON columns** — Messages with JSON values get typed columns (Int64, Float64, Boolean, Utf8) auto-inferred and persisted to Parquet. Query with standard SQL: `SELECT user_id, city, AVG(score) FROM topic GROUP BY city`
+- **Partition pruning** — `WHERE _partition = 0` now skips irrelevant partitions via custom `PartitionedMemTable` (6ms for 500K rows vs full scan)
+- **Vector search dedup** — HNSW offset dedup prevents stale duplicate vectors; vector-aware routing for correct fan-out
+- **Hot buffer accuracy** — `MAX_RECORDS` now counts individual Kafka messages, not WAL batches
+- **GroupCommitWal deadlock fix** — Commit workers now always run on the main tokio runtime
+- **WAL recovery OOM fix** — Reads only segment headers instead of loading all records
+
+**Also in v2.4.0:**
+- RecordBatch caching in hot buffer (11,000x improvement for repeated SQL queries)
+- Query router with distributed fan-out and configurable timeout
+- Vector optimization phases VO-1 through VO-6 (scalar quantization, Matryoshka truncation, query cache, snapshots)
+- 940 tests passing
 
 ## Previous Highlights
 
+- **v2.3.0**: Query Orchestrator (`/_query`), RRF ranking, multi-topic fan-out, 132K vectors on k8s
 - **v2.2.25**: 837K msg/s bare metal cluster, fixed closed-socket spin loop, Kubernetes Operator
 - **v2.2.22**: Hot Buffer SQL (0-1ms), Columnar Storage (DataFusion), Vector Search (HNSW), Unified API
 
@@ -49,9 +66,11 @@ A high-performance streaming platform built in Rust that implements core Kafka w
 ### SQL & Columnar Storage (v2.2.22+)
 - **Hot Buffer SQL**: Query recent data in **0-1ms** via in-memory Arrow tables - sub-second latency for live data
 - **Columnar Storage**: DataFusion 44 SQL engine for analytics over Parquet files
+- **Automatic JSON Columns** (v2.4.0+): JSON message values auto-inferred into typed columns (Int64, Float64, Boolean, Utf8) — query with standard SQL, no UDFs needed
+- **Partition Pruning** (v2.4.0+): `WHERE _partition = N` skips irrelevant partitions for fast filtered queries
 - **Unified Views**: Automatic UNION of hot (MemTable) and cold (Parquet) data - seamless time-range queries
 - **S3/GCS/Azure Upload**: Optional cloud storage for Parquet files with local-first defaults
-- **10K+ msg/s under load**: Load tested with concurrent producers and SQL queries, P99 <20ms
+- **Validated at 43.9M records**: Load tested with k6 at 1000 VUs — SQL 185ms p50, 0% errors
 
 ### Search & Analytics
 - **Searchable Topics**: Opt-in real-time full-text search with Tantivy (3% overhead) - see [docs/SEARCHABLE_TOPICS.md](docs/SEARCHABLE_TOPICS.md)
@@ -565,7 +584,7 @@ All images support both **linux/amd64** and **linux/arm64** architectures:
 
 | Image | Tags | Description |
 |-------|------|-------------|
-| `ghcr.io/lspecian/chronik-stream` | `latest`, `v2.3.0`, `2.3` | Chronik server with SQL, search, query orchestrator, and KSQL support |
+| `ghcr.io/lspecian/chronik-stream` | `latest`, `v2.4.0`, `2.4` | Chronik server with SQL, search, vector, JSON columns, and KSQL support |
 
 ### Supported Platforms
 
@@ -782,6 +801,11 @@ Apache License 2.0. See [LICENSE](LICENSE) for details.
 ### SQL & Columnar Storage (v2.2.22+)
 - [docs/COLUMNAR_STORAGE_GUIDE.md](docs/COLUMNAR_STORAGE_GUIDE.md) - **Hot buffer SQL & Parquet storage guide**
 - [docs/API_REFERENCE.md](docs/API_REFERENCE.md) - Unified REST API reference (`/_sql`, `/_search`, admin)
+
+### Dataset Validation (v2.4.0)
+- [docs/DATASET_VALIDATION_REPORT.md](docs/DATASET_VALIDATION_REPORT.md) - **Full validation report (DV-1, DV-2a, DV-2b, DV-2c)**
+- [docs/ROADMAP_DATASET_VALIDATION.md](docs/ROADMAP_DATASET_VALIDATION.md) - Validation methodology and roadmap
+- [docs/ROADMAP_RELEVANCE_ENGINE.md](docs/ROADMAP_RELEVANCE_ENGINE.md) - Relevance engine roadmap (reranking, governance)
 
 ### v2.2.8 Release (Critical Fixes)
 - [docs/WATERMARK_IDEMPOTENCE_FIX_v2.2.7.md](docs/WATERMARK_IDEMPOTENCE_FIX_v2.2.7.md) - Watermark idempotence fix details
