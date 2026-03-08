@@ -6,255 +6,276 @@
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
 
-A high-performance streaming platform built in Rust that implements core Kafka wire protocol functionality with comprehensive Write-Ahead Log (WAL) durability and automatic recovery.
+**An event-native data platform that unifies streaming, analytics, search, and semantic retrieval in a single binary.**
 
-**Latest Release: v2.4.0** — Validated at **43.9M records** with BM25 search quality exceeding Elasticsearch, zero-error SQL at scale, and automatic JSON column inference. See [CHANGELOG.md](CHANGELOG.md) for full release history.
+Write events once. Query them immediately — with SQL, full-text search, vector similarity, or Kafka consumers. No ETL. No glue. No pipeline tax.
 
-## What's New in v2.4.0
+---
 
-**Dataset Validation — Search Quality & Scale (DV-1 through DV-2c):**
+## The Problem
 
-Chronik's search and query engine has been validated against real-world datasets on a 3-node bare metal k8s cluster (Dell Xeon, 256GB RAM each):
-
-| Validation | Dataset | Records | Key Result |
-|------------|---------|---------|------------|
-| **DV-1** | WANDS (Wayfair) | 42,994 products, 480 queries | BM25 NDCG@10 = **0.5927** (exceeds Elasticsearch) |
-| **DV-2a** | Amazon Appliances | 2.1M reviews | Text search **2.8ms** p50 at 1000 VUs |
-| **DV-2b** | Amazon Grocery | 14.3M reviews | Stable at scale, **0.00%** text errors |
-| **DV-2c** | Amazon Electronics | 43.9M reviews | SQL **185ms** p50, text **112ms** p50, **0.00%** errors |
-
-**Search Quality (WANDS benchmark):**
-
-| System | NDCG@10 | vs Elasticsearch |
-|--------|---------|-----------------|
-| Elasticsearch BM25 | ~0.50-0.56 | baseline |
-| **Chronik BM25** (Tantivy) | **0.5927** | **+6-18% better** |
-| Elasticsearch Hybrid | ~0.58-0.65 | baseline |
-| **Chronik Hybrid** (RRF) | **0.6095** | **within range** |
-
-See [docs/DATASET_VALIDATION_REPORT.md](docs/DATASET_VALIDATION_REPORT.md) for full methodology, per-query breakdowns, and bugs found/fixed.
-
-**Foundational Infrastructure Fixes:**
-- **Automatic JSON columns** — Messages with JSON values get typed columns (Int64, Float64, Boolean, Utf8) auto-inferred and persisted to Parquet. Query with standard SQL: `SELECT user_id, city, AVG(score) FROM topic GROUP BY city`
-- **Partition pruning** — `WHERE _partition = 0` now skips irrelevant partitions via custom `PartitionedMemTable` (6ms for 500K rows vs full scan)
-- **Vector search dedup** — HNSW offset dedup prevents stale duplicate vectors; vector-aware routing for correct fan-out
-- **Hot buffer accuracy** — `MAX_RECORDS` now counts individual Kafka messages, not WAL batches
-- **GroupCommitWal deadlock fix** — Commit workers now always run on the main tokio runtime
-- **WAL recovery OOM fix** — Reads only segment headers instead of loading all records
-
-**Also in v2.4.0:**
-- RecordBatch caching in hot buffer (11,000x improvement for repeated SQL queries)
-- Query router with distributed fan-out and configurable timeout
-- Vector optimization phases VO-1 through VO-6 (scalar quantization, Matryoshka truncation, query cache, snapshots)
-- 940 tests passing
-
-## Previous Highlights
-
-- **v2.3.0**: Query Orchestrator (`/_query`), RRF ranking, multi-topic fan-out, 132K vectors on k8s
-- **v2.2.25**: 837K msg/s bare metal cluster, fixed closed-socket spin loop, Kubernetes Operator
-- **v2.2.22**: Hot Buffer SQL (0-1ms), Columnar Storage (DataFusion), Vector Search (HNSW), Unified API
-
-## 🚀 Features
-
-### Core Streaming
-- **Kafka Wire Protocol**: Full Kafka wire protocol with consumer group and transactional support
-- **Zero Message Loss**: WAL ensures durability for all acks modes (0, 1, -1) even during unexpected shutdowns
-- **Automatic Recovery**: WAL records are automatically replayed on startup to restore state with 100% accuracy
-- **Transactional APIs**: Full support for Kafka transactions (InitProducerId, AddPartitionsToTxn, EndTxn)
-- **Full Compression Support**: All Kafka compression codecs (Gzip, Snappy, LZ4, Zstd) - see [COMPRESSION_SUPPORT.md](COMPRESSION_SUPPORT.md)
-
-### SQL & Columnar Storage (v2.2.22+)
-- **Hot Buffer SQL**: Query recent data in **0-1ms** via in-memory Arrow tables - sub-second latency for live data
-- **Columnar Storage**: DataFusion 44 SQL engine for analytics over Parquet files
-- **Automatic JSON Columns** (v2.4.0+): JSON message values auto-inferred into typed columns (Int64, Float64, Boolean, Utf8) — query with standard SQL, no UDFs needed
-- **Partition Pruning** (v2.4.0+): `WHERE _partition = N` skips irrelevant partitions for fast filtered queries
-- **Unified Views**: Automatic UNION of hot (MemTable) and cold (Parquet) data - seamless time-range queries
-- **S3/GCS/Azure Upload**: Optional cloud storage for Parquet files with local-first defaults
-- **Validated at 43.9M records**: Load tested with k6 at 1000 VUs — SQL 185ms p50, 0% errors
-
-### Search & Analytics
-- **Searchable Topics**: Opt-in real-time full-text search with Tantivy (3% overhead) - see [docs/SEARCHABLE_TOPICS.md](docs/SEARCHABLE_TOPICS.md)
-- **Vector Search**: HNSW-based semantic search with embedding providers (OpenAI, custom)
-- **Query Orchestrator** (v2.3.0+): Multi-topic, multi-backend fan-out with RRF ranking via `/_query` endpoint
-- **Unified REST API**: Single endpoint for SQL (`/_sql`), search (`/_search`), vector (`/_vector`), orchestrator (`/_query`), and admin ops
-
-### Operations
-- **WAL-based Metadata**: ChronikMetaLog provides event-sourced metadata persistence
-- **GroupCommitWal**: PostgreSQL-style group commit with per-partition background workers and batched fsync
-- **Real Client Testing**: Tested with kafka-python, confluent-kafka, KSQL, and Apache Flink
-- **Stress Tested**: Verified at scale with 1B+ messages, zero data loss, 837K msgs/sec on bare metal cluster
-- **High Performance**: Async architecture with zero-copy networking optimizations
-- **Multi-Architecture**: Native support for x86_64 and ARM64 (Apple Silicon, AWS Graviton)
-- **Container Ready**: Docker deployment with proper network configuration
-- **Simplified Operations**: Single-process architecture reduces operational complexity
-
-## 🏗️ Architecture - Modular Feature System
-
-Chronik is **pure Kafka by default** with optional features that can be independently enabled per topic:
+Modern real-time architectures require stitching together many systems:
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Chronik Streaming Platform                   │
-├─────────────────────────────────────────────────────────────────┤
-│  BASE LAYER (always on) - Pure Kafka Compatible                │
-│  ├─ Kafka Protocol (produce, consume, consumer groups)         │
-│  ├─ WAL Durability (zero message loss, automatic recovery)     │
-│  └─ Standard Kafka fetch/produce at wire-protocol level        │
-├─────────────────────────────────────────────────────────────────┤
-│  OPTIONAL FEATURES (per-topic, independent toggles)             │
-│                                                                  │
-│  ┌─────────────────────────┐    ┌─────────────────────────┐     │
-│  │  columnar.enabled=true  │    │  searchable.enabled=true│     │
-│  ├─────────────────────────┤    ├─────────────────────────┤     │
-│  │ Format: Parquet files   │    │ Format: Tantivy indexes │     │
-│  │ Hot: Arrow MemTable     │    │ Hot: In-memory index    │     │
-│  │ Cold: Parquet on S3     │    │ Cold: Tantivy on S3     │     │
-│  │ API: /_sql endpoint     │    │ API: /_search endpoint  │     │
-│  │ Latency: 0-10ms         │    │ Latency: 1-500ms        │     │
-│  └─────────────────────────┘    └─────────────────────────┘     │
-│              ↓                           ↓                      │
-│         Can enable BOTH → SQL + Search on same topic            │
-├─────────────────────────────────────────────────────────────────┤
-│  STORAGE TIER (applies to enabled features)                     │
-│  ├─ Local (default) - fast queries, bounded disk               │
-│  └─ S3/GCS/Azure (opt-in) - unlimited retention                │
-└─────────────────────────────────────────────────────────────────┘
+Producer -> Kafka -> Flink/Spark -> Data Warehouse -> BI Tools
+                 |-> Kafka Connect -> Elasticsearch -> Search API
+                 |-> Custom ETL -> Vector DB -> AI/Agent API
+                 |-> S3 Sink -> Athena/Trino -> Ad-hoc Queries
 ```
 
-### Topic Configuration Examples
+Each arrow is a failure point, a latency penalty, and an operational burden. Data is copied, reformatted, and re-indexed across systems that each serve one purpose. By the time an event is searchable, queryable, and semantically retrievable, it has passed through 4-8 systems with minutes to hours of delay.
+
+## The Chronik Approach
+
+Chronik treats the event log as the source of truth and derives all query capabilities directly from it — at ingestion time, in the same process:
+
+```
+Producer -> Chronik -> Done.
+               |
+               |  (internally, at write time)
+               |-> WAL (durability, Kafka consumers)
+               |-> Arrow/Parquet (SQL via DataFusion)
+               |-> Tantivy (full-text search, BM25)
+               |-> HNSW (vector embeddings, semantic search)
+```
+
+Events become queryable across all modalities within seconds of ingestion. There is no ETL pipeline between the log and the query engine — they are the same system.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        Chronik Stream                        │
+│                                                              │
+│  Kafka Protocol (9092)          Unified API (6092)           │
+│  ├─ Produce / Fetch             ├─ /_sql    (DataFusion)     │
+│  ├─ Consumer Groups             ├─ /_search (BM25/Tantivy)   │
+│  ├─ Transactions                ├─ /_vector (HNSW)           │
+│  └─ 24 Kafka APIs               ├─ /_query  (Orchestrator)   │
+│                                  └─ /admin   (Cluster ops)   │
+│                                                              │
+│  One binary. One log. Multiple query modalities.             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+This replaces what traditionally requires Kafka + ClickHouse + Elasticsearch + a vector database — with one Rust binary that speaks the Kafka wire protocol.
+
+## Per-Topic Capability Model
+
+Features are orthogonal and enabled per topic. A topic with no features enabled is a pure Kafka topic. Each capability adds a background indexing path — nothing changes in the write path.
 
 ```bash
-# Pure Kafka - no extras, just streaming
+# Pure Kafka — no extras, just streaming
 kafka-topics.sh --create --topic logs
 
-# SQL analytics - enables /_sql queries
+# SQL analytics — enables /_sql queries
 kafka-topics.sh --create --topic orders \
   --config columnar.enabled=true
 
-# Full-text search - enables /_search queries
+# Full-text search — enables /_search queries
 kafka-topics.sh --create --topic documents \
   --config searchable.enabled=true
 
-# Both SQL + Search on same topic
+# Vector search — enables /_vector semantic queries
+kafka-topics.sh --create --topic support-tickets \
+  --config vector.enabled=true \
+  --config vector.embedding.provider=openai
+
+# All capabilities on a single topic
 kafka-topics.sh --create --topic events \
   --config columnar.enabled=true \
-  --config searchable.enabled=true
-
-# With S3 archival for unlimited retention
-kafka-topics.sh --create --topic audit \
-  --config columnar.enabled=true \
   --config searchable.enabled=true \
-  --config storage.s3.enabled=true \
-  --config retention.ms=-1
+  --config vector.enabled=true
 ```
 
-### Hot/Cold is About Latency, Not Format
+Enable what you need, pay only for what you use. A topic with nothing enabled has zero indexing overhead.
 
-Both Parquet (SQL) and Tantivy (Search) have hot and cold tiers:
+### What Gets Enabled
 
-| Feature | Hot (In-Memory) | Cold (S3/Disk) |
-|---------|-----------------|----------------|
-| **Columnar (SQL)** | Arrow MemTable: 0-1ms | Parquet files: 1-200ms |
-| **Searchable** | Memory index: 1-10ms | Tantivy S3: 100-500ms |
+| Capability | Config | Query Endpoint | Engine | Latency |
+|------------|--------|----------------|--------|---------|
+| **Streaming** | always on | Kafka Fetch (9092) | WAL | < 1ms |
+| **SQL** | `columnar.enabled=true` | `POST /_sql` | DataFusion + Arrow/Parquet | 0-200ms |
+| **Search** | `searchable.enabled=true` | `POST /_search` | Tantivy (BM25) | 1-500ms |
+| **Vector** | `vector.enabled=true` | `POST /_vector/:topic/search` | HNSW + embeddings | 5-100ms |
+| **Orchestrator** | automatic | `POST /_query` | RRF multi-backend fusion | 10-500ms |
 
-The system automatically queries hot first, falls back to cold seamlessly.
+### How It Works Internally
 
-### Key Differentiators vs Kafka
+All indexing happens asynchronously after the produce ack. The write path is unaffected:
 
-| Feature | Apache Kafka | Chronik |
-|---------|--------------|---------|
-| **Pure Kafka mode** | ✅ Yes | ✅ Yes (default) |
-| **SQL Queries** | ❌ NO | ✅ `columnar.enabled=true` |
-| **Full-text Search** | ❌ NO | ✅ `searchable.enabled=true` |
-| **Hot Buffer SQL** | ❌ NO | ✅ 0-1ms via Arrow |
-| **Tiered Storage** | ✅ S3 (raw) | ✅ S3 (Parquet + Tantivy) |
-| **Unlimited Retention** | ✅ Yes | ✅ Yes |
-| **Local Disk** | Grows forever | Bounded (S3 offload) |
+```
+Producer -> WAL (fsync) -> Produce Ack      (~2-10ms, same as Kafka)
+               |
+               v  (background, async)
+          WalIndexer
+               |
+    ┌──────────┼──────────┐
+    v          v          v
+ Tantivy    Parquet    Embeddings
+ (search)   (SQL)      (vector)
+```
 
-**The key insight**: Features are orthogonal. Enable what you need, pay only for what you use.
+Query availability after ingestion:
+- **Kafka Fetch**: immediate
+- **SQL (hot buffer)**: ~1 second
+- **Full-text search**: 30-60 seconds
+- **Vector search**: 30-90 seconds (includes embedding API call)
 
-## ⚡ Quick Start
+## Architecture Comparison
 
-### Using Docker (Recommended)
+### What Chronik Replaces
+
+| Capability | Traditional Stack | Chronik |
+|------------|-------------------|---------|
+| Event streaming | Apache Kafka | Built-in (Kafka protocol) |
+| Stream processing | Flink / Spark Streaming | DataFusion SQL at query time |
+| Data warehouse | ClickHouse / BigQuery | Arrow hot buffer + Parquet cold storage |
+| Full-text search | Elasticsearch / OpenSearch | Tantivy (BM25), validated above ES quality |
+| Vector search | Pinecone / Weaviate / Qdrant | HNSW with pluggable embeddings |
+| ETL pipelines | Kafka Connect / Debezium / dbt | Eliminated — indexing is built-in |
+| Object storage | S3 sink connector | Native S3/GCS/Azure tiered storage |
+
+### What Chronik Does Not Replace
+
+Chronik is not a general-purpose OLAP database, a graph database, or a batch processing framework. It is purpose-built for event data: append-only logs where records arrive in time order and are queried by content, time range, or semantic similarity.
+
+## Benchmarks and Validation
+
+Validated on a 3-node bare metal cluster (Dell Xeon E5-2667v4, 32 cores, 256GB RAM, 1GbE) running MicroK8s.
+
+### Streaming Throughput
+
+| Configuration | Messages/sec | Throughput | Errors |
+|---------------|-------------|------------|--------|
+| Cluster, 12 ingestors, 256B | **837,284 msg/s** | 245 MB/s | 0.00% |
+| Cluster, 36 ingestors, 1KB | 420,609 msg/s | **411 MB/s** | 0.00% |
+| Standalone, acks=1 | 309,000 msg/s | — | 0.00% |
+
+Zero data loss across 1B+ messages. See [BARE_METAL_PERFORMANCE.md](BARE_METAL_PERFORMANCE.md).
+
+### Search Quality (WANDS Benchmark — v2.4.0)
+
+| System | NDCG@10 | Notes |
+|--------|---------|-------|
+| Elasticsearch BM25 | ~0.50-0.56 | Published baselines |
+| **Chronik BM25** (Tantivy) | **0.5927** | +6-18% vs Elasticsearch |
+| Elasticsearch Hybrid | ~0.58-0.65 | Published baselines |
+| **Chronik Hybrid** (BM25 + Vector, RRF) | **0.6095** | Within ES hybrid range |
+
+Tested against the [WANDS dataset](https://github.com/wayfair/WANDS) (42,994 products, 480 queries). See [docs/DATASET_VALIDATION_REPORT.md](docs/DATASET_VALIDATION_REPORT.md).
+
+### Scale Validation (Amazon Reviews — v2.4.0)
+
+| Dataset | Records | Text Search p50 | SQL p50 | Errors |
+|---------|---------|-----------------|---------|--------|
+| Amazon Appliances | 2.1M | 2.8ms @ 1000 VUs | 43ms | 0.00% |
+| Amazon Grocery | 14.3M | 8.7ms @ 1000 VUs | 360ms | 0.00% |
+| Amazon Electronics | 43.9M | 112ms @ 1000 VUs | 185ms | 0.00% |
+
+
+## Use Cases
+
+### Operational Analytics
+Replace Kafka + Flink + ClickHouse. Produce events via Kafka protocol. Query with SQL. No pipeline.
 
 ```bash
-# Quick start - single node
-docker run -d -p 9092:9092 \
+# Produce events from your application (any Kafka client)
+producer.send('orders', {'user_id': 42, 'amount': 99.50, 'city': 'Berlin'})
+
+# Query immediately via SQL
+curl -X POST http://localhost:6092/_sql \
+  -d '{"query": "SELECT city, COUNT(*), AVG(amount) FROM orders GROUP BY city"}'
+```
+
+### Real-Time Search
+Replace Kafka + Kafka Connect + Elasticsearch. Events become searchable within seconds.
+
+```bash
+# Full-text search across all messages
+curl -X POST http://localhost:6092/_search \
+  -d '{"index": "support-tickets", "query": {"match": {"_all": "login timeout error"}}}'
+```
+
+### AI and Agent Memory
+Replace Kafka + custom ETL + Pinecone/Weaviate. Events are embedded and indexed for semantic retrieval automatically.
+
+```bash
+# Semantic search — "what happened recently that's similar to this?"
+curl -X POST http://localhost:6092/_vector/incidents/search \
+  -d '{"query": "database connection pool exhausted", "k": 10}'
+
+# Hybrid search — combine keyword precision with semantic recall
+curl -X POST http://localhost:6092/_vector/incidents/hybrid \
+  -d '{"query": "OOM kill postgres", "k": 10, "vector_weight": 0.7}'
+```
+
+### Multi-Modal Retrieval
+Use the query orchestrator to search across modalities and topics in a single request:
+
+```bash
+curl -X POST http://localhost:6092/_query \
+  -d '{
+    "query": "payment failures in EU",
+    "topics": ["orders", "support-tickets", "incidents"],
+    "backends": ["search", "vector"],
+    "k": 20
+  }'
+```
+
+Results are fused via Reciprocal Rank Fusion (RRF) and returned as a single ranked list.
+
+## Quick Start
+
+### Docker (Recommended)
+
+```bash
+# Single node — just works
+docker run -d -p 9092:9092 -p 6092:6092 \
   -e CHRONIK_ADVERTISED_ADDR=localhost \
   ghcr.io/lspecian/chronik-stream:latest start
 
 # With persistent storage
 docker run -d --name chronik \
-  -p 9092:9092 \
+  -p 9092:9092 -p 6092:6092 \
   -v chronik-data:/data \
   -e CHRONIK_ADVERTISED_ADDR=localhost \
-  -e RUST_LOG=info \
   ghcr.io/lspecian/chronik-stream:latest start
-
-# Using docker-compose
-curl -O https://raw.githubusercontent.com/lspecian/chronik-stream/main/docker-compose.yml
-docker-compose up -d
 ```
 
-### With S3/MinIO Object Storage
+**IMPORTANT**: `CHRONIK_ADVERTISED_ADDR` is required when binding to `0.0.0.0` or running in Docker. Without it, clients receive `0.0.0.0:9092` and fail to connect.
+
+### Binary
 
 ```bash
-# MinIO for development
-docker run -d --name chronik \
-  -p 9092:9092 \
-  -e CHRONIK_ADVERTISED_ADDR=localhost \
-  -e OBJECT_STORE_BACKEND=s3 \
-  -e S3_ENDPOINT=http://minio:9000 \
-  -e S3_BUCKET=chronik-storage \
-  -e S3_ACCESS_KEY=minioadmin \
-  -e S3_SECRET_KEY=minioadmin \
-  -e S3_PATH_STYLE=true \
-  ghcr.io/lspecian/chronik-stream:latest start
+# Linux x86_64
+curl -L https://github.com/lspecian/chronik-stream/releases/latest/download/chronik-server-linux-amd64.tar.gz | tar xz
+./chronik-server start
 
-# AWS S3 for production (uses IAM role)
-docker run -d --name chronik \
-  -p 9092:9092 \
-  -e CHRONIK_ADVERTISED_ADDR=localhost \
-  -e OBJECT_STORE_BACKEND=s3 \
-  -e S3_REGION=us-west-2 \
-  -e S3_BUCKET=chronik-prod-archives \
-  ghcr.io/lspecian/chronik-stream:latest start
+# macOS (Apple Silicon)
+curl -L https://github.com/lspecian/chronik-stream/releases/latest/download/chronik-server-darwin-arm64.tar.gz | tar xz
+./chronik-server start
 ```
 
-### ⚠️ Critical Docker Configuration
+### From Source
 
-**IMPORTANT**: When running Chronik Stream in Docker or binding to `0.0.0.0`, you **MUST** set `CHRONIK_ADVERTISED_ADDR`:
-
-```yaml
-# docker-compose.yml example
-services:
-  chronik-stream:
-    image: ghcr.io/lspecian/chronik-stream:latest
-    ports:
-      - "9092:9092"
-    environment:
-      CHRONIK_BIND_ADDR: "0.0.0.0"  # Just host, no port
-      CHRONIK_ADVERTISED_ADDR: "chronik-stream"  # REQUIRED - use container name for Docker networks
-      # or "localhost" for host access, or your public hostname/IP for remote access
+```bash
+git clone https://github.com/lspecian/chronik-stream.git
+cd chronik-stream
+cargo build --release --bin chronik-server
+./target/release/chronik-server start
 ```
 
-Without `CHRONIK_ADVERTISED_ADDR`, clients will receive `0.0.0.0:9092` in metadata responses and fail to connect.
-
-### Test with Kafka Client
+### Test with a Kafka Client
 
 ```python
-# Python example
 from kafka import KafkaProducer, KafkaConsumer
 
-# Single-node setup
 producer = KafkaProducer(
     bootstrap_servers='localhost:9092',
-    api_version=(0, 10, 0)  # Important: specify version
+    api_version=(0, 10, 0)
 )
 producer.send('test-topic', b'Hello Chronik!')
 producer.flush()
 
-# Consumer
 consumer = KafkaConsumer(
     'test-topic',
     bootstrap_servers='localhost:9092',
@@ -265,72 +286,9 @@ for message in consumer:
     print(f"Received: {message.value}")
 ```
 
-**⚠️ CRITICAL for Cluster Deployments**: When using a multi-node cluster, **ALWAYS configure clients with ALL cluster brokers** for 100% message consumption success:
+## SQL API
 
-```python
-# ✅ CORRECT - Cluster configuration (ALL brokers)
-producer = KafkaProducer(
-    bootstrap_servers='localhost:9092,localhost:9093,localhost:9094',  # All 3 brokers!
-    api_version=(0, 10, 0)
-)
-
-# ❌ WRONG - Single broker causes leadership rejections and message loss
-producer = KafkaProducer(
-    bootstrap_servers='localhost:9092',  # Only one broker - NOT RECOMMENDED for clusters!
-    api_version=(0, 10, 0)
-)
-```
-
-See [docs/100_PERCENT_CONSUMPTION_INVESTIGATION.md](docs/100_PERCENT_CONSUMPTION_INVESTIGATION.md) for detailed analysis.
-
-### Using Binary
-
-```bash
-# Download latest release (Linux x86_64)
-curl -L https://github.com/lspecian/chronik-stream/releases/latest/download/chronik-server-linux-amd64.tar.gz -o chronik-server.tar.gz
-tar xzf chronik-server.tar.gz
-./chronik-server start
-
-# macOS (Apple Silicon)
-curl -L https://github.com/lspecian/chronik-stream/releases/latest/download/chronik-server-darwin-arm64.tar.gz -o chronik-server.tar.gz
-tar xzf chronik-server.tar.gz
-./chronik-server start
-```
-
-### Building from Source
-
-```bash
-# Clone repository
-git clone https://github.com/lspecian/chronik-stream.git
-cd chronik-stream
-
-# Build release binary
-cargo build --release --bin chronik-server
-
-# Run single-node
-./target/release/chronik-server start
-
-# Or run 3-node cluster locally
-./target/release/chronik-server start --config config/examples/cluster/chronik-cluster-node1.toml
-./target/release/chronik-server start --config config/examples/cluster/chronik-cluster-node2.toml
-./target/release/chronik-server start --config config/examples/cluster/chronik-cluster-node3.toml
-```
-
-## 🌟 KSQL Integration
-
-Chronik Stream provides **full compatibility** with KSQLDB (Confluent's SQL engine for Kafka) including transactional support. Simply point KSQLDB at Chronik's Kafka endpoint:
-
-```properties
-# ksql-server.properties
-bootstrap.servers=localhost:9092
-ksql.service.id=ksql_service_1
-```
-
-For detailed KSQL setup and usage examples, see [docs/KSQL_INTEGRATION_GUIDE.md](docs/KSQL_INTEGRATION_GUIDE.md).
-
-## 🔍 SQL API (v2.2.22+)
-
-Query your Kafka topics directly with SQL - no external database required:
+Query Kafka topics directly with SQL. No external database required.
 
 ```bash
 # Create a columnar-enabled topic
@@ -338,140 +296,109 @@ curl -X POST http://localhost:6092/topics \
   -H "Content-Type: application/json" \
   -d '{"name": "orders", "partitions": 3, "config": {"columnar.enabled": "true"}}'
 
-# Produce some data (via Kafka client)
-# ... produce messages to 'orders' topic ...
-
-# Query recent data (0-1ms latency from hot buffer)
+# Produce data via any Kafka client, then query immediately
 curl -X POST http://localhost:6092/_sql \
-  -H "Content-Type: application/json" \
-  -d '{"query": "SELECT COUNT(*) FROM orders_hot"}'
+  -d '{"query": "SELECT city, COUNT(*) as cnt, AVG(amount) FROM orders GROUP BY city ORDER BY cnt DESC LIMIT 10"}'
 
-# Query all data (hot + cold unified view)
+# Recent data (0-1ms from in-memory hot buffer)
 curl -X POST http://localhost:6092/_sql \
-  -H "Content-Type: application/json" \
-  -d '{"query": "SELECT * FROM orders WHERE _offset > 1000 LIMIT 10"}'
+  -d '{"query": "SELECT * FROM orders_hot WHERE amount > 100 LIMIT 10"}'
 
-# Aggregations
+# Historical data (Parquet files)
 curl -X POST http://localhost:6092/_sql \
-  -H "Content-Type: application/json" \
-  -d '{"query": "SELECT _partition, COUNT(*) as cnt FROM orders GROUP BY _partition"}'
-
-# Describe table schema
-curl http://localhost:6092/_sql/describe/orders
+  -d '{"query": "SELECT * FROM orders_cold WHERE _partition = 0 LIMIT 10"}'
 ```
 
-**Available Tables per Topic:**
-| Table | Description | Latency |
-|-------|-------------|---------|
+JSON message values are automatically inferred into typed columns (Int64, Float64, Boolean, Utf8). Query with standard SQL — no UDFs or schema definitions needed.
+
+**Tables per topic:**
+
+| Table | Source | Latency |
+|-------|--------|---------|
 | `{topic}_hot` | In-memory Arrow buffer (recent data) | 0-1ms |
-| `{topic}_cold` | Parquet files (historical data) | 1-10ms |
-| `{topic}` | Unified view (hot + cold UNION) | 1-10ms |
+| `{topic}_cold` | Parquet files (historical data) | 1-200ms |
+| `{topic}` | Unified view (hot + cold) | 1-200ms |
 
-For detailed SQL syntax and examples, see [docs/COLUMNAR_STORAGE_GUIDE.md](docs/COLUMNAR_STORAGE_GUIDE.md).
+See [docs/COLUMNAR_STORAGE_GUIDE.md](docs/COLUMNAR_STORAGE_GUIDE.md) for full SQL reference.
 
-## 🎯 Operational Modes
+## Cluster Mode
 
-The unified `chronik-server` binary supports two deployment modes via the `start` command:
-
-### Single-Node Mode (Default)
-Perfect for development, testing, and single-node production deployments:
+Chronik supports multi-node clusters with Raft consensus, automatic replication, and zero-downtime operations. Minimum 3 nodes for quorum.
 
 ```bash
-# Simplest - just start
-./chronik-server start
-
-# With custom data directory
-./chronik-server start --data-dir /var/lib/chronik
-
-# With advertised address (required for Docker/remote clients)
-./chronik-server start --advertise my-hostname.com:9092
+# Start a 3-node cluster (one terminal per node)
+./chronik-server start --config cluster-node1.toml
+./chronik-server start --config cluster-node2.toml
+./chronik-server start --config cluster-node3.toml
 ```
 
-**Features:**
-- ✅ Full Kafka protocol compatibility
-- ✅ WAL-based durability (zero message loss)
-- ✅ Automatic crash recovery
-- ✅ 3-tier storage (local + S3/GCS/Azure)
-- ✅ Full-text search with Tantivy
-
-### Cluster Mode (Multi-Node Replication)
-**Available in v2.2.0+**: Production-ready multi-node cluster with Raft consensus, automatic replication, and zero-downtime operations.
-
-**Minimum 3 nodes required** for quorum-based replication.
-
-**Quick Start (Local Testing):**
-```bash
-# Terminal 1 - Node 1
-./chronik-server start --config config/examples/cluster/chronik-cluster-node1.toml
-
-# Terminal 2 - Node 2
-./chronik-server start --config config/examples/cluster/chronik-cluster-node2.toml
-
-# Terminal 3 - Node 3
-./chronik-server start --config config/examples/cluster/chronik-cluster-node3.toml
-```
-
-**Production Setup (3 Machines):**
-```bash
-# On each node, create config file with unique node_id
-# Example node1.toml:
-enabled = true
+```toml
+# cluster-node1.toml
 node_id = 1
 replication_factor = 3
 min_insync_replicas = 2
 
 [[peers]]
 id = 1
-kafka = "node1.example.com:9092"
-wal = "node1.example.com:9291"
-raft = "node1.example.com:5001"
+kafka = "node1:9092"
+wal = "node1:9291"
+raft = "node1:5001"
 
 [[peers]]
 id = 2
-kafka = "node2.example.com:9092"
-wal = "node2.example.com:9291"
-raft = "node2.example.com:5001"
+kafka = "node2:9092"
+wal = "node2:9291"
+raft = "node2:5001"
 
 [[peers]]
 id = 3
-kafka = "node3.example.com:9092"
-wal = "node3.example.com:9291"
-raft = "node3.example.com:5001"
-
-# Start each node
-./chronik-server start --config /etc/chronik/node1.toml
+kafka = "node3:9092"
+wal = "node3:9291"
+raft = "node3:5001"
 ```
 
-**Key Features:**
-- ✅ Quorum-based replication (survives minority node failures)
-- ✅ Automatic leader election via Raft consensus
-- ✅ Strong consistency (linearizable reads/writes)
-- ✅ Zero-downtime node addition and removal (v2.2.0+)
-- ✅ Automatic partition rebalancing
-- ✅ Comprehensive monitoring via Prometheus metrics
+**Cluster management:**
 
-**Cluster Management:**
 ```bash
-# Add node to running cluster
-export CHRONIK_ADMIN_API_KEY=<key>
-./chronik-server cluster add-node 4 \
-  --kafka node4:9092 \
-  --wal node4:9291 \
-  --raft node4:5001 \
-  --config cluster.toml
+# Add a node (zero downtime)
+./chronik-server cluster add-node 4 --kafka node4:9092 --wal node4:9291 --raft node4:5001 --config cluster.toml
 
-# Query cluster status
+# Check status
 ./chronik-server cluster status --config cluster.toml
 
-# Remove node gracefully
+# Remove a node gracefully
 ./chronik-server cluster remove-node 4 --config cluster.toml
 ```
 
-**Complete Guide:** See [docs/RUNNING_A_CLUSTER.md](docs/RUNNING_A_CLUSTER.md) for step-by-step instructions.
+See [docs/RUNNING_A_CLUSTER.md](docs/RUNNING_A_CLUSTER.md) for the complete cluster guide.
 
-### Configuration Options
+## Kafka Compatibility
 
-**Commands:**
+Chronik implements 24 Kafka wire protocol APIs and is tested with real clients:
+
+| API | Versions | API | Versions |
+|-----|----------|-----|----------|
+| Produce | v0-v9 | ApiVersions | v0-v3 |
+| Fetch | v0-v13 | CreateTopics | v0-v7 |
+| ListOffsets | v0-v7 | DeleteTopics | v0-v6 |
+| Metadata | v0-v12 | CreatePartitions | v0-v3 |
+| OffsetCommit | v0-v8 | InitProducerId | v0-v4 |
+| OffsetFetch | v0-v8 | AddPartitionsToTxn | v0-v3 |
+| FindCoordinator | v0-v4 | AddOffsetsToTxn | v0-v3 |
+| JoinGroup | v0-v9 | EndTxn | v0-v3 |
+| SyncGroup | v0-v5 | TxnOffsetCommit | v0-v3 |
+| Heartbeat | v0-v4 | SaslHandshake | v0-v1 |
+| LeaveGroup | v0-v5 | SaslAuthenticate | v0-v2 |
+| DescribeGroups | v0-v5 | ListGroups | v0-v4 |
+
+**Tested clients:** kafka-python, confluent-kafka, KSQLDB, Apache Flink.
+
+Chronik also provides a Confluent-compatible **Schema Registry** (Avro, JSON Schema, Protobuf) on the admin API port. See [docs/SCHEMA_REGISTRY.md](docs/SCHEMA_REGISTRY.md).
+
+## Configuration Reference
+
+### Commands
+
 ```bash
 chronik-server start [OPTIONS]          # Start server (auto-detects single-node or cluster)
 chronik-server cluster <SUBCOMMAND>     # Manage cluster (add-node, remove-node, status)
@@ -479,351 +406,133 @@ chronik-server version                  # Display version info
 chronik-server compact <SUBCOMMAND>     # Manage WAL compaction
 ```
 
-**Start Command Options:**
-```bash
-chronik-server start [OPTIONS]
-
-Options:
-  -d, --data-dir <DIR>         Data directory (default: ./data)
-  --config <FILE>              Cluster config file (enables cluster mode)
-  --node-id <ID>               Override node ID from config
-  --advertise <ADDR:PORT>      Advertised Kafka address (for remote clients)
-  -l, --log-level <LEVEL>      Log level (error/warn/info/debug/trace)
-```
-
-**Key Environment Variables:**
-```bash
-# Server Configuration
-CHRONIK_DATA_DIR             Data directory path (default: ./data)
-CHRONIK_ADVERTISED_ADDR      Address advertised to clients (CRITICAL for Docker)
-RUST_LOG                     Log level (error, warn, info, debug, trace)
-
-# Performance Tuning
-CHRONIK_WAL_PROFILE          WAL performance: low/medium/high/ultra (auto-detects)
-CHRONIK_PRODUCE_PROFILE      Producer flush: low-latency/balanced/high-throughput
-CHRONIK_WAL_ROTATION_SIZE    WAL segment size: 100KB/250MB (default)/1GB
-
-# Hot Buffer SQL (v2.2.22+)
-CHRONIK_HOT_BUFFER_ENABLED   Enable sub-second SQL queries (default: true)
-CHRONIK_HOT_BUFFER_MAX_RECORDS  Max records per partition in hot buffer (default: 100000)
-CHRONIK_HOT_BUFFER_REFRESH_MS   Hot buffer refresh interval in ms (default: 1000)
-
-# Columnar Storage (v2.2.22+)
-CHRONIK_COLUMNAR_USE_OBJECT_STORE  Upload Parquet to S3/GCS/Azure (default: false)
-CHRONIK_COLUMNAR_S3_PREFIX   Object storage prefix (default: columnar)
-CHRONIK_COLUMNAR_KEEP_LOCAL  Keep local Parquet copies for fast queries (default: true)
-
-# Cluster Management (v2.2.0+)
-CHRONIK_ADMIN_API_KEY        Admin API authentication key (REQUIRED for production clusters)
-
-# Object Store (3-Tier Storage)
-OBJECT_STORE_BACKEND         Backend: s3/gcs/azure/local (default: local)
-
-# S3/MinIO Configuration
-S3_ENDPOINT                  S3 endpoint (e.g., http://minio:9000)
-S3_REGION                    AWS region (default: us-east-1)
-S3_BUCKET                    Bucket name (default: chronik-storage)
-S3_ACCESS_KEY                Access key ID
-S3_SECRET_KEY                Secret access key
-S3_PATH_STYLE                Path-style URLs (default: true, required for MinIO)
-S3_DISABLE_SSL               Disable SSL (default: false)
-
-# GCS Configuration
-GCS_BUCKET                   GCS bucket name
-GCS_PROJECT_ID               GCP project ID
-
-# Azure Configuration
-AZURE_ACCOUNT_NAME           Storage account name
-AZURE_CONTAINER              Container name
-```
-
-## ⚡ Performance Tuning
-
-Chronik Stream provides two layers of performance tuning for different workloads:
-
-### WAL Performance Profiles
-
-The Write-Ahead Log is the primary performance lever. It automatically detects system resources (CPU, memory, Docker/K8s limits) and selects an appropriate profile. Override with:
+### Key Environment Variables
 
 ```bash
-CHRONIK_WAL_PROFILE=low        # Containers, small VMs (≤1 CPU, <512MB) - 2ms batch
-CHRONIK_WAL_PROFILE=medium     # Typical servers (2-4 CPUs, 512MB-4GB) - 10ms batch
-CHRONIK_WAL_PROFILE=high       # Dedicated servers (4-16 CPUs, 4-16GB) - 50ms batch
-CHRONIK_WAL_PROFILE=ultra      # Maximum throughput (16+ CPUs, 16GB+) - 100ms batch
+# Server
+CHRONIK_DATA_DIR              # Data directory (default: ./data)
+CHRONIK_ADVERTISED_ADDR       # Address advertised to Kafka clients (REQUIRED for Docker)
+CHRONIK_UNIFIED_API_PORT      # Unified API port (default: 6092)
+RUST_LOG                      # Log level: error, warn, info, debug, trace
+
+# Performance
+CHRONIK_WAL_PROFILE           # WAL batch interval: low (2ms), medium (10ms), high (50ms), ultra (100ms)
+CHRONIK_PRODUCE_PROFILE       # Flush profile: low-latency, balanced, high-throughput, extreme
+
+# SQL / Columnar
+CHRONIK_HOT_BUFFER_ENABLED    # Enable in-memory SQL queries (default: true)
+CHRONIK_HOT_BUFFER_MAX_RECORDS  # Max records per partition in hot buffer (default: 100000)
+
+# Vector / Embeddings
+OPENAI_API_KEY                # OpenAI API key for vector embeddings
+CHRONIK_EMBEDDING_PROVIDER    # Embedding provider: openai, external
+
+# Object Storage (tiered storage)
+OBJECT_STORE_BACKEND          # Backend: s3, gcs, azure, local (default: local)
+S3_BUCKET                     # S3 bucket name
+S3_REGION                     # AWS region
+S3_ENDPOINT                   # Custom endpoint (e.g., MinIO)
+
+# Cluster
+CHRONIK_ADMIN_API_KEY         # Admin API authentication (REQUIRED for production clusters)
 ```
 
-**Benchmark results use `high` profile** - see [BASELINE_PERFORMANCE.md](BASELINE_PERFORMANCE.md) for detailed methodology.
+## Security
+
+```bash
+# SASL authentication (PLAIN, SCRAM-SHA-256, SCRAM-SHA-512)
+CHRONIK_SASL_USERS='myuser:securepass123,app:app-secret' ./chronik-server start
+
+# Disable default test users in production
+CHRONIK_SASL_NO_DEFAULTS=1 ./chronik-server start
+```
+
+Admin API and Schema Registry support API key and HTTP Basic Auth respectively. See [docs/ADMIN_API_SECURITY.md](docs/ADMIN_API_SECURITY.md).
+
+## Performance Tuning
+
+### WAL Profiles
+
+The WAL auto-detects system resources and selects an appropriate batch interval. Override when needed:
+
+```bash
+CHRONIK_WAL_PROFILE=low        # Containers, small VMs (2ms batch)
+CHRONIK_WAL_PROFILE=medium     # Typical servers (10ms batch)
+CHRONIK_WAL_PROFILE=high       # Dedicated servers (50ms batch)
+CHRONIK_WAL_PROFILE=ultra      # Maximum throughput (100ms batch)
+```
 
 ### Producer Flush Profiles
 
-Control when buffered messages become visible to consumers:
+| Profile | Flush Interval | Buffer | Use Case |
+|---------|----------------|--------|----------|
+| `low-latency` | 10ms | 16MB | Real-time analytics, instant messaging |
+| `balanced` | 100ms | 32MB | General-purpose workloads |
+| `high-throughput` | 500ms | 128MB | Data pipelines, ETL, batch processing |
+| `extreme` | 2000ms | 512MB | Bulk ingestion, data migrations |
 
-| Profile | Batches | Flush Interval | Buffer | Use Case |
-|---------|---------|----------------|--------|----------|
-| `low-latency` (default) | 1 | 10ms | 16MB | Real-time analytics, instant messaging |
-| `balanced` | 10 | 100ms | 32MB | General-purpose workloads |
-| `high-throughput` | 100 | 500ms | 128MB | Data pipelines, ETL, batch processing |
-| `extreme` | 500 | 2000ms | 512MB | Bulk ingestion, data migrations |
-
-```bash
-# Set producer profile (low-latency is default, use high-throughput for batch workloads)
-CHRONIK_PRODUCE_PROFILE=high-throughput ./chronik-server start
-```
-
-### Benchmarking
-
-Run the built-in benchmark tool:
-```bash
-cargo build --release
-./target/release/chronik-bench -c 128 -s 256 -d 30s -m produce
-```
-
-## 📦 Docker Images
-
-All images support both **linux/amd64** and **linux/arm64** architectures:
-
-| Image | Tags | Description |
-|-------|------|-------------|
-| `ghcr.io/lspecian/chronik-stream` | `latest`, `v2.4.0`, `2.4` | Chronik server with SQL, search, vector, JSON columns, and KSQL support |
-
-### Supported Platforms
-
-- ✅ **Linux x86_64** (amd64)
-- ✅ **Linux ARM64** (aarch64) - AWS Graviton, Raspberry Pi 4+
-- ✅ **macOS x86_64** (Intel)
-- ✅ **macOS ARM64** (Apple Silicon M1/M2/M3)
-
-## ✅ Kafka Compatibility
-
-### Supported Kafka APIs (24 total)
-
-| API | Version | Status | Description |
-|-----|---------|--------|-------------|
-| Produce | v0-v9 | ✅ Full | Send messages to topics |
-| Fetch | v0-v13 | ✅ Full | Retrieve messages from topics |
-| ListOffsets | v0-v7 | ✅ Full | Query partition offsets |
-| Metadata | v0-v12 | ✅ Full | Get cluster metadata |
-| OffsetCommit | v0-v8 | ✅ Full | Commit consumer offsets |
-| OffsetFetch | v0-v8 | ✅ Full | Retrieve consumer offsets |
-| FindCoordinator | v0-v4 | ✅ Full | Find group coordinator |
-| JoinGroup | v0-v9 | ✅ Full | Join consumer group |
-| Heartbeat | v0-v4 | ✅ Full | Consumer heartbeat |
-| LeaveGroup | v0-v5 | ✅ Full | Leave consumer group |
-| SyncGroup | v0-v5 | ✅ Full | Sync group assignments |
-| ApiVersions | v0-v3 | ✅ Full | Negotiate API versions |
-| CreateTopics | v0-v7 | ✅ Full | Create new topics |
-| DeleteTopics | v0-v6 | ✅ Full | Delete topics |
-| DescribeGroups | v0-v5 | ✅ Full | Describe consumer groups |
-| ListGroups | v0-v4 | ✅ Full | List all groups |
-| SaslHandshake | v0-v1 | ✅ Full | SASL authentication |
-| SaslAuthenticate | v0-v2 | ✅ Full | SASL auth exchange |
-| CreatePartitions | v0-v3 | ✅ Full | Add partitions to topics |
-| InitProducerId | v0-v4 | ✅ Full | Initialize transactional producer |
-| AddPartitionsToTxn | v0-v3 | ✅ Full | Add partitions to transaction |
-| AddOffsetsToTxn | v0-v3 | ✅ Full | Add consumer offsets to transaction |
-| EndTxn | v0-v3 | ✅ Full | Commit or abort transaction |
-| TxnOffsetCommit | v0-v3 | ✅ Full | Commit offsets within transaction |
-
-### Tested Clients
-
-- ✅ **kafka-python** - Python client (full compatibility)
-- ✅ **confluent-kafka** - High-performance C-based client
-- ✅ **KSQLDB** - Full support including transactional operations
-- ✅ **Apache Flink** - Stream processing integration
-
-## 🛠️ Development
-
-### Prerequisites
-
-- Rust 1.75+
-- Docker & Docker Compose (for testing)
-- Python 3.8+ with kafka-python (for client testing)
-
-### Building
-
-```bash
-# Build all components
-cargo build --release
-
-# Run tests (unit and bin tests only)
-cargo test --workspace --lib --bins
-
-# Run integration tests (requires setup)
-cargo test --test integration
-
-# Run benchmarks
-cargo bench
-```
-
-### Project Structure
+## Project Structure
 
 ```
 chronik-stream/
 ├── crates/
-│   ├── chronik-server/      # Main server binary (unified)
-│   ├── chronik-protocol/    # Kafka wire protocol implementation
-│   ├── chronik-storage/     # Storage abstraction layer
-│   ├── chronik-columnar/    # Columnar storage & SQL (DataFusion) [v2.2.22+]
-│   ├── chronik-embeddings/  # Vector embeddings & HNSW search [v2.2.22+]
-│   ├── chronik-search/      # Search engine integration (Tantivy)
-│   ├── chronik-query/       # Query processing
-│   ├── chronik-common/      # Shared utilities
-│   ├── chronik-auth/        # Authentication & authorization
-│   ├── chronik-monitoring/  # Metrics & observability
-│   ├── chronik-config/      # Configuration management
-│   ├── chronik-backup/      # Backup functionality
-│   ├── chronik-bench/       # Performance benchmarking tool
-│   ├── chronik-wal/         # Write-Ahead Log & metadata store
-│   ├── chronik-raft/        # Raft consensus implementation
-│   ├── chronik-raft-bridge/ # Raft integration bridge
-│   ├── raft/                # Vendored TiKV raft (prost 0.12)
-│   └── raft-proto/          # Vendored raft-proto (prost codegen)
-├── tests/                   # Integration tests
-├── Dockerfile              # Multi-arch Docker build
-├── docker-compose.yml      # Local development setup
-└── .github/workflows/      # CI/CD pipelines
+│   ├── chronik-server/       # Unified server binary
+│   ├── chronik-protocol/     # Kafka wire protocol (24 APIs)
+│   ├── chronik-wal/          # Write-Ahead Log, group commit, recovery
+│   ├── chronik-storage/      # Storage abstraction, segment I/O, WalIndexer
+│   ├── chronik-columnar/     # Arrow/Parquet, DataFusion SQL, HNSW vector search
+│   ├── chronik-embeddings/   # Embedding providers (OpenAI, external)
+│   ├── chronik-search/       # Tantivy full-text search
+│   ├── chronik-query/        # Query processing
+│   ├── chronik-common/       # Shared types, metadata traits
+│   ├── chronik-raft/         # Raft consensus
+│   ├── chronik-raft-bridge/  # Raft integration bridge
+│   ├── chronik-operator/     # Kubernetes operator (ChronikCluster CRD)
+│   ├── chronik-auth/         # SASL, TLS, ACLs
+│   ├── chronik-monitoring/   # Prometheus metrics
+│   ├── chronik-config/       # Configuration management
+│   ├── chronik-backup/       # Backup and disaster recovery
+│   └── chronik-bench/        # Benchmarking tool
+├── tests/                    # Integration tests
+├── docs/                     # Guides and references
+└── .github/workflows/        # CI/CD
 ```
 
-## Performance
+## Project Status
 
-### Bare Metal Cluster (v2.2.25)
+Chronik Stream is in active development. The core streaming, SQL, search, and vector capabilities are validated at scale (43.9M records, 3-node cluster). The Kafka protocol layer has been tested with real clients across production workloads.
 
-Tested on 3x Dell Xeon E5-2667v4 (32 cores, 256GB RAM, 1GbE) running a 3-node Raft cluster with full replication (acks=all). Traffic flows through a realistic HTTP ingestor pipeline with k6 load generators simulating thousands of concurrent users.
+**Current version: v2.4.1** — See [CHANGELOG.md](CHANGELOG.md) for release history.
 
-| Configuration | Messages/sec | Throughput | Errors |
-|---------------|-------------|------------|--------|
-| 12 ingestors, 256B messages | **837,284 msg/s** | 245 MB/s | 0.00% |
-| 12 ingestors, 1KB messages | 270,000 msg/s | 270 MB/s | 0.00% |
-| 36 ingestors, 1KB messages | 420,609 msg/s | **411 MB/s** | 0.00% |
+**Roadmap priorities:**
+- Cross-encoder reranking for search quality (Phase 10)
+- Query governance and policy controls (Phase 11)
+- Production hardening and ecosystem integrations
 
-- **Zero data loss** across 1B+ messages
-- CPU returns to idle within seconds of load completion
-- Cluster never exceeded 80% CPU utilization (I/O bound, not CPU bound)
+See [docs/ROADMAP_RELEVANCE_ENGINE.md](docs/ROADMAP_RELEVANCE_ENGINE.md) for the full roadmap.
 
-See [BARE_METAL_PERFORMANCE.md](BARE_METAL_PERFORMANCE.md) for full test methodology, architecture diagrams, and bottleneck analysis.
+## Documentation
 
-### Single-Node Benchmarks
+| Guide | Description |
+|-------|-------------|
+| [CHANGELOG.md](CHANGELOG.md) | Release history |
+| [docs/RUNNING_A_CLUSTER.md](docs/RUNNING_A_CLUSTER.md) | Cluster setup guide |
+| [docs/COLUMNAR_STORAGE_GUIDE.md](docs/COLUMNAR_STORAGE_GUIDE.md) | SQL and Parquet storage |
+| [docs/SEARCHABLE_TOPICS.md](docs/SEARCHABLE_TOPICS.md) | Full-text search |
+| [docs/VECTOR_SEARCH_GUIDE.md](docs/VECTOR_SEARCH_GUIDE.md) | Vector search and embeddings |
+| [docs/SCHEMA_REGISTRY.md](docs/SCHEMA_REGISTRY.md) | Confluent-compatible Schema Registry |
+| [docs/KSQL_INTEGRATION_GUIDE.md](docs/KSQL_INTEGRATION_GUIDE.md) | KSQLDB integration |
+| [docs/API_REFERENCE.md](docs/API_REFERENCE.md) | Unified REST API reference |
+| [docs/DATASET_VALIDATION_REPORT.md](docs/DATASET_VALIDATION_REPORT.md) | Scale and quality validation |
+| [docs/DISASTER_RECOVERY.md](docs/DISASTER_RECOVERY.md) | Backup and recovery |
+| [docs/ADMIN_API_SECURITY.md](docs/ADMIN_API_SECURITY.md) | Admin API security |
+| [BASELINE_PERFORMANCE.md](BASELINE_PERFORMANCE.md) | Performance benchmarks |
+| [BARE_METAL_PERFORMANCE.md](BARE_METAL_PERFORMANCE.md) | Cluster throughput testing |
 
-| Mode | Configuration | Throughput | p99 Latency |
-|------|---------------|------------|-------------|
-| **Standalone** | acks=1 | **309K msg/s** | 0.59ms |
-| **Standalone** | acks=all | **348K msg/s** | 0.56ms |
-| **Cluster (3 nodes)** | acks=1 | **188K msg/s** | 2.81ms |
-| **Cluster (3 nodes)** | acks=all | **166K msg/s** | 1.80ms |
+## Contributing
 
-### Key Performance Features
+Contributions are welcome. Please feel free to submit a Pull Request.
 
-- **High Throughput**: 837K msg/s cluster (bare metal), 348K msg/s standalone
-- **Low Latency**: Sub-millisecond p99 latency standalone, sub-3ms cluster
-- **SQL Query Latency**: 0-1ms for hot buffer, <20ms P99 under 10K msg/s load
-- **Zero Data Loss**: All acks modes (0, 1, -1) guaranteed durable with WAL
-- **Group Commit**: PostgreSQL-style batched fsync reduces I/O overhead
-- **Recovery**: Full WAL recovery in seconds even for large datasets
-
-See [BASELINE_PERFORMANCE.md](BASELINE_PERFORMANCE.md) for single-node benchmark methodology.
-
-## 🔒 Security
-
-### SASL Authentication
-
-Chronik Stream supports SASL authentication with the following mechanisms:
-- **PLAIN** - Username/password authentication
-- **SCRAM-SHA-256** - Challenge-response authentication
-- **SCRAM-SHA-512** - Challenge-response authentication (stronger)
-
-**Configuration:**
-```bash
-# Production: Configure custom users
-CHRONIK_SASL_USERS='myuser:securepass123,kafka-app:app-secret' ./chronik-server start
-
-# Production: Disable all default users
-CHRONIK_SASL_NO_DEFAULTS=1 ./chronik-server start
-
-# Development only: Default test users (NOT for production!)
-# - admin/admin123, user/user123, kafka/kafka-secret
-# These are used if no CHRONIK_SASL_* env vars are set
-```
-
-```python
-# Python example with SASL/PLAIN
-from kafka import KafkaProducer
-
-producer = KafkaProducer(
-    bootstrap_servers='localhost:9092',
-    security_protocol='SASL_PLAINTEXT',
-    sasl_mechanism='PLAIN',
-    sasl_plain_username='myuser',
-    sasl_plain_password='securepass123'
-)
-```
-
-### Additional Security Features
-
-- **TLS/SSL**: End-to-end encryption (infrastructure in `chronik-auth` crate)
-- **ACLs**: Topic and consumer group access control framework
-- **Admin API**: Secured with API key authentication (cluster management)
-
-> ⚠️ **Security Note**: Default test users are for development only. Always set `CHRONIK_SASL_USERS` or `CHRONIK_SASL_NO_DEFAULTS=1` in production.
-
-## 📊 Monitoring
-
-### Prometheus Metrics
-
-```bash
-# Expose metrics endpoint
-chronik --metrics-port 9093
-
-# Key metrics:
-- chronik_messages_received_total
-- chronik_messages_stored_total
-- chronik_produce_latency_seconds
-- chronik_fetch_latency_seconds
-- chronik_storage_usage_bytes
-- chronik_active_connections
-```
-
-## 🤝 Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-## 📄 License
+## License
 
 Apache License 2.0. See [LICENSE](LICENSE) for details.
-
-## 📚 Documentation
-
-### Getting Started
-- [CHANGELOG.md](CHANGELOG.md) - Detailed release history
-- [docs/RUNNING_A_CLUSTER.md](docs/RUNNING_A_CLUSTER.md) - **Complete cluster setup guide (v2.2.0+)**
-- [docs/SEARCHABLE_TOPICS.md](docs/SEARCHABLE_TOPICS.md) - **Searchable topics with real-time indexing (v2.2.16+)**
-- [docs/KSQL_INTEGRATION_GUIDE.md](docs/KSQL_INTEGRATION_GUIDE.md) - KSQL setup and usage
-
-### SQL & Columnar Storage (v2.2.22+)
-- [docs/COLUMNAR_STORAGE_GUIDE.md](docs/COLUMNAR_STORAGE_GUIDE.md) - **Hot buffer SQL & Parquet storage guide**
-- [docs/API_REFERENCE.md](docs/API_REFERENCE.md) - Unified REST API reference (`/_sql`, `/_search`, admin)
-
-### Dataset Validation (v2.4.0)
-- [docs/DATASET_VALIDATION_REPORT.md](docs/DATASET_VALIDATION_REPORT.md) - **Full validation report (DV-1, DV-2a, DV-2b, DV-2c)**
-- [docs/ROADMAP_DATASET_VALIDATION.md](docs/ROADMAP_DATASET_VALIDATION.md) - Validation methodology and roadmap
-- [docs/ROADMAP_RELEVANCE_ENGINE.md](docs/ROADMAP_RELEVANCE_ENGINE.md) - Relevance engine roadmap (reranking, governance)
-
-### v2.2.8 Release (Critical Fixes)
-- [docs/WATERMARK_IDEMPOTENCE_FIX_v2.2.7.md](docs/WATERMARK_IDEMPOTENCE_FIX_v2.2.7.md) - Watermark idempotence fix details
-- [docs/WATERMARK_OVERWRITE_BUG_ROOT_CAUSE.md](docs/WATERMARK_OVERWRITE_BUG_ROOT_CAUSE.md) - Root cause analysis
-- [docs/100_PERCENT_CONSUMPTION_INVESTIGATION.md](docs/100_PERCENT_CONSUMPTION_INVESTIGATION.md) - **100% consumption guide**
-- [docs/WATERMARK_REPLICATION_TEST_RESULTS_v2.2.7.2.md](docs/WATERMARK_REPLICATION_TEST_RESULTS_v2.2.7.2.md) - Test results and findings
-
-### Operations & Performance
-- [BASELINE_PERFORMANCE.md](BASELINE_PERFORMANCE.md) - **Performance benchmarks (standalone vs cluster, searchable vs non-searchable)**
-- [docs/WAL_AUTO_TUNING.md](docs/WAL_AUTO_TUNING.md) - WAL performance auto-tuning guide
-- [docs/DISASTER_RECOVERY.md](docs/DISASTER_RECOVERY.md) - Disaster recovery and backup strategies
-- [docs/ADMIN_API_SECURITY.md](docs/ADMIN_API_SECURITY.md) - Admin API security configuration
-
-### Cluster Management (v2.2.0+)
-- [docs/TESTING_NODE_REMOVAL.md](docs/TESTING_NODE_REMOVAL.md) - Testing node addition/removal
-- [docs/PRIORITY4_COMPLETE.md](docs/PRIORITY4_COMPLETE.md) - Node removal implementation details
-
-### Development
-- [CLAUDE.md](CLAUDE.md) - Development guide for AI assistants
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) - System architecture and design
-- [docs/BUILD_INSTRUCTIONS.md](docs/BUILD_INSTRUCTIONS.md) - Build and development setup
