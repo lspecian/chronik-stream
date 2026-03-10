@@ -243,6 +243,7 @@ async fn search_wal_indices(base_path: &str, request: &SearchRequest) -> Result<
             // Try to open the Tantivy index
             match Index::open_in_dir(&path) {
                 Ok(index) => {
+                    chronik_storage::register_analyzer(&index);
                     debug!("Successfully opened index: {}", index_name);
 
                     // Search this index
@@ -472,6 +473,7 @@ fn build_tantivy_query(
                 Some(i) => i,
                 None => {
                     tmp_index = tantivy::Index::create_in_ram(schema.clone());
+                    chronik_storage::register_analyzer(&tmp_index);
                     &tmp_index
                 }
             };
@@ -486,17 +488,26 @@ fn build_tantivy_query(
             // — terms in different JSON paths (e.g., color="turquoise", class="pillows")
             // won't match when parsed as a single query string.
             let words: Vec<&str> = query_text.split_whitespace().collect();
+            // If the analyzer removes all tokens (stop-word-only query like "the"),
+            // fall back to match-all so the user still gets results.
+            if !chronik_storage::text_analysis::has_tokens(&query_text) {
+                debug!("Query '{}' contains only stop words, falling back to match-all", query_text);
+                return Ok(Box::new(AllQuery));
+            }
+
+            let query_parser = QueryParser::for_index(idx, fields.clone());
             let query: Box<dyn TantivyQuery> = if words.len() <= 1 {
-                let query_parser = QueryParser::for_index(idx, fields.clone());
                 query_parser.parse_query(&query_text)
                     .map_err(|e| Error::InvalidInput(format!("Invalid query: {}", e)))?
             } else {
-                // Create per-word sub-queries and OR them together
+                // Create per-word sub-queries and OR them together,
+                // skipping words that are stop words
                 let mut sub_queries: Vec<(Occur, Box<dyn TantivyQuery>)> = Vec::new();
-                let query_parser = QueryParser::for_index(idx, fields.clone());
                 for word in &words {
-                    if let Ok(sub_q) = query_parser.parse_query(word) {
-                        sub_queries.push((Occur::Should, sub_q));
+                    if chronik_storage::text_analysis::has_tokens(word) {
+                        if let Ok(sub_q) = query_parser.parse_query(word) {
+                            sub_queries.push((Occur::Should, sub_q));
+                        }
                     }
                 }
                 if sub_queries.is_empty() {

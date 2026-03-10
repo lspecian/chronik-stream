@@ -2,6 +2,7 @@
 
 use crate::canonical_record::{CanonicalRecord, CanonicalRecordEntry, RecordHeader, CompressionType, TimestampType};
 use crate::object_store::{ObjectStore, PutOptions};
+use crate::text_analysis;
 use chronik_common::{Result, Error};
 use tantivy::{
     doc, schema::*, Index, IndexWriter, IndexReader,
@@ -97,6 +98,7 @@ impl TantivySegmentWriter {
     pub fn new(topic: String, partition: i32, base_offset: i64) -> Result<Self> {
         let (schema, schema_fields) = SchemaFields::build_schema();
         let index = Index::create_in_ram(schema);
+        text_analysis::register_analyzer(&index);
         let writer = index.writer(50_000_000)
             .map_err(|e| Error::Internal(format!("Failed to create Tantivy writer: {}", e)))?;
 
@@ -180,6 +182,7 @@ impl TantivySegmentWriter {
         let (schema, _fields) = SchemaFields::build_schema();
         let disk_index = Index::create_in_dir(&index_dir, schema.clone())
             .map_err(|e| Error::Internal(format!("Failed to create disk index: {}", e)))?;
+        text_analysis::register_analyzer(&disk_index);
 
         let mut disk_writer: IndexWriter<TantivyDocument> = disk_index.writer(50_000_000)
             .map_err(|e| Error::Internal(format!("Failed to create disk writer: {}", e)))?;
@@ -316,6 +319,7 @@ impl TantivySegmentReader {
         let (_schema, schema_fields) = SchemaFields::build_schema();
         let index = Index::open_in_dir(index_path)
             .map_err(|e| Error::Internal(format!("Failed to open index: {}", e)))?;
+        text_analysis::register_analyzer(&index);
         let reader = index.reader()
             .map_err(|e| Error::Internal(format!("Failed to create reader: {}", e)))?;
 
@@ -350,6 +354,7 @@ impl TantivySegmentReader {
         let (_schema, schema_fields) = SchemaFields::build_schema();
         let index = Index::open_in_dir(&index_path)
             .map_err(|e| Error::Internal(format!("Failed to open index: {}", e)))?;
+        text_analysis::register_analyzer(&index);
         let reader = index.reader()
             .map_err(|e| Error::Internal(format!("Failed to create reader: {}", e)))?;
 
@@ -383,6 +388,7 @@ impl TantivySegmentReader {
         let (_schema, schema_fields) = SchemaFields::build_schema();
         let index = Index::open_in_dir(&index_path)
             .map_err(|e| Error::Internal(format!("Failed to open index: {}", e)))?;
+        text_analysis::register_analyzer(&index);
         let reader = index.reader()
             .map_err(|e| Error::Internal(format!("Failed to create reader: {}", e)))?;
 

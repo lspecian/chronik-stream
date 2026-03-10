@@ -493,7 +493,8 @@ async fn create_topic_index(
         .map_err(|e| Error::Internal(format!("Failed to open directory: {}", e)))?;
     let index = Index::open_or_create(directory, schema)
         .map_err(|e| Error::Internal(format!("Failed to create index: {}", e)))?;
-    
+    chronik_storage::register_analyzer(&index);
+
     let index_writer = index.writer_with_num_threads(
         config.num_indexing_threads,
         config.indexing_memory_budget

@@ -73,7 +73,8 @@ impl SearchIndex {
         
         // Create in-memory index
         let index = Index::create_in_ram(schema.clone());
-        
+        crate::text_analysis::register_analyzer(&index);
+
         // Index all records
         let mut index_writer = index.writer(50_000_000)
             .map_err(|e| Error::Search(e.to_string()))?;
@@ -129,6 +130,7 @@ impl SearchIndex {
         // Open the index
         let index = Index::open_in_dir(index_path)
             .map_err(|e| Error::Search(e.to_string()))?;
+        crate::text_analysis::register_analyzer(&index);
         let schema = index.schema();
         
         // Rebuild field map
@@ -221,7 +223,8 @@ impl SearchIndex {
                 .map_err(|e| Error::Search(e.to_string()))?;
             let disk_index = Index::open_or_create(mmap_dir, self.schema.clone())
                 .map_err(|e| Error::Search(e.to_string()))?;
-            
+            crate::text_analysis::register_analyzer(&disk_index);
+
             // Copy all documents
             let mut writer = disk_index.writer(50_000_000)
                 .map_err(|e| Error::Search(e.to_string()))?;

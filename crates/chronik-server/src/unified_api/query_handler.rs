@@ -434,6 +434,7 @@ fn search_wal_topic_for_candidates(
             Ok(idx) => idx,
             Err(_) => continue,
         };
+        chronik_storage::register_analyzer(&index);
 
         let reader = match index.reader() {
             Ok(r) => r,

@@ -87,7 +87,8 @@ impl TantivyIndexer {
         
         let index = Index::open_or_create(directory, schema.clone())
             .map_err(|e| Error::Internal(format!("Failed to create index: {}", e)))?;
-        
+        chronik_storage::register_analyzer(&index);
+
         // Create index writer
         let index_writer = index.writer_with_num_threads(config.num_threads, config.heap_size_bytes)
             .map_err(|e| Error::Internal(format!("Failed to create index writer: {}", e)))?;

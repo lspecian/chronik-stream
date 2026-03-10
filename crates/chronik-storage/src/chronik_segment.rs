@@ -403,7 +403,8 @@ impl ChronikSegment {
         
         // Create in-memory index for simplicity (in production, use persistent storage)
         let index = Index::create_in_ram(schema.clone());
-        
+        crate::text_analysis::register_analyzer(&index);
+
         let mut index_writer = index.writer(50_000_000)
             .map_err(|e| Error::Internal(format!("Failed to create index writer: {}", e)))?;
         

@@ -20,6 +20,7 @@ pub mod segment_cache;
 pub mod optimized_segment;
 pub mod vector_search;
 pub mod extended_segment;
+pub mod text_analysis;
 // v2.2.7 Phase 5: Deleted metadata_wal_adapter.rs (old WAL adapter, replaced by Raft)
 
 pub use canonical_record::{
@@ -64,6 +65,7 @@ pub use segment_index::{
     SegmentIndex, SegmentMetadata as SegmentIndexMetadata, TopicPartition as SegmentIndexTopicPartition, IndexStats,
     ParquetSegmentMetadata, ParquetIndexStats, CombinedIndexStats,
 };
+pub use text_analysis::register_analyzer;
 pub use segment_compaction::{
     SegmentCompactor, CompactionConfig, CompactionStrategy, CompactionStats,
 };

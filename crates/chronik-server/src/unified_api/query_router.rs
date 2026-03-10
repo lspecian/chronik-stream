@@ -726,6 +726,20 @@ pub fn merge_search_responses(
         all_hits.extend(peer_resp.hits.hits);
     }
 
+    // Deduplicate by (_index, _id), keeping highest score.
+    // With RF=N, the same document exists on multiple nodes and would
+    // otherwise appear N times in merged results, crowding out unique hits.
+    let mut best: HashMap<(String, String), Hit> = HashMap::new();
+    for hit in all_hits {
+        let key = (hit._index.clone(), hit._id.clone());
+        let score = hit._score.unwrap_or(0.0);
+        match best.get(&key) {
+            Some(existing) if existing._score.unwrap_or(0.0) >= score => {}
+            _ => { best.insert(key, hit); }
+        }
+    }
+    let mut all_hits: Vec<Hit> = best.into_values().collect();
+
     // Sort by score descending
     all_hits.sort_by(|a, b| {
         let sa = a._score.unwrap_or(0.0);

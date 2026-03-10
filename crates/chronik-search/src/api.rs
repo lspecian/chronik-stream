@@ -554,6 +554,7 @@ impl SearchApi {
         
         // Create index
         let index = Index::create_in_ram(schema.clone());
+        chronik_storage::register_analyzer(&index);
         let writer = index.writer(50_000_000)
             .map_err(|e| Error::Internal(format!("Failed to create index writer: {}", e)))?;
         

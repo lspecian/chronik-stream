@@ -76,7 +76,8 @@ impl IndexBuilder {
         
         // Create in-memory index
         let index = Index::create_in_ram(schema.clone());
-        
+        crate::text_analysis::register_analyzer(&index);
+
         // Create index writer with 50MB heap
         let index_writer = index.writer(50_000_000)
             .map_err(|e| Error::Internal(format!("Failed to create index writer: {}", e)))?;
@@ -259,7 +260,8 @@ impl SegmentSearcher {
         
         // Create in-memory index
         let index = Index::create_in_ram(schema.clone());
-        
+        crate::text_analysis::register_analyzer(&index);
+
         // Create reader
         let reader = index.reader_builder()
             .reload_policy(ReloadPolicy::Manual)

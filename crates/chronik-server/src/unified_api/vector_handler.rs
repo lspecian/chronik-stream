@@ -1221,6 +1221,7 @@ fn search_wal_tantivy_for_hybrid(
             Ok(idx) => idx,
             Err(_) => continue,
         };
+        chronik_storage::register_analyzer(&index);
 
         let reader = match index.reader() {
             Ok(r) => r,
