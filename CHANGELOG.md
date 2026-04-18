@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.1] - 2026-04-18
+
+### Fixed
+
+- **`/_query` orchestrator now uses hot paths** — v2.5.0 wired hot text and hot vector indexes into the direct backend endpoints (`/{topic}/_search`, `/_vector/{topic}/search`, `/_vector/{topic}/hybrid`) but missed the `/_query` orchestrator's `BackendAdapter`. Users running unified queries through `/_query` saw cold-path freshness (1.5-30s lag) instead of the sub-second hot-path freshness available to direct endpoints.
+
+  `ServerBackendAdapter::execute_text` now pulls from `search_api.hot_text_index` before the cold sources and dedups by `(partition, offset)` with hot winning on conflict. `execute_vector` does the same against `state.hot_vector_index`, using the query embedding that's already cached.
+
+  Measured `/_query` freshness after the fix: **p50 298ms / p99 408ms** (10 probes, single-node, same kcat→query shape that previously timed out). Matches direct-endpoint behavior plus the orchestrator+RRF overhead (~100ms).
+
 ## [2.5.0] - 2026-04-18
 
 ### Added

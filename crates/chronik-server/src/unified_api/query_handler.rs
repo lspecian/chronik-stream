@@ -45,7 +45,39 @@ impl BackendAdapter for ServerBackendAdapter {
             let search_api = self.state.search_api.as_ref()
                 .ok_or_else(|| BackendError::NotAvailable("Text search not enabled".into()))?;
 
-            let mut candidates = Vec::new();
+            // HP-Query: hot text hits first. Earlier rank assignment doesn't
+            // matter — we re-rank after the sort below. Hot wins on dedup.
+            let mut candidates: Vec<Candidate> = Vec::new();
+            if let Some(ref hot_idx) = search_api.hot_text_index {
+                match hot_idx.search_topic(topic, query, k).await {
+                    Ok(hits) => {
+                        for (rank, h) in hits.into_iter().enumerate() {
+                            let mut c = Candidate::new(
+                                topic.to_string(),
+                                h.partition,
+                                h.offset,
+                                QueryMode::Text,
+                                h.score as f64,
+                                rank,
+                            );
+                            if h.timestamp > 0 {
+                                c = c.with_timestamp(h.timestamp);
+                            }
+                            if !h.value.is_empty() {
+                                let cleaned = strip_system_fields(&h.value);
+                                let truncated = if cleaned.len() > 300 {
+                                    format!("{}...", &cleaned[..300])
+                                } else {
+                                    cleaned
+                                };
+                                c = c.with_text_preview(truncated);
+                            }
+                            candidates.push(c);
+                        }
+                    }
+                    Err(e) => debug!(topic = %topic, error = %e, "Hot text search failed"),
+                }
+            }
 
             // 1. Search in-memory indices (created via REST API)
             if let Some(state) = search_api.indices.get(topic) {
@@ -69,6 +101,15 @@ impl BackendAdapter for ServerBackendAdapter {
                     Ok(hits) => candidates.extend(hits),
                     Err(e) => debug!(topic = %topic, error = %e, "Real-time index search returned no results"),
                 }
+            }
+
+            // HP-Query: dedup by (partition, offset) preserving first occurrence.
+            // Because hot entries were pushed first, they win on conflict — the
+            // same "hot wins" semantics as /_search.
+            {
+                use std::collections::HashSet;
+                let mut seen: HashSet<(i32, i64)> = HashSet::with_capacity(candidates.len());
+                candidates.retain(|c| seen.insert((c.partition, c.offset)));
             }
 
             // Sort by score descending and truncate
@@ -127,12 +168,37 @@ impl BackendAdapter for ServerBackendAdapter {
             result.vector
         };
 
-        // Search across all partitions of the topic
+        // Search across all partitions of the topic (cold HNSW).
         let raw_results = manager.search_topic(topic, &query_vector, k).await
             .map_err(|e| BackendError::ExecutionFailed(format!("Vector search failed: {}", e)))?;
 
-        // Convert to candidates
-        let candidates: Vec<Candidate> = raw_results
+        // HP-Query: hot vector hits first (brute-force over recent offsets).
+        // Dedup by (partition, offset) with hot winning — same semantics as
+        // /_vector/:topic/search.
+        let mut merged: Vec<(i32, i64, f32)> = Vec::with_capacity(k * 2);
+        let mut seen: std::collections::HashSet<(i32, i64)> = std::collections::HashSet::new();
+        if let Some(ref hot_idx) = self.state.hot_vector_index {
+            match hot_idx.search_topic(topic, &query_vector, k).await {
+                Ok(hits) => {
+                    for h in hits {
+                        if seen.insert((h.partition, h.offset)) {
+                            merged.push((h.partition, h.offset, h.distance));
+                        }
+                    }
+                }
+                Err(e) => debug!(topic = %topic, "Hot vector search failed: {}", e),
+            }
+        }
+        for (partition, offset, score) in raw_results {
+            if seen.insert((partition, offset)) {
+                merged.push((partition, offset, score));
+            }
+        }
+        // Distance/score is "lower = more similar" — sort ascending and truncate.
+        merged.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+        merged.truncate(k);
+
+        let candidates: Vec<Candidate> = merged
             .into_iter()
             .enumerate()
             .map(|(rank, (partition, offset, score))| {
