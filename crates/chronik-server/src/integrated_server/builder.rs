@@ -72,6 +72,12 @@ pub struct IntegratedKafkaServerBuilder {
     response_pipeline: Option<Arc<crate::response_pipeline::ResponsePipeline>>,
     kafka_handler: Option<Arc<KafkaProtocolHandler>>,
     wal_indexer: Option<Arc<WalIndexer>>,
+    // HP-1.2: In-memory hot text index (NRT search). None = feature disabled.
+    hot_text_index: Option<Arc<chronik_search::hot_text_index::HotTextIndex>>,
+    // HP-2.x: In-memory hot vector index + shared batcher-handle slot.
+    hot_vector_index: Option<Arc<chronik_columnar::hot_vector_index::HotVectorIndex>>,
+    hot_vector_batcher_slot:
+        Option<Arc<std::sync::OnceLock<chronik_columnar::hot_vector_batcher::MicroBatcherHandle>>>,
 
     // Replication and leader election (Stage 4)
     wal_replication_manager: Option<Arc<crate::wal_replication::WalReplicationManager>>,
@@ -107,6 +113,9 @@ impl IntegratedKafkaServerBuilder {
             response_pipeline: None,
             kafka_handler: None,
             wal_indexer: None,
+            hot_text_index: None,
+            hot_vector_index: None,
+            hot_vector_batcher_slot: None,
             wal_replication_manager: None,
             leader_elector: None,
             metadata_uploader: None,
@@ -558,6 +567,21 @@ impl IntegratedKafkaServerBuilder {
         // Step 5: Setup response pipeline with WAL callback
         let response_pipeline = self.setup_response_pipeline(&mut produce_handler_inner, wal_manager);
 
+        // Step 5b (HP-1.2): Attach hot text index if enabled
+        if let Some(hot_idx) = self.init_hot_text_index() {
+            produce_handler_inner.set_hot_text_index(hot_idx.clone());
+            self.hot_text_index = Some(hot_idx);
+        }
+
+        // Step 5c (HP-2.x): Create the hot vector index + shared batcher-handle
+        // slot. The slot is empty for now — main.rs populates it once the
+        // embedder has been constructed from env vars.
+        if let Some((hot_vec_idx, slot)) = self.init_hot_vector_slot() {
+            produce_handler_inner.set_hot_vector_batcher_slot(slot.clone());
+            self.hot_vector_index = Some(hot_vec_idx);
+            self.hot_vector_batcher_slot = Some(slot);
+        }
+
         // Step 6: Finalize and start background tasks
         let (produce_handler_base, wal_handler) = self.finalize_produce_handler(produce_handler_inner, wal_manager).await;
 
@@ -570,6 +594,283 @@ impl IntegratedKafkaServerBuilder {
         self.leader_elector = leader_elector;
 
         info!("✅ ProduceHandler initialized with all dependencies and wiring");
+        Ok(())
+    }
+
+    /// HP-1.2: Initialize the hot text index if enabled by env.
+    ///
+    /// Controlled by `CHRONIK_HOT_TEXT_ENABLED` (default: true). When enabled,
+    /// spawns a background commit timer that flips in-memory buffer visibility
+    /// on `CHRONIK_HOT_TEXT_COMMIT_INTERVAL_MS` (default: 100ms).
+    ///
+    /// No disk I/O — Tantivy RAMDirectory only.
+    fn init_hot_text_index(
+        &self,
+    ) -> Option<Arc<chronik_search::hot_text_index::HotTextIndex>> {
+        use chronik_search::hot_text_index::{HotTextConfig, HotTextIndex};
+
+        let enabled = std::env::var("CHRONIK_HOT_TEXT_ENABLED")
+            .map(|v| v != "false" && v != "0")
+            .unwrap_or(true);
+        if !enabled {
+            info!("HotTextIndex disabled via CHRONIK_HOT_TEXT_ENABLED=false");
+            return None;
+        }
+
+        let commit_interval_ms = std::env::var("CHRONIK_HOT_TEXT_COMMIT_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(100);
+        let max_docs = std::env::var("CHRONIK_HOT_TEXT_MAX_DOCS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(100_000);
+        let heap_bytes = std::env::var("CHRONIK_HOT_TEXT_WRITER_HEAP_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(15_000_000);
+
+        let idx = Arc::new(HotTextIndex::new(HotTextConfig {
+            writer_heap_bytes: heap_bytes,
+            max_docs_per_partition: max_docs,
+        }));
+
+        // Background commit timer — in-memory visibility flip, no disk writes.
+        let _handle = Arc::clone(&idx)
+            .start_commit_timer(std::time::Duration::from_millis(commit_interval_ms));
+
+        info!(
+            "✅ HotTextIndex enabled — commit_interval={}ms, max_docs/partition={}, heap={}B",
+            commit_interval_ms, max_docs, heap_bytes
+        );
+        Some(idx)
+    }
+
+    /// HP-2.x: Initialize the hot vector index and shared batcher-handle slot.
+    ///
+    /// The index itself is created here so it can be wired into the
+    /// `ProduceHandler` (for later enqueue via the `OnceLock` slot),
+    /// `WalIndexer` (for eviction via the `ColdFlushListener` adapter),
+    /// and the unified API (for query-time hot+cold merge). The actual
+    /// batcher — which needs an `EmbeddingProvider` — is constructed in
+    /// `main.rs` after the embedder is built from env vars; it sets the
+    /// `OnceLock` once it has the handle.
+    ///
+    /// Controlled by `CHRONIK_HOT_VECTOR_ENABLED` (default: true).
+    fn init_hot_vector_slot(
+        &self,
+    ) -> Option<(
+        Arc<chronik_columnar::hot_vector_index::HotVectorIndex>,
+        Arc<std::sync::OnceLock<chronik_columnar::hot_vector_batcher::MicroBatcherHandle>>,
+    )> {
+        use chronik_columnar::hot_vector_index::{
+            HotDistanceMetric, HotVectorConfig, HotVectorIndex,
+        };
+
+        let enabled = std::env::var("CHRONIK_HOT_VECTOR_ENABLED")
+            .map(|v| v != "false" && v != "0")
+            .unwrap_or(true);
+        if !enabled {
+            info!("HotVectorIndex disabled via CHRONIK_HOT_VECTOR_ENABLED=false");
+            return None;
+        }
+
+        let max_vectors = std::env::var("CHRONIK_HOT_VECTOR_MAX_VECTORS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(50_000);
+        let dims = std::env::var("CHRONIK_EMBEDDING_DIMENSIONS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1536);
+        // Metric is fixed to Cosine for Phase 2 first pass — matches OpenAI
+        // text-embedding-3-* and the default VectorIndexConfig.
+        let config = HotVectorConfig {
+            max_vectors_per_partition: max_vectors,
+            dimensions: dims,
+            metric: HotDistanceMetric::Cosine,
+        };
+        let idx = Arc::new(HotVectorIndex::new(config));
+
+        // Background trim timer — keeps RAM bounded independent of eviction.
+        let _ = Arc::clone(&idx)
+            .start_trim_timer(std::time::Duration::from_millis(250));
+
+        let slot = Arc::new(std::sync::OnceLock::new());
+        info!(
+            "✅ HotVectorIndex enabled — max_vectors/partition={}, dims={}",
+            max_vectors, dims
+        );
+        Some((idx, slot))
+    }
+
+    /// HP-1.5: Populate the hot text index from the WAL tail so it is not
+    /// blind for the ~30s between server start and the first cold-path
+    /// Tantivy commit.
+    ///
+    /// Reads up to `CHRONIK_HOT_TEXT_MAX_DOCS` recent WAL records per
+    /// (searchable topic, partition) and inserts their entries. No disk I/O
+    /// writes — only WAL reads. Errors are logged but non-fatal; startup
+    /// continues even if warm-up fails.
+    async fn warm_up_hot_text_index(&self) -> Result<()> {
+        let Some(hot_idx) = self.hot_text_index.as_ref() else {
+            return Ok(());
+        };
+        let wal_manager = self
+            .wal_manager
+            .as_ref()
+            .context("wal_manager not initialized before warm-up")?;
+        let metadata_store = self
+            .metadata_store
+            .as_ref()
+            .context("metadata_store not initialized before warm-up")?;
+
+        use chronik_search::hot_text_index::HotDoc;
+        use chronik_storage::CanonicalRecord;
+        use chronik_wal::record::WalRecord;
+
+        let max_docs = std::env::var("CHRONIK_HOT_TEXT_MAX_DOCS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(100_000);
+
+        let start = std::time::Instant::now();
+        let topics = match metadata_store.list_topics().await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("warm-up: failed to list topics: {}", e);
+                return Ok(());
+            }
+        };
+
+        let mut total_docs = 0usize;
+        let mut partitions_warmed = 0usize;
+
+        for topic_meta in topics {
+            if !topic_meta.config.is_searchable() {
+                continue;
+            }
+            let partition_count = topic_meta.config.partition_count as i32;
+            for partition in 0..partition_count {
+                let max_offset = match wal_manager
+                    .get_max_offset_for_partition(&topic_meta.name, partition)
+                    .await
+                {
+                    Ok(Some(m)) if m >= 0 => m,
+                    Ok(_) => continue,
+                    Err(e) => {
+                        debug!(
+                            topic = %topic_meta.name, partition,
+                            "warm-up: get_max_offset failed: {}", e
+                        );
+                        continue;
+                    }
+                };
+
+                // Approximate: read the trailing `max_docs` offset range.
+                let start_offset = (max_offset + 1).saturating_sub(max_docs as i64).max(0);
+                let records = match wal_manager
+                    .read_from(&topic_meta.name, partition, start_offset, max_docs)
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        debug!(
+                            topic = %topic_meta.name, partition,
+                            "warm-up: read_from failed: {}", e
+                        );
+                        continue;
+                    }
+                };
+
+                let mut docs: Vec<HotDoc> = Vec::new();
+                for wal_record in &records {
+                    match wal_record {
+                        WalRecord::V2 { canonical_data, .. } => {
+                            let canonical: CanonicalRecord = match bincode::deserialize(canonical_data) {
+                                Ok(c) => c,
+                                Err(_) => continue,
+                            };
+                            for entry in &canonical.records {
+                                let value_str = entry
+                                    .value
+                                    .as_deref()
+                                    .map(|v| String::from_utf8_lossy(v).into_owned())
+                                    .unwrap_or_default();
+                                let key_str = entry
+                                    .key
+                                    .as_deref()
+                                    .and_then(|k| String::from_utf8(k.to_vec()).ok());
+                                docs.push(HotDoc {
+                                    offset: entry.offset,
+                                    timestamp: entry.timestamp,
+                                    key: key_str,
+                                    value: value_str,
+                                    headers: None,
+                                });
+                            }
+                        }
+                        WalRecord::V1 {
+                            offset,
+                            timestamp,
+                            key,
+                            value,
+                            ..
+                        } => {
+                            let key_str = key
+                                .as_deref()
+                                .and_then(|k| String::from_utf8(k.to_vec()).ok());
+                            docs.push(HotDoc {
+                                offset: *offset,
+                                timestamp: *timestamp,
+                                key: key_str,
+                                value: String::from_utf8_lossy(value).into_owned(),
+                                headers: None,
+                            });
+                        }
+                    }
+                }
+
+                // Trim to the last `max_docs` messages — docs are offset-ordered
+                // because read_from returns batches in offset order.
+                if docs.len() > max_docs {
+                    let excess = docs.len() - max_docs;
+                    docs.drain(0..excess);
+                }
+
+                if docs.is_empty() {
+                    continue;
+                }
+                let doc_count = docs.len();
+                if let Err(e) = hot_idx
+                    .add_batch(&topic_meta.name, partition, &docs)
+                    .await
+                {
+                    warn!(
+                        topic = %topic_meta.name, partition,
+                        "warm-up: hot add_batch failed: {}", e
+                    );
+                    continue;
+                }
+                if let Err(e) = hot_idx.commit(&topic_meta.name, partition).await {
+                    warn!(
+                        topic = %topic_meta.name, partition,
+                        "warm-up: hot commit failed: {}", e
+                    );
+                    continue;
+                }
+
+                total_docs += doc_count;
+                partitions_warmed += 1;
+            }
+        }
+
+        info!(
+            docs = total_docs,
+            partitions = partitions_warmed,
+            duration_ms = start.elapsed().as_millis() as u64,
+            "✅ HotTextIndex warm-up complete (HP-1.5)"
+        );
         Ok(())
     }
 
@@ -1188,6 +1489,12 @@ impl IntegratedKafkaServerBuilder {
 
         info!("✅ All 15 stages complete - assembling IntegratedKafkaServer");
 
+        // HP-1.5: warm up the hot text index from WAL tail so queries are
+        // not blind for the first ~30s after startup.
+        if let Err(e) = self.warm_up_hot_text_index().await {
+            warn!("Hot text index warm-up failed (continuing): {}", e);
+        }
+
         // Create the final server instance using the new_from_components constructor
         let kafka_handler = self.kafka_handler.unwrap();
         let metadata_store = self.metadata_store.unwrap();
@@ -1195,6 +1502,9 @@ impl IntegratedKafkaServerBuilder {
         let metadata_uploader = self.metadata_uploader;
         let leader_elector = self.leader_elector;
         let isr_tracker = self.isr_tracker;
+        let hot_text_index = self.hot_text_index;
+        let hot_vector_index = self.hot_vector_index;
+        let hot_vector_batcher_slot = self.hot_vector_batcher_slot;
 
         let server = IntegratedKafkaServer::new_from_components(
             self.config,
@@ -1204,6 +1514,9 @@ impl IntegratedKafkaServerBuilder {
             metadata_uploader,
             leader_elector,
             isr_tracker,
+            hot_text_index,
+            hot_vector_index,
+            hot_vector_batcher_slot,
         );
 
         info!("🎉 IntegratedKafkaServer build complete!");

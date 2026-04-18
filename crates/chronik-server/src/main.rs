@@ -17,6 +17,7 @@ mod integrated_server;
 mod error_handler;
 mod kafka_handler;
 mod produce_handler;
+mod hot_vector_adapter;  // HP-2.6: bridge HotVectorIndex → ColdFlushListener
 mod pipelined_connection;  // v2.2.9: Async request pipelining for leader forwarding
 mod response_pipeline;     // v2.2.10: Async response delivery for acks=1 (eliminates 168x bottleneck)
 mod storage;
@@ -177,6 +178,13 @@ enum Commands {
         /// Node ID (overrides config file)
         #[arg(long, env = "CHRONIK_NODE_ID")]
         node_id: Option<u64>,
+
+        /// Disable the in-memory hot text index (NRT full-text search).
+        /// Default: enabled. When set, `/_search` will fall back to the
+        /// cold disk-based Tantivy indexes only, increasing freshness lag
+        /// from sub-second to 30–60s.
+        #[arg(long, env = "CHRONIK_DISABLE_HOT_TEXT")]
+        disable_hot_text: bool,
     },
 
     /// Manage cluster membership
@@ -653,7 +661,14 @@ async fn main() -> Result<()> {
             Ok(())
         }
 
-        Commands::Start { config, bind, advertise, node_id } => {
+        Commands::Start { config, bind, advertise, node_id, disable_hot_text } => {
+            // HP-1.6: CLI flag translates to the env var the builder reads.
+            // Setting here (before any builder code runs) keeps the env-var
+            // path authoritative and avoids threading another arg through
+            // every stage.
+            if *disable_hot_text {
+                std::env::set_var("CHRONIK_HOT_TEXT_ENABLED", "false");
+            }
             run_start_command(&cli, config.clone(), bind.clone(), advertise.clone(), *node_id).await
         }
 
@@ -781,7 +796,13 @@ async fn run_cluster_mode(
     let (search_router, search_api_ref) = {
         let index_base_path = format!("{}/tantivy_indexes", init_config.data_dir.to_string_lossy());
         info!("Search API index base path: {}", index_base_path);
-        match unified_api::search_handler::create_search_api(wal_indexer.clone(), &index_base_path) {
+        // HP-1.3: attach the shared hot text index if the server built one
+        let hot_idx = server.get_hot_text_index();
+        match unified_api::search_handler::create_search_api_with_hot(
+            wal_indexer.clone(),
+            &index_base_path,
+            hot_idx,
+        ) {
             Ok(search_api) => {
                 info!("✓ Search API integrated into Unified API");
                 let router = unified_api::search_handler::search_router(search_api.clone());
@@ -854,13 +875,61 @@ async fn run_cluster_mode(
     .with_query_engine(columnar_query_engine)
     .with_vector_index_manager(vector_index_manager)
     .with_wal_indexer(wal_indexer.clone());
-    if let Some(provider) = try_create_embedding_provider() {
-        unified_state = unified_state.with_embedding_provider(provider);
+    let embedder = try_create_embedding_provider();
+    if let Some(ref provider) = embedder {
+        unified_state = unified_state.with_embedding_provider(provider.clone());
     }
     if let Some(ref hb) = hot_buffer {
         // v2.4.1: Wire hot buffer to WalIndexer for flushed offset notifications
         wal_indexer.set_hot_buffer(hb.clone()).await;
         unified_state = unified_state.with_hot_buffer(hb.clone());
+    }
+    // HP-1.4: Wire hot text index to WalIndexer for eviction after cold flush
+    #[cfg(feature = "search")]
+    if let Some(hot_text_idx) = server.get_hot_text_index() {
+        let adapter = chronik_search::hot_text_index::HotTextColdFlushAdapter::new(hot_text_idx);
+        wal_indexer.set_cold_flush_listener(adapter).await;
+    }
+    // HP-2.6/2.8: Build the micro-batcher once we have an embedder, populate
+    // the shared slot, wire the hot vector index into WalIndexer for
+    // eviction, and expose it to the unified API for query-time merge.
+    if let (Some(ref provider), Some(hot_vec_idx), Some(slot)) = (
+        embedder.as_ref(),
+        server.get_hot_vector_index(),
+        server.get_hot_vector_batcher_slot(),
+    ) {
+        use chronik_columnar::hot_vector_batcher::{MicroBatcherConfig, ProviderKind};
+        let provider_kind = match provider.name() {
+            "openai" => ProviderKind::OpenAi,
+            _ => ProviderKind::Local,
+        };
+        let cfg = match provider_kind {
+            ProviderKind::OpenAi => MicroBatcherConfig::openai_defaults(),
+            ProviderKind::Local => MicroBatcherConfig::local_defaults(),
+        }
+        .with_env_overrides(provider_kind);
+        info!(
+            "HP-2.x: starting hot vector batcher (provider={}, batch={}, window_ms={})",
+            provider.name(),
+            cfg.batch_size,
+            cfg.window.as_millis() as u64
+        );
+        let (handle, _worker) = chronik_columnar::hot_vector_batcher::start(
+            cfg,
+            Arc::clone(provider),
+            Arc::clone(&hot_vec_idx),
+        );
+        if slot.set(handle).is_err() {
+            warn!("HP-2.x: hot vector batcher slot already populated (unexpected)");
+        }
+        // Cold-flush eviction adapter
+        let adapter = crate::hot_vector_adapter::HotVectorColdFlushAdapter::new(
+            Arc::clone(&hot_vec_idx),
+        );
+        wal_indexer.set_cold_flush_listener(adapter).await;
+        // HP-2 follow-up A: cold embedding pipeline reuses hot-cached vectors.
+        wal_indexer.set_hot_vector_index(Arc::clone(&hot_vec_idx)).await;
+        unified_state = unified_state.with_hot_vector_index(hot_vec_idx);
     }
     if let Some(cache) = try_create_embedding_cache() {
         unified_state = unified_state.with_embedding_cache(cache);
@@ -1000,7 +1069,9 @@ async fn run_single_node_mode(
         let wal_indexer = server.get_wal_indexer();
         let index_base_path = format!("{}/tantivy_indexes", cli.data_dir.to_string_lossy());
         info!("Search API index base path: {}", index_base_path);
-        match unified_api::search_handler::create_search_api(wal_indexer, &index_base_path) {
+        // HP-1.3: attach the shared hot text index if the server built one
+        let hot_idx = server.get_hot_text_index();
+        match unified_api::search_handler::create_search_api_with_hot(wal_indexer, &index_base_path, hot_idx) {
             Ok(search_api) => {
                 info!("✓ Search API integrated into Unified API");
                 let router = unified_api::search_handler::search_router(search_api.clone());
@@ -1065,13 +1136,58 @@ async fn run_single_node_mode(
         .with_wal_manager(wal_indexer.wal_manager().clone())
         .with_wal_indexer(wal_indexer.clone());
 
-        if let Some(provider) = try_create_embedding_provider() {
-            unified_state = unified_state.with_embedding_provider(provider);
+        let embedder = try_create_embedding_provider();
+        if let Some(ref provider) = embedder {
+            unified_state = unified_state.with_embedding_provider(provider.clone());
         }
         if let Some(ref hb) = hot_buffer {
             // v2.4.1: Wire hot buffer to WalIndexer for flushed offset notifications
             wal_indexer.set_hot_buffer(hb.clone()).await;
             unified_state = unified_state.with_hot_buffer(hb.clone());
+        }
+        // HP-1.4: Wire hot text index to WalIndexer for eviction after cold flush
+        #[cfg(feature = "search")]
+        if let Some(hot_text_idx) = server.get_hot_text_index() {
+            let adapter = chronik_search::hot_text_index::HotTextColdFlushAdapter::new(hot_text_idx);
+            wal_indexer.set_cold_flush_listener(adapter).await;
+        }
+        // HP-2.x: Hot vector batcher + cold-flush adapter + unified state wiring.
+        if let (Some(ref provider), Some(hot_vec_idx), Some(slot)) = (
+            embedder.as_ref(),
+            server.get_hot_vector_index(),
+            server.get_hot_vector_batcher_slot(),
+        ) {
+            use chronik_columnar::hot_vector_batcher::{MicroBatcherConfig, ProviderKind};
+            let provider_kind = match provider.name() {
+                "openai" => ProviderKind::OpenAi,
+                _ => ProviderKind::Local,
+            };
+            let cfg = match provider_kind {
+                ProviderKind::OpenAi => MicroBatcherConfig::openai_defaults(),
+                ProviderKind::Local => MicroBatcherConfig::local_defaults(),
+            }
+            .with_env_overrides(provider_kind);
+            info!(
+                "HP-2.x: starting hot vector batcher (provider={}, batch={}, window_ms={})",
+                provider.name(),
+                cfg.batch_size,
+                cfg.window.as_millis() as u64
+            );
+            let (handle, _worker) = chronik_columnar::hot_vector_batcher::start(
+                cfg,
+                Arc::clone(provider),
+                Arc::clone(&hot_vec_idx),
+            );
+            if slot.set(handle).is_err() {
+                warn!("HP-2.x: hot vector batcher slot already populated (unexpected)");
+            }
+            let adapter = crate::hot_vector_adapter::HotVectorColdFlushAdapter::new(
+                Arc::clone(&hot_vec_idx),
+            );
+            wal_indexer.set_cold_flush_listener(adapter).await;
+            // HP-2 follow-up A: cold embedding pipeline reuses hot-cached vectors.
+            wal_indexer.set_hot_vector_index(Arc::clone(&hot_vec_idx)).await;
+            unified_state = unified_state.with_hot_vector_index(hot_vec_idx);
         }
         if let Some(cache) = try_create_embedding_cache() {
             unified_state = unified_state.with_embedding_cache(cache);

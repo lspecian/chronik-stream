@@ -160,6 +160,35 @@ pub struct UnifiedMetrics {
     pub query_candidates_count: AtomicU64,     // Count for candidates average
     pub query_planning_errors: AtomicU64,      // Planning errors
     pub query_execution_errors: AtomicU64,     // Execution errors
+
+    // ========== HP-3.1: Hot Path Metrics ==========
+    // Hot text index (in-memory Tantivy NRT search)
+    pub hot_text_docs_added: AtomicU64,        // Total docs added
+    pub hot_text_docs_evicted: AtomicU64,      // Total docs evicted via cold-flush
+    pub hot_text_commits: AtomicU64,           // Commit timer ticks that made buffer visible
+    pub hot_text_trims: AtomicU64,             // Capacity trims
+    pub hot_text_resets: AtomicU64,            // Hard resets (tombstone reclaim)
+    pub hot_text_searches: AtomicU64,          // Search calls
+    pub hot_text_search_latency_us_sum: AtomicU64,
+    pub hot_text_search_count: AtomicU64,
+    // Hot vector index (brute-force + micro-batcher)
+    pub hot_vector_enqueued: AtomicU64,        // Items accepted into the batcher
+    pub hot_vector_dropped_overflow: AtomicU64,
+    pub hot_vector_batches_flushed: AtomicU64,
+    pub hot_vector_embedder_errors: AtomicU64,
+    pub hot_vector_vectors_added: AtomicU64,   // Successfully indexed into hot HNSW
+    pub hot_vector_evicted: AtomicU64,         // Evicted via cold-flush
+    pub hot_vector_searches: AtomicU64,
+    pub hot_vector_search_latency_us_sum: AtomicU64,
+    pub hot_vector_search_count: AtomicU64,
+    // Single-embed cache reuse (Follow-up A)
+    pub hot_vector_cache_hits: AtomicU64,      // Cold pipeline reused hot-cached vector
+    pub hot_vector_cache_misses: AtomicU64,    // Cold pipeline had to embed (miss)
+    // Freshness: produce_timestamp → visible-in-hot-index (milliseconds, HP-3 Item 2)
+    pub hot_text_visibility_lag_ms_sum: AtomicU64,
+    pub hot_text_visibility_lag_count: AtomicU64,
+    pub hot_vector_visibility_lag_ms_sum: AtomicU64,
+    pub hot_vector_visibility_lag_count: AtomicU64,
 }
 
 impl Default for UnifiedMetrics {
@@ -308,6 +337,30 @@ impl UnifiedMetrics {
             query_candidates_count: AtomicU64::new(0),
             query_planning_errors: AtomicU64::new(0),
             query_execution_errors: AtomicU64::new(0),
+            // HP-3.1 hot path metrics
+            hot_text_docs_added: AtomicU64::new(0),
+            hot_text_docs_evicted: AtomicU64::new(0),
+            hot_text_commits: AtomicU64::new(0),
+            hot_text_trims: AtomicU64::new(0),
+            hot_text_resets: AtomicU64::new(0),
+            hot_text_searches: AtomicU64::new(0),
+            hot_text_search_latency_us_sum: AtomicU64::new(0),
+            hot_text_search_count: AtomicU64::new(0),
+            hot_vector_enqueued: AtomicU64::new(0),
+            hot_vector_dropped_overflow: AtomicU64::new(0),
+            hot_vector_batches_flushed: AtomicU64::new(0),
+            hot_vector_embedder_errors: AtomicU64::new(0),
+            hot_vector_vectors_added: AtomicU64::new(0),
+            hot_vector_evicted: AtomicU64::new(0),
+            hot_vector_searches: AtomicU64::new(0),
+            hot_vector_search_latency_us_sum: AtomicU64::new(0),
+            hot_vector_search_count: AtomicU64::new(0),
+            hot_vector_cache_hits: AtomicU64::new(0),
+            hot_vector_cache_misses: AtomicU64::new(0),
+            hot_text_visibility_lag_ms_sum: AtomicU64::new(0),
+            hot_text_visibility_lag_count: AtomicU64::new(0),
+            hot_vector_visibility_lag_ms_sum: AtomicU64::new(0),
+            hot_vector_visibility_lag_count: AtomicU64::new(0),
         }
     }
 
@@ -784,6 +837,97 @@ impl UnifiedMetrics {
         output.push_str(&format!("chronik_query_candidates_total{{stat=\"count\"}} {}\n", c_count));
         output.push_str(&format!("chronik_query_candidates_total{{stat=\"sum\"}} {}\n", c_sum));
 
+        // ========== HP-3.1: Hot Path Metrics ==========
+        output.push_str("# HELP chronik_hot_text_docs_total Hot text index docs added / evicted\n");
+        output.push_str("# TYPE chronik_hot_text_docs_total counter\n");
+        output.push_str(&format!("chronik_hot_text_docs_total{{op=\"added\"}} {}\n",
+            self.hot_text_docs_added.load(Ordering::Relaxed)));
+        output.push_str(&format!("chronik_hot_text_docs_total{{op=\"evicted\"}} {}\n",
+            self.hot_text_docs_evicted.load(Ordering::Relaxed)));
+
+        output.push_str("# HELP chronik_hot_text_events_total Hot text index lifecycle events\n");
+        output.push_str("# TYPE chronik_hot_text_events_total counter\n");
+        output.push_str(&format!("chronik_hot_text_events_total{{event=\"commit\"}} {}\n",
+            self.hot_text_commits.load(Ordering::Relaxed)));
+        output.push_str(&format!("chronik_hot_text_events_total{{event=\"trim\"}} {}\n",
+            self.hot_text_trims.load(Ordering::Relaxed)));
+        output.push_str(&format!("chronik_hot_text_events_total{{event=\"reset\"}} {}\n",
+            self.hot_text_resets.load(Ordering::Relaxed)));
+
+        let ht_count = self.hot_text_search_count.load(Ordering::Relaxed);
+        let ht_sum = self.hot_text_search_latency_us_sum.load(Ordering::Relaxed);
+        let ht_avg = if ht_count > 0 { ht_sum / ht_count } else { 0 };
+        output.push_str("# HELP chronik_hot_text_search_latency_us Hot text search latency in microseconds\n");
+        output.push_str("# TYPE chronik_hot_text_search_latency_us gauge\n");
+        output.push_str(&format!("chronik_hot_text_search_latency_us{{stat=\"avg\"}} {}\n", ht_avg));
+        output.push_str(&format!("chronik_hot_text_search_latency_us{{stat=\"count\"}} {}\n", ht_count));
+        output.push_str(&format!("chronik_hot_text_search_latency_us{{stat=\"sum\"}} {}\n", ht_sum));
+        output.push_str("# HELP chronik_hot_text_searches_total Hot text searches executed\n");
+        output.push_str("# TYPE chronik_hot_text_searches_total counter\n");
+        output.push_str(&format!("chronik_hot_text_searches_total {}\n",
+            self.hot_text_searches.load(Ordering::Relaxed)));
+
+        output.push_str("# HELP chronik_hot_vector_queue_total Hot vector batcher queue events\n");
+        output.push_str("# TYPE chronik_hot_vector_queue_total counter\n");
+        output.push_str(&format!("chronik_hot_vector_queue_total{{op=\"enqueued\"}} {}\n",
+            self.hot_vector_enqueued.load(Ordering::Relaxed)));
+        output.push_str(&format!("chronik_hot_vector_queue_total{{op=\"dropped\"}} {}\n",
+            self.hot_vector_dropped_overflow.load(Ordering::Relaxed)));
+
+        output.push_str("# HELP chronik_hot_vector_batches_total Hot vector batcher flush results\n");
+        output.push_str("# TYPE chronik_hot_vector_batches_total counter\n");
+        output.push_str(&format!("chronik_hot_vector_batches_total{{result=\"success\"}} {}\n",
+            self.hot_vector_batches_flushed.load(Ordering::Relaxed)
+                .saturating_sub(self.hot_vector_embedder_errors.load(Ordering::Relaxed))));
+        output.push_str(&format!("chronik_hot_vector_batches_total{{result=\"error\"}} {}\n",
+            self.hot_vector_embedder_errors.load(Ordering::Relaxed)));
+
+        output.push_str("# HELP chronik_hot_vector_vectors_total Hot vector index mutation counts\n");
+        output.push_str("# TYPE chronik_hot_vector_vectors_total counter\n");
+        output.push_str(&format!("chronik_hot_vector_vectors_total{{op=\"added\"}} {}\n",
+            self.hot_vector_vectors_added.load(Ordering::Relaxed)));
+        output.push_str(&format!("chronik_hot_vector_vectors_total{{op=\"evicted\"}} {}\n",
+            self.hot_vector_evicted.load(Ordering::Relaxed)));
+
+        let hv_count = self.hot_vector_search_count.load(Ordering::Relaxed);
+        let hv_sum = self.hot_vector_search_latency_us_sum.load(Ordering::Relaxed);
+        let hv_avg = if hv_count > 0 { hv_sum / hv_count } else { 0 };
+        output.push_str("# HELP chronik_hot_vector_search_latency_us Hot vector search latency in microseconds\n");
+        output.push_str("# TYPE chronik_hot_vector_search_latency_us gauge\n");
+        output.push_str(&format!("chronik_hot_vector_search_latency_us{{stat=\"avg\"}} {}\n", hv_avg));
+        output.push_str(&format!("chronik_hot_vector_search_latency_us{{stat=\"count\"}} {}\n", hv_count));
+        output.push_str(&format!("chronik_hot_vector_search_latency_us{{stat=\"sum\"}} {}\n", hv_sum));
+        output.push_str("# HELP chronik_hot_vector_searches_total Hot vector searches executed\n");
+        output.push_str("# TYPE chronik_hot_vector_searches_total counter\n");
+        output.push_str(&format!("chronik_hot_vector_searches_total {}\n",
+            self.hot_vector_searches.load(Ordering::Relaxed)));
+
+        output.push_str("# HELP chronik_hot_vector_cache_total Cold pipeline single-embed reuse (HP-2 follow-up A)\n");
+        output.push_str("# TYPE chronik_hot_vector_cache_total counter\n");
+        output.push_str(&format!("chronik_hot_vector_cache_total{{result=\"hit\"}} {}\n",
+            self.hot_vector_cache_hits.load(Ordering::Relaxed)));
+        output.push_str(&format!("chronik_hot_vector_cache_total{{result=\"miss\"}} {}\n",
+            self.hot_vector_cache_misses.load(Ordering::Relaxed)));
+
+        // HP-3 Item 2: freshness histograms (produce → visible-in-hot-index).
+        let ht_fresh_count = self.hot_text_visibility_lag_count.load(Ordering::Relaxed);
+        let ht_fresh_sum = self.hot_text_visibility_lag_ms_sum.load(Ordering::Relaxed);
+        let ht_fresh_avg = if ht_fresh_count > 0 { ht_fresh_sum / ht_fresh_count } else { 0 };
+        output.push_str("# HELP chronik_hot_text_visibility_lag_ms Freshness: produce timestamp → visible in hot text index (ms)\n");
+        output.push_str("# TYPE chronik_hot_text_visibility_lag_ms gauge\n");
+        output.push_str(&format!("chronik_hot_text_visibility_lag_ms{{stat=\"avg\"}} {}\n", ht_fresh_avg));
+        output.push_str(&format!("chronik_hot_text_visibility_lag_ms{{stat=\"count\"}} {}\n", ht_fresh_count));
+        output.push_str(&format!("chronik_hot_text_visibility_lag_ms{{stat=\"sum\"}} {}\n", ht_fresh_sum));
+
+        let hv_fresh_count = self.hot_vector_visibility_lag_count.load(Ordering::Relaxed);
+        let hv_fresh_sum = self.hot_vector_visibility_lag_ms_sum.load(Ordering::Relaxed);
+        let hv_fresh_avg = if hv_fresh_count > 0 { hv_fresh_sum / hv_fresh_count } else { 0 };
+        output.push_str("# HELP chronik_hot_vector_visibility_lag_ms Freshness: produce timestamp → visible in hot vector index (ms)\n");
+        output.push_str("# TYPE chronik_hot_vector_visibility_lag_ms gauge\n");
+        output.push_str(&format!("chronik_hot_vector_visibility_lag_ms{{stat=\"avg\"}} {}\n", hv_fresh_avg));
+        output.push_str(&format!("chronik_hot_vector_visibility_lag_ms{{stat=\"count\"}} {}\n", hv_fresh_count));
+        output.push_str(&format!("chronik_hot_vector_visibility_lag_ms{{stat=\"sum\"}} {}\n", hv_fresh_sum));
+
         output
     }
 }
@@ -1135,5 +1279,83 @@ impl MetricsRecorder {
         let metrics = global_metrics();
         metrics.query_candidates_sum.fetch_add(count, Ordering::Relaxed);
         metrics.query_candidates_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    // ========== HP-3.1: Hot Path Metrics ==========
+
+    pub fn record_hot_text_add(docs: u64) {
+        global_metrics().hot_text_docs_added.fetch_add(docs, Ordering::Relaxed);
+    }
+    pub fn record_hot_text_evict(docs: u64) {
+        global_metrics().hot_text_docs_evicted.fetch_add(docs, Ordering::Relaxed);
+    }
+    pub fn record_hot_text_commit() {
+        global_metrics().hot_text_commits.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_hot_text_trim(docs: u64) {
+        let m = global_metrics();
+        m.hot_text_trims.fetch_add(1, Ordering::Relaxed);
+        m.hot_text_docs_evicted.fetch_add(docs, Ordering::Relaxed);
+    }
+    pub fn record_hot_text_reset() {
+        global_metrics().hot_text_resets.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_hot_text_search(duration: std::time::Duration) {
+        let us = duration.as_micros() as u64;
+        let m = global_metrics();
+        m.hot_text_searches.fetch_add(1, Ordering::Relaxed);
+        m.hot_text_search_latency_us_sum.fetch_add(us, Ordering::Relaxed);
+        m.hot_text_search_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_hot_vector_enqueue(dropped: bool) {
+        let m = global_metrics();
+        if dropped {
+            m.hot_vector_dropped_overflow.fetch_add(1, Ordering::Relaxed);
+        } else {
+            m.hot_vector_enqueued.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn record_hot_vector_flush(success: bool, vectors_added: u64) {
+        let m = global_metrics();
+        m.hot_vector_batches_flushed.fetch_add(1, Ordering::Relaxed);
+        if success {
+            m.hot_vector_vectors_added.fetch_add(vectors_added, Ordering::Relaxed);
+        } else {
+            m.hot_vector_embedder_errors.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn record_hot_vector_evict(vectors: u64) {
+        global_metrics().hot_vector_evicted.fetch_add(vectors, Ordering::Relaxed);
+    }
+    pub fn record_hot_vector_search(duration: std::time::Duration) {
+        let us = duration.as_micros() as u64;
+        let m = global_metrics();
+        m.hot_vector_searches.fetch_add(1, Ordering::Relaxed);
+        m.hot_vector_search_latency_us_sum.fetch_add(us, Ordering::Relaxed);
+        m.hot_vector_search_count.fetch_add(1, Ordering::Relaxed);
+    }
+    /// HP-2 follow-up A: cold pipeline reused a hot-cached vector.
+    pub fn record_hot_vector_cache_hit() {
+        global_metrics().hot_vector_cache_hits.fetch_add(1, Ordering::Relaxed);
+    }
+    /// HP-2 follow-up A: cold pipeline had to embed (cache miss).
+    pub fn record_hot_vector_cache_miss() {
+        global_metrics().hot_vector_cache_misses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// HP-3 Item 2: record a hot-text freshness sample.
+    /// `lag_ms` = (wall clock at visibility) − (record produce timestamp).
+    pub fn record_hot_text_visibility_lag(lag_ms: u64) {
+        let m = global_metrics();
+        m.hot_text_visibility_lag_ms_sum.fetch_add(lag_ms, Ordering::Relaxed);
+        m.hot_text_visibility_lag_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// HP-3 Item 2: record a hot-vector freshness sample.
+    pub fn record_hot_vector_visibility_lag(lag_ms: u64) {
+        let m = global_metrics();
+        m.hot_vector_visibility_lag_ms_sum.fetch_add(lag_ms, Ordering::Relaxed);
+        m.hot_vector_visibility_lag_count.fetch_add(1, Ordering::Relaxed);
     }
 }

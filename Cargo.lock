@@ -1957,6 +1957,7 @@ dependencies = [
  "bincode",
  "bytes",
  "chronik-common",
+ "chronik-monitoring",
  "chronik-protocol",
  "chronik-storage",
  "chrono",

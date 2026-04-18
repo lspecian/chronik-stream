@@ -35,6 +35,8 @@ pub struct SearchApi {
     wal_indexer: Option<Arc<chronik_storage::WalIndexer>>,
     /// Base path for WAL-created Tantivy indices
     index_base_path: Option<String>,
+    /// HP-1.3: In-memory hot text index for NRT search, shadowing the WAL tail.
+    pub hot_text_index: Option<Arc<crate::hot_text_index::HotTextIndex>>,
 }
 
 /// State for a single index
@@ -402,6 +404,7 @@ impl SearchApi {
             cache: Arc::new(crate::cache::QueryCache::new(cache_config)),
             wal_indexer: None,
             index_base_path: None,
+            hot_text_index: None,
         })
     }
 
@@ -415,7 +418,18 @@ impl SearchApi {
             cache: Arc::new(crate::cache::QueryCache::new(cache_config)),
             wal_indexer: Some(wal_indexer),
             index_base_path: Some(index_base_path),
+            hot_text_index: None,
         })
+    }
+
+    /// HP-1.3: Attach a hot text index so queries merge NRT results with cold hits.
+    /// Builder-pattern — call once after construction, before serving.
+    pub fn with_hot_text_index(
+        mut self,
+        hot_text_index: Arc<crate::hot_text_index::HotTextIndex>,
+    ) -> Self {
+        self.hot_text_index = Some(hot_text_index);
+        self
     }
 
     /// Get the WAL indexer's index base path for querying WAL-created indices

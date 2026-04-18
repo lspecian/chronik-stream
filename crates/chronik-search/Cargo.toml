@@ -9,6 +9,7 @@ license.workspace = true
 chronik-common = { path = "../chronik-common" }
 chronik-storage = { path = "../chronik-storage" }
 chronik-protocol = { path = "../chronik-protocol" }
+chronik-monitoring = { path = "../chronik-monitoring" }
 
 # Web framework (use workspace axum 0.6.20)
 axum = { workspace = true }

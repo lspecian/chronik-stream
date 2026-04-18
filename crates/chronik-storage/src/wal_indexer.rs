@@ -240,6 +240,33 @@ pub struct WalIndexer {
     /// After Parquet files are created, we notify the hot buffer so it stops reading
     /// already-persisted records from WAL, reducing memory usage.
     hot_buffer: Arc<RwLock<Option<Arc<HotDataBuffer>>>>,
+
+    /// HP-1.4/HP-2.6: Listeners notified after each successful cold Tantivy
+    /// commit. Each listener evicts its in-memory view of offsets that are
+    /// now in cold storage. Multiple listeners are supported so both the hot
+    /// text and hot vector indexes can plug in.
+    ///
+    /// Decoupled via a trait to avoid chronik-storage ↔ chronik-search /
+    /// chronik-columnar circular dependencies.
+    cold_flush_listener: Arc<RwLock<Vec<Arc<dyn ColdFlushListener>>>>,
+
+    /// HP-2 follow-up A: Optional hot vector index for single-embed reuse.
+    /// When set, the cold embedding pipeline checks this cache before calling
+    /// the embedding provider, saving API calls for offsets the hot path
+    /// already embedded.
+    hot_vector_index: Arc<RwLock<Option<Arc<chronik_columnar::hot_vector_index::HotVectorIndex>>>>,
+}
+
+/// HP-1.4: Trait implemented by hot-index shadows (text, vector) that need
+/// to be notified when an offset is safely persisted to cold storage.
+///
+/// Implementations must return quickly and must not block. A typical impl
+/// spawns a detached task to perform eviction asynchronously.
+pub trait ColdFlushListener: Send + Sync + 'static {
+    /// Called after the cold Tantivy index for `(topic, partition)` has been
+    /// sealed with records up to `max_offset`. The listener is responsible
+    /// for evicting its in-memory view of offsets ≤ `max_offset`.
+    fn notify_cold_flushed(&self, topic: String, partition: i32, max_offset: i64);
 }
 
 impl WalIndexer {
@@ -304,7 +331,19 @@ impl WalIndexer {
             vector_index_manager,
             is_leader: is_leader.unwrap_or_else(|| Arc::new(AtomicBool::new(true))),
             hot_buffer: Arc::new(RwLock::new(None)),
+            cold_flush_listener: Arc::new(RwLock::new(Vec::new())),
+            hot_vector_index: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// HP-2 follow-up A: Attach the hot vector index so the cold embedding
+    /// pipeline can reuse already-embedded vectors.
+    pub async fn set_hot_vector_index(
+        &self,
+        index: Arc<chronik_columnar::hot_vector_index::HotVectorIndex>,
+    ) {
+        *self.hot_vector_index.write().await = Some(index);
+        info!("HotVectorIndex wired to WalIndexer for single-embed reuse");
     }
 
     /// v2.4.1: Set the HotDataBuffer reference for flushed offset notifications.
@@ -312,6 +351,14 @@ impl WalIndexer {
     pub async fn set_hot_buffer(&self, buffer: Arc<HotDataBuffer>) {
         *self.hot_buffer.write().await = Some(buffer);
         info!("HotDataBuffer wired to WalIndexer for flushed offset notifications");
+    }
+
+    /// HP-1.4/HP-2.6: Attach a cold-flush listener. Multiple calls append
+    /// listeners — they all fire (in order) after every successful cold
+    /// Tantivy commit.
+    pub async fn set_cold_flush_listener(&self, listener: Arc<dyn ColdFlushListener>) {
+        self.cold_flush_listener.write().await.push(listener);
+        info!("ColdFlushListener added to WalIndexer");
     }
 
     /// v2.2.16: Refresh the searchable topics cache from metadata store
@@ -474,6 +521,8 @@ impl WalIndexer {
         let vector_index_manager = Arc::clone(&self.vector_index_manager);
         let is_leader = Arc::clone(&self.is_leader);
         let hot_buffer = Arc::clone(&self.hot_buffer);
+        let cold_flush_listener = Arc::clone(&self.cold_flush_listener);
+        let hot_vector_index = Arc::clone(&self.hot_vector_index);
         let snapshot_interval = self.config.snapshot_interval_secs();
 
         // CRITICAL v2.2.10: Spawn on dedicated runtime, NOT main runtime
@@ -542,6 +591,8 @@ impl WalIndexer {
                     &vector_index_manager,
                     &is_leader,
                     &hot_buffer,
+                    &cold_flush_listener,
+                    &hot_vector_index,
                 ).await {
                     Ok(stats) => {
                         if stats.segments_processed > 0 {
@@ -595,11 +646,13 @@ impl WalIndexer {
             &self.vector_index_manager,
             &self.is_leader,
             &self.hot_buffer,
+            &self.cold_flush_listener,
+            &self.hot_vector_index,
         ).await
     }
 
     /// Index sealed segments (internal implementation)
-    #[instrument(skip(config, wal_manager, object_store, segment_index, metadata_store, indexing_in_progress, vector_index_manager, is_leader, hot_buffer))]
+    #[instrument(skip(config, wal_manager, object_store, segment_index, metadata_store, indexing_in_progress, vector_index_manager, is_leader, hot_buffer, cold_flush_listener, hot_vector_index))]
     async fn index_sealed_segments_internal(
         config: &WalIndexerConfig,
         wal_manager: &Arc<WalManager>,
@@ -610,6 +663,8 @@ impl WalIndexer {
         vector_index_manager: &Arc<VectorIndexManager>,
         is_leader: &Arc<AtomicBool>,
         hot_buffer: &Arc<RwLock<Option<Arc<HotDataBuffer>>>>,
+        cold_flush_listener: &Arc<RwLock<Vec<Arc<dyn ColdFlushListener>>>>,
+        hot_vector_index: &Arc<RwLock<Option<Arc<chronik_columnar::hot_vector_index::HotVectorIndex>>>>,
     ) -> Result<IndexingStats> {
         let start_time = std::time::Instant::now();
         let mut stats = IndexingStats::default();
@@ -674,6 +729,8 @@ impl WalIndexer {
                 &mut stats,
                 is_leader,
                 hot_buffer,
+                cold_flush_listener,
+                hot_vector_index,
             ).await {
                 Ok(_) => {
                     debug!(segment = %segment_id, "Successfully indexed segment");
@@ -698,7 +755,7 @@ impl WalIndexer {
     }
 
     /// Index a single sealed WAL segment
-    #[instrument(skip(config, wal_manager, object_store, segment_index, metadata_store, vector_index_manager, stats, is_leader, hot_buffer))]
+    #[instrument(skip(config, wal_manager, object_store, segment_index, metadata_store, vector_index_manager, stats, is_leader, hot_buffer, cold_flush_listener, hot_vector_index))]
     async fn index_segment(
         config: &WalIndexerConfig,
         wal_manager: &Arc<WalManager>,
@@ -710,6 +767,8 @@ impl WalIndexer {
         stats: &mut IndexingStats,
         is_leader: &Arc<AtomicBool>,
         hot_buffer: &Arc<RwLock<Option<Arc<HotDataBuffer>>>>,
+        cold_flush_listener: &Arc<RwLock<Vec<Arc<dyn ColdFlushListener>>>>,
+        hot_vector_index: &Arc<RwLock<Option<Arc<chronik_columnar::hot_vector_index::HotVectorIndex>>>>,
     ) -> Result<()> {
         info!(segment = %segment_id, "Indexing WAL segment");
 
@@ -833,15 +892,29 @@ impl WalIndexer {
                     &tp,
                     records,
                 ).await {
-                    Ok(bytes_written) => {
+                    Ok((bytes_written, max_offset)) => {
                         info!(
                             topic = %tp.topic,
                             partition = tp.partition,
                             bytes = bytes_written,
+                            max_offset = max_offset,
                             "Created Tantivy index (searchable topic)"
                         );
                         stats.indexes_created += 1;
                         stats.bytes_written += bytes_written;
+
+                        // HP-1.4/HP-2.6: notify all listeners (hot text, hot vector)
+                        // that everything up to max_offset is now safely in cold
+                        // storage — they can evict.
+                        if max_offset >= 0 {
+                            for listener in cold_flush_listener.read().await.iter() {
+                                listener.notify_cold_flushed(
+                                    tp.topic.clone(),
+                                    tp.partition,
+                                    max_offset,
+                                );
+                            }
+                        }
                     }
                     Err(e) => {
                         error!(
@@ -931,6 +1004,9 @@ impl WalIndexer {
                 .max(1)
                 .min(8);
 
+            // HP-2 follow-up A: snapshot the hot vector index once.
+            let hot_vec_for_reuse = hot_vector_index.read().await.clone();
+
             if vector_work_items.len() == 1 || max_partition_concurrency <= 1 {
                 // Serial: single partition or concurrency disabled
                 for (tp, records) in vector_work_items {
@@ -940,6 +1016,7 @@ impl WalIndexer {
                         vector_index_manager,
                         &tp,
                         records,
+                        hot_vec_for_reuse.clone(),
                     ).await {
                         Ok(embeddings_generated) => {
                             info!(
@@ -971,6 +1048,7 @@ impl WalIndexer {
                     let config = config.clone();
                     let metadata_store = Arc::clone(metadata_store);
                     let vector_index_manager = Arc::clone(vector_index_manager);
+                    let hot_vec_for_task = hot_vec_for_reuse.clone();
 
                     join_set.spawn(async move {
                         let result = Self::process_vector_embeddings(
@@ -979,6 +1057,7 @@ impl WalIndexer {
                             &vector_index_manager,
                             &tp,
                             records,
+                            hot_vec_for_task,
                         ).await;
                         drop(permit);
                         (tp, result)
@@ -1131,9 +1210,9 @@ impl WalIndexer {
         segment_index: &Arc<SegmentIndex>,
         tp: &TopicPartition,
         canonical_records: Vec<CanonicalRecord>,
-    ) -> Result<u64> {
+    ) -> Result<(u64, i64)> {
         if canonical_records.is_empty() {
-            return Ok(0);
+            return Ok((0, -1));
         }
 
         // Get base offset and calculate ranges from all records
@@ -1231,7 +1310,7 @@ impl WalIndexer {
             "Registered segment in index"
         );
 
-        Ok(bytes_written)
+        Ok((bytes_written, max_offset))
     }
 
     /// v2.2.21: Create Parquet file from CanonicalRecords for columnar storage
@@ -1526,16 +1605,17 @@ impl WalIndexer {
     /// - `vector.field` = "value" (default) | "key" | JSON path like "$.message.text"
     /// - `vector.provider` = "openai" | "external" | "local"
     /// - `vector.model` = model name (e.g., "text-embedding-3-small")
-    #[instrument(skip(config, metadata_store, vector_index_manager, canonical_records))]
+    #[instrument(skip(config, metadata_store, vector_index_manager, canonical_records, hot_vector_index))]
     async fn process_vector_embeddings(
         config: &WalIndexerConfig,
         metadata_store: &Arc<dyn MetadataStore>,
         vector_index_manager: &Arc<VectorIndexManager>,
         tp: &TopicPartition,
         canonical_records: Vec<CanonicalRecord>,
+        hot_vector_index: Option<Arc<chronik_columnar::hot_vector_index::HotVectorIndex>>,
     ) -> Result<usize> {
         Self::process_vector_embeddings_with_model(
-            config, metadata_store, vector_index_manager, tp, canonical_records, None,
+            config, metadata_store, vector_index_manager, tp, canonical_records, None, hot_vector_index,
         ).await
     }
 
@@ -1551,6 +1631,7 @@ impl WalIndexer {
         tp: &TopicPartition,
         canonical_records: Vec<CanonicalRecord>,
         model_id: Option<&str>,
+        hot_vector_index: Option<Arc<chronik_columnar::hot_vector_index::HotVectorIndex>>,
     ) -> Result<usize> {
         if canonical_records.is_empty() {
             return Ok(0);
@@ -1631,13 +1712,17 @@ impl WalIndexer {
             vector_index_manager.register_topic(&tp.topic, hnsw_config).await;
         }
 
-        // Create embedding pipeline with configured concurrency
-        let pipeline = EmbeddingPipeline::with_concurrency(
+        // Create embedding pipeline with configured concurrency.
+        // HP-2 follow-up A: attach hot vector index for single-embed reuse.
+        let mut pipeline = EmbeddingPipeline::with_concurrency(
             provider,
             Arc::clone(vector_index_manager),
             vector_config.batch_size,
             vector_config.embedding_concurrency,
         );
+        if let Some(hot) = hot_vector_index {
+            pipeline = pipeline.with_hot_vector_index(hot);
+        }
 
         // Process messages through the pipeline (model-aware when specified)
         match pipeline.process_messages_for_model(&tp.topic, tp.partition, texts, model_id).await {
@@ -1969,7 +2054,10 @@ impl WalIndexer {
                 continue;
             }
 
-            // Run through the vector embedding pipeline
+            // Run through the vector embedding pipeline.
+            // HP-2 follow-up A: pass the hot vector index so already-embedded
+            // offsets skip the provider call.
+            let hot_vec = self.hot_vector_index.read().await.clone();
             match Self::process_vector_embeddings_with_model(
                 &self.config,
                 &self.metadata_store,
@@ -1977,6 +2065,7 @@ impl WalIndexer {
                 &tp,
                 canonical_records,
                 model_id,
+                hot_vec,
             ).await {
                 Ok(embeddings_generated) => {
                     info!(

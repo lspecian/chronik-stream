@@ -1888,6 +1888,10 @@ pub struct EmbeddingPipeline {
     batch_size: usize,
     /// Maximum concurrent in-flight embedding API calls
     concurrency: usize,
+    /// HP-2 follow-up A: Hot vector index for single-embed reuse.
+    /// When set, offsets that already have a cached vector skip the
+    /// embedding call — we take the hot-cached vector directly.
+    hot_vector_index: Option<Arc<crate::hot_vector_index::HotVectorIndex>>,
 }
 
 impl EmbeddingPipeline {
@@ -1905,6 +1909,7 @@ impl EmbeddingPipeline {
             index_manager,
             batch_size: effective_batch_size,
             concurrency: 4,
+            hot_vector_index: None,
         }
     }
 
@@ -1925,7 +1930,18 @@ impl EmbeddingPipeline {
             index_manager,
             batch_size: effective_batch_size,
             concurrency: effective_concurrency,
+            hot_vector_index: None,
         }
+    }
+
+    /// HP-2 follow-up A: attach the hot vector index so already-embedded
+    /// offsets skip the provider call and reuse the cached vector.
+    pub fn with_hot_vector_index(
+        mut self,
+        hot_index: Arc<crate::hot_vector_index::HotVectorIndex>,
+    ) -> Self {
+        self.hot_vector_index = Some(hot_index);
+        self
     }
 
     /// Process a batch of messages and add embeddings to the index (default model).
@@ -1985,11 +2001,61 @@ impl EmbeddingPipeline {
                     .map_err(|e| anyhow!("Semaphore closed: {}", e))?;
                 let provider = Arc::clone(&self.provider);
                 let topic_owned = topic.to_string();
+                let hot_vec = self.hot_vector_index.clone();
 
                 join_set.spawn(async move {
-                    let texts: Vec<&str> = chunk.iter().map(|(_, text)| text.as_str()).collect();
-                    let offsets: Vec<i64> = chunk.iter().map(|(offset, _)| *offset).collect();
+                    // HP-2 follow-up A: split chunk into cache hits vs misses.
+                    let mut cached_entries: Vec<VectorEntry> = Vec::new();
+                    let mut to_embed_idx: Vec<usize> = Vec::new();
+                    if let Some(ref hot) = hot_vec {
+                        for (i, (offset, text)) in chunk.iter().enumerate() {
+                            if let Some(vec) =
+                                hot.get_cached_vector(&topic_owned, partition, *offset).await
+                            {
+                                MetricsRecorder::record_hot_vector_cache_hit();
+                                cached_entries.push(VectorEntry {
+                                    offset: *offset,
+                                    vector: vec,
+                                    text_preview: Some(
+                                        truncate_to_char_boundary(text, 100).to_string(),
+                                    ),
+                                });
+                            } else {
+                                MetricsRecorder::record_hot_vector_cache_miss();
+                                to_embed_idx.push(i);
+                            }
+                        }
+                    } else {
+                        to_embed_idx = (0..chunk.len()).collect();
+                    }
+
                     let chunk_len = chunk.len();
+                    let cached_hits = cached_entries.len();
+
+                    // If every offset is already in the hot cache, skip the provider call.
+                    if to_embed_idx.is_empty() {
+                        MetricsRecorder::record_embedding_request(
+                            true,
+                            chunk_len as u64,
+                            cached_hits as u64,
+                            0,
+                        );
+                        debug!(
+                            topic = %topic_owned,
+                            partition = partition,
+                            cached = cached_hits,
+                            "single-embed reuse (concurrent): full batch from hot cache"
+                        );
+                        drop(permit);
+                        return (batch_idx, Ok((cached_entries, 0, topic_owned)));
+                    }
+
+                    let texts: Vec<&str> = to_embed_idx
+                        .iter()
+                        .map(|&i| chunk[i].1.as_str())
+                        .collect();
+                    let offsets: Vec<i64> =
+                        to_embed_idx.iter().map(|&i| chunk[i].0).collect();
 
                     MetricsRecorder::increment_embedding_queue();
                     let embed_start = Instant::now();
@@ -2004,7 +2070,7 @@ impl EmbeddingPipeline {
 
                     match result {
                         Ok(batch) => {
-                            let entries: Vec<VectorEntry> = batch
+                            let mut entries: Vec<VectorEntry> = batch
                                 .embeddings
                                 .into_iter()
                                 .zip(offsets.iter())
@@ -2014,6 +2080,7 @@ impl EmbeddingPipeline {
                                     text_preview: Some(truncate_to_char_boundary(&emb_result.text, 100).to_string()),
                                 })
                                 .collect();
+                            entries.append(&mut cached_entries);
                             let tokens_used = batch.total_tokens.unwrap_or(0);
 
                             MetricsRecorder::record_embedding_request(
@@ -2022,6 +2089,16 @@ impl EmbeddingPipeline {
                                 entries.len() as u64,
                                 tokens_used as u64,
                             );
+
+                            if cached_hits > 0 {
+                                debug!(
+                                    topic = %topic_owned,
+                                    partition = partition,
+                                    cached = cached_hits,
+                                    embedded = offsets.len(),
+                                    "single-embed reuse (concurrent): partial batch from hot cache"
+                                );
+                            }
 
                             (batch_idx, Ok((entries, tokens_used, topic_owned)))
                         }
@@ -2032,18 +2109,24 @@ impl EmbeddingPipeline {
                             );
                             MetricsRecorder::record_embedding_request(
                                 false,
-                                chunk_len as u64,
+                                offsets.len() as u64,
                                 0,
                                 0,
                             );
-                            (batch_idx, Err((chunk_len, e.to_string())))
+                            // Even on embed failure, keep the cached entries —
+                            // they're correct and saved a round trip.
+                            (batch_idx, Err((offsets.len(), cached_entries, e.to_string())))
                         }
                     }
                 });
             }
 
-            // Collect results and add to index in batch order
-            let mut results: Vec<(usize, std::result::Result<(Vec<VectorEntry>, usize, String), (usize, String)>)> = Vec::with_capacity(total_batches);
+            // Collect results and add to index in batch order.
+            // HP-2 follow-up A: Err arm now carries (missed_count, cached_entries, error).
+            type BatchOk = (Vec<VectorEntry>, usize, String);
+            type BatchErr = (usize, Vec<VectorEntry>, String);
+            let mut results: Vec<(usize, std::result::Result<BatchOk, BatchErr>)> =
+                Vec::with_capacity(total_batches);
             while let Some(join_result) = join_set.join_next().await {
                 match join_result {
                     Ok(batch_result) => results.push(batch_result),
@@ -2075,9 +2158,24 @@ impl EmbeddingPipeline {
                             stats.total_tokens += tokens_used;
                         }
                     }
-                    Err((chunk_len, error_msg)) => {
-                        stats.failed += chunk_len;
+                    Err((missed, cached_entries, error_msg)) => {
+                        stats.failed += missed;
                         stats.errors.push(error_msg);
+                        // Best-effort: cached entries are still valid.
+                        if !cached_entries.is_empty() {
+                            let add_result = if let Some(mid) = model_id {
+                                self.index_manager
+                                    .add_vectors_for_model(topic, partition, mid, cached_entries)
+                                    .await
+                            } else {
+                                self.index_manager
+                                    .add_vectors(topic, partition, cached_entries)
+                                    .await
+                            };
+                            if let Ok(added) = add_result {
+                                stats.embedded += added;
+                            }
+                        }
                     }
                 }
             }
@@ -2092,6 +2190,42 @@ impl EmbeddingPipeline {
         Ok(stats)
     }
 
+    /// HP-2 follow-up A: split a chunk into (cached, missing). For each
+    /// offset, if the hot vector index has an embedding, use it directly
+    /// (saves an API call); otherwise fall through to the provider.
+    ///
+    /// Returns `(entries_from_cache, chunk_to_embed)`. The second Vec is the
+    /// input to `provider.embed_batch`; the first is ready to go straight
+    /// into the cold HNSW.
+    async fn partition_cache_hits<'a>(
+        &self,
+        topic: &str,
+        partition: i32,
+        chunk: &'a [(i64, String)],
+    ) -> (Vec<VectorEntry>, Vec<&'a (i64, String)>) {
+        let Some(hot) = self.hot_vector_index.as_ref() else {
+            return (Vec::new(), chunk.iter().collect());
+        };
+        let mut cached = Vec::new();
+        let mut missing = Vec::new();
+        for entry in chunk {
+            if let Some(vec) = hot.get_cached_vector(topic, partition, entry.0).await {
+                MetricsRecorder::record_hot_vector_cache_hit();
+                cached.push(VectorEntry {
+                    offset: entry.0,
+                    vector: vec,
+                    text_preview: Some(
+                        truncate_to_char_boundary(&entry.1, 100).to_string(),
+                    ),
+                });
+            } else {
+                MetricsRecorder::record_hot_vector_cache_miss();
+                missing.push(entry);
+            }
+        }
+        (cached, missing)
+    }
+
     /// Process a single batch of messages serially (used for concurrency=1 path)
     async fn process_single_batch(
         &self,
@@ -2101,8 +2235,46 @@ impl EmbeddingPipeline {
         stats: &mut ProcessingStats,
         model_id: Option<&str>,
     ) {
-        let texts: Vec<&str> = chunk.iter().map(|(_, text)| text.as_str()).collect();
-        let offsets: Vec<i64> = chunk.iter().map(|(offset, _)| *offset).collect();
+        // HP-2 follow-up A: reuse hot-cached vectors, only embed the misses.
+        let (mut cached_entries, to_embed) =
+            self.partition_cache_hits(topic, partition, chunk).await;
+        let cached_hits = cached_entries.len();
+
+        if to_embed.is_empty() {
+            // Everything was hot-cached — skip the provider entirely.
+            let add_result = if let Some(mid) = model_id {
+                self.index_manager.add_vectors_for_model(topic, partition, mid, cached_entries).await
+            } else {
+                self.index_manager.add_vectors(topic, partition, cached_entries).await
+            };
+            match add_result {
+                Ok(added) => {
+                    stats.embedded += added;
+                    stats.batches_processed += 1;
+                    MetricsRecorder::record_embedding_request(
+                        true,
+                        chunk.len() as u64,
+                        added as u64,
+                        0, // zero tokens used — reused from hot cache
+                    );
+                }
+                Err(e) => {
+                    warn!("Failed to add vectors for {}-{} (all from cache): {}", topic, partition, e);
+                    stats.failed += chunk.len();
+                    stats.errors.push(e.to_string());
+                }
+            }
+            debug!(
+                topic = topic,
+                partition = partition,
+                cached = cached_hits,
+                "single-embed reuse: full batch from hot cache"
+            );
+            return;
+        }
+
+        let texts: Vec<&str> = to_embed.iter().map(|(_, text)| text.as_str()).collect();
+        let offsets: Vec<i64> = to_embed.iter().map(|(offset, _)| *offset).collect();
 
         MetricsRecorder::increment_embedding_queue();
         let embed_start = Instant::now();
@@ -2113,7 +2285,7 @@ impl EmbeddingPipeline {
                 MetricsRecorder::record_embedding_latency(latency);
                 MetricsRecorder::decrement_embedding_queue();
 
-                let entries: Vec<VectorEntry> = batch
+                let mut entries: Vec<VectorEntry> = batch
                     .embeddings
                     .into_iter()
                     .zip(offsets.iter())
@@ -2123,6 +2295,16 @@ impl EmbeddingPipeline {
                         text_preview: Some(truncate_to_char_boundary(&result.text, 100).to_string()),
                     })
                     .collect();
+                entries.append(&mut cached_entries);
+                if cached_hits > 0 {
+                    debug!(
+                        topic = topic,
+                        partition = partition,
+                        cached = cached_hits,
+                        embedded = offsets.len(),
+                        "single-embed reuse: partial batch from hot cache"
+                    );
+                }
 
                 let add_result = if let Some(mid) = model_id {
                     self.index_manager.add_vectors_for_model(topic, partition, mid, entries).await
@@ -2160,15 +2342,31 @@ impl EmbeddingPipeline {
                     "Embedding batch failed for {}-{}: {}",
                     topic, partition, e
                 );
-                stats.failed += chunk.len();
+                // Only the items we actually tried to embed are "failed".
+                // Cached entries are still safe to add — do them below.
+                let missed = to_embed.len();
+                stats.failed += missed;
                 stats.errors.push(e.to_string());
 
                 MetricsRecorder::record_embedding_request(
                     false,
-                    chunk.len() as u64,
+                    missed as u64,
                     0,
                     0,
                 );
+
+                // Best-effort: even on embed failure, write cached entries so
+                // we don't waste the hot-path work.
+                if !cached_entries.is_empty() {
+                    let add_result = if let Some(mid) = model_id {
+                        self.index_manager.add_vectors_for_model(topic, partition, mid, cached_entries).await
+                    } else {
+                        self.index_manager.add_vectors(topic, partition, cached_entries).await
+                    };
+                    if let Ok(added) = add_result {
+                        stats.embedded += added;
+                    }
+                }
             }
         }
     }

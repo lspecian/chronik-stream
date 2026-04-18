@@ -36,10 +36,14 @@ Producer ──▶ ProduceHandler ──▶ WAL (fsync) ──▶ Response to cl
 ```
 
 **Key Guarantees**:
-- Embedding generation happens AFTER produce in the background
-- Produce latency remains unchanged (~2-10ms)
+- Embedding generation happens AFTER produce in the background — produce latency is unchanged (~2-10ms)
 - Embedding failures don't affect message durability
-- Query availability: 30-90s after produce (embedding + indexing time)
+- Query availability:
+  - With the **hot vector path** (default, HP-2): < 150ms with a local embedder, < 500ms with OpenAI
+  - With the hot path disabled (`CHRONIK_HOT_VECTOR_ENABLED=false`): cold-only, 30–90s
+- The hot path also populates a cache that the cold pipeline reuses, so the embedder only runs once per record
+
+See [HOT_PATH_GUIDE.md](./HOT_PATH_GUIDE.md) for operator details.
 
 ---
 
@@ -500,8 +504,9 @@ Watch these metrics:
    - Check logs for embedding API errors
 
 4. **Wait for indexing**:
-   - Vector search is available ~30-90s after produce
-   - This includes embedding API latency
+   - With the hot vector path (default): available in < 500ms after produce
+   - With the hot path disabled: ~30-90s via the cold pipeline only
+   - If freshness is slower than expected, check `chronik_hot_vector_queue_total{op="dropped"}` (embedder backpressure) and `chronik_hot_vector_batches_total{result="error"}` (embedder errors)
 
 ### Poor Search Quality
 

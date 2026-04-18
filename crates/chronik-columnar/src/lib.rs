@@ -45,6 +45,8 @@ pub mod topic_query;
 pub mod vector_index;
 pub mod vector_cache;
 pub mod hot_buffer;
+pub mod hot_vector_index;
+pub mod hot_vector_batcher;
 pub mod json_schema;
 
 #[cfg(feature = "flight")]

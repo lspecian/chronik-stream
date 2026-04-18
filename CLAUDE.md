@@ -1095,9 +1095,9 @@ Producer → WAL (fsync) → Response  (~2-10ms)
 
 **Query availability latency**:
 - Kafka Fetch: Immediate
-- Full-text search: 30-60s
-- SQL queries: 30-60s
-- Vector search: 30-90s (includes embedding API)
+- Full-text search: < 500ms when hot text index enabled (HP Phase 1, default on); falls back to 30–60s cold-only if `CHRONIK_HOT_TEXT_ENABLED=false`
+- SQL queries: ~1s (HotDataBuffer) for recent data, 30-60s for cold Parquet-only topics
+- Vector search: < 150ms with a local embedder, < 500ms with OpenAI (HP Phase 2, default on). Falls back to 30–90s if `CHRONIK_HOT_VECTOR_ENABLED=false`.
 
 ## Environment Variables
 
@@ -1127,6 +1127,19 @@ Key environment variables:
 - `CHRONIK_COLUMNAR_USE_OBJECT_STORE` - Enable S3/GCS/Azure for Parquet files (default: `false`, local-first)
 - `CHRONIK_COLUMNAR_S3_PREFIX` - Prefix for Parquet files in object storage (default: `columnar`)
 - `CHRONIK_COLUMNAR_KEEP_LOCAL` - Keep local copy when uploading to object storage (default: `true`)
+- `CHRONIK_HOT_TEXT_ENABLED` - Enable in-memory Tantivy hot text index for NRT search (default: `true`). Merged with cold Tantivy hits on `/_search`, query-cache bypassed while active.
+- `CHRONIK_HOT_TEXT_COMMIT_INTERVAL_MS` - In-memory buffer visibility flip interval (default: `100`). Purely a RAM-only Tantivy `commit` — no disk I/O.
+- `CHRONIK_HOT_TEXT_MAX_DOCS` - Soft cap on documents per (topic, partition) in hot index (default: `100000`). Also the trailing-offset window read from WAL at startup warm-up.
+- `CHRONIK_HOT_TEXT_WRITER_HEAP_BYTES` - Tantivy writer heap budget per partition in bytes (default: `15_000_000`, Tantivy minimum). In-memory only.
+- `CHRONIK_HOT_VECTOR_ENABLED` - Enable in-memory hot vector index for NRT ANN search (default: `true`). Works with any configured embedding provider (OpenAI or external/local). Fire-and-forget from the produce path; embedder runs on a dedicated worker.
+- `CHRONIK_HOT_VECTOR_MAX_VECTORS` - Soft cap on vectors per (topic, partition) in hot index (default: `50000`). Trimmed to the most recent offsets on the trim timer.
+- `CHRONIK_HOT_VECTOR_BATCH_SIZE_LOCAL` - Batch size for the `external` embedding provider (default: `32`).
+- `CHRONIK_HOT_VECTOR_BATCH_WINDOW_MS_LOCAL` - Flush window for `external` (default: `20`).
+- `CHRONIK_HOT_VECTOR_BATCH_SIZE_OPENAI` - Batch size for OpenAI (default: `256`). Larger batch amortizes network round-trip.
+- `CHRONIK_HOT_VECTOR_BATCH_WINDOW_MS_OPENAI` - Flush window for OpenAI (default: `200`). Larger window stays within tier-1 RPM for sustained high throughput.
+- `CHRONIK_HOT_VECTOR_QUEUE_SIZE` - Bounded channel capacity between the produce path and the embedder worker (default: local 10K / OpenAI 20K). Overflow drops new entries — the cold path still embeds them from WAL, only freshness suffers.
+- Per-topic `vector.hot.enabled=false` - Disable NRT enqueue for a specific topic while keeping cold-path embedding intact. Useful for cost-sensitive topics on OpenAI. Defaults to `true` for vector-enabled topics.
+- Cold-path reuse - When the hot path is enabled, WalIndexer's cold embedding pipeline automatically reuses hot-cached vectors before calling the embedder, cutting embedding-API cost ~to zero for offsets that the hot path already embedded.
 
 ## CRC and Checksum Architecture
 

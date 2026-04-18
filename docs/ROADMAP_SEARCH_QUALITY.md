@@ -19,7 +19,7 @@ Every phase must record **both relevance and system metrics**. Chronik's value i
 - Indexing throughput: msgs/sec with analyzer enabled
 - Freshness lag: T0 (event written) → T1 (BM25 searchable) → T2 (vector searchable)
 - Index size on disk (Tantivy segments)
-- Memory usause pge delta
+- Memory usage delta
 
 ---
 
@@ -29,17 +29,18 @@ Every phase must record **both relevance and system metrics**. Chronik's value i
 
 Define freshness as the time between event arrival and query availability:
 
-| Metric | Definition | Baseline | Target |
+| Metric | Definition | Cold-only baseline | With hot path (default) |
 |--------|-----------|----------|--------|
-| T0→T1 (BM25) | Event written → searchable by full-text | ~30-60s | <60s |
-| T0→T2 (Vector) | Event written → searchable by ANN | ~30-90s | <120s |
-| T0→T3 (Hybrid) | Event written → available in hybrid search | max(T1,T2) | <120s |
+| T0→T1 (BM25) | Event written → searchable by full-text | ~30-60s (WalIndexer tick) | **p50 201ms / p99 507ms** (measured 2026-04-17) |
+| T0→T2 (Vector) | Event written → searchable by ANN | ~30-90s (cold embed + HNSW rebuild) | **p50 18ms / p99 31ms** with mock embedder; ~70-150ms with real local GPU; ~400-800ms with OpenAI |
+| T0→T3 (Hybrid) | Event written → available in hybrid search | max(T1,T2) | same as T1/T2 bounds — hybrid handler merges hot hits into RRF fusion |
 
-**Measurement method**:
-1. Produce a record with `{"ts": now(), "marker": "freshness-probe-{uuid}"}`
-2. Poll `/_search` every 1s until the marker appears in BM25 results → T1
-3. Poll `/_vector/topic/search` until marker appears → T2
-4. Record median and p99 across 100 probes
+Hot paths are enabled by default. See [HOT_PATH_GUIDE.md](./HOT_PATH_GUIDE.md) for ops and [ROADMAP_HOT_PATH.md](./ROADMAP_HOT_PATH.md) for design history.
+
+**Measurement method** (on-demand):
+- [tests/bench_hot_text_freshness.sh](../tests/bench_hot_text_freshness.sh) — produces markers, polls `/_search`, reports min/p50/p95/p99 across N probes
+- [tests/bench_hot_vector.sh](../tests/bench_hot_vector.sh) — same for `/_vector/:topic/search`
+- Cold-only baseline: run either script with `CHRONIK_HOT_TEXT_ENABLED=false` or `CHRONIK_HOT_VECTOR_ENABLED=false`
 
 **Freshness must be measured after each phase** to ensure analyzer/indexing changes don't increase lag.
 
@@ -171,14 +172,28 @@ Remaining ~2.4% gap is per-partition BM25 IDF fragmentation (known property of s
 
 **File**: `crates/chronik-search/src/handlers.rs` (build_tantivy_query, ~line 443-510)
 
-### SQ-2.3: BM25 parameter tuning (k1, b) _(optional — do last, likely near-optimal already)_
+### SQ-2.3: Distributed IDF coordination (`dfs_query_then_fetch`)
+- [ ] Implement two-phase query mode for multi-shard clusters:
+  - **Phase 1 (DFS)**: Fan out to all shards, collect per-term document frequencies and total doc counts
+  - **Phase 2 (Query)**: Re-query with merged global IDF stats so all shards score on the same scale
+- [ ] Add `search_type` parameter to `/_search` endpoint: `query_then_fetch` (default, current behavior) or `dfs_query_then_fetch`
+- [ ] In `query_router.rs`: new `dfs_search()` method that does two round-trips
+- [ ] In `handlers.rs` / Tantivy query: accept external IDF overrides (may require custom `Scorer` or pre-computed boost factors)
+- [ ] Fallback: if cluster has only 1 shard, skip DFS phase (no benefit)
+- [ ] Measure NDCG@10 on WANDS with 3-shard cluster — should close the ~2.4% gap vs single-node
+
+**Why**: With N shards, each computes IDF from its local subset (~1/N of corpus). Rare terms on one shard get inflated scores vs the same term on another shard, producing suboptimal merged rankings. This is the same problem Elasticsearch solves with `dfs_query_then_fetch`.
+
+**Files**: `crates/chronik-server/src/unified_api/query_router.rs`, `crates/chronik-search/src/handlers.rs`
+
+### SQ-2.4: BM25 parameter tuning (k1, b) _(optional — do last, likely near-optimal already)_
 - [ ] Investigate Tantivy 0.24 API for custom BM25 parameters
 - [ ] If not exposed: evaluate if custom `Scorer` wrapper is feasible
 - [ ] If exposed: grid search k1 in [0.5, 0.7, 0.9, 1.0, 1.2, 1.5] and b in [0.5, 0.6, 0.75, 0.85]
 - [ ] Use WANDS queries for evaluation, record NDCG@10 for each (k1, b) pair
 - [ ] Note: Tantivy defaults (k1=0.9, b=0.75) may already be near-optimal
 
-### SQ-2.4: Run WANDS evaluation
+### SQ-2.5: Run WANDS evaluation
 - [ ] Re-run with phrase matching + field boosting (+ BM25 tuning if done)
 - [ ] Record deltas vs Phase 1 baseline
 - [ ] Document results

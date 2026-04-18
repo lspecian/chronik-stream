@@ -106,6 +106,16 @@ pub struct IntegratedKafkaServer {
     leader_elector: Option<Arc<crate::leader_election::LeaderElector>>,
     /// v2.2.22: ISR tracker for admin API (tracks follower offsets from WAL ACKs)
     isr_tracker: Option<Arc<crate::isr_tracker::IsrTracker>>,
+    /// HP-1.3: Shared hot text index (NRT search), exposed so the unified API
+    /// search router can attach it to SearchApi at startup.
+    hot_text_index: Option<Arc<chronik_search::hot_text_index::HotTextIndex>>,
+    /// HP-2.x: Shared hot vector index (NRT ANN), exposed for query-time merge
+    /// and cold-flush eviction wiring.
+    hot_vector_index: Option<Arc<chronik_columnar::hot_vector_index::HotVectorIndex>>,
+    /// HP-2.x: Shared OnceLock for the batcher handle. main.rs populates it
+    /// after the embedder is built from env vars.
+    hot_vector_batcher_slot:
+        Option<Arc<std::sync::OnceLock<chronik_columnar::hot_vector_batcher::MicroBatcherHandle>>>,
 }
 
 impl Clone for IntegratedKafkaServer {
@@ -118,6 +128,9 @@ impl Clone for IntegratedKafkaServer {
             metadata_uploader: self.metadata_uploader.clone(),
             leader_elector: self.leader_elector.clone(),
             isr_tracker: self.isr_tracker.clone(),
+            hot_text_index: self.hot_text_index.clone(),
+            hot_vector_index: self.hot_vector_index.clone(),
+            hot_vector_batcher_slot: self.hot_vector_batcher_slot.clone(),
         }
     }
 }
@@ -133,6 +146,11 @@ impl IntegratedKafkaServer {
         metadata_uploader: Option<Arc<chronik_common::metadata::MetadataUploader>>,
         leader_elector: Option<Arc<crate::leader_election::LeaderElector>>,
         isr_tracker: Option<Arc<crate::isr_tracker::IsrTracker>>,
+        hot_text_index: Option<Arc<chronik_search::hot_text_index::HotTextIndex>>,
+        hot_vector_index: Option<Arc<chronik_columnar::hot_vector_index::HotVectorIndex>>,
+        hot_vector_batcher_slot: Option<
+            Arc<std::sync::OnceLock<chronik_columnar::hot_vector_batcher::MicroBatcherHandle>>,
+        >,
     ) -> Self {
         Self {
             config,
@@ -142,12 +160,36 @@ impl IntegratedKafkaServer {
             metadata_uploader,
             leader_elector,
             isr_tracker,
+            hot_text_index,
+            hot_vector_index,
+            hot_vector_batcher_slot,
         }
+    }
+
+    /// HP-2.x: Accessors for main.rs to complete wiring after embedder setup.
+    pub fn get_hot_vector_index(
+        &self,
+    ) -> Option<Arc<chronik_columnar::hot_vector_index::HotVectorIndex>> {
+        self.hot_vector_index.clone()
+    }
+
+    pub fn get_hot_vector_batcher_slot(
+        &self,
+    ) -> Option<Arc<std::sync::OnceLock<chronik_columnar::hot_vector_batcher::MicroBatcherHandle>>>
+    {
+        self.hot_vector_batcher_slot.clone()
     }
 
     /// Get reference to the WAL indexer for search integration
     pub fn get_wal_indexer(&self) -> Arc<WalIndexer> {
         self.wal_indexer.clone()
+    }
+
+    /// HP-1.3: Shared hot text index (None when disabled).
+    pub fn get_hot_text_index(
+        &self,
+    ) -> Option<Arc<chronik_search::hot_text_index::HotTextIndex>> {
+        self.hot_text_index.clone()
     }
 
 

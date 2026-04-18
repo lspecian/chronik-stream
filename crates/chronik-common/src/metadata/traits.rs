@@ -80,6 +80,21 @@ impl TopicConfig {
             .unwrap_or(false)  // 3. Hardcoded default: false (max performance)
     }
 
+    /// HP-3 Item 1: Check whether the in-memory hot text path is enabled
+    /// for this topic. Defaults to `true` — the hot path is opt-out at the
+    /// topic level, matching the global `CHRONIK_HOT_TEXT_ENABLED` default.
+    /// Setting `searchable.hot.enabled=false` on a topic disables the NRT
+    /// shadow into `HotTextIndex` (useful for high-volume log topics where
+    /// the realtime indexer's cadence is already acceptable).
+    ///
+    /// Only consulted when `is_searchable()` is already true.
+    pub fn is_searchable_hot_enabled(&self) -> bool {
+        if let Some(val) = self.config.get("searchable.hot.enabled") {
+            return val.eq_ignore_ascii_case("true");
+        }
+        true
+    }
+
     /// Create a searchable topic config
     pub fn with_searchable(mut self, searchable: bool) -> Self {
         self.config.insert("searchable".to_string(), searchable.to_string());
@@ -166,6 +181,21 @@ impl TopicConfig {
         std::env::var("CHRONIK_DEFAULT_VECTOR_ENABLED")
             .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(false) // 3. Hardcoded default: false
+    }
+
+    /// HP-2 follow-up B: Check whether the hot vector path is enabled for
+    /// this topic. Defaults to `true` — the hot path is opt-out at the
+    /// topic level, matching the global `CHRONIK_HOT_VECTOR_ENABLED`
+    /// default. Setting `vector.hot.enabled=false` on a topic disables
+    /// the NRT enqueue (useful for cost-sensitive OpenAI topics where you
+    /// only want cold-path embedding at WalIndexer tick cadence).
+    ///
+    /// Only consulted when `is_vector_enabled()` is already true.
+    pub fn is_vector_hot_enabled(&self) -> bool {
+        if let Some(val) = self.config.get("vector.hot.enabled") {
+            return val.eq_ignore_ascii_case("true");
+        }
+        true
     }
 
     /// Get the vector embedding provider (openai, external, local).

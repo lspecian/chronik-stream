@@ -52,6 +52,167 @@ pub async fn metrics_handler() -> impl IntoResponse {
     String::from_utf8(buffer).unwrap()
 }
 
+/// HP-1.3: Best-effort extraction of a plain-text query from a simple
+/// ElasticSearch QueryDsl so the hot index can be consulted.
+///
+/// Returns `None` when we can't flatten the DSL to a single string — in
+/// that case the hot index is skipped and only cold results are used.
+/// The cold (Tantivy) path continues to handle the full DSL as today.
+fn extract_simple_query_text(dsl: &QueryDsl) -> Option<String> {
+    match dsl {
+        QueryDsl::MatchAll(_) => Some("*".to_string()),
+        QueryDsl::Match(m) => m
+            .field_value
+            .values()
+            .next()
+            .and_then(|v| match v {
+                serde_json::Value::String(s) => Some(s.clone()),
+                serde_json::Value::Object(obj) => obj
+                    .get("query")
+                    .and_then(|q| q.as_str())
+                    .map(|s| s.to_string()),
+                _ => None,
+            }),
+        QueryDsl::Bool(b) => {
+            // Only handle simple Bool(must=[Match|MatchAll, ...]) shapes
+            let parts: Vec<String> = b
+                .must
+                .iter()
+                .chain(b.should.iter())
+                .filter_map(extract_simple_query_text)
+                .filter(|s| s != "*")
+                .collect();
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join(" "))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// HP-1.3: Convert a HotHit into the Elasticsearch-compatible Hit shape,
+/// matching the field layout produced by `search_tantivy_index`.
+fn hot_hit_to_es_hit(hit: crate::hot_text_index::HotHit) -> Hit {
+    let mut source = serde_json::Map::new();
+    source.insert("topic".to_string(), serde_json::Value::String(hit.topic.clone()));
+    source.insert(
+        "partition".to_string(),
+        serde_json::Value::Number(hit.partition.into()),
+    );
+    source.insert(
+        "offset".to_string(),
+        serde_json::Value::Number(hit.offset.into()),
+    );
+    source.insert(
+        "timestamp".to_string(),
+        serde_json::Value::Number(hit.timestamp.into()),
+    );
+    if let Some(k) = hit.key {
+        source.insert("key".to_string(), serde_json::Value::String(k));
+    }
+    source.insert("value".to_string(), serde_json::Value::String(hit.value));
+
+    Hit {
+        _index: hit.topic,
+        _id: hit.offset.to_string(),
+        _score: Some(hit.score),
+        _source: serde_json::Value::Object(source),
+        highlight: None,
+    }
+}
+
+/// HP-1.3: Query the hot index for a specific topic and return ES-shaped Hits.
+/// Empty Vec if hot index absent, topic unknown, or query text unextractable.
+async fn search_hot_topic(
+    api: &Arc<SearchApi>,
+    topic: &str,
+    request: &SearchRequest,
+) -> Vec<Hit> {
+    let Some(hot_idx) = api.hot_text_index.as_ref() else {
+        return Vec::new();
+    };
+    let Some(dsl) = request.query.as_ref() else {
+        return Vec::new();
+    };
+    let Some(query_text) = extract_simple_query_text(dsl) else {
+        return Vec::new();
+    };
+    let k = request.size.max(10);
+    match hot_idx.search_topic(topic, &query_text, k).await {
+        Ok(hits) => hits.into_iter().map(hot_hit_to_es_hit).collect(),
+        Err(e) => {
+            debug!("hot text search for topic {} failed: {}", topic, e);
+            Vec::new()
+        }
+    }
+}
+
+/// HP-1.3: Query the hot index across every known topic and return ES-shaped Hits.
+async fn search_hot_all(api: &Arc<SearchApi>, request: &SearchRequest) -> Vec<Hit> {
+    let Some(hot_idx) = api.hot_text_index.as_ref() else {
+        return Vec::new();
+    };
+    let Some(dsl) = request.query.as_ref() else {
+        return Vec::new();
+    };
+    let Some(query_text) = extract_simple_query_text(dsl) else {
+        return Vec::new();
+    };
+
+    let mut topics: Vec<String> = hot_idx
+        .partition_keys()
+        .into_iter()
+        .map(|(t, _)| t)
+        .collect();
+    topics.sort();
+    topics.dedup();
+
+    let k = request.size.max(10);
+    let mut out = Vec::new();
+    for topic in topics {
+        if let Some(filter) = &request.index {
+            if filter != &topic {
+                continue;
+            }
+        }
+        match hot_idx.search_topic(&topic, &query_text, k).await {
+            Ok(hits) => out.extend(hits.into_iter().map(hot_hit_to_es_hit)),
+            Err(e) => debug!("hot text search for topic {} failed: {}", topic, e),
+        }
+    }
+    out
+}
+
+/// HP-1.3: Merge hot hits with cold hits, preferring hot on (_index, _id) dedup.
+/// Both inputs are consumed; returned Vec is sorted by score desc.
+fn merge_hot_and_cold_hits(hot: Vec<Hit>, cold: Vec<Hit>) -> Vec<Hit> {
+    use std::collections::HashSet;
+    let mut seen: HashSet<(String, String)> = HashSet::with_capacity(hot.len() + cold.len());
+    let mut merged = Vec::with_capacity(hot.len() + cold.len());
+
+    for h in hot {
+        let key = (h._index.clone(), h._id.clone());
+        if seen.insert(key) {
+            merged.push(h);
+        }
+    }
+    for c in cold {
+        let key = (c._index.clone(), c._id.clone());
+        if seen.insert(key) {
+            merged.push(c);
+        }
+    }
+    merged.sort_by(|a, b| {
+        b._score
+            .unwrap_or(0.0)
+            .partial_cmp(&a._score.unwrap_or(0.0))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    merged
+}
+
 /// Search all indices
 pub async fn search_all(
     State(api): State<Arc<SearchApi>>,
@@ -62,9 +223,15 @@ pub async fn search_all(
     // Generate cache key
     let cache_key = crate::cache::QueryCache::generate_key(None, &request);
 
+    // HP-1.3: skip cache when hot index is active — cached responses would
+    // mask newly-visible NRT docs.
+    let hot_enabled = api.hot_text_index.is_some();
+
     // Check cache first
-    if let Some(cached_response) = api.cache.get(&cache_key) {
-        return Json(cached_response);
+    if !hot_enabled {
+        if let Some(cached_response) = api.cache.get(&cache_key) {
+            return Json(cached_response);
+        }
     }
 
     // Search across all indices
@@ -115,8 +282,17 @@ pub async fn search_all(
         all_hits.retain(|hit| hit._index == *index_filter);
     }
 
-    // Sort and limit results
-    all_hits.sort_by(|a, b| b._score.partial_cmp(&a._score).unwrap());
+    // HP-1.3: merge with hot index hits (NRT), preferring hot on dedup.
+    if hot_enabled {
+        let hot_hits = search_hot_all(&api, &request).await;
+        if !hot_hits.is_empty() {
+            debug!("hot text index contributed {} hits", hot_hits.len());
+        }
+        all_hits = merge_hot_and_cold_hits(hot_hits, all_hits);
+    } else {
+        // preserve existing behavior (cold-only sort)
+        all_hits.sort_by(|a, b| b._score.partial_cmp(&a._score).unwrap());
+    }
     all_hits.truncate(request.size);
 
     let took = start.elapsed().unwrap_or_default().as_millis() as u64;
@@ -143,8 +319,10 @@ pub async fn search_all(
         aggregations: None,
     };
 
-    // Cache the response
-    api.cache.put(cache_key, response.clone());
+    // Cache the response — skip when hot path active (would cache stale NRT view)
+    if !hot_enabled {
+        api.cache.put(cache_key, response.clone());
+    }
 
     Json(response)
 }
@@ -156,34 +334,55 @@ pub async fn search_index(
     Json(request): Json<SearchRequest>,
 ) -> impl IntoResponse {
     let start = SystemTime::now();
-    
-    let state = match api.indices.get(&index) {
-        Some(state) => state,
+
+    // HP-1.3: when the hot path is active and the in-memory `indices` map
+    // doesn't know this index, fall back to checking WAL/hot indices via the
+    // search_all path. For now, when the REST index is missing we still want
+    // hot results, so build an empty cold hits Vec rather than 404-ing.
+    let (cold_hits, aggregations) = match api.indices.get(&index) {
+        Some(state) => {
+            let hits = search_in_index(&index, &state, &request)
+                .await
+                .map_err(|e| search_error(e))?;
+
+            let aggregations = if let Some(aggs) = request.aggs.as_ref().or(request.aggregations.as_ref()) {
+                let query = match &request.query {
+                    Some(query_dsl) => build_tantivy_query(query_dsl, &state.schema, Some(&state.index))
+                        .map_err(|e| search_error(e))?,
+                    None => Box::new(AllQuery),
+                };
+
+                let agg_executor = crate::aggregations::AggregationExecutor::new(
+                    state.reader.clone(),
+                    state.schema.clone(),
+                );
+
+                Some(
+                    agg_executor
+                        .execute(query, aggs.clone())
+                        .map_err(|e| search_error(Error::Internal(format!("Aggregation failed: {}", e))))?,
+                )
+            } else {
+                None
+            };
+            (hits, aggregations)
+        }
+        None if api.hot_text_index.is_some() => {
+            // Hot-only path: the REST index isn't registered but the topic
+            // may still exist in the hot index (NRT before cold flush).
+            (Vec::new(), None)
+        }
         None => return Err(index_not_found_error(&index)),
     };
-    
-    let hits = search_in_index(&index, &state, &request).await
-        .map_err(|e| search_error(e))?;
-    
-    // Execute aggregations if present
-    let aggregations = if let Some(aggs) = request.aggs.as_ref().or(request.aggregations.as_ref()) {
-        let query = match &request.query {
-            Some(query_dsl) => build_tantivy_query(query_dsl, &state.schema, Some(&state.index))
-                .map_err(|e| search_error(e))?,
-            None => Box::new(AllQuery),
-        };
-        
-        let agg_executor = crate::aggregations::AggregationExecutor::new(
-            state.reader.clone(),
-            state.schema.clone()
-        );
-        
-        Some(agg_executor.execute(query, aggs.clone())
-            .map_err(|e| search_error(Error::Internal(format!("Aggregation failed: {}", e))))?)
+
+    // HP-1.3: merge with hot index hits; hot wins on (_index, _id) dedup.
+    let hits = if api.hot_text_index.is_some() {
+        let hot_hits = search_hot_topic(&api, &index, &request).await;
+        merge_hot_and_cold_hits(hot_hits, cold_hits)
     } else {
-        None
+        cold_hits
     };
-    
+
     let took = start.elapsed().unwrap_or_default().as_millis() as u64;
     
     let response = SearchResponse {
@@ -1061,4 +1260,125 @@ fn generate_highlights(
     // The snippet API has changed in recent versions of Tantivy
     // For now, return None to allow compilation
     Ok(None)
+}
+
+#[cfg(test)]
+mod hot_merge_tests {
+    use super::*;
+    use crate::api::MatchQuery;
+
+    fn h(idx: &str, id: &str, score: f32) -> Hit {
+        Hit {
+            _index: idx.to_string(),
+            _id: id.to_string(),
+            _score: Some(score),
+            _source: serde_json::json!({}),
+            highlight: None,
+        }
+    }
+
+    #[test]
+    fn extract_match_all_returns_star() {
+        let q = QueryDsl::MatchAll(crate::api::MatchAllQuery {});
+        assert_eq!(extract_simple_query_text(&q), Some("*".to_string()));
+    }
+
+    #[test]
+    fn extract_match_flat_string() {
+        let mut fv = HashMap::new();
+        fv.insert(
+            "value".to_string(),
+            serde_json::Value::String("leather sofa".into()),
+        );
+        let q = QueryDsl::Match(MatchQuery { field_value: fv });
+        assert_eq!(
+            extract_simple_query_text(&q),
+            Some("leather sofa".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_match_object_form_with_query_key() {
+        let mut fv = HashMap::new();
+        fv.insert(
+            "value".to_string(),
+            serde_json::json!({ "query": "running shoes" }),
+        );
+        let q = QueryDsl::Match(MatchQuery { field_value: fv });
+        assert_eq!(
+            extract_simple_query_text(&q),
+            Some("running shoes".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_bool_concatenates_matches() {
+        let mut fv1 = HashMap::new();
+        fv1.insert("value".to_string(), serde_json::Value::String("alpha".into()));
+        let mut fv2 = HashMap::new();
+        fv2.insert("key".to_string(), serde_json::Value::String("beta".into()));
+        let q = QueryDsl::Bool(crate::api::BoolQuery {
+            must: vec![
+                QueryDsl::Match(MatchQuery { field_value: fv1 }),
+                QueryDsl::Match(MatchQuery { field_value: fv2 }),
+            ],
+            should: vec![],
+            must_not: vec![],
+            filter: vec![],
+        });
+        assert_eq!(
+            extract_simple_query_text(&q),
+            Some("alpha beta".to_string())
+        );
+    }
+
+    #[test]
+    fn merge_prefers_hot_on_conflict() {
+        // Same (index, id) present in both — hot wins regardless of score.
+        let hot = vec![h("topic", "42", 1.0)];
+        let cold = vec![h("topic", "42", 99.0), h("topic", "7", 5.0)];
+        let merged = merge_hot_and_cold_hits(hot.clone(), cold);
+
+        // Total length = 2 (hot 42 replaces cold 42) + cold 7
+        assert_eq!(merged.len(), 2);
+
+        // The hot 42 (score 1.0) should be in the merged set — verified
+        // by checking its score matches the hot version, not the cold.
+        let hit_42 = merged.iter().find(|h| h._id == "42").unwrap();
+        assert_eq!(hit_42._score, Some(1.0));
+    }
+
+    #[test]
+    fn merge_sorts_by_score_desc() {
+        let hot = vec![h("t", "1", 0.5)];
+        let cold = vec![h("t", "2", 10.0), h("t", "3", 2.0)];
+        let merged = merge_hot_and_cold_hits(hot, cold);
+        assert_eq!(merged[0]._id, "2");
+        assert_eq!(merged[1]._id, "3");
+        assert_eq!(merged[2]._id, "1");
+    }
+
+    #[test]
+    fn hot_hit_conversion_preserves_fields() {
+        let hh = crate::hot_text_index::HotHit {
+            topic: "orders".into(),
+            partition: 3,
+            offset: 1234,
+            timestamp: 1_700_000_000,
+            score: 0.75,
+            key: Some("k1".into()),
+            value: "payload text".into(),
+        };
+        let es = hot_hit_to_es_hit(hh);
+        assert_eq!(es._index, "orders");
+        assert_eq!(es._id, "1234");
+        assert_eq!(es._score, Some(0.75));
+        let src = es._source.as_object().unwrap();
+        assert_eq!(src.get("partition").and_then(|v| v.as_i64()), Some(3));
+        assert_eq!(src.get("offset").and_then(|v| v.as_i64()), Some(1234));
+        assert_eq!(
+            src.get("value").and_then(|v| v.as_str()),
+            Some("payload text")
+        );
+    }
 }

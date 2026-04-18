@@ -16,8 +16,49 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info};
 
 use chronik_columnar::{VectorSearchFilters, VectorSearchResult, VectorSearchService};
+use chronik_columnar::hot_vector_index::HotVectorHit;
 
 use super::UnifiedApiState;
+
+/// HP-2.5: merge hot vector hits with cold `VectorSearchResult`s.
+///
+/// Dedup by `(partition, offset)` — hot wins on conflict because its vector
+/// is more recent (the cold path may have a stale vector from an earlier
+/// embedding round). Result is sorted by `score` ascending (cold convention:
+/// lower = better for distance metrics) and truncated to `top_k`.
+fn merge_hot_cold_results(
+    hot: Vec<HotVectorHit>,
+    cold: Vec<VectorSearchResult>,
+    top_k: usize,
+) -> Vec<VectorSearchResult> {
+    use std::collections::HashSet;
+    let mut seen: HashSet<(i32, i64)> = HashSet::with_capacity(hot.len() + cold.len());
+    let mut merged: Vec<VectorSearchResult> = Vec::with_capacity(hot.len() + cold.len());
+    for h in hot {
+        if seen.insert((h.partition, h.offset)) {
+            merged.push(VectorSearchResult {
+                topic: h.topic,
+                partition: h.partition,
+                offset: h.offset,
+                score: h.distance,
+                text_preview: None,
+                embedding: None,
+            });
+        }
+    }
+    for c in cold {
+        if seen.insert((c.partition, c.offset)) {
+            merged.push(c);
+        }
+    }
+    merged.sort_by(|a, b| {
+        a.score
+            .partial_cmp(&b.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    merged.truncate(top_k);
+    merged
+}
 
 /// Text-based vector search request
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -324,6 +365,30 @@ pub async fn search(
                 service.get_vector_count(&topic).await
             };
             let mut reranked = false;
+
+            // HP-2.5: merge hot vector hits if the hot path is wired + we have
+            // a cached query embedding. The cache is populated by the cold path's
+            // search_by_text call immediately above, so this piggybacks on it
+            // without a second embedding call.
+            if let (Some(hot_idx), Some(cache)) =
+                (&state.hot_vector_index, &state.embedding_cache)
+            {
+                if let Some(qvec) = cache.get(&request.query).await {
+                    match hot_idx.search_topic(&topic, &qvec, search_k).await {
+                        Ok(hot_hits) if !hot_hits.is_empty() => {
+                            results = merge_hot_cold_results(
+                                hot_hits,
+                                results,
+                                search_k,
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            debug!(topic = %topic, "hot vector search failed: {}", e);
+                        }
+                    }
+                }
+            }
 
             // VO-4: Apply cross-encoder re-ranking if enabled
             if rerank_enabled {
@@ -830,7 +895,7 @@ pub async fn hybrid_search(
     ).with_cache(state.embedding_cache.clone());
 
     // VO-5: Use model-specific search when model param provided
-    let vector_results = if let Some(ref model_id) = request.model {
+    let mut vector_results = if let Some(ref model_id) = request.model {
         match service.search_by_text_model(&topic, &request.query, search_k, filters.clone(), model_id).await {
             Ok(results) => results,
             Err(e) => {
@@ -847,6 +912,20 @@ pub async fn hybrid_search(
             }
         }
     };
+
+    // HP-2 follow-up C: merge hot vector hits into the hybrid vector side.
+    // Piggybacks on the query embedding cache populated by search_by_text above.
+    if let (Some(hot_idx), Some(cache)) =
+        (&state.hot_vector_index, &state.embedding_cache)
+    {
+        if let Some(qvec) = cache.get(&request.query).await {
+            if let Ok(hot_hits) = hot_idx.search_topic(&topic, &qvec, search_k).await {
+                if !hot_hits.is_empty() {
+                    vector_results = merge_hot_cold_results(hot_hits, vector_results, search_k);
+                }
+            }
+        }
+    }
 
     let vector_results_count = vector_results.len();
 
@@ -880,6 +959,30 @@ pub async fn hybrid_search(
                         Ok(hits) => results.extend(hits),
                         Err(e) => {
                             debug!(topic = %topic, error = %e, "Real-time text search failed in hybrid");
+                        }
+                    }
+                }
+                // HP-2 follow-up C: include hot text index hits so NRT
+                // documents participate in RRF fusion alongside the BM25 side.
+                if let Some(ref api) = state.search_api {
+                    if let Some(ref hot_text) = api.hot_text_index {
+                        if let Ok(hot_hits) = hot_text
+                            .search_topic(&topic, &request.query, search_k)
+                            .await
+                        {
+                            // Prepend so the earliest ranks go to hot — matches
+                            // the "hot wins on conflict" policy from /_search.
+                            let mut prefixed: Vec<(i32, i64, Option<String>)> = hot_hits
+                                .into_iter()
+                                .map(|h| (h.partition, h.offset, Some(h.value)))
+                                .collect();
+                            prefixed.append(&mut results);
+                            // dedup by (partition, offset) preserving first occurrence
+                            use std::collections::HashSet;
+                            let mut seen: HashSet<(i32, i64)> =
+                                HashSet::with_capacity(prefixed.len());
+                            prefixed.retain(|(p, o, _)| seen.insert((*p, *o)));
+                            results = prefixed;
                         }
                     }
                 }

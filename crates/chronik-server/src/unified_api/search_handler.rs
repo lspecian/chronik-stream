@@ -40,10 +40,23 @@ pub fn create_search_api(
     wal_indexer: Arc<WalIndexer>,
     index_base_path: &str,
 ) -> Result<Arc<SearchApi>, chronik_common::Error> {
-    // Note: index_base_path is already the full path to tantivy_indexes from main.rs
-    // The handler will also search "{base_path}" with "tantivy_indexes" replaced by "index"
-    // to find RealtimeIndexer's indices
-    Ok(Arc::new(SearchApi::new_with_wal_indexer(wal_indexer, index_base_path.to_string())?))
+    create_search_api_with_hot(wal_indexer, index_base_path, None)
+}
+
+/// HP-1.3: Variant that accepts an optional hot text index for NRT search.
+/// When provided, `/_search` and `/:index/_search` merge hot hits with
+/// cold results, preferring hot on (_index, _id) dedup.
+#[cfg(feature = "search")]
+pub fn create_search_api_with_hot(
+    wal_indexer: Arc<WalIndexer>,
+    index_base_path: &str,
+    hot_text_index: Option<Arc<chronik_search::hot_text_index::HotTextIndex>>,
+) -> Result<Arc<SearchApi>, chronik_common::Error> {
+    let mut api = SearchApi::new_with_wal_indexer(wal_indexer, index_base_path.to_string())?;
+    if let Some(hot) = hot_text_index {
+        api = api.with_hot_text_index(hot);
+    }
+    Ok(Arc::new(api))
 }
 
 /// Get the search API router for mounting in the unified API

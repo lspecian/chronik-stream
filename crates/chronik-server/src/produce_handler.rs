@@ -23,7 +23,9 @@ use chronik_storage::kafka_records::{
 use chronik_search::{
     realtime_indexer::{RealtimeIndexer, JsonDocument, RealtimeIndexerConfig},
     json_pipeline::JsonPipeline,
+    hot_text_index::{HotTextIndex, HotDoc},
 };
+use chronik_columnar::hot_vector_batcher::{MicroBatcherHandle, PendingEmbed};
 use serde_json::Map as JsonMap;
 use chronik_storage::{
     RecordBatch, Record, SegmentWriter,
@@ -488,6 +490,18 @@ pub struct ProduceHandler {
     /// Key: topic name, Value: (is_searchable, last_updated)
     /// TTL: 60 seconds to pick up config changes within reasonable time
     searchable_topic_cache: Arc<DashMap<String, (bool, std::time::Instant)>>,
+    /// Hot path NRT search — in-memory Tantivy shadowing the WAL tail.
+    /// Fire-and-forget from the produce path; never blocks acks.
+    /// See `docs/ROADMAP_HOT_PATH.md` (HP-1.2).
+    hot_text_index: Option<Arc<HotTextIndex>>,
+    /// Hot path NRT vector search — micro-batcher feeds the hot vector index.
+    /// Fire-and-forget enqueue; embedder runs off the produce thread.
+    /// See `docs/ROADMAP_HOT_PATH.md` (HP-2.3).
+    ///
+    /// The outer `Arc<OnceLock<...>>` is shared with main.rs — the builder
+    /// creates the lock, main.rs initializes it once the embedder has been
+    /// constructed from env vars. Reads are lock-free.
+    hot_vector_batcher: Option<Arc<std::sync::OnceLock<MicroBatcherHandle>>>,
 }
 
 /// Replication request for ISR management
@@ -1032,6 +1046,8 @@ impl ProduceHandler {
             pipelined_pool: Arc::new(PipelinedConnectionPool::new(10000)),  // v2.2.9: Async pipelined connection pool (capacity increased from 1000 → 10000 to prevent channel blocking)
             response_pipeline: None,  // v2.2.10: Initialize as None (set via set_response_pipeline) - CRITICAL FIX #7
             searchable_topic_cache: Arc::new(DashMap::new()),  // v2.2.16: Cache for topic searchability
+            hot_text_index: None,  // HP-1.2: Wired via set_hot_text_index
+            hot_vector_batcher: None,  // HP-2.3: Wired via set_hot_vector_batcher
         })
     }
 
@@ -2235,7 +2251,15 @@ impl ProduceHandler {
                                             );
                                             if is_searchable {
                                                 self.send_to_indexer(topic, partition, &records).await;
+                                                // HP-1.2: fire-and-forget shadow into hot index
+                                                self.send_to_hot_text_index(topic, partition, &records);
                                             }
+                                        }
+
+                                        // HP-2.3: fire-and-forget enqueue into the hot vector batcher
+                                        // (gated on vector.enabled, independent of is_searchable)
+                                        if self.is_topic_vector_enabled(topic).await {
+                                            self.send_to_hot_vector_batcher(topic, partition, &records);
                                         }
 
                                         // Reconstruct response to match function return type (5 fields only)
@@ -2355,7 +2379,14 @@ impl ProduceHandler {
             );
             if is_searchable {
                 self.send_to_indexer(topic, partition, &records).await;
+                // HP-1.2: fire-and-forget shadow into hot index
+                self.send_to_hot_text_index(topic, partition, &records);
             }
+        }
+
+        // HP-2.3: fire-and-forget enqueue into the hot vector batcher
+        if self.is_topic_vector_enabled(topic).await {
+            self.send_to_hot_vector_batcher(topic, partition, &records);
         }
 
         // Handle acknowledgment modes
@@ -2931,6 +2962,107 @@ impl ProduceHandler {
     }
     
     /// Send records to indexing pipeline
+    /// Attach the hot text index so produce writes shadow into it.
+    /// HP-1.2. Called once at builder-init time.
+    pub fn set_hot_text_index(&mut self, index: Arc<HotTextIndex>) {
+        info!("Setting HotTextIndex for ProduceHandler — NRT search enabled");
+        self.hot_text_index = Some(index);
+    }
+
+    /// Attach the shared batcher-handle slot. HP-2.3. The slot may be empty
+    /// at this point — main.rs will populate it once the embedder is built.
+    pub fn set_hot_vector_batcher_slot(
+        &mut self,
+        slot: Arc<std::sync::OnceLock<MicroBatcherHandle>>,
+    ) {
+        info!("Wired HotVectorBatcher slot for ProduceHandler");
+        self.hot_vector_batcher = Some(slot);
+    }
+
+    /// HP-2.3: Check whether a topic has vector search enabled AND the
+    /// hot-path (NRT) enqueue is enabled for it. Users opt out of the hot
+    /// path per-topic via `vector.hot.enabled=false` — cold-path embedding
+    /// still runs on the WalIndexer cadence. HP-2 follow-up B.
+    ///
+    /// Best-effort: if the metadata call fails the request is simply not
+    /// enqueued (cold path still embeds it later).
+    async fn is_topic_vector_enabled(&self, topic: &str) -> bool {
+        match self.metadata_store.get_topic(topic).await {
+            Ok(Some(meta)) => {
+                meta.config.is_vector_enabled() && meta.config.is_vector_hot_enabled()
+            }
+            _ => false,
+        }
+    }
+
+    /// Fire-and-forget enqueue into the hot vector micro-batcher. Never
+    /// blocks the produce path. Silently drops under overflow (the cold
+    /// path still embeds these offsets from WAL).
+    fn send_to_hot_vector_batcher(
+        &self,
+        topic: &str,
+        partition: i32,
+        records: &[ProduceRecord],
+    ) {
+        let Some(slot) = &self.hot_vector_batcher else { return };
+        let Some(handle) = slot.get() else { return };
+        for r in records {
+            // For Phase 2 first pass the embedded text is the UTF-8 value.
+            // `vector.field` config support (key, JSON path) lands later.
+            let text = match std::str::from_utf8(&r.value) {
+                Ok(s) => s.to_string(),
+                Err(_) => continue, // skip binary payloads
+            };
+            handle.enqueue(PendingEmbed {
+                topic: topic.to_string(),
+                partition,
+                offset: r.offset,
+                text,
+                produce_timestamp_ms: r.timestamp,
+            });
+        }
+    }
+
+    /// Fire-and-forget shadow of this batch into the in-memory hot index.
+    /// Returns immediately — the actual add_document call runs on a spawned
+    /// task so the produce path never waits on the tantivy write lock.
+    ///
+    /// No disk I/O. No backpressure. If the hot index falls behind, cold path
+    /// still catches every record from WAL.
+    fn send_to_hot_text_index(&self, topic: &str, partition: i32, records: &[ProduceRecord]) {
+        let Some(idx) = &self.hot_text_index else { return };
+        if records.is_empty() {
+            return;
+        }
+        let hot_idx = Arc::clone(idx);
+        let topic_owned = topic.to_string();
+        let metadata_store = Arc::clone(&self.metadata_store);
+        let docs: Vec<HotDoc> = records
+            .iter()
+            .map(|r| HotDoc {
+                offset: r.offset,
+                timestamp: r.timestamp,
+                key: r.key.as_ref().and_then(|k| String::from_utf8(k.clone()).ok()),
+                value: String::from_utf8_lossy(&r.value).into_owned(),
+                headers: None,
+            })
+            .collect();
+        tokio::spawn(async move {
+            // HP-3 Item 1: per-topic hot opt-out. Already gated on
+            // is_topic_searchable at the call site; this is the extra check
+            // for `searchable.hot.enabled=false`. Doing the lookup in the
+            // spawned task keeps the produce path off the metadata read.
+            if let Ok(Some(meta)) = metadata_store.get_topic(&topic_owned).await {
+                if !meta.config.is_searchable_hot_enabled() {
+                    return;
+                }
+            }
+            if let Err(e) = hot_idx.add_batch(&topic_owned, partition, &docs).await {
+                trace!(topic = %topic_owned, partition, "hot_text_index add_batch failed: {}", e);
+            }
+        });
+    }
+
     async fn send_to_indexer(&self, topic: &str, partition: i32, records: &[ProduceRecord]) {
         debug!("v2.2.16: send_to_indexer called for {} records on {}-{}", records.len(), topic, partition);
         if let Some(sender) = &self.index_sender {
@@ -3652,6 +3784,8 @@ impl Clone for ProduceHandler {
             pipelined_pool: Arc::clone(&self.pipelined_pool),  // v2.2.9: Async pipelined connection pool
             response_pipeline: self.response_pipeline.clone(),  // v2.2.10: Async response delivery (CRITICAL FIX #7)
             searchable_topic_cache: Arc::clone(&self.searchable_topic_cache),  // v2.2.16: Share cache
+            hot_text_index: self.hot_text_index.clone(),  // HP-1.2
+            hot_vector_batcher: self.hot_vector_batcher.clone(),  // HP-2.3
         }
     }
 }

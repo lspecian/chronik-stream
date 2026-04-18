@@ -150,6 +150,9 @@ pub struct UnifiedApiState {
     /// Distributed query router for cluster-mode scatter-gather fan-out.
     /// None in single-node mode — queries execute locally only.
     pub query_router: Option<Arc<query_router::QueryRouter>>,
+    /// HP-2.5: Shared hot vector index for NRT ANN search.
+    /// When present, `/_vector/:topic/search` merges hot hits with cold HNSW.
+    pub hot_vector_index: Option<Arc<chronik_columnar::hot_vector_index::HotVectorIndex>>,
 }
 
 impl UnifiedApiState {
@@ -175,7 +178,17 @@ impl UnifiedApiState {
             wal_indexer: None,
             reranker: None,
             query_router: None,
+            hot_vector_index: None,
         }
+    }
+
+    /// HP-2.5: Attach the shared hot vector index for NRT ANN search.
+    pub fn with_hot_vector_index(
+        mut self,
+        index: Arc<chronik_columnar::hot_vector_index::HotVectorIndex>,
+    ) -> Self {
+        self.hot_vector_index = Some(index);
+        self
     }
 
     /// Set the WalIndexer for vector backfill support
