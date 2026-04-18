@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.0] - 2026-04-18
+
+### Added
+
+- **Hot text search path** — in-memory Tantivy `RAMDirectory` per `(topic, partition)` that shadows the WAL tail for near-real-time `/_search`. Default on; disable with `--disable-hot-text` or `CHRONIK_HOT_TEXT_ENABLED=false`. Measured: p50 201ms / p99 507ms produce → queryable (vs 30-60s cold-only). No produce regression (< 1% across all percentiles).
+- **Hot vector search path** — brute-force top-k shadow plus a `MicroBatcher` that feeds the embedding provider on its own worker. Works with both `external` (local model) and `openai` providers, with per-provider default tuning. Default on.
+  - Local embedder: p50 18ms / p99 31ms freshness (mock embedder)
+  - OpenAI `text-embedding-3-small`: p50 121ms / p99 141ms freshness, real measurement
+  - Single-embed cache: cold pipeline reuses hot-cached vectors before calling the embedder, eliminating double billing (metric: `chronik_hot_vector_cache_total{result}`)
+- **Unified hot-path cold handoff** — `ColdFlushListener` trait in `chronik-storage::wal_indexer` now supports multiple listeners (Vec), so both hot text and hot vector eviction fire after each WalIndexer commit. RAM is bounded by trim-on-commit + hard-reset when tombstones accumulate past 2× cap.
+- **20+ new Prometheus metrics** (`chronik_hot_*` prefix) covering docs added/evicted, queue enqueue/drop, batches flushed success/error, cache hit/miss, per-partition search latency, and produce → visible-in-hot-index freshness histograms (`chronik_hot_text_visibility_lag_ms`, `chronik_hot_vector_visibility_lag_ms`).
+- **Per-topic hot-path opt-out** — `searchable.hot.enabled=false` disables NRT text shadow for one topic; `vector.hot.enabled=false` does the same for vector. Global defaults still apply elsewhere.
+- **`--disable-hot-text` CLI flag** on `chronik-server start`, visible in `--help`.
+- **Long-text truncation** — embedder inputs are clipped to `max_input_tokens() * 2` bytes at a UTF-8 char boundary, preventing provider-side rejections on oversize payloads.
+- **Hybrid search hot wiring** — `/_vector/:topic/hybrid` now merges hot vector and hot text hits into its RRF fusion (previously only cold Tantivy + cold HNSW).
+- **Operator guide** — `docs/HOT_PATH_GUIDE.md` with knobs, metrics catalog, failure-mode recovery table, OpenAI cost estimate table, and structured log fields (`hot_path`, `event`).
+- **Bench harness** — `tests/bench_hot_text_{freshness,regression}.sh`, `tests/bench_hot_vector.sh`, `tests/bench_hot_vector_openai.sh` (real OpenAI, auto-loads `.env`), and `tests/mock_embedder/` (hyper-based fake embedder for reproducible local testing).
+- **Structured log fields** — `hot_path=text|vector`, `event=queue_overflow|embedder_error|partition_reset`; sampled WARN on sustained queue overflow (first drop + every 1000th).
+
+### Fixed
+
+- **Docker image crashed on start (closes #1)** — `Dockerfile.binary` still used the pre-v2.2.0 CLI (`--bind-addr` flag and `standalone` subcommand, both removed in v2.2.0). `ENTRYPOINT`/`CMD` now use the current `start --bind 0.0.0.0 --data-dir /data` form. `EXPOSE` refreshed to `9092 6092 13092` (dropped stale 9093, added Unified API and Prometheus ports).
+
+### Changed
+
+- Environment-variable documentation in `CLAUDE.md` expanded with hot-path knobs (`CHRONIK_HOT_TEXT_*`, `CHRONIK_HOT_VECTOR_*`) and per-provider defaults.
+- `docs/VECTOR_SEARCH_GUIDE.md` and `docs/ROADMAP_SEARCH_QUALITY.md` freshness tables replaced stale "30-90s" copy with measured hot-path numbers.
+
 ## [2.4.1] - 2026-03-06
 
 ### Fixed
