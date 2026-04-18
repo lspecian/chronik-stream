@@ -29,13 +29,19 @@ USER chronik
 # Data volume
 VOLUME ["/data"]
 
-# Expose Kafka and metrics ports
-EXPOSE 9092 9093
+# Expose ports:
+#   9092  — Kafka protocol
+#   6092  — Unified API (SQL, vector search, Elasticsearch-compat search, admin)
+#   13092 — Prometheus metrics (default single-node port = 13000 + node_id=92)
+EXPOSE 9092 6092 13092
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD nc -z localhost 9092 || exit 1
 
-# Run the server
+# Run the server (v2.2.0+ CLI: `start` auto-detects single-node vs cluster mode).
+# IMPORTANT: set CHRONIK_ADVERTISE (or pass --advertise) when running so Kafka
+# clients receive a reachable address instead of 0.0.0.0:
+#   docker run -e CHRONIK_ADVERTISE=my-hostname ghcr.io/lspecian/chronik-stream:latest
 ENTRYPOINT ["chronik-server"]
-CMD ["--bind-addr", "0.0.0.0", "--data-dir", "/data", "standalone"]
+CMD ["start", "--bind", "0.0.0.0", "--data-dir", "/data"]
