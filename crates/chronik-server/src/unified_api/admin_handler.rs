@@ -40,7 +40,7 @@ use chronik_common::metadata::traits::MetadataStore;
 /// # Returns
 /// An AdminApiState ready for use with the unified API router
 pub fn create_admin_state(
-    raft_cluster: Arc<RaftCluster>,
+    raft_cluster: Option<Arc<RaftCluster>>,
     metadata_store: Arc<dyn MetadataStore>,
     api_key: Option<String>,
     isr_tracker: Option<Arc<IsrTracker>>,
@@ -95,7 +95,7 @@ pub fn admin_router(state: AdminApiState) -> Router {
 /// # Returns
 /// An Axum router ready for merging into the unified API
 pub fn create_admin_router_for_unified_api(
-    raft_cluster: Arc<RaftCluster>,
+    raft_cluster: Option<Arc<RaftCluster>>,
     metadata_store: Arc<dyn MetadataStore>,
     api_key: Option<String>,
     isr_tracker: Option<Arc<IsrTracker>>,

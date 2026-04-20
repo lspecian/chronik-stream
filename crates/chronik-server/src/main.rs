@@ -819,7 +819,7 @@ async fn run_cluster_mode(
 
     // Create admin router for unified API (cluster management + Schema Registry)
     let admin_router = unified_api::create_admin_router_for_unified_api(
-        raft_cluster.clone(),
+        Some(raft_cluster.clone()),
         server.metadata_store().clone(),
         None, // Uses CHRONIK_ADMIN_API_KEY env var
         server.isr_tracker(),
@@ -1198,12 +1198,30 @@ async fn run_single_node_mode(
             info!("✓ SearchApi wired into query orchestrator for text search");
         }
 
+        // v2.5.2: single-node admin router. `raft_cluster: None` signals to
+        // mutation handlers (add-node / remove-node / rebalance) that they
+        // should return a 501-ish JSON body explaining why. `/admin/health`
+        // and Schema Registry routes work unchanged — they don't need Raft.
+        let schema_registry_single = Arc::new(schema_registry::SchemaRegistry::new(
+            schema_registry::SchemaRegistryConfig::from_env()
+        ));
+        let admin_router_single = unified_api::create_admin_router_for_unified_api(
+            None, // no Raft in single-node
+            server.metadata_store().clone(),
+            None, // Uses CHRONIK_ADMIN_API_KEY env var
+            None, // no ISR tracker in single-node
+            schema_registry_single,
+        );
+
         let _unified_handle = unified_api::start_unified_api_with_state(
             unified_state,
             search_router,
-            None, // admin_router - not needed in single-node mode
+            Some(admin_router_single),
         ).await?;
         info!("Unified API available at http://{}:6092", bind);
+        info!("  /admin/health         — liveness probe (no auth)");
+        info!("  /admin/status         — cluster status (requires X-API-Key if CHRONIK_ADMIN_API_KEY is set)");
+        info!("  /subjects/*, /schemas/*, /config — Schema Registry (Confluent-compatible)");
     }
 
     // Start server with signal handling

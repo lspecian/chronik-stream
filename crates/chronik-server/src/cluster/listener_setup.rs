@@ -103,7 +103,7 @@ pub async fn start_admin_api(
     info!("Starting Admin API + Schema Registry on port {}", admin_port);
 
     let admin_api_key = std::env::var("CHRONIK_ADMIN_API_KEY").ok();
-    admin_api::start_admin_api(raft_cluster, metadata_store, admin_port, admin_api_key, isr_tracker, schema_registry).await?;
+    admin_api::start_admin_api(Some(raft_cluster), metadata_store, admin_port, admin_api_key, isr_tracker, schema_registry).await?;
 
     info!("✓ Admin API available at http://{}:{}/admin", bind, admin_port);
     info!("✓ Schema Registry available at http://{}:{}/subjects", bind, admin_port);

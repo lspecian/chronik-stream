@@ -59,7 +59,10 @@ use chronik_common::metadata::traits::MetadataStore;
 /// Admin API state shared across handlers
 #[derive(Clone)]
 pub struct AdminApiState {
-    pub raft_cluster: Arc<RaftCluster>,
+    /// v2.5.2: Optional so single-node mode (no Raft) can still expose
+    /// `/admin/health`, `/subjects/*`, `/schemas/*`. Mutation routes that
+    /// require cluster consensus return 501 when this is None.
+    pub raft_cluster: Option<Arc<RaftCluster>>,
     pub metadata_store: Arc<dyn MetadataStore>,
     pub api_key: Option<String>,
     /// v2.2.22: ISR tracker for accurate in-sync replica queries
@@ -228,8 +231,16 @@ async fn handle_node_removal(
         req.node_id, req.force
     );
 
+    let Some(raft) = state.raft_cluster.clone() else {
+        return Ok(Json(RemoveNodeResponse {
+            success: false,
+            message: "remove-node requires cluster mode (no Raft in single-node)".into(),
+            node_id: None,
+        }));
+    };
+
     // Call helper function instead of direct method call
-    match do_remove_node(state.raft_cluster.clone(), req.node_id, req.force).await {
+    match do_remove_node(raft, req.node_id, req.force).await {
         Ok(()) => {
             info!("✓ Successfully proposed removing node {}", req.node_id);
             Ok(Json(RemoveNodeResponse {
@@ -272,9 +283,16 @@ async fn handle_add_node(
         }));
     }
 
+    let Some(raft) = state.raft_cluster.as_ref() else {
+        return Ok(Json(AddNodeResponse {
+            success: false,
+            message: "add-node requires cluster mode (no Raft in single-node)".into(),
+            node_id: None,
+        }));
+    };
+
     // Call RaftCluster::propose_add_node()
-    match state
-        .raft_cluster
+    match raft
         .propose_add_node(
             req.node_id,
             req.kafka_addr.clone(),
@@ -306,14 +324,22 @@ async fn handle_add_node(
 }
 
 /// GET /admin/health - Health check endpoint
+///
+/// v2.5.2: Works in both single-node (no Raft) and cluster mode. Reports
+/// `"standalone": true` and `cluster_nodes = []` when no Raft cluster is
+/// attached. Safe for Kubernetes liveness / Docker HEALTHCHECK probes in
+/// any deployment topology.
 async fn handle_health(
     State(state): State<AdminApiState>,
 ) -> Result<Json<HealthResponse>, AdminApiError> {
-    let cluster_nodes = state.raft_cluster.get_all_nodes().await;
-    let node_id = state.raft_cluster.node_id();
-
-    // Check if this node is the leader
-    let is_leader = state.raft_cluster.is_leader().await;
+    let (node_id, is_leader, cluster_nodes) = match state.raft_cluster.as_ref() {
+        Some(raft) => (
+            raft.node_id(),
+            raft.is_leader().await,
+            raft.get_all_nodes().await,
+        ),
+        None => (1, true, Vec::new()), // Single-node: always "leader" of itself
+    };
 
     Ok(Json(HealthResponse {
         status: "ok".to_string(),
@@ -329,19 +355,39 @@ async fn handle_status(
 ) -> Result<Json<ClusterStatusResponse>, AdminApiError> {
     info!("Admin API: Received cluster status request");
 
-    let node_id = state.raft_cluster.node_id();
-    let is_leader = state.raft_cluster.is_leader().await;
-    let (leader_ready, leader_id, _) = state.raft_cluster.is_leader_ready().await;
-
-    // Get all nodes with their information
-    let node_info = state.raft_cluster.get_node_info();
-    let nodes: Vec<NodeInfo> = node_info.iter().map(|(id, addr)| {
-        NodeInfo {
-            node_id: *id,
-            address: addr.clone(),
-            is_leader: *id == leader_id,
+    // v2.5.2: Single-node responds with a one-node "cluster" summary.
+    let (node_id, is_leader, leader_id_opt, nodes) = match state.raft_cluster.as_ref() {
+        Some(raft) => {
+            let nid = raft.node_id();
+            let is_ldr = raft.is_leader().await;
+            let (leader_ready, leader_id, _) = raft.is_leader_ready().await;
+            let node_info = raft.get_node_info();
+            let nodes: Vec<NodeInfo> = node_info
+                .iter()
+                .map(|(id, addr)| NodeInfo {
+                    node_id: *id,
+                    address: addr.clone(),
+                    is_leader: *id == leader_id,
+                })
+                .collect();
+            (
+                nid,
+                is_ldr,
+                if leader_ready { Some(leader_id) } else { None },
+                nodes,
+            )
         }
-    }).collect();
+        None => (
+            1,
+            true,
+            Some(1),
+            vec![NodeInfo {
+                node_id: 1,
+                address: "localhost".into(),
+                is_leader: true,
+            }],
+        ),
+    };
 
     // Get all partition assignments from metadata store (not Raft - v2.2.13 fix)
     // v2.2.22: Pass isr_tracker for accurate ISR queries
@@ -358,7 +404,7 @@ async fn handle_status(
 
     Ok(Json(ClusterStatusResponse {
         node_id,
-        leader_id: if leader_ready { Some(leader_id) } else { None },
+        leader_id: leader_id_opt,
         is_leader,
         nodes,
         partitions,
@@ -371,8 +417,16 @@ async fn handle_rebalance(
 ) -> Result<Json<RebalanceResponse>, AdminApiError> {
     info!("Admin API: Received rebalance request");
 
+    let Some(raft) = state.raft_cluster.as_ref() else {
+        return Ok(Json(RebalanceResponse {
+            success: false,
+            message: "rebalance requires cluster mode (no Raft in single-node)".into(),
+            topics_rebalanced: 0,
+        }));
+    };
+
     // Get current cluster nodes
-    let current_nodes = state.raft_cluster.get_all_nodes().await;
+    let current_nodes = raft.get_all_nodes().await;
     let node_count = current_nodes.len();
 
     if node_count == 0 {
@@ -758,13 +812,27 @@ async fn handle_set_subject_config(
     }
 }
 
+/// v2.5.2: helper that turns an auth/route failure into a JSON body.
+/// Prevents the "accepts TCP but returns empty HTTP" operator confusion
+/// where axum 0.6's `Err(StatusCode)` produces a bare status line with
+/// no payload.
+fn admin_error_response(status: StatusCode, reason: &str, hint: &str) -> Response {
+    let body = serde_json::json!({
+        "status": status.as_u16(),
+        "error": reason,
+        "hint": hint,
+        "docs": "https://github.com/lspecian/chronik-stream/blob/main/docs/ADMIN_API_SECURITY.md",
+    });
+    (status, Json(body)).into_response()
+}
+
 /// Authentication middleware for Admin API (X-API-Key header)
 async fn auth_middleware(
     State(state): State<AdminApiState>,
     headers: HeaderMap,
     request: Request<Body>,
     next: Next<Body>,
-) -> Result<Response, StatusCode> {
+) -> Result<Response, Response> {
     // Skip auth if no API key is configured
     let Some(expected_key) = &state.api_key else {
         return Ok(next.run(request).await);
@@ -779,11 +847,19 @@ async fn auth_middleware(
         Some(key) if key == expected_key => Ok(next.run(request).await),
         Some(_) => {
             warn!("Admin API: Invalid API key provided");
-            Err(StatusCode::UNAUTHORIZED)
+            Err(admin_error_response(
+                StatusCode::UNAUTHORIZED,
+                "invalid X-API-Key",
+                "Set the X-API-Key header to the value of CHRONIK_ADMIN_API_KEY.",
+            ))
         }
         None => {
             warn!("Admin API: No API key provided");
-            Err(StatusCode::UNAUTHORIZED)
+            Err(admin_error_response(
+                StatusCode::UNAUTHORIZED,
+                "missing X-API-Key header",
+                "This route is protected. Add: -H 'X-API-Key: <key>' (value of CHRONIK_ADMIN_API_KEY).",
+            ))
         }
     }
 }
@@ -797,11 +873,13 @@ async fn schema_registry_auth_middleware(
     headers: HeaderMap,
     request: Request<Body>,
     next: Next<Body>,
-) -> Result<Response, StatusCode> {
+) -> Result<Response, Response> {
     // Skip auth if not required
     if !state.schema_registry.is_auth_required() {
         return Ok(next.run(request).await);
     }
+
+    let hint = "Confluent Schema Registry uses HTTP Basic Auth. Use: -u <user>:<pass>";
 
     // Get Authorization header
     let auth_header = headers
@@ -810,13 +888,21 @@ async fn schema_registry_auth_middleware(
 
     let Some(auth_value) = auth_header else {
         warn!("Schema Registry: No Authorization header provided");
-        return Err(StatusCode::UNAUTHORIZED);
+        return Err(admin_error_response(
+            StatusCode::UNAUTHORIZED,
+            "missing Authorization header",
+            hint,
+        ));
     };
 
     // Parse Basic auth: "Basic <base64(username:password)>"
     if !auth_value.starts_with("Basic ") {
         warn!("Schema Registry: Invalid Authorization scheme (expected Basic)");
-        return Err(StatusCode::UNAUTHORIZED);
+        return Err(admin_error_response(
+            StatusCode::UNAUTHORIZED,
+            "unexpected Authorization scheme",
+            hint,
+        ));
     }
 
     let encoded = &auth_value[6..]; // Skip "Basic "
@@ -825,12 +911,20 @@ async fn schema_registry_auth_middleware(
             Ok(s) => s,
             Err(_) => {
                 warn!("Schema Registry: Invalid UTF-8 in credentials");
-                return Err(StatusCode::UNAUTHORIZED);
+                return Err(admin_error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "invalid credentials encoding",
+                    hint,
+                ));
             }
         },
         Err(_) => {
             warn!("Schema Registry: Invalid base64 encoding");
-            return Err(StatusCode::UNAUTHORIZED);
+            return Err(admin_error_response(
+                StatusCode::UNAUTHORIZED,
+                "invalid base64 in Authorization header",
+                hint,
+            ));
         }
     };
 
@@ -838,7 +932,11 @@ async fn schema_registry_auth_middleware(
     let parts: Vec<&str> = decoded.splitn(2, ':').collect();
     if parts.len() != 2 {
         warn!("Schema Registry: Invalid credentials format (expected username:password)");
-        return Err(StatusCode::UNAUTHORIZED);
+        return Err(admin_error_response(
+            StatusCode::UNAUTHORIZED,
+            "credentials missing ':' separator",
+            hint,
+        ));
     }
 
     let (username, password) = (parts[0], parts[1]);
@@ -849,7 +947,11 @@ async fn schema_registry_auth_middleware(
         Ok(next.run(request).await)
     } else {
         warn!("Schema Registry: Invalid credentials for user '{}'", username);
-        Err(StatusCode::UNAUTHORIZED)
+        Err(admin_error_response(
+            StatusCode::UNAUTHORIZED,
+            "invalid Schema Registry credentials",
+            hint,
+        ))
     }
 }
 
@@ -888,6 +990,33 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, &'static str> {
     Ok(output)
 }
 
+/// v2.5.2: fallback for unknown admin paths. Returns a JSON body with
+/// the available routes so the "empty HTTP" symptom never happens from a
+/// typo like `/admin` (no suffix) or `/admin/statuss`.
+async fn admin_not_found() -> Response {
+    let body = serde_json::json!({
+        "status": 404,
+        "error": "unknown admin path",
+        "available": {
+            "public": ["GET /admin/health"],
+            "protected": [
+                "GET /admin/status",
+                "POST /admin/add-node",
+                "POST /admin/remove-node",
+                "POST /admin/rebalance"
+            ],
+            "schema_registry": [
+                "GET /subjects",
+                "POST /subjects/{subject}/versions",
+                "GET /schemas/ids/{id}",
+                "GET /config"
+            ]
+        },
+        "docs": "https://github.com/lspecian/chronik-stream/blob/main/docs/ADMIN_API_SECURITY.md"
+    });
+    (StatusCode::NOT_FOUND, Json(body)).into_response()
+}
+
 /// Create the admin API router
 pub fn create_admin_router(state: AdminApiState) -> Router {
     // Admin routes require authentication
@@ -900,7 +1029,11 @@ pub fn create_admin_router(state: AdminApiState) -> Router {
 
     // Health check is public
     let public_routes = Router::new()
-        .route("/admin/health", get(handle_health));
+        .route("/admin/health", get(handle_health))
+        // v2.5.2: catch /admin and /admin/* that don't match the specific
+        // routes above. Returns a JSON body with the known route list.
+        .route("/admin", get(admin_not_found))
+        .route("/admin/", get(admin_not_found));
 
     // Schema Registry routes (Confluent-compatible)
     // HTTP Basic Auth is optional, enabled via CHRONIK_SCHEMA_REGISTRY_AUTH_ENABLED
@@ -956,7 +1089,7 @@ pub fn create_admin_router(state: AdminApiState) -> Router {
 /// The Schema Registry is always enabled and provides Confluent-compatible REST API
 /// for schema management. Schema Registry routes do NOT require authentication.
 pub async fn start_admin_api(
-    raft_cluster: Arc<RaftCluster>,
+    raft_cluster: Option<Arc<RaftCluster>>,
     metadata_store: Arc<dyn MetadataStore>,
     port: u16,
     api_key: Option<String>,

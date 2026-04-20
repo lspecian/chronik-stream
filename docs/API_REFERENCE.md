@@ -4,7 +4,7 @@
 **Base URLs**:
 - Kafka Protocol: `localhost:9092`
 - Unified API: `localhost:6092`
-- Admin API: `localhost:10001` (or `10000 + node_id` in cluster mode)
+- Admin API: `localhost:6092/admin/*` (under the Unified API). Legacy separate port `10000 + node_id` exists in cluster mode only, deprecated.
 
 ---
 
@@ -416,12 +416,14 @@ Get a specific document by ID.
 
 ## Admin API
 
-The Admin API runs on port `10000 + node_id` (e.g., 10001 for node 1).
+Mounted on the Unified API at `http://<host>:6092/admin/*`. Works in both single-node and cluster modes — in single-node, mutation routes (`add-node`, `remove-node`, `rebalance`) return a JSON response explaining they require Raft. `/admin/health` and `/admin/status` are always available.
 
-**Authentication**: All endpoints except `/admin/health` require the `X-API-Key` header.
+A legacy separate port (`10000 + node_id`) exists for backward compatibility in cluster mode only — it is deprecated and will be removed in a future release. See [ADMIN_API_SECURITY.md](ADMIN_API_SECURITY.md) for the migration.
+
+**Authentication**: all endpoints except `/admin/health` require `X-API-Key`. If `CHRONIK_ADMIN_API_KEY` is unset, auth is skipped (a WARN is logged). Auth failures return a JSON body explaining the problem (v2.5.2+), not an empty 401.
 
 ```bash
-curl -H "X-API-Key: your-api-key" http://localhost:10001/admin/status
+curl -H "X-API-Key: your-api-key" http://localhost:6092/admin/status
 ```
 
 ### Cluster Management

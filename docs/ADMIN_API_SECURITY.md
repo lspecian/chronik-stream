@@ -1,410 +1,225 @@
 # Admin API Security Guide
 
-**Version**: v2.2.20
-**Status**: Production-Ready with Authentication
+**Version**: v2.5.2
+**Status**: Production-ready with authentication
+
+---
+
+## TL;DR
+
+The Admin API lives on the **Unified API port (6092)** under `/admin/*`. Use:
+
+```bash
+# Liveness (no auth needed)
+curl http://localhost:6092/admin/health
+
+# Cluster status (requires API key)
+curl -H "X-API-Key: $CHRONIK_ADMIN_API_KEY" http://localhost:6092/admin/status
+```
+
+Works in both **single-node** and **cluster** mode. In single-node, mutation routes (`add-node`, `remove-node`, `rebalance`) return a JSON "not supported" response; everything else works.
+
+There is also a **legacy separate port** at `10000 + node_id` that exists for cluster-mode backward compatibility — it is **deprecated** and will be removed in a future release. See the [Legacy port appendix](#legacy-port-10000--node_id-deprecated) at the end of this document.
 
 ---
 
 ## Overview
 
-The Chronik Admin API provides:
-1. **Cluster management endpoints** for adding/removing nodes and querying cluster status
-2. **Schema Registry endpoints** for Confluent-compatible schema management
+The Chronik Admin API exposes two surfaces on the Unified API:
 
-Both services share the same port (`10000 + node_id`) but use **different authentication methods**:
+1. **Cluster management** under `/admin/*` — auth via `X-API-Key` header.
+2. **Schema Registry (Confluent-compatible)** under `/subjects/*`, `/schemas/*`, `/config/*` — auth via HTTP Basic.
 
-| Service | Auth Method | Header | Environment Variable |
-|---------|-------------|--------|---------------------|
-| Admin API | API Key | `X-API-Key` | `CHRONIK_ADMIN_API_KEY` |
-| Schema Registry | HTTP Basic | `Authorization: Basic` | `CHRONIK_SCHEMA_REGISTRY_USERS` |
+| Service | Path prefix | Auth method | Env var |
+|---|---|---|---|
+| Admin | `/admin/*` | `X-API-Key` header | `CHRONIK_ADMIN_API_KEY` |
+| Schema Registry | `/subjects/*`, `/schemas/*`, `/config/*` | HTTP Basic | `CHRONIK_SCHEMA_REGISTRY_USERS` |
 
 ---
 
-## Schema Registry Authentication
+## Admin API (`X-API-Key`)
 
-The Schema Registry supports optional HTTP Basic Auth (Confluent-compatible).
+### Endpoints
 
-### Enable Authentication
+| Method | Path | Auth | Notes |
+|---|---|---|---|
+| GET | `/admin/health` | **no** | Liveness probe. Works in single-node and cluster. |
+| GET | `/admin/status` | yes | Cluster topology, ISR, partition assignments. |
+| POST | `/admin/add-node` | yes | Cluster only. Single-node returns `success: false` with explanation. |
+| POST | `/admin/remove-node` | yes | Cluster only. Same note. |
+| POST | `/admin/rebalance` | yes | Cluster only. Same note. |
+
+### Enable authentication
+
+```bash
+export CHRONIK_ADMIN_API_KEY="use-a-long-random-string-here"
+./chronik-server start --advertise my-host
+```
+
+When `CHRONIK_ADMIN_API_KEY` is **not** set, a WARN is logged at startup and auth is skipped. Do not do this in production.
+
+### Error-body contract (v2.5.2+)
+
+Previously, auth failures returned **bare HTTP status lines with empty bodies** (axum 0.6 convention when handlers return `Err(StatusCode)`). This produced operator confusion of the form "Chronik admin port accepts TCP but returns empty HTTP." Starting in v2.5.2, every auth/route failure carries a JSON body:
+
+```json
+{
+  "status": 401,
+  "error": "missing X-API-Key header",
+  "hint": "This route is protected. Add: -H 'X-API-Key: <key>' (value of CHRONIK_ADMIN_API_KEY).",
+  "docs": "https://github.com/lspecian/chronik-stream/blob/main/docs/ADMIN_API_SECURITY.md"
+}
+```
+
+Hitting `/admin` with no sub-path (or a typo like `/admin/statuss`) returns a JSON 404 listing the available routes:
+
+```json
+{
+  "status": 404,
+  "error": "unknown admin path",
+  "available": {
+    "public": ["GET /admin/health"],
+    "protected": ["GET /admin/status", "POST /admin/add-node", "POST /admin/remove-node", "POST /admin/rebalance"],
+    "schema_registry": ["GET /subjects", "POST /subjects/{subject}/versions", "GET /schemas/ids/{id}", "GET /config"]
+  },
+  "docs": "..."
+}
+```
+
+### Common calls
+
+```bash
+export KEY=$CHRONIK_ADMIN_API_KEY
+
+# Liveness
+curl http://localhost:6092/admin/health
+
+# Cluster status (single-node reports node_id=1, is_leader=true, one entry)
+curl -H "X-API-Key: $KEY" http://localhost:6092/admin/status
+
+# Add node (cluster only)
+curl -X POST http://localhost:6092/admin/add-node \
+  -H "X-API-Key: $KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"node_id":4,"kafka_addr":"node4:9092","wal_addr":"node4:9291","raft_addr":"node4:5001"}'
+
+# Remove node (cluster only)
+curl -X POST http://localhost:6092/admin/remove-node \
+  -H "X-API-Key: $KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"node_id":4,"force":false}'
+```
+
+---
+
+## Schema Registry (HTTP Basic Auth)
+
+Enable auth:
 
 ```bash
 export CHRONIK_SCHEMA_REGISTRY_AUTH_ENABLED=true
 export CHRONIK_SCHEMA_REGISTRY_USERS="admin:secret123,readonly:viewonly"
 ```
 
-### Usage
+Use:
 
 ```bash
-# With curl -u flag
-curl -u admin:secret123 http://localhost:10001/subjects
+# With -u flag
+curl -u admin:secret123 http://localhost:6092/subjects
 
-# Without credentials (returns 401 when auth enabled)
-curl http://localhost:10001/subjects
+# Without credentials when auth enabled → JSON 401 (same error-body contract)
+curl http://localhost:6092/subjects
 ```
 
-### Environment Variables
+When `CHRONIK_SCHEMA_REGISTRY_AUTH_ENABLED=false` (default), the Schema Registry is unauthenticated.
+
+### Environment variables
 
 | Variable | Default | Description |
-|----------|---------|-------------|
+|---|---|---|
 | `CHRONIK_SCHEMA_REGISTRY_AUTH_ENABLED` | `false` | Enable HTTP Basic Auth |
 | `CHRONIK_SCHEMA_REGISTRY_USERS` | (none) | Comma-separated `user:pass` pairs |
 
-**See [Schema Registry Guide](SCHEMA_REGISTRY.md) for full documentation.**
-
 ---
 
-## Admin API Authentication
+## Deployment patterns
 
-### API Key Authentication
+### Kubernetes liveness probe
 
-The admin API uses API key authentication via the `X-API-Key` HTTP header.
+```yaml
+livenessProbe:
+  httpGet:
+    path: /admin/health
+    port: 6092
+  initialDelaySeconds: 10
+  periodSeconds: 10
+```
 
-#### Setup
+`/admin/health` is always available without auth, in both single-node and cluster mode, so it's safe as a kubelet probe target.
 
-**1. Generate a secure API key:**
+### Docker HEALTHCHECK
+
+```dockerfile
+HEALTHCHECK --interval=30s --timeout=3s \
+  CMD curl -fsS http://localhost:6092/admin/health || exit 1
+```
+
+The image as shipped uses a simpler `nc -z localhost 9092` check; upgrade to the above if you want HTTP-level verification.
+
+### Network isolation
 
 ```bash
-# Generate a random API key
-API_KEY=$(openssl rand -hex 32)
-echo "Generated API key: $API_KEY"
+# Restrict the Unified API to an internal management network
+iptables -A INPUT -p tcp --dport 6092 -s 10.0.1.0/24 -j ACCEPT
+iptables -A INPUT -p tcp --dport 6092 -j DROP
 ```
 
-**2. Configure all cluster nodes with the same API key:**
-
-```bash
-export CHRONIK_ADMIN_API_KEY="your-secret-api-key-here"
-```
-
-**3. Start cluster:**
-
-```bash
-./chronik-server start --config cluster.toml
-```
-
-**Expected log output:**
-```
-✓ Admin API authentication enabled
-Starting Admin API HTTP server on 0.0.0.0:10001
-```
-
-#### Usage
-
-**Add node with authentication:**
-
-```bash
-export CHRONIK_ADMIN_API_KEY="your-secret-api-key-here"
-
-./chronik-server cluster add-node 4 \
-  --kafka localhost:9095 \
-  --wal localhost:9294 \
-  --raft localhost:5004 \
-  --config cluster.toml
-```
-
-**Or with curl:**
-
-```bash
-curl -X POST http://localhost:10001/admin/add-node \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: your-secret-api-key-here" \
-  -d '{
-    "node_id": 4,
-    "kafka_addr": "localhost:9095",
-    "wal_addr": "localhost:9294",
-    "raft_addr": "localhost:5004"
-  }'
-```
-
-### Without Authentication (Development Only)
-
-**⚠️ WARNING: Running without authentication is INSECURE and should NEVER be used in production!**
-
-If `CHRONIK_ADMIN_API_KEY` is not set, the admin API will run without authentication:
-
-```bash
-# INSECURE - Development only
-./chronik-server start --config cluster.toml
-```
-
-**Log output:**
-```
-⚠ CHRONIK_ADMIN_API_KEY not set - Admin API will run WITHOUT authentication!
-⚠ This is INSECURE for production. Set CHRONIK_ADMIN_API_KEY to enable auth.
-```
-
----
-
-## TLS Support
-
-### Current Status
-
-**TLS support is documented but not currently implemented** (requires `axum-server` crate).
-
-The admin API will warn if you try to enable TLS:
-
-```
-⚠ TLS configuration detected but axum-server crate not available
-⚠ Admin API will run over HTTP. To enable TLS, add axum-server dependency.
-```
-
-### Future TLS Implementation
-
-When TLS is implemented, configuration will be:
-
-```bash
-export CHRONIK_ADMIN_TLS_CERT="/path/to/cert.pem"
-export CHRONIK_ADMIN_TLS_KEY="/path/to/key.pem"
-```
-
----
-
-## Endpoints
-
-### Public Endpoints (No Auth Required)
-
-#### GET /admin/health
-
-Health check endpoint - always accessible without authentication.
-
-**Response:**
-```json
-{
-  "status": "ok",
-  "node_id": 1,
-  "is_leader": true,
-  "cluster_nodes": [1, 2, 3]
-}
-```
-
-### Protected Endpoints (Auth Required)
-
-#### POST /admin/add-node
-
-Add a new node to the cluster.
-
-**Request:**
-```json
-{
-  "node_id": 4,
-  "kafka_addr": "localhost:9095",
-  "wal_addr": "localhost:9294",
-  "raft_addr": "localhost:5004"
-}
-```
-
-**Response (Success):**
-```json
-{
-  "success": true,
-  "message": "Node 4 addition proposed. Waiting for Raft consensus...",
-  "node_id": 4
-}
-```
-
-**Response (Error - No Auth):**
-```
-HTTP 401 Unauthorized
-```
-
-**Response (Error - Invalid Key):**
-```
-HTTP 401 Unauthorized
-```
-
-**Response (Error - Not Leader):**
-```json
-{
-  "success": false,
-  "message": "Cannot add node: this node is not the leader"
-}
-```
-
----
-
-## Security Best Practices
-
-### 1. Always Use Authentication in Production
-
-```bash
-# ✓ GOOD - Authentication enabled
-export CHRONIK_ADMIN_API_KEY="$(openssl rand -hex 32)"
-./chronik-server start --config cluster.toml
-
-# ✗ BAD - No authentication
-./chronik-server start --config cluster.toml
-```
-
-### 2. Use Strong API Keys
-
-```bash
-# ✓ GOOD - Random 256-bit key
-API_KEY=$(openssl rand -hex 32)
-
-# ✗ BAD - Weak key
-API_KEY="password123"
-```
-
-### 3. Rotate Keys Regularly
-
-```bash
-# Generate new key
-NEW_KEY=$(openssl rand -hex 32)
-
-# Update on all nodes (requires restart)
-export CHRONIK_ADMIN_API_KEY="$NEW_KEY"
-```
-
-### 4. Restrict Network Access
-
-**Use firewall rules to restrict admin API access:**
-
-```bash
-# Only allow from management subnet
-iptables -A INPUT -p tcp --dport 10001:10010 -s 10.0.1.0/24 -j ACCEPT
-iptables -A INPUT -p tcp --dport 10001:10010 -j DROP
-```
-
-**Or bind to specific interface:**
-
-```toml
-# cluster.toml
-[bind]
-admin = "10.0.1.10:10001"  # Internal management network only
-```
-
-### 5. Use TLS (When Available)
-
-```bash
-# Future: TLS support
-export CHRONIK_ADMIN_TLS_CERT="/etc/chronik/tls/cert.pem"
-export CHRONIK_ADMIN_TLS_KEY="/etc/chronik/tls/key.pem"
-export CHRONIK_ADMIN_API_KEY="$(openssl rand -hex 32)"
-```
-
-### 6. Log Monitoring
-
-Monitor authentication failures:
-
-```bash
-# Watch for auth failures
-tail -f /var/log/chronik/server.log | grep "Invalid API key\|No API key"
-```
-
-### 7. Principle of Least Privilege
-
-- Only expose admin API to operations team
-- Use separate API keys for different environments (dev/staging/prod)
-- Never commit API keys to version control
+Kafka (9092) stays open to clients; admin/HTTP (6092) stays behind your management network.
 
 ---
 
 ## Troubleshooting
 
-### Issue: "401 Unauthorized" when adding node
+### "Chronik admin port accepts TCP but returns empty HTTP"
 
-**Cause**: API key mismatch or not provided.
+This was the canonical symptom in v2.5.1 and earlier: hitting a protected route without `X-API-Key`, or hitting `/admin` with no sub-path, returned a bare status line with no body. **Fixed in v2.5.2.** If you still see an empty body, make sure the release artifact is v2.5.2+ (`curl localhost:6092/admin/health` now includes `"status": "ok"` in JSON).
 
-**Solution:**
-```bash
-# Ensure CHRONIK_ADMIN_API_KEY is set
-echo $CHRONIK_ADMIN_API_KEY
+### `curl` returns 404 but I'm hitting the right path
 
-# Check server logs for authentication errors
-grep "Admin API" /var/log/chronik/server.log
-```
+Check the path spelling. `/admin/status` is correct; `/admin/statuss` or `/admin/stats` returns JSON 404 with the route list.
 
-### Issue: CLI can't find leader
+### "add-node requires cluster mode (no Raft in single-node)"
 
-**Cause**: All nodes are followers or unreachable.
+This is expected in single-node mode. Start with a cluster config (see `examples/cluster-3node.toml` or [RUNNING_A_CLUSTER.md](RUNNING_A_CLUSTER.md)) if you need multi-node management.
 
-**Solution:**
-```bash
-# Check cluster health on all nodes
-for port in 10001 10002 10003; do
-  echo "Node $port:"
-  curl http://localhost:$port/admin/health | jq
-done
-```
+### Logs show `⚠ CHRONIK_ADMIN_API_KEY not set`
 
-### Issue: Server warns about missing authentication
-
-**Cause**: `CHRONIK_ADMIN_API_KEY` not set.
-
-**Solution:**
-```bash
-export CHRONIK_ADMIN_API_KEY="your-secret-key"
-```
+Auth is disabled. Set the env var. Anyone on the network can hit `/admin/add-node` without a key — not safe for production.
 
 ---
 
-## Production Deployment Checklist
+## Legacy port `10000 + node_id` (DEPRECATED)
 
-- [ ] API key generated with `openssl rand -hex 32`
-- [ ] `CHRONIK_ADMIN_API_KEY` set on all nodes
-- [ ] API key stored securely (env var, secrets manager)
-- [ ] Firewall rules restrict admin API access
-- [ ] TLS enabled (when available)
-- [ ] Monitoring configured for auth failures
-- [ ] API key rotation process documented
-- [ ] Backup admin access method available
+Before v2.2.22 the Admin API ran on a separate port (`10000 + node_id`, e.g. `10001` for node 1). That port is still bound **in cluster mode** for backward compatibility but logs a deprecation warning at startup:
 
----
-
-## Environment Variables Reference
-
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `CHRONIK_ADMIN_API_KEY` | **Recommended** | None | API key for authentication |
-| `CHRONIK_ADMIN_TLS_CERT` | No | None | Path to TLS certificate (future) |
-| `CHRONIK_ADMIN_TLS_KEY` | No | None | Path to TLS private key (future) |
-
----
-
-## Examples
-
-### Example 1: Production Setup (3-Node Cluster)
-
-```bash
-# Generate API key (save this securely!)
-API_KEY=$(openssl rand -hex 32)
-echo "API Key: $API_KEY" > /secure/location/api-key.txt
-
-# Node 1
-export CHRONIK_ADMIN_API_KEY="$API_KEY"
-./chronik-server start --config cluster.toml --node-id 1 &
-
-# Node 2
-export CHRONIK_ADMIN_API_KEY="$API_KEY"
-./chronik-server start --config cluster.toml --node-id 2 &
-
-# Node 3
-export CHRONIK_ADMIN_API_KEY="$API_KEY"
-./chronik-server start --config cluster.toml --node-id 3 &
-
-# Add node 4
-export CHRONIK_ADMIN_API_KEY="$API_KEY"
-./chronik-server cluster add-node 4 \
-  --kafka node4:9092 \
-  --wal node4:9291 \
-  --raft node4:5001 \
-  --config cluster.toml
+```
+⚠ DEPRECATED: Admin API running on separate port 10001
+⚠ In v2.2.22+, use the Unified API on port 6092 (CHRONIK_UNIFIED_API_PORT) instead.
+⚠ The separate admin port (10000+node_id) will be removed in a future version.
 ```
 
-### Example 2: Development Setup (No Auth)
+Single-node mode does **not** bind the legacy port at all (if you see "connection refused" on 10001 in single-node, that's why).
 
-```bash
-# Start cluster without authentication (INSECURE)
-./chronik-server start --config cluster.toml --node-id 1 &
-./chronik-server start --config cluster.toml --node-id 2 &
-./chronik-server start --config cluster.toml --node-id 3 &
+Migration:
+- Replace `http://host:10001/admin/...` → `http://host:6092/admin/...`
+- Replace `http://host:10001/subjects` → `http://host:6092/subjects`
 
-# Add node 4 (no API key needed)
-./chronik-server cluster add-node 4 \
-  --kafka localhost:9095 \
-  --wal localhost:9294 \
-  --raft localhost:5004 \
-  --config cluster.toml
-```
+Everything else — auth, request bodies, response shapes — is identical. The legacy port will be removed in a future major release.
 
 ---
 
-**Security is not optional for production deployments. Always use authentication!**
+## References
+
+- [API_REFERENCE.md](API_REFERENCE.md) — all Chronik HTTP endpoints
+- [SCHEMA_REGISTRY.md](SCHEMA_REGISTRY.md) — Schema Registry data model and API
+- [RUNNING_A_CLUSTER.md](RUNNING_A_CLUSTER.md) — cluster bootstrap and management

@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.2] - 2026-04-20
+
+### Fixed
+
+- **Admin API returned empty HTTP bodies on auth failure.** The canonical customer symptom was "Chronik admin port accepts TCP but returns empty HTTP." Auth middleware returned `Err(StatusCode::UNAUTHORIZED)`, which axum 0.6 serializes as a bare status line with no body, leaving operators without any clue what went wrong. Starting in v2.5.2, every auth/route failure carries a JSON body:
+
+  ```json
+  {
+    "status": 401,
+    "error": "missing X-API-Key header",
+    "hint": "This route is protected. Add: -H 'X-API-Key: <key>' (value of CHRONIK_ADMIN_API_KEY).",
+    "docs": "..."
+  }
+  ```
+
+  Same contract for 404s on unknown admin paths — the response lists every available route so `/admin` (no suffix) or typos like `/admin/statuss` tell the operator what they meant.
+
+- **Single-node mode had no admin endpoints at all.** The admin router was passed as `None` into the unified API in single-node mode, so `curl localhost:6092/admin/health` returned 404 and the legacy port `10001` was never bound. This broke Kubernetes liveness probes, Docker HEALTHCHECKs, and anyone following `docs/ADMIN_API_SECURITY.md` on a non-cluster deployment.
+
+  `AdminApiState::raft_cluster` is now `Option<Arc<RaftCluster>>`. Single-node wires up the router without Raft; `/admin/health` and `/admin/status` work unchanged, mutation routes (`add-node`, `remove-node`, `rebalance`) return a JSON body explaining the route requires cluster mode. Schema Registry routes (`/subjects/*`, `/schemas/*`, `/config/*`) are available on both single-node and cluster.
+
+### Changed
+
+- **Documentation consolidated around port 6092.** Three separate docs disagreed on where the admin API lived (10001 vs 6092). They now all point to `/admin/*` on the Unified API:
+  - [docs/ADMIN_API_SECURITY.md](docs/ADMIN_API_SECURITY.md) rewritten for 6092. Legacy 10001 kept as a clearly-marked deprecation appendix.
+  - [docs/API_REFERENCE.md](docs/API_REFERENCE.md) base URL line corrected; admin section updated.
+  - `CLAUDE.md` admin/Schema Registry sections updated.
+
 ## [2.5.1] - 2026-04-18
 
 ### Fixed

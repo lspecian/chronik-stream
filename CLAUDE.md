@@ -665,25 +665,25 @@ All cluster commands also available via HTTP API:
 grep "Admin API key" ./data/node1/chronik.log
 
 # Query status
-curl http://localhost:10001/admin/status \
+curl http://localhost:6092/admin/status \
   -H "X-API-Key: <api-key>"
 
 # Add node
-curl -X POST http://localhost:10001/admin/add-node \
+curl -X POST http://localhost:6092/admin/add-node \
   -H "X-API-Key: <api-key>" \
   -H "Content-Type: application/json" \
   -d '{"node_id": 4, "kafka_addr": "localhost:9095", "wal_addr": "localhost:9294", "raft_addr": "localhost:5004"}'
 
 # Remove node
-curl -X POST http://localhost:10001/admin/remove-node \
+curl -X POST http://localhost:6092/admin/remove-node \
   -H "X-API-Key: <api-key>" \
   -H "Content-Type: application/json" \
   -d '{"node_id": 4, "force": false}'
 ```
 
-**Admin API runs on port:** `10000 + node_id` (e.g., Node 1 → 10001, Node 2 → 10002)
+**Admin API lives on the Unified API (port 6092)** under `/admin/*`. Available in both single-node and cluster modes (single-node mutation routes return a JSON "not supported" body). Legacy separate port `10000 + node_id` exists for cluster backward compatibility only and is deprecated.
 
-**Security:** All endpoints except `/admin/health` require API key authentication.
+**Security:** All endpoints except `/admin/health` require `X-API-Key` (value of `CHRONIK_ADMIN_API_KEY`). Auth failures return a JSON body (v2.5.2+), not empty.
 
 See [docs/ADMIN_API_SECURITY.md](docs/ADMIN_API_SECURITY.md) for details.
 
@@ -696,21 +696,21 @@ Chronik includes a Confluent-compatible Schema Registry for managing Avro, JSON 
 - Avro, JSON Schema, and Protobuf support
 - Schema compatibility checking (BACKWARD, FORWARD, FULL, NONE)
 - Optional HTTP Basic Auth (Confluent-compatible)
-- Runs on Admin API port (`10000 + node_id`)
+- Runs on the Unified API (port 6092) under `/subjects/*`, `/schemas/*`, `/config/*`
 
 #### Quick Start
 
 ```bash
 # Register a schema
-curl -X POST http://localhost:10001/subjects/user-value/versions \
+curl -X POST http://localhost:6092/subjects/user-value/versions \
   -H "Content-Type: application/json" \
   -d '{"schema": "{\"type\": \"record\", \"name\": \"User\", \"fields\": [{\"name\": \"id\", \"type\": \"long\"}]}"}'
 
 # List subjects
-curl http://localhost:10001/subjects
+curl http://localhost:6092/subjects
 
 # Get schema by ID
-curl http://localhost:10001/schemas/ids/1
+curl http://localhost:6092/schemas/ids/1
 ```
 
 #### Authentication
@@ -723,7 +723,7 @@ export CHRONIK_SCHEMA_REGISTRY_AUTH_ENABLED=true
 export CHRONIK_SCHEMA_REGISTRY_USERS="admin:secret123,readonly:viewonly"
 
 # Usage with curl
-curl -u admin:secret123 http://localhost:10001/subjects
+curl -u admin:secret123 http://localhost:6092/subjects
 ```
 
 **See [docs/SCHEMA_REGISTRY.md](docs/SCHEMA_REGISTRY.md) for full documentation.**
