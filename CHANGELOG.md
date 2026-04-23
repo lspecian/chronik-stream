@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.4] - 2026-04-23
+
+### Fixed
+
+- **`POST /:topic/_search` 404'd on auto-created Kafka topics when the hot path was disabled.** The handler only consulted the in-memory REST-registered index map. Topics created by a Kafka produce (the common case) aren't in that map, so the endpoint returned `index_not_found_exception` even though the realtime indexer had the documents on disk. The `/_search` variant (no topic in path) already consulted WAL + realtime disk indexes via `search_wal_indices`; this parity gap between the two handlers has existed since v2.0. Closes the second half of the gap flagged in the v2.5.3 release notes.
+
+  Fix: `search_index` now queries every available cold source for the topic:
+    1. The in-memory REST-registered index (`api.indices`) — for any index created via `PUT /:index`
+    2. WAL Tantivy archives under `{data_dir}/tantivy_indexes/{topic}[-N]/`
+    3. The realtime indexer's on-disk index under `{data_dir}/index/{topic}[-N]/`
+
+  A new helper `search_wal_indices_for_topic` scans those directories but only opens the ones that start with the requested topic, avoiding the whole-directory scan used by `search_all`. Hits from each source are merged and deduped by `(_index, _id)` with hot winning; ranks are reassigned after sort.
+
+- **`search_tantivy_index` silently upgraded schema-mismatch errors to `AllQuery`.** When the user's DSL referenced fields missing from a disk index's schema (e.g., the realtime indexer's schema uses `_value` while users query `value`), `build_tantivy_query` returned an error which the handler caught and replaced with `AllQuery`. Every doc matched, so `bool.must` against that source silently became "match everything" — the exact regression that re-opened when v2.5.4 started consulting disk indexes from `search_index`. The silent fallback is now a skip: on build failure that source contributes zero hits, other sources still contribute.
+
+- **Hot↔cold dedup was broken because the two paths used different `_id` conventions.** Hot emitted `_id = offset.to_string()`; `search_tantivy_index` looked up `source["offset"]` — which doesn't exist in the realtime indexer (it uses `_offset`), so every disk hit got a fresh UUID and identical documents showed up twice in the merged result. `search_tantivy_index` now falls through `offset` → `_offset` → `_id` before minting a UUID.
+
+### Verified
+
+Single-node, default config, after produce to an auto-created topic:
+
+| Scenario | Before (v2.5.3) | After (v2.5.4) |
+|---|---|---|
+| Hot on + `match_all` | 2 (dup) | 1 ✓ |
+| Hot on + `bool.must[value=foo, key=B]` | 0 | 0 ✓ |
+| Hot on + `bool.must[value=foo, key=A]` | 1 | 1 ✓ |
+| Hot off + `match_all` | 404 | 1 ✓ |
+| Hot off + `bool.must[_value=foo, _key=B]` | 404 | 0 ✓ |
+
 ## [2.5.3] - 2026-04-23
 
 ### Fixed

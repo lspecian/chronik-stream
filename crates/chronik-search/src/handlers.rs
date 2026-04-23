@@ -365,45 +365,74 @@ pub async fn search_index(
 ) -> impl IntoResponse {
     let start = SystemTime::now();
 
-    // HP-1.3: when the hot path is active and the in-memory `indices` map
-    // doesn't know this index, fall back to checking WAL/hot indices via the
-    // search_all path. For now, when the REST index is missing we still want
-    // hot results, so build an empty cold hits Vec rather than 404-ing.
-    let (cold_hits, aggregations) = match api.indices.get(&index) {
-        Some(state) => {
-            let hits = search_in_index(&index, &state, &request)
-                .await
-                .map_err(|e| search_error(e))?;
+    // v2.5.4: Build cold hits from every source available for this topic,
+    // in priority order:
+    //   1. In-memory REST-registered index (api.indices)     — aggregations
+    //   2. WAL Tantivy archives on disk ({data}/tantivy_indexes)
+    //   3. Realtime indexer's in-memory-flushed index ({data}/index)
+    //
+    // Previously `search_index` returned 404 for auto-created Kafka topics
+    // unless the hot path was enabled, because it only consulted (1). This
+    // matches the multi-source behavior `search_all` already had.
+    let mut cold_hits = Vec::<Hit>::new();
+    let mut aggregations = None;
+    let mut have_any_cold_source = false;
 
-            let aggregations = if let Some(aggs) = request.aggs.as_ref().or(request.aggregations.as_ref()) {
-                let query = match &request.query {
-                    Some(query_dsl) => build_tantivy_query(query_dsl, &state.schema, Some(&state.index))
-                        .map_err(|e| search_error(e))?,
-                    None => Box::new(AllQuery),
-                };
+    if let Some(state) = api.indices.get(&index) {
+        have_any_cold_source = true;
+        let hits = search_in_index(&index, &state, &request)
+            .await
+            .map_err(|e| search_error(e))?;
+        cold_hits.extend(hits);
 
-                let agg_executor = crate::aggregations::AggregationExecutor::new(
-                    state.reader.clone(),
-                    state.schema.clone(),
-                );
-
-                Some(
-                    agg_executor
-                        .execute(query, aggs.clone())
-                        .map_err(|e| search_error(Error::Internal(format!("Aggregation failed: {}", e))))?,
-                )
-            } else {
-                None
+        if let Some(aggs) = request.aggs.as_ref().or(request.aggregations.as_ref()) {
+            let query = match &request.query {
+                Some(query_dsl) => build_tantivy_query(query_dsl, &state.schema, Some(&state.index))
+                    .map_err(|e| search_error(e))?,
+                None => Box::new(AllQuery),
             };
-            (hits, aggregations)
+            let agg_executor = crate::aggregations::AggregationExecutor::new(
+                state.reader.clone(),
+                state.schema.clone(),
+            );
+            aggregations = Some(
+                agg_executor
+                    .execute(query, aggs.clone())
+                    .map_err(|e| search_error(Error::Internal(format!("Aggregation failed: {}", e))))?,
+            );
         }
-        None if api.hot_text_index.is_some() => {
-            // Hot-only path: the REST index isn't registered but the topic
-            // may still exist in the hot index (NRT before cold flush).
-            (Vec::new(), None)
+    }
+
+    if let Some(base_path) = api.get_index_base_path() {
+        // WAL-created Tantivy archives under `{data}/tantivy_indexes/{topic}[-part]/`
+        match search_wal_indices_for_topic(base_path, &index, &request).await {
+            Ok(hits) => {
+                if !hits.is_empty() || std::path::Path::new(base_path).exists() {
+                    have_any_cold_source = true;
+                }
+                cold_hits.extend(hits);
+            }
+            Err(e) => debug!(topic = %index, "WAL disk search returned no results: {}", e),
         }
-        None => return Err(index_not_found_error(&index)),
-    };
+        // Realtime indexer writes to `{data}/index/{topic}[-part]/`
+        let realtime_path = base_path.replace("tantivy_indexes", "index");
+        match search_wal_indices_for_topic(&realtime_path, &index, &request).await {
+            Ok(hits) => {
+                if !hits.is_empty() || std::path::Path::new(&realtime_path).exists() {
+                    have_any_cold_source = true;
+                }
+                cold_hits.extend(hits);
+            }
+            Err(e) => debug!(topic = %index, "Realtime disk search returned no results: {}", e),
+        }
+    }
+
+    // If no cold source was found AND the hot path is off, preserve the
+    // v2.5.x "index not found" error. With the hot path on, absence from
+    // cold sources just means the topic is NRT-only for now.
+    if !have_any_cold_source && cold_hits.is_empty() && api.hot_text_index.is_none() {
+        return Err(index_not_found_error(&index));
+    }
 
     // HP-1.3: merge with hot index hits; hot wins on (_index, _id) dedup.
     let hits = if api.hot_text_index.is_some() {
@@ -439,6 +468,73 @@ pub async fn search_index(
 }
 
 /// Search WAL-created Tantivy indices from disk
+/// v2.5.4: Like `search_wal_indices` but filtered to a single topic.
+///
+/// Used by `search_index` to search auto-created topics' on-disk Tantivy
+/// indexes (realtime and WAL) when the REST-registered in-memory index
+/// map has no entry. Fixes the "POST /:topic/_search returns 404" gap
+/// for Kafka-produced topics when the hot path is disabled or cold.
+///
+/// WAL/realtime index directories are named `{topic}` or `{topic}-{partition}`.
+async fn search_wal_indices_for_topic(
+    base_path: &str,
+    topic: &str,
+    request: &SearchRequest,
+) -> Result<Vec<Hit>> {
+    use std::fs;
+    use std::path::Path;
+    use tantivy::Index;
+
+    let mut all_hits = Vec::new();
+    let base = Path::new(base_path);
+    if !base.exists() {
+        return Ok(all_hits);
+    }
+
+    let entries = fs::read_dir(base)
+        .map_err(|e| Error::Internal(format!("Failed to read index directory: {}", e)))?;
+
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+
+        // Match either "topic" or "topic-N". We start with starts_with(topic)
+        // then confirm the suffix is empty or begins with '-' to avoid
+        // matching "topicfoo" when asked about "topic".
+        if !dir_name.starts_with(topic) {
+            continue;
+        }
+        let suffix = &dir_name[topic.len()..];
+        if !suffix.is_empty() && !suffix.starts_with('-') {
+            continue;
+        }
+
+        match Index::open_in_dir(&path) {
+            Ok(index) => {
+                chronik_storage::register_analyzer(&index);
+                match search_tantivy_index(topic, &index, request).await {
+                    Ok(mut hits) => {
+                        // Normalize _index to the queried topic name (strip "-N" suffix)
+                        for h in &mut hits {
+                            h._index = topic.to_string();
+                        }
+                        all_hits.append(&mut hits);
+                    }
+                    Err(e) => debug!("Search error in {}: {}", dir_name, e),
+                }
+            }
+            Err(e) => debug!("Could not open index at {}: {}", path.display(), e),
+        }
+    }
+    Ok(all_hits)
+}
+
 async fn search_wal_indices(base_path: &str, request: &SearchRequest) -> Result<Vec<Hit>> {
     use std::fs;
     use std::path::Path;
@@ -514,15 +610,26 @@ async fn search_tantivy_index(
     }
 
     // Build query - for WAL indices, we'll do a match_all by default
-    // since we don't have the schema mapping readily available
+    // since we don't have the schema mapping readily available.
+    //
+    // v2.5.4: for an EXPLICIT QueryDsl (not "no query" → match_all), do NOT
+    // silently upgrade build failures into `AllQuery`. That broke
+    // `bool.must` against any disk index whose schema used different field
+    // names (e.g., the realtime indexer uses `_value`/`_key` while users
+    // query `value`/`key`) — the mismatch produced AllQuery which matched
+    // every doc, making bool.must behave like bool.should (issue #2 regression
+    // when cold sources were added in v2.5.4). Return empty from this source
+    // instead; other sources (hot, in-memory REST) still contribute.
     let schema = index.schema();
     let query: Box<dyn TantivyQuery> = if let Some(query_dsl) = &request.query {
-        // Try to build query, fall back to match_all if schema mismatch
         match build_tantivy_query(query_dsl, &schema, Some(index)) {
             Ok(q) => q,
             Err(e) => {
-                debug!("Could not build query for index {}: {}, using match_all", index_name, e);
-                Box::new(AllQuery)
+                debug!(
+                    "Skipping disk index {} for this query (schema mismatch: {})",
+                    index_name, e
+                );
+                return Ok(Vec::new());
             }
         }
     } else {
@@ -564,10 +671,15 @@ async fn search_tantivy_index(
             }
         }
 
-        // Generate document ID
+        // Generate document ID. Try both naming conventions: the cold
+        // TantivyIndexer uses `offset`, the realtime indexer uses `_offset`.
+        // v2.5.4: also fall back to `_id` for REST-created indexes. Stable
+        // IDs are required for hot↔cold dedup in `search_index` to work.
         let doc_id = source.get("offset")
             .and_then(|v| v.as_i64())
             .map(|o| o.to_string())
+            .or_else(|| source.get("_offset").and_then(|v| v.as_i64()).map(|o| o.to_string()))
+            .or_else(|| source.get("_id").and_then(|v| v.as_str()).map(|s| s.to_string()))
             .unwrap_or_else(|| Uuid::new_v4().to_string());
 
         hits.push(Hit {
