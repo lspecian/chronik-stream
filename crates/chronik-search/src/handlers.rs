@@ -52,12 +52,13 @@ pub async fn metrics_handler() -> impl IntoResponse {
     String::from_utf8(buffer).unwrap()
 }
 
-/// HP-1.3: Best-effort extraction of a plain-text query from a simple
-/// ElasticSearch QueryDsl so the hot index can be consulted.
-///
-/// Returns `None` when we can't flatten the DSL to a single string — in
-/// that case the hot index is skipped and only cold results are used.
-/// The cold (Tantivy) path continues to handle the full DSL as today.
+/// HP-1.3: Best-effort extraction of a plain-text query from the simplest
+/// ElasticSearch DSLs. Used only for `MatchAll` and flat `Match` — anything
+/// structural (Bool, Term, Range, …) must go through the structured hot
+/// path (`build_tantivy_query` per partition) so clause semantics are
+/// preserved. Issue #2: previously this function concatenated bool.must
+/// clauses with spaces, which Tantivy's multi-word parser then OR'd,
+/// silently dropping the AND.
 fn extract_simple_query_text(dsl: &QueryDsl) -> Option<String> {
     match dsl {
         QueryDsl::MatchAll(_) => Some("*".to_string()),
@@ -73,22 +74,7 @@ fn extract_simple_query_text(dsl: &QueryDsl) -> Option<String> {
                     .map(|s| s.to_string()),
                 _ => None,
             }),
-        QueryDsl::Bool(b) => {
-            // Only handle simple Bool(must=[Match|MatchAll, ...]) shapes
-            let parts: Vec<String> = b
-                .must
-                .iter()
-                .chain(b.should.iter())
-                .filter_map(extract_simple_query_text)
-                .filter(|s| s != "*")
-                .collect();
-            if parts.is_empty() {
-                None
-            } else {
-                Some(parts.join(" "))
-            }
-        }
-        _ => None,
+        _ => None, // Bool/Term/Range/etc. go through the structured path.
     }
 }
 
@@ -124,7 +110,13 @@ fn hot_hit_to_es_hit(hit: crate::hot_text_index::HotHit) -> Hit {
 }
 
 /// HP-1.3: Query the hot index for a specific topic and return ES-shaped Hits.
-/// Empty Vec if hot index absent, topic unknown, or query text unextractable.
+/// Empty Vec if hot index absent or topic unknown.
+///
+/// Routing:
+///   - `MatchAll` / flat `Match` → flat QueryParser path (fastest, common case)
+///   - Anything else (including `Bool`, Term, Range) → structured path that
+///     builds a real Tantivy query per partition, preserving bool semantics
+///     (issue #2).
 async fn search_hot_topic(
     api: &Arc<SearchApi>,
     topic: &str,
@@ -136,28 +128,46 @@ async fn search_hot_topic(
     let Some(dsl) = request.query.as_ref() else {
         return Vec::new();
     };
-    let Some(query_text) = extract_simple_query_text(dsl) else {
-        return Vec::new();
-    };
     let k = request.size.max(10);
-    match hot_idx.search_topic(topic, &query_text, k).await {
+
+    if let Some(query_text) = extract_simple_query_text(dsl) {
+        return match hot_idx.search_topic(topic, &query_text, k).await {
+            Ok(hits) => hits.into_iter().map(hot_hit_to_es_hit).collect(),
+            Err(e) => {
+                debug!("hot text search for topic {} failed: {}", topic, e);
+                Vec::new()
+            }
+        };
+    }
+
+    // Structured DSL: build the Tantivy query against each partition's schema.
+    let dsl_owned = dsl.clone();
+    let result = hot_idx
+        .search_topic_structured(
+            topic,
+            move |schema, index| {
+                build_tantivy_query(&dsl_owned, schema, Some(index))
+                    .map_err(|e| anyhow::anyhow!("build_tantivy_query: {}", e))
+            },
+            k,
+        )
+        .await;
+    match result {
         Ok(hits) => hits.into_iter().map(hot_hit_to_es_hit).collect(),
         Err(e) => {
-            debug!("hot text search for topic {} failed: {}", topic, e);
+            debug!("hot structured search for topic {} failed: {}", topic, e);
             Vec::new()
         }
     }
 }
 
 /// HP-1.3: Query the hot index across every known topic and return ES-shaped Hits.
+/// Routes to the same simple-vs-structured split as `search_hot_topic`.
 async fn search_hot_all(api: &Arc<SearchApi>, request: &SearchRequest) -> Vec<Hit> {
     let Some(hot_idx) = api.hot_text_index.as_ref() else {
         return Vec::new();
     };
     let Some(dsl) = request.query.as_ref() else {
-        return Vec::new();
-    };
-    let Some(query_text) = extract_simple_query_text(dsl) else {
         return Vec::new();
     };
 
@@ -170,6 +180,7 @@ async fn search_hot_all(api: &Arc<SearchApi>, request: &SearchRequest) -> Vec<Hi
     topics.dedup();
 
     let k = request.size.max(10);
+    let simple_text = extract_simple_query_text(dsl);
     let mut out = Vec::new();
     for topic in topics {
         if let Some(filter) = &request.index {
@@ -177,9 +188,28 @@ async fn search_hot_all(api: &Arc<SearchApi>, request: &SearchRequest) -> Vec<Hi
                 continue;
             }
         }
-        match hot_idx.search_topic(&topic, &query_text, k).await {
-            Ok(hits) => out.extend(hits.into_iter().map(hot_hit_to_es_hit)),
-            Err(e) => debug!("hot text search for topic {} failed: {}", topic, e),
+        match simple_text.as_ref() {
+            Some(q) => match hot_idx.search_topic(&topic, q, k).await {
+                Ok(hits) => out.extend(hits.into_iter().map(hot_hit_to_es_hit)),
+                Err(e) => debug!("hot text search for topic {} failed: {}", topic, e),
+            },
+            None => {
+                let dsl_owned = dsl.clone();
+                let result = hot_idx
+                    .search_topic_structured(
+                        &topic,
+                        move |schema, index| {
+                            build_tantivy_query(&dsl_owned, schema, Some(index))
+                                .map_err(|e| anyhow::anyhow!("build_tantivy_query: {}", e))
+                        },
+                        k,
+                    )
+                    .await;
+                match result {
+                    Ok(hits) => out.extend(hits.into_iter().map(hot_hit_to_es_hit)),
+                    Err(e) => debug!("hot structured search for topic {} failed: {}", topic, e),
+                }
+            }
         }
     }
     out
@@ -631,8 +661,12 @@ async fn search_in_index(
     Ok(hits)
 }
 
-/// Build Tantivy query from Elasticsearch query DSL
-fn build_tantivy_query(
+/// Build Tantivy query from Elasticsearch query DSL.
+///
+/// Exposed crate-wide so the hot text index can build structured queries
+/// against its own per-partition schemas (fixes GitHub issue #2 where
+/// bool.must was flattened into an OR in the hot path).
+pub(crate) fn build_tantivy_query(
     query_dsl: &QueryDsl,
     schema: &tantivy::schema::Schema,
     index: Option<&tantivy::Index>,
@@ -1311,8 +1345,14 @@ mod hot_merge_tests {
         );
     }
 
+    /// Issue #2 regression: extract_simple_query_text must NOT flatten bool.
+    /// Bool queries go through the structured hot-path instead (search_hot_topic
+    /// → search_topic_structured → build_tantivy_query per partition), which
+    /// preserves AND/OR semantics. Flattening to a space-joined string caused
+    /// Tantivy's multi-word handling to OR the clauses, silently dropping
+    /// `must` constraints.
     #[test]
-    fn extract_bool_concatenates_matches() {
+    fn extract_bool_returns_none_so_structured_path_fires() {
         let mut fv1 = HashMap::new();
         fv1.insert("value".to_string(), serde_json::Value::String("alpha".into()));
         let mut fv2 = HashMap::new();
@@ -1328,7 +1368,8 @@ mod hot_merge_tests {
         });
         assert_eq!(
             extract_simple_query_text(&q),
-            Some("alpha beta".to_string())
+            None,
+            "Bool must route through structured path, not be flattened"
         );
     }
 

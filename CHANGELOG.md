@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.3] - 2026-04-23
+
+### Fixed
+
+- **`bool.must` did not AND its clauses when every clause was a `match` (closes #2).** In the hot text path, two `match` clauses under `bool.must` targeting different text fields failed to intersect — a clause that should have narrowed the result set to zero was silently dropped, and the first clause's hits came through. Replacing the first clause with `match_all` made `bool.must` AND correctly, which was the telltale that the bug lived in the `match`-extraction path.
+
+  Root cause: the hot path's `extract_simple_query_text` helper flattened `bool.must` and `bool.should` into a single space-joined query string. Tantivy's multi-word handling then OR'd the terms, so two disjoint must clauses effectively became a single "foo OR beta" query. The naive flattening was covering up that the hot path never had a structured query path.
+
+  Fix: the hot text index now exposes `search_topic_structured`, which iterates each partition, hands its `(Schema, Index)` to a caller-provided builder closure, and executes the resulting Tantivy query. `search_hot_topic` / `search_hot_all` call it for any DSL that isn't `MatchAll` or a flat `Match`, reusing the same `build_tantivy_query` that the cold path already uses. Bool, Term, Range, Geo, and nested Bool all get real AND/OR/NOT semantics.
+
+  Regression test: `hot_text_index::tests::structured_bool_must_ands_its_clauses` asserts that `bool.must[value=foo, key=beta]` returns 0 against a doc with `key=alpha` — the exact issue-2 repro — and `bool.must[value=foo, key=alpha]` returns 1.
+
+  End-to-end verified against the issue-2 scenario: `match_all AND match.key=B → 0`, `match.value=foo AND match.key=B → 0` (was returning 1 in v2.5.1/v2.5.2), `match.value=foo AND match.key=A → 1`, `bool.should[foo, nope] → 1`.
+
 ## [2.5.2] - 2026-04-20
 
 ### Fixed

@@ -221,6 +221,28 @@ impl HotPartitionIndex {
         Ok(hits)
     }
 
+    /// Issue #2: Execute a caller-built Tantivy query against this
+    /// partition's index. Used for structured queries (bool, etc.) where
+    /// the flat-string path via `search()` would lose AND semantics.
+    fn search_with_query(
+        &self,
+        query: &dyn tantivy::query::Query,
+        top_k: usize,
+    ) -> Result<Vec<HotHit>> {
+        let searcher = self.reader.searcher();
+        let top_docs = searcher
+            .search(query, &TopDocs::with_limit(top_k))
+            .map_err(|e| anyhow!("hot structured search: {}", e))?;
+        let mut hits = Vec::with_capacity(top_docs.len());
+        for (score, doc_addr) in top_docs {
+            let doc: tantivy::TantivyDocument = searcher
+                .doc(doc_addr)
+                .map_err(|e| anyhow!("hot doc fetch: {}", e))?;
+            hits.push(self.doc_to_hit(&doc, score)?);
+        }
+        Ok(hits)
+    }
+
     fn doc_to_hit(&self, doc: &tantivy::TantivyDocument, score: f32) -> Result<HotHit> {
         use tantivy::schema::Value;
         let get_i64 = |f: Field| -> Option<i64> {
@@ -515,6 +537,72 @@ impl HotTextIndex {
             all.append(&mut hits);
         }
         // dedup by (partition, offset); keep highest score on tie
+        all.sort_by(|a, b| {
+            a.partition
+                .cmp(&b.partition)
+                .then(a.offset.cmp(&b.offset))
+                .then(b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        all.dedup_by(|a, b| a.partition == b.partition && a.offset == b.offset);
+        all.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        all.truncate(top_k);
+        Ok(all)
+    }
+
+    /// Issue #2: Structured search across all partitions of a topic. The
+    /// caller provides a closure that builds a Tantivy query given the
+    /// per-partition schema + index (each HotPartitionIndex owns its own
+    /// Tantivy Index, so queries can't be shared across partitions).
+    ///
+    /// Unlike `search_topic` (which routes through QueryParser and a flat
+    /// query string), this path preserves the structure of bool queries —
+    /// `bool.must` actually ANDs its clauses, `bool.should` actually ORs,
+    /// etc.
+    pub async fn search_topic_structured<F>(
+        &self,
+        topic: &str,
+        build_query: F,
+        top_k: usize,
+    ) -> Result<Vec<HotHit>>
+    where
+        F: Fn(
+            &tantivy::schema::Schema,
+            &tantivy::Index,
+        ) -> Result<Box<dyn tantivy::query::Query>>,
+    {
+        let keys: Vec<(String, i32)> = self
+            .partitions
+            .iter()
+            .filter(|e| e.key().0 == topic)
+            .map(|e| e.key().clone())
+            .collect();
+
+        let mut all = Vec::new();
+        for (t, p) in keys {
+            let Some(entry) = self.partitions.get(&(t.clone(), p)) else {
+                continue;
+            };
+            let part = entry.clone();
+            drop(entry);
+            let guard = part.read().await;
+            // Build the Tantivy query per partition using that partition's
+            // Index/Schema instance (Tantivy queries bind to a specific Index).
+            let query = match build_query(&guard.index.schema(), &guard.index) {
+                Ok(q) => q,
+                Err(e) => {
+                    trace!(topic = %t, partition = p, "hot structured build: {}", e);
+                    continue;
+                }
+            };
+            let start = std::time::Instant::now();
+            match guard.search_with_query(query.as_ref(), top_k) {
+                Ok(mut hits) => all.append(&mut hits),
+                Err(e) => trace!(topic = %t, partition = p, "hot structured search: {}", e),
+            }
+            chronik_monitoring::MetricsRecorder::record_hot_text_search(start.elapsed());
+        }
+
+        // Dedup + top-k, same as search_topic.
         all.sort_by(|a, b| {
             a.partition
                 .cmp(&b.partition)
@@ -871,5 +959,97 @@ mod tests {
         assert!(hits.is_empty());
         assert_eq!(idx.doc_count("nope", 0).await, 0);
         assert_eq!(idx.evict_up_to("nope", 0, 10).await.unwrap(), 0);
+    }
+
+    /// Issue #2 regression: `bool.must` ANDs its clauses. Previously the hot
+    /// path flattened must clauses into a space-joined OR query, so two
+    /// disjoint must clauses — one matching the only doc, one matching zero —
+    /// returned 1 hit instead of 0.
+    #[tokio::test]
+    async fn structured_bool_must_ands_its_clauses() {
+        use tantivy::query::{BooleanQuery, Occur, Query, QueryParser};
+
+        let idx = HotTextIndex::new(HotTextConfig::default());
+        // Produce one doc: value contains "foo", key is "alpha"
+        idx.add_batch(
+            "t",
+            0,
+            &[HotDoc {
+                offset: 0,
+                timestamp: 1,
+                key: Some("alpha".into()),
+                value: "has foo content".into(),
+                headers: None,
+            }],
+        )
+        .await
+        .unwrap();
+        idx.commit("t", 0).await.unwrap();
+
+        // Sanity: value=foo alone matches the doc.
+        let sanity = idx
+            .search_topic_structured(
+                "t",
+                |_schema, index| {
+                    let parser = QueryParser::for_index(
+                        index,
+                        vec![index.schema().get_field("value").unwrap()],
+                    );
+                    Ok(parser.parse_query("foo").unwrap())
+                },
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(sanity.len(), 1, "value=foo alone should hit");
+
+        // Structured bool.must: (value=foo AND key=beta). Second clause has
+        // no match, so the whole thing must return 0.
+        let and_miss: Vec<_> = idx
+            .search_topic_structured(
+                "t",
+                |_schema, index| {
+                    let schema = index.schema();
+                    let value_f = schema.get_field("value").unwrap();
+                    let key_f = schema.get_field("key").unwrap();
+                    let value_parser = QueryParser::for_index(index, vec![value_f]);
+                    let key_parser = QueryParser::for_index(index, vec![key_f]);
+                    let clauses: Vec<(Occur, Box<dyn Query>)> = vec![
+                        (Occur::Must, value_parser.parse_query("foo").unwrap()),
+                        (Occur::Must, key_parser.parse_query("beta").unwrap()),
+                    ];
+                    Ok(Box::new(BooleanQuery::new(clauses)) as Box<dyn Query>)
+                },
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            and_miss.len(),
+            0,
+            "bool.must[value=foo, key=beta] must AND to 0 — the fix for GitHub #2"
+        );
+
+        // Positive: (value=foo AND key=alpha) → 1 hit.
+        let and_hit: Vec<_> = idx
+            .search_topic_structured(
+                "t",
+                |_schema, index| {
+                    let schema = index.schema();
+                    let value_f = schema.get_field("value").unwrap();
+                    let key_f = schema.get_field("key").unwrap();
+                    let vp = QueryParser::for_index(index, vec![value_f]);
+                    let kp = QueryParser::for_index(index, vec![key_f]);
+                    let clauses: Vec<(Occur, Box<dyn Query>)> = vec![
+                        (Occur::Must, vp.parse_query("foo").unwrap()),
+                        (Occur::Must, kp.parse_query("alpha").unwrap()),
+                    ];
+                    Ok(Box::new(BooleanQuery::new(clauses)) as Box<dyn Query>)
+                },
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(and_hit.len(), 1, "bool.must AND matching both should hit");
     }
 }
