@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.5] - 2026-04-24
+
+### Fixed
+
+- **`match.value=<substring>` returned zero hits against Kafka-produced topics whose value is a JSON object.** The realtime disk indexer's `_value` / `_key` Tantivy fields were never populated for those documents, so cold-path searches silently came back empty. Query A in issue #2 (`match_all` + `match.key=B`) coincidentally returned the right count (0) for the wrong reason — the `match.key` clause had nothing to match against. Reproduced with `kcat -k A -P '{"note":"has foo content"}'` + `CHRONIK_HOT_TEXT_ENABLED=false`.
+
+  Two-layer ingest data loss:
+    1. `produce_handler::send_to_indexer` dropped the Kafka record key on every branch and dropped the raw Kafka value on the JSON-object branch (only the parsed fields survived, merged into the document's `content`).
+    2. `realtime_indexer::index_json_document` then tried to read `content.get("key")` / `content.get("value")` to populate Tantivy's `_key` / `_value` — a category error conflating "the Kafka record key" with "a JSON field literally named `key`". Neither was usually present.
+
+  Fix: carry the raw Kafka bytes explicitly. `JsonDocument` gains `raw_key: Option<String>` and `raw_value: Option<String>` (UTF-8, lossy for value). `send_to_indexer` populates them unconditionally from `record.key` / `record.value`. The indexer writes Tantivy's `_key` / `_value` from those carriers, not from `content`. `_json_content` indexing is unchanged — it remains the right channel for querying parsed JSON fields.
+
+- **Hot text index dropped any Kafka key that looked like an English stopword.** The hot index registered `key` as a TEXT field, which ran through the English analyzer pipeline (lowercase → stopword filter → stemmer). A produced key of `"A"` lowercases to `"a"` and hits the stopword filter, so the doc was stored with no searchable key term. `match.key="A"` returned 0 on the hot path while the cold path (STRING) returned 1 — an inconsistency that issue #2's `match.key="B"` probe missed because `"B"` isn't a stopword.
+
+  Fix: Kafka keys are opaque identifiers, not prose. `key` is now STRING (same as the cold indexer's `_key`), so both schemas return the same hit set. Hot indexes are in-memory only; no migration.
+
+- **`match.value` / `match.key` didn't resolve against the underscore-prefixed schema (already uncommitted from v2.5.4 follow-up).** Added `resolve_field` in `build_tantivy_query`: when the user writes `value`, try `value` first, then `_value`, then strip a leading underscore. Same symmetry for every other field. Applies to `Match`, `Term`, and `Range` query types. Lets the same DSL work against hot (schema `key` / `value`) and cold (schema `_key` / `_value`) without the caller knowing which is live.
+
+### Verified
+
+Pre-tag matrix (`tests/issue2_matrix.sh`), single record produced via `kcat -k A -P '{"note":"has foo content"}'` with `CHRONIK_DEFAULT_SEARCHABLE=true`. All three cells × six queries = 18/18:
+
+| Query | Expected | hot-on | hot-off | rest-only |
+|---|---|---|---|---|
+| `bool.must[match_all, match.key=B]` (issue #2 Query A) | 0 | 0 | 0 | 0 |
+| `bool.must[match.value=foo, match.key=B]` (issue #2 Query B) | 0 | 0 | 0 | 0 |
+| `match.value=foo` | 1 | 1 | 1 | 1 |
+| `match.key=A` | 1 | 1 | 1 | 1 |
+| `match._value=foo` (alias) | 1 | 1 | 1 | 1 |
+| `match._key=A` (alias) | 1 | 1 | 1 | 1 |
+
+Unit tests: 39 passed (chronik-search) + 190 passed (chronik-server).
+
+Full investigation notes in `docs/SEARCH_FIELD_MODEL_INVESTIGATION.md`.
+
 ## [2.5.4] - 2026-04-23
 
 ### Fixed

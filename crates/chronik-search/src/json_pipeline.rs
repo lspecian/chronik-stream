@@ -149,7 +149,15 @@ impl JsonPipeline {
             
             // Create document ID
             let doc_id = format!("{}-{}-{}", topic, partition, record.offset);
-            
+
+            let raw_key = record.key.as_deref()
+                .and_then(|k| std::str::from_utf8(k).ok().map(|s| s.to_string()));
+            let raw_value = if record.value.is_empty() {
+                None
+            } else {
+                Some(String::from_utf8_lossy(&record.value).into_owned())
+            };
+
             let document = JsonDocument {
                 id: doc_id,
                 topic: topic.to_string(),
@@ -158,6 +166,8 @@ impl JsonPipeline {
                 timestamp: record.timestamp,
                 content: doc_content,
                 metadata: None,
+                raw_key,
+                raw_value,
             };
             
             // Send to indexer

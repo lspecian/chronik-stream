@@ -773,6 +773,40 @@ async fn search_in_index(
     Ok(hits)
 }
 
+/// v2.5.5: Look up a field by name, tolerating the two Chronik schema
+/// conventions — plain (`value`, `key`, `offset`, …) used by the hot text
+/// index and the WAL-archived TantivyIndexer, and underscore-prefixed
+/// (`_value`, `_key`, `_offset`, …) used by the realtime indexer. A user
+/// writing `{"match": {"value": "foo"}}` should get hits from every
+/// source they have, not just the one whose schema happens to match
+/// their spelling.
+///
+/// Resolution order:
+///   1. exact name the user wrote
+///   2. same name with a leading `_` added (when user wrote `value`, try `_value`)
+///   3. same name with a leading `_` stripped (when user wrote `_value`, try `value`)
+///
+/// Returns `Err` only when none of the three variants exist in the schema.
+fn resolve_field(
+    schema: &tantivy::schema::Schema,
+    field_name: &str,
+) -> std::result::Result<tantivy::schema::Field, ()> {
+    if let Ok(f) = schema.get_field(field_name) {
+        return Ok(f);
+    }
+    if !field_name.starts_with('_') {
+        let prefixed = format!("_{}", field_name);
+        if let Ok(f) = schema.get_field(&prefixed) {
+            return Ok(f);
+        }
+    } else if let Some(stripped) = field_name.strip_prefix('_') {
+        if let Ok(f) = schema.get_field(stripped) {
+            return Ok(f);
+        }
+    }
+    Err(())
+}
+
 /// Build Tantivy query from Elasticsearch query DSL.
 ///
 /// Exposed crate-wide so the hot text index can build structured queries
@@ -802,7 +836,10 @@ pub(crate) fn build_tantivy_query(
                     })
                     .collect::<Vec<_>>()
             } else {
-                let field = schema.get_field(field_name)
+                // v2.5.5: resolve `value` against `_value` too (and vice versa)
+                // so the same query works against hot, WAL-archived, and realtime
+                // schemas without the caller knowing which is live.
+                let field = resolve_field(schema, field_name)
                     .map_err(|_| Error::InvalidInput(format!("Field {} not found", field_name)))?;
                 vec![field]
             };
@@ -869,9 +906,9 @@ pub(crate) fn build_tantivy_query(
             let (field_name, value) = term_query.field_value.iter().next()
                 .ok_or_else(|| Error::InvalidInput("Term query must specify a field".to_string()))?;
             
-            let field = schema.get_field(field_name)
+            let field = resolve_field(schema, field_name)
                 .map_err(|_| Error::InvalidInput(format!("Field {} not found", field_name)))?;
-            
+
             let term = match value {
                 serde_json::Value::String(s) => Term::from_field_text(field, s),
                 serde_json::Value::Number(n) => {
@@ -892,8 +929,8 @@ pub(crate) fn build_tantivy_query(
         QueryDsl::Range(range_query) => {
             let (field_name, range_clause) = range_query.field_range.iter().next()
                 .ok_or_else(|| Error::InvalidInput("Range query must specify a field".to_string()))?;
-            
-            let field = schema.get_field(field_name)
+
+            let field = resolve_field(schema, field_name)
                 .map_err(|_| Error::InvalidInput(format!("Field {} not found", field_name)))?;
             
             // For now, we'll create a simple numeric range query
@@ -1455,6 +1492,38 @@ mod hot_merge_tests {
             extract_simple_query_text(&q),
             Some("running shoes".to_string())
         );
+    }
+
+    /// v2.5.5 regression: `resolve_field` must tolerate the two Chronik
+    /// schema conventions (`value` vs `_value`, etc.) so a single user
+    /// query works across hot / WAL-archive / realtime disk indexes
+    /// without the caller knowing which naming scheme is in play.
+    #[test]
+    fn resolve_field_maps_across_underscore_convention() {
+        use tantivy::schema::{Schema, TEXT, STRING, STORED};
+
+        // Realtime-style schema (underscore-prefixed).
+        let rt = {
+            let mut b = Schema::builder();
+            b.add_text_field("_value", TEXT | STORED);
+            b.add_text_field("_key", STRING | STORED);
+            b.build()
+        };
+        assert!(resolve_field(&rt, "value").is_ok(), "value → _value");
+        assert!(resolve_field(&rt, "key").is_ok(), "key → _key");
+        assert!(resolve_field(&rt, "_value").is_ok(), "_value exact");
+        assert!(resolve_field(&rt, "bogus").is_err(), "unknown field is Err");
+
+        // Plain-style schema (hot / WAL TantivyIndexer).
+        let hot = {
+            let mut b = Schema::builder();
+            b.add_text_field("value", TEXT | STORED);
+            b.add_text_field("key", TEXT | STORED);
+            b.build()
+        };
+        assert!(resolve_field(&hot, "_value").is_ok(), "_value → value");
+        assert!(resolve_field(&hot, "_key").is_ok(), "_key → key");
+        assert!(resolve_field(&hot, "value").is_ok(), "value exact");
     }
 
     /// Issue #2 regression: extract_simple_query_text must NOT flatten bool.

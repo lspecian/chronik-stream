@@ -3081,7 +3081,21 @@ impl ProduceHandler {
                         metadata.insert(format!("_header_{}", key), serde_json::Value::String(header_str));
                     }
                 }
-                
+
+                // Carry the raw Kafka record identity alongside the parsed JSON view.
+                // `_key` / `_value` Tantivy fields are populated from these, not from
+                // user JSON fields that happen to be named "key" / "value". Only valid
+                // UTF-8 keys become searchable — binary keys land as None and stay out
+                // of the text index. The value uses lossy UTF-8 so binary payloads
+                // still leave something tokenizable rather than vanishing.
+                let raw_key = record.key.as_deref()
+                    .and_then(|k| std::str::from_utf8(k).ok().map(|s| s.to_string()));
+                let raw_value = if record.value.is_empty() {
+                    None
+                } else {
+                    Some(String::from_utf8_lossy(&record.value).into_owned())
+                };
+
                 // Try to parse value as JSON, fallback to string
                 let document = if let Ok(json_value) = serde_json::from_slice::<serde_json::Value>(&record.value) {
                     // Merge JSON value with metadata
@@ -3097,6 +3111,8 @@ impl ProduceHandler {
                             timestamp: record.timestamp,
                             content: serde_json::Value::Object(obj),
                             metadata: Some(metadata),
+                            raw_key: raw_key.clone(),
+                            raw_value: raw_value.clone(),
                         }
                     } else {
                         // Non-object JSON, wrap it
@@ -3110,6 +3126,8 @@ impl ProduceHandler {
                             timestamp: record.timestamp,
                             content: serde_json::Value::Object(obj),
                             metadata: Some(metadata),
+                            raw_key: raw_key.clone(),
+                            raw_value: raw_value.clone(),
                         }
                     }
                 } else {
@@ -3123,7 +3141,7 @@ impl ProduceHandler {
                         let encoded = base64::engine::general_purpose::STANDARD.encode(&record.value);
                         obj.insert("_value_base64".to_string(), serde_json::Value::String(encoded));
                     }
-                    
+
                     JsonDocument {
                         id: format!("{}-{}-{}", topic, partition, record.offset),
                         topic: topic.to_string(),
@@ -3132,6 +3150,8 @@ impl ProduceHandler {
                         timestamp: record.timestamp,
                         content: serde_json::Value::Object(obj),
                         metadata: Some(metadata),
+                        raw_key: raw_key.clone(),
+                        raw_value: raw_value.clone(),
                     }
                 };
                 

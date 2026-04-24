@@ -115,7 +115,13 @@ impl HotPartitionIndex {
             "timestamp",
             NumericOptions::default().set_indexed().set_stored(),
         );
-        let key_field = schema_builder.add_text_field("key", TEXT | STORED);
+        // `key` is STRING — Kafka keys are opaque identifiers, not prose. Indexing
+        // them through the English analyzer drops stopword-shaped keys (e.g. "A",
+        // "the") entirely and mangles everything else by stemming/lowercasing. Keep
+        // this consistent with Schema A in realtime_indexer.rs, where `_key` is also
+        // STRING; otherwise hot and cold paths return different hit sets for the same
+        // query. See docs/SEARCH_FIELD_MODEL_INVESTIGATION.md.
+        let key_field = schema_builder.add_text_field("key", STRING | STORED);
         let value_field = schema_builder.add_text_field("value", TEXT | STORED);
         let headers_field = schema_builder.add_text_field("headers", TEXT | STORED);
         let schema = schema_builder.build();

@@ -82,6 +82,8 @@ async fn test_realtime_json_indexing() {
             timestamp: chrono::Utc::now().timestamp_millis(),
             content,
             metadata: None,
+            raw_key: None,
+            raw_value: None,
         };
         sender.send(doc).await.unwrap();
     }
@@ -305,6 +307,8 @@ async fn test_field_indexing_policies() {
             "secret": "also-not-indexed"
         }),
         metadata: None,
+        raw_key: None,
+        raw_value: None,
     };
     
     sender.send(doc).await.unwrap();
@@ -422,6 +426,8 @@ async fn test_high_throughput_indexing() {
                 }
             }),
             metadata: None,
+            raw_key: None,
+            raw_value: None,
         };
         sender.send(doc).await.unwrap();
     }

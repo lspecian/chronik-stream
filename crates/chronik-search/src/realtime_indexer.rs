@@ -157,6 +157,19 @@ pub struct JsonDocument {
     pub content: JsonValue,
     /// Optional metadata
     pub metadata: Option<JsonMap<String, JsonValue>>,
+    /// Raw Kafka record key as UTF-8. None when the key is absent or not valid UTF-8.
+    ///
+    /// Carried separately from `content` so Schema A's Tantivy `_key` field is populated
+    /// from the Kafka record identity rather than from a same-named user JSON field —
+    /// a category error in earlier versions where `_key` stayed empty for JSON-produced
+    /// topics. See `docs/SEARCH_FIELD_MODEL_INVESTIGATION.md`.
+    pub raw_key: Option<String>,
+    /// Raw Kafka record value as lossy UTF-8. None only when the value is empty.
+    ///
+    /// Carried separately from `content` because JSON-object values are merged field-wise
+    /// into `content`, erasing the raw value string. Schema A's Tantivy `_value` field
+    /// is populated from this.
+    pub raw_value: Option<String>,
 }
 
 /// Indexing metrics
@@ -552,17 +565,16 @@ async fn index_json_document(
         tantivy_doc.add_text(json_field, &json_str);
     }
     
-    // Also add key and value if they exist in the JSON
-    if let Some(key) = doc.content.get("key").and_then(|v| v.as_str()) {
-        if let Ok(field) = schema.get_field("_key") {
-            tantivy_doc.add_text(field, key);
-        }
+    // Populate Tantivy `_key` / `_value` from the raw Kafka record identity, not from
+    // same-named JSON fields in `content` — that prior lookup was a category error that
+    // left `_key` empty for every JSON-produced topic and `_value` empty whenever the
+    // Kafka value parsed as a JSON object. Carried as explicit fields on `JsonDocument`
+    // so the Kafka identity never collides with user JSON content.
+    if let (Ok(field), Some(k)) = (schema.get_field("_key"), doc.raw_key.as_deref()) {
+        tantivy_doc.add_text(field, k);
     }
-    
-    if let Some(value) = doc.content.get("value").and_then(|v| v.as_str()) {
-        if let Ok(field) = schema.get_field("_value") {
-            tantivy_doc.add_text(field, value);
-        }
+    if let (Ok(field), Some(v)) = (schema.get_field("_value"), doc.raw_value.as_deref()) {
+        tantivy_doc.add_text(field, v);
     }
     
     // Calculate document size
@@ -856,6 +868,8 @@ mod tests {
                     }
                 }),
                 metadata: None,
+                raw_key: None,
+                raw_value: None,
             };
             sender.send(doc).await.unwrap();
         }
@@ -915,6 +929,8 @@ mod tests {
                 "array_field": [1, 2, 3]
             }),
             metadata: None,
+            raw_key: None,
+            raw_value: None,
         };
         
         sender.send(doc1).await.unwrap();
@@ -962,6 +978,8 @@ mod tests {
                 "deeply_nested": create_deeply_nested_json(10)
             }),
             metadata: None,
+            raw_key: None,
+            raw_value: None,
         };
         
         sender.send(doc).await.unwrap();
