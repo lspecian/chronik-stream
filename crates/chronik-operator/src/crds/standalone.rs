@@ -3,8 +3,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::common::{
-    Condition, EnvVar, ImagePullSecret, ObjectStoreSpec, ResourceRequirements, StorageSpec,
-    Toleration, VectorSearchSpec,
+    Condition, EnvVar, ImagePullSecret, ObjectStoreSpec, PodSecurityContextSpec,
+    ResourceRequirements, StorageSpec, Toleration, VectorSearchSpec,
 };
 
 /// Spec for a single-node Chronik deployment.
@@ -97,6 +97,15 @@ pub struct ChronikStandaloneSpec {
     /// Extra environment variables.
     #[serde(default)]
     pub env: Vec<EnvVar>,
+
+    /// Pod-level security context applied to the standalone Pod.
+    ///
+    /// When omitted, the controller defaults to `fsGroup: 1001` so the
+    /// official `ghcr.io/lspecian/chronik-stream` image (which runs as
+    /// `chronik` UID/GID 1001) can write to RWO PVCs that ship as
+    /// `root:root`. Set explicitly to override.
+    #[serde(default)]
+    pub pod_security_context: Option<PodSecurityContextSpec>,
 }
 
 /// Status for ChronikStandalone.

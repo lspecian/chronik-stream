@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use super::common::{
     Condition, EnvVar, ImagePullSecret, ListenerSpec, ListenerStatus, ObjectStoreSpec, PdbSpec,
-    ResourceRequirements, SchemaRegistrySpec, StorageSpec, Toleration, UpdateStrategy,
-    VectorSearchSpec,
+    PodSecurityContextSpec, ResourceRequirements, SchemaRegistrySpec, StorageSpec, Toleration,
+    UpdateStrategy, VectorSearchSpec,
 };
 
 /// Spec for a multi-node Chronik Raft cluster.
@@ -140,6 +140,16 @@ pub struct ChronikClusterSpec {
     /// Extra environment variables.
     #[serde(default)]
     pub env: Vec<EnvVar>,
+
+    /// Pod-level security context applied to every broker Pod.
+    ///
+    /// When omitted, the controller defaults to `fsGroup: 1001` so the
+    /// official `ghcr.io/lspecian/chronik-stream` image (which runs as
+    /// `chronik` UID/GID 1001) can write to RWO PVCs that ship as
+    /// `root:root`. Set explicitly to override (e.g. when running a
+    /// custom image with a different UID, or to harden the broker).
+    #[serde(default)]
+    pub pod_security_context: Option<PodSecurityContextSpec>,
 }
 
 /// Status for ChronikCluster.

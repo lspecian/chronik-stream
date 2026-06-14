@@ -2,14 +2,60 @@ use std::collections::BTreeMap;
 
 use k8s_openapi::api::core::v1::{
     Container, ContainerPort, EnvVar, LocalObjectReference, PersistentVolumeClaimVolumeSource, Pod,
-    PodSpec, Probe, ResourceRequirements, TCPSocketAction, Toleration, Volume, VolumeMount,
+    PodSecurityContext, PodSpec, Probe, ResourceRequirements, TCPSocketAction, Toleration, Volume,
+    VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 
 use crate::constants::{self, labels, values};
+use crate::crds::common::PodSecurityContextSpec;
 use crate::crds::standalone::ChronikStandaloneSpec;
+
+/// UID/GID baked into the official `ghcr.io/lspecian/chronik-stream` image
+/// (see `Dockerfile.binary`: `useradd -u 1001 chronik`). The kubelet uses
+/// this as `fsGroup` when the user hasn't overridden, which makes RWO PVCs
+/// writable by the container on every common CSI driver (Longhorn, EBS,
+/// GCE-PD, AzureDisk, NFS-CSI, …). See chronik-stream issue #3.
+const CHRONIK_IMAGE_UID: i64 = 1001;
+
+/// Resolve the Pod-level `SecurityContext` to apply to a broker Pod.
+///
+/// Precedence: explicit `pod_security_context` from the CR spec wins.
+/// Otherwise default to `fsGroup = 1001` so the chronik UID can `chown`
+/// the volume on PVC mount. Returns `None` only when the caller passes a
+/// user override that translates to "everything default" — i.e. when none
+/// of the override fields are set, the helper falls back to the default
+/// rather than emitting an empty `securityContext: {}` block, since the
+/// empty block is what the cluster was generating before this fix and
+/// what the broken behaviour required us to change.
+pub(crate) fn resolve_pod_security_context(
+    user_override: Option<&PodSecurityContextSpec>,
+) -> Option<PodSecurityContext> {
+    if let Some(spec) = user_override {
+        let any_set = spec.fs_group.is_some()
+            || spec.run_as_user.is_some()
+            || spec.run_as_group.is_some()
+            || spec.run_as_non_root.is_some()
+            || spec.fs_group_change_policy.is_some();
+        if any_set {
+            return Some(PodSecurityContext {
+                fs_group: spec.fs_group,
+                run_as_user: spec.run_as_user,
+                run_as_group: spec.run_as_group,
+                run_as_non_root: spec.run_as_non_root,
+                fs_group_change_policy: spec.fs_group_change_policy.clone(),
+                ..Default::default()
+            });
+        }
+    }
+    // Default — what users want 99 % of the time.
+    Some(PodSecurityContext {
+        fs_group: Some(CHRONIK_IMAGE_UID),
+        ..Default::default()
+    })
+}
 
 /// Build a Pod for a ChronikStandalone instance.
 pub fn build_standalone_pod(
@@ -283,6 +329,7 @@ pub fn build_standalone_pod(
             node_selector: spec.node_selector.clone(),
             tolerations,
             image_pull_secrets,
+            security_context: resolve_pod_security_context(spec.pod_security_context.as_ref()),
             volumes: Some(vec![Volume {
                 name: "data".into(),
                 persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
@@ -645,6 +692,7 @@ pub fn build_cluster_node_pod(
             tolerations,
             image_pull_secrets,
             affinity,
+            security_context: resolve_pod_security_context(spec.pod_security_context.as_ref()),
             volumes: Some(vec![
                 Volume {
                     name: "data".into(),
@@ -955,5 +1003,60 @@ mod tests {
         assert_eq!(sel.get(labels::INSTANCE).unwrap(), "prod");
         assert_eq!(sel.get(labels::COMPONENT).unwrap(), "cluster-node");
         assert!(!sel.contains_key(labels::NODE_ID));
+    }
+
+    #[test]
+    fn pod_security_context_defaults_to_fsgroup_1001() {
+        let ctx = resolve_pod_security_context(None).expect("should default");
+        assert_eq!(ctx.fs_group, Some(1001));
+        // Everything else stays unset so we don't surprise the user with
+        // narrower defaults than upstream k8s.
+        assert!(ctx.run_as_user.is_none());
+        assert!(ctx.run_as_group.is_none());
+        assert!(ctx.run_as_non_root.is_none());
+    }
+
+    #[test]
+    fn pod_security_context_empty_override_falls_back_to_default() {
+        // An override struct with no fields set means "I want the default"
+        // — without this, the user couldn't have a CR with
+        // `podSecurityContext: {}` and still get the fsGroup fix.
+        let empty = PodSecurityContextSpec::default();
+        let ctx = resolve_pod_security_context(Some(&empty)).expect("should default");
+        assert_eq!(ctx.fs_group, Some(1001));
+    }
+
+    #[test]
+    fn pod_security_context_override_wins() {
+        let custom = PodSecurityContextSpec {
+            fs_group: Some(2000),
+            run_as_user: Some(2000),
+            run_as_group: Some(2000),
+            run_as_non_root: Some(true),
+            fs_group_change_policy: Some("OnRootMismatch".into()),
+        };
+        let ctx = resolve_pod_security_context(Some(&custom)).expect("should resolve");
+        assert_eq!(ctx.fs_group, Some(2000));
+        assert_eq!(ctx.run_as_user, Some(2000));
+        assert_eq!(ctx.run_as_group, Some(2000));
+        assert_eq!(ctx.run_as_non_root, Some(true));
+        assert_eq!(ctx.fs_group_change_policy.as_deref(), Some("OnRootMismatch"));
+    }
+
+    #[test]
+    fn pod_security_context_partial_override_keeps_set_fields_and_drops_default_fsgroup() {
+        // User sets only `runAsNonRoot: true` (security hardening) — we must
+        // honour that EXACTLY, NOT silently merge in our default fsGroup.
+        // Otherwise an opinionated operator surprises a hardener.
+        let custom = PodSecurityContextSpec {
+            run_as_non_root: Some(true),
+            ..Default::default()
+        };
+        let ctx = resolve_pod_security_context(Some(&custom)).expect("should resolve");
+        assert_eq!(ctx.run_as_non_root, Some(true));
+        assert!(
+            ctx.fs_group.is_none(),
+            "partial override must not inherit default fsGroup"
+        );
     }
 }

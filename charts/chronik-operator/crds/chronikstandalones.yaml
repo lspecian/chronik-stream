@@ -136,6 +136,37 @@ spec:
                 required:
                 - backend
                 type: object
+              podSecurityContext:
+                description: |-
+                  Pod-level security context applied to the standalone Pod.
+
+                  When omitted, the controller defaults to `fsGroup: 1001` so the official `ghcr.io/lspecian/chronik-stream` image (which runs as `chronik` UID/GID 1001) can write to RWO PVCs that ship as `root:root`. Set explicitly to override.
+                nullable: true
+                properties:
+                  fsGroup:
+                    description: Special supplemental group that applies to all containers in the Pod. Kubelet `chown`s the volume to this GID when the volume plugin supports it (Longhorn, EBS, GCE-PD, AzureDisk, NFS-CSI, …).
+                    format: int64
+                    nullable: true
+                    type: integer
+                  fsGroupChangePolicy:
+                    description: 'Policy for when the volume is chowned to fsGroup. Valid: `OnRootMismatch`, `Always`. When unset, kubelet picks the default.'
+                    nullable: true
+                    type: string
+                  runAsGroup:
+                    description: Primary GID to run the Pod's containers as.
+                    format: int64
+                    nullable: true
+                    type: integer
+                  runAsNonRoot:
+                    description: When `true`, the kubelet validates that the container's effective UID is non-zero and refuses to start the Pod otherwise.
+                    nullable: true
+                    type: boolean
+                  runAsUser:
+                    description: UID to run the Pod's containers as. Overrides the image's `USER`.
+                    format: int64
+                    nullable: true
+                    type: integer
+                type: object
               produceProfile:
                 default: balanced
                 description: 'Produce handler flush profile: low-latency, balanced, high-throughput.'

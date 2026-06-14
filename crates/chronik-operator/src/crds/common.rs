@@ -250,3 +250,43 @@ pub struct Toleration {
 pub struct ImagePullSecret {
     pub name: String,
 }
+
+/// Pod-level security context, applied to every Pod the controller creates
+/// for a `ChronikCluster` or `ChronikStandalone`. Mirrors the Kubernetes
+/// `corev1.PodSecurityContext` subset most relevant to PVC ownership.
+///
+/// When omitted, the controller defaults `fsGroup = 1001` because the
+/// official `ghcr.io/lspecian/chronik-stream` image runs as
+/// `chronik` (UID/GID 1001) — without `fsGroup` set, fresh `ReadWriteOnce`
+/// PVCs are mounted as `root:root` and the container can't write to
+/// `/data`. See chronik-stream issue #3 for the reproduction.
+///
+/// Set explicitly to override (e.g. when running a custom image with a
+/// different UID, or to harden with `runAsNonRoot: true`).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PodSecurityContextSpec {
+    /// Special supplemental group that applies to all containers in the
+    /// Pod. Kubelet `chown`s the volume to this GID when the volume
+    /// plugin supports it (Longhorn, EBS, GCE-PD, AzureDisk, NFS-CSI, …).
+    #[serde(default)]
+    pub fs_group: Option<i64>,
+
+    /// UID to run the Pod's containers as. Overrides the image's `USER`.
+    #[serde(default)]
+    pub run_as_user: Option<i64>,
+
+    /// Primary GID to run the Pod's containers as.
+    #[serde(default)]
+    pub run_as_group: Option<i64>,
+
+    /// When `true`, the kubelet validates that the container's effective
+    /// UID is non-zero and refuses to start the Pod otherwise.
+    #[serde(default)]
+    pub run_as_non_root: Option<bool>,
+
+    /// Policy for when the volume is chowned to fsGroup. Valid:
+    /// `OnRootMismatch`, `Always`. When unset, kubelet picks the default.
+    #[serde(default)]
+    pub fs_group_change_policy: Option<String>,
+}
