@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.6] - 2026-06-27
+
+### Fixed
+- **Cluster distributed search data loss**: the scatter-gather query router
+  hardcoded Unified API port 6092 for every peer, but each node binds to
+  `6091 + node_id`. On multi-port single-host clusters this pointed 2 of 3
+  peers at the wrong port, so distributed `/_search` silently dropped ~1/3 of
+  results. Peer port is now resolved per node (`CHRONIK_UNIFIED_API_PORT_NODE_<id>`
+  override → `CHRONIK_UNIFIED_API_PORT` → `6091 + peer.id`). Production
+  single-port deployments are unchanged.
+
 ## [2.5.5] - 2026-04-24
 
 ### Fixed
