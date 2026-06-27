@@ -18,6 +18,8 @@ members = [
     "crates/chronik-embeddings",
     "crates/chronik-operator",
     "crates/chronik-perf",
+    "crates/chronik-memory",
+    "bindings/python",
 ]
 exclude = ["tests"]
 

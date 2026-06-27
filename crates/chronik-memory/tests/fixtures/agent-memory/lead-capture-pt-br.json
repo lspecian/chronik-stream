@@ -1,0 +1,87 @@
+{
+  "name": "lead-capture-pt-br",
+  "description": "Cross-lingual: pt-BR conversation, predicates remain canonical English snake_case. Tests that v3 produces consistent predicates regardless of input language. Calibrated against AnthropicExtractor v3 (temperature=0).",
+  "conversation": [
+    {
+      "role": "user",
+      "content": "Boa tarde, estou procurando um apartamento em Pinheiros, São Paulo.",
+      "ts": "2026-04-25T16:00:00Z"
+    },
+    {
+      "role": "assistant",
+      "content": "Boa tarde. Quantos quartos você procura?",
+      "ts": "2026-04-25T16:00:30Z"
+    },
+    {
+      "role": "user",
+      "content": "Três quartos, sendo uma suíte. Preciso de pelo menos 90m² e duas vagas de garagem.",
+      "ts": "2026-04-25T16:01:15Z"
+    },
+    {
+      "role": "assistant",
+      "content": "Entendi. Qual o orçamento?",
+      "ts": "2026-04-25T16:01:30Z"
+    },
+    {
+      "role": "user",
+      "content": "Até R$ 1,8 milhão. Pagamento à vista.",
+      "ts": "2026-04-25T16:02:00Z"
+    }
+  ],
+  "expected_memories": [
+    {
+      "type": "fact",
+      "key": "user|prefers_neighborhood",
+      "subject_predicate": ["user", "prefers_neighborhood"],
+      "source_indexes": [0],
+      "min_confidence": 0.6
+    },
+    {
+      "type": "fact",
+      "key": "user|bedrooms",
+      "subject_predicate": ["user", "bedrooms"],
+      "source_indexes": [2],
+      "min_confidence": 0.6
+    },
+    {
+      "type": "fact",
+      "key": "user|min_area_sqm",
+      "subject_predicate": ["user", "min_area_sqm"],
+      "source_indexes": [2],
+      "min_confidence": 0.5
+    },
+    {
+      "type": "fact",
+      "key": "user|parking_spaces",
+      "subject_predicate": ["user", "parking_spaces"],
+      "source_indexes": [2],
+      "min_confidence": 0.5
+    },
+    {
+      "type": "fact",
+      "key": "user|budget",
+      "subject_predicate": ["user", "budget"],
+      "source_indexes": [4],
+      "min_confidence": 0.7
+    },
+    {
+      "type": "fact",
+      "key": "user|payment_method",
+      "subject_predicate": ["user", "payment_method"],
+      "source_indexes": [4],
+      "min_confidence": 0.5
+    }
+  ],
+  "recall_queries": [
+    {
+      "query": "what neighborhood does this user want",
+      "expected_keys": ["user|prefers_neighborhood"],
+      "k": 5
+    },
+    {
+      "query": "qual o orçamento deste cliente",
+      "expected_keys": ["user|budget"],
+      "k": 5
+    }
+  ]
+}

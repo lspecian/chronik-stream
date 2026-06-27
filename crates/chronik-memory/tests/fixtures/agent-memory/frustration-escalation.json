@@ -1,0 +1,52 @@
+{
+  "name": "frustration-escalation",
+  "description": "Multi-turn sentiment degradation — user frustrated across two turns, agent escalates to a human. Calibrated against AnthropicExtractor v3 (temperature=0).",
+  "conversation": [
+    {
+      "role": "user",
+      "content": "I asked twice already and still no answer about the unit on Rua das Flores 42.",
+      "ts": "2026-04-25T18:00:00Z"
+    },
+    {
+      "role": "assistant",
+      "content": "Sorry about the wait — let me check that property record now.",
+      "ts": "2026-04-25T18:00:20Z"
+    },
+    {
+      "role": "user",
+      "content": "This is ridiculous. Are you even paying attention to me?",
+      "ts": "2026-04-25T18:01:30Z"
+    },
+    {
+      "role": "assistant",
+      "content": "I hear you, and I'm flagging this conversation to a human agent right now. Someone will follow up within the hour.",
+      "ts": "2026-04-25T18:01:50Z"
+    }
+  ],
+  "expected_memories": [
+    {
+      "type": "fact",
+      "key": "user|inquired_about_property",
+      "subject_predicate": ["user", "inquired_about_property"],
+      "source_indexes": [0],
+      "min_confidence": 0.6
+    },
+    {
+      "type": "instruction",
+      "source_indexes": [3],
+      "min_confidence": 0.7
+    },
+    {
+      "type": "task",
+      "source_indexes": [3],
+      "min_confidence": 0.7
+    }
+  ],
+  "recall_queries": [
+    {
+      "query": "what property did this user ask about",
+      "expected_keys": ["user|inquired_about_property"],
+      "k": 5
+    }
+  ]
+}
