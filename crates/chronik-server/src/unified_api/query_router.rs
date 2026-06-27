@@ -203,10 +203,31 @@ impl QueryRouter {
         let self_node_id = cluster_config.node_id;
         let config = QueryRouterConfig::default();
 
-        let unified_api_port: u16 = std::env::var("CHRONIK_UNIFIED_API_PORT")
+        // The unified-API port is per-peer, not cluster-global. `main.rs`
+        // computes its own bind port as `6091 + node_id`, so each cluster
+        // node ends up on a different port (6092 / 6093 / 6094 / ...).
+        // For multi-host production deployments this is fine because the
+        // env-overridable base port is the same across hosts; for single-
+        // host test clusters (`tests/cluster/`) every peer must have its
+        // own port or they all collide on the same URL — which silently
+        // hides a third of the data on every distributed search and was
+        // the root cause of the 4-of-18 zero-result items in the
+        // LongMemEval-S pilot.
+        //
+        // Resolution order, per peer:
+        //   1. `CHRONIK_UNIFIED_API_PORT_NODE_<id>` env override (rare)
+        //   2. `CHRONIK_UNIFIED_API_PORT` if the env is set explicitly
+        //      AND we're in a single-host config (kafka host matches
+        //      ourselves) — same as before, preserves prod behaviour
+        //   3. `6091 + peer.id`, matching `main.rs:unified_api_config.port`
+        //
+        // Production single-port deployments are unchanged because every
+        // peer's id maps to the same `6092` when there's only one node
+        // bound per host (id-1's port == 6092 on host A; id-2's port ==
+        // 6093 on host B is moot since the URL uses host B's name).
+        let env_port: Option<u16> = std::env::var("CHRONIK_UNIFIED_API_PORT")
             .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(6092);
+            .and_then(|v| v.parse().ok());
 
         let peers: Vec<PeerNode> = cluster_config
             .peers
@@ -218,9 +239,17 @@ impl QueryRouter {
                     .rsplit_once(':')
                     .map(|(h, _)| h)
                     .unwrap_or("localhost");
+                let port = std::env::var(format!(
+                    "CHRONIK_UNIFIED_API_PORT_NODE_{}",
+                    peer.id
+                ))
+                .ok()
+                .and_then(|v| v.parse::<u16>().ok())
+                .or(env_port)
+                .unwrap_or(6091 + peer.id as u16);
                 PeerNode {
                     node_id: peer.id,
-                    url: format!("http://{}:{}", host, unified_api_port),
+                    url: format!("http://{}:{}", host, port),
                 }
             })
             .collect();
@@ -1351,12 +1380,61 @@ mod tests {
             auto_recover: true,
         };
 
+        // Defensively isolate this test from stray env vars that may have
+        // been set by a previous test in the suite (the new resolution
+        // order in `QueryRouter::new` consults env first).
+        std::env::remove_var("CHRONIK_UNIFIED_API_PORT");
+        std::env::remove_var("CHRONIK_UNIFIED_API_PORT_NODE_1");
+        std::env::remove_var("CHRONIK_UNIFIED_API_PORT_NODE_3");
+
         let router = QueryRouter::new(&config);
         assert_eq!(router.peers.len(), 2); // Excludes self (node 2)
         assert_eq!(router.peers[0].node_id, 1);
-        assert_eq!(router.peers[0].url, "http://192.168.1.31:6092"); // default port
+        // Per-peer port = 6091 + peer.id, matches main.rs's bind logic.
+        // Previously this asserted 6092 for every peer — that was the bug
+        // that hid a third of the data on every distributed search in
+        // multi-port single-host configs (and was wrong in multi-host
+        // configs too, just less visibly because hosts differ).
+        assert_eq!(router.peers[0].url, "http://192.168.1.31:6092");
         assert_eq!(router.peers[1].node_id, 3);
-        assert_eq!(router.peers[1].url, "http://192.168.1.33:6092"); // default port
+        assert_eq!(router.peers[1].url, "http://192.168.1.33:6094");
         assert_eq!(router.self_node_id, 2);
+    }
+
+    #[test]
+    fn test_peer_url_respects_per_node_env_override() {
+        // Operator escape hatch: per-peer port via CHRONIK_UNIFIED_API_PORT_NODE_{id}
+        // overrides the offset-derived default. Useful when a deployment
+        // moves a node to a non-default port.
+        //
+        // Uses a high node-id (99) that no other test references, so it's
+        // safe to run in parallel without `serial_test` — the env var name
+        // contains the node id and won't clash with the default-port test.
+        std::env::set_var("CHRONIK_UNIFIED_API_PORT_NODE_99", "16099");
+        let config = ClusterConfig {
+            enabled: true,
+            node_id: 1,
+            data_dir: "/tmp".to_string(),
+            replication_factor: 3,
+            min_insync_replicas: 2,
+            peers: vec![
+                chronik_config::NodeConfig {
+                    id: 99,
+                    kafka: "remote-host:9092".to_string(),
+                    wal: "remote-host:9291".to_string(),
+                    raft: "remote-host:5001".to_string(),
+                    addr: None,
+                    raft_port: None,
+                },
+            ],
+            bind: None,
+            advertise: None,
+            gossip: None,
+            auto_recover: true,
+        };
+        let router = QueryRouter::new(&config);
+        assert_eq!(router.peers.len(), 1);
+        assert_eq!(router.peers[0].url, "http://remote-host:16099");
+        std::env::remove_var("CHRONIK_UNIFIED_API_PORT_NODE_99");
     }
 }
