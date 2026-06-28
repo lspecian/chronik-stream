@@ -116,7 +116,9 @@ pub use extractor::{
     OllamaPromptVersion, OpenAIExtractor, OpenAIPromptVersion, RuleExtractor, Turn,
 };
 pub use ingest::IngestAck;
-pub use ranking::{half_life, Channel, RRF_K};
+pub use ranking::{
+    detect_intent, half_life, intent_boost, Channel, QueryIntent, RRF_K,
+};
 pub use recall::{
     extract_subject_candidates, RecallBuilder, RecallResult, SqlFilter, SynthesizedAnswer,
     ABSTAIN_LITERAL,

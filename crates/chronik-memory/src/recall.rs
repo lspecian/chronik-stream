@@ -34,7 +34,8 @@ use crate::client::Memory;
 use crate::embeddings::TextGenerator;
 use crate::error::{MemoryError, Result};
 use crate::ranking::{
-    decay_factor, half_life, rrf_contribution, type_weight, Channel, RRF_K,
+    decay_factor, detect_intent, half_life, intent_boost, rrf_contribution, type_weight,
+    Channel, QueryIntent, RRF_K,
 };
 use crate::schema::{MemoryRecord, MemoryType};
 use chrono::{DateTime, Utc};
@@ -481,14 +482,26 @@ impl<'a> RecallBuilder<'a> {
             }
         }
 
-        // Final score = sum of channel contributions × type_weight × decay × confidence.
+        // Detect the query's intent once — used to boost value-bearing
+        // memories on numeric / temporal queries (LongMemEval levers #2 + #3).
+        let intent = detect_intent(&self.query);
+
+        // Final score = sum of channel contributions × type_weight × decay × confidence × intent_boost.
         for result in master.values_mut() {
             let ty = result.memory.body.kind();
             let decay = decay_factor(result.memory.valid_from, now, half_life(ty));
             let conf = result.memory.confidence as f64;
             let type_w = type_weight(ty);
+            let boost = intent_boost(intent, &result.memory);
             let channel_sum: f64 = result.channels.values().sum();
-            result.score = channel_sum * type_w * decay * conf;
+            result.score = channel_sum * type_w * decay * conf * boost;
+        }
+        if !matches!(intent, QueryIntent::Identity) {
+            tracing::debug!(
+                query = %self.query,
+                intent = ?intent,
+                "applied question-aware intent boost"
+            );
         }
 
         // Compaction-style dedup on (namespace, key) keeping highest version,

@@ -405,13 +405,15 @@ Recall p99 over HTTP:        not measured
 
 ### Levers to close the 0.144 gap to 0.70
 
-Three structural gaps identified at Pilot 7 (none picked yet):
+Three structural gaps identified at Pilot 7:
 
-1. **Two-pass extraction** — closes single-session-assistant 0/3 (Andy clothing, 2-3 eggs, Roscioli). First pass extracts facts as today; second pass scans for assistant-stated facts the user accepted but never restated.
-2. **Question-aware ranker** — closes multi-fact arithmetic items (item 4 "$720", item 10 "2 count"). Aggregator-word detection ("how many", "total") boosts numeric-bearing facts before RRF.
-3. **Temporal-anchor surfacing** — closes temporal items (item 12 "21 days", item 14 "Met Museum"). Same idea as #2 but for time references.
+1. **Two-pass extraction** — closes single-session-assistant 0/3 (Andy clothing, 2-3 eggs, Roscioli). First pass extracts facts as today; second pass scans for assistant-stated facts the user accepted but never restated. **Status**: ❌ pending.
+2. **Question-aware ranker** — closes multi-fact arithmetic items (item 4 "$720", item 10 "2 count"). Aggregator-word detection ("how many", "total") boosts numeric-bearing facts before RRF. **Status**: ✅ implemented 2026-06-28 — `ranking::detect_intent` + `ranking::intent_boost` (3-tier classifier: strong-temporal → numeric → weak-temporal → identity). Wired into `recall.rs::send` after RRF combine. 8 new unit tests pass.
+3. **Temporal-anchor surfacing** — closes temporal items (item 12 "21 days", item 14 "Met Museum"). Same idea as #2 but for time references. **Status**: ✅ implemented 2026-06-28 — same `intent_boost` covers Temporal queries (events get 1.6×, tasks with `due_at` 1.4×, facts mentioning date words 1.3×).
 
 See **Appendix B** for the empirical evidence that supports these three; gated under standing directive *"no Phase 3 work until LongMemEval ≥ 0.70"*.
+
+**Validation plan**: pilot 8 = V3 + multi-channel + synthesis + `_abs`-aware judge + anti-abstention + intent boost. Expected lift comes from numeric items 4 / 10 and temporal items 12 / 14 moving up the RRF order. Cost: ~$2 + ~75 min against a live cluster.
 
 ---
 
