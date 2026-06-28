@@ -15,11 +15,13 @@ pub mod calibration;
 pub mod prompts;
 pub mod providers;
 pub mod rules;
+pub mod two_pass;
 
 pub use providers::anthropic::AnthropicExtractor;
 pub use providers::ollama::{OllamaExtractor, OllamaPromptVersion};
 pub use providers::openai::{OpenAIExtractor, OpenAIPromptVersion};
 pub use rules::RuleExtractor;
+pub use two_pass::TwoPassExtractor;
 
 use crate::error::Result;
 use crate::schema::Body;

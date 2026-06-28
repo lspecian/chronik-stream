@@ -114,6 +114,7 @@ pub use extractor::providers::anthropic::PromptVersion;
 pub use extractor::{
     AnthropicExtractor, ChainedExtractor, Extracted, Extractor, OllamaExtractor,
     OllamaPromptVersion, OpenAIExtractor, OpenAIPromptVersion, RuleExtractor, Turn,
+    TwoPassExtractor,
 };
 pub use ingest::IngestAck;
 pub use ranking::{
