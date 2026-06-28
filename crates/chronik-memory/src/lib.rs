@@ -1,7 +1,10 @@
-//! Chronik Memory — event-native agent-memory SDK.
+//! Chronik Memory — event-native agent memory, server-internal implementation.
 //!
-//! `chronik-memory` is the Rust core of the Chronik Memory SDK. Customers run their
-//! own Chronik cluster; this crate is the client. See `docs/ROADMAP_AGENT_MEMORY_SDK.md`.
+//! This crate is the Rust implementation behind the `/memory/v1/*` HTTP endpoints
+//! mounted on Chronik's Unified API (port 6092). It is **not** a public client SDK
+//! — see `docs/ROADMAP_AGENT_MEMORY.md` for the architectural decision (AD-1) and
+//! the endpoint reference (Appendix A). Customers interact with agent memory via
+//! HTTP/JSON; this crate's types are not a stable public API.
 //!
 //! # Quickstart (Phase 1)
 //!

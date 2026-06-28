@@ -10,8 +10,9 @@ readme = "README.md"
 keywords = ["agent", "memory", "rag", "kafka", "chronik"]
 categories = ["database", "asynchronous"]
 
-# Independent version track from chronik-stream platform (currently 2.5.5).
-# This crate follows its own semver — see docs/ROADMAP_AGENT_MEMORY_SDK.md.
+# Internal server crate for Chronik Agent Memory — see docs/ROADMAP_AGENT_MEMORY.md
+# (Architectural Decision AD-1: the agent-memory surface is HTTP endpoints under
+# /memory/v1/* on the Unified API; this crate is the server's internal implementation).
 
 [dependencies]
 # Async runtime

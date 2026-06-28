@@ -1,15 +1,16 @@
 # chronik-memory
 
-Event-native agent-memory SDK for [Chronik](https://github.com/chronik-stream/chronik-stream).
+Server-internal implementation of Chronik Agent Memory. Powers the `/memory/v1/*` HTTP endpoints on Chronik's Unified API (port 6092).
 
-Status: **Phase 1 (MVP) complete in code**. End-to-end eval against a live cluster pending — see [`docs/ROADMAP_AGENT_MEMORY_SDK.md`](../../docs/ROADMAP_AGENT_MEMORY_SDK.md).
+Status: **Phase 1 implementation complete; HTTP surface conversion (AM-1.7) pending**. See [`docs/ROADMAP_AGENT_MEMORY.md`](../../docs/ROADMAP_AGENT_MEMORY.md) for the roadmap, architectural decisions, and the pilot history (Appendix B).
 
 ## What this is
 
-A Rust crate that turns a running Chronik cluster into an agent-memory backend. Customers run their own Chronik; this crate is the client. Hybrid retrieval (BM25 + vector + SQL) over Kafka-compatible event streams, with structured extraction of facts / events / instructions / tasks from raw conversation turns.
+The Rust crate that implements ingest, extraction, multi-channel recall (BM25 + vector + key-match + HyDE + SQL), synthesis, and lifecycle for Chronik Agent Memory. It is composed into `chronik-server` and exposed only via HTTP — customer-facing access is `POST /memory/v1/*` over JSON, not Rust imports.
 
 ## What this is **not**
 
+- Not a public client SDK. The Rust types are not a stable API — see [`docs/ROADMAP_AGENT_MEMORY.md`](../../docs/ROADMAP_AGENT_MEMORY.md) AD-1 for why we collapsed the SDK back into server-side endpoints.
 - Not a managed service.
 - Not a competitor to Mem0/Letta/Zep on storage — different substrate.
 - Not a foundation model (BYO LLM: Anthropic, OpenAI, Ollama, vLLM).
