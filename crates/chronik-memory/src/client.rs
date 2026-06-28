@@ -193,6 +193,7 @@ impl Memory {
             TopicConfig::event(layout.typed(MemoryType::Event)),
             TopicConfig::instruction(layout.typed(MemoryType::Instruction)),
             TopicConfig::task(layout.typed(MemoryType::Task)),
+            TopicConfig::audit(layout.audit()), // AM-2.6
         ];
         self.create_topics_idempotent(&configs).await
     }
@@ -700,6 +701,20 @@ impl Memory {
             }
         }
         Ok(latest)
+    }
+
+    /// Emit an audit event for this `(tenant, namespace)` (AM-2.6).
+    ///
+    /// Best-effort: returns the [`IngestAck`] on success; logs and returns
+    /// `Err` on Kafka failure. Callers in `chronik-server` handlers should
+    /// log the error and continue — audit failure must never block the
+    /// user-visible response.
+    ///
+    /// The audit topic (`mem.audit.{tenant}`) is created by
+    /// [`Memory::init_namespace_full`]; out-of-band production of audit
+    /// records into a missing topic fails cleanly with a Kafka error.
+    pub async fn audit(&self, event: &crate::audit::AuditEvent) -> Result<IngestAck> {
+        crate::audit::emit_audit(&self.inner.producer, event).await
     }
 
     /// Tombstone a memory by `key` (for compactable types) or by `memory_id`.

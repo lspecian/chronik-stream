@@ -120,6 +120,14 @@ impl TopicLayout {
         format!("mem.concept.{}", self.namespace.tenant)
     }
 
+    /// Append-only audit-log topic — `mem.audit.{tenant}` (AM-2.6).
+    /// One row per `/memory/v1/*` operation. Columnar storage enabled for
+    /// SQL-based compliance queries; never compacted (audit retention is
+    /// time-based, not key-based).
+    pub fn audit(&self) -> String {
+        format!("mem.audit.{}", self.namespace.tenant)
+    }
+
     /// All topics this namespace uses (Phase 1 only creates raw + fact + event;
     /// Phase 2 adds instruction + task; Phase 3 adds concept).
     pub fn all_topics(&self) -> Vec<String> {
@@ -244,6 +252,19 @@ impl TopicConfig {
             cleanup_policy: "compact",
             bm25_enabled: true,
             vector_enabled: true,
+            columnar_enabled: true,
+        }
+    }
+
+    /// Config template for `mem.audit.*` (AM-2.6) — append-only audit log,
+    /// columnar enabled for SQL compliance queries, no text or vector
+    /// indexing (audit rows are scanned, not searched).
+    pub fn audit(name: String) -> Self {
+        Self {
+            name,
+            cleanup_policy: "delete",
+            bm25_enabled: false,
+            vector_enabled: false,
             columnar_enabled: true,
         }
     }

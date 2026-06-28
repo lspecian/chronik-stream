@@ -17,7 +17,8 @@ use axum::{
 };
 use chronik_memory::{
     schema::{Body, MemoryRecord, MemoryType, Source},
-    Channel, MemoryRegistry, RecallResult, SynthesizedAnswer, TextGenerator, Turn,
+    AuditEvent, Channel, Memory, MemoryRegistry, RecallResult, SynthesizedAnswer,
+    TextGenerator, Turn,
 };
 use serde_json::json;
 use std::collections::HashSet;
@@ -125,6 +126,47 @@ fn map_memory_error(e: chronik_memory::MemoryError) -> (StatusCode, Json<ErrorRe
     (status, Json(ErrorResponse::new(code, e.to_string())))
 }
 
+/// Emit an audit event for an operation. Best-effort — Kafka failure is
+/// logged and swallowed so the user-visible response stays clean (AM-2.6).
+/// The `caller_tenant` arg is the post-passthrough `X-Tenant-Id` header.
+async fn audit_emit(
+    mem: &Memory,
+    op: &str,
+    namespace: &str,
+    caller_tenant: Option<&str>,
+    status_code: u16,
+    error_code: Option<&str>,
+    query: Option<&str>,
+    memory_ids: Vec<String>,
+    latency_ms: u64,
+) {
+    let mut event = AuditEvent {
+        ts: chrono::Utc::now(),
+        tenant: mem.tenant().to_string(),
+        namespace: namespace.to_string(),
+        op: op.to_string(),
+        query: None,
+        memory_ids: vec![],
+        caller_tenant: None,
+        status_code,
+        error_code: error_code.map(|s| s.to_string()),
+        latency_ms,
+    };
+    if let Some(q) = query {
+        event = event.with_query(q);
+    }
+    if !memory_ids.is_empty() {
+        event = event.with_memory_ids(memory_ids);
+    }
+    if let Some(ct) = caller_tenant {
+        event = event.with_caller_tenant(ct);
+    }
+    if let Err(e) = mem.audit(&event).await {
+        // Already logged at warn inside emit_audit; keep this trace cheap.
+        tracing::trace!(error = %e, "audit emit failed");
+    }
+}
+
 // ───────────────────────── INGEST ─────────────────────────
 
 pub async fn ingest(
@@ -132,7 +174,8 @@ pub async fn ingest(
     headers: HeaderMap,
     Json(req): Json<IngestRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let _auth = extract_auth(&headers, state.memory_require_auth)?;
+    let started = Instant::now();
+    let (caller_tenant, _api_key) = extract_auth(&headers, state.memory_require_auth)?;
     let registry = require_registry(&state)?;
 
     if req.turns.is_empty() {
@@ -159,6 +202,7 @@ pub async fn ingest(
         })
         .collect();
 
+    let n = internal.len();
     let acks = mem.ingest_batch(internal).await.map_err(map_memory_error)?;
 
     let skipped = acks.iter().filter(|a| a.deduped).count();
@@ -176,6 +220,20 @@ pub async fn ingest(
             })
             .collect(),
     };
+
+    audit_emit(
+        &mem,
+        "ingest",
+        &req.namespace,
+        caller_tenant.as_deref(),
+        202,
+        None,
+        Some(&format!("turns={n}")),
+        vec![],
+        started.elapsed().as_millis() as u64,
+    )
+    .await;
+
     Ok((StatusCode::ACCEPTED, Json(response)))
 }
 
@@ -186,7 +244,8 @@ pub async fn remember(
     headers: HeaderMap,
     Json(req): Json<RememberRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let _auth = extract_auth(&headers, state.memory_require_auth)?;
+    let started = Instant::now();
+    let (caller_tenant, _api_key) = extract_auth(&headers, state.memory_require_auth)?;
     let registry = require_registry(&state)?;
 
     // Round-trip wire {type, body} → Body enum via serde's tagged repr.
@@ -211,10 +270,21 @@ pub async fn remember(
         .await
         .map_err(map_memory_error)?;
 
-    // The `remember` ack doesn't expose memory_id directly, but the offset is
-    // the canonical pointer. Derive a memory_id surrogate from (topic, offset)
-    // for the response — callers should treat it as opaque.
     let memory_id = format!("{}@{}", ack.topic, ack.offset);
+
+    audit_emit(
+        &mem,
+        "remember",
+        &req.namespace,
+        caller_tenant.as_deref(),
+        200,
+        None,
+        req.key.as_deref(),
+        vec![memory_id.clone()],
+        started.elapsed().as_millis() as u64,
+    )
+    .await;
+
     Ok((
         StatusCode::OK,
         Json(RememberResponse {
@@ -233,7 +303,8 @@ pub async fn forget(
     headers: HeaderMap,
     Json(req): Json<ForgetRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let _auth = extract_auth(&headers, state.memory_require_auth)?;
+    let started = Instant::now();
+    let (caller_tenant, _api_key) = extract_auth(&headers, state.memory_require_auth)?;
     let registry = require_registry(&state)?;
     let kind = parse_memory_type(&req.r#type)?;
 
@@ -257,6 +328,25 @@ pub async fn forget(
         .await
         .map_err(map_memory_error)?;
 
+    let target_id = req
+        .memory_id
+        .clone()
+        .or_else(|| req.key.clone())
+        .unwrap_or_default();
+
+    audit_emit(
+        &mem,
+        "forget",
+        &req.namespace,
+        caller_tenant.as_deref(),
+        200,
+        None,
+        Some(&format!("type={} target={target_id}", req.r#type)),
+        vec![target_id],
+        started.elapsed().as_millis() as u64,
+    )
+    .await;
+
     Ok(Json(ForgetResponse {
         tombstoned: true,
         topic: ack.topic,
@@ -272,7 +362,7 @@ pub async fn recall(
     headers: HeaderMap,
     Json(req): Json<RecallRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let _auth = extract_auth(&headers, state.memory_require_auth)?;
+    let (caller_tenant, _api_key) = extract_auth(&headers, state.memory_require_auth)?;
     let registry = require_registry(&state)?;
 
     let mem = registry
@@ -353,6 +443,7 @@ pub async fn recall(
     };
     let latency_ms = started.elapsed().as_millis() as u64;
 
+    let memory_ids: Vec<String> = results.iter().map(|r| r.memory.memory_id.clone()).collect();
     let response = RecallResponse {
         results: results.into_iter().map(into_wire_result).collect(),
         synthesis: synth.map(into_wire_synthesis),
@@ -363,6 +454,20 @@ pub async fn recall(
             .map(|c| channel_to_str(*c).to_string())
             .collect(),
     };
+
+    audit_emit(
+        &mem,
+        "recall",
+        &req.namespace,
+        caller_tenant.as_deref(),
+        200,
+        None,
+        Some(&req.query),
+        memory_ids,
+        latency_ms,
+    )
+    .await;
+
     Ok(Json(response))
 }
 

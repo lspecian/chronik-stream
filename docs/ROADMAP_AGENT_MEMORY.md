@@ -372,12 +372,17 @@ System (in-process Rust API, not HTTP):
 - [ ] Per-tenant Prometheus labels (cardinality cap)
 - [ ] Quota enforcement
 
-### AM-2.6: Provenance & audit — ⚠️ partial
+### AM-2.6: Provenance & audit — ⚠️ partial (audit done 2026-06-28; source endpoint still pending)
 
 - [x] Schema carries `source.{topic,offsets,extractor}` end-to-end
 - [x] Extractor rejects memories without offsets in batch (verified in `extractor/mod.rs`)
-- [ ] `GET /memory/v1/{memory_id}/source` endpoint — pending AM-1.7
-- [ ] `mem.audit.{tenant}` topic + emitter — not built
+- [ ] `GET /memory/v1/{memory_id}/source` endpoint — handler stub returns 501; needs `memory_id → (topic, offset)` index (separate work item)
+- [x] `mem.audit.{tenant}` topic + emitter — landed 2026-06-28:
+  - [`crates/chronik-memory/src/audit.rs`](../crates/chronik-memory/src/audit.rs) — `AuditEvent { ts, tenant, namespace, op, query?, memory_ids, caller_tenant?, status_code, error_code?, latency_ms }` with builder methods + 512-char query truncation + JSON serialization (7 unit tests)
+  - `Memory::audit(&event)` produces to `mem.audit.{tenant}` keyed by namespace; best-effort (failure logged + swallowed)
+  - `TopicLayout::audit()` + `TopicConfig::audit()` (append-only, `columnar.enabled=true` for SQL compliance queries, no text/vector indexing — audit rows are scanned not searched)
+  - `init_namespace_full()` now provisions `mem.audit.{tenant}` alongside the typed topics
+  - Wired into `/memory/v1/ingest`, `/remember`, `/forget`, `/recall` in `unified_api/memory.rs` — every request emits an audit row carrying op, namespace, query/key, memory_ids touched, latency_ms, and the caller's `X-Tenant-Id` (so attempted cross-tenant access surfaces in the audit log even before AM-2.5 enforcement lands)
 
 ### AM-2.7: Eval (extraction quality + recall NDCG + LongMemEval) — ⚠️ partial
 
