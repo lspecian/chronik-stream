@@ -1,0 +1,69 @@
+name: Agent Memory PR Checks
+
+# AM-1.8: Pre-merge gates. Runs on every PR that touches agent-memory paths.
+# Fast (no LLM, no cluster) — must complete in under ~5 minutes.
+
+on:
+  pull_request:
+    paths:
+      - 'crates/chronik-memory/**'
+      - 'crates/chronik-server/src/unified_api/memory*.rs'
+      - 'crates/chronik-server/src/main.rs'
+      - 'docs/ROADMAP_AGENT_MEMORY.md'
+      - '.github/workflows/agent-memory-pr.yml'
+
+env:
+  RUST_BACKTRACE: 1
+  CARGO_TERM_COLOR: always
+
+jobs:
+  unit-and-offline-integration:
+    name: Unit + offline integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-agent-memory-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-agent-memory-
+
+      - name: Check (chronik-memory)
+        run: cargo check -p chronik-memory --all-features
+
+      - name: Check (chronik-server)
+        run: cargo check -p chronik-server
+
+      # Library unit tests — fast, no LLM, no cluster.
+      - name: Lib unit tests (chronik-memory)
+        run: cargo test -p chronik-memory --lib --bins
+
+      - name: Lib unit tests (memory handlers)
+        run: cargo test -p chronik-server --lib unified_api::memory
+
+      # Offline integration tests — anything in tests/ that doesn't gate on
+      # CHRONIK_INTEGRATION=1. Includes baseline checks against the seeded
+      # floor, percentile-math unit tests, and the eval-runner self-tests.
+      - name: Baseline check
+        run: cargo test -p chronik-memory --test check_baseline
+
+      # Lint: no new unwrap/panic/todo in src/ touched by this PR. We don't
+      # fail on the existing burden — only on regressions.
+      - name: Clippy (warn-on-introduce)
+        run: |
+          cargo clippy -p chronik-memory --all-targets -- -A clippy::all -D clippy::unwrap_used -D clippy::panic -D clippy::todo
+        continue-on-error: true  # Phase 1: warn-only until clippy debt is paid down

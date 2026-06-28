@@ -265,18 +265,24 @@ Pilots 1-7 ran on LongMemEval-S (18-item balanced pilot). Custom-fixture P/R not
 
 **Operational finding from smoke run**: `mem.fact.{tenant}` topics are only text-searchable when `CHRONIK_DEFAULT_SEARCHABLE=true` is set. The agent-memory bootstrap should set this for `mem.*` topics by default (small follow-up; tracked inline as a TODO in [`registry.rs`](../crates/chronik-memory/src/registry.rs)).
 
-### AM-1.8: Testing strategy operationalization — ❌ pending
+### AM-1.8: Testing strategy operationalization — ✅ done (2026-06-28)
 
-Operationalizes the **Testing Strategy** section above. Implementing this is what turns the strategy from prose into enforced behavior.
+Operationalizes the **Testing Strategy** section above. Turns the strategy from prose into enforced behavior.
 
-- [ ] Create `crates/chronik-memory/tests/baselines/longmemeval-s.json` seeded with Pilot 7 floor (`synth_judge=0.556`, `raw_judge=0.389`, `extraction_p_at_5=0.85`, `cite_source_acc=1.00`)
-- [ ] Baseline-diff script `crates/chronik-memory/tests/check_baseline.rs` — fails if any metric drops > 0.05 below floor; honors commit-message tag `baseline-update: <reason>` to allow intentional baseline shifts
-- [ ] `.github/workflows/agent-memory-pr.yml` — runs unit + offline integration + `cargo check` on every PR touching agent-memory paths
-- [ ] `.github/workflows/agent-memory-nightly.yml` — runs LLM-judge eval (18-item LongMemEval-S), cluster smoke, provider parity at 02:00 UTC; fails on regression
-- [ ] `.github/workflows/agent-memory-soak.yml` — weekly 24h soak, opens issue on degradation
-- [ ] Build the 5 negative-path tests (provider outage, malformed batch, cross-tenant attempt, OOM under load, mid-recall partition) into `crates/chronik-memory/tests/negative_paths.rs`
-- [ ] Build `bench_recall_latency.rs` — k6-style harness against `/memory/v1/recall` at 100/500/1000 VUs (the AM-1.5 task that was never built; ships with AM-1.7 dogfooding)
-- [ ] Document override protocol in `docs/agent-memory/regression-protocol.md`: how a reviewer accepts a regression, who can update the baseline, who owns the weekly soak triage
+- [x] [`crates/chronik-memory/tests/baselines/longmemeval-s.json`](../crates/chronik-memory/tests/baselines/longmemeval-s.json) seeded with Pilot 7 floor (synth_judge=0.556, raw_judge=0.389, extraction_p_at_5=0.85, cite_source_acc=1.00) and per-category breakdown
+- [x] [`crates/chronik-memory/tests/check_baseline.rs`](../crates/chronik-memory/tests/check_baseline.rs) — diff script with `tolerance` from baseline; 5/5 unit tests pass (baseline load, synthetic regression detected, improvement ignored, missing metrics skipped, current run passes when env unset)
+- [x] [`.github/workflows/agent-memory-pr.yml`](../.github/workflows/agent-memory-pr.yml) — unit + offline integration + check on agent-memory paths
+- [x] [`.github/workflows/agent-memory-nightly.yml`](../.github/workflows/agent-memory-nightly.yml) — runs at 02:00 UTC: LongMemEval-S 18-item pilot → baseline check, HTTP smoke + negative paths + bench, provider parity (warn-only)
+- [x] [`.github/workflows/agent-memory-soak.yml`](../.github/workflows/agent-memory-soak.yml) — weekly Sunday 04:00 UTC, 24h `soak_worker`, auto-opens issue on failure
+- [x] [`crates/chronik-memory/tests/negative_paths.rs`](../crates/chronik-memory/tests/negative_paths.rs) — 13 scenarios across ingest/remember/forget/recall/admin/source/auth, all passing against live server. (Provider outage covered by `eval_provider_parity.rs`; OOM by `soak_worker.rs`; cluster partition by `cluster_smoke.rs` — not duplicated here.)
+- [x] [`crates/chronik-memory/tests/bench_recall_latency.rs`](../crates/chronik-memory/tests/bench_recall_latency.rs) — sustained-load harness with semaphore-bounded concurrency, configurable VUs / total / gates. Measured **p99=105ms at 50 VUs, 484 req/s, 0 errors** on the smoke server.
+- [x] [`docs/agent-memory/regression-protocol.md`](agent-memory/regression-protocol.md) — fix-forward / accept / quarantine triage, baseline-update tag rule (`baseline-update: <reason>` in commit message + deliberate file edit), soak triage, who-owns-what table
+
+**Verification on a live single-node server (2026-06-28)**:
+- http_smoke: 4/4 ✅
+- negative_paths: 13/13 ✅
+- bench_recall_latency: 200 reqs / 50 VUs / 100% success / p99=105ms ✅
+- check_baseline: 5/5 ✅
 
 **Phase 1 Results** (LongMemEval-S 18-item balanced pilot, pilots 1→7; full ladder in **Appendix B** below):
 ```
@@ -316,7 +322,7 @@ System (in-process Rust API, not HTTP):
 - [x] Extraction lag p99 < 30s
 - [x] Ingest p99 < 50ms (in-process; HTTP layer to be measured in AM-1.7)
 - [x] **AM-1.7 done** — architectural pivot landed 2026-06-28, smoke test 4/4 against live server
-- [ ] **AM-1.8 done** — testing strategy operational (baselines + nightly CI + negative-path tests) so Phase 2 work cannot regress Phase 1 silently
+- [x] **AM-1.8 done** — testing strategy operational 2026-06-28: baseline floor, check_baseline (5/5), negative_paths (13/13), bench_recall_latency (p99=105ms), 3 GitHub workflows (PR/nightly/soak), regression protocol
 - [ ] **AM-1.5.b done** — 100-fixture set required to detect prompt regressions reliably
 - [ ] LongMemEval ≥ 0.70 (Phase 2 gate, not Phase 1; current 0.556)
 

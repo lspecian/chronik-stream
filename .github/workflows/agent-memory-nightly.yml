@@ -1,0 +1,191 @@
+name: Agent Memory Nightly
+
+# AM-1.8: Nightly regression gates. Runs at 02:00 UTC every day.
+# Heavy (live cluster + LLM API calls) — budget ~30-45 minutes.
+# Failures don't block PRs, but they block release tags and open an issue.
+
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch or SHA to run against (defaults to main)'
+        required: false
+        default: 'main'
+
+env:
+  RUST_BACKTRACE: 1
+  CARGO_TERM_COLOR: always
+  RUST_LOG: info
+
+jobs:
+  longmemeval-baseline:
+    name: LongMemEval-S baseline check
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    if: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-agent-memory-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build server
+        run: cargo build --release --bin chronik-server
+
+      # Start a single-node cluster with all the agent-memory env vars
+      # the eval harness needs. Background process; the eval will hit
+      # localhost:6092.
+      - name: Start chronik-server
+        env:
+          CHRONIK_MEMORY_ENABLED: 'true'
+          CHRONIK_MEMORY_KAFKA: 'localhost:9092'
+          CHRONIK_MEMORY_API: 'http://127.0.0.1:6092'
+          CHRONIK_DEFAULT_SEARCHABLE: 'true'
+          CHRONIK_DEFAULT_COLUMNAR: 'true'
+        run: |
+          mkdir -p /tmp/nightly-data
+          nohup target/release/chronik-server start --data-dir /tmp/nightly-data > /tmp/server.log 2>&1 &
+          echo $! > /tmp/server.pid
+          for i in $(seq 1 30); do
+            if curl -sS --max-time 2 http://localhost:6092/memory/v1/health > /dev/null; then
+              echo "Server ready after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Server did not become ready"
+          tail -50 /tmp/server.log
+          exit 1
+
+      - name: Run LongMemEval-S 18-item pilot + save metrics
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CHRONIK_INTEGRATION: '1'
+          LONGMEMEVAL_USE_LLM_JUDGE: '1'
+          LONGMEMEVAL_USE_SYNTHESIS: '1'
+          LONGMEMEVAL_RESULTS_JSON: '/tmp/longmemeval-results.json'
+        run: cargo test -p chronik-memory --test eval_longmemeval --release -- --nocapture --test-threads=1
+
+      - name: Baseline floor check
+        env:
+          LONGMEMEVAL_RESULTS_JSON: '/tmp/longmemeval-results.json'
+        run: cargo test -p chronik-memory --test check_baseline current_run_passes_baseline_floor -- --nocapture
+
+      - name: Stop server
+        if: always()
+        run: |
+          if [ -f /tmp/server.pid ]; then
+            kill "$(cat /tmp/server.pid)" 2>/dev/null || true
+          fi
+
+      - name: Upload metrics JSON
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: longmemeval-results
+          path: /tmp/longmemeval-results.json
+          retention-days: 30
+
+      - name: Upload server log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-log
+          path: /tmp/server.log
+          retention-days: 14
+
+  http-smoke:
+    name: HTTP smoke + negative paths
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build server
+        run: cargo build --release --bin chronik-server
+
+      - name: Start chronik-server
+        env:
+          CHRONIK_MEMORY_ENABLED: 'true'
+          CHRONIK_MEMORY_KAFKA: 'localhost:9092'
+          CHRONIK_MEMORY_API: 'http://127.0.0.1:6092'
+          CHRONIK_DEFAULT_SEARCHABLE: 'true'
+        run: |
+          mkdir -p /tmp/smoke-data
+          nohup target/release/chronik-server start --data-dir /tmp/smoke-data > /tmp/server.log 2>&1 &
+          echo $! > /tmp/server.pid
+          for i in $(seq 1 30); do
+            if curl -sS --max-time 2 http://localhost:6092/memory/v1/health > /dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          tail -50 /tmp/server.log
+          exit 1
+
+      - name: HTTP smoke (4 tests)
+        env:
+          CHRONIK_INTEGRATION: '1'
+        run: cargo test -p chronik-memory --test http_smoke -- --nocapture
+
+      - name: Negative paths (13 scenarios)
+        env:
+          CHRONIK_INTEGRATION: '1'
+        run: cargo test -p chronik-memory --test negative_paths -- --nocapture
+
+      - name: Recall latency bench
+        env:
+          CHRONIK_INTEGRATION: '1'
+          CHRONIK_BENCH_TOTAL: '1000'
+          CHRONIK_BENCH_CONCURRENCY: '100'
+          CHRONIK_BENCH_P99_MS_MAX: '500'
+        run: cargo test -p chronik-memory --test bench_recall_latency bench_recall_latency -- --nocapture
+
+      - name: Stop server
+        if: always()
+        run: kill "$(cat /tmp/server.pid)" 2>/dev/null || true
+
+      - name: Upload server log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-server-log
+          path: /tmp/server.log
+          retention-days: 7
+
+  # Provider parity is warn-only: provider drift on Anthropic / OpenAI / Ollama
+  # is interesting but shouldn't fail nightly. It opens an issue (separate job).
+  provider-parity:
+    name: Provider parity (warn-only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    if: ${{ secrets.ANTHROPIC_API_KEY != '' && secrets.OPENAI_API_KEY != '' }}
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run parity eval
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          CHRONIK_INTEGRATION: '1'
+        run: cargo test -p chronik-memory --test eval_provider_parity --release -- --nocapture

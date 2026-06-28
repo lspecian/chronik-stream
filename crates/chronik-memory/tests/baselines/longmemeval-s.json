@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "benchmark": "longmemeval-s-18-balanced",
+  "description": "Regression floor for LongMemEval-S (18-item balanced pilot). Updates require an explicit `baseline-update:` commit-message tag; see docs/agent-memory/regression-protocol.md.",
+  "established_at": "2026-05-15",
+  "established_by": "Pilot 7 — V3 prompt + multi-channel + synthesis + _abs-aware judge + anti-abstention prompt",
+  "tolerance": 0.05,
+  "metrics": {
+    "synth_judge_rate": 0.556,
+    "raw_judge_rate": 0.389,
+    "synth_substring_rate": 0.278,
+    "synth_abstain_rate": 0.500,
+    "extraction_p_at_5": 0.85,
+    "cite_source_acc": 1.00
+  },
+  "per_category_synth_judge": {
+    "knowledge-update": 1.00,
+    "single-session-user": 1.00,
+    "single-session-preference": 0.67,
+    "multi-session": 0.33,
+    "temporal-reasoning": 0.33,
+    "single-session-assistant": 0.00
+  },
+  "notes": [
+    "Update gate: nightly diff fails when any metric drops > tolerance below floor.",
+    "Per-category metrics are informational, not gating — single-session-assistant is a known structural 0/3 (extraction gaps).",
+    "The 0.144 gap from synth_judge=0.556 to the Phase 2 target of 0.70 requires one of three structural fixes (see ROADMAP_AGENT_MEMORY.md \"Levers to close the 0.144 gap\")."
+  ]
+}
