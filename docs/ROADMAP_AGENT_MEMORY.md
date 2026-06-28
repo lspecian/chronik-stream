@@ -63,6 +63,74 @@ Every phase records **three classes of metrics**. Improving recall NDCG while de
 
 ---
 
+## Testing Strategy
+
+Measurement Discipline says *what* we measure. This section says *when* it runs, *what blocks a merge*, and *how* we catch regressions. Implementation is tracked as **AM-1.8**.
+
+### Layers
+
+| Layer | Location | Trigger | Blocks merge? |
+|-------|----------|---------|---------------|
+| Unit (~218 tests today) | `crates/chronik-memory/src/**/#[cfg(test)]` | every PR | ✅ yes |
+| Integration (offline) | `crates/chronik-memory/tests/*.rs` with no env-var gate | every PR | ✅ yes |
+| LLM-judge eval | same tests, gated by `ANTHROPIC_API_KEY` + `CHRONIK_INTEGRATION=1` | nightly | ✅ yes — fail CI on regression |
+| Cluster smoke | `tests/cluster_smoke.rs` against `tests/cluster/start.sh` | nightly | ✅ yes |
+| Provider parity | `tests/eval_provider_parity.rs` (Anthropic / OpenAI / Ollama) | nightly | ⚠️ warn-only — provider drift is real |
+| Soak | `tests/soak_worker.rs` 24h | weekly | manual |
+| Scale/load | `bench_recall_latency.rs` (TODO), k6 at 100/500/1000 VUs | per release | manual |
+
+### Pre-merge gates (must pass on every PR)
+
+- `cargo test --workspace --lib --bins` clean
+- `cargo check --workspace --all-features` clean
+- Offline integration tests in `crates/chronik-memory/tests/` pass without API keys
+- No new `unwrap()` / `panic!()` / `todo!()` in `src/` (clippy lint)
+- If a PR touches an AM-1.x or AM-2.x task, the corresponding status marker in this roadmap is updated in the same PR
+
+### Nightly gates (block release tags, not PRs)
+
+- LongMemEval-S 18-item balanced pilot: `synth_judge_rate` must be **≥ baseline − 0.05**
+- Custom-fixture extraction P/R: precision **≥ 0.80**, cite-source **≥ 0.95**
+- Cluster smoke: 3-node ingest → wait for extraction → recall → forget roundtrip green
+- Recall latency p99 < 500ms (no synthesis), < 1500ms (with synthesis)
+
+### Regression baselines
+
+- File: `crates/chronik-memory/tests/baselines/longmemeval-s.json`
+- Current floor (Pilot 7, 2026-05): `{"synth_judge_rate": 0.556, "raw_judge_rate": 0.389, "extraction_p_at_5": 0.85, "cite_source_acc": 1.00}`
+- PR check: nightly job diffs current run vs baseline; fails if any metric drops > 0.05
+- **Baseline updates require an explicit `update-baseline` workflow run + commit-message tag `baseline-update: <reason>`** so improvements are never accidentally locked in as floors before they're proven stable
+
+### Negative-path scenarios (must-have tests)
+
+1. **Provider outage mid-extraction** — Anthropic returns 503 on item 4/18. Worker retries with backoff; no Kafka offset commit; on recovery, batch reprocesses cleanly with no duplicate memories.
+2. **Malformed Kafka batch** — required field is null in `mem.raw.*` batch. Parser drops the individual record, the rest persist, `memory_extraction_errors_total{reason=malformed_record}` increments.
+3. **Cross-tenant recall attempt** — API key for tenant A queries namespace owned by tenant B → 403 + audit log entry on `mem.audit.A` AND `mem.audit.B` (so neither tenant can hide the attempt).
+4. **OOM under sustained load** — 10K msg/s for 5 min with constrained heap. Server returns 503 on overload, no data loss in WAL, no segment corruption.
+5. **Network partition mid-recall** — kill one of three nodes during a recall. Surviving nodes return partial results with `partial: true` flag, or an honest 503 if quorum lost.
+
+### Scale/load targets (per release)
+
+- **Ingest**: 100K msg/s sustained on 3-node cluster, no extraction lag growth > 60s p99 over 1h
+- **Recall**: 1000 VUs against `/memory/v1/recall`, p99 < 1s, error rate < 0.1%
+- **Soak**: 24h continuous ingest + recall, no RSS growth, no extractor goroutine leak, no Tantivy segment count blowup
+
+### CI implementation
+
+Three GitHub Actions workflows (to be created in AM-1.8):
+- `.github/workflows/agent-memory-pr.yml` — runs on every PR touching `crates/chronik-memory/` or `crates/chronik-server/src/unified_api/memory*`. Executes pre-merge gates only.
+- `.github/workflows/agent-memory-nightly.yml` — runs at 02:00 UTC. Executes LLM-judge evals, cluster smoke, provider parity. Fails build on regression > 0.05.
+- `.github/workflows/agent-memory-soak.yml` — runs weekly Sunday 04:00 UTC. 24h soak; reports to issue tracker on degradation.
+
+### What we are NOT testing in CI (explicit)
+
+- Real-conversation corpus quality (no production data yet — only synthetic fixtures)
+- Multi-tenant noisy-neighbor scenarios (gated on AM-2.5 multi-tenant infrastructure)
+- Multi-region replication latency (gated on Phase 4 multi-region work)
+- LLM provider billing/quota exhaustion (test environment uses dedicated low-rate budget)
+
+---
+
 ## Current State Analysis
 
 Chronik already provides ~70% of an agent memory system at the substrate level:
@@ -187,6 +255,19 @@ Pilots 1-7 ran on LongMemEval-S (18-item balanced pilot). Custom-fixture P/R not
 - [ ] Delete `bindings/python` and any references in the workspace `Cargo.toml`
 - [ ] Replace SDK README with `docs/agent-memory/{quickstart,api-reference}.md` and `examples/agent-memory/{python,typescript,curl}.md`
 
+### AM-1.8: Testing strategy operationalization — ❌ pending
+
+Operationalizes the **Testing Strategy** section above. Implementing this is what turns the strategy from prose into enforced behavior.
+
+- [ ] Create `crates/chronik-memory/tests/baselines/longmemeval-s.json` seeded with Pilot 7 floor (`synth_judge=0.556`, `raw_judge=0.389`, `extraction_p_at_5=0.85`, `cite_source_acc=1.00`)
+- [ ] Baseline-diff script `crates/chronik-memory/tests/check_baseline.rs` — fails if any metric drops > 0.05 below floor; honors commit-message tag `baseline-update: <reason>` to allow intentional baseline shifts
+- [ ] `.github/workflows/agent-memory-pr.yml` — runs unit + offline integration + `cargo check` on every PR touching agent-memory paths
+- [ ] `.github/workflows/agent-memory-nightly.yml` — runs LLM-judge eval (18-item LongMemEval-S), cluster smoke, provider parity at 02:00 UTC; fails on regression
+- [ ] `.github/workflows/agent-memory-soak.yml` — weekly 24h soak, opens issue on degradation
+- [ ] Build the 5 negative-path tests (provider outage, malformed batch, cross-tenant attempt, OOM under load, mid-recall partition) into `crates/chronik-memory/tests/negative_paths.rs`
+- [ ] Build `bench_recall_latency.rs` — k6-style harness against `/memory/v1/recall` at 100/500/1000 VUs (the AM-1.5 task that was never built; ships with AM-1.7 dogfooding)
+- [ ] Document override protocol in `docs/agent-memory/regression-protocol.md`: how a reviewer accepts a regression, who can update the baseline, who owns the weekly soak triage
+
 **Phase 1 Results** (LongMemEval-S 18-item balanced pilot, pilots 1→7; full ladder in **Appendix B** below):
 ```
 LongMemEval-S synth_judge_rate (target Phase 2: ≥ 0.70):
@@ -225,6 +306,7 @@ System (in-process Rust API, not HTTP):
 - [x] Extraction lag p99 < 30s
 - [x] Ingest p99 < 50ms (in-process; HTTP layer to be measured in AM-1.7)
 - [ ] **AM-1.7 done** — the architectural pivot must land before Phase 2
+- [ ] **AM-1.8 done** — testing strategy operational (baselines + nightly CI + negative-path tests) so Phase 2 work cannot regress Phase 1 silently
 - [ ] **AM-1.5.b done** — 100-fixture set required to detect prompt regressions reliably
 - [ ] LongMemEval ≥ 0.70 (Phase 2 gate, not Phase 1; current 0.556)
 
