@@ -867,6 +867,15 @@ impl MemoryBuilder {
         self
     }
 
+    /// Same as [`extractor`](Self::extractor) but accepts an already-`Arc`-wrapped
+    /// trait object. Used by [`MemoryRegistry`](crate::registry::MemoryRegistry)
+    /// so multiple `Memory` instances can share one extractor without
+    /// double-`Arc` indirection.
+    pub fn extractor_arc(mut self, e: Arc<dyn Extractor>) -> Self {
+        self.extractor = Some(e);
+        self
+    }
+
     /// Override default idempotency cache capacity (default 1024).
     pub fn idempotency_capacity(mut self, n: usize) -> Self {
         self.idempotency_capacity = Some(n);

@@ -19,7 +19,9 @@ members = [
     "crates/chronik-operator",
     "crates/chronik-perf",
     "crates/chronik-memory",
-    "bindings/python",
+    # NOTE (AM-1.7, AD-1): bindings/python deleted. Agent memory is now an HTTP
+    # surface under /memory/v1/* (port 6092); any language with an HTTP client
+    # has parity. Curl + Python examples live in examples/agent-memory/.
 ]
 exclude = ["tests"]
 

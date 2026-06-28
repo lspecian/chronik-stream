@@ -585,6 +585,47 @@ fn try_create_embedding_provider() -> Option<Arc<dyn chronik_embeddings::Embeddi
 /// - `CHRONIK_EMBEDDING_CACHE_ENABLED` (default: `true`)
 /// - `CHRONIK_EMBEDDING_CACHE_MAX_ENTRIES` (default: `10000`)
 /// - `CHRONIK_EMBEDDING_CACHE_TTL_SECS` (default: `3600`)
+/// AM-1.7: Build a [`chronik_memory::MemoryRegistry`] from environment.
+///
+/// Reads:
+/// - `CHRONIK_MEMORY_ENABLED` (default: `true` when both KAFKA + API are set, else `false`)
+/// - `CHRONIK_MEMORY_KAFKA` (default: `localhost:9092`)
+/// - `CHRONIK_MEMORY_API`   (default: `http://127.0.0.1:6092`)
+/// - `CHRONIK_MEMORY_REQUIRE_AUTH` (default: `false`)
+///
+/// Returns `None` when disabled. The server still mounts `/memory/v1/*` routes
+/// in that case — they reply 503 `service_unavailable`.
+fn try_create_memory_registry() -> Option<Arc<chronik_memory::MemoryRegistry>> {
+    let kafka = std::env::var("CHRONIK_MEMORY_KAFKA").ok();
+    let api = std::env::var("CHRONIK_MEMORY_API").ok();
+    let enabled = std::env::var("CHRONIK_MEMORY_ENABLED")
+        .map(|v| v.to_lowercase() == "true" || v == "1")
+        .unwrap_or(kafka.is_some() && api.is_some());
+
+    if !enabled {
+        info!(
+            "Agent memory disabled (set CHRONIK_MEMORY_ENABLED=true and \
+             CHRONIK_MEMORY_KAFKA + CHRONIK_MEMORY_API to enable)"
+        );
+        return None;
+    }
+
+    let kafka = kafka.unwrap_or_else(|| "localhost:9092".to_string());
+    let api = api.unwrap_or_else(|| "http://127.0.0.1:6092".to_string());
+    info!(
+        "AM-1.7: Agent memory enabled (kafka={}, api={})",
+        kafka, api
+    );
+    let config = chronik_memory::RegistryConfig::new(kafka, api);
+    Some(Arc::new(chronik_memory::MemoryRegistry::new(config)))
+}
+
+fn memory_require_auth() -> bool {
+    std::env::var("CHRONIK_MEMORY_REQUIRE_AUTH")
+        .map(|v| v.to_lowercase() == "true" || v == "1")
+        .unwrap_or(false)
+}
+
 fn try_create_embedding_cache() -> Option<Arc<chronik_columnar::QueryEmbeddingCache>> {
     let enabled = std::env::var("CHRONIK_EMBEDDING_CACHE_ENABLED")
         .map(|v| v.to_lowercase() != "false" && v != "0")
@@ -934,6 +975,13 @@ async fn run_cluster_mode(
     if let Some(cache) = try_create_embedding_cache() {
         unified_state = unified_state.with_embedding_cache(cache);
     }
+    // AM-1.7: Wire MemoryRegistry into /memory/v1/* handlers.
+    if let Some(registry) = try_create_memory_registry() {
+        unified_state = unified_state
+            .with_memory_registry(registry)
+            .with_memory_require_auth(memory_require_auth());
+        info!("✓ Agent memory registry wired into Unified API (/memory/v1/*)");
+    }
     // Distributed query router for cluster-mode scatter-gather fan-out
     let query_router = Arc::new(unified_api::query_router::QueryRouter::new(&init_config.cluster_config));
     unified_state = unified_state.with_query_router(query_router.clone());
@@ -1191,6 +1239,13 @@ async fn run_single_node_mode(
         }
         if let Some(cache) = try_create_embedding_cache() {
             unified_state = unified_state.with_embedding_cache(cache);
+        }
+        // AM-1.7: Wire MemoryRegistry into /memory/v1/* handlers.
+        if let Some(registry) = try_create_memory_registry() {
+            unified_state = unified_state
+                .with_memory_registry(registry)
+                .with_memory_require_auth(memory_require_auth());
+            info!("✓ Agent memory registry wired into Unified API (/memory/v1/*)");
         }
         #[cfg(feature = "search")]
         if let Some(api) = search_api_ref {

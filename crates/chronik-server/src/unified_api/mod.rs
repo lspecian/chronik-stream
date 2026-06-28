@@ -26,6 +26,10 @@ pub mod query_router;
 #[cfg(feature = "search")]
 pub mod search_handler;
 
+// AM-1.7: Agent Memory endpoints (/memory/v1/*).
+pub mod memory;
+pub mod memory_types;
+
 use axum::{
     extract::State,
     http::StatusCode,
@@ -153,6 +157,19 @@ pub struct UnifiedApiState {
     /// HP-2.5: Shared hot vector index for NRT ANN search.
     /// When present, `/_vector/:topic/search` merges hot hits with cold HNSW.
     pub hot_vector_index: Option<Arc<chronik_columnar::hot_vector_index::HotVectorIndex>>,
+
+    // ───────────────────────── AM-1.7: Agent Memory ─────────────────────────
+    /// Per-namespace [`chronik_memory::Memory`] cache. When `None`, the
+    /// `/memory/v1/*` endpoints respond 503 `service_unavailable`. Wire it
+    /// from `main.rs` after reading `CHRONIK_MEMORY_KAFKA` + `CHRONIK_MEMORY_API`.
+    pub memory_registry: Option<Arc<chronik_memory::MemoryRegistry>>,
+    /// Optional text generator for `synthesize: true` recall. Typically an
+    /// Anthropic Haiku 4.5 client wired from `CHRONIK_MEMORY_SYNTHESIS_PROVIDER`.
+    pub memory_text_generator: Option<Arc<dyn chronik_memory::TextGenerator>>,
+    /// When `true`, `/memory/v1/*` requires `X-Tenant-Id` + `X-API-Key` headers
+    /// (Phase 1: passthrough validation; AM-2.5 will check `mem.tenants`).
+    /// Toggle via `CHRONIK_MEMORY_REQUIRE_AUTH=true`.
+    pub memory_require_auth: bool,
 }
 
 impl UnifiedApiState {
@@ -179,7 +196,38 @@ impl UnifiedApiState {
             reranker: None,
             query_router: None,
             hot_vector_index: None,
+            memory_registry: None,
+            memory_text_generator: None,
+            memory_require_auth: false,
         }
+    }
+
+    /// AM-1.7: Attach the per-namespace `Memory` cache for the
+    /// `/memory/v1/*` endpoints. Without this, those endpoints reply
+    /// `503 service_unavailable`.
+    pub fn with_memory_registry(
+        mut self,
+        registry: Arc<chronik_memory::MemoryRegistry>,
+    ) -> Self {
+        self.memory_registry = Some(registry);
+        self
+    }
+
+    /// AM-1.7: Attach a text generator used when callers request
+    /// `synthesize: true` on `/memory/v1/recall`.
+    pub fn with_memory_text_generator(
+        mut self,
+        gen: Arc<dyn chronik_memory::TextGenerator>,
+    ) -> Self {
+        self.memory_text_generator = Some(gen);
+        self
+    }
+
+    /// AM-1.7: Require `X-Tenant-Id` + `X-API-Key` on every `/memory/v1/*`
+    /// request. Toggle via `CHRONIK_MEMORY_REQUIRE_AUTH=true`.
+    pub fn with_memory_require_auth(mut self, require: bool) -> Self {
+        self.memory_require_auth = require;
+        self
     }
 
     /// HP-2.5: Attach the shared hot vector index for NRT ANN search.
@@ -341,7 +389,19 @@ pub fn create_router_full(
         .route("/_query/capabilities", get(query_handler::handle_capabilities))
         .route("/_query/profiles", get(query_handler::handle_profiles));
 
-    // Add shared state for SQL/Vector/Query endpoints
+    // AM-1.7: Agent Memory endpoints (always registered; handlers return 503
+    // when memory_registry is None on UnifiedApiState).
+    router = router
+        .route("/memory/v1/ingest", post(memory::ingest))
+        .route("/memory/v1/remember", post(memory::remember))
+        .route("/memory/v1/forget", post(memory::forget))
+        .route("/memory/v1/recall", post(memory::recall))
+        .route("/memory/v1/feedback", post(memory::feedback))
+        .route("/memory/v1/health", get(memory::health))
+        .route("/memory/v1/admin/init-namespace", post(memory::admin_init_namespace))
+        .route("/memory/v1/:memory_id/source", get(memory::source));
+
+    // Add shared state for SQL/Vector/Query/Memory endpoints
     let mut router = router.with_state(state);
 
     // Merge search router if provided

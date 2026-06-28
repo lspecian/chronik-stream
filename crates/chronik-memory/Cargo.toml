@@ -45,6 +45,9 @@ hex = "0.4"
 lru = "0.12"
 parking_lot = { workspace = true }
 
+# MemoryRegistry: per-namespace Memory cache (AM-1.7)
+dashmap = { workspace = true }
+
 # Extractor: rule-pass regex (AMS-1.3)
 regex = "1.10"
 

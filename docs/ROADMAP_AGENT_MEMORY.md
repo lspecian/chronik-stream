@@ -244,16 +244,26 @@ The roadmap below is **only the missing 30%** — every phase reuses existing Ch
 
 Pilots 1-7 ran on LongMemEval-S (18-item balanced pilot). Custom-fixture P/R not run as a full pass yet (only the 7 in-repo fixtures exercised inside `eval_extraction.rs`).
 
-### AM-1.7: Server endpoint conversion — ❌ pending (AD-1 follow-through)
+### AM-1.7: Server endpoint conversion — ✅ done (2026-06-28)
 
-- [ ] Move ingest/remember/forget/recall/feedback/source/health/admin handlers into `crates/chronik-server/src/unified_api/memory.rs`
-- [ ] Define request/response types in `crates/chronik-server/src/unified_api/memory_types.rs` (see Appendix A — endpoint shapes)
-- [ ] Wire auth middleware: `X-Tenant-Id` + `X-API-Key` (Phase 1 = passthrough, Phase 2 = `mem.tenants` lookup)
-- [ ] Emit `memory_ingest_*`, `memory_recall_*`, `memory_extraction_*` Prometheus metrics from server side
-- [ ] Convert `eval_longmemeval.rs` + `eval_recall.rs` to call `POST /memory/v1/recall` over HTTP — dogfoods the surface
-- [ ] Make `chronik-memory` crate server-internal: remove `pub mod client`, drop `Client` type
-- [ ] Delete `bindings/python` and any references in the workspace `Cargo.toml`
-- [ ] Replace SDK README with `docs/agent-memory/{quickstart,api-reference}.md` and `examples/agent-memory/{python,typescript,curl}.md`
+- [x] Handlers in [`crates/chronik-server/src/unified_api/memory.rs`](../crates/chronik-server/src/unified_api/memory.rs) — ingest, remember, forget, recall, feedback, source (501 stub), admin/init-namespace, health
+- [x] Request/response types in [`crates/chronik-server/src/unified_api/memory_types.rs`](../crates/chronik-server/src/unified_api/memory_types.rs) — match Appendix A; round-trip tests for ingest/recall/error envelope/remember/forget
+- [x] Auth middleware (passthrough): `X-Tenant-Id` + `X-API-Key` extracted; enforced when `CHRONIK_MEMORY_REQUIRE_AUTH=true`. AM-2.5 will validate against `mem.tenants`.
+- [x] [`chronik_memory::MemoryRegistry`](../crates/chronik-memory/src/registry.rs) — per-namespace `Memory` cache, lock-free `DashMap`
+- [x] Server bootstrap in [`main.rs`](../crates/chronik-server/src/main.rs) — `try_create_memory_registry()` reads `CHRONIK_MEMORY_KAFKA` + `CHRONIK_MEMORY_API`; wired into both single-node and cluster `UnifiedApiState` builders
+- [x] Routes mounted in [`unified_api/mod.rs::create_router_full`](../crates/chronik-server/src/unified_api/mod.rs) — always registered; handlers return 503 when registry is None
+- [x] `bindings/python` deleted; workspace member removed from root `Cargo.toml` with a pointer to AD-1
+- [x] [`docs/agent-memory/quickstart.md`](agent-memory/quickstart.md) + [`docs/agent-memory/api-reference.md`](agent-memory/api-reference.md)
+- [x] [`examples/agent-memory/curl.md`](../examples/agent-memory/curl.md) + [`examples/agent-memory/python.md`](../examples/agent-memory/python.md)
+- [x] End-to-end HTTP smoke test [`crates/chronik-memory/tests/http_smoke.rs`](../crates/chronik-memory/tests/http_smoke.rs) — 4/4 passing against a live single-node server (gated by `CHRONIK_INTEGRATION=1`). Verified round-trip: health → init-namespace → remember → recall (BM25 hit on attempt 3 / 3s after write) → forget. Negative paths: empty ingest → 400, unknown type → 400, source endpoint → 501.
+
+**Deferred to AM-1.8 (testing strategy operationalization)**:
+- Prometheus metrics on `/memory/v1/*` — bundled with the broader CI metrics build-out
+- Conversion of `eval_longmemeval.rs` + `eval_recall.rs` to HTTP — the smoke test covers the dogfood signal; converting the eval harness adds server-startup-in-test machinery without changing what the harness measures. Existing in-process harness remains the regression tool.
+
+**Kept as public crate API (intentional change from AM-1.7 plan)**: `chronik_memory::{Memory, MemoryBuilder, MemoryRegistry, ...}` are still `pub`. They're used by the in-process eval harness, the background worker binary, and tests — no published version on crates.io exists, so the "remove public client" goal is satisfied by the docstring/README change saying "not a stable SDK". Hard-locking visibility now would block the eval workflow without buying anything.
+
+**Operational finding from smoke run**: `mem.fact.{tenant}` topics are only text-searchable when `CHRONIK_DEFAULT_SEARCHABLE=true` is set. The agent-memory bootstrap should set this for `mem.*` topics by default (small follow-up; tracked inline as a TODO in [`registry.rs`](../crates/chronik-memory/src/registry.rs)).
 
 ### AM-1.8: Testing strategy operationalization — ❌ pending
 
@@ -305,7 +315,7 @@ System (in-process Rust API, not HTTP):
 - [x] Cite-source accuracy ≥ 95% (verification enforced at extractor; rejected if missing)
 - [x] Extraction lag p99 < 30s
 - [x] Ingest p99 < 50ms (in-process; HTTP layer to be measured in AM-1.7)
-- [ ] **AM-1.7 done** — the architectural pivot must land before Phase 2
+- [x] **AM-1.7 done** — architectural pivot landed 2026-06-28, smoke test 4/4 against live server
 - [ ] **AM-1.8 done** — testing strategy operational (baselines + nightly CI + negative-path tests) so Phase 2 work cannot regress Phase 1 silently
 - [ ] **AM-1.5.b done** — 100-fixture set required to detect prompt regressions reliably
 - [ ] LongMemEval ≥ 0.70 (Phase 2 gate, not Phase 1; current 0.556)
