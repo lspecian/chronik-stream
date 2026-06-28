@@ -104,6 +104,7 @@ pub mod recall;
 pub mod registry;
 pub mod remember;
 pub mod schema;
+pub mod tenants;
 pub mod topics;
 pub mod wikilinks;
 pub mod worker;
@@ -133,6 +134,7 @@ pub use schema::{
 pub use embeddings::{cosine_similarity, Embedder, OpenAIEmbedder, TextGenerator};
 pub use lifecycle::{DedupDecision, SemanticDedup, DEFAULT_SIMILARITY_THRESHOLD};
 pub use registry::{MemoryRegistry, RegistryConfig};
+pub use tenants::{validate_request, AuthError, Tenant, TenantQuotas, TenantRegistry};
 pub use topics::{NamespacePath, TopicLayout};
 pub use wikilinks::extract_wikilinks;
 pub use worker::{Worker, WorkerConfig, WorkerStats};

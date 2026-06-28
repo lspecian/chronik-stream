@@ -626,6 +626,23 @@ fn memory_require_auth() -> bool {
         .unwrap_or(false)
 }
 
+/// AM-2.5: Build the tenant registry from `CHRONIK_MEMORY_TENANTS` env var.
+/// Returns `None` when no tenants are configured (handlers stay in
+/// passthrough mode). Production deployments will replace this with a
+/// `mem.tenants` Kafka consumer; the env-var bootstrap covers local dev
+/// + small deployments + the AM-2.5 integration tests.
+fn try_create_tenant_registry() -> Option<Arc<chronik_memory::TenantRegistry>> {
+    let registry = chronik_memory::TenantRegistry::from_env();
+    if registry.is_empty() {
+        return None;
+    }
+    info!(
+        "AM-2.5: TenantRegistry seeded with {} tenant(s) from CHRONIK_MEMORY_TENANTS",
+        registry.len()
+    );
+    Some(Arc::new(registry))
+}
+
 fn try_create_embedding_cache() -> Option<Arc<chronik_columnar::QueryEmbeddingCache>> {
     let enabled = std::env::var("CHRONIK_EMBEDDING_CACHE_ENABLED")
         .map(|v| v.to_lowercase() != "false" && v != "0")
@@ -981,6 +998,11 @@ async fn run_cluster_mode(
             .with_memory_registry(registry)
             .with_memory_require_auth(memory_require_auth());
         info!("✓ Agent memory registry wired into Unified API (/memory/v1/*)");
+        // AM-2.5: optional tenant registry for multi-tenant auth.
+        if let Some(tenants) = try_create_tenant_registry() {
+            unified_state = unified_state.with_memory_tenants(tenants);
+            info!("✓ Agent memory tenant registry wired (full auth enabled)");
+        }
     }
     // Distributed query router for cluster-mode scatter-gather fan-out
     let query_router = Arc::new(unified_api::query_router::QueryRouter::new(&init_config.cluster_config));
@@ -1246,6 +1268,11 @@ async fn run_single_node_mode(
                 .with_memory_registry(registry)
                 .with_memory_require_auth(memory_require_auth());
             info!("✓ Agent memory registry wired into Unified API (/memory/v1/*)");
+            // AM-2.5: optional tenant registry for multi-tenant auth.
+            if let Some(tenants) = try_create_tenant_registry() {
+                unified_state = unified_state.with_memory_tenants(tenants);
+                info!("✓ Agent memory tenant registry wired (full auth enabled)");
+            }
         }
         #[cfg(feature = "search")]
         if let Some(api) = search_api_ref {

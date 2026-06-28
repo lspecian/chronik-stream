@@ -364,13 +364,20 @@ System (in-process Rust API, not HTTP):
 - [x] HyDE channel behind opt-in flag
 - [x] Per-call `channels: [...]` toggle in builder API; per-tenant `mem.config.{tenant}` not yet (pending AM-2.5)
 
-### AM-2.5: Multi-tenancy — ❌ pending (gated on AM-1.7)
+### AM-2.5: Multi-tenancy — ⚠️ foundation done 2026-06-28, rate limits + Kafka consumer pending
 
-- [ ] API-key auth middleware
-- [ ] `mem.tenants` topic + namespace authorization
-- [ ] Per-tenant rate limits
-- [ ] Per-tenant Prometheus labels (cardinality cap)
-- [ ] Quota enforcement
+Foundation landed: `Tenant` schema + `TenantRegistry` + `validate_request()` +
+handler wiring + env-var bootstrap. Production deployments can now run with
+enforced auth via `CHRONIK_MEMORY_TENANTS=tenant1:key1,tenant2:key2` and
+`CHRONIK_MEMORY_REQUIRE_AUTH=true`.
+
+- [x] Validation primitives in [`crates/chronik-memory/src/tenants.rs`](../crates/chronik-memory/src/tenants.rs): `Tenant`, `TenantQuotas`, `TenantRegistry` (lock-free reads via `parking_lot::RwLock`), glob-ish `namespace_patterns` (`acme:*` matches `acme` and anything starting with `acme:`), `validate_request()` returning `AuthError::{MissingCredentials, UnknownTenant, InvalidKey, ForbiddenNamespace}`. 12 unit tests pass.
+- [x] `extract_auth` + new `authorize_namespace` in [`unified_api/memory.rs`](../crates/chronik-server/src/unified_api/memory.rs) — three-mode shape: (1) passthrough default, (2) `require_auth=true` enforces header presence (401), (3) `tenants` registry populated enforces full validation (401 on unknown tenant / bad key, 403 on cross-namespace). Wired into `ingest`, `remember`, `forget`, `recall`.
+- [x] `UnifiedApiState::with_memory_tenants(Arc<TenantRegistry>)` + bootstrap from `CHRONIK_MEMORY_TENANTS` env var in `main.rs::try_create_tenant_registry`. Tolerant of malformed entries (skip + log warn).
+- [ ] **`mem.tenants` Kafka compacted topic consumer** — production source of truth. Env-var bootstrap is the dev/test convenience.
+- [ ] **Per-tenant rate limits** (`ingest_msgs_per_sec`, `recall_qps`) — `TenantQuotas` carries the fields; enforcement is a follow-up (token-bucket middleware).
+- [ ] **Per-tenant Prometheus labels** with cardinality cap (`tenant=other` for the long tail).
+- [ ] **Per-tenant storage quota tracking** — needs sum-of-topic-bytes per tenant.
 
 ### AM-2.6: Provenance & audit — ⚠️ partial (audit done 2026-06-28; source endpoint still pending)
 

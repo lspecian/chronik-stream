@@ -166,10 +166,18 @@ pub struct UnifiedApiState {
     /// Optional text generator for `synthesize: true` recall. Typically an
     /// Anthropic Haiku 4.5 client wired from `CHRONIK_MEMORY_SYNTHESIS_PROVIDER`.
     pub memory_text_generator: Option<Arc<dyn chronik_memory::TextGenerator>>,
-    /// When `true`, `/memory/v1/*` requires `X-Tenant-Id` + `X-API-Key` headers
-    /// (Phase 1: passthrough validation; AM-2.5 will check `mem.tenants`).
+    /// When `true`, `/memory/v1/*` requires `X-Tenant-Id` + `X-API-Key` headers.
+    /// In Phase 1 passthrough this only checks presence; with [`Self::memory_tenants`]
+    /// populated (AM-2.5), the handlers validate `(tenant_id, api_key)` against
+    /// the registry and reject cross-namespace access.
     /// Toggle via `CHRONIK_MEMORY_REQUIRE_AUTH=true`.
     pub memory_require_auth: bool,
+    /// AM-2.5: Tenant registry for full multi-tenant auth/authorization.
+    /// When empty (default), handlers run in passthrough mode (only the
+    /// header-presence check from `memory_require_auth` applies). When
+    /// populated, handlers validate `(X-Tenant-Id, X-API-Key)` against the
+    /// registry on every request and reject cross-namespace access with 403.
+    pub memory_tenants: Option<Arc<chronik_memory::TenantRegistry>>,
 }
 
 impl UnifiedApiState {
@@ -199,6 +207,7 @@ impl UnifiedApiState {
             memory_registry: None,
             memory_text_generator: None,
             memory_require_auth: false,
+            memory_tenants: None,
         }
     }
 
@@ -227,6 +236,17 @@ impl UnifiedApiState {
     /// request. Toggle via `CHRONIK_MEMORY_REQUIRE_AUTH=true`.
     pub fn with_memory_require_auth(mut self, require: bool) -> Self {
         self.memory_require_auth = require;
+        self
+    }
+
+    /// AM-2.5: Attach a populated tenant registry. When present, handlers
+    /// validate every request's `(X-Tenant-Id, X-API-Key)` against the
+    /// registry and reject cross-namespace access with 403.
+    pub fn with_memory_tenants(
+        mut self,
+        tenants: Arc<chronik_memory::TenantRegistry>,
+    ) -> Self {
+        self.memory_tenants = Some(tenants);
         self
     }
 

@@ -17,8 +17,8 @@ use axum::{
 };
 use chronik_memory::{
     schema::{Body, MemoryRecord, MemoryType, Source},
-    AuditEvent, Channel, Memory, MemoryRegistry, RecallResult, SynthesizedAnswer,
-    TextGenerator, Turn,
+    AuditEvent, AuthError, Channel, Memory, MemoryRegistry, RecallResult, SynthesizedAnswer,
+    TenantRegistry, TextGenerator, Turn,
 };
 use serde_json::json;
 use std::collections::HashSet;
@@ -39,9 +39,16 @@ use super::UnifiedApiState;
 
 // ───────────────────────── Auth ─────────────────────────
 
-/// Pull `(tenant, api_key)` from headers. In Phase 1 these are advisory;
-/// AM-2.5 will validate against `mem.tenants`. When `require_auth=true`,
-/// either missing header yields 401.
+/// Pull `(tenant, api_key)` from headers.
+///
+/// Modes (most-strict last wins):
+///   1. **Passthrough** (default): just extract whatever's in the headers.
+///   2. **`require_auth=true`**: reject (401) when either header is missing.
+///   3. **`tenants` registry populated** (AM-2.5): also validate the
+///      tenant exists and the api_key matches.
+///
+/// Namespace authorization is a separate call ([`authorize_namespace`])
+/// because the target namespace lives in the request body, not headers.
 fn extract_auth(
     headers: &HeaderMap,
     require_auth: bool,
@@ -65,6 +72,54 @@ fn extract_auth(
         ));
     }
     Ok((tenant, api_key))
+}
+
+/// AM-2.5: When a tenant registry is wired into state, validate the request
+/// fully: `(tenant_id, api_key)` must match a registered tenant AND that
+/// tenant must own `target_namespace`. Returns `Ok(())` when no registry is
+/// configured (passthrough mode).
+fn authorize_namespace(
+    tenants: Option<&Arc<TenantRegistry>>,
+    caller_tenant: Option<&str>,
+    api_key: Option<&str>,
+    target_namespace: &str,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let Some(registry) = tenants else {
+        return Ok(()); // passthrough — no registry configured
+    };
+    match chronik_memory::validate_request(
+        registry.as_ref(),
+        caller_tenant,
+        api_key,
+        target_namespace,
+    ) {
+        Ok(_) => Ok(()),
+        Err(AuthError::MissingCredentials) => Err((
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse::new(
+                "unauthorized",
+                "X-Tenant-Id and X-API-Key headers are required",
+            )),
+        )),
+        Err(AuthError::UnknownTenant(t)) => Err((
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse::new(
+                "unauthorized",
+                format!("unknown tenant {t:?}"),
+            )),
+        )),
+        Err(AuthError::InvalidKey(_)) => Err((
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse::new("unauthorized", "invalid API key")),
+        )),
+        Err(AuthError::ForbiddenNamespace(t, ns)) => Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse::new(
+                "forbidden",
+                format!("tenant {t:?} is not authorized for namespace {ns:?}"),
+            )),
+        )),
+    }
 }
 
 fn require_registry(
@@ -175,7 +230,13 @@ pub async fn ingest(
     Json(req): Json<IngestRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let started = Instant::now();
-    let (caller_tenant, _api_key) = extract_auth(&headers, state.memory_require_auth)?;
+    let (caller_tenant, api_key) = extract_auth(&headers, state.memory_require_auth)?;
+    authorize_namespace(
+        state.memory_tenants.as_ref(),
+        caller_tenant.as_deref(),
+        api_key.as_deref(),
+        &req.namespace,
+    )?;
     let registry = require_registry(&state)?;
 
     if req.turns.is_empty() {
@@ -245,7 +306,13 @@ pub async fn remember(
     Json(req): Json<RememberRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let started = Instant::now();
-    let (caller_tenant, _api_key) = extract_auth(&headers, state.memory_require_auth)?;
+    let (caller_tenant, api_key) = extract_auth(&headers, state.memory_require_auth)?;
+    authorize_namespace(
+        state.memory_tenants.as_ref(),
+        caller_tenant.as_deref(),
+        api_key.as_deref(),
+        &req.namespace,
+    )?;
     let registry = require_registry(&state)?;
 
     // Round-trip wire {type, body} → Body enum via serde's tagged repr.
@@ -304,7 +371,13 @@ pub async fn forget(
     Json(req): Json<ForgetRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let started = Instant::now();
-    let (caller_tenant, _api_key) = extract_auth(&headers, state.memory_require_auth)?;
+    let (caller_tenant, api_key) = extract_auth(&headers, state.memory_require_auth)?;
+    authorize_namespace(
+        state.memory_tenants.as_ref(),
+        caller_tenant.as_deref(),
+        api_key.as_deref(),
+        &req.namespace,
+    )?;
     let registry = require_registry(&state)?;
     let kind = parse_memory_type(&req.r#type)?;
 
@@ -362,7 +435,13 @@ pub async fn recall(
     headers: HeaderMap,
     Json(req): Json<RecallRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let (caller_tenant, _api_key) = extract_auth(&headers, state.memory_require_auth)?;
+    let (caller_tenant, api_key) = extract_auth(&headers, state.memory_require_auth)?;
+    authorize_namespace(
+        state.memory_tenants.as_ref(),
+        caller_tenant.as_deref(),
+        api_key.as_deref(),
+        &req.namespace,
+    )?;
     let registry = require_registry(&state)?;
 
     let mem = registry
