@@ -89,6 +89,8 @@ impl AuditEvent {
         }
     }
 
+    /// Attach the request's free-text query. Truncated to 512 chars at emit
+    /// time so a chatty caller can't blow up the audit topic.
     pub fn with_query(mut self, q: impl Into<String>) -> Self {
         let mut s: String = q.into();
         if s.len() > 512 {
@@ -99,21 +101,27 @@ impl AuditEvent {
         self
     }
 
+    /// Record the memory IDs returned to / written by the caller.
     pub fn with_memory_ids(mut self, ids: impl IntoIterator<Item = String>) -> Self {
         self.memory_ids = ids.into_iter().collect();
         self
     }
 
+    /// Record the caller's `X-Tenant-Id` header. Useful in Phase 1
+    /// passthrough mode to detect attempted cross-tenant reads before
+    /// AM-2.5 enforcement is wired.
     pub fn with_caller_tenant(mut self, t: impl Into<String>) -> Self {
         self.caller_tenant = Some(t.into());
         self
     }
 
+    /// Set the measured wall-clock latency for the operation.
     pub fn with_latency_ms(mut self, ms: u64) -> Self {
         self.latency_ms = ms;
         self
     }
 
+    /// Override the default status code (200 for `ok`, set on error).
     pub fn with_status_code(mut self, code: u16) -> Self {
         self.status_code = code;
         self

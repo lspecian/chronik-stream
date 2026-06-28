@@ -609,6 +609,37 @@ async fn evaluate_longmemeval() {
         println!("  {:30} {:>2}/{:<2}  rate={:.2}", k, h, n, h as f32 / n as f32);
     }
 
+    // AM-1.8: write metrics JSON for the nightly baseline-diff check
+    // (`tests/check_baseline.rs` reads this and compares against
+    // `tests/baselines/longmemeval-s.json`).
+    if let Ok(path) = std::env::var("LONGMEMEVAL_RESULTS_JSON") {
+        let metrics = serde_json::json!({
+            "schema_version": 1,
+            "benchmark": "longmemeval-s-18-balanced",
+            "n_total_runs": n_total_runs,
+            "metrics": {
+                "hit_rate": hit_rate,
+                "substring_rate": if use_llm_judge { substring_hits as f32 / n_total_runs as f32 } else { hit_rate },
+                "raw_judge_rate": if use_llm_judge { judge_hits as f32 / n_total_runs as f32 } else { hit_rate },
+                "synth_substring_rate": if use_synth { synth_substring_hits as f32 / n_total_runs as f32 } else { 0.0 },
+                "synth_judge_rate": if use_synth { synth_judge_hits as f32 / n_total_runs as f32 } else { 0.0 },
+                "synth_abstain_rate": if use_synth { synth_abstain_count as f32 / n_total_runs as f32 } else { 0.0 }
+            },
+            "per_category_synth_judge": by_type.iter().map(|(k, (h, n))| {
+                (k.clone(), if *n > 0 { *h as f32 / *n as f32 } else { 0.0 })
+            }).collect::<std::collections::BTreeMap<_, _>>(),
+            "wall_secs": total_runner_secs,
+            "extraction_secs": total_extraction_secs,
+            "recall_secs": total_recall_secs,
+            "synth_secs": total_synth_secs,
+            "judge_secs": total_judge_secs,
+        });
+        match std::fs::write(&path, serde_json::to_vec_pretty(&metrics).unwrap()) {
+            Ok(_) => eprintln!("[eval_longmemeval] wrote results to {path}"),
+            Err(e) => eprintln!("[eval_longmemeval] failed to write {path}: {e}"),
+        }
+    }
+
     let floor = min_hit_rate();
     if floor > 0.0 {
         assert!(
