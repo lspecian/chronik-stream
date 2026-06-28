@@ -350,12 +350,12 @@ System (in-process Rust API, not HTTP):
 - [x] Forget emits null-value tombstone — `forget.rs`
 - [ ] Integration test "ingest 10 contradictions, recall returns latest" — not written
 
-### AM-2.3: Lifecycle controller — ⚠️ scaffold only
+### AM-2.3: Lifecycle controller — ⚠️ decision logic done, consumer wiring + ops endpoint pending
 
-- [x] `crates/chronik-memory/src/lifecycle.rs` stub (4 fns)
-- [ ] Semantic dedup consumer on `mem.fact.{tenant}` — not implemented
-- [ ] Per-namespace half-life overrides via `mem.config.{tenant}` topic — not implemented
-- [ ] `POST /memory/v1/compact` one-shot endpoint — pending AM-1.7
+- [x] `crates/chronik-memory/src/lifecycle.rs` — full `SemanticDedup<E: Embedder>` with `decide() → DedupDecision::{Keep, Drop, Supersede}` (threshold-based, confidence-tied tiebreak, batched embedding). Pure function, no LLM/Kafka deps in the call path.
+- [ ] **Kafka consumer on `mem.fact.{tenant}`** — substantial follow-up (~400 LOC + new binary `chronik-memory-lifecycle-worker`). Pattern mirrors the existing `chronik-memory-worker` binary; reads new facts, calls `Memory::recall` to fetch existing same-`(subject, predicate)` candidates, applies `SemanticDedup::decide`, emits `Drop`/`Supersede` decisions back to Kafka.
+- [ ] **Per-namespace half-life overrides via `mem.config.{tenant}` topic** — not implemented; today the half-lives are hardcoded constants in `ranking.rs`.
+- [ ] **`POST /memory/v1/compact` one-shot endpoint** — handler stub not built; would invoke the dedup pass synchronously and return a job ID.
 
 ### AM-2.4: Hybrid ranking — ✅ done
 
