@@ -660,6 +660,145 @@ impl WalManager {
         Ok(0)
     }
     
+    /// Physically delete WAL segment files that fall entirely below `log_start_offset`.
+    ///
+    /// This backs the Kafka DeleteRecords API: after a partition's log start offset is
+    /// advanced, any sealed segment whose highest offset is strictly below the new low
+    /// watermark holds only deleted records and can be reclaimed. Matching Kafka, this
+    /// only removes whole segments — a segment that straddles the watermark is kept, and
+    /// the active (highest-id, currently-written) segment is never touched.
+    ///
+    /// Returns the number of segment files deleted.
+    pub async fn delete_records_before(
+        &self,
+        topic: &str,
+        partition: i32,
+        log_start_offset: i64,
+    ) -> Result<usize> {
+        if log_start_offset <= 0 {
+            return Ok(0);
+        }
+
+        let partition_dir = self.config.data_dir
+            .join(topic)
+            .join(partition.to_string());
+        if !partition_dir.exists() {
+            return Ok(0);
+        }
+
+        // Collect (segment_id, path) for every WAL segment file in this partition.
+        let mut wal_files: Vec<(u64, std::path::PathBuf)> = Vec::new();
+        let mut entries = tokio::fs::read_dir(&partition_dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
+                let prefix = format!("wal_{}_", partition);
+                if let Some(seg_id) = filename
+                    .strip_prefix(&prefix)
+                    .and_then(|rest| rest.strip_suffix(".log"))
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
+                    wal_files.push((seg_id, path));
+                }
+            }
+        }
+
+        if wal_files.len() <= 1 {
+            // Only the active segment exists — nothing sealed to reclaim.
+            return Ok(0);
+        }
+
+        wal_files.sort_by_key(|(seg_id, _)| *seg_id);
+        // Never delete the active segment (highest id, still being written).
+        let active_seg_id = wal_files.last().map(|(id, _)| *id).unwrap_or(u64::MAX);
+
+        let mut deleted = 0usize;
+        for (seg_id, path) in wal_files.iter() {
+            if *seg_id == active_seg_id {
+                continue;
+            }
+            // Determine this segment's highest offset by scanning record headers.
+            let file_data = match tokio::fs::read(path).await {
+                Ok(d) => d,
+                Err(e) => {
+                    warn!("DeleteRecords: could not read segment {:?}: {}", path, e);
+                    continue;
+                }
+            };
+            let seg_last_offset = match Self::scan_segment_last_offset(&file_data) {
+                Some(o) => o,
+                None => continue, // empty/unparseable — leave it alone
+            };
+
+            // Only reclaim segments whose ENTIRE range is below the watermark.
+            if seg_last_offset < log_start_offset {
+                if let Err(e) = self.group_commit_wal.delete_segment_file(topic, partition, *seg_id) {
+                    warn!("DeleteRecords: failed to delete segment {}:{}:{}: {}", topic, partition, seg_id, e);
+                } else {
+                    deleted += 1;
+                }
+            }
+        }
+
+        if deleted > 0 {
+            info!(
+                "DeleteRecords: reclaimed {} WAL segment(s) below offset {} for {}-{}",
+                deleted, log_start_offset, topic, partition
+            );
+        }
+        Ok(deleted)
+    }
+
+    /// Scan a WAL segment file's V2 record headers and return the highest `last_offset`,
+    /// without allocating record bodies. Returns None if no valid records are found.
+    fn scan_segment_last_offset(file_data: &[u8]) -> Option<i64> {
+        use byteorder::{LittleEndian, ReadBytesExt};
+        use std::io::Cursor as IoCursor;
+
+        let mut cursor = 0usize;
+        let mut max_last: i64 = -1;
+        while cursor < file_data.len() {
+            if cursor + 12 > file_data.len() {
+                break;
+            }
+            let record_start = cursor;
+            let mut rdr = IoCursor::new(&file_data[cursor..]);
+
+            let magic = rdr.read_u16::<LittleEndian>().ok()?;
+            let version = rdr.read_u8().ok()?;
+            let _flags = rdr.read_u8().ok()?;
+            let _length = rdr.read_u32::<LittleEndian>().ok()?;
+            let _crc32 = rdr.read_u32::<LittleEndian>().ok()?;
+
+            if magic != 0xCA7E || version != 2 {
+                break;
+            }
+
+            let topic_len = rdr.read_u16::<LittleEndian>().ok()? as usize;
+            let new_pos = rdr.position() as usize + topic_len;
+            if new_pos > file_data.len() - cursor { break; }
+            rdr.set_position(new_pos as u64);
+
+            if rdr.read_i32::<LittleEndian>().is_err() { break; } // partition
+
+            let canonical_data_len = rdr.read_u32::<LittleEndian>().ok()? as usize;
+            let skip_pos = rdr.position() as usize + canonical_data_len;
+            if skip_pos > file_data.len() - cursor { break; }
+            rdr.set_position(skip_pos as u64);
+
+            let _base_offset = rdr.read_i64::<LittleEndian>().ok()?;
+            let last_offset = rdr.read_i64::<LittleEndian>().ok()?;
+            if rdr.read_i32::<LittleEndian>().is_err() { break; } // record_count
+
+            if last_offset > max_last {
+                max_last = last_offset;
+            }
+            cursor = record_start + rdr.position() as usize;
+        }
+
+        if max_last >= 0 { Some(max_last) } else { None }
+    }
+
     /// Flush all partitions to disk (v1.3.53+: No-op, GroupCommitWal flushes automatically)
     pub async fn flush_all(&self) -> Result<()> {
         // GroupCommitWal handles flushing via background workers

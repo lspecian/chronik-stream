@@ -737,17 +737,21 @@ pub fn supported_api_versions() -> HashMap<ApiKey, VersionRange> {
     versions.insert(ApiKey::DeleteAcls, VersionRange { min: 0, max: 3 });
     
     // Additional APIs (NOT IMPLEMENTED - placeholder for librdkafka compatibility)
-    versions.insert(ApiKey::DeleteRecords, VersionRange { min: 0, max: 0 });
+    // DeleteRecords: implemented v0-v1 (non-flexible; v2 adds flexible encoding).
+    // Used by Kafka UI / AKHQ "Clear messages" and the Java AdminClient.
+    versions.insert(ApiKey::DeleteRecords, VersionRange { min: 0, max: 1 });
     versions.insert(ApiKey::OffsetForLeaderEpoch, VersionRange { min: 0, max: 0 });
     versions.insert(ApiKey::AlterReplicaLogDirs, VersionRange { min: 0, max: 0 });
     versions.insert(ApiKey::DescribeLogDirs, VersionRange { min: 0, max: 0 });
     versions.insert(ApiKey::SaslAuthenticate, VersionRange { min: 0, max: 2 });
-    versions.insert(ApiKey::CreatePartitions, VersionRange { min: 0, max: 0 });
+    // CreatePartitions: implemented v0-v1 (non-flexible; v2 adds flexible encoding).
+    versions.insert(ApiKey::CreatePartitions, VersionRange { min: 0, max: 1 });
     versions.insert(ApiKey::CreateDelegationToken, VersionRange { min: 0, max: 0 });
     versions.insert(ApiKey::RenewDelegationToken, VersionRange { min: 0, max: 0 });
     versions.insert(ApiKey::ExpireDelegationToken, VersionRange { min: 0, max: 0 });
     versions.insert(ApiKey::DescribeDelegationToken, VersionRange { min: 0, max: 0 });
-    versions.insert(ApiKey::DeleteGroups, VersionRange { min: 0, max: 0 });
+    // DeleteGroups: implemented v0-v1 (non-flexible; v2 adds flexible encoding).
+    versions.insert(ApiKey::DeleteGroups, VersionRange { min: 0, max: 1 });
     versions.insert(ApiKey::ElectLeaders, VersionRange { min: 0, max: 0 });
     versions.insert(ApiKey::IncrementalAlterConfigs, VersionRange { min: 0, max: 0 });
     versions.insert(ApiKey::AlterPartitionReassignments, VersionRange { min: 0, max: 0 });

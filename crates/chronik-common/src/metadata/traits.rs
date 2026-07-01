@@ -478,6 +478,29 @@ pub trait MetadataStore: Send + Sync {
     async fn update_partition_offset(&self, topic: &str, partition: u32, high_watermark: i64, log_start_offset: i64) -> Result<()>;
     async fn get_partition_offset(&self, topic: &str, partition: u32) -> Result<Option<(i64, i64)>>; // Returns (high_watermark, log_start_offset)
 
+    /// Advance the log start offset (low watermark) for a partition, e.g. via the
+    /// Kafka DeleteRecords API. This is monotonic — the stored value never regresses —
+    /// and is persisted durably (separate from `update_partition_offset`, whose
+    /// high-watermark callers pass log_start_offset=0). Returns the effective
+    /// (post-clamp) log start offset. Default impl is an in-memory no-op that echoes
+    /// the requested value, sufficient for test/mocks.
+    async fn update_log_start_offset(&self, _topic: &str, _partition: u32, log_start_offset: i64) -> Result<i64> {
+        Ok(log_start_offset)
+    }
+
+    /// Delete a consumer group and all of its committed offsets (Kafka DeleteGroups API).
+    /// Default impl is a no-op for stores that don't persist consumer groups.
+    async fn delete_consumer_group(&self, _group_id: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Delete committed offsets for a consumer group (Kafka OffsetDelete API).
+    /// When `topic_partitions` is empty, delete all offsets for the group; otherwise
+    /// delete only the listed (topic, partition) pairs. Default impl is a no-op.
+    async fn delete_consumer_offsets(&self, _group_id: &str, _topic_partitions: &[(String, u32)]) -> Result<()> {
+        Ok(())
+    }
+
     // Replicated event application (for followers receiving from leader)
     // v2.2.9 Phase 7: Apply replicated metadata events WITHOUT writing to WAL
     async fn apply_replicated_event(&self, event: super::events::MetadataEvent) -> Result<()>;

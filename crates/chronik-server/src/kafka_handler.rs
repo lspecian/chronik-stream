@@ -133,6 +133,10 @@ impl KafkaProtocolHandler {
             ApiKey::SaslHandshake => self.handle_sasl_handshake_request(header, buf).await,
             ApiKey::SaslAuthenticate => self.handle_sasl_authenticate_request(header, buf).await,
             ApiKey::DeleteTopics => self.handle_delete_topics_request(request_bytes).await,
+            ApiKey::DeleteRecords => self.handle_delete_records_request(header, buf).await,
+            ApiKey::DeleteGroups => self.handle_delete_groups_request(header, buf).await,
+            ApiKey::OffsetDelete => self.handle_offset_delete_request(header, buf).await,
+            ApiKey::ListGroups => self.handle_list_groups_request(header, buf).await,
             _ => self.handle_default_request(request_bytes, header.api_key, header.api_version).await,
         }
     }
@@ -706,6 +710,248 @@ impl KafkaProtocolHandler {
         Ok(response)
     }
 
+    /// Handle DeleteRecords API request (key 21).
+    ///
+    /// Backs Kafka UI / AKHQ "Clear messages" and the Java AdminClient
+    /// `deleteRecords`. For each partition, advances the log start offset to the
+    /// requested offset (or the high watermark when offset == -1), which makes the
+    /// deleted records unreadable, persists the new low watermark, and reclaims WAL
+    /// segments that fall entirely below it. Returns the new low watermark per
+    /// partition.
+    async fn handle_delete_records_request(
+        &self,
+        header: chronik_protocol::parser::RequestHeader,
+        mut buf: Bytes,
+    ) -> Result<Response> {
+        use chronik_protocol::parser::{Decoder, Encoder, KafkaDecodable, KafkaEncodable};
+        use chronik_protocol::delete_records_types::{
+            DeleteRecordsRequest, DeleteRecordsResponse, DeleteRecordsResponseTopic,
+            DeleteRecordsResponsePartition, error_codes as ec,
+        };
+        use bytes::BytesMut;
+
+        let request = {
+            let mut decoder = Decoder::new(&mut buf);
+            DeleteRecordsRequest::decode(&mut decoder, header.api_version)?
+        };
+
+        tracing::info!(
+            "DeleteRecords v{} request: {} topic(s)",
+            header.api_version, request.topics.len()
+        );
+
+        let mut response_topics = Vec::with_capacity(request.topics.len());
+        for topic in &request.topics {
+            // Validate the topic exists before touching partitions.
+            let topic_exists = self.metadata_store
+                .get_topic(&topic.name)
+                .await
+                .ok()
+                .flatten()
+                .is_some();
+
+            let mut response_partitions = Vec::with_capacity(topic.partitions.len());
+            for p in &topic.partitions {
+                let (low_watermark, error_code) = if !topic_exists {
+                    (-1, ec::UNKNOWN_TOPIC_OR_PARTITION)
+                } else {
+                    match self.produce_handler
+                        .delete_records(&topic.name, p.partition_index, p.offset)
+                        .await
+                    {
+                        Ok(lw) => (lw, ec::NONE),
+                        Err(code) => (-1, code),
+                    }
+                };
+                response_partitions.push(DeleteRecordsResponsePartition {
+                    partition_index: p.partition_index,
+                    low_watermark,
+                    error_code,
+                });
+            }
+            response_topics.push(DeleteRecordsResponseTopic {
+                name: topic.name.clone(),
+                partitions: response_partitions,
+            });
+        }
+
+        let response = DeleteRecordsResponse {
+            throttle_time_ms: 0,
+            topics: response_topics,
+        };
+
+        let mut body_buf = BytesMut::new();
+        {
+            let mut encoder = Encoder::new(&mut body_buf);
+            response.encode(&mut encoder, header.api_version)?;
+        }
+
+        Ok(Response {
+            header: ResponseHeader {
+                correlation_id: header.correlation_id,
+            },
+            body: body_buf.freeze(),
+            is_flexible: false, // DeleteRecords v0-v1 are non-flexible
+            api_key: ApiKey::DeleteRecords,
+            throttle_time_ms: None,
+        })
+    }
+
+    /// Handle ListGroups API request (key 16).
+    ///
+    /// Reads from the live GroupManager (where real consumer groups live) rather
+    /// than the protocol handler's separate map, so admin tools (Kafka UI, AKHQ,
+    /// kafka-consumer-groups --list) actually see active groups.
+    async fn handle_list_groups_request(
+        &self,
+        header: chronik_protocol::parser::RequestHeader,
+        _buf: Bytes,
+    ) -> Result<Response> {
+        use chronik_protocol::list_groups_types::{ListGroupsResponse, ListGroupsResponseGroup, error_codes};
+        use bytes::BytesMut;
+
+        let group_ids = self.group_manager.list_groups().await.unwrap_or_default();
+        let groups = group_ids.into_iter().map(|group_id| ListGroupsResponseGroup {
+            group_id,
+            protocol_type: "consumer".to_string(),
+        }).collect::<Vec<_>>();
+        tracing::info!("ListGroups: returning {} group(s) from GroupManager", groups.len());
+
+        let response = ListGroupsResponse { throttle_time_ms: 0, error_code: error_codes::NONE, groups };
+        let mut body_buf = BytesMut::new();
+        self.protocol_handler.encode_list_groups_response(&mut body_buf, &response, header.api_version)?;
+
+        Ok(Response {
+            header: ResponseHeader { correlation_id: header.correlation_id },
+            body: body_buf.freeze(),
+            is_flexible: header.api_version >= 3, // ListGroups v3+ uses flexible headers
+            api_key: ApiKey::ListGroups,
+            throttle_time_ms: None,
+        })
+    }
+
+    /// Handle DeleteGroups API request (key 42).
+    ///
+    /// Backs the Kafka UI / AdminClient "delete consumer group". Operates on the
+    /// server's live GroupManager (where real groups live) plus the durable metadata
+    /// store. Kafka semantics: only empty groups can be deleted.
+    async fn handle_delete_groups_request(
+        &self,
+        header: chronik_protocol::parser::RequestHeader,
+        mut buf: Bytes,
+    ) -> Result<Response> {
+        use chronik_protocol::parser::{Decoder, Encoder, KafkaDecodable, KafkaEncodable};
+        use chronik_protocol::delete_groups_types::{
+            DeleteGroupsRequest, DeleteGroupsResponse, DeletableGroupResult, error_codes as ec,
+        };
+        use bytes::BytesMut;
+
+        let request = {
+            let mut decoder = Decoder::new(&mut buf);
+            DeleteGroupsRequest::decode(&mut decoder, header.api_version)?
+        };
+        tracing::info!("DeleteGroups v{} request: {:?}", header.api_version, request.groups_names);
+
+        let mut results = Vec::with_capacity(request.groups_names.len());
+        for group_id in &request.groups_names {
+            let error_code = match self.group_manager.group_status(group_id).await {
+                None => ec::GROUP_ID_NOT_FOUND,
+                Some(true) => ec::GROUP_NOT_EMPTY,
+                Some(false) => {
+                    self.group_manager.remove_group_in_memory(group_id).await;
+                    if let Err(e) = self.metadata_store.delete_consumer_group(group_id).await {
+                        tracing::warn!("DeleteGroups: failed to persist deletion of '{}': {}", group_id, e);
+                    }
+                    tracing::info!("DeleteGroups: deleted consumer group '{}'", group_id);
+                    ec::NONE
+                }
+            };
+            results.push(DeletableGroupResult { group_id: group_id.clone(), error_code });
+        }
+
+        let response = DeleteGroupsResponse { throttle_time_ms: 0, results };
+        let mut body_buf = BytesMut::new();
+        {
+            let mut encoder = Encoder::new(&mut body_buf);
+            response.encode(&mut encoder, header.api_version)?;
+        }
+        Ok(Response {
+            header: ResponseHeader { correlation_id: header.correlation_id },
+            body: body_buf.freeze(),
+            is_flexible: false, // DeleteGroups v0-v1 are non-flexible
+            api_key: ApiKey::DeleteGroups,
+            throttle_time_ms: None,
+        })
+    }
+
+    /// Handle OffsetDelete API request (key 47).
+    ///
+    /// Backs the Kafka UI / AdminClient "delete offsets for a consumer group".
+    /// Deletes committed offsets for the given (topic, partition)s from the durable
+    /// metadata store. Kafka semantics: unknown group -> top-level GROUP_ID_NOT_FOUND;
+    /// a group with active members subscribed -> GROUP_SUBSCRIBED_TO_TOPIC per partition.
+    async fn handle_offset_delete_request(
+        &self,
+        header: chronik_protocol::parser::RequestHeader,
+        mut buf: Bytes,
+    ) -> Result<Response> {
+        use chronik_protocol::parser::{Decoder, Encoder, KafkaDecodable, KafkaEncodable};
+        use chronik_protocol::offset_delete_types::{
+            OffsetDeleteRequest, OffsetDeleteResponse, OffsetDeleteResponseTopic,
+            OffsetDeleteResponsePartition, error_codes as ec,
+        };
+        use bytes::BytesMut;
+
+        let request = {
+            let mut decoder = Decoder::new(&mut buf);
+            OffsetDeleteRequest::decode(&mut decoder, header.api_version)?
+        };
+        tracing::info!("OffsetDelete v{} request for group: {}", header.api_version, request.group_id);
+
+        let status = self.group_manager.group_status(&request.group_id).await;
+        let group_error = match status {
+            None => ec::GROUP_ID_NOT_FOUND,
+            Some(_) => ec::NONE,
+        };
+        let has_members = matches!(status, Some(true));
+
+        let mut deleted_pairs: Vec<(String, u32)> = Vec::new();
+        let topics: Vec<OffsetDeleteResponseTopic> = request.topics.iter().map(|topic| {
+            let partitions = topic.partitions.iter().map(|p| {
+                let error_code = if group_error != ec::NONE {
+                    group_error
+                } else if has_members {
+                    ec::GROUP_SUBSCRIBED_TO_TOPIC
+                } else {
+                    deleted_pairs.push((topic.name.clone(), p.partition_index as u32));
+                    ec::NONE
+                };
+                OffsetDeleteResponsePartition { partition_index: p.partition_index, error_code }
+            }).collect();
+            OffsetDeleteResponseTopic { name: topic.name.clone(), partitions }
+        }).collect();
+
+        if !deleted_pairs.is_empty() {
+            if let Err(e) = self.metadata_store.delete_consumer_offsets(&request.group_id, &deleted_pairs).await {
+                tracing::warn!("OffsetDelete: failed to persist deletions for '{}': {}", request.group_id, e);
+            }
+        }
+
+        let response = OffsetDeleteResponse { error_code: group_error, throttle_time_ms: 0, topics };
+        let mut body_buf = BytesMut::new();
+        {
+            let mut encoder = Encoder::new(&mut body_buf);
+            response.encode(&mut encoder, header.api_version)?;
+        }
+        Ok(Response {
+            header: ResponseHeader { correlation_id: header.correlation_id },
+            body: body_buf.freeze(),
+            is_flexible: false, // OffsetDelete v0 is non-flexible
+            api_key: ApiKey::OffsetDelete,
+            throttle_time_ms: None,
+        })
+    }
+
     /// Handle CreateTopics API request
     ///
     /// Creates topics with Raft forwarding and partition initialization.
@@ -1108,9 +1354,13 @@ impl KafkaProtocolHandler {
                     .as_millis() as i64)
             }
             EARLIEST_TIMESTAMP => {
-                // Return the earliest offset (always 0 for now)
-                tracing::info!("ListOffsets: Returning earliest offset 0 for {}-{}", topic_name, partition_index);
-                (0, std::time::SystemTime::now()
+                // Earliest = the partition's log start offset (low watermark). This is
+                // 0 normally, but advances after a Kafka DeleteRecords ("clear messages").
+                let earliest = self.produce_handler
+                    .get_log_start_offset(topic_name, partition_index)
+                    .await;
+                tracing::info!("ListOffsets: Returning earliest offset {} for {}-{}", earliest, topic_name, partition_index);
+                (earliest, std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
                     .as_millis() as i64 - 86400000) // 1 day ago

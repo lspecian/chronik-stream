@@ -738,7 +738,33 @@ impl GroupManager {
         group_ids.dedup();
         Ok(group_ids)
     }
-    
+
+    /// Return the status of a consumer group for admin operations:
+    /// `Some(true)` if it exists with active members, `Some(false)` if it exists
+    /// but is empty, `None` if it does not exist. Consults the metadata store as a
+    /// fallback for groups persisted but not currently resident in memory.
+    pub async fn group_status(&self, group_id: &str) -> Option<bool> {
+        {
+            let groups = self.groups.read().await;
+            if let Some(group) = groups.get(group_id) {
+                return Some(!group.members.is_empty());
+            }
+        }
+        // Not in memory — check durable metadata (offsets-only / restarted groups).
+        match self.metadata_store.get_consumer_group(group_id).await {
+            Ok(Some(_)) => Some(false), // persisted groups have no live members
+            _ => None,
+        }
+    }
+
+    /// Remove a consumer group from the in-memory registry (used by DeleteGroups
+    /// after the empty-group check). Durable deletion is handled by the caller via
+    /// the metadata store. Returns true if a group was present.
+    pub async fn remove_group_in_memory(&self, group_id: &str) -> bool {
+        let mut groups = self.groups.write().await;
+        groups.remove(group_id).is_some()
+    }
+
     /// Get or create a consumer group
     pub async fn get_or_create_group(&self, group_id: String, protocol_type: String) -> Result<String> {
         let mut groups = self.groups.write().await;
@@ -1873,6 +1899,17 @@ impl GroupManager {
         use chronik_protocol::types::{OffsetCommitResponseTopic, OffsetCommitResponsePartition};
 
         info!("OffsetCommit for group: {}", request.group_id);
+
+        // Ensure the group is registered even for "simple" consumers that commit
+        // offsets via assign() without ever calling JoinGroup. Kafka tracks such
+        // groups (in Empty state) so they appear in ListGroups and can be managed
+        // by DeleteGroups / OffsetDelete. Without this, admin tools (Kafka UI, AKHQ)
+        // can't see or clean up simple-consumer groups.
+        {
+            let mut groups = self.groups.write().await;
+            groups.entry(request.group_id.clone())
+                .or_insert_with(|| ConsumerGroup::new(request.group_id.clone(), "consumer".to_string()));
+        }
 
         let mut response_topics = Vec::new();
 

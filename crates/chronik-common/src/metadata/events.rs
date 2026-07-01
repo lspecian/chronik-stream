@@ -191,12 +191,27 @@ pub enum MetadataEventPayload {
         partition: u32,
         new_offset: i64,
     },
+    /// A committed consumer-group offset was deleted (Kafka OffsetDelete API /
+    /// group deletion). Removes the (group, topic, partition) offset entry.
+    ConsumerOffsetDeleted {
+        group_id: String,
+        topic: String,
+        partition: u32,
+    },
 
     // High watermark events (for partition replication)
     HighWatermarkUpdated {
         topic: String,
         partition: i32,
         new_watermark: i64,
+    },
+    /// The log start offset (low watermark) advanced for a partition, e.g. via
+    /// the Kafka DeleteRecords API. Monotonic: only ever increases. Persisted so
+    /// deleted records stay deleted across restarts.
+    LogStartOffsetUpdated {
+        topic: String,
+        partition: i32,
+        new_log_start_offset: i64,
     },
 
     // Transactional offset events
@@ -371,6 +386,8 @@ impl EventLog {
                 MetadataEventPayload::PartitionReassigned { topic: t, .. } => t == topic,
                 MetadataEventPayload::OffsetCommitted { offset } => offset.topic == topic,
                 MetadataEventPayload::OffsetsReset { topic: t, .. } => t == topic,
+                MetadataEventPayload::ConsumerOffsetDeleted { topic: t, .. } => t == topic,
+                MetadataEventPayload::LogStartOffsetUpdated { topic: t, .. } => t == topic,
                 MetadataEventPayload::ConfigUpdated { scope, .. } => {
                     matches!(scope, ConfigScope::Topic(t) if t == topic)
                 }

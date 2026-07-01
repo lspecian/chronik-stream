@@ -760,6 +760,91 @@ impl ProduceHandler {
         }
     }
 
+    /// Get the current log start offset (low watermark) for a partition.
+    ///
+    /// This reflects Kafka DeleteRecords: records below this offset have been
+    /// deleted and are no longer readable. Falls back to the persisted metadata
+    /// value if the partition has no in-memory state yet (e.g. right after start).
+    pub async fn get_log_start_offset(&self, topic: &str, partition: i32) -> i64 {
+        let key = (topic.to_string(), partition);
+        if let Some(state) = self.partition_states.get(&key) {
+            return state.value().log_start_offset.load(Ordering::SeqCst) as i64;
+        }
+        // Fall back to persisted metadata (survives restarts before first produce).
+        if let Ok(Some((_hwm, lso))) = self.metadata_store.get_partition_offset(topic, partition as u32).await {
+            return lso.max(0);
+        }
+        0
+    }
+
+    /// Execute a Kafka DeleteRecords for a single partition.
+    ///
+    /// `requested_offset` is the offset before which records should be deleted;
+    /// the special value `-1` means "the high watermark" (delete every record).
+    /// The log start offset is advanced monotonically to the clamped target,
+    /// persisted durably, and WAL segments that fall entirely below the new low
+    /// watermark are reclaimed. Returns the partition's new low watermark.
+    ///
+    /// Returns `Err` with a Kafka error code embedded by the caller on invalid input.
+    pub async fn delete_records(
+        &self,
+        topic: &str,
+        partition: i32,
+        requested_offset: i64,
+    ) -> std::result::Result<i64, i16> {
+        use chronik_protocol::delete_records_types::error_codes as ec;
+
+        // Ensure partition state exists (loads persisted offsets from metadata).
+        let state = self
+            .get_or_create_partition_state(topic, partition)
+            .await
+            .map_err(|_| ec::UNKNOWN_TOPIC_OR_PARTITION)?;
+
+        let high_watermark = state.high_watermark.load(Ordering::SeqCst) as i64;
+        let current_lso = state.log_start_offset.load(Ordering::SeqCst) as i64;
+
+        // Resolve the special -1 sentinel to "delete everything up to the HWM".
+        let target = if requested_offset == -1 {
+            high_watermark
+        } else {
+            requested_offset
+        };
+
+        // Validate the requested offset is within [log_start_offset, high_watermark].
+        if target < 0 || target > high_watermark {
+            return Err(ec::OFFSET_OUT_OF_RANGE);
+        }
+
+        // Log start offset is monotonic; requests below the current low watermark
+        // are a no-op that simply echoes the current value.
+        let new_lso = target.max(current_lso);
+
+        // 1) Advance in-memory low watermark (authoritative for fetch).
+        state.log_start_offset.store(new_lso as u64, Ordering::SeqCst);
+
+        // 2) Persist durably so the deletion survives restart. This is monotonic
+        //    and independent of the high-watermark update path.
+        if let Err(e) = self
+            .metadata_store
+            .update_log_start_offset(topic, partition as u32, new_lso)
+            .await
+        {
+            warn!("DeleteRecords: failed to persist log start offset for {}-{}: {:?}", topic, partition, e);
+            // In-memory state is advanced; report success with the new watermark
+            // rather than failing the client — records are already unreadable.
+        }
+
+        // 3) Best-effort physical reclamation of fully-deleted WAL segments.
+        if let Some(ref wal_mgr) = self.wal_manager {
+            if let Err(e) = wal_mgr.delete_records_before(topic, partition, new_lso).await {
+                warn!("DeleteRecords: WAL segment reclamation failed for {}-{}: {}", topic, partition, e);
+            }
+        }
+
+        info!("DeleteRecords: {}-{} low watermark advanced to {}", topic, partition, new_lso);
+        Ok(new_lso)
+    }
+
     /// Update high watermark in memory (v2.2.9 - simplified architecture)
     ///
     /// ARCHITECTURAL CHANGE: Removed redundant metadata_store persistence.

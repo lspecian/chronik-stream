@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.6.0] - 2026-07-02
+
+### Added
+- **Kafka UI / AdminClient admin APIs** — the operations Kafka UI, AKHQ and the
+  Java `AdminClient` rely on are now implemented and wire-tested end-to-end
+  (kafka-clients 3.6.0, 11/11 checks passing):
+  - **DeleteRecords (API 21)** — backs Kafka UI's "Clear messages". Advances and
+    durably persists a per-partition log start offset (new `LogStartOffsetUpdated`
+    metadata event, monotonic), enforces `OFFSET_OUT_OF_RANGE` on fetch below it,
+    reports it as the ListOffsets earliest offset, and physically reclaims WAL
+    segments that fall entirely below the new low watermark (never the active or a
+    straddling segment — matching Kafka). Advertised v0–v1. `offset = -1` clears
+    the whole partition.
+  - **CreatePartitions (API 37)** — expands an existing topic's partition count,
+    assigning and initialising the new partitions. Advertised v0–v1.
+  - **DeleteGroups (API 42)** and **OffsetDelete (API 47)** — delete consumer
+    groups and their committed offsets via the live `GroupManager` + durable
+    metadata store. Only empty groups are deletable (Kafka semantics).
+
+### Fixed
+- **ListGroups returned an empty list** — it read the protocol handler's unused
+  in-memory map instead of the server's `GroupManager`, so `kafka-consumer-groups
+  --list`, Kafka UI and AKHQ saw no consumer groups. Now served from the
+  `GroupManager`.
+- **Simple-consumer groups were invisible** — `OffsetCommit` now registers the
+  group (Empty state) even for consumers that commit via `assign()` without
+  `JoinGroup`, matching Kafka; such groups now appear in ListGroups and can be
+  deleted.
+- **Log start offset could be reset to 0** — `update_partition_offset` overwrote
+  the low watermark on every high-watermark update (hot path passes
+  `log_start_offset = 0`); it is now monotonic, so a DeleteRecords watermark
+  can't be clobbered by ordinary produces.
+
 ## [2.5.6] - 2026-06-27
 
 ### Fixed

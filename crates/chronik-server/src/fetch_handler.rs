@@ -351,6 +351,21 @@ impl FetchHandler {
         Ok(high_watermark)
     }
 
+    /// Get the partition's log start offset (low watermark) for a fetch.
+    ///
+    /// Advanced by the Kafka DeleteRecords API; records below it were deleted.
+    /// ProduceHandler is authoritative (and itself falls back to persisted
+    /// metadata); if there is no ProduceHandler we read metadata directly.
+    async fn get_log_start_offset_for_fetch(&self, topic: &str, partition: i32) -> i64 {
+        if let Some(ref produce_handler) = self.produce_handler {
+            return produce_handler.get_log_start_offset(topic, partition).await;
+        }
+        if let Ok(Some((_hwm, log_start))) = self.metadata_store.get_partition_offset(topic, partition as u32).await {
+            return log_start.max(0);
+        }
+        0
+    }
+
     /// Validate fetch_offset is within valid range
     ///
     /// Returns None if valid, Some(error_response) if out of range
@@ -648,10 +663,13 @@ impl FetchHandler {
         // Phase 2: Get high watermark from ProduceHandler with metadata_store fallback
         let high_watermark = self.get_high_watermark_for_fetch(topic, partition, fetch_offset).await?;
 
-        // Log start offset is always 0 in NEW architecture (WAL-based)
-        let log_start_offset = 0;
+        // Log start offset (low watermark). Advanced by the Kafka DeleteRecords API;
+        // records below it have been deleted and must not be served. Sourced from
+        // ProduceHandler (authoritative), falling back to persisted metadata.
+        let log_start_offset = self.get_log_start_offset_for_fetch(topic, partition).await;
 
-        // Phase 3: Validate fetch_offset is within valid range
+        // Phase 3: Validate fetch_offset is within valid range. A fetch below the
+        // low watermark (deleted range) returns OFFSET_OUT_OF_RANGE.
         if let Some(error_response) = self.check_offset_range(partition, fetch_offset, log_start_offset, high_watermark) {
             return Ok(error_response);
         }
