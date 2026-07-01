@@ -264,6 +264,34 @@ impl MetadataStore for InMemoryMetadataStore {
         Ok(offsets.get(&key).cloned())
     }
 
+    async fn update_log_start_offset(&self, topic: &str, partition: u32, log_start_offset: i64) -> Result<i64> {
+        let mut offsets = self.partition_offsets.write().await;
+        let key = (topic.to_string(), partition);
+        let entry = offsets.entry(key).or_insert((0, 0));
+        if log_start_offset > entry.1 {
+            entry.1 = log_start_offset;
+        }
+        Ok(entry.1)
+    }
+
+    async fn delete_consumer_group(&self, group_id: &str) -> Result<()> {
+        self.consumer_groups.write().await.remove(group_id);
+        self.consumer_offsets.write().await.retain(|(g, _, _), _| g != group_id);
+        Ok(())
+    }
+
+    async fn delete_consumer_offsets(&self, group_id: &str, topic_partitions: &[(String, u32)]) -> Result<()> {
+        let mut offsets = self.consumer_offsets.write().await;
+        if topic_partitions.is_empty() {
+            offsets.retain(|(g, _, _), _| g != group_id);
+        } else {
+            for (topic, partition) in topic_partitions {
+                offsets.remove(&(group_id.to_string(), topic.clone(), *partition));
+            }
+        }
+        Ok(())
+    }
+
     async fn apply_replicated_event(&self, event: super::events::MetadataEvent) -> Result<()> {
         use super::events::MetadataEventPayload;
         match event.payload {

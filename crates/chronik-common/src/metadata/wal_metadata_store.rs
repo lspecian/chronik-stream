@@ -228,6 +228,27 @@ impl MetadataState {
                 Ok(())
             }
 
+            MetadataEventPayload::LogStartOffsetUpdated { topic, partition, new_log_start_offset } => {
+                // Log start offset is monotonic (only advances). Never regress it,
+                // so a stale/replayed event can't resurrect deleted records.
+                let mut offsets = self.partition_offsets.write().await;
+                let key = (topic.clone(), *partition as u32);
+                if let Some((_hwm, lso)) = offsets.get_mut(&key) {
+                    if *new_log_start_offset > *lso {
+                        *lso = *new_log_start_offset;
+                    }
+                } else {
+                    offsets.insert(key, (0, *new_log_start_offset));
+                }
+                Ok(())
+            }
+
+            MetadataEventPayload::ConsumerOffsetDeleted { group_id, topic, partition } => {
+                let mut offsets = self.consumer_offsets.write().await;
+                offsets.remove(&(group_id.clone(), topic.clone(), *partition));
+                Ok(())
+            }
+
             MetadataEventPayload::BrokerRegistered { metadata } => {
                 let mut brokers = self.brokers.write().await;
                 brokers.insert(metadata.broker_id, metadata.clone());
@@ -271,6 +292,10 @@ impl MetadataState {
             MetadataEventPayload::ConsumerGroupDeleted { group_id } => {
                 let mut groups = self.consumer_groups.write().await;
                 groups.remove(group_id);
+                drop(groups);
+                // Also purge all committed offsets belonging to this group.
+                let mut offsets = self.consumer_offsets.write().await;
+                offsets.retain(|(g, _, _), _| g != group_id);
                 Ok(())
             }
 
@@ -790,15 +815,93 @@ impl MetadataStore for WalMetadataStore {
             self.write_and_apply(event).await?;
         }
 
-        // Also update log_start_offset (not replicated via event yet - TODO)
+        // Update log_start_offset MONOTONICALLY. The high-watermark hot path calls
+        // this with log_start_offset=0; without the max() guard those calls would
+        // reset a DeleteRecords low watermark back to 0 and resurrect deleted
+        // records. Durable advancement goes through update_log_start_offset().
         let mut offsets = self.state.partition_offsets.write().await;
         if let Some((_hwm, lso)) = offsets.get_mut(&key) {
-            *lso = log_start_offset;
+            if log_start_offset > *lso {
+                *lso = log_start_offset;
+            }
         } else {
             // Initialize if missing (shouldn't happen, but be defensive)
             offsets.insert(key, (high_watermark, log_start_offset));
         }
 
+        Ok(())
+    }
+
+    async fn update_log_start_offset(&self, topic: &str, partition: u32, log_start_offset: i64) -> Result<i64> {
+        let key = (topic.to_string(), partition);
+
+        // Only advance; compute the effective value under the read lock first.
+        let (should_write, effective) = {
+            let offsets = self.state.partition_offsets.read().await;
+            match offsets.get(&key) {
+                Some((_hwm, current_lso)) => {
+                    if log_start_offset > *current_lso {
+                        (true, log_start_offset)
+                    } else {
+                        (false, *current_lso)
+                    }
+                }
+                None => (true, log_start_offset),
+            }
+        };
+
+        if should_write {
+            let event = MetadataEvent::new_with_node(
+                MetadataEventPayload::LogStartOffsetUpdated {
+                    topic: topic.to_string(),
+                    partition: partition as i32,
+                    new_log_start_offset: log_start_offset,
+                },
+                self.node_id,
+            );
+            // write_and_apply persists to the metadata WAL and applies to state
+            // (the apply arm enforces monotonicity again, defensively).
+            self.write_and_apply(event).await?;
+        }
+
+        Ok(effective)
+    }
+
+    async fn delete_consumer_group(&self, group_id: &str) -> Result<()> {
+        let event = MetadataEvent::new_with_node(
+            MetadataEventPayload::ConsumerGroupDeleted {
+                group_id: group_id.to_string(),
+            },
+            self.node_id,
+        );
+        self.write_and_apply(event).await
+    }
+
+    async fn delete_consumer_offsets(&self, group_id: &str, topic_partitions: &[(String, u32)]) -> Result<()> {
+        // Resolve the concrete (topic, partition) set to delete. Empty input means
+        // "all offsets for this group".
+        let targets: Vec<(String, u32)> = if topic_partitions.is_empty() {
+            let offsets = self.state.consumer_offsets.read().await;
+            offsets
+                .keys()
+                .filter(|(g, _, _)| g == group_id)
+                .map(|(_, t, p)| (t.clone(), *p))
+                .collect()
+        } else {
+            topic_partitions.to_vec()
+        };
+
+        for (topic, partition) in targets {
+            let event = MetadataEvent::new_with_node(
+                MetadataEventPayload::ConsumerOffsetDeleted {
+                    group_id: group_id.to_string(),
+                    topic,
+                    partition,
+                },
+                self.node_id,
+            );
+            self.write_and_apply(event).await?;
+        }
         Ok(())
     }
 

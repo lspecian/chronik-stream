@@ -134,6 +134,8 @@ impl ProtocolHandler {
             false  // AddPartitionsToTxn v0-v2 use NON-flexible headers (v3+ use flexible)
         } else if api_key == ApiKey::EndTxn && header.api_version < 3 {
             false  // EndTxn v0-v2 use NON-flexible headers (v3+ use flexible)
+        } else if api_key == ApiKey::CreatePartitions && header.api_version < 2 {
+            false  // CreatePartitions v0-v1 use NON-flexible headers (v2+ use flexible)
         } else {
             // For other APIs and DescribeCluster v1+/Metadata v9+, use flexible headers
             // when the client has negotiated ApiVersions v3+
@@ -2956,13 +2958,39 @@ impl ProtocolHandler {
 
         tracing::info!("DeleteGroups request: {:?}", request);
 
-        // Build response - for now, return GROUP_ID_NOT_FOUND for all groups
-        // since we don't actually implement group deletion yet
+        // Delete each requested group. Kafka semantics: a group can only be deleted
+        // when it is empty (no active members); non-empty groups return NON_EMPTY_GROUP,
+        // unknown groups return GROUP_ID_NOT_FOUND. Removes both in-memory state and
+        // the durable metadata (group + its committed offsets).
         let mut results = Vec::new();
         for group_id in &request.groups_names {
+            let error_code = {
+                let mut group_state = self.consumer_groups.lock().await;
+                match group_state.groups.get(group_id) {
+                    None => error_codes::GROUP_ID_NOT_FOUND,
+                    Some(group) if !group.members.is_empty() => {
+                        error_codes::GROUP_NOT_EMPTY
+                    }
+                    Some(_) => {
+                        group_state.groups.remove(group_id);
+                        error_codes::NONE
+                    }
+                }
+            };
+
+            // Persist the deletion durably (group + offsets) when it succeeded.
+            if error_code == error_codes::NONE {
+                if let Some(ref metadata_store) = self.metadata_store {
+                    if let Err(e) = metadata_store.delete_consumer_group(group_id).await {
+                        tracing::warn!("DeleteGroups: failed to persist deletion of '{}': {}", group_id, e);
+                    }
+                }
+                tracing::info!("DeleteGroups: deleted consumer group '{}'", group_id);
+            }
+
             results.push(DeletableGroupResult {
                 group_id: group_id.clone(),
-                error_code: error_codes::GROUP_ID_NOT_FOUND,
+                error_code,
             });
         }
 
@@ -3330,6 +3358,67 @@ impl ProtocolHandler {
         Ok(Self::make_response(&header, ApiKey::IncrementalAlterConfigs, body_buf.freeze()))
     }
 
+    /// Expand an existing topic to `new_count` partitions.
+    ///
+    /// Updates the topic's partition count and assigns + initialises offsets for the
+    /// newly-added partitions [current..new_count). Broker assignment is round-robin,
+    /// matching topic creation. Used by the Kafka CreatePartitions API.
+    async fn expand_topic_partitions(
+        &self,
+        metadata_store: &Arc<dyn chronik_common::metadata::traits::MetadataStore>,
+        existing: &chronik_common::metadata::TopicMetadata,
+        new_count: i32,
+    ) -> Result<()> {
+        use chronik_common::metadata::{PartitionAssignment, BrokerStatus};
+
+        let current = existing.config.partition_count as i32;
+
+        // 1) Bump the topic's partition count.
+        let mut new_config = existing.config.clone();
+        new_config.partition_count = new_count as u32;
+        metadata_store.update_topic(&existing.name, new_config).await
+            .map_err(|e| Error::Internal(format!("update_topic failed: {:?}", e)))?;
+
+        // 2) Assign + initialise offsets for each newly-added partition.
+        let brokers = metadata_store.list_brokers().await
+            .map_err(|e| Error::Internal(format!("list_brokers failed: {:?}", e)))?;
+        let online: Vec<_> = brokers.iter()
+            .filter(|b| b.status == BrokerStatus::Online)
+            .collect();
+        let broker_count = if online.is_empty() { 1 } else { online.len() };
+        let all_replicas: Vec<u64> = if online.is_empty() {
+            vec![self.broker_id as u64]
+        } else {
+            online.iter().map(|b| b.broker_id as u64).collect()
+        };
+
+        for partition in current..new_count {
+            let broker_id = if online.is_empty() {
+                self.broker_id
+            } else {
+                online[(partition as usize) % broker_count].broker_id
+            };
+            metadata_store.assign_partition(PartitionAssignment {
+                topic: existing.name.clone(),
+                partition: partition as u32,
+                broker_id,
+                is_leader: true, // deprecated field, kept for compatibility
+                replicas: all_replicas.clone(),
+                leader_id: broker_id as u64,
+            }).await
+                .map_err(|e| Error::Internal(format!("assign_partition failed: {:?}", e)))?;
+
+            metadata_store.update_partition_offset(&existing.name, partition as u32, 0, 0).await
+                .map_err(|e| Error::Internal(format!("update_partition_offset failed: {:?}", e)))?;
+        }
+
+        tracing::info!(
+            "CreatePartitions: expanded '{}' from {} to {} partitions",
+            existing.name, current, new_count
+        );
+        Ok(())
+    }
+
     /// Handle CreatePartitions request
     async fn handle_create_partitions(
         &self,
@@ -3349,19 +3438,49 @@ impl ProtocolHandler {
 
         tracing::info!("CreatePartitions request: {:?}", request);
 
-        // Build response - for now, return INVALID_PARTITIONS for all topics
-        // since we don't actually implement partition creation yet
+        let with_msg = |code: i16, msg: &str| CreatePartitionsTopicResult {
+            name: String::new(),
+            error_code: code,
+            error_message: if header.api_version >= 1 { Some(msg.to_string()) } else { None },
+        };
+
         let mut results = Vec::new();
         for topic in &request.topics {
-            results.push(CreatePartitionsTopicResult {
-                name: topic.name.clone(),
-                error_code: error_codes::INVALID_PARTITIONS,
-                error_message: if header.api_version >= 1 {
-                    Some("Partition creation not yet implemented".to_string())
-                } else {
-                    None
-                },
-            });
+            let mut result = if let Some(ref metadata_store) = self.metadata_store {
+                match metadata_store.get_topic(&topic.name).await {
+                    Ok(Some(existing)) => {
+                        let current = existing.config.partition_count as i32;
+                        if topic.count < current {
+                            with_msg(error_codes::INVALID_PARTITIONS,
+                                &format!("Topic '{}' currently has {} partitions; cannot reduce to {}",
+                                    topic.name, current, topic.count))
+                        } else if topic.count == current {
+                            with_msg(error_codes::INVALID_PARTITIONS,
+                                &format!("Topic '{}' already has {} partitions", topic.name, current))
+                        } else if request.validate_only {
+                            with_msg(error_codes::NONE, "")
+                        } else {
+                            match self.expand_topic_partitions(metadata_store, &existing, topic.count).await {
+                                Ok(()) => with_msg(error_codes::NONE, ""),
+                                Err(e) => {
+                                    tracing::error!("CreatePartitions: failed to expand '{}': {:?}", topic.name, e);
+                                    with_msg(error_codes::INVALID_PARTITIONS, "Failed to create partitions")
+                                }
+                            }
+                        }
+                    }
+                    Ok(None) => with_msg(error_codes::UNKNOWN_TOPIC_OR_PARTITION,
+                        &format!("Topic '{}' does not exist", topic.name)),
+                    Err(e) => {
+                        tracing::error!("CreatePartitions: metadata lookup failed for '{}': {:?}", topic.name, e);
+                        with_msg(error_codes::INVALID_PARTITIONS, "Metadata lookup failed")
+                    }
+                }
+            } else {
+                with_msg(error_codes::INVALID_PARTITIONS, "Metadata store unavailable")
+            };
+            result.name = topic.name.clone();
+            results.push(result);
         }
 
         let response = CreatePartitionsResponse {
@@ -3394,21 +3513,71 @@ impl ProtocolHandler {
 
         tracing::info!("OffsetDelete for group: {}", request.group_id);
 
-        // For now, return error for all partitions (not implemented)
-        let topics = request.topics.iter().map(|topic| {
-            OffsetDeleteResponseTopic {
-                name: topic.name.clone(),
-                partitions: topic.partitions.iter().map(|partition| {
-                    OffsetDeleteResponsePartition {
-                        partition_index: partition.partition_index,
-                        error_code: error_codes::GROUP_SUBSCRIBED_TO_TOPIC, // Cannot delete active consumer group offsets
-                    }
-                }).collect(),
+        // Resolve the group state once. Kafka semantics:
+        //  - unknown group           -> top-level GROUP_ID_NOT_FOUND
+        //  - group has active members -> per-partition GROUP_SUBSCRIBED_TO_TOPIC
+        //  - otherwise               -> delete each committed offset, NONE
+        let (group_error, group_has_members) = {
+            let group_state = self.consumer_groups.lock().await;
+            match group_state.groups.get(&request.group_id) {
+                None => (error_codes::GROUP_ID_NOT_FOUND, false),
+                Some(group) => (error_codes::NONE, !group.members.is_empty()),
             }
-        }).collect();
+        };
+
+        // Collect the (topic, partition) pairs we successfully removed from memory so
+        // we can mirror the deletion to the durable metadata store afterwards.
+        let mut deleted_pairs: Vec<(String, u32)> = Vec::new();
+
+        let topics: Vec<OffsetDeleteResponseTopic> = if group_error != error_codes::NONE {
+            // Unknown group: echo the group-level error on every partition.
+            request.topics.iter().map(|topic| OffsetDeleteResponseTopic {
+                name: topic.name.clone(),
+                partitions: topic.partitions.iter().map(|p| OffsetDeleteResponsePartition {
+                    partition_index: p.partition_index,
+                    error_code: group_error,
+                }).collect(),
+            }).collect()
+        } else {
+            request.topics.iter().map(|topic| {
+                let partitions = topic.partitions.iter().map(|p| {
+                    let error_code = if group_has_members {
+                        error_codes::GROUP_SUBSCRIBED_TO_TOPIC
+                    } else {
+                        // Record for removal from in-memory + durable state below.
+                        deleted_pairs.push((topic.name.clone(), p.partition_index as u32));
+                        error_codes::NONE
+                    };
+                    OffsetDeleteResponsePartition {
+                        partition_index: p.partition_index,
+                        error_code,
+                    }
+                }).collect();
+                OffsetDeleteResponseTopic { name: topic.name.clone(), partitions }
+            }).collect()
+        };
+
+        // Apply the in-memory offset removals (done outside the map to keep borrows simple).
+        if !deleted_pairs.is_empty() {
+            let mut group_state = self.consumer_groups.lock().await;
+            if let Some(group) = group_state.groups.get_mut(&request.group_id) {
+                for (topic_name, partition) in &deleted_pairs {
+                    if let Some(topic_offsets) = group.offsets.get_mut(topic_name) {
+                        topic_offsets.remove(&(*partition as i32));
+                    }
+                }
+            }
+            drop(group_state);
+            // Mirror to durable metadata store.
+            if let Some(ref metadata_store) = self.metadata_store {
+                if let Err(e) = metadata_store.delete_consumer_offsets(&request.group_id, &deleted_pairs).await {
+                    tracing::warn!("OffsetDelete: failed to persist offset deletions for '{}': {}", request.group_id, e);
+                }
+            }
+        }
 
         let response = OffsetDeleteResponse {
-            error_code: error_codes::NONE,
+            error_code: group_error,
             throttle_time_ms: 0,
             topics,
         };
@@ -5403,7 +5572,7 @@ impl ProtocolHandler {
     }
     
     /// Encode ListGroups response
-    fn encode_list_groups_response(
+    pub fn encode_list_groups_response(
         &self,
         buf: &mut BytesMut,
         response: &crate::list_groups_types::ListGroupsResponse,

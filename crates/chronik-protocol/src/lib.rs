@@ -32,6 +32,7 @@ pub mod list_groups_types;
 pub mod leave_group_types;
 pub mod consumer_group_types;
 pub mod delete_topics_types;
+pub mod delete_records_types;
 pub mod delete_groups_types;
 pub mod alter_configs_types;
 pub mod describe_configs_types;

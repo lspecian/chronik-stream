@@ -1231,6 +1231,29 @@ impl GroupCommitWal {
         }
     }
 
+    /// Force-delete a sealed segment's on-disk file and drop its tracking entry,
+    /// regardless of archive state. Used by the Kafka DeleteRecords API to reclaim
+    /// disk for segments that fall entirely below a partition's new log start offset.
+    /// The caller MUST NOT pass the active (currently-written) segment.
+    pub fn delete_segment_file(&self, topic: &str, partition: i32, segment_id: u64) -> Result<()> {
+        let key = format!("{}:{}:{}", topic, partition, segment_id);
+        // Drop tracking (if present) and recover the file path from it.
+        let tracked = self.sealed_segments.remove(&key);
+        let path = if let Some((_, info)) = &tracked {
+            info.file_path.clone()
+        } else {
+            self.base_dir
+                .join(topic)
+                .join(partition.to_string())
+                .join(format!("wal_{}_{}.log", partition, segment_id))
+        };
+        if path.exists() {
+            std::fs::remove_file(&path)?;
+            info!("DeleteRecords: removed WAL segment file {:?}", path);
+        }
+        Ok(())
+    }
+
     /// Remove archived segment (called after S3 upload and local cleanup)
     pub fn remove_segment(&self, topic: &str, partition: i32, segment_id: u64) -> Result<()> {
         let key = format!("{}:{}:{}", topic, partition, segment_id);
