@@ -192,11 +192,22 @@ impl RollupBuffer {
             actor: body.actor.clone(),
             object: body.object.clone().unwrap_or_default(),
         };
-        let mut entry = self.inner.entry(key.clone()).or_default();
-        entry.push(record.clone());
+        // Compute + potentially drain inside a bounded block so the
+        // DashMap entry write lock is released before we call
+        // `self.inner.len()` — otherwise `len()` walks every shard and
+        // can deadlock on the shard we're holding.
+        let fire = {
+            let mut entry = self.inner.entry(key.clone()).or_default();
+            entry.push(record.clone());
+            if self.threshold > 0 && entry.len() >= self.threshold {
+                let drained = std::mem::take(entry.value_mut());
+                Some(drained)
+            } else {
+                None
+            }
+        };
         stats.windows_open = self.inner.len() as u64;
-        if self.threshold > 0 && entry.len() >= self.threshold {
-            let drained = std::mem::take(entry.value_mut());
+        if let Some(drained) = fire {
             stats.triggers_fired += 1;
             return Some((key, drained));
         }
