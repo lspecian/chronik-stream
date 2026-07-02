@@ -1,0 +1,80 @@
+{
+  "name": "real-estate-lapa",
+  "description": "WhatsApp real-estate lead — user states preferences, agent acknowledges, user adds budget. Calibrated against AnthropicExtractor v3 (canonical predicate vocabulary, temperature=0).",
+  "conversation": [
+    {
+      "role": "user",
+      "content": "Hi! I'm looking for a 3-bedroom apartment in Lapa, Lisbon. South-facing if possible.",
+      "ts": "2026-04-25T10:00:00Z"
+    },
+    {
+      "role": "assistant",
+      "content": "Got it — T3 in Lapa, south-facing preferred. Any budget?",
+      "ts": "2026-04-25T10:00:30Z"
+    },
+    {
+      "role": "user",
+      "content": "Maximum 800k euros. Need to move in by September.",
+      "ts": "2026-04-25T10:01:15Z"
+    }
+  ],
+  "expected_memories": [
+    {
+      "type": "fact",
+      "key": "user|bedrooms",
+      "subject_predicate": ["user", "bedrooms"],
+      "source_indexes": [0],
+      "min_confidence": 0.6
+    },
+    {
+      "type": "fact",
+      "key": "user|prefers_neighborhood",
+      "subject_predicate": ["user", "prefers_neighborhood"],
+      "source_indexes": [0],
+      "min_confidence": 0.6
+    },
+    {
+      "type": "fact",
+      "key": "user|orientation_preference",
+      "subject_predicate": ["user", "orientation_preference"],
+      "source_indexes": [0],
+      "min_confidence": 0.5
+    },
+    {
+      "type": "fact",
+      "key": "user|budget",
+      "subject_predicate": ["user", "budget"],
+      "source_indexes": [2],
+      "min_confidence": 0.6
+    },
+    {
+      "type": "fact",
+      "key": "user|move_in_deadline",
+      "subject_predicate": ["user", "move_in_deadline"],
+      "source_indexes": [2],
+      "min_confidence": 0.5
+    }
+  ],
+  "recall_queries": [
+    {
+      "query": "what neighborhoods does the user prefer",
+      "expected_keys": ["user|prefers_neighborhood"],
+      "k": 5
+    },
+    {
+      "query": "what is the user's budget",
+      "expected_keys": ["user|budget"],
+      "k": 5
+    },
+    {
+      "query": "tell me about this user's property requirements",
+      "expected_keys": [
+        "user|bedrooms",
+        "user|prefers_neighborhood",
+        "user|budget",
+        "user|orientation_preference"
+      ],
+      "k": 10
+    }
+  ]
+}

@@ -1,0 +1,113 @@
+# BGE reranker (BAAI/bge-reranker-v2-m3) served via `infinity` in Cohere-compatible mode.
+# Drop-in target for chronik-embeddings::ExternalReranker.
+#
+# Endpoint (from inside chronik-perf): http://bge-reranker.chronik-perf.svc.cluster.local/rerank
+# Wire format: Cohere-compatible ({query, documents, top_n} -> {results:[{index, relevance_score}]}).
+#
+# The container downloads the model on first start (~2GB). PVC caches it so subsequent
+# starts skip the download.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: bge-reranker-cache
+  namespace: chronik-perf
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: standard
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bge-reranker
+  namespace: chronik-perf
+  labels:
+    app: bge-reranker
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate  # only 1 GPU slot per pod, no rolling update
+  selector:
+    matchLabels:
+      app: bge-reranker
+  template:
+    metadata:
+      labels:
+        app: bge-reranker
+    spec:
+      restartPolicy: Always
+      containers:
+        - name: infinity
+          image: michaelf34/infinity:0.0.75
+          imagePullPolicy: IfNotPresent
+          args:
+            - "v2"
+            - "--model-id"
+            - "BAAI/bge-reranker-v2-m3"
+            - "--engine"
+            - "torch"
+            - "--device"
+            - "cuda"
+            - "--port"
+            - "7997"
+            - "--api-key"
+            - "" # disable API key auth for the in-cluster private service
+          ports:
+            - name: http
+              containerPort: 7997
+              protocol: TCP
+          env:
+            - name: HF_HOME
+              value: /cache/huggingface
+            - name: TRANSFORMERS_CACHE
+              value: /cache/huggingface
+          resources:
+            requests:
+              cpu: "2"
+              memory: 4Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "4"
+              memory: 8Gi
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: cache
+              mountPath: /cache
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 5
+            failureThreshold: 60  # allow up to 5 min for cold-start model download
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 300
+            periodSeconds: 30
+            failureThreshold: 4
+      volumes:
+        - name: cache
+          persistentVolumeClaim:
+            claimName: bge-reranker-cache
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: bge-reranker
+  namespace: chronik-perf
+  labels:
+    app: bge-reranker
+spec:
+  type: ClusterIP
+  selector:
+    app: bge-reranker
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP

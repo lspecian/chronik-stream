@@ -1,0 +1,41 @@
+{
+  "name": "event-timestamped-viewing",
+  "description": "User reports a real-world event (property viewing) with a specific timestamp. Exercises Event memory type + temporal grounding — recall query names the event without the timestamp, extractor must ground the ts anyway.",
+  "conversation": [
+    {
+      "role": "user",
+      "content": "I went to see the Alfama one-bed today at 4pm — great light but the kitchen is a shoebox.",
+      "ts": "2026-05-10T18:20:00Z"
+    },
+    {
+      "role": "assistant",
+      "content": "Understood — I'll note the Alfama viewing and the concern about the kitchen size.",
+      "ts": "2026-05-10T18:20:25Z"
+    }
+  ],
+  "expected_memories": [
+    {
+      "type": "event",
+      "source_indexes": [0],
+      "min_confidence": 0.7
+    },
+    {
+      "type": "fact",
+      "subject_predicate": ["property:alfama-1bed", "kitchen_size"],
+      "source_indexes": [0],
+      "min_confidence": 0.5
+    }
+  ],
+  "recall_queries": [
+    {
+      "query": "which properties has the user actually visited",
+      "expected_keys": [],
+      "k": 5
+    },
+    {
+      "query": "what did the user think of the Alfama place",
+      "expected_keys": [],
+      "k": 5
+    }
+  ]
+}

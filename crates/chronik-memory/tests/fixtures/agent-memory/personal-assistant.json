@@ -1,0 +1,54 @@
+{
+  "name": "personal-assistant",
+  "description": "Personal assistant — user gives a tone instruction and shares a personal fact. Calibrated against AnthropicExtractor v3 (temperature=0).",
+  "conversation": [
+    {
+      "role": "user",
+      "content": "Always reply to me in Portuguese, formal register (você, not tu).",
+      "ts": "2026-04-25T08:00:00Z"
+    },
+    {
+      "role": "assistant",
+      "content": "Compreendido. Falarei com você de forma formal em português.",
+      "ts": "2026-04-25T08:00:20Z"
+    },
+    {
+      "role": "user",
+      "content": "I work as a data engineer at a financial services company.",
+      "ts": "2026-04-25T08:01:00Z"
+    }
+  ],
+  "expected_memories": [
+    {
+      "type": "instruction",
+      "source_indexes": [0],
+      "min_confidence": 0.7
+    },
+    {
+      "type": "fact",
+      "key": "user|occupation",
+      "subject_predicate": ["user", "occupation"],
+      "source_indexes": [2],
+      "min_confidence": 0.7
+    },
+    {
+      "type": "fact",
+      "key": "user|employer_industry",
+      "subject_predicate": ["user", "employer_industry"],
+      "source_indexes": [2],
+      "min_confidence": 0.5
+    }
+  ],
+  "recall_queries": [
+    {
+      "query": "what does this user do for work",
+      "expected_keys": ["user|occupation"],
+      "k": 5
+    },
+    {
+      "query": "what tone should I use when talking to this user",
+      "expected_keys": [],
+      "k": 5
+    }
+  ]
+}

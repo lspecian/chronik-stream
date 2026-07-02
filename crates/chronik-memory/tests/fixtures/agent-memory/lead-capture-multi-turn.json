@@ -1,0 +1,90 @@
+{
+  "name": "lead-capture-multi-turn",
+  "description": "5-turn lead capture — budget, bedrooms, timing, financing accumulate across turns. Calibrated against AnthropicExtractor v3 (canonical predicate vocabulary, temperature=0).",
+  "conversation": [
+    {
+      "role": "user",
+      "content": "Hi, I'm looking at moving to Cascais this autumn.",
+      "ts": "2026-04-25T09:00:00Z"
+    },
+    {
+      "role": "assistant",
+      "content": "Welcome — Cascais is great. What kind of place are you thinking?",
+      "ts": "2026-04-25T09:00:25Z"
+    },
+    {
+      "role": "user",
+      "content": "Two bedrooms, ground floor if possible because of my dog. Sea-view bonus.",
+      "ts": "2026-04-25T09:01:10Z"
+    },
+    {
+      "role": "assistant",
+      "content": "Got it — T2 ground floor, sea view nice-to-have. Budget?",
+      "ts": "2026-04-25T09:01:35Z"
+    },
+    {
+      "role": "user",
+      "content": "Up to 650k, paying half cash, half mortgage with Millennium.",
+      "ts": "2026-04-25T09:02:20Z"
+    }
+  ],
+  "expected_memories": [
+    {
+      "type": "fact",
+      "key": "user|prefers_neighborhood",
+      "subject_predicate": ["user", "prefers_neighborhood"],
+      "source_indexes": [0],
+      "min_confidence": 0.6
+    },
+    {
+      "type": "fact",
+      "key": "user|bedrooms",
+      "subject_predicate": ["user", "bedrooms"],
+      "source_indexes": [2],
+      "min_confidence": 0.6
+    },
+    {
+      "type": "fact",
+      "key": "user|pet_owner",
+      "subject_predicate": ["user", "pet_owner"],
+      "source_indexes": [2],
+      "min_confidence": 0.5
+    },
+    {
+      "type": "fact",
+      "key": "user|budget",
+      "subject_predicate": ["user", "budget"],
+      "source_indexes": [4],
+      "min_confidence": 0.7
+    },
+    {
+      "type": "fact",
+      "key": "user|payment_method",
+      "subject_predicate": ["user", "payment_method"],
+      "source_indexes": [4],
+      "min_confidence": 0.5
+    }
+  ],
+  "recall_queries": [
+    {
+      "query": "where does this user want to live",
+      "expected_keys": ["user|prefers_neighborhood"],
+      "k": 5
+    },
+    {
+      "query": "what's the user's budget",
+      "expected_keys": ["user|budget"],
+      "k": 5
+    },
+    {
+      "query": "summarize what this user is looking for",
+      "expected_keys": [
+        "user|prefers_neighborhood",
+        "user|bedrooms",
+        "user|budget",
+        "user|payment_method"
+      ],
+      "k": 10
+    }
+  ]
+}

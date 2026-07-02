@@ -1,0 +1,102 @@
+name: Agent Memory Weekly Soak
+
+# AM-1.8: 24-hour soak. Runs Sunday 04:00 UTC.
+# Looks for: RSS growth, extraction lag growth, segment count blowup.
+# Failures open an issue tagged `area/agent-memory`.
+
+on:
+  schedule:
+    - cron: '0 4 * * 0'  # Sunday 04:00 UTC
+  workflow_dispatch:
+    inputs:
+      duration_secs:
+        description: 'Soak duration in seconds (default: 86400 = 24h)'
+        required: false
+        default: '86400'
+
+env:
+  RUST_BACKTRACE: 1
+
+jobs:
+  soak:
+    name: 24h soak
+    runs-on: ubuntu-latest
+    timeout-minutes: 1500  # 25h ceiling, soak itself caps at 24h
+    if: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-soak-${{ hashFiles('**/Cargo.lock') }}
+      - name: Build server (release)
+        run: cargo build --release --bin chronik-server
+      - name: Start chronik-server
+        env:
+          CHRONIK_MEMORY_ENABLED: 'true'
+          CHRONIK_MEMORY_KAFKA: 'localhost:9092'
+          CHRONIK_MEMORY_API: 'http://127.0.0.1:6092'
+          CHRONIK_DEFAULT_SEARCHABLE: 'true'
+        run: |
+          mkdir -p /tmp/soak-data
+          nohup target/release/chronik-server start --data-dir /tmp/soak-data > /tmp/soak-server.log 2>&1 &
+          echo $! > /tmp/soak.pid
+          for i in $(seq 1 30); do
+            if curl -sS --max-time 2 http://localhost:6092/memory/v1/health > /dev/null; then
+              echo "Server ready"
+              exit 0
+            fi
+            sleep 1
+          done
+          tail -50 /tmp/soak-server.log
+          exit 1
+
+      - name: Run soak_worker
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CHRONIK_INTEGRATION: '1'
+          CHRONIK_SOAK_DURATION_SECS: ${{ github.event.inputs.duration_secs || '86400' }}
+        run: cargo test -p chronik-memory --test soak_worker --release -- --nocapture --test-threads=1
+
+      - name: Stop server
+        if: always()
+        run: kill "$(cat /tmp/soak.pid)" 2>/dev/null || true
+
+      - name: Upload server log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-server-log
+          path: /tmp/soak-server.log
+          retention-days: 30
+
+      - name: Open issue on failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = `Agent Memory soak failed (${context.runId})`;
+            const body = [
+              `Weekly 24h soak failed.`,
+              ``,
+              `Workflow: ${context.workflow}`,
+              `Run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              `Commit: ${context.sha}`,
+              ``,
+              `Server log uploaded as workflow artifact.`,
+            ].join('\n');
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              body,
+              labels: ['area/agent-memory', 'soak-failure'],
+            });

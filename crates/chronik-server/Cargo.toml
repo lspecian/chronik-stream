@@ -25,6 +25,9 @@ chronik-config = { path = "../chronik-config" }  # Required for cluster configur
 chronik-columnar = { path = "../chronik-columnar" }
 chronik-embeddings = { path = "../chronik-embeddings" }
 
+# Agent Memory — AM-1.7: server-internal implementation of /memory/v1/* endpoints
+chronik-memory = { path = "../chronik-memory" }
+
 # Query orchestration (Phase 9)
 chronik-query = { path = "../chronik-query" }
 

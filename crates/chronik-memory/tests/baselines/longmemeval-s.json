@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "benchmark": "longmemeval-s-18-balanced",
+  "description": "Regression floor for LongMemEval-S (18-item balanced pilot). Updates require an explicit `baseline-update:` commit-message tag; see docs/agent-memory/regression-protocol.md.",
+  "established_at": "2026-07-02",
+  "established_by": "Pilot 8 — V3 prompt + multi-channel + synthesis + _abs-aware judge + anti-abstention prompt + numeric intent boost + temporal intent boost",
+  "tolerance": 0.05,
+  "metrics": {
+    "synth_judge_rate": 0.611,
+    "raw_judge_rate": 0.444,
+    "synth_substring_rate": 0.278,
+    "synth_abstain_rate": 0.389,
+    "extraction_p_at_5": 0.85,
+    "cite_source_acc": 1.00
+  },
+  "per_category_synth_judge": {
+    "knowledge-update": 1.00,
+    "single-session-user": 1.00,
+    "single-session-preference": 1.00,
+    "multi-session": 0.33,
+    "temporal-reasoning": 0.33,
+    "single-session-assistant": 0.00
+  },
+  "notes": [
+    "Update gate: nightly diff fails when any metric drops > tolerance below floor.",
+    "synth_abstain_rate is DIAGNOSTIC, not gating — a decrease is neutral-to-good (fewer wrong-abstains). Kept in metrics for visibility but the current check_baseline.rs treats every drop > tolerance as a fail, which is a false positive on this field. TODO(AM-1.8.b): teach check_baseline about direction-per-metric.",
+    "Per-category metrics are informational, not gating — single-session-assistant is a known structural 0/3 (extraction gaps). Even TwoPassExtractor in pilot 9 could not lift it — the synthesizer refuses to commit to assistant-stated facts.",
+    "The 0.089 gap from synth_judge=0.611 to the Phase 2 target of 0.70 is now believed to be an ARCHITECTURAL ceiling for this stack (Haiku extractor + BM25/vector recall + Haiku synthesis). Pilots 9/10/11 measured three orthogonal levers (TwoPassExtractor, v2 synth prompt, cross-encoder reranker) and none crossed the gap; the reranker (pilot 11) regressed to 0.389. See ROADMAP_AGENT_MEMORY.md \"Pilot 8-11 results\" for the full analysis."
+  ]
+}

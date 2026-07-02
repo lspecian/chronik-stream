@@ -1,0 +1,46 @@
+{
+  "name": "support-billing",
+  "description": "Customer support — user reports a billing problem, agent opens a ticket. Calibrated against AnthropicExtractor v3 (temperature=0).",
+  "conversation": [
+    {
+      "role": "user",
+      "content": "My invoice for April 2026 was charged twice — same amount on the 15th and 16th.",
+      "ts": "2026-04-25T14:00:00Z"
+    },
+    {
+      "role": "assistant",
+      "content": "I see two charges on your account on April 15 and 16. I'll open a ticket and refund the duplicate.",
+      "ts": "2026-04-25T14:00:45Z"
+    },
+    {
+      "role": "user",
+      "content": "Thanks. My customer ID is C-9182.",
+      "ts": "2026-04-25T14:01:30Z"
+    }
+  ],
+  "expected_memories": [
+    {
+      "type": "fact",
+      "subject_predicate": ["user:C-9182", "customer_id"],
+      "source_indexes": [2],
+      "min_confidence": 0.7
+    },
+    {
+      "type": "task",
+      "source_indexes": [1],
+      "min_confidence": 0.6
+    }
+  ],
+  "recall_queries": [
+    {
+      "query": "what is this customer's ID",
+      "expected_keys": ["user:C-9182|customer_id"],
+      "k": 5
+    },
+    {
+      "query": "did this user report a duplicate charge",
+      "expected_keys": [],
+      "k": 5
+    }
+  ]
+}

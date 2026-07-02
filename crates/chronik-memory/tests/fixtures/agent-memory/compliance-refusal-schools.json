@@ -1,0 +1,42 @@
+{
+  "name": "compliance-refusal-schools",
+  "description": "Negative-space test — user asks the agent for school assessment, agent declines (Fair Housing). Extractor must NOT invent any factual claim about school quality. The agent's refusal should be captured as a future-applicable instruction (steer-clear rule), not as a fact about schools. Calibrated against AnthropicExtractor v3 (temperature=0).",
+  "conversation": [
+    {
+      "role": "user",
+      "content": "Are the schools good in that area? Worth moving for?",
+      "ts": "2026-04-25T11:00:00Z"
+    },
+    {
+      "role": "assistant",
+      "content": "I don't offer my own opinion on school quality — that can lead to steering. For zoning and performance data, GreatSchools (US) or your local Department of Education are the right sources.",
+      "ts": "2026-04-25T11:00:25Z"
+    },
+    {
+      "role": "user",
+      "content": "Fair enough. I'll check those.",
+      "ts": "2026-04-25T11:00:55Z"
+    }
+  ],
+  "expected_memories": [
+    {
+      "type": "instruction",
+      "source_indexes": [1],
+      "min_confidence": 0.6
+    }
+  ],
+  "recall_queries": [
+    {
+      "query": "did this user ask about schools",
+      "expected_keys": [],
+      "k": 5
+    }
+  ],
+  "negative_assertions": {
+    "must_not_extract_predicates": [
+      "user|school_quality_assessment",
+      "agent|recommended_neighborhood_for_schools"
+    ],
+    "rationale": "v3 extractor must not synthesize quality judgments the agent explicitly declined to make."
+  }
+}
