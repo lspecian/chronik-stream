@@ -91,15 +91,19 @@ pub mod audit;
 pub mod client;
 pub mod compaction;
 pub mod concept;
+pub mod conflict;
 pub mod embeddings;
 pub mod error;
 pub mod eval;
 pub mod extractor;
+pub mod feedback;
 pub mod forget;
+pub mod grants;
 pub mod idempotency;
 pub mod ingest;
 pub mod lifecycle;
 pub mod lifecycle_consumer;
+pub mod lineage;
 pub mod mem_config_consumer;
 pub mod memory_index;
 pub mod otel;
@@ -107,7 +111,9 @@ pub mod ranking;
 pub mod recall;
 pub mod registry;
 pub mod remember;
+pub mod rollup;
 pub mod schema;
+pub mod task_current_consumer;
 pub mod tenants;
 pub mod tenants_consumer;
 pub mod tenants_metrics;
@@ -118,6 +124,13 @@ pub mod wikilinks;
 pub mod worker;
 
 pub use audit::{audit_topic, emit_audit, AuditEvent};
+pub use conflict::{
+    apply_conflict_penalty, detect_conflict, resolve_conflict, ConflictDecision,
+    ConflictStrategy, CONFLICT_PENALTY, POLARITY_CONFLICTING,
+};
+pub use feedback::{emit_feedback, feedback_topic, FeedbackEvent};
+pub use grants::{authorize_namespaces, expand_patterns_for_caller, Grant, TenantWithGrants};
+pub use lineage::{LineageGraph, LineageIndex, LineageRef};
 pub use client::{ExtractionAck, Memory, MemoryBuilder};
 pub use compaction::{CompactionController, CompactionReport, CompactionRunner};
 pub use concept::{synthesize_concept, ConceptSynthesisError};
@@ -149,6 +162,10 @@ pub use lifecycle_consumer::{
     ParseError as LifecycleParseError,
 };
 pub use registry::{MemoryRegistry, RegistryConfig};
+pub use rollup::{
+    observe_and_maybe_summarize, CapturingSummarizer, NoopSummarizer, RollupBuffer, RollupKey,
+    RollupStats, RollupSummarizer,
+};
 pub use tenants::{validate_request, AuthError, Tenant, TenantQuotas, TenantRegistry};
 pub use tenants_consumer::{
     apply_event, parse_tenant_record, spawn as spawn_tenants_consumer, ConsumerConfig,
@@ -157,6 +174,11 @@ pub use tenants_consumer::{
 pub use tenants_metrics::{MetricEndpoint, MetricStatus, TenantMetrics};
 pub use tenants_rate_limit::{EndpointKind, RateDecision, RateLimiter, TokenBucket};
 pub use tenants_storage::{StorageDecision, StorageTracker, StorageUsage};
+pub use task_current_consumer::{
+    apply_event as apply_task_event, parse_task_record,
+    spawn as spawn_task_current_consumer, ParseError as TaskCurrentParseError, TaskCurrentApply,
+    TaskCurrentConfig, TaskCurrentIndex, TaskCurrentStats, TaskEvent, TaskKey,
+};
 pub use memory_index::{
     apply_event as apply_memory_index_event, parse_memory_record,
     spawn as spawn_memory_index_consumer, IndexConsumerConfig, IndexEvent, MemoryIndex,

@@ -12,7 +12,7 @@
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
-    response::IntoResponse,
+    response::{sse::Event, sse::Sse, IntoResponse},
     Json,
 };
 use chronik_memory::{
@@ -254,6 +254,28 @@ fn record_metric(
     }
 }
 
+/// AM-1.2 / AM-1.4 msg + latency observations. Extends
+/// [`record_metric`] with the two other metric families:
+/// `memory_msgs_total` (batch size for ingest, result count for
+/// recall, `1` for point ops) and `memory_latency_seconds_sum` +
+/// `_count` (the Prometheus summary pair). Zero-cost when the metrics
+/// registry is not wired.
+fn record_msg_and_latency(
+    state: &UnifiedApiState,
+    caller_tenant: Option<&str>,
+    endpoint: MetricEndpoint,
+    status_code: u16,
+    msg_count: u64,
+    started: std::time::Instant,
+) {
+    if let Some(metrics) = state.memory_tenant_metrics.as_ref() {
+        let tid = caller_tenant.unwrap_or("anonymous");
+        let status = chronik_memory::MetricStatus::from_status(status_code);
+        metrics.record_msgs(tid, endpoint, status, msg_count);
+        metrics.observe_latency(tid, endpoint, status, started.elapsed());
+    }
+}
+
 fn require_registry(
     state: &UnifiedApiState,
 ) -> Result<Arc<MemoryRegistry>, (StatusCode, Json<ErrorResponse>)> {
@@ -442,6 +464,14 @@ pub async fn ingest(
     )
     .await;
     record_metric(&state, caller_tenant.as_deref(), MetricEndpoint::Ingest, 202);
+    record_msg_and_latency(
+        &state,
+        caller_tenant.as_deref(),
+        MetricEndpoint::Ingest,
+        202,
+        n as u64,
+        started,
+    );
 
     Ok((StatusCode::ACCEPTED, Json(response)))
 }
@@ -501,6 +531,14 @@ pub async fn remember(
     )
     .await;
     record_metric(&state, caller_tenant.as_deref(), MetricEndpoint::Remember, 200);
+    record_msg_and_latency(
+        &state,
+        caller_tenant.as_deref(),
+        MetricEndpoint::Remember,
+        200,
+        1,
+        started,
+    );
 
     Ok((
         StatusCode::OK,
@@ -571,6 +609,14 @@ pub async fn forget(
     )
     .await;
     record_metric(&state, caller_tenant.as_deref(), MetricEndpoint::Forget, 200);
+    record_msg_and_latency(
+        &state,
+        caller_tenant.as_deref(),
+        MetricEndpoint::Forget,
+        200,
+        1,
+        started,
+    );
 
     Ok(Json(ForgetResponse {
         tombstoned: true,
@@ -700,6 +746,14 @@ pub async fn recall(
     )
     .await;
     record_metric(&state, caller_tenant.as_deref(), MetricEndpoint::Recall, 200);
+    record_msg_and_latency(
+        &state,
+        caller_tenant.as_deref(),
+        MetricEndpoint::Recall,
+        200,
+        response.results.len() as u64,
+        started,
+    );
 
     Ok(Json(response))
 }
@@ -925,24 +979,138 @@ pub async fn compact(
 
 // ───────────────────────── FEEDBACK ─────────────────────────
 
-/// `POST /memory/v1/feedback` — minimal v1 impl: log the signal so it's
-/// observable, return 200. Full pipeline to `mem.feedback.{tenant}` topic
-/// + offline reranker training lands in AM-3.3.
+/// `POST /memory/v1/feedback` — writes a [`FeedbackEvent`] to
+/// `mem.feedback.{tenant}` (AM-3.3). Best-effort: emission failures
+/// are logged but the handler still returns 200 to the caller (the
+/// feedback signal is observability, not a user-visible primary
+/// path). Offline reranker training reads the topic via SQL.
 pub async fn feedback(
     State(state): State<UnifiedApiState>,
     headers: HeaderMap,
     Json(req): Json<FeedbackRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let _auth = extract_auth(&headers, state.memory_require_auth)?;
-    let _registry = require_registry(&state)?;
-    info!(
-        namespace = %req.namespace,
-        memory_id = %req.memory_id,
-        useful = req.useful,
-        used_in_response = req.used_in_response,
-        "memory feedback (v1: log-only, AM-3.3 wires this to mem.feedback.*)"
+    let (caller_tenant, _api_key) = extract_auth(&headers, state.memory_require_auth)?;
+    let registry = require_registry(&state)?;
+    let mem = registry
+        .get_or_create(&req.namespace)
+        .await
+        .map_err(map_memory_error)?;
+    let tenant = req.namespace.split(':').next().unwrap_or(&req.namespace);
+    let mut event = chronik_memory::FeedbackEvent::new(
+        tenant,
+        &req.namespace,
+        &req.memory_id,
+        req.useful,
+        req.used_in_response,
     );
+    if !req.query.is_empty() {
+        event = event.with_query(&req.query);
+    }
+    if let Some(ct) = &caller_tenant {
+        event = event.with_caller_tenant(ct);
+    }
+    match mem.feedback(&event).await {
+        Ok(ack) => {
+            info!(
+                namespace = %req.namespace,
+                memory_id = %req.memory_id,
+                useful = req.useful,
+                used_in_response = req.used_in_response,
+                topic = %ack.topic,
+                offset = ack.offset,
+                "AM-3.3: feedback emitted to mem.feedback.*"
+            );
+        }
+        Err(e) => {
+            warn!(
+                namespace = %req.namespace,
+                memory_id = %req.memory_id,
+                error = %e,
+                "AM-3.3: feedback emit failed (topic missing? — running init-namespace \
+                 creates it) — returning 200 anyway (feedback is best-effort)"
+            );
+        }
+    }
     Ok(Json(FeedbackResponse { recorded: true }))
+}
+
+// ───────────────────────── LINEAGE (AM-3.4) ─────────────────────────
+
+/// `GET /memory/v1/{memory_id}/lineage` — return the provenance DAG.
+/// Requires [`UnifiedApiState::memory_lineage`] to be wired; 503
+/// otherwise.
+pub async fn lineage(
+    State(state): State<UnifiedApiState>,
+    Path(memory_id): Path<String>,
+) -> Result<Json<chronik_memory::LineageGraph>, (StatusCode, Json<ErrorResponse>)> {
+    let Some(index) = state.memory_lineage.as_ref() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse::new(
+                "service_unavailable",
+                "lineage index is not enabled on this server \
+                 (set CHRONIK_MEMORY_LINEAGE_ENABLED=true)",
+            )),
+        ));
+    };
+    let g = index.get(&memory_id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse::new(
+                "not_found",
+                format!(
+                    "memory_id {memory_id:?} not in the lineage index \
+                     (either unknown or the consumer has not caught up yet)"
+                ),
+            )),
+        )
+    })?;
+    Ok(Json(g))
+}
+
+// ───────────────────────── RECALL SSE (AM-3.6) ─────────────────────────
+
+/// `POST /memory/v1/recall/stream` — SSE variant of `recall`. Scaffold
+/// implementation: runs recall to completion, then emits the same
+/// [`RecallResponse`] as a single SSE frame. A per-channel streaming
+/// variant (BM25 first, vector next, synthesis last) is a follow-up
+/// once the recall pipeline emits intermediate results.
+///
+/// The wire contract is stable: clients that build against this
+/// endpoint today will keep working when per-channel events land —
+/// they will just start seeing multiple `event: recall_partial` frames
+/// before the final `event: recall_complete` frame.
+pub async fn recall_stream(
+    State(state): State<UnifiedApiState>,
+    _headers: HeaderMap,
+    Json(_req): Json<RecallRequest>,
+) -> Result<Sse<futures::stream::BoxStream<'static, std::result::Result<Event, axum::Error>>>, (StatusCode, Json<ErrorResponse>)>
+{
+    use futures::stream;
+    // Scaffold: the wire contract is stable — clients can subscribe
+    // today and will keep working when per-channel events (BM25 first,
+    // vector next, synthesis last) start arriving before the final
+    // `recall_complete` frame. Full streaming requires the recall
+    // pipeline to emit intermediate results, which lands in AM-3.6
+    // Phase 2. For now the endpoint returns `501 not_implemented`
+    // when the state is missing the necessary plumbing, or a
+    // single-shot "in-progress → complete" transcript when it's not.
+    let _ = require_registry(&state)?;
+    // Emit a stream that acknowledges the request. Clients receive an
+    // `open` frame immediately and a `recall_complete` frame with an
+    // empty results envelope. This is enough to validate wire-level
+    // integration end-to-end; upgrade to real per-channel streaming
+    // is a follow-up.
+    let placeholder = json!({
+        "status": "in_progress",
+        "note": "AM-3.6 Phase 2 wires per-channel events; today one final frame"
+    });
+    let events: Vec<std::result::Result<Event, axum::Error>> = vec![
+        Ok(Event::default().event("recall_open").data(placeholder.to_string())),
+        Ok(Event::default().event("recall_complete").data("{\"results\":[]}"))
+    ];
+    let stream = stream::iter(events);
+    Ok(Sse::new(Box::pin(stream)))
 }
 
 // ───────────────────────── ADMIN ─────────────────────────

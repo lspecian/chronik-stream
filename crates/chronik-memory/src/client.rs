@@ -727,6 +727,17 @@ impl Memory {
         crate::audit::emit_audit(&self.inner.producer, event).await
     }
 
+    /// AM-3.3: Produce a [`FeedbackEvent`](crate::feedback::FeedbackEvent) to
+    /// `mem.feedback.{tenant}`. Best-effort — a transport failure returns
+    /// `Err` but callers typically log-and-continue since feedback is
+    /// observability, not a user-visible path.
+    pub async fn feedback(
+        &self,
+        event: &crate::feedback::FeedbackEvent,
+    ) -> Result<IngestAck> {
+        crate::feedback::emit_feedback(&self.inner.producer, event).await
+    }
+
     /// Tombstone a memory by `key` (for compactable types) or by `memory_id`.
     /// Pass exactly one.
     ///

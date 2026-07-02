@@ -128,6 +128,14 @@ impl TopicLayout {
         format!("mem.audit.{}", self.namespace.tenant)
     }
 
+    /// Append-only feedback-log topic — `mem.feedback.{tenant}` (AM-3.3).
+    /// One row per `POST /memory/v1/feedback` call. Columnar-enabled for
+    /// offline reranker training; never compacted (feedback retention is
+    /// time-based).
+    pub fn feedback(&self) -> String {
+        format!("mem.feedback.{}", self.namespace.tenant)
+    }
+
     /// All topics this namespace uses (Phase 1 only creates raw + fact + event;
     /// Phase 2 adds instruction + task; Phase 3 adds concept).
     pub fn all_topics(&self) -> Vec<String> {

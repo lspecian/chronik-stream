@@ -83,6 +83,11 @@ impl Tenant {
     }
 }
 
+/// Public re-export used by cross-namespace grants (AM-3.5).
+pub fn pattern_matches_public(pat: &str, ns: &str) -> bool {
+    pattern_matches(pat, ns)
+}
+
 /// Glob-ish pattern matcher. Currently supports:
 ///   - `*` matches any single segment (between colons)
 ///   - `**` matches everything to end of string

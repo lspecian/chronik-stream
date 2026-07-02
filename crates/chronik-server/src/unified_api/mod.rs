@@ -209,6 +209,11 @@ pub struct UnifiedApiState {
     /// quota get `413 Payload Too Large`. When either is `None`, writes
     /// pass through without accounting.
     pub memory_storage_tracker: Option<Arc<chronik_memory::StorageTracker>>,
+    /// AM-3.4: Provenance-graph index backing
+    /// `GET /memory/v1/{memory_id}/lineage`. Populated by a consumer
+    /// that tails typed-memory topics. When `None`, the endpoint
+    /// returns 503.
+    pub memory_lineage: Option<Arc<chronik_memory::LineageIndex>>,
 }
 
 impl UnifiedApiState {
@@ -244,6 +249,7 @@ impl UnifiedApiState {
             memory_tenant_metrics: None,
             memory_compaction: None,
             memory_storage_tracker: None,
+            memory_lineage: None,
         }
     }
 
@@ -336,6 +342,16 @@ impl UnifiedApiState {
         tracker: Arc<chronik_memory::StorageTracker>,
     ) -> Self {
         self.memory_storage_tracker = Some(tracker);
+        self
+    }
+
+    /// AM-3.4: Attach the lineage / provenance-graph index. Without
+    /// it, `GET /memory/v1/{memory_id}/lineage` returns 503.
+    pub fn with_memory_lineage(
+        mut self,
+        idx: Arc<chronik_memory::LineageIndex>,
+    ) -> Self {
+        self.memory_lineage = Some(idx);
         self
     }
 
@@ -510,7 +526,9 @@ pub fn create_router_full(
         .route("/memory/v1/metrics", get(memory::metrics))
         .route("/memory/v1/admin/init-namespace", post(memory::admin_init_namespace))
         .route("/memory/v1/compact", post(memory::compact))
-        .route("/memory/v1/:memory_id/source", get(memory::source));
+        .route("/memory/v1/recall/stream", post(memory::recall_stream))
+        .route("/memory/v1/:memory_id/source", get(memory::source))
+        .route("/memory/v1/:memory_id/lineage", get(memory::lineage));
 
     // Add shared state for SQL/Vector/Query/Memory endpoints
     let mut router = router.with_state(state);
