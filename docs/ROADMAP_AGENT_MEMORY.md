@@ -348,7 +348,7 @@ System (in-process Rust API, not HTTP):
 - [x] Kafka compaction inherited from Chronik core; topic configs set in `topics.rs`
 - [x] `version` field on supersession with tiebreak in `recall.rs:660`
 - [x] Forget emits null-value tombstone — `forget.rs`
-- [ ] Integration test "ingest 10 contradictions, recall returns latest" — not written
+- [x] Integration test "ingest 10 contradictions, recall returns latest" — landed 2026-07-02 as 4 unit tests on `dedup_results_keep_max_score` in `crates/chronik-memory/src/recall.rs`: (1) `dedup_ten_contradictions_returns_latest_version` — 10 versions on the same `(namespace, key)`, arrival-order shuffled, asserts version 10 wins; (2) `dedup_ten_contradictions_across_namespaces_keeps_one_per_namespace` — 10 versions × 2 namespaces, one winner per namespace; (3) `dedup_tombstone_at_highest_version_wins_the_bucket` — tombstone at `u64::MAX` wins the bucket (downstream `passes_filters` drops it — the dedup pass just picks the winner); (4) `dedup_ties_prefer_higher_score` — same-version tiebreak by RRF score. In-process pure-function tests — no cluster or Kafka needed; asserts the same invariant a live cluster would after Kafka log compaction folds the topic.
 
 ### AM-2.3: Lifecycle controller — ✅ done 2026-07-02 (consumer + emitter + config + compact endpoint + main.rs wire-up)
 

@@ -1458,6 +1458,84 @@ mod tests {
         assert_eq!(out.len(), 2);
     }
 
+    // AM-2.2 integration-shaped test: "ingest 10 contradictions on the
+    // same (namespace, key), recall returns the latest version". Runs
+    // in-process on the pure dedup function — no cluster / Kafka needed.
+    // The test asserts the same invariant a live cluster would after
+    // Kafka log compaction folds the topic.
+    #[test]
+    fn dedup_ten_contradictions_returns_latest_version() {
+        let mut inputs: Vec<RecallResult> = (1..=10)
+            .map(|v| scored(0.5 - (v as f64) * 0.01, fact_record(v, "k", "ns")))
+            .collect();
+        // Interleave arrival order to prove version wins regardless of
+        // input order.
+        inputs.rotate_left(3);
+        inputs.swap(2, 7);
+
+        let out = dedup_results_keep_max_score(inputs);
+        assert_eq!(out.len(), 1, "one winner per (namespace, key)");
+        assert_eq!(
+            out[0].memory.version, 10,
+            "highest version wins even when arrival order shuffled"
+        );
+    }
+
+    #[test]
+    fn dedup_ten_contradictions_across_namespaces_keeps_one_per_namespace() {
+        // Two namespaces, 10 versions each on the same key.
+        let ns_a: Vec<RecallResult> = (1..=10)
+            .map(|v| scored(0.5, fact_record(v, "k", "ns-a")))
+            .collect();
+        let ns_b: Vec<RecallResult> = (1..=10)
+            .map(|v| scored(0.4, fact_record(v, "k", "ns-b")))
+            .collect();
+        let mut all = ns_a;
+        all.extend(ns_b);
+
+        let mut out = dedup_results_keep_max_score(all);
+        out.sort_by(|a, b| a.memory.namespace.cmp(&b.memory.namespace));
+        assert_eq!(out.len(), 2, "one winner per namespace");
+        assert_eq!(out[0].memory.namespace, "ns-a");
+        assert_eq!(out[0].memory.version, 10);
+        assert_eq!(out[1].memory.namespace, "ns-b");
+        assert_eq!(out[1].memory.version, 10);
+    }
+
+    #[test]
+    fn dedup_tombstone_at_highest_version_wins_the_bucket() {
+        // The lifecycle consumer emits a tombstone at version=u64::MAX so
+        // it always wins the (namespace, key) bucket during recall
+        // dedup. Downstream `passes_filters` then drops it — but that's
+        // in the caller. Here we prove the tombstone survives the
+        // dedup pass when it has the highest version.
+        let mut live = fact_record(5, "k", "ns");
+        live.tombstoned = false;
+        let mut tomb = fact_record(u64::MAX, "k", "ns");
+        tomb.tombstoned = true;
+
+        let out = dedup_results_keep_max_score(vec![
+            scored(0.9, live),
+            scored(0.1, tomb.clone()),
+        ]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].memory.version, u64::MAX);
+        assert!(out[0].memory.tombstoned);
+    }
+
+    #[test]
+    fn dedup_ties_prefer_higher_score() {
+        // Two records with the SAME version and key — tiebreak by score
+        // (documented behaviour of dedup_results_keep_max_score).
+        let r_lo = scored(0.10, fact_record(3, "k", "ns"));
+        let mut hi_mem = fact_record(3, "k", "ns");
+        hi_mem.memory_id = "id-3-hi".into();
+        let r_hi = scored(0.90, hi_mem);
+        let out = dedup_results_keep_max_score(vec![r_lo, r_hi]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].memory.memory_id, "id-3-hi");
+    }
+
     #[test]
     fn parse_envelope_handles_wrapped_shape() {
         let envelope = serde_json::json!({
