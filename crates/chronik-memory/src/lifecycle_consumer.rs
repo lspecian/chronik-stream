@@ -360,6 +360,23 @@ impl KafkaEmitter {
     ) -> Self {
         Self { producer, timeout }
     }
+
+    /// Convenience: build a `FutureProducer` from a broker string and
+    /// wrap it in a `KafkaEmitter` with a 5s timeout. Callers that
+    /// already own a producer should use [`Self::new`] to share it.
+    pub fn from_brokers(brokers: &str) -> crate::error::Result<Self> {
+        use rdkafka::ClientConfig;
+        let producer: rdkafka::producer::FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", brokers)
+            .set("message.timeout.ms", "5000")
+            .create()
+            .map_err(|e| {
+                MemoryError::Kafka(format!(
+                    "KafkaEmitter::from_brokers producer create: {e}"
+                ))
+            })?;
+        Ok(Self::new(producer, std::time::Duration::from_secs(5)))
+    }
 }
 
 #[async_trait::async_trait]

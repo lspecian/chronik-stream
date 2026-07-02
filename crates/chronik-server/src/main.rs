@@ -694,6 +694,118 @@ fn memory_require_auth() -> bool {
         .unwrap_or(false)
 }
 
+/// AM-2.3 finalization: build the lifecycle controller — a shared
+/// `CandidateStore`, `SemanticDedup`, and `Arc<dyn DecisionEmitter>` —
+/// spawn the `mem.fact.{tenant}` consumer, and return a
+/// [`chronik_memory::CompactionRunner`] backed by the same trio so
+/// `POST /memory/v1/compact` can run a synchronous pass on demand.
+///
+/// Reads:
+/// - `CHRONIK_MEMORY_LIFECYCLE_ENABLED` — must be `true` or `1` (default: `false`).
+/// - `CHRONIK_MEMORY_KAFKA` — brokers (default `localhost:9092`).
+/// - `CHRONIK_MEMORY_LIFECYCLE_TOPIC` — single topic to consume. When
+///   unset, the wire-up is skipped: the consumer requires an exact
+///   topic name today (extending to a regex fan-out is a follow-up).
+/// - `CHRONIK_MEMORY_LIFECYCLE_GROUP_ID` — consumer group (default
+///   `chronik-memory-lifecycle-consumer`).
+/// - `CHRONIK_MEMORY_LIFECYCLE_EMITTER` — `logging` (default) or `kafka`.
+///   `kafka` produces tombstones back to the source topic on `Drop` /
+///   `Supersede`; `logging` only observes.
+/// - `OPENAI_API_KEY` — required (the semantic-dedup pass calls
+///   OpenAI's embeddings API). When unset, the wire-up is skipped.
+/// - `CHRONIK_MEMORY_DEDUP_THRESHOLD` — cosine threshold (default `0.97`).
+///
+/// Returns `Some(Arc<dyn CompactionRunner>)` on success. `None` when any
+/// of the required env / API keys are missing.
+fn try_create_lifecycle_controller(
+) -> Option<Arc<dyn chronik_memory::CompactionRunner>> {
+    let enabled = std::env::var("CHRONIK_MEMORY_LIFECYCLE_ENABLED")
+        .map(|v| v.to_lowercase() == "true" || v == "1")
+        .unwrap_or(false);
+    if !enabled {
+        return None;
+    }
+    let topic = match std::env::var("CHRONIK_MEMORY_LIFECYCLE_TOPIC") {
+        Ok(t) if !t.trim().is_empty() => t,
+        _ => {
+            warn!(
+                "AM-2.3: CHRONIK_MEMORY_LIFECYCLE_ENABLED=true but \
+                 CHRONIK_MEMORY_LIFECYCLE_TOPIC is unset — lifecycle \
+                 controller disabled. Pass e.g. `mem.fact.acme` to \
+                 enable dedup on one tenant."
+            );
+            return None;
+        }
+    };
+    let api_key = match std::env::var("OPENAI_API_KEY") {
+        Ok(k) if !k.trim().is_empty() => k,
+        _ => {
+            warn!(
+                "AM-2.3: CHRONIK_MEMORY_LIFECYCLE_ENABLED=true but \
+                 OPENAI_API_KEY is unset — semantic-dedup embeddings \
+                 need an OpenAI key. Lifecycle controller disabled."
+            );
+            return None;
+        }
+    };
+
+    let brokers = std::env::var("CHRONIK_MEMORY_KAFKA")
+        .unwrap_or_else(|_| "localhost:9092".to_string());
+    let group_id = std::env::var("CHRONIK_MEMORY_LIFECYCLE_GROUP_ID")
+        .unwrap_or_else(|_| "chronik-memory-lifecycle-consumer".to_string());
+    let threshold = std::env::var("CHRONIK_MEMORY_DEDUP_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(chronik_memory::DEFAULT_SIMILARITY_THRESHOLD);
+
+    let embedder = chronik_memory::OpenAIEmbedder::new(api_key.clone());
+    let dedup = Arc::new(
+        chronik_memory::lifecycle::SemanticDedup::new(embedder.clone())
+            .with_threshold(threshold),
+    );
+    let store = chronik_memory::lifecycle_consumer::CandidateStore::new();
+    let stats = Arc::new(parking_lot::Mutex::new(
+        chronik_memory::LifecycleStats::default(),
+    ));
+
+    let emitter_kind = std::env::var("CHRONIK_MEMORY_LIFECYCLE_EMITTER")
+        .unwrap_or_else(|_| "logging".to_string());
+    let emitter: Arc<dyn chronik_memory::DecisionEmitter> =
+        match emitter_kind.to_lowercase().as_str() {
+            "kafka" => match chronik_memory::KafkaEmitter::from_brokers(&brokers) {
+                Ok(e) => Arc::new(e),
+                Err(err) => {
+                    warn!(
+                        error = %err,
+                        "AM-2.3: KafkaEmitter producer build failed — falling back to LoggingEmitter"
+                    );
+                    Arc::new(chronik_memory::lifecycle_consumer::LoggingEmitter)
+                }
+            },
+            _ => Arc::new(chronik_memory::lifecycle_consumer::LoggingEmitter),
+        };
+
+    let lifecycle_config = chronik_memory::LifecycleConfig::new(brokers.clone(), topic.clone())
+        .with_group_id(group_id.clone());
+    info!(
+        brokers = %brokers,
+        topic = %topic,
+        threshold,
+        emitter = %emitter_kind,
+        "AM-2.3: spawning lifecycle consumer (mem.fact + SemanticDedup)"
+    );
+    let _handle = chronik_memory::lifecycle_consumer::spawn(
+        lifecycle_config,
+        dedup.clone(),
+        store.clone(),
+        stats,
+        emitter.clone(),
+    );
+
+    let controller = chronik_memory::CompactionController::new(store, dedup, emitter);
+    Some(Arc::new(controller))
+}
+
 /// VO-4 wire-up: build a cross-encoder reranker from environment variables.
 ///
 /// Reads:
@@ -1153,6 +1265,12 @@ async fn run_cluster_mode(
             unified_state = unified_state.with_memory_index(index);
             info!("✓ Agent memory memory_id index wired (/memory/v1/*/source)");
         }
+        // AM-2.3: opt-in lifecycle consumer + compaction runner for
+        // POST /memory/v1/compact.
+        if let Some(runner) = try_create_lifecycle_controller() {
+            unified_state = unified_state.with_memory_compaction(runner);
+            info!("✓ Agent memory lifecycle controller wired (POST /memory/v1/compact)");
+        }
     }
     // VO-4: optional cross-encoder reranker for /_vector/*.
     if let Some(reranker) = try_create_reranker() {
@@ -1444,6 +1562,11 @@ async fn run_single_node_mode(
             if let Some(index) = try_create_memory_index() {
                 unified_state = unified_state.with_memory_index(index);
                 info!("✓ Agent memory memory_id index wired (/memory/v1/*/source)");
+            }
+            // AM-2.3: opt-in lifecycle consumer + compaction runner.
+            if let Some(runner) = try_create_lifecycle_controller() {
+                unified_state = unified_state.with_memory_compaction(runner);
+                info!("✓ Agent memory lifecycle controller wired (POST /memory/v1/compact)");
             }
         }
         // VO-4: optional cross-encoder reranker for /_vector/*.
