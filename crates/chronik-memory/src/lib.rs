@@ -99,6 +99,7 @@ pub mod idempotency;
 pub mod ingest;
 pub mod lifecycle;
 pub mod lifecycle_consumer;
+pub mod mem_config_consumer;
 pub mod memory_index;
 pub mod otel;
 pub mod ranking;
@@ -156,6 +157,12 @@ pub use memory_index::{
     apply_event as apply_memory_index_event, parse_memory_record,
     spawn as spawn_memory_index_consumer, IndexConsumerConfig, IndexEvent, MemoryIndex,
     ParseError as MemoryIndexParseError, INDEX_TOPICS_REGEX,
+};
+pub use mem_config_consumer::{
+    apply_event as apply_mem_config_event, parse_config_record,
+    spawn as spawn_mem_config_consumer, ConfigEvent, ConfigValue, MemConfig,
+    MemConfigConsumerConfig, MemConfigRecordEnvelope, ParseError as MemConfigParseError,
+    CONFIG_TOPICS_REGEX, CONFIG_TOPIC_PREFIX,
 };
 pub use topics::{NamespacePath, TopicLayout};
 pub use wikilinks::extract_wikilinks;
