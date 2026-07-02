@@ -350,10 +350,11 @@ System (in-process Rust API, not HTTP):
 - [x] Forget emits null-value tombstone — `forget.rs`
 - [ ] Integration test "ingest 10 contradictions, recall returns latest" — not written
 
-### AM-2.3: Lifecycle controller — ⚠️ decision logic done, consumer wiring + ops endpoint pending
+### AM-2.3: Lifecycle controller — ⚠️ consumer MVP done 2026-07-02, tombstone emission + ops endpoint pending
 
 - [x] `crates/chronik-memory/src/lifecycle.rs` — full `SemanticDedup<E: Embedder>` with `decide() → DedupDecision::{Keep, Drop, Supersede}` (threshold-based, confidence-tied tiebreak, batched embedding). Pure function, no LLM/Kafka deps in the call path.
-- [ ] **Kafka consumer on `mem.fact.{tenant}`** — substantial follow-up (~400 LOC + new binary `chronik-memory-lifecycle-worker`). Pattern mirrors the existing `chronik-memory-worker` binary; reads new facts, calls `Memory::recall` to fetch existing same-`(subject, predicate)` candidates, applies `SemanticDedup::decide`, emits `Drop`/`Supersede` decisions back to Kafka.
+- [x] **Kafka consumer on `mem.fact.{tenant}`** — landed 2026-07-02 as [`crates/chronik-memory/src/lifecycle_consumer.rs`](../crates/chronik-memory/src/lifecycle_consumer.rs). Reads new facts from a topic, decodes to `FactEvent::{Upsert, Tombstone}`, and applies `SemanticDedup::decide` against an in-memory `CandidateStore` keyed by `(namespace, subject, predicate)`. Every decision is counted in `LifecycleStats { records_processed, facts_indexed, tombstones_observed, keeps, drops, supersedes, parse_errors, decide_errors }`. `spawn()` runs it in a background tokio task with 5s retry-on-error. **In-memory candidate lookup, not `Memory::recall`** — the roadmap plan called for recall-based lookup, but the in-memory approach is simpler, deterministic, and doesn't add latency to fact writes. Recall-based lookup can be a follow-up if the in-memory store's growth becomes a concern. 15 unit tests including deterministic-embedder Keep/Drop/Supersede assertions.
+- [ ] **Tombstone / Supersede emission back to Kafka** — the MVP only *decides*; producing the compaction tombstone or the higher-versioned supersede envelope is deliberately deferred to avoid thundering-herd self-triggered decisions on the same topic the consumer reads.
 - [ ] **Per-namespace half-life overrides via `mem.config.{tenant}` topic** — not implemented; today the half-lives are hardcoded constants in `ranking.rs`.
 - [ ] **`POST /memory/v1/compact` one-shot endpoint** — handler stub not built; would invoke the dedup pass synchronously and return a job ID.
 
