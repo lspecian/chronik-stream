@@ -616,8 +616,45 @@ fn try_create_memory_registry() -> Option<Arc<chronik_memory::MemoryRegistry>> {
         "AM-1.7: Agent memory enabled (kafka={}, api={})",
         kafka, api
     );
-    let config = chronik_memory::RegistryConfig::new(kafka, api);
+    let mut config = chronik_memory::RegistryConfig::new(kafka.clone(), api);
+    if let Some(cfg) = try_create_mem_config(&kafka) {
+        config = config.with_mem_config(cfg);
+    }
     Some(Arc::new(chronik_memory::MemoryRegistry::new(config)))
+}
+
+/// AM-2.3: Build the shared `MemConfig` and spawn the `mem.config.{tenant}`
+/// consumer that hydrates per-tenant half-life overrides. Returns `None`
+/// when disabled.
+///
+/// Reads:
+/// - `CHRONIK_MEMORY_CONFIG_ENABLED` — must be `true` or `1` to enable
+///   (default: `false`, opt-in).
+/// - `CHRONIK_MEMORY_KAFKA` — brokers (defaults to the value threaded in).
+/// - `CHRONIK_MEMORY_CONFIG_GROUP_ID` — consumer group (defaults to
+///   `chronik-mem-config-consumer`).
+fn try_create_mem_config(default_brokers: &str) -> Option<Arc<chronik_memory::MemConfig>> {
+    let enabled = std::env::var("CHRONIK_MEMORY_CONFIG_ENABLED")
+        .map(|v| v.to_lowercase() == "true" || v == "1")
+        .unwrap_or(false);
+    if !enabled {
+        return None;
+    }
+    let brokers = std::env::var("CHRONIK_MEMORY_KAFKA")
+        .unwrap_or_else(|_| default_brokers.to_string());
+    let group_id = std::env::var("CHRONIK_MEMORY_CONFIG_GROUP_ID")
+        .unwrap_or_else(|_| "chronik-mem-config-consumer".to_string());
+    let cfg = chronik_memory::MemConfigConsumerConfig::new(brokers.clone())
+        .with_group_id(group_id);
+    // MemConfig has interior `Arc<DashMap>`; cloning gives a shared handle so
+    // writes from the consumer are visible to recall through the Arc handle.
+    let shared = chronik_memory::MemConfig::new();
+    info!(
+        brokers = %brokers,
+        "AM-2.3: spawning mem.config.{{tenant}} consumer (per-tenant half-life overrides)"
+    );
+    let _handle = chronik_memory::spawn_mem_config_consumer(cfg, shared.clone());
+    Some(Arc::new(shared))
 }
 
 /// AM-2.6: Build the in-memory `memory_id → Source` index and spawn the

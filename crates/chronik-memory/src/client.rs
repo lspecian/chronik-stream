@@ -53,6 +53,10 @@ struct Inner {
     http: reqwest::Client,
     extractor: Option<Arc<dyn Extractor>>,
     idempotency: Mutex<IdempotencyCache>,
+    /// AM-2.3: optional per-tenant config source. When present, the recall
+    /// scoring path resolves half-lives against it before falling back to
+    /// the ranking constants.
+    mem_config: Option<Arc<crate::MemConfig>>,
 }
 
 impl std::fmt::Debug for Memory {
@@ -110,6 +114,12 @@ impl Memory {
     /// HTTP client — used by the recall path (AMS-1.4).
     pub(crate) fn http(&self) -> &reqwest::Client {
         &self.inner.http
+    }
+
+    /// AM-2.3: optional shared [`MemConfig`] used by the recall scoring
+    /// path to resolve per-tenant half-life overrides.
+    pub fn mem_config(&self) -> Option<&Arc<crate::MemConfig>> {
+        self.inner.mem_config.as_ref()
     }
 
     /// Build a recall query against this namespace's typed topics.
@@ -855,6 +865,7 @@ pub struct MemoryBuilder {
     idempotency_capacity: Option<usize>,
     idempotency_ttl: Option<Duration>,
     request_timeout: Option<Duration>,
+    mem_config: Option<Arc<crate::MemConfig>>,
 }
 
 impl MemoryBuilder {
@@ -906,6 +917,15 @@ impl MemoryBuilder {
     /// Override the HTTP request timeout used for Chronik API calls (default 10s).
     pub fn request_timeout(mut self, ttl: Duration) -> Self {
         self.request_timeout = Some(ttl);
+        self
+    }
+
+    /// AM-2.3: Share a [`MemConfig`] instance across every `Memory` built
+    /// by the same [`crate::MemoryRegistry`]. The recall scoring path
+    /// consults it for tenant-specific half-life overrides before falling
+    /// back to the ranking constants.
+    pub fn mem_config(mut self, cfg: Arc<crate::MemConfig>) -> Self {
+        self.mem_config = Some(cfg);
         self
     }
 
@@ -970,6 +990,7 @@ impl MemoryBuilder {
                 http,
                 extractor: self.extractor,
                 idempotency: Mutex::new(cache),
+                mem_config: self.mem_config,
             }),
         })
     }

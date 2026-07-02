@@ -487,9 +487,16 @@ impl<'a> RecallBuilder<'a> {
         let intent = detect_intent(&self.query);
 
         // Final score = sum of channel contributions × type_weight × decay × confidence × intent_boost.
+        // AM-2.3: consult MemConfig for per-tenant half-life overrides before
+        // falling back to the ranking constants.
+        let mem_config = self.memory.mem_config().cloned();
         for result in master.values_mut() {
             let ty = result.memory.body.kind();
-            let decay = decay_factor(result.memory.valid_from, now, half_life(ty));
+            let hl = mem_config
+                .as_ref()
+                .map(|c| c.half_life(&result.memory.tenant_id, ty))
+                .unwrap_or_else(|| half_life(ty));
+            let decay = decay_factor(result.memory.valid_from, now, hl);
             let conf = result.memory.confidence as f64;
             let type_w = type_weight(ty);
             let boost = intent_boost(intent, &result.memory);

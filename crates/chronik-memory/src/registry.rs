@@ -37,6 +37,12 @@ pub struct RegistryConfig {
     pub chronik_api: String,
     /// Optional extractor shared across all cached `Memory` instances.
     pub extractor: Option<Arc<dyn Extractor>>,
+    /// Optional shared per-tenant config (half-life overrides). Every
+    /// `Memory` built from this registry consults the same `MemConfig` at
+    /// recall-scoring time. Populated by
+    /// [`spawn_mem_config_consumer`](crate::spawn_mem_config_consumer) at
+    /// server startup.
+    pub mem_config: Option<Arc<crate::MemConfig>>,
     /// Override `Memory::builder().idempotency_capacity(...)`.
     pub idempotency_capacity: Option<usize>,
     /// Override `Memory::builder().idempotency_ttl(...)`.
@@ -52,6 +58,7 @@ impl RegistryConfig {
             kafka_brokers: kafka_brokers.into(),
             chronik_api: chronik_api.into(),
             extractor: None,
+            mem_config: None,
             idempotency_capacity: None,
             idempotency_ttl: None,
             request_timeout: None,
@@ -63,6 +70,13 @@ impl RegistryConfig {
         self.extractor = Some(e);
         self
     }
+
+    /// Attach a shared `MemConfig` that every cached `Memory` will consult
+    /// at recall-scoring time for per-tenant half-life overrides.
+    pub fn with_mem_config(mut self, cfg: Arc<crate::MemConfig>) -> Self {
+        self.mem_config = Some(cfg);
+        self
+    }
 }
 
 impl std::fmt::Debug for RegistryConfig {
@@ -71,6 +85,7 @@ impl std::fmt::Debug for RegistryConfig {
             .field("kafka_brokers", &self.kafka_brokers)
             .field("chronik_api", &self.chronik_api)
             .field("extractor", &self.extractor.as_ref().map(|e| e.id()))
+            .field("mem_config", &self.mem_config.is_some())
             .field("idempotency_capacity", &self.idempotency_capacity)
             .field("idempotency_ttl", &self.idempotency_ttl)
             .field("request_timeout", &self.request_timeout)
@@ -95,6 +110,7 @@ impl MemoryRegistry {
             kafka_brokers = %config.kafka_brokers,
             chronik_api = %config.chronik_api,
             has_extractor = config.extractor.is_some(),
+            has_mem_config = config.mem_config.is_some(),
             "MemoryRegistry initialized"
         );
         Self {
@@ -140,6 +156,9 @@ impl MemoryRegistry {
         }
         if let Some(ext) = &self.config.extractor {
             builder = builder.extractor_arc(ext.clone());
+        }
+        if let Some(cfg) = &self.config.mem_config {
+            builder = builder.mem_config(cfg.clone());
         }
         let mem = builder.build().await?;
         let arc = Arc::new(mem);
