@@ -196,6 +196,11 @@ pub struct UnifiedApiState {
     /// (unlimited). Denied requests get `429 Too Many Requests` with a
     /// `Retry-After`-shaped message body.
     pub memory_rate_limiter: Option<Arc<chronik_memory::RateLimiter>>,
+    /// AM-2.3: Synchronous compaction runner for
+    /// `POST /memory/v1/compact`. Object-safe so the state doesn't
+    /// leak the [`chronik_memory::compaction::CompactionController`]
+    /// embedder generic. When `None`, the endpoint returns 503.
+    pub memory_compaction: Option<Arc<dyn chronik_memory::CompactionRunner>>,
 }
 
 impl UnifiedApiState {
@@ -229,6 +234,7 @@ impl UnifiedApiState {
             memory_rate_limiter: None,
             memory_index: None,
             memory_tenant_metrics: None,
+            memory_compaction: None,
         }
     }
 
@@ -301,6 +307,16 @@ impl UnifiedApiState {
         metrics: Arc<chronik_memory::TenantMetrics>,
     ) -> Self {
         self.memory_tenant_metrics = Some(metrics);
+        self
+    }
+
+    /// AM-2.3: Attach the synchronous compaction runner. When missing,
+    /// `POST /memory/v1/compact` returns `503 service_unavailable`.
+    pub fn with_memory_compaction(
+        mut self,
+        runner: Arc<dyn chronik_memory::CompactionRunner>,
+    ) -> Self {
+        self.memory_compaction = Some(runner);
         self
     }
 
@@ -474,6 +490,7 @@ pub fn create_router_full(
         .route("/memory/v1/health", get(memory::health))
         .route("/memory/v1/metrics", get(memory::metrics))
         .route("/memory/v1/admin/init-namespace", post(memory::admin_init_namespace))
+        .route("/memory/v1/compact", post(memory::compact))
         .route("/memory/v1/:memory_id/source", get(memory::source));
 
     // Add shared state for SQL/Vector/Query/Memory endpoints

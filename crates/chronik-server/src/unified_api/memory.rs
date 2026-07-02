@@ -769,6 +769,72 @@ pub async fn source(
     }))
 }
 
+// ───────────────────────── COMPACT ─────────────────────────
+
+/// `POST /memory/v1/compact` — trigger a synchronous [`CompactionRunner`]
+/// pass over the in-memory candidate store.
+///
+/// Returns `503 service_unavailable` when
+/// [`UnifiedApiState::memory_compaction`] is `None` (i.e. the lifecycle
+/// controller / compaction runner is not wired in this deployment).
+///
+/// Returns `500 internal_error` when the pass errors out — typically an
+/// embedding-provider outage under the hood; the report body is not
+/// returned in that case.
+pub async fn compact(
+    State(state): State<UnifiedApiState>,
+    headers: HeaderMap,
+    Json(req): Json<CompactRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let (caller_tenant, _api_key) = extract_auth(&headers, state.memory_require_auth)?;
+    let Some(runner) = state.memory_compaction.as_ref() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse::new(
+                "service_unavailable",
+                "compaction runner is not enabled on this server \
+                 (lifecycle controller not wired — set \
+                 CHRONIK_MEMORY_LIFECYCLE_ENABLED=true)",
+            )),
+        ));
+    };
+    let namespace = req.namespace.as_deref();
+    let dry_run = req.dry_run;
+    info!(
+        caller = ?caller_tenant,
+        namespace = ?namespace,
+        dry_run,
+        "compact: starting synchronous pass"
+    );
+    let started = Instant::now();
+    let report = runner.run(namespace, dry_run).await.map_err(|e| {
+        error!(error = %e, "compact: runner errored");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse::new(
+                "internal_error",
+                format!("compaction pass failed: {e}"),
+            )),
+        )
+    })?;
+    let elapsed = started.elapsed();
+    info!(
+        caller = ?caller_tenant,
+        namespace = ?namespace,
+        dry_run,
+        groups_scanned = report.groups_scanned,
+        records_scanned = report.records_scanned,
+        keeps = report.keeps,
+        drops = report.drops,
+        supersedes = report.supersedes,
+        decide_errors = report.decide_errors,
+        emit_errors = report.emit_errors,
+        elapsed_ms = elapsed.as_millis() as u64,
+        "compact: pass complete"
+    );
+    Ok(Json(report))
+}
+
 // ───────────────────────── FEEDBACK ─────────────────────────
 
 /// `POST /memory/v1/feedback` — minimal v1 impl: log the signal so it's

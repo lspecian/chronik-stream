@@ -185,6 +185,14 @@ impl CandidateStore {
             .unwrap_or_default()
     }
 
+    /// Friend accessor used by [`crate::compaction::CompactionController`]
+    /// to iterate every group without recomputing the composite key. Returns
+    /// the raw `DashMap` handle; consumers should treat it as read-only for
+    /// snapshot purposes.
+    pub fn inner_for_compaction(&self) -> Arc<DashMap<CandidateKey, Vec<MemoryRecord>>> {
+        self.inner.clone()
+    }
+
     /// Forget every candidate whose Kafka key matches `key`.
     ///
     /// The store is indexed by `(namespace, subject, predicate)` not Kafka

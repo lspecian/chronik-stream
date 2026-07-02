@@ -89,6 +89,7 @@
 
 pub mod audit;
 pub mod client;
+pub mod compaction;
 pub mod concept;
 pub mod embeddings;
 pub mod error;
@@ -117,6 +118,7 @@ pub mod worker;
 
 pub use audit::{audit_topic, emit_audit, AuditEvent};
 pub use client::{ExtractionAck, Memory, MemoryBuilder};
+pub use compaction::{CompactionController, CompactionReport, CompactionRunner};
 pub use concept::{synthesize_concept, ConceptSynthesisError};
 pub use error::{MemoryError, Result};
 pub use extractor::providers::anthropic::PromptVersion;

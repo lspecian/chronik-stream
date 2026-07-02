@@ -268,6 +268,22 @@ pub struct InitNamespaceResponse {
     pub topics_created: Vec<String>,
 }
 
+// ───────────────────────── COMPACT ─────────────────────────
+
+/// `POST /memory/v1/compact` — trigger a synchronous dedup pass over the
+/// in-memory candidate store. Serviced by
+/// [`chronik_memory::CompactionRunner`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CompactRequest {
+    /// Restrict the pass to one namespace. When omitted, every namespace
+    /// currently indexed in the candidate store is compacted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    /// When `true`, decisions are counted but no tombstones are emitted.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
 // ───────────────────────── HEALTH ─────────────────────────
 
 /// `GET /memory/v1/health` — quick liveness + lag readout.
