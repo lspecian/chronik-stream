@@ -17,8 +17,8 @@ use axum::{
 };
 use chronik_memory::{
     schema::{Body, MemoryRecord, MemoryType, Source},
-    AuditEvent, AuthError, Channel, EndpointKind, Memory, MemoryRegistry, RateDecision,
-    RateLimiter, RecallResult, SynthesizedAnswer, TenantRegistry, TextGenerator, Turn,
+    AuditEvent, AuthError, Channel, EndpointKind, Memory, MemoryRegistry, MetricEndpoint,
+    RateDecision, RateLimiter, RecallResult, SynthesizedAnswer, TenantRegistry, TextGenerator, Turn,
 };
 use serde_json::json;
 use std::collections::HashSet;
@@ -157,6 +157,21 @@ fn check_rate_limit(
                 )),
             ))
         }
+    }
+}
+
+/// AM-2.5 metrics helper. Increments the per-tenant counter (if the
+/// registry is wired). Uses `"anonymous"` when the caller sent no
+/// `X-Tenant-Id` header. Zero-cost when the registry is None.
+fn record_metric(
+    state: &UnifiedApiState,
+    caller_tenant: Option<&str>,
+    endpoint: MetricEndpoint,
+    status_code: u16,
+) {
+    if let Some(metrics) = state.memory_tenant_metrics.as_ref() {
+        let tid = caller_tenant.unwrap_or("anonymous");
+        metrics.record_status(tid, endpoint, status_code);
     }
 }
 
@@ -338,6 +353,7 @@ pub async fn ingest(
         started.elapsed().as_millis() as u64,
     )
     .await;
+    record_metric(&state, caller_tenant.as_deref(), MetricEndpoint::Ingest, 202);
 
     Ok((StatusCode::ACCEPTED, Json(response)))
 }
@@ -396,6 +412,7 @@ pub async fn remember(
         started.elapsed().as_millis() as u64,
     )
     .await;
+    record_metric(&state, caller_tenant.as_deref(), MetricEndpoint::Remember, 200);
 
     Ok((
         StatusCode::OK,
@@ -465,6 +482,7 @@ pub async fn forget(
         started.elapsed().as_millis() as u64,
     )
     .await;
+    record_metric(&state, caller_tenant.as_deref(), MetricEndpoint::Forget, 200);
 
     Ok(Json(ForgetResponse {
         tombstoned: true,
@@ -593,8 +611,37 @@ pub async fn recall(
         latency_ms,
     )
     .await;
+    record_metric(&state, caller_tenant.as_deref(), MetricEndpoint::Recall, 200);
 
     Ok(Json(response))
+}
+
+/// `GET /memory/v1/metrics` — Prometheus text-format payload.
+///
+/// Emits `memory_ops_total{tenant, endpoint, status}` counters for every
+/// tenant that hit `/memory/v1/*`. When the registry is not wired, returns
+/// just the `# HELP` / `# TYPE` headers with no data (so scrapers don't
+/// error).
+///
+/// Cardinality cap is controlled via `CHRONIK_MEMORY_METRICS_CAP` env var
+/// on the server (default: unlimited). Read at the server level and
+/// passed via [`UnifiedApiState`]; that plumbing is a follow-up — for now
+/// the endpoint always emits every tenant.
+pub async fn metrics(State(state): State<UnifiedApiState>) -> impl IntoResponse {
+    let body = state
+        .memory_tenant_metrics
+        .as_ref()
+        .map(|m| m.format_prometheus(None))
+        .unwrap_or_else(|| {
+            "# HELP memory_ops_total Total /memory/v1/* operations per tenant.\n\
+             # TYPE memory_ops_total counter\n"
+                .to_string()
+        });
+    (
+        StatusCode::OK,
+        [("content-type", "text/plain; version=0.0.4")],
+        body,
+    )
 }
 
 fn channel_to_str(c: Channel) -> &'static str {

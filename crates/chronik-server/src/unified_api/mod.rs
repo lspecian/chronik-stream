@@ -178,6 +178,11 @@ pub struct UnifiedApiState {
     /// populated, handlers validate `(X-Tenant-Id, X-API-Key)` against the
     /// registry on every request and reject cross-namespace access with 403.
     pub memory_tenants: Option<Arc<chronik_memory::TenantRegistry>>,
+    /// AM-2.5: Per-tenant Prometheus counters exposed at
+    /// `GET /memory/v1/metrics`. Cheap to clone (`Arc` interior). When
+    /// `None`, handlers skip the increment and the metrics endpoint returns
+    /// an empty payload with just the # HELP/TYPE headers.
+    pub memory_tenant_metrics: Option<Arc<chronik_memory::TenantMetrics>>,
     /// AM-2.6: In-memory `memory_id → Source` index used by
     /// `GET /memory/v1/{memory_id}/source`. Populated by
     /// [`chronik_memory::spawn_memory_index_consumer`] tailing every
@@ -223,6 +228,7 @@ impl UnifiedApiState {
             memory_tenants: None,
             memory_rate_limiter: None,
             memory_index: None,
+            memory_tenant_metrics: None,
         }
     }
 
@@ -284,6 +290,17 @@ impl UnifiedApiState {
         index: Arc<chronik_memory::MemoryIndex>,
     ) -> Self {
         self.memory_index = Some(index);
+        self
+    }
+
+    /// AM-2.5: Attach the per-tenant metric registry. When missing,
+    /// handlers skip the increment and `GET /memory/v1/metrics` returns
+    /// an empty payload.
+    pub fn with_memory_tenant_metrics(
+        mut self,
+        metrics: Arc<chronik_memory::TenantMetrics>,
+    ) -> Self {
+        self.memory_tenant_metrics = Some(metrics);
         self
     }
 
@@ -455,6 +472,7 @@ pub fn create_router_full(
         .route("/memory/v1/recall", post(memory::recall))
         .route("/memory/v1/feedback", post(memory::feedback))
         .route("/memory/v1/health", get(memory::health))
+        .route("/memory/v1/metrics", get(memory::metrics))
         .route("/memory/v1/admin/init-namespace", post(memory::admin_init_namespace))
         .route("/memory/v1/:memory_id/source", get(memory::source));
 

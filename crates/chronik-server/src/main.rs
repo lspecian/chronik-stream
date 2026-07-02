@@ -1102,6 +1102,10 @@ async fn run_cluster_mode(
             let limiter = Arc::new(chronik_memory::RateLimiter::new());
             unified_state = unified_state.with_memory_rate_limiter(limiter);
             info!("✓ Agent memory per-tenant rate limiter wired");
+            // AM-2.5: per-tenant Prometheus metrics.
+            let metrics = Arc::new(chronik_memory::TenantMetrics::new());
+            unified_state = unified_state.with_memory_tenant_metrics(metrics);
+            info!("✓ Agent memory per-tenant metrics wired (GET /memory/v1/metrics)");
         }
         // AM-2.6: opt-in memory-index consumer for GET /memory/v1/{id}/source.
         if let Some(index) = try_create_memory_index() {

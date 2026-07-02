@@ -108,6 +108,7 @@ pub mod remember;
 pub mod schema;
 pub mod tenants;
 pub mod tenants_consumer;
+pub mod tenants_metrics;
 pub mod tenants_rate_limit;
 pub mod topics;
 pub mod wikilinks;
@@ -148,6 +149,7 @@ pub use tenants_consumer::{
     apply_event, parse_tenant_record, spawn as spawn_tenants_consumer, ConsumerConfig,
     ParseError as TenantsParseError, TenantEvent, TenantRecordEnvelope, TENANTS_TOPIC,
 };
+pub use tenants_metrics::{MetricEndpoint, MetricStatus, TenantMetrics};
 pub use tenants_rate_limit::{EndpointKind, RateDecision, RateLimiter, TokenBucket};
 pub use memory_index::{
     apply_event as apply_memory_index_event, parse_memory_record,
