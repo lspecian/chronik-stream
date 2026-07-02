@@ -140,8 +140,9 @@ pub use embeddings::{cosine_similarity, Embedder, OpenAIEmbedder, TextGenerator}
 pub use lifecycle::{DedupDecision, SemanticDedup, DEFAULT_SIMILARITY_THRESHOLD};
 pub use lifecycle_consumer::{
     apply_event as apply_lifecycle_event, parse_fact_record,
-    spawn as spawn_lifecycle_consumer, CandidateKey, CandidateStore, FactEvent, LifecycleConfig,
-    LifecycleStats, ParseError as LifecycleParseError,
+    spawn as spawn_lifecycle_consumer, CandidateKey, CandidateStore, CapturingEmitter,
+    DecisionEmitter, FactEvent, KafkaEmitter, LifecycleConfig, LifecycleStats, LoggingEmitter,
+    ParseError as LifecycleParseError,
 };
 pub use registry::{MemoryRegistry, RegistryConfig};
 pub use tenants::{validate_request, AuthError, Tenant, TenantQuotas, TenantRegistry};

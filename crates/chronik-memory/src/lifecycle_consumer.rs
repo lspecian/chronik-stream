@@ -236,6 +236,166 @@ impl LifecycleStats {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────
+// Decision emitter — writes tombstones for Drop / Supersede outcomes.
+// Extracted behind a trait so tests can capture emissions without touching
+// Kafka.
+// ─────────────────────────────────────────────────────────────────
+
+/// Sink for [`DedupDecision`] outcomes. Called by the consumer after each
+/// `apply_event` that returns a non-`Keep` decision.
+#[async_trait::async_trait]
+pub trait DecisionEmitter: Send + Sync {
+    /// Produce a tombstone (or supersede envelope) for the given decision.
+    ///
+    /// - `source_topic` — the topic the record came from (e.g. `mem.fact.acme`).
+    /// - `record` — the record the consumer just observed (the one being
+    ///   dropped/superseded). Emitter implementations use its `key`
+    ///   (Kafka compaction key) to write the tombstone.
+    async fn emit(
+        &self,
+        decision: &DedupDecision,
+        source_topic: &str,
+        record: &MemoryRecord,
+    ) -> crate::error::Result<()>;
+}
+
+/// No-op emitter — logs the decision but does not touch Kafka. Default for
+/// deployments that want the visibility of a running consumer without the
+/// self-emit feedback path.
+#[derive(Debug, Default, Clone)]
+pub struct LoggingEmitter;
+
+#[async_trait::async_trait]
+impl DecisionEmitter for LoggingEmitter {
+    async fn emit(
+        &self,
+        decision: &DedupDecision,
+        source_topic: &str,
+        record: &MemoryRecord,
+    ) -> crate::error::Result<()> {
+        info!(
+            ?decision,
+            source_topic = %source_topic,
+            memory_id = %record.memory_id,
+            key = ?record.key,
+            "lifecycle: emit (logging only)"
+        );
+        Ok(())
+    }
+}
+
+/// In-memory emitter used by tests. Every `emit` call is appended to a
+/// shared `Vec` the test can inspect.
+#[derive(Debug, Default, Clone)]
+pub struct CapturingEmitter {
+    /// Captured `(decision, source_topic, memory_id)` triples in call order.
+    pub captured: Arc<parking_lot::Mutex<Vec<(DedupDecision, String, String)>>>,
+}
+
+impl CapturingEmitter {
+    /// Fresh empty capture buffer.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Snapshot the captured emissions in call order.
+    pub fn snapshot(&self) -> Vec<(DedupDecision, String, String)> {
+        self.captured.lock().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl DecisionEmitter for CapturingEmitter {
+    async fn emit(
+        &self,
+        decision: &DedupDecision,
+        source_topic: &str,
+        record: &MemoryRecord,
+    ) -> crate::error::Result<()> {
+        self.captured.lock().push((
+            decision.clone(),
+            source_topic.to_string(),
+            record.memory_id.clone(),
+        ));
+        Ok(())
+    }
+}
+
+/// Kafka-backed emitter — writes a compaction tombstone (null payload) to
+/// `source_topic` with the record's Kafka key. Kafka compaction subsequently
+/// removes the record on the next segment merge; recall's `passes_filters`
+/// path also drops tombstoned records at query time.
+///
+/// Requires the caller to construct an rdkafka `FutureProducer` (typically
+/// shared with the main Memory client).
+#[derive(Clone)]
+pub struct KafkaEmitter {
+    producer: rdkafka::producer::FutureProducer,
+    timeout: std::time::Duration,
+}
+
+impl std::fmt::Debug for KafkaEmitter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KafkaEmitter")
+            .field("timeout", &self.timeout)
+            .finish()
+    }
+}
+
+impl KafkaEmitter {
+    /// Build with a shared producer + a produce timeout (5s is a sensible
+    /// default; tombstones are tiny and should ack quickly).
+    pub fn new(
+        producer: rdkafka::producer::FutureProducer,
+        timeout: std::time::Duration,
+    ) -> Self {
+        Self { producer, timeout }
+    }
+}
+
+#[async_trait::async_trait]
+impl DecisionEmitter for KafkaEmitter {
+    async fn emit(
+        &self,
+        decision: &DedupDecision,
+        source_topic: &str,
+        record: &MemoryRecord,
+    ) -> crate::error::Result<()> {
+        use rdkafka::producer::FutureRecord;
+        use rdkafka::util::Timeout;
+        // Only Drop / Supersede warrant an emission. Keep is a no-op.
+        if matches!(decision, DedupDecision::Keep) {
+            return Ok(());
+        }
+        let Some(key) = record.key.as_deref() else {
+            warn!(
+                memory_id = %record.memory_id,
+                "lifecycle: cannot emit tombstone — record has no Kafka key"
+            );
+            return Ok(());
+        };
+        // Null payload = Kafka compaction tombstone.
+        let rec: FutureRecord<'_, str, [u8]> =
+            FutureRecord::to(source_topic).key(key);
+        self.producer
+            .send(rec, Timeout::After(self.timeout))
+            .await
+            .map_err(|(e, _)| {
+                crate::error::MemoryError::Kafka(format!(
+                    "lifecycle: emit tombstone to {source_topic}: {e}"
+                ))
+            })?;
+        debug!(
+            ?decision,
+            source_topic = %source_topic,
+            key = %key,
+            "lifecycle: tombstone emitted"
+        );
+        Ok(())
+    }
+}
+
 /// Convert a `MemoryRecord` into the [`Extracted`] shape that
 /// [`SemanticDedup::decide`] expects. Preserves body, key, and confidence;
 /// synth `source_indexes = vec![0]` because it doesn't take part in the
@@ -295,19 +455,24 @@ pub async fn apply_event<E: Embedder + Clone>(
 /// Spawn a background task that runs the lifecycle consumer forever.
 /// Retries transient errors with a 5s backoff.
 ///
+/// The `emitter` argument is called for every Drop / Supersede decision.
+/// Pass [`LoggingEmitter`] for observability without side effects, or a
+/// [`KafkaEmitter`] to actually produce compaction tombstones.
+///
 /// Returns the JoinHandle so callers can await + tear down gracefully.
 pub fn spawn<E>(
     config: LifecycleConfig,
     dedup: Arc<SemanticDedup<E>>,
     store: CandidateStore,
     stats: Arc<parking_lot::Mutex<LifecycleStats>>,
+    emitter: Arc<dyn DecisionEmitter>,
 ) -> tokio::task::JoinHandle<()>
 where
     E: Embedder + Clone + Send + Sync + 'static,
 {
     tokio::spawn(async move {
         loop {
-            match run_consumer(&config, &dedup, &store, &stats).await {
+            match run_consumer(&config, &dedup, &store, &stats, emitter.as_ref()).await {
                 Ok(()) => {
                     info!("mem.fact consumer exited cleanly");
                     return;
@@ -328,6 +493,7 @@ pub async fn run_consumer<E>(
     dedup: &SemanticDedup<E>,
     store: &CandidateStore,
     stats: &Arc<parking_lot::Mutex<LifecycleStats>>,
+    emitter: &dyn DecisionEmitter,
 ) -> Result<()>
 where
     E: Embedder + Clone,
@@ -371,10 +537,39 @@ where
                             let s = stats.lock();
                             s.clone()
                         };
+                        // Keep a reference to the source record so we can
+                        // pass it to the emitter after apply_event consumes
+                        // the event.
+                        let source_record: Option<MemoryRecord> = match &event {
+                            FactEvent::Upsert(r) => Some(r.clone()),
+                            FactEvent::Tombstone { .. } => None,
+                        };
                         let result =
                             apply_event(dedup, store, &mut local_stats, event).await;
                         match result {
-                            Ok(_decision) => {
+                            Ok(Some(decision)) => {
+                                *stats.lock() = local_stats;
+                                // Emit for Drop / Supersede outcomes. Keep
+                                // is a no-op — no tombstone needed. Emit
+                                // failure is logged and swallowed; the
+                                // record stays in the topic + the next
+                                // consumer pass may retry.
+                                if !matches!(decision, DedupDecision::Keep) {
+                                    if let Some(record) = source_record {
+                                        if let Err(e) = emitter
+                                            .emit(&decision, &config.topic, &record)
+                                            .await
+                                        {
+                                            warn!(
+                                                error = %e,
+                                                memory_id = %record.memory_id,
+                                                "lifecycle: emit failed"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(None) => {
                                 *stats.lock() = local_stats;
                             }
                             Err(e) => {
@@ -678,5 +873,94 @@ mod tests {
         assert_eq!(c.topic, "mem.fact.acme");
         let c2 = c.with_group_id("custom");
         assert_eq!(c2.group_id, "custom");
+    }
+
+    // ─── DecisionEmitter tests ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn capturing_emitter_records_drop() {
+        let emitter = CapturingEmitter::new();
+        let rec = fact_record("m", "acme:ns", "user", "budget", "hi", 1.0);
+        let decision = DedupDecision::Drop {
+            existing_id: "prev".into(),
+            similarity: 0.99,
+        };
+        emitter
+            .emit(&decision, "mem.fact.acme", &rec)
+            .await
+            .unwrap();
+        let snap = emitter.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].1, "mem.fact.acme");
+        assert_eq!(snap[0].2, "m");
+        assert!(matches!(snap[0].0, DedupDecision::Drop { .. }));
+    }
+
+    #[tokio::test]
+    async fn logging_emitter_is_a_noop() {
+        // LoggingEmitter never fails and captures nothing external.
+        let emitter = LoggingEmitter::default();
+        let rec = fact_record("m", "acme:ns", "user", "budget", "hi", 1.0);
+        emitter
+            .emit(
+                &DedupDecision::Supersede {
+                    existing_id: "p".into(),
+                    similarity: 0.99,
+                },
+                "mem.fact.acme",
+                &rec,
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn capturing_emitter_records_supersede() {
+        let emitter = CapturingEmitter::new();
+        let rec = fact_record("newer", "acme:ns", "user", "budget", "hi", 1.0);
+        let decision = DedupDecision::Supersede {
+            existing_id: "older".into(),
+            similarity: 0.98,
+        };
+        emitter
+            .emit(&decision, "mem.fact.acme", &rec)
+            .await
+            .unwrap();
+        assert_eq!(emitter.snapshot().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn capturing_emitter_across_multiple_calls() {
+        let emitter = CapturingEmitter::new();
+        let a = fact_record("a", "acme:ns", "user", "budget", "hi", 1.0);
+        let b = fact_record("b", "acme:ns", "user", "color", "blue", 1.0);
+        emitter
+            .emit(
+                &DedupDecision::Drop {
+                    existing_id: "x".into(),
+                    similarity: 0.99,
+                },
+                "mem.fact.acme",
+                &a,
+            )
+            .await
+            .unwrap();
+        emitter
+            .emit(
+                &DedupDecision::Supersede {
+                    existing_id: "y".into(),
+                    similarity: 0.98,
+                },
+                "mem.fact.beta",
+                &b,
+            )
+            .await
+            .unwrap();
+        let snap = emitter.snapshot();
+        assert_eq!(snap.len(), 2);
+        assert_eq!(snap[0].2, "a");
+        assert_eq!(snap[0].1, "mem.fact.acme");
+        assert_eq!(snap[1].2, "b");
+        assert_eq!(snap[1].1, "mem.fact.beta");
     }
 }
