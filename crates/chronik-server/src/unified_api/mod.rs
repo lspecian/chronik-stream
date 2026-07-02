@@ -178,6 +178,13 @@ pub struct UnifiedApiState {
     /// populated, handlers validate `(X-Tenant-Id, X-API-Key)` against the
     /// registry on every request and reject cross-namespace access with 403.
     pub memory_tenants: Option<Arc<chronik_memory::TenantRegistry>>,
+    /// AM-2.5: Per-tenant token-bucket rate limiter. When present AND
+    /// [`Self::memory_tenants`] is populated, every write / recall consumes
+    /// tokens from the caller's `TenantQuotas.{ingest_msgs_per_sec,
+    /// recall_qps}` bucket. When either is `None`, requests pass through
+    /// (unlimited). Denied requests get `429 Too Many Requests` with a
+    /// `Retry-After`-shaped message body.
+    pub memory_rate_limiter: Option<Arc<chronik_memory::RateLimiter>>,
 }
 
 impl UnifiedApiState {
@@ -208,6 +215,7 @@ impl UnifiedApiState {
             memory_text_generator: None,
             memory_require_auth: false,
             memory_tenants: None,
+            memory_rate_limiter: None,
         }
     }
 
@@ -247,6 +255,17 @@ impl UnifiedApiState {
         tenants: Arc<chronik_memory::TenantRegistry>,
     ) -> Self {
         self.memory_tenants = Some(tenants);
+        self
+    }
+
+    /// AM-2.5: Attach a per-tenant token-bucket rate limiter. Only takes
+    /// effect when combined with [`Self::with_memory_tenants`] — otherwise
+    /// handlers can't identify the caller's quotas.
+    pub fn with_memory_rate_limiter(
+        mut self,
+        limiter: Arc<chronik_memory::RateLimiter>,
+    ) -> Self {
+        self.memory_rate_limiter = Some(limiter);
         self
     }
 

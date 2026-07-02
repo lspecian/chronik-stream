@@ -1066,6 +1066,11 @@ async fn run_cluster_mode(
         if let Some(tenants) = try_create_tenant_registry() {
             unified_state = unified_state.with_memory_tenants(tenants);
             info!("✓ Agent memory tenant registry wired (full auth enabled)");
+            // AM-2.5: per-tenant rate limiter (token bucket). Only useful
+            // when the tenant registry is populated, so we opt in here.
+            let limiter = Arc::new(chronik_memory::RateLimiter::new());
+            unified_state = unified_state.with_memory_rate_limiter(limiter);
+            info!("✓ Agent memory per-tenant rate limiter wired");
         }
     }
     // VO-4: optional cross-encoder reranker for /_vector/*.

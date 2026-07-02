@@ -17,8 +17,8 @@ use axum::{
 };
 use chronik_memory::{
     schema::{Body, MemoryRecord, MemoryType, Source},
-    AuditEvent, AuthError, Channel, Memory, MemoryRegistry, RecallResult, SynthesizedAnswer,
-    TenantRegistry, TextGenerator, Turn,
+    AuditEvent, AuthError, Channel, EndpointKind, Memory, MemoryRegistry, RateDecision,
+    RateLimiter, RecallResult, SynthesizedAnswer, TenantRegistry, TextGenerator, Turn,
 };
 use serde_json::json;
 use std::collections::HashSet;
@@ -119,6 +119,44 @@ fn authorize_namespace(
                 format!("tenant {t:?} is not authorized for namespace {ns:?}"),
             )),
         )),
+    }
+}
+
+/// AM-2.5 rate-limit gate. Returns `Ok(())` when the limiter is not wired
+/// (passthrough) or when the caller has no matching tenant (unauthenticated
+/// or unknown). Returns `429 Too Many Requests` with a `Retry-After` hint
+/// when the token bucket is empty.
+fn check_rate_limit(
+    state: &UnifiedApiState,
+    caller_tenant: Option<&str>,
+    kind: EndpointKind,
+    size: usize,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let (Some(limiter), Some(tenants)) =
+        (state.memory_rate_limiter.as_ref(), state.memory_tenants.as_ref())
+    else {
+        return Ok(()); // passthrough — no limiter or no tenants configured
+    };
+    let Some(caller_tid) = caller_tenant else {
+        return Ok(()); // passthrough for anonymous callers (auth will reject later)
+    };
+    let Some(tenant) = tenants.get(caller_tid) else {
+        return Ok(()); // unknown tenant — authorize_namespace will 401
+    };
+    match limiter.try_acquire(&tenant, kind, size) {
+        RateDecision::Allowed => Ok(()),
+        RateDecision::Denied { retry_after } => {
+            let secs = retry_after.as_secs_f64();
+            Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(ErrorResponse::new(
+                    "rate_limited",
+                    format!(
+                        "tenant {caller_tid:?} exceeded quota; retry after {secs:.2}s"
+                    ),
+                )),
+            ))
+        }
     }
 }
 
@@ -237,6 +275,12 @@ pub async fn ingest(
         api_key.as_deref(),
         &req.namespace,
     )?;
+    check_rate_limit(
+        &state,
+        caller_tenant.as_deref(),
+        EndpointKind::Ingest,
+        req.turns.len().max(1),
+    )?;
     let registry = require_registry(&state)?;
 
     if req.turns.is_empty() {
@@ -313,6 +357,7 @@ pub async fn remember(
         api_key.as_deref(),
         &req.namespace,
     )?;
+    check_rate_limit(&state, caller_tenant.as_deref(), EndpointKind::Write, 1)?;
     let registry = require_registry(&state)?;
 
     // Round-trip wire {type, body} → Body enum via serde's tagged repr.
@@ -378,6 +423,7 @@ pub async fn forget(
         api_key.as_deref(),
         &req.namespace,
     )?;
+    check_rate_limit(&state, caller_tenant.as_deref(), EndpointKind::Write, 1)?;
     let registry = require_registry(&state)?;
     let kind = parse_memory_type(&req.r#type)?;
 
@@ -442,6 +488,7 @@ pub async fn recall(
         api_key.as_deref(),
         &req.namespace,
     )?;
+    check_rate_limit(&state, caller_tenant.as_deref(), EndpointKind::Recall, 1)?;
     let registry = require_registry(&state)?;
 
     let mem = registry

@@ -107,6 +107,7 @@ pub mod remember;
 pub mod schema;
 pub mod tenants;
 pub mod tenants_consumer;
+pub mod tenants_rate_limit;
 pub mod topics;
 pub mod wikilinks;
 pub mod worker;
@@ -146,6 +147,7 @@ pub use tenants_consumer::{
     apply_event, parse_tenant_record, spawn as spawn_tenants_consumer, ConsumerConfig,
     ParseError as TenantsParseError, TenantEvent, TenantRecordEnvelope, TENANTS_TOPIC,
 };
+pub use tenants_rate_limit::{EndpointKind, RateDecision, RateLimiter, TokenBucket};
 pub use topics::{NamespacePath, TopicLayout};
 pub use wikilinks::extract_wikilinks;
 pub use worker::{Worker, WorkerConfig, WorkerStats};
