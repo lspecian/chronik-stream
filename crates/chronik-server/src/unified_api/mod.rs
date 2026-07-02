@@ -178,6 +178,12 @@ pub struct UnifiedApiState {
     /// populated, handlers validate `(X-Tenant-Id, X-API-Key)` against the
     /// registry on every request and reject cross-namespace access with 403.
     pub memory_tenants: Option<Arc<chronik_memory::TenantRegistry>>,
+    /// AM-2.6: In-memory `memory_id → Source` index used by
+    /// `GET /memory/v1/{memory_id}/source`. Populated by
+    /// [`chronik_memory::spawn_memory_index_consumer`] tailing every
+    /// `mem.{type}.{tenant}` topic. When `None`, the source endpoint
+    /// returns 503.
+    pub memory_index: Option<Arc<chronik_memory::MemoryIndex>>,
     /// AM-2.5: Per-tenant token-bucket rate limiter. When present AND
     /// [`Self::memory_tenants`] is populated, every write / recall consumes
     /// tokens from the caller's `TenantQuotas.{ingest_msgs_per_sec,
@@ -216,6 +222,7 @@ impl UnifiedApiState {
             memory_require_auth: false,
             memory_tenants: None,
             memory_rate_limiter: None,
+            memory_index: None,
         }
     }
 
@@ -266,6 +273,17 @@ impl UnifiedApiState {
         limiter: Arc<chronik_memory::RateLimiter>,
     ) -> Self {
         self.memory_rate_limiter = Some(limiter);
+        self
+    }
+
+    /// AM-2.6: Attach the `memory_id → Source` index used by the
+    /// `GET /memory/v1/{memory_id}/source` provenance endpoint. When
+    /// missing, the endpoint replies `503 service_unavailable`.
+    pub fn with_memory_index(
+        mut self,
+        index: Arc<chronik_memory::MemoryIndex>,
+    ) -> Self {
+        self.memory_index = Some(index);
         self
     }
 

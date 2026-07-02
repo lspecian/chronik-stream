@@ -99,6 +99,7 @@ pub mod idempotency;
 pub mod ingest;
 pub mod lifecycle;
 pub mod lifecycle_consumer;
+pub mod memory_index;
 pub mod otel;
 pub mod ranking;
 pub mod recall;
@@ -148,6 +149,11 @@ pub use tenants_consumer::{
     ParseError as TenantsParseError, TenantEvent, TenantRecordEnvelope, TENANTS_TOPIC,
 };
 pub use tenants_rate_limit::{EndpointKind, RateDecision, RateLimiter, TokenBucket};
+pub use memory_index::{
+    apply_event as apply_memory_index_event, parse_memory_record,
+    spawn as spawn_memory_index_consumer, IndexConsumerConfig, IndexEvent, MemoryIndex,
+    ParseError as MemoryIndexParseError, INDEX_TOPICS_REGEX,
+};
 pub use topics::{NamespacePath, TopicLayout};
 pub use wikilinks::extract_wikilinks;
 pub use worker::{Worker, WorkerConfig, WorkerStats};

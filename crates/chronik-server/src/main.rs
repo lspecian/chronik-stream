@@ -620,6 +620,37 @@ fn try_create_memory_registry() -> Option<Arc<chronik_memory::MemoryRegistry>> {
     Some(Arc::new(chronik_memory::MemoryRegistry::new(config)))
 }
 
+/// AM-2.6: Build the in-memory `memory_id → Source` index and spawn the
+/// Kafka consumer that hydrates it. Returns `None` when disabled.
+///
+/// Reads:
+/// - `CHRONIK_MEMORY_INDEX_ENABLED` — must be `true` or `1` to enable.
+/// - `CHRONIK_MEMORY_KAFKA` — brokers (defaults to `localhost:9092`).
+/// - `CHRONIK_MEMORY_INDEX_GROUP_ID` — consumer group (defaults to
+///   `chronik-memory-index-consumer`).
+fn try_create_memory_index() -> Option<Arc<chronik_memory::MemoryIndex>> {
+    let enabled = std::env::var("CHRONIK_MEMORY_INDEX_ENABLED")
+        .map(|v| v.to_lowercase() == "true" || v == "1")
+        .unwrap_or(false);
+    if !enabled {
+        return None;
+    }
+    let brokers = std::env::var("CHRONIK_MEMORY_KAFKA")
+        .unwrap_or_else(|_| "localhost:9092".to_string());
+    let group_id = std::env::var("CHRONIK_MEMORY_INDEX_GROUP_ID")
+        .unwrap_or_else(|_| "chronik-memory-index-consumer".to_string());
+    let config = chronik_memory::IndexConsumerConfig::new(brokers.clone())
+        .with_group_id(group_id);
+    let index = chronik_memory::MemoryIndex::new();
+    let arc = Arc::new(index.clone());
+    info!(
+        brokers = %brokers,
+        "AM-2.6: spawning memory-index consumer (tails every mem.<type>.<tenant> topic)"
+    );
+    let _handle = chronik_memory::spawn_memory_index_consumer(config, index);
+    Some(arc)
+}
+
 fn memory_require_auth() -> bool {
     std::env::var("CHRONIK_MEMORY_REQUIRE_AUTH")
         .map(|v| v.to_lowercase() == "true" || v == "1")
@@ -1072,6 +1103,11 @@ async fn run_cluster_mode(
             unified_state = unified_state.with_memory_rate_limiter(limiter);
             info!("✓ Agent memory per-tenant rate limiter wired");
         }
+        // AM-2.6: opt-in memory-index consumer for GET /memory/v1/{id}/source.
+        if let Some(index) = try_create_memory_index() {
+            unified_state = unified_state.with_memory_index(index);
+            info!("✓ Agent memory memory_id index wired (/memory/v1/*/source)");
+        }
     }
     // VO-4: optional cross-encoder reranker for /_vector/*.
     if let Some(reranker) = try_create_reranker() {
@@ -1346,6 +1382,15 @@ async fn run_single_node_mode(
             if let Some(tenants) = try_create_tenant_registry() {
                 unified_state = unified_state.with_memory_tenants(tenants);
                 info!("✓ Agent memory tenant registry wired (full auth enabled)");
+                // AM-2.5: per-tenant token-bucket rate limiter.
+                let limiter = Arc::new(chronik_memory::RateLimiter::new());
+                unified_state = unified_state.with_memory_rate_limiter(limiter);
+                info!("✓ Agent memory per-tenant rate limiter wired");
+            }
+            // AM-2.6: opt-in memory-index consumer for GET /memory/v1/{id}/source.
+            if let Some(index) = try_create_memory_index() {
+                unified_state = unified_state.with_memory_index(index);
+                info!("✓ Agent memory memory_id index wired (/memory/v1/*/source)");
             }
         }
         // VO-4: optional cross-encoder reranker for /_vector/*.

@@ -664,23 +664,62 @@ fn into_wire_synthesis(s: SynthesizedAnswer) -> SynthesisResponse {
 
 // ───────────────────────── SOURCE ─────────────────────────
 
-/// `GET /memory/v1/{memory_id}/source` — stub returning 501 in v1.
+/// `GET /memory/v1/{memory_id}/source` — provenance walk (AM-2.6).
 ///
-/// Provenance walk requires an index from `memory_id → (topic, offset)`. That
-/// index isn't built yet (AM-2.6). The endpoint is wired so the wire surface
-/// stays complete; implementation lands as part of Phase 2 audit work.
+/// Returns the source pointer for `memory_id` from the in-memory
+/// [`chronik_memory::MemoryIndex`]. The pointer is
+/// `{topic, offsets[], extractor}`; the caller can fetch the actual raw
+/// turns via its own Kafka client or via `/_sql SELECT * FROM {topic}`.
+///
+/// Server-side raw-turn resolution is deliberately deferred — a Kafka
+/// consumer-based reader over N offsets is a whole subsystem and not
+/// needed for the immediate provenance / compliance use case (which is
+/// "prove where this fact came from"). `raw_turns` is left empty.
+///
+/// Responses:
+/// - `503 service_unavailable` — index not wired (server started without
+///   `CHRONIK_MEMORY_INDEX_ENABLED=true`).
+/// - `404 not_found` — memory_id has not been observed by the index
+///   consumer. This is a possibly-transient state; a retry after the
+///   consumer catches up may succeed.
+/// - `200 OK` — pointer returned.
 pub async fn source(
-    State(_state): State<UnifiedApiState>,
+    State(state): State<UnifiedApiState>,
     Path(memory_id): Path<String>,
-) -> (StatusCode, Json<ErrorResponse>) {
-    debug!(%memory_id, "source endpoint hit (not implemented)");
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(ErrorResponse::new(
-            "not_implemented",
-            "provenance walk not yet supported (tracked in AM-2.6)",
-        )),
-    )
+) -> Result<Json<SourceResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let Some(index) = state.memory_index.as_ref() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse::new(
+                "service_unavailable",
+                "memory-index consumer is not enabled on this server \
+                 (set CHRONIK_MEMORY_INDEX_ENABLED=true)",
+            )),
+        ));
+    };
+    let src = index.lookup(&memory_id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse::new(
+                "not_found",
+                format!(
+                    "memory_id {memory_id:?} not in the index (either unknown \
+                     or the consumer has not caught up yet — retry"
+                ),
+            )),
+        )
+    })?;
+    debug!(%memory_id, "source: pointer returned");
+    Ok(Json(SourceResponse {
+        memory_id,
+        source: SourceRef {
+            topic: src.topic.clone(),
+            offsets: src.offsets.clone(),
+            extractor: src.extractor.clone(),
+        },
+        raw_turns: Vec::new(),
+        extractor: src.extractor,
+    }))
 }
 
 // ───────────────────────── FEEDBACK ─────────────────────────

@@ -200,11 +200,24 @@ pub struct SynthesisResponse {
 
 // ───────────────────────── SOURCE ─────────────────────────
 
-/// `GET /memory/v1/{memory_id}/source` — walks back to the raw turns.
+/// `GET /memory/v1/{memory_id}/source` — provenance walk.
+///
+/// The AM-2.6 MVP returns the raw-turn *pointer* (`source.topic` +
+/// `source.offsets`) so callers can fetch the actual turn payloads via
+/// their own Kafka client or `/_sql`. `raw_turns` is left empty for now;
+/// server-side resolution is a follow-up.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceResponse {
     pub memory_id: String,
+    /// Pointer to the raw-turn topic + offsets. Callers resolve.
+    pub source: SourceRef,
+    /// Raw turns, when available. MVP always returns empty; kept in the
+    /// wire shape so a future server-side resolver can populate without
+    /// clients changing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub raw_turns: Vec<RawTurnView>,
+    /// Extractor identifier that produced this memory (e.g. `anthropic-v3`).
+    /// Convenience field — the same value is on `source.extractor`.
     pub extractor: String,
 }
 

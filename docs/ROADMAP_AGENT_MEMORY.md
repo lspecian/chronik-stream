@@ -386,11 +386,11 @@ CHRONIK_MEMORY_KAFKA=broker:9092                         # broker for consumer
 - [ ] **Per-tenant Prometheus labels** with cardinality cap (`tenant=other` for the long tail).
 - [ ] **Per-tenant storage quota tracking** — needs sum-of-topic-bytes per tenant.
 
-### AM-2.6: Provenance & audit — ⚠️ partial (audit done 2026-06-28; source endpoint still pending)
+### AM-2.6: Provenance & audit — ✅ core done (2026-07-02); server-side raw-turn resolution deferred
 
 - [x] Schema carries `source.{topic,offsets,extractor}` end-to-end
 - [x] Extractor rejects memories without offsets in batch (verified in `extractor/mod.rs`)
-- [ ] `GET /memory/v1/{memory_id}/source` endpoint — handler stub returns 501; needs `memory_id → (topic, offset)` index (separate work item)
+- [x] **`GET /memory/v1/{memory_id}/source` endpoint** — landed 2026-07-02. Backed by an in-memory [`chronik_memory::MemoryIndex`](../crates/chronik-memory/src/memory_index.rs) hydrated by a Kafka consumer that tails every `mem.{type}.{tenant}` topic via a regex subscription (`^mem\.(fact|event|instruction|task|task\.current|concept)\.[^.]+$`). Handler responses: `503` when the index isn't wired, `404` when the memory_id hasn't been observed (transient — may succeed on retry as the consumer catches up), `200` with `{memory_id, source: {topic, offsets, extractor}, raw_turns: []}` on hit. **Raw-turn resolution is deliberately deferred** — the pointer is the compliance-critical piece; fetching the actual turn payloads server-side needs a Kafka reader subsystem and can happen in a follow-up. Callers can resolve the pointer today via their own Kafka client or `/_sql SELECT * FROM {source.topic}`. Bootstrapped in `main.rs::try_create_memory_index` behind `CHRONIK_MEMORY_INDEX_ENABLED=true`. 15 unit tests cover parse (happy, tombstone flag, null value, empty value, non-UTF-8 key, bad JSON), index CRUD (insert skips tombstones, remove, upsert replaces source), apply_event lifecycle, and the topics regex (positive + negative cases).
 - [x] `mem.audit.{tenant}` topic + emitter — landed 2026-06-28:
   - [`crates/chronik-memory/src/audit.rs`](../crates/chronik-memory/src/audit.rs) — `AuditEvent { ts, tenant, namespace, op, query?, memory_ids, caller_tenant?, status_code, error_code?, latency_ms }` with builder methods + 512-char query truncation + JSON serialization (7 unit tests)
   - `Memory::audit(&event)` produces to `mem.audit.{tenant}` keyed by namespace; best-effort (failure logged + swallowed)
