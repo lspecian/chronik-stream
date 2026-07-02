@@ -105,6 +105,7 @@ pub mod registry;
 pub mod remember;
 pub mod schema;
 pub mod tenants;
+pub mod tenants_consumer;
 pub mod topics;
 pub mod wikilinks;
 pub mod worker;
@@ -135,6 +136,10 @@ pub use embeddings::{cosine_similarity, Embedder, OpenAIEmbedder, TextGenerator}
 pub use lifecycle::{DedupDecision, SemanticDedup, DEFAULT_SIMILARITY_THRESHOLD};
 pub use registry::{MemoryRegistry, RegistryConfig};
 pub use tenants::{validate_request, AuthError, Tenant, TenantQuotas, TenantRegistry};
+pub use tenants_consumer::{
+    apply_event, parse_tenant_record, spawn as spawn_tenants_consumer, ConsumerConfig,
+    ParseError as TenantsParseError, TenantEvent, TenantRecordEnvelope, TENANTS_TOPIC,
+};
 pub use topics::{NamespacePath, TopicLayout};
 pub use wikilinks::extract_wikilinks;
 pub use worker::{Worker, WorkerConfig, WorkerStats};

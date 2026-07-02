@@ -364,17 +364,23 @@ System (in-process Rust API, not HTTP):
 - [x] HyDE channel behind opt-in flag
 - [x] Per-call `channels: [...]` toggle in builder API; per-tenant `mem.config.{tenant}` not yet (pending AM-2.5)
 
-### AM-2.5: Multi-tenancy — ⚠️ foundation done 2026-06-28, rate limits + Kafka consumer pending
+### AM-2.5: Multi-tenancy — ⚠️ Kafka consumer + foundation done 2026-07-02, rate limits + metrics + storage quota pending
 
-Foundation landed: `Tenant` schema + `TenantRegistry` + `validate_request()` +
-handler wiring + env-var bootstrap. Production deployments can now run with
-enforced auth via `CHRONIK_MEMORY_TENANTS=tenant1:key1,tenant2:key2` and
-`CHRONIK_MEMORY_REQUIRE_AUTH=true`.
+Foundation + live-hydration Kafka consumer both landed. Production
+deployments can now serve a growing tenant catalog from `mem.tenants`
+without restarts:
+
+```
+CHRONIK_MEMORY_TENANTS=acme:key1                        # optional seed
+CHRONIK_MEMORY_TENANTS_KAFKA_ENABLED=true               # opt into consumer
+CHRONIK_MEMORY_REQUIRE_AUTH=true                         # enforce validation
+CHRONIK_MEMORY_KAFKA=broker:9092                         # broker for consumer
+```
 
 - [x] Validation primitives in [`crates/chronik-memory/src/tenants.rs`](../crates/chronik-memory/src/tenants.rs): `Tenant`, `TenantQuotas`, `TenantRegistry` (lock-free reads via `parking_lot::RwLock`), glob-ish `namespace_patterns` (`acme:*` matches `acme` and anything starting with `acme:`), `validate_request()` returning `AuthError::{MissingCredentials, UnknownTenant, InvalidKey, ForbiddenNamespace}`. 12 unit tests pass.
 - [x] `extract_auth` + new `authorize_namespace` in [`unified_api/memory.rs`](../crates/chronik-server/src/unified_api/memory.rs) — three-mode shape: (1) passthrough default, (2) `require_auth=true` enforces header presence (401), (3) `tenants` registry populated enforces full validation (401 on unknown tenant / bad key, 403 on cross-namespace). Wired into `ingest`, `remember`, `forget`, `recall`.
 - [x] `UnifiedApiState::with_memory_tenants(Arc<TenantRegistry>)` + bootstrap from `CHRONIK_MEMORY_TENANTS` env var in `main.rs::try_create_tenant_registry`. Tolerant of malformed entries (skip + log warn).
-- [ ] **`mem.tenants` Kafka compacted topic consumer** — production source of truth. Env-var bootstrap is the dev/test convenience.
+- [x] **`mem.tenants` Kafka compacted topic consumer** — landed 2026-07-02 in [`crates/chronik-memory/src/tenants_consumer.rs`](../crates/chronik-memory/src/tenants_consumer.rs). Topic `mem.tenants`, keyed by `tenant_id`, JSON envelope value with `schema_version=1`. Consumer: `parse_tenant_record()` (pure, unit-testable) + `apply_event()` (mutates the shared `Arc<TenantRegistry>`) + `spawn()` background task with automatic retry on transient errors. Semantics: key/tenant_id mismatch = skip + warn; JSON decode failure = skip + warn; null/empty value = compaction tombstone; upsert = full record replace. 14 unit tests cover parse + apply + full-lifecycle. Wired into `main.rs::try_create_tenant_registry` alongside the env-var seed — both sources co-exist, consumer applies live on top.
 - [ ] **Per-tenant rate limits** (`ingest_msgs_per_sec`, `recall_qps`) — `TenantQuotas` carries the fields; enforcement is a follow-up (token-bucket middleware).
 - [ ] **Per-tenant Prometheus labels** with cardinality cap (`tenant=other` for the long tail).
 - [ ] **Per-tenant storage quota tracking** — needs sum-of-topic-bytes per tenant.

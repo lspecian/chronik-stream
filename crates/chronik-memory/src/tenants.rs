@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 /// One tenant's configuration. Wire-compatible with the eventual
 /// `mem.tenants` topic record.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Tenant {
     /// Tenant identifier (matches the `tenant` segment of namespace paths).
     pub tenant_id: String,
@@ -43,7 +43,7 @@ pub struct Tenant {
     pub quotas: TenantQuotas,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct TenantQuotas {
     /// Max ingest messages per second. `None` = unlimited.
     #[serde(default)]

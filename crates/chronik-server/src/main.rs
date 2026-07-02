@@ -660,21 +660,51 @@ fn try_create_reranker(
     ))
 }
 
-/// AM-2.5: Build the tenant registry from `CHRONIK_MEMORY_TENANTS` env var.
-/// Returns `None` when no tenants are configured (handlers stay in
-/// passthrough mode). Production deployments will replace this with a
-/// `mem.tenants` Kafka consumer; the env-var bootstrap covers local dev
-/// + small deployments + the AM-2.5 integration tests.
+/// AM-2.5: Build the tenant registry, hydrated from both the
+/// `CHRONIK_MEMORY_TENANTS` env var AND (when enabled) the `mem.tenants`
+/// Kafka topic. Returns `None` when neither source is configured — handlers
+/// stay in passthrough mode.
+///
+/// - Env-var seed is applied first (small deployments, local dev, tests).
+/// - Kafka consumer (opt-in via `CHRONIK_MEMORY_TENANTS_KAFKA_ENABLED=true`)
+///   runs continuously and applies live changes on top. Uses the
+///   `CHRONIK_MEMORY_KAFKA` bootstrap servers (falling back to
+///   `localhost:9092`).
 fn try_create_tenant_registry() -> Option<Arc<chronik_memory::TenantRegistry>> {
     let registry = chronik_memory::TenantRegistry::from_env();
-    if registry.is_empty() {
+    let kafka_enabled = std::env::var("CHRONIK_MEMORY_TENANTS_KAFKA_ENABLED")
+        .map(|v| v.to_lowercase() == "true" || v == "1")
+        .unwrap_or(false);
+
+    if registry.is_empty() && !kafka_enabled {
         return None;
     }
     info!(
-        "AM-2.5: TenantRegistry seeded with {} tenant(s) from CHRONIK_MEMORY_TENANTS",
-        registry.len()
+        "AM-2.5: TenantRegistry seeded with {} tenant(s) from CHRONIK_MEMORY_TENANTS \
+         (kafka_consumer={})",
+        registry.len(),
+        kafka_enabled
     );
-    Some(Arc::new(registry))
+    let arc_registry = Arc::new(registry);
+
+    if kafka_enabled {
+        let brokers = std::env::var("CHRONIK_MEMORY_KAFKA")
+            .unwrap_or_else(|_| "localhost:9092".to_string());
+        let group_id = std::env::var("CHRONIK_MEMORY_TENANTS_GROUP_ID")
+            .unwrap_or_else(|_| "chronik-memory-tenants-consumer".to_string());
+        let config = chronik_memory::ConsumerConfig::new(brokers.clone())
+            .with_group_id(group_id);
+        info!(
+            brokers = %brokers,
+            topic = chronik_memory::TENANTS_TOPIC,
+            "AM-2.5: spawning mem.tenants Kafka consumer for live tenant updates"
+        );
+        let _handle = chronik_memory::spawn_tenants_consumer(config, arc_registry.clone());
+        // JoinHandle intentionally dropped — the consumer retries forever
+        // on transient errors; server shutdown drops the whole runtime.
+    }
+
+    Some(arc_registry)
 }
 
 fn try_create_embedding_cache() -> Option<Arc<chronik_columnar::QueryEmbeddingCache>> {
