@@ -688,6 +688,25 @@ fn try_create_memory_index() -> Option<Arc<chronik_memory::MemoryIndex>> {
     Some(arc)
 }
 
+/// AM-3.4: Build the in-memory provenance-graph index backing
+/// `GET /memory/v1/{id}/lineage`. Enabled by
+/// `CHRONIK_MEMORY_LINEAGE_ENABLED=true`. The index hydrates
+/// lazily as callers observe records via a wire-up follow-up;
+/// today it starts empty and only surfaces memories fed to
+/// `LineageIndex::observe`. Suitable for smoke-testing the wire
+/// contract; automatic consumer hydration lands with the
+/// per-topic tail (same shape as `try_create_memory_index`).
+fn try_create_memory_lineage() -> Option<Arc<chronik_memory::LineageIndex>> {
+    let enabled = std::env::var("CHRONIK_MEMORY_LINEAGE_ENABLED")
+        .map(|v| v.to_lowercase() == "true" || v == "1")
+        .unwrap_or(false);
+    if !enabled {
+        return None;
+    }
+    info!("AM-3.4: lineage index enabled — starts empty, hydrate via observe()");
+    Some(Arc::new(chronik_memory::LineageIndex::new()))
+}
+
 fn memory_require_auth() -> bool {
     std::env::var("CHRONIK_MEMORY_REQUIRE_AUTH")
         .map(|v| v.to_lowercase() == "true" || v == "1")
@@ -1271,6 +1290,11 @@ async fn run_cluster_mode(
             unified_state = unified_state.with_memory_compaction(runner);
             info!("✓ Agent memory lifecycle controller wired (POST /memory/v1/compact)");
         }
+        // AM-3.4: opt-in lineage index for GET /memory/v1/{id}/lineage.
+        if let Some(idx) = try_create_memory_lineage() {
+            unified_state = unified_state.with_memory_lineage(idx);
+            info!("✓ Agent memory lineage index wired (GET /memory/v1/*/lineage)");
+        }
     }
     // VO-4: optional cross-encoder reranker for /_vector/*.
     if let Some(reranker) = try_create_reranker() {
@@ -1567,6 +1591,11 @@ async fn run_single_node_mode(
             if let Some(runner) = try_create_lifecycle_controller() {
                 unified_state = unified_state.with_memory_compaction(runner);
                 info!("✓ Agent memory lifecycle controller wired (POST /memory/v1/compact)");
+            }
+            // AM-3.4: opt-in lineage index for GET /memory/v1/{id}/lineage.
+            if let Some(idx) = try_create_memory_lineage() {
+                unified_state = unified_state.with_memory_lineage(idx);
+                info!("✓ Agent memory lineage index wired (GET /memory/v1/*/lineage)");
             }
         }
         // VO-4: optional cross-encoder reranker for /_vector/*.

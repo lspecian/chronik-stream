@@ -775,8 +775,16 @@ pub async fn metrics(State(state): State<UnifiedApiState>) -> impl IntoResponse 
         .as_ref()
         .map(|m| m.format_prometheus(None))
         .unwrap_or_else(|| {
+            // Empty-registry fallback still emits every family's
+            // HELP/TYPE headers so Prometheus scrapers see the shape.
             "# HELP memory_ops_total Total /memory/v1/* operations per tenant.\n\
-             # TYPE memory_ops_total counter\n"
+             # TYPE memory_ops_total counter\n\
+             # HELP memory_msgs_total Total memories touched (batch size for ingest, result count for recall).\n\
+             # TYPE memory_msgs_total counter\n\
+             # HELP memory_latency_seconds_sum Cumulative /memory/v1/* latency in seconds (Prometheus summary sum).\n\
+             # TYPE memory_latency_seconds_sum counter\n\
+             # HELP memory_latency_seconds_count Number of /memory/v1/* observations (Prometheus summary count).\n\
+             # TYPE memory_latency_seconds_count counter\n"
                 .to_string()
         });
     (
