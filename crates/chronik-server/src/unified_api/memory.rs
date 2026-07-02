@@ -160,6 +160,85 @@ fn check_rate_limit(
     }
 }
 
+/// AM-2.5 storage quota gate. Consults the per-tenant
+/// [`chronik_memory::StorageTracker`] against
+/// [`chronik_memory::TenantQuotas::storage_bytes`]. Returns `Ok(())`
+/// when the tracker or tenants registry is not wired (passthrough) or
+/// the caller has no matching tenant. Returns `413 Payload Too Large`
+/// with a descriptive body when the write would push the tenant over
+/// its cap.
+fn check_storage_quota(
+    state: &UnifiedApiState,
+    caller_tenant: Option<&str>,
+    estimated_bytes: u64,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let (Some(tracker), Some(tenants)) = (
+        state.memory_storage_tracker.as_ref(),
+        state.memory_tenants.as_ref(),
+    ) else {
+        return Ok(());
+    };
+    let Some(caller_tid) = caller_tenant else {
+        return Ok(());
+    };
+    let Some(tenant) = tenants.get(caller_tid) else {
+        return Ok(());
+    };
+    let limit = tenant.quotas.storage_bytes;
+    match tracker.try_reserve(caller_tid, estimated_bytes, limit) {
+        chronik_memory::StorageDecision::Allowed => Ok(()),
+        chronik_memory::StorageDecision::Denied {
+            used_bytes,
+            limit_bytes,
+            requested_bytes,
+        } => Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(ErrorResponse::new(
+                "storage_quota_exceeded",
+                format!(
+                    "tenant {caller_tid:?} would exceed storage quota: \
+                     used={used_bytes} + requested={requested_bytes} > \
+                     limit={limit_bytes}"
+                ),
+            )),
+        )),
+    }
+}
+
+/// AM-2.5 storage tracker bump. Adds the actual write size to the
+/// tenant's counter after a successful produce. No-op when the tracker
+/// is not wired.
+fn record_storage(state: &UnifiedApiState, caller_tenant: Option<&str>, bytes: u64) {
+    if bytes == 0 {
+        return;
+    }
+    if let (Some(tracker), Some(caller_tid)) =
+        (state.memory_storage_tracker.as_ref(), caller_tenant)
+    {
+        tracker.add(caller_tid, bytes);
+    }
+}
+
+/// AM-2.5 storage-quota byte estimator for ingest.
+///
+/// Sums `role.len() + content.len() + optional field lens` per turn and
+/// adds a small per-turn overhead constant to approximate Kafka framing
+/// + JSON envelope. **Estimation, not measurement** — good enough for
+/// quota gating; the tracker records the same estimate as "used" so
+/// callers see a consistent number.
+fn estimate_ingest_bytes(turns: &[TurnInput]) -> u64 {
+    const PER_TURN_OVERHEAD: u64 = 128;
+    turns
+        .iter()
+        .map(|t| {
+            let base = (t.role.len() + t.content.len()) as u64;
+            let channel = t.channel.as_deref().map(|s| s.len() as u64).unwrap_or(0);
+            let external_id = t.external_id.as_deref().map(|s| s.len() as u64).unwrap_or(0);
+            base + channel + external_id + PER_TURN_OVERHEAD
+        })
+        .sum()
+}
+
 /// AM-2.5 metrics helper. Increments the per-tenant counter (if the
 /// registry is wired). Uses `"anonymous"` when the caller sent no
 /// `X-Tenant-Id` header. Zero-cost when the registry is None.
@@ -296,6 +375,8 @@ pub async fn ingest(
         EndpointKind::Ingest,
         req.turns.len().max(1),
     )?;
+    let estimated_bytes = estimate_ingest_bytes(&req.turns);
+    check_storage_quota(&state, caller_tenant.as_deref(), estimated_bytes)?;
     let registry = require_registry(&state)?;
 
     if req.turns.is_empty() {
@@ -324,6 +405,13 @@ pub async fn ingest(
 
     let n = internal.len();
     let acks = mem.ingest_batch(internal).await.map_err(map_memory_error)?;
+    // Charge the tenant only for records that actually landed (dedup skips
+    // don't cost storage). Estimated at the average per-turn cost.
+    let accepted = acks.iter().filter(|a| !a.deduped).count();
+    if accepted > 0 && n > 0 {
+        let attributed = estimated_bytes.saturating_mul(accepted as u64) / (n as u64);
+        record_storage(&state, caller_tenant.as_deref(), attributed);
+    }
 
     let skipped = acks.iter().filter(|a| a.deduped).count();
     let response = IngestResponse {

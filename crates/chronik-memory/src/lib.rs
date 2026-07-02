@@ -112,6 +112,7 @@ pub mod tenants;
 pub mod tenants_consumer;
 pub mod tenants_metrics;
 pub mod tenants_rate_limit;
+pub mod tenants_storage;
 pub mod topics;
 pub mod wikilinks;
 pub mod worker;
@@ -155,6 +156,7 @@ pub use tenants_consumer::{
 };
 pub use tenants_metrics::{MetricEndpoint, MetricStatus, TenantMetrics};
 pub use tenants_rate_limit::{EndpointKind, RateDecision, RateLimiter, TokenBucket};
+pub use tenants_storage::{StorageDecision, StorageTracker, StorageUsage};
 pub use memory_index::{
     apply_event as apply_memory_index_event, parse_memory_record,
     spawn as spawn_memory_index_consumer, IndexConsumerConfig, IndexEvent, MemoryIndex,

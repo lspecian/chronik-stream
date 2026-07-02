@@ -201,6 +201,14 @@ pub struct UnifiedApiState {
     /// leak the [`chronik_memory::compaction::CompactionController`]
     /// embedder generic. When `None`, the endpoint returns 503.
     pub memory_compaction: Option<Arc<dyn chronik_memory::CompactionRunner>>,
+    /// AM-2.5: Per-tenant storage byte counter + quota gate. When
+    /// present AND [`Self::memory_tenants`] is populated, every write
+    /// consults the tracker via
+    /// [`StorageTracker::try_reserve`](chronik_memory::StorageTracker::try_reserve)
+    /// against the caller's `TenantQuotas.storage_bytes`. Writes over
+    /// quota get `413 Payload Too Large`. When either is `None`, writes
+    /// pass through without accounting.
+    pub memory_storage_tracker: Option<Arc<chronik_memory::StorageTracker>>,
 }
 
 impl UnifiedApiState {
@@ -235,6 +243,7 @@ impl UnifiedApiState {
             memory_index: None,
             memory_tenant_metrics: None,
             memory_compaction: None,
+            memory_storage_tracker: None,
         }
     }
 
@@ -317,6 +326,16 @@ impl UnifiedApiState {
         runner: Arc<dyn chronik_memory::CompactionRunner>,
     ) -> Self {
         self.memory_compaction = Some(runner);
+        self
+    }
+
+    /// AM-2.5: Attach the per-tenant storage byte counter. When missing,
+    /// writes are not accounted (passthrough).
+    pub fn with_memory_storage_tracker(
+        mut self,
+        tracker: Arc<chronik_memory::StorageTracker>,
+    ) -> Self {
+        self.memory_storage_tracker = Some(tracker);
         self
     }
 
