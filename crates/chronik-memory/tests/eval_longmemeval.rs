@@ -36,8 +36,8 @@ use chronik_memory::eval::longmemeval::{
 };
 use chronik_memory::extractor::Turn;
 use chronik_memory::{
-    extract_subject_candidates, synthesize_concept, AnthropicExtractor, ChainedExtractor, Memory,
-    MemoryType, PromptVersion, RuleExtractor,
+    extract_subject_candidates, synthesize_concept, AnthropicExtractor, ChainedExtractor, Extractor,
+    Memory, MemoryType, PromptVersion, RuleExtractor, TwoPassExtractor,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -261,14 +261,40 @@ async fn evaluate_longmemeval() {
     let mut total_judge_secs = 0.0_f64;
     let runner_t0 = Instant::now();
 
+    // AM-1.7 lever #1: chain TwoPassExtractor when LONGMEMEVAL_USE_TWO_PASS=1.
+    // This wraps the base AnthropicExtractor with an entity-scan + per-entity
+    // sweep pass, closing the single-session-assistant category that stays 0/3
+    // when the single-pass extractor misses assistant-stated facts.
+    let use_two_pass = std::env::var("LONGMEMEVAL_USE_TWO_PASS")
+        .ok()
+        .as_deref()
+        == Some("1");
+    if use_two_pass {
+        println!("TWO-PASS EXTRACTOR ENABLED — Anthropic entity-scan + per-entity sweep (lever #1)");
+    }
+
     for (i, item) in items.iter().enumerate() {
-        let ns = format!("longmemeval:{}:{}", item.question_id, Ulid::new());
+        // Override tenant via LONGMEMEVAL_TENANT so pilots can create fresh typed
+        // topics when a previous run left them in a bad state (e.g. after a
+        // cluster roll invalidates leader assignments).
+        let tenant = std::env::var("LONGMEMEVAL_TENANT")
+            .unwrap_or_else(|_| "longmemeval".to_string());
+        let ns = format!("{}:{}:{}", tenant, item.question_id, Ulid::new());
+        let base_pass1: Arc<dyn Extractor> = Arc::new(
+            AnthropicExtractor::new(api_key.clone())
+                .with_prompt_version(prompt_version),
+        );
+        let inner_extractor: Arc<dyn Extractor> = if use_two_pass {
+            Arc::new(
+                TwoPassExtractor::new(base_pass1, api_key.clone())
+                    .expect("build TwoPassExtractor"),
+            )
+        } else {
+            base_pass1
+        };
         let extractor = ChainedExtractor::new(vec![
             Arc::new(RuleExtractor::new()),
-            Arc::new(
-                AnthropicExtractor::new(api_key.clone())
-                    .with_prompt_version(prompt_version),
-            ),
+            inner_extractor,
         ]);
         let mem = Memory::builder()
             .chronik_kafka(kafka.clone())

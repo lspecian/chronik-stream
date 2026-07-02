@@ -425,7 +425,29 @@ Three structural gaps identified at Pilot 7:
 
 See **Appendix B** for the empirical evidence that supports these three; gated under standing directive *"no Phase 3 work until LongMemEval ≥ 0.70"*.
 
-**Validation plan**: pilot 8 = V3 + multi-channel + synthesis + `_abs`-aware judge + anti-abstention + intent boost. Expected lift comes from numeric items 4 / 10 and temporal items 12 / 14 moving up the RRF order. Cost: ~$2 + ~75 min against a live cluster.
+### Pilot 8–11 results (2026-07-02): 0.611 is an architectural ceiling
+
+After Pilot 7's 0.556, four levers were built and measured against the Thunderbird K8s cluster:
+
+| Pilot | Config | synth_judge | Δ vs pilot 7 | Verdict |
+|-------|--------|-------------|--------------|---------|
+| **8** | Pilot 7 + numeric intent boost + temporal intent boost (levers #2 + #3) | **0.611** | +0.056 | **new headline — real lift on items 4, 5, 6, 7** |
+| 9 | Pilot 8 + TwoPassExtractor (lever #1) | 0.500 (contaminated; ~0.556 clean) | 0.000 | no lift; 2× extraction cost. Extractor DID find more entity facts (item 2 n_results 1→5) but synthesizer still abstains on assistant-stated targets. |
+| 10 | Pilot 8 + v2 synthesis prompt ("commit to assistant-stated facts + single-clear-candidate wins") | 0.556 halfway; killed | –0.056 | v2's aggressive "commit" instruction *broke `_abs` items* (item 9 flipped from correct-abstain HIT to wrong-commit miss). |
+| **11** | Pilot 8 + BGE-reranker-v2-m3 (GPU-served, Cohere-compatible) | **0.389** | **–0.222** | worst of all. Cross-encoder demoted answer-carrying memories in favor of topically-similar ones. knowledge-update: 3/3 → 2/3; single-session-user: 3/3 → 1/3. |
+
+**Conclusion**: **0.611 is a real architectural ceiling** with the current stack (Claude Haiku 4.5 extractor + BM25/vector recall + Haiku synthesis). Three orthogonal levers — extraction, ranking, synthesis-prompt, and reranking — all failed to lift it, and reranking regressed it substantially. The remaining 0.089 gap to Phase 2's 0.70 gate requires something *structurally* different (a stronger extractor like Sonnet or GPT-4, fine-tuning on the LongMemEval training set, or multi-hop query decomposition).
+
+**Decision**: publish 0.611 as our number, treat the gate to 0.70 as blocked by *fundamental architecture choices* not *tuning*, and unblock Phase 2 work on the "ceiling" side. Phase 3 gate remains at ≥ 0.70; we accept it will stay blocked until we invest in a stronger extractor or a fine-tuned reranker specific to memory retrieval.
+
+**Kept as opt-in infrastructure** (built cleanly, no code rot, low future risk):
+- `chronik_memory::TwoPassExtractor` — wraps any Extractor
+- `CHRONIK_MEMORY_SYNTH_PROMPT=v2` env-gated alternate synthesis prompt
+- `CHRONIK_MEMORY_RECALL_RERANK=1` env-gated `rerank: true` opt-in on vector fan-out
+- `chronik-server` main.rs `try_create_reranker()` bootstrap (CHRONIK_RERANKER_ENDPOINT / MODEL / API_KEY env vars)
+- BGE-reranker-v2-m3 K8s manifest at [`deploy/agent-memory/bge-reranker.yaml`](../deploy/agent-memory/bge-reranker.yaml) — GPU-backed, Cohere-compatible via michaelf34/infinity
+
+Any of these can be re-enabled cheaply if a future architecture shift makes them worthwhile.
 
 ---
 

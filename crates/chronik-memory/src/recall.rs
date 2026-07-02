@@ -787,11 +787,23 @@ async fn run_vector(
     query: String,
     fanout: usize,
 ) -> Result<Vec<TypedLoc>> {
+    // Opt-in cross-encoder reranking. When `CHRONIK_MEMORY_RECALL_RERANK=1`
+    // is set, ask the vector endpoint to overretrieve and rerank via the
+    // configured reranker (VO-4). The server-side reranker falls back to
+    // no-op when no endpoint is configured, so this is safe to leave on.
+    let rerank_enabled = std::env::var("CHRONIK_MEMORY_RECALL_RERANK")
+        .ok()
+        .as_deref()
+        == Some("1");
     let mut futures = Vec::with_capacity(types.len());
     for ty in types {
         let topic = layout.typed(*ty);
         let url = format!("{api}/_vector/{topic}/search");
-        let body = serde_json::json!({"query": query, "k": fanout});
+        let body = if rerank_enabled {
+            serde_json::json!({"query": query, "k": fanout, "rerank": true})
+        } else {
+            serde_json::json!({"query": query, "k": fanout})
+        };
         let topic_owned = topic.clone();
         let http_owned = http.clone();
         futures.push(async move {
@@ -1027,6 +1039,18 @@ fn render_memory_for_synthesis(m: &MemoryRecord) -> String {
 /// can detect it via `SynthesizedAnswer::abstained` and avoid surfacing
 /// hallucinated answers.
 fn build_synthesis_prompt(question: &str, memories: &[RecallResult]) -> String {
+    // Env-gated A/B: `CHRONIK_MEMORY_SYNTH_PROMPT=v2` selects the
+    // assistant-fact-committing variant (Option B from the LongMemEval pilot
+    // ladder). Default stays v1 so measurements against the pilot-7/8 baseline
+    // aren't disturbed unless the operator explicitly opts in.
+    match std::env::var("CHRONIK_MEMORY_SYNTH_PROMPT").as_deref() {
+        Ok("v2") => build_synthesis_prompt_v2(question, memories),
+        _ => build_synthesis_prompt_v1(question, memories),
+    }
+}
+
+/// v1 — original pilot-7 anti-abstention prompt. Kept for baseline comparison.
+fn build_synthesis_prompt_v1(question: &str, memories: &[RecallResult]) -> String {
     let mut bullets = String::new();
     for (i, r) in memories.iter().enumerate() {
         let line = render_memory_for_synthesis(&r.memory);
@@ -1042,6 +1066,44 @@ Rules:\n\
 - **Temporal questions** (\"how long ago\", \"how many days\", \"when did I last\"): reason from memory timestamps and any time-anchored content (a memory dated 2026-04-01 about an event implies \"~four weeks ago\" relative to the recent memories). Output the duration / date naturally (\"four weeks\", \"about two hours\", \"over a year\").\n\
 - Be concise — one sentence whenever possible. No preamble, no \"Based on the memories...\", just the answer.\n\
 - **Abstain only when no relevant memory exists.** Reply EXACTLY: {ABSTAIN_LITERAL} if (and only if) the memories carry nothing that could plausibly answer the question even after computation or temporal reasoning. Don't abstain just because the answer requires combining facts — that's the job.\n\
+\n\
+Memories (relevance order, with timestamps):\n\
+{bullets}\n\
+Question: {question}\n\
+\n\
+Answer:"
+    )
+}
+
+/// v2 — commits to assistant-stated facts (Option B).
+///
+/// Pilot 8/9 diagnosis: `single-session-assistant` items stayed 0/3 not because
+/// extraction missed the facts (pilot 9's TwoPassExtractor confirmed the facts
+/// DO reach recall) but because the synthesizer refused to commit to them when
+/// the user hadn't explicitly restated the assistant's statement. This variant
+/// tells the model that assistant-stated facts the user was present for are
+/// authoritative and should be committed to.
+///
+/// It also tightens the "single clear candidate" case: when exactly one memory
+/// plausibly answers the question, commit rather than hedge.
+fn build_synthesis_prompt_v2(question: &str, memories: &[RecallResult]) -> String {
+    let mut bullets = String::new();
+    for (i, r) in memories.iter().enumerate() {
+        let line = render_memory_for_synthesis(&r.memory);
+        bullets.push_str(&format!("[{}] {}\n", i + 1, line));
+    }
+    format!(
+        "You are a precise question-answering assistant working with an agent's long-term memory. \
+Answer the user's question using ONLY the provided memories.\n\
+\n\
+Rules:\n\
+- When two memories conflict (e.g. an updated preference, a changed budget), prefer the one with the most recent timestamp.\n\
+- **Assistant-stated facts count.** These memories were extracted from a conversation the user was present for. If a memory records the assistant naming, describing, recommending, or quantifying something — a person's clothing, a place, a food, a brand, a duration, a count — and the user did not object in a later turn, treat that as a settled fact. Commit to it. Do NOT abstain because the user did not restate it.\n\
+- **One clear candidate wins.** If the retrieved memories contain exactly one fact that plausibly answers the question, commit to it. Do NOT abstain because you are not 100% certain — abstention costs more than a specific answer in this task.\n\
+- **Arithmetic questions** (\"how many\", \"total\", \"sum\", \"average\", \"how much\"): if you see ANY value-bearing memories — counts, durations, dollar amounts, quantities — even just two of them, COMPUTE the aggregate from those values. Return only the computed value (e.g. \"$720\", \"3\", \"four weeks\"). Show the arithmetic only if asked.\n\
+- **Temporal questions** (\"how long ago\", \"how many days\", \"when did I last\"): reason from memory timestamps and any time-anchored content. Output the duration / date naturally (\"four weeks\", \"about two hours\", \"over a year\").\n\
+- Be concise — one sentence whenever possible. No preamble, no \"Based on the memories...\", just the answer.\n\
+- **Abstain only when NO retrieved memory is topically relevant.** Reply EXACTLY: {ABSTAIN_LITERAL} only if every listed memory is clearly unrelated to the question. Do NOT abstain when memories touch the topic but require you to commit to a specific value, entity, or fact — committing IS the job.\n\
 \n\
 Memories (relevance order, with timestamps):\n\
 {bullets}\n\

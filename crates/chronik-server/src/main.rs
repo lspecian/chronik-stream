@@ -626,6 +626,40 @@ fn memory_require_auth() -> bool {
         .unwrap_or(false)
 }
 
+/// VO-4 wire-up: build a cross-encoder reranker from environment variables.
+///
+/// Reads:
+/// - `CHRONIK_RERANKER_ENDPOINT` — HTTP endpoint for a Cohere-compatible
+///   reranker (BAAI/bge, Cohere Rerank, Jina, Voyage, self-hosted infinity/TEI).
+///   When unset, the reranker is disabled (`/_vector/*` requests with
+///   `rerank: true` fall back to first-pass ranking).
+/// - `CHRONIK_RERANKER_MODEL` — model name sent in the request body
+///   (default: `bge-reranker-v2-m3`). For self-hosted single-model servers
+///   the value is informational; for Cohere API it must match a valid model id.
+/// - `CHRONIK_RERANKER_API_KEY` — sent as `Bearer` token. Empty or unset =
+///   no auth header (fine for in-cluster private services).
+fn try_create_reranker(
+) -> Option<Arc<dyn chronik_embeddings::reranker::RerankerProvider>> {
+    let endpoint = std::env::var("CHRONIK_RERANKER_ENDPOINT").ok()?;
+    if endpoint.trim().is_empty() {
+        return None;
+    }
+    let model = std::env::var("CHRONIK_RERANKER_MODEL")
+        .unwrap_or_else(|_| "bge-reranker-v2-m3".to_string());
+    let api_key = std::env::var("CHRONIK_RERANKER_API_KEY")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    info!(
+        "VO-4: Reranker enabled (endpoint={}, model={}, auth={})",
+        endpoint,
+        model,
+        if api_key.is_some() { "yes" } else { "no" }
+    );
+    Some(Arc::new(
+        chronik_embeddings::reranker::ExternalReranker::new(endpoint, model, api_key),
+    ))
+}
+
 /// AM-2.5: Build the tenant registry from `CHRONIK_MEMORY_TENANTS` env var.
 /// Returns `None` when no tenants are configured (handlers stay in
 /// passthrough mode). Production deployments will replace this with a
@@ -1004,6 +1038,11 @@ async fn run_cluster_mode(
             info!("✓ Agent memory tenant registry wired (full auth enabled)");
         }
     }
+    // VO-4: optional cross-encoder reranker for /_vector/*.
+    if let Some(reranker) = try_create_reranker() {
+        unified_state = unified_state.with_reranker(reranker);
+        info!("✓ Reranker wired into Unified API (/_vector/*)");
+    }
     // Distributed query router for cluster-mode scatter-gather fan-out
     let query_router = Arc::new(unified_api::query_router::QueryRouter::new(&init_config.cluster_config));
     unified_state = unified_state.with_query_router(query_router.clone());
@@ -1273,6 +1312,11 @@ async fn run_single_node_mode(
                 unified_state = unified_state.with_memory_tenants(tenants);
                 info!("✓ Agent memory tenant registry wired (full auth enabled)");
             }
+        }
+        // VO-4: optional cross-encoder reranker for /_vector/*.
+        if let Some(reranker) = try_create_reranker() {
+            unified_state = unified_state.with_reranker(reranker);
+            info!("✓ Reranker wired into Unified API (/_vector/*)");
         }
         #[cfg(feature = "search")]
         if let Some(api) = search_api_ref {
