@@ -17,6 +17,25 @@
 //!   ANTHROPIC_API_KEY=... CHRONIK_INTEGRATION=1 \
 //!   CHRONIK_API=http://localhost:6094 CHRONIK_KAFKA=localhost:9094 \
 //!   cargo test -p chronik-memory --test eval_longmemeval -- --ignored --nocapture
+//!
+//! # Full 500-item pass split across 10 parallel processes (each runs 50):
+//! LONGMEMEVAL_PATH=/path/to/longmemeval_s.jsonl \
+//!   LONGMEMEVAL_N=50 LONGMEMEVAL_SHARDS=10 LONGMEMEVAL_SHARD_INDEX=0 \
+//!   ANTHROPIC_API_KEY=... CHRONIK_INTEGRATION=1 \
+//!   cargo test -p chronik-memory --test eval_longmemeval -- --ignored --nocapture
+//! # ... repeat with SHARD_INDEX=1,2,...,9 in parallel; aggregate per-shard reports.
+//!
+//! # Just the temporal category (reproducing a regression):
+//! LONGMEMEVAL_CATEGORIES=temporal,temporal-reasoning \
+//!   LONGMEMEVAL_PATH=/path/to/longmemeval_s.jsonl \
+//!   ANTHROPIC_API_KEY=... CHRONIK_INTEGRATION=1 \
+//!   cargo test -p chronik-memory --test eval_longmemeval -- --ignored --nocapture
+//!
+//! # Skip specific known-broken items while everything else runs:
+//! LONGMEMEVAL_SKIP_ITEMS=q0042,q0057 \
+//!   LONGMEMEVAL_PATH=/path/to/longmemeval_s.jsonl \
+//!   ANTHROPIC_API_KEY=... CHRONIK_INTEGRATION=1 \
+//!   cargo test -p chronik-memory --test eval_longmemeval -- --ignored --nocapture
 //! ```
 //!
 //! The dataset is published at <https://github.com/xiaowu0162/LongMemEval>
@@ -78,6 +97,101 @@ fn turns_per_batch() -> usize {
         .unwrap_or(50)
 }
 
+/// Sharding for parallel execution: split the dataset into
+/// `LONGMEMEVAL_SHARDS` disjoint slices and run only shard
+/// `LONGMEMEVAL_SHARD_INDEX` in this process (0-indexed). Items are
+/// assigned round-robin so every shard sees a comparable category mix.
+/// Defaults `(1, 0)` → the whole dataset, no sharding.
+fn shard_config() -> (usize, usize) {
+    let shards = std::env::var("LONGMEMEVAL_SHARDS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(1);
+    let index = std::env::var("LONGMEMEVAL_SHARD_INDEX")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
+    (shards, index.min(shards.saturating_sub(1)))
+}
+
+/// Optional comma-separated allow-list of `question_type` values to
+/// keep — everything else is filtered out. Useful for reproducing a
+/// regression in one category without paying for the full 500-item pass.
+/// Empty / unset = no filter.
+fn category_filter() -> Option<Vec<String>> {
+    let raw = std::env::var("LONGMEMEVAL_CATEGORIES").ok()?;
+    let cats: Vec<String> = raw
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if cats.is_empty() {
+        None
+    } else {
+        Some(cats)
+    }
+}
+
+/// Optional comma-separated skip-list of `question_id` values —
+/// e.g. `LONGMEMEVAL_SKIP_ITEMS=q0042,q0057` to work around known-broken
+/// items while the rest of the dataset runs. Empty / unset = no skips.
+fn skip_list() -> std::collections::HashSet<String> {
+    std::env::var("LONGMEMEVAL_SKIP_ITEMS")
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Apply category filter, skip list, and shard slicing to the raw
+/// dataset. Returns the subset the caller should evaluate.
+///
+/// Ordering: (a) categories filtered → (b) skip-list applied → (c)
+/// shard slicing (round-robin) → (d) `LONGMEMEVAL_N` cap. This means
+/// `LONGMEMEVAL_N=10` under a 3-shard split gives 10 *per shard*, so
+/// each parallel process runs the same fixed amount of work.
+///
+/// Non-shard callers pass `(1, 0)` and get the whole (filtered) set
+/// with the `LONGMEMEVAL_N` cap applied — identical to the pre-refactor
+/// behaviour when no shard / filter env vars are set.
+fn select_items<'a>(
+    all: &'a [LongMemEvalItem],
+    shards: usize,
+    shard_index: usize,
+    n_cap: usize,
+    categories: Option<&[String]>,
+    skips: &std::collections::HashSet<String>,
+) -> Vec<&'a LongMemEvalItem> {
+    let mut filtered: Vec<&LongMemEvalItem> = all
+        .iter()
+        .filter(|item| {
+            if let Some(cats) = categories {
+                if !cats.iter().any(|c| c == &item.question_type) {
+                    return false;
+                }
+            }
+            if skips.contains(&item.question_id) {
+                return false;
+            }
+            true
+        })
+        .collect();
+    if shards > 1 {
+        filtered = filtered
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| i % shards == shard_index)
+            .map(|(_, item)| item)
+            .collect();
+    }
+    filtered.into_iter().take(n_cap).collect()
+}
+
 fn item_to_turns(item: &LongMemEvalItem) -> Vec<Turn> {
     let mut turns = Vec::new();
     for session in &item.haystack_sessions {
@@ -129,12 +243,38 @@ async fn evaluate_longmemeval() {
     let raw = std::fs::read_to_string(&path).expect("read dataset");
     let all_items = parse_jsonl(&raw).expect("parse dataset");
     let n_total = all_items.len();
-    let n_run = item_limit().min(n_total);
-    let items: Vec<&LongMemEvalItem> = all_items.iter().take(n_run).collect();
+    let n_cap = item_limit();
+    let (shards, shard_index) = shard_config();
+    let categories = category_filter();
+    let skips = skip_list();
+    let items: Vec<&LongMemEvalItem> = select_items(
+        &all_items,
+        shards,
+        shard_index,
+        n_cap,
+        categories.as_deref(),
+        &skips,
+    );
+    let n_run = items.len();
     println!(
         "\nLongMemEval — running {} / {} items from {:?}",
         n_run, n_total, path
     );
+    if shards > 1 {
+        println!(
+            "  shard {}/{} (LONGMEMEVAL_SHARDS={}, LONGMEMEVAL_SHARD_INDEX={})",
+            shard_index + 1,
+            shards,
+            shards,
+            shard_index
+        );
+    }
+    if let Some(cats) = &categories {
+        println!("  category filter: {}", cats.join(","));
+    }
+    if !skips.is_empty() {
+        println!("  skip list ({}): {:?}", skips.len(), skips);
+    }
 
     let kafka =
         std::env::var("CHRONIK_KAFKA").unwrap_or_else(|_| "localhost:9092".to_string());
@@ -681,4 +821,177 @@ async fn evaluate_longmemeval() {
         "all {} items missed — extraction or recall is broken (not a quality gate)",
         n_total_runs
     );
+}
+
+// ─────────────────────────────────────────────────────────────
+// Unit tests for the selector — these run under `cargo test` even
+// without `--ignored`, so shard/filter logic is protected by CI.
+// ─────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod selector_tests {
+    use super::*;
+    use chronik_memory::eval::longmemeval::LongMemEvalItem;
+    use std::collections::HashSet;
+
+    fn make_item(id: &str, qtype: &str) -> LongMemEvalItem {
+        LongMemEvalItem {
+            question_id: id.into(),
+            question_type: qtype.into(),
+            question: format!("q for {id}"),
+            answer: "gold".into(),
+            haystack_sessions: vec![],
+            answer_session_ids: Vec::new(),
+        }
+    }
+
+    fn corpus() -> Vec<LongMemEvalItem> {
+        vec![
+            make_item("q0", "single-session-user"),
+            make_item("q1", "single-session-assistant"),
+            make_item("q2", "temporal"),
+            make_item("q3", "knowledge-update"),
+            make_item("q4", "single-session-user"),
+            make_item("q5", "temporal"),
+            make_item("q6", "multi-session"),
+            make_item("q7", "temporal-abs"),
+            make_item("q8", "single-session-user"),
+        ]
+    }
+
+    #[test]
+    fn no_filter_no_shard_returns_full_dataset_up_to_cap() {
+        let items = corpus();
+        let skips = HashSet::new();
+        let picked = select_items(&items, 1, 0, usize::MAX, None, &skips);
+        assert_eq!(picked.len(), items.len());
+    }
+
+    #[test]
+    fn n_cap_takes_first_n() {
+        let items = corpus();
+        let skips = HashSet::new();
+        let picked = select_items(&items, 1, 0, 3, None, &skips);
+        assert_eq!(picked.len(), 3);
+        assert_eq!(picked[0].question_id, "q0");
+        assert_eq!(picked[2].question_id, "q2");
+    }
+
+    #[test]
+    fn category_filter_keeps_only_matching_types() {
+        let items = corpus();
+        let skips = HashSet::new();
+        let cats = vec!["temporal".to_string()];
+        let picked = select_items(&items, 1, 0, usize::MAX, Some(&cats), &skips);
+        assert_eq!(picked.len(), 2);
+        assert!(picked.iter().all(|i| i.question_type == "temporal"));
+    }
+
+    #[test]
+    fn multi_category_filter_is_union() {
+        let items = corpus();
+        let skips = HashSet::new();
+        let cats = vec!["temporal".to_string(), "multi-session".to_string()];
+        let picked = select_items(&items, 1, 0, usize::MAX, Some(&cats), &skips);
+        assert_eq!(picked.len(), 3, "2 temporal + 1 multi-session");
+    }
+
+    #[test]
+    fn skip_list_removes_named_items() {
+        let items = corpus();
+        let skips: HashSet<String> = ["q0", "q4"].iter().map(|s| s.to_string()).collect();
+        let picked = select_items(&items, 1, 0, usize::MAX, None, &skips);
+        assert_eq!(picked.len(), 7);
+        assert!(picked.iter().all(|i| i.question_id != "q0"
+            && i.question_id != "q4"));
+    }
+
+    #[test]
+    fn shard_slices_round_robin_and_is_deterministic() {
+        let items = corpus();
+        let skips = HashSet::new();
+        let shard0 = select_items(&items, 3, 0, usize::MAX, None, &skips);
+        let shard1 = select_items(&items, 3, 1, usize::MAX, None, &skips);
+        let shard2 = select_items(&items, 3, 2, usize::MAX, None, &skips);
+        assert_eq!(shard0.len(), 3, "9 items / 3 shards = 3 each");
+        assert_eq!(shard1.len(), 3);
+        assert_eq!(shard2.len(), 3);
+        // Round-robin: shard k gets indexes {k, k+shards, k+2*shards, ...}
+        assert_eq!(shard0[0].question_id, "q0");
+        assert_eq!(shard0[1].question_id, "q3");
+        assert_eq!(shard0[2].question_id, "q6");
+        assert_eq!(shard1[0].question_id, "q1");
+        assert_eq!(shard2[0].question_id, "q2");
+        // All shards union = full dataset, no overlap.
+        let mut all: Vec<String> = shard0
+            .iter()
+            .chain(shard1.iter())
+            .chain(shard2.iter())
+            .map(|i| i.question_id.clone())
+            .collect();
+        all.sort();
+        let mut expected: Vec<String> = corpus().iter().map(|i| i.question_id.clone()).collect();
+        expected.sort();
+        assert_eq!(all, expected);
+    }
+
+    #[test]
+    fn shard_with_n_cap_applies_per_shard() {
+        let items = corpus();
+        let skips = HashSet::new();
+        // 9 items, 3 shards, cap 2 → each shard runs at most 2.
+        let shard0 = select_items(&items, 3, 0, 2, None, &skips);
+        assert_eq!(shard0.len(), 2, "N cap applies AFTER shard slicing");
+    }
+
+    #[test]
+    fn category_filter_and_shard_compose() {
+        let items = corpus();
+        let skips = HashSet::new();
+        let cats = vec!["single-session-user".to_string()];
+        // 3 items match, split across 2 shards.
+        let shard0 = select_items(&items, 2, 0, usize::MAX, Some(&cats), &skips);
+        let shard1 = select_items(&items, 2, 1, usize::MAX, Some(&cats), &skips);
+        assert_eq!(shard0.len() + shard1.len(), 3);
+        // The union of shards under the filter equals the filter output.
+        let mut combined: Vec<String> = shard0
+            .iter()
+            .chain(shard1.iter())
+            .map(|i| i.question_id.clone())
+            .collect();
+        combined.sort();
+        assert_eq!(combined, vec!["q0", "q4", "q8"]);
+    }
+
+    #[test]
+    fn skip_list_and_category_and_shard_compose() {
+        let items = corpus();
+        let skips: HashSet<String> = ["q0"].iter().map(|s| s.to_string()).collect();
+        let cats = vec!["single-session-user".to_string()];
+        // Match "single-session-user" AND not in skips → q4, q8.
+        let picked = select_items(&items, 1, 0, usize::MAX, Some(&cats), &skips);
+        let ids: Vec<String> = picked.iter().map(|i| i.question_id.clone()).collect();
+        assert_eq!(ids, vec!["q4".to_string(), "q8".to_string()]);
+    }
+
+    #[test]
+    fn empty_dataset_returns_empty_regardless_of_filters() {
+        let items: Vec<LongMemEvalItem> = Vec::new();
+        let skips = HashSet::new();
+        assert!(select_items(&items, 1, 0, 100, None, &skips).is_empty());
+        assert!(select_items(&items, 4, 2, 100, Some(&["x".into()]), &skips).is_empty());
+    }
+
+    #[test]
+    fn shard_index_clamped_by_config_helper() {
+        // shard_config() clamps: passing SHARD_INDEX >= SHARDS should
+        // return the last valid shard.
+        std::env::set_var("LONGMEMEVAL_SHARDS", "3");
+        std::env::set_var("LONGMEMEVAL_SHARD_INDEX", "5");
+        let (shards, index) = shard_config();
+        assert_eq!(shards, 3);
+        assert_eq!(index, 2, "out-of-range index clamps to last shard");
+        std::env::remove_var("LONGMEMEVAL_SHARDS");
+        std::env::remove_var("LONGMEMEVAL_SHARD_INDEX");
+    }
 }

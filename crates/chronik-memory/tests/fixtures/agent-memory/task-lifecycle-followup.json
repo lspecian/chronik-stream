@@ -1,0 +1,46 @@
+{
+  "name": "task-lifecycle-followup",
+  "description": "User creates a follow-up task, agent confirms, later user marks it done. Exercises Task memory type + state transition. Calibrated for AnthropicExtractor v3.",
+  "conversation": [
+    {
+      "role": "user",
+      "content": "Remind me to call the contractor about the Lapa apartment quote next Tuesday morning.",
+      "ts": "2026-05-04T09:15:00Z"
+    },
+    {
+      "role": "assistant",
+      "content": "Got it — I've noted a reminder to call the contractor about the Lapa quote for Tuesday morning.",
+      "ts": "2026-05-04T09:15:20Z"
+    },
+    {
+      "role": "user",
+      "content": "Actually done — I called them this morning, waiting on the revised quote.",
+      "ts": "2026-05-06T11:40:00Z"
+    }
+  ],
+  "expected_memories": [
+    {
+      "type": "task",
+      "source_indexes": [0],
+      "min_confidence": 0.7
+    },
+    {
+      "type": "fact",
+      "subject_predicate": ["user", "waiting_on"],
+      "source_indexes": [2],
+      "min_confidence": 0.5
+    }
+  ],
+  "recall_queries": [
+    {
+      "query": "what pending tasks does this user have",
+      "expected_keys": [],
+      "k": 5
+    },
+    {
+      "query": "did the user hear back from the contractor",
+      "expected_keys": [],
+      "k": 5
+    }
+  ]
+}

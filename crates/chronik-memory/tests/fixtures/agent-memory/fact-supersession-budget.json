@@ -1,0 +1,44 @@
+{
+  "name": "fact-supersession-budget",
+  "description": "User states a budget, later revises it upward. Two Fact envelopes on the same (subject, predicate) key — the second must supersede the first by (namespace|subject|predicate) compaction key. Recall must return the revised value.",
+  "conversation": [
+    {
+      "role": "user",
+      "content": "My ceiling for the Lapa apartment is 750,000 EUR.",
+      "ts": "2026-05-01T10:00:00Z"
+    },
+    {
+      "role": "assistant",
+      "content": "Noted — targeting listings up to 750k in Lapa.",
+      "ts": "2026-05-01T10:00:15Z"
+    },
+    {
+      "role": "user",
+      "content": "Actually I can stretch to 820k if the finish is worth it.",
+      "ts": "2026-05-03T14:22:00Z"
+    }
+  ],
+  "expected_memories": [
+    {
+      "type": "fact",
+      "key": "user|budget_ceiling",
+      "subject_predicate": ["user", "budget_ceiling"],
+      "source_indexes": [0],
+      "min_confidence": 0.7
+    },
+    {
+      "type": "fact",
+      "key": "user|budget_ceiling",
+      "subject_predicate": ["user", "budget_ceiling"],
+      "source_indexes": [2],
+      "min_confidence": 0.7
+    }
+  ],
+  "recall_queries": [
+    {
+      "query": "what is this user's budget for the Lapa apartment",
+      "expected_keys": ["user|budget_ceiling"],
+      "k": 3
+    }
+  ]
+}
