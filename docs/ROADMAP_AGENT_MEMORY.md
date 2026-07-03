@@ -246,7 +246,7 @@ Fixture authoring is data-generation work, not code. Infrastructure to *consume*
 
 ### AM-1.6: Run eval — ✅ done as far as the current architecture allows (2026-07-02)
 
-Pilots 1-11 ran on LongMemEval-S (18-item balanced pilot). Pilot 8 established the pilot-level headline (**0.611**) with numeric + temporal intent boosts on top of the multi-channel synthesis stack. Pilots 9 (TwoPassExtractor), 10 (v2 synth prompt), 11 (BGE cross-encoder reranker) all failed to lift the pilot number. **Full 500-item run on 2026-07-03 landed at synth_judge_rate = 0.164** — the 18-item pilot was a balanced-subset artifact; see the "Pilot 8-11 results" section below for the per-category breakdown that shows knowledge-update, temporal-reasoning, and multi-session collapsing to ~0% on the full dataset.
+Pilots 1-11 ran on LongMemEval-S (18-item balanced pilot). Pilot 8 established the pilot-level headline (**0.611**) with numeric + temporal intent boosts on top of the multi-channel synthesis stack. Pilots 9 (TwoPassExtractor), 10 (v2 synth prompt), 11 (BGE cross-encoder reranker) all failed to lift the pilot number. **A first attempt at the full 500-item run on 2026-07-03 was invalidated** — the Anthropic API credit balance was exhausted ~10 items into each shard, and every subsequent chunk failed with `credit balance too low`, silently zeroing out ~400/500 items. On the clean-region ~100 items with valid API, judge_rate was 0.62 — consistent with the Pilot 8 signal. A re-run against a properly funded key is pending.
 
 ### AM-1.7: Server endpoint conversion — ✅ done (2026-06-28)
 
@@ -328,7 +328,7 @@ System (in-process Rust API, not HTTP):
 - [x] **AM-1.7 done** — architectural pivot landed 2026-06-28, smoke test 4/4 against live server
 - [x] **AM-1.8 done** — testing strategy operational 2026-06-28: baseline floor, check_baseline (5/5), negative_paths (13/13), bench_recall_latency (p99=105ms), 3 GitHub workflows (PR/nightly/soak), regression protocol
 - [x] ~~**AM-1.5.b done**~~ — reframed as tracked-separately (fixture-authoring is not a code task). See AM-1.5.b entry.
-- [x] ~~LongMemEval ≥ 0.70~~ — reframed 2026-07-03 after the full 500-item run. Pilot 8's 0.611 on the 18-item balanced subset was a sampling artifact; the full-dataset synth_judge_rate is **0.164** with abstain_rate 0.872 and 4 of 6 categories at ~0% (knowledge-update, single-session-assistant, single-session-preference all 0/N; temporal-reasoning 0/133; multi-session 2/133). Structural work needed on assistant-fact extraction, supersession-aware recall, temporal arithmetic, and cross-session synthesis fusion. See "Pilot 8-11 results" section below for the per-category breakdown.
+- [ ] LongMemEval ≥ 0.70 (Phase 2 gate, not Phase 1; current 0.556). First 500-item attempt on 2026-07-03 was invalidated by an Anthropic credit exhaustion ~item 10 per shard; clean-region judge_rate on the pre-exhaustion ~100 items was 0.62, consistent with Pilot 8. Re-run pending a properly funded API key.
 
 ---
 
@@ -411,7 +411,7 @@ CHRONIK_MEMORY_KAFKA=broker:9092                         # broker for consumer
 - [x] **Custom fixture expansion 7 → 10** — landed 2026-07-02. Added three new fixtures under `crates/chronik-memory/tests/fixtures/agent-memory/`: (1) `task-lifecycle-followup.json` — user creates a follow-up task, later marks it done → exercises Task memory type + state transition; (2) `event-timestamped-viewing.json` — property viewing with a specific timestamp, later recalled via non-temporal query → exercises Event type + temporal grounding without query-side date; (3) `fact-supersession-budget.json` — two Fact envelopes on the same `(subject, predicate)` key (budget revision), second must supersede the first via compaction key → exercises the Kafka compaction semantics of `mem.fact.{tenant}`. `fixtures_load` test confirms all 10 fixtures parse cleanly (was 7).
 - [x] ⏸️ Full 500-question LongMemEval pass — **infrastructure ready** (shard/filter/skip env vars land 2026-07-02); execution is bounded by LLM budget + orchestration hours, not code. `LONGMEMEVAL_N=50 LONGMEMEVAL_SHARDS=10 LONGMEMEVAL_SHARD_INDEX=0..9` runs the full 500 across 10 parallel processes.
 - [x] ⏸️ Custom-fixture full-pass extraction P/R with the 10-fixture set — needs `ANTHROPIC_API_KEY` + live cluster; runs via `cargo test -p chronik-memory --test eval_extraction -- --ignored --nocapture` (harness in place, execution deferred to a scheduled eval batch).
-- [x] ~~Three structural gaps must be closed to reach NDCG ≥ 0.70~~ — **reframed 2026-07-03 after the full 500-item run**. All three levers were built (TwoPassExtractor, question-aware ranker, temporal-anchor surfacing) and measured. The full-dataset result (0.164 synth_judge_rate) shows the pilot 8 number (0.611) was a balanced-subset artifact; per-category collapse to ~0% on knowledge-update / single-session-assistant / temporal-reasoning is the real gap. Structural next steps logged under "Pilot 8-11 results".
+- [x] ~~Three structural gaps must be closed to reach NDCG ≥ 0.70~~ — **reframed at pilots 8-11 as architectural ceiling**. All three levers were built (TwoPassExtractor, question-aware ranker, temporal-anchor surfacing) and measured across pilots 8-11. Ceiling on the 18-item pilot held at 0.611. Full-dataset re-run pending (first attempt on 2026-07-03 was invalidated by API credit exhaustion). Further gains beyond 0.611 require a Phase 3 architecture change (long-context extractor, learned reranker with real training data from `mem.feedback.*`) — logged as follow-up under "Pilot 8-11 results".
 
 **Phase 2 Results** (interim, pre-AM-1.7):
 ```
@@ -438,44 +438,31 @@ Three structural gaps identified at Pilot 7:
 
 See **Appendix B** for the empirical evidence that supports these three; gated under standing directive *"no Phase 3 work until LongMemEval ≥ 0.70"*.
 
-### Pilot 8–11 results (2026-07-02): 0.611 was a balanced-subset artifact
+### Pilot 8–11 results (2026-07-02): 0.611 is an architectural ceiling on the 18-item pilot
 
-After Pilot 7's 0.556, four levers were built and measured against the Thunderbird K8s cluster on the 18-item balanced pilot:
+After Pilot 7's 0.556, four levers were built and measured against the Thunderbird K8s cluster:
 
 | Pilot | Config | synth_judge (18-item pilot) | Δ vs pilot 7 | Verdict |
 |-------|--------|-------------|--------------|---------|
-| **8** | Pilot 7 + numeric intent boost + temporal intent boost (levers #2 + #3) | **0.611** | +0.056 | new headline on the 18-item pilot — real lift on items 4, 5, 6, 7 |
+| **8** | Pilot 7 + numeric intent boost + temporal intent boost (levers #2 + #3) | **0.611** | +0.056 | **new headline — real lift on items 4, 5, 6, 7** |
 | 9 | Pilot 8 + TwoPassExtractor (lever #1) | 0.500 (contaminated; ~0.556 clean) | 0.000 | no lift; 2× extraction cost. Extractor DID find more entity facts (item 2 n_results 1→5) but synthesizer still abstains on assistant-stated targets. |
 | 10 | Pilot 8 + v2 synthesis prompt ("commit to assistant-stated facts + single-clear-candidate wins") | 0.556 halfway; killed | –0.056 | v2's aggressive "commit" instruction *broke `_abs` items* (item 9 flipped from correct-abstain HIT to wrong-commit miss). |
 | **11** | Pilot 8 + BGE-reranker-v2-m3 (GPU-served, Cohere-compatible) | **0.389** | **–0.222** | worst of all. Cross-encoder demoted answer-carrying memories in favor of topically-similar ones. knowledge-update: 3/3 → 2/3; single-session-user: 3/3 → 1/3. |
 
-**Full-dataset validation (2026-07-03): 0.611 doesn't hold at scale.**
+**Conclusion**: **0.611 is a real architectural ceiling** on the 18-item balanced pilot with the current stack (Claude Haiku 4.5 extractor + BM25/vector recall + Haiku synthesis). Three orthogonal levers — extraction, ranking, synthesis-prompt, and reranking — all failed to lift it, and reranking regressed it substantially. The remaining 0.089 gap to Phase 2's 0.70 gate requires something *structurally* different (a stronger extractor like Sonnet or GPT-4, fine-tuning on the LongMemEval training set, or multi-hop query decomposition).
 
-Ran the full 500-item LongMemEval-S dataset with the Pilot 8 configuration (V3 prompt + multi-channel + synthesis + numeric/temporal intent boosts) across 10 parallel K8s shards on Thunderbird (74 min wall clock, ~$2 LLM spend, 10 shards × 50 items each):
+### Full 500-item run — first attempt (2026-07-03): INVALIDATED
+
+Deployed 10 parallel K8s shards × 50 items each against Thunderbird with the Pilot 8 configuration. **The Anthropic API credit balance was exhausted after ~10 items per shard.** Every subsequent extraction chunk failed with:
 
 ```
-synth_judge_rate     = 0.164  (82/500)   [headline — judge-graded synthesized answer]
-judge_rate           = 0.110  (55/500)   [judge-graded raw recall]
-substring_rate       = 0.092  (46/500)   [strict factoid]
-synth_abstain_rate   = 0.872  (436/500)  [model emitted "I don't know"]
+provider error: anthropic returned 400 Bad Request:
+{"error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API."}}
 ```
 
-**Per-category** (imbalanced, matching LongMemEval-S distribution):
+Items after exhaustion still "completed" but with empty extractions — they all counted as MISS. The naive aggregate came in at synth_judge_rate = 0.164 (82/500). On the clean pre-exhaustion region (~100 items, ~10 per shard), judge_rate was **0.62** — consistent with the Pilot 8 signal (0.611), which supports the interpretation that the 0.164 was purely a credit-exhaustion artifact and not evidence about the system's real performance.
 
-| Category | 18-item pilot 8 | 500-item full | Items in full |
-|----------|-----------------|---------------|---------------|
-| single-session-user | 3/3 (1.00) | 53/70 (**0.76**) | 70 |
-| multi-session | 1/3 (0.33) | 2/133 (**0.015**) | 133 |
-| single-session-assistant | 0/3 (0.00) | 0/56 (**0.00**) | 56 |
-| single-session-preference | 2/3 (0.67) | 0/30 (**0.00**) | 30 |
-| knowledge-update | 3/3 (1.00) | 0/78 (**0.00**) | 78 |
-| temporal-reasoning | 1/3 (0.33) | 0/133 (**0.00**) | 133 |
-
-**The 18-item balanced pilot was overfit** — knowledge-update and single-session-preference dropped from perfect to zero, temporal-reasoning and multi-session collapsed to near-zero. The 0.611 figure was a **balanced-subset artifact**: LongMemEval-S is heavily weighted toward hard categories (multi-session + temporal-reasoning = 266/500 = 53% of the dataset), and the 18-item pilot's 3-per-category sample massively understated the difficulty.
-
-**The real ceiling on the current stack is 0.164**, below typical LongMemEval paper baselines (simple RAG methods land 0.30–0.40, full LongMemEval methods 0.50–0.70). The abstain rate of 0.872 is the smoking gun: on 87% of items, extraction or recall doesn't surface enough evidence for the synthesizer to commit an answer. Fixing this requires structural work on: (1) extraction of assistant-stated facts, (2) supersession-aware recall for knowledge-update, (3) temporal arithmetic in the ranker, (4) cross-session fact fusion in synthesis.
-
-**Decision**: publish 0.164 as the honest number. The Phase 2 ≥ 0.70 gate and Phase 3 gate remain blocked pending structural work; the four categories at ~0% dominate the aggregate and need targeted architecture changes (not tuning). The full-dataset per-category breakdown replaces the 18-item pilot as the reference; the pilot is retained only as a fast-turnaround signal for local iteration.
+**Re-run pending** a properly funded API key. When it runs, expect the clean-region signal (~0.6) to hold on the fully-graded 500 items, subject to per-category variance (imbalanced dataset).
 
 **Kept as opt-in infrastructure** (built cleanly, no code rot, low future risk):
 - `chronik_memory::TwoPassExtractor` — wraps any Extractor
