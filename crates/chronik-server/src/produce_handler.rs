@@ -502,6 +502,19 @@ pub struct ProduceHandler {
     /// creates the lock, main.rs initializes it once the embedder has been
     /// constructed from env vars. Reads are lock-free.
     hot_vector_batcher: Option<Arc<std::sync::OnceLock<MicroBatcherHandle>>>,
+    /// v2.7.1: Debounced metadata watermark flusher.
+    ///
+    /// Replaces the fire-and-forget `tokio::spawn` that was called on every
+    /// produce that advanced a partition watermark. Under 10 concurrent
+    /// producers × 4 topics × 3 partitions the old spawn rate (~500/sec)
+    /// saturated the main runtime and caused acks=1 clients to time out —
+    /// see `watermark_flusher.rs` module docs for the full failure chain.
+    ///
+    /// The flusher coalesces many notes for the same (topic, partition) into
+    /// a single metadata-store write, at a rate governed by `CHRONIK_WATERMARK_FLUSH_MS`
+    /// (default 100ms). Watermarks are monotonic so intermediate values are
+    /// safe to drop.
+    watermark_flusher: crate::watermark_flusher::WatermarkFlusher,
 }
 
 /// Replication request for ISR management
@@ -1105,6 +1118,13 @@ impl ProduceHandler {
         MetricsRecorder::set_produce_profile(profile_id);
         info!("ProduceHandler initialized with profile: {} (id={})", config.flush_profile.name(), profile_id);
 
+        // v2.7.1: Start the debounced watermark flusher on the current runtime.
+        // Every produce that advances a watermark records into this flusher;
+        // a single background task drains the pending map into the metadata store
+        // ~10× per second. Replaces the per-produce fire-and-forget spawn that
+        // saturated the runtime under concurrent load (see watermark_flusher.rs).
+        let watermark_flusher = crate::watermark_flusher::WatermarkFlusher::spawn(metadata_store.clone());
+
         Ok(Self {
             config,
             storage,
@@ -1133,6 +1153,7 @@ impl ProduceHandler {
             searchable_topic_cache: Arc::new(DashMap::new()),  // v2.2.16: Cache for topic searchability
             hot_text_index: None,  // HP-1.2: Wired via set_hot_text_index
             hot_vector_batcher: None,  // HP-2.3: Wired via set_hot_vector_batcher
+            watermark_flusher,  // v2.7.1: debounced metadata watermark updates
         })
     }
 
@@ -2497,24 +2518,12 @@ impl ProduceHandler {
                 // v2.2.7.2: Emit watermark event for < 10ms replication
                 self.emit_watermark_event(topic, partition, new_watermark);
 
-                // OPTIMIZATION P1 (v2.2.11): ASYNC metadata update for acks=0 (eliminate second fsync!)
-                // In-memory watermark already updated above, so ListOffsets queries see it immediately
-                // Metadata WAL update ensures durability but doesn't need to block producer (fire-and-forget)
-                // This eliminates second fsync from critical path: ~25ms → ~15ms latency (30-40% improvement)
+                // v2.7.1: Debounced watermark update via WatermarkFlusher.
+                // Previously spawned a tokio task per produce; under 10 concurrent
+                // producers × N partitions that saturated the runtime and caused
+                // acks=1 downstream to time out. `note()` is O(1) synchronous.
                 if prev_watermark < new_watermark {
-                    let metadata_store = self.metadata_store.clone();
-                    let topic_clone = topic.to_string();
-                    let partition_u32 = partition as u32;
-                    tokio::spawn(async move {
-                        if let Err(e) = metadata_store.update_partition_offset(
-                            &topic_clone,
-                            partition_u32,
-                            new_watermark,
-                            0  // log_start_offset
-                        ).await {
-                            debug!("Background metadata watermark update failed for {}-{}: {:?}", topic_clone, partition_u32, e);
-                        }
-                    });
+                    self.watermark_flusher.note(topic, partition, new_watermark);
                 }
             }
             1 => {
@@ -2563,21 +2572,9 @@ impl ProduceHandler {
                     // v2.2.7.2: Emit watermark event for < 10ms replication
                     self.emit_watermark_event(topic, partition, new_watermark);
 
-                    // ASYNC metadata update (fire-and-forget)
+                    // v2.7.1: Debounced watermark update (see acks=0 branch above).
                     if prev_watermark < new_watermark {
-                        let metadata_store = self.metadata_store.clone();
-                        let topic_clone = topic.to_string();
-                        let partition_u32 = partition as u32;
-                        tokio::spawn(async move {
-                            if let Err(e) = metadata_store.update_partition_offset(
-                                &topic_clone,
-                                partition_u32,
-                                new_watermark,
-                                0  // log_start_offset
-                            ).await {
-                                debug!("Background metadata watermark update failed for {}-{}: {:?}", topic_clone, partition_u32, e);
-                            }
-                        });
+                        self.watermark_flusher.note(topic, partition, new_watermark);
                     }
 
                     // CRITICAL: Await async response from ResponsePipeline
@@ -2624,21 +2621,9 @@ impl ProduceHandler {
                     // Emit watermark event
                     self.emit_watermark_event(topic, partition, new_watermark);
 
-                    // ASYNC metadata update
+                    // v2.7.1: Debounced watermark update (see acks=0 branch above).
                     if prev_watermark < new_watermark {
-                        let metadata_store = self.metadata_store.clone();
-                        let topic_clone = topic.to_string();
-                        let partition_u32 = partition as u32;
-                        tokio::spawn(async move {
-                            if let Err(e) = metadata_store.update_partition_offset(
-                                &topic_clone,
-                                partition_u32,
-                                new_watermark,
-                                0  // log_start_offset
-                            ).await {
-                                debug!("Background metadata watermark update failed for {}-{}: {:?}", topic_clone, partition_u32, e);
-                            }
-                        });
+                        self.watermark_flusher.note(topic, partition, new_watermark);
                     }
 
                     // Return immediate response (fallback behavior)
@@ -2734,24 +2719,9 @@ impl ProduceHandler {
                             // v2.2.7.2: Emit watermark event for < 10ms replication
                             self.emit_watermark_event(topic, partition, new_watermark);
 
-                            // v2.2.9.1 ASYNC FIX: Update metadata_store in background (don't block produce response)
-                            // In-memory watermark (line 2064) is already updated, so ListOffsets queries see it immediately
-                            // Metadata WAL update ensures durability and follower visibility, but doesn't need to block producer
-                            // This eliminates second fsync from critical path: ~100ms → ~50ms p50 latency (50% improvement)
+                            // v2.7.1: Debounced watermark update (see acks=0 branch).
                             if prev_watermark < new_watermark {
-                                let metadata_store = self.metadata_store.clone();
-                                let topic_clone = topic.to_string();
-                                let partition_u32 = partition as u32;
-                                tokio::spawn(async move {
-                                    if let Err(e) = metadata_store.update_partition_offset(
-                                        &topic_clone,
-                                        partition_u32,
-                                        new_watermark,
-                                        0  // log_start_offset
-                                    ).await {
-                                        debug!("Background metadata watermark update failed for {}-{}: {:?}", topic_clone, partition_u32, e);
-                                    }
-                                });
+                                self.watermark_flusher.note(topic, partition, new_watermark);
                             }
                         }
                         Ok(Ok(Err(e))) => {
@@ -3891,6 +3861,7 @@ impl Clone for ProduceHandler {
             searchable_topic_cache: Arc::clone(&self.searchable_topic_cache),  // v2.2.16: Share cache
             hot_text_index: self.hot_text_index.clone(),  // HP-1.2
             hot_vector_batcher: self.hot_vector_batcher.clone(),  // HP-2.3
+            watermark_flusher: self.watermark_flusher.clone(),  // v2.7.1: Cheap Arc-shared clone
         }
     }
 }
@@ -4568,12 +4539,95 @@ mod tests {
         // All requests should succeed
         assert_eq!(success_count, 10);
         assert_eq!(error_count, 0);
-        
+
         // Topic should have been created only once
         // Check the cache is properly cleaned up by waiting
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    
+
+    /// Regression guard for the v2.7.1 acks=1 stall under concurrent load.
+    ///
+    /// Before the WatermarkFlusher, every acks=1 produce that advanced a
+    /// watermark did a fire-and-forget `tokio::spawn` calling
+    /// `metadata_store.update_partition_offset(...).await`. Under N=200
+    /// concurrent produces those spawns saturated the runtime and cascaded
+    /// into acks=1 timeouts. After the flusher, watermark updates are
+    /// coalesced into O(partitions) writes per flush interval — this test
+    /// pins the wire-up between ProduceHandler and the flusher.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn produce_handler_wires_watermark_flusher_for_concurrent_acks1() {
+        let (handler, _tmp) = create_test_handler().await;
+        let handler = Arc::new(handler);
+
+        const CONCURRENCY: usize = 200;
+        let mut joins = Vec::with_capacity(CONCURRENCY);
+        let start = std::time::Instant::now();
+
+        for i in 0..CONCURRENCY {
+            let h = Arc::clone(&handler);
+            joins.push(tokio::spawn(async move {
+                let records_data = create_test_record_batch(
+                    1_000 + i as i64,
+                    0,
+                    vec![("k", "v")],
+                );
+                let request = ProduceRequest {
+                    transactional_id: None,
+                    acks: 1,
+                    timeout_ms: 30_000,
+                    topics: vec![ProduceRequestTopic {
+                        name: "test-topic".to_string(),
+                        partitions: vec![ProduceRequestPartition {
+                            index: (i % 3) as i32, // spread across the 3 partitions
+                            records: records_data,
+                        }],
+                    }],
+                };
+                h.handle_produce(request, i as i32).await
+            }));
+        }
+
+        // All requests must return; count successes.
+        let mut ok = 0;
+        for j in joins {
+            let resp = j.await.unwrap().expect("produce should not error");
+            if resp.topics[0].partitions[0].error_code == 0 {
+                ok += 1;
+            }
+        }
+        assert_eq!(ok, CONCURRENCY, "all 200 acks=1 produces must succeed");
+
+        // Regression bound: this used to hang until the request's 30s outer
+        // timeout on the broken tree. On the fixed tree it completes in well
+        // under a second on a laptop; give it 10s for CI headroom.
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "concurrent acks=1 batch took {:?}, expected <10s (spawn-explosion regression?)",
+            elapsed
+        );
+
+        // Give the flusher a moment to drain, then verify each partition's
+        // watermark reached the metadata store. The exact per-partition count
+        // depends on how the 200 requests distribute (200/3 = ~66 each), so
+        // just verify each is > 0.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        for p in 0..3u32 {
+            let recorded = handler
+                .metadata_store
+                .get_partition_offset("test-topic", p)
+                .await
+                .unwrap();
+            let hwm = recorded.map(|(h, _)| h).unwrap_or(0);
+            assert!(
+                hwm > 0,
+                "partition {} watermark should have propagated via WatermarkFlusher, got {}",
+                p,
+                hwm
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_invalid_topic_name_auto_creation() {
         let temp_dir = TempDir::new().unwrap();

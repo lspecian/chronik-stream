@@ -17,6 +17,7 @@ mod integrated_server;
 mod error_handler;
 mod kafka_handler;
 mod produce_handler;
+mod watermark_flusher;     // v2.7.1: debounced metadata watermark flusher — fixes acks=1 stall under concurrent load
 mod hot_vector_adapter;  // HP-2.6: bridge HotVectorIndex → ColdFlushListener
 mod pipelined_connection;  // v2.2.9: Async request pipelining for leader forwarding
 mod response_pipeline;     // v2.2.10: Async response delivery for acks=1 (eliminates 168x bottleneck)
