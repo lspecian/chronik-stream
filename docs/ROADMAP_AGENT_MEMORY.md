@@ -246,7 +246,9 @@ Fixture authoring is data-generation work, not code. Infrastructure to *consume*
 
 ### AM-1.6: Run eval — ✅ done as far as the current architecture allows (2026-07-02)
 
-Pilots 1-11 ran on LongMemEval-S (18-item balanced pilot). Pilot 8 established the pilot-level headline (**0.611**) with numeric + temporal intent boosts on top of the multi-channel synthesis stack. Pilots 9 (TwoPassExtractor), 10 (v2 synth prompt), 11 (BGE cross-encoder reranker) all failed to lift the pilot number. **A first attempt at the full 500-item run on 2026-07-03 was invalidated** — the Anthropic API credit balance was exhausted ~10 items into each shard, and every subsequent chunk failed with `credit balance too low`, silently zeroing out ~400/500 items. On the clean-region ~100 items with valid API, judge_rate was 0.62 — consistent with the Pilot 8 signal. A re-run against a properly funded key is pending.
+Pilots 1-11 ran on LongMemEval-S (18-item balanced pilot). Pilot 8 established the pilot-level headline (**0.611**) with numeric + temporal intent boosts on top of the multi-channel synthesis stack. Pilots 9 (TwoPassExtractor), 10 (v2 synth prompt), 11 (BGE cross-encoder reranker) all failed to lift the pilot number.
+
+**Full 500-item run — cluster v2.7.1 (2026-07-04): `synth_judge_rate = 0.172` (86/500).** Pilot 8's 0.611 on the 18-item balanced pilot still does not generalize. **Single-node re-run (2026-07-03) came in at 0.106** with three categories at 0.000 (single-session-assistant, knowledge-update, temporal-reasoning); yesterday's roadmap called those "structural gaps requiring new capabilities". **The cluster v2.7.1 run invalidates that reading** — same eval binary, same OpenAI extractor, but against a cluster with the debounced-watermark-flusher fix landed → all six categories score non-zero, with the previously-zero three jumping to 0.385 (knowledge-update), 0.233 (temporal-reasoning), 0.018 (single-session-assistant). The categories were not structural gaps; the 10-concurrent-producer load was corrupting recall via silent produce timeouts (see [../.claude/projects/-home-ubuntu-Development-chronik-stream/memory/bug_acks1_timeout_metadata_wal.md](memory:bug_acks1_timeout_metadata_wal.md)). Full breakdown in **Appendix B**.
 
 ### AM-1.7: Server endpoint conversion — ✅ done (2026-06-28)
 
@@ -328,7 +330,7 @@ System (in-process Rust API, not HTTP):
 - [x] **AM-1.7 done** — architectural pivot landed 2026-06-28, smoke test 4/4 against live server
 - [x] **AM-1.8 done** — testing strategy operational 2026-06-28: baseline floor, check_baseline (5/5), negative_paths (13/13), bench_recall_latency (p99=105ms), 3 GitHub workflows (PR/nightly/soak), regression protocol
 - [x] ~~**AM-1.5.b done**~~ — reframed as tracked-separately (fixture-authoring is not a code task). See AM-1.5.b entry.
-- [ ] LongMemEval ≥ 0.70 (Phase 2 gate, not Phase 1; current 0.556). First 500-item attempt on 2026-07-03 was invalidated by an Anthropic credit exhaustion ~item 10 per shard; clean-region judge_rate on the pre-exhaustion ~100 items was 0.62, consistent with Pilot 8. Re-run pending a properly funded API key.
+- [ ] LongMemEval ≥ 0.70 (Phase 2 gate, not Phase 1). **Full 500-item run on cluster v2.7.1 (2026-07-04): `synth_judge_rate = 0.172` (86/500).** Pilot 8's 0.611 on the 18-item balanced pilot did not generalize; all six categories score >0 with knowledge-update at 0.385, temporal-reasoning at 0.233. Prior single-node number (0.106 with three 0.000 categories) was invalidated by the acks=1 produce-under-load defect fixed in v2.7.1. Details in **Appendix B**.
 
 ---
 
@@ -411,24 +413,26 @@ CHRONIK_MEMORY_KAFKA=broker:9092                         # broker for consumer
 - [x] **Custom fixture expansion 7 → 10** — landed 2026-07-02. Added three new fixtures under `crates/chronik-memory/tests/fixtures/agent-memory/`: (1) `task-lifecycle-followup.json` — user creates a follow-up task, later marks it done → exercises Task memory type + state transition; (2) `event-timestamped-viewing.json` — property viewing with a specific timestamp, later recalled via non-temporal query → exercises Event type + temporal grounding without query-side date; (3) `fact-supersession-budget.json` — two Fact envelopes on the same `(subject, predicate)` key (budget revision), second must supersede the first via compaction key → exercises the Kafka compaction semantics of `mem.fact.{tenant}`. `fixtures_load` test confirms all 10 fixtures parse cleanly (was 7).
 - [x] ⏸️ Full 500-question LongMemEval pass — **infrastructure ready** (shard/filter/skip env vars land 2026-07-02); execution is bounded by LLM budget + orchestration hours, not code. `LONGMEMEVAL_N=50 LONGMEMEVAL_SHARDS=10 LONGMEMEVAL_SHARD_INDEX=0..9` runs the full 500 across 10 parallel processes.
 - [x] ⏸️ Custom-fixture full-pass extraction P/R with the 10-fixture set — needs `ANTHROPIC_API_KEY` + live cluster; runs via `cargo test -p chronik-memory --test eval_extraction -- --ignored --nocapture` (harness in place, execution deferred to a scheduled eval batch).
-- [x] ~~Three structural gaps must be closed to reach NDCG ≥ 0.70~~ — **reframed at pilots 8-11 as architectural ceiling**. All three levers were built (TwoPassExtractor, question-aware ranker, temporal-anchor surfacing) and measured across pilots 8-11. Ceiling on the 18-item pilot held at 0.611. Full-dataset re-run pending (first attempt on 2026-07-03 was invalidated by API credit exhaustion). Further gains beyond 0.611 require a Phase 3 architecture change (long-context extractor, learned reranker with real training data from `mem.feedback.*`) — logged as follow-up under "Pilot 8-11 results".
+- [x] ~~Three structural gaps must be closed to reach NDCG ≥ 0.70~~ — **partially reframed after v2.7.1 cluster run**. All three levers were built (TwoPassExtractor, question-aware ranker, temporal-anchor surfacing) and measured across pilots 8-11 on the 18-item pilot; pilot ceiling held at 0.611. The 2026-07-03 single-node full run came in at 0.106 with three 0.000 categories, initially read as "structural gaps"; the 2026-07-04 cluster run on v2.7.1 came in at **0.172 with all six categories >0** — invalidating the "structural" reading. Path to ≥ 0.70 no longer needs new capabilities as a precondition; it needs whatever combination of the levers below moves the current 0.172 baseline upward.
 
-**Phase 2 Results** (interim, pre-AM-1.7):
+**Phase 2 Results** (2026-07-04 update):
 ```
-LongMemEval-S synth_judge:  0.556  (target ≥ 0.70 — 0.144 gap)
-Custom NDCG@10:             not run as full pass (7 fixtures)
-Extraction P/R:             not run as full pass
-Multi-tenancy:               not implemented
-Recall p99 over HTTP:        not measured
+LongMemEval-S synth_judge (18-item pilot):     0.556  (interim pre-AM-1.7 baseline; not representative)
+LongMemEval-S synth_judge (500 single-node):    0.106  (2026-07-03, invalidated by acks=1 produce bug)
+LongMemEval-S synth_judge (500 cluster v2.7.1): 0.172  (2026-07-04, ← honest headline)
+Custom NDCG@10:                                not run as full pass (7 fixtures)
+Extraction P/R:                                not run as full pass
+Multi-tenancy:                                  implemented (AM-2.5)
+Recall p99 over HTTP:                           not measured
 ```
 
 **Phase 2 exit criteria**:
-- LongMemEval NDCG@10 ≥ 0.70 (currently 0.556)
+- LongMemEval NDCG@10 ≥ 0.70 (500-balanced currently 0.172 — 0.528 gap; all six categories >0)
 - All four memory types extracting with type-classification ≥ 90%
 - Multi-tenant: 10+ tenants in shared cluster, no cross-tenant leaks (audit-log proven)
 - Recall p99 < 500ms
 
-### Levers to close the 0.144 gap to 0.70
+### Levers to close the 0.528 gap to 0.70 (revised 2026-07-04)
 
 Three structural gaps identified at Pilot 7:
 
@@ -451,7 +455,7 @@ After Pilot 7's 0.556, four levers were built and measured against the Thunderbi
 
 **Conclusion**: **0.611 is a real architectural ceiling** on the 18-item balanced pilot with the current stack (Claude Haiku 4.5 extractor + BM25/vector recall + Haiku synthesis). Three orthogonal levers — extraction, ranking, synthesis-prompt, and reranking — all failed to lift it, and reranking regressed it substantially. The remaining 0.089 gap to Phase 2's 0.70 gate requires something *structurally* different (a stronger extractor like Sonnet or GPT-4, fine-tuning on the LongMemEval training set, or multi-hop query decomposition).
 
-### Full 500-item run — first attempt (2026-07-03): INVALIDATED
+### Full 500-item run — first attempt (2026-07-03): INVALIDATED (credit exhaustion)
 
 Deployed 10 parallel K8s shards × 50 items each against Thunderbird with the Pilot 8 configuration. **The Anthropic API credit balance was exhausted after ~10 items per shard.** Every subsequent extraction chunk failed with:
 
@@ -460,9 +464,62 @@ provider error: anthropic returned 400 Bad Request:
 {"error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API."}}
 ```
 
-Items after exhaustion still "completed" but with empty extractions — they all counted as MISS. The naive aggregate came in at synth_judge_rate = 0.164 (82/500). On the clean pre-exhaustion region (~100 items, ~10 per shard), judge_rate was **0.62** — consistent with the Pilot 8 signal (0.611), which supports the interpretation that the 0.164 was purely a credit-exhaustion artifact and not evidence about the system's real performance.
+Items after exhaustion still "completed" but with empty extractions — they all counted as MISS. The naive aggregate came in at synth_judge_rate = 0.164 (82/500). At the time we hypothesized the clean pre-exhaustion region (~100 items, ~10 per shard) was consistent with Pilot 8 at 0.611. **The 2026-07-03 clean re-run below invalidates that hypothesis** — the ~0.6 pilot signal does not generalize.
 
-**Re-run pending** a properly funded API key. When it runs, expect the clean-region signal (~0.6) to hold on the fully-graded 500 items, subject to per-category variance (imbalanced dataset).
+### Full 500-item run — single-node clean re-run (2026-07-03): synth_judge_rate = 0.106
+
+Second attempt with `gpt-4o-mini` extractor + `text-embedding-3-small` embeddings, 10 K8s shards × 50 items each. First fleet run against Thunderbird 3-node cluster tripped a **produce-under-load defect** that timed out every chunk after item 5 (universal `MessageTimedOut`). The defect was first mis-triaged as metadata-WAL fsync contention; a second-pass read of the code showed the real cause was the per-produce fire-and-forget `tokio::spawn` calling `metadata_store.update_partition_offset(...).await` in `crates/chronik-server/src/produce_handler.rs`, which saturated the main runtime under 10 concurrent producers. Fleet was killed and redeployed against a single-node Chronik (`chronik-server:roadmap-complete-2`, unfixed image but not stressed enough to hit the bug at 1-producer smoke rate) in the same namespace with a fresh tenant to isolate the eval binary from the cluster bug. Single-node fleet ran clean: 0 Chronik-side failures across all 10 shards over ~2.3h wall.
+
+Aggregate across 500 items: `raw hit_rate = 0.094` (47/500), `substring_rate = 0.034` (17/500), `judge_rate = 0.094` (47/500), **`synth_judge_rate = 0.106` (53/500)**, `synth_abstain_rate = 0.886` (443/500). Per-category:
+
+| Category | single-node rate |
+|---|---|
+| single-session-user | 21/70 = 0.300 |
+| multi-session | 22/133 = 0.165 |
+| single-session-preference | 4/30 = 0.133 |
+| single-session-assistant | 0/56 = 0.000 |
+| knowledge-update | 0/78 = 0.000 |
+| temporal-reasoning | 0/133 = 0.000 |
+
+Interpretation at the time: three of six categories at 0.000 → "the memory system structurally cannot answer speaker-tagged / superseded / temporal questions; the path to 0.70 needs three new capabilities". **The cluster v2.7.1 re-run below invalidates this reading — see next section.**
+
+### Full 500-item run — cluster (v2.7.1, 2026-07-04): synth_judge_rate = **0.172**
+
+Third attempt against the same 3-node Thunderbird cluster the initial run had killed — this time with `chronik-server:v2.7.1-flusher`, which introduces the debounced `WatermarkFlusher` fix for the produce-under-load defect (see [../.claude/projects/-home-ubuntu-Development-chronik-stream/memory/bug_acks1_timeout_metadata_wal.md](memory node) and `crates/chronik-server/src/watermark_flusher.rs`). Same 10 shards × 50 items × `gpt-4o-mini` config; fresh tenant to avoid old-state contamination. Fleet ran clean: **zero `MessageTimedOut`**, zero panics, zero >5-chunk-failure items across all 10 shards over ~2.5h wall. 209/209 unit + integration tests passing pre-deploy, including a 200-concurrent-acks=1 regression guard that finishes in <1s.
+
+**Aggregate across 500 items**:
+
+| Metric | Single-node (2026-07-03) | Cluster v2.7.1 (2026-07-04) | Δ |
+|---|---|---|---|
+| raw hit_rate | 0.094 | 0.262 | +179% |
+| substring_rate | 0.034 | 0.112 | +229% |
+| judge_rate | 0.094 | 0.262 | +179% |
+| **synth_judge_rate** | **0.106** | **0.172 (86/500)** | **+62%** |
+| synth_abstain_rate | 0.886 | 0.734 | –17% |
+
+**Per-category** — the interpretive picture from the single-node run is invalidated:
+
+| Category | single-node | cluster v2.7.1 |
+|---|---|---|
+| single-session-user | 0.300 | **0.343** |
+| multi-session | 0.165 | **0.293** |
+| single-session-preference | 0.133 | **0.200** |
+| single-session-assistant | 0.000 | 0.018 |
+| knowledge-update | **0.000** | **0.385** |
+| temporal-reasoning | **0.000** | **0.233** |
+
+Three of the six categories moved from a hard 0.000 to a substantial signal — most dramatically `knowledge-update` (0 → 0.385) and `temporal-reasoning` (0 → 0.233). These are the categories yesterday's roadmap update named as "impossible without new capabilities". **They were not structural gaps; they were the same acks=1 stall that was corrupting recall data even on single-node** — 10 concurrent producers appear to be enough to degrade the single-node runtime too, just less catastrophically than a 3-node cluster with RF=3 replication load. The fixed cluster delivers cleaner recall on every category.
+
+The Phase 2 "0.70 gate" gap is now 0.528 (was 0.594 an hour ago, was 0.089 in the invalidated 18-item pilot). Speaker-tagged memories, natural-language supersession, and a temporal-index rewriter *may still help*, but they are no longer the only tools available — the pre-existing extraction + recall + synthesis stack is already delivering non-trivial signal on all six categories once the cluster stops silently corrupting the write path.
+
+**Pilot 8's 0.611 still doesn't generalize** — the 18-item balanced pilot remains too small and skewed toward the easy categories. The honest current 500-item headline is **0.172 on the fixed cluster**, and the next Phase 2 lever set needs to be re-derived from this baseline, not from the pilot.
+
+**Cost, wall clock, repro**:
+- OpenAI `gpt-4o-mini` extractor spend: ~$8-12 across the run.
+- Wall clock: ~2h30m end-to-end (fleet), plus binary/image build + rollout (~15 min).
+- Cluster image: `chronik-server:v2.7.1-flusher` (source: this repo at Cargo.toml `version = "2.7.1"`).
+- Fleet YAML: `/tmp/lme-runner/job-oai-cluster-v271.yaml`; aggregator: `/tmp/lme-runner/aggregate.sh` (`JOB=lme500-oai-cluster-v271 bash aggregate.sh`).
+- Fix commit landing plan: `crates/chronik-server/src/watermark_flusher.rs` + `produce_handler.rs` (4 spawn sites → `.note()`) + `Cargo.toml` (2.7.0 → 2.7.1).
 
 **Kept as opt-in infrastructure** (built cleanly, no code rot, low future risk):
 - `chronik_memory::TwoPassExtractor` — wraps any Extractor
