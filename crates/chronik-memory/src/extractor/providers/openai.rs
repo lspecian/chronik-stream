@@ -286,7 +286,12 @@ fn build_request_body(
                 }
             }
         ],
-        "tool_choice": {"type": "function", "function": {"name": pv.tool_name()}}
+        // `"required"` (string) works on real OpenAI *and* on self-hosted
+        // OpenAI-compat servers (LM Studio, some vLLM builds) that reject the
+        // object form `{"type": "function", "function": {"name": ...}}`.
+        // Since we only expose one tool in `tools`, "required" is equivalent
+        // to forcing that specific tool.
+        "tool_choice": "required"
     })
 }
 
@@ -403,12 +408,14 @@ mod tests {
     }
 
     #[test]
-    fn build_request_uses_function_tool_choice() {
+    fn build_request_uses_required_string_tool_choice() {
         let body =
             build_request_body("gpt-4o-mini", 1024, &[turn("user", "hi")], OpenAIPromptVersion::V2);
         assert_eq!(body["model"], "gpt-4o-mini");
-        assert_eq!(body["tool_choice"]["type"], "function");
-        assert_eq!(body["tool_choice"]["function"]["name"], v1::TOOL_NAME);
+        // "required" (string) is portable across real OpenAI + LM Studio +
+        // vLLM. Since we only expose one tool, it's equivalent to forcing that
+        // specific tool.
+        assert_eq!(body["tool_choice"], "required");
         assert_eq!(body["tools"][0]["function"]["name"], v1::TOOL_NAME);
     }
 

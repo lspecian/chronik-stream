@@ -56,8 +56,81 @@ use chronik_memory::eval::longmemeval::{
 use chronik_memory::extractor::Turn;
 use chronik_memory::{
     extract_subject_candidates, synthesize_concept, AnthropicExtractor, ChainedExtractor, Extractor,
-    Memory, MemoryType, PromptVersion, RuleExtractor, TwoPassExtractor,
+    Memory, MemoryType, OpenAIExtractor, PromptVersion, RuleExtractor, TwoPassExtractor,
 };
+
+/// Returns the LLM factory for this run. When
+/// `LONGMEMEVAL_LLM_PROVIDER=local` and `LONGMEMEVAL_LLM_ENDPOINT` +
+/// `LONGMEMEVAL_LLM_MODEL` are set, uses an OpenAI-compat local server
+/// (LM Studio, vLLM, llama.cpp, etc.). Otherwise falls back to Anthropic.
+fn llm_provider_choice() -> LlmProvider {
+    let provider = std::env::var("LONGMEMEVAL_LLM_PROVIDER").unwrap_or_default();
+    match provider.as_str() {
+        "local" => {
+            let endpoint = std::env::var("LONGMEMEVAL_LLM_ENDPOINT")
+                .expect("LONGMEMEVAL_LLM_PROVIDER=local requires LONGMEMEVAL_LLM_ENDPOINT");
+            let model = std::env::var("LONGMEMEVAL_LLM_MODEL")
+                .expect("LONGMEMEVAL_LLM_PROVIDER=local requires LONGMEMEVAL_LLM_MODEL");
+            eprintln!("LLM provider: local (endpoint={}, model={})", endpoint, model);
+            LlmProvider::Local { endpoint, model }
+        }
+        "openai" => {
+            let model = std::env::var("LONGMEMEVAL_LLM_MODEL")
+                .unwrap_or_else(|_| "gpt-4o-mini".to_string());
+            eprintln!("LLM provider: openai (model={})", model);
+            LlmProvider::OpenAI { model }
+        }
+        _ => {
+            eprintln!("LLM provider: anthropic (default)");
+            LlmProvider::Anthropic
+        }
+    }
+}
+
+#[derive(Clone)]
+enum LlmProvider {
+    Anthropic,
+    Local { endpoint: String, model: String },
+    OpenAI { model: String },
+}
+
+impl LlmProvider {
+    /// Build a TextGenerator (for judge / synth) — uses `complete` only.
+    fn build_generator(
+        &self,
+        api_key: &str,
+    ) -> Arc<dyn chronik_memory::embeddings::TextGenerator> {
+        match self {
+            LlmProvider::Anthropic => Arc::new(AnthropicExtractor::new(api_key.to_string())),
+            LlmProvider::Local { endpoint, model } => Arc::new(
+                OpenAIExtractor::for_local_server(endpoint, model).with_max_tokens(1024),
+            ),
+            LlmProvider::OpenAI { model } => Arc::new(
+                OpenAIExtractor::new(api_key.to_string()).with_model(model),
+            ),
+        }
+    }
+
+    /// Build an Extractor (for ingest_with_extraction).
+    fn build_extractor(
+        &self,
+        api_key: &str,
+        prompt_version: PromptVersion,
+    ) -> Arc<dyn Extractor> {
+        match self {
+            LlmProvider::Anthropic => Arc::new(
+                AnthropicExtractor::new(api_key.to_string())
+                    .with_prompt_version(prompt_version),
+            ),
+            LlmProvider::Local { endpoint, model } => Arc::new(
+                OpenAIExtractor::for_local_server(endpoint, model).with_max_tokens(1024),
+            ),
+            LlmProvider::OpenAI { model } => Arc::new(
+                OpenAIExtractor::new(api_key.to_string()).with_model(model),
+            ),
+        }
+    }
+}
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -224,12 +297,27 @@ async fn evaluate_longmemeval() {
         eprintln!("skipping: set CHRONIK_INTEGRATION=1 to run");
         return;
     }
-    let api_key = match std::env::var("ANTHROPIC_API_KEY") {
-        Ok(k) if !k.is_empty() => k,
-        _ => {
-            eprintln!("skipping: ANTHROPIC_API_KEY not set");
-            return;
-        }
+    // Provider-specific credential lookup:
+    // - "local"  → LM Studio / vLLM (placeholder api_key "local")
+    // - "openai" → OpenAI (reads OPENAI_API_KEY)
+    // - default  → Anthropic (reads ANTHROPIC_API_KEY)
+    let provider_env = std::env::var("LONGMEMEVAL_LLM_PROVIDER").unwrap_or_default();
+    let api_key = match provider_env.as_str() {
+        "local" => std::env::var("ANTHROPIC_API_KEY").unwrap_or_else(|_| "local".to_string()),
+        "openai" => match std::env::var("OPENAI_API_KEY") {
+            Ok(k) if !k.is_empty() => k,
+            _ => {
+                eprintln!("skipping: OPENAI_API_KEY not set");
+                return;
+            }
+        },
+        _ => match std::env::var("ANTHROPIC_API_KEY") {
+            Ok(k) if !k.is_empty() => k,
+            _ => {
+                eprintln!("skipping: ANTHROPIC_API_KEY not set");
+                return;
+            }
+        },
     };
 
     let path = dataset_path();
@@ -290,14 +378,15 @@ async fn evaluate_longmemeval() {
     // substring matcher and an Anthropic-driven judge. The substring score
     // is a strict lower bound (factoid-only); the judge score is paraphrase-
     // tolerant. Side-by-side output makes the calibration gap obvious.
+    let llm_provider = llm_provider_choice();
+
     let use_llm_judge = std::env::var("LONGMEMEVAL_USE_LLM_JUDGE")
         .map(|v| v != "0" && !v.is_empty())
         .unwrap_or(false);
-    // The judge LLM is a separate `AnthropicExtractor` instance — we want
-    // its `TextGenerator::complete` impl, which doesn't carry tool-use
-    // overhead. Same model + temperature=0 as the extractor.
+    // The judge LLM uses the same provider as the extractor by default —
+    // `TextGenerator::complete` for judge-graded scoring.
     let judge: Option<Arc<dyn chronik_memory::embeddings::TextGenerator>> = if use_llm_judge {
-        Some(Arc::new(AnthropicExtractor::new(api_key.clone())))
+        Some(llm_provider.build_generator(&api_key))
     } else {
         None
     };
@@ -325,7 +414,7 @@ async fn evaluate_longmemeval() {
         );
     }
     let synth_gen: Option<Arc<dyn chronik_memory::embeddings::TextGenerator>> = if use_synth {
-        Some(Arc::new(AnthropicExtractor::new(api_key.clone())))
+        Some(llm_provider.build_generator(&api_key))
     } else {
         None
     };
@@ -420,10 +509,7 @@ async fn evaluate_longmemeval() {
         let tenant = std::env::var("LONGMEMEVAL_TENANT")
             .unwrap_or_else(|_| "longmemeval".to_string());
         let ns = format!("{}:{}:{}", tenant, item.question_id, Ulid::new());
-        let base_pass1: Arc<dyn Extractor> = Arc::new(
-            AnthropicExtractor::new(api_key.clone())
-                .with_prompt_version(prompt_version),
-        );
+        let base_pass1: Arc<dyn Extractor> = llm_provider.build_extractor(&api_key, prompt_version);
         let inner_extractor: Arc<dyn Extractor> = if use_two_pass {
             Arc::new(
                 TwoPassExtractor::new(base_pass1, api_key.clone())
@@ -460,7 +546,13 @@ async fn evaluate_longmemeval() {
         let mut chunk_failures = 0usize;
         for (chunk_idx, chunk) in turns.chunks(batch_size).enumerate() {
             match mem.ingest_with_extraction(chunk.to_vec()).await {
-                Ok(_) => {}
+                Ok(ack) => {
+                    eprintln!(
+                        "  [dbg] item {} chunk {} OK: raw_acks={} typed_acks={}",
+                        item.question_id, chunk_idx,
+                        ack.raw_acks.len(), ack.typed_acks.len()
+                    );
+                }
                 Err(e) => {
                     chunk_failures += 1;
                     eprintln!(
