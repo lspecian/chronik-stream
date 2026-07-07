@@ -61,6 +61,20 @@ Memory-type guide:\n\
 - `task` — an action item the agent or someone else still needs to do. (task_id, title, state, due_at).\n\
   Use a deterministic task_id derived from the title (lowercase, snake_case, prefixed with `tsk_`).\n\
 \n\
+Speaker attribution (CRITICAL — drives \"what did you tell me\" recall):\n\
+- Every fact carries a `speaker` field: `\"user\"` when the user stated it, `\"assistant\"` \
+when the assistant stated it.\n\
+- **Extract assistant-stated facts.** When the assistant names, recommends, quotes, \
+designates, or quantifies something concrete — an app (\"I recommend Memrise\"), a place, \
+a website, a designation (\"your jumpsuit is 'LIV'\"), a definition, a quoted passage — \
+and the user engages with it rather than rejecting it, emit a fact with \
+speaker=\"assistant\". Subject is the entity the claim is about \
+(e.g. `(user, recommended_language_app, Memrise)` with speaker=\"assistant\").\n\
+- Do NOT skip a fact merely because the user never restated it. Users later ask \
+\"what did you tell me about X?\" — the assistant's statement IS the memory.\n\
+- Generic assistant filler (\"great choice!\", \"let me know if you need anything\") is \
+NOT a fact. Extract only concrete, referable content.\n\
+\n\
 Type-boundary tie-breakers:\n\
 - A claim about the world or about the user → **fact**, even if expressed as a preference.\n\
   \"I prefer Lapa\" → fact `(user, prefers_neighborhood, Lapa)`, NOT an instruction.\n\
@@ -115,6 +129,10 @@ not the user's natural language.\n\
 General rules:\n\
 - Each extraction must cite the index(es) of the turns it came from in `source_indexes`.\n\
 - Only extract claims explicitly stated. Do NOT speculate or infer.\n\
+- **Numeric objects are JSON numbers.** When a fact's object is a quantity — a count, \
+a price, a duration in days, an area — emit it as a bare JSON number (750000, 3, 21), \
+NOT a string (\"$750K\", \"three\", \"21 days\"). Put the unit and original wording in `text`. \
+This drives numeric-aware ranking downstream.\n\
 - Subject and actor identifiers should be lowercase, namespace-style (e.g. `user`, `user:luis`, `agent:bot`).\n\
 - Predicate, verb, and trigger names are snake_case English (regardless of conversation language).\n\
 - Confidence is in [0.0, 1.0].\n\
@@ -162,12 +180,13 @@ fn fact_item_schema() -> serde_json::Value {
         "properties": {
             "subject": {"type": "string", "description": "Lowercase namespace-style subject id (e.g. `user`, `user:luis`, `agent:bot`)."},
             "predicate": {"type": "string", "description": "Short snake_case concept name. Drop redundant domain qualifiers (e.g. `bedrooms`, not `apartment_bedrooms`). Prefer canonical names when one applies."},
-            "object": {},
+            "object": {"description": "The fact's value. Quantities (counts, prices, durations, areas) MUST be JSON numbers (750000, 3, 21) — never strings like \"$750K\" or \"three\". Units and original wording go in `text`."},
             "text": {"type": "string"},
+            "speaker": {"type": "string", "enum": ["user", "assistant"], "description": "Who stated the claim in the conversation. \"assistant\" for facts the assistant introduced (recommendations, names, quotes, designations)."},
             "source_indexes": {"type": "array", "items": {"type": "integer", "minimum": 0}},
             "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0}
         },
-        "required": ["subject", "predicate", "object", "text", "source_indexes", "confidence"]
+        "required": ["subject", "predicate", "object", "text", "speaker", "source_indexes", "confidence"]
     })
 }
 

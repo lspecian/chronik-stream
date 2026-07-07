@@ -112,6 +112,11 @@ impl LlmProvider {
     }
 
     /// Build an Extractor (for ingest_with_extraction).
+    ///
+    /// Local models get the condensed V3-lite prompt: the full V3's ~13K
+    /// chars of canonicalization rules make 30B-class models under-extract
+    /// (probed 2026-07-05: 0 facts under V3, 7 under a short prompt on the
+    /// same chunk). Cloud models keep full V3.
     fn build_extractor(
         &self,
         api_key: &str,
@@ -123,7 +128,11 @@ impl LlmProvider {
                     .with_prompt_version(prompt_version),
             ),
             LlmProvider::Local { endpoint, model } => Arc::new(
-                OpenAIExtractor::for_local_server(endpoint, model).with_max_tokens(1024),
+                OpenAIExtractor::for_local_server(endpoint, model)
+                    .with_max_tokens(8192)
+                    .with_prompt_version(
+                        chronik_memory::extractor::providers::openai::OpenAIPromptVersion::V3Lite,
+                    ),
             ),
             LlmProvider::OpenAI { model } => Arc::new(
                 OpenAIExtractor::new(api_key.to_string()).with_model(model),
@@ -266,8 +275,19 @@ fn select_items<'a>(
 }
 
 fn item_to_turns(item: &LongMemEvalItem) -> Vec<Turn> {
+    use chronik_memory::eval::longmemeval::parse_longmemeval_date;
     let mut turns = Vec::new();
-    for session in &item.haystack_sessions {
+    for (si, session) in item.haystack_sessions.iter().enumerate() {
+        // WS-3.2: thread the session date into every turn of the session so
+        // the WS-0 source excerpt carries a real date and synthesis can do
+        // temporal arithmetic. NOTE: intentionally NOT written to the
+        // memory's `valid_from` — 2023-dated valid_from would push events
+        // through ~36 decay half-lives and destroy their ranking (bi-temporal
+        // ranking is Sprint 3).
+        let session_ts = item
+            .haystack_dates
+            .get(si)
+            .and_then(|d| parse_longmemeval_date(d));
         for rc in session {
             // LongMemEval-S has occasional turns with empty role or content
             // (data artifacts). The SDK rejects empty content with
@@ -281,13 +301,159 @@ fn item_to_turns(item: &LongMemEvalItem) -> Vec<Turn> {
             turns.push(Turn {
                 role: role.to_string(),
                 content: content.to_string(),
-                ts: None,
+                ts: session_ts,
                 channel: None,
                 external_id: None,
             });
         }
     }
     turns
+}
+
+/// Poll Chronik's `/_search` until this item's typed facts are visible in
+/// the fact topic's index, so recall measures retrieval quality rather than
+/// indexing lag. Readiness = hits for this item's unique namespace reach
+/// `max(1, total_typed/3)` (a third is plenty — recall's k is far smaller).
+/// `floor_ms` is always waited (cold-index cycle floor); polling then runs
+/// every 5s up to `timeout_ms`. Items that extracted nothing skip polling.
+async fn wait_until_indexed(
+    api: &str,
+    tenant: &str,
+    namespace: &str,
+    total_typed: usize,
+    floor_ms: u64,
+    timeout_ms: u64,
+    question_id: &str,
+    wait_vector: bool,
+) {
+    tokio::time::sleep(Duration::from_millis(floor_ms)).await;
+    if total_typed == 0 {
+        return;
+    }
+    // Readiness bar: at least a third of the extracted facts, capped at 10 —
+    // recall's k is far smaller than 10 per channel anyway. CRITICAL: Chronik's
+    // ES-compat `hits.total` reflects the RETURNED hits array, not the matched
+    // count, so `size: 0` always reads 0 (this bug burned the first sprint-3c
+    // launch). Request `size: need` and count the actual hits array.
+    let need = std::cmp::min(std::cmp::max(1, total_typed / 3), 10) as u64;
+    let client = reqwest::Client::new();
+    let url = format!("{}/_search", api.trim_end_matches('/'));
+    // Match on the namespace's unique trailing ULID only. A match query on
+    // the full namespace would OR its tokens and count hits from every item
+    // sharing the tenant prefix, making readiness trivially (and wrongly)
+    // true. The ULID is a single unique token.
+    let unique_token = namespace.rsplit(':').next().unwrap_or(namespace);
+    let body = serde_json::json!({
+        "index": format!("mem.fact.{}", tenant),
+        "query": {"match": {"_all": unique_token}},
+        "size": need
+    });
+    let t0 = Instant::now();
+    // Per-node visibility: the cluster serves /_search from whichever pod the
+    // ClusterIP picks, and hot-index visibility differs per node until the
+    // cold indexer catches up everywhere. One positive probe only proves ONE
+    // node is ready (the sprint-3c litmus failed exactly this way: readiness
+    // passed via the leader, recall hit a stale peer and got 0). Require
+    // three consecutive positive probes, 5s apart, so with 3 server pods the
+    // odds of recall landing on a stale node are negligible.
+    let mut consecutive = 0u32;
+    loop {
+        let hits: u64 = match client.post(&url).json(&body).send().await {
+            Ok(resp) => resp
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .and_then(|v| v["hits"]["hits"].as_array().map(|a| a.len() as u64))
+                .unwrap_or(0),
+            Err(_) => 0,
+        };
+        if hits >= need {
+            consecutive += 1;
+            if consecutive >= 3 {
+                break;
+            }
+        } else {
+            consecutive = 0;
+        }
+        if t0.elapsed().as_millis() as u64 + floor_ms >= timeout_ms {
+            eprintln!(
+                "  [warn] item {} index-readiness timed out: {}/{} facts visible \
+                 after {}s — recall may under-measure",
+                question_id,
+                hits,
+                need,
+                (t0.elapsed().as_millis() as u64 + floor_ms) / 1000
+            );
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+
+    // Sprint 5: vector-liveness gate. Text (STEP 2) and embeddings (STEP 3)
+    // run in the SAME WalIndexer `index_segment` pass, so once this item's
+    // text is 3×-confirmed above the segment's embeddings have almost
+    // certainly completed too. What the text gate CANNOT catch is the whole
+    // channel silently dead — s4c ran 500 items with `total_vectors:0` and
+    // nobody noticed because recall degraded to text-only. This guard makes
+    // that failure loud: require the fact topic's HNSW index to be non-empty
+    // before recall runs.
+    //
+    // CRITICAL: poll `/_vector/.../search`, NOT `/_vector/.../stats`. The stats
+    // endpoint is LOCAL-only (never fans out), so behind the round-robin
+    // ClusterIP with per-node vector indexes it reports total_vectors=0 on the
+    // 2/3 of nodes that aren't the partition leader — which stalls the gate
+    // 300s/item even though search works fine. `/search` runs the same fan-out
+    // as real recall (needs_fan_out → fan_out_post → merge), so its
+    // total_vectors is the cluster-wide count and matches what recall sees.
+    if wait_vector {
+        let search_url = format!(
+            "{}/_vector/mem.fact.{}/search",
+            api.trim_end_matches('/'),
+            tenant
+        );
+        // Any query works — the gate only reads total_vectors from the response,
+        // which the handler fills from the fanned-out cluster-wide count. Reuse
+        // the item's unique namespace token so we don't embed anything exotic.
+        let probe = serde_json::json!({ "query": unique_token, "k": 1 });
+        let tv0 = Instant::now();
+        loop {
+            let total: u64 = match client.post(&search_url).json(&probe).send().await {
+                Ok(resp) => resp
+                    .json::<serde_json::Value>()
+                    .await
+                    .ok()
+                    .and_then(|v| v["total_vectors"].as_u64())
+                    .unwrap_or(0),
+                Err(_) => 0,
+            };
+            if total > 0 {
+                return;
+            }
+            if tv0.elapsed().as_millis() as u64 >= timeout_ms {
+                eprintln!(
+                    "  [warn] item {} vector-index liveness timed out: total_vectors=0 \
+                     after {}s — vector channel may be dead, recall degrading to text-only",
+                    question_id,
+                    tv0.elapsed().as_millis() as u64 / 1000
+                );
+                return;
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    }
+}
+
+/// WS-3.2: anchor temporal questions to the question's own date instead of
+/// the eval wall clock. LongMemEval golds like "7 days ago" are computed
+/// relative to `question_date`; without the anchor the synthesizer has no
+/// "today" to subtract from.
+fn anchored_question(item: &LongMemEvalItem) -> String {
+    match &item.question_date {
+        Some(d) if !d.trim().is_empty() => {
+            format!("(Today is {}.) {}", d, item.question)
+        }
+        _ => item.question.clone(),
+    }
 }
 
 #[tokio::test]
@@ -518,15 +684,28 @@ async fn evaluate_longmemeval() {
         } else {
             base_pass1
         };
-        let extractor = ChainedExtractor::new(vec![
+        // Extraction cache (cost control): LONGMEMEVAL_EXTRACTION_CACHE=<dir>
+        // replays previously-computed extractions instead of calling the LLM.
+        // Wraps the whole chain (rules + LLM) so a hit costs zero API calls.
+        // The cache key embeds the chain id (provider + prompt version), so
+        // extractor/prompt changes re-extract automatically. ~$12-13 of a
+        // ~$15 fleet run is extraction — cached re-runs cost ~$1.50.
+        let chain: Arc<dyn Extractor> = Arc::new(ChainedExtractor::new(vec![
             Arc::new(RuleExtractor::new()),
             inner_extractor,
-        ]);
+        ]));
+        let extractor: Arc<dyn Extractor> = match std::env::var("LONGMEMEVAL_EXTRACTION_CACHE") {
+            Ok(dir) if !dir.trim().is_empty() => Arc::new(
+                chronik_memory::extractor::cached::CachedExtractor::new(chain, dir)
+                    .expect("extraction cache dir"),
+            ),
+            _ => chain,
+        };
         let mem = Memory::builder()
             .chronik_kafka(kafka.clone())
             .chronik_api(api.clone())
             .namespace(&ns)
-            .extractor(extractor)
+            .extractor_arc(extractor)
             .request_timeout(Duration::from_secs(60))
             .build()
             .await
@@ -544,9 +723,11 @@ async fn evaluate_longmemeval() {
         // and continue with whatever already landed for this item.
         let extract_t0 = Instant::now();
         let mut chunk_failures = 0usize;
+        let mut total_typed_acks = 0usize;
         for (chunk_idx, chunk) in turns.chunks(batch_size).enumerate() {
             match mem.ingest_with_extraction(chunk.to_vec()).await {
                 Ok(ack) => {
+                    total_typed_acks += ack.typed_acks.len();
                     eprintln!(
                         "  [dbg] item {} chunk {} OK: raw_acks={} typed_acks={}",
                         item.question_id, chunk_idx,
@@ -573,8 +754,36 @@ async fn evaluate_longmemeval() {
             );
         }
 
-        // Wait for the cold WalIndexer cycle.
-        tokio::time::sleep(Duration::from_millis(index_sleep_ms)).await;
+        // Index-readiness wait. The sprint-3 fleet (2026-07-04) proved a
+        // fixed sleep is a race: with ~2× fact volume the cluster's indexing
+        // lag exceeded 45s halfway through the run and empty recalls went
+        // 17/250 → 172/250 between the first and second half — measuring
+        // indexing lag instead of recall quality. Poll until this item's own
+        // facts are actually searchable (search the fact topic for this
+        // item's unique namespace), with `index_sleep_ms` acting as a floor
+        // and `LONGMEMEVAL_INDEX_TIMEOUT_MS` (default 300s) as the cap.
+        let index_timeout_ms: u64 = std::env::var("LONGMEMEVAL_INDEX_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300_000);
+        // Sprint 5: when vector search is enabled, also gate on the HNSW index
+        // being non-empty so a dead embedding channel fails loud rather than
+        // silently degrading recall to text-only (the s4c blind-run trap).
+        let wait_vector = matches!(
+            std::env::var("LONGMEMEVAL_WAIT_VECTOR").as_deref(),
+            Ok("1") | Ok("true") | Ok("on")
+        );
+        wait_until_indexed(
+            &api,
+            mem.tenant(),
+            mem.namespace(),
+            total_typed_acks,
+            index_sleep_ms,
+            index_timeout_ms,
+            &item.question_id,
+            wait_vector,
+        )
+        .await;
 
         // Concept-page pre-synthesis (path B, opt-in). For each candidate
         // entity (top-1 from question + "user" as universal fallback),
@@ -683,8 +892,12 @@ async fn evaluate_longmemeval() {
                 // synthesis-call failure (provider blip, schema glitch on
                 // tool-use model emit, etc.) should be reported as a miss +
                 // abstention, not crash the pilot.
+                // WS-3.2: recall with the plain question (retrieval keys are
+                // date-agnostic), but the anchored question ("Today is X. ...")
+                // reaches the synthesis prompt via the builder's query, giving
+                // the model a "today" to compute "N days ago" against.
                 let synth_res = mem
-                    .recall(&item.question)
+                    .recall(anchored_question(item))
                     .types(&[
                         MemoryType::Fact,
                         MemoryType::Event,
@@ -694,7 +907,11 @@ async fn evaluate_longmemeval() {
                     .with_vector()
                     .with_key_match()
                     .include_concepts(use_concepts)
-                    .k(10)
+                    // Sprint 3: k=15 (was 10). Multi-session questions lost 34
+                    // raw hits at k=10 — the answer-bearing memories from the
+                    // other sessions ranked 11-15. Excerpts keep the prompt
+                    // well within gpt-4o-mini's context at k=15.
+                    .k(15)
                     .synthesize(gen.clone())
                     .await;
                 let elapsed = t0.elapsed().as_secs_f64();
@@ -934,6 +1151,8 @@ mod selector_tests {
             answer: "gold".into(),
             haystack_sessions: vec![],
             answer_session_ids: Vec::new(),
+            haystack_dates: Vec::new(),
+            question_date: None,
         }
     }
 

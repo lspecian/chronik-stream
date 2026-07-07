@@ -204,7 +204,7 @@ mod tests {
             source: Source {
                 topic: "mem.raw.t".into(),
                 offsets: vec![0],
-                extractor: "test@1".into(),
+                extractor: "test@1".into(), excerpt: None,
             },
             tombstoned: false,
             body: Body::Fact(FactBody {
@@ -213,6 +213,7 @@ mod tests {
                 object: obj,
                 polarity: "asserted".into(),
                 text: "u budget".into(),
+                speaker: "user".into(),
             }),
         }
     }
@@ -232,7 +233,7 @@ mod tests {
             source: Source {
                 topic: "mem.event.t".into(),
                 offsets: vec![0],
-                extractor: "test@1".into(),
+                extractor: "test@1".into(), excerpt: None,
             },
             tombstoned: false,
             body: Body::Event(EventBody {

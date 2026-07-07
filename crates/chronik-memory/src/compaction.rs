@@ -358,7 +358,7 @@ mod tests {
             source: crate::schema::Source {
                 topic: "mem.raw.test".into(),
                 offsets: vec![0],
-                extractor: "test-extractor@1".into(),
+                extractor: "test-extractor@1".into(), excerpt: None,
             },
             confidence,
             tombstoned: false,
@@ -368,6 +368,7 @@ mod tests {
                 object: serde_json::Value::String(object.into()),
                 polarity: "asserted".into(),
                 text: format!("{} {} {}", subject, predicate, object),
+                speaker: "user".into(),
             }),
         }
     }

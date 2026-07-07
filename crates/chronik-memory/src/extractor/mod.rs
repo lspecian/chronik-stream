@@ -11,6 +11,7 @@
 //! The trait is object-safe so callers can hold `Box<dyn Extractor>` in the
 //! [`Memory`](crate::Memory) struct without a type parameter.
 
+pub mod cached;
 pub mod calibration;
 pub mod prompts;
 pub mod providers;
@@ -61,7 +62,7 @@ pub struct Turn {
 /// `source_offsets` are indexes into the *batch* passed to [`Extractor::extract`],
 /// not Kafka offsets. The [`Memory`](crate::Memory) client maps these to actual
 /// Kafka offsets when producing the typed memory record.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Extracted {
     /// The structured body the extractor produced.
     pub body: Body,
