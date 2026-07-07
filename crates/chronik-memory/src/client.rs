@@ -209,14 +209,47 @@ impl Memory {
     }
 
     async fn create_topics_idempotent(&self, configs: &[TopicConfig]) -> Result<()> {
+        // Indexed memory topics (fact/event/instruction/task — searchable or
+        // vector) get MULTIPLE partitions so their leaders spread across cluster
+        // nodes, giving N× text+embedding indexing throughput. Single-partition
+        // tenants funnel ALL of a tenant's indexing onto ONE leader node, which
+        // cannot keep up with fleet ingest and progressively lags until recall
+        // returns n_results=0 — the confound that invalidated every LongMemEval
+        // hybrid run (2026-07-07). Facts distribute by key hash
+        // (record_key = `namespace|key`), so same-key records still land on one
+        // partition and key-based compaction stays correct. Raw stays
+        // single-partition (never indexed); audit is low-volume. Configurable
+        // via `CHRONIK_MEMORY_INDEX_PARTITIONS` (default 3 = one leader per node
+        // on a 3-node cluster).
+        let index_partitions: i32 = std::env::var("CHRONIK_MEMORY_INDEX_PARTITIONS")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(3);
         let new_topics: Vec<NewTopic<'_>> = configs
             .iter()
             .map(|c| {
-                let mut t = NewTopic::new(&c.name, 1, TopicReplication::Fixed(1))
+                let parts = if c.bm25_enabled || c.vector_enabled {
+                    index_partitions
+                } else {
+                    1
+                };
+                let mut t = NewTopic::new(&c.name, parts, TopicReplication::Fixed(1))
                     .set("cleanup.policy", c.cleanup_policy);
-                // `bm25_enabled` is intentionally NOT sent — it's not a
-                // recognised per-topic key. Search is enabled globally on the
-                // broker via `CHRONIK_DEFAULT_SEARCHABLE=true`.
+                // Send an EXPLICIT per-topic `searchable` flag from
+                // `bm25_enabled`. The broker's `TopicConfig::is_searchable()`
+                // checks explicit config BEFORE the `CHRONIK_DEFAULT_SEARCHABLE`
+                // env default, so this correctly keeps the raw transcript
+                // topics (`bm25_enabled=false`) OUT of the Tantivy indexer.
+                //
+                // Previously the SDK sent nothing and relied on the global
+                // env=true — which force-indexed the per-conversation `mem.raw.*`
+                // topics (hundreds per eval run, huge, never queried), drowning
+                // the WalIndexer and starving `mem.fact.*` indexing. That was
+                // the root cause of every readiness-timeout / index-lag failure
+                // in the LongMemEval fleets (diagnosed 2026-07-07). See
+                // ROADMAP_MEMORY_QUALITY.md.
+                t = t.set("searchable", if c.bm25_enabled { "true" } else { "false" });
                 if c.vector_enabled {
                     t = t.set("vector.enabled", "true");
                 }
@@ -227,13 +260,26 @@ impl Memory {
             })
             .collect();
 
-        let opts = AdminOptions::new().request_timeout(Some(Duration::from_secs(10)));
-        let results = self
-            .inner
-            .admin
-            .create_topics(new_topics.iter(), &opts)
-            .await
-            .map_err(|e| MemoryError::Kafka(format!("create_topics: {e}")))?;
+        // Retry the admin op on transient timeouts. Right after a cluster
+        // roll the metadata/consensus layer is briefly slow, and a burst of
+        // concurrent CreateTopics (e.g. 10 eval shards) blows past the admin
+        // timeout — which used to be a fatal `.expect()` in the eval harness,
+        // killing whole shards (observed 2026-07-07). Bumped to 30s + 4
+        // attempts with linear backoff; AlreadyExists short-circuits so a
+        // partial success on an earlier attempt is idempotent.
+        let opts = AdminOptions::new().request_timeout(Some(Duration::from_secs(30)));
+        let mut attempt = 0u32;
+        let results = loop {
+            match self.inner.admin.create_topics(new_topics.iter(), &opts).await {
+                Ok(r) => break r,
+                Err(e) if attempt < 3 => {
+                    attempt += 1;
+                    warn!(attempt, error = %e, "create_topics failed — retrying after backoff");
+                    tokio::time::sleep(Duration::from_secs(3 * attempt as u64)).await;
+                }
+                Err(e) => return Err(MemoryError::Kafka(format!("create_topics: {e}"))),
+            }
+        };
 
         for r in results {
             match r {
@@ -473,6 +519,12 @@ impl Memory {
                 &raw_topic,
             )?;
             env.source.offsets = offsets;
+            // WS-0 (ROADMAP_MEMORY_QUALITY.md): rounds-as-values. Attach a
+            // verbatim excerpt of the cited turns so synthesis sees the raw
+            // wording (assistant-stated names, exact quantities, quotes) that
+            // the atomic (s, p, o) compression loses, and BM25 can match the
+            // original phrasing via the indexed envelope JSON.
+            env.source.excerpt = build_source_excerpt(&turns, &ex.source_indexes);
             typed_acks.push(self.produce_memory(&env).await?);
         }
 
@@ -777,6 +829,7 @@ impl Memory {
                 object: serde_json::Value::Null,
                 polarity: "tombstone".into(),
                 text: String::new(),
+                speaker: "user".into(),
             }),
             MemoryType::Event => crate::schema::Body::Event(crate::schema::EventBody {
                 actor: "tombstone".into(),
@@ -1011,9 +1064,117 @@ fn strip_kafka_scheme(s: &str) -> &str {
     s.strip_prefix("kafka://").unwrap_or(s)
 }
 
+/// Cap on the total source-excerpt length attached to a typed memory (WS-0).
+/// Keeps envelope growth bounded: the excerpt exists to hand synthesis the
+/// verbatim wording of the cited round, not to replicate the raw topic.
+const EXCERPT_MAX_TOTAL: usize = 700;
+/// Per-turn cap inside the excerpt — long turns are truncated with an ellipsis.
+const EXCERPT_MAX_PER_TURN: usize = 240;
+/// At most this many cited turns are excerpted (extra citations are dropped).
+const EXCERPT_MAX_TURNS: usize = 4;
+
+/// Build the WS-0 rounds-as-values excerpt for one extraction: the cited
+/// turns rendered as `role: content` lines, per-turn and total-length capped.
+///
+/// Returns `None` when no cited index resolves to a turn (defensive — the
+/// extractor rejects empty citations upstream).
+fn build_source_excerpt(
+    turns: &[crate::extractor::Turn],
+    source_indexes: &[usize],
+) -> Option<String> {
+    let mut out = String::new();
+    for &i in source_indexes.iter().take(EXCERPT_MAX_TURNS) {
+        let Some(t) = turns.get(i) else { continue };
+        let mut content = t.content.trim().to_string();
+        if content.len() > EXCERPT_MAX_PER_TURN {
+            let mut end = EXCERPT_MAX_PER_TURN;
+            while end > 0 && !content.is_char_boundary(end) {
+                end -= 1;
+            }
+            content.truncate(end);
+            content.push('…');
+        }
+        // WS-3.2: date-stamp the quoted turn when the caller supplied a
+        // timestamp, so temporal questions can be answered by arithmetic
+        // over the quoted dates ("[2023-05-23 09:46] user: I fixed the
+        // fence" + "Today is 2023/05/30" → "7 days ago").
+        let line = match t.ts {
+            Some(ts) => format!("[{}] {}: {}\n", ts.format("%Y-%m-%d %H:%M"), t.role, content),
+            None => format!("{}: {}\n", t.role, content),
+        };
+        if out.len() + line.len() > EXCERPT_MAX_TOTAL {
+            break;
+        }
+        out.push_str(&line);
+    }
+    let trimmed = out.trim_end();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------------------------------------------------------------
+    // WS-0 source excerpt (ROADMAP_MEMORY_QUALITY.md, rounds-as-values)
+    // ---------------------------------------------------------------
+
+    fn turn(role: &str, content: &str) -> crate::extractor::Turn {
+        crate::extractor::Turn {
+            role: role.into(),
+            content: content.into(),
+            ts: None,
+            channel: None,
+            external_id: None,
+        }
+    }
+
+    #[test]
+    fn excerpt_renders_cited_turns_with_roles() {
+        let turns = vec![
+            turn("user", "What language app should I use?"),
+            turn("assistant", "I recommend Memrise for vocabulary."),
+        ];
+        let ex = build_source_excerpt(&turns, &[0, 1]).expect("excerpt");
+        assert!(ex.contains("user: What language app"));
+        assert!(ex.contains("assistant: I recommend Memrise"));
+    }
+
+    #[test]
+    fn excerpt_includes_date_when_turn_has_ts() {
+        use chrono::TimeZone;
+        let mut t = turn("user", "I fixed the fence today.");
+        t.ts = Some(chrono::Utc.with_ymd_and_hms(2023, 5, 23, 9, 46, 0).unwrap());
+        let ex = build_source_excerpt(&[t], &[0]).expect("excerpt");
+        assert!(
+            ex.starts_with("[2023-05-23 09:46] user:"),
+            "got: {ex}"
+        );
+    }
+
+    #[test]
+    fn excerpt_truncates_long_turns_and_caps_total() {
+        let long = "x".repeat(EXCERPT_MAX_PER_TURN * 3);
+        let turns = vec![
+            turn("user", &long),
+            turn("assistant", &long),
+            turn("user", &long),
+            turn("assistant", &long),
+        ];
+        let ex = build_source_excerpt(&turns, &[0, 1, 2, 3]).expect("excerpt");
+        assert!(ex.len() <= EXCERPT_MAX_TOTAL + 8, "len={}", ex.len());
+        assert!(ex.contains('…'), "long turns must be ellipsized");
+    }
+
+    #[test]
+    fn excerpt_none_when_indexes_out_of_range() {
+        let turns = vec![turn("user", "hello")];
+        assert!(build_source_excerpt(&turns, &[7]).is_none());
+    }
 
     #[tokio::test]
     async fn build_requires_kafka_api_namespace() {
