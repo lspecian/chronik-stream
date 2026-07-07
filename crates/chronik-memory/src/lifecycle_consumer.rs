@@ -694,7 +694,7 @@ mod tests {
             source: Source {
                 topic: "mem.fact.acme".into(),
                 offsets: vec![0],
-                extractor: "test".into(),
+                extractor: "test".into(), excerpt: None,
             },
             tombstoned: false,
             body: Body::Fact(FactBody {
@@ -703,6 +703,7 @@ mod tests {
                 object: serde_json::Value::Null,
                 polarity: "asserted".into(),
                 text: text.into(),
+                speaker: "user".into(),
             }),
         }
     }

@@ -122,6 +122,7 @@ fn make_fact(
             object,
             polarity: "asserted".into(),
             text,
+            speaker: "user".into(),
         }),
         key: Some(format!("{}|{}", subject, predicate)),
         confidence: RULE_CONFIDENCE,

@@ -176,7 +176,7 @@ mod tests {
             source: Source {
                 topic: source_topic.into(),
                 offsets,
-                extractor: "test@1".into(),
+                extractor: "test@1".into(), excerpt: None,
             },
             tombstoned: false,
             body: Body::Fact(FactBody {
@@ -185,6 +185,7 @@ mod tests {
                 object: serde_json::json!("o"),
                 polarity: "asserted".into(),
                 text: "u p o".into(),
+                speaker: "user".into(),
             }),
         }
     }

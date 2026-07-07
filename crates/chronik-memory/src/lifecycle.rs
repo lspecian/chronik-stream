@@ -215,6 +215,7 @@ mod tests {
                 object: serde_json::json!("o"),
                 polarity: "asserted".into(),
                 text: text.into(),
+                speaker: "user".into(),
             }),
             key: Some("user|p".into()),
             confidence: conf,
@@ -236,7 +237,7 @@ mod tests {
             source: Source {
                 topic: "x".into(),
                 offsets: vec![0],
-                extractor: "x".into(),
+                extractor: "x".into(), excerpt: None,
             },
             tombstoned: false,
             body: Body::Fact(FactBody {
@@ -245,6 +246,7 @@ mod tests {
                 object: serde_json::json!("o"),
                 polarity: "asserted".into(),
                 text: text.into(),
+                speaker: "user".into(),
             }),
         }
     }
@@ -264,7 +266,7 @@ mod tests {
             source: Source {
                 topic: "x".into(),
                 offsets: vec![0],
-                extractor: "x".into(),
+                extractor: "x".into(), excerpt: None,
             },
             tombstoned: false,
             body: Body::Event(EventBody {

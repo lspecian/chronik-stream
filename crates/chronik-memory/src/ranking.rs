@@ -127,6 +127,10 @@ pub enum QueryIntent {
     Numeric,
     /// Temporal query — "when", "how long", "duration", "before/after X".
     Temporal,
+    /// "What did you tell/say/recommend..." — the answer was stated by the
+    /// ASSISTANT (WS-2, ROADMAP_MEMORY_QUALITY.md). Boosts facts with
+    /// `speaker == "assistant"`.
+    AssistantStated,
     /// Default — just look for matching facts.
     Identity,
 }
@@ -136,12 +140,38 @@ pub enum QueryIntent {
 /// Cheap rule-based classifier. Conservative — when in doubt, returns
 /// `Identity` (no boost).
 ///
-/// Detection order matters: strong temporal phrases (e.g. "how long",
-/// "for how many days") win over numeric aggregators ("how many") because
-/// "how many days" is asking for a time count, not a generic count. Then
-/// numeric aggregators, then weak temporal markers, then fall through.
+/// Detection order matters: assistant-stated phrasings ("what did you
+/// tell me") win first — they are unambiguous and often co-occur with
+/// numeric/temporal words that would misroute them. Then strong temporal
+/// phrases (e.g. "how long", "for how many days") over numeric
+/// aggregators ("how many"), then weak temporal markers, then fall through.
 pub fn detect_intent(query: &str) -> QueryIntent {
     let q = query.to_lowercase();
+
+    // Pass 0: assistant-stated phrasings (WS-2). The second-person subject
+    // makes these unambiguous — the user is asking what the ASSISTANT said.
+    const ASSISTANT_STATED: &[&str] = &[
+        "did you tell",
+        "did you say",
+        "did you recommend",
+        "did you suggest",
+        "did you mention",
+        "did you give",
+        "you told me",
+        "you said",
+        "you recommended",
+        "you suggested",
+        "you mentioned",
+        "you gave me",
+        "you provided",
+        "you quoted",
+        "according to you",
+    ];
+    for p in ASSISTANT_STATED {
+        if q.contains(p) {
+            return QueryIntent::AssistantStated;
+        }
+    }
 
     // Pass 1: strong temporal phrases that imply a time query even when
     // numeric aggregators are present.
@@ -229,9 +259,28 @@ pub fn detect_intent(query: &str) -> QueryIntent {
 /// signal — it's a tiebreaker for the borderline cases that fall just below
 /// the synthesis-context cutoff.
 pub fn intent_boost(intent: QueryIntent, record: &MemoryRecord) -> f64 {
+    // Sprint 4 tried a speaker-aware de-dilution penalty (0.7× on
+    // assistant-speaker facts for non-assistant queries) to recover
+    // single-session-user. The full-500 run (s4c) showed it FAILED its
+    // hypothesis: ssu dropped further (0.386→0.300) while the headline
+    // moved only +2 items (noise). Removed in Sprint 5 — the real recall
+    // gap is semantic, not a ranking artifact, so vector search is the
+    // lever instead. See ROADMAP_MEMORY_QUALITY.md.
+    intent_boost_base(intent, record)
+}
+
+/// Intent-type boost. See [`intent_boost`].
+fn intent_boost_base(intent: QueryIntent, record: &MemoryRecord) -> f64 {
     use crate::schema::Body;
     match intent {
         QueryIntent::Identity => 1.0,
+        QueryIntent::AssistantStated => match &record.body {
+            // Strong match: the fact was stated by the assistant (WS-2).
+            Body::Fact(f) if f.speaker == "assistant" => 1.8,
+            // Weak: agent-actor events sometimes carry assistant statements.
+            Body::Event(e) if e.actor.starts_with("agent") => 1.2,
+            _ => 1.0,
+        },
         QueryIntent::Numeric => match &record.body {
             Body::Fact(f) => {
                 // Strong match: object is a JSON number.
@@ -336,7 +385,7 @@ mod tests {
             source: Source {
                 topic: "x".into(),
                 offsets: vec![],
-                extractor: "x".into(),
+                extractor: "x".into(), excerpt: None,
             },
             tombstoned: false,
             body: Body::Fact(FactBody {
@@ -345,8 +394,90 @@ mod tests {
                 object: serde_json::json!("o"),
                 polarity: "asserted".into(),
                 text: "t".into(),
+                speaker: "user".into(),
             }),
         }
+    }
+
+    // ---------------- Sprint 3 / WS-2: assistant-stated intent ----------------
+
+    #[test]
+    fn detects_assistant_stated_phrasings() {
+        for q in [
+            "What language-learning app did you recommend?",
+            "What did you tell me about the hostel in Amsterdam?",
+            "What was the quote you gave me from Borges?",
+            "You mentioned a meditation website — which one?",
+            "you said my jumpsuit had a designation, what was it?",
+        ] {
+            assert_eq!(
+                detect_intent(q),
+                QueryIntent::AssistantStated,
+                "should be AssistantStated: {q}"
+            );
+        }
+    }
+
+    #[test]
+    fn assistant_intent_does_not_fire_on_user_stated() {
+        for q in [
+            "What degree did I graduate with?",
+            "How many days did the fence repair take?",
+            "Where did my sister move to?",
+            "I told you my budget, what apartments fit it?",
+        ] {
+            assert_ne!(
+                detect_intent(q),
+                QueryIntent::AssistantStated,
+                "should NOT be AssistantStated: {q}"
+            );
+        }
+    }
+
+    #[test]
+    fn assistant_boost_prefers_assistant_speaker_facts() {
+        let mut assistant_fact = fact(1, "k");
+        if let Body::Fact(f) = &mut assistant_fact.body {
+            f.speaker = "assistant".into();
+        }
+        let user_fact = fact(1, "k2");
+        let b_a = intent_boost(QueryIntent::AssistantStated, &assistant_fact);
+        let b_u = intent_boost(QueryIntent::AssistantStated, &user_fact);
+        assert!(b_a > b_u, "assistant fact must outrank user fact: {b_a} vs {b_u}");
+        assert!((b_a - 1.8).abs() < 1e-9);
+        assert!((b_u - 1.0).abs() < 1e-9);
+    }
+
+    // -------- Sprint 5: de-dilution penalty removed (failed in s4c) --------
+
+    fn assistant_fact() -> MemoryRecord {
+        let mut m = fact(1, "ak");
+        if let Body::Fact(f) = &mut m.body {
+            f.speaker = "assistant".into();
+        }
+        m
+    }
+
+    #[test]
+    fn assistant_facts_not_penalized_on_non_assistant_queries() {
+        // Sprint 4's 0.7× penalty was removed after s4c showed it hurt
+        // single-session-user instead of helping. Non-assistant intents now
+        // treat assistant and user facts by intent-type alone (no speaker
+        // penalty): both get base 1.0 on Identity/Numeric/Temporal.
+        let asst = assistant_fact();
+        for intent in [QueryIntent::Identity, QueryIntent::Numeric, QueryIntent::Temporal] {
+            let b = intent_boost(intent, &asst);
+            assert!((b - 1.0).abs() < 1e-9, "no penalty on {intent:?}: {b}");
+        }
+    }
+
+    #[test]
+    fn assistant_facts_boosted_on_assistant_queries() {
+        // The AssistantStated boost stays: when the question IS about what the
+        // assistant said, assistant facts still get the 1.8× lift.
+        let asst = assistant_fact();
+        let b = intent_boost(QueryIntent::AssistantStated, &asst);
+        assert!((b - 1.8).abs() < 1e-9, "assistant fact boosted: {b}");
     }
 
     #[test]
@@ -413,7 +544,7 @@ mod tests {
             source: Source {
                 topic: "x".into(),
                 offsets: vec![],
-                extractor: "x".into(),
+                extractor: "x".into(), excerpt: None,
             },
             tombstoned: false,
             body: Body::Event(EventBody {
@@ -519,7 +650,7 @@ mod tests {
             valid_from: Utc::now(),
             valid_to: None,
             confidence: 1.0,
-            source: Source { topic: "x".into(), offsets: vec![], extractor: "x".into() },
+            source: Source { topic: "x".into(), offsets: vec![], extractor: "x".into(), excerpt: None },
             tombstoned: false,
             body: Body::Event(EventBody {
                 actor: "u".into(),

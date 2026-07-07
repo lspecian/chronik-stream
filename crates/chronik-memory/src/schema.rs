@@ -102,6 +102,20 @@ pub struct Source {
 
     /// Extractor identifier — typically `{name}@{git-sha-or-version}`.
     pub extractor: String,
+
+    /// Verbatim excerpt of the source round(s) this memory was extracted
+    /// from, as `role: content` lines (WS-0, ROADMAP_MEMORY_QUALITY.md).
+    ///
+    /// Facts-as-keys, rounds-as-values: the (s, p, o) triple is the
+    /// retrieval key; this excerpt is the value handed to synthesis. It
+    /// preserves exact wording (assistant-stated names, quantities, quotes)
+    /// that atomic extraction loses, and its presence in the indexed JSON
+    /// also lets BM25 match the raw phrasing (fact-expansion).
+    ///
+    /// Capped at ingest (see `client.rs`) so envelopes stay bounded.
+    /// `None` on records written before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub excerpt: Option<String>,
 }
 
 /// Memory type discriminant.
@@ -182,10 +196,23 @@ pub struct FactBody {
     pub polarity: String,
     /// Free-text rendering of the claim. Indexed by Tantivy.
     pub text: String,
+    /// Who stated the claim in the source conversation — `"user"` or
+    /// `"assistant"` (WS-2, ROADMAP_MEMORY_QUALITY.md). Assistant-stated
+    /// facts (recommendations, designations, quotes the user accepted) are
+    /// first-class memories; queries like "what did you tell me about X"
+    /// boost `speaker == "assistant"` at recall and synthesis commits to
+    /// them without requiring the user to have restated them.
+    /// Defaults to `"user"` for records written before this field existed.
+    #[serde(default = "default_speaker")]
+    pub speaker: String,
 }
 
 fn default_polarity() -> String {
     "asserted".to_string()
+}
+
+fn default_speaker() -> String {
+    "user".to_string()
 }
 
 /// Event body — time-stamped append-only occurrence.
@@ -332,7 +359,7 @@ mod tests {
         Source {
             topic: "mem.raw.acme.bot.user-luis".to_string(),
             offsets: vec![1, 2, 3],
-            extractor: "extractor-v1@deadbeef".to_string(),
+            extractor: "extractor-v1@deadbeef".to_string(), excerpt: None,
         }
     }
 
@@ -362,6 +389,7 @@ mod tests {
             object: serde_json::json!("Lapa"),
             polarity: "asserted".to_string(),
             text: "Luis prefers Lapa".to_string(),
+                speaker: "user".into(),
         }));
 
         let json = serde_json::to_value(&m).unwrap();
@@ -450,6 +478,7 @@ mod tests {
                     object: serde_json::json!("o"),
                     polarity: "asserted".into(),
                     text: "t".into(),
+                speaker: "user".into(),
                 }),
                 MemoryType::Fact,
             ),

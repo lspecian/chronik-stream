@@ -301,7 +301,7 @@ mod tests {
             source: Source {
                 topic: "mem.raw.acme.agent.bot.user.luis".into(),
                 offsets: vec![127, 128],
-                extractor: "anthropic-v3".into(),
+                extractor: "anthropic-v3".into(), excerpt: None,
             },
             tombstoned,
             body: Body::Fact(FactBody {
@@ -310,6 +310,7 @@ mod tests {
                 object: serde_json::Value::Null,
                 polarity: "asserted".into(),
                 text: "budget $4000".into(),
+                speaker: "user".into(),
             }),
         }
     }

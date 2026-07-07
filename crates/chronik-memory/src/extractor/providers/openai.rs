@@ -14,7 +14,7 @@
 
 use crate::embeddings::TextGenerator;
 use crate::error::{MemoryError, Result};
-use crate::extractor::prompts::{v1, v2, v3, v4, v5};
+use crate::extractor::prompts::{v1, v2, v3, v3_lite, v4, v5};
 use crate::extractor::providers::common::{filter_and_convert, RawToolInput};
 use crate::extractor::{Extracted, Extractor, Turn};
 use async_trait::async_trait;
@@ -30,6 +30,7 @@ const ID_V2: &str = "openai-v2";
 const ID_V3: &str = "openai-v3";
 const ID_V4: &str = "openai-v4";
 const ID_V5: &str = "openai-v5";
+const ID_V3LITE: &str = "openai-v3lite";
 
 /// Which prompt revision the extractor sends. Same shape as Anthropic — only
 /// the wire-format wrapping differs.
@@ -50,6 +51,10 @@ pub enum OpenAIPromptVersion {
     /// descriptions) without trading user-fact density. Opt-in for
     /// measurement.
     V5,
+    /// Condensed V3 for small local models (LM Studio / vLLM) — the full
+    /// V3 rule volume makes 30B-class models under-extract (0 facts where
+    /// a ~600-char prompt yields 7). Same tool schema as V3.
+    V3Lite,
 }
 
 impl OpenAIPromptVersion {
@@ -60,6 +65,7 @@ impl OpenAIPromptVersion {
             OpenAIPromptVersion::V3 => ID_V3,
             OpenAIPromptVersion::V4 => ID_V4,
             OpenAIPromptVersion::V5 => ID_V5,
+            OpenAIPromptVersion::V3Lite => ID_V3LITE,
         }
     }
     fn system_prompt(self) -> &'static str {
@@ -69,6 +75,7 @@ impl OpenAIPromptVersion {
             OpenAIPromptVersion::V3 => v3::SYSTEM_PROMPT,
             OpenAIPromptVersion::V4 => v4::SYSTEM_PROMPT,
             OpenAIPromptVersion::V5 => v5::SYSTEM_PROMPT,
+            OpenAIPromptVersion::V3Lite => v3_lite::SYSTEM_PROMPT,
         }
     }
     fn tool_input_schema(self) -> serde_json::Value {
@@ -78,6 +85,7 @@ impl OpenAIPromptVersion {
             OpenAIPromptVersion::V3 => v3::tool_input_schema(),
             OpenAIPromptVersion::V4 => v4::tool_input_schema(),
             OpenAIPromptVersion::V5 => v5::tool_input_schema(),
+            OpenAIPromptVersion::V3Lite => v3_lite::tool_input_schema(),
         }
     }
     fn render_user_message(self, turns: &[Turn]) -> String {
@@ -87,6 +95,7 @@ impl OpenAIPromptVersion {
             OpenAIPromptVersion::V3 => v3::render_user_message(turns),
             OpenAIPromptVersion::V4 => v4::render_user_message(turns),
             OpenAIPromptVersion::V5 => v5::render_user_message(turns),
+            OpenAIPromptVersion::V3Lite => v3_lite::render_user_message(turns),
         }
     }
     fn tool_name(self) -> &'static str {
@@ -230,24 +239,70 @@ impl Extractor for OpenAIExtractor {
             self.base_url.trim_end_matches('/')
         );
 
-        let resp = self
-            .http
-            .post(&url)
-            .bearer_auth(&self.api_key)
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await?;
+        // 429 retry with exponential backoff (Sprint 3, ROADMAP_MEMORY_QUALITY.md).
+        // Under fleet load (10 concurrent eval shards) transient RPM spikes
+        // returned 429 and each one cost a whole chunk of extractions —
+        // 3 items degraded on the sprint-2 run. Rate limits are the ONLY
+        // retried status: 4xx re-sends would fail identically and 5xx is
+        // left to the caller's chunk-skip tolerance.
+        const MAX_RETRIES: u32 = 4;
+        const BASE_BACKOFF_SECS: u64 = 5;
+        let mut attempt = 0u32;
+        let parsed: ChatCompletionsResponse = loop {
+            let resp = self
+                .http
+                .post(&url)
+                .bearer_auth(&self.api_key)
+                .header("content-type", "application/json")
+                .json(&body)
+                .send()
+                .await?;
 
-        let status = resp.status();
-        if !status.is_success() {
-            let txt = resp.text().await.unwrap_or_default();
-            return Err(MemoryError::Provider(format!(
-                "openai-compatible endpoint returned {status}: {txt}"
-            )));
-        }
+            let status = resp.status();
+            if status.as_u16() == 429 && attempt < MAX_RETRIES {
+                // Honor Retry-After when present; otherwise exponential backoff.
+                let retry_after = resp
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok());
+                let wait = retry_after
+                    .unwrap_or(BASE_BACKOFF_SECS * 2u64.pow(attempt))
+                    .min(120);
+                tracing::warn!(
+                    attempt,
+                    wait_secs = wait,
+                    "openai 429 — backing off and retrying"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                attempt += 1;
+                continue;
+            }
+            if !status.is_success() {
+                let txt = resp.text().await.unwrap_or_default();
+                // LM Studio: a model crash under concurrent load returns 400
+                // "The model has crashed...". The next request triggers a JIT
+                // reload, so a delayed retry usually succeeds. Retryable —
+                // unlike other 400s (schema/context errors), which would fail
+                // identically on re-send.
+                if txt.contains("model has crashed") && attempt < MAX_RETRIES {
+                    let wait = 30 * (attempt as u64 + 1);
+                    tracing::warn!(
+                        attempt,
+                        wait_secs = wait,
+                        "local model crashed — waiting for JIT reload and retrying"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                    attempt += 1;
+                    continue;
+                }
+                return Err(MemoryError::Provider(format!(
+                    "openai-compatible endpoint returned {status}: {txt}"
+                )));
+            }
+            break resp.json().await?;
+        };
 
-        let parsed: ChatCompletionsResponse = resp.json().await?;
         let raw = parse_tool_output(&parsed, self.prompt_version)?;
         Ok(filter_and_convert(
             raw,
@@ -306,7 +361,6 @@ struct ChatCompletionsResponse {
 #[derive(Debug, Deserialize)]
 struct Choice {
     message: AssistantMessage,
-    #[allow(dead_code)]
     #[serde(default)]
     finish_reason: Option<String>,
 }
@@ -315,7 +369,6 @@ struct Choice {
 struct AssistantMessage {
     #[serde(default)]
     tool_calls: Vec<ToolCall>,
-    #[allow(dead_code)]
     #[serde(default)]
     content: Option<String>,
 }
@@ -363,7 +416,31 @@ fn parse_tool_output(
             });
         }
     }
-    // No matching tool call — treat as empty (model refused or returned text only).
+    // No matching tool call — treat as empty (model refused or returned text
+    // only). LOUD warn: with `tool_choice: "required"` this almost always
+    // means the completion was truncated by max_tokens mid-tool-call (LM
+    // Studio then reports it as content / empty arguments). This silent path
+    // masked a 0-facts-per-chunk failure for days — see the 2026-07-05
+    // sprint-3c diagnosis. If finish_reason=length, raise max_tokens.
+    let finish = resp
+        .choices
+        .first()
+        .and_then(|c| c.finish_reason.as_deref())
+        .unwrap_or("?");
+    let content_prefix: String = resp
+        .choices
+        .first()
+        .and_then(|c| c.message.content.as_deref())
+        .unwrap_or("")
+        .chars()
+        .take(120)
+        .collect();
+    tracing::warn!(
+        finish_reason = finish,
+        content_prefix = %content_prefix,
+        "no matching tool call in completion — returning EMPTY extraction; \
+         if finish_reason=length, max_tokens is too small for the tool JSON"
+    );
     Ok(RawToolInput::default())
 }
 

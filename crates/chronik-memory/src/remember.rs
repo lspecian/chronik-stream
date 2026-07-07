@@ -49,7 +49,7 @@ pub(crate) fn build_envelope(
         source: Source {
             topic: source_topic.to_string(),
             offsets: vec![],
-            extractor: extractor_id.to_string(),
+            extractor: extractor_id.to_string(), excerpt: None,
         },
         tombstoned: false,
         body,
@@ -114,6 +114,7 @@ mod tests {
             object: serde_json::json!("Lapa"),
             polarity: "asserted".into(),
             text: "Luis prefers Lapa".into(),
+                speaker: "user".into(),
         })
     }
 

@@ -44,7 +44,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Default size of the fan-out window per channel before RRF.
-const DEFAULT_FANOUT_SIZE: usize = 50;
+///
+/// Sprint-1 (ROADMAP_MEMORY_QUALITY.md WS-4.1): raised 50 → 150. The
+/// 2026-07-04 fleet analysis showed value-bearing memories ranking below the
+/// old window for count-style temporal questions ("how many times did X"),
+/// and RRF fusion absorbs the extra candidates without ranking damage. RRF
+/// contribution at rank 150 with RRF_K=60 is ~0.005 vs ~0.016 at rank 1, so
+/// deep candidates only surface when several channels agree.
+const DEFAULT_FANOUT_SIZE: usize = 150;
 
 /// One ranked result from [`Memory::recall`].
 #[derive(Debug, Clone)]
@@ -373,20 +380,73 @@ impl<'a> RecallBuilder<'a> {
             opt_fut(sql_fut),
         );
 
-        if let Some(out) = b? {
-            full_per_channel.insert(Channel::Bm25, out);
+        // Channel fault tolerance: multi-channel RRF must degrade, not die,
+        // when one channel errors — e.g. `/_vector` on a topic created with
+        // `vector.enabled=false` (CHRONIK_MEMORY_VECTOR_TOPICS=false) returns
+        // an error; before this, that single failure zeroed the entire recall
+        // (`?` on each channel). A failed channel now logs and contributes
+        // nothing; recall errors only when EVERY enabled channel failed.
+        let mut channel_errors: Vec<MemoryError> = Vec::new();
+        let mut any_channel_ok = false;
+        match b {
+            Ok(Some(out)) => {
+                any_channel_ok = true;
+                full_per_channel.insert(Channel::Bm25, out);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!("recall bm25 channel failed (degrading): {e}");
+                channel_errors.push(e);
+            }
         }
-        if let Some(out) = v? {
-            id_per_channel.insert(Channel::Vector, out);
+        match v {
+            Ok(Some(out)) => {
+                any_channel_ok = true;
+                id_per_channel.insert(Channel::Vector, out);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!("recall vector channel failed (degrading): {e}");
+                channel_errors.push(e);
+            }
         }
-        if let Some(out) = km? {
-            full_per_channel.insert(Channel::KeyMatch, out);
+        match km {
+            Ok(Some(out)) => {
+                any_channel_ok = true;
+                full_per_channel.insert(Channel::KeyMatch, out);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!("recall key-match channel failed (degrading): {e}");
+                channel_errors.push(e);
+            }
         }
-        if let Some(out) = h? {
-            id_per_channel.insert(Channel::Hyde, out);
+        match h {
+            Ok(Some(out)) => {
+                any_channel_ok = true;
+                id_per_channel.insert(Channel::Hyde, out);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!("recall hyde channel failed (degrading): {e}");
+                channel_errors.push(e);
+            }
         }
-        if let Some(out) = s? {
-            full_per_channel.insert(Channel::Sql, out);
+        match s {
+            Ok(Some(out)) => {
+                any_channel_ok = true;
+                full_per_channel.insert(Channel::Sql, out);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!("recall sql channel failed (degrading): {e}");
+                channel_errors.push(e);
+            }
+        }
+        if !any_channel_ok {
+            if let Some(first) = channel_errors.into_iter().next() {
+                return Err(first);
+            }
         }
 
         // Build master result map keyed by memory_id. Channels that produce
@@ -999,19 +1059,29 @@ const STOPWORDS: &[&str] = &[
 /// LLM-judge prompt for consistency.
 const MAX_SYNTH_SNIPPET_CHARS: usize = 280;
 
-/// Render one [`MemoryRecord`] as a single bulleted line for the synthesis
-/// prompt. Includes type + valid_from + the most-informative typed fields so
-/// the model can reason about recency and structured content (subject /
-/// predicate / object for facts, actor / verb for events, etc.).
+/// Cap for the WS-0 source-excerpt block appended under a memory line in the
+/// synthesis prompt. The excerpt is already ingest-capped at 700 chars
+/// (client.rs `EXCERPT_MAX_TOTAL`); this is defensive and keeps the k=10
+/// prompt under ~10 KB even if older records carry longer excerpts.
+const MAX_SYNTH_EXCERPT_CHARS: usize = 700;
+
+/// Render one [`MemoryRecord`] as a bulleted entry for the synthesis prompt.
+/// Includes type + valid_from + the most-informative typed fields so the
+/// model can reason about recency and structured content, plus — when
+/// present — the WS-0 verbatim source excerpt of the round the memory was
+/// extracted from, indented under the summary line. The excerpt carries
+/// speaker labels and exact wording (assistant-stated names, quantities,
+/// quotes) that the atomic extraction loses.
 fn render_memory_for_synthesis(m: &MemoryRecord) -> String {
     use crate::schema::Body::*;
     let typed = match &m.body {
         Fact(f) => format!(
-            "fact subject={} predicate={} object={} polarity={} text={}",
+            "fact subject={} predicate={} object={} polarity={} speaker={} text={}",
             f.subject,
             f.predicate,
             serde_json::to_string(&f.object).unwrap_or_default(),
             f.polarity,
+            f.speaker,
             f.text
         ),
         Event(e) => format!(
@@ -1035,7 +1105,17 @@ fn render_memory_for_synthesis(m: &MemoryRecord) -> String {
         ),
     };
     let truncated: String = typed.chars().take(MAX_SYNTH_SNIPPET_CHARS).collect();
-    format!("({}) {}", m.valid_from.to_rfc3339(), truncated)
+    let mut line = format!("({}) {}", m.valid_from.to_rfc3339(), truncated);
+    if let Some(excerpt) = &m.source.excerpt {
+        let capped: String = excerpt.chars().take(MAX_SYNTH_EXCERPT_CHARS).collect();
+        // Indent each excerpt line so it reads as a quoted block under the
+        // memory summary, not as a separate memory.
+        for l in capped.lines() {
+            line.push_str("\n      | ");
+            line.push_str(l);
+        }
+    }
+    line
 }
 
 /// Build the synthesis prompt. Format is deliberately minimal — bulleted
@@ -1046,14 +1126,83 @@ fn render_memory_for_synthesis(m: &MemoryRecord) -> String {
 /// can detect it via `SynthesizedAnswer::abstained` and avoid surfacing
 /// hallucinated answers.
 fn build_synthesis_prompt(question: &str, memories: &[RecallResult]) -> String {
-    // Env-gated A/B: `CHRONIK_MEMORY_SYNTH_PROMPT=v2` selects the
-    // assistant-fact-committing variant (Option B from the LongMemEval pilot
-    // ladder). Default stays v1 so measurements against the pilot-7/8 baseline
-    // aren't disturbed unless the operator explicitly opts in.
+    // Sprint-1 (ROADMAP_MEMORY_QUALITY.md WS-1): v2 is the default.
+    // The 2026-07-04 fleet analysis showed v1's abstention gate destroyed
+    // 76 raw-recall hits (net −45) with a 73% overall abstain rate against
+    // only ~30/500 questions where abstention is correct. `v1` remains
+    // available as an env opt-out for baseline comparison.
+    //
+    // Preference-shaped questions get a dedicated template (WS-1.3):
+    // their golds are "the user would prefer..." paragraphs, which the
+    // factoid-shaped prompt converted at 0/6 on the 2026-07-04 fleet.
     match std::env::var("CHRONIK_MEMORY_SYNTH_PROMPT").as_deref() {
-        Ok("v2") => build_synthesis_prompt_v2(question, memories),
-        _ => build_synthesis_prompt_v1(question, memories),
+        Ok("v1") => build_synthesis_prompt_v1(question, memories),
+        _ => {
+            if is_preference_question(question) {
+                build_synthesis_prompt_preference(question, memories)
+            } else {
+                build_synthesis_prompt_v2(question, memories)
+            }
+        }
     }
+}
+
+/// Detect preference-shaped questions (LongMemEval `single-session-preference`
+/// style): the gold answer is a description of what the user would or would
+/// not prefer, grounded in their stated experiences — not a factoid.
+fn is_preference_question(question: &str) -> bool {
+    let q = question.to_lowercase();
+    const PREFERENCE_MARKERS: &[&str] = &[
+        "would i prefer",
+        "would i like",
+        "what would i",
+        "do i prefer",
+        "what do i prefer",
+        "suggest",
+        "recommend",
+        "what should i",
+        "any ideas for",
+        "tips for me",
+        "help me plan",
+        "how should you respond",
+        "tailor",
+    ];
+    PREFERENCE_MARKERS.iter().any(|m| q.contains(m))
+}
+
+/// Preference template (WS-1.3) — instead of a one-line factoid, produce a
+/// short grounded description of the user's relevant preferences and
+/// constraints. The LongMemEval judge grades these paraphrase-tolerantly
+/// against golds of the form "The user would prefer responses that ...".
+fn build_synthesis_prompt_preference(question: &str, memories: &[RecallResult]) -> String {
+    let mut bullets = String::new();
+    for (i, r) in memories.iter().enumerate() {
+        let line = render_memory_for_synthesis(&r.memory);
+        bullets.push_str(&format!("[{}] {}\n", i + 1, line));
+    }
+    format!(
+        "You are answering on behalf of an assistant that knows the user's long-term memories. \
+The question asks what the user would want, prefer, or find helpful. Answer it as a short \
+description of the user's relevant preferences, grounded ONLY in the provided memories.\n\
+\n\
+Rules:\n\
+- Lines starting with `|` under a memory quote the ORIGINAL conversation verbatim (`user:` / `assistant:` prefixes show who spoke). Use them for the concrete specifics.\n\
+- Answer in 2-4 sentences of the form: what the user would prefer (tied to their specific \
+stated experiences, interests, possessions, or constraints from the memories), and what they \
+would NOT prefer (generic suggestions that ignore those specifics).\n\
+- Reference the concrete specifics from the memories — names, activities, items, situations. \
+Specificity is what makes the answer correct.\n\
+- Do NOT invent preferences that no memory supports.\n\
+- Only reply EXACTLY: {ABSTAIN_LITERAL} if every listed memory is about a completely \
+different subject than the question. If ANY memory relates to the question's topic, answer \
+from it — describing the user's known preferences IS the job, even from partial information.\n\
+\n\
+Memories (relevance order, with timestamps):\n\
+{bullets}\n\
+Question: {question}\n\
+\n\
+Answer:"
+    )
 }
 
 /// v1 — original pilot-7 anti-abstention prompt. Kept for baseline comparison.
@@ -1104,13 +1253,15 @@ fn build_synthesis_prompt_v2(question: &str, memories: &[RecallResult]) -> Strin
 Answer the user's question using ONLY the provided memories.\n\
 \n\
 Rules:\n\
+- Lines starting with `|` under a memory quote the ORIGINAL conversation verbatim (`user:` / `assistant:` prefixes show who spoke). Trust their exact wording — names, numbers, quotes, orderings — over the structured summary above them.\n\
 - When two memories conflict (e.g. an updated preference, a changed budget), prefer the one with the most recent timestamp.\n\
 - **Assistant-stated facts count.** These memories were extracted from a conversation the user was present for. If a memory records the assistant naming, describing, recommending, or quantifying something — a person's clothing, a place, a food, a brand, a duration, a count — and the user did not object in a later turn, treat that as a settled fact. Commit to it. Do NOT abstain because the user did not restate it.\n\
 - **One clear candidate wins.** If the retrieved memories contain exactly one fact that plausibly answers the question, commit to it. Do NOT abstain because you are not 100% certain — abstention costs more than a specific answer in this task.\n\
 - **Arithmetic questions** (\"how many\", \"total\", \"sum\", \"average\", \"how much\"): if you see ANY value-bearing memories — counts, durations, dollar amounts, quantities — even just two of them, COMPUTE the aggregate from those values. Return only the computed value (e.g. \"$720\", \"3\", \"four weeks\"). Show the arithmetic only if asked.\n\
 - **Temporal questions** (\"how long ago\", \"how many days\", \"when did I last\"): reason from memory timestamps and any time-anchored content. Output the duration / date naturally (\"four weeks\", \"about two hours\", \"over a year\").\n\
+- **Read in two steps (silently).** First, for each memory that touches the question's topic, note what it contributes — entity, value, date, who said it. Second, compose the answer from those notes, combining across memories when the question spans several conversations. Do NOT write the notes out; output only the final answer.\n\
 - Be concise — one sentence whenever possible. No preamble, no \"Based on the memories...\", just the answer.\n\
-- **Abstain only when NO retrieved memory is topically relevant.** Reply EXACTLY: {ABSTAIN_LITERAL} only if every listed memory is clearly unrelated to the question. Do NOT abstain when memories touch the topic but require you to commit to a specific value, entity, or fact — committing IS the job.\n\
+- **Abstention is for absent subjects, not uncertainty.** Reply EXACTLY: {ABSTAIN_LITERAL} in exactly two situations: (1) every listed memory is about a clearly different subject than the question, or (2) the question asks about a SPECIFIC entity or attribute (a person, an item, an occasion) that no memory mentions — e.g. the question asks about a gift from your dad but the memories only record a gift from your sister; in that case the correct answer is that you don't know. In every other case — when a memory names the entity or attribute the question asks about — COMMIT to the best-supported answer. Do NOT abstain because you are unsure, because the evidence is partial, or because the answer requires combining or computing from several memories. Committing IS the job.\n\
 \n\
 Memories (relevance order, with timestamps):\n\
 {bullets}\n\
@@ -1381,7 +1532,7 @@ mod tests {
             source: Source {
                 topic: "mem.raw.t".into(),
                 offsets: vec![1],
-                extractor: "x@1".into(),
+                extractor: "x@1".into(), excerpt: None,
             },
             tombstoned: false,
             body: Body::Fact(FactBody {
@@ -1390,6 +1541,7 @@ mod tests {
                 object: serde_json::json!("o"),
                 polarity: "asserted".into(),
                 text: "t".into(),
+                speaker: "user".into(),
             }),
         }
     }
@@ -1409,7 +1561,7 @@ mod tests {
             source: Source {
                 topic: "mem.raw.t".into(),
                 offsets: vec![1],
-                extractor: "x@1".into(),
+                extractor: "x@1".into(), excerpt: None,
             },
             tombstoned: false,
             body: Body::Event(EventBody {
@@ -1779,5 +1931,65 @@ mod tests {
         });
         let m = parse_envelope_from_source(&wrapped).expect("parse");
         assert_eq!(m.body.kind(), MemoryType::Fact);
+    }
+
+    // ------------------------------------------------------------------
+    // Sprint-1 synthesis prompt selection (ROADMAP_MEMORY_QUALITY.md WS-1)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn preference_detector_matches_preference_shapes() {
+        for q in [
+            "What kind of gift ideas would I prefer for my niece?",
+            "Can you suggest some podcasts for my commute?",
+            "Recommend a slow cooker recipe for me",
+            "What should I make for the potluck?",
+            "Any ideas for staying connected with colleagues?",
+        ] {
+            assert!(is_preference_question(q), "should detect: {q}");
+        }
+    }
+
+    #[test]
+    fn preference_detector_rejects_factoid_shapes() {
+        for q in [
+            "What is the designation on my jumpsuit?",
+            "How many days did the fence repair take?",
+            "When did I last visit the dentist?",
+            "Where did my sister move to?",
+        ] {
+            assert!(!is_preference_question(q), "should NOT detect: {q}");
+        }
+    }
+
+    #[test]
+    fn synthesis_prompt_defaults_to_v2_committing_rules() {
+        // No env override in test context (tests must not set the var — env
+        // is process-global); the default path must produce the v2 prompt
+        // for factoid questions.
+        let mems = vec![scored(1.0, fact_record(1, "k", "ns"))];
+        let p = build_synthesis_prompt("Where did my sister move to?", &mems);
+        assert!(
+            p.contains("Assistant-stated facts count"),
+            "default prompt must be v2 (got v1?)"
+        );
+        assert!(
+            p.contains("Abstention is for absent subjects"),
+            "v2 must carry the narrowed abstention gate"
+        );
+    }
+
+    #[test]
+    fn synthesis_prompt_uses_preference_template_for_preference_questions() {
+        let mems = vec![scored(1.0, fact_record(1, "k", "ns"))];
+        let p = build_synthesis_prompt("Can you suggest some podcasts for my commute?", &mems);
+        assert!(
+            p.contains("what the user would prefer"),
+            "preference question must select the preference template"
+        );
+        assert!(
+            p.contains(ABSTAIN_LITERAL),
+            "preference template must still carry the abstention contract"
+        );
     }
 }

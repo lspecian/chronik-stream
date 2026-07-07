@@ -369,6 +369,7 @@ mod tests {
                 topic: format!("mem.task.{}", namespace.split(':').next().unwrap_or("t")),
                 offsets: vec![0],
                 extractor: "test@1".into(),
+                excerpt: None,
             },
             tombstoned: false,
             body: Body::Task(TaskBody {
@@ -397,7 +398,7 @@ mod tests {
             source: Source {
                 topic: "mem.raw.t".into(),
                 offsets: vec![0],
-                extractor: "test@1".into(),
+                extractor: "test@1".into(), excerpt: None,
             },
             tombstoned: false,
             body: Body::Fact(FactBody {
@@ -406,6 +407,7 @@ mod tests {
                 object: serde_json::json!("o"),
                 polarity: "asserted".into(),
                 text: "u p o".into(),
+                speaker: "user".into(),
             }),
         }
     }
