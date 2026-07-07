@@ -178,6 +178,23 @@ pub struct TopicConfig {
     pub columnar_enabled: bool,
 }
 
+/// Whether typed memory topics are created with the HNSW vector index on.
+///
+/// Default: true (semantic recall is a headline capability). Set
+/// `CHRONIK_MEMORY_VECTOR_TOPICS=false` to create memory topics without
+/// vector indexing — every fact/event otherwise flows through the embedding
+/// provider inside the WalIndexer, which under bulk ingest (e.g. the
+/// LongMemEval fleets, ~100K facts/run) serializes the indexer behind
+/// OpenAI round-trips, starves cold text indexing, and burns embedding
+/// spend on throwaway corpora. BM25 + source excerpts carry recall on
+/// their own for text-heavy workloads.
+fn default_vector_enabled() -> bool {
+    !matches!(
+        std::env::var("CHRONIK_MEMORY_VECTOR_TOPICS").as_deref(),
+        Ok("false") | Ok("0") | Ok("off")
+    )
+}
+
 impl TopicConfig {
     /// Config template for `mem.raw.*` — append-only, columnar for analytics, no
     /// vector or text indexing on raw turns (those are extracted into typed topics).
@@ -197,7 +214,7 @@ impl TopicConfig {
             name,
             cleanup_policy: "compact",
             bm25_enabled: true,
-            vector_enabled: true,
+            vector_enabled: default_vector_enabled(),
             columnar_enabled: true,
         }
     }
@@ -208,7 +225,7 @@ impl TopicConfig {
             name,
             cleanup_policy: "delete",
             bm25_enabled: true,
-            vector_enabled: true,
+            vector_enabled: default_vector_enabled(),
             columnar_enabled: true,
         }
     }
@@ -219,7 +236,7 @@ impl TopicConfig {
             name,
             cleanup_policy: "compact",
             bm25_enabled: true,
-            vector_enabled: true,
+            vector_enabled: default_vector_enabled(),
             columnar_enabled: true,
         }
     }
@@ -259,7 +276,7 @@ impl TopicConfig {
             name,
             cleanup_policy: "compact",
             bm25_enabled: true,
-            vector_enabled: true,
+            vector_enabled: default_vector_enabled(),
             columnar_enabled: true,
         }
     }
