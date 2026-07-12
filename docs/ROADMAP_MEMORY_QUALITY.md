@@ -313,3 +313,25 @@ A *uniform* drop is the tell: a vector-specific effect would be *mixed* (help pa
 4. **Vector**: keep available (helps the narrow single-session-user paraphrase case, +0.11 in s5b), default **off** per-topic for keyword/cost-sensitive workloads.
 
 Server fixes shipped while chasing this (cold-embed decoupling, dedicated embed runtime, multi-partition memory tenants) are genuine product wins regardless — they make hybrid/vector work correctly at scale for anyone who *does* want it.
+
+---
+
+## UPDATE (2026-07-08): Concept-page rollups ALSO falsified — the lever is the ANSWER STEP, not retrieval
+
+Ran the #1 reprioritized item above (concept-page rollups) as a clean full-500: concepts ON, vector OFF, fresh tenant `lme500s13`, warm extraction cache (~$2).
+
+| metric | concepts ON (s13) | text-only baseline | vector (s12) |
+|---|---|---|---|
+| **synth_judge_rate** | **0.268** (134/500) | **0.336** | 0.262 |
+| raw judge_rate | 0.258 | — | — |
+| **synth_abstain_rate** | **0.610** (305/500) | — | — |
+
+Per-category (all suppressed vs text-only): knowledge-update 0.359, multi-session 0.331, temporal 0.226, single-session-preference 0.233, single-session-user 0.171, single-session-assistant 0.143.
+
+**Conclusion: concept rollups land at 0.268 — right where vector did (0.262), ~0.07 below text-only.** The concept page inlines at rank-0 with 1.5× `type_weight`, displaces the specific answer-bearing fact in the k=10, and the model abstains or errs. **Two "add a retrieval surface" levers are now falsified (vector + concept-rollups).** The pattern is unambiguous: the atomic-extraction pipeline is already strong; *anything that competes with it in the k=10 dilutes.* Do not try a third retrieval-surface variant.
+
+**The real signal is abstention.** 61% of items get "I don't know," yet answered items are ~69% accurate. The bottleneck is a too-conservative **synthesis/answer step**, not retrieval breadth. Reprioritized again:
+
+1. **Reduce abstention** (NEW #1) — tune the synthesis prompt to commit more often. Largest recoverable pool; orthogonal to retrieval; adds no competing surface. First: confirm the text-only baseline's own abstain rate to know if this is pure upside or whether concepts caused the spike.
+2. **Contradiction/lint on the atomic facts** — *cleans* the existing surface rather than adding one (the distinction that matters).
+3. ~~Concept-page rollups~~ — FALSIFIED (0.268). Code retained (`synthesize_concept`/`include_concepts`), default OFF like vector.
