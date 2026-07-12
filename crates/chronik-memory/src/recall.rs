@@ -399,6 +399,46 @@ impl<'a> RecallBuilder<'a> {
                 channel_errors.push(e);
             }
         }
+        // T2 entity-centric recall augmentation (gated CHRONIK_MEMORY_ENTITY_RECALL=1).
+        // Multi-session questions often need answer-facts from sessions whose
+        // wording the question doesn't match, so question-BM25 misses them.
+        // Here we ALSO BM25 on each entity the question names and union the hits
+        // into the Bm25 pool — the existing RRF ranking + supersession-lint then
+        // trim to k, and dedup collapses overlaps. Reuses
+        // `extract_subject_candidates`; no new retrieval surface, no LLM call.
+        if std::env::var("CHRONIK_MEMORY_ENTITY_RECALL")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(false)
+        {
+            let entities: Vec<String> = extract_subject_candidates(&self.query)
+                .into_iter()
+                .take(3)
+                .collect();
+            for e in &entities {
+                match run_bm25(
+                    http.clone(),
+                    api.clone(),
+                    layout,
+                    &namespace,
+                    &self.types,
+                    e,
+                    self.fanout_size,
+                )
+                .await
+                {
+                    Ok(recs) => {
+                        any_channel_ok = true;
+                        full_per_channel
+                            .entry(Channel::Bm25)
+                            .or_default()
+                            .extend(recs);
+                    }
+                    Err(err) => {
+                        tracing::warn!("recall entity-bm25 for {e:?} failed (degrading): {err}");
+                    }
+                }
+            }
+        }
         match v {
             Ok(Some(out)) => {
                 any_channel_ok = true;
@@ -585,6 +625,16 @@ impl<'a> RecallBuilder<'a> {
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
+        // E4 recall-time supersession lint (gated). Drops stale facts that a
+        // newer fact on the same (namespace, subject, predicate) supersedes,
+        // BEFORE the top-k cut — so knowledge-updates surface only the current
+        // value and freed slots go to distinct facts. Opt-in per run.
+        if std::env::var("CHRONIK_MEMORY_LINT")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(false)
+        {
+            out = apply_supersession_lint(out);
+        }
         out.truncate(self.k);
         Ok(out)
     }
@@ -722,6 +772,131 @@ type TypedLoc = (String, i32, i64);
 struct EnrichedRecord {
     record: MemoryRecord,
     typed_loc: Option<TypedLoc>,
+}
+
+/// E4 recall-time supersession lint (gated by `CHRONIK_MEMORY_LINT=1`).
+///
+/// When two recalled FACTS share `(namespace, subject, predicate)` with
+/// distinct non-null objects — the codebase's definition of a conflict
+/// ([`crate::conflict::detect_conflict`]) — keep only the newest by
+/// `valid_from` and drop the older, superseded value. Rationale: a small
+/// synthesis model shouldn't have to reason about which of several stale
+/// values is current (the v2/v3 prompt asks it to "prefer the most recent
+/// timestamp", but a 4B model does this unreliably). Filtering at recall
+/// time hands it a clean set and frees top-k slots for distinct facts.
+///
+/// The winner takes the highest-scored slot of its group (input is
+/// score-sorted), so relevance ranking is preserved. Non-fact records and
+/// facts lacking a comparable subject/predicate/object pass through.
+fn apply_supersession_lint(results: Vec<RecallResult>) -> Vec<RecallResult> {
+    // T3 (gated CHRONIK_MEMORY_CURATION=1): resolve the supersession key with
+    // deterministic entity/relation normalization so trivially-equivalent
+    // facts collapse into one group. E4's lint keyed on the byte-exact
+    // (subject, predicate); across sessions the extractor drifts ("my dog" /
+    // "the dog" / "Dog"; "lives in" / "location") and the exact key misses the
+    // supersession, leaving a stale value in the top-k. Normalizing the key
+    // only ever MERGES groups (drops a superseded duplicate, keeps the newest
+    // by valid_from) — it never adds a record — so it extends the proven
+    // cleaning lever without adding a retrieval surface. Off => exact E4 key.
+    let curate = std::env::var("CHRONIK_MEMORY_CURATION")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(false);
+    let mut slot_of: HashMap<(String, String, String), usize> = HashMap::new();
+    let mut out: Vec<RecallResult> = Vec::with_capacity(results.len());
+    for r in results.into_iter() {
+        let key = match &r.memory.body {
+            crate::schema::Body::Fact(f)
+                if !f.object.is_null() && !f.subject.is_empty() && !f.predicate.is_empty() =>
+            {
+                let (subj, pred) = if curate {
+                    (normalize_entity(&f.subject), normalize_relation(&f.predicate))
+                } else {
+                    (f.subject.clone(), f.predicate.clone())
+                };
+                // A normalizer that collapses to empty (e.g. subject was only
+                // an article) is unsafe to group on — fall back to raw.
+                if subj.is_empty() || pred.is_empty() {
+                    Some((r.memory.namespace.clone(), f.subject.clone(), f.predicate.clone()))
+                } else {
+                    Some((r.memory.namespace.clone(), subj, pred))
+                }
+            }
+            _ => None,
+        };
+        match key {
+            Some(k) => {
+                if let Some(&idx) = slot_of.get(&k) {
+                    // Same subject+predicate already seen: keep whichever is
+                    // newer by valid_from in that (higher-scored) slot; drop
+                    // the older one entirely.
+                    if r.memory.valid_from > out[idx].memory.valid_from {
+                        out[idx] = r;
+                    }
+                } else {
+                    slot_of.insert(k, out.len());
+                    out.push(r);
+                }
+            }
+            None => out.push(r),
+        }
+    }
+    out
+}
+
+/// T3 entity resolution: normalize a fact `subject` so that trivially
+/// co-referent surface forms collapse to one key. Deterministic and
+/// conservative — lowercase, collapse whitespace, strip a leading
+/// determiner/possessive ("my"/"the"/"your"/…) and a trailing possessive
+/// `'s`/punctuation. Intentionally does NOT stem or singularize (too lossy:
+/// "glasses"≠"glass"), and keeps adjectives ("old car"≠"new car") so distinct
+/// entities stay distinct. Returns the normalized token string (may differ in
+/// word count from the input; the caller falls back to the raw key if empty).
+fn normalize_entity(subject: &str) -> String {
+    let lowered = subject.trim().to_lowercase();
+    // Split into tokens on whitespace, dropping surrounding punctuation.
+    let mut toks: Vec<&str> = lowered
+        .split_whitespace()
+        .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric()))
+        .filter(|t| !t.is_empty())
+        .collect();
+    // Strip one leading determiner/possessive.
+    const LEADING: &[&str] = &[
+        "my", "the", "a", "an", "your", "our", "their", "his", "her", "its",
+    ];
+    if toks.len() > 1 && LEADING.contains(&toks[0]) {
+        toks.remove(0);
+    }
+    // Strip a dangling possessive marker token if extraction split it out.
+    if toks.len() > 1 && (toks.last() == Some(&"s") || toks.last() == Some(&"'s")) {
+        toks.pop();
+    }
+    toks.join(" ")
+}
+
+/// T3 relation resolution: normalize a fact `predicate` so equivalent relation
+/// phrasings share a key. Lowercase + whitespace-collapse, drop a leading
+/// copula/auxiliary ("is"/"was"/"has"/"had") that the extractor adds
+/// inconsistently ("is named" vs "named"), and drop a trailing preposition
+/// ("lives in" vs "lives") that varies with object phrasing. Conservative: no
+/// synonym mapping (would risk merging distinct relations).
+fn normalize_relation(predicate: &str) -> String {
+    let lowered = predicate.trim().to_lowercase();
+    let mut toks: Vec<&str> = lowered
+        .split_whitespace()
+        .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric()))
+        .filter(|t| !t.is_empty())
+        .collect();
+    const LEADING: &[&str] = &["is", "are", "was", "were", "has", "have", "had", "be", "been"];
+    if toks.len() > 1 && LEADING.contains(&toks[0]) {
+        toks.remove(0);
+    }
+    const TRAILING: &[&str] = &[
+        "in", "at", "on", "to", "of", "for", "with", "by", "from", "as",
+    ];
+    if toks.len() > 1 && TRAILING.contains(toks.last().unwrap()) {
+        toks.pop();
+    }
+    toks.join(" ")
 }
 
 /// Dedup [`RecallResult`] using compaction semantics: highest version per
@@ -1072,7 +1247,54 @@ const MAX_SYNTH_EXCERPT_CHARS: usize = 700;
 /// extracted from, indented under the summary line. The excerpt carries
 /// speaker labels and exact wording (assistant-stated names, quantities,
 /// quotes) that the atomic extraction loses.
+/// T1 temporal date-computation (gated `CHRONIK_MEMORY_TEMPORAL=1`). Parses the
+/// `(Today is YYYY-MM-DD.)` anchor the eval prepends to temporal questions.
+/// Returns `None` when the flag is off or no anchor is present — so non-temporal
+/// runs and untagged questions are unaffected.
+fn temporal_ref_date(question: &str) -> Option<chrono::NaiveDate> {
+    if !std::env::var("CHRONIK_MEMORY_TEMPORAL")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let idx = question.find("Today is ")? + "Today is ".len();
+    let cand: String = question[idx..].chars().take(10).collect();
+    chrono::NaiveDate::parse_from_str(&cand, "%Y-%m-%d").ok()
+}
+
+/// Pre-compute the "≈N days/weeks/months ago" gap from a fact's `valid_from` to
+/// the query's reference date — the date arithmetic a small model does badly.
+/// Handing it the answer offloads the exact failure mode behind the weak
+/// temporal-reasoning category. Empty string for future-dated facts.
+fn age_annotation(ref_date: chrono::NaiveDate, valid_from: DateTime<Utc>) -> String {
+    let days = (ref_date - valid_from.date_naive()).num_days();
+    if days < 0 {
+        return String::new();
+    }
+    let human = if days == 0 {
+        "today".to_string()
+    } else if days == 1 {
+        "1 day ago".to_string()
+    } else if days < 21 {
+        format!("{days} days ago")
+    } else if days < 60 {
+        format!("~{} weeks ago", ((days as f64) / 7.0).round() as i64)
+    } else if days < 730 {
+        format!("~{} months ago", ((days as f64) / 30.44).round() as i64)
+    } else {
+        format!("~{} years ago", ((days as f64) / 365.25).round() as i64)
+    };
+    format!(" [{human}]")
+}
+
 fn render_memory_for_synthesis(m: &MemoryRecord) -> String {
+    render_memory_for_synthesis_ref(m, None)
+}
+
+/// As [`render_memory_for_synthesis`] but, when `ref_date` is `Some`, injects a
+/// pre-computed age annotation (T1) right after the fact's timestamp.
+fn render_memory_for_synthesis_ref(m: &MemoryRecord, ref_date: Option<chrono::NaiveDate>) -> String {
     use crate::schema::Body::*;
     let typed = match &m.body {
         Fact(f) => format!(
@@ -1105,7 +1327,10 @@ fn render_memory_for_synthesis(m: &MemoryRecord) -> String {
         ),
     };
     let truncated: String = typed.chars().take(MAX_SYNTH_SNIPPET_CHARS).collect();
-    let mut line = format!("({}) {}", m.valid_from.to_rfc3339(), truncated);
+    let age = ref_date
+        .map(|rd| age_annotation(rd, m.valid_from))
+        .unwrap_or_default();
+    let mut line = format!("({}{}) {}", m.valid_from.to_rfc3339(), age, truncated);
     if let Some(excerpt) = &m.source.excerpt {
         let capped: String = excerpt.chars().take(MAX_SYNTH_EXCERPT_CHARS).collect();
         // Indent each excerpt line so it reads as a quoted block under the
@@ -1137,6 +1362,15 @@ fn build_synthesis_prompt(question: &str, memories: &[RecallResult]) -> String {
     // factoid-shaped prompt converted at 0/6 on the 2026-07-04 fleet.
     match std::env::var("CHRONIK_MEMORY_SYNTH_PROMPT").as_deref() {
         Ok("v1") => build_synthesis_prompt_v1(question, memories),
+        Ok("v3") => {
+            // E2 lever: maximally anti-abstention. Preference questions keep
+            // their dedicated template; everything else gets the never-abstain v3.
+            if is_preference_question(question) {
+                build_synthesis_prompt_preference(question, memories)
+            } else {
+                build_synthesis_prompt_v3(question, memories)
+            }
+        }
         _ => {
             if is_preference_question(question) {
                 build_synthesis_prompt_preference(question, memories)
@@ -1176,8 +1410,9 @@ fn is_preference_question(question: &str) -> bool {
 /// against golds of the form "The user would prefer responses that ...".
 fn build_synthesis_prompt_preference(question: &str, memories: &[RecallResult]) -> String {
     let mut bullets = String::new();
+    let ref_date = temporal_ref_date(question);
     for (i, r) in memories.iter().enumerate() {
-        let line = render_memory_for_synthesis(&r.memory);
+        let line = render_memory_for_synthesis_ref(&r.memory, ref_date);
         bullets.push_str(&format!("[{}] {}\n", i + 1, line));
     }
     format!(
@@ -1208,8 +1443,9 @@ Answer:"
 /// v1 — original pilot-7 anti-abstention prompt. Kept for baseline comparison.
 fn build_synthesis_prompt_v1(question: &str, memories: &[RecallResult]) -> String {
     let mut bullets = String::new();
+    let ref_date = temporal_ref_date(question);
     for (i, r) in memories.iter().enumerate() {
-        let line = render_memory_for_synthesis(&r.memory);
+        let line = render_memory_for_synthesis_ref(&r.memory, ref_date);
         bullets.push_str(&format!("[{}] {}\n", i + 1, line));
     }
     format!(
@@ -1244,8 +1480,9 @@ Answer:"
 /// plausibly answers the question, commit rather than hedge.
 fn build_synthesis_prompt_v2(question: &str, memories: &[RecallResult]) -> String {
     let mut bullets = String::new();
+    let ref_date = temporal_ref_date(question);
     for (i, r) in memories.iter().enumerate() {
-        let line = render_memory_for_synthesis(&r.memory);
+        let line = render_memory_for_synthesis_ref(&r.memory, ref_date);
         bullets.push_str(&format!("[{}] {}\n", i + 1, line));
     }
     format!(
@@ -1262,6 +1499,45 @@ Rules:\n\
 - **Read in two steps (silently).** First, for each memory that touches the question's topic, note what it contributes — entity, value, date, who said it. Second, compose the answer from those notes, combining across memories when the question spans several conversations. Do NOT write the notes out; output only the final answer.\n\
 - Be concise — one sentence whenever possible. No preamble, no \"Based on the memories...\", just the answer.\n\
 - **Abstention is for absent subjects, not uncertainty.** Reply EXACTLY: {ABSTAIN_LITERAL} in exactly two situations: (1) every listed memory is about a clearly different subject than the question, or (2) the question asks about a SPECIFIC entity or attribute (a person, an item, an occasion) that no memory mentions — e.g. the question asks about a gift from your dad but the memories only record a gift from your sister; in that case the correct answer is that you don't know. In every other case — when a memory names the entity or attribute the question asks about — COMMIT to the best-supported answer. Do NOT abstain because you are unsure, because the evidence is partial, or because the answer requires combining or computing from several memories. Committing IS the job.\n\
+\n\
+Memories (relevance order, with timestamps):\n\
+{bullets}\n\
+Question: {question}\n\
+\n\
+Answer:"
+    )
+}
+
+/// v3 — MAXIMALLY anti-abstention (E2 lever, 2026-07-09). Same evidence
+/// guidance as v2, but the abstention clause is replaced with a hard
+/// "never abstain — always commit your single best answer" rule. Rationale:
+/// under the local judge, baseline abstention is ~0.208 (104/500); every
+/// abstained item is a guaranteed miss. Since the judge grades correctness,
+/// a wrong committed guess scores the SAME as an abstain-miss — so forcing
+/// a guess can only convert the subset of abstained items whose answer was
+/// actually retrievable into hits, at no downside on truly-absent items.
+/// Env-gated: `CHRONIK_MEMORY_SYNTH_PROMPT=v3`. Tests whether the smaller
+/// model's residual abstention is costing recoverable points.
+fn build_synthesis_prompt_v3(question: &str, memories: &[RecallResult]) -> String {
+    let mut bullets = String::new();
+    let ref_date = temporal_ref_date(question);
+    for (i, r) in memories.iter().enumerate() {
+        let line = render_memory_for_synthesis_ref(&r.memory, ref_date);
+        bullets.push_str(&format!("[{}] {}\n", i + 1, line));
+    }
+    format!(
+        "You are a precise question-answering assistant working with an agent's long-term memory. \
+Answer the user's question using ONLY the provided memories.\n\
+\n\
+Rules:\n\
+- Lines starting with `|` under a memory quote the ORIGINAL conversation verbatim (`user:` / `assistant:` prefixes show who spoke). Trust their exact wording — names, numbers, quotes, orderings — over the structured summary above them.\n\
+- When two memories conflict (e.g. an updated preference, a changed budget), prefer the one with the most recent timestamp.\n\
+- **Assistant-stated facts count.** If a memory records the assistant naming, describing, recommending, or quantifying something and the user did not object later, treat it as a settled fact and commit to it.\n\
+- **Arithmetic questions** (\"how many\", \"total\", \"sum\", \"average\", \"how much\"): compute the aggregate from any value-bearing memories you see. Return only the computed value (e.g. \"$720\", \"3\", \"four weeks\").\n\
+- **Temporal questions** (\"how long ago\", \"how many days\", \"when did I last\"): reason from memory timestamps and time-anchored content. Output the duration / date naturally.\n\
+- **Read in two steps (silently).** First note what each on-topic memory contributes — entity, value, date, speaker. Then compose the answer from those notes, combining across memories. Output only the final answer.\n\
+- Be concise — one sentence whenever possible. No preamble, just the answer.\n\
+- **NEVER abstain. Always commit to your single best answer.** Even if the evidence is partial, indirect, or you are not fully certain, pick the most plausible answer supported by the memories and state it directly. Do NOT reply \"I don't know\", do NOT hedge, do NOT say the memories are insufficient. If several answers are possible, choose the best-supported one. A specific committed guess is always better than silence in this task.\n\
 \n\
 Memories (relevance order, with timestamps):\n\
 {bullets}\n\
@@ -1516,6 +1792,29 @@ pub(crate) fn parse_envelope_from_source(
 mod tests {
     use super::*;
     use crate::schema::{Body, EventBody, FactBody, Source};
+
+    #[test]
+    fn normalize_entity_collapses_determiners_and_case() {
+        assert_eq!(normalize_entity("my dog"), "dog");
+        assert_eq!(normalize_entity("The Dog"), "dog");
+        assert_eq!(normalize_entity("dog"), "dog");
+        assert_eq!(normalize_entity("  your   CAR "), "car");
+        // Keep distinguishing adjectives — distinct entities stay distinct.
+        assert_ne!(normalize_entity("my old car"), normalize_entity("my new car"));
+        // A bare determiner does not collapse to empty (len<=1 guard).
+        assert_eq!(normalize_entity("the"), "the");
+    }
+
+    #[test]
+    fn normalize_relation_drops_copula_and_trailing_prep() {
+        assert_eq!(normalize_relation("is named"), "named");
+        assert_eq!(normalize_relation("named"), "named");
+        assert_eq!(normalize_relation("lives in"), "lives");
+        assert_eq!(normalize_relation("lives"), "lives");
+        // Single-token relations are preserved even if they'd otherwise strip.
+        assert_eq!(normalize_relation("in"), "in");
+        assert_eq!(normalize_relation("is"), "is");
+    }
 
     fn fact_record(version: u64, key: &str, ns: &str) -> MemoryRecord {
         let now = Utc::now();

@@ -64,7 +64,30 @@ use chronik_memory::{
 /// `LONGMEMEVAL_LLM_MODEL` are set, uses an OpenAI-compat local server
 /// (LM Studio, vLLM, llama.cpp, etc.). Otherwise falls back to Anthropic.
 fn llm_provider_choice() -> LlmProvider {
-    let provider = std::env::var("LONGMEMEVAL_LLM_PROVIDER").unwrap_or_default();
+    provider_from_var("LONGMEMEVAL_LLM_PROVIDER")
+}
+
+/// Provider used for EXTRACTION specifically. Defaults to
+/// `LONGMEMEVAL_EXTRACTION_PROVIDER` when set, else falls back to the main
+/// `LONGMEMEVAL_LLM_PROVIDER`. Decoupling matters when synth/judge run on a
+/// local model (free, unlimited) but extraction should stay on the cached
+/// cloud extractor: the extraction cache is keyed by the extractor id
+/// (`chain[rules@v1+openai-v3]`), so keeping extraction on `openai` replays
+/// the paid gpt-4o-mini facts from disk with ZERO API calls, while
+/// `LONGMEMEVAL_LLM_PROVIDER=local` sends only synth+judge to Ollama.
+fn extraction_provider_choice() -> LlmProvider {
+    if std::env::var("LONGMEMEVAL_EXTRACTION_PROVIDER")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+    {
+        provider_from_var("LONGMEMEVAL_EXTRACTION_PROVIDER")
+    } else {
+        llm_provider_choice()
+    }
+}
+
+fn provider_from_var(var: &str) -> LlmProvider {
+    let provider = std::env::var(var).unwrap_or_default();
     match provider.as_str() {
         "local" => {
             let endpoint = std::env::var("LONGMEMEVAL_LLM_ENDPOINT")
@@ -545,6 +568,11 @@ async fn evaluate_longmemeval() {
     // is a strict lower bound (factoid-only); the judge score is paraphrase-
     // tolerant. Side-by-side output makes the calibration gap obvious.
     let llm_provider = llm_provider_choice();
+    // Extraction provider is decoupled: with `LONGMEMEVAL_LLM_PROVIDER=local`
+    // for synth/judge, set `LONGMEMEVAL_EXTRACTION_PROVIDER=openai` to keep
+    // extraction on the cached gpt-4o-mini path (id `openai-v3`, model-
+    // independent) — cache hits replay facts from disk with zero API calls.
+    let extraction_provider = extraction_provider_choice();
 
     let use_llm_judge = std::env::var("LONGMEMEVAL_USE_LLM_JUDGE")
         .map(|v| v != "0" && !v.is_empty())
@@ -579,8 +607,27 @@ async fn evaluate_longmemeval() {
              implicitly enabling LLM-judge mode for the synthesis prompt."
         );
     }
+    // The SYNTH model may be overridden independently of the judge via
+    // `LONGMEMEVAL_SYNTH_MODEL` (local provider only). This isolates the
+    // synth-model variable: hold the judge at the baseline model (e.g.
+    // gemma3:4b, keeping synth_judge_rate comparable to the E4 0.546 anchor)
+    // while swapping ONLY the answer-generating model. Without this split,
+    // changing LONGMEMEVAL_LLM_MODEL would move the judge too and confound the
+    // result (the E5 mistake). Defaults to `llm_provider` when unset.
+    let synth_provider = match &llm_provider {
+        LlmProvider::Local { endpoint, .. } => {
+            match std::env::var("LONGMEMEVAL_SYNTH_MODEL") {
+                Ok(m) if !m.trim().is_empty() => {
+                    eprintln!("SYNTH model override: local (endpoint={endpoint}, model={m}) — judge stays on baseline model");
+                    LlmProvider::Local { endpoint: endpoint.clone(), model: m }
+                }
+                _ => llm_provider.clone(),
+            }
+        }
+        other => other.clone(),
+    };
     let synth_gen: Option<Arc<dyn chronik_memory::embeddings::TextGenerator>> = if use_synth {
-        Some(llm_provider.build_generator(&api_key))
+        Some(synth_provider.build_generator(&api_key))
     } else {
         None
     };
@@ -601,6 +648,15 @@ async fn evaluate_longmemeval() {
     // multi-fact-arithmetic and dense-context items where on-demand
     // synthesis abstained because the raw values aren't surfaced together.
     let use_concepts = std::env::var("LONGMEMEVAL_USE_CONCEPTS")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(false);
+    // Vector recall channel — OFF by default. When enabled, recall requests the
+    // server's vector channel, which embeds the query. If the cluster's
+    // embedding provider is unreachable/quota-dead, that embed call retries for
+    // ~16s PER ITEM before degrading to BM25 — pure waste when no HNSW index
+    // exists (vector.enabled=false). Vector was also shown not to be the lever
+    // (s12=0.262 < 0.336). So gate it: opt in via LONGMEMEVAL_USE_VECTOR=1.
+    let use_vector = std::env::var("LONGMEMEVAL_USE_VECTOR")
         .map(|v| v != "0" && !v.is_empty())
         .unwrap_or(false);
     if use_concepts && synth_gen.is_none() {
@@ -675,7 +731,7 @@ async fn evaluate_longmemeval() {
         let tenant = std::env::var("LONGMEMEVAL_TENANT")
             .unwrap_or_else(|_| "longmemeval".to_string());
         let ns = format!("{}:{}:{}", tenant, item.question_id, Ulid::new());
-        let base_pass1: Arc<dyn Extractor> = llm_provider.build_extractor(&api_key, prompt_version);
+        let base_pass1: Arc<dyn Extractor> = extraction_provider.build_extractor(&api_key, prompt_version);
         let inner_extractor: Arc<dyn Extractor> = if use_two_pass {
             Arc::new(
                 TwoPassExtractor::new(base_pass1, api_key.clone())
@@ -841,10 +897,13 @@ async fn evaluate_longmemeval() {
         // When `LONGMEMEVAL_USE_CONCEPTS=1`, also inline the top concept
         // page from `mem.concept.{tenant}` above atomic memories.
         let recall_t0 = Instant::now();
-        let results = mem
+        let mut rb = mem
             .recall(&item.question)
-            .types(&[MemoryType::Fact, MemoryType::Event, MemoryType::Instruction, MemoryType::Task])
-            .with_vector()
+            .types(&[MemoryType::Fact, MemoryType::Event, MemoryType::Instruction, MemoryType::Task]);
+        if use_vector {
+            rb = rb.with_vector();
+        }
+        let results = rb
             .with_key_match()
             .include_concepts(use_concepts)
             .k(10)
@@ -896,15 +955,18 @@ async fn evaluate_longmemeval() {
                 // date-agnostic), but the anchored question ("Today is X. ...")
                 // reaches the synthesis prompt via the builder's query, giving
                 // the model a "today" to compute "N days ago" against.
-                let synth_res = mem
+                let mut srb = mem
                     .recall(anchored_question(item))
                     .types(&[
                         MemoryType::Fact,
                         MemoryType::Event,
                         MemoryType::Instruction,
                         MemoryType::Task,
-                    ])
-                    .with_vector()
+                    ]);
+                if use_vector {
+                    srb = srb.with_vector();
+                }
+                let synth_res = srb
                     .with_key_match()
                     .include_concepts(use_concepts)
                     // Sprint 3: k=15 (was 10). Multi-session questions lost 34
