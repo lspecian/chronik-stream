@@ -113,6 +113,8 @@ fn provider_from_var(var: &str) -> LlmProvider {
 #[derive(Clone)]
 enum LlmProvider {
     Anthropic,
+    /// Anthropic with an explicit model pin (e.g. `claude-haiku-4-5`).
+    AnthropicModel { model: String },
     Local { endpoint: String, model: String },
     OpenAI { model: String },
 }
@@ -125,6 +127,9 @@ impl LlmProvider {
     ) -> Arc<dyn chronik_memory::embeddings::TextGenerator> {
         match self {
             LlmProvider::Anthropic => Arc::new(AnthropicExtractor::new(api_key.to_string())),
+            LlmProvider::AnthropicModel { model } => {
+                Arc::new(AnthropicExtractor::new(api_key.to_string()).with_model(model.clone()))
+            }
             LlmProvider::Local { endpoint, model } => Arc::new(
                 OpenAIExtractor::for_local_server(endpoint, model).with_max_tokens(1024),
             ),
@@ -148,6 +153,11 @@ impl LlmProvider {
         match self {
             LlmProvider::Anthropic => Arc::new(
                 AnthropicExtractor::new(api_key.to_string())
+                    .with_prompt_version(prompt_version),
+            ),
+            LlmProvider::AnthropicModel { model } => Arc::new(
+                AnthropicExtractor::new(api_key.to_string())
+                    .with_model(model.clone())
                     .with_prompt_version(prompt_version),
             ),
             LlmProvider::Local { endpoint, model } => Arc::new(
@@ -607,25 +617,86 @@ async fn evaluate_longmemeval() {
              implicitly enabling LLM-judge mode for the synthesis prompt."
         );
     }
-    // The SYNTH model may be overridden independently of the judge via
-    // `LONGMEMEVAL_SYNTH_MODEL` (local provider only). This isolates the
-    // synth-model variable: hold the judge at the baseline model (e.g.
-    // gemma3:4b, keeping synth_judge_rate comparable to the E4 0.546 anchor)
-    // while swapping ONLY the answer-generating model. Without this split,
-    // changing LONGMEMEVAL_LLM_MODEL would move the judge too and confound the
-    // result (the E5 mistake). Defaults to `llm_provider` when unset.
-    let synth_provider = match &llm_provider {
-        LlmProvider::Local { endpoint, .. } => {
-            match std::env::var("LONGMEMEVAL_SYNTH_MODEL") {
-                Ok(m) if !m.trim().is_empty() => {
-                    eprintln!("SYNTH model override: local (endpoint={endpoint}, model={m}) — judge stays on baseline model");
-                    LlmProvider::Local { endpoint: endpoint.clone(), model: m }
+    // The SYNTH (answerer) model may be overridden independently of the judge.
+    // This isolates the synth-model variable: hold the judge at the baseline
+    // model (keeping synth_judge_rate comparable to a prior anchor) while
+    // swapping ONLY the answer-generating model. Without the split, changing
+    // LONGMEMEVAL_LLM_MODEL would move the judge too and confound the result
+    // (the E5 mistake).
+    //
+    // `LONGMEMEVAL_SYNTH_PROVIDER` selects the provider for synth alone
+    // (`anthropic` | `openai` | `local`); `LONGMEMEVAL_SYNTH_MODEL` sets its
+    // model. The reader is the dominant term in this benchmark — every
+    // published system that scores well pairs the memory layer with a
+    // frontier reader — so being able to point synth at a cloud model while
+    // the rest of the harness stays local is the whole point.
+    let synth_provider = match std::env::var("LONGMEMEVAL_SYNTH_PROVIDER") {
+        Ok(p) if !p.trim().is_empty() => {
+            let sp = provider_from_var("LONGMEMEVAL_SYNTH_PROVIDER");
+            // provider_from_var reads LONGMEMEVAL_LLM_MODEL for the model; if a
+            // synth-specific model is set, honour it instead.
+            match (sp, std::env::var("LONGMEMEVAL_SYNTH_MODEL")) {
+                (LlmProvider::Anthropic, Ok(m)) if !m.trim().is_empty() => {
+                    eprintln!("SYNTH override: anthropic (model={m}) — judge stays on the baseline model");
+                    LlmProvider::AnthropicModel { model: m }
                 }
-                _ => llm_provider.clone(),
+                (LlmProvider::Anthropic, _) => {
+                    eprintln!("SYNTH override: anthropic (default model) — judge stays on the baseline model");
+                    LlmProvider::Anthropic
+                }
+                (LlmProvider::OpenAI { .. }, Ok(m)) if !m.trim().is_empty() => {
+                    eprintln!("SYNTH override: openai (model={m}) — judge stays on the baseline model");
+                    LlmProvider::OpenAI { model: m }
+                }
+                (LlmProvider::Local { endpoint, model }, Ok(m)) if !m.trim().is_empty() => {
+                    eprintln!("SYNTH override: local (endpoint={endpoint}, model={m}) — judge stays on the baseline model");
+                    LlmProvider::Local { endpoint, model: m }
+                }
+                (other, _) => other,
             }
         }
-        other => other.clone(),
+        // No synth provider set: allow a model-only override on the local path
+        // (the pre-existing behaviour).
+        _ => match &llm_provider {
+            LlmProvider::Local { endpoint, .. } => {
+                match std::env::var("LONGMEMEVAL_SYNTH_MODEL") {
+                    Ok(m) if !m.trim().is_empty() => {
+                        eprintln!("SYNTH model override: local (endpoint={endpoint}, model={m}) — judge stays on baseline model");
+                        LlmProvider::Local { endpoint: endpoint.clone(), model: m }
+                    }
+                    _ => llm_provider.clone(),
+                }
+            }
+            other => other.clone(),
+        },
     };
+
+    // Retrieval budget. `k` is a function of the READER, not a constant: a 4B
+    // local model is crowded by a large fact set (measured — extra facts
+    // dilute its top-10), whereas a frontier reader sifts one (mem0 et al.
+    // run k=200). Tune per reader rather than assuming a universal optimum.
+    let recall_k: usize = std::env::var("LONGMEMEVAL_RECALL_K")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
+    let synth_k: usize = std::env::var("LONGMEMEVAL_SYNTH_K")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(15);
+    // Fan-out is the candidate window each channel pulls BEFORE fusion and the
+    // top-k cut — and on this benchmark it, not k, is the binding constraint.
+    // Every conversation's facts share one topic (`mem.fact.{tenant}`), and the
+    // namespace is only a soft BM25 bias (a ULID mixed into the text), not a
+    // hard filter. So a 150-doc window over ~50k facts is dominated by OTHER
+    // conversations; after namespace filtering only a handful of in-namespace
+    // facts survive (measured: n_results 1-14 even with k=50). Raising k does
+    // nothing when the window never contained the answer fact in the first
+    // place. Widen the window and the in-namespace pool grows with it.
+    let fanout: usize = std::env::var("LONGMEMEVAL_FANOUT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(150);
+    println!("Retrieval budget: fanout={fanout}, recall k={recall_k}, synth k={synth_k}");
     let synth_gen: Option<Arc<dyn chronik_memory::embeddings::TextGenerator>> = if use_synth {
         Some(synth_provider.build_generator(&api_key))
     } else {
@@ -906,7 +977,8 @@ async fn evaluate_longmemeval() {
         let results = rb
             .with_key_match()
             .include_concepts(use_concepts)
-            .k(10)
+            .fanout_size(fanout)
+            .k(recall_k)
             .send()
             .await
             .expect("recall");
@@ -969,11 +1041,16 @@ async fn evaluate_longmemeval() {
                 let synth_res = srb
                     .with_key_match()
                     .include_concepts(use_concepts)
-                    // Sprint 3: k=15 (was 10). Multi-session questions lost 34
-                    // raw hits at k=10 — the answer-bearing memories from the
-                    // other sessions ranked 11-15. Excerpts keep the prompt
-                    // well within gpt-4o-mini's context at k=15.
-                    .k(15)
+                    .fanout_size(fanout)
+                    // Sprint 3 set k=15 (was 10): multi-session questions lost
+                    // 34 raw hits at k=10 — the answer-bearing memories from
+                    // other sessions ranked 11-15. Now env-tunable: a small
+                    // local reader saturates around 15 and *dilutes* beyond it,
+                    // but published systems (mem0 et al.) run k=50-200 against
+                    // a frontier reader, which sifts a large fact set rather
+                    // than being crowded by it. So k is a function of the
+                    // reader, not a constant — see LONGMEMEVAL_SYNTH_K.
+                    .k(synth_k)
                     .synthesize(gen.clone())
                     .await;
                 let elapsed = t0.elapsed().as_secs_f64();
