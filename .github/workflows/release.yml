@@ -82,14 +82,14 @@ jobs:
         env:
           RUSTC_WRAPPER: ""
         run: |
-          cross build --release --target ${{ matrix.target }} --bin chronik-server
+          cross build --release --target ${{ matrix.target }} -p chronik-server --bin chronik-server
 
       - name: Build native (macOS)
         if: "!matrix.use_cross"
         env:
           RUSTC_WRAPPER: ""  # Disable sccache for cross-target macOS builds (ARM runner building x86_64)
         run: |
-          cargo build --release --target ${{ matrix.target }} --bin chronik-server
+          cargo build --release --target ${{ matrix.target }} -p chronik-server --bin chronik-server
           
       - name: Package binary
         run: |
