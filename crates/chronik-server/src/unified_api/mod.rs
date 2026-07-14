@@ -27,7 +27,9 @@ pub mod query_router;
 pub mod search_handler;
 
 // AM-1.7: Agent Memory endpoints (/memory/v1/*).
+#[cfg(feature = "memory")]
 pub mod memory;
+#[cfg(feature = "memory")]
 pub mod memory_types;
 
 use axum::{
@@ -159,35 +161,44 @@ pub struct UnifiedApiState {
     pub hot_vector_index: Option<Arc<chronik_columnar::hot_vector_index::HotVectorIndex>>,
 
     // ───────────────────────── AM-1.7: Agent Memory ─────────────────────────
+    // Present only under the `memory` feature. See the `chronik-memory` note in
+    // Cargo.toml: that crate is a Kafka *client* (librdkafka), which the static
+    // musl artifact cannot link.
     /// Per-namespace [`chronik_memory::Memory`] cache. When `None`, the
     /// `/memory/v1/*` endpoints respond 503 `service_unavailable`. Wire it
     /// from `main.rs` after reading `CHRONIK_MEMORY_KAFKA` + `CHRONIK_MEMORY_API`.
+    #[cfg(feature = "memory")]
     pub memory_registry: Option<Arc<chronik_memory::MemoryRegistry>>,
     /// Optional text generator for `synthesize: true` recall. Typically an
     /// Anthropic Haiku 4.5 client wired from `CHRONIK_MEMORY_SYNTHESIS_PROVIDER`.
+    #[cfg(feature = "memory")]
     pub memory_text_generator: Option<Arc<dyn chronik_memory::TextGenerator>>,
     /// When `true`, `/memory/v1/*` requires `X-Tenant-Id` + `X-API-Key` headers.
     /// In Phase 1 passthrough this only checks presence; with [`Self::memory_tenants`]
     /// populated (AM-2.5), the handlers validate `(tenant_id, api_key)` against
     /// the registry and reject cross-namespace access.
     /// Toggle via `CHRONIK_MEMORY_REQUIRE_AUTH=true`.
+    #[cfg(feature = "memory")]
     pub memory_require_auth: bool,
     /// AM-2.5: Tenant registry for full multi-tenant auth/authorization.
     /// When empty (default), handlers run in passthrough mode (only the
     /// header-presence check from `memory_require_auth` applies). When
     /// populated, handlers validate `(X-Tenant-Id, X-API-Key)` against the
     /// registry on every request and reject cross-namespace access with 403.
+    #[cfg(feature = "memory")]
     pub memory_tenants: Option<Arc<chronik_memory::TenantRegistry>>,
     /// AM-2.5: Per-tenant Prometheus counters exposed at
     /// `GET /memory/v1/metrics`. Cheap to clone (`Arc` interior). When
     /// `None`, handlers skip the increment and the metrics endpoint returns
     /// an empty payload with just the # HELP/TYPE headers.
+    #[cfg(feature = "memory")]
     pub memory_tenant_metrics: Option<Arc<chronik_memory::TenantMetrics>>,
     /// AM-2.6: In-memory `memory_id → Source` index used by
     /// `GET /memory/v1/{memory_id}/source`. Populated by
     /// [`chronik_memory::spawn_memory_index_consumer`] tailing every
     /// `mem.{type}.{tenant}` topic. When `None`, the source endpoint
     /// returns 503.
+    #[cfg(feature = "memory")]
     pub memory_index: Option<Arc<chronik_memory::MemoryIndex>>,
     /// AM-2.5: Per-tenant token-bucket rate limiter. When present AND
     /// [`Self::memory_tenants`] is populated, every write / recall consumes
@@ -195,11 +206,13 @@ pub struct UnifiedApiState {
     /// recall_qps}` bucket. When either is `None`, requests pass through
     /// (unlimited). Denied requests get `429 Too Many Requests` with a
     /// `Retry-After`-shaped message body.
+    #[cfg(feature = "memory")]
     pub memory_rate_limiter: Option<Arc<chronik_memory::RateLimiter>>,
     /// AM-2.3: Synchronous compaction runner for
     /// `POST /memory/v1/compact`. Object-safe so the state doesn't
     /// leak the [`chronik_memory::compaction::CompactionController`]
     /// embedder generic. When `None`, the endpoint returns 503.
+    #[cfg(feature = "memory")]
     pub memory_compaction: Option<Arc<dyn chronik_memory::CompactionRunner>>,
     /// AM-2.5: Per-tenant storage byte counter + quota gate. When
     /// present AND [`Self::memory_tenants`] is populated, every write
@@ -208,11 +221,13 @@ pub struct UnifiedApiState {
     /// against the caller's `TenantQuotas.storage_bytes`. Writes over
     /// quota get `413 Payload Too Large`. When either is `None`, writes
     /// pass through without accounting.
+    #[cfg(feature = "memory")]
     pub memory_storage_tracker: Option<Arc<chronik_memory::StorageTracker>>,
     /// AM-3.4: Provenance-graph index backing
     /// `GET /memory/v1/{memory_id}/lineage`. Populated by a consumer
     /// that tails typed-memory topics. When `None`, the endpoint
     /// returns 503.
+    #[cfg(feature = "memory")]
     pub memory_lineage: Option<Arc<chronik_memory::LineageIndex>>,
 }
 
@@ -240,15 +255,25 @@ impl UnifiedApiState {
             reranker: None,
             query_router: None,
             hot_vector_index: None,
+            #[cfg(feature = "memory")]
             memory_registry: None,
+            #[cfg(feature = "memory")]
             memory_text_generator: None,
+            #[cfg(feature = "memory")]
             memory_require_auth: false,
+            #[cfg(feature = "memory")]
             memory_tenants: None,
+            #[cfg(feature = "memory")]
             memory_rate_limiter: None,
+            #[cfg(feature = "memory")]
             memory_index: None,
+            #[cfg(feature = "memory")]
             memory_tenant_metrics: None,
+            #[cfg(feature = "memory")]
             memory_compaction: None,
+            #[cfg(feature = "memory")]
             memory_storage_tracker: None,
+            #[cfg(feature = "memory")]
             memory_lineage: None,
         }
     }
@@ -256,6 +281,7 @@ impl UnifiedApiState {
     /// AM-1.7: Attach the per-namespace `Memory` cache for the
     /// `/memory/v1/*` endpoints. Without this, those endpoints reply
     /// `503 service_unavailable`.
+    #[cfg(feature = "memory")]
     pub fn with_memory_registry(
         mut self,
         registry: Arc<chronik_memory::MemoryRegistry>,
@@ -266,6 +292,7 @@ impl UnifiedApiState {
 
     /// AM-1.7: Attach a text generator used when callers request
     /// `synthesize: true` on `/memory/v1/recall`.
+    #[cfg(feature = "memory")]
     pub fn with_memory_text_generator(
         mut self,
         gen: Arc<dyn chronik_memory::TextGenerator>,
@@ -276,6 +303,7 @@ impl UnifiedApiState {
 
     /// AM-1.7: Require `X-Tenant-Id` + `X-API-Key` on every `/memory/v1/*`
     /// request. Toggle via `CHRONIK_MEMORY_REQUIRE_AUTH=true`.
+    #[cfg(feature = "memory")]
     pub fn with_memory_require_auth(mut self, require: bool) -> Self {
         self.memory_require_auth = require;
         self
@@ -284,6 +312,7 @@ impl UnifiedApiState {
     /// AM-2.5: Attach a populated tenant registry. When present, handlers
     /// validate every request's `(X-Tenant-Id, X-API-Key)` against the
     /// registry and reject cross-namespace access with 403.
+    #[cfg(feature = "memory")]
     pub fn with_memory_tenants(
         mut self,
         tenants: Arc<chronik_memory::TenantRegistry>,
@@ -295,6 +324,7 @@ impl UnifiedApiState {
     /// AM-2.5: Attach a per-tenant token-bucket rate limiter. Only takes
     /// effect when combined with [`Self::with_memory_tenants`] — otherwise
     /// handlers can't identify the caller's quotas.
+    #[cfg(feature = "memory")]
     pub fn with_memory_rate_limiter(
         mut self,
         limiter: Arc<chronik_memory::RateLimiter>,
@@ -306,6 +336,7 @@ impl UnifiedApiState {
     /// AM-2.6: Attach the `memory_id → Source` index used by the
     /// `GET /memory/v1/{memory_id}/source` provenance endpoint. When
     /// missing, the endpoint replies `503 service_unavailable`.
+    #[cfg(feature = "memory")]
     pub fn with_memory_index(
         mut self,
         index: Arc<chronik_memory::MemoryIndex>,
@@ -317,6 +348,7 @@ impl UnifiedApiState {
     /// AM-2.5: Attach the per-tenant metric registry. When missing,
     /// handlers skip the increment and `GET /memory/v1/metrics` returns
     /// an empty payload.
+    #[cfg(feature = "memory")]
     pub fn with_memory_tenant_metrics(
         mut self,
         metrics: Arc<chronik_memory::TenantMetrics>,
@@ -327,6 +359,7 @@ impl UnifiedApiState {
 
     /// AM-2.3: Attach the synchronous compaction runner. When missing,
     /// `POST /memory/v1/compact` returns `503 service_unavailable`.
+    #[cfg(feature = "memory")]
     pub fn with_memory_compaction(
         mut self,
         runner: Arc<dyn chronik_memory::CompactionRunner>,
@@ -337,6 +370,7 @@ impl UnifiedApiState {
 
     /// AM-2.5: Attach the per-tenant storage byte counter. When missing,
     /// writes are not accounted (passthrough).
+    #[cfg(feature = "memory")]
     pub fn with_memory_storage_tracker(
         mut self,
         tracker: Arc<chronik_memory::StorageTracker>,
@@ -347,6 +381,7 @@ impl UnifiedApiState {
 
     /// AM-3.4: Attach the lineage / provenance-graph index. Without
     /// it, `GET /memory/v1/{memory_id}/lineage` returns 503.
+    #[cfg(feature = "memory")]
     pub fn with_memory_lineage(
         mut self,
         idx: Arc<chronik_memory::LineageIndex>,
@@ -514,8 +549,11 @@ pub fn create_router_full(
         .route("/_query/capabilities", get(query_handler::handle_capabilities))
         .route("/_query/profiles", get(query_handler::handle_profiles));
 
-    // AM-1.7: Agent Memory endpoints (always registered; handlers return 503
-    // when memory_registry is None on UnifiedApiState).
+    // AM-1.7: Agent Memory endpoints. Registered whenever the `memory` feature
+    // is compiled in; the handlers return 503 when memory_registry is None on
+    // UnifiedApiState. Without the feature the routes are absent entirely (404).
+    #[cfg(feature = "memory")]
+    {
     router = router
         .route("/memory/v1/ingest", post(memory::ingest))
         .route("/memory/v1/remember", post(memory::remember))
@@ -529,6 +567,7 @@ pub fn create_router_full(
         .route("/memory/v1/recall/stream", post(memory::recall_stream))
         .route("/memory/v1/:memory_id/source", get(memory::source))
         .route("/memory/v1/:memory_id/lineage", get(memory::lineage));
+    }
 
     // Add shared state for SQL/Vector/Query/Memory endpoints
     let mut router = router.with_state(state);

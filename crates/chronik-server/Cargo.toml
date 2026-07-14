@@ -25,8 +25,20 @@ chronik-config = { path = "../chronik-config" }  # Required for cluster configur
 chronik-columnar = { path = "../chronik-columnar" }
 chronik-embeddings = { path = "../chronik-embeddings" }
 
-# Agent Memory — AM-1.7: server-internal implementation of /memory/v1/* endpoints
-chronik-memory = { path = "../chronik-memory" }
+# Agent Memory — AM-1.7: server-internal implementation of /memory/v1/* endpoints.
+#
+# Optional, behind the `memory` feature. chronik-memory is a Kafka *client*: it
+# opens an rdkafka producer/admin and several StreamConsumer groups against a
+# bootstrap address (see crates/chronik-memory/src/client.rs). Linking it into
+# the broker pulls librdkafka (a C library) into a binary that already speaks the
+# Kafka protocol natively — which is what breaks the static musl target, since
+# librdkafka does not cross-compile against musl without a vendored zlib/OpenSSL
+# and glibc-only FORTIFY_SOURCE stubs.
+#
+# The release musl job therefore builds --no-default-features --features search,backup.
+# Remove this dependency once /memory/v1/* is served through the broker's internal
+# produce/fetch handlers instead of a loopback Kafka client.
+chronik-memory = { path = "../chronik-memory", optional = true }
 
 # Query orchestration (Phase 9)
 chronik-query = { path = "../chronik-query" }
@@ -104,10 +116,13 @@ tabled = "0.15"
 
 
 [features]
-default = ["search", "backup"]
+default = ["search", "backup", "memory"]
 search = ["dep:chronik-search", "dep:tantivy"]
 backup = ["dep:chronik-backup"]
-full = ["search", "backup"]
+# Agent Memory (/memory/v1/*). Pulls in librdkafka; incompatible with the static
+# musl target. Off for musl artifacts, on everywhere else.
+memory = ["dep:chronik-memory"]
+full = ["search", "backup", "memory"]
 
 # Minimal build without optional features (Raft is always included)
 minimal = []

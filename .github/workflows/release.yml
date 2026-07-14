@@ -26,20 +26,39 @@ jobs:
     strategy:
       matrix:
         include:
-          # Linux builds using cross for proper musl static linking
+          # Standalone static binaries (musl). These CANNOT carry the `memory`
+          # feature: it pulls chronik-memory -> rdkafka -> librdkafka, a C library
+          # that does not cross-compile against musl. See the note on the
+          # chronik-memory dependency in crates/chronik-server/Cargo.toml.
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             artifact: chronik-server-linux-amd64
             use_cross: true
+            features: "--no-default-features --features search,backup"
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
             artifact: chronik-server-linux-arm64
             use_cross: true
+            features: "--no-default-features --features search,backup"
+          # glibc builds that back the Docker image. Dockerfile.binary is based on
+          # ubuntu:24.04, so static musl buys it nothing — and building gnu here is
+          # what keeps /memory/v1/* in the published container.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: chronik-server-linux-amd64-gnu
+            use_cross: true
+            features: ""
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            artifact: chronik-server-linux-arm64-gnu
+            use_cross: true
+            features: ""
           # macOS build (ARM only - Intel is deprecated)
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact: chronik-server-darwin-arm64
             use_cross: false
+            features: ""
     
     steps:
       - uses: actions/checkout@v4
@@ -82,14 +101,16 @@ jobs:
         env:
           RUSTC_WRAPPER: ""
         run: |
-          cross build --release --target ${{ matrix.target }} -p chronik-server --bin chronik-server
+          cross build --release --target ${{ matrix.target }} \
+            -p chronik-server --bin chronik-server ${{ matrix.features }}
 
       - name: Build native (macOS)
         if: "!matrix.use_cross"
         env:
           RUSTC_WRAPPER: ""  # Disable sccache for cross-target macOS builds (ARM runner building x86_64)
         run: |
-          cargo build --release --target ${{ matrix.target }} -p chronik-server --bin chronik-server
+          cargo build --release --target ${{ matrix.target }} \
+            -p chronik-server --bin chronik-server ${{ matrix.features }}
           
       - name: Package binary
         run: |
@@ -130,20 +151,28 @@ jobs:
           path: artifacts-download
       
       - name: Prepare artifacts for Docker
+        # Use the *-gnu artifacts, not the musl ones. Dockerfile.binary is based on
+        # ubuntu:24.04 (glibc), and only the gnu builds carry the `memory` feature —
+        # feeding the musl binaries here would silently drop /memory/v1/* from the
+        # published image.
         run: |
-          # Extract Linux binaries for Docker
           mkdir -p artifacts/linux/amd64
           mkdir -p artifacts/linux/arm64
-          
+
           cd artifacts-download
-          tar -xzf chronik-server-linux-amd64/chronik-server-linux-amd64.tar.gz -C ../artifacts/linux/amd64/
-          tar -xzf chronik-server-linux-arm64/chronik-server-linux-arm64.tar.gz -C ../artifacts/linux/arm64/
-          
+          tar -xzf chronik-server-linux-amd64-gnu/chronik-server-linux-amd64-gnu.tar.gz -C ../artifacts/linux/amd64/
+          tar -xzf chronik-server-linux-arm64-gnu/chronik-server-linux-arm64-gnu.tar.gz -C ../artifacts/linux/arm64/
+
           # Make binaries executable
           chmod +x ../artifacts/linux/*/chronik-server
-          
+
           # Verify binaries
           ls -la ../artifacts/linux/*/
+          # Fail loudly if the memory surface is missing from the image binary.
+          if ! grep -qa "/memory/v1/ingest" ../artifacts/linux/amd64/chronik-server; then
+            echo "::error::amd64 image binary has no /memory/v1/* routes — wrong artifact?"
+            exit 1
+          fi
       
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3

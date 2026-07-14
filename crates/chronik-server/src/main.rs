@@ -596,6 +596,7 @@ fn try_create_embedding_provider() -> Option<Arc<dyn chronik_embeddings::Embeddi
 ///
 /// Returns `None` when disabled. The server still mounts `/memory/v1/*` routes
 /// in that case — they reply 503 `service_unavailable`.
+#[cfg(feature = "memory")]
 fn try_create_memory_registry() -> Option<Arc<chronik_memory::MemoryRegistry>> {
     let kafka = std::env::var("CHRONIK_MEMORY_KAFKA").ok();
     let api = std::env::var("CHRONIK_MEMORY_API").ok();
@@ -634,6 +635,7 @@ fn try_create_memory_registry() -> Option<Arc<chronik_memory::MemoryRegistry>> {
 /// - `CHRONIK_MEMORY_KAFKA` — brokers (defaults to the value threaded in).
 /// - `CHRONIK_MEMORY_CONFIG_GROUP_ID` — consumer group (defaults to
 ///   `chronik-mem-config-consumer`).
+#[cfg(feature = "memory")]
 fn try_create_mem_config(default_brokers: &str) -> Option<Arc<chronik_memory::MemConfig>> {
     let enabled = std::env::var("CHRONIK_MEMORY_CONFIG_ENABLED")
         .map(|v| v.to_lowercase() == "true" || v == "1")
@@ -666,6 +668,7 @@ fn try_create_mem_config(default_brokers: &str) -> Option<Arc<chronik_memory::Me
 /// - `CHRONIK_MEMORY_KAFKA` — brokers (defaults to `localhost:9092`).
 /// - `CHRONIK_MEMORY_INDEX_GROUP_ID` — consumer group (defaults to
 ///   `chronik-memory-index-consumer`).
+#[cfg(feature = "memory")]
 fn try_create_memory_index() -> Option<Arc<chronik_memory::MemoryIndex>> {
     let enabled = std::env::var("CHRONIK_MEMORY_INDEX_ENABLED")
         .map(|v| v.to_lowercase() == "true" || v == "1")
@@ -697,6 +700,7 @@ fn try_create_memory_index() -> Option<Arc<chronik_memory::MemoryIndex>> {
 /// `LineageIndex::observe`. Suitable for smoke-testing the wire
 /// contract; automatic consumer hydration lands with the
 /// per-topic tail (same shape as `try_create_memory_index`).
+#[cfg(feature = "memory")]
 fn try_create_memory_lineage() -> Option<Arc<chronik_memory::LineageIndex>> {
     let enabled = std::env::var("CHRONIK_MEMORY_LINEAGE_ENABLED")
         .map(|v| v.to_lowercase() == "true" || v == "1")
@@ -708,6 +712,7 @@ fn try_create_memory_lineage() -> Option<Arc<chronik_memory::LineageIndex>> {
     Some(Arc::new(chronik_memory::LineageIndex::new()))
 }
 
+#[cfg(feature = "memory")]
 fn memory_require_auth() -> bool {
     std::env::var("CHRONIK_MEMORY_REQUIRE_AUTH")
         .map(|v| v.to_lowercase() == "true" || v == "1")
@@ -737,6 +742,7 @@ fn memory_require_auth() -> bool {
 ///
 /// Returns `Some(Arc<dyn CompactionRunner>)` on success. `None` when any
 /// of the required env / API keys are missing.
+#[cfg(feature = "memory")]
 fn try_create_lifecycle_controller(
 ) -> Option<Arc<dyn chronik_memory::CompactionRunner>> {
     let enabled = std::env::var("CHRONIK_MEMORY_LIFECYCLE_ENABLED")
@@ -870,6 +876,7 @@ fn try_create_reranker(
 ///   runs continuously and applies live changes on top. Uses the
 ///   `CHRONIK_MEMORY_KAFKA` bootstrap servers (falling back to
 ///   `localhost:9092`).
+#[cfg(feature = "memory")]
 fn try_create_tenant_registry() -> Option<Arc<chronik_memory::TenantRegistry>> {
     let registry = chronik_memory::TenantRegistry::from_env();
     let kafka_enabled = std::env::var("CHRONIK_MEMORY_TENANTS_KAFKA_ENABLED")
@@ -905,6 +912,62 @@ fn try_create_tenant_registry() -> Option<Arc<chronik_memory::TenantRegistry>> {
     }
 
     Some(arc_registry)
+}
+
+/// AM-1.7: Attach the agent-memory registry and its optional side indexes to
+/// the Unified API state, so `/memory/v1/*` is served rather than 503.
+///
+/// Called from both the single-node and cluster start paths. Compiled out
+/// entirely without the `memory` feature — see the note on the `chronik-memory`
+/// dependency in Cargo.toml for why the static musl artifact excludes it.
+#[cfg(feature = "memory")]
+fn wire_agent_memory(mut state: unified_api::UnifiedApiState) -> unified_api::UnifiedApiState {
+    let Some(registry) = try_create_memory_registry() else {
+        return state;
+    };
+    state = state
+        .with_memory_registry(registry)
+        .with_memory_require_auth(memory_require_auth());
+    info!("✓ Agent memory registry wired into Unified API (/memory/v1/*)");
+
+    // AM-2.5: optional tenant registry for multi-tenant auth. The per-tenant
+    // rate limiter, metrics, and storage tracker are only meaningful once the
+    // registry is populated, so they opt in together.
+    if let Some(tenants) = try_create_tenant_registry() {
+        state = state
+            .with_memory_tenants(tenants)
+            .with_memory_rate_limiter(Arc::new(chronik_memory::RateLimiter::new()))
+            .with_memory_tenant_metrics(Arc::new(chronik_memory::TenantMetrics::new()))
+            .with_memory_storage_tracker(Arc::new(chronik_memory::StorageTracker::new()));
+        info!(
+            "✓ Agent memory tenant registry wired (full auth, rate limiting, \
+             per-tenant metrics, storage quotas)"
+        );
+    }
+    // AM-2.6: opt-in memory-index consumer for GET /memory/v1/{id}/source.
+    if let Some(index) = try_create_memory_index() {
+        state = state.with_memory_index(index);
+        info!("✓ Agent memory memory_id index wired (/memory/v1/*/source)");
+    }
+    // AM-2.3: opt-in lifecycle consumer + compaction runner for POST /memory/v1/compact.
+    if let Some(runner) = try_create_lifecycle_controller() {
+        state = state.with_memory_compaction(runner);
+        info!("✓ Agent memory lifecycle controller wired (POST /memory/v1/compact)");
+    }
+    // AM-3.4: opt-in lineage index for GET /memory/v1/{id}/lineage.
+    if let Some(idx) = try_create_memory_lineage() {
+        state = state.with_memory_lineage(idx);
+        info!("✓ Agent memory lineage index wired (GET /memory/v1/*/lineage)");
+    }
+    state
+}
+
+/// No-op when the `memory` feature is off. The `/memory/v1/*` routes are not
+/// mounted at all in that build; clients get 404 rather than 503.
+#[cfg(not(feature = "memory"))]
+fn wire_agent_memory(state: unified_api::UnifiedApiState) -> unified_api::UnifiedApiState {
+    info!("Agent memory not compiled in (build with --features memory to enable /memory/v1/*)");
+    state
 }
 
 fn try_create_embedding_cache() -> Option<Arc<chronik_columnar::QueryEmbeddingCache>> {
@@ -1257,46 +1320,7 @@ async fn run_cluster_mode(
         unified_state = unified_state.with_embedding_cache(cache);
     }
     // AM-1.7: Wire MemoryRegistry into /memory/v1/* handlers.
-    if let Some(registry) = try_create_memory_registry() {
-        unified_state = unified_state
-            .with_memory_registry(registry)
-            .with_memory_require_auth(memory_require_auth());
-        info!("✓ Agent memory registry wired into Unified API (/memory/v1/*)");
-        // AM-2.5: optional tenant registry for multi-tenant auth.
-        if let Some(tenants) = try_create_tenant_registry() {
-            unified_state = unified_state.with_memory_tenants(tenants);
-            info!("✓ Agent memory tenant registry wired (full auth enabled)");
-            // AM-2.5: per-tenant rate limiter (token bucket). Only useful
-            // when the tenant registry is populated, so we opt in here.
-            let limiter = Arc::new(chronik_memory::RateLimiter::new());
-            unified_state = unified_state.with_memory_rate_limiter(limiter);
-            info!("✓ Agent memory per-tenant rate limiter wired");
-            // AM-2.5: per-tenant Prometheus metrics.
-            let metrics = Arc::new(chronik_memory::TenantMetrics::new());
-            unified_state = unified_state.with_memory_tenant_metrics(metrics);
-            info!("✓ Agent memory per-tenant metrics wired (GET /memory/v1/metrics)");
-            // AM-2.5: per-tenant storage byte counter + quota enforcement.
-            let tracker = Arc::new(chronik_memory::StorageTracker::new());
-            unified_state = unified_state.with_memory_storage_tracker(tracker);
-            info!("✓ Agent memory per-tenant storage tracker wired (413 on quota exceed)");
-        }
-        // AM-2.6: opt-in memory-index consumer for GET /memory/v1/{id}/source.
-        if let Some(index) = try_create_memory_index() {
-            unified_state = unified_state.with_memory_index(index);
-            info!("✓ Agent memory memory_id index wired (/memory/v1/*/source)");
-        }
-        // AM-2.3: opt-in lifecycle consumer + compaction runner for
-        // POST /memory/v1/compact.
-        if let Some(runner) = try_create_lifecycle_controller() {
-            unified_state = unified_state.with_memory_compaction(runner);
-            info!("✓ Agent memory lifecycle controller wired (POST /memory/v1/compact)");
-        }
-        // AM-3.4: opt-in lineage index for GET /memory/v1/{id}/lineage.
-        if let Some(idx) = try_create_memory_lineage() {
-            unified_state = unified_state.with_memory_lineage(idx);
-            info!("✓ Agent memory lineage index wired (GET /memory/v1/*/lineage)");
-        }
-    }
+    unified_state = wire_agent_memory(unified_state);
     // VO-4: optional cross-encoder reranker for /_vector/*.
     if let Some(reranker) = try_create_reranker() {
         unified_state = unified_state.with_reranker(reranker);
@@ -1561,44 +1585,7 @@ async fn run_single_node_mode(
             unified_state = unified_state.with_embedding_cache(cache);
         }
         // AM-1.7: Wire MemoryRegistry into /memory/v1/* handlers.
-        if let Some(registry) = try_create_memory_registry() {
-            unified_state = unified_state
-                .with_memory_registry(registry)
-                .with_memory_require_auth(memory_require_auth());
-            info!("✓ Agent memory registry wired into Unified API (/memory/v1/*)");
-            // AM-2.5: optional tenant registry for multi-tenant auth.
-            if let Some(tenants) = try_create_tenant_registry() {
-                unified_state = unified_state.with_memory_tenants(tenants);
-                info!("✓ Agent memory tenant registry wired (full auth enabled)");
-                // AM-2.5: per-tenant token-bucket rate limiter.
-                let limiter = Arc::new(chronik_memory::RateLimiter::new());
-                unified_state = unified_state.with_memory_rate_limiter(limiter);
-                info!("✓ Agent memory per-tenant rate limiter wired");
-                // AM-2.5: per-tenant Prometheus metrics.
-                let metrics = Arc::new(chronik_memory::TenantMetrics::new());
-                unified_state = unified_state.with_memory_tenant_metrics(metrics);
-                info!("✓ Agent memory per-tenant metrics wired (GET /memory/v1/metrics)");
-                // AM-2.5: per-tenant storage byte counter + quota enforcement.
-                let tracker = Arc::new(chronik_memory::StorageTracker::new());
-                unified_state = unified_state.with_memory_storage_tracker(tracker);
-                info!("✓ Agent memory per-tenant storage tracker wired (413 on quota exceed)");
-            }
-            // AM-2.6: opt-in memory-index consumer for GET /memory/v1/{id}/source.
-            if let Some(index) = try_create_memory_index() {
-                unified_state = unified_state.with_memory_index(index);
-                info!("✓ Agent memory memory_id index wired (/memory/v1/*/source)");
-            }
-            // AM-2.3: opt-in lifecycle consumer + compaction runner.
-            if let Some(runner) = try_create_lifecycle_controller() {
-                unified_state = unified_state.with_memory_compaction(runner);
-                info!("✓ Agent memory lifecycle controller wired (POST /memory/v1/compact)");
-            }
-            // AM-3.4: opt-in lineage index for GET /memory/v1/{id}/lineage.
-            if let Some(idx) = try_create_memory_lineage() {
-                unified_state = unified_state.with_memory_lineage(idx);
-                info!("✓ Agent memory lineage index wired (GET /memory/v1/*/lineage)");
-            }
-        }
+        unified_state = wire_agent_memory(unified_state);
         // VO-4: optional cross-encoder reranker for /_vector/*.
         if let Some(reranker) = try_create_reranker() {
             unified_state = unified_state.with_reranker(reranker);
