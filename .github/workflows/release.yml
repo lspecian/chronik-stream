@@ -121,6 +121,12 @@ jobs:
         if: "!matrix.use_cross"
         env:
           RUSTC_WRAPPER: ""  # sccache off for cross-target builds
+          # librdkafka's CMakeLists still declares a pre-3.5 cmake_minimum_required,
+          # and CMake 4 (shipped on macos-latest) removed that compatibility. Ubuntu
+          # 24.04 is still on CMake 3.28, so this only bites the macOS build today —
+          # but it will bite any runner that moves to CMake 4. This is the escape
+          # hatch CMake itself suggests. Only the `memory` builds reach librdkafka.
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
         run: |
           cargo build --release --target ${{ matrix.target }} \
             -p chronik-server --bin chronik-server ${{ matrix.features }}
