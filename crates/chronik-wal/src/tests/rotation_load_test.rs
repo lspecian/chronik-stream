@@ -158,13 +158,19 @@ async fn collect_segment_info(data_dir: &std::path::Path, topic: &str, partition
         let path = entry.path();
         if path.extension().map_or(false, |ext| ext == "log") {
             if let Some(file_name) = path.file_stem().and_then(|n| n.to_str()) {
-                // Parse filename format: wal_{id}_{base_offset}.log
+                // Filename format is wal_{partition}_{segment_id}.log — see
+                // GroupCommitWal::segment_path in group_commit.rs. Capture group 1
+                // is the PARTITION, group 2 is the segment id. Reading group 1 as
+                // the id gives every segment the same key (the partition), which
+                // makes the sort below a no-op and leaves the caller looking at
+                // raw readdir order — the callers' "skip the first and last
+                // segment" logic then skips arbitrary entries.
                 if let Some(caps) = regex::Regex::new(r"wal_(\d+)_(\d+)")
                     .unwrap()
                     .captures(file_name) {
-                    let id: u64 = caps[1].parse().unwrap_or(0);
-                    let _base_offset: u64 = caps[2].parse().unwrap_or(0);
-                    
+                    let _partition: u64 = caps[1].parse().unwrap_or(0);
+                    let id: u64 = caps[2].parse().unwrap_or(0);
+
                     // Get file size
                     let metadata = tokio::fs::metadata(&path).await?;
                     let size = metadata.len();

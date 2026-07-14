@@ -20,9 +20,18 @@ jobs:
   unit-and-offline-integration:
     name: Unit + offline integration
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # A cold cache means compiling the whole workspace (tantivy, DataFusion, arrow)
+    # before a single test runs, which does not fit in 15 minutes. This job never
+    # reached the compile stage until now — it died in protoc — so its cache has
+    # never been populated. Warm runs finish in a few minutes.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libsasl2-dev
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -53,7 +62,10 @@ jobs:
         run: cargo test -p chronik-memory --lib --bins
 
       - name: Lib unit tests (memory handlers)
-        run: cargo test -p chronik-server --lib unified_api::memory
+        # chronik-server is a bin-only crate (no [lib] target), so --lib errors out
+        # with "no library targets found". The /memory/v1/* handler tests live in
+        # the binary; they need --bins.
+        run: cargo test -p chronik-server --bins unified_api::memory
 
       # Offline integration tests — anything in tests/ that doesn't gate on
       # CHRONIK_INTEGRATION=1. Includes baseline checks against the seeded

@@ -25,6 +25,11 @@ jobs:
     if: ${{ secrets.ANTHROPIC_API_KEY != '' }}
     steps:
       - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libsasl2-dev
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Cache cargo
