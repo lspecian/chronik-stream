@@ -24,11 +24,15 @@ jobs:
     name: Build Release Binaries
     runs-on: ${{ matrix.os }}
     strategy:
+      # Don't cancel the other targets when one fails — we want the full picture
+      # of which targets are broken, not just the first one to trip.
+      fail-fast: false
       matrix:
         include:
-          # Standalone static binaries (musl). These CANNOT carry the `memory`
-          # feature: it pulls chronik-memory -> rdkafka -> librdkafka, a C library
-          # that does not cross-compile against musl. See the note on the
+          # ── Standalone static binaries (musl), built with `cross` ──
+          # These CANNOT carry the `memory` feature: it pulls chronik-memory ->
+          # rdkafka -> librdkafka, a C library that does not cross-compile (its
+          # CMake cannot see vendored deps in a cross sysroot). See the note on the
           # chronik-memory dependency in crates/chronik-server/Cargo.toml.
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
@@ -40,18 +44,22 @@ jobs:
             artifact: chronik-server-linux-arm64
             use_cross: true
             features: "--no-default-features --features search,backup"
-          # glibc builds that back the Docker image. Dockerfile.binary is based on
-          # ubuntu:24.04, so static musl buys it nothing — and building gnu here is
-          # what keeps /memory/v1/* in the published container.
+          # ── glibc builds that back the Docker image, built NATIVELY ──
+          # Dockerfile.binary is based on ubuntu:24.04, so static musl buys it
+          # nothing, and these are the builds that keep /memory/v1/* in the
+          # published container. They carry `memory`, which means librdkafka —
+          # so they must NOT use cross. librdkafka only compiles when the build
+          # is native to the runner's architecture. Hence a real ARM runner for
+          # aarch64 (free on public repos) rather than cross-compiling to it.
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact: chronik-server-linux-amd64-gnu
-            use_cross: true
+            use_cross: false
             features: ""
-          - os: ubuntu-latest
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             artifact: chronik-server-linux-arm64-gnu
-            use_cross: true
+            use_cross: false
             features: ""
           # macOS build (ARM only - Intel is deprecated)
           - os: macos-latest
@@ -80,23 +88,28 @@ jobs:
             ~/.cargo/git/db/
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Install protoc (Linux)
-        if: matrix.use_cross
+      # Key these on the runner OS, not on use_cross. The native gnu builds are
+      # Linux too, and gating protoc on use_cross would leave them without it —
+      # raft-proto's build script shells out to protoc and would fail.
+      # cmake is needed by librdkafka (rdkafka's cmake-build feature) on the
+      # native gnu builds that carry `memory`.
+      - name: Install protoc + cmake (Linux)
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+          sudo apt-get install -y protobuf-compiler cmake
 
       - name: Install protoc (macOS)
-        if: "!matrix.use_cross"
+        if: runner.os == 'macOS'
         run: |
           brew install protobuf
 
-      - name: Install cross (Linux builds)
+      - name: Install cross
         if: matrix.use_cross
         run: |
           cargo install cross --git https://github.com/cross-rs/cross
-      
-      - name: Build with cross (Linux)
+
+      - name: Build with cross
         if: matrix.use_cross
         env:
           RUSTC_WRAPPER: ""
@@ -104,10 +117,10 @@ jobs:
           cross build --release --target ${{ matrix.target }} \
             -p chronik-server --bin chronik-server ${{ matrix.features }}
 
-      - name: Build native (macOS)
+      - name: Build native
         if: "!matrix.use_cross"
         env:
-          RUSTC_WRAPPER: ""  # Disable sccache for cross-target macOS builds (ARM runner building x86_64)
+          RUSTC_WRAPPER: ""  # sccache off for cross-target builds
         run: |
           cargo build --release --target ${{ matrix.target }} \
             -p chronik-server --bin chronik-server ${{ matrix.features }}
@@ -205,7 +218,11 @@ jobs:
           context: .
           file: ./Dockerfile.binary
           platforms: linux/amd64,linux/arm64
-          push: true
+          # Only publish images for real tags. A workflow_dispatch run builds the
+          # image (exercising Dockerfile.binary and the /memory/v1 artifact guard)
+          # without pushing anything to the registry, so the matrix can be
+          # validated before minting a tag.
+          push: ${{ startsWith(github.ref, 'refs/tags/') }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
@@ -216,6 +233,9 @@ jobs:
   # Create GitHub release
   release:
     name: Create Release
+    # Tags only. Without this, a workflow_dispatch run from a branch would publish
+    # a GitHub release named after the branch (github.ref_name == "main").
+    if: startsWith(github.ref, 'refs/tags/')
     needs: [build-binaries, docker]
     runs-on: ubuntu-latest
     permissions:
