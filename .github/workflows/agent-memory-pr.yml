@@ -20,7 +20,11 @@ jobs:
   unit-and-offline-integration:
     name: Unit + offline integration
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # A cold cache means compiling the whole workspace (tantivy, DataFusion, arrow)
+    # before a single test runs, which does not fit in 15 minutes. This job never
+    # reached the compile stage until now — it died in protoc — so its cache has
+    # never been populated. Warm runs finish in a few minutes.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
