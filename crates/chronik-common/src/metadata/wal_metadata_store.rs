@@ -38,6 +38,26 @@ pub type WalAppendFn = Arc<dyn Fn(Vec<u8>) -> Pin<Box<dyn Future<Output = std::r
 /// Returns: Number of subscribers that received the event
 pub type EventBusPublishFn = Arc<dyn Fn(MetadataEvent) -> usize + Send + Sync>;
 
+/// Whether a metadata event should be replicated to followers over the
+/// fire-and-forget event bus.
+///
+/// Segment-index events (Tantivy + Parquet) are HIGH-FREQUENCY derived local
+/// state: every node builds its own indexes from its own replicated partition
+/// data, so a follower never needs the leader's copy — it can rebuild them from
+/// the data WAL on restart. They outnumber catalog events (TopicCreated etc.)
+/// ~45:1, and routing that flood through the bounded broadcast channel is what
+/// starves catalog replication and diverges the topic catalog across nodes under
+/// load. Keep them node-local; replicate only catalog / consumer / watermark state.
+fn replicate_to_followers(payload: &MetadataEventPayload) -> bool {
+    !matches!(
+        payload,
+        MetadataEventPayload::SegmentCreated { .. }
+            | MetadataEventPayload::SegmentDeleted { .. }
+            | MetadataEventPayload::ParquetSegmentCreated { .. }
+            | MetadataEventPayload::ParquetSegmentDeleted { .. }
+    )
+}
+
 /// WAL-based metadata store with event sourcing
 pub struct WalMetadataStore {
     /// Node ID for cluster coordination
@@ -411,19 +431,31 @@ impl WalMetadataStore {
         self.state.apply_event(&event).await?;
 
         // 4. v2.2.9 Phase 7 FIX: Publish event to event bus for replication
-        // This allows MetadataWalReplicator to hear the event and replicate to followers
-        if let Some(ref publish_fn) = self.event_bus_publish {
-            let subscriber_count = publish_fn(event.clone());
-            tracing::info!(
-                "✅ Published metadata event to {} subscribers: {:?}",
-                subscriber_count,
-                event.payload
-            );
-        } else {
-            tracing::warn!(
-                "⚠️  Event bus not wired up - metadata will NOT replicate to followers! Event: {:?}",
-                event.payload
-            );
+        // This allows MetadataWalReplicator to hear the event and replicate to followers.
+        //
+        // v2.7.4: Do NOT replicate high-frequency segment-index events. Each node
+        // builds its own Tantivy/Parquet segments from its own replicated partition
+        // data, so a follower gains nothing from the leader's SegmentCreated events —
+        // they are derived local state, recoverable on restart. But they DOMINATE the
+        // metadata stream (~45:1 vs TopicCreated), and pushing them through the bounded
+        // fire-and-forget broadcast channel saturates it, causing the rare TopicCreated
+        // events to be dropped — which is how the topic catalog diverges across nodes
+        // under load. Keeping them local drains the channel so the catalog replicates
+        // reliably. They are still written to the local WAL + applied above.
+        if replicate_to_followers(&event.payload) {
+            if let Some(ref publish_fn) = self.event_bus_publish {
+                let subscriber_count = publish_fn(event.clone());
+                tracing::debug!(
+                    "Published metadata event to {} subscribers: {:?}",
+                    subscriber_count,
+                    event.payload
+                );
+            } else {
+                tracing::warn!(
+                    "⚠️  Event bus not wired up - metadata will NOT replicate to followers! Event: {:?}",
+                    event.payload
+                );
+            }
         }
 
         Ok(())
@@ -998,5 +1030,63 @@ impl MetadataStore for WalMetadataStore {
 
     async fn fence_producer(&self, _transactional_id: String, _old_producer_id: i64, _old_producer_epoch: i16, _new_producer_id: i64, _new_producer_epoch: i16) -> Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod replication_filter_tests {
+    use super::*;
+
+    fn segment_meta() -> SegmentMetadata {
+        SegmentMetadata {
+            segment_id: "s0".to_string(),
+            topic: "t".to_string(),
+            partition: 0,
+            start_offset: 0,
+            end_offset: 1,
+            size: 1,
+            record_count: 1,
+            path: "p".to_string(),
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    /// Catalog + consumer + watermark events MUST replicate to followers.
+    #[test]
+    fn catalog_events_replicate() {
+        assert!(replicate_to_followers(&MetadataEventPayload::TopicCreated {
+            name: "t".to_string(),
+            config: TopicConfig::default(),
+        }));
+        assert!(replicate_to_followers(&MetadataEventPayload::TopicDeleted {
+            name: "t".to_string(),
+        }));
+        // Watermarks are low-volume and kept replicated (only segment-index events
+        // are filtered); guards against over-filtering.
+        assert!(replicate_to_followers(&MetadataEventPayload::HighWatermarkUpdated {
+            topic: "t".to_string(),
+            partition: 0,
+            new_watermark: 42,
+        }));
+    }
+
+    /// High-frequency segment-index events (derived local state, ~45:1 vs
+    /// TopicCreated) MUST NOT replicate — keeping them off the bus is what stops
+    /// the flood that starved catalog replication.
+    #[test]
+    fn segment_index_events_do_not_replicate() {
+        assert!(!replicate_to_followers(&MetadataEventPayload::SegmentCreated {
+            metadata: segment_meta(),
+        }));
+        assert!(!replicate_to_followers(&MetadataEventPayload::SegmentDeleted {
+            topic: "t".to_string(),
+            partition: 0,
+            segment_id: "s0".to_string(),
+        }));
+        assert!(!replicate_to_followers(&MetadataEventPayload::ParquetSegmentDeleted {
+            topic: "t".to_string(),
+            partition: 0,
+            segment_id: "s0".to_string(),
+        }));
     }
 }

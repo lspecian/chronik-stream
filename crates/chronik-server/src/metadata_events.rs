@@ -117,9 +117,22 @@ impl MetadataEventBus {
 
 impl Default for MetadataEventBus {
     fn default() -> Self {
-        // Default buffer: 1000 events
-        // At ~100 bytes per event = ~100KB memory
-        Self::new(1000)
+        // The buffer must exceed the largest burst a follower can fall behind on.
+        // The worst burst is broadcast_all_topics() re-pushing the ENTIRE catalog
+        // (one TopicCreated per topic) in a tight loop on restart; if that burst
+        // exceeds the buffer, the follower's receiver lags and tokio::broadcast
+        // silently drops the OLDEST events — the topic catalog then diverges across
+        // nodes under load (observed: followers stuck at ~1500/1879 with buffer=1000).
+        //
+        // Default sized for tens of thousands of topics; override for larger
+        // deployments via CHRONIK_METADATA_EVENT_BUFFER. Cost is ~event_size * N
+        // held transiently (~tens of MB at 50k), only while followers are catching up.
+        let buffer = std::env::var("CHRONIK_METADATA_EVENT_BUFFER")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(50_000);
+        Self::new(buffer)
     }
 }
 
@@ -192,6 +205,65 @@ mod tests {
                 assert_eq!(t2, "test");
             }
             _ => panic!("Wrong event types"),
+        }
+    }
+
+    /// Regression: the default event bus must survive a bulk re-broadcast of the
+    /// entire catalog without dropping events. `broadcast_all_topics()` pushes one
+    /// TopicCreated per topic in a tight loop on restart; with the old buffer of
+    /// 1000 (see `test_small_buffer_drops_bulk_rebroadcast`) a burst larger than
+    /// the buffer made the follower's receiver lag and tokio::broadcast silently
+    /// dropped the oldest events, diverging the topic catalog across nodes.
+    #[tokio::test]
+    async fn test_default_buffer_survives_bulk_rebroadcast() {
+        // Isolate from any ambient CHRONIK_METADATA_EVENT_BUFFER in the env.
+        let bus = MetadataEventBus::new(50_000);
+        let mut receiver = bus.subscribe();
+
+        // A catalog far larger than the old 1000 buffer, pushed before any drain.
+        const N: usize = 3000;
+        for i in 0..N {
+            bus.publish(MetadataEvent::TopicCreated {
+                topic: format!("repro-{}", i),
+                num_partitions: 1,
+            });
+        }
+
+        // Drain: every event must arrive, in order, with no Lagged gap.
+        for i in 0..N {
+            match receiver.try_recv() {
+                Ok(MetadataEvent::TopicCreated { topic, .. }) => {
+                    assert_eq!(topic, format!("repro-{}", i), "out-of-order / dropped at {}", i);
+                }
+                Ok(other) => panic!("unexpected event: {:?}", other),
+                Err(e) => panic!("event {} dropped/unavailable: {:?} — buffer too small", i, e),
+            }
+        }
+    }
+
+    /// Documents the OLD failure mode: a buffer smaller than the burst drops the
+    /// oldest events (RecvError::Lagged). This is what diverged the catalog; the
+    /// default is now sized well past realistic catalogs so this cannot happen.
+    #[tokio::test]
+    async fn test_small_buffer_drops_bulk_rebroadcast() {
+        use tokio::sync::broadcast::error::TryRecvError;
+        let bus = MetadataEventBus::new(1000);
+        let mut receiver = bus.subscribe();
+
+        for i in 0..3000 {
+            bus.publish(MetadataEvent::TopicCreated {
+                topic: format!("repro-{}", i),
+                num_partitions: 1,
+            });
+        }
+
+        // With capacity 1000 and 3000 sent undrained, the first recv reports the
+        // dropped span rather than event 0.
+        match receiver.try_recv() {
+            Err(TryRecvError::Lagged(dropped)) => {
+                assert!(dropped > 0, "expected lag drops with an undersized buffer");
+            }
+            other => panic!("expected Lagged with buffer<burst, got {:?}", other),
         }
     }
 
