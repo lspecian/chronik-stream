@@ -51,16 +51,20 @@ jobs:
           # so they must NOT use cross. librdkafka only compiles when the build
           # is native to the runner's architecture. Hence a real ARM runner for
           # aarch64 (free on public repos) rather than cross-compiling to it.
+          # `memory` is now off by default (see crates/chronik-server/Cargo.toml),
+          # so these must opt in explicitly to keep /memory/v1/* in the image. The
+          # bare `cargo build` default is clean core; only the shipped Docker image
+          # carries memory, and only on glibc.
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact: chronik-server-linux-amd64-gnu
             use_cross: false
-            features: ""
+            features: "--features memory"
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             artifact: chronik-server-linux-arm64-gnu
             use_cross: false
-            features: ""
+            features: "--features memory"
           # macOS build (ARM only - Intel is deprecated)
           - os: macos-latest
             target: aarch64-apple-darwin

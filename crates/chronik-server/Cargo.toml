@@ -116,11 +116,17 @@ tabled = "0.15"
 
 
 [features]
-default = ["search", "backup", "memory"]
+# Agent memory is OFF by default. It pulls chronik-memory -> rdkafka -> librdkafka
+# (a Kafka *client* C library) into the broker, which is what broke the static
+# musl release build at v2.7.0. Memory is an unproven add-on; the core streaming
+# engine must never again be taxed by it. Opt in with --features memory (or build
+# the sidecar worker), and only on glibc targets. See docs/ROADMAP_MEMORY_EMBEDDED.md
+# for the in-process path that would let memory return to default without librdkafka.
+default = ["search", "backup"]
 search = ["dep:chronik-search", "dep:tantivy"]
 backup = ["dep:chronik-backup"]
 # Agent Memory (/memory/v1/*). Pulls in librdkafka; incompatible with the static
-# musl target. Off for musl artifacts, on everywhere else.
+# musl target. Off by default; enable explicitly on glibc builds only.
 memory = ["dep:chronik-memory"]
 full = ["search", "backup", "memory"]
 
