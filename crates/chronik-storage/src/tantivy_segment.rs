@@ -86,12 +86,29 @@ pub struct SegmentMetadata {
     pub compression: CompressionType,
 }
 
+/// Diagnostic: number of TantivySegmentWriter instances currently alive.
+/// Each holds a live Tantivy IndexWriter (50MB budget + ~9 threads), so a
+/// sustained high count means segment-indexing jobs are piling up while each
+/// holds a writer — the memory profile that OOM-killed nodes at scale.
+pub static LIVE_SEGMENT_WRITERS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// RAII guard for [`LIVE_SEGMENT_WRITERS`]. A member (not a Drop impl on the
+/// struct itself) so `commit(self)` can still move fields out.
+struct WriterCountGuard;
+impl Drop for WriterCountGuard {
+    fn drop(&mut self) {
+        LIVE_SEGMENT_WRITERS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Writer for creating Tantivy segments
 pub struct TantivySegmentWriter {
     index: Index,
     writer: IndexWriter,
     schema_fields: SchemaFields,
     metadata: SegmentMetadata,
+    _count_guard: WriterCountGuard,
 }
 
 impl TantivySegmentWriter {
@@ -101,6 +118,10 @@ impl TantivySegmentWriter {
         text_analysis::register_analyzer(&index);
         let writer = index.writer(50_000_000)
             .map_err(|e| Error::Internal(format!("Failed to create Tantivy writer: {}", e)))?;
+        let live = LIVE_SEGMENT_WRITERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if live > 8 {
+            tracing::warn!(live, "TantivySegmentWriter instances piling up (each = 50MB writer budget + ~9 threads)");
+        }
 
         let metadata = SegmentMetadata {
             topic, partition, base_offset,
@@ -112,7 +133,7 @@ impl TantivySegmentWriter {
             compression: CompressionType::None,
         };
 
-        Ok(Self { index, writer, schema_fields, metadata })
+        Ok(Self { index, writer, schema_fields, metadata, _count_guard: WriterCountGuard })
     }
 
     pub fn write_batch(&mut self, canonical: &CanonicalRecord) -> Result<()> {

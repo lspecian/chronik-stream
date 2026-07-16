@@ -1421,7 +1421,10 @@ async fn run_single_node_mode(
         advertised_host,
         advertised_port,
         data_dir: cli.data_dir.to_string_lossy().to_string(),
-        enable_indexing: cfg!(feature = "search"),
+        // Legacy realtime indexer: off by default (write-only output, and a
+        // per-topic Tantivy writer held forever — OOMs at thousands of topics).
+        // See IntegratedKafkaServerConfig::default.
+        enable_indexing: false,
         enable_compression: true,
         auto_create_topics: true,
         num_partitions: 3,  // Default to 3 partitions for better parallelism (configurable via --num-partitions)

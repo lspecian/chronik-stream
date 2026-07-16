@@ -29,7 +29,10 @@ pub async fn create_integrated_server(
         advertised_host: init_config.advertised_host.clone(),
         advertised_port: init_config.advertised_port,
         data_dir: init_config.data_dir.to_string_lossy().to_string(),
-        enable_indexing: cfg!(feature = "search"),
+        // Legacy realtime indexer: off by default (write-only output, per-topic
+        // Tantivy writer held forever — OOMs at thousands of topics). See
+        // IntegratedServerConfig::default.
+        enable_indexing: false,
         enable_compression: true,
         auto_create_topics: true,
         num_partitions: 3,  // Default for better parallelism
@@ -49,7 +52,7 @@ pub async fn create_integrated_server(
         .build()
         .await?;
 
-    info!("✓ IntegratedKafkaServer initialized successfully (builder pattern)");
+    info!("â IntegratedKafkaServer initialized successfully (builder pattern)");
     Ok(Arc::new(server))
 }
 
@@ -95,7 +98,10 @@ mod tests {
             advertised_host: init_config.advertised_host.clone(),
             advertised_port: init_config.advertised_port,
             data_dir: init_config.data_dir.to_string_lossy().to_string(),
-            enable_indexing: cfg!(feature = "search"),
+            // Legacy realtime indexer: off by default (write-only output, per-topic
+        // Tantivy writer held forever — OOMs at thousands of topics). See
+        // IntegratedServerConfig::default.
+        enable_indexing: false,
             enable_compression: true,
             auto_create_topics: true,
             num_partitions: 3,

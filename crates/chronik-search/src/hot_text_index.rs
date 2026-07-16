@@ -3,7 +3,7 @@
 //! See `docs/ROADMAP_HOT_PATH.md` (HP-1.1) for the full design.
 //!
 //! The hot path is RAM-only. "writer" and "commit" below refer to Tantivy's
-//! in-memory API (RAMDirectory, buffer visibility flip) — there is no disk I/O.
+//! in-memory API (RAMDirectory, buffer visibility flip) â there is no disk I/O.
 //!
 //! Query path merges hot hits with cold Tantivy hits; eviction is driven by
 //! WalIndexer after it successfully persists offsets to the cold index.
@@ -35,6 +35,28 @@ use tracing::{debug, trace, warn};
 
 /// Minimum heap a Tantivy writer accepts.
 const TANTIVY_MIN_HEAP: usize = 15_000_000;
+
+/// Live hot writers across ALL partitions. Each is >=15MB of heap budget plus
+/// indexing threads, so during a bulk topic-creation burst (thousands of
+/// partitions written within one commit window) unbounded writers OOM the node
+/// (measured: hot text alone added ~11GB at a 2000-topic burst; the idle-release
+/// path cannot keep up because the commit timer walks dirty partitions
+/// sequentially). `add_batch` consults this to commit+release eagerly once the
+/// burst cap is exceeded â bursty partitions pay one cheap RAM-only commit per
+/// batch while steady producers stay under the cap and keep their writers.
+
+/// Burst cap on concurrent live hot writers (env: CHRONIK_HOT_TEXT_MAX_LIVE_WRITERS).
+/// 64 writers â 1GB worst-case budget.
+fn hot_writer_burst_cap() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("CHRONIK_HOT_TEXT_MAX_LIVE_WRITERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(64)
+    })
+}
 
 /// A record to be inserted into the hot index.
 #[derive(Debug, Clone)]
@@ -79,9 +101,29 @@ impl Default for HotTextConfig {
 /// Per-partition in-memory Tantivy index.
 struct HotPartitionIndex {
     topic: String,
+    /// Shared live-writer counter owned by the parent HotTextIndex; updated by
+    /// ensure_writer/release_writer so add_batch can enforce the burst cap.
+    live_writers: Arc<std::sync::atomic::AtomicUsize>,
     partition: i32,
     index: Index,
-    writer: IndexWriter,
+    /// Lazily-held writer. A Tantivy writer costs a >=15MB heap budget plus
+    /// indexing threads PER INSTANCE, and one instance per (topic, partition)
+    /// held forever is what OOM-killed nodes at a few thousand topics
+    /// (measured: hot text alone added ~11GB for 2000 topics). The writer is
+    /// only needed while writes are pending: it is created on demand by
+    /// `ensure_writer` and dropped by the commit timer once the partition goes
+    /// idle. The in-RAM `index`/`reader` stay alive, so searchability is
+    /// unaffected â only the mutation machinery is released.
+    writer: Option<IndexWriter>,
+    /// Uncommitted adds/deletes since the last visibility flip. Lets the
+    /// commit timer skip idle partitions instead of churning every writer
+    /// (and lets it know when it is safe to release the writer).
+    dirty: bool,
+    /// Consecutive commit-timer ticks with no pending work. The writer is
+    /// released after a short grace period rather than immediately, so a
+    /// steady producer slightly slower than the tick interval does not
+    /// recreate its writer every other tick.
+    idle_ticks: u8,
     reader: IndexReader,
     /// HP-3 Item 2: most recent produce timestamp (ms since epoch) added to
     /// this partition. Sampled at commit time to report visibility lag.
@@ -100,7 +142,12 @@ struct HotPartitionIndex {
 }
 
 impl HotPartitionIndex {
-    fn new(topic: String, partition: i32, config: HotTextConfig) -> Result<Self> {
+    fn new(
+        topic: String,
+        partition: i32,
+        config: HotTextConfig,
+        live_writers: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Result<Self> {
         let mut schema_builder = Schema::builder();
         let topic_field = schema_builder.add_text_field("topic", STRING | STORED);
         let partition_field = schema_builder.add_i64_field(
@@ -115,7 +162,7 @@ impl HotPartitionIndex {
             "timestamp",
             NumericOptions::default().set_indexed().set_stored(),
         );
-        // `key` is STRING — Kafka keys are opaque identifiers, not prose. Indexing
+        // `key` is STRING â Kafka keys are opaque identifiers, not prose. Indexing
         // them through the English analyzer drops stopword-shaped keys (e.g. "A",
         // "the") entirely and mangles everything else by stemming/lowercasing. Keep
         // this consistent with Schema A in realtime_indexer.rs, where `_key` is also
@@ -129,10 +176,6 @@ impl HotPartitionIndex {
         let index = Index::create_in_ram(schema);
         chronik_storage::register_analyzer(&index);
 
-        let heap = config.writer_heap_bytes.max(TANTIVY_MIN_HEAP);
-        let writer = index
-            .writer(heap)
-            .map_err(|e| anyhow!("create hot writer for {}-{}: {}", topic, partition, e))?;
         let reader = index
             .reader_builder()
             .reload_policy(ReloadPolicy::OnCommitWithDelay)
@@ -143,7 +186,12 @@ impl HotPartitionIndex {
             topic,
             partition,
             index,
-            writer,
+            live_writers,
+            // Created on first write by ensure_writer(), not up front: most
+            // partitions in a many-topic deployment are idle at any moment.
+            writer: None,
+            dirty: false,
+            idle_ticks: 0,
             reader,
             last_add_produce_ts_ms: None,
             topic_field,
@@ -160,7 +208,36 @@ impl HotPartitionIndex {
         })
     }
 
+    /// Get the writer, creating it if this partition has none. See the field
+    /// docs on `writer` for why it is lazy.
+    fn ensure_writer(&mut self) -> Result<&mut IndexWriter> {
+        if self.writer.is_none() {
+            let heap = self.config.writer_heap_bytes.max(TANTIVY_MIN_HEAP);
+            let writer = self
+                .index
+                .writer(heap)
+                .map_err(|e| anyhow!("create hot writer for {}-{}: {}", self.topic, self.partition, e))?;
+            self.writer = Some(writer);
+            self.live_writers.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(self.writer.as_mut().expect("writer just ensured"))
+    }
+
+    /// Drop the writer, freeing its heap arena and indexing threads. Committed
+    /// docs remain searchable through `reader`; the next write recreates the
+    /// writer via `ensure_writer`. Callers must only release a clean writer â
+    /// dropping one with uncommitted adds would lose them.
+    fn release_writer(&mut self) {
+        debug_assert!(!self.dirty, "releasing a dirty hot writer would drop pending docs");
+        if self.writer.take().is_some() {
+            self.live_writers.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     fn add_batch(&mut self, docs: &[HotDoc]) -> Result<()> {
+        // Build documents first (immutable borrows of the schema fields), then
+        // feed them to the lazily-created writer.
+        let mut tantivy_docs = Vec::with_capacity(docs.len());
         for d in docs {
             let mut doc = tantivy::TantivyDocument::default();
             doc.add_text(self.topic_field, &self.topic);
@@ -174,10 +251,19 @@ impl HotPartitionIndex {
             if let Some(h) = &d.headers {
                 doc.add_text(self.headers_field, h);
             }
-            self.writer
+            tantivy_docs.push(doc);
+        }
+
+        let writer = self.ensure_writer()?;
+        for doc in tantivy_docs {
+            writer
                 .add_document(doc)
                 .map_err(|e| anyhow!("hot add_document: {}", e))?;
+        }
+        self.dirty = true;
+        self.idle_ticks = 0;
 
+        for d in docs {
             self.doc_count += 1;
             self.min_offset = Some(self.min_offset.map_or(d.offset, |o| o.min(d.offset)));
             self.max_offset = Some(self.max_offset.map_or(d.offset, |o| o.max(d.offset)));
@@ -190,15 +276,21 @@ impl HotPartitionIndex {
         Ok(())
     }
 
-    /// Flip in-memory buffer visibility. Tantivy name is `commit` — no disk writes.
-    fn make_visible(&mut self) -> Result<()> {
-        self.writer
+    /// Flip in-memory buffer visibility. Tantivy name is `commit` â no disk writes.
+    /// Returns whether there was pending work: a clean partition is a no-op, so
+    /// the commit timer does not churn thousands of idle writers every tick.
+    fn make_visible(&mut self) -> Result<bool> {
+        if !self.dirty {
+            return Ok(false);
+        }
+        self.ensure_writer()?
             .commit()
             .map_err(|e| anyhow!("hot writer commit: {}", e))?;
         self.reader
             .reload()
             .map_err(|e| anyhow!("hot reader reload: {}", e))?;
-        Ok(())
+        self.dirty = false;
+        Ok(true)
     }
 
     fn search(&self, query_str: &str, top_k: usize) -> Result<Vec<HotHit>> {
@@ -280,7 +372,7 @@ impl HotPartitionIndex {
         // rebuild-from-surviving-offsets strategy later.
         let evicted_before = self.doc_count;
 
-        // Collect surviving offsets first — needed only if we rebuild.
+        // Collect surviving offsets first â needed only if we rebuild.
         let searcher = self.reader.searcher();
         let mut to_delete: Vec<i64> = Vec::new();
         for seg_reader in searcher.segment_readers() {
@@ -305,11 +397,15 @@ impl HotPartitionIndex {
             }
         }
 
-        for off in &to_delete {
-            let term = Term::from_field_i64(self.offset_field, *off);
-            self.writer.delete_term(term);
+        if !to_delete.is_empty() {
+            let offset_field = self.offset_field;
+            let writer = self.ensure_writer()?;
+            for off in &to_delete {
+                writer.delete_term(Term::from_field_i64(offset_field, *off));
+            }
+            self.dirty = true;
+            self.make_visible()?;
         }
-        self.make_visible()?;
 
         // Recompute counters from the post-commit reader.
         self.recompute_counters()?;
@@ -380,7 +476,7 @@ impl HotPartitionIndex {
     ///
     /// Strategy: keep a sliding window of the most-recent `max_docs_per_partition`
     /// offsets. Offsets below `max_offset - max_docs` are dropped. Since WAL
-    /// offsets are dense in the common case, this keeps doc count within ~2×
+    /// offsets are dense in the common case, this keeps doc count within ~2Ã
     /// the cap even with batch-level granularity.
     fn trim_to_capacity(&mut self) -> Result<usize> {
         if !self.over_capacity() {
@@ -402,6 +498,8 @@ impl HotPartitionIndex {
 pub struct HotTextIndex {
     partitions: DashMap<(String, i32), Arc<RwLock<HotPartitionIndex>>>,
     config: HotTextConfig,
+    /// Live writers across all partitions of THIS index — the burst-cap input.
+    live_writers: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl HotTextIndex {
@@ -409,6 +507,7 @@ impl HotTextIndex {
         Self {
             partitions: DashMap::new(),
             config,
+            live_writers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -416,7 +515,12 @@ impl HotTextIndex {
         if let Some(entry) = self.partitions.get(&(topic.to_string(), partition)) {
             return Ok(entry.clone());
         }
-        let part = HotPartitionIndex::new(topic.to_string(), partition, self.config.clone())?;
+        let part = HotPartitionIndex::new(
+            topic.to_string(),
+            partition,
+            self.config.clone(),
+            Arc::clone(&self.live_writers),
+        )?;
         let arc = Arc::new(RwLock::new(part));
         self.partitions
             .insert((topic.to_string(), partition), arc.clone());
@@ -424,7 +528,7 @@ impl HotTextIndex {
     }
 
     /// Insert a batch of docs into (topic, partition). Does not make them
-    /// visible to readers — call `commit` (or rely on the background timer).
+    /// visible to readers â call `commit` (or rely on the background timer).
     pub async fn add_batch(&self, topic: &str, partition: i32, docs: &[HotDoc]) -> Result<()> {
         if docs.is_empty() {
             return Ok(());
@@ -433,9 +537,19 @@ impl HotTextIndex {
         let mut guard = part.write().await;
         guard.add_batch(docs)?;
         chronik_monitoring::MetricsRecorder::record_hot_text_add(docs.len() as u64);
+        // Burst cap: during bulk topic creation thousands of partitions acquire
+        // writers within one commit window and the sequential commit timer cannot
+        // release them fast enough â unbounded writers OOM the node. Once too
+        // many are live, make this batch visible NOW and release the writer
+        // rather than waiting for the idle timer. RAM-only commit, ~ms; steady
+        // high-throughput partitions stay under the cap and keep their writers.
+        if self.live_writers.load(std::sync::atomic::Ordering::Relaxed) > hot_writer_burst_cap() {
+            guard.make_visible()?;
+            guard.release_writer();
+        }
         if guard.over_capacity() {
             // Over-capacity is recovered by the commit-timer trim + hard-reset
-            // path (HP-1.7). Just trace here — noisy at bulk throughput.
+            // path (HP-1.7). Just trace here â noisy at bulk throughput.
             trace!(
                 topic, partition,
                 doc_count = guard.doc_count,
@@ -446,53 +560,87 @@ impl HotTextIndex {
         Ok(())
     }
 
+    /// How many consecutive no-work commit ticks a partition may sit on its
+    /// writer before it is released. A small grace period so a producer
+    /// slightly slower than the tick interval does not thrash writer
+    /// create/drop on alternating ticks.
+    const WRITER_IDLE_RELEASE_TICKS: u8 = 2;
+
     /// Flip buffer visibility for a single partition. Background-timer path.
-    /// Also trims the partition to `max_docs_per_partition` if over capacity.
+    /// Also trims the partition to `max_docs_per_partition` if over capacity,
+    /// releases the writer once the partition goes idle, and reaps the entry
+    /// entirely once it is both idle and empty (cold search covers evicted
+    /// offsets). The release/reap steps are what keep hot-text memory bounded
+    /// by the ACTIVE partition set instead of every partition ever written â
+    /// one Tantivy writer per partition held forever OOM-killed nodes at a few
+    /// thousand topics.
     pub async fn commit(&self, topic: &str, partition: i32) -> Result<()> {
-        let needs_reset = {
+        let remove_entry = {
             let Some(entry) = self.partitions.get(&(topic.to_string(), partition)) else {
                 return Ok(());
             };
             let part = entry.clone();
             drop(entry);
             let mut guard = part.write().await;
-            guard.make_visible()?;
-            chronik_monitoring::MetricsRecorder::record_hot_text_commit();
-            // HP-3 Item 2: emit a visibility lag sample for the newest doc
-            // that just became visible. Consume the marker so we only sample
-            // on commits that actually made new docs visible.
-            if let Some(ts_ms) = guard.last_add_produce_ts_ms.take() {
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as i64)
-                    .unwrap_or(ts_ms);
-                let lag = (now_ms - ts_ms).max(0) as u64;
-                chronik_monitoring::MetricsRecorder::record_hot_text_visibility_lag(lag);
+            let had_work = guard.make_visible()?;
+
+            if had_work {
+                chronik_monitoring::MetricsRecorder::record_hot_text_commit();
+                // HP-3 Item 2: emit a visibility lag sample for the newest doc
+                // that just became visible. Consume the marker so we only sample
+                // on commits that actually made new docs visible.
+                if let Some(ts_ms) = guard.last_add_produce_ts_ms.take() {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(ts_ms);
+                    let lag = (now_ms - ts_ms).max(0) as u64;
+                    chronik_monitoring::MetricsRecorder::record_hot_text_visibility_lag(lag);
+                }
+                // HP-1.7: bound RAM â drop offsets outside the sliding window.
+                let trimmed = guard.trim_to_capacity()?;
+                if trimmed > 0 {
+                    trace!(topic, partition, trimmed, "hot text: trimmed on commit");
+                    chronik_monitoring::MetricsRecorder::record_hot_text_trim(trimmed as u64);
+                }
+                // HP-1.7: Tantivy's delete_term marks docs as tombstones but does
+                // not reclaim their bytes in a RAMDirectory until merge. Under
+                // sustained high-throughput ingest the heap grows unboundedly.
+                // When the total (live + tombstoned) count is â¥ 2Ã the cap we
+                // drop the partition entirely and let the next add_batch recreate
+                // it fresh. The coverage gap is brief and cold search continues
+                // to serve these offsets.
+                if guard.total_including_deleted()
+                    >= 2 * guard.config.max_docs_per_partition.max(1)
+                {
+                    tracing::debug!(
+                        hot_path = "text",
+                        event = "partition_reset",
+                        topic,
+                        partition,
+                        "hot text: resetting partition RAMDirectory to reclaim tombstones"
+                    );
+                    chronik_monitoring::MetricsRecorder::record_hot_text_reset();
+                    true
+                } else {
+                    false
+                }
+            } else {
+                // Idle tick: no adds or deletes since the last flip.
+                guard.idle_ticks = guard.idle_ticks.saturating_add(1);
+                if guard.idle_ticks >= Self::WRITER_IDLE_RELEASE_TICKS && guard.writer.is_some() {
+                    trace!(topic, partition, "hot text: releasing idle writer");
+                    guard.release_writer();
+                }
+                // Empty + idle + writer released â nothing left worth holding:
+                // reap the whole entry (index + reader). The next produce
+                // recreates it; cold search serves the evicted offsets.
+                guard.doc_count == 0
+                    && guard.writer.is_none()
+                    && guard.idle_ticks >= Self::WRITER_IDLE_RELEASE_TICKS
             }
-            // HP-1.7: bound RAM — drop offsets outside the sliding window.
-            let trimmed = guard.trim_to_capacity()?;
-            if trimmed > 0 {
-                trace!(topic, partition, trimmed, "hot text: trimmed on commit");
-                chronik_monitoring::MetricsRecorder::record_hot_text_trim(trimmed as u64);
-            }
-            // HP-1.7: Tantivy's delete_term marks docs as tombstones but does
-            // not reclaim their bytes in a RAMDirectory until merge. Under
-            // sustained high-throughput ingest the heap grows unboundedly.
-            // When the total (live + tombstoned) count is ≥ 2× the cap we
-            // drop the partition entirely and let the next add_batch recreate
-            // it fresh. The coverage gap is brief and cold search continues
-            // to serve these offsets.
-            guard.total_including_deleted() >= 2 * guard.config.max_docs_per_partition.max(1)
         };
-        if needs_reset {
-            tracing::debug!(
-                hot_path = "text",
-                event = "partition_reset",
-                topic,
-                partition,
-                "hot text: resetting partition RAMDirectory to reclaim tombstones"
-            );
-            chronik_monitoring::MetricsRecorder::record_hot_text_reset();
+        if remove_entry {
             self.partitions.remove(&(topic.to_string(), partition));
         }
         Ok(())
@@ -561,7 +709,7 @@ impl HotTextIndex {
     /// Tantivy Index, so queries can't be shared across partitions).
     ///
     /// Unlike `search_topic` (which routes through QueryParser and a flat
-    /// query string), this path preserves the structure of bool queries —
+    /// query string), this path preserves the structure of bool queries â
     /// `bool.must` actually ANDs its clauses, `bool.should` actually ORs,
     /// etc.
     pub async fn search_topic_structured<F>(
@@ -676,7 +824,7 @@ impl HotTextIndex {
     /// partitions on a fixed interval. Returns the JoinHandle so the caller
     /// can abort on shutdown.
     ///
-    /// No disk I/O — this only makes buffered in-memory docs visible to
+    /// No disk I/O â this only makes buffered in-memory docs visible to
     /// in-memory readers (Tantivy `commit` semantics on RAMDirectory).
     pub fn start_commit_timer(
         self: Arc<Self>,
@@ -700,7 +848,7 @@ impl HotTextIndex {
 /// HP-1.4: Adapter that owns an `Arc<HotTextIndex>` and implements
 /// `ColdFlushListener`. The indirection exists because `notify_cold_flushed`
 /// takes `&self` but eviction needs an `Arc<Self>` to spawn a detached task.
-/// Register the adapter — not `HotTextIndex` directly — via
+/// Register the adapter â not `HotTextIndex` directly â via
 /// `WalIndexer::set_cold_flush_listener`.
 pub struct HotTextColdFlushAdapter {
     inner: Arc<HotTextIndex>,
@@ -755,6 +903,93 @@ mod tests {
         assert_eq!(hits[0].offset, 2);
     }
 
+    /// Regression (per-topic memory OOM): an idle partition must release its
+    /// Tantivy writer (>=15MB heap budget + indexing threads each) while its
+    /// docs stay searchable. One writer per partition held forever OOM-killed
+    /// nodes at a few thousand topics.
+    #[tokio::test]
+    async fn idle_partition_releases_writer_but_stays_searchable() {
+        let idx = HotTextIndex::new(HotTextConfig::default());
+        idx.add_batch("t", 0, &[make_doc(0, "hello world")]).await.unwrap();
+        idx.commit("t", 0).await.unwrap(); // had work: commit + keep writer
+
+        // Idle ticks: no new docs. Writer released after the grace period.
+        for _ in 0..HotTextIndex::WRITER_IDLE_RELEASE_TICKS {
+            idx.commit("t", 0).await.unwrap();
+        }
+        {
+            let entry = idx.partitions.get(&("t".to_string(), 0)).expect("entry kept: docs remain");
+            let part = entry.clone();
+            drop(entry);
+            assert!(part.read().await.writer.is_none(), "idle writer must be released");
+        }
+
+        // Still searchable without a writer.
+        let hits = idx.search_partition("t", 0, "hello", 10).await.unwrap();
+        assert_eq!(hits.len(), 1);
+
+        // A new write recreates the writer and works end-to-end.
+        idx.add_batch("t", 0, &[make_doc(1, "hello again")]).await.unwrap();
+        idx.commit("t", 0).await.unwrap();
+        let hits = idx.search_partition("t", 0, "hello", 10).await.unwrap();
+        assert_eq!(hits.len(), 2);
+    }
+
+    /// Regression (per-topic memory OOM, burst): a bulk topic-creation burst
+    /// must not accumulate unbounded live writers â past the burst cap,
+    /// add_batch commits + releases eagerly. Docs must remain searchable.
+    #[tokio::test]
+    async fn bulk_burst_caps_live_writers() {
+        let idx = HotTextIndex::new(HotTextConfig::default());
+        const N: i32 = 90; // > default cap of 64
+        for p in 0..N {
+            idx.add_batch("burst", p, &[make_doc(0, &format!("burst doc {}", p))])
+                .await
+                .unwrap();
+        }
+        let live = idx.live_writers.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            live <= hot_writer_burst_cap() + 1,
+            "live hot writers must be capped during bursts, got {}",
+            live
+        );
+        // Eagerly released partitions are already visible; the rest need a commit.
+        for p in 0..N {
+            idx.commit("burst", p).await.unwrap();
+        }
+        let hits = idx.search_topic("burst", "burst", N as usize * 2).await.unwrap();
+        assert_eq!(hits.len(), N as usize, "all burst docs must stay searchable");
+    }
+
+    /// Regression (per-topic memory OOM): once a partition is empty (all docs
+    /// evicted after cold flush) and idle, its entire entry â in-RAM index,
+    /// reader, map slot â must be reaped, not held forever.
+    #[tokio::test]
+    async fn empty_idle_partition_is_reaped() {
+        let idx = HotTextIndex::new(HotTextConfig::default());
+        idx.add_batch("t", 0, &[make_doc(0, "ephemeral doc")]).await.unwrap();
+        idx.commit("t", 0).await.unwrap();
+
+        // Cold flush covered offset 0: evict everything.
+        idx.evict_up_to("t", 0, 0).await.unwrap();
+        assert_eq!(idx.doc_count("t", 0).await, 0);
+
+        // Idle ticks after the eviction commit â entry reaped.
+        for _ in 0..=HotTextIndex::WRITER_IDLE_RELEASE_TICKS {
+            idx.commit("t", 0).await.unwrap();
+        }
+        assert!(
+            idx.partitions.get(&("t".to_string(), 0)).is_none(),
+            "empty idle partition must be reaped from the map"
+        );
+
+        // And a later produce transparently recreates it.
+        idx.add_batch("t", 0, &[make_doc(5, "reborn")]).await.unwrap();
+        idx.commit("t", 0).await.unwrap();
+        let hits = idx.search_partition("t", 0, "reborn", 10).await.unwrap();
+        assert_eq!(hits.len(), 1);
+    }
+
     #[tokio::test]
     async fn insert_1k_docs_and_query() {
         let idx = HotTextIndex::new(HotTextConfig::default());
@@ -774,7 +1009,7 @@ mod tests {
         assert_eq!(idx.doc_count("bench", 0).await, 1000);
 
         let hits = idx.search_partition("bench", 0, "fox", 20).await.unwrap();
-        // Every 7th doc (0, 7, 14, ..., 994) — 143 matches; top_k caps at 20.
+        // Every 7th doc (0, 7, 14, ..., 994) â 143 matches; top_k caps at 20.
         assert_eq!(hits.len(), 20);
         for h in &hits {
             assert!(h.offset % 7 == 0, "fox only in multiples-of-7 docs");
@@ -813,7 +1048,7 @@ mod tests {
         idx.commit("t", 1).await.unwrap();
 
         let hits = idx.search_topic("t", "red", 10).await.unwrap();
-        // Same offset on different partitions — both should appear.
+        // Same offset on different partitions â both should appear.
         assert_eq!(hits.len(), 2);
         let parts: std::collections::HashSet<i32> = hits.iter().map(|h| h.partition).collect();
         assert_eq!(parts, [0, 1].into_iter().collect());
@@ -865,12 +1100,12 @@ mod tests {
             idx.commit("t", 0).await.unwrap();
         }
         // Each commit trimmed live docs but accumulated tombstones. At some
-        // point the partition is reset — after reset it's absent from the map.
+        // point the partition is reset â after reset it's absent from the map.
         // Either way, total live docs should be bounded.
         let remaining = idx.doc_count("t", 0).await;
         assert!(
             remaining <= 50,
-            "post-reset live doc count {} should be ≤ 50",
+            "post-reset live doc count {} should be â¤ 50",
             remaining
         );
     }
@@ -889,11 +1124,11 @@ mod tests {
         // commit triggers the trim because we're over capacity
         idx.commit("t", 0).await.unwrap();
 
-        // After trim: max_offset=499, threshold=499-100=399 → offsets >399 survive → 100 docs
+        // After trim: max_offset=499, threshold=499-100=399 â offsets >399 survive â 100 docs
         let remaining = idx.doc_count("t", 0).await;
         assert!(
             remaining <= 100,
-            "doc count {} should be ≤ 100 after trim",
+            "doc count {} should be â¤ 100 after trim",
             remaining
         );
         // Oldest offsets should be gone
@@ -921,7 +1156,7 @@ mod tests {
         // Pretend WalIndexer just committed offsets 0..=1 to cold Tantivy.
         adapter.notify_cold_flushed("t".to_string(), 0, 1);
 
-        // Eviction is spawned — wait for it to land.
+        // Eviction is spawned â wait for it to land.
         for _ in 0..50 {
             if idx.doc_count("t", 0).await == 2 {
                 break;
@@ -969,7 +1204,7 @@ mod tests {
 
     /// Issue #2 regression: `bool.must` ANDs its clauses. Previously the hot
     /// path flattened must clauses into a space-joined OR query, so two
-    /// disjoint must clauses — one matching the only doc, one matching zero —
+    /// disjoint must clauses â one matching the only doc, one matching zero â
     /// returned 1 hit instead of 0.
     #[tokio::test]
     async fn structured_bool_must_ands_its_clauses() {
@@ -1033,10 +1268,10 @@ mod tests {
         assert_eq!(
             and_miss.len(),
             0,
-            "bool.must[value=foo, key=beta] must AND to 0 — the fix for GitHub #2"
+            "bool.must[value=foo, key=beta] must AND to 0 â the fix for GitHub #2"
         );
 
-        // Positive: (value=foo AND key=alpha) → 1 hit.
+        // Positive: (value=foo AND key=alpha) â 1 hit.
         let and_hit: Vec<_> = idx
             .search_topic_structured(
                 "t",

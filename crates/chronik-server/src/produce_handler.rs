@@ -221,7 +221,9 @@ impl Default for ProduceHandlerConfig {
             node_id: 0,
             storage_config: StorageConfig::default(),
             indexer_config: RealtimeIndexerConfig::default(),
-            enable_indexing: true,
+            // Legacy realtime indexer: off by default — write-only output, and a
+            // per-topic Tantivy writer held forever (OOMs at thousands of topics).
+            enable_indexing: false,
             enable_idempotence: true,
             enable_transactions: true,
             max_in_flight_requests: 5,
@@ -2349,15 +2351,18 @@ impl ProduceHandler {
 
                                         // v2.2.16 FIX: Call indexing BEFORE early return (async path)
                                         // This ensures searchable topics are indexed even with acks=1 async responses
-                                        if self.config.enable_indexing {
+                                        {
                                             let is_searchable = self.is_topic_searchable(topic).await;
-                                            debug!(
-                                                "v2.2.16: Realtime indexing check (async path) for topic {}: is_searchable={}",
-                                                topic, is_searchable
-                                            );
                                             if is_searchable {
-                                                self.send_to_indexer(topic, partition, &records).await;
-                                                // HP-1.2: fire-and-forget shadow into hot index
+                                                // Legacy realtime indexer (write-only: nothing reads
+                                                // {data_dir}/index — /_search serves WalIndexer's
+                                                // {data_dir}/tantivy_indexes). Off by default; costs a
+                                                // Tantivy writer (threads + heap) per topic when on.
+                                                if self.config.enable_indexing {
+                                                    self.send_to_indexer(topic, partition, &records).await;
+                                                }
+                                                // HP-1.2: fire-and-forget shadow into hot index. NRT
+                                                // search must not depend on the legacy indexer flag.
                                                 self.send_to_hot_text_index(topic, partition, &records);
                                             }
                                         }
@@ -2471,20 +2476,18 @@ impl ProduceHandler {
         self.metrics.records_produced.fetch_add(records.len() as u64, Ordering::Relaxed);
         self.metrics.bytes_produced.fetch_add(total_bytes, Ordering::Relaxed);
         
-        // Send to indexing pipeline if enabled AND topic is searchable (v2.2.16)
-        // This ensures we only index searchable topics in the realtime indexer,
-        // matching the WAL Indexer behavior and respecting opt-in searchability.
-        if self.config.enable_indexing {
+        // Index searchable topics (v2.2.16). The hot NRT shadow depends only on
+        // searchability; the legacy realtime indexer additionally requires
+        // enable_indexing (off by default — it is write-only: nothing reads its
+        // {data_dir}/index output, /_search serves WalIndexer's tantivy_indexes,
+        // and it costs a Tantivy writer with threads + up-to-512MB budget PER
+        // TOPIC held forever, which OOM-killed nodes at a few thousand topics).
+        {
             let is_searchable = self.is_topic_searchable(topic).await;
-            debug!(
-                "v2.2.16: Realtime indexing check for topic {}: enable_indexing={}, is_searchable={}, index_sender={}",
-                topic,
-                self.config.enable_indexing,
-                is_searchable,
-                self.index_sender.is_some()
-            );
             if is_searchable {
-                self.send_to_indexer(topic, partition, &records).await;
+                if self.config.enable_indexing {
+                    self.send_to_indexer(topic, partition, &records).await;
+                }
                 // HP-1.2: fire-and-forget shadow into hot index
                 self.send_to_hot_text_index(topic, partition, &records);
             }

@@ -79,7 +79,13 @@ impl Default for IntegratedServerConfig {
             advertised_host: "localhost".to_string(),
             advertised_port: 9092,
             data_dir: "./data".to_string(),
-            enable_indexing: cfg!(feature = "search"), // Enable when search feature is compiled
+            // Legacy realtime indexer: OFF by default. It is write-only — nothing
+            // reads its {data_dir}/index output (/_search serves the WalIndexer's
+            // {data_dir}/tantivy_indexes) — and it holds a Tantivy writer with 4+4
+            // threads and an up-to-512MB budget PER TOPIC forever, which OOM-killed
+            // nodes at a few thousand topics. Hot NRT search and cold WalIndexer
+            // search are independent of this flag.
+            enable_indexing: false,
             enable_compression: true,
             auto_create_topics: true,
             num_partitions: 3,
