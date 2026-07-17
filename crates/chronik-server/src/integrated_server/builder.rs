@@ -377,35 +377,40 @@ impl IntegratedKafkaServerBuilder {
 
         info!("✅ Metadata replication initialized with event listener");
 
-        // Re-broadcast all topic metadata to followers after a delay.
-        // After restart, followers may have lost topic metadata that was only in
-        // in-memory state (from before the apply_replicated_event WAL persistence
-        // fix). This re-publishes TopicCreated events to the event bus so the
-        // MetadataWalReplicator sends them to followers.
+        // Periodically re-broadcast all topic metadata to followers.
         //
-        // We delay 45 seconds because WAL replication connections are established
-        // after Raft election (~20-30s), and we need followers to be connected
-        // before broadcasting. The broadcast repeats at 60s intervals to handle
-        // late-joining followers or transient network issues.
+        // This is the catalog anti-entropy loop. It re-publishes TopicCreated
+        // events to the event bus so the MetadataWalReplicator sends them to
+        // followers, letting any node that missed events (down, disconnected,
+        // still recovering) converge within one period.
+        //
+        // This MUST be periodic, not a fixed number of startup shots: the old
+        // 45s/120s two-shot was tuned for fast startups and permanently missed
+        // its window on large clusters — a node recovering tens of GB of WAL
+        // takes minutes to establish replication connections, both shots fired
+        // into the void, and the catalog stayed diverged forever (observed
+        // 15 / 4695 / 882 topics across three nodes). The event-bus buffer is
+        // sized for full-catalog bursts (see MetadataEventBus::default), so a
+        // periodic full re-broadcast is safe; at 5min x thousands of topics the
+        // steady-state cost is trivial.
         let broadcast_store = wal_metadata_store.clone();
+        let rebroadcast_secs = std::env::var("CHRONIK_METADATA_REBROADCAST_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(300);
         tokio::spawn(async move {
-            // Initial delay: wait for Raft election + WAL replication setup
+            // First pass early: covers the common fast-startup case.
             tokio::time::sleep(std::time::Duration::from_secs(45)).await;
-            let count = broadcast_store.broadcast_all_topics().await;
-            if count > 0 {
-                tracing::info!(
-                    topics_broadcast = count,
-                    "Re-broadcast topic metadata for follower sync"
-                );
-            }
-            // Second broadcast at 120s for late joiners
-            tokio::time::sleep(std::time::Duration::from_secs(75)).await;
-            let count = broadcast_store.broadcast_all_topics().await;
-            if count > 0 {
-                tracing::info!(
-                    topics_broadcast = count,
-                    "Re-broadcast topic metadata (second pass)"
-                );
+            loop {
+                let count = broadcast_store.broadcast_all_topics().await;
+                if count > 0 {
+                    tracing::info!(
+                        topics_broadcast = count,
+                        "Re-broadcast topic metadata for follower sync (anti-entropy)"
+                    );
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(rebroadcast_secs)).await;
             }
         });
 
