@@ -2675,16 +2675,20 @@ impl ProtocolHandler {
     ) -> Result<Response> {
         use crate::describe_acls_types::{DescribeAclsResponse, encode_describe_acls_response};
 
-        tracing::info!("Handling DescribeAcls request v{} - returning empty ACL list (ACLs not implemented)",
+        tracing::info!("Handling DescribeAcls request v{} - no authorizer configured, returning SECURITY_DISABLED",
             header.api_version);
 
-        // Return empty ACL list - Chronik doesn't implement ACLs yet
-        // This is valid and prevents AdminClient from crashing
+        // Chronik has no ACL authorizer, so security features are disabled. This
+        // is exactly what Apache Kafka returns for ACL operations when no
+        // authorizer is configured (error 54). Returning NONE + an empty list
+        // would falsely imply ACLs are supported but simply unset; SECURITY_DISABLED
+        // is the honest, spec-compliant answer so operators aren't misled into
+        // believing the cluster is access-controlled.
         let response = DescribeAclsResponse {
             throttle_time_ms: 0,
-            error_code: 0, // NONE
-            error_message: None,
-            resources: vec![], // No ACLs configured
+            error_code: error_codes::SECURITY_DISABLED,
+            error_message: Some("ACLs are not supported: no authorizer is configured".to_string()),
+            resources: vec![],
         };
 
         let body_bytes = encode_describe_acls_response(&response, header.api_version);
@@ -2698,19 +2702,35 @@ impl ProtocolHandler {
         header: RequestHeader,
         _body: &mut Bytes,
     ) -> Result<Response> {
-        use crate::create_acls_types::{CreateAclsResponse, AclCreationResult};
+        use crate::create_acls_types::{CreateAclsResponse, AclCreationResult, parse_create_acls_request};
 
-        tracing::info!("Handling CreateAcls request v{} - ACLs not implemented, returning success",
-            header.api_version);
+        // Decode the request so we return exactly one result per requested ACL
+        // (the Java AdminClient matches results to creations by index; a count
+        // mismatch throws). On decode failure, fall back to a single result.
+        let creation_count = {
+            let mut decoder = crate::parser::Decoder::new(_body);
+            parse_create_acls_request(&mut decoder, header.api_version)
+                .map(|req| req.creations.len())
+                .unwrap_or(1)
+                .max(1)
+        };
 
-        // Return success but ACLs won't actually be enforced
-        // This prevents AdminClient from crashing while being honest about capability
+        tracing::info!("Handling CreateAcls request v{} ({} creations) - no authorizer configured, returning SECURITY_DISABLED",
+            header.api_version, creation_count);
+
+        // Previously this returned NONE ("pretend it succeeded"), which is a
+        // security footgun: an operator setting ACLs would get success and
+        // believe the cluster was locked down while nothing was enforced. With
+        // no authorizer configured, the honest, Kafka-spec-compliant answer is
+        // SECURITY_DISABLED (error 54) for every requested ACL.
         let response = CreateAclsResponse {
             throttle_time_ms: 0,
-            results: vec![AclCreationResult {
-                error_code: 0, // NONE - pretend it succeeded
-                error_message: None,
-            }],
+            results: (0..creation_count)
+                .map(|_| AclCreationResult {
+                    error_code: error_codes::SECURITY_DISABLED,
+                    error_message: Some("ACLs are not supported: no authorizer is configured".to_string()),
+                })
+                .collect(),
         };
 
         let body_bytes = crate::create_acls_types::encode_create_acls_response(&response);
@@ -2724,19 +2744,31 @@ impl ProtocolHandler {
         header: RequestHeader,
         _body: &mut Bytes,
     ) -> Result<Response> {
-        use crate::delete_acls_types::{DeleteAclsResponse, FilterResult};
+        use crate::delete_acls_types::{DeleteAclsResponse, FilterResult, parse_delete_acls_request};
 
-        tracing::info!("Handling DeleteAcls request v{} - ACLs not implemented, returning empty",
-            header.api_version);
+        // One filter result per requested filter (AdminClient matches by index).
+        let filter_count = {
+            let mut decoder = crate::parser::Decoder::new(_body);
+            parse_delete_acls_request(&mut decoder, header.api_version)
+                .map(|req| req.filters.len())
+                .unwrap_or(1)
+                .max(1)
+        };
 
-        // Return empty results - no ACLs to delete
+        tracing::info!("Handling DeleteAcls request v{} ({} filters) - no authorizer configured, returning SECURITY_DISABLED",
+            header.api_version, filter_count);
+
+        // No authorizer configured: every filter is rejected with SECURITY_DISABLED
+        // rather than silently reporting an empty (successful) deletion.
         let response = DeleteAclsResponse {
             throttle_time_ms: 0,
-            filter_results: vec![FilterResult {
-                error_code: 0, // NONE
-                error_message: None,
-                matching_acls: vec![], // No ACLs matched (because none exist)
-            }],
+            filter_results: (0..filter_count)
+                .map(|_| FilterResult {
+                    error_code: error_codes::SECURITY_DISABLED,
+                    error_message: Some("ACLs are not supported: no authorizer is configured".to_string()),
+                    matching_acls: vec![],
+                })
+                .collect(),
         };
 
         let body_bytes = crate::delete_acls_types::encode_delete_acls_response(&response, header.api_version);
