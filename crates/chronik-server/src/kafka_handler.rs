@@ -1021,54 +1021,38 @@ impl KafkaProtocolHandler {
         };
 
         if should_initialize_partitions {
-            // Parse the request to extract topic names and partition counts
-            use chronik_protocol::create_topics_types::CreateTopicsRequest;
+            // Fully parse the request with the same parser the protocol handler
+            // uses, so we initialize Raft partition metadata for EVERY topic in a
+            // batched CreateTopics — not just the first. The previous hand-rolled
+            // parse couldn't advance past a topic's replica assignments/configs, so
+            // it bailed after topic #1, leaving the rest of a multi-topic request
+            // without Raft partition metadata in cluster mode.
+            use chronik_protocol::create_topics::request_parser::RequestParser;
             use chronik_protocol::parser::Decoder;
 
             let mut decoder = Decoder::new(&mut buf);
-            let use_compact = header.api_version >= 5;
-
-            // Parse topic count
-            let topic_count = if use_compact {
-                let compact_len = decoder.read_unsigned_varint()?;
-                if compact_len > 0 { (compact_len - 1) as usize } else { 0 }
-            } else {
-                let len = decoder.read_i32()?;
-                if len >= 0 { len as usize } else { 0 }
-            };
-
-            // Parse each topic and initialize Raft partition metadata
-            for _ in 0..topic_count {
-                // Topic name
-                let topic_name = if use_compact {
-                    decoder.read_compact_string()?.unwrap_or_default()
-                } else {
-                    decoder.read_string()?.unwrap_or_default()
-                };
-
-                // Number of partitions
-                let num_partitions = decoder.read_i32()?;
-
-                if num_partitions > 0 {
-                    // Initialize Raft partition metadata asynchronously
-                    // This proposes AssignPartition, SetPartitionLeader, and UpdateISR commands
-                    if let Err(e) = self.produce_handler.initialize_raft_partitions(
-                        &topic_name,
-                        num_partitions as u32
-                    ).await {
-                        tracing::warn!("Failed to initialize Raft partition metadata for '{}': {:?}",
-                                     topic_name, e);
-                        // Continue anyway - topic is already created in metadata store
-                    } else {
-                        tracing::info!("✓ Phase 3: Initialized Raft partition metadata for topic '{}' ({} partitions)",
-                                     topic_name, num_partitions);
+            match RequestParser::parse(&mut decoder, header.api_version) {
+                Ok(create_req) => {
+                    for topic in &create_req.topics {
+                        if topic.num_partitions > 0 {
+                            // Proposes AssignPartition, SetPartitionLeader, and UpdateISR.
+                            if let Err(e) = self.produce_handler.initialize_raft_partitions(
+                                &topic.name,
+                                topic.num_partitions as u32,
+                            ).await {
+                                tracing::warn!("Failed to initialize Raft partition metadata for '{}': {:?}",
+                                             topic.name, e);
+                                // Continue anyway - topic is already created in metadata store
+                            } else {
+                                tracing::info!("✓ Phase 3: Initialized Raft partition metadata for topic '{}' ({} partitions)",
+                                             topic.name, topic.num_partitions);
+                            }
+                        }
                     }
                 }
-
-                // Skip remaining fields (we only need topic name and partition count)
-                // This is a simplified parse - full parsing is done by protocol handler
-                // We just need to extract the topic names to initialize Raft metadata
-                break; // For now, handle first topic only (can extend later)
+                Err(e) => {
+                    tracing::warn!("Could not parse CreateTopics for Raft partition init: {:?} - topics still created in metadata store", e);
+                }
             }
         } else {
             tracing::debug!("Skipping partition initialization (not Raft leader) - will be handled by leader");
