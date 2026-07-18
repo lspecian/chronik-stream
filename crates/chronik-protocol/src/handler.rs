@@ -3137,9 +3137,14 @@ impl ProtocolHandler {
                         }
                     }
                     4 => {
-                        // Broker configuration - resource_type 4
-                        tracing::info!("Broker configuration updates accepted but not persisted (not implemented)");
-                        // Return success - broker configs are accepted but not persisted
+                        // Broker configuration - resource_type 4. Chronik has no
+                        // dynamic broker-config machinery (broker settings come from
+                        // startup config/env), so there is nowhere to apply these.
+                        // Return an honest error instead of a false success that
+                        // would mislead an operator into thinking the change took effect.
+                        tracing::warn!("Rejecting broker configuration alteration for '{}' (dynamic broker config not supported)", resource.resource_name);
+                        error_code = crate::error_codes::INVALID_CONFIG;
+                        error_message = Some("Dynamic broker configuration is not supported; configure the broker via startup config/environment".to_string());
                     }
                     _ => {
                         error_code = error_codes::INVALID_REQUEST;
@@ -3323,12 +3328,16 @@ impl ProtocolHandler {
                         }
                     }
                     resource_type::BROKER => {
-                        // Broker configs are not persisted yet
-                        tracing::info!("Broker configuration updates not implemented");
+                        // No dynamic broker-config machinery exists — reject
+                        // honestly rather than silently accepting a no-op.
+                        tracing::warn!("Rejecting broker configuration alteration for '{}' (dynamic broker config not supported)", resource.resource_name);
+                        error_code = crate::error_codes::INVALID_CONFIG;
+                        error_message = Some("Dynamic broker configuration is not supported; configure the broker via startup config/environment".to_string());
                     }
                     resource_type::CLUSTER => {
-                        // Cluster configs are not persisted yet
-                        tracing::info!("Cluster configuration updates not implemented");
+                        tracing::warn!("Rejecting cluster configuration alteration for '{}' (dynamic cluster config not supported)", resource.resource_name);
+                        error_code = crate::error_codes::INVALID_CONFIG;
+                        error_message = Some("Dynamic cluster configuration is not supported".to_string());
                     }
                     _ => {
                         error_code = error_codes::INVALID_REQUEST;
