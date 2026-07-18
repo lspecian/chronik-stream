@@ -881,11 +881,6 @@ impl IntegratedKafkaServerBuilder {
 
     /// Helper: Build ProduceHandler configuration
     fn create_produce_handler_config(&self, storage_config: &IngestStorageConfig) -> ProduceHandlerConfig {
-        let indexer_config = chronik_search::realtime_indexer::RealtimeIndexerConfig {
-            index_base_path: PathBuf::from(format!("{}/index", self.config.data_dir)),
-            ..Default::default()
-        };
-
         let flush_profile = ProduceFlushProfile::auto_select();
         let compression_type = if self.config.enable_compression {
             chronik_storage::kafka_records::CompressionType::Snappy
@@ -896,8 +891,6 @@ impl IntegratedKafkaServerBuilder {
         ProduceHandlerConfig {
             node_id: self.config.node_id,
             storage_config: storage_config.clone(),
-            indexer_config,
-            enable_indexing: self.config.enable_indexing,
             enable_idempotence: true,
             enable_transactions: false,
             max_in_flight_requests: 5,

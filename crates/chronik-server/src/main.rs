@@ -1175,8 +1175,8 @@ async fn run_cluster_mode(
 
     // Create search router + SearchApi for unified API (Elasticsearch-compatible search)
     // CRITICAL FIX v2.2.22: Use init_config.data_dir (from cluster TOML config)
-    // instead of cli.data_dir (CLI default), so SearchApi finds indices
-    // created by RealtimeIndexer at {data_dir}/index/
+    // instead of cli.data_dir (CLI default), so SearchApi finds the cold indices
+    // the WalIndexer writes at {data_dir}/tantivy_indexes/
     #[cfg(feature = "search")]
     let (search_router, search_api_ref) = {
         let index_base_path = format!("{}/tantivy_indexes", init_config.data_dir.to_string_lossy());
@@ -1424,7 +1424,6 @@ async fn run_single_node_mode(
         // Legacy realtime indexer: off by default (write-only output, and a
         // per-topic Tantivy writer held forever — OOMs at thousands of topics).
         // See IntegratedKafkaServerConfig::default.
-        enable_indexing: false,
         enable_compression: true,
         auto_create_topics: true,
         num_partitions: 3,  // Default to 3 partitions for better parallelism (configurable via --num-partitions)
