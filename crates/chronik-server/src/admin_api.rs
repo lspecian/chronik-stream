@@ -542,6 +542,26 @@ async fn collect_partition_info_from_metadata(
     // For each topic, get partition assignments
     for topic_meta in topics {
         match metadata_store.get_partition_assignments(&topic_meta.name).await {
+            Ok(assignments) if assignments.is_empty() => {
+                // The topic exists (list_topics returned it) but has no partition
+                // assignments — e.g. it was healed to a follower via a replicated
+                // TopicCreated without a matching PartitionAssigned. It is still a
+                // real topic and Kafka clients see it (the metadata path derives
+                // partitions from partition_count), so it must not vanish from
+                // admin/status. Represent it from partition_count with unknown
+                // leader/replicas rather than dropping it — dropping it made
+                // admin/status silently undercount a healed catalog.
+                let n = topic_meta.config.partition_count.max(1);
+                for partition in 0..n {
+                    all_partitions.push(PartitionInfo {
+                        topic: topic_meta.name.clone(),
+                        partition: partition as i32,
+                        leader: None,
+                        replicas: Vec::new(),
+                        isr: Vec::new(),
+                    });
+                }
+            }
             Ok(assignments) => {
                 for assignment in assignments {
                     // v2.2.22: Use IsrTracker for accurate ISR if available

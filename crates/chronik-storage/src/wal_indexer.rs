@@ -183,6 +183,46 @@ impl TopicPartition {
     }
 }
 
+/// A dedicated tokio runtime whose `Drop` is non-blocking.
+///
+/// A plain `tokio::runtime::Runtime` blocks on drop while it joins its worker
+/// threads, which panics ("Cannot drop a runtime in a context where blocking is
+/// not allowed") if that drop happens inside another runtime's async context —
+/// exactly what occurs when the server is torn down on SIGTERM and the last
+/// `Arc<WalIndexer>` is dropped from within `#[tokio::main]`. `shutdown_background()`
+/// tears the runtime down without blocking, so this is safe to drop anywhere.
+struct BackgroundRuntime {
+    inner: Option<tokio::runtime::Runtime>,
+}
+
+impl BackgroundRuntime {
+    fn new(rt: tokio::runtime::Runtime) -> Self {
+        Self { inner: Some(rt) }
+    }
+
+    fn handle(&self) -> &tokio::runtime::Handle {
+        self.inner.as_ref().expect("runtime present until drop").handle()
+    }
+
+    fn spawn<F>(&self, future: F) -> tokio::task::JoinHandle<F::Output>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.handle().spawn(future)
+    }
+}
+
+impl Drop for BackgroundRuntime {
+    fn drop(&mut self) {
+        if let Some(rt) = self.inner.take() {
+            // Non-blocking: detaches worker threads instead of joining them, so
+            // this never blocks and is safe inside an async context.
+            rt.shutdown_background();
+        }
+    }
+}
+
 /// WAL Indexer - converts sealed WAL segments to Tantivy indexes
 pub struct WalIndexer {
     /// Configuration
@@ -212,7 +252,7 @@ pub struct WalIndexer {
     /// CRITICAL v2.2.10: Dedicated tokio runtime for background indexing
     /// Prevents WalIndexer from starving the main runtime's accept loop under heavy load
     /// 2 worker threads are sufficient for sequential segment processing
-    runtime: Arc<tokio::runtime::Runtime>,
+    runtime: Arc<BackgroundRuntime>,
 
     /// v2.2.16: Cache of searchable topics (refreshed periodically)
     /// Topics with config["searchable"] = "true" or CHRONIK_DEFAULT_SEARCHABLE=true
@@ -324,7 +364,7 @@ impl WalIndexer {
             indexing_in_progress: Arc::new(RwLock::new(HashSet::new())),
             last_stats: Arc::new(RwLock::new(IndexingStats::default())),
             running: Arc::new(RwLock::new(false)),
-            runtime: Arc::new(runtime),
+            runtime: Arc::new(BackgroundRuntime::new(runtime)),
             searchable_topics: Arc::new(RwLock::new(HashSet::new())),
             columnar_topics: Arc::new(RwLock::new(HashSet::new())),
             vector_topics: Arc::new(RwLock::new(HashSet::new())),
