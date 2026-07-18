@@ -19,7 +19,6 @@ chronik-stream/
 ├── chronik-search/          # Real-time Tantivy indexing
 ├── chronik-common/          # Shared types, metadata traits
 ├── chronik-config/          # Configuration management
-├── chronik-auth/            # SASL, TLS authentication
 ├── chronik-monitoring/      # Prometheus metrics, tracing
 ├── chronik-query/           # Query processing
 ├── chronik-backup/          # Backup functionality
