@@ -474,6 +474,26 @@ pub trait MetadataStore: Send + Sync {
         new_producer_epoch: i16,
     ) -> Result<()>;
     
+    /// Allocate a durable, monotonic, cluster-unique producer id for InitProducerId.
+    ///
+    /// The default impl uses a process-local counter — correct in a single process
+    /// but it collides across restarts and cluster nodes, which breaks idempotence
+    /// and transactions. Production stores (WalMetadataStore) override this with a
+    /// persisted block allocator that survives restart and never hands out a
+    /// duplicate id. Kept as a default so in-memory/mocks keep working.
+    async fn allocate_producer_id(&self) -> Result<i64> {
+        use std::sync::atomic::{AtomicI64, Ordering};
+        static COUNTER: AtomicI64 = AtomicI64::new(1);
+        Ok(COUNTER.fetch_add(1, Ordering::SeqCst))
+    }
+
+    /// Look up the current transaction-coordinator state for a `transactional.id`.
+    /// Returns `None` if the id is unknown. Default impl returns `None` (stores
+    /// without transaction support).
+    async fn get_transaction(&self, _transactional_id: &str) -> Result<Option<super::transaction::TransactionMetadata>> {
+        Ok(None)
+    }
+
     // Partition offset operations
     async fn update_partition_offset(&self, topic: &str, partition: u32, high_watermark: i64, log_start_offset: i64) -> Result<()>;
     async fn get_partition_offset(&self, topic: &str, partition: u32) -> Result<Option<(i64, i64)>>; // Returns (high_watermark, log_start_offset)

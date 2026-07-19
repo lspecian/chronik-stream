@@ -4,6 +4,7 @@
 //! v2.2.9: Added WAL-based metadata store (Option A - Raft-free for performance)
 
 pub mod traits;
+pub mod transaction;
 pub mod memory;
 pub mod events;
 pub mod wal_metadata_store;
@@ -19,6 +20,7 @@ pub mod raft_meta_log;
 pub mod raft_state_machine;
 
 pub use traits::*;
+pub use transaction::{TransactionMetadata, TransactionState};
 pub use memory::InMemoryMetadataStore;
 pub use events::{MetadataEvent, MetadataEventPayload, EventLog, EventApplicator};
 pub use wal_metadata_store::{WalMetadataStore, WalAppendFn, EventBusPublishFn};
