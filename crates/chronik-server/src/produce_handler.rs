@@ -2905,80 +2905,94 @@ impl ProduceHandler {
             return Ok(());
         }
         
-        let mut producers = self.producer_info.write().await;
-        
-        // Get or create producer info
-        let producer_info = producers.entry(batch.header.producer_id).or_insert_with(|| {
-            ProducerInfo {
-                producer_id: batch.header.producer_id,
-                producer_epoch: batch.header.producer_epoch,
-                sequence_numbers: HashMap::new(),
-                transactional_id: transactional_id.map(String::from),
-                transaction_state: TransactionState::None,
-                last_activity: Instant::now(),
-            }
-        });
-        
-        // Validate producer epoch
-        if producer_info.producer_epoch != batch.header.producer_epoch {
-            if batch.header.producer_epoch < producer_info.producer_epoch {
-                return Err(Error::InvalidProducerEpoch("Producer epoch does not match".to_string()));
-            }
-            // Newer epoch, reset state
-            producer_info.producer_epoch = batch.header.producer_epoch;
-            producer_info.sequence_numbers.clear();
-        }
-        
-        // Validate transactional ID
-        if let Some(txn_id) = transactional_id {
-            if let Some(ref existing_txn_id) = producer_info.transactional_id {
-                if existing_txn_id != txn_id {
-                    return Err(Error::InvalidTransactionState("Producer is not in a transaction".to_string()));
-                }
-            } else {
-                producer_info.transactional_id = Some(txn_id.to_string());
-            }
-        }
-        
-        // Check sequence number
-        let key = (topic.to_string(), partition);
-        let expected_sequence = producer_info.sequence_numbers
-            .get(&key)
-            .map(|&seq| seq + 1)
-            .unwrap_or(0);
-        
-        if batch.header.base_sequence < expected_sequence {
-            // Duplicate
-            warn!(
-                "Duplicate sequence number detected: producer={}, topic={}, partition={}, expected={}, received={}",
-                batch.header.producer_id, topic, partition, expected_sequence, batch.header.base_sequence
-            );
-            self.metrics.duplicate_records.fetch_add(batch.records.len() as u64, Ordering::Relaxed);
-            return Err(Error::DuplicateSequenceNumber(format!("Duplicate sequence: {}", batch.header.base_sequence)));
-        } else if batch.header.base_sequence > expected_sequence {
-            // Out of order
-            return Err(Error::OutOfOrderSequenceNumber(format!("Expected sequence: {}, got: {}", expected_sequence, batch.header.base_sequence)));
-        }
-
-        // In order (base_sequence == expected_sequence). Advance the tracked
-        // sequence to this batch's last sequence WHILE STILL HOLDING the write
-        // lock, so validate + advance are one atomic critical section.
+        // Bounded wait for the expected sequence.
         //
-        // Doing the advance in a separate call (a second lock acquisition) opened a
-        // race: idempotent producers keep up to max.in.flight (5 by default)
-        // batches in flight per partition, and the connection handler processes
-        // requests concurrently. A second batch could then acquire the lock and
-        // validate against the *pre-advance* sequence, and be spuriously rejected
-        // as OutOfOrderSequence under load (observed: a 1000-record transaction
-        // failing intermittently only under concurrent test load, never in
-        // isolation). Advancing here closes that window.
-        let last_sequence = batch.header.base_sequence + batch.records.len() as i32 - 1;
-        producer_info.sequence_numbers.insert(key, last_sequence);
+        // Idempotent producers keep up to max.in.flight (5 by default) batches in
+        // flight per partition, and the connection handler spawns a task per request
+        // (responses are ordered, but the handler *logic* runs concurrently). So a
+        // later batch — higher base_sequence — can reach validation before an
+        // earlier in-flight batch for the same (producer, partition). Rejecting
+        // immediately with OutOfOrderSequence is FATAL for a transactional producer
+        // (it aborts the whole transaction), and was observed intermittently on a
+        // 1000-record transaction under concurrent load. Instead, wait briefly for
+        // the earlier batch to advance the tracked sequence: it has no dependency on
+        // us, makes progress independently, and the reorder resolves within a few ms.
+        // The in-order case takes the fast path on the first iteration.
+        //
+        // validate + advance happen in ONE write-lock critical section so they are
+        // atomic (a separate advance call was a second race window).
+        let key = (topic.to_string(), partition);
+        let deadline = Instant::now() + std::time::Duration::from_millis(500);
+        loop {
+            {
+                let mut producers = self.producer_info.write().await;
 
-        // Update last activity
-        producer_info.last_activity = Instant::now();
+                let producer_info = producers.entry(batch.header.producer_id).or_insert_with(|| {
+                    ProducerInfo {
+                        producer_id: batch.header.producer_id,
+                        producer_epoch: batch.header.producer_epoch,
+                        sequence_numbers: HashMap::new(),
+                        transactional_id: transactional_id.map(String::from),
+                        transaction_state: TransactionState::None,
+                        last_activity: Instant::now(),
+                    }
+                });
 
-        Ok(())
+                // Validate producer epoch
+                if producer_info.producer_epoch != batch.header.producer_epoch {
+                    if batch.header.producer_epoch < producer_info.producer_epoch {
+                        return Err(Error::InvalidProducerEpoch("Producer epoch does not match".to_string()));
+                    }
+                    // Newer epoch, reset state
+                    producer_info.producer_epoch = batch.header.producer_epoch;
+                    producer_info.sequence_numbers.clear();
+                }
+
+                // Validate transactional ID
+                if let Some(txn_id) = transactional_id {
+                    if let Some(ref existing_txn_id) = producer_info.transactional_id {
+                        if existing_txn_id != txn_id {
+                            return Err(Error::InvalidTransactionState("Producer is not in a transaction".to_string()));
+                        }
+                    } else {
+                        producer_info.transactional_id = Some(txn_id.to_string());
+                    }
+                }
+
+                let expected_sequence = producer_info.sequence_numbers
+                    .get(&key)
+                    .map(|&seq| seq + 1)
+                    .unwrap_or(0);
+
+                if batch.header.base_sequence < expected_sequence {
+                    // Duplicate (already applied).
+                    warn!(
+                        "Duplicate sequence number detected: producer={}, topic={}, partition={}, expected={}, received={}",
+                        batch.header.producer_id, topic, partition, expected_sequence, batch.header.base_sequence
+                    );
+                    self.metrics.duplicate_records.fetch_add(batch.records.len() as u64, Ordering::Relaxed);
+                    return Err(Error::DuplicateSequenceNumber(format!("Duplicate sequence: {}", batch.header.base_sequence)));
+                } else if batch.header.base_sequence == expected_sequence {
+                    // In order — advance the tracked sequence atomically (same lock).
+                    let last_sequence = batch.header.base_sequence + batch.records.len() as i32 - 1;
+                    producer_info.sequence_numbers.insert(key, last_sequence);
+                    producer_info.last_activity = Instant::now();
+                    return Ok(());
+                }
+                // base_sequence > expected_sequence: an earlier batch is still in
+                // flight. Release the lock (end of scope) and wait for it.
+            }
+
+            if Instant::now() >= deadline {
+                // The earlier batch never arrived within the window — genuinely out
+                // of order. This is the correct terminal error.
+                return Err(Error::OutOfOrderSequenceNumber(format!(
+                    "Out of order sequence after wait: producer={}, topic={}, partition={}, got={}",
+                    batch.header.producer_id, topic, partition, batch.header.base_sequence
+                )));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
     }
     
     /// Send records to indexing pipeline
