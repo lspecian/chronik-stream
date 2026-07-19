@@ -32,7 +32,6 @@ pub async fn create_integrated_server(
         // Legacy realtime indexer: off by default (write-only output, per-topic
         // Tantivy writer held forever — OOMs at thousands of topics). See
         // IntegratedServerConfig::default.
-        enable_indexing: false,
         enable_compression: true,
         auto_create_topics: true,
         num_partitions: 3,  // Default for better parallelism
@@ -101,7 +100,6 @@ mod tests {
             // Legacy realtime indexer: off by default (write-only output, per-topic
         // Tantivy writer held forever — OOMs at thousands of topics). See
         // IntegratedServerConfig::default.
-        enable_indexing: false,
             enable_compression: true,
             auto_create_topics: true,
             num_partitions: 3,

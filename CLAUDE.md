@@ -1255,7 +1255,6 @@ chronik-stream/
 │   ├── chronik-search/      # Tantivy full-text search integration
 │   ├── chronik-query/       # Query processing
 │   ├── chronik-monitoring/  # Prometheus metrics, tracing
-│   ├── chronik-auth/        # SASL, TLS, ACLs
 │   ├── chronik-backup/      # Backup functionality
 │   ├── chronik-config/      # Configuration management
 │   ├── chronik-cli/         # CLI tools

@@ -20,11 +20,7 @@ use chronik_protocol::{
 use chronik_storage::kafka_records::{
     KafkaRecordBatch, CompressionType, TimestampType, RecordHeader as KafkaRecordHeader,
 };
-use chronik_search::{
-    realtime_indexer::{RealtimeIndexer, JsonDocument, RealtimeIndexerConfig},
-    json_pipeline::JsonPipeline,
-    hot_text_index::{HotTextIndex, HotDoc},
-};
+use chronik_search::hot_text_index::{HotTextIndex, HotDoc};
 use chronik_columnar::hot_vector_batcher::{MicroBatcherHandle, PendingEmbed};
 use serde_json::Map as JsonMap;
 use chronik_storage::{
@@ -181,10 +177,6 @@ pub struct ProduceHandlerConfig {
     pub node_id: i32,
     /// Storage configuration
     pub storage_config: StorageConfig,
-    /// Indexer configuration
-    pub indexer_config: RealtimeIndexerConfig,
-    /// Enable real-time indexing
-    pub enable_indexing: bool,
     /// Enable idempotent producer support
     pub enable_idempotence: bool,
     /// Enable transactional producer support
@@ -220,10 +212,6 @@ impl Default for ProduceHandlerConfig {
         Self {
             node_id: 0,
             storage_config: StorageConfig::default(),
-            indexer_config: RealtimeIndexerConfig::default(),
-            // Legacy realtime indexer: off by default — write-only output, and a
-            // per-topic Tantivy writer held forever (OOMs at thousands of topics).
-            enable_indexing: false,
             enable_idempotence: true,
             enable_transactions: true,
             max_in_flight_requests: 5,
@@ -435,9 +423,6 @@ pub struct TopicCreationStats {
 pub struct ProduceHandler {
     config: ProduceHandlerConfig,
     storage: Arc<dyn ObjectStore>,
-    indexer: Option<Arc<RealtimeIndexer>>,
-    json_pipeline: Option<Arc<JsonPipeline>>,
-    index_sender: Option<mpsc::Sender<JsonDocument>>,
     metadata_store: Arc<dyn MetadataStore>,
     // PERFORMANCE (v2.2.7 - P2): Use DashMap instead of RwLock<HashMap> for lock-free partition access
     // This eliminates lock contention with 128 concurrent producers (10-15% throughput gain)
@@ -1083,29 +1068,6 @@ impl ProduceHandler {
         storage: Arc<dyn ObjectStore>,
         metadata_store: Arc<dyn MetadataStore>,
     ) -> Result<Self> {
-        // Create indexer if enabled
-        let (indexer, index_sender) = if config.enable_indexing {
-            let (sender, receiver) = mpsc::channel(10000);
-            let indexer = Arc::new(RealtimeIndexer::new(config.indexer_config.clone())?);
-            
-            // Start indexing pipeline
-            let indexer_clone = Arc::clone(&indexer);
-            tokio::spawn(async move {
-                let _ = indexer_clone.start(receiver).await;
-            });
-            
-            (Some(indexer), Some(sender))
-        } else {
-            (None, None)
-        };
-        
-        // Create JSON pipeline for transformation (only when indexing enabled)
-        let json_pipeline = if config.enable_indexing {
-            Some(Arc::new(JsonPipeline::new(Default::default(), config.indexer_config.clone()).await?))
-        } else {
-            None
-        };
-        
         // P3 OPTIMIZATION (v2.2.7): Lock-free memory tracking
         let memory_limit_bytes = config.buffer_memory as u64;
         let memory_used_bytes = Arc::new(AtomicU64::new(0));
@@ -1130,9 +1092,6 @@ impl ProduceHandler {
         Ok(Self {
             config,
             storage,
-            indexer,
-            json_pipeline,
-            index_sender,
             metadata_store,
             partition_states: Arc::new(DashMap::new()),  // PERFORMANCE (v2.2.7 - P2): Lock-free concurrent hashmap
             producer_info: Arc::new(RwLock::new(HashMap::new())),
@@ -2354,15 +2313,9 @@ impl ProduceHandler {
                                         {
                                             let is_searchable = self.is_topic_searchable(topic).await;
                                             if is_searchable {
-                                                // Legacy realtime indexer (write-only: nothing reads
-                                                // {data_dir}/index — /_search serves WalIndexer's
-                                                // {data_dir}/tantivy_indexes). Off by default; costs a
-                                                // Tantivy writer (threads + heap) per topic when on.
-                                                if self.config.enable_indexing {
-                                                    self.send_to_indexer(topic, partition, &records).await;
-                                                }
-                                                // HP-1.2: fire-and-forget shadow into hot index. NRT
-                                                // search must not depend on the legacy indexer flag.
+                                                // HP-1.2: fire-and-forget shadow into the in-memory hot
+                                                // text index (NRT search). Cold search is served by the
+                                                // WalIndexer's {data_dir}/tantivy_indexes.
                                                 self.send_to_hot_text_index(topic, partition, &records);
                                             }
                                         }
@@ -2476,19 +2429,12 @@ impl ProduceHandler {
         self.metrics.records_produced.fetch_add(records.len() as u64, Ordering::Relaxed);
         self.metrics.bytes_produced.fetch_add(total_bytes, Ordering::Relaxed);
         
-        // Index searchable topics (v2.2.16). The hot NRT shadow depends only on
-        // searchability; the legacy realtime indexer additionally requires
-        // enable_indexing (off by default — it is write-only: nothing reads its
-        // {data_dir}/index output, /_search serves WalIndexer's tantivy_indexes,
-        // and it costs a Tantivy writer with threads + up-to-512MB budget PER
-        // TOPIC held forever, which OOM-killed nodes at a few thousand topics).
+        // Index searchable topics (v2.2.16): fire-and-forget shadow into the
+        // in-memory hot text index for NRT search. Cold search is served by the
+        // WalIndexer's {data_dir}/tantivy_indexes.
         {
             let is_searchable = self.is_topic_searchable(topic).await;
             if is_searchable {
-                if self.config.enable_indexing {
-                    self.send_to_indexer(topic, partition, &records).await;
-                }
-                // HP-1.2: fire-and-forget shadow into hot index
                 self.send_to_hot_text_index(topic, partition, &records);
             }
         }
@@ -3121,106 +3067,6 @@ impl ProduceHandler {
         });
     }
 
-    async fn send_to_indexer(&self, topic: &str, partition: i32, records: &[ProduceRecord]) {
-        debug!("v2.2.16: send_to_indexer called for {} records on {}-{}", records.len(), topic, partition);
-        if let Some(sender) = &self.index_sender {
-            // Convert ProduceRecords to JsonDocuments
-            for record in records {
-                // Create metadata for the document
-                let mut metadata = serde_json::Map::new();
-                metadata.insert("_topic".to_string(), serde_json::Value::String(topic.to_string()));
-                metadata.insert("_partition".to_string(), serde_json::Value::Number(partition.into()));
-                metadata.insert("_offset".to_string(), serde_json::Value::Number(record.offset.into()));
-                metadata.insert("_timestamp".to_string(), serde_json::Value::Number(record.timestamp.into()));
-                
-                // Add headers as metadata
-                for (key, value) in &record.headers {
-                    if let Ok(header_str) = String::from_utf8(value.clone()) {
-                        metadata.insert(format!("_header_{}", key), serde_json::Value::String(header_str));
-                    }
-                }
-
-                // Carry the raw Kafka record identity alongside the parsed JSON view.
-                // `_key` / `_value` Tantivy fields are populated from these, not from
-                // user JSON fields that happen to be named "key" / "value". Only valid
-                // UTF-8 keys become searchable — binary keys land as None and stay out
-                // of the text index. The value uses lossy UTF-8 so binary payloads
-                // still leave something tokenizable rather than vanishing.
-                let raw_key = record.key.as_deref()
-                    .and_then(|k| std::str::from_utf8(k).ok().map(|s| s.to_string()));
-                let raw_value = if record.value.is_empty() {
-                    None
-                } else {
-                    Some(String::from_utf8_lossy(&record.value).into_owned())
-                };
-
-                // Try to parse value as JSON, fallback to string
-                let document = if let Ok(json_value) = serde_json::from_slice::<serde_json::Value>(&record.value) {
-                    // Merge JSON value with metadata
-                    if let serde_json::Value::Object(mut obj) = json_value {
-                        for (k, v) in &metadata {
-                            obj.insert(k.clone(), v.clone());
-                        }
-                        JsonDocument {
-                            id: format!("{}-{}-{}", topic, partition, record.offset),
-                            topic: topic.to_string(),
-                            partition,
-                            offset: record.offset,
-                            timestamp: record.timestamp,
-                            content: serde_json::Value::Object(obj),
-                            metadata: Some(metadata),
-                            raw_key: raw_key.clone(),
-                            raw_value: raw_value.clone(),
-                        }
-                    } else {
-                        // Non-object JSON, wrap it
-                        let mut obj = metadata.clone();
-                        obj.insert("_value".to_string(), json_value);
-                        JsonDocument {
-                            id: format!("{}-{}-{}", topic, partition, record.offset),
-                            topic: topic.to_string(),
-                            partition,
-                            offset: record.offset,
-                            timestamp: record.timestamp,
-                            content: serde_json::Value::Object(obj),
-                            metadata: Some(metadata),
-                            raw_key: raw_key.clone(),
-                            raw_value: raw_value.clone(),
-                        }
-                    }
-                } else {
-                    // Not JSON, store as string
-                    let mut obj = metadata.clone();
-                    if let Ok(value_str) = String::from_utf8(record.value.clone()) {
-                        obj.insert("_value".to_string(), serde_json::Value::String(value_str));
-                    } else {
-                        // Binary data, store as base64
-                        use base64::Engine;
-                        let encoded = base64::engine::general_purpose::STANDARD.encode(&record.value);
-                        obj.insert("_value_base64".to_string(), serde_json::Value::String(encoded));
-                    }
-
-                    JsonDocument {
-                        id: format!("{}-{}-{}", topic, partition, record.offset),
-                        topic: topic.to_string(),
-                        partition,
-                        offset: record.offset,
-                        timestamp: record.timestamp,
-                        content: serde_json::Value::Object(obj),
-                        metadata: Some(metadata),
-                        raw_key: raw_key.clone(),
-                        raw_value: raw_value.clone(),
-                    }
-                };
-                
-                // Send to indexer (non-blocking)
-                if let Err(e) = sender.try_send(document) {
-                    debug!("Failed to send document to indexer: {}", e);
-                    self.metrics.indexing_lag_ms.store(1000, Ordering::Relaxed);
-                }
-            }
-        }
-    }
     
     /// Flush partition if needed based on size or time
     ///
@@ -3808,12 +3654,7 @@ impl ProduceHandler {
                 error!("Error flushing partition {}-{} during shutdown: {}", topic, partition, e);
             }
         }
-        
-        // Stop indexer
-        // if let Some(ref indexer) = self.indexer {
-        //     indexer.stop().await?;
-        // }
-        
+
         info!("Produce handler shutdown complete");
         Ok(())
     }
@@ -3839,9 +3680,6 @@ impl Clone for ProduceHandler {
         Self {
             config: self.config.clone(),
             storage: Arc::clone(&self.storage),
-            indexer: self.indexer.clone(),
-            json_pipeline: self.json_pipeline.clone(),
-            index_sender: self.index_sender.clone(),
             metadata_store: Arc::clone(&self.metadata_store),
             partition_states: Arc::clone(&self.partition_states),
             producer_info: Arc::clone(&self.producer_info),
@@ -3912,7 +3750,6 @@ mod tests {
         
         let config = ProduceHandlerConfig {
             node_id: 1, // Must match InMemoryMetadataStore's leader_id (hardcoded to 1)
-            enable_indexing: false, // Disable for tests
             auto_create_topics_enable: false, // Tests pre-create topics explicitly
             ..Default::default()
         };
@@ -4351,7 +4188,6 @@ mod tests {
         
         let config = ProduceHandlerConfig {
             node_id: 1, // Must match InMemoryMetadataStore's leader_id
-            enable_indexing: false,
             auto_create_topics_enable: true,
             num_partitions: 5,
             default_replication_factor: 3,
@@ -4419,7 +4255,6 @@ mod tests {
         
         let config = ProduceHandlerConfig {
             node_id: 1, // Must match InMemoryMetadataStore's leader_id
-            enable_indexing: false,
             auto_create_topics_enable: false, // Disabled
             ..Default::default()
         };
@@ -4477,7 +4312,6 @@ mod tests {
         
         let config = ProduceHandlerConfig {
             node_id: 1, // Must match InMemoryMetadataStore's leader_id
-            enable_indexing: false,
             auto_create_topics_enable: true,
             num_partitions: 3,
             default_replication_factor: 1,
@@ -4653,7 +4487,6 @@ mod tests {
         
         let config = ProduceHandlerConfig {
             node_id: 1, // Must match InMemoryMetadataStore's leader_id
-            enable_indexing: false,
             auto_create_topics_enable: true,
             ..Default::default()
         };
@@ -4751,7 +4584,6 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let produce_config = ProduceHandlerConfig {
             node_id: 1, // Must match InMemoryMetadataStore's leader_id
-            enable_indexing: false,
             ..ProduceHandlerConfig::default()
         };
 
@@ -4806,7 +4638,6 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let produce_config = ProduceHandlerConfig {
             node_id: 1,
-            enable_indexing: false,
             ..ProduceHandlerConfig::default()
         };
 
@@ -4861,7 +4692,6 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let produce_config = ProduceHandlerConfig {
             node_id: 1,
-            enable_indexing: false,
             ..ProduceHandlerConfig::default()
         };
 

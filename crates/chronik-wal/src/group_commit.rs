@@ -1350,10 +1350,29 @@ impl GroupCommitWal {
             self.sealed_segments.remove(key);
         }
 
-        if !partitions.is_empty() || !sealed_keys.is_empty() {
+        // Reclaim ON-DISK storage for the deleted topic. Previously cleanup only
+        // dropped in-memory state (queues + sealed-segment tracking) but left the
+        // `wal_*.log` files on disk under `base_dir/<topic>/`, so a deleted
+        // topic's data lingered forever (~44GB/node accrued from the LongMemEval
+        // eval), and the WalIndexer kept grinding those orphaned segments. Remove
+        // the whole topic dir — all partitions + active + sealed segment files.
+        let topic_dir = self.base_dir.join(topic);
+        let removed_dir = if topic_dir.exists() {
+            match std::fs::remove_dir_all(&topic_dir) {
+                Ok(()) => true,
+                Err(e) => {
+                    warn!("cleanup_topic: failed to remove WAL dir {:?}: {}", topic_dir, e);
+                    false
+                }
+            }
+        } else {
+            false
+        };
+
+        if !partitions.is_empty() || !sealed_keys.is_empty() || removed_dir {
             info!(
-                "Topic '{}' cleanup: removed {} partition queues, {} sealed segments",
-                topic, partitions.len(), sealed_keys.len()
+                "Topic '{}' cleanup: removed {} partition queues, {} sealed segments, wal_dir={}",
+                topic, partitions.len(), sealed_keys.len(), removed_dir
             );
         }
     }

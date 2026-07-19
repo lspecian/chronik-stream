@@ -46,8 +46,6 @@ pub struct IntegratedServerConfig {
     pub advertised_port: i32,
     /// Data directory for storage
     pub data_dir: String,
-    /// Enable real-time indexing
-    pub enable_indexing: bool,
     /// Enable compression
     pub enable_compression: bool,
     /// Auto-create topics
@@ -79,13 +77,6 @@ impl Default for IntegratedServerConfig {
             advertised_host: "localhost".to_string(),
             advertised_port: 9092,
             data_dir: "./data".to_string(),
-            // Legacy realtime indexer: OFF by default. It is write-only — nothing
-            // reads its {data_dir}/index output (/_search serves the WalIndexer's
-            // {data_dir}/tantivy_indexes) — and it holds a Tantivy writer with 4+4
-            // threads and an up-to-512MB budget PER TOPIC forever, which OOM-killed
-            // nodes at a few thousand topics. Hot NRT search and cold WalIndexer
-            // search are independent of this flag.
-            enable_indexing: false,
             enable_compression: true,
             auto_create_topics: true,
             num_partitions: 3,
@@ -564,175 +555,120 @@ impl IntegratedKafkaServer {
         }
     }
 
-    /// Build and write response to socket
-    ///
-    /// Complexity: < 25 (response construction + write)
-    async fn build_and_write_response(
-        response: chronik_protocol::handler::Response,
-        socket_writer: &Arc<tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>>,
-        addr: std::net::SocketAddr,
-    ) -> Result<()> {
-        // Build complete response with size header
+    /// Frame a handler Response into wire bytes (size prefix + response header +
+    /// body). Pure/synchronous so it runs inside the concurrent handler task;
+    /// only the WRITE must be ordered — see [`Self::spawn_ordered_writer`].
+    fn encode_response(response: chronik_protocol::handler::Response) -> Vec<u8> {
         let mut header_bytes = Vec::new();
         header_bytes.extend_from_slice(&response.header.correlation_id.to_be_bytes());
-
-        // TODO(v2.2.7): CRITICAL BUG - OffsetCommit v8 flexible protocol issue
-        // Current: Only adds tagged fields for non-ApiVersions flexible responses
-        // Bug: Consumers get "Protocol read buffer underflow" for OffsetCommit v8
-        // Need to research correct format from KIP-482 and working APIs
-        let _tagged_byte_added = if response.is_flexible {
-            if response.api_key != chronik_protocol::parser::ApiKey::ApiVersions {
-                header_bytes.push(0);
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-
-        let mut full_response = Vec::with_capacity(header_bytes.len() + response.body.len() + 4);
+        // Flexible (v9+) response headers carry an empty tagged-fields buffer
+        // (a single 0 byte) — except ApiVersions, which always uses a v0 header.
+        if response.is_flexible
+            && response.api_key != chronik_protocol::parser::ApiKey::ApiVersions
+        {
+            header_bytes.push(0);
+        }
         let size = (header_bytes.len() + response.body.len()) as i32;
-        full_response.extend_from_slice(&size.to_be_bytes());
-        full_response.extend_from_slice(&header_bytes);
-        full_response.extend_from_slice(&response.body);
+        let mut full = Vec::with_capacity(header_bytes.len() + response.body.len() + 4);
+        full.extend_from_slice(&size.to_be_bytes());
+        full.extend_from_slice(&header_bytes);
+        full.extend_from_slice(&response.body);
+        full
+    }
 
-        // DETAILED LOGGING FOR DEBUGGING
-        tracing::debug!(
-            "[DIRECT WRITE] Built response for API {:?}, correlation_id={}, total_size={} bytes (header={}, body={})",
-            response.api_key, response.header.correlation_id, full_response.len(), header_bytes.len(), response.body.len()
-        );
-
-        // CRITICAL DEBUGGING: Log full OffsetCommit response bytes
-        if matches!(response.api_key, chronik_protocol::parser::ApiKey::OffsetCommit) {
-            tracing::error!(
-                "!!! OFFSETCOMMIT FULL RESPONSE (all {} bytes): {:02x?}",
-                full_response.len(), full_response
-            );
-            // Verify structure
-            if full_response.len() >= 12 {
-                let msg_size = i32::from_be_bytes([full_response[0], full_response[1], full_response[2], full_response[3]]);
-                let corr_id = i32::from_be_bytes([full_response[4], full_response[5], full_response[6], full_response[7]]);
-                let throttle = i32::from_be_bytes([full_response[8], full_response[9], full_response[10], full_response[11]]);
-                tracing::error!(
-                    "!!! OFFSETCOMMIT STRUCTURE: msg_size={}, correlation_id={}, throttle_time={}",
-                    msg_size, corr_id, throttle
-                );
-                if full_response.len() >= 16 {
-                    let topics_len = i32::from_be_bytes([full_response[12], full_response[13], full_response[14], full_response[15]]);
-                    tracing::error!("!!! OFFSETCOMMIT topics_array_len={}", topics_len);
-                } else {
-                    tracing::error!("!!! OFFSETCOMMIT ERROR: Response too short to include topics array! Only {} bytes", full_response.len());
+    /// Per-connection ordered response writer — fixes `CorrelationIdMismatch`.
+    ///
+    /// Request handlers run concurrently (per-request `tokio::spawn`, so a
+    /// long-poll Fetch never blocks the read loop), but the Kafka protocol
+    /// requires responses on a connection to be written in **request order**;
+    /// Java's `NetworkClient` matches responses to in-flight requests strictly
+    /// FIFO. The old design wrote each response as its handler *completed*, so a
+    /// LeaveGroup/Metadata could overtake an in-flight Fetch during `.close()`
+    /// and desync the stream (the client then read the next response's leading
+    /// `throttle_time_ms`=0 bytes as correlation_id=0).
+    ///
+    /// Fix: the read loop enqueues one `oneshot::Receiver` per request *in read
+    /// order*; this task drains the queue FIFO, awaiting each slot before the
+    /// next, so completion order never leaks onto the wire. `None` = write
+    /// nothing for that slot (reserved for acks=0 suppression / throttle /
+    /// close). Generic over the writer so plaintext and TLS share one impl.
+    fn spawn_ordered_writer<W>(
+        writer: Arc<tokio::sync::Mutex<W>>,
+        addr: std::net::SocketAddr,
+    ) -> tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Receiver<Option<Vec<u8>>>>
+    where
+        W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        use tokio::io::AsyncWriteExt;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<
+            tokio::sync::oneshot::Receiver<Option<Vec<u8>>>,
+        >();
+        tokio::spawn(async move {
+            while let Some(slot) = rx.recv().await {
+                match slot.await {
+                    Ok(Some(bytes)) => {
+                        let mut w = writer.lock().await;
+                        if let Err(e) = w.write_all(&bytes).await {
+                            debug!("ordered write to {} failed (peer gone?): {}", addr, e);
+                            break;
+                        }
+                    }
+                    // handler chose to send nothing, or was dropped without responding
+                    Ok(None) | Err(_) => {}
                 }
-            } else {
-                tracing::error!("!!! OFFSETCOMMIT ERROR: Full response too short! Only {} bytes", full_response.len());
             }
-        }
-
-        // CRITICAL FIX (v2.2.13): Write response directly to socket write-half (no channel)
-        // Socket is split: write-half is exclusive for writing, no contention with read loop
-        let write_start = std::time::Instant::now();
-        let write_result = {
-            let mut writer_guard = socket_writer.lock().await;
-            writer_guard.write_all(&full_response).await
-        };
-        let write_duration = write_start.elapsed();
-
-        match write_result {
-            Ok(_) => {
-                tracing::debug!(
-                    "[DIRECT WRITE] Successfully wrote response for API {:?}, correlation_id={}, size={} bytes, latency={}ms",
-                    response.api_key, response.header.correlation_id, full_response.len(), write_duration.as_millis()
-                );
-            }
-            Err(e) => {
-                error!("Failed to write response to socket for addr={}: {}", addr, e);
-                return Err(anyhow::anyhow!("Socket write failed: {}", e));
-            }
-        }
-
-        if write_duration.as_millis() > 100 {
-            warn!("Direct socket write took {}ms (correlation_id={}) - slow write detected",
-                  write_duration.as_millis(), response.header.correlation_id);
-        }
-
-        Ok(())
+            debug!("ordered writer for {} stopped", addr);
+        });
+        tx
     }
 
     /// Handle request processing errors with recovery strategies
     ///
     /// Complexity: < 25 (error conversion + recovery)
-    async fn handle_request_error_recovery(
+    /// Produce the wire bytes for an error response, or `None` to write nothing.
+    /// Mirrors the old `handle_request_error_recovery` recovery logic but returns
+    /// bytes instead of writing, so error responses flow through the ordered
+    /// writer and stay in request order like every other response. Shared by
+    /// plaintext and TLS.
+    async fn build_error_bytes(
         error: chronik_common::Error,
         error_handler: &Arc<ErrorHandler>,
         correlation_id: i32,
         request_data: &[u8],
-        socket_writer: &Arc<tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>>,
         addr: std::net::SocketAddr,
-    ) -> ErrorRecovery {
-        // Convert to ServerError for proper handling (chronik_common::Error → anyhow::Error → ServerError)
+    ) -> Option<Vec<u8>> {
         let server_error = ErrorHandler::from_anyhow(anyhow::anyhow!("{}", error));
-        let recovery = error_handler.handle_error(
-            server_error,
-            &format!("request from {}", addr)
-        ).await;
+        let recovery = error_handler
+            .handle_error(server_error, &format!("request from {}", addr))
+            .await;
 
         match recovery {
             ErrorRecovery::ReturnError(error_code) => {
-                // Parse API key and version from request_data for proper error response
                 let (api_key, api_version) = if request_data.len() >= 4 {
                     (
                         i16::from_be_bytes([request_data[0], request_data[1]]),
-                        i16::from_be_bytes([request_data[2], request_data[3]])
+                        i16::from_be_bytes([request_data[2], request_data[3]]),
                     )
                 } else {
                     (0, 0) // Fallback for malformed requests
                 };
-
-                // Build proper error response with preserved correlation ID and API info
-                let error_response = error_handler.build_error_response(
+                Some(error_handler.build_error_response(
                     error_code,
                     correlation_id,
                     api_key,
                     api_version,
-                );
-
-                // CRITICAL FIX (v2.2.13): Write error response directly to socket write-half (no channel)
-                let write_start = std::time::Instant::now();
-                let write_result = {
-                    let mut writer_guard = socket_writer.lock().await;
-                    writer_guard.write_all(&error_response).await
-                };
-                let write_duration = write_start.elapsed();
-
-                match write_result {
-                    Ok(_) => {
-                        tracing::debug!(
-                            "[DIRECT WRITE] Successfully wrote error response, correlation_id={}, size={} bytes",
-                            correlation_id, error_response.len()
-                        );
-                    }
-                    Err(e) => {
-                        error!("Failed to write error response: {}", e);
-                    }
-                }
-
-                if write_duration.as_millis() > 100 {
-                    warn!("Error response socket write took {}ms - slow write detected", write_duration.as_millis());
-                }
-
-                ErrorRecovery::ReturnError(error_code)
-            }
-            ErrorRecovery::CloseConnection => {
-                info!("Closing connection to {} due to error", addr);
-                ErrorRecovery::CloseConnection
+                ))
             }
             ErrorRecovery::Throttle(ms) => {
                 debug!("Throttling client {} for {}ms", addr, ms);
                 tokio::time::sleep(tokio::time::Duration::from_millis(ms)).await;
-                ErrorRecovery::Throttle(ms)
+                None
             }
-            other => other,
+            ErrorRecovery::CloseConnection => {
+                info!("Error from {} → sending no response (connection closes on next read)", addr);
+                None
+            }
+            _ => None,
         }
     }
 
@@ -782,6 +718,12 @@ impl IntegratedKafkaServer {
                         let mut request_buffer = vec![0; 65536];
                         let mut socket_reader = socket_reader;
 
+                        // Ordered response writer: handlers run concurrently but
+                        // responses are written in REQUEST order (fixes
+                        // CorrelationIdMismatch on consumer .close()). See
+                        // spawn_ordered_writer.
+                        let resp_order_tx = Self::spawn_ordered_writer(socket_writer, addr);
+
                         loop {
                             // Read request frame
                             let request_size = match Self::read_request_frame(&mut socket_reader, &mut request_buffer, addr).await {
@@ -793,12 +735,18 @@ impl IntegratedKafkaServer {
                             // Parse request metadata
                             let (_api_key, _api_version, correlation_id) = Self::parse_request_metadata(&request_buffer, request_size);
 
-                            // CRITICAL FIX (v2.2.13): Process request and write response directly to socket write-half
-                            // Socket split: read-half for reading, write-half cloned for concurrent writes
-                            // Copy request data, then spawn handler
                             let request_data = request_buffer[..request_size].to_vec();
+
+                            // Reserve this request's response slot IN READ ORDER
+                            // before spawning the handler; the ordered writer
+                            // drains slots FIFO, so completion order never leaks
+                            // onto the wire.
+                            let (resp_tx, resp_rx) = tokio::sync::oneshot::channel::<Option<Vec<u8>>>();
+                            if resp_order_tx.send(resp_rx).is_err() {
+                                break; // ordered writer task gone → connection dead
+                            }
+
                             let handler_clone = kafka_handler.clone();
-                            let socket_writer_clone = socket_writer.clone();
                             let produce_sem_clone = produce_sem.clone();
                             let control_sem_clone = control_sem.clone();
                             let error_handler_clone = error_handler.clone();
@@ -817,30 +765,25 @@ impl IntegratedKafkaServer {
                                     Ok(p) => p,
                                     Err(_) => {
                                         error!("Failed to acquire semaphore for request");
+                                        let _ = resp_tx.send(None);
                                         return;
                                     }
                                 };
 
-                                // Handle request using the integrated handler
-                                match handler_clone.handle_request(&request_data).await {
-                                    Ok(response) => {
-                                        // Build and write response
-                                        if let Err(e) = Self::build_and_write_response(response, &socket_writer_clone, addr_clone).await {
-                                            error!("Failed to build/write response: {}", e);
-                                        }
-                                    }
-                                    Err(e) => {
-                                        // Handle error with recovery strategy
-                                        Self::handle_request_error_recovery(
-                                            e,
-                                            &error_handler_clone,
-                                            correlation_id,
-                                            &request_data,
-                                            &socket_writer_clone,
-                                            addr_clone
-                                        ).await;
-                                    }
-                                }
+                                // Handle request; produce response bytes (or None).
+                                // Encoding runs here (concurrent); only the WRITE
+                                // is ordered, via resp_tx → ordered writer.
+                                let bytes = match handler_clone.handle_request(&request_data).await {
+                                    Ok(response) => Some(Self::encode_response(response)),
+                                    Err(e) => Self::build_error_bytes(
+                                        e,
+                                        &error_handler_clone,
+                                        correlation_id,
+                                        &request_data,
+                                        addr_clone,
+                                    ).await,
+                                };
+                                let _ = resp_tx.send(bytes);
                             });  // End of spawned handler task
                         }
 
@@ -896,6 +839,10 @@ impl IntegratedKafkaServer {
                         let mut request_buffer = vec![0; 65536];
                         let mut socket_reader = socket_reader;
 
+                        // Ordered response writer (see spawn_ordered_writer) —
+                        // same request-order guarantee as the plaintext path.
+                        let resp_order_tx = Self::spawn_ordered_writer(socket_writer, addr);
+
                         loop {
                             // Read request frame (TLS-aware)
                             let request_size = match Self::read_request_frame_tls(&mut socket_reader, &mut request_buffer, addr).await {
@@ -907,8 +854,13 @@ impl IntegratedKafkaServer {
                             let (_api_key, _api_version, correlation_id) = Self::parse_request_metadata(&request_buffer, request_size);
 
                             let request_data = request_buffer[..request_size].to_vec();
+
+                            let (resp_tx, resp_rx) = tokio::sync::oneshot::channel::<Option<Vec<u8>>>();
+                            if resp_order_tx.send(resp_rx).is_err() {
+                                break; // ordered writer task gone → connection dead
+                            }
+
                             let handler_clone = kafka_handler.clone();
-                            let socket_writer_clone = socket_writer.clone();
                             let produce_sem_clone = produce_sem.clone();
                             let control_sem_clone = control_sem.clone();
                             let error_handler_clone = error_handler.clone();
@@ -925,27 +877,22 @@ impl IntegratedKafkaServer {
                                     Ok(p) => p,
                                     Err(_) => {
                                         error!("Failed to acquire semaphore for request");
+                                        let _ = resp_tx.send(None);
                                         return;
                                     }
                                 };
 
-                                match handler_clone.handle_request(&request_data).await {
-                                    Ok(response) => {
-                                        if let Err(e) = Self::build_and_write_response_tls(response, &socket_writer_clone, addr_clone).await {
-                                            error!("Failed to build/write response: {}", e);
-                                        }
-                                    }
-                                    Err(e) => {
-                                        Self::handle_request_error_recovery_tls(
-                                            e,
-                                            &error_handler_clone,
-                                            correlation_id,
-                                            &request_data,
-                                            &socket_writer_clone,
-                                            addr_clone
-                                        ).await;
-                                    }
-                                }
+                                let bytes = match handler_clone.handle_request(&request_data).await {
+                                    Ok(response) => Some(Self::encode_response(response)),
+                                    Err(e) => Self::build_error_bytes(
+                                        e,
+                                        &error_handler_clone,
+                                        correlation_id,
+                                        &request_data,
+                                        addr_clone,
+                                    ).await,
+                                };
+                                let _ = resp_tx.send(bytes);
                             });
                         }
 
@@ -1025,62 +972,8 @@ impl IntegratedKafkaServer {
         }
     }
 
-    /// Build and write response to a TLS-aware stream
-    async fn build_and_write_response_tls(
-        response: chronik_protocol::handler::Response,
-        socket_writer: &Arc<tokio::sync::Mutex<MaybeTlsWriteHalf>>,
-        addr: std::net::SocketAddr,
-    ) -> Result<()> {
-        use tokio::io::AsyncWriteExt;
-
-        // Build complete response with size header
-        let mut header_bytes = Vec::new();
-        header_bytes.extend_from_slice(&response.header.correlation_id.to_be_bytes());
-
-        if response.is_flexible && response.api_key != chronik_protocol::parser::ApiKey::ApiVersions {
-            header_bytes.push(0);
-        }
-
-        let mut full_response = Vec::with_capacity(header_bytes.len() + response.body.len() + 4);
-        let size = (header_bytes.len() + response.body.len()) as i32;
-        full_response.extend_from_slice(&size.to_be_bytes());
-        full_response.extend_from_slice(&header_bytes);
-        full_response.extend_from_slice(&response.body);
-
-        tracing::debug!(
-            "[TLS WRITE] Built response for API {:?}, correlation_id={}, size={} bytes",
-            response.api_key, response.header.correlation_id, full_response.len()
-        );
-
-        // Write response
-        let write_start = std::time::Instant::now();
-        let write_result = {
-            let mut writer_guard = socket_writer.lock().await;
-            writer_guard.write_all(&full_response).await
-        };
-        let write_duration = write_start.elapsed();
-
-        match write_result {
-            Ok(_) => {
-                tracing::debug!(
-                    "[TLS WRITE] Wrote response, latency={}ms",
-                    write_duration.as_millis()
-                );
-            }
-            Err(e) => {
-                error!("Failed to write TLS response to {}: {}", addr, e);
-                return Err(anyhow::anyhow!("TLS write failed: {}", e));
-            }
-        }
-
-        if write_duration.as_millis() > 100 {
-            warn!("TLS write took {}ms - slow write detected", write_duration.as_millis());
-        }
-
-        Ok(())
-    }
-
     /// Handle request errors for TLS connections
+    #[allow(dead_code)]
     async fn handle_request_error_recovery_tls(
         error: chronik_common::Error,
         _error_handler: &Arc<ErrorHandler>,
