@@ -2126,6 +2126,19 @@ impl ProduceHandler {
                 partition,
                 transactional_id,
             ).await?;
+
+            // Record the producer's last sequence HERE, right after validation —
+            // NOT after the WAL write. For acks=1/all the produce path returns early
+            // via the async response pipeline, so an update placed later never runs,
+            // and the producer's next batch (or next transaction) is wrongly rejected
+            // as OutOfOrderSequence (expected 0). The batch is already validated and
+            // will be written, so advancing the tracked sequence now is correct.
+            self.update_producer_sequence(
+                kafka_batch.header.producer_id,
+                topic,
+                partition,
+                kafka_batch.header.base_sequence + kafka_batch.records.len() as i32 - 1,
+            ).await;
         }
 
         // EOS layer 6: a transactional (non-control) data batch opens a transaction on
@@ -2736,20 +2749,8 @@ impl ProduceHandler {
             }
         }
         
-        // Update producer sequence for idempotence. Control batches (COMMIT/ABORT
-        // markers) must be EXCLUDED: they carry the transaction's producer id but are
-        // not part of the data sequence space, so advancing/resetting the tracked
-        // sequence from a marker corrupts the next transaction's sequence check
-        // (observed: OutOfOrderSequenceException on the producer's 2nd transaction).
-        let is_control_batch = (kafka_batch.header.attributes & 0x20) != 0;
-        if kafka_batch.header.producer_id >= 0 && !is_control_batch {
-            self.update_producer_sequence(
-                kafka_batch.header.producer_id,
-                topic,
-                partition,
-                kafka_batch.header.base_sequence + records.len() as i32 - 1,
-            ).await;
-        }
+        // (producer sequence is updated right after validation, above — before the
+        // async response path can return early)
         
         // P3 OPTIMIZATION (v2.2.7): Release memory atomically
         self.memory_used_bytes.fetch_sub(bytes_to_reserve, Ordering::Release);
