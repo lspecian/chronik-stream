@@ -2120,25 +2120,17 @@ impl ProduceHandler {
         // — otherwise the marker's base_sequence would be rejected as a duplicate.
         let is_control_batch = (kafka_batch.header.attributes & 0x20) != 0;
         if kafka_batch.header.producer_id >= 0 && !is_control_batch {
+            // validate_producer_sequence both checks AND advances the producer's
+            // tracked sequence atomically (one write-lock acquisition). The advance
+            // must happen here, before the acks=1/all async-response early return —
+            // an advance placed after the WAL write never runs on that path, so the
+            // producer's next batch would be wrongly rejected as OutOfOrderSequence.
             self.validate_producer_sequence(
                 &kafka_batch,
                 topic,
                 partition,
                 transactional_id,
             ).await?;
-
-            // Record the producer's last sequence HERE, right after validation —
-            // NOT after the WAL write. For acks=1/all the produce path returns early
-            // via the async response pipeline, so an update placed later never runs,
-            // and the producer's next batch (or next transaction) is wrongly rejected
-            // as OutOfOrderSequence (expected 0). The batch is already validated and
-            // will be written, so advancing the tracked sequence now is correct.
-            self.update_producer_sequence(
-                kafka_batch.header.producer_id,
-                topic,
-                partition,
-                kafka_batch.header.base_sequence + kafka_batch.records.len() as i32 - 1,
-            ).await;
         }
 
         // EOS layer 6: a transactional (non-control) data batch opens a transaction on
@@ -2967,26 +2959,26 @@ impl ProduceHandler {
             // Out of order
             return Err(Error::OutOfOrderSequenceNumber(format!("Expected sequence: {}, got: {}", expected_sequence, batch.header.base_sequence)));
         }
-        
+
+        // In order (base_sequence == expected_sequence). Advance the tracked
+        // sequence to this batch's last sequence WHILE STILL HOLDING the write
+        // lock, so validate + advance are one atomic critical section.
+        //
+        // Doing the advance in a separate call (a second lock acquisition) opened a
+        // race: idempotent producers keep up to max.in.flight (5 by default)
+        // batches in flight per partition, and the connection handler processes
+        // requests concurrently. A second batch could then acquire the lock and
+        // validate against the *pre-advance* sequence, and be spuriously rejected
+        // as OutOfOrderSequence under load (observed: a 1000-record transaction
+        // failing intermittently only under concurrent test load, never in
+        // isolation). Advancing here closes that window.
+        let last_sequence = batch.header.base_sequence + batch.records.len() as i32 - 1;
+        producer_info.sequence_numbers.insert(key, last_sequence);
+
         // Update last activity
         producer_info.last_activity = Instant::now();
-        
+
         Ok(())
-    }
-    
-    /// Update producer sequence after successful write
-    async fn update_producer_sequence(
-        &self,
-        producer_id: i64,
-        topic: &str,
-        partition: i32,
-        last_sequence: i32,
-    ) {
-        let mut producers = self.producer_info.write().await;
-        if let Some(producer_info) = producers.get_mut(&producer_id) {
-            let key = (topic.to_string(), partition);
-            producer_info.sequence_numbers.insert(key, last_sequence);
-        }
     }
     
     /// Send records to indexing pipeline
