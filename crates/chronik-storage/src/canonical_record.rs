@@ -551,8 +551,6 @@ impl CanonicalRecord {
         // v2 RecordBatch CRC is calculated over the ENTIRE batch (header + compressed payload).
         // We MUST return the original bytes to guarantee CRC matches what Java clients expect.
         if let Some(ref v2_bytes) = self.original_v2_wire_format {
-            eprintln!("V2→PRESERVED: Returning original v2 RecordBatch ({} bytes, {} records)",
-                v2_bytes.len(), self.records.len());
             return Ok(Bytes::from(v2_bytes.clone()));
         }
 
@@ -637,19 +635,16 @@ impl CanonicalRecord {
         // Zero out CRC field first
         buf[crc_pos..crc_pos + 4].copy_from_slice(&[0, 0, 0, 0]);
 
-        // CRC is calculated over everything from partition_leader_epoch to end
-        let crc_data = &buf[crc_start..];
+        // Kafka's CRC-32C covers from ATTRIBUTES (immediately after the CRC field,
+        // offset 21 = crc_pos + 4) to the end — NOT from partition_leader_epoch.
+        // The old `crc_start` (offset 12) was self-consistent with this crate's
+        // non-validating decoder but non-spec, so any batch reconstructed here (a
+        // transactional data batch or a control marker whose original wire bytes
+        // weren't preserved) was rejected as corrupt by real Kafka clients. This is
+        // the twin of the fix in KafkaRecordBatch::encode(); the two must agree.
+        let _ = crc_start; // superseded by the spec-correct range below
+        let crc_data = &buf[crc_pos + 4..];
         let crc = calculate_crc32(crc_data);
-
-        // DEBUG: Log CRC calculation details
-        eprintln!("CRC→DEBUG: base_offset={}, records_count={}, crc_data_len={}, calculated_crc={:#010x}",
-            self.base_offset, self.records.len(), crc_data.len(), crc);
-        if crc_data.len() <= 200 {
-            eprintln!("CRC→DEBUG: crc_data hex: {}", hex::encode(crc_data));
-        } else {
-            eprintln!("CRC→DEBUG: crc_data hex (first 100 bytes): {}", hex::encode(&crc_data[..100]));
-            eprintln!("CRC→DEBUG: crc_data hex (last 100 bytes): {}", hex::encode(&crc_data[crc_data.len()-100..]));
-        }
 
         // Write CRC as little-endian (Kafka protocol requirement)
         buf[crc_pos..crc_pos + 4].copy_from_slice(&crc.to_le_bytes());
