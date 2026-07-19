@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.9.0] - 2026-07-19
+
+**Exactly-once semantics (transactions) now work end-to-end**, validated with the real
+Java transactional producer + consumer (kafka-clients 3.7.0), 4/4 of the transactional
+test matrix plus a two-committed-transaction test.
+
+### Added
+- **Transaction coordinator (durable, event-sourced).** Producer-id allocation is now
+  durable and cluster-unique (node-namespaced, monotonic, recovered past replayed ids)
+  instead of a process-local counter; the coordinator tracks each `transactional.id`'s
+  producer id/epoch, lifecycle state, and enrolled partitions in the metadata WAL, so it
+  survives restart and replicates to followers. InitProducerId bumps the epoch to fence
+  zombie producers.
+- **Transaction control markers.** On EndTxn, a COMMIT/ABORT control batch is written to
+  every enrolled partition through the produce/WAL path (real offset, durable, fetchable).
+- **`read_committed` fetch semantics.** Fetch reports the real Last Stable Offset and the
+  aborted-transactions list; a `read_committed` consumer returns only committed records and
+  filters aborted ones, while `read_uncommitted` returns all data records.
+
+### Fixed
+- **Batch CRC-32C, three stacked bugs** — latent because Chronik normally serves producer
+  batches verbatim and rarely encodes its own, but exposed once it began emitting control
+  markers:
+  - CRC range computed from offset 12 (partition_leader_epoch) instead of the Kafka-spec
+    offset 21 (attributes), in both `KafkaRecordBatch::encode` and
+    `CanonicalRecord::to_kafka_batch`.
+  - **CRC field written little-endian instead of big-endian** (Kafka stores it big-endian);
+    proven by a wire capture showing the client's stored-vs-computed CRCs were exact
+    byte-reverses. This was the core control-marker fix.
+- **Producer sequence state was never recorded for acks=1/all** — `update_producer_sequence`
+  ran after the async response pipeline had already returned, so a producer's second
+  transaction was rejected with `OutOfOrderSequence` and aborted data wasn't surfaced to
+  `read_uncommitted`. The update now runs right after validation, on every acks path.
+
 ## [2.8.0] - 2026-07-19
 
 Correctness and honesty pass across the Kafka protocol surface, plus a large dead-code
