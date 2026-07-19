@@ -2038,6 +2038,7 @@ dependencies = [
  "chronik-wal",
  "chrono",
  "clap",
+ "crc32c",
  "crc32fast",
  "crossbeam",
  "dashmap 5.5.3",

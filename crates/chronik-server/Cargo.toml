@@ -96,6 +96,7 @@ parking_lot = { workspace = true }
 murmur2 = { workspace = true }
 crossbeam = "0.8"  # Lock-free queues for WAL replication
 crc32fast = "1.4"  # CRC32 checksums for WAL replication frames
+crc32c = "0.6"  # temp EOS diagnostics
 arc-swap = "1.7"  # Lock-free atomic pointer swapping for metadata state machine (v2.2.7 deadlock fix)
 
 # Socket configuration
