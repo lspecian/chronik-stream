@@ -2111,8 +2111,12 @@ impl ProduceHandler {
             (bytes, kafka_batch)
         };
 
-        // Validate producer info for idempotence
-        if kafka_batch.header.producer_id >= 0 {
+        // Validate producer info for idempotence. Control batches (COMMIT/ABORT
+        // end-transaction markers) carry the transaction's producer id/epoch but are
+        // NOT part of the data sequence space, so they must skip sequence validation
+        // — otherwise the marker's base_sequence would be rejected as a duplicate.
+        let is_control_batch = (kafka_batch.header.attributes & 0x20) != 0;
+        if kafka_batch.header.producer_id >= 0 && !is_control_batch {
             self.validate_producer_sequence(
                 &kafka_batch,
                 topic,

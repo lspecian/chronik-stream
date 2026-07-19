@@ -137,6 +137,7 @@ impl KafkaProtocolHandler {
             ApiKey::DeleteGroups => self.handle_delete_groups_request(header, buf).await,
             ApiKey::OffsetDelete => self.handle_offset_delete_request(header, buf).await,
             ApiKey::ListGroups => self.handle_list_groups_request(header, buf).await,
+            ApiKey::EndTxn => self.handle_end_txn_request(header, buf).await,
             _ => self.handle_default_request(request_bytes, header.api_key, header.api_version).await,
         }
     }
@@ -397,6 +398,112 @@ impl KafkaProtocolHandler {
             body: body_buf.freeze(),
             is_flexible: header.api_version >= 9,  // v9+ uses flexible/compact encoding
             api_key: ApiKey::Produce,
+            throttle_time_ms: None,
+        })
+    }
+
+    /// Handle EndTxn (commit/abort a transaction). EOS layer 5b.
+    ///
+    /// Intercepted here (rather than delegated to the protocol handler) because
+    /// completing a transaction requires WRITING control markers into the log,
+    /// which needs produce-path access. On EndTxn we: look up the transaction's
+    /// enrolled partitions from the coordinator, append a COMMIT or ABORT control
+    /// batch to each of them through the normal produce/WAL path (so the marker
+    /// gets a real offset, is durable, replicates, and is fetchable), then finalize
+    /// the coordinator state. `read_committed` consumers use these markers to know
+    /// where each transaction commits or aborts in the log.
+    async fn handle_end_txn_request(
+        &self,
+        header: chronik_protocol::parser::RequestHeader,
+        mut buf: Bytes,
+    ) -> Result<Response> {
+        use chronik_protocol::end_txn_types::{EndTxnRequest, EndTxnResponse, error_codes};
+        use chronik_protocol::parser::{Decoder, Encoder, KafkaDecodable, KafkaEncodable};
+        use chronik_protocol::types::{ProduceRequest, ProduceRequestTopic, ProduceRequestPartition};
+        use chronik_storage::control_batch::{build_end_txn_marker, ControlMarker};
+        use std::collections::HashMap;
+
+        let mut decoder = Decoder::new(&mut buf);
+        let request = EndTxnRequest::decode(&mut decoder, header.api_version)?;
+        let marker = if request.committed { ControlMarker::Commit } else { ControlMarker::Abort };
+        let ts = chrono::Utc::now().timestamp_millis();
+
+        tracing::info!(
+            "EndTxn: txn={}, producer_id={}, epoch={}, committed={}",
+            request.transactional_id, request.producer_id, request.producer_epoch, request.committed
+        );
+
+        let error_code = match self.metadata_store.get_transaction(&request.transactional_id).await {
+            Ok(Some(txn)) => {
+                if txn.is_fenced(request.producer_id, request.producer_epoch) {
+                    tracing::warn!("EndTxn fenced: request pid/epoch {}/{} vs bound {}/{}",
+                        request.producer_id, request.producer_epoch, txn.producer_id, txn.producer_epoch);
+                    error_codes::INVALID_PRODUCER_EPOCH
+                } else {
+                    // Prepare (durable intent) before writing markers, for commit.
+                    if request.committed {
+                        let _ = self.metadata_store.prepare_commit_transaction(
+                            request.transactional_id.clone(), request.producer_id, request.producer_epoch,
+                        ).await;
+                    }
+
+                    // One control marker per enrolled partition, grouped by topic.
+                    let mut topics_map: HashMap<String, Vec<ProduceRequestPartition>> = HashMap::new();
+                    for (topic, partition) in &txn.partitions {
+                        let bytes = build_end_txn_marker(0, request.producer_id, request.producer_epoch, marker, ts);
+                        topics_map.entry(topic.clone()).or_default().push(ProduceRequestPartition {
+                            index: *partition as i32,
+                            records: bytes,
+                        });
+                    }
+                    if !topics_map.is_empty() {
+                        let topics: Vec<ProduceRequestTopic> = topics_map.into_iter()
+                            .map(|(name, partitions)| ProduceRequestTopic { name, partitions })
+                            .collect();
+                        let marker_req = ProduceRequest {
+                            transactional_id: Some(request.transactional_id.clone()),
+                            acks: 1,
+                            timeout_ms: 30000,
+                            topics,
+                        };
+                        if let Err(e) = self.wal_handler.handle_produce(marker_req, header.correlation_id).await {
+                            tracing::error!("EndTxn: failed to write control markers: {}", e);
+                        } else {
+                            tracing::info!("EndTxn: wrote {} marker(s) for txn {}",
+                                txn.partitions.len(), request.transactional_id);
+                        }
+                    }
+
+                    // Finalize coordinator state (clears enrollment).
+                    let fin = if request.committed {
+                        self.metadata_store.commit_transaction(
+                            request.transactional_id.clone(), request.producer_id, request.producer_epoch).await
+                    } else {
+                        self.metadata_store.abort_transaction(
+                            request.transactional_id.clone(), request.producer_id, request.producer_epoch).await
+                    };
+                    match fin {
+                        Ok(()) => error_codes::NONE,
+                        Err(e) => { tracing::warn!("EndTxn finalize failed: {}", e); error_codes::COORDINATOR_NOT_AVAILABLE }
+                    }
+                }
+            }
+            // No coordinator state for this transactional.id: nothing to mark. Ack so
+            // the client isn't stuck (matches Kafka's lenient handling of an empty txn).
+            Ok(None) => error_codes::NONE,
+            Err(e) => { tracing::warn!("EndTxn get_transaction failed: {}", e); error_codes::COORDINATOR_NOT_AVAILABLE }
+        };
+
+        let response = EndTxnResponse { throttle_time_ms: 0, error_code };
+        let mut body_buf = BytesMut::new();
+        let mut encoder = Encoder::new(&mut body_buf);
+        response.encode(&mut encoder, header.api_version)?;
+
+        Ok(Response {
+            header: ResponseHeader { correlation_id: header.correlation_id },
+            body: body_buf.freeze(),
+            is_flexible: header.api_version >= 3,  // EndTxn v3+ uses a flexible response header
+            api_key: ApiKey::EndTxn,
             throttle_time_ms: None,
         })
     }
