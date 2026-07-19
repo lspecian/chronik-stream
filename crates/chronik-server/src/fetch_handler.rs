@@ -220,7 +220,7 @@ impl FetchHandler {
             let mut response_partitions = Vec::new();
             
             for partition_request in topic_request.partitions {
-                let partition_response = self.fetch_partition(
+                let mut partition_response = self.fetch_partition(
                     &topic_request.name,
                     partition_request.partition,
                     partition_request.fetch_offset,
@@ -228,7 +228,30 @@ impl FetchHandler {
                     request.max_wait_ms,
                     request.min_bytes,
                 ).await?;
-                
+
+                // EOS layer 6: for read_committed (isolation_level == 1) report the real
+                // Last Stable Offset and the aborted-transactions list from the per-
+                // partition transaction index. The consumer uses the LSO as its read
+                // boundary and the aborted list (with the ABORT control markers in the
+                // log) to drop aborted records. read_uncommitted (0) is left untouched.
+                if request.isolation_level == 1 {
+                    if let Some(ref ph) = self.produce_handler {
+                        let idx = ph.transaction_index();
+                        let hwm = partition_response.high_watermark;
+                        partition_response.last_stable_offset =
+                            idx.last_stable_offset(&topic_request.name, partition_response.partition, hwm);
+                        let aborted: Vec<chronik_protocol::AbortedTransaction> =
+                            idx.aborted_below(&topic_request.name, partition_response.partition, hwm)
+                                .into_iter()
+                                .map(|a| chronik_protocol::AbortedTransaction {
+                                    producer_id: a.producer_id,
+                                    first_offset: a.first_offset,
+                                })
+                                .collect();
+                        partition_response.aborted = Some(aborted);
+                    }
+                }
+
                 response_partitions.push(partition_response);
             }
             
@@ -615,8 +638,13 @@ impl FetchHandler {
         partition: i32,
         high_watermark: i64,
         log_start_offset: i64,
-        records: Vec<u8>,
+        mut records: Vec<u8>,
     ) -> FetchResponsePartition {
+        // EOS: every response path funnels through here, so sanitize control-batch CRCs
+        // in one place (see sanitize_batch_crcs). This makes transaction COMMIT/ABORT
+        // markers self-consistent on the wire regardless of which serving path assembled
+        // them; producer data batches are left byte-identical.
+        sanitize_batch_crcs(&mut records);
         FetchResponsePartition {
             partition,
             error_code: 0,
@@ -2612,6 +2640,40 @@ impl FetchHandler {
         // Encode the batch
         let encoded = batch.encode()?;
         Ok(encoded.to_vec())
+    }
+}
+
+/// Recompute the CRC-32C of every v2 RecordBatch in a concatenated fetch payload,
+/// over the Kafka-spec range (attributes .. end of batch), and write it into each
+/// batch's CRC field. Makes every outgoing batch self-consistent regardless of which
+/// serving path produced it. The batch content is left byte-identical; only the CRC
+/// field (bytes 17-20 of each batch, little-endian) is (re)written. Non-v2 or partial
+/// trailing bytes are left untouched.
+fn sanitize_batch_crcs(bytes: &mut [u8]) {
+    let mut pos = 0usize;
+    let len = bytes.len();
+    while pos + 21 <= len {
+        // batch_length counts everything after the base_offset(8) + batch_length(4) fields.
+        let batch_length = i32::from_be_bytes([
+            bytes[pos + 8], bytes[pos + 9], bytes[pos + 10], bytes[pos + 11],
+        ]) as usize;
+        let batch_end = pos + 12 + batch_length;
+        if batch_length < 9 || batch_end > len {
+            break; // malformed or partial trailing batch — leave as-is
+        }
+        let magic = bytes[pos + 16] as i8;
+        // Only re-CRC CONTROL batches (attributes bit 5). These are the batches Chronik
+        // itself produces (transaction COMMIT/ABORT markers) and are the only ones that
+        // can reach the wire with an inconsistent CRC. Producer data batches are served
+        // with their own valid CRC and must NOT be touched (recomputing them risks
+        // mismatches on compressed/multi-record batches).
+        let is_control = (u16::from_be_bytes([bytes[pos + 21], bytes[pos + 22]]) & 0x20) != 0;
+        if magic == 2 && is_control {
+            // CRC covers attributes (pos+21) to end of batch.
+            let crc = crc32c::crc32c(&bytes[pos + 21..batch_end]);
+            bytes[pos + 17..pos + 21].copy_from_slice(&crc.to_be_bytes());
+        }
+        pos = batch_end;
     }
 }
 

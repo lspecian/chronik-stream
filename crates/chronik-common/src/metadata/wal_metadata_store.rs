@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::pin::Pin;
 use std::future::Future;
 use async_trait::async_trait;
@@ -23,8 +24,19 @@ use tokio::sync::RwLock;
 use chrono::Utc;
 use dashmap::DashMap;
 
-use super::events::{MetadataEvent, MetadataEventPayload};
+use super::events::{MetadataEvent, MetadataEventPayload, TransactionPartition};
+use super::transaction::{TransactionMetadata, TransactionState};
 use super::traits::*;
+
+/// Each node owns a disjoint 2^40 producer-id range so ids are cluster-unique
+/// without any cross-node coordination. Within a node they are monotonic; on
+/// recovery the counter is advanced past every producer id seen in replayed
+/// transaction events so a restart never re-hands-out a live id.
+fn producer_id_base(node_id: u64) -> i64 {
+    // node 0 -> 1, node 1 -> 2^40, node 2 -> 2^41, ... (avoid 0, which Kafka
+    // treats as "no producer id").
+    ((node_id as i64) << 40) | 1
+}
 
 /// Type alias for WAL append callback (injected by chronik-server)
 ///
@@ -87,10 +99,14 @@ struct MetadataState {
     partition_offsets: RwLock<HashMap<(String, u32), (i64, i64)>>,
     // Parquet segments for columnar storage (keyed by topic-partition, segment_id)
     parquet_segments: RwLock<HashMap<(String, i32, String), ParquetSegmentMetadata>>,
+    /// Transaction coordinator state, keyed by transactional.id (EOS).
+    transactions: RwLock<HashMap<String, TransactionMetadata>>,
+    /// Next producer id to hand out (node-namespaced, advanced past recovered ids).
+    next_producer_id: AtomicI64,
 }
 
 impl MetadataState {
-    fn new() -> Self {
+    fn new(node_id: u64) -> Self {
         Self {
             topics: RwLock::new(HashMap::new()),
             brokers: RwLock::new(HashMap::new()),
@@ -101,7 +117,15 @@ impl MetadataState {
             segments: RwLock::new(HashMap::new()),
             partition_offsets: RwLock::new(HashMap::new()),
             parquet_segments: RwLock::new(HashMap::new()),
+            transactions: RwLock::new(HashMap::new()),
+            next_producer_id: AtomicI64::new(producer_id_base(node_id)),
         }
+    }
+
+    /// Ensure the producer-id counter is past `pid` so a recovered/replicated id
+    /// is never re-allocated.
+    fn observe_producer_id(&self, pid: i64) {
+        self.next_producer_id.fetch_max(pid + 1, Ordering::SeqCst);
     }
 
     /// Apply a metadata event to update state
@@ -368,6 +392,126 @@ impl MetadataState {
                 Ok(())
             }
 
+            // ===== Transaction coordinator events (EOS) =====
+            // These are event-sourced so the coordinator state is rebuilt identically
+            // on recovery and on followers. `observe_producer_id` keeps the allocator
+            // past every id we have ever seen so a restart never reuses a live id.
+            MetadataEventPayload::BeginTransaction {
+                transactional_id, producer_id, producer_epoch, transaction_timeout_ms,
+            } => {
+                self.observe_producer_id(*producer_id);
+                let now_ms = event.timestamp.timestamp_millis();
+                let mut txns = self.transactions.write().await;
+                let txn = txns.entry(transactional_id.clone()).or_insert_with(|| {
+                    TransactionMetadata::new(transactional_id.clone(), *producer_id, *producer_epoch, *transaction_timeout_ms, now_ms)
+                });
+                // InitProducerId registration (or re-registration with a bumped epoch
+                // for fencing): bind the producer and reset to Empty with no enrollment.
+                // The transaction becomes Ongoing on the first AddPartitionsToTransaction,
+                // matching Kafka — there is no separate server-side "begin" RPC.
+                txn.producer_id = *producer_id;
+                txn.producer_epoch = *producer_epoch;
+                txn.timeout_ms = *transaction_timeout_ms;
+                txn.state = TransactionState::Empty;
+                txn.partitions.clear();
+                txn.groups.clear();
+                txn.last_updated_ms = now_ms;
+                Ok(())
+            }
+            MetadataEventPayload::AddPartitionsToTransaction {
+                transactional_id, producer_id, partitions, ..
+            } => {
+                self.observe_producer_id(*producer_id);
+                let now_ms = event.timestamp.timestamp_millis();
+                let mut txns = self.transactions.write().await;
+                if let Some(txn) = txns.get_mut(transactional_id) {
+                    for p in partitions {
+                        txn.partitions.insert((p.topic.clone(), p.partition));
+                    }
+                    if txn.state == TransactionState::Empty
+                        || txn.state == TransactionState::CompleteCommit
+                        || txn.state == TransactionState::CompleteAbort {
+                        txn.state = TransactionState::Ongoing;
+                    }
+                    txn.last_updated_ms = now_ms;
+                }
+                Ok(())
+            }
+            MetadataEventPayload::AddOffsetsToTransaction {
+                transactional_id, producer_id, group_id, ..
+            } => {
+                self.observe_producer_id(*producer_id);
+                let now_ms = event.timestamp.timestamp_millis();
+                let mut txns = self.transactions.write().await;
+                if let Some(txn) = txns.get_mut(transactional_id) {
+                    txn.groups.insert(group_id.clone());
+                    if txn.state == TransactionState::Empty
+                        || txn.state == TransactionState::CompleteCommit
+                        || txn.state == TransactionState::CompleteAbort {
+                        txn.state = TransactionState::Ongoing;
+                    }
+                    txn.last_updated_ms = now_ms;
+                }
+                Ok(())
+            }
+            MetadataEventPayload::PrepareCommit { transactional_id, producer_id, .. } => {
+                self.observe_producer_id(*producer_id);
+                let now_ms = event.timestamp.timestamp_millis();
+                let mut txns = self.transactions.write().await;
+                if let Some(txn) = txns.get_mut(transactional_id) {
+                    txn.state = TransactionState::PrepareCommit;
+                    txn.last_updated_ms = now_ms;
+                }
+                Ok(())
+            }
+            MetadataEventPayload::PrepareAbort { transactional_id, producer_id, .. } => {
+                self.observe_producer_id(*producer_id);
+                let now_ms = event.timestamp.timestamp_millis();
+                let mut txns = self.transactions.write().await;
+                if let Some(txn) = txns.get_mut(transactional_id) {
+                    txn.state = TransactionState::PrepareAbort;
+                    txn.last_updated_ms = now_ms;
+                }
+                Ok(())
+            }
+            MetadataEventPayload::CommitTransaction { transactional_id, producer_id, .. } => {
+                self.observe_producer_id(*producer_id);
+                let now_ms = event.timestamp.timestamp_millis();
+                let mut txns = self.transactions.write().await;
+                if let Some(txn) = txns.get_mut(transactional_id) {
+                    txn.state = TransactionState::CompleteCommit;
+                    txn.partitions.clear();
+                    txn.groups.clear();
+                    txn.last_updated_ms = now_ms;
+                }
+                Ok(())
+            }
+            MetadataEventPayload::AbortTransaction { transactional_id, producer_id, .. } => {
+                self.observe_producer_id(*producer_id);
+                let now_ms = event.timestamp.timestamp_millis();
+                let mut txns = self.transactions.write().await;
+                if let Some(txn) = txns.get_mut(transactional_id) {
+                    txn.state = TransactionState::CompleteAbort;
+                    txn.partitions.clear();
+                    txn.groups.clear();
+                    txn.last_updated_ms = now_ms;
+                }
+                Ok(())
+            }
+            MetadataEventPayload::ProducerFenced {
+                transactional_id, new_producer_id, new_producer_epoch, ..
+            } => {
+                self.observe_producer_id(*new_producer_id);
+                let now_ms = event.timestamp.timestamp_millis();
+                let mut txns = self.transactions.write().await;
+                if let Some(txn) = txns.get_mut(transactional_id) {
+                    txn.producer_id = *new_producer_id;
+                    txn.producer_epoch = *new_producer_epoch;
+                    txn.last_updated_ms = now_ms;
+                }
+                Ok(())
+            }
+
             _ => {
                 // Other events not yet implemented
                 tracing::warn!("Unhandled metadata event: {:?}", event.payload);
@@ -403,7 +547,7 @@ impl WalMetadataStore {
     pub fn new(node_id: u64, wal_append: WalAppendFn) -> Self {
         Self {
             node_id,
-            state: Arc::new(MetadataState::new()),
+            state: Arc::new(MetadataState::new(node_id)),
             wal_append,
             event_bus_publish: None, // Set later via set_event_bus()
         }
@@ -1003,33 +1147,189 @@ impl MetadataStore for WalMetadataStore {
         Ok(())
     }
 
-    // Transaction methods - stub implementations for now
-    async fn begin_transaction(&self, _transactional_id: String, _producer_id: i64, _producer_epoch: i16, _timeout_ms: i32) -> Result<()> {
-        Ok(())
+    // ===== Transaction coordinator methods (EOS) =====
+    // Each writes an event-sourced coordinator state transition to the metadata WAL
+    // (durable + replicated), then applies it to in-memory state via write_and_apply.
+
+    async fn allocate_producer_id(&self) -> Result<i64> {
+        Ok(self.state.next_producer_id.fetch_add(1, Ordering::SeqCst))
     }
 
-    async fn add_partitions_to_transaction(&self, _transactional_id: String, _producer_id: i64, _producer_epoch: i16, _partitions: Vec<(String, u32)>) -> Result<()> {
-        Ok(())
+    async fn get_transaction(&self, transactional_id: &str) -> Result<Option<TransactionMetadata>> {
+        Ok(self.state.transactions.read().await.get(transactional_id).cloned())
     }
 
-    async fn add_offsets_to_transaction(&self, _transactional_id: String, _producer_id: i64, _producer_epoch: i16, _group_id: String) -> Result<()> {
-        Ok(())
+    async fn begin_transaction(&self, transactional_id: String, producer_id: i64, producer_epoch: i16, timeout_ms: i32) -> Result<()> {
+        let event = MetadataEvent::new(MetadataEventPayload::BeginTransaction {
+            transactional_id, producer_id, producer_epoch, transaction_timeout_ms: timeout_ms,
+        });
+        self.write_and_apply(event).await
     }
 
-    async fn prepare_commit_transaction(&self, _transactional_id: String, _producer_id: i64, _producer_epoch: i16) -> Result<()> {
-        Ok(())
+    async fn add_partitions_to_transaction(&self, transactional_id: String, producer_id: i64, producer_epoch: i16, partitions: Vec<(String, u32)>) -> Result<()> {
+        let partitions = partitions.into_iter()
+            .map(|(topic, partition)| TransactionPartition { topic, partition })
+            .collect();
+        let event = MetadataEvent::new(MetadataEventPayload::AddPartitionsToTransaction {
+            transactional_id, producer_id, producer_epoch, partitions,
+        });
+        self.write_and_apply(event).await
     }
 
-    async fn commit_transaction(&self, _transactional_id: String, _producer_id: i64, _producer_epoch: i16) -> Result<()> {
-        Ok(())
+    async fn add_offsets_to_transaction(&self, transactional_id: String, producer_id: i64, producer_epoch: i16, group_id: String) -> Result<()> {
+        let event = MetadataEvent::new(MetadataEventPayload::AddOffsetsToTransaction {
+            transactional_id, producer_id, producer_epoch, group_id,
+        });
+        self.write_and_apply(event).await
     }
 
-    async fn abort_transaction(&self, _transactional_id: String, _producer_id: i64, _producer_epoch: i16) -> Result<()> {
-        Ok(())
+    async fn prepare_commit_transaction(&self, transactional_id: String, producer_id: i64, producer_epoch: i16) -> Result<()> {
+        let event = MetadataEvent::new(MetadataEventPayload::PrepareCommit {
+            transactional_id, producer_id, producer_epoch,
+        });
+        self.write_and_apply(event).await
     }
 
-    async fn fence_producer(&self, _transactional_id: String, _old_producer_id: i64, _old_producer_epoch: i16, _new_producer_id: i64, _new_producer_epoch: i16) -> Result<()> {
-        Ok(())
+    async fn commit_transaction(&self, transactional_id: String, producer_id: i64, producer_epoch: i16) -> Result<()> {
+        // Record the partitions/groups that were part of the transaction in the event
+        // so the log is self-describing (used by control-marker writing).
+        let committed_partitions = self.state.transactions.read().await
+            .get(&transactional_id)
+            .map(|t| t.partitions.iter().map(|(topic, partition)| TransactionPartition { topic: topic.clone(), partition: *partition }).collect())
+            .unwrap_or_default();
+        let event = MetadataEvent::new(MetadataEventPayload::CommitTransaction {
+            transactional_id, producer_id, producer_epoch,
+            committed_partitions, committed_offsets: Vec::new(),
+        });
+        self.write_and_apply(event).await
+    }
+
+    async fn abort_transaction(&self, transactional_id: String, producer_id: i64, producer_epoch: i16) -> Result<()> {
+        let aborted_partitions = self.state.transactions.read().await
+            .get(&transactional_id)
+            .map(|t| t.partitions.iter().map(|(topic, partition)| TransactionPartition { topic: topic.clone(), partition: *partition }).collect())
+            .unwrap_or_default();
+        let event = MetadataEvent::new(MetadataEventPayload::AbortTransaction {
+            transactional_id, producer_id, producer_epoch, aborted_partitions,
+        });
+        self.write_and_apply(event).await
+    }
+
+    async fn fence_producer(&self, transactional_id: String, old_producer_id: i64, old_producer_epoch: i16, new_producer_id: i64, new_producer_epoch: i16) -> Result<()> {
+        let event = MetadataEvent::new(MetadataEventPayload::ProducerFenced {
+            transactional_id, old_producer_id, old_producer_epoch, new_producer_id, new_producer_epoch,
+        });
+        self.write_and_apply(event).await
+    }
+}
+
+#[cfg(test)]
+mod transaction_coordinator_tests {
+    use super::*;
+
+    fn noop_store(node_id: u64) -> WalMetadataStore {
+        // wal_append is a no-op sink: the coordinator state is exercised via the
+        // in-memory apply path, which is exactly what recovery replays.
+        let wal_append: WalAppendFn = Arc::new(|_bytes| Box::pin(async { Ok(0i64) }));
+        WalMetadataStore::new(node_id, wal_append)
+    }
+
+    #[tokio::test]
+    async fn producer_ids_are_monotonic_and_node_namespaced() {
+        let node0 = noop_store(0);
+        let a = node0.allocate_producer_id().await.unwrap();
+        let b = node0.allocate_producer_id().await.unwrap();
+        assert!(b > a, "producer ids must be monotonic");
+
+        // Different nodes hand out disjoint ranges (no coordination needed).
+        let node1 = noop_store(1);
+        let c = node1.allocate_producer_id().await.unwrap();
+        assert!(c > b + 1_000_000, "node 1's range must be far above node 0's early ids");
+    }
+
+    #[tokio::test]
+    async fn full_transaction_lifecycle_tracks_state_and_partitions() {
+        let store = noop_store(0);
+        let txn_id = "orders-tx".to_string();
+        let pid = store.allocate_producer_id().await.unwrap();
+
+        // InitProducerId registration: Empty, no partitions.
+        store.begin_transaction(txn_id.clone(), pid, 0, 60000).await.unwrap();
+        let t = store.get_transaction(&txn_id).await.unwrap().unwrap();
+        assert_eq!(t.state, TransactionState::Empty);
+        assert!(t.partitions.is_empty());
+
+        // First AddPartitionsToTxn starts the transaction (Ongoing) and enrolls partitions.
+        store.add_partitions_to_transaction(txn_id.clone(), pid, 0, vec![("orders".into(), 0), ("orders".into(), 1)]).await.unwrap();
+        let t = store.get_transaction(&txn_id).await.unwrap().unwrap();
+        assert_eq!(t.state, TransactionState::Ongoing);
+        assert_eq!(t.partitions.len(), 2);
+        assert!(t.partitions.contains(&("orders".to_string(), 1)));
+
+        // Commit: PrepareCommit -> CommitTransaction clears enrollment, state CompleteCommit.
+        store.prepare_commit_transaction(txn_id.clone(), pid, 0).await.unwrap();
+        assert_eq!(store.get_transaction(&txn_id).await.unwrap().unwrap().state, TransactionState::PrepareCommit);
+        store.commit_transaction(txn_id.clone(), pid, 0).await.unwrap();
+        let t = store.get_transaction(&txn_id).await.unwrap().unwrap();
+        assert_eq!(t.state, TransactionState::CompleteCommit);
+        assert!(t.partitions.is_empty(), "enrollment cleared after commit");
+    }
+
+    #[tokio::test]
+    async fn abort_marks_complete_abort_and_clears_partitions() {
+        let store = noop_store(0);
+        let txn_id = "t".to_string();
+        let pid = store.allocate_producer_id().await.unwrap();
+        store.begin_transaction(txn_id.clone(), pid, 0, 60000).await.unwrap();
+        store.add_partitions_to_transaction(txn_id.clone(), pid, 0, vec![("t".into(), 0)]).await.unwrap();
+        store.abort_transaction(txn_id.clone(), pid, 0).await.unwrap();
+        let t = store.get_transaction(&txn_id).await.unwrap().unwrap();
+        assert_eq!(t.state, TransactionState::CompleteAbort);
+        assert!(t.partitions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn recovery_replays_events_into_identical_state() {
+        // Simulate a producer session, capturing the events, then replay them into a
+        // fresh store (as recovery does) and assert the coordinator state matches.
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::<MetadataEvent>::new()));
+        let cap = events.clone();
+        let wal_append: WalAppendFn = Arc::new(move |bytes| {
+            let cap = cap.clone();
+            Box::pin(async move {
+                if let Ok(ev) = MetadataEvent::from_bytes(&bytes) {
+                    cap.lock().unwrap().push(ev);
+                }
+                Ok(0i64)
+            })
+        });
+        let store = WalMetadataStore::new(0, wal_append);
+        let pid = store.allocate_producer_id().await.unwrap();
+        store.begin_transaction("tx".into(), pid, 0, 60000).await.unwrap();
+        store.add_partitions_to_transaction("tx".into(), pid, 0, vec![("t".into(), 3)]).await.unwrap();
+
+        // Replay captured events into a fresh store.
+        let fresh = noop_store(0);
+        for ev in events.lock().unwrap().iter() {
+            fresh.state.apply_event(ev).await.unwrap();
+        }
+        let t = fresh.get_transaction("tx").await.unwrap().unwrap();
+        assert_eq!(t.state, TransactionState::Ongoing);
+        assert_eq!(t.producer_id, pid);
+        assert!(t.partitions.contains(&("t".to_string(), 3)));
+        // Recovery must advance the allocator past the recovered producer id.
+        assert!(fresh.allocate_producer_id().await.unwrap() > pid);
+    }
+
+    #[tokio::test]
+    async fn is_fenced_detects_stale_producer() {
+        let store = noop_store(0);
+        let pid = store.allocate_producer_id().await.unwrap();
+        store.begin_transaction("tx".into(), pid, 5, 60000).await.unwrap();
+        let t = store.get_transaction("tx").await.unwrap().unwrap();
+        assert!(t.is_fenced(pid, 4), "lower epoch is fenced");
+        assert!(t.is_fenced(pid + 1, 5), "different producer id is fenced");
+        assert!(!t.is_fenced(pid, 5), "current producer/epoch is not fenced");
     }
 }
 

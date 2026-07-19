@@ -3747,33 +3747,68 @@ impl ProtocolHandler {
             request.transaction_timeout_ms
         );
 
-        // Generate a simple producer ID (in production, this would need proper coordination)
-        static PRODUCER_ID_COUNTER: AtomicI64 = AtomicI64::new(1000);
-        let producer_id = PRODUCER_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let producer_epoch = 0;
+        // Process-local fallback used only when there is no metadata store wired
+        // (e.g. bare-protocol tests). Real deployments always have one.
+        static FALLBACK_PRODUCER_ID: AtomicI64 = AtomicI64::new(1);
 
-        // If transactional_id is provided, begin a transaction with WAL persistence
-        let error_code = if let Some(transactional_id) = &request.transactional_id {
-            if let Some(ref metadata_store) = self.metadata_store {
-                // Begin the transaction
-                if let Err(e) = metadata_store.begin_transaction(
-                    transactional_id.clone(),
-                    producer_id,
-                    producer_epoch,
-                    request.transaction_timeout_ms,
-                ).await {
-                    tracing::warn!("Failed to begin transaction: {}", e);
-                    error_codes::COORDINATOR_NOT_AVAILABLE
-                } else {
-                    tracing::info!("Transaction started: {}, producer_id: {}, epoch: {}",
-                        transactional_id, producer_id, producer_epoch);
-                    error_codes::NONE
+        // Allocate a DURABLE producer id and, for transactional producers, register
+        // the producer with the coordinator (bumping the epoch to fence any zombie
+        // from a previous session — see TransactionMetadata::is_fenced).
+        let (producer_id, producer_epoch, error_code) = match (&request.transactional_id, &self.metadata_store) {
+            (Some(transactional_id), Some(metadata_store)) => {
+                match metadata_store.get_transaction(transactional_id).await {
+                    Ok(Some(existing)) => {
+                        // Returning producer for this transactional.id: keep its
+                        // producer id, bump the epoch to fence zombies, and re-register
+                        // (state resets to Empty; the first send re-enrolls partitions).
+                        let new_epoch = existing.producer_epoch.wrapping_add(1);
+                        match metadata_store.begin_transaction(
+                            transactional_id.clone(), existing.producer_id, new_epoch, request.transaction_timeout_ms,
+                        ).await {
+                            Ok(()) => {
+                                tracing::info!("Re-init transactional producer '{}': producer_id={}, epoch {}->{}",
+                                    transactional_id, existing.producer_id, existing.producer_epoch, new_epoch);
+                                (existing.producer_id, new_epoch, error_codes::NONE)
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to re-register transactional producer: {}", e);
+                                (existing.producer_id, existing.producer_epoch, error_codes::COORDINATOR_NOT_AVAILABLE)
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        // First time we see this transactional.id: allocate a durable
+                        // producer id and register it at epoch 0.
+                        let pid = metadata_store.allocate_producer_id().await.unwrap_or(-1);
+                        match metadata_store.begin_transaction(
+                            transactional_id.clone(), pid, 0, request.transaction_timeout_ms,
+                        ).await {
+                            Ok(()) => {
+                                tracing::info!("Registered new transactional producer '{}': producer_id={}, epoch=0",
+                                    transactional_id, pid);
+                                (pid, 0, error_codes::NONE)
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to register transactional producer: {}", e);
+                                (pid, 0, error_codes::COORDINATOR_NOT_AVAILABLE)
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to look up transaction state: {}", e);
+                        (FALLBACK_PRODUCER_ID.fetch_add(1, Ordering::SeqCst), 0, error_codes::COORDINATOR_NOT_AVAILABLE)
+                    }
                 }
-            } else {
-                error_codes::NONE // No WAL, but allow non-transactional usage
             }
-        } else {
-            error_codes::NONE
+            (None, Some(metadata_store)) => {
+                // Idempotent (non-transactional) producer: durable id, epoch 0.
+                let pid = metadata_store.allocate_producer_id().await.unwrap_or_else(|_| FALLBACK_PRODUCER_ID.fetch_add(1, Ordering::SeqCst));
+                (pid, 0, error_codes::NONE)
+            }
+            (_, None) => {
+                // No coordinator available: fall back to a process-local id.
+                (FALLBACK_PRODUCER_ID.fetch_add(1, Ordering::SeqCst), 0, error_codes::NONE)
+            }
         };
 
         let response = InitProducerIdResponse {

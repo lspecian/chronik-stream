@@ -9,6 +9,7 @@ pub mod index;
 pub mod object_store;
 pub mod record_batch;
 pub mod kafka_records;
+pub mod control_batch;
 pub mod segment;
 pub mod segment_writer;
 pub mod segment_reader;

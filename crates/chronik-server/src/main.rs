@@ -17,6 +17,7 @@ mod integrated_server;
 mod error_handler;
 mod kafka_handler;
 mod produce_handler;
+mod transaction_index;     // EOS layer 6: per-partition LSO + aborted-txn tracking for read_committed
 mod watermark_flusher;     // v2.7.1: debounced metadata watermark flusher — fixes acks=1 stall under concurrent load
 mod hot_vector_adapter;  // HP-2.6: bridge HotVectorIndex → ColdFlushListener
 mod pipelined_connection;  // v2.2.9: Async request pipelining for leader forwarding

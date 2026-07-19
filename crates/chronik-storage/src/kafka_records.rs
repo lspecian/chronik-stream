@@ -211,27 +211,22 @@ impl KafkaRecordBatch {
         let batch_length = (buf.len() - batch_length_pos - 4) as i32;
         buf[batch_length_pos..batch_length_pos + 4].copy_from_slice(&batch_length.to_be_bytes());
         
-        // Calculate and write CRC
-        // CRITICAL FIX v1.3.31: Zero out CRC field before calculation
-        buf[crc_pos..crc_pos + 4].copy_from_slice(&[0, 0, 0, 0]);
-
-        // Calculate CRC over EVERYTHING from partition_leader_epoch onwards (including zeroed CRC)
-        // Kafka CRC-32C calculation must include: partition_leader_epoch, magic, CRC (zeroed), attributes, and all remaining fields
-        let crc_data = &buf[crc_start..];
+        // Calculate and write CRC.
+        // Kafka's CRC-32C covers the bytes from ATTRIBUTES (the field immediately
+        // after the CRC) to the end of the batch — NOT partition_leader_epoch, magic,
+        // or the CRC field itself. `crc_pos + 4` is exactly ATTRIBUTES_OFFSET (21).
+        // The previous range (from partition_leader_epoch, offset 12) was self-
+        // consistent with this crate's decoder but non-spec, so any batch this
+        // encoder CREATES (e.g. transaction control markers) was rejected as
+        // corrupt by real Kafka clients that compute CRC from offset 21. Producer
+        // batches are served verbatim (their own CRC), so this only surfaced once
+        // Chronik began emitting its own batches.
+        let attributes_offset = crc_pos + 4;
+        let crc_data = &buf[attributes_offset..];
         let crc = calculate_crc32(crc_data);
 
-        // DEBUG: Log CRC calculation details
-        eprintln!("KAFKA_BATCH→CRC: base_offset={}, records_count={}, crc_data_len={}, calculated_crc={:#010x}",
-            self.header.base_offset, self.header.records_count, crc_data.len(), crc);
-        if crc_data.len() <= 200 {
-            eprintln!("KAFKA_BATCH→CRC: crc_data hex: {}", hex::encode(crc_data));
-        } else {
-            eprintln!("KAFKA_BATCH→CRC: crc_data hex (first 100 bytes): {}", hex::encode(&crc_data[..100]));
-            eprintln!("KAFKA_BATCH→CRC: crc_data hex (last 100 bytes): {}", hex::encode(&crc_data[crc_data.len()-100..]));
-        }
-
-        // Write CRC as LITTLE-ENDIAN (Kafka protocol requirement)
-        buf[crc_pos..crc_pos + 4].copy_from_slice(&crc.to_le_bytes());
+        // Write CRC as BIG-ENDIAN (Kafka protocol requirement — Java ByteBuffer.putInt)
+        buf[crc_pos..crc_pos + 4].copy_from_slice(&crc.to_be_bytes());
         
         Ok(buf.freeze())
     }
