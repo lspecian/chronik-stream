@@ -748,6 +748,53 @@ impl WalIndexer {
             return Ok(stats);
         }
 
+        // Orphan reclamation: drop segments whose topic no longer exists in
+        // metadata. DeleteTopics removes the topic from metadata and (v2.7.4+)
+        // its WAL dir, but WAL recovery on restart re-registers any on-disk
+        // segments that predate the fix — so the indexer would grind deleted
+        // topics forever (this is what clogged the cluster after the
+        // LongMemEval eval churned ~9K tenants). When we see an orphaned topic,
+        // cleanup_topic() removes its whole WAL dir from disk (freeing storage)
+        // and we skip its segments. Per-topic existence is cached for the run.
+        {
+            let mut checked: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+            let mut orphan_topics: HashSet<String> = HashSet::new();
+            for segment_id in &segments_to_index {
+                let topic = segment_id.split(':').next().unwrap_or("").to_string();
+                if topic.is_empty() {
+                    continue;
+                }
+                let exists = match checked.get(&topic) {
+                    Some(&e) => e,
+                    None => {
+                        let e = metadata_store
+                            .get_topic(&topic)
+                            .await
+                            .ok()
+                            .flatten()
+                            .is_some();
+                        checked.insert(topic.clone(), e);
+                        e
+                    }
+                };
+                if !exists {
+                    orphan_topics.insert(topic);
+                }
+            }
+            if !orphan_topics.is_empty() {
+                for t in &orphan_topics {
+                    warn!(topic = %t, "WalIndexer: topic absent from metadata (orphaned) — reclaiming WAL storage");
+                    wal_manager.cleanup_topic(t).await;
+                }
+                segments_to_index
+                    .retain(|s| !orphan_topics.contains(s.split(':').next().unwrap_or("")));
+            }
+        }
+        if segments_to_index.is_empty() {
+            debug!("All pending segments were orphaned (topics deleted) — reclaimed, nothing to index");
+            return Ok(stats);
+        }
+
         // Mark segments as being indexed
         {
             let mut in_progress = indexing_in_progress.write().await;

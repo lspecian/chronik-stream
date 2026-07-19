@@ -713,7 +713,17 @@ pub fn supported_api_versions() -> HashMap<ApiKey, VersionRange> {
     versions.insert(ApiKey::SaslHandshake, VersionRange { min: 0, max: 1 });
     versions.insert(ApiKey::ApiVersions, VersionRange { min: 0, max: 4 });
     versions.insert(ApiKey::CreateTopics, VersionRange { min: 0, max: 7 });
-    versions.insert(ApiKey::DeleteTopics, VersionRange { min: 0, max: 6 });
+    // DeleteTopics v4+ is a FLEXIBLE version (compact arrays/strings, tagged
+    // fields, and v6 topic-id UUIDs), but `delete_topics_types.rs` only
+    // implements the NON-flexible v0-v3 wire format. Advertising max=6 made
+    // clients negotiate to v6, whose response Chronik mis-encoded → the Java
+    // AdminClient hit "Buffer underflow ... apiKey=DELETE_TOPICS, apiVersion=6"
+    // and the delete silently no-op'd (bug found 2026-07-11, blocked eval
+    // tenant cleanup). Cap to the last version the encoder/decoder handle
+    // correctly. v3 supports name-based deletion (all Chronik does — no topic
+    // IDs) and every client negotiates down to it cleanly. Raise this only
+    // after adding real flexible v4-6 encoding (mirror CreateTopics).
+    versions.insert(ApiKey::DeleteTopics, VersionRange { min: 0, max: 3 });
     versions.insert(ApiKey::DescribeConfigs, VersionRange { min: 0, max: 4 });
     versions.insert(ApiKey::AlterConfigs, VersionRange { min: 0, max: 2 });
     
