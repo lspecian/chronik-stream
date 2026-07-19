@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.8.0] - 2026-07-19
+
+Correctness and honesty pass across the Kafka protocol surface, plus a large dead-code
+removal. Every behavioural change is verified end-to-end with the real Java AdminClient
+(kafka-clients 3.7.0) on both a single node and a 3-node cluster.
+
+### Fixed
+- **Response header flexibility (3 real client crashes).** `make_response` sent a
+  *flexible* response header (extra tagged-fields byte) for APIs whose negotiated
+  version is *non-flexible*, shifting the whole response body by one byte. Surfaced
+  and fixed for **DeleteTopics v0–v3**, **the ACL APIs v0–v1**, and
+  **IncrementalAlterConfigs v0**. Before the fix a strict Java AdminClient crashed
+  (`reading byte array of 13824 bytes, only 56 available`), threw
+  `NullPointerException`, or reported "controller response did not contain a result"
+  even though the broker had applied the change.
+- **DeleteTopics** now actually deletes via modern clients (v6 was malformed; advertised
+  max capped to v3) and **reclaims on-disk WAL storage** for the deleted topic, with an
+  orphan-GC safety net in the WAL indexer.
+- **Consumer close no longer throws `CorrelationIdMismatch`** — responses are written to
+  the socket in request order (per-connection ordered writer), not handler-completion
+  order.
+- **Batched CreateTopics initializes Raft partition metadata for *all* topics** in
+  cluster mode, not just the first (verified: every topic in a multi-topic request gets
+  leaders/replicas/ISRs across all nodes).
+
+### Changed
+- **ACLs report `SECURITY_DISABLED`** instead of faking success. There is no authorizer,
+  so `CreateAcls`/`DescribeAcls`/`DeleteAcls` return error 54 (matching Kafka with no
+  authorizer configured) rather than silently pretending ACLs are enforced.
+- **AlterConfigs rejects broker/cluster config changes** with `INVALID_CONFIG` instead of
+  accepting-then-dropping them. Topic config alteration is unchanged.
+- Corrected two wrong central error-code constants (`SECURITY_DISABLED` 62→54,
+  `TRANSACTIONAL_ID_AUTHORIZATION_FAILED` 61→53) to match the Kafka spec.
+
+### Added
+- **Schema Registry: real Avro compatibility checking.** BACKWARD/FORWARD/FULL (and their
+  transitive variants) are now enforced at the record-field level (was a silent no-op that
+  always returned "compatible"). JSON Schema / Protobuf are accepted with an explicit
+  warning that the level is not enforced for those formats. Verified via HTTP: an
+  incompatible evolution returns 409, a compatible one 200.
+- **EOS foundation (transaction coordinator, layer 1):** durable node-namespaced
+  producer-id allocation and event-sourced transaction coordinator state (lifecycle +
+  enrolled partitions, recovered on restart) replacing the previous process-local counter
+  and no-op coordinator. InitProducerId now bumps the producer epoch to fence zombies.
+  (Control markers and `read_committed` filtering are subsequent layers.)
+
+### Removed
+- **Dead legacy RealtimeIndexer subsystem (~2,000 LOC).** It was write-only — nothing read
+  its output — and held a per-topic Tantivy writer forever (an OOM source). Search is
+  served by the in-memory hot text index (NRT) plus the WalIndexer's cold indexes; both
+  are unaffected.
+
+### Docs
+- Removed the nonexistent `chronik-auth` crate from the project-structure listings, and
+  corrected false-"complete" roadmap claims (ACL enforcement is data-model-only; operator
+  leader-aware rolling updates are not implemented).
+
 ## [2.6.0] - 2026-07-02
 
 ### Added
