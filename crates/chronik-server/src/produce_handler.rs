@@ -424,6 +424,8 @@ pub struct ProduceHandler {
     config: ProduceHandlerConfig,
     storage: Arc<dyn ObjectStore>,
     metadata_store: Arc<dyn MetadataStore>,
+    /// EOS layer 6: per-partition transaction index (LSO + aborted list for read_committed).
+    transaction_index: Arc<crate::transaction_index::TransactionIndex>,
     // PERFORMANCE (v2.2.7 - P2): Use DashMap instead of RwLock<HashMap> for lock-free partition access
     // This eliminates lock contention with 128 concurrent producers (10-15% throughput gain)
     pub(crate) partition_states: Arc<DashMap<(String, i32), Arc<PartitionState>>>,
@@ -1093,6 +1095,7 @@ impl ProduceHandler {
             config,
             storage,
             metadata_store,
+            transaction_index: Arc::new(crate::transaction_index::TransactionIndex::new()),
             partition_states: Arc::new(DashMap::new()),  // PERFORMANCE (v2.2.7 - P2): Lock-free concurrent hashmap
             producer_info: Arc::new(RwLock::new(HashMap::new())),
             metrics: Arc::new(ProduceMetrics::default()),
@@ -2123,6 +2126,17 @@ impl ProduceHandler {
                 partition,
                 transactional_id,
             ).await?;
+        }
+
+        // EOS layer 6: a transactional (non-control) data batch opens a transaction on
+        // this partition. Record its first offset so read_committed fetches can compute
+        // the Last Stable Offset and the aborted-transactions list. Idempotent — only
+        // the first batch of the transaction sets the first offset.
+        let batch_is_transactional = (kafka_batch.header.attributes & 0x10) != 0;
+        if batch_is_transactional && !is_control_batch && kafka_batch.header.producer_id >= 0 {
+            self.transaction_index.on_transactional_produce(
+                topic, partition, kafka_batch.header.producer_id, base_offset as i64,
+            );
         }
         
         // partition_state and base_offset already loaded above (before re-encoding)
@@ -3663,6 +3677,13 @@ impl ProduceHandler {
         Ok(())
     }
     
+    /// Shared per-partition transaction index (EOS layer 6). Used by the EndTxn
+    /// handler to resolve transactions and by the fetch path to compute the LSO
+    /// and aborted-transactions list for read_committed.
+    pub fn transaction_index(&self) -> &Arc<crate::transaction_index::TransactionIndex> {
+        &self.transaction_index
+    }
+
     /// Get the high watermark for a partition (includes in-memory messages)
     pub async fn get_partition_high_watermark(&self, topic: &str, partition: i32) -> i64 {
         if let Some(state) = self.partition_states.get(&(topic.to_string(), partition)) {
@@ -3685,6 +3706,7 @@ impl Clone for ProduceHandler {
             config: self.config.clone(),
             storage: Arc::clone(&self.storage),
             metadata_store: Arc::clone(&self.metadata_store),
+            transaction_index: Arc::clone(&self.transaction_index),
             partition_states: Arc::clone(&self.partition_states),
             producer_info: Arc::clone(&self.producer_info),
             metrics: Arc::clone(&self.metrics),

@@ -474,6 +474,17 @@ impl KafkaProtocolHandler {
                         }
                     }
 
+                    // EOS layer 6: resolve the transaction in the per-partition index so
+                    // read_committed fetches compute the correct LSO and aborted list.
+                    let tx_index = self.produce_handler.transaction_index();
+                    for (topic, partition) in &txn.partitions {
+                        if request.committed {
+                            tx_index.on_commit(topic, *partition as i32, request.producer_id);
+                        } else {
+                            tx_index.on_abort(topic, *partition as i32, request.producer_id);
+                        }
+                    }
+
                     // Finalize coordinator state (clears enrollment).
                     let fin = if request.committed {
                         self.metadata_store.commit_transaction(

@@ -220,7 +220,7 @@ impl FetchHandler {
             let mut response_partitions = Vec::new();
             
             for partition_request in topic_request.partitions {
-                let partition_response = self.fetch_partition(
+                let mut partition_response = self.fetch_partition(
                     &topic_request.name,
                     partition_request.partition,
                     partition_request.fetch_offset,
@@ -228,7 +228,30 @@ impl FetchHandler {
                     request.max_wait_ms,
                     request.min_bytes,
                 ).await?;
-                
+
+                // EOS layer 6: for read_committed (isolation_level == 1) report the real
+                // Last Stable Offset and the aborted-transactions list from the per-
+                // partition transaction index. The consumer uses the LSO as its read
+                // boundary and the aborted list (with the ABORT control markers in the
+                // log) to drop aborted records. read_uncommitted (0) is left untouched.
+                if request.isolation_level == 1 {
+                    if let Some(ref ph) = self.produce_handler {
+                        let idx = ph.transaction_index();
+                        let hwm = partition_response.high_watermark;
+                        partition_response.last_stable_offset =
+                            idx.last_stable_offset(&topic_request.name, partition_response.partition, hwm);
+                        let aborted: Vec<chronik_protocol::AbortedTransaction> =
+                            idx.aborted_below(&topic_request.name, partition_response.partition, hwm)
+                                .into_iter()
+                                .map(|a| chronik_protocol::AbortedTransaction {
+                                    producer_id: a.producer_id,
+                                    first_offset: a.first_offset,
+                                })
+                                .collect();
+                        partition_response.aborted = Some(aborted);
+                    }
+                }
+
                 response_partitions.push(partition_response);
             }
             
