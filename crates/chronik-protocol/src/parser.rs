@@ -742,9 +742,15 @@ pub fn supported_api_versions() -> HashMap<ApiKey, VersionRange> {
     versions.insert(ApiKey::TxnOffsetCommit, VersionRange { min: 0, max: 3 });  // v0-v3 supported
     
     // ACL APIs (v0-v3 supported, flexible encoding from v2+)
-    versions.insert(ApiKey::DescribeAcls, VersionRange { min: 0, max: 3 });
-    versions.insert(ApiKey::CreateAcls, VersionRange { min: 0, max: 3 });
-    versions.insert(ApiKey::DeleteAcls, VersionRange { min: 0, max: 3 });
+    // ACL APIs: the response encoders only emit the non-flexible v0-v1 wire
+    // format. Flexible encoding starts at v2, so advertising v2+ would produce
+    // malformed responses (buffer underflow), the same class of bug DeleteTopics
+    // had at v6. Cap to v1 until flexible encoders exist. ACLs are not enforced
+    // (no authorizer) — the handlers return SECURITY_DISABLED, which requires a
+    // well-formed response to reach the client cleanly.
+    versions.insert(ApiKey::DescribeAcls, VersionRange { min: 0, max: 1 });
+    versions.insert(ApiKey::CreateAcls, VersionRange { min: 0, max: 1 });
+    versions.insert(ApiKey::DeleteAcls, VersionRange { min: 0, max: 1 });
     
     // Additional APIs (NOT IMPLEMENTED - placeholder for librdkafka compatibility)
     // DeleteRecords: implemented v0-v1 (non-flexible; v2 adds flexible encoding).
@@ -814,7 +820,28 @@ pub trait KafkaEncodable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
+    #[test]
+    fn acl_apis_capped_to_non_flexible_versions() {
+        // The ACL response encoders only emit the non-flexible v0-v1 wire format;
+        // flexible encoding starts at v2. Advertising v2+ would produce malformed
+        // responses (the DeleteTopics-v6 class of bug). Guard the cap at v1.
+        let versions = supported_api_versions();
+        for api in [ApiKey::DescribeAcls, ApiKey::CreateAcls, ApiKey::DeleteAcls] {
+            let range = versions.get(&api).expect("ACL api advertised");
+            assert_eq!(range.max, 1, "{:?} must be capped to v1 (non-flexible encoder)", api);
+        }
+    }
+
+    #[test]
+    fn security_and_txn_error_codes_match_kafka_spec() {
+        // These central constants were wrong (62 / 61); Kafka's canonical wire
+        // values are 54 / 53. A wrong code makes a client read SECURITY_DISABLED
+        // as DELEGATION_TOKEN_NOT_FOUND. Guard the corrected values.
+        assert_eq!(crate::error_codes::SECURITY_DISABLED, 54);
+        assert_eq!(crate::error_codes::TRANSACTIONAL_ID_AUTHORIZATION_FAILED, 53);
+    }
+
     #[test]
     fn test_varint_encoding() {
         let mut buf = BytesMut::new();

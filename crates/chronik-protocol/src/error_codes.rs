@@ -121,10 +121,10 @@ pub const LOG_DIR_NOT_FOUND: i16 = 57;
 pub const SASL_AUTHENTICATION_FAILED: i16 = 58;
 
 /// The producer's transactional id authorization failed
-pub const TRANSACTIONAL_ID_AUTHORIZATION_FAILED: i16 = 61;
+pub const TRANSACTIONAL_ID_AUTHORIZATION_FAILED: i16 = 53;
 
 /// Security features are disabled
-pub const SECURITY_DISABLED: i16 = 62;
+pub const SECURITY_DISABLED: i16 = 54;
 
 /// The broker epoch has changed
 pub const BROKER_ID_NOT_REGISTERED: i16 = 68;
