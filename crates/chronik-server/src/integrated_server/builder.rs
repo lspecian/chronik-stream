@@ -1030,6 +1030,11 @@ impl IntegratedKafkaServerBuilder {
         let recovered_partitions = wal_manager.get_partitions();
         if !recovered_partitions.is_empty() {
             Self::recover_partitions_from_wal(produce_handler_base, wal_manager, &recovered_partitions).await;
+            // Rebuild the read_committed transaction index from the WAL tail so an
+            // open (produced-but-not-committed) transaction that was interrupted by a
+            // crash keeps its records below the Last Stable Offset — i.e. invisible to
+            // read_committed — instead of leaking as if committed. Bounded + best-effort.
+            Self::rebuild_transaction_index_from_wal(produce_handler_base, wal_manager, &recovered_partitions).await;
         } else {
             // WAL is empty - restore from metadata store instead
             Self::recover_partitions_from_metadata(produce_handler_base, metadata_store).await;
@@ -1089,6 +1094,103 @@ impl IntegratedKafkaServerBuilder {
             }
         }
         info!("WAL replay complete");
+    }
+
+    /// Rebuild the per-partition `read_committed` transaction index by replaying the
+    /// tail of each partition's WAL.
+    ///
+    /// The transaction index (open transactions → LSO cap, aborted transactions →
+    /// aborted list) is in-memory, so a crash would otherwise reset it to "nothing
+    /// open" and a transaction that was produced-but-never-committed before the crash
+    /// would leak to `read_committed` consumers as if committed. Replaying the WAL
+    /// reconstructs the state deterministically from the log: a transactional data
+    /// batch opens a transaction (records its first offset), a COMMIT marker closes
+    /// it, an ABORT marker closes and records it. What remains open after replay caps
+    /// the LSO exactly as Kafka does.
+    ///
+    /// Bounded: only the trailing `CHRONIK_TXN_INDEX_REBUILD_WINDOW` offsets (default
+    /// 1,000,000) per partition are scanned. Realistic open transactions live at the
+    /// very tail, so this recovers them while keeping startup cost proportional. A
+    /// transaction left open for longer than the window is not reconstructed (a full
+    /// coordinator would have timed it out and written an ABORT); this is a
+    /// best-effort safety net, not a substitute for transaction-timeout recovery.
+    async fn rebuild_transaction_index_from_wal(
+        produce_handler: &Arc<crate::produce_handler::ProduceHandler>,
+        wal_manager: &Arc<WalManager>,
+        partitions: &[chronik_wal::manager::TopicPartition],
+    ) {
+        use chronik_wal::record::WalRecord;
+        use chronik_storage::CanonicalRecord;
+
+        let window: usize = std::env::var("CHRONIK_TXN_INDEX_REBUILD_WINDOW")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(1_000_000);
+
+        let txn_index = produce_handler.transaction_index();
+        let mut open_total = 0usize;
+        let mut aborted_total = 0usize;
+
+        for tp in partitions {
+            let max_offset = match wal_manager.get_max_offset_for_partition(&tp.topic, tp.partition).await {
+                Ok(Some(m)) if m >= 0 => m,
+                _ => continue,
+            };
+            let start_offset = (max_offset + 1).saturating_sub(window as i64).max(0);
+            let records = match wal_manager.read_from(&tp.topic, tp.partition, start_offset, window).await {
+                Ok(r) => r,
+                Err(e) => {
+                    debug!(topic = %tp.topic, partition = tp.partition,
+                           "txn-index rebuild: read_from failed: {}", e);
+                    continue;
+                }
+            };
+
+            for wal_record in &records {
+                let WalRecord::V2 { canonical_data, .. } = wal_record else { continue };
+                let canonical: CanonicalRecord = match bincode::deserialize(canonical_data) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                if canonical.producer_id < 0 {
+                    continue;
+                }
+                if canonical.is_control {
+                    // Control batch: the single control record's key encodes the
+                    // marker type (i16 version, i16 type: 0 = ABORT, 1 = COMMIT).
+                    let marker_type = canonical.records.first()
+                        .and_then(|r| r.key.as_ref())
+                        .filter(|k| k.len() >= 4)
+                        .map(|k| i16::from_be_bytes([k[2], k[3]]));
+                    match marker_type {
+                        Some(1) => txn_index.on_commit(&tp.topic, tp.partition, canonical.producer_id),
+                        Some(0) => txn_index.on_abort(&tp.topic, tp.partition, canonical.producer_id),
+                        _ => {}
+                    }
+                } else if canonical.is_transactional {
+                    txn_index.on_transactional_produce(
+                        &tp.topic, tp.partition, canonical.producer_id, canonical.base_offset,
+                    );
+                }
+            }
+
+            let hwm = (max_offset + 1) as i64;
+            let lso = txn_index.last_stable_offset(&tp.topic, tp.partition, hwm);
+            if lso < hwm {
+                open_total += 1;
+                info!("txn-index rebuild: {}-{} has open transaction(s), LSO={} (HWM={})",
+                      tp.topic, tp.partition, lso, hwm);
+            }
+            aborted_total += txn_index.aborted_below(&tp.topic, tp.partition, hwm).len();
+        }
+
+        if open_total > 0 || aborted_total > 0 {
+            info!("Transaction index rebuilt from WAL: {} partition(s) with open transactions, {} aborted transaction(s) recorded",
+                  open_total, aborted_total);
+        } else {
+            debug!("Transaction index rebuild: no open/aborted transactions found in WAL tail");
+        }
     }
 
     /// Helper: Recover partitions from metadata store (fallback when WAL is empty)

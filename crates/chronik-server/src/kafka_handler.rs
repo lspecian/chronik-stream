@@ -474,16 +474,14 @@ impl KafkaProtocolHandler {
                         }
                     }
 
-                    // EOS layer 6: resolve the transaction in the per-partition index so
-                    // read_committed fetches compute the correct LSO and aborted list.
-                    let tx_index = self.produce_handler.transaction_index();
-                    for (topic, partition) in &txn.partitions {
-                        if request.committed {
-                            tx_index.on_commit(topic, *partition as i32, request.producer_id);
-                        } else {
-                            tx_index.on_abort(topic, *partition as i32, request.producer_id);
-                        }
-                    }
+                    // EOS layer 6: the per-partition transaction index is NOT updated
+                    // here. It is driven by the control markers written above as they
+                    // land in each partition's LEADER log (produce_handler::apply_log_batch)
+                    // and on followers via replication apply. In a cluster the coordinator
+                    // (this node) is frequently NOT the partition leader, so updating the
+                    // index from this RPC handler would touch the wrong node's index and
+                    // leave the leader's LSO stuck / aborts leaked. Log-derived updates are
+                    // correct on whichever node serves read_committed for the partition.
 
                     // Finalize coordinator state (clears enrollment).
                     let fin = if request.committed {

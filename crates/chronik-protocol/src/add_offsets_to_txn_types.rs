@@ -18,13 +18,34 @@ pub struct AddOffsetsToTxnRequest {
 }
 
 impl KafkaDecodable for AddOffsetsToTxnRequest {
-    fn decode(decoder: &mut Decoder, _version: i16) -> Result<Self> {
-        let transactional_id = decoder.read_string()?
-            .ok_or_else(|| Error::Protocol("Transactional ID cannot be null".into()))?;
+    fn decode(decoder: &mut Decoder, version: i16) -> Result<Self> {
+        // AddOffsetsToTxn is flexible from v3: strings are compact and the body
+        // carries trailing tagged fields. Using non-compact reads on a v3 request
+        // mis-parses every field (the Java client always sends v3), so the decode
+        // must switch on the version.
+        let flexible = version >= 3;
+        let transactional_id = if flexible {
+            decoder.read_compact_string()?
+        } else {
+            decoder.read_string()?
+        }.ok_or_else(|| Error::Protocol("Transactional ID cannot be null".into()))?;
         let producer_id = decoder.read_i64()?;
         let producer_epoch = decoder.read_i16()?;
-        let consumer_group_id = decoder.read_string()?
-            .ok_or_else(|| Error::Protocol("Consumer group ID cannot be null".into()))?;
+        let consumer_group_id = if flexible {
+            decoder.read_compact_string()?
+        } else {
+            decoder.read_string()?
+        }.ok_or_else(|| Error::Protocol("Consumer group ID cannot be null".into()))?;
+        if flexible {
+            // Consume the request-body tagged fields (none expected, but the bytes
+            // are present and must be drained so the buffer is fully consumed).
+            let n = decoder.read_unsigned_varint()?;
+            for _ in 0..n {
+                let _tag = decoder.read_unsigned_varint()?;
+                let size = decoder.read_unsigned_varint()? as usize;
+                decoder.advance(size)?;
+            }
+        }
 
         Ok(AddOffsetsToTxnRequest {
             transactional_id,
@@ -36,11 +57,21 @@ impl KafkaDecodable for AddOffsetsToTxnRequest {
 }
 
 impl KafkaEncodable for AddOffsetsToTxnRequest {
-    fn encode(&self, encoder: &mut Encoder, _version: i16) -> Result<()> {
-        encoder.write_string(Some(&self.transactional_id));
+    fn encode(&self, encoder: &mut Encoder, version: i16) -> Result<()> {
+        let flexible = version >= 3;
+        if flexible {
+            encoder.write_compact_string(Some(&self.transactional_id));
+        } else {
+            encoder.write_string(Some(&self.transactional_id));
+        }
         encoder.write_i64(self.producer_id);
         encoder.write_i16(self.producer_epoch);
-        encoder.write_string(Some(&self.consumer_group_id));
+        if flexible {
+            encoder.write_compact_string(Some(&self.consumer_group_id));
+            encoder.write_tagged_fields();
+        } else {
+            encoder.write_string(Some(&self.consumer_group_id));
+        }
         Ok(())
     }
 }
@@ -55,9 +86,17 @@ pub struct AddOffsetsToTxnResponse {
 }
 
 impl KafkaEncodable for AddOffsetsToTxnResponse {
-    fn encode(&self, encoder: &mut Encoder, _version: i16) -> Result<()> {
+    fn encode(&self, encoder: &mut Encoder, version: i16) -> Result<()> {
         encoder.write_i32(self.throttle_time_ms);
         encoder.write_i16(self.error_code);
+        // Flexible from v3: the response body ends with tagged fields. Omitting
+        // them leaves the body one byte short, so the Java client's
+        // AddOffsetsToTxnResponse parser underflows and the producer's
+        // sendOffsetsToTransaction hangs (retries forever). v0-v2 have no tagged
+        // fields.
+        if version >= 3 {
+            encoder.write_tagged_fields();
+        }
         Ok(())
     }
 }

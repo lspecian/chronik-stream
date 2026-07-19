@@ -238,8 +238,9 @@ impl FetchHandler {
                     if let Some(ref ph) = self.produce_handler {
                         let idx = ph.transaction_index();
                         let hwm = partition_response.high_watermark;
-                        partition_response.last_stable_offset =
-                            idx.last_stable_offset(&topic_request.name, partition_response.partition, hwm);
+                        let lso = idx.last_stable_offset(
+                            &topic_request.name, partition_response.partition, hwm);
+                        partition_response.last_stable_offset = lso;
                         let aborted: Vec<chronik_protocol::AbortedTransaction> =
                             idx.aborted_below(&topic_request.name, partition_response.partition, hwm)
                                 .into_iter()
@@ -249,6 +250,25 @@ impl FetchHandler {
                                 })
                                 .collect();
                         partition_response.aborted = Some(aborted);
+
+                        // A read_committed consumer must not receive records at or
+                        // beyond the LSO — they belong to a still-open transaction.
+                        // Setting the LSO field alone is not enough: the Java client
+                        // delivers whatever record batches the broker returns, so the
+                        // broker must also truncate the returned batches at the LSO
+                        // (a transaction's first batch starts exactly on the LSO, so
+                        // this drops on a batch boundary). Without this, an open (or
+                        // crash-recovered open) transaction's records leak to
+                        // read_committed as if committed.
+                        if lso < hwm && !partition_response.records.is_empty() {
+                            let before = partition_response.records.len();
+                            let keep = keep_len_below_offset(&partition_response.records, lso);
+                            if keep < before {
+                                tracing::debug!("read_committed truncate {}-{}: lso={} hwm={} bytes {}->{}",
+                                    topic_request.name, partition_response.partition, lso, hwm, before, keep);
+                                partition_response.records.truncate(keep);
+                            }
+                        }
                     }
                 }
 
@@ -2649,6 +2669,35 @@ impl FetchHandler {
 /// serving path produced it. The batch content is left byte-identical; only the CRC
 /// field (bytes 17-20 of each batch, little-endian) is (re)written. Non-v2 or partial
 /// trailing bytes are left untouched.
+/// Length of the leading run of record batches whose base_offset is strictly below
+/// `offset`. Batches are offset-ordered and self-delimiting (base_offset i64 at [0..8],
+/// batch_length i32 at [8..12] counting everything after those 12 bytes). Used to
+/// truncate a read_committed fetch response at the Last Stable Offset — the first batch
+/// with base_offset >= offset marks the cut point. Returns the full length if no batch
+/// reaches `offset`.
+fn keep_len_below_offset(bytes: &[u8], offset: i64) -> usize {
+    let mut pos = 0usize;
+    let len = bytes.len();
+    while pos + 12 <= len {
+        let base_offset = i64::from_be_bytes([
+            bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3],
+            bytes[pos + 4], bytes[pos + 5], bytes[pos + 6], bytes[pos + 7],
+        ]);
+        let batch_length = i32::from_be_bytes([
+            bytes[pos + 8], bytes[pos + 9], bytes[pos + 10], bytes[pos + 11],
+        ]) as usize;
+        let batch_end = pos + 12 + batch_length;
+        if batch_length < 9 || batch_end > len {
+            break; // malformed or partial trailing batch — keep what precedes it
+        }
+        if base_offset >= offset {
+            return pos;
+        }
+        pos = batch_end;
+    }
+    len
+}
+
 fn sanitize_batch_crcs(bytes: &mut [u8]) {
     let mut pos = 0usize;
     let len = bytes.len();
