@@ -150,6 +150,12 @@ impl ProtocolHandler {
             // resource_type/name, can't match the result to the requested resource, and
             // throws NullPointerException even though the broker applied the change.
             false
+        } else if api_key == ApiKey::DeleteTopics && header.api_version < 4 {
+            // DeleteTopics v0-v3 use NON-flexible headers (flexible starts at v4; we
+            // advertise max v3). Same header/body shift: without this the Java
+            // AdminClient reports "controller response did not contain a result for
+            // topic X" even though the delete + WAL reclaim happened server-side.
+            false
         } else {
             // For other APIs and DescribeCluster v1+/Metadata v9+, use flexible headers
             // when the client has negotiated ApiVersions v3+
