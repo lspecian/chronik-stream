@@ -88,6 +88,115 @@ impl Default for CompatibilityLevel {
     }
 }
 
+/// Direction of a compatibility check between a new and a prior schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompatDirection {
+    /// New schema (reader) can read data written by the old schema (writer).
+    Backward,
+    /// Old schema (reader) can read data written by the new schema (writer).
+    Forward,
+    /// Both Backward and Forward.
+    Full,
+}
+
+/// Avro record-level compatibility checking.
+///
+/// Implements the field-evolution rules Confluent/Avro enforce for record types
+/// (the dominant real-world case), using only `serde_json` — no schema library.
+///
+/// Rules (reader must be able to read data written by writer):
+/// - A field present in the writer but absent in the reader is ignored by the
+///   reader → always safe.
+/// - A field present in the reader but absent in the writer must have a default
+///   in the reader (otherwise the reader can't fill it when reading old data).
+/// - A field present in both must have a matching type. We compare the field's
+///   `type` JSON structurally: identical → compatible; different → treated as
+///   incompatible (conservative — never a false "compatible", and unchanged
+///   complex/union/nested fields still pass, so ordinary evolution is unaffected).
+///
+/// Only top-level Avro `record` schemas are analyzed. A non-record top-level
+/// schema (or one that doesn't parse as JSON) yields an explicit error rather
+/// than a silent pass, so we never claim a check we didn't perform.
+mod avro_compat {
+    use super::CompatDirection;
+    use serde_json::Value;
+
+    struct Field {
+        type_json: Value,
+        has_default: bool,
+    }
+
+    fn parse_record_fields(schema: &str) -> Result<std::collections::BTreeMap<String, Field>, String> {
+        let root: Value = serde_json::from_str(schema)
+            .map_err(|e| format!("schema is not valid JSON: {}", e))?;
+        let obj = root.as_object().ok_or_else(|| {
+            "compatibility checking is only supported for Avro record schemas (top-level object expected)".to_string()
+        })?;
+        let is_record = obj.get("type").and_then(|t| t.as_str()) == Some("record");
+        if !is_record {
+            return Err("compatibility checking is only supported for Avro record schemas".to_string());
+        }
+        let fields = obj.get("fields").and_then(|f| f.as_array()).ok_or_else(|| {
+            "Avro record schema has no 'fields' array".to_string()
+        })?;
+        let mut out = std::collections::BTreeMap::new();
+        for f in fields {
+            let fo = f.as_object().ok_or_else(|| "field entry is not an object".to_string())?;
+            let name = fo.get("name").and_then(|n| n.as_str())
+                .ok_or_else(|| "field entry has no 'name'".to_string())?
+                .to_string();
+            let type_json = fo.get("type").cloned().unwrap_or(Value::Null);
+            let has_default = fo.contains_key("default");
+            out.insert(name, Field { type_json, has_default });
+        }
+        Ok(out)
+    }
+
+    /// Check that `reader` can read data written by `writer` (one direction).
+    fn reader_can_read_writer(
+        reader: &std::collections::BTreeMap<String, Field>,
+        writer: &std::collections::BTreeMap<String, Field>,
+    ) -> Result<(), String> {
+        for (name, rfield) in reader {
+            match writer.get(name) {
+                None => {
+                    // Field is new in the reader; reading old (writer) data needs a default.
+                    if !rfield.has_default {
+                        return Err(format!(
+                            "field '{}' was added without a default, so it cannot read data written without it",
+                            name
+                        ));
+                    }
+                }
+                Some(wfield) => {
+                    if rfield.type_json != wfield.type_json {
+                        return Err(format!("field '{}' changed type incompatibly", name));
+                    }
+                }
+            }
+        }
+        // Fields present in the writer but not the reader are ignored by the reader — safe.
+        Ok(())
+    }
+
+    /// Check `new_schema` against `old_schema` in the given direction.
+    /// Returns Err(reason) if incompatible.
+    pub fn check(new_schema: &str, old_schema: &str, direction: CompatDirection) -> Result<(), String> {
+        let new_fields = parse_record_fields(new_schema)?;
+        let old_fields = parse_record_fields(old_schema)?;
+        match direction {
+            // Backward: the NEW schema is the reader of OLD data.
+            CompatDirection::Backward => reader_can_read_writer(&new_fields, &old_fields),
+            // Forward: the OLD schema is the reader of NEW data.
+            CompatDirection::Forward => reader_can_read_writer(&old_fields, &new_fields),
+            CompatDirection::Full => {
+                reader_can_read_writer(&new_fields, &old_fields)?;
+                reader_can_read_writer(&old_fields, &new_fields)
+            }
+        }
+    }
+}
+
 /// A registered schema with metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisteredSchema {
@@ -569,12 +678,18 @@ impl SchemaRegistry {
         Ok(())
     }
 
-    /// Check if a new schema is compatible with existing schemas
+    /// Check if a new schema is compatible with existing schemas.
+    ///
+    /// Avro compatibility is enforced at the record-field level per the Confluent/
+    /// Avro rules (see [`avro_compat`]). For JSON Schema and Protobuf we cannot
+    /// perform a correct resolution check without a heavy schema library, so those
+    /// are accepted with a clear warning rather than a silent false "PASSED" —
+    /// callers are told the level is not enforced for those formats.
     async fn check_compatibility(
         &self,
         subject: &str,
-        _new_schema: &str,
-        _schema_type: SchemaType,
+        new_schema: &str,
+        schema_type: SchemaType,
     ) -> Result<(), SchemaRegistryError> {
         let compatibility = self.get_compatibility(Some(subject)).await;
 
@@ -582,25 +697,70 @@ impl SchemaRegistry {
             return Ok(());
         }
 
-        let subjects = self.subjects.read().await;
-        if let Some(subj) = subjects.get(subject) {
-            if subj.versions.is_empty() {
-                return Ok(());
+        // Collect the prior schemas to check against: the latest version for the
+        // non-transitive levels, every version for the transitive levels.
+        let (transitive, direction) = match compatibility {
+            CompatibilityLevel::None => return Ok(()),
+            CompatibilityLevel::Backward => (false, CompatDirection::Backward),
+            CompatibilityLevel::BackwardTransitive => (true, CompatDirection::Backward),
+            CompatibilityLevel::Forward => (false, CompatDirection::Forward),
+            CompatibilityLevel::ForwardTransitive => (true, CompatDirection::Forward),
+            CompatibilityLevel::Full => (false, CompatDirection::Full),
+            CompatibilityLevel::FullTransitive => (true, CompatDirection::Full),
+        };
+
+        let prior_schemas: Vec<(u32, String, SchemaType)> = {
+            let subjects = self.subjects.read().await;
+            match subjects.get(subject) {
+                Some(subj) if !subj.versions.is_empty() => {
+                    let mut versions: Vec<&SchemaVersion> = subj.versions.values().collect();
+                    versions.sort_by_key(|v| v.version);
+                    if transitive {
+                        versions.iter().map(|v| (v.version, v.schema.clone(), v.schema_type)).collect()
+                    } else {
+                        // latest only
+                        versions.last().map(|v| vec![(v.version, v.schema.clone(), v.schema_type)]).unwrap_or_default()
+                    }
+                }
+                // No prior versions -> nothing to be incompatible with.
+                _ => return Ok(()),
             }
+        };
 
-            // TODO: Implement actual schema compatibility checking
-            // For now, we just check that the schema can be parsed
-            // Full implementation would require:
-            // - Avro: apache-avro crate for schema parsing and resolution
-            // - JSON Schema: jsonschema crate for validation
-            // - Protobuf: prost crate for proto parsing
-
-            debug!(
-                "Compatibility check for subject '{}' (level: {:?}) - PASSED (basic)",
-                subject, compatibility
-            );
+        if prior_schemas.is_empty() {
+            return Ok(());
         }
 
+        // JSON Schema / Protobuf: we cannot correctly resolve compatibility without
+        // a dedicated schema library. Do NOT claim enforcement — accept with a clear
+        // warning so operators know the configured level is not being checked.
+        if schema_type != SchemaType::Avro {
+            warn!(
+                "Compatibility level {:?} is set for subject '{}' but is NOT enforced for {:?} schemas \
+                 (only Avro compatibility checking is implemented); accepting registration",
+                compatibility, subject, schema_type
+            );
+            return Ok(());
+        }
+
+        for (prev_version, prev_schema, prev_type) in &prior_schemas {
+            if *prev_type != SchemaType::Avro {
+                // Mixed-type history we can't reason about; skip that pair honestly.
+                warn!("Skipping compatibility check against non-Avro version {} of '{}'", prev_version, subject);
+                continue;
+            }
+            avro_compat::check(new_schema, prev_schema, direction).map_err(|reason| {
+                SchemaRegistryError::Incompatible(format!(
+                    "new schema is not {:?}-compatible with version {}: {}",
+                    compatibility, prev_version, reason
+                ))
+            })?;
+        }
+
+        debug!(
+            "Compatibility check for subject '{}' (level: {:?}) - PASSED (Avro field-level, {} prior version(s))",
+            subject, compatibility, prior_schemas.len()
+        );
         Ok(())
     }
 
@@ -766,6 +926,63 @@ impl From<SchemaRegistryError> for ErrorResponse {
 }
 
 #[cfg(test)]
+mod avro_compat_tests {
+    use super::avro_compat::check;
+    use super::CompatDirection::{Backward, Forward, Full};
+
+    const V1: &str = r#"{"type":"record","name":"User","fields":[{"name":"id","type":"long"}]}"#;
+    // Adds a field WITH a default.
+    const V2_DEFAULT: &str = r#"{"type":"record","name":"User","fields":[{"name":"id","type":"long"},{"name":"email","type":"string","default":""}]}"#;
+    // Adds a field WITHOUT a default.
+    const V2_NO_DEFAULT: &str = r#"{"type":"record","name":"User","fields":[{"name":"id","type":"long"},{"name":"email","type":"string"}]}"#;
+    // Changes id's type.
+    const V2_TYPE_CHANGE: &str = r#"{"type":"record","name":"User","fields":[{"name":"id","type":"string"}]}"#;
+
+    #[test]
+    fn backward_add_field_with_default_ok() {
+        // New (reader) reading old data: the new 'email' field has a default -> OK.
+        assert!(check(V2_DEFAULT, V1, Backward).is_ok());
+    }
+
+    #[test]
+    fn backward_add_field_without_default_rejected() {
+        // New 'email' has no default -> can't read old data missing it.
+        assert!(check(V2_NO_DEFAULT, V1, Backward).is_err());
+    }
+
+    #[test]
+    fn forward_add_field_ok_regardless_of_default() {
+        // Forward: old (reader) reading new data ignores the added field -> OK
+        // whether or not it has a default.
+        assert!(check(V2_DEFAULT, V1, Forward).is_ok());
+        assert!(check(V2_NO_DEFAULT, V1, Forward).is_ok());
+    }
+
+    #[test]
+    fn full_requires_default_on_added_field() {
+        assert!(check(V2_DEFAULT, V1, Full).is_ok());
+        assert!(check(V2_NO_DEFAULT, V1, Full).is_err());
+    }
+
+    #[test]
+    fn type_change_is_incompatible_both_directions() {
+        assert!(check(V2_TYPE_CHANGE, V1, Backward).is_err());
+        assert!(check(V2_TYPE_CHANGE, V1, Forward).is_err());
+    }
+
+    #[test]
+    fn identical_schema_is_compatible() {
+        assert!(check(V1, V1, Full).is_ok());
+    }
+
+    #[test]
+    fn non_record_schema_errors_rather_than_false_pass() {
+        // A non-record top-level schema is explicitly unsupported, never a silent pass.
+        assert!(check(r#""string""#, V1, Backward).is_err());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -864,8 +1081,9 @@ mod tests {
             .await
             .unwrap();
 
-        // Register second version (different schema)
-        let schema2 = r#"{"type":"record","name":"User","fields":[{"name":"name","type":"string"},{"name":"age","type":"int"}]}"#;
+        // Register second version: adds 'age' WITH a default so it is a valid
+        // BACKWARD-compatible evolution (default compat is Backward, now enforced).
+        let schema2 = r#"{"type":"record","name":"User","fields":[{"name":"name","type":"string"},{"name":"age","type":"int","default":0}]}"#;
         let id2 = registry
             .register_schema("user-value", schema2, SchemaType::Avro, vec![])
             .await
