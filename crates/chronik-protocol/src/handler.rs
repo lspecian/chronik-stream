@@ -136,6 +136,20 @@ impl ProtocolHandler {
             false  // EndTxn v0-v2 use NON-flexible headers (v3+ use flexible)
         } else if api_key == ApiKey::CreatePartitions && header.api_version < 2 {
             false  // CreatePartitions v0-v1 use NON-flexible headers (v2+ use flexible)
+        } else if (api_key == ApiKey::DescribeAcls || api_key == ApiKey::CreateAcls || api_key == ApiKey::DeleteAcls) && header.api_version < 2 {
+            // ACL APIs v0-v1 use NON-flexible headers (headerVersion=0); flexible
+            // starts at v2. Without this, a v3-negotiated connection gets a flexible
+            // response header (extra tagged-fields byte) on a non-flexible v0-v1 ACL
+            // body, shifting the body by one byte and crashing the Java AdminClient
+            // parser (observed: "reading byte array of 13824 bytes, only 56 available").
+            false
+        } else if api_key == ApiKey::IncrementalAlterConfigs && header.api_version < 1 {
+            // IncrementalAlterConfigs v0 uses a NON-flexible header (flexible starts at
+            // v1). Same latent bug as the ACL APIs: a flexible header on a non-flexible
+            // v0 body shifts the response, so the Java AdminClient reads a bogus
+            // resource_type/name, can't match the result to the requested resource, and
+            // throws NullPointerException even though the broker applied the change.
+            false
         } else {
             // For other APIs and DescribeCluster v1+/Metadata v9+, use flexible headers
             // when the client has negotiated ApiVersions v3+
