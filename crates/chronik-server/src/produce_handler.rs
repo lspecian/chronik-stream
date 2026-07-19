@@ -2133,16 +2133,26 @@ impl ProduceHandler {
             ).await?;
         }
 
-        // EOS layer 6: a transactional (non-control) data batch opens a transaction on
-        // this partition. Record its first offset so read_committed fetches can compute
-        // the Last Stable Offset and the aborted-transactions list. Idempotent — only
-        // the first batch of the transaction sets the first offset.
+        // EOS layer 6 (log-derived): update the per-partition transaction index from
+        // this batch as it lands in the local log — a transactional data batch opens a
+        // transaction (records its first offset → LSO cap), a COMMIT/ABORT control
+        // marker closes it. This runs on the partition LEADER (the produce path; EndTxn
+        // markers are forwarded here from the coordinator), so the index that serves
+        // read_committed fetches on this node is driven by the log, not by an RPC on a
+        // possibly-different coordinator node. Followers get the same via replication
+        // apply (wal_replication::write_to_wal). Idempotent for data (only the first
+        // batch of a transaction sets the first offset).
         let batch_is_transactional = (kafka_batch.header.attributes & 0x10) != 0;
-        if batch_is_transactional && !is_control_batch && kafka_batch.header.producer_id >= 0 {
-            self.transaction_index.on_transactional_produce(
-                topic, partition, kafka_batch.header.producer_id, base_offset as i64,
-            );
-        }
+        let first_record_key = kafka_batch.records.first().and_then(|r| r.key.as_deref());
+        self.transaction_index.apply_log_batch(
+            topic,
+            partition,
+            kafka_batch.header.producer_id,
+            batch_is_transactional,
+            is_control_batch,
+            first_record_key,
+            base_offset as i64,
+        );
         
         // partition_state and base_offset already loaded above (before re-encoding)
 

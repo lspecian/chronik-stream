@@ -74,6 +74,47 @@ impl TransactionIndex {
         }
     }
 
+    /// Apply one batch's effect on the index as it lands in *this node's* copy of
+    /// the partition log, from the batch's CanonicalRecord-level attributes.
+    ///
+    /// This is the log-derived update. It is called on the leader (produce path) and
+    /// on followers (replication apply) so the index is a deterministic function of
+    /// the replicated log — NOT of which node happened to run the EndTxn RPC. In a
+    /// cluster the transaction coordinator and a partition's leader are often
+    /// different nodes; updating the index from an RPC handler on the coordinator
+    /// left the leader's (and followers') index stale, so `read_committed` on the
+    /// leader saw a stuck LSO / leaked aborts. Driving it from the log fixes that.
+    ///
+    /// `first_record_key` is the key of the batch's first record — for a control
+    /// batch it encodes the marker type (i16 version, i16 type: 0 = ABORT,
+    /// 1 = COMMIT). Non-transactional / non-producer batches are ignored.
+    pub fn apply_log_batch(
+        &self,
+        topic: &str,
+        partition: i32,
+        producer_id: i64,
+        is_transactional: bool,
+        is_control: bool,
+        first_record_key: Option<&[u8]>,
+        base_offset: i64,
+    ) {
+        if producer_id < 0 {
+            return;
+        }
+        if is_control {
+            match first_record_key
+                .filter(|k| k.len() >= 4)
+                .map(|k| i16::from_be_bytes([k[2], k[3]]))
+            {
+                Some(1) => self.on_commit(topic, partition, producer_id),
+                Some(0) => self.on_abort(topic, partition, producer_id),
+                _ => {}
+            }
+        } else if is_transactional {
+            self.on_transactional_produce(topic, partition, producer_id, base_offset);
+        }
+    }
+
     /// The Last Stable Offset for a partition given its current high watermark.
     /// If any transaction is open, the LSO is the lowest open first-offset; otherwise
     /// it is the high watermark (everything is stable).

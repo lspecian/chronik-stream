@@ -2075,6 +2075,25 @@ impl WalReceiver {
         ).await
         .context("Failed to append replicated record to local WAL")?;
 
+        // EOS (log-derived txn index): a follower must apply the same transaction
+        // index updates the leader applies, so read_committed served from this node
+        // (follower reads are enabled by default) computes the same LSO / aborted
+        // list. Drive it from the replicated CanonicalRecord exactly as the leader's
+        // produce path does — a transactional data batch opens a transaction, a
+        // COMMIT/ABORT control marker closes it.
+        if let Some(ref handler) = produce_handler {
+            let first_key = canonical_record.records.first().and_then(|r| r.key.as_deref());
+            handler.transaction_index().apply_log_batch(
+                &record.topic,
+                record.partition,
+                canonical_record.producer_id,
+                canonical_record.is_transactional,
+                canonical_record.is_control,
+                first_key,
+                canonical_record.base_offset,
+            );
+        }
+
         // v2.2.9 FIX: Update high watermark on follower via ProduceHandler
         // This ensures watermarks are visible via ListOffsets API (which queries ProduceHandler, not Raft)
         // Trust the leader - we're receiving replicated state
