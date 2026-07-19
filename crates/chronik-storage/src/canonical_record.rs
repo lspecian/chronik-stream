@@ -647,7 +647,7 @@ impl CanonicalRecord {
         let crc = calculate_crc32(crc_data);
 
         // Write CRC as little-endian (Kafka protocol requirement)
-        buf[crc_pos..crc_pos + 4].copy_from_slice(&crc.to_le_bytes());
+        buf[crc_pos..crc_pos + 4].copy_from_slice(&crc.to_be_bytes());
 
         Ok(buf.freeze())
     }

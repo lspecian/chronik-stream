@@ -225,8 +225,8 @@ impl KafkaRecordBatch {
         let crc_data = &buf[attributes_offset..];
         let crc = calculate_crc32(crc_data);
 
-        // Write CRC as LITTLE-ENDIAN (Kafka protocol requirement)
-        buf[crc_pos..crc_pos + 4].copy_from_slice(&crc.to_le_bytes());
+        // Write CRC as BIG-ENDIAN (Kafka protocol requirement — Java ByteBuffer.putInt)
+        buf[crc_pos..crc_pos + 4].copy_from_slice(&crc.to_be_bytes());
         
         Ok(buf.freeze())
     }

@@ -2671,7 +2671,7 @@ fn sanitize_batch_crcs(bytes: &mut [u8]) {
         if magic == 2 && is_control {
             // CRC covers attributes (pos+21) to end of batch.
             let crc = crc32c::crc32c(&bytes[pos + 21..batch_end]);
-            bytes[pos + 17..pos + 21].copy_from_slice(&crc.to_le_bytes());
+            bytes[pos + 17..pos + 21].copy_from_slice(&crc.to_be_bytes());
         }
         pos = batch_end;
     }
