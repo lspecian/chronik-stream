@@ -21,8 +21,8 @@ This document provides detailed implementation plans for all pending features in
 | Phase 4.2 | Vector Search (HNSW) | v2.2.20 | ✅ Complete |
 | Phase 4.3 | Benchmarks CLI | v2.2.20 | ✅ Complete |
 | Phase 5.1 | TLS for Kafka Protocol | v2.2.20 | ✅ Complete |
-| Phase 5.2 | ACL Authorization System | v2.2.20 | ✅ Complete |
-| Phase 5.3 | Schema Registry (Confluent-compatible) | v2.2.20 | ✅ Complete |
+| Phase 5.2 | ACL Authorization System | v2.2.20 | ⚠️ Data model only — NOT enforced (see 5.2) |
+| Phase 5.3 | Schema Registry (Confluent-compatible) | v2.2.20 | ✅ Complete (Avro compat enforced; JSON/Protobuf compat not enforced) |
 
 ---
 
@@ -120,24 +120,24 @@ CHRONIK_TLS_KEY=/path/to/server.key
 
 ---
 
-### 5.2 ACL Authorization System ✅ COMPLETE
+### 5.2 ACL Authorization System ⚠️ NOT ENFORCED (data model only)
 
-**Implemented in**: `crates/chronik-server/src/acl.rs`
+**Partially implemented in**: `crates/chronik-server/src/acl.rs`
 
-**Features**:
-- Kafka-compatible ACL data model (ResourceType, PatternType, AclOperation, AclPermission)
-- ACL bindings with principal, host, operation, and permission
-- ACL filtering for queries/deletions
-- Superuser bypass support
-- Default deny policy
+**What exists**: a Kafka-compatible ACL data model + `AclManager` (ResourceType,
+PatternType, AclOperation, AclPermission, principal/host bindings, superuser bypass,
+default-deny) with unit tests.
 
-**Configuration**:
-```bash
-CHRONIK_ACL_ENABLED=true
-CHRONIK_SUPERUSERS=admin,kafka-admin
-```
+**What does NOT exist (the important part)**: the `AclManager` is **never
+instantiated by the server and `authorize()` is never called on the produce/fetch/
+admin path** — no request is actually authorized. The ACL admin APIs
+(CreateAcls/DescribeAcls/DeleteAcls) return **SECURITY_DISABLED** (error 54), which
+is what Kafka returns when no authorizer is configured. `CHRONIK_ACL_ENABLED` toggles
+the manager's internal flag but nothing consults it.
 
-**Documentation**: See ACL section in code comments.
+**To reach "complete"**: instantiate `AclManager` in the server, persist the ACL
+admin APIs into it, and add an `authorize()` gate to the Produce/Fetch/Group/Admin
+request paths keyed on an authenticated SASL principal.
 
 ---
 

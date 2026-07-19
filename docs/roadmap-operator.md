@@ -2,7 +2,7 @@
 
 > **Created**: 2026-02-06
 > **Last Updated**: 2026-02-21
-> **Status**: Phase 8 Complete — Testing, CI pipeline, clippy/fmt clean, 111 tests passing
+> **Status**: Phases 1–8 largely complete (111 tests, CI, clippy/fmt clean), with known gaps still open — NOT fully done. Notably, **leader-aware rolling updates and `maxUnavailable` enforcement are NOT implemented** (see the unchecked items under Phase 8), so graceful cluster upgrades are not yet available despite being described below as a capability.
 > **Crate**: `crates/chronik-operator`
 
 ---

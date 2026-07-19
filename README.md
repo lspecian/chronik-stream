@@ -488,7 +488,6 @@ chronik-stream/
 │   ├── chronik-raft/         # Raft consensus
 │   ├── chronik-raft-bridge/  # Raft integration bridge
 │   ├── chronik-operator/     # Kubernetes operator (ChronikCluster CRD)
-│   ├── chronik-auth/         # SASL, TLS, ACLs
 │   ├── chronik-monitoring/   # Prometheus metrics
 │   ├── chronik-config/       # Configuration management
 │   ├── chronik-backup/       # Backup and disaster recovery
