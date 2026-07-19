@@ -3576,11 +3576,28 @@ impl ProduceHandler {
             info!("Initializing partition metadata for topic '{}' ({} partitions) - WAL-ONLY (no Raft propose)",
                   topic_name, num_partitions);
 
-            // Get all nodes in the cluster (for replication)
-            // For now, use a fixed list of node IDs (1, 2, 3 for a 3-node cluster)
-            // TODO: Get this from cluster configuration
-            let all_nodes = vec![1_u64, 2_u64, 3_u64];
-            let replication_factor = self.config.default_replication_factor.min(all_nodes.len() as u32);
+            // Get the ACTUAL cluster node IDs from Raft membership.
+            //
+            // CRITICAL (single-node correctness): this must NOT be a hardcoded
+            // vec![1, 2, 3]. A single-node deployment still runs a 1-voter Raft, so
+            // this method executes with `raft` = Some and `am_i_leader` = true. The
+            // old hardcoded list round-robined partitions onto nonexistent nodes 2
+            // and 3, leaving those partitions with a leader_id the broker list never
+            // advertises. Clients then could not route produce/fetch to partitions
+            // 1..N — every multi-partition topic hung on acks=1/all produce because
+            // the Java client can't find a leader for those partitions.
+            //
+            // get_all_nodes() returns the Raft voter set: [1] on single-node,
+            // [1, 2, 3] on a real 3-node cluster. Fall back to just this node if the
+            // membership somehow comes back empty (a bootstrapped Raft always has
+            // self as a voter, so this is only a safety net).
+            let mut all_nodes = raft.get_all_nodes().await;
+            all_nodes.sort_unstable();
+            all_nodes.dedup();
+            if all_nodes.is_empty() {
+                all_nodes.push(raft.node_id());
+            }
+            let replication_factor = self.config.default_replication_factor.min(all_nodes.len() as u32).max(1);
 
             for partition in 0..num_partitions {
                 // Assign replicas (round-robin across nodes)
