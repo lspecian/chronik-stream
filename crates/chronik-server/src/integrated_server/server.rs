@@ -46,8 +46,6 @@ pub struct IntegratedServerConfig {
     pub advertised_port: i32,
     /// Data directory for storage
     pub data_dir: String,
-    /// Enable real-time indexing
-    pub enable_indexing: bool,
     /// Enable compression
     pub enable_compression: bool,
     /// Auto-create topics
@@ -79,13 +77,6 @@ impl Default for IntegratedServerConfig {
             advertised_host: "localhost".to_string(),
             advertised_port: 9092,
             data_dir: "./data".to_string(),
-            // Legacy realtime indexer: OFF by default. It is write-only — nothing
-            // reads its {data_dir}/index output (/_search serves the WalIndexer's
-            // {data_dir}/tantivy_indexes) — and it holds a Tantivy writer with 4+4
-            // threads and an up-to-512MB budget PER TOPIC forever, which OOM-killed
-            // nodes at a few thousand topics. Hot NRT search and cold WalIndexer
-            // search are independent of this flag.
-            enable_indexing: false,
             enable_compression: true,
             auto_create_topics: true,
             num_partitions: 3,

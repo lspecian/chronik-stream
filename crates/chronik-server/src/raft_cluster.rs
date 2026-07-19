@@ -2776,7 +2776,6 @@ pub async fn run_raft_cluster(config: RaftClusterConfig) -> Result<()> {
         advertised_host: config.advertised_addr.clone(),
         advertised_port: config.kafka_port as i32,
         data_dir: config.data_dir,
-        enable_indexing: false,
         enable_compression: true,
         auto_create_topics: true,
         num_partitions: 1,
