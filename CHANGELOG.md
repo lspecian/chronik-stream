@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.10.0] - 2026-07-19
+
+**Exactly-once semantics are now reliable on a cluster, and a critical multi-partition
+produce bug is fixed.** Found by extensive EOS stress-testing with the real Java client
+(kafka-clients 3.7.0) and verified single-node, on a local 3-node cluster, and on a real
+3-node Kubernetes (MicroK8s) cluster: the full 7-scenario EOS matrix passes, and RF=3
+read_committed returns correct results through every node (leaders spread across all
+three nodes, follower reads).
+
+### Fixed
+- **CRITICAL: multi-partition topics were leaderless on a single node.**
+  `initialize_raft_partitions()` (which runs whenever a Raft cluster is present — including
+  single-node, since single-node bootstraps a 1-voter Raft and is its own leader) assigned
+  partition replicas round-robin over a **hardcoded `[1, 2, 3]`** node list. On a single-node
+  deployment this handed partitions 1..N to nonexistent nodes 2 and 3, so their leader was an
+  address the Metadata response never advertised — clients saw `leader=null` and **every
+  multi-partition topic hung on acks=1/all produce** ("Expiring N record(s)"). Not
+  transaction-specific; it broke all multi-partition producing with acks>0 (acks=0
+  fire-and-forget masked it). Now derived from actual Raft membership (`get_all_nodes()`).
+- **read_committed transaction index is now log-derived — cluster read_committed is correct.**
+  The index (open transactions → Last Stable Offset, aborted transactions → aborted list) was
+  updated by the EndTxn RPC handler on the transaction *coordinator*, which in a cluster is
+  frequently not a partition's leader — so the leader (and followers, with follower reads on by
+  default) never saw the commit/abort, leaving the LSO stuck and aborts leaking. It is now
+  driven by the COMMIT/ABORT control markers as they land in each partition's local log (leader
+  produce path — markers are forwarded coordinator → leader — and follower replication apply),
+  making it a deterministic function of the replicated log.
+- **AddOffsetsToTxn and TxnOffsetCommit v3+ flexible wire format.** Both used non-compact
+  strings and omitted tagged fields (TxnOffsetCommit also skipped the v3 generation_id /
+  member_id / group_instance_id fields). The Java producer always uses v3, so its response
+  parser underflowed and `sendOffsetsToTransaction` hung forever. Now version-aware
+  (compact + tagged fields for v3+).
+- **Idempotent producer sequence race.** validate + advance now happen in one atomic
+  critical section, and a batch whose sequence is ahead of expected waits briefly for the
+  earlier in-flight batch instead of failing with a fatal OutOfOrderSequenceException — the
+  connection handler processes requests concurrently, so same-partition batches can arrive at
+  validation out of send order under load.
+- **read_committed correctness across crash and at the fetch boundary.** The transaction index
+  is rebuilt from the WAL tail on startup (so a produced-but-not-committed transaction
+  interrupted by a crash stays invisible to read_committed instead of leaking), and
+  read_committed fetches are truncated at the Last Stable Offset (setting the LSO field alone
+  let the client deliver records past it).
+
 ## [2.9.0] - 2026-07-19
 
 **Exactly-once semantics (transactions) now work end-to-end**, validated with the real
