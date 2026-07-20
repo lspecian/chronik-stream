@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.10.3] - 2026-07-20
+
+### Fixed
+- **Graceful UNSUPPORTED_VERSION for unknown APIs / out-of-range versions.** A bogus
+  or too-high API version (e.g. Metadata v99) was treated as flexible and the request
+  header parse died reading tagged fields ("Incomplete varint"), returning a bare
+  error and losing the correlation_id — so the client never received the well-formed
+  UNSUPPORTED_VERSION response it needs for version negotiation. The version is now
+  validated from the fixed header prefix before the rest of the header is parsed, and
+  unknown APIs / out-of-range versions return a proper error response with the
+  correlation_id preserved. (Verified the real Java AdminClient is unaffected — the
+  guard only rejects versions outside the advertised range, which negotiated clients
+  never send.)
+
+### Internal
+- Greened the entire `chronik-protocol` conformance test suite (228/228). Eight test
+  files were failing on stale assumptions — chiefly reading the correlation_id from
+  the response body when it lives in the wire header, plus wrong per-version field
+  orders and non-flexible builds of flexible-version requests. These were test bugs,
+  not client-facing regressions (real clients pass the integration suites); no
+  behavior change beyond the version guard above.
+
 ## [2.10.2] - 2026-07-20
 
 ### Fixed
