@@ -810,7 +810,7 @@ impl KafkaProtocolHandler {
         let topic_names = match chronik_protocol::delete_topics_types::DeleteTopicsRequest::decode(
             &mut decoder, header.api_version
         ) {
-            Ok(req) => req.topic_names,
+            Ok(req) => req.topic_names(),
             Err(_) => vec![], // If parsing fails, still delegate to protocol handler
         };
 
