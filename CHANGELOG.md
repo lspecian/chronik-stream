@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.10.2] - 2026-07-20
+
+### Fixed
+- **CreateTopics broker crash on a null replica-assignments array.** The
+  replica-assignments, broker-ids, and configs array lengths were decoded as
+  `read_i32()? as usize`; a null array (Kafka encodes it as -1) became ~1.8e19 and
+  `Vec::with_capacity` panicked with "capacity overflow" — so a client sending
+  CreateTopics with a null `replica_assignments` array (the normal "assign
+  automatically" form) could crash the broker. All counts now clamp negatives to 0.
+- **CreateTopics now returns TOPIC_ALREADY_EXISTS for a genuine duplicate** (error
+  36) instead of silently succeeding, matching Kafka. The auto-create expansion path
+  (an explicit CreateTopics that grows a smaller auto-created topic) is preserved.
+- **CreateTopics validation**: reject "." and ".." topic names, and validate config
+  *values* — `compression.type`, `cleanup.policy`, `segment.bytes` (>= 14),
+  `retention.ms` (>= -1) — with INVALID_CONFIG, instead of accepting any value.
+
+Verified with the real Java AdminClient (valid configs create, invalid rejected,
+duplicate throws TopicExistsException with the topic intact) and the create_topics
+conformance suites (7/7 and 9/9, both previously panicking).
+
 ## [2.10.1] - 2026-07-20
 
 ### Fixed
