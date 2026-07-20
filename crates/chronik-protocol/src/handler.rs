@@ -5862,13 +5862,20 @@ impl ProtocolHandler {
                                 tracing::info!("✅ Expanded topic '{}' from {} to {} partitions",
                                     topic.name, existing_count, requested_count);
                             } else {
-                                // Same or more partitions already - update configs only
-                                tracing::info!("Topic '{}' already exists with {} partitions (requested {}), updating config",
+                                // Genuine duplicate: the topic already exists with at
+                                // least the requested partition count (nothing to
+                                // expand). Kafka returns TOPIC_ALREADY_EXISTS here — the
+                                // caller maps this "already exists" error to error code
+                                // 36. (The expansion branch above still returns Ok, so
+                                // an explicit CreateTopics that grows an auto-created
+                                // topic keeps working.)
+                                tracing::info!("Topic '{}' already exists with {} partitions (requested {})",
                                     topic.name, existing_count, requested_count);
-                                if let Err(update_err) = metadata_store.update_topic(&topic.name, config).await {
-                                    tracing::warn!("Failed to update topic config: {:?}", update_err);
-                                }
+                                return Err(Error::Internal(format!("Topic '{}' already exists", topic.name)));
                             }
+                        } else {
+                            // Reported as existing but not retrievable — surface it.
+                            return Err(Error::Internal(format!("Topic '{}' already exists", topic.name)));
                         }
                     } else {
                         return Err(Error::Internal(format!("Failed to create topic: {:?}", e)));

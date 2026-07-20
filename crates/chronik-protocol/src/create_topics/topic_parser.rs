@@ -69,11 +69,15 @@ impl TopicParser {
         decoder: &mut Decoder,
         use_compact: bool,
     ) -> Result<Vec<ReplicaAssignment>> {
-        // Parse assignment count
+        // Parse assignment count. A null array is -1 (non-compact) or a compact
+        // length of 0 (→ -1 after the -1 offset); clamp to 0 so it is treated as
+        // empty. Without the clamp, `-1 as usize` becomes ~1.8e19 and the
+        // Vec::with_capacity below panics with "capacity overflow" — a real client
+        // sending a null replica_assignments array would crash the broker.
         let assignment_count = if use_compact {
-            (decoder.read_unsigned_varint()? as i32 - 1) as usize
+            (decoder.read_unsigned_varint()? as i64 - 1).max(0) as usize
         } else {
-            decoder.read_i32()? as usize
+            decoder.read_i32()?.max(0) as usize
         };
 
         if assignment_count == 0 {
@@ -85,11 +89,11 @@ impl TopicParser {
         for _ in 0..assignment_count {
             let partition_index = decoder.read_i32()?;
 
-            // Parse broker IDs for this partition
+            // Parse broker IDs for this partition (clamp null/negative to 0).
             let broker_count = if use_compact {
-                (decoder.read_unsigned_varint()? as i32 - 1) as usize
+                (decoder.read_unsigned_varint()? as i64 - 1).max(0) as usize
             } else {
-                decoder.read_i32()? as usize
+                decoder.read_i32()?.max(0) as usize
             };
 
             let mut broker_ids = Vec::with_capacity(broker_count);
@@ -118,11 +122,11 @@ impl TopicParser {
         decoder: &mut Decoder,
         use_compact: bool,
     ) -> Result<HashMap<String, String>> {
-        // Parse config count
+        // Parse config count (clamp null/negative to 0).
         let config_count = if use_compact {
-            (decoder.read_unsigned_varint()? as i32 - 1) as usize
+            (decoder.read_unsigned_varint()? as i64 - 1).max(0) as usize
         } else {
-            decoder.read_i32()? as usize
+            decoder.read_i32()?.max(0) as usize
         };
 
         if config_count == 0 {
