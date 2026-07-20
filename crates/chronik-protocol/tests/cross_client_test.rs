@@ -4,7 +4,23 @@
 //! Kafka client libraries by testing against known request/response patterns.
 
 use bytes::{Buf, BufMut, BytesMut};
-use chronik_protocol::handler::ProtocolHandler;
+use chronik_protocol::handler::{ProtocolHandler, Response};
+use chronik_protocol::ApiKey;
+
+/// Assemble the on-the-wire response bytes a real client parses (minus the 4-byte
+/// length prefix): correlation_id, then an empty tagged-fields byte for flexible
+/// response headers (all APIs except ApiVersions, which always uses a v0 header),
+/// then the body. Mirrors `integrated_server::encode_response`. The correlation_id
+/// lives in the wire header, NOT in `Response::body`.
+fn to_wire(resp: &Response) -> Vec<u8> {
+    let mut w = Vec::new();
+    w.extend_from_slice(&resp.header.correlation_id.to_be_bytes());
+    if resp.is_flexible && resp.api_key != ApiKey::ApiVersions {
+        w.push(0);
+    }
+    w.extend_from_slice(&resp.body);
+    w
+}
 
 /// Test compatibility with librdkafka client requests
 #[tokio::test]
@@ -22,24 +38,20 @@ async fn test_librdkafka_compatibility() {
     ];
     
     let response = handler.handle_request(&librdkafka_request).await.unwrap();
-    
-    // Verify response structure
+
     assert_eq!(response.header.correlation_id, 1);
-    
-    // Parse response body
-    let mut body = &response.body[..];
-    let correlation_id = body.get_i32();
-    assert_eq!(correlation_id, 1);
-    
-    // For v0, array comes before error code
-    let array_len = body.get_i32();
-    assert!(array_len > 0, "Should have API versions");
-    
-    // Skip array entries
-    body.advance((array_len * 6) as usize);
-    
-    let error_code = body.get_i16();
+
+    // Parse the full wire response as librdkafka would. ApiVersions uses a
+    // non-flexible header, so wire = correlation_id + body.
+    let wire = to_wire(&response);
+    let mut w = &wire[..];
+    assert_eq!(w.get_i32(), 1, "correlation_id at the front of the wire response");
+
+    // ApiVersions v0 body layout (chronik): error_code, then the versions array.
+    let error_code = w.get_i16();
     assert_eq!(error_code, 0, "Should have no error");
+    let array_len = w.get_i32();
+    assert!(array_len > 0, "Should advertise API versions");
 }
 
 /// Test compatibility with Java client (Apache Kafka client) requests
@@ -47,38 +59,39 @@ async fn test_librdkafka_compatibility() {
 async fn test_java_client_compatibility() {
     let handler = ProtocolHandler::new();
     
-    // Real request pattern from Apache Kafka Java client 3.0.0
-    // Metadata request (v9) with client ID "consumer-1"
+    // Apache Kafka Java client 3.0.0: Metadata v9. v9 is flexible, so the request
+    // header carries a tagged-fields byte after client_id and the body uses compact
+    // encoding (a null topics array is the varint 0, NOT i32 -1).
     let mut java_request = BytesMut::new();
     java_request.put_i16(3); // Metadata
     java_request.put_i16(9); // Version 9
     java_request.put_i32(12345); // Correlation ID
     java_request.put_i16(10); // Client ID length
     java_request.put_slice(b"consumer-1");
-    
-    // Metadata v9 body
-    java_request.put_i32(-1); // Topics: null (fetch all)
+    java_request.put_u8(0); // header tagged fields (flexible)
+
+    // Metadata v9 body (flexible)
+    java_request.put_u8(0); // topics: null (compact array)
     java_request.put_u8(1); // allow_auto_topic_creation: true
     java_request.put_u8(0); // include_cluster_authorized_operations: false
     java_request.put_u8(0); // include_topic_authorized_operations: false
-    
+    java_request.put_u8(0); // body tagged fields
+
     let response = handler.handle_request(&java_request).await.unwrap();
-    
+
     // Verify response
     assert_eq!(response.header.correlation_id, 12345);
     
-    // Parse response body
-    let mut body = &response.body[..];
-    let correlation_id = body.get_i32();
-    assert_eq!(correlation_id, 12345);
-    
-    // v9 has throttle time
-    let throttle_time = body.get_i32();
+    // Parse the wire response as the Java client would. Metadata v9 has a FLEXIBLE
+    // response header, so wire = correlation_id + one tagged-fields byte + body.
+    let wire = to_wire(&response);
+    let mut w = &wire[..];
+    assert_eq!(w.get_i32(), 12345, "correlation_id at the front of the wire response");
+    assert_eq!(w.get_u8(), 0, "flexible response-header tagged fields");
+    // Body: throttle_time_ms, then a compact brokers array (varint length).
+    let throttle_time = w.get_i32();
     assert_eq!(throttle_time, 0);
-    
-    // Brokers array
-    let brokers_len = body.get_i32();
-    assert!(brokers_len >= 0, "Should have brokers array");
+    assert!(!w.is_empty(), "brokers/cluster metadata follows throttle");
 }
 
 /// Test compatibility with confluent-kafka-go client requests
@@ -100,23 +113,18 @@ async fn test_confluent_kafka_go_compatibility() {
     // Verify response
     assert_eq!(response.header.correlation_id, 999);
     
-    // Parse v1 response
-    let mut body = &response.body[..];
-    let correlation_id = body.get_i32();
-    assert_eq!(correlation_id, 999);
-    
-    // v1 has error code first
-    let error_code = body.get_i16();
-    assert_eq!(error_code, 0);
-    
-    // Then API versions array
-    let array_len = body.get_i32();
-    assert!(array_len > 0);
-    
-    // Then throttle time
-    body.advance((array_len * 6) as usize);
-    let throttle_time = body.get_i32();
+    // Parse the wire response. ApiVersions uses a non-flexible header.
+    let wire = to_wire(&response);
+    let mut w = &wire[..];
+    assert_eq!(w.get_i32(), 999, "correlation_id at the front of the wire response");
+
+    // ApiVersions v1 body layout (chronik): throttle_time_ms, error_code, array.
+    let throttle_time = w.get_i32();
     assert!(throttle_time >= 0);
+    let error_code = w.get_i16();
+    assert_eq!(error_code, 0);
+    let array_len = w.get_i32();
+    assert!(array_len > 0);
 }
 
 /// Test compatibility with node-rdkafka client requests
@@ -143,13 +151,14 @@ async fn test_node_rdkafka_compatibility() {
     // Verify response
     assert_eq!(response.header.correlation_id, 42);
     
-    // Parse response
-    let mut body = &response.body[..];
-    let correlation_id = body.get_i32();
-    assert_eq!(correlation_id, 42);
-    
-    // Topics array
-    let topics_len = body.get_i32();
+    // Parse the wire response (Produce uses a non-flexible header at v0).
+    let wire = to_wire(&response);
+    let mut w = &wire[..];
+    assert_eq!(w.get_i32(), 42, "correlation_id at the front of the wire response");
+
+    // Produce v0 response body starts with the per-topic responses array; the
+    // request carried no topics, so it is empty.
+    let topics_len = w.get_i32();
     assert_eq!(topics_len, 0, "Should have empty topics array");
 }
 
@@ -338,21 +347,17 @@ async fn test_kafkactl_patterns() {
     // Verify response matches kafkactl expectations
     assert_eq!(response.header.correlation_id, 0);
     
-    // Parse response - kafkactl expects v0 format
-    let mut body = &response.body[..];
-    let correlation_id = body.get_i32();
-    assert_eq!(correlation_id, 0);
-    
-    // v0: array before error code
-    let array_len = body.get_i32();
-    assert!(array_len > 0);
-    
-    // Skip array
-    body.advance((array_len * 6) as usize);
-    
-    // Error code at the end
-    let error_code = body.get_i16();
+    // Parse the wire response (ApiVersions v0, non-flexible header). kafkactl uses
+    // correlation_id 0, which must round-trip.
+    let wire = to_wire(&response);
+    let mut w = &wire[..];
+    assert_eq!(w.get_i32(), 0, "correlation_id 0 round-trips on the wire");
+
+    // ApiVersions v0 body layout (chronik): error_code, then the versions array.
+    let error_code = w.get_i16();
     assert_eq!(error_code, 0);
+    let array_len = w.get_i32();
+    assert!(array_len > 0);
 }
 
 /// Test that our responses are parseable by common client decoders
@@ -378,52 +383,65 @@ async fn test_response_parseability() {
         request.put_i16(4);
         request.put_slice(b"test");
         
-        // Add minimal body based on API
+        // Flexible request headers (flexible APIs EXCEPT ApiVersions, which always
+        // uses a v0 request header) carry a tagged-fields byte after client_id. In
+        // this list only Metadata v9 qualifies.
+        let flexible = matches!((api_key, version), (3, v) if v >= 9);
+        if flexible {
+            request.put_u8(0); // request-header tagged fields
+        }
+
+        // Add a minimal, version-correct body per API.
         match api_key {
             3 => {
                 // Metadata
-                if version >= 1 {
-                    request.put_i32(-1); // null topics
-                }
-                if version >= 4 {
+                if flexible {
+                    request.put_u8(0); // topics: null (compact array)
                     request.put_u8(1); // allow_auto_topic_creation
-                }
-                if version >= 8 {
                     request.put_u8(0); // include_cluster_authorized_operations
                     request.put_u8(0); // include_topic_authorized_operations
+                    request.put_u8(0); // body tagged fields
+                } else {
+                    // v0 uses an empty topics array; v1+ allow null (-1) = all.
+                    if version == 0 {
+                        request.put_i32(0);
+                    } else {
+                        request.put_i32(-1);
+                    }
+                    if version >= 4 {
+                        request.put_u8(1); // allow_auto_topic_creation
+                    }
+                    if version >= 8 {
+                        request.put_u8(0);
+                        request.put_u8(0);
+                    }
                 }
             }
             18 => {
-                // ApiVersions
-                if version == 3 {
+                // ApiVersions (request header is never flexible). v3+ has a compact body.
+                if version >= 3 {
                     request.put_u8(1); // empty client_software_name
                     request.put_u8(1); // empty client_software_version
                     request.put_u8(0); // tagged fields
                 }
             }
             32 => {
-                // DescribeConfigs
-                request.put_i32(0); // empty resources
+                // DescribeConfigs v0: empty resources array.
+                request.put_i32(0);
             }
             _ => {}
         }
-        
+
         let response = handler.handle_request(&request).await.unwrap();
-        
-        // Verify response is parseable
-        assert!(!response.body.is_empty(), "Response should have body");
+
+        // The correlation_id is the first field of the WIRE response, not the body.
+        assert!(!response.body.is_empty(), "Response {} v{} should have a body", api_key, version);
         assert_eq!(response.header.correlation_id, 9999);
-        
-        // Verify correlation ID in body
-        let body_correlation_id = i32::from_be_bytes([
-            response.body[0],
-            response.body[1],
-            response.body[2],
-            response.body[3],
-        ]);
+        let wire = to_wire(&response);
+        let wire_corr = i32::from_be_bytes([wire[0], wire[1], wire[2], wire[3]]);
         assert_eq!(
-            body_correlation_id, 9999,
-            "Correlation ID should be in response body for API {} v{}",
+            wire_corr, 9999,
+            "Correlation ID should be at the front of the wire response for API {} v{}",
             api_key, version
         );
     }
