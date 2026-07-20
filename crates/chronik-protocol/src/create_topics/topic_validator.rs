@@ -22,7 +22,9 @@ impl TopicValidator {
     /// - Contain only alphanumeric, dots, hyphens, and underscores
     /// - Not exceed 249 characters
     pub fn is_valid_topic_name(name: &str) -> bool {
-        if name.is_empty() || name.len() > 249 {
+        // Kafka rejects empty, "." and ".." (they collide with directory entries),
+        // and names longer than 249 chars.
+        if name.is_empty() || name == "." || name == ".." || name.len() > 249 {
             return false;
         }
 
@@ -137,9 +139,42 @@ impl TopicValidator {
                     }
                 }
                 "retention.ms" => {
-                    if value.parse::<i64>().is_err() {
-                        error!("Invalid retention.ms value: {}", value);
+                    // Integer milliseconds; -1 means infinite retention. Anything
+                    // below -1 (or non-numeric) is invalid.
+                    match value.parse::<i64>() {
+                        Ok(v) if v >= -1 => {}
+                        _ => {
+                            error!("Invalid retention.ms value: {} (integer >= -1)", value);
+                            return Err(error_codes::INVALID_CONFIG);
+                        }
+                    }
+                }
+                "compression.type" => {
+                    // Kafka's accepted codecs (superset of what we compress with).
+                    const VALID: [&str; 7] =
+                        ["none", "uncompressed", "gzip", "snappy", "lz4", "zstd", "producer"];
+                    if !VALID.contains(&value.as_str()) {
+                        error!("Invalid compression.type value: {}", value);
                         return Err(error_codes::INVALID_CONFIG);
+                    }
+                }
+                "cleanup.policy" => {
+                    // "delete", "compact", or a comma-separated combination.
+                    let valid = !value.is_empty()
+                        && value.split(',').all(|p| matches!(p.trim(), "delete" | "compact"));
+                    if !valid {
+                        error!("Invalid cleanup.policy value: {}", value);
+                        return Err(error_codes::INVALID_CONFIG);
+                    }
+                }
+                "segment.bytes" => {
+                    // Kafka's minimum segment size is 14 bytes.
+                    match value.parse::<i64>() {
+                        Ok(v) if v >= 14 => {}
+                        _ => {
+                            error!("Invalid segment.bytes value: {} (integer >= 14)", value);
+                            return Err(error_codes::INVALID_CONFIG);
+                        }
                     }
                 }
                 "searchable" => {
