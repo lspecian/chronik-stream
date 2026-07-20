@@ -84,19 +84,23 @@ proptest! {
     ) {
         let mut buf = BytesMut::new();
         let mut encoder = chronik_protocol::parser::Encoder::new(&mut buf);
-        
+
+        let had_input = !strings.is_empty();
         for s in strings {
             // Test different string encoding methods
             encoder.write_string(s.as_deref());
-            
+
             if let Some(s) = s {
                 // Also test compact string for non-null values
                 encoder.write_compact_string(Some(&s));
             }
         }
-        
-        // Should have written something
-        prop_assert!(!buf.is_empty());
+
+        // Encoding any string (even a null) writes bytes; an empty input list
+        // legitimately produces no output (proptest's vec range includes 0).
+        if had_input {
+            prop_assert!(!buf.is_empty());
+        }
     }
 
     /// Test correlation ID preservation with random values
@@ -161,10 +165,11 @@ proptest! {
     ) {
         let mut buf = BytesMut::new();
         let mut encoder = chronik_protocol::parser::Encoder::new(&mut buf);
-        
+
+        let had_input = !lengths.is_empty();
         for len in lengths {
             encoder.write_i32(len);
-            
+
             // For non-negative lengths, write that many dummy items
             if len >= 0 && len < 100 {
                 // Limit to reasonable size
@@ -173,9 +178,12 @@ proptest! {
                 }
             }
         }
-        
-        // Should have written something
-        prop_assert!(!buf.is_empty());
+
+        // Writing any length prefix produces bytes; an empty input list
+        // legitimately produces no output (proptest's vec range includes 0).
+        if had_input {
+            prop_assert!(!buf.is_empty());
+        }
     }
 
     /// Test metadata request parsing with random fields

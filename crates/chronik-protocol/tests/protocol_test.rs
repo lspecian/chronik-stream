@@ -386,13 +386,10 @@ async fn test_describe_configs() {
     assert_eq!(response.header.correlation_id, 999);
     assert!(!response.body.is_empty());
     
-    // Parse response body
+    // Parse response body. The correlation_id lives in the wire header (asserted
+    // above), NOT in the body — the DescribeConfigs v0 body starts with throttle_time.
     let mut body = response.body.clone();
-    
-    // Skip correlation ID (already in header)
-    let corr_id = body.get_i32();
-    assert_eq!(corr_id, 999);
-    
+
     // Throttle time
     let throttle_time = body.get_i32();
     assert_eq!(throttle_time, 0);

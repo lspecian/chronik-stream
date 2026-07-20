@@ -159,27 +159,27 @@ async fn test_unsupported_version_errors() {
 async fn test_sasl_authentication_failure() {
     let handler = ProtocolHandler::new();
     
-    // Create SASL handshake request
+    // SaslHandshake for a mechanism the broker does NOT support. (PLAIN, SCRAM, and
+    // GSSAPI ARE supported, so requesting one of those would return error_code 0.)
     let mut request = BytesMut::new();
     request.put_i16(17); // SaslHandshake
     request.put_i16(0); // Version
     request.put_i32(456);
     request.put_i16(4);
     request.put_slice(b"test");
-    request.put_i16(5); // Mechanism length
-    request.put_slice(b"PLAIN");
-    
+    request.put_i16(11); // Mechanism length
+    request.put_slice(b"OAUTHBEARER"); // not supported
+
     let response = handler.handle_request(&request).await.unwrap();
-    
-    // Parse response
+
+    // SaslHandshake response body begins with the error_code (correlation_id is in
+    // the wire header, not the body).
     let mut body = response.body.clone();
-    body.advance(4); // Skip correlation ID
-    
     let error_code = body.get_i16();
     assert_eq!(
         error_code,
         ErrorCode::UnsupportedSaslMechanism as i16,
-        "SASL should return authentication failure"
+        "an unsupported SASL mechanism should be rejected"
     );
 }
 
@@ -188,11 +188,12 @@ async fn test_sasl_authentication_failure() {
 async fn test_error_response_format() {
     let handler = ProtocolHandler::new();
     
-    // Test various APIs that should return errors
+    // APIs that should return an error response. (InitProducerId (22) is NOT here
+    // anymore — it is now a fully supported transaction API and correctly returns
+    // NO_ERROR.)
     let error_apis = vec![
-        (99, "NonExistentAPI"),
-        (4, "LeaderAndIsr"), // Broker-only API
-        (22, "InitProducerId"), // Transaction API
+        (99, "NonExistentAPI"),  // unknown API key
+        (4, "LeaderAndIsr"),     // broker-internal API we don't serve
     ];
     
     for (api_key, name) in error_apis {
@@ -310,15 +311,13 @@ async fn test_sequential_error_handling() {
 /// Helper to extract error code from response body
 fn extract_error_code(body: &[u8]) -> Option<i16> {
     use bytes::Buf;
-    
-    if body.len() < 6 {
+
+    // The correlation_id lives in the wire header, NOT in Response::body. An error
+    // response body is just the error_code (i16) at the front.
+    if body.len() < 2 {
         return None;
     }
-    
     let mut buf = body;
-    buf.advance(4); // Skip correlation ID
-    
-    // Next should be error code (for most error responses)
     Some(buf.get_i16())
 }
 

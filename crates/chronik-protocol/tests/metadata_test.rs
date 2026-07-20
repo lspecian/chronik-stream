@@ -56,7 +56,7 @@ async fn test_metadata_empty_when_no_topics() {
     let handler = ProtocolHandler::with_metadata_store(metadata_store.clone());
     
     // Request metadata when no topics exist
-    let request = encode_metadata_request(None, 1);
+    let request = encode_metadata_request(None, 7);
     let response = handler.handle_request(&request).await.unwrap();
     
     // Parse response
@@ -116,7 +116,7 @@ async fn test_metadata_returns_created_topics() {
     let _create_response = handler.handle_request(&create_request).await.unwrap();
     
     // Now request metadata
-    let metadata_request = encode_metadata_request(None, 1);
+    let metadata_request = encode_metadata_request(None, 7);
     let response = handler.handle_request(&metadata_request).await.unwrap();
     
     // Parse response
@@ -227,7 +227,7 @@ async fn test_metadata_specific_topics() {
     let _create_response = handler.handle_request(&create_request).await.unwrap();
     
     // Request metadata for specific topics
-    let metadata_request = encode_metadata_request(Some(vec!["topic1", "topic3"]), 1);
+    let metadata_request = encode_metadata_request(Some(vec!["topic1", "topic3"]), 7);
     let response = handler.handle_request(&metadata_request).await.unwrap();
     
     // Parse response

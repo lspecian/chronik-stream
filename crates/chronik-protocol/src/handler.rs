@@ -1522,6 +1522,35 @@ impl ProtocolHandler {
         tracing::debug!("Received {} byte request, first {} bytes: {:02x?}",
                        request_bytes.len(), preview_len, &request_bytes[..preview_len]);
 
+        // Pre-decode version guard. The fixed header prefix — api_key (i16),
+        // api_version (i16), correlation_id (i32) — is version-independent, so we can
+        // reject an unsupported/garbage version BEFORE parsing the rest of the header.
+        // Otherwise a bogus high version (e.g. Metadata v99) is treated as flexible and
+        // the header parse dies reading tagged fields ("Incomplete varint"), losing the
+        // correlation_id — the client then never gets the well-formed UNSUPPORTED_VERSION
+        // response Kafka clients expect for version negotiation.
+        if request_bytes.len() >= 8 {
+            let api_key_raw = i16::from_be_bytes([request_bytes[0], request_bytes[1]]);
+            let api_version = i16::from_be_bytes([request_bytes[2], request_bytes[3]]);
+            let correlation_id = i32::from_be_bytes([
+                request_bytes[4], request_bytes[5], request_bytes[6], request_bytes[7],
+            ]);
+            let unsupported = match ApiKey::from_i16(api_key_raw) {
+                Some(api_key) => match self.supported_versions.get(&api_key) {
+                    Some(range) => api_version < range.min || api_version > range.max,
+                    None => true, // known enum but not served
+                },
+                None => true, // unknown api key entirely
+            };
+            if unsupported {
+                tracing::warn!(
+                    "Unsupported API/version: api_key={}, version={} — returning UNSUPPORTED_VERSION",
+                    api_key_raw, api_version
+                );
+                return self.error_response(correlation_id, error_codes::UNSUPPORTED_VERSION);
+            }
+        }
+
         let mut buf = Bytes::copy_from_slice(request_bytes);
 
         // Use the new parsing function that preserves correlation ID

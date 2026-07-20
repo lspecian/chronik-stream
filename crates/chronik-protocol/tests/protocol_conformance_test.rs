@@ -160,13 +160,11 @@ fn test_record_batch() {
     // Encode
     let encoded = batch.encode().unwrap();
     assert!(!encoded.is_empty());
-    
-    // The encoded batch starts with a 4-byte padding (was meant for length but set to 0)
-    // Skip the first 4 bytes to get to the actual RecordBatch data
-    let batch_data = encoded.slice(4..);
-    
-    // Decode
-    let decoded = RecordBatch::decode(batch_data).unwrap();
+
+    // encode() removes its internal 4-byte scratch padding before returning
+    // (`buf.split_off(4)`), so the bytes already start directly with base_offset,
+    // exactly as a Kafka RecordBatch on the wire. Decode them as-is.
+    let decoded = RecordBatch::decode(encoded).unwrap();
     assert_eq!(decoded.records.len(), 3);
     assert_eq!(decoded.base_offset, 1000);
     assert_eq!(decoded.producer_id, 12345);

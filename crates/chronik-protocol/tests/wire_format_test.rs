@@ -409,24 +409,13 @@ async fn test_correlation_id_preservation() {
         
         let response = handler.handle_request(&request).await.unwrap();
         
+        // The correlation_id is preserved in the response HEADER. It is NOT part of
+        // Response::body — the wire framing prepends it (see encode_response), so it
+        // must be checked on the header, not the body.
         assert_eq!(
             response.header.correlation_id,
             correlation_id,
             "Correlation ID not preserved"
-        );
-        
-        // Also verify it's in the response body
-        let body_correlation_id = i32::from_be_bytes([
-            response.body[0],
-            response.body[1],
-            response.body[2],
-            response.body[3],
-        ]);
-        
-        assert_eq!(
-            body_correlation_id,
-            correlation_id,
-            "Correlation ID not in response body"
         );
     }
 }
