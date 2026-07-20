@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.10.1] - 2026-07-20
+
+### Fixed
+- **DeleteTopics finally works with modern Kafka clients.** DeleteTopics encoded
+  responses and decoded requests as non-flexible for every version (i32 array
+  lengths, non-compact strings, no tagged fields, no v6 topic-id UUID), but flexible
+  starts at v4 and v6 replaced the request `topics` array with `[{name, topic_id}]`
+  and added a `topic_id` to each result. We advertise max v6 and every modern client
+  (AdminClient, Kafka UI, AKHQ) negotiates v6, so the request was mis-parsed and the
+  response underflowed the client's parser — topic deletion silently failed. Request
+  and response are now version-aware (classic v0-3, compact + tagged fields v4-5,
+  `DeleteTopicState`/`topic_id` UUID v6), and the handler resolves id-addressed
+  topics to a name and echoes each topic's real UUID. Verified with the real Java
+  AdminClient (kafka-clients 3.7.0): full admin E2E 7/7 (CreateTopics,
+  CreatePartitions, DeleteRecords, ListGroups, OffsetDelete, DeleteGroups,
+  DeleteTopics v6).
+
 ## [2.10.0] - 2026-07-19
 
 **Exactly-once semantics are now reliable on a cluster, and a critical multi-partition
