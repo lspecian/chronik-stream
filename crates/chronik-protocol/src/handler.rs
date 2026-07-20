@@ -151,10 +151,9 @@ impl ProtocolHandler {
             // throws NullPointerException even though the broker applied the change.
             false
         } else if api_key == ApiKey::DeleteTopics && header.api_version < 4 {
-            // DeleteTopics v0-v3 use NON-flexible headers (flexible starts at v4; we
-            // advertise max v3). Same header/body shift: without this the Java
-            // AdminClient reports "controller response did not contain a result for
-            // topic X" even though the delete + WAL reclaim happened server-side.
+            // DeleteTopics v0-v3 use NON-flexible headers (flexible starts at v4). We
+            // advertise max v6; v4+ get a flexible header (the default below) matching
+            // the flexible v4+/v6 body encoding in delete_topics_types.rs.
             false
         } else {
             // For other APIs and DescribeCluster v1+/Metadata v9+, use flexible headers
@@ -2904,76 +2903,87 @@ impl ProtocolHandler {
         tracing::info!("DeleteTopics request: {:?}", request);
 
         // Build response
+        use crate::delete_topics_types::ZERO_UUID;
+        let with_msg = header.api_version >= 5; // error_message field exists from v5
         let mut responses = Vec::new();
 
-        // Check if we have a metadata store
         if let Some(ref metadata_store) = self.metadata_store {
-            for topic_name in &request.topic_names {
-                // Check if topic exists
-                match metadata_store.get_topic(topic_name).await {
-                    Ok(Some(_)) => {
-                        // Topic exists, delete it
-                        match metadata_store.delete_topic(topic_name).await {
-                            Ok(()) => {
-                                tracing::info!("🗑️ Successfully deleted topic '{}'", topic_name);
-                                responses.push(DeletableTopicResult {
-                                    name: topic_name.clone(),
-                                    error_code: error_codes::NONE,
-                                    error_message: None,
-                                });
-                            }
-                            Err(e) => {
-                                tracing::error!("Failed to delete topic '{}': {}", topic_name, e);
-                                responses.push(DeletableTopicResult {
-                                    name: topic_name.clone(),
-                                    error_code: error_codes::UNKNOWN_SERVER_ERROR,
-                                    error_message: if header.api_version >= 5 {
-                                        Some(format!("Delete failed: {}", e))
-                                    } else {
-                                        None
-                                    },
-                                });
-                            }
+            for state in &request.topics {
+                // Resolve the topic name. v6 clients may address a topic purely by
+                // id, which we resolve to a name via the catalog.
+                let resolved_name: Option<String> = match &state.name {
+                    Some(n) => Some(n.clone()),
+                    None if state.topic_id != ZERO_UUID => {
+                        match metadata_store.list_topics().await {
+                            Ok(topics) => topics.into_iter()
+                                .find(|t| t.id.as_bytes() == &state.topic_id)
+                                .map(|t| t.name),
+                            Err(_) => None,
                         }
                     }
-                    Ok(None) => {
-                        // Topic doesn't exist
-                        tracing::warn!("DeleteTopics: topic '{}' not found", topic_name);
+                    None => None,
+                };
+
+                let name = match resolved_name {
+                    Some(n) => n,
+                    None => {
                         responses.push(DeletableTopicResult {
-                            name: topic_name.clone(),
+                            name: state.name.clone(),
+                            topic_id: state.topic_id,
                             error_code: error_codes::UNKNOWN_TOPIC_OR_PARTITION,
-                            error_message: if header.api_version >= 5 {
-                                Some(format!("Topic '{}' does not exist", topic_name))
-                            } else {
-                                None
-                            },
+                            error_message: with_msg.then(|| "Unknown topic (no name or resolvable id)".to_string()),
+                        });
+                        continue;
+                    }
+                };
+
+                // Echo the topic's real id where known (v6 responses carry it).
+                let (exists, real_id) = match metadata_store.get_topic(&name).await {
+                    Ok(Some(meta)) => (true, *meta.id.as_bytes()),
+                    Ok(None) => (false, state.topic_id),
+                    Err(e) => {
+                        tracing::error!("Failed to look up topic '{}': {}", name, e);
+                        (false, state.topic_id)
+                    }
+                };
+
+                if !exists {
+                    tracing::warn!("DeleteTopics: topic '{}' not found", name);
+                    responses.push(DeletableTopicResult {
+                        name: Some(name.clone()),
+                        topic_id: real_id,
+                        error_code: error_codes::UNKNOWN_TOPIC_OR_PARTITION,
+                        error_message: with_msg.then(|| format!("Topic '{}' does not exist", name)),
+                    });
+                    continue;
+                }
+
+                match metadata_store.delete_topic(&name).await {
+                    Ok(()) => {
+                        tracing::info!("🗑️ Successfully deleted topic '{}'", name);
+                        responses.push(DeletableTopicResult {
+                            name: Some(name), topic_id: real_id,
+                            error_code: error_codes::NONE, error_message: None,
                         });
                     }
                     Err(e) => {
-                        tracing::error!("Failed to get topic '{}': {}", topic_name, e);
+                        tracing::error!("Failed to delete topic '{}': {}", name, e);
                         responses.push(DeletableTopicResult {
-                            name: topic_name.clone(),
+                            name: Some(name), topic_id: real_id,
                             error_code: error_codes::UNKNOWN_SERVER_ERROR,
-                            error_message: if header.api_version >= 5 {
-                                Some(format!("Failed to check topic: {}", e))
-                            } else {
-                                None
-                            },
+                            error_message: with_msg.then(|| format!("Delete failed: {}", e)),
                         });
                     }
                 }
             }
         } else {
             // No metadata store available
-            for topic_name in &request.topic_names {
+            for state in &request.topics {
                 responses.push(DeletableTopicResult {
-                    name: topic_name.clone(),
+                    name: state.name.clone(),
+                    topic_id: state.topic_id,
                     error_code: error_codes::NOT_CONTROLLER,
-                    error_message: if header.api_version >= 5 {
-                        Some("No metadata store available".to_string())
-                    } else {
-                        None
-                    },
+                    error_message: with_msg.then(|| "No metadata store available".to_string()),
                 });
             }
         }
