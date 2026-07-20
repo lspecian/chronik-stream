@@ -63,11 +63,20 @@ struct SegmentInfo {
 /// Configuration for FetchHandler behavior
 #[derive(Debug, Clone)]
 pub struct FetchHandlerConfig {
-    /// Enable follower reads (default: true)
-    /// If false, only leaders can serve fetches
+    /// NOT WIRED. Kept for forward-compatibility with KIP-392 follower fetching, but
+    /// the fetch path does not currently branch on it: every node serves fetches from
+    /// its own local log, and clients route to the partition leader via the Metadata
+    /// response, so in practice reads are always served by the leader. This is
+    /// deliberate for read_committed — the leader applies the COMMIT/ABORT markers
+    /// synchronously (see transaction_index::apply_log_batch on the produce path), so
+    /// the Last Stable Offset is correct the instant `commitTransaction` returns
+    /// (measured: committed records become visible to a read_committed consumer in
+    /// ~6ms server-side). Enabling true follower fetching here would reintroduce a
+    /// replication-lag visibility window on read_committed, so any future wiring must
+    /// force read_committed to the leader (or make the follower wait for the marker).
     pub allow_follower_reads: bool,
 
-    /// Maximum wait time for commit in follower reads (ms)
+    /// NOT WIRED (see `allow_follower_reads`). Intended follower-read commit wait.
     pub follower_read_max_wait_ms: u64,
 
     /// Node ID (for preferred_read_replica)
