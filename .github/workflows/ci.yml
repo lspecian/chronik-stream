@@ -65,6 +65,13 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --lib --bins
 
+      # Protocol conformance / wire-format suites (in-process, no Docker). These live
+      # under crates/chronik-protocol/tests and are NOT covered by --lib --bins, so
+      # they previously rotted unnoticed. Run them explicitly to guard the Kafka wire
+      # protocol against regressions.
+      - name: Run protocol conformance tests
+        run: cargo test -p chronik-protocol --tests
+
   build:
     name: Build
     runs-on: ubuntu-latest
