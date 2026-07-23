@@ -158,19 +158,21 @@ impl TopicLayout {
 /// - `vector.enabled` — HNSW vector index
 /// - `columnar.enabled` — Parquet/DataFusion SQL table
 ///
-/// **Search (Tantivy BM25) is not a per-topic key in Chronik today** — it is
-/// controlled globally by the `CHRONIK_DEFAULT_SEARCHABLE` env var on the
-/// broker. The SDK still tracks an intent flag (`bm25_enabled`) on the
-/// template for documentation and future use; it is not currently sent in
-/// the CreateTopics request.
+/// **Search (Tantivy BM25) is sent as an explicit per-topic `searchable` key**,
+/// derived from `bm25_enabled`. The broker's `TopicConfig::is_searchable()`
+/// checks the explicit `config["searchable"]` value before falling back to the
+/// `CHRONIK_DEFAULT_SEARCHABLE` env default, so raw transcript topics
+/// (`bm25_enabled=false`) stay OUT of the Tantivy indexer regardless of the
+/// broker-wide default — which matters at fleet scale, where force-indexing
+/// hundreds of `mem.raw.*` topics starves `mem.fact.*` indexing.
 #[derive(Debug, Clone)]
 pub struct TopicConfig {
     /// Topic name.
     pub name: String,
     /// Cleanup policy: `"delete"` (append-only) or `"compact"` (key-based supersession).
     pub cleanup_policy: &'static str,
-    /// Documented intent — full-text BM25 index. Currently set globally on the
-    /// broker via `CHRONIK_DEFAULT_SEARCHABLE`; not sent as a per-topic key.
+    /// Full-text BM25 index intent. Sent to the broker as an explicit per-topic
+    /// `searchable` key (which `is_searchable()` honors over the env default).
     pub bm25_enabled: bool,
     /// Enable HNSW vector index (per-topic key `vector.enabled`).
     pub vector_enabled: bool,
