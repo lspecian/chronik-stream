@@ -57,7 +57,9 @@ reqwest = { version = "0.11", default-features = false, features = ["json", "rus
 reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
 tokio-test = "0.4"
 tempfile = "3.8"
-# axum-test = "14.0"  # Temporarily disabled - requires axum 0.7, we're on 0.6 for compatibility
+# axum-test 13.x is the last line that targets axum 0.6 (14+ requires axum 0.7). Pinned
+# so the api_test/geo_search_test integration suites compile against our workspace axum 0.6.
+axum-test = "13"
 criterion = { workspace = true }
 
 [[bench]]

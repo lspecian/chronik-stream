@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.10.4] - 2026-07-23
+
+### Fixed
+- **Search API crashed when a second `SearchApi` was constructed in one process.**
+  `ApiMetrics::new()` registered its counters/histogram into the process-wide default
+  Prometheus registry via the `register_*!` macros, which error on a duplicate name —
+  so a second `SearchApi` in the same process failed to build. Registration is now
+  best-effort: each collector is always constructed and registered on a first-wins
+  basis (a duplicate is tolerated and the collector is kept unregistered). Production
+  builds exactly one `SearchApi`, so `/metrics` scraping is unchanged; this also makes
+  the API testable in-process.
+- **Search writes were not immediately visible after indexing.** `index_document` and
+  `delete_document` committed the Tantivy writer ("commit immediately for consistency")
+  but never reloaded the reader, which uses `ReloadPolicy::OnCommitWithDelay` — so an
+  index/delete immediately followed by a get or search read a stale searcher and
+  returned the old (or empty) result. Both handlers now reload the reader after commit,
+  making writes synchronously visible (Elasticsearch realtime-GET semantics), honoring
+  the commit's stated intent.
+
+### Internal
+- **Rescued three integration test suites that had silently rotted** because CI only ran
+  `--lib --bins` and the protocol `tests/` — every other crate's `tests/` was never
+  exercised. `chronik-query`'s `orchestrator_test` (stale after `QueryRequest` gained a
+  `rerank` field), `chronik-storage`'s `segment_test` (decoded v3 length-prefixed
+  `indexed_records` with the old v2 loop; the production decoder was already correct),
+  and `chronik-search`'s `api_test`/`geo_search_test` (dev-dep `axum-test` was commented
+  out; pinned to `13`, the last line targeting axum 0.6) all compile and pass again. The
+  two `chronik-search` fixes above were found precisely because these tests were dark.
+- **CI now runs the whole workspace's integration suites** (`cargo test --workspace
+  --tests`) instead of only the protocol conformance tests, so no crate's `tests/` can
+  rot unnoticed again. All infra-coupled cases (live broker/cluster/model/API key) are
+  `#[ignore]`-gated and skipped; the run is hermetic and needs no Docker.
+
 ## [2.10.3] - 2026-07-20
 
 ### Fixed

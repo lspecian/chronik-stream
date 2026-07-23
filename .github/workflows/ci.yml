@@ -62,15 +62,18 @@ jobs:
             target/
           key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
       
-      - name: Run tests
+      # Unit tests (lib + bins) across the workspace — fast fail-first signal.
+      - name: Run unit tests
         run: cargo test --workspace --lib --bins
 
-      # Protocol conformance / wire-format suites (in-process, no Docker). These live
-      # under crates/chronik-protocol/tests and are NOT covered by --lib --bins, so
-      # they previously rotted unnoticed. Run them explicitly to guard the Kafka wire
-      # protocol against regressions.
-      - name: Run protocol conformance tests
-        run: cargo test -p chronik-protocol --tests
+      # Integration / conformance suites live under each crate's tests/ dir and are
+      # NOT covered by --lib --bins, so they previously rotted unnoticed (the protocol
+      # wire-format suites, plus chronik-query/chronik-search/chronik-storage suites,
+      # had all silently broken this way). Every crate's tests/ suite is now hermetic —
+      # infra-coupled cases (live broker/cluster/model/API key) are #[ignore]-gated and
+      # skipped here — so run them all to guard against regressions. No Docker required.
+      - name: Run integration tests
+        run: cargo test --workspace --tests
 
   build:
     name: Build

@@ -180,6 +180,7 @@ async fn test_single_topic_text_only() {
         rank: None,
         timeout_ms: None,
         result_format: ResultFormat::Merged,
+        rerank: false,
     };
 
     let caps = make_capabilities();
@@ -227,6 +228,7 @@ async fn test_hybrid_text_vector_rrf_boost() {
         rank: None,
         timeout_ms: None,
         result_format: ResultFormat::Merged,
+        rerank: false,
     };
 
     let caps = make_capabilities();
@@ -294,6 +296,7 @@ async fn test_multi_topic_query() {
         rank: None,
         timeout_ms: None,
         result_format: ResultFormat::Merged,
+        rerank: false,
     };
 
     let caps = make_capabilities();
@@ -336,6 +339,7 @@ async fn test_grouped_result_format() {
         rank: None,
         timeout_ms: None,
         result_format: ResultFormat::Grouped,
+        rerank: false,
     };
 
     let caps = make_capabilities();
@@ -383,6 +387,7 @@ async fn test_merged_result_format() {
         rank: None,
         timeout_ms: None,
         result_format: ResultFormat::Merged,
+        rerank: false,
     };
 
     let caps = make_capabilities();
@@ -421,6 +426,7 @@ async fn test_profile_switching_affects_ranking() {
         }),
         timeout_ms: None,
         result_format: ResultFormat::Merged,
+        rerank: false,
     };
 
     let caps = make_capabilities();
@@ -534,6 +540,7 @@ async fn test_timeout_returns_partial_results() {
         rank: None,
         timeout_ms: Some(200), // Short timeout
         result_format: ResultFormat::Merged,
+        rerank: false,
     };
 
     let caps = make_capabilities();
@@ -591,6 +598,7 @@ async fn test_missing_capability_skipped() {
         rank: None,
         timeout_ms: None,
         result_format: ResultFormat::Merged,
+        rerank: false,
     };
 
     let caps = make_capabilities();
@@ -671,6 +679,7 @@ async fn test_empty_results() {
         rank: None,
         timeout_ms: None,
         result_format: ResultFormat::Merged,
+        rerank: false,
     };
 
     let caps = make_capabilities();
@@ -707,6 +716,7 @@ async fn test_feature_logging_connected() {
         rank: None,
         timeout_ms: None,
         result_format: ResultFormat::Merged,
+        rerank: false,
     };
 
     let caps = make_capabilities();
@@ -745,6 +755,7 @@ async fn test_query_response_has_query_id() {
         rank: None,
         timeout_ms: None,
         result_format: ResultFormat::Merged,
+        rerank: false,
     };
 
     let caps = make_capabilities();
@@ -790,6 +801,7 @@ async fn test_response_serializable_to_json() {
         }),
         timeout_ms: None,
         result_format: ResultFormat::Merged,
+        rerank: false,
     };
 
     let caps = make_capabilities();
@@ -839,6 +851,7 @@ async fn test_k_truncation() {
         rank: None,
         timeout_ms: None,
         result_format: ResultFormat::Merged,
+        rerank: false,
     };
 
     let caps = make_capabilities();

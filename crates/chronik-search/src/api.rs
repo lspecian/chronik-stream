@@ -6,7 +6,7 @@ use axum::{
     Router,
 };
 use dashmap::DashMap;
-use prometheus::{register_counter_vec, register_histogram_vec, CounterVec, HistogramVec};
+use prometheus::{CounterVec, HistogramVec, Opts, HistogramOpts};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -57,28 +57,42 @@ struct ApiMetrics {
 
 impl ApiMetrics {
     fn new() -> Result<Self> {
-        let requests_total = register_counter_vec!(
-            "search_api_requests_total",
-            "Total number of API requests",
-            &["method", "endpoint", "status"]
-        ).map_err(|e| Error::Internal(format!("Failed to register metric: {}", e)))?;
-
-        let request_duration_seconds = register_histogram_vec!(
-            "search_api_request_duration_seconds",
-            "API request duration in seconds",
-            &["method", "endpoint"]
-        ).map_err(|e| Error::Internal(format!("Failed to register metric: {}", e)))?;
-
-        let errors_total = register_counter_vec!(
-            "search_api_errors_total",
-            "Total number of API errors",
-            &["method", "endpoint", "error_type"]
-        ).map_err(|e| Error::Internal(format!("Failed to register metric: {}", e)))?;
+        // Build each collector and register it into the process-wide default
+        // registry on a best-effort basis. A duplicate-registration error means
+        // an ApiMetrics already exists in this process (e.g. multiple SearchApi
+        // instances in a single test binary) — in that case we keep the freshly
+        // built collector unregistered rather than failing construction.
+        // Production builds exactly one SearchApi, so the first registration
+        // always wins and /metrics scraping is unaffected.
+        fn counter_vec(name: &str, help: &str, labels: &[&str]) -> Result<CounterVec> {
+            let cv = CounterVec::new(Opts::new(name, help), labels)
+                .map_err(|e| Error::Internal(format!("Failed to build metric {}: {}", name, e)))?;
+            let _ = prometheus::default_registry().register(Box::new(cv.clone()));
+            Ok(cv)
+        }
+        fn histogram_vec(name: &str, help: &str, labels: &[&str]) -> Result<HistogramVec> {
+            let hv = HistogramVec::new(HistogramOpts::new(name, help), labels)
+                .map_err(|e| Error::Internal(format!("Failed to build metric {}: {}", name, e)))?;
+            let _ = prometheus::default_registry().register(Box::new(hv.clone()));
+            Ok(hv)
+        }
 
         Ok(Self {
-            requests_total,
-            request_duration_seconds,
-            errors_total,
+            requests_total: counter_vec(
+                "search_api_requests_total",
+                "Total number of API requests",
+                &["method", "endpoint", "status"],
+            )?,
+            request_duration_seconds: histogram_vec(
+                "search_api_request_duration_seconds",
+                "API request duration in seconds",
+                &["method", "endpoint"],
+            )?,
+            errors_total: counter_vec(
+                "search_api_errors_total",
+                "Total number of API errors",
+                &["method", "endpoint", "error_type"],
+            )?,
         })
     }
 }

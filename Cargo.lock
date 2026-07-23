@@ -725,6 +725,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
+name = "auto-future"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c1e7e457ea78e524f48639f551fd79703ac3f2237f5ecccdf4708f8a75ad373"
+
+[[package]]
 name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1258,6 +1264,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "axum-test"
+version = "13.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "deffdcc6ae7bc024b82f4bd3f46b048781a504588e86716a6d5ccc10b2615e99"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "auto-future",
+ "axum 0.6.20",
+ "bytes",
+ "cookie",
+ "http 0.2.12",
+ "hyper 0.14.32",
+ "pretty_assertions",
+ "reserve-port",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
+ "smallvec",
+ "tokio",
+ "tower 0.4.13",
+ "url",
+]
+
+[[package]]
 name = "backoff"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1620,7 +1651,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-backup"
-version = "2.10.3"
+version = "2.10.4"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -1688,7 +1719,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-columnar"
-version = "2.10.3"
+version = "2.10.4"
 dependencies = [
  "anyhow",
  "arrow 54.2.1",
@@ -1731,7 +1762,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-common"
-version = "2.10.3"
+version = "2.10.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1753,7 +1784,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-config"
-version = "2.10.3"
+version = "2.10.4"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1778,7 +1809,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-embeddings"
-version = "2.10.3"
+version = "2.10.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1823,7 +1854,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-monitoring"
-version = "2.10.3"
+version = "2.10.4"
 dependencies = [
  "anyhow",
  "axum 0.6.20",
@@ -1845,7 +1876,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-operator"
-version = "2.10.3"
+version = "2.10.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -1887,7 +1918,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-protocol"
-version = "2.10.3"
+version = "2.10.4"
 dependencies = [
  "anyhow",
  "base64 0.21.7",
@@ -1911,7 +1942,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-query"
-version = "2.10.3"
+version = "2.10.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1939,7 +1970,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-raft"
-version = "2.10.3"
+version = "2.10.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1969,7 +2000,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-raft-bridge"
-version = "2.10.3"
+version = "2.10.4"
 dependencies = [
  "bytes",
  "prost 0.12.6",
@@ -1978,10 +2009,11 @@ dependencies = [
 
 [[package]]
 name = "chronik-search"
-version = "2.10.3"
+version = "2.10.4"
 dependencies = [
  "anyhow",
  "axum 0.6.20",
+ "axum-test",
  "base64 0.21.7",
  "bincode",
  "bytes",
@@ -2013,7 +2045,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-server"
-version = "2.10.3"
+version = "2.10.4"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2076,7 +2108,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-storage"
-version = "2.10.3"
+version = "2.10.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2126,7 +2158,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-wal"
-version = "2.10.3"
+version = "2.10.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2365,6 +2397,16 @@ name = "constant_time_eq"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c74b8349d32d297c9134b8c88677813a227df8f779daa29bfc29c183fe3dca6"
+
+[[package]]
+name = "cookie"
+version = "0.18.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ddef33a339a91ea89fb53151bd0a4689cfce27055c291dfa69945475d22c747"
+dependencies = [
+ "time",
+ "version_check",
+]
 
 [[package]]
 name = "core-foundation"
@@ -3197,6 +3239,12 @@ dependencies = [
  "quote",
  "syn 1.0.109",
 ]
+
+[[package]]
+name = "diff"
+version = "0.1.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "56254986775e3233ffa9c4d7d3faaf6d36a2c09d30b20687e9f88bc8bafc16c8"
 
 [[package]]
 name = "digest"
@@ -5878,6 +5926,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pretty_assertions"
+version = "1.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ae130e2f271fbc2ac3a40fb1d07180839cdbbe443c7a27e1e3c13c5cac0116d"
+dependencies = [
+ "diff",
+ "yansi",
+]
+
+[[package]]
 name = "prettyplease"
 version = "0.2.37"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6141,7 +6199,7 @@ dependencies = [
  "rustc-hash",
  "rustls 0.23.34",
  "socket2 0.6.1",
- "thiserror 2.0.17",
+ "thiserror 2.0.19",
  "tokio",
  "tracing",
  "web-time",
@@ -6162,7 +6220,7 @@ dependencies = [
  "rustls 0.23.34",
  "rustls-pki-types",
  "slab",
- "thiserror 2.0.17",
+ "thiserror 2.0.19",
  "tinyvec",
  "tracing",
  "web-time",
@@ -6530,6 +6588,15 @@ dependencies = [
  "wasm-bindgen-futures",
  "web-sys",
  "webpki-roots 1.0.4",
+]
+
+[[package]]
+name = "reserve-port"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "71ea98a177596a4579881992bd2bd4af27772fc95d0e5f5668a8f9535eca6380"
+dependencies = [
+ "thiserror 2.0.19",
 ]
 
 [[package]]
@@ -7181,7 +7248,7 @@ checksum = "297f631f50729c8c99b84667867963997ec0b50f32b2a7dbcab828ef0541e8bb"
 dependencies = [
  "num-bigint",
  "num-traits",
- "thiserror 2.0.17",
+ "thiserror 2.0.19",
  "time",
 ]
 
@@ -7410,6 +7477,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "syn"
+version = "3.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a207d6d6a2b7fc470b80443726053f18a2481b7e1eee970597051596567987a3"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "unicode-ident",
+]
+
+[[package]]
 name = "sync_wrapper"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7526,7 +7604,7 @@ dependencies = [
  "tantivy-stacker",
  "tantivy-tokenizer-api",
  "tempfile",
- "thiserror 2.0.17",
+ "thiserror 2.0.19",
  "time",
  "uuid",
  "winapi",
@@ -7661,11 +7739,11 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "2.0.17"
+version = "2.0.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f63587ca0f12b72a0600bcba1d40081f830876000bb46dd2337a3051618f4fc8"
+checksum = "09a43598840e33d5b0331f38c5e30d13bb11c11210a4b58f0d9b18a5a5eefcd9"
 dependencies = [
- "thiserror-impl 2.0.17",
+ "thiserror-impl 2.0.19",
 ]
 
 [[package]]
@@ -7681,13 +7759,13 @@ dependencies = [
 
 [[package]]
 name = "thiserror-impl"
-version = "2.0.17"
+version = "2.0.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ff15c8ecd7de3849db632e14d18d2571fa09dfc5ed93479bc4485c7a517c913"
+checksum = "43cbfe0cf76104d42a574802844187e84a305e531ed54455f11fbde0f10541cd"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.108",
+ "syn 3.0.2",
 ]
 
 [[package]]
@@ -9088,6 +9166,12 @@ checksum = "56c1936c4cc7a1c9ab21a1ebb602eb942ba868cbd44a99cb7cdc5892335e1c85"
 dependencies = [
  "linked-hash-map",
 ]
+
+[[package]]
+name = "yansi"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cfe53a6657fd280eaa890a3bc59152892ffa3e30101319d168b781ed6529b049"
 
 [[package]]
 name = "yoke"

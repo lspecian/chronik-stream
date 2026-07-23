@@ -46,7 +46,10 @@ fn test_segment_serialization_roundtrip() {
     assert_eq!(deserialized.metadata.base_offset, metadata.base_offset);
     assert_eq!(deserialized.metadata.last_offset, metadata.last_offset);
     assert_eq!(deserialized.raw_kafka_batches, Bytes::from("test kafka data"));
-    assert_eq!(deserialized.indexed_records, Bytes::from("test indexed data"));
+    // v3 format: add_indexed_record() prepends a u32 big-endian length prefix to each
+    // record (fixes the multi-batch decode bug); raw_kafka_batches are stored verbatim.
+    // The first 4 bytes are the length prefix, so compare the payload after them.
+    assert_eq!(&deserialized.indexed_records[4..], b"test indexed data");
     assert_eq!(deserialized.index_data, Bytes::from("test index data"));
 }
 
@@ -239,25 +242,36 @@ fn test_segment_round_trip_multi_batch() {
 
     println!("Segment has {} bytes of indexed_records", deserialized.indexed_records.len());
 
-    // Now decode all records from indexed_records (this is what fetch_handler does)
+    // Now decode all records from indexed_records the same way production does
+    // (IndexedRecordDecoder::decode_indexed_records). v3 segments prefix each batch
+    // with a u32 big-endian length, so we read the prefix, decode exactly that many
+    // bytes, then advance past both prefix and payload.
     let mut all_records = Vec::new();
     let mut cursor_pos = 0;
     let total_len = deserialized.indexed_records.len();
     let mut batch_count = 0;
 
-    while cursor_pos < total_len {
-        match RecordBatch::decode(&deserialized.indexed_records[cursor_pos..]) {
+    while cursor_pos + 4 <= total_len {
+        let batch_len = u32::from_be_bytes([
+            deserialized.indexed_records[cursor_pos],
+            deserialized.indexed_records[cursor_pos + 1],
+            deserialized.indexed_records[cursor_pos + 2],
+            deserialized.indexed_records[cursor_pos + 3],
+        ]) as usize;
+        let batch_start = cursor_pos + 4;
+        let batch_end = batch_start + batch_len;
+        if batch_end > total_len {
+            panic!("Truncated v3 batch: prefix says {} bytes at {}, but only {} remain",
+                batch_len, cursor_pos, total_len - batch_start);
+        }
+
+        match RecordBatch::decode(&deserialized.indexed_records[batch_start..batch_end]) {
             Ok((batch, bytes_consumed)) => {
                 println!("Batch {}: {} records, {} bytes consumed at position {}",
                     batch_count + 1, batch.records.len(), bytes_consumed, cursor_pos);
 
                 all_records.extend(batch.records);
-                cursor_pos += bytes_consumed;
                 batch_count += 1;
-
-                if bytes_consumed == 0 {
-                    panic!("Zero bytes consumed at position {}", cursor_pos);
-                }
             }
             Err(e) => {
                 eprintln!("ERROR: Failed to decode batch {} at position {}/{}: {}",
@@ -267,6 +281,8 @@ fn test_segment_round_trip_multi_batch() {
                 break;
             }
         }
+
+        cursor_pos = batch_end;
     }
 
     // THIS IS THE CRITICAL ASSERTION - should get all 20 records

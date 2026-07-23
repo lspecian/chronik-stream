@@ -1076,7 +1076,15 @@ pub async fn index_document(
     writer.commit()
         .map_err(|e| Error::Internal(format!("Failed to commit: {}", e)))
         .map_err(|e| indexing_error(e))?;
-    
+
+    // The reader uses ReloadPolicy::OnCommitWithDelay, so a commit alone does not
+    // make the write visible to the next searcher() until the delayed reload fires.
+    // Force a reload here so an index is immediately followed by a consistent
+    // get/search (Elasticsearch realtime-GET semantics), honoring the commit above.
+    state.reader.reload()
+        .map_err(|e| Error::Internal(format!("Failed to reload reader: {}", e)))
+        .map_err(|e| indexing_error(e))?;
+
     let response = IndexDocumentResponse {
         _index: index,
         _id: id,
@@ -1200,7 +1208,13 @@ pub async fn delete_document(
     writer.commit()
         .map_err(|e| Error::Internal(format!("Failed to commit: {}", e)))
         .map_err(|e| deletion_error(e))?;
-    
+
+    // Force a reader reload so the deletion is immediately visible to the next
+    // get/search (see the note in index_document — OnCommitWithDelay otherwise lags).
+    state.reader.reload()
+        .map_err(|e| Error::Internal(format!("Failed to reload reader: {}", e)))
+        .map_err(|e| deletion_error(e))?;
+
     let response = DeleteDocumentResponse {
         _index: index,
         _id: id,
