@@ -135,6 +135,7 @@ async fn sdk_drives_cluster_end_to_end() {
         object: serde_json::json!(800_000),
         polarity: "asserted".into(),
         text: "User has max budget 800000 EUR".into(),
+        speaker: "user".into(),
     });
     let body_neighborhood = Body::Fact(FactBody {
         subject: "user".into(),
@@ -142,6 +143,7 @@ async fn sdk_drives_cluster_end_to_end() {
         object: serde_json::json!("Lapa"),
         polarity: "asserted".into(),
         text: "User prefers Lapa neighborhood".into(),
+        speaker: "user".into(),
     });
 
     let ack_budget = mem
