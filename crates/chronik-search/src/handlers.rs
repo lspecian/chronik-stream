@@ -1709,7 +1709,8 @@ mod hot_merge_tests {
         };
         let es = hot_hit_to_es_hit(hh);
         assert_eq!(es._index, "orders");
-        assert_eq!(es._id, "1234");
+        // Partition-qualified: offset alone collides across partitions.
+        assert_eq!(es._id, "3-1234");
         assert_eq!(es._score, Some(0.75));
         let src = es._source.as_object().unwrap();
         assert_eq!(src.get("partition").and_then(|v| v.as_i64()), Some(3));
