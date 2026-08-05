@@ -102,7 +102,9 @@ fn hot_hit_to_es_hit(hit: crate::hot_text_index::HotHit) -> Hit {
 
     Hit {
         _index: hit.topic,
-        _id: hit.offset.to_string(),
+        // Partition-qualified, matching search_tantivy_index — offset alone
+        // collides across partitions, collapsing the (_index,_id) dedup.
+        _id: format!("{}-{}", hit.partition, hit.offset),
         _score: Some(hit.score),
         _source: serde_json::Value::Object(source),
         highlight: None,
@@ -427,6 +429,28 @@ pub async fn search_index(
         }
     }
 
+    // Object-store cold segments — the WalIndexer's ACTUAL output. The two
+    // on-disk reads above miss these: the WalIndexer writes each segment's
+    // Tantivy index as a nested `{topic}/partition-N/segment-*.tar.gz` archive
+    // THROUGH the object store (not to the on-disk `index_base_path`), so
+    // Kafka-produced searchable topics were served only by the decaying hot
+    // index (regression 0e37747). Consulted when the on-disk sources yielded
+    // nothing for this topic, so legacy topics that still have a `{data}/index`
+    // dir keep their existing single-source behavior and don't double-count.
+    if cold_hits.is_empty() {
+        if let Some(wal_indexer) = api.wal_indexer() {
+            match search_object_store_segments(wal_indexer, &index, &request).await {
+                Ok(hits) => {
+                    if !hits.is_empty() {
+                        have_any_cold_source = true;
+                    }
+                    cold_hits.extend(hits);
+                }
+                Err(e) => debug!(topic = %index, "object-store cold search error: {}", e),
+            }
+        }
+    }
+
     // If no cold source was found AND the hot path is off, preserve the
     // v2.5.x "index not found" error. With the hot path on, absence from
     // cold sources just means the topic is NRT-only for now.
@@ -530,6 +554,74 @@ async fn search_wal_indices_for_topic(
                 }
             }
             Err(e) => debug!("Could not open index at {}: {}", path.display(), e),
+        }
+    }
+    Ok(all_hits)
+}
+
+/// Search a topic's cold Tantivy segments via the WalIndexer's object store.
+///
+/// This is the fix for the 0e37747 regression: the WalIndexer writes each
+/// sealed segment's Tantivy index as a nested `{topic}/partition-N/segment-*.tar.gz`
+/// archive THROUGH the object store (local dir or S3), registering it in the
+/// segment index. The on-disk `search_wal_indices*` readers never see these —
+/// they scan `index_base_path` on the filesystem, which is a different physical
+/// location and a different (flat, unarchived) layout. So Kafka-produced
+/// searchable topics were served only by the in-memory hot-text index, which
+/// ages out — making documents silently disappear from search over time.
+///
+/// Here we enumerate the topic's segments from the segment index, download and
+/// open each archive via [`TantivySegmentReader::from_object_store`] (works for
+/// both local and S3 backends), and reuse [`search_tantivy_index`] to build
+/// hits. Fan-out across partitions is implicit: the segment index holds every
+/// partition's segments for the topic.
+async fn search_object_store_segments(
+    wal_indexer: &std::sync::Arc<chronik_storage::WalIndexer>,
+    topic: &str,
+    request: &SearchRequest,
+) -> Result<Vec<Hit>> {
+    use chronik_storage::tantivy_segment::TantivySegmentReader;
+
+    let segments = wal_indexer
+        .segment_index()
+        .get_segments_for_topic(topic)
+        .await
+        .map_err(|e| Error::Internal(format!("segment lookup for {}: {}", topic, e)))?;
+    if segments.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let object_store = wal_indexer.object_store();
+    // Persistent extraction cache, keyed by the (immutable) segment object key.
+    // Survives across queries; re-populated after a restart. Kept off the data
+    // dir deliberately — it is a disposable cache, not durable state.
+    let cache_root = std::env::temp_dir().join("chronik-cold-search");
+    let mut all_hits = Vec::new();
+    for seg in segments {
+        let dest_dir = cache_root.join(seg.object_store_path.replace(['/', '\\'], "_"));
+        match TantivySegmentReader::from_object_store_cached(
+            object_store.clone(),
+            &seg.object_store_path,
+            &dest_dir,
+        )
+        .await
+        {
+            Ok(reader) => match search_tantivy_index(topic, reader.index(), request).await {
+                Ok(mut hits) => {
+                    for h in &mut hits {
+                        h._index = topic.to_string();
+                    }
+                    all_hits.append(&mut hits);
+                }
+                Err(e) => debug!(
+                    "cold segment search error ({}): {}",
+                    seg.object_store_path, e
+                ),
+            },
+            Err(e) => debug!(
+                "could not open cold segment {}: {}",
+                seg.object_store_path, e
+            ),
         }
     }
     Ok(all_hits)
@@ -675,12 +767,22 @@ async fn search_tantivy_index(
         // TantivyIndexer uses `offset`, the realtime indexer uses `_offset`.
         // v2.5.4: also fall back to `_id` for REST-created indexes. Stable
         // IDs are required for hot↔cold dedup in `search_index` to work.
-        let doc_id = source.get("offset")
-            .and_then(|v| v.as_i64())
-            .map(|o| o.to_string())
-            .or_else(|| source.get("_offset").and_then(|v| v.as_i64()).map(|o| o.to_string()))
-            .or_else(|| source.get("_id").and_then(|v| v.as_str()).map(|s| s.to_string()))
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        //
+        // Multi-partition fix: qualify the id by partition when present. Offset
+        // alone collides across partitions (every partition has offset 0,1,2…),
+        // so the (_index,_id) dedup in `merge_hot_and_cold_hits` would collapse
+        // distinct docs from different partitions — dropping ~2/3 of a
+        // 3-partition topic's hits.
+        let offset_part = source.get("offset").and_then(|v| v.as_i64())
+            .or_else(|| source.get("_offset").and_then(|v| v.as_i64()));
+        let partition_part = source.get("partition").and_then(|v| v.as_i64())
+            .or_else(|| source.get("_partition").and_then(|v| v.as_i64()));
+        let doc_id = match (partition_part, offset_part) {
+            (Some(p), Some(o)) => format!("{}-{}", p, o),
+            (None, Some(o)) => o.to_string(),
+            _ => source.get("_id").and_then(|v| v.as_str()).map(|s| s.to_string())
+                .unwrap_or_else(|| Uuid::new_v4().to_string()),
+        };
 
         hits.push(Hit {
             _index: index_name.to_string(),
@@ -1607,7 +1709,8 @@ mod hot_merge_tests {
         };
         let es = hot_hit_to_es_hit(hh);
         assert_eq!(es._index, "orders");
-        assert_eq!(es._id, "1234");
+        // Partition-qualified: offset alone collides across partitions.
+        assert_eq!(es._id, "3-1234");
         assert_eq!(es._score, Some(0.75));
         let src = es._source.as_object().unwrap();
         assert_eq!(src.get("partition").and_then(|v| v.as_i64()), Some(3));

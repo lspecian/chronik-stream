@@ -394,6 +394,23 @@ impl SegmentIndex {
         Ok(all_segments)
     }
 
+    /// Get all cold segments for a topic across every partition. Used by
+    /// `/_search` to fan a full-text query across a topic's cold Tantivy
+    /// segments regardless of which partition (hence which node-local leader)
+    /// produced them.
+    pub async fn get_segments_for_topic(&self, topic: &str) -> Result<Vec<SegmentMetadata>> {
+        let segments = self.segments.read().await;
+
+        let mut topic_segments = Vec::new();
+        for (tp, partition_segments) in segments.iter() {
+            if tp.topic == topic {
+                topic_segments.extend(partition_segments.values().cloned());
+            }
+        }
+
+        Ok(topic_segments)
+    }
+
     // =========================================================================
     // Parquet Segment Methods (for columnar storage / SQL queries)
     // =========================================================================

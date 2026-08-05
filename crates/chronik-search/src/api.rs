@@ -451,6 +451,14 @@ impl SearchApi {
         self.index_base_path.as_deref()
     }
 
+    /// The WAL indexer, when running integrated with the server. Used by the
+    /// cold search path to enumerate a topic's Tantivy segments and download
+    /// them from the object store (the archives the WalIndexer writes are not
+    /// reachable via the on-disk `index_base_path`).
+    pub fn wal_indexer(&self) -> Option<&Arc<chronik_storage::WalIndexer>> {
+        self.wal_indexer.as_ref()
+    }
+
     /// Create router for the API (standalone mode)
     pub fn router(self: Arc<Self>) -> Router {
         Router::new()

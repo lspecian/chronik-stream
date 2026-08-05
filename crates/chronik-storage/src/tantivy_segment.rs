@@ -38,6 +38,15 @@ pub struct SchemaFields {
     pub is_control: Field,
     pub compression: Field,
     pub timestamp_type: Field,
+    /// Tokenized, searchable copy of the record value (UTF-8, lossy). The raw
+    /// `_value` bytes field is STORED-only for exact offset retrieval; this
+    /// `value` TEXT field is what full-text `/_search` matches against, mirroring
+    /// the (now-disabled) realtime indexer's `value` field so cold segments are
+    /// content-searchable, not just offset-retrievable.
+    pub value_text: Field,
+    /// Partition, INDEXED so a hit can be uniquely identified by
+    /// `(partition, offset)` — offset alone collides across partitions.
+    pub partition: Field,
 }
 
 impl SchemaFields {
@@ -60,6 +69,9 @@ impl SchemaFields {
         let is_control = schema_builder.add_bool_field("_is_control", STORED);
         let compression = schema_builder.add_u64_field("_compression", STORED);
         let timestamp_type = schema_builder.add_u64_field("_timestamp_type", STORED);
+        // Content-searchable value + indexed partition (see field docs).
+        let value_text = schema_builder.add_text_field("value", TEXT | STORED);
+        let partition = schema_builder.add_i64_field("partition", INDEXED | STORED | FAST);
 
         let schema = schema_builder.build();
 
@@ -67,7 +79,7 @@ impl SchemaFields {
             offset, timestamp, key, value, headers_json, attributes,
             base_offset, partition_leader_epoch, producer_id, producer_epoch,
             base_sequence, sequence, is_transactional, is_control,
-            compression, timestamp_type,
+            compression, timestamp_type, value_text, partition,
         })
     }
 }
@@ -150,7 +162,11 @@ impl TantivySegmentWriter {
             }
             if let Some(ref v) = record.value {
                 doc.add_bytes(self.schema_fields.value, v);
+                // Tokenized, searchable copy for full-text `/_search`.
+                doc.add_text(self.schema_fields.value_text, &String::from_utf8_lossy(v));
             }
+
+            doc.add_i64(self.schema_fields.partition, self.metadata.partition as i64);
 
             let headers_json = serde_json::to_string(&record.headers)
                 .map_err(|e| Error::Internal(format!("Failed to serialize headers: {}", e)))?;
@@ -347,6 +363,17 @@ impl TantivySegmentReader {
         Ok(Self { index, reader, schema_fields, metadata })
     }
 
+    /// Borrow the underlying Tantivy index — used by the search layer to run
+    /// full-text queries against a cold segment via the shared query builder.
+    pub fn index(&self) -> &Index {
+        &self.index
+    }
+
+    /// Segment metadata (topic, partition, offset range, record count).
+    pub fn metadata(&self) -> &SegmentMetadata {
+        &self.metadata
+    }
+
     /// Deserialize a segment from a tar.gz file
     pub fn from_tar_gz(tar_gz_path: &Path) -> Result<Self> {
         // Create temp directory for extraction
@@ -436,6 +463,55 @@ impl TantivySegmentReader {
 
         // Deserialize from tar.gz
         Self::from_tar_gz(&tar_gz_path)
+    }
+
+    /// Download a segment from the object store and extract it into `dest_dir`
+    /// (a caller-owned, PERSISTENT directory), then open it.
+    ///
+    /// Unlike [`from_object_store`], which extracts into a `TempDir` that is
+    /// deleted the instant it returns — leaving the reader backed by unlinked
+    /// files — the extracted index here lives for the reader's whole lifetime,
+    /// and the directory doubles as a cross-query cache: if `dest_dir` already
+    /// holds a fully-extracted index (marked by a `.ready` sentinel) the
+    /// download and unpack are skipped. Cache key correctness is the caller's
+    /// job — key `dest_dir` by the segment's object key, which is immutable for
+    /// a given offset range (a growing topic produces new keys, so the cache
+    /// never serves stale data for real appends).
+    pub async fn from_object_store_cached(
+        object_store: Arc<dyn ObjectStore>,
+        object_key: &str,
+        dest_dir: &Path,
+    ) -> Result<Self> {
+        let index_dir = dest_dir.join("index");
+        let ready = dest_dir.join(".ready");
+
+        if !ready.exists() {
+            let data = object_store.get(object_key)
+                .await
+                .map_err(|e| Error::Internal(format!("Failed to download from object store: {}", e)))?;
+            let dest = dest_dir.to_path_buf();
+            // Extraction is blocking I/O — keep it off the async worker.
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                let _ = fs::remove_dir_all(&dest);
+                fs::create_dir_all(&dest)
+                    .map_err(|e| Error::Internal(format!("Failed to create cache dir: {}", e)))?;
+                let dec = GzDecoder::new(data.as_ref());
+                let mut archive = tar::Archive::new(dec);
+                archive.unpack(&dest)
+                    .map_err(|e| Error::Internal(format!("Failed to unpack tar: {}", e)))?;
+                fs::write(dest.join(".ready"), b"")
+                    .map_err(|e| Error::Internal(format!("Failed to write ready marker: {}", e)))?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("Extraction task join error: {}", e)))??;
+        }
+
+        let metadata_content = fs::read_to_string(dest_dir.join("metadata.json"))
+            .map_err(|e| Error::Internal(format!("Failed to read cached metadata: {}", e)))?;
+        let metadata: SegmentMetadata = serde_json::from_str(&metadata_content)
+            .map_err(|e| Error::Internal(format!("Failed to parse cached metadata: {}", e)))?;
+        Self::open(&index_dir, metadata)
     }
 
     pub fn query_by_offset_range(&self, start: i64, end: i64) -> Result<Vec<CanonicalRecordEntry>> {

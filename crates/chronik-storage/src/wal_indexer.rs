@@ -514,6 +514,14 @@ impl WalIndexer {
         &self.segment_index
     }
 
+    /// Object store holding this node's cold Tantivy/Parquet segments. Exposed
+    /// so `/_search` can download+open a topic's cold Tantivy segments (the
+    /// WalIndexer writes them here via `object_store.put`; nothing else can
+    /// resolve the real physical/S3 location of those archives).
+    pub fn object_store(&self) -> Arc<dyn ObjectStore> {
+        Arc::clone(&self.object_store)
+    }
+
     /// v2.2.22: Get reference to vector index manager
     pub fn vector_index_manager(&self) -> &Arc<VectorIndexManager> {
         &self.vector_index_manager
