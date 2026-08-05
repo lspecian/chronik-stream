@@ -102,7 +102,9 @@ fn hot_hit_to_es_hit(hit: crate::hot_text_index::HotHit) -> Hit {
 
     Hit {
         _index: hit.topic,
-        _id: hit.offset.to_string(),
+        // Partition-qualified, matching search_tantivy_index — offset alone
+        // collides across partitions, collapsing the (_index,_id) dedup.
+        _id: format!("{}-{}", hit.partition, hit.offset),
         _score: Some(hit.score),
         _source: serde_json::Value::Object(source),
         highlight: None,
