@@ -765,12 +765,22 @@ async fn search_tantivy_index(
         // TantivyIndexer uses `offset`, the realtime indexer uses `_offset`.
         // v2.5.4: also fall back to `_id` for REST-created indexes. Stable
         // IDs are required for hot↔cold dedup in `search_index` to work.
-        let doc_id = source.get("offset")
-            .and_then(|v| v.as_i64())
-            .map(|o| o.to_string())
-            .or_else(|| source.get("_offset").and_then(|v| v.as_i64()).map(|o| o.to_string()))
-            .or_else(|| source.get("_id").and_then(|v| v.as_str()).map(|s| s.to_string()))
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        //
+        // Multi-partition fix: qualify the id by partition when present. Offset
+        // alone collides across partitions (every partition has offset 0,1,2…),
+        // so the (_index,_id) dedup in `merge_hot_and_cold_hits` would collapse
+        // distinct docs from different partitions — dropping ~2/3 of a
+        // 3-partition topic's hits.
+        let offset_part = source.get("offset").and_then(|v| v.as_i64())
+            .or_else(|| source.get("_offset").and_then(|v| v.as_i64()));
+        let partition_part = source.get("partition").and_then(|v| v.as_i64())
+            .or_else(|| source.get("_partition").and_then(|v| v.as_i64()));
+        let doc_id = match (partition_part, offset_part) {
+            (Some(p), Some(o)) => format!("{}-{}", p, o),
+            (None, Some(o)) => o.to_string(),
+            _ => source.get("_id").and_then(|v| v.as_str()).map(|s| s.to_string())
+                .unwrap_or_else(|| Uuid::new_v4().to_string()),
+        };
 
         hits.push(Hit {
             _index: index_name.to_string(),

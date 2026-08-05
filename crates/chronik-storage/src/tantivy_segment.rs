@@ -38,6 +38,15 @@ pub struct SchemaFields {
     pub is_control: Field,
     pub compression: Field,
     pub timestamp_type: Field,
+    /// Tokenized, searchable copy of the record value (UTF-8, lossy). The raw
+    /// `_value` bytes field is STORED-only for exact offset retrieval; this
+    /// `value` TEXT field is what full-text `/_search` matches against, mirroring
+    /// the (now-disabled) realtime indexer's `value` field so cold segments are
+    /// content-searchable, not just offset-retrievable.
+    pub value_text: Field,
+    /// Partition, INDEXED so a hit can be uniquely identified by
+    /// `(partition, offset)` — offset alone collides across partitions.
+    pub partition: Field,
 }
 
 impl SchemaFields {
@@ -60,6 +69,9 @@ impl SchemaFields {
         let is_control = schema_builder.add_bool_field("_is_control", STORED);
         let compression = schema_builder.add_u64_field("_compression", STORED);
         let timestamp_type = schema_builder.add_u64_field("_timestamp_type", STORED);
+        // Content-searchable value + indexed partition (see field docs).
+        let value_text = schema_builder.add_text_field("value", TEXT | STORED);
+        let partition = schema_builder.add_i64_field("partition", INDEXED | STORED | FAST);
 
         let schema = schema_builder.build();
 
@@ -67,7 +79,7 @@ impl SchemaFields {
             offset, timestamp, key, value, headers_json, attributes,
             base_offset, partition_leader_epoch, producer_id, producer_epoch,
             base_sequence, sequence, is_transactional, is_control,
-            compression, timestamp_type,
+            compression, timestamp_type, value_text, partition,
         })
     }
 }
@@ -150,7 +162,11 @@ impl TantivySegmentWriter {
             }
             if let Some(ref v) = record.value {
                 doc.add_bytes(self.schema_fields.value, v);
+                // Tokenized, searchable copy for full-text `/_search`.
+                doc.add_text(self.schema_fields.value_text, &String::from_utf8_lossy(v));
             }
+
+            doc.add_i64(self.schema_fields.partition, self.metadata.partition as i64);
 
             let headers_json = serde_json::to_string(&record.headers)
                 .map_err(|e| Error::Internal(format!("Failed to serialize headers: {}", e)))?;
