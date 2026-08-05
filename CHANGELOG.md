@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.10.5] - 2026-08-05
+
+### Fixed
+- **Cold full-text search regression** (introduced by the OOM fix `0e37747`, which
+  disabled and later removed the realtime indexer that populated the on-disk
+  full-text index `/_search` reads). Since then, searchable topics were served
+  only by the in-memory hot index, which ages out — so content search results
+  silently decayed to empty over minutes (data was never lost; Kafka Fetch
+  always returned everything). `/_search` now serves cold data from the
+  WalIndexer's object-store Tantivy segments (works local and S3):
+  - `TantivySegmentReader::from_object_store_cached` downloads + extracts each
+    segment archive into a persistent cache (fixes a latent temp-dir-deletion
+    bug in `from_object_store`); wired into `search_index` via a new
+    `search_object_store_segments`, consulted when on-disk sources are empty.
+  - Cold segments now index the value as a tokenized `value` TEXT field plus an
+    indexed `partition` field, making them content-searchable (they previously
+    stored the value as raw bytes, for offset retrieval only).
+  - Search hit `_id` is now partition-qualified (`{partition}-{offset}`) in both
+    the cold and hot paths, fixing a cross-partition dedup collision that
+    collapsed a multi-partition topic's results (e.g. 15 docs → 6).
+  Verified on a live 3-node cluster: content search restored, all docs returned
+  across the fan-out, and stable over time (no decay). See PR #17.
+
 ## [2.10.4] - 2026-07-23
 
 ### Fixed
