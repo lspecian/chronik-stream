@@ -11,6 +11,15 @@ use std::path::{Path, PathBuf};
 use chronik_wal::config::WalConfig;
 use chronik_wal::WalManager;
 
+/// Base offset of a WAL record, whichever version it is.
+fn base_offset_of(record: &chronik_wal::WalRecord) -> i64 {
+    use chronik_wal::WalRecord;
+    match record {
+        WalRecord::V2 { base_offset, .. } => *base_offset,
+        WalRecord::V1 { offset, .. } => *offset,
+    }
+}
+
 fn segment_path(dir: &Path, topic: &str, partition: i32, segment_id: u64) -> PathBuf {
     dir.join(topic)
         .join(partition.to_string())
@@ -134,12 +143,19 @@ async fn concurrent_commits_never_land_in_a_sealed_segment() {
         );
     }
 
-    // And nothing was lost along the way.
+    // And nothing was lost or duplicated along the way. Assert the offsets
+    // themselves: a count alone would let a duplicate paper over a missing one.
     let records = manager
         .read_from(topic, partition, 0, usize::MAX)
         .await
         .expect("read across segments");
-    assert_eq!(records.len(), 400, "rotation under load must not lose records");
+    let mut offsets: Vec<i64> = records.iter().map(base_offset_of).collect();
+    offsets.sort_unstable();
+    assert_eq!(
+        offsets,
+        (0..400).collect::<Vec<i64>>(),
+        "rotation under load must preserve every offset exactly once"
+    );
 }
 
 #[tokio::test]
@@ -162,9 +178,11 @@ async fn all_records_remain_readable_across_the_rotation() {
         .await
         .expect("read across segments");
 
+    let mut offsets: Vec<i64> = records.iter().map(base_offset_of).collect();
+    offsets.sort_unstable();
     assert_eq!(
-        records.len(),
-        30,
+        offsets,
+        (0..30).collect::<Vec<i64>>(),
         "rotation must not lose or duplicate records"
     );
 }
