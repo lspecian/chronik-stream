@@ -243,6 +243,18 @@ pub struct WalIndexer {
     /// Set of segments currently being indexed (to avoid duplicate work)
     indexing_in_progress: Arc<RwLock<HashSet<String>>>,
 
+    /// Issue #19: segments already indexed in this process, with the size they
+    /// had at the time (`segment_id → size_bytes`).
+    ///
+    /// Sealed segments are immutable, so re-reading one republishes byte-for-byte
+    /// identical output: the same raw segment upload and the same Parquet file.
+    /// Without this guard the indexer redoes every sealed segment on every run
+    /// (every 30s, forever), which is O(all WAL data) of pointless S3 traffic and
+    /// CPU. The size is part of the key so a segment that somehow grows is still
+    /// re-indexed. In-memory only: after a restart each segment is indexed once
+    /// more, which is harmless because the output is deterministic.
+    indexed_segments: Arc<RwLock<HashMap<String, u64>>>,
+
     /// Statistics from last indexing run
     last_stats: Arc<RwLock<IndexingStats>>,
 
@@ -362,6 +374,7 @@ impl WalIndexer {
             segment_index,
             metadata_store,
             indexing_in_progress: Arc::new(RwLock::new(HashSet::new())),
+            indexed_segments: Arc::new(RwLock::new(HashMap::new())),
             last_stats: Arc::new(RwLock::new(IndexingStats::default())),
             running: Arc::new(RwLock::new(false)),
             runtime: Arc::new(BackgroundRuntime::new(runtime)),
@@ -563,6 +576,7 @@ impl WalIndexer {
         let segment_index = Arc::clone(&self.segment_index);
         let metadata_store = Arc::clone(&self.metadata_store);
         let indexing_in_progress = Arc::clone(&self.indexing_in_progress);
+        let indexed_segments = Arc::clone(&self.indexed_segments);
         let last_stats = Arc::clone(&self.last_stats);
         let running = Arc::clone(&self.running);
         let runtime = Arc::clone(&self.runtime);
@@ -636,6 +650,7 @@ impl WalIndexer {
                     &segment_index,
                     &metadata_store,
                     &indexing_in_progress,
+                    &indexed_segments,
                     &vector_index_manager,
                     &is_leader,
                     &hot_buffer,
@@ -691,6 +706,7 @@ impl WalIndexer {
             &self.segment_index,
             &self.metadata_store,
             &self.indexing_in_progress,
+            &self.indexed_segments,
             &self.vector_index_manager,
             &self.is_leader,
             &self.hot_buffer,
@@ -700,7 +716,7 @@ impl WalIndexer {
     }
 
     /// Index sealed segments (internal implementation)
-    #[instrument(skip(config, wal_manager, object_store, segment_index, metadata_store, indexing_in_progress, vector_index_manager, is_leader, hot_buffer, cold_flush_listener, hot_vector_index))]
+    #[instrument(skip(config, wal_manager, object_store, segment_index, metadata_store, indexing_in_progress, indexed_segments, vector_index_manager, is_leader, hot_buffer, cold_flush_listener, hot_vector_index))]
     async fn index_sealed_segments_internal(
         config: &WalIndexerConfig,
         wal_manager: &Arc<WalManager>,
@@ -708,6 +724,7 @@ impl WalIndexer {
         segment_index: &Arc<SegmentIndex>,
         metadata_store: &Arc<dyn MetadataStore>,
         indexing_in_progress: &Arc<RwLock<HashSet<String>>>,
+        indexed_segments: &Arc<RwLock<HashMap<String, u64>>>,
         vector_index_manager: &Arc<VectorIndexManager>,
         is_leader: &Arc<AtomicBool>,
         hot_buffer: &Arc<RwLock<Option<Arc<HotDataBuffer>>>>,
@@ -728,25 +745,48 @@ impl WalIndexer {
         }
 
         // Get list of sealed segments from WAL manager (v1.3.47+: direct call)
-        let sealed_segments = wal_manager.get_sealed_segments();
+        let sealed_segments = wal_manager.get_sealed_segments_with_size();
 
         if sealed_segments.is_empty() {
             debug!("No sealed segments to index");
             return Ok(stats);
         }
 
-        info!(count = sealed_segments.len(), "Found sealed WAL segments to index");
-
-        // Filter out segments already being indexed
+        // Filter out segments already being indexed, and those already indexed
+        // at this exact size — a sealed segment is immutable, so re-reading it
+        // would republish byte-identical output (issue #19).
         let mut segments_to_index = Vec::new();
+        let mut segment_sizes: HashMap<String, u64> = HashMap::new();
+        let mut already_done = 0usize;
         {
             let in_progress = indexing_in_progress.read().await;
-            for segment in sealed_segments {
-                if !in_progress.contains(&segment) {
-                    segments_to_index.push(segment);
+            let done = indexed_segments.read().await;
+            for (segment, size) in sealed_segments {
+                if in_progress.contains(&segment) {
+                    continue;
                 }
+                if done.get(&segment) == Some(&size) {
+                    already_done += 1;
+                    continue;
+                }
+                segment_sizes.insert(segment.clone(), size);
+                segments_to_index.push(segment);
             }
         }
+
+        if segments_to_index.is_empty() {
+            debug!(
+                already_indexed = already_done,
+                "No new sealed segments to index"
+            );
+            return Ok(stats);
+        }
+
+        info!(
+            count = segments_to_index.len(),
+            already_indexed = already_done,
+            "Found sealed WAL segments to index"
+        );
 
         // Limit number of segments per run
         segments_to_index.truncate(config.max_segments_per_run);
@@ -813,6 +853,7 @@ impl WalIndexer {
 
         // Process each segment
         for segment_id in &segments_to_index {
+            let errors_before = stats.errors;
             match Self::index_segment(
                 config,
                 wal_manager,
@@ -829,6 +870,16 @@ impl WalIndexer {
             ).await {
                 Ok(_) => {
                     debug!(segment = %segment_id, "Successfully indexed segment");
+                    // Record only fully clean passes: a segment whose upload or
+                    // Parquet write failed must be retried on the next run.
+                    if stats.errors == errors_before {
+                        if let Some(size) = segment_sizes.get(segment_id) {
+                            indexed_segments
+                                .write()
+                                .await
+                                .insert(segment_id.clone(), *size);
+                        }
+                    }
                 }
                 Err(e) => {
                     error!(segment = %segment_id, error = %e, "Failed to index segment");

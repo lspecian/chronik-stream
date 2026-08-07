@@ -45,6 +45,7 @@ pub mod topic_query;
 pub mod vector_index;
 pub mod vector_cache;
 pub mod hot_buffer;
+pub mod live_parquet;
 pub mod hot_vector_index;
 pub mod hot_vector_batcher;
 pub mod json_schema;
@@ -66,7 +67,10 @@ pub use vector_index::{
     ScalarQuantizer,
 };
 pub use vector_cache::QueryEmbeddingCache;
-pub use hot_buffer::{HotDataBuffer, HotBufferConfig, HotBufferStats};
+pub use hot_buffer::{HotDataBuffer, HotBufferConfig, HotBufferStats, LiveHotTableProvider};
+pub use live_parquet::{
+    LiveParquetTableProvider, ParquetPathSource, StaticParquetPaths, DEFAULT_PARQUET_REFRESH_MS,
+};
 pub use json_schema::InferredJsonSchema;
 
 // v2.2.22: Re-export datafusion for unified API
