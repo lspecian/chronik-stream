@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.10.6] - 2026-08-07
+
+### Fixed
+- **Cold full-text search completeness** — v2.10.5 wired the object-store cold
+  read into the topic-scoped `/{topic}/_search` but not the generic `/_search`
+  (`search_all`), which is the path memory recall and most clients use. Cold
+  facts were therefore invisible to recall (`/_search` returned 0 while
+  `/{topic}/_search` returned them). `search_all` now performs the same
+  object-store segment read, targeting the requested index or fanning across the
+  segment index. Completes the v2.10.5 cold-search fix.
+- **Idle-segment rotation backlog** — `check_and_rotate_segments` rotated on the
+  age threshold unconditionally, so an idle topic sealed a new *empty* segment
+  every ~30s. With many low-traffic topics (per-conversation memory topics being
+  the extreme case) this produced tens of thousands of empty sealed segments,
+  burying the WalIndexer so it fell hours behind — freshly-produced records
+  weren't indexed within the readiness window and recall silently returned 0 for
+  most items. Now only rotate on age when the segment holds data. Validated on a
+  live 18-item eval: recall went from 14/18 items returning nothing to all 18
+  returning results. See PR #18.
+
 ## [2.10.5] - 2026-08-05
 
 ### Fixed
