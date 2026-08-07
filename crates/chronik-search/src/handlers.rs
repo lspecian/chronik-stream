@@ -309,6 +309,38 @@ pub async fn search_all(
         }
     }
 
+    // Object-store cold segments — the WalIndexer's ACTUAL output. Same fix as
+    // `search_index`: the on-disk reads above never see the nested `.tar.gz`
+    // archives the WalIndexer writes through the object store. `search_index`
+    // (topic-scoped `/{topic}/_search`) was wired for this, but memory recall
+    // and any client hitting the generic `/_search` came through here and still
+    // missed cold data. When the request targets a specific index (recall always
+    // does), read that topic's segments; otherwise fan across all topics in the
+    // segment index.
+    if let Some(wal_indexer) = api.wal_indexer() {
+        let topics: Vec<String> = if let Some(ref idx) = request.index {
+            vec![idx.clone()]
+        } else {
+            wal_indexer
+                .segment_index()
+                .get_all_segments()
+                .await
+                .map(|segs| {
+                    let mut t: Vec<String> = segs.into_iter().map(|s| s.topic).collect();
+                    t.sort();
+                    t.dedup();
+                    t
+                })
+                .unwrap_or_default()
+        };
+        for topic in topics {
+            match search_object_store_segments(wal_indexer, &topic, &request).await {
+                Ok(mut hits) => all_hits.append(&mut hits),
+                Err(e) => debug!(topic = %topic, "object-store cold search error: {}", e),
+            }
+        }
+    }
+
     // Filter by index/topic name if specified in request body
     if let Some(ref index_filter) = request.index {
         all_hits.retain(|hit| hit._index == *index_filter);
