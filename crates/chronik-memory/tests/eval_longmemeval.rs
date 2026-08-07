@@ -587,10 +587,27 @@ async fn evaluate_longmemeval() {
     let use_llm_judge = std::env::var("LONGMEMEVAL_USE_LLM_JUDGE")
         .map(|v| v != "0" && !v.is_empty())
         .unwrap_or(false);
-    // The judge LLM uses the same provider as the extractor by default —
-    // `TextGenerator::complete` for judge-graded scoring.
+    // Independent JUDGE override. By default the judge uses the same provider as
+    // the extractor/answerer — which means the model grades its OWN synthesized
+    // answers (lenient, and it credits abstentions as hits). Set
+    // `LONGMEMEVAL_JUDGE_PROVIDER=local` + `LONGMEMEVAL_JUDGE_ENDPOINT` +
+    // `LONGMEMEVAL_JUDGE_MODEL` to grade with a DIFFERENT model/family so the
+    // score isn't self-referential.
+    let judge_provider: LlmProvider = match std::env::var("LONGMEMEVAL_JUDGE_PROVIDER") {
+        Ok(p) if p.trim() == "local" => {
+            let endpoint = std::env::var("LONGMEMEVAL_JUDGE_ENDPOINT")
+                .expect("LONGMEMEVAL_JUDGE_PROVIDER=local requires LONGMEMEVAL_JUDGE_ENDPOINT");
+            let model = std::env::var("LONGMEMEVAL_JUDGE_MODEL")
+                .expect("LONGMEMEVAL_JUDGE_PROVIDER=local requires LONGMEMEVAL_JUDGE_MODEL");
+            eprintln!(
+                "JUDGE override: local (endpoint={endpoint}, model={model}) — independent of synth/extractor"
+            );
+            LlmProvider::Local { endpoint, model }
+        }
+        _ => llm_provider.clone(),
+    };
     let judge: Option<Arc<dyn chronik_memory::embeddings::TextGenerator>> = if use_llm_judge {
-        Some(llm_provider.build_generator(&api_key))
+        Some(judge_provider.build_generator(&api_key))
     } else {
         None
     };
