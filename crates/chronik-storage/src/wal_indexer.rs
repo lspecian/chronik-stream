@@ -836,6 +836,15 @@ impl WalIndexer {
                 }
                 segments_to_index
                     .retain(|s| !orphan_topics.contains(s.split(':').next().unwrap_or("")));
+
+                // Forget what we indexed for those topics. A topic recreated
+                // under the same name restarts at segment 0, and a stale
+                // `segment_id → size` entry that happened to match would make
+                // us skip the new topic's first segment entirely.
+                let mut done = indexed_segments.write().await;
+                done.retain(|segment_id, _| {
+                    !orphan_topics.contains(segment_id.split(':').next().unwrap_or(""))
+                });
             }
         }
         if segments_to_index.is_empty() {
@@ -1722,14 +1731,22 @@ impl WalIndexer {
             schema_fingerprint: parquet_metadata.schema_fingerprint,
         };
 
-        if let Err(e) = metadata_store.persist_parquet_segment(common_metadata).await {
-            warn!(
-                topic = %tp.topic,
-                partition = tp.partition,
-                error = %e,
-                "Failed to persist Parquet segment metadata (non-fatal)"
-            );
-        }
+        // Issue #19: this is NOT optional. The SQL cold table is built from
+        // `get_parquet_paths`, so a segment whose metadata never lands is
+        // invisible to queries — and if we returned Ok here the caller would
+        // mark the WAL segment indexed (never retrying) *and* advance the hot
+        // buffer's flushed offset past those rows, dropping them from both
+        // tiers. Failing keeps the rows served from hot until a later run
+        // succeeds; re-running rewrites the identical Parquet file.
+        metadata_store
+            .persist_parquet_segment(common_metadata)
+            .await
+            .map_err(|e| {
+                Error::Internal(format!(
+                    "Failed to persist Parquet segment metadata for {}-{}: {}",
+                    tp.topic, tp.partition, e
+                ))
+            })?;
 
         debug!(
             topic = %tp.topic,

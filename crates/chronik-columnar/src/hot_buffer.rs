@@ -33,7 +33,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
 use dashmap::DashMap;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 // Use DataFusion's re-exported arrow types to avoid version conflicts
 // DataFusion 44 uses arrow 53.x, while direct arrow deps are 54.x
@@ -336,10 +336,15 @@ impl TableProvider for LiveHotTableProvider {
             Ok(Some(table)) => table.scan(state, projection, filters, limit).await,
             Ok(None) => self.empty_scan(projection),
             Err(e) => {
-                // A missing partition directory (WAL fully truncated after
-                // indexing) is normal, not a query failure: the rows live in
-                // the cold Parquet table instead.
-                debug!("Hot buffer unavailable for '{}': {}", self.topic, e);
+                // Missing partition directories are already handled per
+                // partition inside get_topic_mem_table, so reaching this arm
+                // means a genuine data problem (e.g. a CanonicalRecord that
+                // will not deserialize). Serve cold-only rather than failing
+                // the query, but say so loudly — hot rows are missing.
+                warn!(
+                    "Hot buffer unavailable for '{}': {} — serving cold data only",
+                    self.topic, e
+                );
                 self.empty_scan(projection)
             }
         }

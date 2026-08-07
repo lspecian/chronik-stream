@@ -83,6 +83,65 @@ async fn idle_seal_rotates_so_sealed_segments_stop_growing() {
     assert_eq!(segment0_entry.1, size_at_seal);
 }
 
+/// Sealing and committing contend for the same writer. If a commit can append
+/// after the segment's size has been recorded, the indexer — which skips
+/// segments it has already seen at that size — never comes back for those
+/// records, so they silently never reach search / SQL / the cold tier.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_commits_never_land_in_a_sealed_segment() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = WalConfig::default();
+    config.data_dir = dir.path().to_path_buf();
+
+    let manager = std::sync::Arc::new(WalManager::new(config).await.unwrap());
+    let (topic, partition) = ("rotate-race", 0);
+
+    append(&manager, topic, partition, 0..5).await;
+
+    // Hammer the partition while sealing runs repeatedly.
+    let writer = {
+        let manager = manager.clone();
+        tokio::spawn(async move {
+            for offset in 5..400 {
+                append(&manager, topic, partition, offset..offset + 1).await;
+            }
+        })
+    };
+
+    let sealer = {
+        let manager = manager.clone();
+        tokio::spawn(async move {
+            for _ in 0..40 {
+                manager.seal_stale_segments(0).await;
+                tokio::task::yield_now().await;
+            }
+        })
+    };
+
+    writer.await.unwrap();
+    sealer.await.unwrap();
+
+    // Every segment reported as sealed must still be exactly the size that was
+    // reported — anything larger means a commit appended after the handoff.
+    for (segment_id, reported) in manager.get_sealed_segments_with_size() {
+        let parts: Vec<&str> = segment_id.split(':').collect();
+        let path = segment_path(dir.path(), parts[0], parts[1].parse().unwrap(), parts[2].parse().unwrap());
+        let on_disk = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(
+            on_disk, reported,
+            "segment {} grew after being sealed ({} on disk vs {} reported)",
+            segment_id, on_disk, reported
+        );
+    }
+
+    // And nothing was lost along the way.
+    let records = manager
+        .read_from(topic, partition, 0, usize::MAX)
+        .await
+        .expect("read across segments");
+    assert_eq!(records.len(), 400, "rotation under load must not lose records");
+}
+
 #[tokio::test]
 async fn all_records_remain_readable_across_the_rotation() {
     let dir = tempfile::tempdir().unwrap();

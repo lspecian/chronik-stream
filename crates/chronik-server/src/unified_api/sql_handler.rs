@@ -49,12 +49,13 @@ impl SqlRequest {
     /// states its own limit now gets it (up to [`MAX_ROW_LIMIT`]); callers who
     /// need a different cap still pass `limit` explicitly.
     pub fn effective_limit(&self) -> usize {
-        if let Some(limit) = self.limit {
-            return limit;
-        }
-        sql_statement_limit(&self.query)
-            .map(|n| n.min(MAX_ROW_LIMIT))
+        // Clamped either way: the query engine stops at `max_rows` regardless,
+        // so a larger cap here would report `truncated: false` on a result the
+        // engine had already cut short.
+        self.limit
+            .or_else(|| sql_statement_limit(&self.query))
             .unwrap_or(DEFAULT_ROW_LIMIT)
+            .min(MAX_ROW_LIMIT)
     }
 }
 
@@ -152,13 +153,24 @@ async fn resolve_parquet_paths(
     metadata_store: &dyn chronik_common::metadata::traits::MetadataStore,
     topic: &str,
 ) -> Vec<String> {
-    let mut paths = match metadata_store.get_parquet_paths(topic).await {
+    let paths = match metadata_store.get_parquet_paths(topic).await {
         Ok(paths) => paths,
         Err(e) => {
             debug!("No Parquet data for topic '{}': {}", topic, e);
             Vec::new()
         }
     };
+
+    // Drop entries pointing at files that no longer exist (stale metadata from a
+    // previous run) *before* deciding whether to fall back — otherwise a topic
+    // whose recorded paths are all stale looks "non-empty" and skips discovery.
+    let mut paths: Vec<String> = paths
+        .into_iter()
+        .filter(|p| {
+            // Object-store URLs are not local paths; only stat real files.
+            p.contains("://") || std::path::Path::new(p).exists()
+        })
+        .collect();
 
     if paths.is_empty() {
         let data_dir =
@@ -181,12 +193,6 @@ async fn resolve_parquet_paths(
     }
 
     paths
-        .into_iter()
-        .filter(|p| {
-            // Object-store URLs are not local paths; only stat real files.
-            p.contains("://") || std::path::Path::new(p).exists()
-        })
-        .collect()
 }
 
 /// What a topic's SQL view is currently built from.
@@ -961,6 +967,11 @@ mod tests {
     fn test_query_limit_is_capped_and_falls_back() {
         // Beyond the engine's own ceiling.
         let request = parse_request(r#"{"query": "SELECT * FROM t LIMIT 999999999"}"#);
+        assert_eq!(request.effective_limit(), MAX_ROW_LIMIT);
+
+        // An explicit request limit is capped too — the engine stops at
+        // max_rows anyway, and a higher cap would mis-report `truncated`.
+        let request = parse_request(r#"{"query": "SELECT * FROM t", "limit": 500000}"#);
         assert_eq!(request.effective_limit(), MAX_ROW_LIMIT);
 
         // Aggregates carry no LIMIT — default applies, and it never truncates a
