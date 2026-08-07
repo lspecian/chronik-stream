@@ -3289,8 +3289,16 @@ impl ProduceHandler {
             let segment_age = Duration::from_millis(
                 Instant::now().duration_since(state.start_time).as_millis() as u64 - segment_created_ms
             );
-            let should_rotate = state.segment_size.load(Ordering::Relaxed) >= MAX_SEGMENT_SIZE ||
-                               segment_age >= MAX_SEGMENT_AGE;
+            let seg_size = state.segment_size.load(Ordering::Relaxed);
+            // Only rotate on the AGE threshold when the segment actually holds
+            // data. Previously an idle topic rotated an EMPTY segment every
+            // MAX_SEGMENT_AGE (~30s) unconditionally — with many topics (e.g.
+            // per-conversation memory topics) that floods the WalIndexer with
+            // tens of thousands of empty sealed segments, so it falls hours
+            // behind and freshly-produced records aren't indexed/searchable
+            // within the readiness window (recall silently returns 0).
+            let should_rotate = seg_size >= MAX_SEGMENT_SIZE
+                || (seg_size > 0 && segment_age >= MAX_SEGMENT_AGE);
 
             if should_rotate {
                 // Flush current segment
