@@ -33,7 +33,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
 use dashmap::DashMap;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 // Use DataFusion's re-exported arrow types to avoid version conflicts
 // DataFusion 44 uses arrow 53.x, while direct arrow deps are 54.x
@@ -265,6 +265,99 @@ impl TableProvider for PartitionedMemTable {
     }
 }
 
+// ============================================================================
+// LiveHotTableProvider: always-current view of the hot buffer
+// ============================================================================
+
+/// A [`TableProvider`] that reads the hot buffer **at scan time**.
+///
+/// [`PartitionedMemTable`] is a snapshot: whatever rows the WAL held when it
+/// was built are the rows it returns forever. Registering one in the DataFusion
+/// catalog therefore freezes `{topic}_hot` at its registration moment, which
+/// silently caps every later `COUNT(*)`/`SELECT` on the topic (issue #19).
+///
+/// This provider registers **once** and resolves the snapshot on every scan, so
+/// the catalog entry — and any VIEW built on top of it — stays current without
+/// re-registration. Freshness is bounded by
+/// [`HotBufferConfig::refresh_interval_ms`], which the buffer's own cache
+/// enforces, so scanning per query costs at most one WAL read per interval.
+pub struct LiveHotTableProvider {
+    buffer: Arc<HotDataBuffer>,
+    topic: String,
+    schema: SchemaRef,
+}
+
+impl LiveHotTableProvider {
+    /// Create a live provider for `topic` backed by `buffer`.
+    pub fn new(buffer: Arc<HotDataBuffer>, topic: impl Into<String>) -> Self {
+        Self {
+            buffer,
+            topic: topic.into(),
+            schema: Arc::new(HotDataBuffer::hot_buffer_schema()),
+        }
+    }
+
+    /// The fixed schema every hot table exposes.
+    pub fn schema_ref() -> SchemaRef {
+        Arc::new(HotDataBuffer::hot_buffer_schema())
+    }
+
+    /// Empty scan result honouring the requested projection.
+    fn empty_scan(&self, projection: Option<&Vec<usize>>) -> DFResult<Arc<dyn ExecutionPlan>> {
+        MemoryExec::try_new(&[vec![]], self.schema.clone(), projection.cloned())
+            .map(|e| Arc::new(e) as Arc<dyn ExecutionPlan>)
+    }
+}
+
+impl std::fmt::Debug for LiveHotTableProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveHotTableProvider")
+            .field("topic", &self.topic)
+            .finish()
+    }
+}
+
+#[async_trait::async_trait]
+impl TableProvider for LiveHotTableProvider {
+    fn as_any(&self) -> &dyn std::any::Any { self }
+
+    fn schema(&self) -> SchemaRef { self.schema.clone() }
+
+    fn table_type(&self) -> TableType { TableType::Base }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        match self.buffer.get_topic_mem_table(&self.topic).await {
+            Ok(Some(table)) => table.scan(state, projection, filters, limit).await,
+            Ok(None) => self.empty_scan(projection),
+            Err(e) => {
+                // Missing partition directories are already handled per
+                // partition inside get_topic_mem_table, so reaching this arm
+                // means a genuine data problem (e.g. a CanonicalRecord that
+                // will not deserialize). Serve cold-only rather than failing
+                // the query, but say so loudly — hot rows are missing.
+                warn!(
+                    "Hot buffer unavailable for '{}': {} — serving cold data only",
+                    self.topic, e
+                );
+                self.empty_scan(projection)
+            }
+        }
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DFResult<Vec<TableProviderFilterPushDown>> {
+        Ok(filters.iter().map(|_| TableProviderFilterPushDown::Inexact).collect())
+    }
+}
+
 /// Extract partition IDs from WHERE _partition = N or WHERE _partition IN (a, b, c).
 fn extract_partition_filters(filters: &[Expr]) -> Vec<i32> {
     let mut partitions = Vec::new();
@@ -340,8 +433,9 @@ pub struct HotDataBuffer {
     cache: DashMap<TopicPartition, CachedBatch>,
     /// Configuration
     config: HotBufferConfig,
-    /// Flushed offsets per topic-partition (data already in Parquet)
-    /// This is updated by the WalIndexer when Parquet files are created
+    /// Highest offset per topic-partition already written to Parquet
+    /// (inclusive). Updated by the WalIndexer when Parquet files are created.
+    /// Absent means nothing has been flushed yet — hot starts at offset 0.
     flushed_offsets: DashMap<TopicPartition, i64>,
 }
 
@@ -361,8 +455,11 @@ impl HotDataBuffer {
         self.config.enabled
     }
 
-    /// Create the simplified Kafka message schema using DataFusion's arrow types
-    fn hot_buffer_schema() -> Schema {
+    /// Create the simplified Kafka message schema using DataFusion's arrow types.
+    ///
+    /// Public so [`LiveHotTableProvider`] can declare it without owning a buffer
+    /// instance — the schema is fixed and independent of the data present.
+    pub fn hot_buffer_schema() -> Schema {
         Schema::new(vec![
             Field::new("_topic", DataType::Utf8, false),
             Field::new("_partition", DataType::Int32, false),
@@ -405,17 +502,18 @@ impl HotDataBuffer {
         }
 
         // Cache miss or stale — read from WAL
-        let flushed_offset = self.flushed_offsets.get(&tp).map(|v| *v).unwrap_or(0);
+        let flushed_offset = self.flushed_offsets.get(&tp).map(|v| *v);
+        let read_from = flushed_offset.map(|o| o + 1).unwrap_or(0);
 
         let wal_records = self
             .wal_manager
-            .read_from(topic, partition, flushed_offset, self.config.max_records_per_partition)
+            .read_from(topic, partition, read_from, self.config.max_records_per_partition)
             .await
             .map_err(|e| anyhow!("Failed to read WAL records: {}", e))?;
 
         if wal_records.is_empty() {
             debug!(
-                "No hot data for {}-{} (flushed_offset={})",
+                "No hot data for {}-{} (flushed_offset={:?})",
                 topic, partition, flushed_offset
             );
             // Cache empty result to avoid repeated WAL reads
@@ -423,7 +521,8 @@ impl HotDataBuffer {
             return Ok(None);
         }
 
-        let hot_records = self.wal_records_to_hot_records(topic, partition, &wal_records)?;
+        let hot_records =
+            Self::wal_records_to_hot_records(topic, partition, &wal_records, flushed_offset)?;
 
         if hot_records.is_empty() {
             self.cache.remove(&tp);
@@ -491,19 +590,33 @@ impl HotDataBuffer {
 
             // Cache miss or stale — read from WAL
             cache_misses += 1;
-            let flushed_offset = self.flushed_offsets.get(&tp).map(|v| *v).unwrap_or(0);
+            let flushed_offset = self.flushed_offsets.get(&tp).map(|v| *v);
+            let read_from = flushed_offset.map(|o| o + 1).unwrap_or(0);
 
-            let wal_records = self
+            let wal_records = match self
                 .wal_manager
-                .read_from(topic, partition, flushed_offset, self.config.max_records_per_partition)
+                .read_from(topic, partition, read_from, self.config.max_records_per_partition)
                 .await
-                .map_err(|e| anyhow!("Failed to read WAL records: {}", e))?;
+            {
+                Ok(records) => records,
+                Err(e) => {
+                    // A partition whose WAL was fully truncated after indexing
+                    // has no hot data — its rows live in the cold table. That
+                    // must not fail the whole topic's scan.
+                    debug!(
+                        "No WAL data for {}-{}: {} (serving remaining partitions)",
+                        topic, partition, e
+                    );
+                    continue;
+                }
+            };
 
             if wal_records.is_empty() {
                 continue;
             }
 
-            let hot_records = self.wal_records_to_hot_records(topic, partition, &wal_records)?;
+            let hot_records =
+                Self::wal_records_to_hot_records(topic, partition, &wal_records, flushed_offset)?;
             if hot_records.is_empty() {
                 continue;
             }
@@ -624,12 +737,18 @@ impl HotDataBuffer {
             .map_err(|e| anyhow!("Failed to create RecordBatch: {}", e))
     }
 
-    /// Convert WAL records to HotRecord format for Arrow conversion
+    /// Expand WAL batches into individual hot records.
+    ///
+    /// `flushed_offset` is the highest offset already written to Parquet, if
+    /// any. Records at or below it are dropped: `WalManager::read_from` filters
+    /// at *batch* granularity, so the batch straddling the flush boundary comes
+    /// back whole and its already-cold records would otherwise be counted twice
+    /// by the hot ∪ cold view.
     fn wal_records_to_hot_records(
-        &self,
         topic: &str,
         partition: i32,
         wal_records: &[WalRecord],
+        flushed_offset: Option<i64>,
     ) -> Result<Vec<HotRecord>> {
         let mut hot_records = Vec::new();
 
@@ -659,6 +778,9 @@ impl HotDataBuffer {
 
                     // Convert each record entry to HotRecord
                     for entry in &canonical.records {
+                        if flushed_offset.is_some_and(|flushed| entry.offset <= flushed) {
+                            continue;
+                        }
                         let hot_record = HotRecord {
                             topic: topic.to_string(),
                             partition,
@@ -682,6 +804,9 @@ impl HotDataBuffer {
                     ..
                 } => {
                     // V1 format (backward compatibility)
+                    if flushed_offset.is_some_and(|flushed| *offset <= flushed) {
+                        continue;
+                    }
                     let hot_record = HotRecord {
                         topic: topic.to_string(),
                         partition,
@@ -748,6 +873,96 @@ pub struct HotBufferStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a V2 WAL record holding one batch of consecutive offsets.
+    fn wal_batch(topic: &str, partition: i32, offsets: std::ops::RangeInclusive<i64>) -> WalRecord {
+        let records: Vec<CanonicalRecordEntry> = offsets
+            .clone()
+            .map(|offset| CanonicalRecordEntry {
+                offset,
+                timestamp: 1_700_000_000_000 + offset,
+                key: None,
+                value: Some(format!("v{}", offset).into_bytes()),
+                headers: Vec::new(),
+                attributes: 0,
+            })
+            .collect();
+
+        let canonical = CanonicalRecord {
+            base_offset: *offsets.start(),
+            partition_leader_epoch: 0,
+            producer_id: -1,
+            producer_epoch: -1,
+            base_sequence: 0,
+            is_transactional: false,
+            is_control: false,
+            compression: CompressionType::None,
+            timestamp_type: TimestampType::CreateTime,
+            base_timestamp: 1_700_000_000_000,
+            max_timestamp: 1_700_000_000_000,
+            records,
+            compressed_records_wire_bytes: None,
+            original_v1_wire_format: None,
+            original_v2_wire_format: None,
+        };
+
+        WalRecord::V2 {
+            magic: 0xCA7E,
+            version: 2,
+            flags: 0,
+            length: 0,
+            crc32: 0,
+            topic: topic.to_string(),
+            partition,
+            canonical_data: bincode::serialize(&canonical).unwrap(),
+            base_offset: *offsets.start(),
+            last_offset: *offsets.end(),
+            record_count: (offsets.end() - offsets.start() + 1) as i32,
+        }
+    }
+
+    /// Issue #19: `read_from` filters at batch granularity, so the batch that
+    /// straddles the Parquet flush boundary comes back whole. Records already in
+    /// Parquet must be dropped here or the hot ∪ cold view counts them twice.
+    #[test]
+    fn test_flushed_records_are_excluded_from_hot() {
+        let records = vec![wal_batch("t", 0, 0..=9)];
+
+        let all = HotDataBuffer::wal_records_to_hot_records("t", 0, &records, None).unwrap();
+        assert_eq!(all.len(), 10, "nothing flushed yet: every record is hot");
+
+        let after_flush =
+            HotDataBuffer::wal_records_to_hot_records("t", 0, &records, Some(4)).unwrap();
+        assert_eq!(
+            after_flush.iter().map(|r| r.offset).collect::<Vec<_>>(),
+            vec![5, 6, 7, 8, 9],
+            "offsets <= flushed_offset are cold and must not appear in hot"
+        );
+
+        let fully_flushed =
+            HotDataBuffer::wal_records_to_hot_records("t", 0, &records, Some(9)).unwrap();
+        assert!(
+            fully_flushed.is_empty(),
+            "a fully flushed batch contributes no hot rows"
+        );
+    }
+
+    /// Offset 0 is a real offset: "nothing flushed" must not be conflated with
+    /// "flushed up to 0".
+    #[test]
+    fn test_flushed_offset_zero_excludes_only_offset_zero() {
+        let records = vec![wal_batch("t", 0, 0..=2)];
+
+        let hot = HotDataBuffer::wal_records_to_hot_records("t", 0, &records, Some(0)).unwrap();
+        assert_eq!(hot.iter().map(|r| r.offset).collect::<Vec<_>>(), vec![1, 2]);
+    }
+
+    #[test]
+    fn test_records_for_other_partitions_are_ignored() {
+        let records = vec![wal_batch("t", 1, 0..=4)];
+        let hot = HotDataBuffer::wal_records_to_hot_records("t", 0, &records, None).unwrap();
+        assert!(hot.is_empty());
+    }
 
     #[test]
     fn test_topic_partition_equality() {

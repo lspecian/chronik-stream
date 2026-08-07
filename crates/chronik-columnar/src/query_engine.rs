@@ -224,6 +224,8 @@ impl ColumnarQueryEngine {
     }
 
     /// Register a custom TableProvider (e.g., PartitionedMemTable with filter pushdown).
+    ///
+    /// Replaces any table already registered under `table_name`.
     pub fn register_table_provider(
         &self,
         table_name: &str,
@@ -231,11 +233,55 @@ impl ColumnarQueryEngine {
     ) -> Result<()> {
         debug!("Registering table provider '{}' for hot buffer", table_name);
 
+        // Registering over an existing name is an error in DataFusion's memory
+        // schema provider, so drop the old entry first.
+        let _ = self.ctx.deregister_table(table_name);
+
         self.ctx
             .register_table(table_name, provider)
             .map_err(|e| anyhow!("Failed to register table provider '{}': {}", table_name, e))?;
 
         debug!("Successfully registered table provider '{}'", table_name);
+        Ok(())
+    }
+
+    /// Register a topic's Parquet segments as a table that stays current.
+    ///
+    /// Unlike [`Self::register_files`], which pins the file list at
+    /// registration time, this registers a [`LiveParquetTableProvider`] that
+    /// re-resolves the file set on every scan (throttled by
+    /// `refresh_interval_ms`). Register once per topic — Parquet segments
+    /// written afterwards are picked up automatically, which is what keeps
+    /// `COUNT(*)` correct as the topic grows.
+    ///
+    /// `schema_sample_path` is read once to infer the table schema, so it must
+    /// point at an existing Parquet file for this topic.
+    pub async fn register_live_parquet_table(
+        &self,
+        table_name: &str,
+        source: Arc<dyn crate::live_parquet::ParquetPathSource>,
+        schema_sample_path: &str,
+        refresh_interval_ms: u64,
+    ) -> Result<()> {
+        let table_url = ListingTableUrl::parse(schema_sample_path)
+            .map_err(|e| anyhow!("Invalid path '{}': {}", schema_sample_path, e))?;
+
+        let listing_options =
+            ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension(".parquet");
+
+        let schema = listing_options
+            .infer_schema(&self.ctx.state(), &table_url)
+            .await
+            .map_err(|e| anyhow!("Failed to infer schema from '{}': {}", schema_sample_path, e))?;
+
+        let provider = Arc::new(crate::live_parquet::LiveParquetTableProvider::new(
+            source,
+            schema,
+            refresh_interval_ms,
+        ));
+
+        self.register_table_provider(table_name, provider)?;
+        debug!("Registered live Parquet table '{}'", table_name);
         Ok(())
     }
 
@@ -263,6 +309,12 @@ impl ColumnarQueryEngine {
     /// ```
     pub async fn register_view(&self, view_name: &str, sql: &str) -> Result<()> {
         debug!("Registering view '{}' with SQL: {}", view_name, sql);
+
+        // A view captures the table providers resolved at CREATE time, so
+        // replacing a view is the only way to change its composition (e.g. when
+        // a topic's cold Parquet table appears after the hot-only view was
+        // created). Drop any existing entry first — CREATE VIEW alone errors.
+        let _ = self.ctx.deregister_table(view_name);
 
         // Use CREATE VIEW SQL statement
         let create_view_sql = format!("CREATE VIEW {} AS {}", view_name, sql);

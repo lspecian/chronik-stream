@@ -62,7 +62,6 @@ tempfile = "3.8"
 axum-test = "13"
 criterion = { workspace = true }
 
-[[bench]]
-name = "realtime_indexing_bench"
-harness = false
-path = "../../benches/realtime_indexing_bench.rs"
+# NOTE: the `realtime_indexing_bench` target was removed here because its source
+# (benches/realtime_indexing_bench.rs) was deleted in 920664d — the dangling path
+# made `cargo check/build --all-targets` fail for the whole workspace.

@@ -137,9 +137,17 @@ Content-Type: application/json
     ...
   ],
   "row_count": 42,
-  "execution_time_ms": 15
+  "execution_time_ms": 15,
+  "truncated": false
 }
 ```
+
+**Row limits.** A query's own `LIMIT n` is honoured (up to 100,000 rows). Queries
+without one return at most 1,000 rows, and set `"truncated": true` when rows were
+dropped. Pass `"limit": <n>` in the request body to override both. Aggregates
+(`COUNT`, `SUM`, `GROUP BY`) are never limited by this — the cap applies to rows
+returned, not rows scanned: aggregation always scans the whole table (hot WAL
+records plus every Parquet segment).
 
 ### Explain Query Plan
 

@@ -159,6 +159,10 @@ pub struct UnifiedApiState {
     /// HP-2.5: Shared hot vector index for NRT ANN search.
     /// When present, `/_vector/:topic/search` merges hot hits with cold HNSW.
     pub hot_vector_index: Option<Arc<chronik_columnar::hot_vector_index::HotVectorIndex>>,
+    /// Issue #19: per-topic SQL table registration bookkeeping. Tracks what the
+    /// unified `{topic}` view is currently built from so it can be rebuilt when
+    /// a topic gains cold Parquet data, and throttles the probe for it.
+    pub sql_tables: Arc<sql_handler::SqlTableRegistry>,
 
     // ───────────────────────── AM-1.7: Agent Memory ─────────────────────────
     // Present only under the `memory` feature. See the `chronik-memory` note in
@@ -255,6 +259,7 @@ impl UnifiedApiState {
             reranker: None,
             query_router: None,
             hot_vector_index: None,
+            sql_tables: Arc::new(sql_handler::SqlTableRegistry::new()),
             #[cfg(feature = "memory")]
             memory_registry: None,
             #[cfg(feature = "memory")]

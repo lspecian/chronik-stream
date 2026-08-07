@@ -24,16 +24,74 @@ use super::UnifiedApiState;
 pub struct SqlRequest {
     /// SQL query to execute
     pub query: String,
-    /// Maximum rows to return (default: 1000)
-    #[serde(default = "default_limit")]
-    pub limit: usize,
+    /// Maximum rows to return. Omit to let the query decide: a query with its
+    /// own `LIMIT n` returns up to `n` rows, anything else returns up to
+    /// [`DEFAULT_ROW_LIMIT`]. An explicit value always wins.
+    #[serde(default)]
+    pub limit: Option<usize>,
     /// Query timeout in seconds (default: 30)
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
 }
 
-fn default_limit() -> usize {
-    1000
+/// Rows returned when neither the request nor the query says otherwise.
+pub const DEFAULT_ROW_LIMIT: usize = 1000;
+
+/// Hard ceiling on rows materialised into a JSON response, mirroring the
+/// query engine's own `max_rows`.
+pub const MAX_ROW_LIMIT: usize = 100_000;
+
+impl SqlRequest {
+    /// Rows this request should return.
+    ///
+    /// Issue #19: `SELECT ... LIMIT 5000` used to return exactly 1000 rows
+    /// because the response cap was applied unconditionally. A query that
+    /// states its own limit now gets it (up to [`MAX_ROW_LIMIT`]); callers who
+    /// need a different cap still pass `limit` explicitly.
+    pub fn effective_limit(&self) -> usize {
+        // Clamped either way: the query engine stops at `max_rows` regardless,
+        // so a larger cap here would report `truncated: false` on a result the
+        // engine had already cut short.
+        self.limit
+            .or_else(|| sql_statement_limit(&self.query))
+            .unwrap_or(DEFAULT_ROW_LIMIT)
+            .min(MAX_ROW_LIMIT)
+    }
+}
+
+/// Extract a top-level `LIMIT <n>` from a SQL statement, if it has one.
+///
+/// Returns None for absent, non-literal (`LIMIT ?`), or unparseable limits —
+/// in which case the default row cap applies.
+fn sql_statement_limit(sql: &str) -> Option<usize> {
+    use chronik_columnar::datafusion::sql::parser::{DFParser, Statement};
+    use chronik_columnar::datafusion::sql::sqlparser::ast::{
+        Expr as SqlExpr, SetExpr, Statement as AstStatement, Value,
+    };
+
+    let statements = DFParser::parse_sql(sql).ok()?;
+    let statement = statements.front()?;
+    let Statement::Statement(ast) = statement else {
+        return None;
+    };
+    let AstStatement::Query(query) = ast.as_ref() else {
+        return None;
+    };
+
+    // A parenthesised query carries its own LIMIT; unwrap one level so
+    // `(SELECT ... LIMIT 5000)` is not mistaken for "no limit".
+    let limit = match query.limit.as_ref() {
+        Some(limit) => Some(limit),
+        None => match query.body.as_ref() {
+            SetExpr::Query(inner) => inner.limit.as_ref(),
+            _ => None,
+        },
+    }?;
+
+    match limit {
+        SqlExpr::Value(Value::Number(n, _)) => n.parse::<usize>().ok(),
+        _ => None,
+    }
 }
 
 fn default_timeout() -> u64 {
@@ -62,6 +120,139 @@ pub struct SqlErrorResponse {
     pub error_type: String,
 }
 
+/// Resolves the Parquet segments backing one topic, on demand.
+///
+/// Used by [`chronik_columnar::LiveParquetTableProvider`] so the `{topic}_cold`
+/// table re-reads the segment list at scan time instead of pinning whatever
+/// existed when the table was first registered.
+struct TopicParquetSource {
+    topic: String,
+    metadata_store: std::sync::Arc<dyn chronik_common::metadata::traits::MetadataStore>,
+}
+
+impl std::fmt::Debug for TopicParquetSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // MetadataStore is not Debug; the topic is the identifying part.
+        f.debug_struct("TopicParquetSource")
+            .field("topic", &self.topic)
+            .finish()
+    }
+}
+
+#[async_trait::async_trait]
+impl chronik_columnar::ParquetPathSource for TopicParquetSource {
+    async fn parquet_paths(&self) -> Vec<String> {
+        resolve_parquet_paths(self.metadata_store.as_ref(), &self.topic).await
+    }
+}
+
+/// Current Parquet paths for a topic: metadata store first, filesystem fallback
+/// for the window before the WalIndexer has persisted segment metadata.
+/// Non-existent paths (stale entries from previous runs) are filtered out.
+async fn resolve_parquet_paths(
+    metadata_store: &dyn chronik_common::metadata::traits::MetadataStore,
+    topic: &str,
+) -> Vec<String> {
+    let paths = match metadata_store.get_parquet_paths(topic).await {
+        Ok(paths) => paths,
+        Err(e) => {
+            debug!("No Parquet data for topic '{}': {}", topic, e);
+            Vec::new()
+        }
+    };
+
+    // Drop entries pointing at files that no longer exist (stale metadata from a
+    // previous run) *before* deciding whether to fall back — otherwise a topic
+    // whose recorded paths are all stale looks "non-empty" and skips discovery.
+    let mut paths: Vec<String> = paths
+        .into_iter()
+        .filter(|p| {
+            // Object-store URLs are not local paths; only stat real files.
+            p.contains("://") || std::path::Path::new(p).exists()
+        })
+        .collect();
+
+    if paths.is_empty() {
+        let data_dir =
+            std::env::var("CHRONIK_DATA_DIR").unwrap_or_else(|_| "./data".to_string());
+        let columnar_dir = format!("{}/columnar/{}", data_dir, topic);
+        let columnar_path = std::path::Path::new(&columnar_dir);
+        if columnar_path.exists() {
+            if let Ok(mut discovered) = discover_parquet_files(columnar_path) {
+                if !discovered.is_empty() {
+                    discovered.sort();
+                    debug!(
+                        topic = %topic,
+                        count = discovered.len(),
+                        "Discovered Parquet files via filesystem fallback"
+                    );
+                    paths = discovered;
+                }
+            }
+        }
+    }
+
+    paths
+}
+
+/// What a topic's SQL view is currently built from.
+///
+/// The unified view captures its base providers at CREATE time, so it must be
+/// rebuilt when a topic gains a source it did not have before (typically when
+/// the first Parquet segment appears for a topic that started hot-only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct ViewComposition {
+    has_hot: bool,
+    has_cold: bool,
+}
+
+/// Per-topic SQL registration bookkeeping.
+///
+/// The providers themselves are live (they re-resolve their data on every
+/// scan), so this only tracks what has been registered and throttles the
+/// "has cold data appeared yet?" probe, which costs a metadata scan.
+#[derive(Debug, Default)]
+pub struct SqlTableRegistry {
+    topics: dashmap::DashMap<String, ViewComposition>,
+    last_cold_probe_ms: dashmap::DashMap<String, u64>,
+}
+
+impl SqlTableRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    /// Whether to re-probe for newly appeared cold data for `topic`.
+    /// Once the cold table exists there is nothing left to probe — the live
+    /// provider refreshes itself.
+    fn should_probe_cold(&self, topic: &str, interval_ms: u64) -> bool {
+        let now = Self::now_ms();
+        // Read the guard in its own statement: holding a DashMap `Ref` across
+        // an `insert` on the same shard deadlocks.
+        let last = self.last_cold_probe_ms.get(topic).map(|v| *v);
+        if last.is_some_and(|last| now.saturating_sub(last) < interval_ms) {
+            return false;
+        }
+        self.last_cold_probe_ms.insert(topic.to_string(), now);
+        true
+    }
+}
+
+/// How often to check whether a hot-only topic has gained Parquet segments.
+fn cold_probe_interval_ms() -> u64 {
+    std::env::var("CHRONIK_SQL_COLD_PROBE_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1_000)
+}
+
 /// SQL Handler (for direct usage without HTTP)
 pub struct SqlHandler;
 
@@ -74,6 +265,13 @@ impl SqlHandler {
     /// - `{topic}`: Union view of hot + cold for seamless queries
     ///
     /// Table names are sanitized (replacing - and . with _) for SQL compatibility.
+    ///
+    /// v2.10.7 (issue #19): every registration is **live**. `{topic}_hot` reads
+    /// the WAL at scan time and `{topic}_cold` re-lists its Parquet segments at
+    /// scan time, so a table registered once keeps returning the whole topic as
+    /// it grows. Before this, both were point-in-time snapshots pinned by the
+    /// first query after startup, which silently froze `COUNT(*)` (and every
+    /// other scan) at whatever the topic held at that instant.
     pub async fn ensure_topics_registered(
         state: &UnifiedApiState,
         engine: &chronik_columnar::ColumnarQueryEngine,
@@ -91,6 +289,8 @@ impl SqlHandler {
             }
         };
 
+        let probe_interval = cold_probe_interval_ms();
+
         // For each topic, register hot and cold tables
         for topic_meta in topics {
             let topic = &topic_meta.name;
@@ -98,78 +298,64 @@ impl SqlHandler {
             let cold_table_name = format!("{}_cold", base_table_name);
             let hot_table_name = format!("{}_hot", base_table_name);
 
-            let mut has_cold = false;
-            let mut has_hot = false;
-
             // ============================================================
-            // Register COLD table (Parquet files)
+            // Register COLD table (live Parquet listing)
             // ============================================================
-            if !registered_set.contains(&cold_table_name) {
-                // Get Parquet paths for this topic from metadata store
-                let mut paths = match state.metadata_store.get_parquet_paths(topic).await {
-                    Ok(paths) => paths,
-                    Err(e) => {
-                        debug!("No Parquet data for topic '{}': {}", topic, e);
-                        Vec::new()
-                    }
-                };
+            let mut has_cold = registered_set.contains(&cold_table_name);
 
-                // v2.4.0: Filesystem fallback — scan columnar directory when metadata
-                // store has no paths yet (happens during initial indexing before
-                // WalIndexer persists parquet metadata)
-                if paths.is_empty() {
-                    let data_dir = std::env::var("CHRONIK_DATA_DIR").unwrap_or_else(|_| "./data".to_string());
-                    let columnar_dir = format!("{}/columnar/{}", data_dir, topic);
-                    let columnar_path = std::path::Path::new(&columnar_dir);
-                    if columnar_path.exists() {
-                        if let Ok(discovered) = discover_parquet_files(columnar_path) {
-                            if !discovered.is_empty() {
-                                debug!(
-                                    topic = %topic,
-                                    count = discovered.len(),
-                                    "Discovered Parquet files via filesystem fallback"
-                                );
-                                paths = discovered;
-                            }
-                        }
-                    }
-                }
+            // Only probe while the topic has no cold table yet: afterwards the
+            // provider keeps itself current and this scan would be wasted work.
+            if !has_cold && state.sql_tables.should_probe_cold(topic, probe_interval) {
+                let paths =
+                    resolve_parquet_paths(state.metadata_store.as_ref(), topic).await;
 
-                if !paths.is_empty() {
-                    // v2.2.22: Filter out non-existent files (stale entries from previous runs)
-                    let valid_paths: Vec<String> = paths
-                        .into_iter()
-                        .filter(|p| std::path::Path::new(p).exists())
-                        .collect();
+                if let Some(sample) = paths.first() {
+                    let source = std::sync::Arc::new(TopicParquetSource {
+                        topic: topic.clone(),
+                        metadata_store: state.metadata_store.clone(),
+                    });
 
-                    if !valid_paths.is_empty() {
-                        if let Err(e) = engine.register_files(&cold_table_name, &valid_paths).await {
-                            warn!("Failed to register cold table '{}': {}", cold_table_name, e);
-                        } else {
+                    match engine
+                        .register_live_parquet_table(
+                            &cold_table_name,
+                            source,
+                            sample,
+                            chronik_columnar::DEFAULT_PARQUET_REFRESH_MS,
+                        )
+                        .await
+                    {
+                        Ok(()) => {
                             info!(
                                 topic = %topic,
                                 table_name = %cold_table_name,
-                                num_files = valid_paths.len(),
+                                num_files = paths.len(),
                                 "Registered cold (Parquet) table"
                             );
                             has_cold = true;
                         }
+                        Err(e) => {
+                            warn!("Failed to register cold table '{}': {}", cold_table_name, e)
+                        }
                     }
                 }
-            } else {
-                has_cold = true;
             }
 
             // ============================================================
-            // Register HOT table (in-memory from WAL)
+            // Register HOT table (live view of the WAL hot buffer)
             // ============================================================
-            if !registered_set.contains(&hot_table_name) {
+            let mut has_hot = registered_set.contains(&hot_table_name);
+
+            if !has_hot {
                 if let Some(hot_buffer) = &state.hot_buffer {
-                    match hot_buffer.get_topic_mem_table(topic).await {
-                        Ok(Some(partitioned_table)) => {
-                            if let Err(e) = engine.register_table_provider(&hot_table_name, std::sync::Arc::new(partitioned_table)) {
-                                debug!("Failed to register hot table '{}': {}", hot_table_name, e);
-                            } else {
+                    if hot_buffer.is_enabled() {
+                        let provider = std::sync::Arc::new(
+                            chronik_columnar::LiveHotTableProvider::new(
+                                hot_buffer.clone(),
+                                topic.clone(),
+                            ),
+                        );
+                        match engine.register_table_provider(&hot_table_name, provider) {
+                            Ok(()) => {
                                 info!(
                                     topic = %topic,
                                     table_name = %hot_table_name,
@@ -177,30 +363,40 @@ impl SqlHandler {
                                 );
                                 has_hot = true;
                             }
-                        }
-                        Ok(None) => {
-                            debug!("No hot data available for topic '{}'", topic);
-                        }
-                        Err(e) => {
-                            debug!("Failed to get hot buffer for topic '{}': {}", topic, e);
+                            Err(e) => {
+                                debug!("Failed to register hot table '{}': {}", hot_table_name, e)
+                            }
                         }
                     }
                 }
-            } else {
-                has_hot = true;
             }
 
             // ============================================================
             // Create unified VIEW (hot UNION ALL cold)
             // ============================================================
-            // Only create view if base table doesn't exist and we have at least one source
-            if !registered_set.contains(&base_table_name) && (has_hot || has_cold) {
+            let composition = ViewComposition { has_hot, has_cold };
+            let current = state.sql_tables.topics.get(topic).map(|c| *c);
+            let view_exists = registered_set.contains(&base_table_name)
+                && current == Some(composition);
+
+            if !view_exists && (has_hot || has_cold) {
                 // v2.2.23: Use explicit columns for UNION to handle schema differences
                 // Hot buffer (MemTable) and cold (Parquet) may have different schemas:
                 // - Hot: Utf8, Binary types without _headers
                 // - Cold: Utf8View, BinaryView types with _headers
                 // We select only the common core columns to ensure UNION compatibility
-                let common_cols = "_topic, _partition, _offset, _timestamp, _timestamp_type, _key, _value";
+                //
+                // Issue #19: the string/binary columns are additionally CAST to a
+                // single canonical type on *both* sides. Letting UNION coerce
+                // Binary vs BinaryView itself trips DataFusion 44's
+                // `optimize_projections` rule ("No field named {table}._value"),
+                // which fails every query that touches `_value` or `_key` on the
+                // unified view — including `SELECT _value FROM {topic}` and any
+                // json_extract_*() aggregation. Identical casts on both sides make
+                // the union inputs schema-identical, so no coercion is inserted.
+                let common_cols = "CAST(_topic AS VARCHAR) AS _topic, _partition, _offset, \
+                                   _timestamp, _timestamp_type, CAST(_key AS BYTEA) AS _key, \
+                                   CAST(_value AS BYTEA) AS _value";
 
                 let view_sql = if has_hot && has_cold {
                     // Both hot and cold available - union them with explicit columns
@@ -218,31 +414,87 @@ impl SqlHandler {
                 };
 
                 if let Err(e) = engine.register_view(&base_table_name, &view_sql).await {
-                    debug!(
-                        "Failed to register unified view '{}': {} (will use individual tables)",
+                    warn!(
+                        "Failed to register unified view '{}': {} (falling back to a single source)",
                         base_table_name, e
                     );
-                    // Fallback: if view creation fails, at least register cold as base name
-                    // This maintains backward compatibility
-                    if has_cold && !has_hot {
-                        // Re-register cold as the base name for backward compat
-                        if let Ok(paths) = state.metadata_store.get_parquet_paths(topic).await {
-                            let valid_paths: Vec<String> = paths
-                                .into_iter()
-                                .filter(|p| std::path::Path::new(p).exists())
-                                .collect();
-                            if !valid_paths.is_empty() {
-                                let _ = engine.register_files(&base_table_name, &valid_paths).await;
-                            }
-                        }
-                    }
+                    // Backward compatibility: the base name must still resolve
+                    // to something queryable. Bind it to whichever single
+                    // source exists (hot wins — it is always registrable).
+                    Self::register_single_source_fallback(
+                        state,
+                        engine,
+                        topic,
+                        &base_table_name,
+                        &cold_table_name,
+                        has_hot,
+                        has_cold,
+                    )
+                    .await;
                 } else {
+                    state
+                        .sql_tables
+                        .topics
+                        .insert(topic.clone(), composition);
                     info!(
                         topic = %topic,
                         view_name = %base_table_name,
                         has_hot = has_hot,
                         has_cold = has_cold,
                         "Registered unified hot/cold view"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Bind `base_table_name` directly to a single live source.
+    ///
+    /// Only reached when the hot ∪ cold view cannot be created (e.g. the two
+    /// schemas refuse to unify). Registering a second live provider under the
+    /// base name keeps `SELECT ... FROM {topic}` working — and keeps it live —
+    /// at the cost of covering one tier instead of both.
+    async fn register_single_source_fallback(
+        state: &UnifiedApiState,
+        engine: &chronik_columnar::ColumnarQueryEngine,
+        topic: &str,
+        base_table_name: &str,
+        cold_table_name: &str,
+        has_hot: bool,
+        has_cold: bool,
+    ) {
+        if has_hot {
+            if let Some(hot_buffer) = &state.hot_buffer {
+                let provider = std::sync::Arc::new(chronik_columnar::LiveHotTableProvider::new(
+                    hot_buffer.clone(),
+                    topic.to_string(),
+                ));
+                if let Err(e) = engine.register_table_provider(base_table_name, provider) {
+                    warn!("Fallback registration of '{}' failed: {}", base_table_name, e);
+                }
+            }
+            return;
+        }
+
+        if has_cold {
+            let paths = resolve_parquet_paths(state.metadata_store.as_ref(), topic).await;
+            if let Some(sample) = paths.first() {
+                let source = std::sync::Arc::new(TopicParquetSource {
+                    topic: topic.to_string(),
+                    metadata_store: state.metadata_store.clone(),
+                });
+                if let Err(e) = engine
+                    .register_live_parquet_table(
+                        base_table_name,
+                        source,
+                        sample,
+                        chronik_columnar::DEFAULT_PARQUET_REFRESH_MS,
+                    )
+                    .await
+                {
+                    warn!(
+                        "Fallback registration of '{}' from '{}' failed: {}",
+                        base_table_name, cold_table_name, e
                     );
                 }
             }
@@ -343,8 +595,13 @@ pub async fn execute_sql(
     headers: HeaderMap,
     Json(request): Json<SqlRequest>,
 ) -> impl IntoResponse {
-    let fan_out_request = request.clone();
-    info!(query = %request.query, limit = request.limit, "Executing SQL query");
+    let row_limit = request.effective_limit();
+    // Peers must apply the same cap we resolved, not re-derive it.
+    let fan_out_request = SqlRequest {
+        limit: Some(row_limit),
+        ..request.clone()
+    };
+    info!(query = %request.query, limit = row_limit, "Executing SQL query");
 
     // Check if SQL engine is available before executing
     if state.query_engine.is_none() {
@@ -355,7 +612,7 @@ pub async fn execute_sql(
         return (StatusCode::SERVICE_UNAVAILABLE, Json(error_response)).into_response();
     }
 
-    match SqlHandler::execute(&state, &request.query, request.limit).await {
+    match SqlHandler::execute(&state, &request.query, row_limit).await {
         Ok(response) => {
             // Distributed fan-out: merge SQL results from all peer nodes
             let response = if let Some(ref router) = state.query_router {
@@ -375,7 +632,7 @@ pub async fn execute_sql(
                                 .fan_out_post("/_sql", &fan_out_request, &all_peers)
                                 .await;
                             debug!(peer_count = peers.len(), "Merging SQL results from peers");
-                            super::query_router::merge_sql_responses(response, peers, fan_out_request.limit)
+                            super::query_router::merge_sql_responses(response, peers, row_limit)
                         } else {
                             response
                         }
@@ -670,19 +927,78 @@ fn arrow_value_to_json(
 mod tests {
     use super::*;
 
+    fn parse_request(json: &str) -> SqlRequest {
+        serde_json::from_str(json).unwrap()
+    }
+
     #[test]
     fn test_sql_request_defaults() {
-        let json = r#"{"query": "SELECT * FROM test"}"#;
-        let request: SqlRequest = serde_json::from_str(json).unwrap();
+        let request = parse_request(r#"{"query": "SELECT * FROM test"}"#);
         assert_eq!(request.query, "SELECT * FROM test");
-        assert_eq!(request.limit, 1000);
+        assert_eq!(request.limit, None);
+        assert_eq!(request.effective_limit(), DEFAULT_ROW_LIMIT);
         assert_eq!(request.timeout_secs, 30);
     }
 
     #[test]
     fn test_sql_request_custom_limit() {
-        let json = r#"{"query": "SELECT * FROM test", "limit": 100}"#;
-        let request: SqlRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(request.limit, 100);
+        let request = parse_request(r#"{"query": "SELECT * FROM test", "limit": 100}"#);
+        assert_eq!(request.limit, Some(100));
+        assert_eq!(request.effective_limit(), 100);
+    }
+
+    /// Issue #19: `LIMIT 5000` returned exactly 1000 rows.
+    #[test]
+    fn test_query_limit_is_honoured_when_request_has_none() {
+        let request = parse_request(r#"{"query": "SELECT * FROM test LIMIT 5000"}"#);
+        assert_eq!(request.effective_limit(), 5000);
+
+        let request = parse_request(r#"{"query": "SELECT * FROM test limit 999"}"#);
+        assert_eq!(request.effective_limit(), 999);
+    }
+
+    #[test]
+    fn test_explicit_request_limit_beats_query_limit() {
+        let request = parse_request(r#"{"query": "SELECT * FROM t LIMIT 5000", "limit": 10}"#);
+        assert_eq!(request.effective_limit(), 10);
+    }
+
+    #[test]
+    fn test_query_limit_is_capped_and_falls_back() {
+        // Beyond the engine's own ceiling.
+        let request = parse_request(r#"{"query": "SELECT * FROM t LIMIT 999999999"}"#);
+        assert_eq!(request.effective_limit(), MAX_ROW_LIMIT);
+
+        // An explicit request limit is capped too — the engine stops at
+        // max_rows anyway, and a higher cap would mis-report `truncated`.
+        let request = parse_request(r#"{"query": "SELECT * FROM t", "limit": 500000}"#);
+        assert_eq!(request.effective_limit(), MAX_ROW_LIMIT);
+
+        // Aggregates carry no LIMIT — default applies, and it never truncates a
+        // one-row result anyway.
+        let request = parse_request(r#"{"query": "SELECT COUNT(*) FROM t"}"#);
+        assert_eq!(request.effective_limit(), DEFAULT_ROW_LIMIT);
+
+        // Unparseable input must not panic or change behaviour.
+        let request = parse_request(r#"{"query": "NOT SQL AT ALL"}"#);
+        assert_eq!(request.effective_limit(), DEFAULT_ROW_LIMIT);
+    }
+
+    #[test]
+    fn test_cold_probe_is_throttled() {
+        let registry = SqlTableRegistry::new();
+        assert!(registry.should_probe_cold("t", 60_000), "first probe runs");
+        assert!(
+            !registry.should_probe_cold("t", 60_000),
+            "second probe inside the interval is skipped"
+        );
+        assert!(
+            registry.should_probe_cold("t", 0),
+            "a zero interval always re-probes"
+        );
+        assert!(
+            registry.should_probe_cold("other", 60_000),
+            "throttling is per-topic"
+        );
     }
 }

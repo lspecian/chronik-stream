@@ -881,6 +881,24 @@ impl WalManager {
             .collect()
     }
 
+    /// Sealed segments with the byte size each held when it was sealed.
+    ///
+    /// The size lets the indexer tell "I have already indexed this exact
+    /// segment" from "this segment grew since I last saw it", so it can skip
+    /// re-reading (and re-publishing) work it has already done.
+    pub fn get_sealed_segments_with_size(&self) -> Vec<(String, u64)> {
+        self.group_commit_wal
+            .get_sealed_segments()
+            .iter()
+            .map(|info| {
+                (
+                    format!("{}:{}:{}", info.topic, info.partition, info.segment_id),
+                    info.size_bytes,
+                )
+            })
+            .collect()
+    }
+
     /// Seal segments that have been idle for longer than the threshold.
     /// This ensures data gets indexed even if topics go quiet.
     /// Returns the number of segments sealed.

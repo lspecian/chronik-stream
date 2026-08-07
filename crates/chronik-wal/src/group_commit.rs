@@ -1038,20 +1038,86 @@ impl GroupCommitWal {
         Ok(())
     }
 
-    /// Force seal a segment (used during shutdown)
+    /// Open a fresh segment file for a partition and reset its size/age counters.
+    ///
+    /// Shared by size/age-triggered rotation and idle sealing: a segment that
+    /// has been handed to the indexer must stop growing, otherwise the indexer
+    /// re-reads it (from offset 0) on every run and republishes an ever-larger,
+    /// overlapping Parquet/raw segment — which double-counts rows in SQL.
+    /// Caller must already hold `queue.file` — that guard is the handoff gate.
+    /// `commit_batch` takes the same lock to write, so holding it across
+    /// seal-then-rotate is what stops a commit from landing in a file that has
+    /// already been recorded as sealed (its recorded size would then be short,
+    /// and the indexer — which skips segments it has seen at that size — would
+    /// never come back for the extra records).
+    async fn rotate_to_new_segment(
+        queue: &PartitionCommitQueue,
+        file: &mut WalWriter,
+        base_dir: &Path,
+        #[cfg(all(target_os = "linux", feature = "async-io"))]
+        io_uring_handle: &Option<StdArc<IoUringThreadHandle>>,
+    ) -> Result<()> {
+        let old_segment_id = queue.segment_id.load(Ordering::Relaxed);
+        let new_segment_id = old_segment_id + 1;
+
+        let new_file_path = base_dir
+            .join(&queue.topic)
+            .join(queue.partition.to_string())
+            .join(format!("wal_{}_{}.log", queue.partition, new_segment_id));
+
+        let partition_key = format!("{}:{}", queue.topic, queue.partition);
+        // Create before publishing: if this fails the partition keeps writing to
+        // the old segment, which is still the one `segment_id` names.
+        let new_writer = WalWriter::create(
+            &new_file_path,
+            partition_key,
+            #[cfg(all(target_os = "linux", feature = "async-io"))]
+            io_uring_handle.clone(),
+        )
+        .await?;
+
+        *file = new_writer;
+        queue.segment_id.store(new_segment_id, Ordering::Relaxed);
+
+        // Reset segment tracking
+        *queue.segment_created_at.lock().await = Instant::now();
+        queue.segment_size_bytes.store(0, Ordering::Relaxed);
+
+        info!(
+            "✅ Rotated to new segment {}/{} segment_id={}",
+            queue.topic, queue.partition, new_segment_id
+        );
+
+        Ok(())
+    }
+
+    /// Force seal a segment (used during shutdown and idle sealing).
+    ///
+    /// When `rotate` is true the partition continues on a *new* segment file,
+    /// leaving the sealed one immutable. Shutdown passes false — nothing will
+    /// write again, and a fresh empty file would only be cleaned up later.
     async fn force_seal_segment(
         queue: &PartitionCommitQueue,
         sealed_segments: &Arc<DashMap<String, SealedSegmentInfo>>,
         base_dir: &Path,
+        rotate: bool,
+        #[cfg(all(target_os = "linux", feature = "async-io"))]
+        io_uring_handle: &Option<StdArc<IoUringThreadHandle>>,
     ) -> Result<()> {
-        // Seal current segment
+        // Hold the writer lock across sync → measure → record → rotate. Commits
+        // take this same lock, so nothing can append to the segment between the
+        // size we record and the moment it stops being the active file.
+        let mut file = queue.file.lock().await;
+
         let old_segment_id = queue.segment_id.load(Ordering::Relaxed);
         let old_file_path = base_dir
             .join(&queue.topic)
             .join(queue.partition.to_string())
             .join(format!("wal_{}_{}.log", queue.partition, old_segment_id));
 
-        // Get actual file size from disk
+        file.sync_all().await?;
+
+        // Size after the fsync, so the recorded size covers every durable byte.
         let file_size = if old_file_path.exists() {
             tokio::fs::metadata(&old_file_path).await
                 .map(|m| m.len())
@@ -1069,13 +1135,6 @@ impl GroupCommitWal {
             "🔒 Force sealing segment {}/{} segment_id={} (file_size={} bytes)",
             queue.topic, queue.partition, old_segment_id, file_size
         );
-
-        // Close current file
-        {
-            let file = queue.file.lock().await;
-            file.sync_all().await?;
-            drop(file); // Explicitly drop to close
-        }
 
         // Record sealed segment info
         let sealed_key = format!("{}:{}:{}", queue.topic, queue.partition, old_segment_id);
@@ -1096,6 +1155,17 @@ impl GroupCommitWal {
             "✅ Sealed segment {}/{} segment_id={} (file_size={} bytes)",
             queue.topic, queue.partition, old_segment_id, file_size
         );
+
+        if rotate {
+            Self::rotate_to_new_segment(
+                queue,
+                &mut file,
+                base_dir,
+                #[cfg(all(target_os = "linux", feature = "async-io"))]
+                io_uring_handle,
+            )
+            .await?;
+        }
 
         Ok(())
     }
@@ -1127,7 +1197,11 @@ impl GroupCommitWal {
             return Ok(());
         }
 
-        // Seal current segment
+        // Same writer handoff as force_seal_segment: hold the lock from the
+        // fsync through the rotation so no commit lands in a file that has
+        // already been recorded as sealed at a given size.
+        let mut file = queue.file.lock().await;
+
         let old_segment_id = queue.segment_id.load(Ordering::Relaxed);
         let old_file_path = base_dir
             .join(&queue.topic)
@@ -1139,12 +1213,11 @@ impl GroupCommitWal {
             queue.topic, queue.partition, old_segment_id, current_size, segment_age
         );
 
-        // Close old file
-        {
-            let file = queue.file.lock().await;
-            file.sync_all().await?;
-            drop(file); // Explicitly drop to close
-        }
+        file.sync_all().await?;
+
+        // Re-read the counter under the lock: a commit may have landed between
+        // the should_seal check and acquiring the writer.
+        let sealed_size = queue.segment_size_bytes.load(Ordering::Relaxed);
 
         // Record sealed segment info
         let sealed_key = format!("{}:{}:{}", queue.topic, queue.partition, old_segment_id);
@@ -1155,42 +1228,21 @@ impl GroupCommitWal {
                 partition: queue.partition,
                 segment_id: old_segment_id,
                 file_path: old_file_path.clone(),
-                size_bytes: current_size,
+                size_bytes: sealed_size,
                 state: SegmentState::Sealed,
                 sealed_at: Instant::now(),
             },
         );
 
         // Rotate to new segment
-        let new_segment_id = old_segment_id + 1;
-        queue.segment_id.store(new_segment_id, Ordering::Relaxed);
-
-        let new_file_path = base_dir
-            .join(&queue.topic)
-            .join(queue.partition.to_string())
-            .join(format!("wal_{}_{}.log", queue.partition, new_segment_id));
-
-        // Open new file with io_uring if available
-        let partition_key = format!("{}:{}", queue.topic, queue.partition);
-        let new_writer = WalWriter::create(
-            &new_file_path,
-            partition_key,
+        Self::rotate_to_new_segment(
+            queue,
+            &mut file,
+            base_dir,
             #[cfg(all(target_os = "linux", feature = "async-io"))]
-            io_uring_handle.clone(),
-        ).await?;
-
-        *queue.file.lock().await = new_writer;
-
-        // Reset segment tracking
-        *queue.segment_created_at.lock().await = Instant::now();
-        queue.segment_size_bytes.store(0, Ordering::Relaxed);
-
-        info!(
-            "✅ Rotated to new segment {}/{} segment_id={}",
-            queue.topic, queue.partition, new_segment_id
-        );
-
-        Ok(())
+            io_uring_handle,
+        )
+        .await
     }
 
     /// Get metrics for a partition
@@ -1297,7 +1349,18 @@ impl GroupCommitWal {
                     topic, partition, segment_id, segment_age, current_size
                 );
 
-                if let Err(e) = Self::force_seal_segment(queue, &self.sealed_segments, &self.base_dir).await {
+                // Rotate: the sealed file is about to be handed to the indexer
+                // and must not keep accepting writes.
+                if let Err(e) = Self::force_seal_segment(
+                    queue,
+                    &self.sealed_segments,
+                    &self.base_dir,
+                    true,
+                    #[cfg(all(target_os = "linux", feature = "async-io"))]
+                    &self.io_uring_handle,
+                )
+                .await
+                {
                     error!("Failed to seal stale segment {}-{}: {}", topic, partition, e);
                 } else {
                     sealed_count += 1;
@@ -1403,7 +1466,17 @@ impl GroupCommitWal {
 
             // Force seal current segment regardless of size
             // (files may have data from previous fsyncs even if buffer is empty)
-            if let Err(e) = Self::force_seal_segment(queue, &self.sealed_segments, &self.base_dir).await {
+            // No rotation on shutdown: nothing will write again.
+            if let Err(e) = Self::force_seal_segment(
+                queue,
+                &self.sealed_segments,
+                &self.base_dir,
+                false,
+                #[cfg(all(target_os = "linux", feature = "async-io"))]
+                &self.io_uring_handle,
+            )
+            .await
+            {
                 error!("Failed to seal segment {}-{}: {}", topic, partition, e);
             } else {
                 info!("Successfully processed seal for {}-{}", topic, partition);
