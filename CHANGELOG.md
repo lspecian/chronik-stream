@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.10.7] - 2026-08-07
+
+### Fixed
+- **SQL aggregations were silently wrong and non-deterministic** (#19) — `COUNT(*)`,
+  `SUM()` and every other `/_sql` scan froze at whatever a topic held when the first
+  query after startup ran, then drifted as duplicate Parquet segments accumulated.
+  Ingesting 3,000 rows and then 2,000 more still answered `COUNT(*)`=3000, forever;
+  behind a load balancer each broker froze at a different instant, so the same query
+  returned different numbers from different nodes. Four defects:
+  - `ensure_topics_registered` registered `{topic}_hot` (a snapshot `MemTable` built
+    from one WAL read) and `{topic}_cold` (a fixed Parquet file list) **once per
+    process**, and nothing ever deregistered them, so later data was invisible. Both
+    are now live `TableProvider`s that resolve their data at scan time — a DataFusion
+    view captures its base providers at CREATE time, so freshness has to live in the
+    provider, not in the registration.
+  - `seal_stale_segments` sealed the active WAL segment without rotating, so the
+    "sealed" file kept accepting writes and the indexer re-read it from offset 0 on
+    every run, publishing ever-larger overlapping Parquet segments (observed
+    `0-5949` and `0-7435` side by side → cold `COUNT(*)`=13500 for 7500 real rows).
+    Idle sealing now rotates, and seal → measure → record → rotate happens under a
+    single writer handoff so a concurrent commit cannot land in a sealed segment.
+  - The WalIndexer re-indexed every sealed segment on every run (every 30s, forever),
+    re-uploading raw segments and rewriting Parquet. It now skips segments already
+    indexed at the same size; failed passes are still retried, and a Parquet metadata
+    persist failure is no longer swallowed (it would have left rows in neither tier).
+  - Any query touching `_value`/`_key` on the unified hot ∪ cold view failed outright
+    (`No field named {topic}_hot._value`): DataFusion 44's `optimize_projections`
+    trips on the `Binary` vs `BinaryView` coercion the UNION inserts. Both sides are
+    now cast to one canonical type, which also unblocks `json_extract_*()`
+    aggregations.
+
+  Verified end-to-end on a live single-node server: counts track ingest, stay exact
+  across the hot→cold flush and a restart (`COUNT` == `COUNT(DISTINCT offset)`), and
+  a 25,000-row topic is queryable. See PR #20.
+
+### Changed
+- `/_sql` honours a query's own `LIMIT n` (up to 100,000 rows) instead of capping
+  every result at 1,000 regardless. `"limit"` in the request body still overrides it,
+  and `truncated` is reported accurately in both cases.
+
 ## [2.10.6] - 2026-08-07
 
 ### Fixed
