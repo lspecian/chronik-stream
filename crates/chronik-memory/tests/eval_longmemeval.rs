@@ -499,7 +499,12 @@ async fn wait_until_raw_indexed(
     }
     // The raw topic is per-conversation, so every record shares this item's
     // namespace ULID — match on that single unique token and count hits.
-    let need = std::cmp::min(std::cmp::max(1, total_raw / 2), 30) as u64;
+    // FIX: wait until ~all turns are searchable, not just 30. The ULID is in
+    // EVERY turn, so a need of 30 passes as soon as any 30 turns index — but
+    // the specific answer turn may not be searchable for much longer (turns
+    // index progressively), so run_raw_search fires prematurely and misses it.
+    // Require ~90% (capped so the size:need response stays bounded).
+    let need = std::cmp::min(std::cmp::max(1, (total_raw * 9) / 10), 400) as u64;
     let unique_token = namespace.rsplit(':').next().unwrap_or(namespace);
     let client = reqwest::Client::new();
     let url = format!("{}/_search", api.trim_end_matches('/'));

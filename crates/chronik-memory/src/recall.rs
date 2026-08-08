@@ -1823,9 +1823,22 @@ async fn run_raw_search(
 ) -> Result<Vec<RawTurn>> {
     let topic = layout.raw();
     let url = format!("{api}/_search");
+    // Sanitize the query to plain alphanumeric words. The hot-text search path
+    // feeds the `_all` match text straight to Tantivy's QueryParser, which
+    // treats `(`, `)`, `/`, `:`, etc. as query syntax and returns ZERO hits for
+    // a natural-language question that contains them — e.g. an anchored
+    // question like "(Today is 2023/05/30 (Tue) 23:40.) What degree...". The
+    // cold path tolerates them, which is why raw retrieval only "worked" once
+    // the cold indexer had caught up (~45s). Replacing every non-alphanumeric
+    // char with a space yields a plain bag-of-words the parser accepts, so raw
+    // retrieval works against the hot index immediately.
+    let sanitized: String = query
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect();
     // The raw topic is already namespace-scoped by name, so pass an empty
     // namespace token — no need to append it to the query.
-    let body = bm25_query_body(&topic, "", query, n);
+    let body = bm25_query_body(&topic, "", sanitized.trim(), n);
     post_raw_search(http, url, body).await
 }
 
