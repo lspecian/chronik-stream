@@ -634,6 +634,31 @@ async fn evaluate_longmemeval() {
              implicitly enabling LLM-judge mode for the synthesis prompt."
         );
     }
+
+    // Read-time extraction A/B (LONGMEMEVAL_READTIME=1). When on, the synthesis
+    // pass answers from raw transcript turns retrieved at query time
+    // (`synthesize_readtime`) instead of from write-time-extracted typed
+    // memories (`synthesize`) — testing whether reading raw beats the
+    // extraction-coverage wall (raw_judge ~0.056). Requires the `mem.raw.*`
+    // topic to be BM25-searchable, so force that flag ON *before* the per-item
+    // `init_namespace()` creates the topics.
+    let use_readtime = std::env::var("LONGMEMEVAL_READTIME")
+        .map(|v| v == "1" || v == "true" || v == "on")
+        .unwrap_or(false);
+    if use_readtime {
+        std::env::set_var("CHRONIK_MEMORY_RAW_SEARCHABLE", "1");
+        eprintln!(
+            "READ-TIME mode ENABLED — synthesis answers from raw mem.raw.* turns \
+             (CHRONIK_MEMORY_RAW_SEARCHABLE forced on); A/B vs the write-time \
+             synthesize() baseline reported as synth_judge_rate."
+        );
+        if !use_synth {
+            eprintln!(
+                "warning: LONGMEMEVAL_READTIME=1 has no effect without \
+                 LONGMEMEVAL_USE_SYNTHESIS=1 (the synthesis pass is what it swaps)."
+            );
+        }
+    }
     // The SYNTH (answerer) model may be overridden independently of the judge.
     // This isolates the synth-model variable: hold the judge at the baseline
     // model (keeping synth_judge_rate comparable to a prior anchor) while
@@ -1055,7 +1080,7 @@ async fn evaluate_longmemeval() {
                 if use_vector {
                     srb = srb.with_vector();
                 }
-                let synth_res = srb
+                let srb = srb
                     .with_key_match()
                     .include_concepts(use_concepts)
                     .fanout_size(fanout)
@@ -1066,10 +1091,15 @@ async fn evaluate_longmemeval() {
                     // but published systems (mem0 et al.) run k=50-200 against
                     // a frontier reader, which sifts a large fact set rather
                     // than being crowded by it. So k is a function of the
-                    // reader, not a constant — see LONGMEMEVAL_SYNTH_K.
-                    .k(synth_k)
-                    .synthesize(gen.clone())
-                    .await;
+                    // reader, not a constant — see LONGMEMEVAL_SYNTH_K. In
+                    // read-time mode, k is the number of raw turns retrieved
+                    // and fed to the reader.
+                    .k(synth_k);
+                let synth_res = if use_readtime {
+                    srb.synthesize_readtime(gen.clone()).await
+                } else {
+                    srb.synthesize(gen.clone()).await
+                };
                 let elapsed = t0.elapsed().as_secs_f64();
                 // LongMemEval-S marks abstention questions with a `_abs`
                 // suffix on the question_id. For these, the gold answer is

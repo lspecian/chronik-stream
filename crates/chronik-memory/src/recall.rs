@@ -715,6 +715,64 @@ impl<'a> RecallBuilder<'a> {
         })
     }
 
+    /// **Read-time (query-conditioned) extraction path.** Instead of answering
+    /// from write-time-extracted typed memories (what [`synthesize`] does), this
+    /// retrieves the raw conversation turns from the lossless transcript topic
+    /// (`mem.raw.{ns}`) that best match the question, then reads the answer out
+    /// of *those* — extraction happens now, conditioned on the question, rather
+    /// than eagerly at ingest.
+    ///
+    /// The point is coverage: a fact the write-time extractor never wrote can
+    /// still be answered, because the raw turn that states it is retained and
+    /// retrievable. This trades query-time latency (an extra `/_search` + a
+    /// read over longer text) for not being bounded by what extraction guessed
+    /// was important at ingest.
+    ///
+    /// Requires `mem.raw.*` to be BM25-searchable — set
+    /// `CHRONIK_MEMORY_RAW_SEARCHABLE=1` at namespace-init time (see
+    /// [`crate::topics`]). If the raw topic isn't indexed the search returns
+    /// empty and this abstains, the same as [`synthesize`] on no memories.
+    ///
+    /// `k` (via [`RecallBuilder::k`]) controls how many raw turns are retrieved
+    /// and fed to the reader. `supporting` on the returned answer is empty —
+    /// the evidence here is raw turns, not [`RecallResult`]s.
+    #[tracing::instrument(skip(self, generator), fields(query = %self.query, k = self.k))]
+    pub async fn synthesize_readtime(
+        self,
+        generator: Arc<dyn TextGenerator>,
+    ) -> Result<SynthesizedAnswer> {
+        if self.query.is_empty() {
+            return Err(MemoryError::InvalidArgument("recall query is empty".into()));
+        }
+        let question = self.query.clone();
+        let layout = self.memory.topic_layout();
+        let api = self.memory.chronik_api().trim_end_matches('/').to_string();
+        let http = self.memory.http().clone();
+
+        let turns = run_raw_search(http, api, layout, &question, self.k).await?;
+        if turns.is_empty() {
+            return Ok(SynthesizedAnswer {
+                answer: ABSTAIN_LITERAL.to_string(),
+                abstained: true,
+                supporting: vec![],
+            });
+        }
+        let prompt = build_readtime_prompt(&question, &turns);
+        let raw = generator.complete(&prompt).await?;
+        let trimmed = raw.trim();
+        let abstained = is_abstention(trimmed);
+        let answer = if abstained {
+            ABSTAIN_LITERAL.to_string()
+        } else {
+            trimmed.to_string()
+        };
+        Ok(SynthesizedAnswer {
+            answer,
+            abstained,
+            supporting: vec![],
+        })
+    }
+
     /// Filters that run BEFORE `dedup_results_keep_max_score`. These exclude
     /// records that are categorically wrong for this recall (cross-namespace
     /// leakers, low-confidence, expired). Tombstones are *not* filtered here
@@ -1698,6 +1756,152 @@ async fn post_vector_search(
         .into_iter()
         .map(|h| (topic.clone(), h.partition, h.offset))
         .collect())
+}
+
+/// A single raw conversation turn retrieved from `mem.raw.{ns}` for the
+/// read-time extraction path. Distinct from a [`RecallResult`]: it is the
+/// original transcript line, not a write-time-extracted memory.
+#[derive(Debug, Clone)]
+struct RawTurn {
+    /// Speaker role (`user` / `assistant` / ...).
+    role: String,
+    /// The verbatim message content.
+    content: String,
+    /// Effective timestamp of the turn, when present on the record.
+    ts: Option<DateTime<Utc>>,
+}
+
+/// Parse a raw turn out of a Chronik `/_search` hit `_source`. Raw records use
+/// the [`crate::ingest::RawTurnRecord`] wire shape (`{role, content, ts, ...}`),
+/// which — unlike typed memories — is NOT a [`MemoryRecord`], so
+/// [`parse_envelope_from_source`] can't be reused. Tolerates the same three
+/// `_source` shapes: direct (the object IS the turn), wrapped-bare (`value`
+/// holds the JSON string), and wrapped-underscored (`_value` / `_json_content`).
+fn parse_raw_turn_from_source(source: &serde_json::Value) -> Option<RawTurn> {
+    // Direct shape: the source object itself carries `content`.
+    if source.get("content").and_then(|v| v.as_str()).is_some() {
+        return raw_turn_from_object(source);
+    }
+    // Wrapped shapes: the turn JSON is a string under one of these fields.
+    for field in ["value", "_value", "_json_content"] {
+        if let Some(s) = source.get(field).and_then(|v| v.as_str()) {
+            if let Ok(inner) = serde_json::from_str::<serde_json::Value>(s) {
+                if let Some(t) = raw_turn_from_object(&inner) {
+                    return Some(t);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn raw_turn_from_object(obj: &serde_json::Value) -> Option<RawTurn> {
+    let content = obj.get("content").and_then(|v| v.as_str())?.to_string();
+    let role = obj
+        .get("role")
+        .and_then(|v| v.as_str())
+        .unwrap_or("user")
+        .to_string();
+    let ts = obj
+        .get("ts")
+        .and_then(|v| v.as_str())
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&Utc));
+    Some(RawTurn { role, content, ts })
+}
+
+/// Retrieve the top-`n` raw conversation turns matching `query` from the
+/// namespace's `mem.raw.{ns}` transcript topic (BM25). Requires the raw topic
+/// to be searchable (`CHRONIK_MEMORY_RAW_SEARCHABLE=1`); otherwise the search
+/// 404s / returns nothing and this yields an empty vec.
+async fn run_raw_search(
+    http: reqwest::Client,
+    api: String,
+    layout: &crate::topics::TopicLayout,
+    query: &str,
+    n: usize,
+) -> Result<Vec<RawTurn>> {
+    let topic = layout.raw();
+    let url = format!("{api}/_search");
+    // The raw topic is already namespace-scoped by name, so pass an empty
+    // namespace token — no need to append it to the query.
+    let body = bm25_query_body(&topic, "", query, n);
+    post_raw_search(http, url, body).await
+}
+
+async fn post_raw_search(
+    http: reqwest::Client,
+    url: String,
+    body: serde_json::Value,
+) -> Result<Vec<RawTurn>> {
+    let resp = match http
+        .post(&url)
+        .header("content-type", "application/json")
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!(error = %e, %url, "raw search failed; treating as empty");
+            return Ok(vec![]);
+        }
+    };
+    let status = resp.status();
+    if !status.is_success() {
+        if status.as_u16() != 404 {
+            tracing::debug!(%status, %url, "raw search non-200; treating as empty");
+        }
+        return Ok(vec![]);
+    }
+    let parsed: SearchResponse = match resp.json().await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::debug!(error = %e, "raw search response unparseable; treating as empty");
+            return Ok(vec![]);
+        }
+    };
+    let mut out = Vec::with_capacity(parsed.hits.hits.len());
+    for h in parsed.hits.hits {
+        if let Some(t) = parse_raw_turn_from_source(&h._source) {
+            out.push(t);
+        }
+    }
+    Ok(out)
+}
+
+/// Build the read-time reader prompt. Mirrors the v2 synthesis answer rules
+/// (so a read-time vs write-time A/B differs only in the EVIDENCE source) but
+/// presents raw conversation turns instead of extracted memory bullets.
+fn build_readtime_prompt(question: &str, turns: &[RawTurn]) -> String {
+    let mut excerpts = String::new();
+    for (i, t) in turns.iter().enumerate() {
+        let when = t
+            .ts
+            .map(|d| d.format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|| "unknown-date".to_string());
+        excerpts.push_str(&format!("[{}] ({}) {}: {}\n", i + 1, when, t.role, t.content));
+    }
+    format!(
+        "You are a precise question-answering assistant. Below are raw conversation \
+excerpts retrieved from the user's history because they best match the question. \
+Answer the question using ONLY these excerpts.\n\
+\n\
+Rules:\n\
+- The excerpts are verbatim transcript lines with a date and speaker (`user:` / `assistant:`). Trust their exact wording — names, numbers, quotes, orderings.\n\
+- **Assistant-stated facts count.** If an `assistant:` line names, describes, recommends, or quantifies something and the user did not object in a later excerpt, treat it as settled and commit to it.\n\
+- When two excerpts conflict (an updated preference, a changed value), prefer the one with the most recent date.\n\
+- **Arithmetic questions** (\"how many\", \"total\", \"sum\", \"average\", \"how much\"): compute the aggregate from the value-bearing excerpts. Return only the computed value.\n\
+- **Temporal questions** (\"how long ago\", \"how many days\", \"when did I last\"): reason from the excerpt dates and any time-anchored content. Output the duration / date naturally.\n\
+- Find the excerpt(s) that answer the question, then compose a concise answer from them — one sentence whenever possible. No preamble, just the answer.\n\
+- **Abstention is for absent subjects, not uncertainty.** Reply EXACTLY: {ABSTAIN_LITERAL} only when none of the excerpts mention the specific entity or attribute the question asks about. If an excerpt names it, COMMIT to the best-supported answer — do NOT abstain because the evidence is partial or requires combining excerpts.\n\
+\n\
+Excerpts (relevance order, with dates):\n\
+{excerpts}\n\
+Question: {question}\n\
+\n\
+Answer:"
+    )
 }
 
 /// Extract typed `(topic, partition, offset)` from a wrapped Chronik `_source`

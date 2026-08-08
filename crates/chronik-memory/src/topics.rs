@@ -197,14 +197,35 @@ fn default_vector_enabled() -> bool {
     )
 }
 
+/// Whether `mem.raw.*` topics are created BM25-searchable.
+///
+/// Default: false — raw transcript topics stay OUT of the Tantivy indexer
+/// (force-indexing hundreds of `mem.raw.*` topics at fleet scale starves
+/// `mem.fact.*` indexing; see [`TopicConfig`] doc). Set
+/// `CHRONIK_MEMORY_RAW_SEARCHABLE=1` to opt in — required by the read-time
+/// extraction recall path (`RecallBuilder::synthesize_readtime`), which
+/// retrieves raw turns directly from the lossless transcript topic rather
+/// than only the write-time-extracted typed topics. Enable only for bounded
+/// workloads (e.g. eval pilots); production read-time retrieval wants a
+/// dedicated on-demand index instead of blanket raw indexing.
+fn raw_searchable() -> bool {
+    matches!(
+        std::env::var("CHRONIK_MEMORY_RAW_SEARCHABLE").as_deref(),
+        Ok("1") | Ok("true") | Ok("on")
+    )
+}
+
 impl TopicConfig {
-    /// Config template for `mem.raw.*` — append-only, columnar for analytics, no
-    /// vector or text indexing on raw turns (those are extracted into typed topics).
+    /// Config template for `mem.raw.*` — append-only, columnar for analytics.
+    ///
+    /// Text/vector indexing on raw turns is off by default (turns are extracted
+    /// into typed topics); `CHRONIK_MEMORY_RAW_SEARCHABLE=1` flips BM25 on for
+    /// the read-time extraction path. See [`raw_searchable`].
     pub fn raw(name: String) -> Self {
         Self {
             name,
             cleanup_policy: "delete",
-            bm25_enabled: false,
+            bm25_enabled: raw_searchable(),
             vector_enabled: false,
             columnar_enabled: true,
         }
