@@ -297,14 +297,32 @@ impl HotPartitionIndex {
         if query_str.trim().is_empty() {
             return Ok(Vec::new());
         }
+        // Sanitize to a bag of words. Tantivy's QueryParser treats `(`, `)`,
+        // `/`, `:`, `"`, `-`, etc. as query syntax, so an Elasticsearch-style
+        // `match` on `_all` carrying natural-language punctuation — or a date
+        // like "2023/05/30 (Tue) 23:40" — either errors or misparses to ZERO
+        // hits. The cold Tantivy path tokenizes the match text as plain terms;
+        // mirror that here so hot and cold agree (before this, hot search
+        // silently returned nothing for any punctuated query, and results only
+        // appeared once the cold indexer caught up ~30-45s later). Callers that
+        // need structured queries use `search_topic_structured`, which is
+        // unaffected.
+        let sanitized: String = query_str
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c.is_whitespace() { c } else { ' ' })
+            .collect();
+        let sanitized = sanitized.trim();
+        if sanitized.is_empty() {
+            return Ok(Vec::new());
+        }
         let searcher = self.reader.searcher();
         let parser = QueryParser::for_index(
             &self.index,
             vec![self.value_field, self.key_field, self.headers_field],
         );
         let query = parser
-            .parse_query(query_str)
-            .map_err(|e| anyhow!("parse hot query `{}`: {}", query_str, e))?;
+            .parse_query(sanitized)
+            .map_err(|e| anyhow!("parse hot query `{}`: {}", sanitized, e))?;
         let top_docs = searcher
             .search(&query, &TopDocs::with_limit(top_k))
             .map_err(|e| anyhow!("hot search: {}", e))?;
@@ -901,6 +919,36 @@ mod tests {
         let hits = idx.search_topic("products", "chair", 10).await.unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].offset, 2);
+    }
+
+    /// Regression: a natural-language query carrying punctuation (parentheses,
+    /// slashes, colons, a date) must still match. Tantivy's QueryParser treats
+    /// those characters as query syntax, so feeding the raw `_all` match text
+    /// returned ZERO hits (or errored) — hot search silently failed for any
+    /// punctuated query until the cold indexer caught up ~30-45s later.
+    /// `search` now sanitizes to a bag of words first.
+    #[tokio::test]
+    async fn punctuated_query_still_matches() {
+        let idx = HotTextIndex::new(HotTextConfig::default());
+        idx.add_batch(
+            "t",
+            0,
+            &[make_doc(0, "I graduated with a degree in business administration")],
+        )
+        .await
+        .unwrap();
+        idx.commit("t", 0).await.unwrap();
+
+        // An anchored question the way the read-time path builds it — parens,
+        // slashes, colons, a date, a trailing '?'. Pre-fix this returned 0 hits.
+        let q = "(Today is 2023/05/30 (Tue) 23:40.) What degree did I graduate with?";
+        let hits = idx.search_topic("t", q, 10).await.unwrap();
+        assert_eq!(hits.len(), 1, "punctuated query must match after sanitization");
+        assert_eq!(hits[0].offset, 0);
+
+        // A query that is ONLY punctuation matches nothing — and does not error.
+        let none = idx.search_topic("t", "()/:-.", 10).await.unwrap();
+        assert!(none.is_empty());
     }
 
     /// Regression (per-topic memory OOM): an idle partition must release its
