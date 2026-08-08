@@ -517,6 +517,31 @@ struct ReplicationRequest {
     response_sender: mpsc::Sender<Result<()>>,
 }
 
+/// RAII guard for the in-flight produce-memory reservation taken in
+/// [`ProduceHandler::produce_to_partition`]. Releases the reserved bytes back to
+/// `memory_used_bytes` on drop, so every exit path — the success return or any
+/// of the 17 `?` early-returns in that function — returns the reservation
+/// exactly once. Before this guard existed, error paths leaked their
+/// reservation permanently; under sustained load the leaked bytes accumulated
+/// until the counter pinned at `memory_limit_bytes` and the handler rejected
+/// every produce with "Memory limit exceeded".
+struct MemoryReservation {
+    counter: Arc<AtomicU64>,
+    bytes: u64,
+}
+
+impl MemoryReservation {
+    fn new(counter: Arc<AtomicU64>, bytes: u64) -> Self {
+        Self { counter, bytes }
+    }
+}
+
+impl Drop for MemoryReservation {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(self.bytes, Ordering::Release);
+    }
+}
+
 impl ProduceHandler {
     /// Get reference to metadata store
     pub fn get_metadata_store(&self) -> &Arc<dyn MetadataStore> {
@@ -2050,7 +2075,18 @@ impl ProduceHandler {
                 Err(_) => continue, // CAS failed, retry
             }
         }
-        
+
+        // RAII release of the reservation just taken. There are 17 early-return
+        // (`?`) sites between here and the end of this function; before this
+        // guard, any of them leaked `bytes_to_reserve` permanently. Under load,
+        // leaked reservations accumulate until `memory_used_bytes` pins at
+        // `memory_limit_bytes` and EVERY subsequent produce is rejected with
+        // "Memory limit exceeded" (observed wedging a debug server during a bulk
+        // ingest, 2026-08-08). Dropping on any exit path — success or error —
+        // returns the reservation exactly once.
+        let _mem_reservation =
+            MemoryReservation::new(Arc::clone(&self.memory_used_bytes), bytes_to_reserve);
+
         // Get or create partition state FIRST
         let partition_state = self.get_or_create_partition_state(topic, partition).await?;
 
@@ -2753,10 +2789,12 @@ impl ProduceHandler {
         
         // (producer sequence is updated right after validation, above — before the
         // async response path can return early)
-        
-        // P3 OPTIMIZATION (v2.2.7): Release memory atomically
-        self.memory_used_bytes.fetch_sub(bytes_to_reserve, Ordering::Release);
-        
+        //
+        // NOTE: the in-flight memory reservation is released by `_mem_reservation`
+        // (RAII) on function exit — success OR any of the 17 `?` early-returns
+        // between the reservation and here. Do not release it explicitly here or
+        // it double-frees.
+
         // Update fetch handler buffer with RAW batch bytes (v1.3.32 CRC FIX)
         // CRITICAL: Store original wire-format bytes to preserve CRC
         if let Some(ref fetch_handler) = self.fetch_handler {

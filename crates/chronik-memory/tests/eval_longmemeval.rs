@@ -476,6 +476,67 @@ async fn wait_until_indexed(
     }
 }
 
+/// Read-time readiness gate. Read-time answers from RAW turns, so we wait for
+/// the namespace's raw transcript topic to be searchable — NOT the fact topic
+/// (which read-time never populates; `wait_until_indexed` would early-return on
+/// `total_typed==0` and recall would fire before hot text indexed the raw
+/// turns). Hot text makes raw turns searchable in <500ms, so this is normally
+/// near-instant. Mirrors `wait_until_indexed`'s hits-array counting: Chronik's
+/// ES-compat `hits.total` reflects the RETURNED array, not the match count, so
+/// `size:0` always reads 0 — request `size:need` and count `hits.hits`.
+async fn wait_until_raw_indexed(
+    api: &str,
+    raw_topic: &str,
+    namespace: &str,
+    total_raw: usize,
+    floor_ms: u64,
+    timeout_ms: u64,
+    question_id: &str,
+) {
+    tokio::time::sleep(Duration::from_millis(floor_ms)).await;
+    if total_raw == 0 {
+        return;
+    }
+    // The raw topic is per-conversation, so every record shares this item's
+    // namespace ULID — match on that single unique token and count hits.
+    let need = std::cmp::min(std::cmp::max(1, total_raw / 2), 30) as u64;
+    let unique_token = namespace.rsplit(':').next().unwrap_or(namespace);
+    let client = reqwest::Client::new();
+    let url = format!("{}/_search", api.trim_end_matches('/'));
+    let body = serde_json::json!({
+        "index": raw_topic,
+        "query": {"match": {"_all": unique_token}},
+        "size": need
+    });
+    let t0 = Instant::now();
+    loop {
+        let hits: u64 = match client.post(&url).json(&body).send().await {
+            Ok(resp) => resp
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .and_then(|v| v["hits"]["hits"].as_array().map(|a| a.len() as u64))
+                .unwrap_or(0),
+            Err(_) => 0,
+        };
+        if hits >= need {
+            break;
+        }
+        if t0.elapsed().as_millis() as u64 + floor_ms >= timeout_ms {
+            eprintln!(
+                "  [warn] item {} raw-readiness timed out: {}/{} raw turns visible \
+                 after {}s — read-time recall may under-measure",
+                question_id,
+                hits,
+                need,
+                (t0.elapsed().as_millis() as u64 + floor_ms) / 1000
+            );
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
 /// WS-3.2: anchor temporal questions to the question's own date instead of
 /// the eval wall clock. LongMemEval golds like "7 days ago" are computed
 /// relative to `question_date`; without the anchor the synthesizer has no
@@ -893,20 +954,35 @@ async fn evaluate_longmemeval() {
         let extract_t0 = Instant::now();
         let mut chunk_failures = 0usize;
         let mut total_typed_acks = 0usize;
+        let mut total_raw_acks = 0usize;
         for (chunk_idx, chunk) in turns.chunks(batch_size).enumerate() {
-            match mem.ingest_with_extraction(chunk.to_vec()).await {
-                Ok(ack) => {
-                    total_typed_acks += ack.typed_acks.len();
+            // Read-time mode answers from RAW turns, so the (slow, Mac-bound)
+            // extraction step is unnecessary — ingest raw turns only via
+            // `ingest_batch`. This decouples the read-time A/B from extraction
+            // entirely, so N can scale without hours of local-LLM extraction.
+            // Write-time mode still extracts typed facts.
+            let res: std::result::Result<(usize, usize), _> = if use_readtime {
+                mem.ingest_batch(chunk.to_vec())
+                    .await
+                    .map(|acks| (acks.len(), 0usize))
+            } else {
+                mem.ingest_with_extraction(chunk.to_vec())
+                    .await
+                    .map(|ack| (ack.raw_acks.len(), ack.typed_acks.len()))
+            };
+            match res {
+                Ok((raw_n, typed_n)) => {
+                    total_raw_acks += raw_n;
+                    total_typed_acks += typed_n;
                     eprintln!(
                         "  [dbg] item {} chunk {} OK: raw_acks={} typed_acks={}",
-                        item.question_id, chunk_idx,
-                        ack.raw_acks.len(), ack.typed_acks.len()
+                        item.question_id, chunk_idx, raw_n, typed_n
                     );
                 }
                 Err(e) => {
                     chunk_failures += 1;
                     eprintln!(
-                        "  [warn] item {} chunk {} ingest_with_extraction failed: {} \
+                        "  [warn] item {} chunk {} ingest failed: {} \
                          — skipping this chunk, eval continues",
                         item.question_id, chunk_idx, e
                     );
@@ -942,17 +1018,34 @@ async fn evaluate_longmemeval() {
             std::env::var("LONGMEMEVAL_WAIT_VECTOR").as_deref(),
             Ok("1") | Ok("true") | Ok("on")
         );
-        wait_until_indexed(
-            &api,
-            mem.tenant(),
-            mem.namespace(),
-            total_typed_acks,
-            index_sleep_ms,
-            index_timeout_ms,
-            &item.question_id,
-            wait_vector,
-        )
-        .await;
+        if use_readtime {
+            // Read-time answers from RAW turns — gate on the raw transcript
+            // topic being searchable, not the (empty) fact topic. The fact
+            // gate would early-return on total_typed_acks==0 and recall would
+            // fire before hot text indexed the raw turns.
+            wait_until_raw_indexed(
+                &api,
+                &mem.topic_layout().raw(),
+                mem.namespace(),
+                total_raw_acks,
+                index_sleep_ms,
+                index_timeout_ms,
+                &item.question_id,
+            )
+            .await;
+        } else {
+            wait_until_indexed(
+                &api,
+                mem.tenant(),
+                mem.namespace(),
+                total_typed_acks,
+                index_sleep_ms,
+                index_timeout_ms,
+                &item.question_id,
+                wait_vector,
+            )
+            .await;
+        }
 
         // Concept-page pre-synthesis (path B, opt-in). For each candidate
         // entity (top-1 from question + "user" as universal fallback),
