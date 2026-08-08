@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.10.8] - 2026-08-08
+
+### Fixed
+- **Broker could wedge into rejecting all produces under sustained load** ("Memory
+  limit exceeded") (#21) — `produce_to_partition` reserved bytes against the
+  in-flight produce-memory counter (`memory_used_bytes`) at the top of the function
+  but released them only near the end, with **17 `?` early-returns in between** that
+  each leaked the reservation permanently. Under load the leaked bytes accumulated
+  until the counter pinned at `memory_limit_bytes` (= `buffer_memory`; 32MB on the
+  balanced default) and every subsequent produce was rejected — the broker refused
+  all writes with no recovery short of restart (observed: 18,813 rejects, 0 rows
+  persisted, during a bulk ingest). The reservation is now held by a
+  `MemoryReservation` RAII guard whose `Drop` releases the bytes exactly once on
+  every exit path — success or error. Not a recent regression: the tracking block is
+  unchanged since the v2.2.7 lock-free rework, so this affects any high-load
+  deployment. Covered by two new unit tests.
+
 ## [2.10.7] - 2026-08-07
 
 ### Fixed
