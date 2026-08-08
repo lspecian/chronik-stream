@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.10.9] - 2026-08-09
+
+### Fixed
+- **Near-real-time (hot) search silently dropped any query containing
+  punctuation** (#23) — `HotTextIndex::search` fed the flat query string
+  straight to Tantivy's `QueryParser`, which treats `(`, `)`, `/`, `:`, `"`,
+  `-` etc. as query syntax. Any natural-language `match` query carrying
+  punctuation — a date like `2023/05/30`, a URL, a parenthetical, a trailing
+  `?` — either errored or misparsed to **zero hits** from the in-memory hot
+  index. The cold Tantivy path tokenizes the match text as plain terms and
+  tolerated it, so results only appeared once the cold indexer caught up
+  (~30-45s). Net effect: NRT search returned nothing for a large class of real
+  queries across `/_search` and the ES-compatible surface, silently defeating
+  the hot path's freshness. Fixed by sanitizing the query string to
+  alphanumeric + whitespace (matching the cold path) before `QueryParser`;
+  structured queries use `search_topic_structured`, which is unaffected.
+  Covered by a regression test.
+
 ## [2.10.8] - 2026-08-08
 
 ### Fixed
