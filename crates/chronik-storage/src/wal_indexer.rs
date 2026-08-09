@@ -909,6 +909,16 @@ impl WalIndexer {
         Ok(stats)
     }
 
+    /// Whether `index_segment` may delete the source WAL segment after a pass.
+    /// Only when deletion is enabled AND the pass recorded no new errors: a
+    /// raw-segment upload failure bumps the error count and continues, so a
+    /// dirty pass must KEEP the WAL copy (the caller also declines to mark such
+    /// a segment "indexed", so the next run re-uploads it). Deleting on a dirty
+    /// pass would lose the data from BOTH the WAL and the object store.
+    fn may_delete_wal_segment(delete_after_index: bool, errors_at_start: usize, errors_now: usize) -> bool {
+        delete_after_index && errors_now == errors_at_start
+    }
+
     /// Index a single sealed WAL segment
     #[instrument(skip(config, wal_manager, object_store, segment_index, metadata_store, vector_index_manager, stats, is_leader, hot_buffer, cold_flush_listener, hot_vector_index))]
     async fn index_segment(
@@ -926,6 +936,16 @@ impl WalIndexer {
         hot_vector_index: &Arc<RwLock<Option<Arc<chronik_columnar::hot_vector_index::HotVectorIndex>>>>,
     ) -> Result<()> {
         info!(segment = %segment_id, "Indexing WAL segment");
+
+        // Snapshot the error count so we can gate WAL-segment deletion on a
+        // clean pass. A raw-segment upload failure only logs + bumps
+        // `stats.errors` and continues (see STEP 1), so without this guard the
+        // WAL segment below would be deleted even though its data never reached
+        // the object store — losing it from BOTH tiers. The caller already
+        // declines to mark such a segment "indexed" (retries next run); keeping
+        // the WAL copy until the pass is clean is what makes that retry able to
+        // re-upload it.
+        let errors_at_start = stats.errors;
 
         // Read all records from the segment (v1.3.47+: direct call)
         let records = wal_manager.read_segment(segment_id).await
@@ -1247,11 +1267,21 @@ impl WalIndexer {
             }
         }
 
-        // Delete WAL segment if configured (v1.3.47+: direct call)
-        if config.delete_after_index {
+        // Delete WAL segment if configured (v1.3.47+: direct call) — but ONLY
+        // on a clean pass. If any step for this segment errored (most
+        // critically a raw-segment upload to the object store), keep the WAL
+        // copy so the durable data isn't lost from both tiers; the caller won't
+        // mark this segment indexed, so the next run retries and re-uploads it.
+        if Self::may_delete_wal_segment(config.delete_after_index, errors_at_start, stats.errors) {
             wal_manager.delete_segment(segment_id).await
                 .map_err(|e| Error::Internal(format!("Failed to delete segment {}: {}", segment_id, e)))?;
             info!(segment = %segment_id, "Deleted WAL segment after indexing");
+        } else if config.delete_after_index {
+            warn!(
+                segment = %segment_id,
+                errors = stats.errors - errors_at_start,
+                "Keeping WAL segment (indexing/upload had errors) — will retry next run"
+            );
         }
 
         stats.segments_processed += 1;
@@ -2291,6 +2321,19 @@ mod tests {
         assert_eq!(config.interval_secs, 30);
         assert_eq!(config.min_segment_age_secs, 10);
         assert!(config.delete_after_index);
+    }
+
+    #[test]
+    fn may_delete_wal_segment_only_on_clean_pass() {
+        // Clean pass (no new errors) with deletion enabled -> may delete.
+        assert!(WalIndexer::may_delete_wal_segment(true, 5, 5));
+        // New errors during the pass (e.g. a failed raw-segment upload) -> KEEP
+        // the WAL copy so the next run can re-upload it. Deleting here would
+        // lose the data from both the WAL and the object store.
+        assert!(!WalIndexer::may_delete_wal_segment(true, 5, 6));
+        // Deletion disabled -> never delete, regardless of errors.
+        assert!(!WalIndexer::may_delete_wal_segment(false, 5, 5));
+        assert!(!WalIndexer::may_delete_wal_segment(false, 5, 6));
     }
 
     #[test]
