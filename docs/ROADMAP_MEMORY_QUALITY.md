@@ -5,6 +5,18 @@
 **Goal**: Phase 2 exit gate `synth_judge_rate ≥ 0.70`.
 **Inputs**: (a) full-fleet failure-mode analysis over all 500 item logs, (b) code audit of `crates/chronik-memory`, (c) external research on LongMemEval SOTA systems. See Appendix for evidence.
 
+> **⚠️ Judge contract — read before comparing any rates in this doc.** A
+> `synth_judge_rate` is only comparable to another when the **judge** matches, not
+> just the extractor/synthesizer. Results here span three judges over time and are
+> **NOT directly comparable across a judge change**: early cluster runs
+> (incl. the 0.172 baseline above) were **OpenAI-judged** (gpt-4o-mini); the
+> free-hardware research loop used **gemma3:4b** (this is why
+> `LONGMEMEVAL_RESEARCH_CONCLUSION.md` flags 0.336 OpenAI-judged vs 0.506/0.546
+> gemma-judged as a judge-style artifact, not a real gain); the 2026-08 read-time
+> result (0.880) used an **independent Mistral-Small-3.1-24B** judge. Any new
+> benchmark row MUST record `(judge provider, model, prompt/contract version, exact
+> item set)` alongside the extractor/synthesizer before its delta is used as evidence.
+
 ---
 
 ## The three failure modes, quantified

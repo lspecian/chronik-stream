@@ -2,7 +2,7 @@
 //! LM Studio endpoint with the real answer-bearing chunk from LongMemEval
 //! item e47becba, and report what survives `filter_and_convert`.
 //!
-//! Run: `LMS=http://192.168.1.169:1234 cargo test -p chronik-memory --test \
+//! Run: `LMS=http://LMS_HOST:1234 cargo test -p chronik-memory --test \
 //! probe_local_extractor -- --ignored --nocapture`
 
 use chronik_memory::extractor::providers::openai::{OpenAIExtractor, OpenAIPromptVersion};
@@ -26,8 +26,13 @@ async fn probe_chunk10_extraction() {
     let path = std::env::var("LONGMEMEVAL_PATH")
         .unwrap_or_else(|_| "datasets/longmemeval_s_500.jsonl".to_string());
     let raw = std::fs::read_to_string(&path).expect("dataset");
-    let first_line = raw.lines().next().expect("first item");
-    let item: serde_json::Value = serde_json::from_str(first_line).expect("json");
+    // Select the DOCUMENTED item e47becba, not whatever happens to be first in
+    // the file — otherwise the probe reports on an unrelated conversation.
+    let item: serde_json::Value = raw
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["question_id"].as_str() == Some("e47becba"))
+        .expect("item e47becba not found in dataset");
 
     // Flatten turns exactly like the harness does.
     let mut turns: Vec<Turn> = Vec::new();
@@ -57,24 +62,19 @@ async fn probe_chunk10_extraction() {
         .with_prompt_version(OpenAIPromptVersion::V3Lite);
 
     let t0 = std::time::Instant::now();
-    match ex.extract(&chunk).await {
-        Ok(extracted) => {
-            eprintln!(
-                "extracted {} memories in {:?}",
-                extracted.len(),
-                t0.elapsed()
-            );
-            let mut has_degree = false;
-            for e in &extracted {
-                if format!("{:?}", e.body).contains("Business Administration") {
-                    has_degree = true;
-                }
-            }
-            eprintln!("degree fact present: {}", has_degree);
-            for e in extracted.iter().take(5) {
-                eprintln!("  sample: {:?}", e.body);
-            }
-        }
-        Err(e) => eprintln!("EXTRACTION ERROR: {e}"),
+    // Propagate errors — a failed extraction must fail the probe, not pass it.
+    let extracted = ex.extract(&chunk).await.expect("extraction failed");
+    eprintln!("extracted {} memories in {:?}", extracted.len(), t0.elapsed());
+    for e in extracted.iter().take(5) {
+        eprintln!("  sample: {:?}", e.body);
     }
+    // Verify the reported result: the answer-bearing chunk must yield the
+    // degree fact. Absence is a real regression, not a diagnostic to print.
+    let has_degree = extracted
+        .iter()
+        .any(|e| format!("{:?}", e.body).contains("Business Administration"));
+    assert!(
+        has_degree,
+        "expected 'Business Administration' degree fact not extracted from item e47becba chunk"
+    );
 }
