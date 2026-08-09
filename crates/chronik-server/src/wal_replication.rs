@@ -1535,6 +1535,21 @@ impl WalReplicationManager {
     }
 
     /// Shutdown the replication manager
+    /// Number of records accepted onto the replication queue since startup.
+    ///
+    /// Exposed so the produce path can be asserted against directly: a produce
+    /// that never enqueues here never reaches a follower, which is exactly how
+    /// `acks=1` / `acks=all` silently stopped replicating (the async-response
+    /// path returned before the replication hook).
+    pub fn total_queued(&self) -> u64 {
+        self.total_queued.load(Ordering::Relaxed)
+    }
+
+    /// Number of records successfully written to at least one follower.
+    pub fn total_sent(&self) -> u64 {
+        self.total_sent.load(Ordering::Relaxed)
+    }
+
     pub async fn shutdown(&self) {
         info!("Shutting down WAL replication manager");
         self.shutdown.store(true, Ordering::Relaxed);
