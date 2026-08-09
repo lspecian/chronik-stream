@@ -195,7 +195,7 @@ impl QueryRouter {
     /// Create a QueryRouter from cluster configuration.
     ///
     /// Computes peer unified API URLs from ClusterConfig peers:
-    /// - Extract host from each peer's `kafka` address (e.g., "192.168.1.31" from "192.168.1.31:9092")
+    /// - Extract host from each peer's `kafka` address (e.g., "192.0.2.1" from "192.0.2.1:9092")
     /// - Port from CHRONIK_UNIFIED_API_PORT env var (default: 6092)
     /// - In K8s each pod has its own IP, all use the same port
     /// - Skip self (peer.id == config.node_id)
@@ -1165,25 +1165,25 @@ mod tests {
             peers: vec![
                 chronik_config::NodeConfig {
                     id: 1,
-                    kafka: "192.168.1.31:9092".to_string(),
-                    wal: "192.168.1.31:9291".to_string(),
-                    raft: "192.168.1.31:5001".to_string(),
+                    kafka: "192.0.2.1:9092".to_string(),
+                    wal: "192.0.2.1:9291".to_string(),
+                    raft: "192.0.2.1:5001".to_string(),
                     addr: None,
                     raft_port: None,
                 },
                 chronik_config::NodeConfig {
                     id: 2,
-                    kafka: "192.168.1.32:9093".to_string(),
-                    wal: "192.168.1.32:9292".to_string(),
-                    raft: "192.168.1.32:5002".to_string(),
+                    kafka: "192.0.2.2:9093".to_string(),
+                    wal: "192.0.2.2:9292".to_string(),
+                    raft: "192.0.2.2:5002".to_string(),
                     addr: None,
                     raft_port: None,
                 },
                 chronik_config::NodeConfig {
                     id: 3,
-                    kafka: "192.168.1.33:9094".to_string(),
-                    wal: "192.168.1.33:9293".to_string(),
-                    raft: "192.168.1.33:5003".to_string(),
+                    kafka: "192.0.2.3:9094".to_string(),
+                    wal: "192.0.2.3:9293".to_string(),
+                    raft: "192.0.2.3:5003".to_string(),
                     addr: None,
                     raft_port: None,
                 },
@@ -1237,25 +1237,25 @@ mod tests {
             peers: vec![
                 chronik_config::NodeConfig {
                     id: 1,
-                    kafka: "192.168.1.31:9092".to_string(),
-                    wal: "192.168.1.31:9291".to_string(),
-                    raft: "192.168.1.31:5001".to_string(),
+                    kafka: "192.0.2.1:9092".to_string(),
+                    wal: "192.0.2.1:9291".to_string(),
+                    raft: "192.0.2.1:5001".to_string(),
                     addr: None,
                     raft_port: None,
                 },
                 chronik_config::NodeConfig {
                     id: 2,
-                    kafka: "192.168.1.32:9093".to_string(),
-                    wal: "192.168.1.32:9292".to_string(),
-                    raft: "192.168.1.32:5002".to_string(),
+                    kafka: "192.0.2.2:9093".to_string(),
+                    wal: "192.0.2.2:9292".to_string(),
+                    raft: "192.0.2.2:5002".to_string(),
                     addr: None,
                     raft_port: None,
                 },
                 chronik_config::NodeConfig {
                     id: 3,
-                    kafka: "192.168.1.33:9094".to_string(),
-                    wal: "192.168.1.33:9293".to_string(),
-                    raft: "192.168.1.33:5003".to_string(),
+                    kafka: "192.0.2.3:9094".to_string(),
+                    wal: "192.0.2.3:9293".to_string(),
+                    raft: "192.0.2.3:5003".to_string(),
                     addr: None,
                     raft_port: None,
                 },
@@ -1297,25 +1297,25 @@ mod tests {
             peers: vec![
                 chronik_config::NodeConfig {
                     id: 1,
-                    kafka: "192.168.1.31:9092".to_string(),
-                    wal: "192.168.1.31:9291".to_string(),
-                    raft: "192.168.1.31:5001".to_string(),
+                    kafka: "192.0.2.1:9092".to_string(),
+                    wal: "192.0.2.1:9291".to_string(),
+                    raft: "192.0.2.1:5001".to_string(),
                     addr: None,
                     raft_port: None,
                 },
                 chronik_config::NodeConfig {
                     id: 2,
-                    kafka: "192.168.1.32:9093".to_string(),
-                    wal: "192.168.1.32:9292".to_string(),
-                    raft: "192.168.1.32:5002".to_string(),
+                    kafka: "192.0.2.2:9093".to_string(),
+                    wal: "192.0.2.2:9292".to_string(),
+                    raft: "192.0.2.2:5002".to_string(),
                     addr: None,
                     raft_port: None,
                 },
                 chronik_config::NodeConfig {
                     id: 3,
-                    kafka: "192.168.1.33:9094".to_string(),
-                    wal: "192.168.1.33:9293".to_string(),
-                    raft: "192.168.1.33:5003".to_string(),
+                    kafka: "192.0.2.3:9094".to_string(),
+                    wal: "192.0.2.3:9293".to_string(),
+                    raft: "192.0.2.3:5003".to_string(),
                     addr: None,
                     raft_port: None,
                 },
@@ -1351,25 +1351,25 @@ mod tests {
             peers: vec![
                 chronik_config::NodeConfig {
                     id: 1,
-                    kafka: "192.168.1.31:9092".to_string(),
-                    wal: "192.168.1.31:9291".to_string(),
-                    raft: "192.168.1.31:5001".to_string(),
+                    kafka: "192.0.2.1:9092".to_string(),
+                    wal: "192.0.2.1:9291".to_string(),
+                    raft: "192.0.2.1:5001".to_string(),
                     addr: None,
                     raft_port: None,
                 },
                 chronik_config::NodeConfig {
                     id: 2,
-                    kafka: "192.168.1.32:9093".to_string(),
-                    wal: "192.168.1.32:9292".to_string(),
-                    raft: "192.168.1.32:5002".to_string(),
+                    kafka: "192.0.2.2:9093".to_string(),
+                    wal: "192.0.2.2:9292".to_string(),
+                    raft: "192.0.2.2:5002".to_string(),
                     addr: None,
                     raft_port: None,
                 },
                 chronik_config::NodeConfig {
                     id: 3,
-                    kafka: "192.168.1.33:9094".to_string(),
-                    wal: "192.168.1.33:9293".to_string(),
-                    raft: "192.168.1.33:5003".to_string(),
+                    kafka: "192.0.2.3:9094".to_string(),
+                    wal: "192.0.2.3:9293".to_string(),
+                    raft: "192.0.2.3:5003".to_string(),
                     addr: None,
                     raft_port: None,
                 },
@@ -1395,9 +1395,9 @@ mod tests {
         // that hid a third of the data on every distributed search in
         // multi-port single-host configs (and was wrong in multi-host
         // configs too, just less visibly because hosts differ).
-        assert_eq!(router.peers[0].url, "http://192.168.1.31:6092");
+        assert_eq!(router.peers[0].url, "http://192.0.2.1:6092");
         assert_eq!(router.peers[1].node_id, 3);
-        assert_eq!(router.peers[1].url, "http://192.168.1.33:6094");
+        assert_eq!(router.peers[1].url, "http://192.0.2.3:6094");
         assert_eq!(router.self_node_id, 2);
     }
 

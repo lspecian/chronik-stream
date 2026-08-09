@@ -3,7 +3,7 @@
 **Date**: 2026-02-25
 **Version**: v2.3.0
 **Cluster**: 3-node ChronikCluster on bare metal k8s (MicroK8s)
-**Nodes**: dell-1 (192.168.1.31), dell-2 (192.168.1.32), dell-3 (192.168.1.33)
+**Nodes**: dell-1, dell-2, dell-3
 
 ---
 
