@@ -58,6 +58,11 @@ pub struct RawFact {
     pub source_indexes: Vec<usize>,
     #[serde(default = "default_confidence")]
     pub confidence: f32,
+    /// Who stated the claim — `"user"` or `"assistant"` (WS-2). Optional at
+    /// the wire level: absent/malformed values fall back to `"user"` in
+    /// `filter_and_convert` so older prompt versions keep working.
+    #[serde(default, deserialize_with = "deser_optional_string")]
+    pub speaker: Option<String>,
 }
 
 /// Deserialize a field that the schema marks as `string` but the model
@@ -193,6 +198,13 @@ pub fn filter_and_convert(
                 format!("{} {} {}", subject, predicate, obj_str)
             }
         });
+        // WS-2: speaker attribution. Only the two canonical values are
+        // accepted; anything else (typo, hallucinated role) falls back to
+        // "user" — the safe default for grading and boosts.
+        let speaker = match f.speaker.as_deref() {
+            Some("assistant") => "assistant".to_string(),
+            _ => "user".to_string(),
+        };
         out.push(Extracted {
             body: Body::Fact(FactBody {
                 subject: subject.clone(),
@@ -200,6 +212,7 @@ pub fn filter_and_convert(
                 object: f.object,
                 polarity: "asserted".into(),
                 text,
+                speaker,
             }),
             key: Some(format!("{}|{}", subject, predicate)),
             confidence: apply_calibration(f.confidence, extractor_version, MemoryType::Fact),
@@ -409,6 +422,7 @@ mod tests {
                     text: Some("t".into()),
                     source_indexes: vec![0, 5],
                     confidence: 0.9,
+                    speaker: None,
                 },
                 RawFact {
                     subject: Some("user".into()),
@@ -417,6 +431,7 @@ mod tests {
                     text: Some("t".into()),
                     source_indexes: vec![0],
                     confidence: 0.9,
+                    speaker: None,
                 },
             ],
             ..empty()
@@ -505,6 +520,7 @@ mod tests {
                 text: Some("t".into()),
                 source_indexes: vec![],
                 confidence: 0.9,
+                speaker: None,
             }],
             ..empty()
         };
@@ -521,6 +537,7 @@ mod tests {
                 text: Some("t".into()),
                 source_indexes: vec![0],
                 confidence: 1.7, // out of range
+                speaker: None,
             }],
             ..empty()
         };
@@ -542,6 +559,7 @@ mod tests {
                 text: None,
                 source_indexes: vec![0],
                 confidence: 0.9,
+                speaker: None,
             }],
             ..empty()
         };
@@ -569,6 +587,7 @@ mod tests {
                     text: None,
                     source_indexes: vec![0],
                     confidence: 0.9,
+                    speaker: None,
                 },
                 RawFact {
                     subject: Some("user".into()),
@@ -577,6 +596,7 @@ mod tests {
                     text: None,
                     source_indexes: vec![0],
                     confidence: 0.9,
+                    speaker: None,
                 },
             ],
             ..empty()

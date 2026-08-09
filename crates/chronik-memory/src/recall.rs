@@ -44,7 +44,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Default size of the fan-out window per channel before RRF.
-const DEFAULT_FANOUT_SIZE: usize = 50;
+///
+/// Sprint-1 (ROADMAP_MEMORY_QUALITY.md WS-4.1): raised 50 → 150. The
+/// 2026-07-04 fleet analysis showed value-bearing memories ranking below the
+/// old window for count-style temporal questions ("how many times did X"),
+/// and RRF fusion absorbs the extra candidates without ranking damage. RRF
+/// contribution at rank 150 with RRF_K=60 is ~0.005 vs ~0.016 at rank 1, so
+/// deep candidates only surface when several channels agree.
+const DEFAULT_FANOUT_SIZE: usize = 150;
 
 /// One ranked result from [`Memory::recall`].
 #[derive(Debug, Clone)]
@@ -373,20 +380,113 @@ impl<'a> RecallBuilder<'a> {
             opt_fut(sql_fut),
         );
 
-        if let Some(out) = b? {
-            full_per_channel.insert(Channel::Bm25, out);
+        // Channel fault tolerance: multi-channel RRF must degrade, not die,
+        // when one channel errors — e.g. `/_vector` on a topic created with
+        // `vector.enabled=false` (CHRONIK_MEMORY_VECTOR_TOPICS=false) returns
+        // an error; before this, that single failure zeroed the entire recall
+        // (`?` on each channel). A failed channel now logs and contributes
+        // nothing; recall errors only when EVERY enabled channel failed.
+        let mut channel_errors: Vec<MemoryError> = Vec::new();
+        let mut any_channel_ok = false;
+        match b {
+            Ok(Some(out)) => {
+                any_channel_ok = true;
+                full_per_channel.insert(Channel::Bm25, out);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!("recall bm25 channel failed (degrading): {e}");
+                channel_errors.push(e);
+            }
         }
-        if let Some(out) = v? {
-            id_per_channel.insert(Channel::Vector, out);
+        // T2 entity-centric recall augmentation (gated CHRONIK_MEMORY_ENTITY_RECALL=1).
+        // Multi-session questions often need answer-facts from sessions whose
+        // wording the question doesn't match, so question-BM25 misses them.
+        // Here we ALSO BM25 on each entity the question names and union the hits
+        // into the Bm25 pool — the existing RRF ranking + supersession-lint then
+        // trim to k, and dedup collapses overlaps. Reuses
+        // `extract_subject_candidates`; no new retrieval surface, no LLM call.
+        if std::env::var("CHRONIK_MEMORY_ENTITY_RECALL")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(false)
+        {
+            let entities: Vec<String> = extract_subject_candidates(&self.query)
+                .into_iter()
+                .take(3)
+                .collect();
+            for e in &entities {
+                match run_bm25(
+                    http.clone(),
+                    api.clone(),
+                    layout,
+                    &namespace,
+                    &self.types,
+                    e,
+                    self.fanout_size,
+                )
+                .await
+                {
+                    Ok(recs) => {
+                        any_channel_ok = true;
+                        full_per_channel
+                            .entry(Channel::Bm25)
+                            .or_default()
+                            .extend(recs);
+                    }
+                    Err(err) => {
+                        tracing::warn!("recall entity-bm25 for {e:?} failed (degrading): {err}");
+                    }
+                }
+            }
         }
-        if let Some(out) = km? {
-            full_per_channel.insert(Channel::KeyMatch, out);
+        match v {
+            Ok(Some(out)) => {
+                any_channel_ok = true;
+                id_per_channel.insert(Channel::Vector, out);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!("recall vector channel failed (degrading): {e}");
+                channel_errors.push(e);
+            }
         }
-        if let Some(out) = h? {
-            id_per_channel.insert(Channel::Hyde, out);
+        match km {
+            Ok(Some(out)) => {
+                any_channel_ok = true;
+                full_per_channel.insert(Channel::KeyMatch, out);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!("recall key-match channel failed (degrading): {e}");
+                channel_errors.push(e);
+            }
         }
-        if let Some(out) = s? {
-            full_per_channel.insert(Channel::Sql, out);
+        match h {
+            Ok(Some(out)) => {
+                any_channel_ok = true;
+                id_per_channel.insert(Channel::Hyde, out);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!("recall hyde channel failed (degrading): {e}");
+                channel_errors.push(e);
+            }
+        }
+        match s {
+            Ok(Some(out)) => {
+                any_channel_ok = true;
+                full_per_channel.insert(Channel::Sql, out);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!("recall sql channel failed (degrading): {e}");
+                channel_errors.push(e);
+            }
+        }
+        if !any_channel_ok {
+            if let Some(first) = channel_errors.into_iter().next() {
+                return Err(first);
+            }
         }
 
         // Build master result map keyed by memory_id. Channels that produce
@@ -525,6 +625,16 @@ impl<'a> RecallBuilder<'a> {
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
+        // E4 recall-time supersession lint (gated). Drops stale facts that a
+        // newer fact on the same (namespace, subject, predicate) supersedes,
+        // BEFORE the top-k cut — so knowledge-updates surface only the current
+        // value and freed slots go to distinct facts. Opt-in per run.
+        if std::env::var("CHRONIK_MEMORY_LINT")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(false)
+        {
+            out = apply_supersession_lint(out);
+        }
         out.truncate(self.k);
         Ok(out)
     }
@@ -605,6 +715,64 @@ impl<'a> RecallBuilder<'a> {
         })
     }
 
+    /// **Read-time (query-conditioned) extraction path.** Instead of answering
+    /// from write-time-extracted typed memories (what [`synthesize`] does), this
+    /// retrieves the raw conversation turns from the lossless transcript topic
+    /// (`mem.raw.{ns}`) that best match the question, then reads the answer out
+    /// of *those* — extraction happens now, conditioned on the question, rather
+    /// than eagerly at ingest.
+    ///
+    /// The point is coverage: a fact the write-time extractor never wrote can
+    /// still be answered, because the raw turn that states it is retained and
+    /// retrievable. This trades query-time latency (an extra `/_search` + a
+    /// read over longer text) for not being bounded by what extraction guessed
+    /// was important at ingest.
+    ///
+    /// Requires `mem.raw.*` to be BM25-searchable — set
+    /// `CHRONIK_MEMORY_RAW_SEARCHABLE=1` at namespace-init time (see
+    /// [`crate::topics`]). If the raw topic isn't indexed the search returns
+    /// empty and this abstains, the same as [`synthesize`] on no memories.
+    ///
+    /// `k` (via [`RecallBuilder::k`]) controls how many raw turns are retrieved
+    /// and fed to the reader. `supporting` on the returned answer is empty —
+    /// the evidence here is raw turns, not [`RecallResult`]s.
+    #[tracing::instrument(skip(self, generator), fields(query = %self.query, k = self.k))]
+    pub async fn synthesize_readtime(
+        self,
+        generator: Arc<dyn TextGenerator>,
+    ) -> Result<SynthesizedAnswer> {
+        if self.query.is_empty() {
+            return Err(MemoryError::InvalidArgument("recall query is empty".into()));
+        }
+        let question = self.query.clone();
+        let layout = self.memory.topic_layout();
+        let api = self.memory.chronik_api().trim_end_matches('/').to_string();
+        let http = self.memory.http().clone();
+
+        let turns = run_raw_search(http, api, layout, &question, self.k).await?;
+        if turns.is_empty() {
+            return Ok(SynthesizedAnswer {
+                answer: ABSTAIN_LITERAL.to_string(),
+                abstained: true,
+                supporting: vec![],
+            });
+        }
+        let prompt = build_readtime_prompt(&question, &turns);
+        let raw = generator.complete(&prompt).await?;
+        let trimmed = raw.trim();
+        let abstained = is_abstention(trimmed);
+        let answer = if abstained {
+            ABSTAIN_LITERAL.to_string()
+        } else {
+            trimmed.to_string()
+        };
+        Ok(SynthesizedAnswer {
+            answer,
+            abstained,
+            supporting: vec![],
+        })
+    }
+
     /// Filters that run BEFORE `dedup_results_keep_max_score`. These exclude
     /// records that are categorically wrong for this recall (cross-namespace
     /// leakers, low-confidence, expired). Tombstones are *not* filtered here
@@ -662,6 +830,131 @@ type TypedLoc = (String, i32, i64);
 struct EnrichedRecord {
     record: MemoryRecord,
     typed_loc: Option<TypedLoc>,
+}
+
+/// E4 recall-time supersession lint (gated by `CHRONIK_MEMORY_LINT=1`).
+///
+/// When two recalled FACTS share `(namespace, subject, predicate)` with
+/// distinct non-null objects — the codebase's definition of a conflict
+/// ([`crate::conflict::detect_conflict`]) — keep only the newest by
+/// `valid_from` and drop the older, superseded value. Rationale: a small
+/// synthesis model shouldn't have to reason about which of several stale
+/// values is current (the v2/v3 prompt asks it to "prefer the most recent
+/// timestamp", but a 4B model does this unreliably). Filtering at recall
+/// time hands it a clean set and frees top-k slots for distinct facts.
+///
+/// The winner takes the highest-scored slot of its group (input is
+/// score-sorted), so relevance ranking is preserved. Non-fact records and
+/// facts lacking a comparable subject/predicate/object pass through.
+fn apply_supersession_lint(results: Vec<RecallResult>) -> Vec<RecallResult> {
+    // T3 (gated CHRONIK_MEMORY_CURATION=1): resolve the supersession key with
+    // deterministic entity/relation normalization so trivially-equivalent
+    // facts collapse into one group. E4's lint keyed on the byte-exact
+    // (subject, predicate); across sessions the extractor drifts ("my dog" /
+    // "the dog" / "Dog"; "lives in" / "location") and the exact key misses the
+    // supersession, leaving a stale value in the top-k. Normalizing the key
+    // only ever MERGES groups (drops a superseded duplicate, keeps the newest
+    // by valid_from) — it never adds a record — so it extends the proven
+    // cleaning lever without adding a retrieval surface. Off => exact E4 key.
+    let curate = std::env::var("CHRONIK_MEMORY_CURATION")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(false);
+    let mut slot_of: HashMap<(String, String, String), usize> = HashMap::new();
+    let mut out: Vec<RecallResult> = Vec::with_capacity(results.len());
+    for r in results.into_iter() {
+        let key = match &r.memory.body {
+            crate::schema::Body::Fact(f)
+                if !f.object.is_null() && !f.subject.is_empty() && !f.predicate.is_empty() =>
+            {
+                let (subj, pred) = if curate {
+                    (normalize_entity(&f.subject), normalize_relation(&f.predicate))
+                } else {
+                    (f.subject.clone(), f.predicate.clone())
+                };
+                // A normalizer that collapses to empty (e.g. subject was only
+                // an article) is unsafe to group on — fall back to raw.
+                if subj.is_empty() || pred.is_empty() {
+                    Some((r.memory.namespace.clone(), f.subject.clone(), f.predicate.clone()))
+                } else {
+                    Some((r.memory.namespace.clone(), subj, pred))
+                }
+            }
+            _ => None,
+        };
+        match key {
+            Some(k) => {
+                if let Some(&idx) = slot_of.get(&k) {
+                    // Same subject+predicate already seen: keep whichever is
+                    // newer by valid_from in that (higher-scored) slot; drop
+                    // the older one entirely.
+                    if r.memory.valid_from > out[idx].memory.valid_from {
+                        out[idx] = r;
+                    }
+                } else {
+                    slot_of.insert(k, out.len());
+                    out.push(r);
+                }
+            }
+            None => out.push(r),
+        }
+    }
+    out
+}
+
+/// T3 entity resolution: normalize a fact `subject` so that trivially
+/// co-referent surface forms collapse to one key. Deterministic and
+/// conservative — lowercase, collapse whitespace, strip a leading
+/// determiner/possessive ("my"/"the"/"your"/…) and a trailing possessive
+/// `'s`/punctuation. Intentionally does NOT stem or singularize (too lossy:
+/// "glasses"≠"glass"), and keeps adjectives ("old car"≠"new car") so distinct
+/// entities stay distinct. Returns the normalized token string (may differ in
+/// word count from the input; the caller falls back to the raw key if empty).
+fn normalize_entity(subject: &str) -> String {
+    let lowered = subject.trim().to_lowercase();
+    // Split into tokens on whitespace, dropping surrounding punctuation.
+    let mut toks: Vec<&str> = lowered
+        .split_whitespace()
+        .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric()))
+        .filter(|t| !t.is_empty())
+        .collect();
+    // Strip one leading determiner/possessive.
+    const LEADING: &[&str] = &[
+        "my", "the", "a", "an", "your", "our", "their", "his", "her", "its",
+    ];
+    if toks.len() > 1 && LEADING.contains(&toks[0]) {
+        toks.remove(0);
+    }
+    // Strip a dangling possessive marker token if extraction split it out.
+    if toks.len() > 1 && (toks.last() == Some(&"s") || toks.last() == Some(&"'s")) {
+        toks.pop();
+    }
+    toks.join(" ")
+}
+
+/// T3 relation resolution: normalize a fact `predicate` so equivalent relation
+/// phrasings share a key. Lowercase + whitespace-collapse, drop a leading
+/// copula/auxiliary ("is"/"was"/"has"/"had") that the extractor adds
+/// inconsistently ("is named" vs "named"), and drop a trailing preposition
+/// ("lives in" vs "lives") that varies with object phrasing. Conservative: no
+/// synonym mapping (would risk merging distinct relations).
+fn normalize_relation(predicate: &str) -> String {
+    let lowered = predicate.trim().to_lowercase();
+    let mut toks: Vec<&str> = lowered
+        .split_whitespace()
+        .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric()))
+        .filter(|t| !t.is_empty())
+        .collect();
+    const LEADING: &[&str] = &["is", "are", "was", "were", "has", "have", "had", "be", "been"];
+    if toks.len() > 1 && LEADING.contains(&toks[0]) {
+        toks.remove(0);
+    }
+    const TRAILING: &[&str] = &[
+        "in", "at", "on", "to", "of", "for", "with", "by", "from", "as",
+    ];
+    if toks.len() > 1 && TRAILING.contains(toks.last().unwrap()) {
+        toks.pop();
+    }
+    toks.join(" ")
 }
 
 /// Dedup [`RecallResult`] using compaction semantics: highest version per
@@ -999,19 +1292,81 @@ const STOPWORDS: &[&str] = &[
 /// LLM-judge prompt for consistency.
 const MAX_SYNTH_SNIPPET_CHARS: usize = 280;
 
-/// Render one [`MemoryRecord`] as a single bulleted line for the synthesis
-/// prompt. Includes type + valid_from + the most-informative typed fields so
-/// the model can reason about recency and structured content (subject /
-/// predicate / object for facts, actor / verb for events, etc.).
+/// Cap for the WS-0 source-excerpt block appended under a memory line in the
+/// synthesis prompt. The excerpt is already ingest-capped at 700 chars
+/// (client.rs `EXCERPT_MAX_TOTAL`); this is defensive and keeps the k=10
+/// prompt under ~10 KB even if older records carry longer excerpts.
+const MAX_SYNTH_EXCERPT_CHARS: usize = 700;
+
+/// Render one [`MemoryRecord`] as a bulleted entry for the synthesis prompt.
+/// Includes type + valid_from + the most-informative typed fields so the
+/// model can reason about recency and structured content, plus — when
+/// present — the WS-0 verbatim source excerpt of the round the memory was
+/// extracted from, indented under the summary line. The excerpt carries
+/// speaker labels and exact wording (assistant-stated names, quantities,
+/// quotes) that the atomic extraction loses.
+/// T1 temporal date-computation (gated `CHRONIK_MEMORY_TEMPORAL=1`). Parses the
+/// `(Today is YYYY-MM-DD.)` anchor the eval prepends to temporal questions.
+/// Returns `None` when the flag is off or no anchor is present — so non-temporal
+/// runs and untagged questions are unaffected.
+fn temporal_ref_date(question: &str) -> Option<chrono::NaiveDate> {
+    if !std::env::var("CHRONIK_MEMORY_TEMPORAL")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let idx = question.find("Today is ")? + "Today is ".len();
+    let cand: String = question[idx..].chars().take(10).collect();
+    // The anchor is written from the raw LongMemEval `question_date`, which uses
+    // slashes ("2023/05/30 (Tue) 23:40"); normalize the separator so the parse
+    // (and thus the T1 age annotations) actually fires instead of silently
+    // returning None on a `%Y-%m-%d`-only parse.
+    let normalized = cand.replace('/', "-");
+    chrono::NaiveDate::parse_from_str(&normalized, "%Y-%m-%d").ok()
+}
+
+/// Pre-compute the "≈N days/weeks/months ago" gap from a fact's `valid_from` to
+/// the query's reference date — the date arithmetic a small model does badly.
+/// Handing it the answer offloads the exact failure mode behind the weak
+/// temporal-reasoning category. Empty string for future-dated facts.
+fn age_annotation(ref_date: chrono::NaiveDate, valid_from: DateTime<Utc>) -> String {
+    let days = (ref_date - valid_from.date_naive()).num_days();
+    if days < 0 {
+        return String::new();
+    }
+    let human = if days == 0 {
+        "today".to_string()
+    } else if days == 1 {
+        "1 day ago".to_string()
+    } else if days < 21 {
+        format!("{days} days ago")
+    } else if days < 60 {
+        format!("~{} weeks ago", ((days as f64) / 7.0).round() as i64)
+    } else if days < 730 {
+        format!("~{} months ago", ((days as f64) / 30.44).round() as i64)
+    } else {
+        format!("~{} years ago", ((days as f64) / 365.25).round() as i64)
+    };
+    format!(" [{human}]")
+}
+
 fn render_memory_for_synthesis(m: &MemoryRecord) -> String {
+    render_memory_for_synthesis_ref(m, None)
+}
+
+/// As [`render_memory_for_synthesis`] but, when `ref_date` is `Some`, injects a
+/// pre-computed age annotation (T1) right after the fact's timestamp.
+fn render_memory_for_synthesis_ref(m: &MemoryRecord, ref_date: Option<chrono::NaiveDate>) -> String {
     use crate::schema::Body::*;
     let typed = match &m.body {
         Fact(f) => format!(
-            "fact subject={} predicate={} object={} polarity={} text={}",
+            "fact subject={} predicate={} object={} polarity={} speaker={} text={}",
             f.subject,
             f.predicate,
             serde_json::to_string(&f.object).unwrap_or_default(),
             f.polarity,
+            f.speaker,
             f.text
         ),
         Event(e) => format!(
@@ -1035,7 +1390,20 @@ fn render_memory_for_synthesis(m: &MemoryRecord) -> String {
         ),
     };
     let truncated: String = typed.chars().take(MAX_SYNTH_SNIPPET_CHARS).collect();
-    format!("({}) {}", m.valid_from.to_rfc3339(), truncated)
+    let age = ref_date
+        .map(|rd| age_annotation(rd, m.valid_from))
+        .unwrap_or_default();
+    let mut line = format!("({}{}) {}", m.valid_from.to_rfc3339(), age, truncated);
+    if let Some(excerpt) = &m.source.excerpt {
+        let capped: String = excerpt.chars().take(MAX_SYNTH_EXCERPT_CHARS).collect();
+        // Indent each excerpt line so it reads as a quoted block under the
+        // memory summary, not as a separate memory.
+        for l in capped.lines() {
+            line.push_str("\n      | ");
+            line.push_str(l);
+        }
+    }
+    line
 }
 
 /// Build the synthesis prompt. Format is deliberately minimal — bulleted
@@ -1046,21 +1414,115 @@ fn render_memory_for_synthesis(m: &MemoryRecord) -> String {
 /// can detect it via `SynthesizedAnswer::abstained` and avoid surfacing
 /// hallucinated answers.
 fn build_synthesis_prompt(question: &str, memories: &[RecallResult]) -> String {
-    // Env-gated A/B: `CHRONIK_MEMORY_SYNTH_PROMPT=v2` selects the
-    // assistant-fact-committing variant (Option B from the LongMemEval pilot
-    // ladder). Default stays v1 so measurements against the pilot-7/8 baseline
-    // aren't disturbed unless the operator explicitly opts in.
+    // Sprint-1 (ROADMAP_MEMORY_QUALITY.md WS-1): v2 is the default.
+    // The 2026-07-04 fleet analysis showed v1's abstention gate destroyed
+    // 76 raw-recall hits (net −45) with a 73% overall abstain rate against
+    // only ~30/500 questions where abstention is correct. `v1` remains
+    // available as an env opt-out for baseline comparison.
+    //
+    // Preference-shaped questions get a dedicated template (WS-1.3):
+    // their golds are "the user would prefer..." paragraphs, which the
+    // factoid-shaped prompt converted at 0/6 on the 2026-07-04 fleet.
     match std::env::var("CHRONIK_MEMORY_SYNTH_PROMPT").as_deref() {
-        Ok("v2") => build_synthesis_prompt_v2(question, memories),
-        _ => build_synthesis_prompt_v1(question, memories),
+        Ok("v1") => build_synthesis_prompt_v1(question, memories),
+        Ok("v3") => {
+            // E2 lever: maximally anti-abstention. Preference questions keep
+            // their dedicated template; everything else gets the never-abstain v3.
+            if is_preference_question(question) {
+                build_synthesis_prompt_preference(question, memories)
+            } else {
+                build_synthesis_prompt_v3(question, memories)
+            }
+        }
+        _ => {
+            if is_preference_question(question) {
+                build_synthesis_prompt_preference(question, memories)
+            } else {
+                build_synthesis_prompt_v2(question, memories)
+            }
+        }
     }
+}
+
+/// Detect preference-shaped questions (LongMemEval `single-session-preference`
+/// style): the gold answer is a description of what the user would or would
+/// not prefer, grounded in their stated experiences — not a factoid.
+fn is_preference_question(question: &str) -> bool {
+    let q = question.to_lowercase();
+    // Past-tense recall of a specific prior suggestion ("What app did you
+    // recommend?") is a factoid, not a preference question — don't let the bare
+    // "suggest"/"recommend" markers below hijack it into the preference path.
+    const FACTOID_RECALL: &[&str] = &[
+        "did you recommend",
+        "did you suggest",
+        "you recommended",
+        "you suggested",
+        "had recommended",
+        "had suggested",
+    ];
+    if FACTOID_RECALL.iter().any(|m| q.contains(m)) {
+        return false;
+    }
+    const PREFERENCE_MARKERS: &[&str] = &[
+        "would i prefer",
+        "would i like",
+        "what would i",
+        "do i prefer",
+        "what do i prefer",
+        "suggest",
+        "recommend",
+        "what should i",
+        "any ideas for",
+        "tips for me",
+        "help me plan",
+        "how should you respond",
+        "tailor",
+    ];
+    PREFERENCE_MARKERS.iter().any(|m| q.contains(m))
+}
+
+/// Preference template (WS-1.3) — instead of a one-line factoid, produce a
+/// short grounded description of the user's relevant preferences and
+/// constraints. The LongMemEval judge grades these paraphrase-tolerantly
+/// against golds of the form "The user would prefer responses that ...".
+fn build_synthesis_prompt_preference(question: &str, memories: &[RecallResult]) -> String {
+    let mut bullets = String::new();
+    let ref_date = temporal_ref_date(question);
+    for (i, r) in memories.iter().enumerate() {
+        let line = render_memory_for_synthesis_ref(&r.memory, ref_date);
+        bullets.push_str(&format!("[{}] {}\n", i + 1, line));
+    }
+    format!(
+        "You are answering on behalf of an assistant that knows the user's long-term memories. \
+The question asks what the user would want, prefer, or find helpful. Answer it as a short \
+description of the user's relevant preferences, grounded ONLY in the provided memories.\n\
+\n\
+Rules:\n\
+- Lines starting with `|` under a memory quote the ORIGINAL conversation verbatim (`user:` / `assistant:` prefixes show who spoke). Use them for the concrete specifics.\n\
+- Answer in 2-4 sentences of the form: what the user would prefer (tied to their specific \
+stated experiences, interests, possessions, or constraints from the memories), and what they \
+would NOT prefer (generic suggestions that ignore those specifics).\n\
+- Reference the concrete specifics from the memories — names, activities, items, situations. \
+Specificity is what makes the answer correct.\n\
+- Do NOT invent preferences that no memory supports.\n\
+- Only reply EXACTLY: {ABSTAIN_LITERAL} if every listed memory is about a completely \
+different subject than the question. If ANY memory relates to the question's topic, answer \
+from it — describing the user's known preferences IS the job, even from partial information.\n\
+\n\
+Memories (relevance order, with timestamps):\n\
+{bullets}\n\
+Question: {question}\n\
+\n\
+Answer:"
+    )
 }
 
 /// v1 — original pilot-7 anti-abstention prompt. Kept for baseline comparison.
 fn build_synthesis_prompt_v1(question: &str, memories: &[RecallResult]) -> String {
     let mut bullets = String::new();
+    let ref_date = temporal_ref_date(question);
     for (i, r) in memories.iter().enumerate() {
-        let line = render_memory_for_synthesis(&r.memory);
+        let line = render_memory_for_synthesis_ref(&r.memory, ref_date);
         bullets.push_str(&format!("[{}] {}\n", i + 1, line));
     }
     format!(
@@ -1095,8 +1557,9 @@ Answer:"
 /// plausibly answers the question, commit rather than hedge.
 fn build_synthesis_prompt_v2(question: &str, memories: &[RecallResult]) -> String {
     let mut bullets = String::new();
+    let ref_date = temporal_ref_date(question);
     for (i, r) in memories.iter().enumerate() {
-        let line = render_memory_for_synthesis(&r.memory);
+        let line = render_memory_for_synthesis_ref(&r.memory, ref_date);
         bullets.push_str(&format!("[{}] {}\n", i + 1, line));
     }
     format!(
@@ -1104,13 +1567,54 @@ fn build_synthesis_prompt_v2(question: &str, memories: &[RecallResult]) -> Strin
 Answer the user's question using ONLY the provided memories.\n\
 \n\
 Rules:\n\
+- Lines starting with `|` under a memory quote the ORIGINAL conversation verbatim (`user:` / `assistant:` prefixes show who spoke). Trust their exact wording — names, numbers, quotes, orderings — over the structured summary above them.\n\
 - When two memories conflict (e.g. an updated preference, a changed budget), prefer the one with the most recent timestamp.\n\
 - **Assistant-stated facts count.** These memories were extracted from a conversation the user was present for. If a memory records the assistant naming, describing, recommending, or quantifying something — a person's clothing, a place, a food, a brand, a duration, a count — and the user did not object in a later turn, treat that as a settled fact. Commit to it. Do NOT abstain because the user did not restate it.\n\
 - **One clear candidate wins.** If the retrieved memories contain exactly one fact that plausibly answers the question, commit to it. Do NOT abstain because you are not 100% certain — abstention costs more than a specific answer in this task.\n\
 - **Arithmetic questions** (\"how many\", \"total\", \"sum\", \"average\", \"how much\"): if you see ANY value-bearing memories — counts, durations, dollar amounts, quantities — even just two of them, COMPUTE the aggregate from those values. Return only the computed value (e.g. \"$720\", \"3\", \"four weeks\"). Show the arithmetic only if asked.\n\
 - **Temporal questions** (\"how long ago\", \"how many days\", \"when did I last\"): reason from memory timestamps and any time-anchored content. Output the duration / date naturally (\"four weeks\", \"about two hours\", \"over a year\").\n\
+- **Read in two steps (silently).** First, for each memory that touches the question's topic, note what it contributes — entity, value, date, who said it. Second, compose the answer from those notes, combining across memories when the question spans several conversations. Do NOT write the notes out; output only the final answer.\n\
 - Be concise — one sentence whenever possible. No preamble, no \"Based on the memories...\", just the answer.\n\
-- **Abstain only when NO retrieved memory is topically relevant.** Reply EXACTLY: {ABSTAIN_LITERAL} only if every listed memory is clearly unrelated to the question. Do NOT abstain when memories touch the topic but require you to commit to a specific value, entity, or fact — committing IS the job.\n\
+- **Abstention is for absent subjects, not uncertainty.** Reply EXACTLY: {ABSTAIN_LITERAL} in exactly two situations: (1) every listed memory is about a clearly different subject than the question, or (2) the question asks about a SPECIFIC entity or attribute (a person, an item, an occasion) that no memory mentions — e.g. the question asks about a gift from your dad but the memories only record a gift from your sister; in that case the correct answer is that you don't know. In every other case — when a memory names the entity or attribute the question asks about — COMMIT to the best-supported answer. Do NOT abstain because you are unsure, because the evidence is partial, or because the answer requires combining or computing from several memories. Committing IS the job.\n\
+\n\
+Memories (relevance order, with timestamps):\n\
+{bullets}\n\
+Question: {question}\n\
+\n\
+Answer:"
+    )
+}
+
+/// v3 — MAXIMALLY anti-abstention (E2 lever, 2026-07-09). Same evidence
+/// guidance as v2, but the abstention clause is replaced with a hard
+/// "never abstain — always commit your single best answer" rule. Rationale:
+/// under the local judge, baseline abstention is ~0.208 (104/500); every
+/// abstained item is a guaranteed miss. Since the judge grades correctness,
+/// a wrong committed guess scores the SAME as an abstain-miss — so forcing
+/// a guess can only convert the subset of abstained items whose answer was
+/// actually retrievable into hits, at no downside on truly-absent items.
+/// Env-gated: `CHRONIK_MEMORY_SYNTH_PROMPT=v3`. Tests whether the smaller
+/// model's residual abstention is costing recoverable points.
+fn build_synthesis_prompt_v3(question: &str, memories: &[RecallResult]) -> String {
+    let mut bullets = String::new();
+    let ref_date = temporal_ref_date(question);
+    for (i, r) in memories.iter().enumerate() {
+        let line = render_memory_for_synthesis_ref(&r.memory, ref_date);
+        bullets.push_str(&format!("[{}] {}\n", i + 1, line));
+    }
+    format!(
+        "You are a precise question-answering assistant working with an agent's long-term memory. \
+Answer the user's question using ONLY the provided memories.\n\
+\n\
+Rules:\n\
+- Lines starting with `|` under a memory quote the ORIGINAL conversation verbatim (`user:` / `assistant:` prefixes show who spoke). Trust their exact wording — names, numbers, quotes, orderings — over the structured summary above them.\n\
+- When two memories conflict (e.g. an updated preference, a changed budget), prefer the one with the most recent timestamp.\n\
+- **Assistant-stated facts count.** If a memory records the assistant naming, describing, recommending, or quantifying something and the user did not object later, treat it as a settled fact and commit to it.\n\
+- **Arithmetic questions** (\"how many\", \"total\", \"sum\", \"average\", \"how much\"): compute the aggregate from any value-bearing memories you see. Return only the computed value (e.g. \"$720\", \"3\", \"four weeks\").\n\
+- **Temporal questions** (\"how long ago\", \"how many days\", \"when did I last\"): reason from memory timestamps and time-anchored content. Output the duration / date naturally.\n\
+- **Read in two steps (silently).** First note what each on-topic memory contributes — entity, value, date, speaker. Then compose the answer from those notes, combining across memories. Output only the final answer.\n\
+- Be concise — one sentence whenever possible. No preamble, just the answer.\n\
+- **NEVER abstain. Always commit to your single best answer.** Even if the evidence is partial, indirect, or you are not fully certain, pick the most plausible answer supported by the memories and state it directly. Do NOT reply \"I don't know\", do NOT hedge, do NOT say the memories are insufficient. If several answers are possible, choose the best-supported one. A specific committed guess is always better than silence in this task.\n\
 \n\
 Memories (relevance order, with timestamps):\n\
 {bullets}\n\
@@ -1273,6 +1777,179 @@ async fn post_vector_search(
         .collect())
 }
 
+/// A single raw conversation turn retrieved from `mem.raw.{ns}` for the
+/// read-time extraction path. Distinct from a [`RecallResult`]: it is the
+/// original transcript line, not a write-time-extracted memory.
+#[derive(Debug, Clone)]
+struct RawTurn {
+    /// Speaker role (`user` / `assistant` / ...).
+    role: String,
+    /// The verbatim message content.
+    content: String,
+    /// Effective timestamp of the turn, when present on the record.
+    ts: Option<DateTime<Utc>>,
+}
+
+/// Parse a raw turn out of a Chronik `/_search` hit `_source`. Raw records use
+/// the [`crate::ingest::RawTurnRecord`] wire shape (`{role, content, ts, ...}`),
+/// which — unlike typed memories — is NOT a [`MemoryRecord`], so
+/// [`parse_envelope_from_source`] can't be reused. Tolerates the same three
+/// `_source` shapes: direct (the object IS the turn), wrapped-bare (`value`
+/// holds the JSON string), and wrapped-underscored (`_value` / `_json_content`).
+fn parse_raw_turn_from_source(source: &serde_json::Value) -> Option<RawTurn> {
+    // Direct shape: the source object itself carries `content`.
+    if source.get("content").and_then(|v| v.as_str()).is_some() {
+        return raw_turn_from_object(source);
+    }
+    // Wrapped shapes: the turn JSON is a string under one of these fields.
+    for field in ["value", "_value", "_json_content"] {
+        if let Some(s) = source.get(field).and_then(|v| v.as_str()) {
+            if let Ok(inner) = serde_json::from_str::<serde_json::Value>(s) {
+                if let Some(t) = raw_turn_from_object(&inner) {
+                    return Some(t);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn raw_turn_from_object(obj: &serde_json::Value) -> Option<RawTurn> {
+    let content = obj.get("content").and_then(|v| v.as_str())?.to_string();
+    let role = obj
+        .get("role")
+        .and_then(|v| v.as_str())
+        .unwrap_or("user")
+        .to_string();
+    let ts = obj
+        .get("ts")
+        .and_then(|v| v.as_str())
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&Utc));
+    Some(RawTurn { role, content, ts })
+}
+
+/// Retrieve the top-`n` raw conversation turns matching `query` from the
+/// namespace's `mem.raw.{ns}` transcript topic (BM25). Requires the raw topic
+/// to be searchable (`CHRONIK_MEMORY_RAW_SEARCHABLE=1`); otherwise the search
+/// 404s / returns nothing and this yields an empty vec.
+async fn run_raw_search(
+    http: reqwest::Client,
+    api: String,
+    layout: &crate::topics::TopicLayout,
+    query: &str,
+    n: usize,
+) -> Result<Vec<RawTurn>> {
+    let topic = layout.raw();
+    let url = format!("{api}/_search");
+    // Sanitize the query to plain alphanumeric words. The hot-text search path
+    // feeds the `_all` match text straight to Tantivy's QueryParser, which
+    // treats `(`, `)`, `/`, `:`, etc. as query syntax and returns ZERO hits for
+    // a natural-language question that contains them — e.g. an anchored
+    // question like "(Today is 2023/05/30 (Tue) 23:40.) What degree...". The
+    // cold path tolerates them, which is why raw retrieval only "worked" once
+    // the cold indexer had caught up (~45s). Replacing every non-alphanumeric
+    // char with a space yields a plain bag-of-words the parser accepts, so raw
+    // retrieval works against the hot index immediately.
+    let sanitized: String = query
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect();
+    // The raw topic is already namespace-scoped by name, so pass an empty
+    // namespace token — no need to append it to the query.
+    let body = bm25_query_body(&topic, "", sanitized.trim(), n);
+    post_raw_search(http, url, body).await
+}
+
+async fn post_raw_search(
+    http: reqwest::Client,
+    url: String,
+    body: serde_json::Value,
+) -> Result<Vec<RawTurn>> {
+    let resp = match http
+        .post(&url)
+        .header("content-type", "application/json")
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!(error = %e, %url, "raw search failed; treating as empty");
+            return Ok(vec![]);
+        }
+    };
+    let status = resp.status();
+    if !status.is_success() {
+        if status.as_u16() != 404 {
+            tracing::debug!(%status, %url, "raw search non-200; treating as empty");
+        }
+        return Ok(vec![]);
+    }
+    let parsed: SearchResponse = match resp.json().await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::debug!(error = %e, "raw search response unparseable; treating as empty");
+            return Ok(vec![]);
+        }
+    };
+    let mut out = Vec::with_capacity(parsed.hits.hits.len());
+    for h in parsed.hits.hits {
+        if let Some(t) = parse_raw_turn_from_source(&h._source) {
+            out.push(t);
+        }
+    }
+    Ok(out)
+}
+
+/// Build the read-time reader prompt. Mirrors the v2 synthesis answer rules
+/// (so a read-time vs write-time A/B differs only in the EVIDENCE source) but
+/// presents raw conversation turns instead of extracted memory bullets.
+/// Per-turn content cap in the read-time prompt. More generous than the typed
+/// snippet cap (`MAX_SYNTH_SNIPPET_CHARS`, 280) because raw turns ARE the full
+/// evidence, but still bounds the prompt so one pathologically long turn can't
+/// blow the reader's context window: worst-case excerpt size is `k` turns ×
+/// this. Well above any normal chat turn, so it's a no-op for typical input.
+const MAX_READTIME_TURN_CHARS: usize = 2000;
+
+fn build_readtime_prompt(question: &str, turns: &[RawTurn]) -> String {
+    let mut excerpts = String::new();
+    for (i, t) in turns.iter().enumerate() {
+        let when = t
+            .ts
+            .map(|d| d.format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|| "unknown-date".to_string());
+        let content: String = if t.content.chars().count() > MAX_READTIME_TURN_CHARS {
+            let mut s: String = t.content.chars().take(MAX_READTIME_TURN_CHARS).collect();
+            s.push('…');
+            s
+        } else {
+            t.content.clone()
+        };
+        excerpts.push_str(&format!("[{}] ({}) {}: {}\n", i + 1, when, t.role, content));
+    }
+    format!(
+        "You are a precise question-answering assistant. Below are raw conversation \
+excerpts retrieved from the user's history because they best match the question. \
+Answer the question using ONLY these excerpts.\n\
+\n\
+Rules:\n\
+- The excerpts are verbatim transcript lines with a date and speaker (`user:` / `assistant:`). Trust their exact wording — names, numbers, quotes, orderings.\n\
+- **Assistant-stated facts count.** If an `assistant:` line names, describes, recommends, or quantifies something and the user did not object in a later excerpt, treat it as settled and commit to it.\n\
+- When two excerpts conflict (an updated preference, a changed value), prefer the one with the most recent date.\n\
+- **Arithmetic questions** (\"how many\", \"total\", \"sum\", \"average\", \"how much\"): compute the aggregate from the value-bearing excerpts. Return only the computed value.\n\
+- **Temporal questions** (\"how long ago\", \"how many days\", \"when did I last\"): reason from the excerpt dates and any time-anchored content. Output the duration / date naturally.\n\
+- Find the excerpt(s) that answer the question, then compose a concise answer from them — one sentence whenever possible. No preamble, just the answer.\n\
+- **Abstention is for absent subjects, not uncertainty.** Reply EXACTLY: {ABSTAIN_LITERAL} only when none of the excerpts mention the specific entity or attribute the question asks about. If an excerpt names it, COMMIT to the best-supported answer — do NOT abstain because the evidence is partial or requires combining excerpts.\n\
+\n\
+Excerpts (relevance order, with dates):\n\
+{excerpts}\n\
+Question: {question}\n\
+\n\
+Answer:"
+    )
+}
+
 /// Extract typed `(topic, partition, offset)` from a wrapped Chronik `_source`
 /// when the wrapped shape is in use. Returns `None` for the direct shape (no
 /// Kafka coordinates surfaced) — id-only channels then can't boost that row,
@@ -1366,6 +2043,29 @@ mod tests {
     use super::*;
     use crate::schema::{Body, EventBody, FactBody, Source};
 
+    #[test]
+    fn normalize_entity_collapses_determiners_and_case() {
+        assert_eq!(normalize_entity("my dog"), "dog");
+        assert_eq!(normalize_entity("The Dog"), "dog");
+        assert_eq!(normalize_entity("dog"), "dog");
+        assert_eq!(normalize_entity("  your   CAR "), "car");
+        // Keep distinguishing adjectives — distinct entities stay distinct.
+        assert_ne!(normalize_entity("my old car"), normalize_entity("my new car"));
+        // A bare determiner does not collapse to empty (len<=1 guard).
+        assert_eq!(normalize_entity("the"), "the");
+    }
+
+    #[test]
+    fn normalize_relation_drops_copula_and_trailing_prep() {
+        assert_eq!(normalize_relation("is named"), "named");
+        assert_eq!(normalize_relation("named"), "named");
+        assert_eq!(normalize_relation("lives in"), "lives");
+        assert_eq!(normalize_relation("lives"), "lives");
+        // Single-token relations are preserved even if they'd otherwise strip.
+        assert_eq!(normalize_relation("in"), "in");
+        assert_eq!(normalize_relation("is"), "is");
+    }
+
     fn fact_record(version: u64, key: &str, ns: &str) -> MemoryRecord {
         let now = Utc::now();
         MemoryRecord {
@@ -1381,7 +2081,7 @@ mod tests {
             source: Source {
                 topic: "mem.raw.t".into(),
                 offsets: vec![1],
-                extractor: "x@1".into(),
+                extractor: "x@1".into(), excerpt: None,
             },
             tombstoned: false,
             body: Body::Fact(FactBody {
@@ -1390,6 +2090,7 @@ mod tests {
                 object: serde_json::json!("o"),
                 polarity: "asserted".into(),
                 text: "t".into(),
+                speaker: "user".into(),
             }),
         }
     }
@@ -1409,7 +2110,7 @@ mod tests {
             source: Source {
                 topic: "mem.raw.t".into(),
                 offsets: vec![1],
-                extractor: "x@1".into(),
+                extractor: "x@1".into(), excerpt: None,
             },
             tombstoned: false,
             body: Body::Event(EventBody {
@@ -1779,5 +2480,71 @@ mod tests {
         });
         let m = parse_envelope_from_source(&wrapped).expect("parse");
         assert_eq!(m.body.kind(), MemoryType::Fact);
+    }
+
+    // ------------------------------------------------------------------
+    // Sprint-1 synthesis prompt selection (ROADMAP_MEMORY_QUALITY.md WS-1)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn preference_detector_matches_preference_shapes() {
+        for q in [
+            "What kind of gift ideas would I prefer for my niece?",
+            "Can you suggest some podcasts for my commute?",
+            "Recommend a slow cooker recipe for me",
+            "What should I make for the potluck?",
+            "Any ideas for staying connected with colleagues?",
+        ] {
+            assert!(is_preference_question(q), "should detect: {q}");
+        }
+    }
+
+    #[test]
+    fn preference_detector_rejects_factoid_shapes() {
+        for q in [
+            "What is the designation on my jumpsuit?",
+            "How many days did the fence repair take?",
+            "When did I last visit the dentist?",
+            "Where did my sister move to?",
+            // Past-tense recall of a prior suggestion is a factoid, not a
+            // preference — the bare "suggest"/"recommend" markers must not
+            // hijack these.
+            "What language-learning app did you recommend?",
+            "Which restaurant did you suggest for the anniversary?",
+            "What book had you recommended for the flight?",
+        ] {
+            assert!(!is_preference_question(q), "should NOT detect: {q}");
+        }
+    }
+
+    #[test]
+    fn synthesis_prompt_defaults_to_v2_committing_rules() {
+        // No env override in test context (tests must not set the var — env
+        // is process-global); the default path must produce the v2 prompt
+        // for factoid questions.
+        let mems = vec![scored(1.0, fact_record(1, "k", "ns"))];
+        let p = build_synthesis_prompt("Where did my sister move to?", &mems);
+        assert!(
+            p.contains("Assistant-stated facts count"),
+            "default prompt must be v2 (got v1?)"
+        );
+        assert!(
+            p.contains("Abstention is for absent subjects"),
+            "v2 must carry the narrowed abstention gate"
+        );
+    }
+
+    #[test]
+    fn synthesis_prompt_uses_preference_template_for_preference_questions() {
+        let mems = vec![scored(1.0, fact_record(1, "k", "ns"))];
+        let p = build_synthesis_prompt("Can you suggest some podcasts for my commute?", &mems);
+        assert!(
+            p.contains("what the user would prefer"),
+            "preference question must select the preference template"
+        );
+        assert!(
+            p.contains(ABSTAIN_LITERAL),
+            "preference template must still carry the abstention contract"
+        );
     }
 }

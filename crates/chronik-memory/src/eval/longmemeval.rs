@@ -95,6 +95,42 @@ pub struct LongMemEvalItem {
     /// Optional date string per the LongMemEval-S variant — pass-through.
     #[serde(default)]
     pub answer_session_ids: Vec<String>,
+
+    /// Per-session date strings, parallel to `haystack_sessions`
+    /// (format: `"2023/05/20 (Sat) 02:21"`). Empty on datasets without dates.
+    /// WS-3.2 (ROADMAP_MEMORY_QUALITY.md): threaded into `Turn.ts` so the
+    /// source excerpt carries real session dates for temporal reasoning.
+    #[serde(default)]
+    pub haystack_dates: Vec<String>,
+
+    /// The date the question is asked (same format as `haystack_dates`).
+    /// Temporal questions ("how many days ago...") are anchored to this
+    /// date, not to the eval's wall clock.
+    #[serde(default)]
+    pub question_date: Option<String>,
+}
+
+/// Parse a LongMemEval date string (`"2023/05/20 (Sat) 02:21"`) into a UTC
+/// timestamp. The weekday token is redundant — strip it before parsing.
+/// Returns `None` on any malformed input (defensive: dataset artifacts).
+pub fn parse_longmemeval_date(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    use chrono::{NaiveDateTime, TimeZone, Utc};
+    // "2023/05/20 (Sat) 02:21" → "2023/05/20 02:21"
+    let cleaned: String = {
+        let mut out = String::with_capacity(s.len());
+        let mut in_paren = false;
+        for c in s.chars() {
+            match c {
+                '(' => in_paren = true,
+                ')' => in_paren = false,
+                _ if !in_paren => out.push(c),
+                _ => {}
+            }
+        }
+        out.split_whitespace().collect::<Vec<_>>().join(" ")
+    };
+    let naive = NaiveDateTime::parse_from_str(&cleaned, "%Y/%m/%d %H:%M").ok()?;
+    Some(Utc.from_utc_datetime(&naive))
 }
 
 /// Plain `(role, content)` pair as it appears in LongMemEval.
@@ -322,9 +358,24 @@ mod tests {
     use crate::schema::{Body, EventBody, FactBody, InstructionBody, TaskBody, TaskState};
     use chrono::Utc;
 
+    #[test]
+    fn parses_longmemeval_date_format() {
+        let ts = parse_longmemeval_date("2023/05/20 (Sat) 02:21").expect("parse");
+        assert_eq!(ts.to_rfc3339(), "2023-05-20T02:21:00+00:00");
+    }
+
+    #[test]
+    fn longmemeval_date_rejects_garbage() {
+        assert!(parse_longmemeval_date("").is_none());
+        assert!(parse_longmemeval_date("not a date").is_none());
+        assert!(parse_longmemeval_date("2023-05-20T02:21:00Z").is_none());
+    }
+
     fn synthetic_item() -> LongMemEvalItem {
         LongMemEvalItem {
             question_id: "test_q1".into(),
+            haystack_dates: vec![],
+            question_date: None,
             question_type: "single-session-preference".into(),
             haystack_sessions: vec![
                 vec![
@@ -444,6 +495,7 @@ mod tests {
             object: serde_json::json!(800000),
             polarity: "asserted".into(),
             text: "User has max budget 800k EUR".into(),
+                speaker: "user".into(),
         });
         let s = render_memory_text(&body);
         assert!(s.contains("max_budget_eur"));

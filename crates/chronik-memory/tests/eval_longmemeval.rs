@@ -64,7 +64,30 @@ use chronik_memory::{
 /// `LONGMEMEVAL_LLM_MODEL` are set, uses an OpenAI-compat local server
 /// (LM Studio, vLLM, llama.cpp, etc.). Otherwise falls back to Anthropic.
 fn llm_provider_choice() -> LlmProvider {
-    let provider = std::env::var("LONGMEMEVAL_LLM_PROVIDER").unwrap_or_default();
+    provider_from_var("LONGMEMEVAL_LLM_PROVIDER")
+}
+
+/// Provider used for EXTRACTION specifically. Defaults to
+/// `LONGMEMEVAL_EXTRACTION_PROVIDER` when set, else falls back to the main
+/// `LONGMEMEVAL_LLM_PROVIDER`. Decoupling matters when synth/judge run on a
+/// local model (free, unlimited) but extraction should stay on the cached
+/// cloud extractor: the extraction cache is keyed by the extractor id
+/// (`chain[rules@v1+openai-v3]`), so keeping extraction on `openai` replays
+/// the paid gpt-4o-mini facts from disk with ZERO API calls, while
+/// `LONGMEMEVAL_LLM_PROVIDER=local` sends only synth+judge to Ollama.
+fn extraction_provider_choice() -> LlmProvider {
+    if std::env::var("LONGMEMEVAL_EXTRACTION_PROVIDER")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+    {
+        provider_from_var("LONGMEMEVAL_EXTRACTION_PROVIDER")
+    } else {
+        llm_provider_choice()
+    }
+}
+
+fn provider_from_var(var: &str) -> LlmProvider {
+    let provider = std::env::var(var).unwrap_or_default();
     match provider.as_str() {
         "local" => {
             let endpoint = std::env::var("LONGMEMEVAL_LLM_ENDPOINT")
@@ -90,6 +113,8 @@ fn llm_provider_choice() -> LlmProvider {
 #[derive(Clone)]
 enum LlmProvider {
     Anthropic,
+    /// Anthropic with an explicit model pin (e.g. `claude-haiku-4-5`).
+    AnthropicModel { model: String },
     Local { endpoint: String, model: String },
     OpenAI { model: String },
 }
@@ -102,6 +127,9 @@ impl LlmProvider {
     ) -> Arc<dyn chronik_memory::embeddings::TextGenerator> {
         match self {
             LlmProvider::Anthropic => Arc::new(AnthropicExtractor::new(api_key.to_string())),
+            LlmProvider::AnthropicModel { model } => {
+                Arc::new(AnthropicExtractor::new(api_key.to_string()).with_model(model.clone()))
+            }
             LlmProvider::Local { endpoint, model } => Arc::new(
                 OpenAIExtractor::for_local_server(endpoint, model).with_max_tokens(1024),
             ),
@@ -112,6 +140,11 @@ impl LlmProvider {
     }
 
     /// Build an Extractor (for ingest_with_extraction).
+    ///
+    /// Local models get the condensed V3-lite prompt: the full V3's ~13K
+    /// chars of canonicalization rules make 30B-class models under-extract
+    /// (probed 2026-07-05: 0 facts under V3, 7 under a short prompt on the
+    /// same chunk). Cloud models keep full V3.
     fn build_extractor(
         &self,
         api_key: &str,
@@ -122,8 +155,17 @@ impl LlmProvider {
                 AnthropicExtractor::new(api_key.to_string())
                     .with_prompt_version(prompt_version),
             ),
+            LlmProvider::AnthropicModel { model } => Arc::new(
+                AnthropicExtractor::new(api_key.to_string())
+                    .with_model(model.clone())
+                    .with_prompt_version(prompt_version),
+            ),
             LlmProvider::Local { endpoint, model } => Arc::new(
-                OpenAIExtractor::for_local_server(endpoint, model).with_max_tokens(1024),
+                OpenAIExtractor::for_local_server(endpoint, model)
+                    .with_max_tokens(8192)
+                    .with_prompt_version(
+                        chronik_memory::extractor::providers::openai::OpenAIPromptVersion::V3Lite,
+                    ),
             ),
             LlmProvider::OpenAI { model } => Arc::new(
                 OpenAIExtractor::new(api_key.to_string()).with_model(model),
@@ -266,8 +308,19 @@ fn select_items<'a>(
 }
 
 fn item_to_turns(item: &LongMemEvalItem) -> Vec<Turn> {
+    use chronik_memory::eval::longmemeval::parse_longmemeval_date;
     let mut turns = Vec::new();
-    for session in &item.haystack_sessions {
+    for (si, session) in item.haystack_sessions.iter().enumerate() {
+        // WS-3.2: thread the session date into every turn of the session so
+        // the WS-0 source excerpt carries a real date and synthesis can do
+        // temporal arithmetic. NOTE: intentionally NOT written to the
+        // memory's `valid_from` — 2023-dated valid_from would push events
+        // through ~36 decay half-lives and destroy their ranking (bi-temporal
+        // ranking is Sprint 3).
+        let session_ts = item
+            .haystack_dates
+            .get(si)
+            .and_then(|d| parse_longmemeval_date(d));
         for rc in session {
             // LongMemEval-S has occasional turns with empty role or content
             // (data artifacts). The SDK rejects empty content with
@@ -281,13 +334,225 @@ fn item_to_turns(item: &LongMemEvalItem) -> Vec<Turn> {
             turns.push(Turn {
                 role: role.to_string(),
                 content: content.to_string(),
-                ts: None,
+                ts: session_ts,
                 channel: None,
                 external_id: None,
             });
         }
     }
     turns
+}
+
+/// Poll Chronik's `/_search` until this item's typed facts are visible in
+/// the fact topic's index, so recall measures retrieval quality rather than
+/// indexing lag. Readiness = hits for this item's unique namespace reach
+/// `max(1, total_typed/3)` (a third is plenty — recall's k is far smaller).
+/// `floor_ms` is always waited (cold-index cycle floor); polling then runs
+/// every 5s up to `timeout_ms`. Items that extracted nothing skip polling.
+async fn wait_until_indexed(
+    api: &str,
+    tenant: &str,
+    namespace: &str,
+    total_typed: usize,
+    floor_ms: u64,
+    timeout_ms: u64,
+    question_id: &str,
+    wait_vector: bool,
+) {
+    tokio::time::sleep(Duration::from_millis(floor_ms)).await;
+    if total_typed == 0 {
+        return;
+    }
+    // Readiness bar: at least a third of the extracted facts, capped at 10 —
+    // recall's k is far smaller than 10 per channel anyway. CRITICAL: Chronik's
+    // ES-compat `hits.total` reflects the RETURNED hits array, not the matched
+    // count, so `size: 0` always reads 0 (this bug burned the first sprint-3c
+    // launch). Request `size: need` and count the actual hits array.
+    let need = std::cmp::min(std::cmp::max(1, total_typed / 3), 10) as u64;
+    let client = reqwest::Client::new();
+    let url = format!("{}/_search", api.trim_end_matches('/'));
+    // Match on the namespace's unique trailing ULID only. A match query on
+    // the full namespace would OR its tokens and count hits from every item
+    // sharing the tenant prefix, making readiness trivially (and wrongly)
+    // true. The ULID is a single unique token.
+    let unique_token = namespace.rsplit(':').next().unwrap_or(namespace);
+    let body = serde_json::json!({
+        "index": format!("mem.fact.{}", tenant),
+        "query": {"match": {"_all": unique_token}},
+        "size": need
+    });
+    let t0 = Instant::now();
+    // Per-node visibility: the cluster serves /_search from whichever pod the
+    // ClusterIP picks, and hot-index visibility differs per node until the
+    // cold indexer catches up everywhere. One positive probe only proves ONE
+    // node is ready (the sprint-3c litmus failed exactly this way: readiness
+    // passed via the leader, recall hit a stale peer and got 0). Require
+    // three consecutive positive probes, 5s apart, so with 3 server pods the
+    // odds of recall landing on a stale node are negligible.
+    let mut consecutive = 0u32;
+    loop {
+        let hits: u64 = match client.post(&url).json(&body).send().await {
+            Ok(resp) => resp
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .and_then(|v| v["hits"]["hits"].as_array().map(|a| a.len() as u64))
+                .unwrap_or(0),
+            Err(_) => 0,
+        };
+        if hits >= need {
+            consecutive += 1;
+            if consecutive >= 3 {
+                break;
+            }
+        } else {
+            consecutive = 0;
+        }
+        if t0.elapsed().as_millis() as u64 + floor_ms >= timeout_ms {
+            eprintln!(
+                "  [warn] item {} index-readiness timed out: {}/{} facts visible \
+                 after {}s — recall may under-measure",
+                question_id,
+                hits,
+                need,
+                (t0.elapsed().as_millis() as u64 + floor_ms) / 1000
+            );
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+
+    // Sprint 5: vector-liveness gate. Text (STEP 2) and embeddings (STEP 3)
+    // run in the SAME WalIndexer `index_segment` pass, so once this item's
+    // text is 3×-confirmed above the segment's embeddings have almost
+    // certainly completed too. What the text gate CANNOT catch is the whole
+    // channel silently dead — s4c ran 500 items with `total_vectors:0` and
+    // nobody noticed because recall degraded to text-only. This guard makes
+    // that failure loud: require the fact topic's HNSW index to be non-empty
+    // before recall runs.
+    //
+    // CRITICAL: poll `/_vector/.../search`, NOT `/_vector/.../stats`. The stats
+    // endpoint is LOCAL-only (never fans out), so behind the round-robin
+    // ClusterIP with per-node vector indexes it reports total_vectors=0 on the
+    // 2/3 of nodes that aren't the partition leader — which stalls the gate
+    // 300s/item even though search works fine. `/search` runs the same fan-out
+    // as real recall (needs_fan_out → fan_out_post → merge), so its
+    // total_vectors is the cluster-wide count and matches what recall sees.
+    if wait_vector {
+        let search_url = format!(
+            "{}/_vector/mem.fact.{}/search",
+            api.trim_end_matches('/'),
+            tenant
+        );
+        // Any query works — the gate only reads total_vectors from the response,
+        // which the handler fills from the fanned-out cluster-wide count. Reuse
+        // the item's unique namespace token so we don't embed anything exotic.
+        let probe = serde_json::json!({ "query": unique_token, "k": 1 });
+        let tv0 = Instant::now();
+        loop {
+            let total: u64 = match client.post(&search_url).json(&probe).send().await {
+                Ok(resp) => resp
+                    .json::<serde_json::Value>()
+                    .await
+                    .ok()
+                    .and_then(|v| v["total_vectors"].as_u64())
+                    .unwrap_or(0),
+                Err(_) => 0,
+            };
+            if total > 0 {
+                return;
+            }
+            if tv0.elapsed().as_millis() as u64 >= timeout_ms {
+                eprintln!(
+                    "  [warn] item {} vector-index liveness timed out: total_vectors=0 \
+                     after {}s — vector channel may be dead, recall degrading to text-only",
+                    question_id,
+                    tv0.elapsed().as_millis() as u64 / 1000
+                );
+                return;
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    }
+}
+
+/// Read-time readiness gate. Read-time answers from RAW turns, so we wait for
+/// the namespace's raw transcript topic to be searchable — NOT the fact topic
+/// (which read-time never populates; `wait_until_indexed` would early-return on
+/// `total_typed==0` and recall would fire before hot text indexed the raw
+/// turns). Hot text makes raw turns searchable in <500ms, so this is normally
+/// near-instant. Mirrors `wait_until_indexed`'s hits-array counting: Chronik's
+/// ES-compat `hits.total` reflects the RETURNED array, not the match count, so
+/// `size:0` always reads 0 — request `size:need` and count `hits.hits`.
+async fn wait_until_raw_indexed(
+    api: &str,
+    raw_topic: &str,
+    namespace: &str,
+    total_raw: usize,
+    floor_ms: u64,
+    timeout_ms: u64,
+    question_id: &str,
+) {
+    tokio::time::sleep(Duration::from_millis(floor_ms)).await;
+    if total_raw == 0 {
+        return;
+    }
+    // The raw topic is per-conversation, so every record shares this item's
+    // namespace ULID — match on that single unique token and count hits.
+    // FIX: wait until ~all turns are searchable, not just 30. The ULID is in
+    // EVERY turn, so a need of 30 passes as soon as any 30 turns index — but
+    // the specific answer turn may not be searchable for much longer (turns
+    // index progressively), so run_raw_search fires prematurely and misses it.
+    // Require ~90% (capped so the size:need response stays bounded).
+    let need = std::cmp::min(std::cmp::max(1, (total_raw * 9) / 10), 400) as u64;
+    let unique_token = namespace.rsplit(':').next().unwrap_or(namespace);
+    let client = reqwest::Client::new();
+    let url = format!("{}/_search", api.trim_end_matches('/'));
+    let body = serde_json::json!({
+        "index": raw_topic,
+        "query": {"match": {"_all": unique_token}},
+        "size": need
+    });
+    let t0 = Instant::now();
+    loop {
+        let hits: u64 = match client.post(&url).json(&body).send().await {
+            Ok(resp) => resp
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .and_then(|v| v["hits"]["hits"].as_array().map(|a| a.len() as u64))
+                .unwrap_or(0),
+            Err(_) => 0,
+        };
+        if hits >= need {
+            break;
+        }
+        if t0.elapsed().as_millis() as u64 + floor_ms >= timeout_ms {
+            eprintln!(
+                "  [warn] item {} raw-readiness timed out: {}/{} raw turns visible \
+                 after {}s — read-time recall may under-measure",
+                question_id,
+                hits,
+                need,
+                (t0.elapsed().as_millis() as u64 + floor_ms) / 1000
+            );
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// WS-3.2: anchor temporal questions to the question's own date instead of
+/// the eval wall clock. LongMemEval golds like "7 days ago" are computed
+/// relative to `question_date`; without the anchor the synthesizer has no
+/// "today" to subtract from.
+fn anchored_question(item: &LongMemEvalItem) -> String {
+    match &item.question_date {
+        Some(d) if !d.trim().is_empty() => {
+            format!("(Today is {}.) {}", d, item.question)
+        }
+        _ => item.question.clone(),
+    }
 }
 
 #[tokio::test]
@@ -379,14 +644,36 @@ async fn evaluate_longmemeval() {
     // is a strict lower bound (factoid-only); the judge score is paraphrase-
     // tolerant. Side-by-side output makes the calibration gap obvious.
     let llm_provider = llm_provider_choice();
+    // Extraction provider is decoupled: with `LONGMEMEVAL_LLM_PROVIDER=local`
+    // for synth/judge, set `LONGMEMEVAL_EXTRACTION_PROVIDER=openai` to keep
+    // extraction on the cached gpt-4o-mini path (id `openai-v3`, model-
+    // independent) — cache hits replay facts from disk with zero API calls.
+    let extraction_provider = extraction_provider_choice();
 
     let use_llm_judge = std::env::var("LONGMEMEVAL_USE_LLM_JUDGE")
         .map(|v| v != "0" && !v.is_empty())
         .unwrap_or(false);
-    // The judge LLM uses the same provider as the extractor by default —
-    // `TextGenerator::complete` for judge-graded scoring.
+    // Independent JUDGE override. By default the judge uses the same provider as
+    // the extractor/answerer — which means the model grades its OWN synthesized
+    // answers (lenient, and it credits abstentions as hits). Set
+    // `LONGMEMEVAL_JUDGE_PROVIDER=local` + `LONGMEMEVAL_JUDGE_ENDPOINT` +
+    // `LONGMEMEVAL_JUDGE_MODEL` to grade with a DIFFERENT model/family so the
+    // score isn't self-referential.
+    let judge_provider: LlmProvider = match std::env::var("LONGMEMEVAL_JUDGE_PROVIDER") {
+        Ok(p) if p.trim() == "local" => {
+            let endpoint = std::env::var("LONGMEMEVAL_JUDGE_ENDPOINT")
+                .expect("LONGMEMEVAL_JUDGE_PROVIDER=local requires LONGMEMEVAL_JUDGE_ENDPOINT");
+            let model = std::env::var("LONGMEMEVAL_JUDGE_MODEL")
+                .expect("LONGMEMEVAL_JUDGE_PROVIDER=local requires LONGMEMEVAL_JUDGE_MODEL");
+            eprintln!(
+                "JUDGE override: local (endpoint={endpoint}, model={model}) — independent of synth/extractor"
+            );
+            LlmProvider::Local { endpoint, model }
+        }
+        _ => llm_provider.clone(),
+    };
     let judge: Option<Arc<dyn chronik_memory::embeddings::TextGenerator>> = if use_llm_judge {
-        Some(llm_provider.build_generator(&api_key))
+        Some(judge_provider.build_generator(&api_key))
     } else {
         None
     };
@@ -413,8 +700,113 @@ async fn evaluate_longmemeval() {
              implicitly enabling LLM-judge mode for the synthesis prompt."
         );
     }
+
+    // Read-time extraction A/B (LONGMEMEVAL_READTIME=1). When on, the synthesis
+    // pass answers from raw transcript turns retrieved at query time
+    // (`synthesize_readtime`) instead of from write-time-extracted typed
+    // memories (`synthesize`) — testing whether reading raw beats the
+    // extraction-coverage wall (raw_judge ~0.056). Requires the `mem.raw.*`
+    // topic to be BM25-searchable, so force that flag ON *before* the per-item
+    // `init_namespace()` creates the topics.
+    let use_readtime = std::env::var("LONGMEMEVAL_READTIME")
+        .map(|v| v == "1" || v == "true" || v == "on")
+        .unwrap_or(false);
+    if use_readtime {
+        std::env::set_var("CHRONIK_MEMORY_RAW_SEARCHABLE", "1");
+        eprintln!(
+            "READ-TIME mode ENABLED — synthesis answers from raw mem.raw.* turns \
+             (CHRONIK_MEMORY_RAW_SEARCHABLE forced on); A/B vs the write-time \
+             synthesize() baseline reported as synth_judge_rate."
+        );
+        if !use_synth {
+            eprintln!(
+                "warning: LONGMEMEVAL_READTIME=1 has no effect without \
+                 LONGMEMEVAL_USE_SYNTHESIS=1 (the synthesis pass is what it swaps)."
+            );
+        }
+    }
+    // The SYNTH (answerer) model may be overridden independently of the judge.
+    // This isolates the synth-model variable: hold the judge at the baseline
+    // model (keeping synth_judge_rate comparable to a prior anchor) while
+    // swapping ONLY the answer-generating model. Without the split, changing
+    // LONGMEMEVAL_LLM_MODEL would move the judge too and confound the result
+    // (the E5 mistake).
+    //
+    // `LONGMEMEVAL_SYNTH_PROVIDER` selects the provider for synth alone
+    // (`anthropic` | `openai` | `local`); `LONGMEMEVAL_SYNTH_MODEL` sets its
+    // model. The reader is the dominant term in this benchmark — every
+    // published system that scores well pairs the memory layer with a
+    // frontier reader — so being able to point synth at a cloud model while
+    // the rest of the harness stays local is the whole point.
+    let synth_provider = match std::env::var("LONGMEMEVAL_SYNTH_PROVIDER") {
+        Ok(p) if !p.trim().is_empty() => {
+            let sp = provider_from_var("LONGMEMEVAL_SYNTH_PROVIDER");
+            // provider_from_var reads LONGMEMEVAL_LLM_MODEL for the model; if a
+            // synth-specific model is set, honour it instead.
+            match (sp, std::env::var("LONGMEMEVAL_SYNTH_MODEL")) {
+                (LlmProvider::Anthropic, Ok(m)) if !m.trim().is_empty() => {
+                    eprintln!("SYNTH override: anthropic (model={m}) — judge stays on the baseline model");
+                    LlmProvider::AnthropicModel { model: m }
+                }
+                (LlmProvider::Anthropic, _) => {
+                    eprintln!("SYNTH override: anthropic (default model) — judge stays on the baseline model");
+                    LlmProvider::Anthropic
+                }
+                (LlmProvider::OpenAI { .. }, Ok(m)) if !m.trim().is_empty() => {
+                    eprintln!("SYNTH override: openai (model={m}) — judge stays on the baseline model");
+                    LlmProvider::OpenAI { model: m }
+                }
+                (LlmProvider::Local { endpoint, model }, Ok(m)) if !m.trim().is_empty() => {
+                    eprintln!("SYNTH override: local (endpoint={endpoint}, model={m}) — judge stays on the baseline model");
+                    LlmProvider::Local { endpoint, model: m }
+                }
+                (other, _) => other,
+            }
+        }
+        // No synth provider set: allow a model-only override on the local path
+        // (the pre-existing behaviour).
+        _ => match &llm_provider {
+            LlmProvider::Local { endpoint, .. } => {
+                match std::env::var("LONGMEMEVAL_SYNTH_MODEL") {
+                    Ok(m) if !m.trim().is_empty() => {
+                        eprintln!("SYNTH model override: local (endpoint={endpoint}, model={m}) — judge stays on baseline model");
+                        LlmProvider::Local { endpoint: endpoint.clone(), model: m }
+                    }
+                    _ => llm_provider.clone(),
+                }
+            }
+            other => other.clone(),
+        },
+    };
+
+    // Retrieval budget. `k` is a function of the READER, not a constant: a 4B
+    // local model is crowded by a large fact set (measured — extra facts
+    // dilute its top-10), whereas a frontier reader sifts one (mem0 et al.
+    // run k=200). Tune per reader rather than assuming a universal optimum.
+    let recall_k: usize = std::env::var("LONGMEMEVAL_RECALL_K")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
+    let synth_k: usize = std::env::var("LONGMEMEVAL_SYNTH_K")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(15);
+    // Fan-out is the candidate window each channel pulls BEFORE fusion and the
+    // top-k cut — and on this benchmark it, not k, is the binding constraint.
+    // Every conversation's facts share one topic (`mem.fact.{tenant}`), and the
+    // namespace is only a soft BM25 bias (a ULID mixed into the text), not a
+    // hard filter. So a 150-doc window over ~50k facts is dominated by OTHER
+    // conversations; after namespace filtering only a handful of in-namespace
+    // facts survive (measured: n_results 1-14 even with k=50). Raising k does
+    // nothing when the window never contained the answer fact in the first
+    // place. Widen the window and the in-namespace pool grows with it.
+    let fanout: usize = std::env::var("LONGMEMEVAL_FANOUT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(150);
+    println!("Retrieval budget: fanout={fanout}, recall k={recall_k}, synth k={synth_k}");
     let synth_gen: Option<Arc<dyn chronik_memory::embeddings::TextGenerator>> = if use_synth {
-        Some(llm_provider.build_generator(&api_key))
+        Some(synth_provider.build_generator(&api_key))
     } else {
         None
     };
@@ -435,6 +827,15 @@ async fn evaluate_longmemeval() {
     // multi-fact-arithmetic and dense-context items where on-demand
     // synthesis abstained because the raw values aren't surfaced together.
     let use_concepts = std::env::var("LONGMEMEVAL_USE_CONCEPTS")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(false);
+    // Vector recall channel — OFF by default. When enabled, recall requests the
+    // server's vector channel, which embeds the query. If the cluster's
+    // embedding provider is unreachable/quota-dead, that embed call retries for
+    // ~16s PER ITEM before degrading to BM25 — pure waste when no HNSW index
+    // exists (vector.enabled=false). Vector was also shown not to be the lever
+    // (s12=0.262 < 0.336). So gate it: opt in via LONGMEMEVAL_USE_VECTOR=1.
+    let use_vector = std::env::var("LONGMEMEVAL_USE_VECTOR")
         .map(|v| v != "0" && !v.is_empty())
         .unwrap_or(false);
     if use_concepts && synth_gen.is_none() {
@@ -509,7 +910,7 @@ async fn evaluate_longmemeval() {
         let tenant = std::env::var("LONGMEMEVAL_TENANT")
             .unwrap_or_else(|_| "longmemeval".to_string());
         let ns = format!("{}:{}:{}", tenant, item.question_id, Ulid::new());
-        let base_pass1: Arc<dyn Extractor> = llm_provider.build_extractor(&api_key, prompt_version);
+        let base_pass1: Arc<dyn Extractor> = extraction_provider.build_extractor(&api_key, prompt_version);
         let inner_extractor: Arc<dyn Extractor> = if use_two_pass {
             Arc::new(
                 TwoPassExtractor::new(base_pass1, api_key.clone())
@@ -518,15 +919,28 @@ async fn evaluate_longmemeval() {
         } else {
             base_pass1
         };
-        let extractor = ChainedExtractor::new(vec![
+        // Extraction cache (cost control): LONGMEMEVAL_EXTRACTION_CACHE=<dir>
+        // replays previously-computed extractions instead of calling the LLM.
+        // Wraps the whole chain (rules + LLM) so a hit costs zero API calls.
+        // The cache key embeds the chain id (provider + prompt version), so
+        // extractor/prompt changes re-extract automatically. ~$12-13 of a
+        // ~$15 fleet run is extraction — cached re-runs cost ~$1.50.
+        let chain: Arc<dyn Extractor> = Arc::new(ChainedExtractor::new(vec![
             Arc::new(RuleExtractor::new()),
             inner_extractor,
-        ]);
+        ]));
+        let extractor: Arc<dyn Extractor> = match std::env::var("LONGMEMEVAL_EXTRACTION_CACHE") {
+            Ok(dir) if !dir.trim().is_empty() => Arc::new(
+                chronik_memory::extractor::cached::CachedExtractor::new(chain, dir)
+                    .expect("extraction cache dir"),
+            ),
+            _ => chain,
+        };
         let mem = Memory::builder()
             .chronik_kafka(kafka.clone())
             .chronik_api(api.clone())
             .namespace(&ns)
-            .extractor(extractor)
+            .extractor_arc(extractor)
             .request_timeout(Duration::from_secs(60))
             .build()
             .await
@@ -544,19 +958,36 @@ async fn evaluate_longmemeval() {
         // and continue with whatever already landed for this item.
         let extract_t0 = Instant::now();
         let mut chunk_failures = 0usize;
+        let mut total_typed_acks = 0usize;
+        let mut total_raw_acks = 0usize;
         for (chunk_idx, chunk) in turns.chunks(batch_size).enumerate() {
-            match mem.ingest_with_extraction(chunk.to_vec()).await {
-                Ok(ack) => {
+            // Read-time mode answers from RAW turns, so the (slow, Mac-bound)
+            // extraction step is unnecessary — ingest raw turns only via
+            // `ingest_batch`. This decouples the read-time A/B from extraction
+            // entirely, so N can scale without hours of local-LLM extraction.
+            // Write-time mode still extracts typed facts.
+            let res: std::result::Result<(usize, usize), _> = if use_readtime {
+                mem.ingest_batch(chunk.to_vec())
+                    .await
+                    .map(|acks| (acks.len(), 0usize))
+            } else {
+                mem.ingest_with_extraction(chunk.to_vec())
+                    .await
+                    .map(|ack| (ack.raw_acks.len(), ack.typed_acks.len()))
+            };
+            match res {
+                Ok((raw_n, typed_n)) => {
+                    total_raw_acks += raw_n;
+                    total_typed_acks += typed_n;
                     eprintln!(
                         "  [dbg] item {} chunk {} OK: raw_acks={} typed_acks={}",
-                        item.question_id, chunk_idx,
-                        ack.raw_acks.len(), ack.typed_acks.len()
+                        item.question_id, chunk_idx, raw_n, typed_n
                     );
                 }
                 Err(e) => {
                     chunk_failures += 1;
                     eprintln!(
-                        "  [warn] item {} chunk {} ingest_with_extraction failed: {} \
+                        "  [warn] item {} chunk {} ingest failed: {} \
                          — skipping this chunk, eval continues",
                         item.question_id, chunk_idx, e
                     );
@@ -573,8 +1004,53 @@ async fn evaluate_longmemeval() {
             );
         }
 
-        // Wait for the cold WalIndexer cycle.
-        tokio::time::sleep(Duration::from_millis(index_sleep_ms)).await;
+        // Index-readiness wait. The sprint-3 fleet (2026-07-04) proved a
+        // fixed sleep is a race: with ~2× fact volume the cluster's indexing
+        // lag exceeded 45s halfway through the run and empty recalls went
+        // 17/250 → 172/250 between the first and second half — measuring
+        // indexing lag instead of recall quality. Poll until this item's own
+        // facts are actually searchable (search the fact topic for this
+        // item's unique namespace), with `index_sleep_ms` acting as a floor
+        // and `LONGMEMEVAL_INDEX_TIMEOUT_MS` (default 300s) as the cap.
+        let index_timeout_ms: u64 = std::env::var("LONGMEMEVAL_INDEX_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300_000);
+        // Sprint 5: when vector search is enabled, also gate on the HNSW index
+        // being non-empty so a dead embedding channel fails loud rather than
+        // silently degrading recall to text-only (the s4c blind-run trap).
+        let wait_vector = matches!(
+            std::env::var("LONGMEMEVAL_WAIT_VECTOR").as_deref(),
+            Ok("1") | Ok("true") | Ok("on")
+        );
+        if use_readtime {
+            // Read-time answers from RAW turns — gate on the raw transcript
+            // topic being searchable, not the (empty) fact topic. The fact
+            // gate would early-return on total_typed_acks==0 and recall would
+            // fire before hot text indexed the raw turns.
+            wait_until_raw_indexed(
+                &api,
+                &mem.topic_layout().raw(),
+                mem.namespace(),
+                total_raw_acks,
+                index_sleep_ms,
+                index_timeout_ms,
+                &item.question_id,
+            )
+            .await;
+        } else {
+            wait_until_indexed(
+                &api,
+                mem.tenant(),
+                mem.namespace(),
+                total_typed_acks,
+                index_sleep_ms,
+                index_timeout_ms,
+                &item.question_id,
+                wait_vector,
+            )
+            .await;
+        }
 
         // Concept-page pre-synthesis (path B, opt-in). For each candidate
         // entity (top-1 from question + "user" as universal fallback),
@@ -632,13 +1108,17 @@ async fn evaluate_longmemeval() {
         // When `LONGMEMEVAL_USE_CONCEPTS=1`, also inline the top concept
         // page from `mem.concept.{tenant}` above atomic memories.
         let recall_t0 = Instant::now();
-        let results = mem
+        let mut rb = mem
             .recall(&item.question)
-            .types(&[MemoryType::Fact, MemoryType::Event, MemoryType::Instruction, MemoryType::Task])
-            .with_vector()
+            .types(&[MemoryType::Fact, MemoryType::Event, MemoryType::Instruction, MemoryType::Task]);
+        if use_vector {
+            rb = rb.with_vector();
+        }
+        let results = rb
             .with_key_match()
             .include_concepts(use_concepts)
-            .k(10)
+            .fanout_size(fanout)
+            .k(recall_k)
             .send()
             .await
             .expect("recall");
@@ -683,20 +1163,41 @@ async fn evaluate_longmemeval() {
                 // synthesis-call failure (provider blip, schema glitch on
                 // tool-use model emit, etc.) should be reported as a miss +
                 // abstention, not crash the pilot.
-                let synth_res = mem
-                    .recall(&item.question)
+                // WS-3.2: recall with the plain question (retrieval keys are
+                // date-agnostic), but the anchored question ("Today is X. ...")
+                // reaches the synthesis prompt via the builder's query, giving
+                // the model a "today" to compute "N days ago" against.
+                let mut srb = mem
+                    .recall(anchored_question(item))
                     .types(&[
                         MemoryType::Fact,
                         MemoryType::Event,
                         MemoryType::Instruction,
                         MemoryType::Task,
-                    ])
-                    .with_vector()
+                    ]);
+                if use_vector {
+                    srb = srb.with_vector();
+                }
+                let srb = srb
                     .with_key_match()
                     .include_concepts(use_concepts)
-                    .k(10)
-                    .synthesize(gen.clone())
-                    .await;
+                    .fanout_size(fanout)
+                    // Sprint 3 set k=15 (was 10): multi-session questions lost
+                    // 34 raw hits at k=10 — the answer-bearing memories from
+                    // other sessions ranked 11-15. Now env-tunable: a small
+                    // local reader saturates around 15 and *dilutes* beyond it,
+                    // but published systems (mem0 et al.) run k=50-200 against
+                    // a frontier reader, which sifts a large fact set rather
+                    // than being crowded by it. So k is a function of the
+                    // reader, not a constant — see LONGMEMEVAL_SYNTH_K. In
+                    // read-time mode, k is the number of raw turns retrieved
+                    // and fed to the reader.
+                    .k(synth_k);
+                let synth_res = if use_readtime {
+                    srb.synthesize_readtime(gen.clone()).await
+                } else {
+                    srb.synthesize(gen.clone()).await
+                };
                 let elapsed = t0.elapsed().as_secs_f64();
                 // LongMemEval-S marks abstention questions with a `_abs`
                 // suffix on the question_id. For these, the gold answer is
@@ -908,8 +1409,17 @@ async fn evaluate_longmemeval() {
         );
     }
     // Sanity floor: at least one hit. If all miss, the pipeline is wedged.
+    // In read-time mode (LONGMEMEVAL_READTIME=1) the typed/recall path is
+    // intentionally empty (extraction-free ingest → typed_acks=0 → hits=0), so
+    // pipeline health is measured by the synthesized-answer path instead — the
+    // only answer path that runs there.
+    let pipeline_hits = if use_readtime {
+        synth_judge_hits.max(synth_substring_hits)
+    } else {
+        hits
+    };
     assert!(
-        hits > 0,
+        pipeline_hits > 0,
         "all {} items missed — extraction or recall is broken (not a quality gate)",
         n_total_runs
     );
@@ -934,6 +1444,8 @@ mod selector_tests {
             answer: "gold".into(),
             haystack_sessions: vec![],
             answer_session_ids: Vec::new(),
+            haystack_dates: Vec::new(),
+            question_date: None,
         }
     }
 

@@ -481,6 +481,7 @@ fn extract_entity_facts(
                             object: serde_json::Value::String(row.object_text.clone()),
                             polarity: "asserted".into(),
                             text: format!("{entity} — {}: {}", row.predicate, row.object_text),
+                            speaker: "user".into(),
                         });
                         let key = Some(format!("{entity}|{}", row.predicate));
                         Some(Extracted {
@@ -553,6 +554,7 @@ mod tests {
                 object: serde_json::Value::String(object.into()),
                 polarity: "asserted".into(),
                 text: format!("{subject}|{predicate}|{object}"),
+                speaker: "user".into(),
             }),
             key: Some(format!("{subject}|{predicate}")),
             confidence: 1.0,

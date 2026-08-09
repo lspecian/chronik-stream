@@ -432,6 +432,8 @@ Recall p99 over HTTP:                           not measured
 - Multi-tenant: 10+ tenants in shared cluster, no cross-tenant leaks (audit-log proven)
 - Recall p99 < 500ms
 
+> **2026-07-04**: The lever analysis below is superseded by [ROADMAP_MEMORY_QUALITY.md](ROADMAP_MEMORY_QUALITY.md), which combines a full-fleet failure-mode analysis (all 500 item logs), a code audit, and external LongMemEval SOTA research into a 3-sprint plan (headline levers: v2 synthesis default + narrowed abstention; facts-as-keys/rounds-as-values; timestamps + temporal channel).
+
 ### Levers to close the 0.528 gap to 0.70 (revised 2026-07-04)
 
 Three structural gaps identified at Pilot 7:

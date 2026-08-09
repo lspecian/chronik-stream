@@ -158,19 +158,21 @@ impl TopicLayout {
 /// - `vector.enabled` — HNSW vector index
 /// - `columnar.enabled` — Parquet/DataFusion SQL table
 ///
-/// **Search (Tantivy BM25) is not a per-topic key in Chronik today** — it is
-/// controlled globally by the `CHRONIK_DEFAULT_SEARCHABLE` env var on the
-/// broker. The SDK still tracks an intent flag (`bm25_enabled`) on the
-/// template for documentation and future use; it is not currently sent in
-/// the CreateTopics request.
+/// **Search (Tantivy BM25) is sent as an explicit per-topic `searchable` key**,
+/// derived from `bm25_enabled`. The broker's `TopicConfig::is_searchable()`
+/// checks the explicit `config["searchable"]` value before falling back to the
+/// `CHRONIK_DEFAULT_SEARCHABLE` env default, so raw transcript topics
+/// (`bm25_enabled=false`) stay OUT of the Tantivy indexer regardless of the
+/// broker-wide default — which matters at fleet scale, where force-indexing
+/// hundreds of `mem.raw.*` topics starves `mem.fact.*` indexing.
 #[derive(Debug, Clone)]
 pub struct TopicConfig {
     /// Topic name.
     pub name: String,
     /// Cleanup policy: `"delete"` (append-only) or `"compact"` (key-based supersession).
     pub cleanup_policy: &'static str,
-    /// Documented intent — full-text BM25 index. Currently set globally on the
-    /// broker via `CHRONIK_DEFAULT_SEARCHABLE`; not sent as a per-topic key.
+    /// Full-text BM25 index intent. Sent to the broker as an explicit per-topic
+    /// `searchable` key (which `is_searchable()` honors over the env default).
     pub bm25_enabled: bool,
     /// Enable HNSW vector index (per-topic key `vector.enabled`).
     pub vector_enabled: bool,
@@ -178,14 +180,52 @@ pub struct TopicConfig {
     pub columnar_enabled: bool,
 }
 
+/// Whether typed memory topics are created with the HNSW vector index on.
+///
+/// Default: true (semantic recall is a headline capability). Set
+/// `CHRONIK_MEMORY_VECTOR_TOPICS=false` to create memory topics without
+/// vector indexing — every fact/event otherwise flows through the embedding
+/// provider inside the WalIndexer, which under bulk ingest (e.g. the
+/// LongMemEval fleets, ~100K facts/run) serializes the indexer behind
+/// OpenAI round-trips, starves cold text indexing, and burns embedding
+/// spend on throwaway corpora. BM25 + source excerpts carry recall on
+/// their own for text-heavy workloads.
+fn default_vector_enabled() -> bool {
+    !matches!(
+        std::env::var("CHRONIK_MEMORY_VECTOR_TOPICS").as_deref(),
+        Ok("false") | Ok("0") | Ok("off")
+    )
+}
+
+/// Whether `mem.raw.*` topics are created BM25-searchable.
+///
+/// Default: false — raw transcript topics stay OUT of the Tantivy indexer
+/// (force-indexing hundreds of `mem.raw.*` topics at fleet scale starves
+/// `mem.fact.*` indexing; see [`TopicConfig`] doc). Set
+/// `CHRONIK_MEMORY_RAW_SEARCHABLE=1` to opt in — required by the read-time
+/// extraction recall path (`RecallBuilder::synthesize_readtime`), which
+/// retrieves raw turns directly from the lossless transcript topic rather
+/// than only the write-time-extracted typed topics. Enable only for bounded
+/// workloads (e.g. eval pilots); production read-time retrieval wants a
+/// dedicated on-demand index instead of blanket raw indexing.
+fn raw_searchable() -> bool {
+    matches!(
+        std::env::var("CHRONIK_MEMORY_RAW_SEARCHABLE").as_deref(),
+        Ok("1") | Ok("true") | Ok("on")
+    )
+}
+
 impl TopicConfig {
-    /// Config template for `mem.raw.*` — append-only, columnar for analytics, no
-    /// vector or text indexing on raw turns (those are extracted into typed topics).
+    /// Config template for `mem.raw.*` — append-only, columnar for analytics.
+    ///
+    /// Text/vector indexing on raw turns is off by default (turns are extracted
+    /// into typed topics); `CHRONIK_MEMORY_RAW_SEARCHABLE=1` flips BM25 on for
+    /// the read-time extraction path. See [`raw_searchable`].
     pub fn raw(name: String) -> Self {
         Self {
             name,
             cleanup_policy: "delete",
-            bm25_enabled: false,
+            bm25_enabled: raw_searchable(),
             vector_enabled: false,
             columnar_enabled: true,
         }
@@ -197,7 +237,7 @@ impl TopicConfig {
             name,
             cleanup_policy: "compact",
             bm25_enabled: true,
-            vector_enabled: true,
+            vector_enabled: default_vector_enabled(),
             columnar_enabled: true,
         }
     }
@@ -208,7 +248,7 @@ impl TopicConfig {
             name,
             cleanup_policy: "delete",
             bm25_enabled: true,
-            vector_enabled: true,
+            vector_enabled: default_vector_enabled(),
             columnar_enabled: true,
         }
     }
@@ -219,7 +259,7 @@ impl TopicConfig {
             name,
             cleanup_policy: "compact",
             bm25_enabled: true,
-            vector_enabled: true,
+            vector_enabled: default_vector_enabled(),
             columnar_enabled: true,
         }
     }
@@ -259,7 +299,7 @@ impl TopicConfig {
             name,
             cleanup_policy: "compact",
             bm25_enabled: true,
-            vector_enabled: true,
+            vector_enabled: default_vector_enabled(),
             columnar_enabled: true,
         }
     }
