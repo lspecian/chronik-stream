@@ -1318,7 +1318,12 @@ fn temporal_ref_date(question: &str) -> Option<chrono::NaiveDate> {
     }
     let idx = question.find("Today is ")? + "Today is ".len();
     let cand: String = question[idx..].chars().take(10).collect();
-    chrono::NaiveDate::parse_from_str(&cand, "%Y-%m-%d").ok()
+    // The anchor is written from the raw LongMemEval `question_date`, which uses
+    // slashes ("2023/05/30 (Tue) 23:40"); normalize the separator so the parse
+    // (and thus the T1 age annotations) actually fires instead of silently
+    // returning None on a `%Y-%m-%d`-only parse.
+    let normalized = cand.replace('/', "-");
+    chrono::NaiveDate::parse_from_str(&normalized, "%Y-%m-%d").ok()
 }
 
 /// Pre-compute the "≈N days/weeks/months ago" gap from a fact's `valid_from` to
@@ -1444,6 +1449,20 @@ fn build_synthesis_prompt(question: &str, memories: &[RecallResult]) -> String {
 /// not prefer, grounded in their stated experiences — not a factoid.
 fn is_preference_question(question: &str) -> bool {
     let q = question.to_lowercase();
+    // Past-tense recall of a specific prior suggestion ("What app did you
+    // recommend?") is a factoid, not a preference question — don't let the bare
+    // "suggest"/"recommend" markers below hijack it into the preference path.
+    const FACTOID_RECALL: &[&str] = &[
+        "did you recommend",
+        "did you suggest",
+        "you recommended",
+        "you suggested",
+        "had recommended",
+        "had suggested",
+    ];
+    if FACTOID_RECALL.iter().any(|m| q.contains(m)) {
+        return false;
+    }
     const PREFERENCE_MARKERS: &[&str] = &[
         "would i prefer",
         "would i like",
@@ -1886,6 +1905,13 @@ async fn post_raw_search(
 /// Build the read-time reader prompt. Mirrors the v2 synthesis answer rules
 /// (so a read-time vs write-time A/B differs only in the EVIDENCE source) but
 /// presents raw conversation turns instead of extracted memory bullets.
+/// Per-turn content cap in the read-time prompt. More generous than the typed
+/// snippet cap (`MAX_SYNTH_SNIPPET_CHARS`, 280) because raw turns ARE the full
+/// evidence, but still bounds the prompt so one pathologically long turn can't
+/// blow the reader's context window: worst-case excerpt size is `k` turns ×
+/// this. Well above any normal chat turn, so it's a no-op for typical input.
+const MAX_READTIME_TURN_CHARS: usize = 2000;
+
 fn build_readtime_prompt(question: &str, turns: &[RawTurn]) -> String {
     let mut excerpts = String::new();
     for (i, t) in turns.iter().enumerate() {
@@ -1893,7 +1919,14 @@ fn build_readtime_prompt(question: &str, turns: &[RawTurn]) -> String {
             .ts
             .map(|d| d.format("%Y-%m-%d").to_string())
             .unwrap_or_else(|| "unknown-date".to_string());
-        excerpts.push_str(&format!("[{}] ({}) {}: {}\n", i + 1, when, t.role, t.content));
+        let content: String = if t.content.chars().count() > MAX_READTIME_TURN_CHARS {
+            let mut s: String = t.content.chars().take(MAX_READTIME_TURN_CHARS).collect();
+            s.push('…');
+            s
+        } else {
+            t.content.clone()
+        };
+        excerpts.push_str(&format!("[{}] ({}) {}: {}\n", i + 1, when, t.role, content));
     }
     format!(
         "You are a precise question-answering assistant. Below are raw conversation \
@@ -2473,6 +2506,12 @@ mod tests {
             "How many days did the fence repair take?",
             "When did I last visit the dentist?",
             "Where did my sister move to?",
+            // Past-tense recall of a prior suggestion is a factoid, not a
+            // preference — the bare "suggest"/"recommend" markers must not
+            // hijack these.
+            "What language-learning app did you recommend?",
+            "Which restaurant did you suggest for the anniversary?",
+            "What book had you recommended for the flight?",
         ] {
             assert!(!is_preference_question(q), "should NOT detect: {q}");
         }

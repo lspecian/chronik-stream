@@ -1,9 +1,21 @@
 # LongMemEval Memory-Quality Research — Conclusion
 
+> **⚠️ SUPERSEDED for the ceiling claim (2026-08-09).** The `0.546` ceiling below
+> holds only for the **write-time extraction** architecture this document
+> studied. A different architecture — **read-time (query-conditioned)
+> extraction**, which retrieves retained raw turns at query time instead of
+> extracting typed facts at write time — breaks it: **`synth_judge = 0.880`
+> (N=50, Qwen3-30B reader, independent Mistral judge)** on the reconciled branch.
+> The wall this document found was the *timing* of extraction, not extractor
+> strength or any retrieval/synth lever. See `docs/READTIME_EXTRACTION_SPIKE.md`.
+> The lever-by-lever negative results below remain valid **within the write-time
+> architecture** and are why read-time — not a bigger extractor — was the fix.
+
 **Status:** Concluded 2026-07-12. **Finding: `synth_judge = 0.546` (v3 prompt +
 supersession lint, gemma3:4b synth) is the empirical quality ceiling for the
-free-hardware stack.** Every other lever — across retrieval, fact-cleaning, and
-synth-model axes — fails to beat it.
+free-hardware stack _under write-time extraction_.** Every other lever within
+that architecture — across retrieval, fact-cleaning, and synth-model axes —
+fails to beat it.
 
 ## What we measured
 

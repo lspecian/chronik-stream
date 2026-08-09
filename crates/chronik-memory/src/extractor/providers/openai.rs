@@ -427,17 +427,17 @@ fn parse_tool_output(
         .first()
         .and_then(|c| c.finish_reason.as_deref())
         .unwrap_or("?");
-    let content_prefix: String = resp
+    // Log the finish reason and content LENGTH only — never the content itself,
+    // which can carry user conversation data / PII into application logs.
+    let content_len = resp
         .choices
         .first()
         .and_then(|c| c.message.content.as_deref())
-        .unwrap_or("")
-        .chars()
-        .take(120)
-        .collect();
+        .map(|s| s.chars().count())
+        .unwrap_or(0);
     tracing::warn!(
         finish_reason = finish,
-        content_prefix = %content_prefix,
+        content_len,
         "no matching tool call in completion — returning EMPTY extraction; \
          if finish_reason=length, max_tokens is too small for the tool JSON"
     );
