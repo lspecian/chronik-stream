@@ -92,9 +92,13 @@ answers.
 
 **A third path — a different extraction *architecture* — was pursued and broke
 it (2026-08-09).** Read-time (query-conditioned) extraction retrieves retained
-raw turns at query time instead of extracting typed facts at write time:
-`synth_judge = 0.880` (LongMemEval-S first 50, Qwen3-30B reader, independent
-Mistral-24B judge) vs `0.111` write-time on the same reader. It landed on `main`
+raw turns at query time instead of extracting typed facts at write time.
+**Same-set architecture comparison** (pilot-18, Qwen3-30B reader, independent
+Mistral-24B judge, identical config — only extraction *timing* differs, plus the
+evidence-serialization caveat in the spike doc): read-time `synth_judge = 0.722`
+vs write-time `0.111`. With deeper raw retrieval (`SYNTH_K=40`) and the
+hot-search punctuation fix, read-time reaches **`0.880`** on LongMemEval-S
+first-50 (a different, larger set — not a same-set delta). It landed on `main`
 (PR #26, env-gated default-off). The ceiling below is specific to the
 **write-time** architecture; the fix was changing *when* extraction happens, not
 the synth model. See `docs/READTIME_EXTRACTION_SPIKE.md`.

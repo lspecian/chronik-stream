@@ -95,8 +95,13 @@ Read-time won decisively and **landed on `main`** (PR #26, env-gated default-off
 | read-time | pilot-18 | Qwen3-30B-A3B | Mistral-3.1-24B | 0.722 |
 | read-time (+`SYNTH_K=40`, hot-search punctuation fix) | LongMemEval-S first 50 | Qwen3-30B-A3B | Mistral-3.1-24B | **0.880** (sub 0.760, abstain 0.040) |
 
-All rows use the independent Mistral-Small-3.1-24B judge (not the reader). The
-0.880 row was re-verified on the reconciled-with-`main` build before merge. Two
+Benchmark contract (per `docs/ROADMAP_MEMORY_QUALITY.md`) for every row: **judge**
+= local mlx `Mistral-Small-3.1-24B` (independent of the reader); **reader/synthesizer**
+= local mlx `Qwen3-30B-A3B` (v2 answer-rules prompt); **extractor** = none for
+read-time (extraction-free), cached OpenAI `gpt-4o-mini` for the write-time
+baseline. The pilot-18 rows are the same-set comparison; the 0.880 row is a
+different, larger set (LongMemEval-S first-50) and was re-verified on the
+reconciled-with-`main` build before merge. Two
 levers stacked the gain: raw-retrieval depth (`SYNTH_K` 15→40: 0.48→0.72) and
 the hot-search punctuation fix (0.72→0.88, shipped v2.10.9). The methodology
 caveat above stands — the write-time vs read-time gap also carries the
