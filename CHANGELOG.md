@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.10.10] - 2026-08-09
+
+### Fixed
+- **WAL segment deleted even when its object-store upload failed → data loss on
+  transient errors** (#24) — `WalIndexer::index_segment` uploads each raw
+  segment to the object store (Tier 2), then deletes the source WAL segment when
+  `delete_after_index` is set. On an upload failure it logged
+  `"CRITICAL DATA LOSS RISK!"` and continued, but still deleted the WAL segment
+  — so a transient S3/GCS/Azure blip lost the raw data from **both** tiers (gone
+  from WAL, never reached object store). The retry machinery already existed
+  (the caller only marks a segment "indexed"/skip-next-run on an error-free
+  pass), so the segment was already set up to be reprocessed — the bug was that
+  deletion ran before the retry could. Deletion is now gated on the same
+  clean-pass condition (`may_delete_wal_segment`); a dirty pass keeps the WAL
+  copy, warns, and the next run re-uploads it. Covered by a unit test.
+
 ## [2.10.9] - 2026-08-09
 
 ### Fixed
