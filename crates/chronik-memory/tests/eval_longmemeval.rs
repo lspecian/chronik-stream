@@ -1409,8 +1409,17 @@ async fn evaluate_longmemeval() {
         );
     }
     // Sanity floor: at least one hit. If all miss, the pipeline is wedged.
+    // In read-time mode (LONGMEMEVAL_READTIME=1) the typed/recall path is
+    // intentionally empty (extraction-free ingest → typed_acks=0 → hits=0), so
+    // pipeline health is measured by the synthesized-answer path instead — the
+    // only answer path that runs there.
+    let pipeline_hits = if use_readtime {
+        synth_judge_hits.max(synth_substring_hits)
+    } else {
+        hits
+    };
     assert!(
-        hits > 0,
+        pipeline_hits > 0,
         "all {} items missed — extraction or recall is broken (not a quality gate)",
         n_total_runs
     );
