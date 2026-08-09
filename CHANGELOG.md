@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.10.10] - 2026-08-09
+
+### Fixed
+- **WAL segment deleted even when its object-store upload failed → data loss on
+  transient errors** (#24) — `WalIndexer::index_segment` uploads each raw
+  segment to the object store (Tier 2), then deletes the source WAL segment when
+  `delete_after_index` is set. On an upload failure it logged
+  `"CRITICAL DATA LOSS RISK!"` and continued, but still deleted the WAL segment
+  — so a transient S3/GCS/Azure blip lost the raw data from **both** tiers (gone
+  from WAL, never reached object store). The retry machinery already existed
+  (the caller only marks a segment "indexed"/skip-next-run on an error-free
+  pass), so the segment was already set up to be reprocessed — the bug was that
+  deletion ran before the retry could. Deletion is now gated on the same
+  clean-pass condition (`may_delete_wal_segment`); a dirty pass keeps the WAL
+  copy, warns, and the next run re-uploads it. Covered by a unit test.
+
+## [2.10.9] - 2026-08-09
+
+### Fixed
+- **Near-real-time (hot) search silently dropped any query containing
+  punctuation** (#23) — `HotTextIndex::search` fed the flat query string
+  straight to Tantivy's `QueryParser`, which treats `(`, `)`, `/`, `:`, `"`,
+  `-` etc. as query syntax. Any natural-language `match` query carrying
+  punctuation — a date like `2023/05/30`, a URL, a parenthetical, a trailing
+  `?` — either errored or misparsed to **zero hits** from the in-memory hot
+  index. The cold Tantivy path tokenizes the match text as plain terms and
+  tolerated it, so results only appeared once the cold indexer caught up
+  (~30-45s). Net effect: NRT search returned nothing for a large class of real
+  queries across `/_search` and the ES-compatible surface, silently defeating
+  the hot path's freshness. Fixed by sanitizing the query string to
+  alphanumeric + whitespace (matching the cold path) before `QueryParser`;
+  structured queries use `search_topic_structured`, which is unaffected.
+  Covered by a regression test.
+
+## [2.10.8] - 2026-08-08
+
+### Fixed
+- **Broker could wedge into rejecting all produces under sustained load** ("Memory
+  limit exceeded") (#21) — `produce_to_partition` reserved bytes against the
+  in-flight produce-memory counter (`memory_used_bytes`) at the top of the function
+  but released them only near the end, with **17 `?` early-returns in between** that
+  each leaked the reservation permanently. Under load the leaked bytes accumulated
+  until the counter pinned at `memory_limit_bytes` (= `buffer_memory`; 32MB on the
+  balanced default) and every subsequent produce was rejected — the broker refused
+  all writes with no recovery short of restart (observed: 18,813 rejects, 0 rows
+  persisted, during a bulk ingest). The reservation is now held by a
+  `MemoryReservation` RAII guard whose `Drop` releases the bytes exactly once on
+  every exit path — success or error. Not a recent regression: the tracking block is
+  unchanged since the v2.2.7 lock-free rework, so this affects any high-load
+  deployment. Covered by two new unit tests.
+
 ## [2.10.7] - 2026-08-07
 
 ### Fixed

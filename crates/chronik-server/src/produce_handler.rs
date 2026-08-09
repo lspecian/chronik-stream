@@ -3826,7 +3826,41 @@ mod tests {
     use chronik_protocol::types::{ProduceRequestTopic, ProduceRequestPartition};
     use tempfile::TempDir;
     use bytes::BufMut;
-    
+
+    // Regression: the in-flight produce-memory reservation must be released on
+    // EVERY exit path. Before the MemoryReservation guard, the 17 `?`
+    // early-returns between reserve and release leaked their bytes; under load
+    // the leaks pinned `memory_used_bytes` at the limit and every produce was
+    // rejected with "Memory limit exceeded".
+    #[test]
+    fn memory_reservation_releases_on_drop() {
+        let counter = Arc::new(AtomicU64::new(0));
+        counter.fetch_add(1000, Ordering::SeqCst); // as the CAS reserve loop does
+        {
+            let _guard = MemoryReservation::new(Arc::clone(&counter), 1000);
+            assert_eq!(counter.load(Ordering::SeqCst), 1000, "held while guard alive");
+        } // drop
+        assert_eq!(counter.load(Ordering::SeqCst), 0, "released exactly once on drop");
+    }
+
+    #[test]
+    fn memory_reservation_releases_on_early_return() {
+        fn faux_produce(counter: &Arc<AtomicU64>, fail: bool) -> Result<()> {
+            counter.fetch_add(500, Ordering::SeqCst);
+            let _guard = MemoryReservation::new(Arc::clone(counter), 500);
+            if fail {
+                return Err(Error::Internal("simulated early `?` return".into()));
+            }
+            Ok(())
+        }
+        let counter = Arc::new(AtomicU64::new(0));
+        let _ = faux_produce(&counter, true); // error path
+        assert_eq!(counter.load(Ordering::SeqCst), 0, "released on error path");
+        let _ = faux_produce(&counter, false); // success path
+        assert_eq!(counter.load(Ordering::SeqCst), 0, "released on success path");
+    }
+
+
     async fn create_test_handler() -> (ProduceHandler, TempDir) {
         let temp_dir = TempDir::new().unwrap();
         let storage_path = temp_dir.path().join("storage");

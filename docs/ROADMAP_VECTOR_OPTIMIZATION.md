@@ -418,7 +418,7 @@ Update this section at the end of each work session to enable seamless continuat
 
 ### Environment
 
-- K8s cluster: 3 Dell nodes (192.168.1.31-33), MicroK8s, 16GB RAM/node
+- K8s cluster: 3 Dell nodes, MicroK8s, 16GB RAM/node
 - Current images: `chronik-server:vo1-throughput`, `chronik-operator:sv2b-fixes`
 - Metrics port: 13001 (13000 + node_id) — NOT on unified API port 6092
 - Image distribution: `docker save | scp | sudo microk8s ctr images import`

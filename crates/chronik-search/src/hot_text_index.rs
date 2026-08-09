@@ -921,6 +921,36 @@ mod tests {
         assert_eq!(hits[0].offset, 2);
     }
 
+    /// Regression: a natural-language query carrying punctuation (parentheses,
+    /// slashes, colons, a date) must still match. Tantivy's QueryParser treats
+    /// those characters as query syntax, so feeding the raw `_all` match text
+    /// returned ZERO hits (or errored) — hot search silently failed for any
+    /// punctuated query until the cold indexer caught up ~30-45s later.
+    /// `search` now sanitizes to a bag of words first.
+    #[tokio::test]
+    async fn punctuated_query_still_matches() {
+        let idx = HotTextIndex::new(HotTextConfig::default());
+        idx.add_batch(
+            "t",
+            0,
+            &[make_doc(0, "I graduated with a degree in business administration")],
+        )
+        .await
+        .unwrap();
+        idx.commit("t", 0).await.unwrap();
+
+        // An anchored question the way the read-time path builds it — parens,
+        // slashes, colons, a date, a trailing '?'. Pre-fix this returned 0 hits.
+        let q = "(Today is 2023/05/30 (Tue) 23:40.) What degree did I graduate with?";
+        let hits = idx.search_topic("t", q, 10).await.unwrap();
+        assert_eq!(hits.len(), 1, "punctuated query must match after sanitization");
+        assert_eq!(hits[0].offset, 0);
+
+        // A query that is ONLY punctuation matches nothing — and does not error.
+        let none = idx.search_topic("t", "()/:-.", 10).await.unwrap();
+        assert!(none.is_empty());
+    }
+
     /// Regression (per-topic memory OOM): an idle partition must release its
     /// Tantivy writer (>=15MB heap budget + indexing threads each) while its
     /// docs stay searchable. One writer per partition held forever OOM-killed
