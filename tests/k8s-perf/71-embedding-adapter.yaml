@@ -123,7 +123,10 @@ spec:
             - name: OLLAMA_URL
               value: "http://ollama:11434"
             - name: OPENAI_BACKENDS
-              value: "http://192.168.1.184:1234,http://192.168.1.6:11430"
+              # Comma-separated OpenAI-compatible embedding backends.
+              # Replace with your own host:port before applying (e.g. an
+              # LM Studio / llama.cpp / vLLM server on your network).
+              value: "http://EMBED_BACKEND_1:1234,http://EMBED_BACKEND_2:11430"
             - name: OPENAI_MODEL
               value: "text-embedding-nomic-embed-text-v1.5"
             - name: PORT

@@ -229,7 +229,7 @@ The final configuration (3 NVIDIA GPUs + 2 external LM Studio servers running `n
 
 **LM Studio backends**:
 - external workstation (128 GB unified memory): ~91 embeddings/s at concurrency 5
-- External server (192.168.1.6): ~188 embeddings/s at concurrency 20
+- External server: ~188 embeddings/s at concurrency 20
 
 The embedding adapter uses round-robin with automatic failover across all backends.
 
