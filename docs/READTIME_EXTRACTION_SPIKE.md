@@ -1,6 +1,6 @@
 # Read-Time Extraction Spike
 
-**Status:** experimental, env-gated, default-off. Branch `feat/memory-hybrid-infra-and-quality`.
+**Status:** ✅ landed on `main` 2026-08-09 (PR #26), env-gated, default-off.
 
 ## Why
 
@@ -20,8 +20,14 @@ knowing what it's looking for. This plays to Chronik's durable-retention thesis
 
 ## What the spike does
 
-A minimal, faithful A/B against the write-time baseline. Only the **evidence
-source** changes; the reader model, judge, and answer rules are held constant.
+A minimal A/B against the write-time baseline. The reader model, judge, and
+answer *rules* are held constant. **Two variables change together**, so the
+delta measures the *paradigm*, not raw retrieval in isolation: (1) the
+**evidence source** (typed memories → raw turns), and (2) its **serialization**
+— `synthesize_readtime` uses a different prompt builder (`build_readtime_prompt`)
+that lists verbatim `(date) role: content` turns instead of extracted memory
+bullets. A fully isolated retrieval-only A/B would hold the serialization
+identical; this one does not, so don't attribute the score gap to retrieval alone.
 
 ```
 baseline  (synthesize):          retrieve TYPED memories (mem.fact/event/...) → read → answer
@@ -59,7 +65,7 @@ LONGMEMEVAL_USE_SYNTHESIS=1 ...  cargo test -p chronik-memory --test eval_longme
 LONGMEMEVAL_READTIME=1 LONGMEMEVAL_USE_SYNTHESIS=1 ...  cargo test ...
 ```
 
-Compare `synth_judge_rate` between the two runs on the same pilot-18 set.
+Compare `synth_judge_rate` between the two runs on the same set.
 
 ## Known limitations / not-yet
 
@@ -79,9 +85,24 @@ Compare `synth_judge_rate` between the two runs on the same pilot-18 set.
   more docs and may lag. If empty-raw-search rate is high, add an explicit raw
   readiness poll before recall.
 
-## Decision gate
+## Result & decision (observed)
 
-If read-time `synth_judge` beats the 0.278 baseline on pilot-18, the paradigm is
-worth a production design (dedicated read-time index + optional distill step).
-If it doesn't, we've falsified the lever cheaply before touching production
-plumbing — the wall would then be retrieval over raw, not extraction timing.
+Read-time won decisively and **landed on `main`** (PR #26, env-gated default-off):
+
+| Config | Set | Reader | Judge | synth_judge |
+|--------|-----|--------|-------|-------------|
+| write-time (baseline) | pilot-18 | Qwen3-30B-A3B | Mistral-3.1-24B | 0.111 |
+| read-time | pilot-18 | Qwen3-30B-A3B | Mistral-3.1-24B | 0.722 |
+| read-time (+`SYNTH_K=40`, hot-search punctuation fix) | LongMemEval-S first 50 | Qwen3-30B-A3B | Mistral-3.1-24B | **0.880** (sub 0.760, abstain 0.040) |
+
+All rows use the independent Mistral-Small-3.1-24B judge (not the reader). The
+0.880 row was re-verified on the reconciled-with-`main` build before merge. Two
+levers stacked the gain: raw-retrieval depth (`SYNTH_K` 15→40: 0.48→0.72) and
+the hot-search punctuation fix (0.72→0.88, shipped v2.10.9). The methodology
+caveat above stands — the write-time vs read-time gap also carries the
+serialization change, so it measures the paradigm, not raw retrieval alone.
+
+Remaining limitations (see above): raw indexing load at fleet scale wants a
+dedicated on-demand index; BM25-only (no raw vector channel yet); the single-call
+reader may be context-limited at large `k` (an explicit distill step is the
+natural v2).

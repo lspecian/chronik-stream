@@ -19,6 +19,17 @@ The bet is **not** "add a graph database." It is: **an Ontology that is event-na
 2. **Provenance is the substrate, not a feature.** Every object attribute and every edge carries the source offset(s) that justified it. "Why do you believe this?" resolves to raw events. Memory already ships this (`source.{topic,offsets}` in [schema.rs:95-105](../crates/chronik-memory/src/schema.rs#L95), plus the `LineageIndex` DAG in [lineage.rs](../crates/chronik-memory/src/lineage.rs)).
 3. **Relationships are derived, not asserted.** An edge exists because an event happened, so it can never drift out of sync with the truth and can always be re-derived. No dual-write consistency problem between "the data" and "the graph" — the failure mode every graph-DB-over-a-warehouse deployment fights.
 
+> **⚠️ OPEN DESIGN DECISION — a consistent `as_of` token is not "one offset."**
+> Point 1 above and the projection model (folds over *multiple* topics/partitions,
+> read by *asynchronous* consumers) are in tension: a single topic/partition
+> offset cannot identify a consistent state *across* projections that read
+> different partitions. `as_of(t)` must resolve to a **cross-projection snapshot
+> token** — either a per-`(topic,partition)` watermark vector or a global
+> monotonic commit token — and the design must define read behavior while a
+> projection **lags or is rebuilding** (serve stale-but-consistent, block until
+> caught up, or error). Unresolved; blocks any as-of / time-travel API. Related:
+> the CAS open decision in §Actions.
+
 **What makes the *product* better.** Today an agent must know Chronik's plumbing (`POST /_search` with a Tantivy match, `/_vector/{topic}/search`, `/_sql`, hot-vs-cold tables, the 5s fan-out timeout). That leaks infrastructure into the agent's reasoning. Both reference systems reject this: Palantir's AIP agents operate *"through governed, auditable pathways defined within the Ontology rather than bypassing it for raw data access"* ([aip-architecture](https://www.palantir.com/docs/foundry/architecture-center/aip-architecture)), and Graphiti exposes *six fixed MCP tools, no raw Cypher* ([mcp-server](https://help.getzep.com/graphiti/getting-started/mcp-server)). The Ontology replaces "know the storage engine" with "ask for objects, traverse links, invoke actions" over one MCP/HTTP surface.
 
 **The defensible wedge — temporal + auditable memory (from the differentiation research).** Points 1–3 above are not just conveniences; on an immutable log they are things a mutable-graph competitor (Zep/Graphiti-on-Neo4j, Mem0, Cognee) *cannot retrofit* without effectively rebuilding on an event log. Three lead with the strongest moat:
@@ -144,6 +155,13 @@ Everything except Actions rides the §4 template. Actions need the single missin
 **Per-action risk tier** (`auto | confirm | approval`) is a property of the Action Type in the registry, driving both the MCP tool schema the LLM sees and whether a human gate is required — mirroring Palantir's per-tool `auto`-vs-`confirm` and LangGraph's `interrupt_on` policy.
 
 **Spike CAS standalone first** — before building any Action semantics, prove the append-only-if-offset-N primitive under concurrency in isolation. It gates every Action; it is the long pole.
+
+> **⚠️ OPEN DESIGN DECISION — CAS scope & atomic-append semantics (the spike MUST resolve these).**
+> `read_offset` alone is under-specified on a partitioned log. Pin before implementing Actions:
+> - **Token scope.** Is the concurrency token `(topic, partition, offset)`, a per-aggregate sequence, or a global commit ID? All events for aggregate `K` must route to the **same partition** (partition key = `K`) so one offset is authoritative for `K`; cross-partition CAS is out of scope for v1.
+> - **Atomic multi-event append.** `ActionApplied.emitted_events` is a *batch* — the CAS check + the append of the whole batch must be atomic (all-or-nothing), never per-event.
+> - **Idempotent retry.** On a producer timeout the outcome is unknown; dedup by `idempotency_key` / `proposal_id` so a blind retry can't double-apply.
+> - **Test gate.** Concurrent same-`K` writes (exactly one wins), stale-token rejection, timeout-retry idempotency, partial-batch rejection.
 
 ---
 

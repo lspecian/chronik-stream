@@ -88,11 +88,21 @@ equally-correct answers (M1 was tied on exact match, just abstained more). No
 local model that fits our GPUs (8GB Tesla P4 / 6GB RTX 3060) produces better
 answers.
 
-## What would break the ceiling (not pursued)
+## What would break the ceiling
+
+**A third path — a different extraction *architecture* — was pursued and broke
+it (2026-08-09).** Read-time (query-conditioned) extraction retrieves retained
+raw turns at query time instead of extracting typed facts at write time:
+`synth_judge = 0.880` (LongMemEval-S first 50, Qwen3-30B reader, independent
+Mistral-24B judge) vs `0.111` write-time on the same reader. It landed on `main`
+(PR #26, env-gated default-off). The ceiling below is specific to the
+**write-time** architecture; the fix was changing *when* extraction happens, not
+the synth model. See `docs/READTIME_EXTRACTION_SPIKE.md`.
+
+Still not pursued within write-time extraction:
 
 - **A genuinely large synth model** (27B+ or a strong cloud model). Needs GPU
-  capacity we don't have, or per-run cloud spend that was ruled out. This is
-  the single highest-upside untested axis.
+  capacity we don't have, or per-run cloud spend that was ruled out.
 - **A different answer step** — multi-hop reasoning over facts, or
   self-consistency voting (sample N answers, majority-vote). Multiplies compute
   per item; not attempted.
