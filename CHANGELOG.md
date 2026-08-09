@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.11.0] - 2026-08-09
+
+### Added
+- **Read-time (query-conditioned) extraction for agent memory** (env-gated,
+  default-off) — retrieves the retained raw conversation turns at query time and
+  reads the answer from them, instead of extracting typed facts at write time.
+  This breaks the extraction-coverage wall: on LongMemEval-S first-50 it reaches
+  `synth_judge = 0.880` (local Qwen3-30B reader, independent Mistral-24B judge)
+  vs `0.111` for write-time extraction; on the same-set pilot-18 comparison it is
+  `0.722` vs `0.111`. New pieces: `RecallBuilder::synthesize_readtime`,
+  `run_raw_search`, `build_readtime_prompt`, and an opt-in
+  `CHRONIK_MEMORY_RAW_SEARCHABLE=1` gate that makes `mem.raw.*` topics
+  BM25-searchable. See `docs/READTIME_EXTRACTION_SPIKE.md`.
+- **Memory-quality infrastructure** (env-gated) — multi-partition indexed memory
+  topics, an explicit per-topic `searchable` config key (honored by the broker
+  over the `CHRONIK_DEFAULT_SEARCHABLE` env default; the global default is
+  unchanged), and CreateTopics retry on the memory client.
+- **LongMemEval eval-harness controls** — independent judge override
+  (`LONGMEMEVAL_JUDGE_PROVIDER`/`_ENDPOINT`/`_MODEL`, so the grader is not the
+  graded model), tunable raw-retrieval depth (`LONGMEMEVAL_SYNTH_K`), and a
+  read-time A/B switch (`LONGMEMEVAL_READTIME=1`).
+
+### Fixed
+- Extractor (OpenAI provider) no longer logs model completion content on the
+  no-tool-call warning path — it could carry user conversation data / PII into
+  application logs; it now logs the finish reason and content length only.
+- Memory recall: the temporal age-annotation anchor now parses the LongMemEval
+  slash date format (`2023/05/30`) so `CHRONIK_MEMORY_TEMPORAL` annotations fire;
+  preference routing no longer misclassifies past-tense factoid recalls ("what
+  did you recommend?"); the read-time reader prompt caps per-turn content length
+  so one pathologically long turn can't blow the reader's context.
+
+### Changed
+- **Security/hygiene:** scrubbed home-lab IP addresses from tracked files —
+  `query_router.rs` test fixtures use the RFC 5737 documentation range
+  (`192.0.2.0/24`); the k8s embedding-adapter manifest and a memory test probe
+  use placeholders; docs dropped bare lab IPs.
+
 ## [2.10.10] - 2026-08-09
 
 ### Fixed
