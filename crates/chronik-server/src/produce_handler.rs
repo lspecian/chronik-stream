@@ -2279,6 +2279,20 @@ impl ProduceHandler {
         // v2.2.0: Store serialized WAL data for replication (zero-copy optimization)
         let serialized_for_replication: Option<Vec<u8>>;
 
+        // The async-response path (acks != 0) used to `return` straight from inside
+        // the WAL block, which silently skipped every post-write side effect below —
+        // most importantly the WAL replication hook, so `acks=1` / `acks=all` never
+        // replicated to followers at all (only `acks=0` did). v2.2.16 papered over
+        // the same early return for indexing by duplicating it into the async branch;
+        // replication and the produced-records metrics stayed stranded behind it.
+        //
+        // Instead of adding a third copy, the async branch now parks its response
+        // here and falls through to the single shared tail, which runs the side
+        // effects exactly once for every path. The tail returns this value before
+        // the `match acks` block, since the ResponsePipeline callback has already
+        // delivered the watermark update and the client response.
+        let mut async_response: Option<ProduceResponsePartition> = None;
+
         // DIAGNOSTIC: Verify wal_manager state at runtime
         debug!("🔍 DIAGNOSTIC: wal_manager present: {}, topic: {}, partition: {}",
               self.wal_manager.is_some(), topic, partition);
@@ -2372,31 +2386,20 @@ impl ProduceHandler {
                                 // The response_rx will be signaled when GroupCommitWal completes the batch fsync
                                 match response_rx.await {
                                     Ok(pipeline_response) => {
-                                        // CRITICAL FIX: Return the response immediately to client!
                                         let wal_elapsed = wal_start.elapsed();
-                                        debug!("✅ ASYNC RESPONSE DELIVERED: topic={} partition={} latency={:?}, returning to client",
+                                        debug!("✅ ASYNC RESPONSE DELIVERED: topic={} partition={} latency={:?}, falling through to shared tail",
                                                topic, partition, wal_elapsed);
 
-                                        // v2.2.16 FIX: Call indexing BEFORE early return (async path)
-                                        // This ensures searchable topics are indexed even with acks=1 async responses
-                                        {
-                                            let is_searchable = self.is_topic_searchable(topic).await;
-                                            if is_searchable {
-                                                // HP-1.2: fire-and-forget shadow into the in-memory hot
-                                                // text index (NRT search). Cold search is served by the
-                                                // WalIndexer's {data_dir}/tantivy_indexes.
-                                                self.send_to_hot_text_index(topic, partition, &records);
-                                            }
-                                        }
-
-                                        // HP-2.3: fire-and-forget enqueue into the hot vector batcher
-                                        // (gated on vector.enabled, independent of is_searchable)
-                                        if self.is_topic_vector_enabled(topic).await {
-                                            self.send_to_hot_vector_batcher(topic, partition, &records);
-                                        }
-
-                                        // Reconstruct response to match function return type (5 fields only)
-                                        return Ok(ProduceResponsePartition {
+                                        // Park the response and fall through to the shared tail.
+                                        // The tail runs replication + metrics + indexing once for
+                                        // every path, then returns this without touching `match acks`
+                                        // (the ResponsePipeline callback already updated the
+                                        // watermark and unblocked the client).
+                                        //
+                                        // Indexing and the hot-vector enqueue used to be duplicated
+                                        // here (v2.2.16) to dodge the early return; the tail owns
+                                        // them now, so there is exactly one copy.
+                                        async_response = Some(ProduceResponsePartition {
                                             index: pipeline_response.index,
                                             error_code: pipeline_response.error_code,
                                             base_offset: pipeline_response.base_offset,
@@ -2511,6 +2514,15 @@ impl ProduceHandler {
         // HP-2.3: fire-and-forget enqueue into the hot vector batcher
         if self.is_topic_vector_enabled(topic).await {
             self.send_to_hot_vector_batcher(topic, partition, &records);
+        }
+
+        // Async-response path (acks != 0 with a ResponsePipeline): the client was
+        // already answered by the pipeline callback, which also advanced the high
+        // watermark. Everything above this point — replication, metrics, indexing —
+        // has now run for it, so return before `match acks` re-registers the same
+        // offset range with the pipeline (a second oneshot that would never fire).
+        if let Some(response) = async_response {
+            return Ok(response);
         }
 
         // Handle acknowledgment modes
@@ -4899,6 +4911,160 @@ mod tests {
 
         // Note: fetch_partition is now private. Integration testing should be done
         // via the public handle_fetch API in separate integration tests.
+    }
+
+    /// Build a ProduceHandler in the exact shape cluster mode uses: a real WAL, a
+    /// WalReplicationManager, and a ResponsePipeline wired to the GroupCommitWal
+    /// commit callback.
+    ///
+    /// The ResponsePipeline is the part that matters. `use_async_responses` is
+    /// `response_pipeline.is_some() && acks != 0`, so a handler *without* one takes
+    /// the synchronous path and replicates fine — which is why every pre-existing
+    /// test missed this bug. Only this wiring reproduces the async path.
+    async fn handler_with_replication(
+        temp_dir: &tempfile::TempDir,
+        metadata_store: Arc<InMemoryMetadataStore>,
+    ) -> (ProduceHandler, Arc<crate::wal_replication::WalReplicationManager>) {
+        use chronik_wal::config::{CompressionType as WalCompression, WalConfig};
+
+        let wal_config = WalConfig {
+            enabled: true,
+            data_dir: temp_dir.path().join("wal"),
+            segment_size: 16 * 1024 * 1024,
+            flush_interval_ms: 10,
+            flush_threshold: 1,
+            compression: WalCompression::None,
+            checkpointing: Default::default(),
+            recovery: Default::default(),
+            rotation: Default::default(),
+            fsync: Default::default(),
+            async_io: Default::default(),
+        };
+        let wal_manager = Arc::new(chronik_wal::WalManager::new(wal_config).await.unwrap());
+
+        let mut object_store_config = chronik_storage::object_store::ObjectStoreConfig::default();
+        object_store_config.backend = chronik_storage::object_store::StorageBackend::Local {
+            path: temp_dir.path().join("segments").to_str().unwrap().to_string(),
+        };
+        let object_store: Arc<dyn chronik_storage::object_store::ObjectStoreTrait> = Arc::from(
+            chronik_storage::object_store::ObjectStoreFactory::create(object_store_config)
+                .await
+                .unwrap(),
+        );
+
+        let produce_config = ProduceHandlerConfig {
+            node_id: 1,
+            ..ProduceHandlerConfig::default()
+        };
+        let mut handler = ProduceHandler::new_with_wal(
+            produce_config,
+            object_store,
+            metadata_store,
+            wal_manager.clone(),
+        )
+        .await
+        .unwrap();
+
+        // No followers: with `metadata_store: None` the manager falls back to
+        // replicate_serialized(), which still enqueues. We assert on the queue,
+        // not on a socket, so no peer is needed.
+        let repl_mgr = crate::wal_replication::WalReplicationManager::new(Vec::new());
+        handler.set_wal_replication_manager(repl_mgr.clone());
+
+        // Mirror builder.rs `setup_response_pipeline`: without the commit callback
+        // the async path's oneshot never resolves.
+        let response_pipeline = Arc::new(crate::response_pipeline::ResponsePipeline::new());
+        let pipeline_for_cb = response_pipeline.clone();
+        let cb_handle = tokio::runtime::Handle::current();
+        let commit_callback: chronik_wal::group_commit::CommitCallback = Arc::new(
+            move |topic: &str, partition: i32, min_offset: i64, max_offset: i64| {
+                let pipeline = pipeline_for_cb.clone();
+                let topic = topic.to_string();
+                cb_handle.spawn(async move {
+                    pipeline.notify_batch_committed(&topic, partition, min_offset, max_offset);
+                });
+            },
+        );
+        wal_manager.group_commit_wal().set_commit_callback(commit_callback);
+        handler.set_response_pipeline(response_pipeline);
+
+        (handler, repl_mgr)
+    }
+
+    /// Regression test for the WAL-replication hook being skipped on the
+    /// async-response path.
+    ///
+    /// `produce_to_partition` used to `return` from inside the WAL block once the
+    /// ResponsePipeline callback fired, jumping over the replication hook that sits
+    /// after it. Since that path is taken whenever `acks != 0`, `acks=1` and
+    /// `acks=all` replicated **nothing** while `acks=0` replicated normally — the
+    /// durability contract exactly inverted. Verified on a live 3-node RF=3 cluster:
+    /// an acks=1 topic existed only on its leader, an acks=0 topic on all three.
+    ///
+    /// Asserting on `total_queued` is the tightest check available: a record that
+    /// never reaches the queue can never reach a follower.
+    #[tokio::test]
+    async fn test_replication_fires_for_every_acks_mode() {
+        use tempfile::TempDir;
+
+        for acks in [0i16, 1, -1] {
+            let temp_dir = TempDir::new().unwrap();
+            let metadata_store = Arc::new(InMemoryMetadataStore::new());
+            let (mut handler, repl_mgr) =
+                handler_with_replication(&temp_dir, metadata_store.clone()).await;
+
+            let mut topic_config = TopicConfig::default();
+            topic_config.partition_count = 1;
+            metadata_store
+                .create_topic("repl-topic", topic_config)
+                .await
+                .unwrap();
+
+            let before = repl_mgr.total_queued();
+
+            let request = ProduceRequest {
+                transactional_id: None,
+                acks,
+                timeout_ms: 5000,
+                topics: vec![ProduceRequestTopic {
+                    name: "repl-topic".to_string(),
+                    partitions: vec![ProduceRequestPartition {
+                        index: 0,
+                        records: create_simple_record_batch(0, vec!["m1", "m2"]),
+                    }],
+                }],
+            };
+
+            // Bound the wait: before the fix the acks!=0 paths simply never enqueued,
+            // so poll rather than sleeping a fixed amount, and fail loudly.
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                handler.handle_produce(request, 1),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("produce timed out for acks={}", acks))
+            .unwrap();
+            assert_eq!(
+                response.topics[0].partitions[0].error_code, 0,
+                "produce failed for acks={}",
+                acks
+            );
+
+            // The hook spawns a fire-and-forget task, so give it a bounded chance to land.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while repl_mgr.total_queued() == before && std::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+
+            assert!(
+                repl_mgr.total_queued() > before,
+                "acks={} produced no replication traffic (queued stayed at {}). \
+                 The produce path returned before the WAL replication hook, so this \
+                 data would exist only on the leader despite RF>1.",
+                acks,
+                before
+            );
+        }
     }
 
     // Helper function to create simple test record batches (for integration tests)

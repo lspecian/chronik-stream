@@ -563,10 +563,26 @@ impl WalReplicationManager {
                     continue;
                 }
 
-                self.total_sent.fetch_add(1, Ordering::Relaxed);
-
-                // Reset heartbeat timer (data was sent)
-                last_heartbeat = std::time::Instant::now();
+                // Count only what actually reached a follower. This used to
+                // increment unconditionally, so a data record that reached no
+                // follower — no live connection, or every write/flush failed —
+                // still counted as "sent", and the one counter that could have
+                // exposed the loss reported success instead.
+                //
+                // Data records are not re-queued (only metadata is, above), so a
+                // failure here IS a silent drop; count it as such so it is at
+                // least visible. Retry/reconciliation is tracked separately.
+                if sent_to_any {
+                    self.total_sent.fetch_add(1, Ordering::Relaxed);
+                    // Reset heartbeat timer (data was sent)
+                    last_heartbeat = std::time::Instant::now();
+                } else {
+                    self.total_dropped.fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        "Dropped replicated record for {}-{} offset {} — no follower received it (no retry for data records)",
+                        record.topic, record.partition, record.base_offset
+                    );
+                }
             } else {
                 // Queue empty - check if we need to send heartbeat
                 if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
@@ -1535,6 +1551,21 @@ impl WalReplicationManager {
     }
 
     /// Shutdown the replication manager
+    /// Number of records accepted onto the replication queue since startup.
+    ///
+    /// Exposed so the produce path can be asserted against directly: a produce
+    /// that never enqueues here never reaches a follower, which is exactly how
+    /// `acks=1` / `acks=all` silently stopped replicating (the async-response
+    /// path returned before the replication hook).
+    pub fn total_queued(&self) -> u64 {
+        self.total_queued.load(Ordering::Relaxed)
+    }
+
+    /// Number of records successfully written to at least one follower.
+    pub fn total_sent(&self) -> u64 {
+        self.total_sent.load(Ordering::Relaxed)
+    }
+
     pub async fn shutdown(&self) {
         info!("Shutting down WAL replication manager");
         self.shutdown.store(true, Ordering::Relaxed);
