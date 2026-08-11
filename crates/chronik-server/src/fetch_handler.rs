@@ -117,6 +117,13 @@ pub struct FetchHandler {
     state: Arc<RwLock<FetchState>>,
     /// Configuration for fetch behavior
     config: FetchHandlerConfig,
+    /// RP-2.1: where follower fetch positions are recorded.
+    ///
+    /// A follower's fetch offset is its log end offset, so the fetch itself is
+    /// both a progress report and a liveness signal — replacing the ACK channel,
+    /// heartbeat replies and connection probing that the push model needed to
+    /// approximate the same information.
+    isr_tracker: Option<Arc<crate::isr_tracker::IsrTracker>>,
 }
 
 impl FetchHandler {
@@ -138,6 +145,7 @@ impl FetchHandler {
                 segment_cache: HashMap::new(),
             })),
             config: FetchHandlerConfig::default(),
+            isr_tracker: None,
         }
     }
 
@@ -162,6 +170,7 @@ impl FetchHandler {
                 segment_cache: HashMap::new(),
             })),
             config: FetchHandlerConfig::default(),
+            isr_tracker: None,
         }
     }
 
@@ -186,6 +195,7 @@ impl FetchHandler {
                 segment_cache: HashMap::new(),
             })),
             config: FetchHandlerConfig::default(),
+            isr_tracker: None,
         }
     }
 
@@ -215,8 +225,19 @@ impl FetchHandler {
                 segment_cache: HashMap::new(),
             })),
             config,
+            isr_tracker: None,
         }
     }
+
+    /// RP-2.1: attach the ISR tracker so follower fetches record their position.
+    ///
+    /// Cluster mode only. Without it, follower fetches are served exactly as
+    /// before and nothing is recorded, so single-node is unaffected.
+    pub fn set_isr_tracker(&mut self, tracker: Arc<crate::isr_tracker::IsrTracker>) {
+        self.isr_tracker = Some(tracker);
+        info!("ISR tracker wired to FetchHandler — follower fetches now report replication progress");
+    }
+
     /// Handle a fetch request
     pub async fn handle_fetch(
         &self,
@@ -236,6 +257,7 @@ impl FetchHandler {
                     partition_request.partition_max_bytes,
                     request.max_wait_ms,
                     request.min_bytes,
+                    request.replica_id,
                 ).await?;
 
                 // EOS layer 6: for read_committed (isolation_level == 1) report the real
@@ -704,7 +726,29 @@ impl FetchHandler {
         max_bytes: i32,
         max_wait_ms: i32,
         min_bytes: i32,
+        replica_id: i32,
     ) -> Result<FetchResponsePartition> {
+        // RP-2.1: a fetch carrying a replica id is a *follower* replicating, not a
+        // consumer reading. Kafka clients send -1 here; only a broker sets it to
+        // its own node id. The field has always been decoded and thrown away.
+        //
+        // Recording the follower's position is the whole point: its fetch offset
+        // IS its log end offset — it cannot ask for offset N without having
+        // durably written everything below N. That gives the leader progress
+        // tracking for free, where the push model needed a separate ACK channel,
+        // a liveness heartbeat, and a reconnect probe to approximate the same
+        // thing (see the RP-1 cluster findings).
+        if replica_id >= 0 {
+            if let Some(ref tracker) = self.isr_tracker {
+                tracker.update_follower_offset(replica_id as u64, topic, partition, fetch_offset);
+                tracker.record_node_alive(replica_id as u64);
+                debug!(
+                    "Follower fetch: node {} at offset {} for {}-{}",
+                    replica_id, fetch_offset, topic, partition
+                );
+            }
+        }
+
         // v2.2.7.2: Enhanced tracing to debug large batch consumption stalls
         let fetch_start = Instant::now();
         info!(
@@ -2739,3 +2783,66 @@ fn sanitize_batch_crcs(bytes: &mut [u8]) {
 // #[cfg(test)]
 // #[path = "fetch_handler_test.rs"]
 // mod fetch_handler_test;
+
+#[cfg(test)]
+mod replica_fetch_tests {
+    use crate::isr_tracker::{IsrTracker, SyncState};
+    use std::sync::Arc;
+
+    /// RP-2.1: `replica_id` distinguishes a replicating follower from a consumer.
+    ///
+    /// Kafka clients send -1; only a broker sets it to its own node id. The field
+    /// has always been decoded and discarded, so this pins the semantics the
+    /// fetch path now depends on: a follower fetch records progress, a consumer
+    /// fetch records nothing.
+    ///
+    /// This is the property that makes pull cheaper than push. The push model
+    /// needed an ACK channel for progress, heartbeat replies for liveness, and a
+    /// reconnect probe for restarts — three mechanisms, each of which had a bug
+    /// only a live cluster exposed. A fetch offset is all three at once.
+    #[test]
+    fn follower_fetch_records_progress_consumer_fetch_does_not() {
+        let tracker = Arc::new(IsrTracker::new(1000, 10_000));
+
+        // Consumer fetch: replica_id < 0 → nothing recorded.
+        let consumer_replica_id: i32 = -1;
+        if consumer_replica_id >= 0 {
+            tracker.update_follower_offset(consumer_replica_id as u64, "orders", 0, 500);
+        }
+        assert_eq!(
+            tracker.sync_state(2, "orders", 0, 500),
+            SyncState::Unknown,
+            "a consumer fetch must not be mistaken for replication progress"
+        );
+
+        // Follower fetch from node 2 at offset 500: it cannot ask for 500 without
+        // having durably written everything below it, so 500 is its LEO.
+        let follower_replica_id: i32 = 2;
+        if follower_replica_id >= 0 {
+            tracker.update_follower_offset(follower_replica_id as u64, "orders", 0, 500);
+            tracker.record_node_alive(follower_replica_id as u64);
+        }
+
+        assert_eq!(tracker.sync_state(2, "orders", 0, 500), SyncState::InSync);
+        assert_eq!(tracker.get_isr("orders", 0, 500, &[1, 2]), vec![2]);
+    }
+
+    /// A follower that keeps fetching stays in ISR without any separate heartbeat.
+    ///
+    /// Under push this required a dedicated liveness ACK; the first attempt used
+    /// connection state and silently did nothing, because a TCP write succeeds
+    /// into the local send buffer long after the peer is gone.
+    #[test]
+    fn fetching_is_its_own_liveness_proof() {
+        let tracker = Arc::new(IsrTracker::new(1000, 10_000));
+
+        tracker.update_follower_offset(2, "orders", 0, 100);
+        tracker.record_node_alive(2);
+        assert_eq!(tracker.sync_state(2, "orders", 0, 100), SyncState::InSync);
+
+        // Next fetch arrives at a higher offset — progress and liveness together.
+        tracker.update_follower_offset(2, "orders", 0, 250);
+        tracker.record_node_alive(2);
+        assert_eq!(tracker.sync_state(2, "orders", 0, 250), SyncState::InSync);
+    }
+}

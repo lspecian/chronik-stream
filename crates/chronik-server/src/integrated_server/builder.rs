@@ -1263,15 +1263,21 @@ impl IntegratedKafkaServerBuilder {
 
         // Create FetchHandler with WAL and ProduceHandler integration
         // FetchHandler needs ProduceHandler to get the real-time high watermark
-        let fetch_handler = Arc::new(FetchHandler::new_with_wal(
+        let mut fetch_handler = FetchHandler::new_with_wal(
             segment_reader.clone(),
             metadata_store.clone(),
             object_store.clone(),
             wal_manager.clone(),
             produce_handler_base.clone(),
-        ));
+        );
 
-        self.fetch_handler = Some(fetch_handler);
+        // RP-2.1: follower fetches report replication progress. Cluster mode only
+        // — there is no ISR tracker in single-node, and no followers to report.
+        if let Some(ref isr_tracker) = self.isr_tracker {
+            fetch_handler.set_isr_tracker(isr_tracker.clone());
+        }
+
+        self.fetch_handler = Some(Arc::new(fetch_handler));
 
         info!("✅ FetchHandler initialized");
         Ok(())
