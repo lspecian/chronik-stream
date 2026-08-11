@@ -8,7 +8,7 @@
 |-------|------|--------|---------|-------|
 | RP-0 | Replication conformance suite | `TESTED` | — | Placement + ISR honesty; fails pre-#29, passes after |
 | RP-1 | Harden the current mechanism | `TESTED` | — | 1.1–1.4 + 3 bugs found by cluster validation |
-| RP-2 | Follower fetch | `NOT STARTED` | — | `replica_id`, per-follower LEO, `HW = min(LEO)` |
+| RP-2 | Follower fetch | `IN PROGRESS` | — | 2.1 + 2.2 done; 2.3 (HW) and 2.4 (fetch loop) remain |
 | RP-3 | Leader epochs & truncation | `NOT STARTED` | — | The hard part. Gated behind RP-0 |
 | RP-4 | Delete the push stack | `NOT STARTED` | — | ~2,500 lines removed |
 
@@ -232,19 +232,24 @@ Every one surfaced only by running the conformance suite against a real 3-node c
 
 ### RP-2.1: Recognise follower fetches
 
-- [ ] Branch on `replica_id >= 0` in the fetch path — **the field is already decoded and discarded today** (`fetch_types.rs:136`, `handler.rs:1301`, `kafka_handler.rs:1191`)
-- [ ] Followers fetch above the high watermark; consumers remain capped at HW
-- [ ] Test: a follower fetch and a consumer fetch at the same offset return different visibility
+- [x] Branch on `replica_id >= 0` in the fetch path
+- [x] Record the follower position — its fetch offset IS its LEO
+- [ ] Followers fetch above the high watermark; consumers remain capped at HW (needs RP-2.3)
+- [x] Test: follower fetch records progress, consumer fetch does not
 
-**Status**: —
+**Status**: `CODE COMPLETE`. Wired in cluster mode only, so single-node is untouched. The fetch doubles as a liveness signal, which under push needed a separate heartbeat-ACK mechanism — and that mechanism had two bugs only a live cluster exposed.
 
 ### RP-2.2: Per-follower LEO tracking
 
-- [ ] Leader records each follower's fetch offset as that follower's LEO
-- [ ] Feeds the ISR computation from RP-1.2 (replacing the ACK-derived position)
-- [ ] Expose per-follower lag in `/admin/status`
+- [x] Leader records each follower's fetch offset as that follower's LEO
+- [x] Feeds the ISR computation from RP-1.2 (the same `IsrTracker`, now fed from fetches as well as ACKs)
+- [x] Expose per-follower lag in `/admin/status`
 
-**Status**: —
+**Status**: `CODE COMPLETE`. `/admin/status` now carries `replica_lag` (`node_id:lag` per follower) and `under_replicated` per partition.
+
+`under_replicated` is the field worth alerting on, and it is exactly what should have been firing during the nine months `acks!=0` replicated nothing. `replica_lag` makes that alert actionable by naming the replica and the distance, instead of leaving an operator to exec into pods and list WAL directories — which is how the original outage actually had to be found.
+
+Still leader-only: followers report to the leader, so a non-leader returns an empty list rather than a misleading zero. RP-2.4 removes the asymmetry.
 
 ### RP-2.3: High watermark from ISR
 
