@@ -85,6 +85,10 @@ pub struct IntegratedKafkaServerBuilder {
 
     // Metadata DR (Stage 5)
     metadata_uploader: Option<Arc<chronik_common::metadata::MetadataUploader>>,
+
+    // Follower-pull replication (Stage 16, RP-2.4). Held so the fetcher lives
+    // as long as the server rather than being dropped at the end of build().
+    replica_fetcher: Option<Arc<crate::replication::replica_fetcher::ReplicaFetcher>>,
 }
 
 impl IntegratedKafkaServerBuilder {
@@ -119,6 +123,7 @@ impl IntegratedKafkaServerBuilder {
             wal_replication_manager: None,
             leader_elector: None,
             metadata_uploader: None,
+            replica_fetcher: None,
         }
     }
 
@@ -564,6 +569,12 @@ impl IntegratedKafkaServerBuilder {
         let isr_ack_tracker = crate::isr_ack_tracker::IsrAckTracker::new();
         let isr_tracker = Arc::new(crate::isr_tracker::IsrTracker::default());
         produce_handler_inner.set_isr_ack_tracker(isr_ack_tracker.clone());
+        // Reap `acks=all` waits that never reach quorum. The producer's own
+        // timeout releases the caller but leaves the registration behind, so
+        // without this the map grows for the life of the process — which it did,
+        // once per acks=all produce, for as long as replication was silently not
+        // running.
+        isr_ack_tracker.start_cleanup_task();
         info!("✅ EventBus, IsrAckTracker, and IsrTracker wired");
 
         // Step 4: Wire Raft dependencies (cluster mode only)
@@ -942,17 +953,26 @@ impl IntegratedKafkaServerBuilder {
         produce_handler.set_leader_elector(elector.clone());
         info!("✓ LeaderElector ready (event-driven mode)");
 
-        // Create and wire WalReplicationManager for data messages
-        let data_wal_repl_manager = crate::wal_replication::WalReplicationManager::new_with_dependencies(
-            Vec::new(),
-            Some(raft_cluster.clone()),
-            Some(isr_tracker.clone()),
-            Some(isr_ack_tracker.clone()),
-            self.config.cluster_config.clone().map(Arc::new),
-            Some(metadata_store.clone()),
-        );
-        produce_handler.set_wal_replication_manager(data_wal_repl_manager);
-        info!("✅ Data WAL replication manager wired (replica cache enabled)");
+        // RP-2.4: under pull replication the leader does not push data — followers
+        // fetch it. Wiring both would deliver every record twice, and the follower
+        // would reject the second copy as a gap. Metadata keeps its own manager
+        // (stage 6) and is unaffected either way.
+        let mode = crate::replication::replica_fetcher::ReplicationMode::from_env();
+        if mode.is_pull() {
+            info!("✅ Pull replication: leader will serve followers via Fetch, not push");
+        } else {
+            // Create and wire WalReplicationManager for data messages
+            let data_wal_repl_manager = crate::wal_replication::WalReplicationManager::new_with_dependencies(
+                Vec::new(),
+                Some(raft_cluster.clone()),
+                Some(isr_tracker.clone()),
+                Some(isr_ack_tracker.clone()),
+                self.config.cluster_config.clone().map(Arc::new),
+                Some(metadata_store.clone()),
+            );
+            produce_handler.set_wal_replication_manager(data_wal_repl_manager);
+            info!("✅ Data WAL replication manager wired (replica cache enabled)");
+        }
 
         Some(elector)
     }
@@ -1277,6 +1297,12 @@ impl IntegratedKafkaServerBuilder {
             fetch_handler.set_isr_tracker(isr_tracker.clone());
         }
 
+        // RP-2.3: under pull, a follower's fetch offset is what releases an
+        // `acks=all` producer — there is no ACK frame to do it.
+        if let Some(ref isr_ack_tracker) = self.isr_ack_tracker {
+            fetch_handler.set_isr_ack_tracker(isr_ack_tracker.clone());
+        }
+
         self.fetch_handler = Some(Arc::new(fetch_handler));
 
         info!("✅ FetchHandler initialized");
@@ -1535,12 +1561,70 @@ impl IntegratedKafkaServerBuilder {
         Ok(())
     }
 
+    /// Stage 16: Start follower-pull replication (RP-2.4).
+    ///
+    /// Cluster mode only, and only when `CHRONIK_REPLICATION_MODE=pull`. Push
+    /// remains the default until pull is soaked on a real cluster; the two are
+    /// mutually exclusive, since running both would deliver every record twice
+    /// and the follower would reject the duplicates as gaps.
+    async fn init_replica_fetcher(&mut self) -> Result<()> {
+        let mode = crate::replication::replica_fetcher::ReplicationMode::from_env();
+        if !mode.is_pull() {
+            debug!("Stage 16: push replication selected, no replica fetcher");
+            return Ok(());
+        }
+
+        let Some(ref cluster_config) = self.config.cluster_config else {
+            info!("Stage 16: single-node mode, nothing to replicate");
+            return Ok(());
+        };
+
+        info!("Stage 16: Starting follower-pull replication");
+
+        let metadata_store = self.metadata_store.as_ref()
+            .context("metadata_store not initialized")?;
+        let wal_manager = self.wal_manager.as_ref()
+            .context("wal_manager not initialized")?;
+        let produce_handler = self.produce_handler_base.as_ref()
+            .context("produce_handler not initialized")?;
+
+        // A follower fetches over the leader's *Kafka* port, not the WAL
+        // replication port — the whole point of pull is that replication is an
+        // ordinary Fetch.
+        let peers: std::collections::HashMap<u64, String> = cluster_config
+            .peers
+            .iter()
+            .filter(|peer| peer.id != cluster_config.node_id)
+            .map(|peer| (peer.id, peer.kafka.clone()))
+            .collect();
+
+        if peers.is_empty() {
+            warn!("Pull replication requested but no peers are configured — nothing to fetch from");
+            return Ok(());
+        }
+
+        let fetcher = crate::replication::replica_fetcher::ReplicaFetcher::new(
+            cluster_config.node_id,
+            crate::replication::replica_fetcher::ReplicaFetcherConfig::from_env(),
+            metadata_store.clone(),
+            wal_manager.clone(),
+            peers,
+        )
+        .with_produce_handler(produce_handler.clone());
+
+        fetcher.start();
+        self.replica_fetcher = Some(fetcher);
+
+        info!("✅ Follower-pull replication started (node {})", cluster_config.node_id);
+        Ok(())
+    }
+
     /// Build the IntegratedKafkaServer
     ///
     /// This orchestrates all initialization stages in order.
     /// Complexity: < 25 (orchestration only, delegates to stage functions)
     pub async fn build(mut self) -> Result<IntegratedKafkaServer> {
-        info!("🔧 Starting IntegratedKafkaServer build process (15 stages)...");
+        info!("🔧 Starting IntegratedKafkaServer build process (16 stages)...");
 
         // Stage 1: Directories
         self.init_directories().await
@@ -1602,7 +1686,11 @@ impl IntegratedKafkaServerBuilder {
         self.init_wal_receiver().await
             .context("Stage 15 failed: WAL Receiver initialization")?;
 
-        info!("✅ All 15 stages complete - assembling IntegratedKafkaServer");
+        // Stage 16: ReplicaFetcher (cluster mode, pull replication only)
+        self.init_replica_fetcher().await
+            .context("Stage 16 failed: ReplicaFetcher initialization")?;
+
+        info!("✅ All 16 stages complete - assembling IntegratedKafkaServer");
 
         // HP-1.5: warm up the hot text index from WAL tail so queries are
         // not blind for the first ~30s after startup.

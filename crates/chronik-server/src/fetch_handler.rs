@@ -124,6 +124,7 @@ pub struct FetchHandler {
     /// heartbeat replies and connection probing that the push model needed to
     /// approximate the same information.
     isr_tracker: Option<Arc<crate::isr_tracker::IsrTracker>>,
+    isr_ack_tracker: Option<Arc<crate::isr_ack_tracker::IsrAckTracker>>,
 }
 
 impl FetchHandler {
@@ -146,6 +147,7 @@ impl FetchHandler {
             })),
             config: FetchHandlerConfig::default(),
             isr_tracker: None,
+            isr_ack_tracker: None,
         }
     }
 
@@ -171,6 +173,7 @@ impl FetchHandler {
             })),
             config: FetchHandlerConfig::default(),
             isr_tracker: None,
+            isr_ack_tracker: None,
         }
     }
 
@@ -196,6 +199,7 @@ impl FetchHandler {
             })),
             config: FetchHandlerConfig::default(),
             isr_tracker: None,
+            isr_ack_tracker: None,
         }
     }
 
@@ -226,6 +230,7 @@ impl FetchHandler {
             })),
             config,
             isr_tracker: None,
+            isr_ack_tracker: None,
         }
     }
 
@@ -236,6 +241,17 @@ impl FetchHandler {
     pub fn set_isr_tracker(&mut self, tracker: Arc<crate::isr_tracker::IsrTracker>) {
         self.isr_tracker = Some(tracker);
         info!("ISR tracker wired to FetchHandler — follower fetches now report replication progress");
+    }
+
+    /// RP-2.3: attach the ACK tracker so a follower's fetch offset settles
+    /// `acks=all` waits, the way an ACK frame does under push.
+    ///
+    /// Cluster mode only; without it, follower fetches record ISR progress but
+    /// do not release producers, which is correct for push where the ACK frame
+    /// already does that job.
+    pub fn set_isr_ack_tracker(&mut self, tracker: Arc<crate::isr_ack_tracker::IsrAckTracker>) {
+        self.isr_ack_tracker = Some(tracker);
+        info!("ISR ACK tracker wired to FetchHandler — follower fetches now settle acks=all");
     }
 
     /// Handle a fetch request
@@ -767,6 +783,15 @@ impl FetchHandler {
                     "Follower fetch: node {} at offset {} for {}-{}",
                     replica_id, fetch_offset, topic, partition
                 );
+            }
+
+            // RP-2.3: the same offset also settles `acks=all`. A follower asking
+            // for N holds everything below N, so this is the pull equivalent of
+            // the ACK frame the push path sends — and it is why the ack tracker
+            // had to become offset-monotonic: a fetch offset skips across many
+            // batch boundaries and rarely equals a registered wait exactly.
+            if let Some(ref tracker) = self.isr_ack_tracker {
+                tracker.record_ack(topic, partition, fetch_offset, replica_id as u64);
             }
         }
 
