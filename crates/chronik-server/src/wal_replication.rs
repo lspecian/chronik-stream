@@ -49,6 +49,14 @@ const PROTOCOL_VERSION: u16 = 1;
 /// Maximum queue size before dropping old records
 const MAX_QUEUE_SIZE: usize = 100_000;
 
+/// RP-1.4: delivery attempts for a data record before it is dropped.
+///
+/// Bounded so a permanently dead follower cannot stall the queue forever; with
+/// the 100ms backoff between attempts this is roughly 30 seconds of retrying,
+/// long enough to ride out a follower restart. Metadata records are exempt and
+/// retry indefinitely — they are low volume and losing one diverges the catalog.
+const MAX_REPLICATION_ATTEMPTS: u32 = 300;
+
 /// Heartbeat interval (10 seconds)
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -90,6 +98,14 @@ pub struct WalReplicationRecord {
 
     /// Serialized CanonicalRecord (bincode)
     pub data: Bytes,
+
+    /// RP-1.4: local delivery attempts, for bounded retry.
+    ///
+    /// Never travels: `serialize_wal_frame` writes the wire fields explicitly, and
+    /// `#[serde(skip)]` keeps it out of any serde path, so the frame format is
+    /// unchanged and followers are unaffected.
+    #[serde(skip)]
+    pub attempts: u32,
 }
 
 /// ACK message sent from follower to leader after successful WAL write (v2.2.7 Phase 4)
@@ -321,6 +337,7 @@ impl WalReplicationManager {
             record_count, // FIXED: Extract from deserialized CanonicalRecord
             timestamp_ms: chrono::Utc::now().timestamp_millis(),
             data,
+            attempts: 0,
         };
 
         // Check queue size (prevent unbounded growth)
@@ -355,6 +372,7 @@ impl WalReplicationManager {
             record_count: 1, // Metadata events are single events
             timestamp_ms: chrono::Utc::now().timestamp_millis(),
             data: Bytes::from(data),
+            attempts: 0,
         };
 
         // Check queue size (prevent unbounded growth)
@@ -513,6 +531,7 @@ impl WalReplicationManager {
             record_count: record.records.len() as u32,
             timestamp_ms: chrono::Utc::now().timestamp_millis(),
             data,
+            attempts: 0,
         };
 
         // Check queue size (prevent unbounded growth)
@@ -553,34 +572,43 @@ impl WalReplicationManager {
                 }
 
                 // Send to all active followers (fan-out)
+                let mut record = record;
                 let sent_to_any = self.send_to_followers(&record).await;
 
-                // v2.2.9 Phase 7 FIX: Re-queue metadata records that failed to send
-                if is_metadata_record && !sent_to_any {
-                    debug!("Re-queuing metadata record (no successful sends)");
-                    self.queue.push(record);
-                    sleep(Duration::from_millis(100)).await;
-                    continue;
-                }
-
-                // Count only what actually reached a follower. This used to
-                // increment unconditionally, so a data record that reached no
-                // follower — no live connection, or every write/flush failed —
-                // still counted as "sent", and the one counter that could have
-                // exposed the loss reported success instead.
-                //
-                // Data records are not re-queued (only metadata is, above), so a
-                // failure here IS a silent drop; count it as such so it is at
-                // least visible. Retry/reconciliation is tracked separately.
                 if sent_to_any {
                     self.total_sent.fetch_add(1, Ordering::Relaxed);
                     // Reset heartbeat timer (data was sent)
                     last_heartbeat = std::time::Instant::now();
                 } else {
+                    // RP-1.4: retry instead of dropping.
+                    //
+                    // Previously only metadata records were re-queued; a data record
+                    // that reached no follower — connection not yet established, or
+                    // every write/flush failed — was discarded with nothing to notice.
+                    // A transient follower restart therefore left a permanent
+                    // under-replicated gap, because nothing in the system re-sends what
+                    // a follower missed.
+                    //
+                    // Bounded: after MAX_REPLICATION_ATTEMPTS the record is dropped and
+                    // counted, so a permanently dead follower cannot stall the queue
+                    // forever. Metadata keeps retrying indefinitely as before — it is
+                    // low volume and losing it diverges the catalog.
+                    record.attempts = record.attempts.saturating_add(1);
+
+                    if is_metadata_record || record.attempts < MAX_REPLICATION_ATTEMPTS {
+                        debug!(
+                            "Re-queuing {}-{} offset {} (attempt {})",
+                            record.topic, record.partition, record.base_offset, record.attempts
+                        );
+                        self.queue.push(record);
+                        sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+
                     self.total_dropped.fetch_add(1, Ordering::Relaxed);
                     warn!(
-                        "Dropped replicated record for {}-{} offset {} — no follower received it (no retry for data records)",
-                        record.topic, record.partition, record.base_offset
+                        "Dropped replicated record for {}-{} offset {} after {} attempts — no follower received it; partition is now under-replicated",
+                        record.topic, record.partition, record.base_offset, record.attempts
                     );
                 }
             } else {
@@ -1566,6 +1594,13 @@ impl WalReplicationManager {
         self.total_sent.load(Ordering::Relaxed)
     }
 
+    /// Records lost without reaching any follower — queue overflow, or exhausting
+    /// the RP-1.4 retry budget. Non-zero means partitions are under-replicated,
+    /// so this belongs on a dashboard rather than only in the logs.
+    pub fn total_dropped(&self) -> u64 {
+        self.total_dropped.load(Ordering::Relaxed)
+    }
+
     pub async fn shutdown(&self) {
         info!("Shutting down WAL replication manager");
         self.shutdown.store(true, Ordering::Relaxed);
@@ -1668,6 +1703,7 @@ pub fn deserialize_wal_frame(mut data: Bytes) -> Result<WalReplicationRecord> {
         record_count,
         timestamp_ms,
         data: record_data,
+        attempts: 0,
     })
 }
 
@@ -2510,5 +2546,65 @@ mod tests {
             let self_wal = format!("node{}.example.com:9291", node_id);
             assert!(!manager.followers.contains(&self_wal));
         }
+    }
+
+    fn repl_record(topic: &str, partition: i32, base_offset: i64) -> WalReplicationRecord {
+        WalReplicationRecord {
+            topic: topic.to_string(),
+            partition,
+            base_offset,
+            record_count: 1,
+            timestamp_ms: 1_700_000_000_000,
+            data: Bytes::from_static(b"payload"),
+            attempts: 0,
+        }
+    }
+
+    /// RP-1.4: a data record that reaches no follower must be retried, then
+    /// eventually dropped — not discarded on the first failure.
+    ///
+    /// Only metadata used to be re-queued, so a follower restart left a permanent
+    /// under-replicated gap: nothing in the system re-sends what a follower
+    /// missed. The bound matters just as much — unbounded retry against a dead
+    /// follower would stall the queue forever.
+    #[tokio::test]
+    async fn data_records_are_retried_then_dropped_when_undeliverable() {
+        // One follower, no connection to it: every send fails.
+        let manager = WalReplicationManager::new(vec!["dead-follower:9291".to_string()]);
+
+        manager.queue.push(repl_record("orders", 0, 42));
+
+        // The worker is already running from `new`. Give it time to burn through
+        // the retry budget (300 attempts x 100ms is far longer than this test
+        // should run, so assert on the retry behaviour rather than the drop).
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+        assert_eq!(manager.total_sent(), 0, "nothing could have been delivered");
+        assert_eq!(
+            manager.total_dropped(),
+            0,
+            "record must still be retrying, not dropped after early failures"
+        );
+        assert_eq!(manager.queue.len(), 1, "record should be back on the queue");
+    }
+
+    /// The retry budget is bounded, so a permanently unreachable follower cannot
+    /// pin a record on the queue indefinitely.
+    #[tokio::test]
+    async fn retry_budget_is_bounded_for_data_records() {
+        let manager = WalReplicationManager::new(vec!["dead-follower:9291".to_string()]);
+
+        // Start one attempt short of the limit; the next failure must drop it.
+        let mut record = repl_record("orders", 0, 7);
+        record.attempts = MAX_REPLICATION_ATTEMPTS - 1;
+        manager.queue.push(record);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while manager.total_dropped() == 0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        assert_eq!(manager.total_dropped(), 1, "record should have been dropped at the budget");
+        assert_eq!(manager.queue.len(), 0, "dropped record must not stay queued");
     }
 }
