@@ -11,7 +11,11 @@
 
 pub mod apply;
 pub mod connection;
+pub mod fetcher;
 pub mod protocol;
 
 pub use apply::{apply_fetched_records, plan_batches, ApplyRefusal, BatchAction, BatchFrame};
 pub use connection::LeaderConnection;
+pub use fetcher::{
+    plan_assignments, FollowedPartition, ReplicaFetcher, ReplicaFetcherConfig, ReplicationMode,
+};
