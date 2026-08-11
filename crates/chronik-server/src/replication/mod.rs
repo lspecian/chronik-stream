@@ -14,6 +14,7 @@
 pub mod connection_state;
 pub mod frame_reader;
 pub mod record_processor;
+pub mod replica_fetcher;
 
 // Re-export key types for convenience
 pub use connection_state::ConnectionState;
