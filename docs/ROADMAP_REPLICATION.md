@@ -8,7 +8,7 @@
 |-------|------|--------|---------|-------|
 | RP-0 | Replication conformance suite | `TESTED` | — | Placement + ISR honesty; fails pre-#29, passes after |
 | RP-1 | Harden the current mechanism | `TESTED` | — | 1.1–1.4 + 3 bugs found by cluster validation |
-| RP-2 | Follower fetch | `IN PROGRESS` | — | 2.1 + 2.2 done; 2.3 (HW) and 2.4 (fetch loop) remain |
+| RP-2 | Follower fetch | `IN PROGRESS` | — | 2.1+2.2 `TESTED`; 2.4 (fetch loop) is the remaining core |
 | RP-3 | Leader epochs & truncation | `NOT STARTED` | — | The hard part. Gated behind RP-0 |
 | RP-4 | Delete the push stack | `NOT STARTED` | — | ~2,500 lines removed |
 
@@ -237,7 +237,7 @@ Every one surfaced only by running the conformance suite against a real 3-node c
 - [ ] Followers fetch above the high watermark; consumers remain capped at HW (needs RP-2.3)
 - [x] Test: follower fetch records progress, consumer fetch does not
 
-**Status**: `CODE COMPLETE`. Wired in cluster mode only, so single-node is untouched. The fetch doubles as a liveness signal, which under push needed a separate heartbeat-ACK mechanism — and that mechanism had two bugs only a live cluster exposed.
+**Status**: `TESTED` on a 3-node cluster. Wired in cluster mode only, so single-node is untouched. The fetch doubles as a liveness signal, which under push needed a separate heartbeat-ACK mechanism — and that mechanism had two bugs only a live cluster exposed.
 
 ### RP-2.2: Per-follower LEO tracking
 
@@ -245,7 +245,7 @@ Every one surfaced only by running the conformance suite against a real 3-node c
 - [x] Feeds the ISR computation from RP-1.2 (the same `IsrTracker`, now fed from fetches as well as ACKs)
 - [x] Expose per-follower lag in `/admin/status`
 
-**Status**: `CODE COMPLETE`. `/admin/status` now carries `replica_lag` (`node_id:lag` per follower) and `under_replicated` per partition.
+**Status**: `TESTED` on a 3-node cluster — with one replica killed, the leader reported `isr=[1,2]`, `under_replicated=true`, `replica_lag=[{node_id:2,lag:0}]`. `/admin/status` now carries `replica_lag` (`node_id:lag` per follower) and `under_replicated` per partition.
 
 `under_replicated` is the field worth alerting on, and it is exactly what should have been firing during the nine months `acks!=0` replicated nothing. `replica_lag` makes that alert actionable by naming the replica and the distance, instead of leaving an operator to exec into pods and list WAL directories — which is how the original outage actually had to be found.
 
@@ -270,7 +270,15 @@ Still leader-only: followers report to the leader, so a non-leader returns an em
 - [ ] On restart, resume from local LEO → **catch-up, for free**
 - [ ] Test: follower down 5 minutes, restarted, converges without operator action
 
-**Status**: —
+**Status**: `NOT STARTED` — the remaining core of RP-2. Design constraints established while building 2.1/2.2, so the next session does not have to rediscover them:
+
+**The follower needs a Kafka protocol *client*, and there isn't one.** `chronik-server` deliberately excludes `rdkafka`: it pulls in librdkafka, which does not cross-compile against musl without a vendored zlib/OpenSSL, and the crate comments call this out explicitly (the agent-memory feature is gated off for the same reason). So the fetch loop must hand-roll Fetch requests using the existing `chronik-protocol` encoders over a plain TCP socket. That is very doable — the encode/decode types are complete and the conformance suite covers them — but it is the bulk of the work and should be budgeted as such.
+
+**It cannot run alongside push.** Both mechanisms would deliver the same records and the follower would write duplicates. So the swap is atomic within the branch: RP-2.4 replaces the push receive path rather than sitting beside it. Land it behind an env gate (house style — `CHRONIK_HOT_TEXT_ENABLED` and friends do this) so the tree stays green while it is built, then flip the default once RP-2.3 lands and the conformance suite passes with pull.
+
+**Ordering: RP-2.4 must precede RP-2.3.** `HW = min(LEO across ISR)` is only safe once followers actually fetch. Do it first and the HW would be pinned by whatever the push ACKs last reported, stalling consumers whenever replication lagged.
+
+**What it deletes.** Once this works, the three mechanisms RP-1 had to fix — ACK channel for progress, heartbeat replies for liveness, connection pruning for restart detection — all become redundant. Each of those needed a live cluster to find its bug. A fetch offset is progress, liveness and resume position in one value.
 
 ---
 
