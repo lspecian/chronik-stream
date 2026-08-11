@@ -6,7 +6,7 @@
 
 | Phase | Name | Status | Version | Notes |
 |-------|------|--------|---------|-------|
-| RP-0 | Replication conformance suite | `NOT STARTED` | — | Guardrail. Must pass against **push** before RP-2 starts |
+| RP-0 | Replication conformance suite | `IN PROGRESS` | — | RP-0.1 `TESTED` — fails on v2.10.10, passes post-#29 |
 | RP-1 | Harden the current mechanism | `NOT STARTED` | — | Valuable standalone; independent of pull |
 | RP-2 | Follower fetch | `NOT STARTED` | — | `replica_id`, per-follower LEO, `HW = min(LEO)` |
 | RP-3 | Leader epochs & truncation | `NOT STARTED` | — | The hard part. Gated behind RP-0 |
@@ -113,12 +113,22 @@ That matters because of how the last two attempts died:
 
 ### RP-0.1: Placement assertions
 
-- [ ] Test helper: produce N records to an RF=3 topic at a given acks level, return per-node partition placement
-- [ ] Assert every replica physically holds every partition, for `acks=0`, `acks=1`, `acks=-1`
-- [ ] Assert consumed count equals produced count with no duplicates
-- [ ] Run against a real 3-node cluster (`tests/cluster/`), not mocks — the bug class is a *wiring* bug and mocks would have passed
+- [x] Test helper: produce N records to an RF=3 topic at a given acks level, return per-node partition placement
+- [x] Assert every replica physically holds every partition, for `acks=0`, `acks=1`, `acks=-1`
+- [x] Assert consumed count equals produced count (acks=0 exempt — fire-and-forget has no delivery guarantee)
+- [x] Run against a real 3-node cluster, not mocks — the bug class is a *wiring* bug and mocks would have passed
+- [x] `local` mode (`tests/cluster/`, kcat) and `k8s` mode (`REPL_MODE=k8s`, kubectl injectable so no lab host is hardcoded)
 
-**Status**: —
+**Status**: `TESTED`. `tests/cluster/regression_replication.sh`. Validated in **both** directions, which is the only way to know a regression test is real:
+
+| Cluster | acks=0 | acks=1 | acks=all | Result |
+|---|---|---|---|---|
+| chronik-thunderbird v2.10.10 (pre-#29) | `[0 1 2]` on all 3 | `[0]`,`[1]`,`[2]` | `[0]`,`[1]`,`[2]` | **FAIL** (correctly) |
+| post-#29 build | `[0 1 2]` on all 3 | `[0 1 2]` on all 3 | `[0 1 2]` on all 3 | **PASS** |
+
+Asserts against the *union* of partitions across nodes rather than a fixed `0..N`, so it stays honest however the client's partitioner distributed records.
+
+⚠️ Found while building this: `kafka-topics.sh --describe` fails against Chronik — `non-nullable field clusterId was serialized as null`. DescribeCluster returns a null cluster id that the Java AdminClient refuses to deserialize, breaking standard Kafka tooling. Filed separately; the RF assertion here is best-effort as a result, and physical placement carries the test.
 
 ### RP-0.2: Unit-level guards
 
