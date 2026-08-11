@@ -646,6 +646,31 @@ impl WalReplicationManager {
     ///
     /// Fallback: If no partition assignment found, uses static followers list.
     ///
+    /// Evict a follower from ISR because its connection is gone.
+    ///
+    /// The connection is the only liveness signal available in the push model. A
+    /// follower that was caught up when it died would otherwise stay in ISR
+    /// forever: the lag bound never fires for a caught-up replica, and it will
+    /// never ACK again, so nothing else can evict it. Heartbeats prune dead
+    /// connections every HEARTBEAT_INTERVAL, so this fires within about one
+    /// interval of a node going away.
+    ///
+    /// RP-2 removes the need for this — a follower's fetch is its own liveness
+    /// proof, which is how Kafka avoids the problem entirely.
+    fn mark_follower_down(&self, follower_addr: &str) {
+        let (Some(tracker), Some(config)) = (&self.isr_tracker, &self.cluster_config) else {
+            return;
+        };
+
+        if let Some(peer) = config.peer_nodes().iter().find(|p| p.wal == follower_addr) {
+            warn!(
+                "Follower node {} ({}) unreachable — removing from ISR",
+                peer.id, follower_addr
+            );
+            tracker.remove_node(peer.id);
+        }
+    }
+
     /// Returns: true if sent to at least one follower, false if all sends failed
     async fn send_to_followers(&self, record: &WalReplicationRecord) -> bool {
         let frame = match serialize_wal_frame(record) {
@@ -700,6 +725,7 @@ impl WalReplicationManager {
                     // Remove dead connection (connection manager will reconnect)
                     drop(conn); // Drop RefMut before removing
                     self.connections.remove(follower_addr);
+                    self.mark_follower_down(follower_addr);
                 } else {
                     // CRITICAL: Flush the TCP stream to actually send the data
                     // Without this, data sits in buffer and never reaches followers!
@@ -707,6 +733,7 @@ impl WalReplicationManager {
                         error!("Failed to flush WAL record to {}: {}", follower_addr, e);
                         drop(conn);
                         self.connections.remove(follower_addr);
+                        self.mark_follower_down(follower_addr);
                     } else {
                         info!("✅ Sent and flushed WAL record for {}-{} to follower: {} ({} bytes)",
                             record.topic, record.partition, follower_addr, frame.len());
@@ -741,10 +768,12 @@ impl WalReplicationManager {
                     debug!("Failed to send heartbeat to {}: {}", follower_addr, e);
                     drop(conn);
                     self.connections.remove(follower_addr);
+                    self.mark_follower_down(follower_addr);
                 } else if let Err(e) = conn.flush().await {
                     debug!("Failed to flush heartbeat to {}: {}", follower_addr, e);
                     drop(conn);
                     self.connections.remove(follower_addr);
+                    self.mark_follower_down(follower_addr);
                 } else {
                     debug!("Sent heartbeat to follower: {}", follower_addr);
                 }

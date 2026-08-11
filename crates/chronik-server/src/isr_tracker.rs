@@ -258,6 +258,23 @@ impl IsrTracker {
             .min()
     }
 
+    /// Drop everything known about a node, across all partitions.
+    ///
+    /// Called when the leader loses its connection to a follower. Without this, a
+    /// follower that was caught up when it died stays in ISR indefinitely: it is
+    /// caught up (so the lag bound never fires) and it will never ACK again (so
+    /// nothing else can evict it). Observed live — a node killed for 60s still
+    /// reported `isr=[1,2,3]`.
+    ///
+    /// Kafka does not need this because a follower proves liveness by continuing
+    /// to fetch. In the push model the only equivalent signal is the connection
+    /// itself, refreshed every heartbeat interval. RP-2 makes this unnecessary
+    /// again by moving to fetch.
+    pub fn remove_node(&self, node_id: u64) {
+        self.follower_offsets
+            .retain(|(nid, _), _| *nid != node_id);
+    }
+
     /// Remove follower state (e.g., when node leaves cluster)
     #[allow(dead_code)]
     pub fn remove_follower(&self, node_id: u64, topic: &str, partition: i32) {
@@ -378,6 +395,46 @@ mod tests {
         assert_eq!(tracker.sync_state(2, "t", 0, 100), SyncState::Lagging);
         assert!(!tracker.is_unknown_for_all("t", 0, &replicas, 1));
         assert!(tracker.get_isr("t", 0, 100, &replicas).is_empty());
+    }
+
+    /// A follower that dies while caught up must still leave ISR.
+    ///
+    /// Removing the time bound for caught-up replicas (so idle partitions keep
+    /// their ISR) creates the opposite hazard: a node killed while caught up is
+    /// in-sync forever, because the lag bound never fires and it will never ACK
+    /// again. Observed live — a node killed for 60s still reported isr=[1,2,3].
+    /// Losing the connection is what evicts it.
+    #[test]
+    fn dead_but_caught_up_follower_is_evicted_on_connection_loss() {
+        let tracker = IsrTracker::new(1000, 10_000);
+        let replicas = vec![1, 2, 3];
+
+        tracker.update_follower_offset(2, "t", 0, 100);
+        tracker.update_follower_offset(3, "t", 0, 100);
+        assert_eq!(tracker.get_isr("t", 0, 100, &replicas), vec![2, 3]);
+
+        // Node 3's connection drops. It stays "caught up" by offset, so only
+        // explicit eviction can remove it.
+        tracker.remove_node(3);
+
+        assert_eq!(tracker.get_isr("t", 0, 100, &replicas), vec![2]);
+        assert_eq!(tracker.sync_state(3, "t", 0, 100), SyncState::Unknown);
+    }
+
+    /// Eviction is per node, across every partition it replicated.
+    #[test]
+    fn remove_node_clears_all_partitions() {
+        let tracker = IsrTracker::new(1000, 10_000);
+
+        tracker.update_follower_offset(3, "a", 0, 10);
+        tracker.update_follower_offset(3, "b", 7, 20);
+        tracker.update_follower_offset(2, "a", 0, 10);
+
+        tracker.remove_node(3);
+
+        assert_eq!(tracker.sync_state(3, "a", 0, 10), SyncState::Unknown);
+        assert_eq!(tracker.sync_state(3, "b", 7, 20), SyncState::Unknown);
+        assert_eq!(tracker.sync_state(2, "a", 0, 10), SyncState::InSync, "other nodes untouched");
     }
 
     /// A backwards clock step must not eject healthy replicas.
