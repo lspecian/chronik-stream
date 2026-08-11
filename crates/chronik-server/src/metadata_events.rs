@@ -119,12 +119,18 @@ impl Default for MetadataEventBus {
     fn default() -> Self {
         // The buffer must exceed the largest burst a follower can fall behind on.
         // The worst burst is broadcast_all_topics() re-pushing the ENTIRE catalog
-        // (one TopicCreated per topic) in a tight loop on restart; if that burst
-        // exceeds the buffer, the follower's receiver lags and tokio::broadcast
-        // silently drops the OLDEST events — the topic catalog then diverges across
-        // nodes under load (observed: followers stuck at ~1500/1879 with buffer=1000).
+        // in a tight loop on restart; if that burst exceeds the buffer, the
+        // follower's receiver lags and tokio::broadcast silently drops the OLDEST
+        // events — the catalog then diverges across nodes under load (observed:
+        // followers stuck at ~1500/1879 with buffer=1000).
         //
-        // Default sized for tens of thousands of topics; override for larger
+        // That burst is now one TopicCreated per topic PLUS one PartitionAssigned
+        // per partition, so size against `topics * (1 + partitions_per_topic)`,
+        // not topic count. Assignments were added because a follower without them
+        // cannot tell who leads a partition, and under follower-pull that means it
+        // replicates nothing at all.
+        //
+        // Default sized for tens of thousands of partitions; override for larger
         // deployments via CHRONIK_METADATA_EVENT_BUFFER. Cost is ~event_size * N
         // held transiently (~tens of MB at 50k), only while followers are catching up.
         let buffer = std::env::var("CHRONIK_METADATA_EVENT_BUFFER")

@@ -640,16 +640,27 @@ impl WalMetadataStore {
         Ok(())
     }
 
-    /// Re-broadcast all topic metadata via the event bus.
+    /// Re-broadcast the whole catalog — topics **and** their partition
+    /// assignments — via the event bus.
     ///
-    /// Called by the leader after startup once metadata replication is wired up.
-    /// This ensures followers receive TopicCreated events for topics that were
-    /// created in previous pod lifecycles. Without this, followers that restart
-    /// would lose topic metadata (since replicated events weren't persisted to
-    /// their local WAL before the apply_replicated_event fix).
+    /// Called by the leader after startup once metadata replication is wired up,
+    /// so followers that restarted (or joined late, or missed an event) heal.
     ///
-    /// Safe to call multiple times — followers' apply_replicated_event is
-    /// idempotent (creates topic only if it doesn't exist).
+    /// ## Why assignments are not optional here
+    ///
+    /// This used to re-broadcast `TopicCreated` only. A healed follower then knew
+    /// every topic and *no* partition assignment — which under push cost nothing,
+    /// because the leader drives replication and only the leader's view has to be
+    /// right. Under follower-pull it is fatal: a follower with no assignment
+    /// cannot tell who leads a partition, so it fetches nothing and replicates
+    /// nothing, silently, while the leader's `/admin/status` still reports
+    /// `isr:[1,2,3]` from its own intact view.
+    ///
+    /// Measured on a 3-node cluster before this fix, same moment, 69 partitions:
+    /// node 1 knew a leader for 66, node 3 for 21, node 2 for **zero**.
+    ///
+    /// Safe to call repeatedly — `apply_replicated_event` is idempotent for both
+    /// event types (topic created only if absent; assignment is an upsert).
     pub async fn broadcast_all_topics(&self) -> usize {
         let publish_fn = match self.event_bus_publish {
             Some(ref f) => f,
@@ -682,7 +693,31 @@ impl WalMetadataStore {
                 "Re-broadcast TopicCreated to followers"
             );
         }
-        tracing::info!(topics_broadcast = count, "Metadata re-broadcast complete");
+        drop(topics);
+
+        // Partition assignments carry the leader, which is what a pulling
+        // follower needs in order to fetch at all. Broadcast them after the
+        // topics so a follower applying in order never sees an assignment for a
+        // topic it does not yet know.
+        let mut assignments_broadcast = 0;
+        for entry in self.state.partition_assignments.iter() {
+            let assignment = entry.value().clone();
+            if assignment.topic.starts_with("__") {
+                continue;
+            }
+            let event = MetadataEvent::new_with_node(
+                MetadataEventPayload::PartitionAssigned { assignment },
+                self.node_id,
+            );
+            publish_fn(event);
+            assignments_broadcast += 1;
+        }
+
+        tracing::info!(
+            topics_broadcast = count,
+            assignments_broadcast,
+            "Metadata re-broadcast complete"
+        );
         count
     }
 }
@@ -1388,5 +1423,135 @@ mod replication_filter_tests {
             partition: 0,
             segment_id: "s0".to_string(),
         }));
+    }
+}
+
+#[cfg(test)]
+mod catalog_healing_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// The leader's startup re-broadcast is how a follower that restarted, joined
+    /// late, or missed an event gets its catalog back. It must carry partition
+    /// assignments, not just topics.
+    ///
+    /// Topics alone leave a follower knowing every topic and no leader for any
+    /// partition. Under push that was survivable — the leader drives replication,
+    /// so only its view had to be right. Under follower-pull the follower must
+    /// know who to fetch from, so an assignment-less heal means it replicates
+    /// nothing at all, silently, while the leader still reports isr:[1,2,3].
+    ///
+    /// Measured on a 3-node cluster before this: node 1 knew a leader for 66 of
+    /// 69 partitions, node 3 for 21, node 2 for zero.
+    #[tokio::test]
+    async fn the_startup_rebroadcast_carries_assignments_not_just_topics() {
+        let wal_append: WalAppendFn = Arc::new(|_bytes| Box::pin(async { Ok(0i64) }));
+        let mut store = WalMetadataStore::new(1, wal_append);
+
+        let published: Arc<Mutex<Vec<MetadataEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&published);
+        store.set_event_bus(Arc::new(move |event: MetadataEvent| {
+            sink.lock().unwrap().push(event);
+            1
+        }));
+
+        let mut config = TopicConfig::default();
+        config.partition_count = 3;
+        store.create_topic("orders", config).await.unwrap();
+
+        for partition in 0..3u32 {
+            store
+                .assign_partition(PartitionAssignment {
+                    topic: "orders".to_string(),
+                    partition,
+                    broker_id: 1,
+                    is_leader: true,
+                    replicas: vec![1, 2, 3],
+                    leader_id: (partition as u64 % 3) + 1,
+                })
+                .await
+                .unwrap();
+        }
+
+        published.lock().unwrap().clear();
+        store.broadcast_all_topics().await;
+
+        let events = published.lock().unwrap().clone();
+        let topics: Vec<&MetadataEvent> = events
+            .iter()
+            .filter(|e| matches!(e.payload, MetadataEventPayload::TopicCreated { .. }))
+            .collect();
+        let assignments: Vec<&MetadataEvent> = events
+            .iter()
+            .filter(|e| matches!(e.payload, MetadataEventPayload::PartitionAssigned { .. }))
+            .collect();
+
+        assert_eq!(topics.len(), 1, "the topic itself must still be re-broadcast");
+        assert_eq!(
+            assignments.len(),
+            3,
+            "every partition's assignment must be re-broadcast, or a pulling follower \
+             cannot find a leader and replicates nothing"
+        );
+
+        // The leader id is the field that matters — it is what the follower fetches from.
+        let mut leaders: Vec<u64> = assignments
+            .iter()
+            .map(|e| match &e.payload {
+                MetadataEventPayload::PartitionAssigned { assignment } => assignment.leader_id,
+                _ => unreachable!(),
+            })
+            .collect();
+        leaders.sort();
+        assert_eq!(leaders, vec![1, 2, 3], "each partition's leader must survive the heal");
+    }
+
+    /// Topics must be broadcast before the assignments that reference them, so a
+    /// follower applying in order never sees an assignment for a topic it does
+    /// not yet know.
+    #[tokio::test]
+    async fn topics_are_broadcast_before_their_assignments() {
+        let wal_append: WalAppendFn = Arc::new(|_bytes| Box::pin(async { Ok(0i64) }));
+        let mut store = WalMetadataStore::new(1, wal_append);
+
+        let published: Arc<Mutex<Vec<MetadataEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&published);
+        store.set_event_bus(Arc::new(move |event: MetadataEvent| {
+            sink.lock().unwrap().push(event);
+            1
+        }));
+
+        let mut config = TopicConfig::default();
+        config.partition_count = 1;
+        store.create_topic("orders", config).await.unwrap();
+        store
+            .assign_partition(PartitionAssignment {
+                topic: "orders".to_string(),
+                partition: 0,
+                broker_id: 1,
+                is_leader: true,
+                replicas: vec![1, 2, 3],
+                leader_id: 1,
+            })
+            .await
+            .unwrap();
+
+        published.lock().unwrap().clear();
+        store.broadcast_all_topics().await;
+
+        let events = published.lock().unwrap().clone();
+        let first_assignment = events
+            .iter()
+            .position(|e| matches!(e.payload, MetadataEventPayload::PartitionAssigned { .. }))
+            .expect("an assignment must be broadcast");
+        let last_topic = events
+            .iter()
+            .rposition(|e| matches!(e.payload, MetadataEventPayload::TopicCreated { .. }))
+            .expect("a topic must be broadcast");
+
+        assert!(
+            last_topic < first_assignment,
+            "assignments must follow the topics they belong to"
+        );
     }
 }

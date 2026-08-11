@@ -382,12 +382,18 @@ impl IntegratedKafkaServerBuilder {
 
         info!("✅ Metadata replication initialized with event listener");
 
-        // Periodically re-broadcast all topic metadata to followers.
+        // Periodically re-broadcast the catalog to followers.
         //
         // This is the catalog anti-entropy loop. It re-publishes TopicCreated
-        // events to the event bus so the MetadataWalReplicator sends them to
-        // followers, letting any node that missed events (down, disconnected,
-        // still recovering) converge within one period.
+        // *and* PartitionAssigned events to the event bus so the
+        // MetadataWalReplicator sends them to followers, letting any node that
+        // missed events (down, disconnected, still recovering) converge within
+        // one period.
+        //
+        // Assignments matter as much as topics: they carry the partition leader,
+        // and a follower that does not know who leads a partition cannot fetch it
+        // at all under follower-pull. Healing topics alone left a node knowing
+        // every topic and replicating nothing.
         //
         // This MUST be periodic, not a fixed number of startup shots: the old
         // 45s/120s two-shot was tuned for fast startups and permanently missed
