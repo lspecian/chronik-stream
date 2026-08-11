@@ -55,11 +55,32 @@ pub struct IsrTracker {
     /// Follower offsets per partition: (node_id, partition) -> state
     follower_offsets: DashMap<(u64, PartitionKey), FollowerState>,
 
+    /// Last time each node was heard from at all, in ms since epoch.
+    ///
+    /// Separate from per-partition offsets because liveness is a property of the
+    /// node, not the partition. A caught-up replica produces no partition ACKs
+    /// when its partitions are idle, so without a node-level beat there is no way
+    /// to tell "caught up and healthy" from "caught up and dead" — a node killed
+    /// for 60s kept reporting in-sync. Fed by heartbeat ACKs.
+    ///
+    /// Connection state is NOT usable for this: a TCP write succeeds into the
+    /// local send buffer long after the peer is gone, so a failed write detects
+    /// death minutes late, if at all.
+    node_last_seen_ms: DashMap<u64, u64>,
+
     /// Maximum lag in number of entries before marking out-of-sync
     max_lag_entries: u64,
 
     /// Maximum lag in milliseconds before marking out-of-sync
     max_lag_ms: u64,
+
+    /// How long a node may go unheard before it counts as dead.
+    ///
+    /// Deliberately wider than `max_lag_ms`: liveness is proven by heartbeat
+    /// replies which arrive on the heartbeat interval, so a bound equal to that
+    /// interval would flap on ordinary jitter. Three intervals absorbs a missed
+    /// beat without holding a genuinely dead node in ISR for long.
+    node_liveness_ms: u64,
 }
 
 impl IsrTracker {
@@ -71,9 +92,41 @@ impl IsrTracker {
     pub fn new(max_lag_entries: u64, max_lag_ms: u64) -> Self {
         Self {
             follower_offsets: DashMap::new(),
+            node_last_seen_ms: DashMap::new(),
             max_lag_entries,
             max_lag_ms,
+            node_liveness_ms: max_lag_ms.saturating_mul(3),
         }
+    }
+
+    /// Record that `node_id` is alive right now.
+    ///
+    /// Called on every ACK, including the liveness ACK a follower sends in reply
+    /// to a heartbeat. That reply is what keeps an idle-but-healthy replica in
+    /// ISR while still evicting a dead one.
+    pub fn record_node_alive(&self, node_id: u64) {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        self.node_last_seen_ms.insert(node_id, now_ms);
+    }
+
+    /// Whether `node_id` has been heard from within the liveness bound.
+    ///
+    /// Unknown nodes count as alive: at startup nothing has been heard from
+    /// anyone, and the caller (`is_unknown_for_all`) handles that case
+    /// separately. Treating unknown as dead here would wrongly empty ISR before
+    /// the first heartbeat.
+    fn node_is_alive(&self, node_id: u64) -> bool {
+        let Some(last) = self.node_last_seen_ms.get(&node_id) else {
+            return true;
+        };
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        now_ms.saturating_sub(*last) <= self.node_liveness_ms
     }
 
     /// Check if a follower is in-sync for a partition
@@ -124,7 +177,15 @@ impl IsrTracker {
             return SyncState::Unknown;
         };
 
-        // Caught up (or ahead) — in-sync regardless of elapsed time.
+        // Liveness first: a node we have stopped hearing from is out, however
+        // far along its last reported offset was. Without this a replica that
+        // died while caught up stays in-sync forever, since the lag bound below
+        // never fires for a caught-up replica and it will never ACK again.
+        if !self.node_is_alive(node_id) {
+            return SyncState::Lagging;
+        }
+
+        // Caught up (or ahead) and alive — in-sync regardless of elapsed time.
         if state.last_offset >= leader_offset {
             return SyncState::InSync;
         }
@@ -403,7 +464,57 @@ mod tests {
     /// their ISR) creates the opposite hazard: a node killed while caught up is
     /// in-sync forever, because the lag bound never fires and it will never ACK
     /// again. Observed live — a node killed for 60s still reported isr=[1,2,3].
-    /// Losing the connection is what evicts it.
+    ///
+    /// Liveness is what evicts it, proven by heartbeat replies. Connection state
+    /// cannot do this job: a TCP write lands in the local send buffer long after
+    /// the peer is gone, so a failed write detects death minutes late — which is
+    /// exactly why the first attempt at this fix did nothing on a real cluster.
+    #[test]
+    fn dead_but_caught_up_follower_leaves_isr_when_it_stops_answering() {
+        let tracker = IsrTracker::new(1000, 10_000);
+        let replicas = vec![1, 2, 3];
+
+        tracker.update_follower_offset(2, "t", 0, 100);
+        tracker.update_follower_offset(3, "t", 0, 100);
+        tracker.record_node_alive(2);
+        tracker.record_node_alive(3);
+        assert_eq!(tracker.get_isr("t", 0, 100, &replicas), vec![2, 3]);
+
+        // Node 3 stops answering heartbeats. Backdate its last-seen past the
+        // liveness window; its offset still says "caught up".
+        let stale = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            - (10_000 * 3 + 1_000);
+        tracker.node_last_seen_ms.insert(3, stale);
+
+        assert_eq!(tracker.sync_state(3, "t", 0, 100), SyncState::Lagging);
+        assert_eq!(tracker.get_isr("t", 0, 100, &replicas), vec![2]);
+    }
+
+    /// The liveness window must be wider than the heartbeat interval or ISR
+    /// flaps on ordinary jitter — a node one heartbeat late is not dead.
+    #[test]
+    fn liveness_window_tolerates_a_missed_heartbeat() {
+        let tracker = IsrTracker::new(1000, 10_000);
+        tracker.update_follower_offset(2, "t", 0, 100);
+
+        let one_beat_late = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            - 15_000; // 1.5 heartbeat intervals
+        tracker.node_last_seen_ms.insert(2, one_beat_late);
+
+        assert_eq!(
+            tracker.sync_state(2, "t", 0, 100),
+            SyncState::InSync,
+            "a single missed heartbeat must not eject a healthy replica"
+        );
+    }
+
+    /// Explicit eviction still works for a node genuinely removed from the cluster.
     #[test]
     fn dead_but_caught_up_follower_is_evicted_on_connection_loss() {
         let tracker = IsrTracker::new(1000, 10_000);
@@ -413,8 +524,6 @@ mod tests {
         tracker.update_follower_offset(3, "t", 0, 100);
         assert_eq!(tracker.get_isr("t", 0, 100, &replicas), vec![2, 3]);
 
-        // Node 3's connection drops. It stays "caught up" by offset, so only
-        // explicit eviction can remove it.
         tracker.remove_node(3);
 
         assert_eq!(tracker.get_isr("t", 0, 100, &replicas), vec![2]);

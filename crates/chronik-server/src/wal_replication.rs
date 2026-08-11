@@ -984,6 +984,21 @@ impl WalReplicationManager {
 
                 match bincode::deserialize::<WalAckMessage>(payload) {
                     Ok(ack_msg) => {
+                        // Any ACK proves the node is alive; a heartbeat reply
+                        // (empty topic) carries nothing else. This is what keeps
+                        // an idle-but-healthy replica in ISR while still evicting
+                        // one that has died.
+                        if let Some(ref tracker) = isr_tracker {
+                            tracker.record_node_alive(ack_msg.node_id);
+                        }
+                        if ack_msg.topic.is_empty() {
+                            debug!(
+                                "Liveness ACK from {} (node {})",
+                                follower_addr, ack_msg.node_id
+                            );
+                            continue;
+                        }
+
                         info!(
                             "✅ ACK RECEIVED from {}: {}-{} offset {} (node {})",
                             follower_addr,
@@ -1997,11 +2012,31 @@ impl WalReceiver {
                 let frame_size = 8 + total_length; // header + payload
 
                 if magic == HEARTBEAT_MAGIC {
-                    // Heartbeat frame - just consume it
                     if buffer.len() >= 8 {
                         buffer.advance(8);
                         debug!("WAL receiver: Received heartbeat");
-                        // Note: Global heartbeat - we'll track per-partition when we receive data
+
+                        // Answer it. This reply is the only liveness signal the
+                        // leader gets from a follower whose partitions are idle,
+                        // and ISR depends on it: without a beat, a replica that
+                        // died while caught up can never be evicted, because the
+                        // lag bound does not fire for a caught-up replica.
+                        //
+                        // Connection state cannot substitute — a TCP write lands
+                        // in the local send buffer long after the peer is gone.
+                        //
+                        // Carried on the existing ACK frame with an empty topic,
+                        // so the format is unchanged; the leader reads an empty
+                        // topic as "liveness only, no offset".
+                        let liveness = WalAckMessage {
+                            topic: String::new(),
+                            partition: -1,
+                            offset: -1,
+                            node_id,
+                        };
+                        if let Err(e) = Self::send_ack(&mut stream, &liveness).await {
+                            debug!("Failed to send heartbeat ACK: {}", e);
+                        }
                     }
                     continue;
                 }

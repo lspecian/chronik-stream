@@ -187,10 +187,60 @@ for acks in 0 1 all; do
   fi
 done
 
+# ---------------------------------------------------- RP-0.3: ISR honesty --
+# ISR must shrink when a replica dies. This is the assertion that would have
+# caught the original outage: /admin/status reported isr:[1,2,3] for nine months
+# while zero follower copies existed on disk.
+#
+# It also guards the two ways the honest version can go wrong, both of which we
+# hit while building it:
+#   - reporting the assignment whenever the tracker is empty (everything looks
+#     healthy precisely when nothing is replicating);
+#   - never evicting a follower that was caught up when it died (a node killed
+#     for 60s still showed isr=[1,2,3]).
+if [ "$MODE" = "k8s" ] && [ "$FAIL" -eq 0 ]; then
+  say ""
+  say "-- ISR honesty: killing a replica, ISR must shrink"
+
+  admin_ip=$($KUBECTL get pod "${PODS}-1" -n "$NS" -o jsonpath='{.status.podIP}' 2>/dev/null)
+  isr_of() { # $1=topic
+    $KUBECTL exec -n "$NS" "$CLIENT" -- sh -c \
+      "curl -s -m 15 http://$admin_ip:6092/admin/status" 2>/dev/null \
+      | tr '{' '\n' | grep "\"topic\":\"$1\"" | grep -o '"isr":\[[^]]*\]' | tr '\n' ' '
+  }
+
+  topic="replplace-all-$$"
+  before=$(isr_of "$topic")
+  say "   before: $before"
+
+  $KUBECTL delete pod "${PODS}-3" -n "$NS" --wait=false >/dev/null 2>&1
+
+  shrunk=0
+  deadline=$((SECONDS + 90))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    now=$(isr_of "$topic")
+    # Node 3 gone from every partition's ISR that still reports.
+    if [ -n "$now" ] && ! echo "$now" | grep -q '3'; then shrunk=1; break; fi
+    sleep 5
+  done
+
+  after=$(isr_of "$topic")
+  say "   after:  $after"
+  [ "$shrunk" -eq 1 ] \
+    || fail "ISR still lists the dead replica after 90s — /admin/status is over-reporting health"
+
+  # Let the pod come back so the cluster is left usable.
+  for i in $(seq 1 30); do
+    r=$($KUBECTL get pods -n "$NS" --no-headers 2>/dev/null | grep -c "^${PODS}-.* 1/1 *Running")
+    [ "$r" -ge 3 ] && break
+    sleep 5
+  done
+fi
+
 $teardown
 say ""
 if [ "$FAIL" -eq 0 ]; then
-  say "== PASS: every replica holds every partition at acks=0, 1 and all =="
+  say "== PASS: every replica holds every partition at acks=0, 1 and all; ISR tracks reality =="
 else
   say "== FAIL: see messages above =="
 fi
