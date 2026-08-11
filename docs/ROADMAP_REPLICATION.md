@@ -12,7 +12,25 @@
 | RP-3 | Leader epochs & truncation | `NOT STARTED` | — | The hard part. Gated behind RP-0 |
 | RP-4 | Delete the push stack | `NOT STARTED` | — | ~2,500 lines removed |
 
-Phases RP-0 and RP-1 are worth doing **even if RP-2 onward never happens**. Every phase leaves the system strictly better than it found it; none leaves a half-migrated mechanism behind.
+---
+
+## Working Model
+
+**This is a breaking change. All work happens on `feat/follower-pull-replication` and nothing releases until the whole thing is complete and tested.**
+
+- **One long-lived branch.** Phases are checkpoints on that branch, not releases. No incremental merges to `main`, no intermediate tags.
+- **Rebase onto `main` regularly** — weekly at minimum, and after any release. A stale long-lived branch is its own failure mode in this repo (`origin/feat/memory-hybrid-infra-and-quality` became an unusable pre-rebase snapshot exactly this way).
+- **Escape hatch**: RP-0 and RP-1 touch the *existing* mechanism and don't depend on pull. If the effort stalls, they can be cherry-picked to `main` on their own and still leave the system better. That is a fallback, not the plan.
+- **Definition of done for release**: every RP-0 test green (including the ones that start `#[ignore]`), a soak on a real 3-node cluster, and the perf numbers in `BASELINE_PERFORMANCE.md` / `BARE_METAL_PERFORMANCE.md` re-measured against the new mechanism.
+
+### Breaking changes this ships
+
+| Change | Consequence |
+|---|---|
+| Replication protocol replaced by Fetch | **No mixed-version cluster.** A pull follower cannot replicate from a push leader, so a rolling upgrade across the boundary does not work — see Open Question 5 |
+| `HW = min(LEO across ISR)` | Consumers may observe *less* than today during follower lag. Today HW is the leader's own write position, which over-reports |
+| WAL replication port 9291 retired | Config, CRD, operator and firewall rules all change |
+| `acks=all` actually waits | Latency increases for `acks=-1` producers; some workloads will feel it |
 
 ---
 
@@ -277,6 +295,7 @@ Answer before the phase that depends on them.
 2. **Does `__chronik_metadata` move to pull, or keep a minimal push transport?** (blocks RP-4) — it is the one topic where push currently works correctly, including retry.
 3. **What lag bound defines ISR?** (blocks RP-1.2) — Kafka uses time (`replica.lag.time.max.ms`). Offset-based lag misbehaves with uneven partition rates.
 4. **Does HW-from-ISR change observable consumer behaviour in existing tests?** (blocks RP-2.3) — consumers currently see the leader's write position; under Kafka semantics they would see less during follower lag.
+5. **How does an existing cluster upgrade across the push→pull boundary?** (blocks release, not any phase) — a pull follower cannot replicate from a push leader, so a rolling upgrade breaks replication mid-roll. Options: accept a full-cluster restart in the release notes; or keep the push *receive* path for one release so new leaders can still feed old followers. The second reintroduces coexistence, which we rejected for the steady state — but a bounded upgrade window is a different question from a permanent flag. **Decide before RP-4 deletes the receive path.**
 
 ---
 
