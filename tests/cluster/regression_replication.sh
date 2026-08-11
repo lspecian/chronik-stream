@@ -204,14 +204,20 @@ if [ "$MODE" = "k8s" ] && [ "$FAIL" -eq 0 ]; then
 
   # curl from a BROKER pod, not the Kafka client pod: the apache/kafka image has
   # no curl, while the chronik image installs it (Dockerfile.binary).
-  isr_of() { # $1=topic
+  #
+  # Only inspect partitions this node LEADS. Followers ACK to the partition
+  # leader, so only the leader's tracker has real data; a non-leader legitimately
+  # falls back to reporting the assignment. Asserting against a non-leader's view
+  # would be testing the fallback, not ISR.
+  isr_of_led() { # $1=topic — ISR of the partitions node 1 leads
     $KUBECTL exec -n "$NS" "${PODS}-1" -- \
       curl -s -m 15 http://localhost:6092/admin/status 2>/dev/null \
-      | tr '{' '\n' | grep "\"topic\":\"$1\"" | grep -o '"isr":\[[^]]*\]' | tr '\n' ' '
+      | tr '{' '\n' | grep "\"topic\":\"$1\"" | grep '"leader":1,' \
+      | grep -o '"isr":\[[^]]*\]' | tr '\n' ' '
   }
 
   topic="replplace-all-$$"
-  before=$(isr_of "$topic")
+  before=$(isr_of_led "$topic")
   say "   before: $before"
 
   $KUBECTL delete pod "${PODS}-3" -n "$NS" --wait=false >/dev/null 2>&1
@@ -219,13 +225,13 @@ if [ "$MODE" = "k8s" ] && [ "$FAIL" -eq 0 ]; then
   shrunk=0
   deadline=$((SECONDS + 90))
   while [ "$SECONDS" -lt "$deadline" ]; do
-    now=$(isr_of "$topic")
+    now=$(isr_of_led "$topic")
     # Node 3 gone from every partition's ISR that still reports.
     if [ -n "$now" ] && ! echo "$now" | grep -q '3'; then shrunk=1; break; fi
     sleep 5
   done
 
-  after=$(isr_of "$topic")
+  after=$(isr_of_led "$topic")
   say "   after:  $after"
   [ "$shrunk" -eq 1 ] \
     || fail "ISR still lists the dead replica after 90s — /admin/status is over-reporting health"
