@@ -220,7 +220,46 @@ impl IsrTracker {
             .collect()
     }
 
+    /// Lowest offset acknowledged by every follower still keeping up, or `None`
+    /// when no follower is tracked for this partition.
+    ///
+    /// This is the retention interlock's input — Postgres's replication slot in
+    /// miniature. WAL at or below this offset has reached every live follower and
+    /// is safe to discard; above it, discarding would strand a replica with no
+    /// way to obtain the data, because nothing in the system re-sends it.
+    ///
+    /// Followers silent beyond `max_lag_ms` are deliberately excluded. They have
+    /// fallen out of ISR and must resync; letting them pin WAL forever would let
+    /// one dead node fill the disk. This matches Kafka, where retention is
+    /// independent of a follower that has dropped out.
+    ///
+    /// `None` means "no replication in play" (single node, or nothing acked yet)
+    /// and callers must treat it as *no* interlock, preserving prior behaviour.
+    pub fn min_acked_offset_of_live_followers(
+        &self,
+        topic: &str,
+        partition: i32,
+    ) -> Option<i64> {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        self.follower_offsets
+            .iter()
+            .filter(|entry| {
+                let (_, (t, p)) = entry.key();
+                t == topic && *p == partition
+            })
+            .filter(|entry| {
+                now_ms.saturating_sub(entry.value().last_update_ms) <= self.max_lag_ms
+            })
+            .map(|entry| entry.value().last_offset)
+            .min()
+    }
+
     /// Remove follower state (e.g., when node leaves cluster)
+    #[allow(dead_code)]
     pub fn remove_follower(&self, node_id: u64, topic: &str, partition: i32) {
         let key = (node_id, (topic.to_string(), partition));
         self.follower_offsets.remove(&key);
@@ -244,6 +283,16 @@ impl IsrTracker {
 impl Default for IsrTracker {
     fn default() -> Self {
         Self::new(10_000, 10_000) // Default: 10K entries, 10s timeout
+    }
+}
+
+/// RP-1.1: lets the WalIndexer hold WAL retention until followers have the data.
+///
+/// The indexer only learns "has every live follower got up to offset N?" — it
+/// deliberately knows nothing about ISR, ACK frames or node ids.
+impl chronik_storage::wal_indexer::ReplicationProgress for IsrTracker {
+    fn min_replicated_offset(&self, topic: &str, partition: i32) -> Option<i64> {
+        self.min_acked_offset_of_live_followers(topic, partition)
     }
 }
 

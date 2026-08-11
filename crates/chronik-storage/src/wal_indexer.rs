@@ -293,6 +293,12 @@ pub struct WalIndexer {
     /// already-persisted records from WAL, reducing memory usage.
     hot_buffer: Arc<RwLock<Option<Arc<HotDataBuffer>>>>,
 
+    /// RP-1.1: Optional follower-progress source for the retention interlock.
+    /// When present, a WAL segment holding records no live follower has yet
+    /// acknowledged is kept rather than deleted after indexing. Decoupled via a
+    /// trait so chronik-storage need not depend on the server's IsrTracker.
+    replication_progress: Arc<RwLock<Option<Arc<dyn ReplicationProgress>>>>,
+
     /// HP-1.4/HP-2.6: Listeners notified after each successful cold Tantivy
     /// commit. Each listener evicts its in-memory view of offsets that are
     /// now in cold storage. Multiple listeners are supported so both the hot
@@ -319,6 +325,27 @@ pub trait ColdFlushListener: Send + Sync + 'static {
     /// sealed with records up to `max_offset`. The listener is responsible
     /// for evicting its in-memory view of offsets ≤ `max_offset`.
     fn notify_cold_flushed(&self, topic: String, partition: i32, max_offset: i64);
+}
+
+/// RP-1.1: Source of follower replication progress, for the retention interlock.
+///
+/// Indexing a WAL segment does not mean its records reached the replicas. Nothing
+/// in the system re-sends a record a follower missed, so deleting WAL that has
+/// not yet been replicated strands that data on one node permanently — the same
+/// class of loss as deleting WAL whose object-store upload failed (v2.10.10),
+/// reached by a different route.
+pub trait ReplicationProgress: Send + Sync + 'static {
+    /// Lowest offset acknowledged by every follower still keeping up with
+    /// `(topic, partition)`.
+    ///
+    /// `None` means no replication is in play — single node, or nothing
+    /// acknowledged yet — and callers must apply no interlock at all, so
+    /// single-node deployments behave exactly as before.
+    ///
+    /// Followers that have fallen too far behind are expected to be excluded by
+    /// the implementation: they must resync rather than pin WAL forever, or one
+    /// dead node would fill the disk.
+    fn min_replicated_offset(&self, topic: &str, partition: i32) -> Option<i64>;
 }
 
 impl WalIndexer {
@@ -384,6 +411,7 @@ impl WalIndexer {
             vector_index_manager,
             is_leader: is_leader.unwrap_or_else(|| Arc::new(AtomicBool::new(true))),
             hot_buffer: Arc::new(RwLock::new(None)),
+            replication_progress: Arc::new(RwLock::new(None)),
             cold_flush_listener: Arc::new(RwLock::new(Vec::new())),
             hot_vector_index: Arc::new(RwLock::new(None)),
         }
@@ -583,6 +611,7 @@ impl WalIndexer {
         let vector_index_manager = Arc::clone(&self.vector_index_manager);
         let is_leader = Arc::clone(&self.is_leader);
         let hot_buffer = Arc::clone(&self.hot_buffer);
+        let replication_progress = Arc::clone(&self.replication_progress);
         let cold_flush_listener = Arc::clone(&self.cold_flush_listener);
         let hot_vector_index = Arc::clone(&self.hot_vector_index);
         let snapshot_interval = self.config.snapshot_interval_secs();
@@ -654,6 +683,7 @@ impl WalIndexer {
                     &vector_index_manager,
                     &is_leader,
                     &hot_buffer,
+                    &replication_progress,
                     &cold_flush_listener,
                     &hot_vector_index,
                 ).await {
@@ -710,13 +740,14 @@ impl WalIndexer {
             &self.vector_index_manager,
             &self.is_leader,
             &self.hot_buffer,
+            &self.replication_progress,
             &self.cold_flush_listener,
             &self.hot_vector_index,
         ).await
     }
 
     /// Index sealed segments (internal implementation)
-    #[instrument(skip(config, wal_manager, object_store, segment_index, metadata_store, indexing_in_progress, indexed_segments, vector_index_manager, is_leader, hot_buffer, cold_flush_listener, hot_vector_index))]
+    #[instrument(skip(config, wal_manager, object_store, segment_index, metadata_store, indexing_in_progress, indexed_segments, vector_index_manager, is_leader, hot_buffer, replication_progress, cold_flush_listener, hot_vector_index))]
     async fn index_sealed_segments_internal(
         config: &WalIndexerConfig,
         wal_manager: &Arc<WalManager>,
@@ -728,6 +759,7 @@ impl WalIndexer {
         vector_index_manager: &Arc<VectorIndexManager>,
         is_leader: &Arc<AtomicBool>,
         hot_buffer: &Arc<RwLock<Option<Arc<HotDataBuffer>>>>,
+        replication_progress: &Arc<RwLock<Option<Arc<dyn ReplicationProgress>>>>,
         cold_flush_listener: &Arc<RwLock<Vec<Arc<dyn ColdFlushListener>>>>,
         hot_vector_index: &Arc<RwLock<Option<Arc<chronik_columnar::hot_vector_index::HotVectorIndex>>>>,
     ) -> Result<IndexingStats> {
@@ -874,6 +906,7 @@ impl WalIndexer {
                 &mut stats,
                 is_leader,
                 hot_buffer,
+                replication_progress,
                 cold_flush_listener,
                 hot_vector_index,
             ).await {
@@ -919,8 +952,46 @@ impl WalIndexer {
         delete_after_index && errors_now == errors_at_start
     }
 
+    /// RP-1.1 retention interlock: whether every record in this pass has reached
+    /// the followers.
+    ///
+    /// `tp_max_offsets` is the highest offset indexed per partition in this
+    /// segment. A partition holds the segment back when a live follower has not
+    /// acknowledged that far, because nothing re-sends what a follower missed —
+    /// deleting here would strand the data on one node with no recovery path.
+    ///
+    /// With no progress source (single node, or replication not configured) this
+    /// returns true and behaviour is unchanged.
+    fn fully_replicated(
+        progress: Option<&Arc<dyn ReplicationProgress>>,
+        tp_max_offsets: &[(TopicPartition, i64)],
+    ) -> Result<()> {
+        let Some(progress) = progress else {
+            return Ok(());
+        };
+
+        for (tp, max_offset) in tp_max_offsets {
+            // None = no live follower tracked → no interlock for this partition.
+            if let Some(acked) = progress.min_replicated_offset(&tp.topic, tp.partition) {
+                if acked < *max_offset {
+                    return Err(Error::Internal(format!(
+                        "{}-{} replicated only to offset {} of {}",
+                        tp.topic, tp.partition, acked, max_offset
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Attach a follower-progress source for the retention interlock (RP-1.1).
+    pub async fn set_replication_progress(&self, progress: Arc<dyn ReplicationProgress>) {
+        *self.replication_progress.write().await = Some(progress);
+        info!("Replication progress wired to WalIndexer — WAL retention now waits for followers");
+    }
+
     /// Index a single sealed WAL segment
-    #[instrument(skip(config, wal_manager, object_store, segment_index, metadata_store, vector_index_manager, stats, is_leader, hot_buffer, cold_flush_listener, hot_vector_index))]
+    #[instrument(skip(config, wal_manager, object_store, segment_index, metadata_store, vector_index_manager, stats, is_leader, hot_buffer, replication_progress, cold_flush_listener, hot_vector_index))]
     async fn index_segment(
         config: &WalIndexerConfig,
         wal_manager: &Arc<WalManager>,
@@ -932,6 +1003,7 @@ impl WalIndexer {
         stats: &mut IndexingStats,
         is_leader: &Arc<AtomicBool>,
         hot_buffer: &Arc<RwLock<Option<Arc<HotDataBuffer>>>>,
+        replication_progress: &Arc<RwLock<Option<Arc<dyn ReplicationProgress>>>>,
         cold_flush_listener: &Arc<RwLock<Vec<Arc<dyn ColdFlushListener>>>>,
         hot_vector_index: &Arc<RwLock<Option<Arc<chronik_columnar::hot_vector_index::HotVectorIndex>>>>,
     ) -> Result<()> {
@@ -985,6 +1057,17 @@ impl WalIndexer {
 
         // Collect vector embedding work for concurrent processing after the main loop
         let mut vector_work_items: Vec<(TopicPartition, Vec<CanonicalRecord>)> = Vec::new();
+
+        // RP-1.1: highest offset this segment carries per partition, so the
+        // retention interlock below can ask whether followers have it yet.
+        let mut tp_max_offsets: Vec<(TopicPartition, i64)> = tp_records
+            .iter()
+            .map(|(tp, records)| {
+                let max = records.iter().map(|r| r.last_offset()).max().unwrap_or(-1);
+                (tp.clone(), max)
+            })
+            .collect();
+        tp_max_offsets.retain(|(_, max)| *max >= 0);
 
         // Process each topic-partition: upload raw segments + create Tantivy indexes
         for (tp, canonical_records) in tp_records {
@@ -1272,7 +1355,21 @@ impl WalIndexer {
         // critically a raw-segment upload to the object store), keep the WAL
         // copy so the durable data isn't lost from both tiers; the caller won't
         // mark this segment indexed, so the next run retries and re-uploads it.
-        if Self::may_delete_wal_segment(config.delete_after_index, errors_at_start, stats.errors) {
+        // RP-1.1 retention interlock: indexed does not mean replicated. Nothing
+        // re-sends a record a follower missed, so deleting WAL the followers do
+        // not have yet strands it on one node permanently.
+        let replication_gap = {
+            let guard = replication_progress.read().await;
+            Self::fully_replicated(guard.as_ref(), &tp_max_offsets).err()
+        };
+
+        if let Some(gap) = replication_gap {
+            warn!(
+                segment = %segment_id,
+                reason = %gap,
+                "Keeping WAL segment — not yet replicated to followers"
+            );
+        } else if Self::may_delete_wal_segment(config.delete_after_index, errors_at_start, stats.errors) {
             wal_manager.delete_segment(segment_id).await
                 .map_err(|e| Error::Internal(format!("Failed to delete segment {}: {}", segment_id, e)))?;
             info!(segment = %segment_id, "Deleted WAL segment after indexing");
@@ -2321,6 +2418,70 @@ mod tests {
         assert_eq!(config.interval_secs, 30);
         assert_eq!(config.min_segment_age_secs, 10);
         assert!(config.delete_after_index);
+    }
+
+    /// Follower progress stub: returns whatever the test dictates per partition.
+    struct StubProgress(std::collections::HashMap<(String, i32), Option<i64>>);
+
+    impl ReplicationProgress for StubProgress {
+        fn min_replicated_offset(&self, topic: &str, partition: i32) -> Option<i64> {
+            self.0
+                .get(&(topic.to_string(), partition))
+                .copied()
+                .flatten()
+        }
+    }
+
+    fn stub(entries: &[(&str, i32, Option<i64>)]) -> Arc<dyn ReplicationProgress> {
+        let mut m = std::collections::HashMap::new();
+        for (t, p, v) in entries {
+            m.insert((t.to_string(), *p), *v);
+        }
+        Arc::new(StubProgress(m))
+    }
+
+    /// RP-1.1: a WAL segment must survive until its records reach the followers.
+    ///
+    /// Indexing is not replication. Nothing re-sends what a follower missed, so
+    /// deleting un-replicated WAL strands that data on a single node with no
+    /// recovery path — the same loss shape as v2.10.10 (deleting WAL after a
+    /// failed object-store upload), reached from a different direction.
+    #[test]
+    fn retention_interlock_holds_unreplicated_segments() {
+        let tp = TopicPartition::new("orders".to_string(), 0);
+
+        // No progress source at all (single node) → no interlock, unchanged behaviour.
+        assert!(WalIndexer::fully_replicated(None, &[(tp.clone(), 100)]).is_ok());
+
+        // Followers have everything → safe to delete.
+        let caught_up = stub(&[("orders", 0, Some(100))]);
+        assert!(WalIndexer::fully_replicated(Some(&caught_up), &[(tp.clone(), 100)]).is_ok());
+
+        // Followers are behind → hold the segment.
+        let behind = stub(&[("orders", 0, Some(99))]);
+        assert!(WalIndexer::fully_replicated(Some(&behind), &[(tp.clone(), 100)]).is_err());
+
+        // No live follower tracked for the partition → no interlock. A dead
+        // replica must not pin WAL forever; it has to resync instead.
+        let unknown = stub(&[("orders", 0, None)]);
+        assert!(WalIndexer::fully_replicated(Some(&unknown), &[(tp.clone(), 100)]).is_ok());
+    }
+
+    /// A segment spanning partitions is held if ANY partition is behind — the
+    /// segment is deleted as a unit, so one lagging partition protects all of it.
+    #[test]
+    fn retention_interlock_is_per_segment_not_per_partition() {
+        let a = TopicPartition::new("orders".to_string(), 0);
+        let b = TopicPartition::new("orders".to_string(), 1);
+
+        let mixed = stub(&[("orders", 0, Some(100)), ("orders", 1, Some(5))]);
+        assert!(
+            WalIndexer::fully_replicated(Some(&mixed), &[(a.clone(), 100), (b.clone(), 50)]).is_err(),
+            "partition 1 is behind, so the whole segment must be kept"
+        );
+
+        let both = stub(&[("orders", 0, Some(100)), ("orders", 1, Some(50))]);
+        assert!(WalIndexer::fully_replicated(Some(&both), &[(a, 100), (b, 50)]).is_ok());
     }
 
     #[test]

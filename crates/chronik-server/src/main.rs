@@ -1540,6 +1540,12 @@ async fn run_single_node_mode(
             wal_indexer.set_hot_buffer(hb.clone()).await;
             unified_state = unified_state.with_hot_buffer(hb.clone());
         }
+        // RP-1.1: Wire follower progress so WAL retention waits for replication.
+        // Cluster mode only — with no followers the tracker reports None and the
+        // interlock is inert, which is exactly right for single-node.
+        if let Some(isr_tracker) = server.isr_tracker() {
+            wal_indexer.set_replication_progress(isr_tracker).await;
+        }
         // HP-1.4: Wire hot text index to WalIndexer for eviction after cold flush
         #[cfg(feature = "search")]
         if let Some(hot_text_idx) = server.get_hot_text_index() {
