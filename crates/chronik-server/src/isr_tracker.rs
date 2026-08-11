@@ -356,9 +356,20 @@ impl IsrTracker {
         leader_offset: i64,
     ) -> Option<i64> {
         let key = (node_id, (topic.to_string(), partition));
-        self.follower_offsets
-            .get(&key)
-            .map(|state| leader_offset - state.last_offset)
+        let last_offset = self.follower_offsets.get(&key).map(|state| state.last_offset)?;
+
+        // A replica that has stopped reporting is frozen at whatever offset it
+        // last reached, so the arithmetic says lag 0 for a replica that is gone.
+        // Reporting that next to `under_replicated: true` invites the reader to
+        // conclude the alert is spurious — the same "metadata looks healthy
+        // while replication is not happening" failure this tracker exists to
+        // end. Its distance is unknown, not zero, so report nothing for it and
+        // let ISR carry the signal.
+        if !self.node_is_alive(node_id) {
+            return None;
+        }
+
+        Some(leader_offset - last_offset)
     }
 }
 
@@ -571,5 +582,35 @@ mod tests {
         // Behind by 5, timestamp in the future: saturating_sub yields 0 elapsed,
         // so this is in-sync rather than wrapped to a colossal lag.
         assert_eq!(tracker.sync_state(2, "t", 0, 15), SyncState::InSync);
+    }
+
+    /// A replica excluded from ISR for liveness must not also be reported at
+    /// lag 0. Its last offset is frozen where it died, so the subtraction says
+    /// "caught up" for a replica that is gone — printed next to
+    /// `under_replicated: true`, that reads as a false alarm. This is the same
+    /// shape as the outage that started this work: the metadata looked healthy
+    /// precisely when replication was not happening.
+    #[test]
+    fn a_dead_replica_reports_no_lag_rather_than_zero_lag() {
+        let tracker = IsrTracker::new(1000, 10_000);
+
+        tracker.update_follower_offset(2, "t", 0, 100);
+        tracker.record_node_alive(2);
+        assert_eq!(tracker.get_follower_lag(2, "t", 0, 100), Some(0));
+
+        // Backdate the liveness stamp well past the window.
+        let stale = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            - 10_000 * 3 - 5_000;
+        tracker.node_last_seen_ms.insert(2, stale);
+
+        assert_eq!(
+            tracker.get_follower_lag(2, "t", 0, 100),
+            None,
+            "a replica that stopped reporting has unknown distance, not zero"
+        );
+        assert_eq!(tracker.sync_state(2, "t", 0, 100), SyncState::Lagging);
     }
 }
