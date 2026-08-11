@@ -13,6 +13,7 @@
 
 pub mod connection_state;
 pub mod frame_reader;
+pub mod leader_epoch;
 pub mod record_processor;
 pub mod replica_fetcher;
 
