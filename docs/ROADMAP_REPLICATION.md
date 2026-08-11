@@ -6,8 +6,8 @@
 
 | Phase | Name | Status | Version | Notes |
 |-------|------|--------|---------|-------|
-| RP-0 | Replication conformance suite | `IN PROGRESS` | — | RP-0.1 `TESTED` — fails on v2.10.10, passes post-#29 |
-| RP-1 | Harden the current mechanism | `CODE COMPLETE` | — | 1.1–1.4 done, unit-tested; cluster soak pending |
+| RP-0 | Replication conformance suite | `TESTED` | — | Placement + ISR honesty; fails pre-#29, passes after |
+| RP-1 | Harden the current mechanism | `TESTED` | — | 1.1–1.4 + 3 bugs found by cluster validation |
 | RP-2 | Follower fetch | `NOT STARTED` | — | `replica_id`, per-follower LEO, `HW = min(LEO)` |
 | RP-3 | Leader epochs & truncation | `NOT STARTED` | — | The hard part. Gated behind RP-0 |
 | RP-4 | Delete the push stack | `NOT STARTED` | — | ~2,500 lines removed |
@@ -206,6 +206,20 @@ Test asserts the produce stays outstanding while only the leader has ACKed, then
 - [x] Surface `total_dropped` as a metric
 
 **Status**: `CODE COMPLETE`. Only metadata was re-queued; a data record reaching no follower was discarded silently, so a transient follower restart left a permanent under-replicated gap. Data records now retry with the same 100ms backoff, bounded at `MAX_REPLICATION_ATTEMPTS` (300 ≈ 30s) so a dead follower cannot stall the queue. The attempt counter is `#[serde(skip)]` and never enters the frame, so the wire format is unchanged. 2 unit tests.
+
+### RP-1 cluster validation — three bugs the unit tests could not have found
+
+Every one surfaced only by running the conformance suite against a real 3-node cluster. All three share a root cause worth carrying into RP-2: **the push model has no reliable signal that a follower is alive.**
+
+1. **ACK offset was in the wrong unit.** Followers ACKed the batch's *base* offset while ISR lag is measured against the leader's high watermark — an LEO. A follower that had written a batch in full still looked behind by the batch size, so it never counted as caught up. Followers now ACK `base_offset + record_count`, and the leader registers quorum waits on `last_offset + 1`. Both sides had to move together or quorum would never match.
+
+2. **A replica that died while caught up never left ISR.** Fixing (1) — plus not ageing out caught-up replicas — meant a dead node stayed in-sync forever: the lag bound does not fire for a caught-up replica and it never ACKs again. Observed: a node killed for 60s still reported `isr=[1,2,3]`. Followers now answer heartbeats with a liveness ACK, carried on the existing ACK frame with an empty topic.
+
+   ⚠️ The first attempt at this used **connection state** and did nothing on a real cluster: a TCP write succeeds into the local send buffer long after the peer is gone. Application-level liveness is the only thing that works here.
+
+3. **A restarted follower was never reconnected — replication to it stopped permanently.** Same root cause: the stale connection stayed in `connections`, so the reconnect loop's `contains_key` check passed and never redialled. Newly created topics landed only on partitions that node led, with nothing reporting a problem. Connections to followers that stop answering heartbeats are now retired so the existing reconnect path fires. Pruning runs on the connection-manager loop, not beside the heartbeat send — heartbeats only fire when the queue is empty and any successful send resets their timer, so with one live and one dead follower under load they would never fire.
+
+**Known limitation carried to RP-2**: `/admin/status` answered by a *non-leader* reports the assignment, not real ISR — only the leader receives ACKs. RP-2 fixes this structurally, since the leader learns each follower's position from its fetches.
 
 ---
 
