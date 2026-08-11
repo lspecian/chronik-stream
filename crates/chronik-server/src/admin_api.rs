@@ -583,12 +583,27 @@ async fn collect_partition_info_from_metadata(
                             &assignment.replicas,
                         );
 
-                        // If tracker has data, use it; otherwise fall back to all replicas
-                        // (on cluster startup before any ACKs, ISR = replicas is correct)
-                        if tracked_isr.is_empty() {
+                        // Fall back to "ISR = replicas" ONLY when the tracker has
+                        // heard nothing at all for this partition — i.e. a freshly
+                        // started cluster before any ACK. Previously any empty ISR
+                        // took this branch, so a partition whose followers had all
+                        // fallen behind (or were never receiving data at all, as
+                        // when acks!=0 silently skipped replication — see #29)
+                        // reported a full, healthy ISR. That is the opposite of the
+                        // truth, and it is why the replication outage stayed
+                        // invisible for nine months.
+                        let nothing_known = tracker.is_unknown_for_all(
+                            &assignment.topic,
+                            assignment.partition as i32,
+                            &assignment.replicas,
+                            assignment.leader_id,
+                        );
+
+                        if nothing_known {
                             assignment.replicas.clone()
                         } else {
-                            // Always include leader in ISR (leader is always in-sync with itself)
+                            // The leader is in-sync with itself by definition; it
+                            // never ACKs to itself so the tracker cannot know it.
                             let mut isr_with_leader = tracked_isr;
                             if !isr_with_leader.contains(&assignment.leader_id) {
                                 isr_with_leader.insert(0, assignment.leader_id);
