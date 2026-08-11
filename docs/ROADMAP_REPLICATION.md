@@ -7,7 +7,7 @@
 | Phase | Name | Status | Version | Notes |
 |-------|------|--------|---------|-------|
 | RP-0 | Replication conformance suite | `IN PROGRESS` | — | RP-0.1 `TESTED` — fails on v2.10.10, passes post-#29 |
-| RP-1 | Harden the current mechanism | `NOT STARTED` | — | Valuable standalone; independent of pull |
+| RP-1 | Harden the current mechanism | `CODE COMPLETE` | — | 1.1–1.4 done, unit-tested; cluster soak pending |
 | RP-2 | Follower fetch | `NOT STARTED` | — | `replica_id`, per-follower LEO, `HW = min(LEO)` |
 | RP-3 | Leader epochs & truncation | `NOT STARTED` | — | The hard part. Gated behind RP-0 |
 | RP-4 | Delete the push stack | `NOT STARTED` | — | ~2,500 lines removed |
@@ -161,40 +161,51 @@ Worth doing **regardless of whether pull ever happens**.
 
 ### RP-1.1: Retention interlock
 
-- [ ] Track the minimum offset any follower has acknowledged, per partition
-- [ ] `delete_after_index` must not delete a WAL segment above that offset
-- [ ] Metric + warning when WAL retention is held back by a lagging follower
-- [ ] Test: lagging follower prevents deletion; caught-up follower permits it
+- [x] Track the minimum offset any follower has acknowledged, per partition
+- [x] `delete_after_index` must not delete a WAL segment above that offset
+- [x] Metric + warning when WAL retention is held back by a lagging follower
+- [x] Test: lagging follower prevents deletion; caught-up follower permits it
 
-**Status**: —
+**Status**: `CODE COMPLETE`. `ReplicationProgress` trait in chronik-storage keeps the indexer ignorant of ISR/ACKs; impl lives on `IsrTracker`. Followers silent past `max_lag_ms` are excluded so a dead node cannot pin WAL forever (matches Kafka). No progress source = no interlock, so single-node is unchanged. 2 unit tests.
 
 > Postgres's replication-slot equivalent. Required under **every** option including doing nothing — today WAL is deleted on indexing with no regard for whether followers received it.
 
 ### RP-1.2: Honest ISR (#31)
 
-- [ ] Leader maintains a *running* acked offset per follower (today's ACKs are one-shot waiters, not a tracked position)
-- [ ] ISR = replicas within a lag bound, with a timeout for silent followers
-- [ ] `/admin/status` and Metadata responses report the real ISR
-- [ ] Under-replicated-partition metric, so this is alertable
+- [x] Leader maintains a *running* acked offset per follower — already existed (`IsrTracker`, fed from the ACK reader). It read empty only because nothing was being replicated
+- [x] ISR = replicas within a lag bound, with a timeout for silent followers
+- [x] `/admin/status` reports the real ISR
+- [x] Under-replicated signal — `total_dropped()` accessor (RP-1.4)
+- [ ] Metadata responses report the real ISR (admin only so far)
 
-**Status**: —
+**Status**: `CODE COMPLETE`. Three defects, all making ISR read healthier than reality:
+
+1. **Empty ISR reported as "all replicas in-sync".** `/admin/status` fell back to the assignment whenever the tracker returned nothing, so a partition replicating to *nobody* showed a full ISR. That inversion is why #29 stayed invisible for nine months. The fallback now applies only when the tracker has heard nothing at all for the partition (`is_unknown_for_all`) — genuinely a fresh cluster.
+2. **Caught-up followers aged out.** The time bound was applied unconditionally, so every replica of an *idle* partition dropped out of ISR after `max_lag_ms` despite holding exactly the leader's data. It now measures how long a replica has been *behind*, matching `replica.lag.time.max.ms`.
+3. **Backwards clock ejected healthy replicas.** `now - last_update` on u64 wraps rather than panicking in release, turning an NTP step into a colossal apparent lag. Saturating subtraction.
+
+Added `SyncState{InSync,Lagging,Unknown}` so "never heard from" is distinguishable from "known behind" — the distinction defect 1 turned on. 5 unit tests.
 
 ### RP-1.3: `acks=all` waits (#30)
 
-- [ ] Verify/repair `quorum_size` — currently `assignment.replicas.len()` (**all** replicas, not a majority); at RF=3 that may demand 3 ACKs from 2 followers and never complete
-- [ ] Change the guard `use_async_responses = response_pipeline.is_some() && acks != 0` → `acks == 1` so `acks=-1` reaches its (already written, currently unreachable) ISR quorum arm
-- [ ] Timeout returns `NOT_ENOUGH_REPLICAS` rather than hanging
-- [ ] Test: `acks=-1` response stays pending until a follower ACK arrives
+- [x] Verify/repair `quorum_size`
+- [x] Change the guard to `acks == 1` so `acks=-1` reaches its ISR quorum arm
+- [x] Timeout returns `NOT_ENOUGH_REPLICAS` rather than hanging
+- [x] Test: `acks=-1` response stays pending until a follower ACK arrives
 - [ ] Measure the latency cost — this moves `acks=-1` off the async fast path
 
-**Status**: —
+**Status**: `CODE COMPLETE`. The quorum arm was fully written and **unreachable since v2.2.10** — `use_async_responses = response_pipeline.is_some() && acks != 0` sent `acks=-1` down the fast path, which answers on the leader's own fsync. Now `acks == 1`, so `acks=-1` falls through and waits. Only viable because #29 made followers actually receive data; before that this would have hung to timeout on every request.
+
+`quorum_size` was `assignment.replicas.len()` — *every* assigned replica — so one slow follower blocked all writes until the 30s timeout even at RF=3/minISR=2. Now `min_insync_replicas` (leader's own ACK counted), matching Kafka. Corrects my earlier reading that it was unsatisfiable: the leader does self-ACK, so it *completed*, it was just far stricter than intended.
+
+Test asserts the produce stays outstanding while only the leader has ACKed, then completes on a follower ACK. **Confirmed it fails with the old guard restored.**
 
 ### RP-1.4: Retry on send failure (#33)
 
-- [ ] Re-queue data records that reached no follower, with bounded retries and backoff (today only metadata is re-queued; data is dropped silently)
-- [ ] Surface `total_dropped` as a metric
+- [x] Re-queue data records that reached no follower, with bounded retries and backoff
+- [x] Surface `total_dropped` as a metric
 
-**Status**: —
+**Status**: `CODE COMPLETE`. Only metadata was re-queued; a data record reaching no follower was discarded silently, so a transient follower restart left a permanent under-replicated gap. Data records now retry with the same 100ms backoff, bounded at `MAX_REPLICATION_ATTEMPTS` (300 ≈ 30s) so a dead follower cannot stall the queue. The attempt counter is `#[serde(skip)]` and never enters the frame, so the wire format is unchanged. 2 unit tests.
 
 ---
 
