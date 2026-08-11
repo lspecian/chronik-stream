@@ -273,9 +273,7 @@ Three defects reached from this work that were not replication bugs at all, and 
 
 The conformance suite itself had **two** faults that made a healthy broker look broken — see the RP-0 section.
 
-### ⛔ Blocker for making pull the default: followers do not reliably know who leads
-
-**Found 2026-08-11 on the test cluster. This gates RP-4 and the release, not RP-2's code.**
+### ✅ Was a blocker: followers did not reliably know who leads (FIXED 2026-08-12)
 
 Pull moves a dependency that push never had. Under push the *leader* drives everything, so only the leader's metadata has to be right. Under pull the **follower** must know which node leads each partition in order to fetch from it — and today, after a restart, it frequently does not.
 
@@ -293,10 +291,22 @@ This is a **pre-existing metadata replication defect**, not a fault in RP-2 — 
 
 Why the conformance suite still passes: it creates topics and produces immediately, and leadership for a freshly created topic propagates at creation. The divergence appears for topics that predate a restart.
 
-Two things follow:
+**Root cause**: the catalog anti-entropy loop re-broadcast `TopicCreated` and nothing else. A follower healed into a state where it knew every topic and not one partition assignment — the exact state `admin_api.rs` already had a comment describing. The assignment is what carries the partition leader.
 
-1. **The metadata defect must be fixed before pull can be the default.** Verify whether the buffer fix is already on `main` (it may have landed in v2.7.4), then reproduce this table after a restart.
-2. **A follower that plans nothing now says so loudly** (`warn_if_replicating_nothing`). Silence was how this cost nine months the first time. This is observability, not a fix.
+**Fix**: `broadcast_all_topics` now re-broadcasts partition assignments too, after the topics they belong to. Note the event-bus buffer must now be sized against `topics * (1 + partitions_per_topic)`, not topic count.
+
+**Verified on a 3-node pull cluster**, all three nodes restarted simultaneously:
+
+| | node 1 | node 2 | node 3 |
+|---|---|---|---|
+| immediately after restart | 3/3 | **0/0** | 9/9 |
+| after the first anti-entropy pass (~42s) | 12/12 | **12/12** | 12/12 |
+
+Converged and stable for 4+ minutes. Fetch coverage then matched leadership exactly — node 1 led 4 partitions, every fetch request carried 4, all 4 reported follower lag. Conformance suite passes after the restart.
+
+**Healing takes up to one anti-entropy period** (first pass 45s, then `CHRONIK_METADATA_REBROADCAST_SECS`, default 300s). A follower that restarts mid-cycle replicates nothing until the next pass. Acceptable for now; if it matters, trigger a re-broadcast when a follower connects.
+
+**A follower that plans nothing also says so loudly now** (`warn_if_replicating_nothing`) — silence is how this cost nine months the first time. That is observability, not the fix.
 
 Also open, and related: `/admin/status` falls back to reporting the assignment as ISR when the tracker knows nothing about a partition (`is_unknown_for_all`). Under push an idle partition legitimately never reports, so the fallback is defensible. Under pull, followers fetch continuously and silence is genuinely suspicious — **when RP-4 deletes push, that fallback should become "under-replicated", not "healthy"**.
 
