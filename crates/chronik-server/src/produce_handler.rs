@@ -2735,12 +2735,17 @@ impl ProduceHandler {
                     );
 
                     let (tx, rx) = tokio::sync::oneshot::channel();
-                    // CRITICAL FIX: Register for base_offset (not last_offset)
-                    // Followers ACK base_offset of the batch, so we must wait for that offset
+                    // Register on the batch's log end offset (last_offset + 1).
+                    //
+                    // Followers now ACK their LEO rather than the base offset, so
+                    // that ISR lag is comparable to the leader's high watermark
+                    // (also an LEO). Both sides must use the same value or quorum
+                    // never matches, so this moved in lockstep with WalAckMessage.
+                    let ack_offset = last_offset as i64 + 1;
                     tracker.register_wait(
                         topic.to_string(),
                         partition,
-                        base_offset as i64,
+                        ack_offset,
                         quorum_size,
                         tx,
                     );
@@ -2754,8 +2759,8 @@ impl ProduceHandler {
                     // In standalone mode (quorum=1), this is the only ACK needed
                     // In cluster mode (quorum=N), leader counts as 1/N ACKs, then waits for followers
                     info!("🏁 Recording leader self-ACK for {}-{} offset {} (quorum={}/{})",
-                        topic, partition, base_offset, 1, quorum_size);
-                    tracker.record_ack(topic, partition, base_offset as i64, self.config.node_id as u64);
+                        topic, partition, ack_offset, 1, quorum_size);
+                    tracker.record_ack(topic, partition, ack_offset, self.config.node_id as u64);
 
                     // Wait for ISR quorum with configured timeout (default: 30s)
                     match timeout(REPLICATION_TIMEOUT, rx).await {
@@ -5170,8 +5175,10 @@ mod tests {
             "acks=all answered the client before any follower acknowledged"
         );
 
-        // Follower 2 acknowledges → quorum of 2 reached → produce completes.
-        ack_tracker.record_ack("quorum-topic", 0, 0, 2);
+        // Follower 2 acknowledges. The ACK carries the follower's log end offset
+        // (base_offset + record_count), not the base offset — one record written
+        // from offset 0 means an LEO of 1. Quorum of 2 reached → produce completes.
+        ack_tracker.record_ack("quorum-topic", 0, 1, 2);
 
         let response = tokio::time::timeout(std::time::Duration::from_secs(10), produce)
             .await

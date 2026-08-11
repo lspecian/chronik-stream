@@ -117,7 +117,18 @@ pub struct WalAckMessage {
     /// Partition ID
     pub partition: i32,
 
-    /// Offset that was successfully replicated
+    /// Follower's log end offset after writing the batch — i.e. the next offset
+    /// it expects, `base_offset + record_count`.
+    ///
+    /// This is deliberately an LEO, not the batch's base offset. ISR lag is
+    /// computed against the leader's high watermark (also an LEO), so ACKing the
+    /// base offset made every follower look permanently behind by the size of
+    /// the last batch. Once a partition went idle its followers then aged out of
+    /// ISR despite holding exactly the leader's data — observed live as
+    /// `isr=[1]` on a partition all three nodes physically had.
+    ///
+    /// The leader registers its quorum waits on the same value, so the two sides
+    /// stay comparable. The wire shape is unchanged; only the meaning is.
     pub offset: i64,
 
     /// Follower node ID
@@ -2072,10 +2083,13 @@ impl WalReceiver {
                                     wal_record.topic, wal_record.partition, wal_record.base_offset, node_id
                                 );
 
+                                // ACK the follower's log end offset, not the batch's
+                                // base offset: ISR lag is measured against the leader's
+                                // high watermark, which is also an LEO. See WalAckMessage.
                                 let ack_msg = WalAckMessage {
                                     topic: wal_record.topic.clone(),
                                     partition: wal_record.partition,
-                                    offset: wal_record.base_offset,
+                                    offset: wal_record.base_offset + wal_record.record_count as i64,
                                     node_id,
                                 };
 
