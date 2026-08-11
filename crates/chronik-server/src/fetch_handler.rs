@@ -245,10 +245,23 @@ impl FetchHandler {
         correlation_id: i32,
     ) -> Result<FetchResponse> {
         let mut response_topics = Vec::new();
-        
+
+        // `max_wait_ms` bounds the REQUEST, not each partition in it. Partitions
+        // are served serially, so giving every idle partition the full budget
+        // made a 10-partition fetch take 10x max_wait_ms to come back — the
+        // client's own timeout would fire first. A shared deadline keeps the
+        // whole response inside the budget the client asked for; partitions
+        // reached after it expires return whatever is already available and the
+        // client picks the rest up on its next fetch.
+        //
+        // This also makes follower-pull viable (RP-2.4), where one request
+        // covers every partition a follower replicates from one leader.
+        let wait_deadline =
+            Instant::now() + Duration::from_millis(request.max_wait_ms.max(0) as u64);
+
         for topic_request in request.topics {
             let mut response_partitions = Vec::new();
-            
+
             for partition_request in topic_request.partitions {
                 let mut partition_response = self.fetch_partition(
                     &topic_request.name,
@@ -258,6 +271,7 @@ impl FetchHandler {
                     request.max_wait_ms,
                     request.min_bytes,
                     request.replica_id,
+                    wait_deadline,
                 ).await?;
 
                 // EOS layer 6: for read_committed (isolation_level == 1) report the real
@@ -582,6 +596,7 @@ impl FetchHandler {
         max_bytes: i32,
         max_wait_ms: i32,
         min_bytes: i32,
+        wait_deadline: Instant,
     ) -> Result<FetchResponsePartition> {
         // v2.2.7.2: Log no data available case
         info!(
@@ -589,11 +604,16 @@ impl FetchHandler {
             topic, partition, fetch_offset, high_watermark
         );
 
+        // The wait budget belongs to the request and is shared across every
+        // partition in it, so what is left here is whatever earlier partitions
+        // did not already spend. Once it is gone, later partitions return
+        // immediately instead of each adding another max_wait_ms to the
+        // response time.
+        let start_time = Instant::now();
+        let wait_duration = wait_deadline.saturating_duration_since(start_time);
+
         // No data available yet - implement wait logic
-        if max_wait_ms > 0 && min_bytes > 0 {
-            // Wait for new data or timeout
-            let start_time = Instant::now();
-            let wait_duration = Duration::from_millis(max_wait_ms as u64);
+        if max_wait_ms > 0 && min_bytes > 0 && !wait_duration.is_zero() {
 
             // Try to wait for data with timeout
             let result = timeout(wait_duration, async {
@@ -727,6 +747,7 @@ impl FetchHandler {
         max_wait_ms: i32,
         min_bytes: i32,
         replica_id: i32,
+        wait_deadline: Instant,
     ) -> Result<FetchResponsePartition> {
         // RP-2.1: a fetch carrying a replica id is a *follower* replicating, not a
         // consumer reading. Kafka clients send -1 here; only a broker sets it to
@@ -800,11 +821,12 @@ impl FetchHandler {
                 max_bytes,
                 max_wait_ms,
                 min_bytes,
+                wait_deadline,
             )
             .await
         }
     }
-    
+
     /// Try fetching raw bytes from Tantivy (Phase 4 for fetch_raw_bytes)
     ///
     /// Complexity: < 20 (Tantivy fetch delegation)
@@ -2844,5 +2866,145 @@ mod replica_fetch_tests {
         tracker.update_follower_offset(2, "orders", 0, 250);
         tracker.record_node_alive(2);
         assert_eq!(tracker.sync_state(2, "orders", 0, 250), SyncState::InSync);
+    }
+}
+
+#[cfg(test)]
+mod fetch_wait_budget_tests {
+    use super::*;
+    use chronik_common::metadata::memory::InMemoryMetadataStore;
+    use chronik_common::metadata::traits::TopicConfig;
+    use chronik_protocol::{FetchRequest, FetchRequestPartition, FetchRequestTopic};
+    use tempfile::TempDir;
+
+    async fn handler_with_topic(partitions: u32) -> (FetchHandler, Arc<InMemoryMetadataStore>, TempDir) {
+        let temp_dir = TempDir::new().unwrap();
+        let metadata_store = Arc::new(InMemoryMetadataStore::new());
+
+        let mut object_store_config = chronik_storage::object_store::ObjectStoreConfig::default();
+        object_store_config.backend = chronik_storage::object_store::StorageBackend::Local {
+            path: temp_dir.path().join("segments").to_str().unwrap().to_string(),
+        };
+        let object_store: Arc<dyn ObjectStoreTrait> = Arc::from(
+            chronik_storage::object_store::ObjectStoreFactory::create(object_store_config)
+                .await
+                .unwrap(),
+        );
+        let segment_reader = Arc::new(chronik_storage::SegmentReader::new(
+            chronik_storage::SegmentReaderConfig::default(),
+            object_store.clone(),
+        ));
+
+        let mut topic_config = TopicConfig::default();
+        topic_config.partition_count = partitions;
+        metadata_store
+            .create_topic("orders", topic_config)
+            .await
+            .unwrap();
+
+        let handler = FetchHandler::new(segment_reader, metadata_store.clone(), object_store);
+        (handler, metadata_store, temp_dir)
+    }
+
+    fn idle_fetch(partitions: i32, max_wait_ms: i32) -> FetchRequest {
+        FetchRequest {
+            replica_id: -1,
+            max_wait_ms,
+            min_bytes: 1,
+            max_bytes: 10 * 1024 * 1024,
+            isolation_level: 0,
+            session_id: 0,
+            session_epoch: -1,
+            topics: vec![FetchRequestTopic {
+                name: "orders".to_string(),
+                partitions: (0..partitions)
+                    .map(|partition| FetchRequestPartition {
+                        partition,
+                        current_leader_epoch: -1,
+                        fetch_offset: 0,
+                        log_start_offset: 0,
+                        partition_max_bytes: 1024 * 1024,
+                    })
+                    .collect(),
+            }],
+        }
+    }
+
+    /// `max_wait_ms` bounds the request, not each partition in it.
+    ///
+    /// Partitions are served serially, so before the shared deadline every idle
+    /// partition spent the full budget and an N-partition fetch took N ×
+    /// max_wait_ms to return — with Kafka's default 500ms, an 8-partition
+    /// consumer waited 4 seconds for an empty response and would usually hit
+    /// its own request timeout first.
+    ///
+    /// This is also what makes follower-pull viable: a follower batches every
+    /// partition it replicates from one leader into a single request.
+    #[tokio::test]
+    async fn an_idle_multi_partition_fetch_stays_within_the_request_budget() {
+        let (handler, _store, _dir) = handler_with_topic(8).await;
+
+        let max_wait_ms = 300;
+        let started = Instant::now();
+        let response = handler
+            .handle_fetch(idle_fetch(8, max_wait_ms), 1)
+            .await
+            .expect("an idle fetch still returns a response");
+        let elapsed = started.elapsed();
+
+        assert_eq!(response.topics[0].partitions.len(), 8);
+
+        // Two-sided on purpose. The upper bound is the bug: serial per-partition
+        // waiting would have taken 8 × 300ms = 2.4s. The lower bound stops the
+        // test passing for the wrong reason — if the wait were dropped entirely
+        // the response would be instant, which would also satisfy the ceiling
+        // while turning every idle follower into a busy loop.
+        assert!(
+            elapsed >= Duration::from_millis(max_wait_ms as u64 / 2),
+            "returned in {:?}: the long poll is not holding at all",
+            elapsed
+        );
+        assert!(
+            elapsed < Duration::from_millis(max_wait_ms as u64 * 3),
+            "8 idle partitions took {:?}, which means the wait budget is still being spent per partition",
+            elapsed
+        );
+    }
+
+    /// The single-partition case must keep waiting the full budget — that long
+    /// poll is what stops an idle consumer from busy-looping, and it is what
+    /// keeps a caught-up follower cheap.
+    #[tokio::test]
+    async fn a_single_idle_partition_still_long_polls() {
+        let (handler, _store, _dir) = handler_with_topic(1).await;
+
+        let max_wait_ms = 200;
+        let started = Instant::now();
+        handler
+            .handle_fetch(idle_fetch(1, max_wait_ms), 1)
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= Duration::from_millis(max_wait_ms as u64 / 2),
+            "an idle single-partition fetch returned in {:?}; the long poll is not holding",
+            elapsed
+        );
+    }
+
+    /// `max_wait_ms = 0` means "answer now". It must not wait at all, whatever
+    /// the deadline arithmetic does.
+    #[tokio::test]
+    async fn a_zero_wait_fetch_returns_immediately() {
+        let (handler, _store, _dir) = handler_with_topic(4).await;
+
+        let started = Instant::now();
+        handler.handle_fetch(idle_fetch(4, 0), 1).await.unwrap();
+
+        assert!(
+            started.elapsed() < Duration::from_millis(150),
+            "max_wait_ms=0 must not block"
+        );
     }
 }
