@@ -279,7 +279,11 @@ impl ReplicaFetcher {
 
         while !self.shutdown.load(Ordering::Relaxed) {
             let desired = match self.read_assignments().await {
-                Ok(assignments) => plan_assignments(self.node_id, &assignments, &self.peers),
+                Ok(assignments) => {
+                    let plan = plan_assignments(self.node_id, &assignments, &self.peers);
+                    self.warn_if_replicating_nothing(&assignments, &plan);
+                    plan
+                }
                 Err(e) => {
                     warn!("Could not read partition assignments: {}", e);
                     sleep(self.config.refresh_interval).await;
@@ -328,6 +332,52 @@ impl ReplicaFetcher {
             handle.abort();
         }
         info!("Follower-pull replication stopped on node {}", self.node_id);
+    }
+
+    /// Say so, loudly, when this node ends up replicating nothing.
+    ///
+    /// Pull moves a dependency that push did not have: the *follower* must know
+    /// who leads each partition. If its metadata is missing or has no leader,
+    /// `plan_assignments` correctly plans nothing — and the node then sits there
+    /// replicating nothing at all, while the leader's `/admin/status` reports
+    /// `isr:[1,2,3]` because its own view is fine.
+    ///
+    /// That is the founding bug of this roadmap reproduced exactly, so it must
+    /// never be silent. Observed on the test cluster: after a restart one node
+    /// held zero partition assignments and replicated nothing, with no log line
+    /// to say so.
+    fn warn_if_replicating_nothing(
+        &self,
+        assignments: &[(String, i32, Option<u64>, Vec<u64>)],
+        plan: &BTreeMap<u64, Vec<FollowedPartition>>,
+    ) {
+        if !plan.is_empty() || assignments.is_empty() {
+            return;
+        }
+
+        let assigned_here = assignments
+            .iter()
+            .filter(|(_, _, _, replicas)| replicas.contains(&self.node_id))
+            .count();
+        let leaderless = assignments
+            .iter()
+            .filter(|(_, _, leader, replicas)| leader.is_none() && replicas.contains(&self.node_id))
+            .count();
+
+        if assigned_here == 0 {
+            warn!(
+                "Node {} replicates nothing: it is not listed as a replica for any of the {} known partitions. \
+                 If this cluster has RF>1, this node's partition assignments are missing or stale.",
+                self.node_id,
+                assignments.len()
+            );
+        } else {
+            warn!(
+                "Node {} replicates nothing despite being a replica for {} partition(s) — {} of them have no leader \
+                 in this node's metadata. Data is NOT being replicated here, whatever the leader's /admin/status says.",
+                self.node_id, assigned_here, leaderless
+            );
+        }
     }
 
     /// Read every partition's leader and replica set from metadata.

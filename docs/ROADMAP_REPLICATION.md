@@ -8,7 +8,7 @@
 |-------|------|--------|---------|-------|
 | RP-0 | Replication conformance suite | `TESTED` | — | Placement + ISR honesty; fails pre-#29, passes after |
 | RP-1 | Harden the current mechanism | `TESTED` | — | 1.1–1.4 + 3 bugs found by cluster validation |
-| RP-2 | Follower fetch | `IN PROGRESS` | — | 2.1/2.2/2.4 `TESTED` on a cluster; 2.3 (HW from ISR) remains |
+| RP-2 | Follower fetch | `TESTED` | — | 2.1–2.4 all validated on a 3-node cluster, behind `CHRONIK_REPLICATION_MODE=pull` |
 | RP-3 | Leader epochs & truncation | `NOT STARTED` | — | The hard part. Gated behind RP-0 |
 | RP-4 | Delete the push stack | `NOT STARTED` | — | ~2,500 lines removed |
 
@@ -273,14 +273,41 @@ Three defects reached from this work that were not replication bugs at all, and 
 
 The conformance suite itself had **two** faults that made a healthy broker look broken — see the RP-0 section.
 
+### ⛔ Blocker for making pull the default: followers do not reliably know who leads
+
+**Found 2026-08-11 on the test cluster. This gates RP-4 and the release, not RP-2's code.**
+
+Pull moves a dependency that push never had. Under push the *leader* drives everything, so only the leader's metadata has to be right. Under pull the **follower** must know which node leads each partition in order to fetch from it — and today, after a restart, it frequently does not.
+
+Measured on the 3-node pull cluster, same moment, same 69 partitions:
+
+| Node | Partitions with a known leader |
+|---|---|
+| 1 | 66 of 69 |
+| 2 | **0 of 69** |
+| 3 | 21 of 69 |
+
+Node 2 held no partition assignments at all, so it planned nothing and **replicated nothing**, while node 1's `/admin/status` reported `isr:[1,2,3]` for those partitions from its own healthy view. That is this roadmap's founding bug reproduced exactly, by a different route.
+
+This is a **pre-existing metadata replication defect**, not a fault in RP-2 — see the `bug-metadata-recovery-diverges-at-scale` note (a `broadcast::channel(1000)` dropping `TopicCreated`, with an uncommitted buffer fix). Push masked it. Pull cannot.
+
+Why the conformance suite still passes: it creates topics and produces immediately, and leadership for a freshly created topic propagates at creation. The divergence appears for topics that predate a restart.
+
+Two things follow:
+
+1. **The metadata defect must be fixed before pull can be the default.** Verify whether the buffer fix is already on `main` (it may have landed in v2.7.4), then reproduce this table after a restart.
+2. **A follower that plans nothing now says so loudly** (`warn_if_replicating_nothing`). Silence was how this cost nine months the first time. This is observability, not a fix.
+
+Also open, and related: `/admin/status` falls back to reporting the assignment as ISR when the tracker knows nothing about a partition (`is_unknown_for_all`). Under push an idle partition legitimately never reports, so the fallback is defensible. Under pull, followers fetch continuously and silence is genuinely suspicious — **when RP-4 deletes push, that fallback should become "under-replicated", not "healthy"**.
+
 ### RP-2.3: High watermark from ISR
 
-- [ ] `HW = min(LEO across ISR)` — today HW is the **leader's own write position** from `ProduceHandler` (`fetch_handler.rs:371`)
-- [ ] Consumers observe only up to HW
+- [x] `HW = min(LEO across ISR)` — was the **leader's own write position** from `ProduceHandler`
+- [x] Consumers observe only up to HW; followers still read to the leader's LEO
 - [x] `acks=all` completes when the quorum has reached the batch's offset
 - [ ] Test: HW does not advance while a follower is behind
 
-**Status**: `IN PROGRESS` — the `acks=all` half is `TESTED` under both push and pull; `HW = min(LEO)` is not started.
+**Status**: `TESTED` on a 3-node cluster under pull. Both halves are done: `acks=all` settles off follower fetch offsets, and consumers are capped at `min(LEO across ISR)`.
 
 The `acks=all` half forced a latent bug into the open. `IsrAckTracker` matched an **exact** `(topic, partition, offset)`, which only worked because push emitted one ACK per pushed batch. A follower's fetch offset is a watermark that skips across many batch boundaries and rarely lands on a registered offset, so under pull every `acks=all` produce would have waited out the full 30s timeout. Replica progress is monotonic — a replica reporting N holds everything below N — so waits are now released by any report at or above their offset. That is strictly more correct under push too: a follower demonstrably at 500 satisfies a wait at 437 even if the ACK for 437 was lost or coalesced.
 
