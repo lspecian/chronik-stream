@@ -8,7 +8,7 @@
 |-------|------|--------|---------|-------|
 | RP-0 | Replication conformance suite | `TESTED` | — | Placement + ISR honesty; fails pre-#29, passes after |
 | RP-1 | Harden the current mechanism | `TESTED` | — | 1.1–1.4 + 3 bugs found by cluster validation |
-| RP-2 | Follower fetch | `IN PROGRESS` | — | 2.1+2.2 `TESTED`; 2.4 (fetch loop) is the remaining core |
+| RP-2 | Follower fetch | `IN PROGRESS` | — | 2.1/2.2/2.4 `TESTED` on a cluster; 2.3 (HW from ISR) remains |
 | RP-3 | Leader epochs & truncation | `NOT STARTED` | — | The hard part. Gated behind RP-0 |
 | RP-4 | Delete the push stack | `NOT STARTED` | — | ~2,500 lines removed |
 
@@ -129,6 +129,16 @@ That matters because of how the last two attempts died:
 Asserts against the *union* of partitions across nodes rather than a fixed `0..N`, so it stays honest however the client's partitioner distributed records.
 
 ⚠️ Found while building this: `kafka-topics.sh --describe` fails against Chronik — `non-nullable field clusterId was serialized as null`. DescribeCluster returns a null cluster id that the Java AdminClient refuses to deserialize, breaking standard Kafka tooling. Filed separately; the RF assertion here is best-effort as a result, and physical placement carries the test.
+
+#### The suite itself lied twice (found during RP-2.4)
+
+Both faults made a **healthy broker look broken** — on the one test whose job is to tell those apart. Recorded because a guardrail that cries wolf is worse than none.
+
+1. **Shell payloads did not survive `REPL_KUBECTL`.** When it is an ssh wrapper — the usage the header documents — ssh flattens its arguments and the remote login shell re-parses them, so `kubectl exec pod -- bash -c "a | b"` arrives as `bash -c a` with `| b` running on the *ssh host*. Every produce was a no-op and the suite reported "no partitions on any node". The quoting level is now **probed** at startup against output that cannot occur by accident, and the suite aborts loudly if no level works.
+
+2. **The ISR assertion never took the replica down.** The operator recreates a deleted pod in ~4s and the broker resumes fetching well before the pod reports Ready — so `0/1 Running` reads as an outage while the replica is fully caught up. The liveness window is 30s and keeping a replica through a 4s blip is *correct*. Delete-once, delete-in-a-loop and `SIGSTOP` on PID 1 all failed to hold it down, each looking exactly like "ISR is over-reporting". Cordoning the node the replica runs on works: the pod goes Pending and stays there.
+
+   Under push this test passed by accident — the leader had to re-establish its own outbound connection before the follower looked alive, stretching the outage past the window. Pull recovers on the follower's schedule instead. **Better behaviour silently invalidated the test**, which is a failure mode worth watching for in the rest of this roadmap.
 
 ### RP-0.2: Unit-level guards
 
@@ -251,34 +261,54 @@ Every one surfaced only by running the conformance suite against a real 3-node c
 
 Still leader-only: followers report to the leader, so a non-leader returns an empty list rather than a misleading zero. RP-2.4 removes the asymmetry.
 
+### Bugs RP-2.4 surfaced outside replication
+
+Three defects reached from this work that were not replication bugs at all, and would have hit any user:
+
+| Bug | Effect | Fix |
+|---|---|---|
+| `max_wait_ms` applied **per partition** | `handle_fetch` serves partitions serially and gave each the full budget, so an idle N-partition fetch took N × `max_wait_ms`. At Kafka's default 500ms an 8-partition consumer waited 4s for an empty response, past its own timeout. A partition with data sat behind every idle one ahead of it. | One deadline per request; the waiting path shares it, the data path keeps its own read timeout |
+| `IsrAckTracker` never reaped | Unbounded growth, one entry per unsatisfied `acks=all` produce | Reaper started by the builder |
+| A dead replica reported `lag: 0` | Its last offset is frozen where it died, so the subtraction says "caught up". Printed beside `under_replicated: true`, it reads as a false alarm | Report no lag for a replica outside the liveness window |
+
+The conformance suite itself had **two** faults that made a healthy broker look broken — see the RP-0 section.
+
 ### RP-2.3: High watermark from ISR
 
 - [ ] `HW = min(LEO across ISR)` — today HW is the **leader's own write position** from `ProduceHandler` (`fetch_handler.rs:371`)
 - [ ] Consumers observe only up to HW
-- [ ] `acks=all` completes when HW passes the batch (supersedes RP-1.3's ack-wait)
+- [x] `acks=all` completes when the quorum has reached the batch's offset
 - [ ] Test: HW does not advance while a follower is behind
 
-**Status**: —
+**Status**: `IN PROGRESS` — the `acks=all` half is `TESTED` under both push and pull; `HW = min(LEO)` is not started.
+
+The `acks=all` half forced a latent bug into the open. `IsrAckTracker` matched an **exact** `(topic, partition, offset)`, which only worked because push emitted one ACK per pushed batch. A follower's fetch offset is a watermark that skips across many batch boundaries and rarely lands on a registered offset, so under pull every `acks=all` produce would have waited out the full 30s timeout. Replica progress is monotonic — a replica reporting N holds everything below N — so waits are now released by any report at or above their offset. That is strictly more correct under push too: a follower demonstrably at 500 satisfies a wait at 437 even if the ACK for 437 was lost or coalesced.
+
+The same rewrite closed a memory leak: `cleanup_expired()` had **no caller anywhere in the tree**. A wait that never reached quorum was never removed — the producer's own `timeout()` released the caller but left the registration behind. While `acks!=0` replicated nothing (#22), that was every `acks=all` produce the broker ever served. Same shape as the v2.10.8 produce-reservation leak.
+
+> `HW = min(LEO)` remains the single riskiest change in the roadmap: it alters what consumers can see. Needs its own soak before RP-4.
 
 > The single riskiest change in the roadmap: it alters what consumers can see. Needs its own soak before RP-4.
 
 ### RP-2.4: Follower fetch loop
 
-- [ ] Background task per replicated partition issuing Fetch to the partition leader
-- [ ] Long-poll so steady-state streaming needs no extra round trip
-- [ ] Append fetched records to the local WAL (reusing today's follower write path)
-- [ ] On restart, resume from local LEO → **catch-up, for free**
+- [x] Background task per **leader** (not per partition) issuing Fetch to the partition leader
+- [x] Long-poll so steady-state streaming needs no extra round trip
+- [x] Append fetched records to the local WAL (shared apply path with the push receiver)
+- [x] On restart, resume from local LEO → **catch-up, for free**
 - [ ] Test: follower down 5 minutes, restarted, converges without operator action
 
-**Status**: `NOT STARTED` — the remaining core of RP-2. Design constraints established while building 2.1/2.2, so the next session does not have to rediscover them:
+**Status**: `TESTED` on a 3-node cluster, behind `CHRONIK_REPLICATION_MODE=pull` (default remains `push`). Conformance suite passes in **both** modes: placement correct at acks=0/1/all with 300/300 consumed, and ISR shrinks honestly when a replica is held down.
 
-**The follower needs a Kafka protocol *client*, and there isn't one.** `chronik-server` deliberately excludes `rdkafka`: it pulls in librdkafka, which does not cross-compile against musl without a vendored zlib/OpenSSL, and the crate comments call this out explicitly (the agent-memory feature is gated off for the same reason). So the fetch loop must hand-roll Fetch requests using the existing `chronik-protocol` encoders over a plain TCP socket. That is very doable — the encode/decode types are complete and the conformance suite covers them — but it is the bulk of the work and should be budgeted as such.
+**Shape.** One fetch task per *leader*, not per partition — a follower batches every partition it replicates from the same leader into one long-polled Fetch, as Kafka's `ReplicaFetcherThread` does. Three leaders means three in-flight requests regardless of partition count.
 
-**It cannot run alongside push.** Both mechanisms would deliver the same records and the follower would write duplicates. So the swap is atomic within the branch: RP-2.4 replaces the push receive path rather than sitting beside it. Land it behind an env gate (house style — `CHRONIK_HOT_TEXT_ENABLED` and friends do this) so the tree stays green while it is built, then flip the default once RP-2.3 lands and the conformance suite passes with pull.
+**The Kafka client had to be hand-rolled.** `chronik-server` deliberately excludes `rdkafka` (librdkafka does not cross-compile against musl without a vendored zlib/OpenSSL). `crates/chronik-server/src/replication/replica_fetcher/protocol.rs` encodes Fetch requests and decodes Fetch responses at **v11** — the highest non-flexible version, so no varints or tagged fields, and it still carries `current_leader_epoch` (v9) for RP-3. The risk in hand-rolling a codec is drift from the server it talks to, so its tests round-trip against the server's own `parse_fetch_request` / `encode_fetch_response` and assert the server consumes every byte.
 
-**Ordering: RP-2.4 must precede RP-2.3.** `HW = min(LEO across ISR)` is only safe once followers actually fetch. Do it first and the HW would be pinned by whatever the push ACKs last reported, stalling consumers whenever replication lagged.
+**The apply path refuses rather than guesses.** `plan_batches` is pure and classifies each fetched batch against the follower's LEO: duplicate (the leader answers with whole batches from the one *containing* the requested offset, so re-receipt is routine), gap, straddle, or partial tail (the leader cuts at a byte budget — flow control, not corruption). A refusal aborts before any append, so a blob lands whole or not at all. A straddle halts that partition, because resolving it needs RP-3's epoch history and the alternative is interleaving two histories in one log.
 
-**What it deletes.** Once this works, the three mechanisms RP-1 had to fix — ACK channel for progress, heartbeat replies for liveness, connection pruning for restart detection — all become redundant. Each of those needed a live cluster to find its bug. A fetch offset is progress, liveness and resume position in one value.
+**Ordering held: RP-2.4 preceded RP-2.3.** `HW = min(LEO across ISR)` is only safe once followers actually fetch.
+
+**What it deletes.** The three mechanisms RP-1 had to fix — ACK channel for progress, heartbeat replies for liveness, connection pruning for restart detection — are all redundant under pull. A fetch offset is progress, liveness and resume position in one value.
 
 ---
 
