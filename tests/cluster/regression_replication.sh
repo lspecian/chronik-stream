@@ -83,6 +83,47 @@ local_rf() {
 }
 
 # ------------------------------------------------------------------ k8s mode --
+# Run a shell script inside a pod.
+#
+# REPL_KUBECTL is frequently an ssh wrapper (it is the documented way to reach a
+# MicroK8s lab). ssh flattens its arguments into one string and hands them to
+# the remote login shell, which re-parses them — so a payload written as
+#   kubectl exec pod -- bash -c "a | b"
+# arrives as `bash -c a` with `| b` running on the SSH HOST instead of in the
+# pod. Everything after the first metacharacter silently executes somewhere
+# else, and the command appears to do nothing.
+#
+# That is not hypothetical: it made every produce in this suite a no-op, and the
+# suite then reported "no partitions on any node" — a broken harness perfectly
+# imitating broken replication, on the one test whose whole job is to tell those
+# apart. QUOTE_LEVEL is probed at setup rather than guessed from the string
+# "ssh", so it is correct for any wrapper.
+sh_quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+pod_sh() { # $1=pod  $2=script
+  local payload="$2"
+  [ "${QUOTE_LEVEL:-0}" -ge 1 ] && payload=$(sh_quote "$2")
+  $KUBECTL exec -n "$NS" "$1" -- bash -c "$payload"
+}
+
+# Determine how many levels of shell quoting the payload has to survive, by
+# running something whose correct output cannot be produced by accident.
+detect_quote_level() {
+  local want='probe-2-ok'
+  local script='echo probe-$((1+1))-ok'
+
+  QUOTE_LEVEL=0
+  [ "$(pod_sh "$CLIENT" "$script" 2>/dev/null | tr -d '\r\n')" = "$want" ] && return 0
+
+  QUOTE_LEVEL=1
+  [ "$(pod_sh "$CLIENT" "$script" 2>/dev/null | tr -d '\r\n')" = "$want" ] && return 0
+
+  say "ABORT: cannot run a shell pipeline inside $CLIENT via REPL_KUBECTL."
+  say "       Neither direct nor single-quoted payloads survived. Without this,"
+  say "       produce silently does nothing and every result below is meaningless."
+  exit 1
+}
+
 k8s_setup() {
   [ -n "$NS" ] && [ -n "$PODS" ] || { say "SKIP: k8s mode needs REPL_NS and REPL_PODS"; exit 0; }
   local ready; ready=$($KUBECTL get pods -n "$NS" --no-headers 2>/dev/null | grep -c "^$PODS.* 1/1 *Running")
@@ -99,6 +140,9 @@ k8s_setup() {
     sleep 3
   done
   BOOT="${PODS}-headless:9092"
+
+  detect_quote_level
+  say "-- client pod ready (shell quote level $QUOTE_LEVEL)"
 }
 k8s_teardown() { $KUBECTL delete pod "$CLIENT" -n "$NS" --wait=false >/dev/null 2>&1; }
 k8s_placement() { $KUBECTL exec -n "$NS" "${PODS}-$1" -- ls "/data/wal/$2" 2>/dev/null | sort -n | tr '\n' ' ' | sed 's/ $//'; }
@@ -106,13 +150,13 @@ k8s_produce() { # $1=topic $2=acks — keyed records so the hash partitioner spr
   $KUBECTL exec -n "$NS" "$CLIENT" -- /opt/kafka/bin/kafka-topics.sh \
     --bootstrap-server "$BOOT" --create --topic "$1" \
     --partitions "$PARTITIONS" --replication-factor 3 >/dev/null 2>&1
-  $KUBECTL exec -n "$NS" "$CLIENT" -- bash -c \
+  pod_sh "$CLIENT" \
     "seq 1 $RECORDS | awk '{print \$1\":acks=$2 rec \"\$1}' | /opt/kafka/bin/kafka-console-producer.sh \
        --bootstrap-server $BOOT --topic $1 --producer-property acks=$2 \
        --property parse.key=true --property key.separator=:" >/dev/null 2>&1
 }
 k8s_consume() {
-  $KUBECTL exec -n "$NS" "$CLIENT" -- bash -c \
+  pod_sh "$CLIENT" \
     "/opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server $BOOT --topic $1 \
        --from-beginning --timeout-ms 30000 2>/dev/null | wc -l" 2>/dev/null | tr -cd '0-9'
 }
@@ -220,21 +264,50 @@ if [ "$MODE" = "k8s" ] && [ "$FAIL" -eq 0 ]; then
   before=$(isr_of_led "$topic")
   say "   before: $before"
 
-  $KUBECTL delete pod "${PODS}-3" -n "$NS" --wait=false >/dev/null 2>&1
+  # The replica has to STAY down, and deleting the pod does not achieve that.
+  #
+  # The operator recreates it within ~4s and the broker resumes fetching almost
+  # immediately — long before the pod reports Ready, so "0/1 Running" looks like
+  # an outage while the replica is in fact fully caught up. The ISR liveness
+  # window is 30s, so a blip that short must NOT evict, and keeping the replica
+  # in ISR through it is correct: Kafka's replica.lag.time.max.ms defaults to
+  # 30s for the same reason.
+  #
+  # Under push this test passed anyway, because the leader had to re-establish
+  # its own outbound connection before the follower looked alive again, which
+  # stretched the outage past the window. Pull recovers on the follower's
+  # schedule instead, in seconds — better behaviour that silently invalidated
+  # the test. Three separate attempts (delete once, delete in a loop, SIGSTOP on
+  # PID 1) all failed to keep the replica down, and each looked exactly like
+  # "ISR is over-reporting" while the broker was in fact correct.
+  #
+  # Cordoning the node the replica lives on is what actually works: the pod goes
+  # Pending and stays there. Running pods elsewhere are unaffected, and it is
+  # undone below.
+  node3=$($KUBECTL get pod "${PODS}-3" -n "$NS" -o jsonpath='{.spec.nodeName}' 2>/dev/null)
+  if [ -z "$node3" ]; then
+    fail "cannot determine which node ${PODS}-3 runs on — skipping the ISR assertion rather than guessing"
+  else
+    say "   holding ${PODS}-3 down (cordoning $node3)"
+    $KUBECTL cordon "$node3" >/dev/null 2>&1
+    $KUBECTL delete pod "${PODS}-3" -n "$NS" --wait=false >/dev/null 2>&1
 
-  shrunk=0
-  deadline=$((SECONDS + 90))
-  while [ "$SECONDS" -lt "$deadline" ]; do
-    now=$(isr_of_led "$topic")
-    # Node 3 gone from every partition's ISR that still reports.
-    if [ -n "$now" ] && ! echo "$now" | grep -q '3'; then shrunk=1; break; fi
-    sleep 5
-  done
+    shrunk=0
+    deadline=$((SECONDS + 120))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+      sleep 5
+      now=$(isr_of_led "$topic")
+      # Node 3 gone from every partition's ISR that still reports.
+      if [ -n "$now" ] && ! echo "$now" | grep -q '3'; then shrunk=1; break; fi
+    done
 
-  after=$(isr_of_led "$topic")
-  say "   after:  $after"
-  [ "$shrunk" -eq 1 ] \
-    || fail "ISR still lists the dead replica after 90s — /admin/status is over-reporting health"
+    after=$(isr_of_led "$topic")
+    say "   after:  $after"
+    [ "$shrunk" -eq 1 ] \
+      || fail "ISR still lists a replica held down for 120s — /admin/status is over-reporting health"
+
+    $KUBECTL uncordon "$node3" >/dev/null 2>&1
+  fi
 
   # Let the pod come back so the cluster is left usable.
   for i in $(seq 1 30); do
