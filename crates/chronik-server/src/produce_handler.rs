@@ -199,6 +199,15 @@ pub struct ProduceHandlerConfig {
     pub num_partitions: u32,
     /// Default replication factor for auto-created topics
     pub default_replication_factor: u32,
+    /// RP-1.3: ACKs required before an `acks=all` produce is acknowledged,
+    /// counting the leader's own.
+    ///
+    /// Waiting for *every* assigned replica (the previous behaviour) means one
+    /// slow or dead follower blocks all writes to the partition until the
+    /// replication timeout expires, even at RF=3 / minISR=2 where the write is
+    /// perfectly durable without it. Kafka waits for the in-sync set and fails
+    /// only when it falls below `min.insync.replicas`.
+    pub min_insync_replicas: usize,
     /// Flush profile for pending_batches management
     pub flush_profile: ProduceFlushProfile,
 }
@@ -223,6 +232,7 @@ impl Default for ProduceHandlerConfig {
             auto_create_topics_enable: true,
             num_partitions: 3,
             default_replication_factor: 1,
+            min_insync_replicas: 1, // single-node default: the leader alone suffices
             flush_profile: profile,
         }
     }
@@ -2341,7 +2351,17 @@ impl ProduceHandler {
                             let wal_start = Instant::now();
 
                             // Check if we should use async response delivery
-                            let use_async_responses = self.response_pipeline.is_some() && acks != 0;
+                            // RP-1.3: `acks == 1` only. `acks=-1` must fall through to the
+                            // `match acks` arm below, which registers with IsrAckTracker and
+                            // waits for follower ACKs before answering the client.
+                            //
+                            // This guard previously read `acks != 0`, which sent acks=-1 down
+                            // the fast path too — so `acks=all` returned on the leader's local
+                            // fsync and the ISR quorum code below was unreachable for nine
+                            // months. Only viable now that #29 makes followers actually receive
+                            // data; before that, waiting here would have hung until timeout on
+                            // every request.
+                            let use_async_responses = self.response_pipeline.is_some() && acks == 1;
 
                             if use_async_responses {
                                 // ASYNC PATH: Register for callback notification, write with acks=0 (non-blocking)
@@ -2676,11 +2696,21 @@ impl ProduceHandler {
                         Ok(assignments) => {
                             match assignments.iter().find(|a| a.partition == partition as u32) {
                                 Some(assignment) => {
-                                    // Quorum = all replicas (ISR) must ack
-                                    let isr = &assignment.replicas;
-                                    let size = isr.len();
-                                    info!("📊 ISR for {}-{} from metadata_store: {:?}, quorum={}",
-                                        topic, partition, isr, size);
+                                    // RP-1.3: wait for min_insync_replicas ACKs (leader's own
+                                    // included), not for every assigned replica.
+                                    //
+                                    // Requiring all of them means a single slow or dead follower
+                                    // blocks every write to the partition until the replication
+                                    // timeout, even at RF=3 / minISR=2 where the write is already
+                                    // durable enough. Kafka fails a produce only when the in-sync
+                                    // set drops below min.insync.replicas.
+                                    let replicas = &assignment.replicas;
+                                    let size = self
+                                        .config
+                                        .min_insync_replicas
+                                        .clamp(1, replicas.len().max(1));
+                                    info!("📊 ISR for {}-{} from metadata_store: {:?}, quorum={} (min_insync={})",
+                                        topic, partition, replicas, size, self.config.min_insync_replicas);
                                     size
                                 }
                                 None => {
@@ -2769,11 +2799,21 @@ impl ProduceHandler {
                             return Err(Error::Internal("ISR quorum channel closed".into()));
                         }
                         Err(_) => {
+                            // RP-1.3: report this as Kafka's NOT_ENOUGH_REPLICAS (19) rather
+                            // than a generic internal error. Clients treat 19 as retriable and
+                            // back off; an opaque error looks like a broker fault and can send
+                            // a producer into a different, less useful recovery path.
                             error!(
-                                "acks=-1: ISR quorum timeout for {}-{} offset {} after {:?}",
+                                "acks=-1: ISR quorum timeout for {}-{} offset {} after {:?} — returning NOT_ENOUGH_REPLICAS",
                                 topic, partition, last_offset, REPLICATION_TIMEOUT
                             );
-                            return Err(Error::Internal("ISR quorum timeout".into()));
+                            return Ok(ProduceResponsePartition {
+                                index: partition,
+                                error_code: chronik_protocol::produce_types::error_codes::NOT_ENOUGH_REPLICAS,
+                                base_offset: -1,
+                                log_append_time: -1,
+                                log_start_offset: 0,
+                            });
                         }
                     }
                 } else {
@@ -5065,6 +5105,83 @@ mod tests {
                 before
             );
         }
+    }
+
+    /// RP-1.3: `acks=all` must not answer the client until follower ACKs arrive.
+    ///
+    /// Before this, `use_async_responses` was `acks != 0`, so `acks=-1` took the
+    /// fast path and returned on the leader's own fsync — the ISR quorum code
+    /// below it had been unreachable since v2.2.10. A producer asking for the
+    /// strongest durability got the weakest guarantee available.
+    #[tokio::test]
+    async fn acks_all_waits_for_follower_ack() {
+        use chronik_common::metadata::traits::PartitionAssignment;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let metadata_store = Arc::new(InMemoryMetadataStore::new());
+        let (mut handler, _repl) =
+            handler_with_replication(&temp_dir, metadata_store.clone()).await;
+
+        // Two replicas, and require both (leader + one follower) to acknowledge.
+        handler.config.min_insync_replicas = 2;
+        let ack_tracker = crate::isr_ack_tracker::IsrAckTracker::new();
+        handler.set_isr_ack_tracker(ack_tracker.clone());
+
+        let mut topic_config = TopicConfig::default();
+        topic_config.partition_count = 1;
+        metadata_store.create_topic("quorum-topic", topic_config).await.unwrap();
+        metadata_store
+            .assign_partition(PartitionAssignment {
+                topic: "quorum-topic".to_string(),
+                partition: 0,
+                broker_id: 1,
+                is_leader: true,
+                replicas: vec![1, 2],
+                leader_id: 1,
+            })
+            .await
+            .unwrap();
+
+        let request = ProduceRequest {
+            transactional_id: None,
+            acks: -1,
+            timeout_ms: 30000,
+            topics: vec![ProduceRequestTopic {
+                name: "quorum-topic".to_string(),
+                partitions: vec![ProduceRequestPartition {
+                    index: 0,
+                    records: create_simple_record_batch(0, vec!["m1"]),
+                }],
+            }],
+        };
+
+        let handler = Arc::new(handler);
+        let produce = tokio::spawn({
+            let handler = handler.clone();
+            async move { handler.handle_produce(request, 1).await }
+        });
+
+        // The leader self-ACKs immediately (1 of 2). With no follower ACK the
+        // produce must still be outstanding.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            !produce.is_finished(),
+            "acks=all answered the client before any follower acknowledged"
+        );
+
+        // Follower 2 acknowledges → quorum of 2 reached → produce completes.
+        ack_tracker.record_ack("quorum-topic", 0, 0, 2);
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(10), produce)
+            .await
+            .expect("acks=all did not complete after the follower ACK")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            response.topics[0].partitions[0].error_code, 0,
+            "produce failed after quorum was reached"
+        );
     }
 
     // Helper function to create simple test record batches (for integration tests)

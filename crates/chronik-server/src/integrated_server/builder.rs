@@ -902,6 +902,15 @@ impl IntegratedKafkaServerBuilder {
             auto_create_topics_enable: self.config.auto_create_topics,
             num_partitions: self.config.num_partitions,
             default_replication_factor: self.config.replication_factor,
+            // RP-1.3: how many ACKs `acks=all` waits for, the leader's included.
+            // Single-node has no cluster config and no followers, so 1 is both
+            // correct and unchanged behaviour there.
+            min_insync_replicas: self
+                .config
+                .cluster_config
+                .as_ref()
+                .map(|c| c.min_insync_replicas)
+                .unwrap_or(1),
             flush_profile,
         }
     }
