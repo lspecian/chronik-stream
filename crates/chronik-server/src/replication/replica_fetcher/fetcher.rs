@@ -331,32 +331,39 @@ impl ReplicaFetcher {
     }
 
     /// Read every partition's leader and replica set from metadata.
+    ///
+    /// Sourced from `get_partition_assignments`, the same call `/admin/status`
+    /// uses, and deliberately NOT from `get_partition_leader` /
+    /// `get_partition_replicas`. Those diverge: after a restart the per-partition
+    /// leader lookup returned `None` for topics whose assignments still carried a
+    /// leader, so a follower silently replicated only the handful of topics that
+    /// had been written to recently — 3 of ~30 on the test cluster — while
+    /// `/admin/status` reported every one of them `isr:[1,2,3]`.
+    ///
+    /// A partition that is quietly not replicated while metadata claims it is, is
+    /// this roadmap's founding bug wearing a different hat. One source of truth.
+    ///
+    /// It is also one metadata call per topic instead of two per partition.
     async fn read_assignments(&self) -> chronik_common::Result<Vec<(String, i32, Option<u64>, Vec<u64>)>> {
         let topics = self.metadata_store.list_topics().await?;
         let mut out = Vec::new();
 
         for topic in topics {
-            for partition in 0..topic.config.partition_count {
-                let partition = partition as i32;
-                let leader = self
-                    .metadata_store
-                    .get_partition_leader(&topic.name, partition as u32)
-                    .await
-                    .ok()
-                    .flatten()
-                    .map(|id| id as u64);
-                let replicas = self
-                    .metadata_store
-                    .get_partition_replicas(&topic.name, partition as u32)
-                    .await
-                    .ok()
-                    .flatten()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|id| id as u64)
-                    .collect();
+            let assignments = match self.metadata_store.get_partition_assignments(&topic.name).await {
+                Ok(assignments) => assignments,
+                Err(e) => {
+                    warn!("Cannot read assignments for {}: {}", topic.name, e);
+                    continue;
+                }
+            };
 
-                out.push((topic.name.clone(), partition, leader, replicas));
+            for assignment in assignments {
+                out.push((
+                    topic.name.clone(),
+                    assignment.partition as i32,
+                    Some(assignment.leader_id),
+                    assignment.replicas.clone(),
+                ));
             }
         }
 
