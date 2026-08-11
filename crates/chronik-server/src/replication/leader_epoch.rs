@@ -464,3 +464,230 @@ mod tests {
         assert_eq!(store.latest_epoch("orders", 1), Some(2), "the other partition is untouched");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Stamping the epoch onto appended batches
+// ---------------------------------------------------------------------------
+
+/// Byte offsets within a v2 RecordBatch header.
+const BATCH_LENGTH_OFFSET: usize = 8;
+const LEADER_EPOCH_OFFSET: usize = 12;
+const MAGIC_OFFSET: usize = 16;
+/// Where Kafka's CRC-32C input begins: the attributes field, immediately after
+/// the CRC itself.
+const ATTRIBUTES_OFFSET: usize = 21;
+/// Smallest v2 header we will touch (through attributes).
+const MIN_BATCH_HEADER: usize = 23;
+
+/// Stamp `epoch` into every v2 record batch in `wire`, in place.
+///
+/// Producers send `partition_leader_epoch` as -1; the leader replaces it on
+/// append so the log carries its own leadership history.
+///
+/// **This does not disturb the CRC.** Kafka's CRC-32C covers the batch from the
+/// *attributes* field (offset 21) to the end — `partition_leader_epoch` sits at
+/// offset 12, before the CRC field, and is deliberately excluded precisely so a
+/// broker can assign it without re-checksumming. Rewriting it is therefore safe
+/// on batches whose original compressed bytes must be preserved byte-for-byte,
+/// which is the constraint that governs everything else in this codebase's
+/// record handling.
+///
+/// Returns how many batches were stamped. A blob that is not well-formed v2 is
+/// left alone from that point on rather than being partially rewritten.
+pub fn stamp_leader_epoch(wire: &mut [u8], epoch: i32) -> usize {
+    if epoch < 0 {
+        return 0;
+    }
+
+    let len = wire.len();
+    let mut pos = 0usize;
+    let mut stamped = 0usize;
+
+    while pos + MIN_BATCH_HEADER <= len {
+        let batch_length = i32::from_be_bytes([
+            wire[pos + BATCH_LENGTH_OFFSET],
+            wire[pos + BATCH_LENGTH_OFFSET + 1],
+            wire[pos + BATCH_LENGTH_OFFSET + 2],
+            wire[pos + BATCH_LENGTH_OFFSET + 3],
+        ]);
+        if batch_length < 9 {
+            break;
+        }
+        let end = pos + 12 + batch_length as usize;
+        if end > len {
+            break; // partial trailing batch — leave it whole
+        }
+
+        // Only v2 batches carry this field. v0/v1 message sets have a different
+        // layout, and writing into them at offset 12 would corrupt real data.
+        if wire[pos + MAGIC_OFFSET] as i8 != 2 {
+            break;
+        }
+
+        wire[pos + LEADER_EPOCH_OFFSET..pos + LEADER_EPOCH_OFFSET + 4]
+            .copy_from_slice(&epoch.to_be_bytes());
+        stamped += 1;
+        pos = end;
+    }
+
+    stamped
+}
+
+/// The epoch stamped on the first batch of `wire`, if it is a v2 batch.
+pub fn read_leader_epoch(wire: &[u8]) -> Option<i32> {
+    if wire.len() < MIN_BATCH_HEADER || wire[MAGIC_OFFSET] as i8 != 2 {
+        return None;
+    }
+    Some(i32::from_be_bytes([
+        wire[LEADER_EPOCH_OFFSET],
+        wire[LEADER_EPOCH_OFFSET + 1],
+        wire[LEADER_EPOCH_OFFSET + 2],
+        wire[LEADER_EPOCH_OFFSET + 3],
+    ]))
+}
+
+#[cfg(test)]
+mod stamp_tests {
+    use super::*;
+    use chronik_storage::kafka_records::{CompressionType, KafkaRecordBatch};
+
+    fn real_batch(base_offset: i64, records: usize) -> Vec<u8> {
+        let mut batch = KafkaRecordBatch::new(
+            base_offset,
+            0,
+            -1,
+            -1,
+            0,
+            CompressionType::None,
+            false,
+        );
+        for i in 0..records {
+            batch.add_record(
+                Some(bytes::Bytes::from(format!("k{i}"))),
+                Some(bytes::Bytes::from(format!("value-{i}"))),
+                vec![],
+                1_700_000_000_000 + i as i64,
+            );
+        }
+        batch.encode().unwrap().to_vec()
+    }
+
+    /// The CRC field and the bytes it covers must be byte-identical after
+    /// stamping. If this ever fails, every Java client rejects every batch the
+    /// broker appends — the failure mode this codebase has already paid for
+    /// several times over.
+    #[test]
+    fn stamping_does_not_disturb_the_crc() {
+        let original = real_batch(0, 5);
+        let mut stamped = original.clone();
+
+        assert_eq!(stamp_leader_epoch(&mut stamped, 7), 1);
+
+        assert_eq!(read_leader_epoch(&stamped), Some(7));
+        assert_eq!(
+            &stamped[ATTRIBUTES_OFFSET..],
+            &original[ATTRIBUTES_OFFSET..],
+            "the CRC input region must be untouched"
+        );
+        assert_eq!(
+            crc32c::crc32c(&stamped[ATTRIBUTES_OFFSET..]),
+            crc32c::crc32c(&original[ATTRIBUTES_OFFSET..]),
+            "the recomputed CRC must be unchanged"
+        );
+        // And the stored CRC still matches what the data hashes to.
+        let stored = u32::from_be_bytes([stamped[17], stamped[18], stamped[19], stamped[20]]);
+        assert_eq!(stored, crc32c::crc32c(&stamped[ATTRIBUTES_OFFSET..]));
+    }
+
+    /// Exactly four bytes change, and only those four.
+    #[test]
+    fn stamping_changes_only_the_epoch_field() {
+        let original = real_batch(42, 3);
+        let mut stamped = original.clone();
+        stamp_leader_epoch(&mut stamped, 12345);
+
+        assert_eq!(&stamped[..LEADER_EPOCH_OFFSET], &original[..LEADER_EPOCH_OFFSET]);
+        assert_eq!(&stamped[MAGIC_OFFSET..], &original[MAGIC_OFFSET..]);
+        assert_eq!(stamped.len(), original.len());
+    }
+
+    /// A produce request can carry several batches; every one belongs to this
+    /// leader, so every one is stamped.
+    #[test]
+    fn every_batch_in_a_blob_is_stamped() {
+        let mut blob = real_batch(0, 2);
+        blob.extend_from_slice(&real_batch(2, 2));
+        blob.extend_from_slice(&real_batch(4, 2));
+
+        assert_eq!(stamp_leader_epoch(&mut blob, 9), 3);
+
+        let mut pos = 0;
+        for _ in 0..3 {
+            assert_eq!(read_leader_epoch(&blob[pos..]), Some(9));
+            let batch_length = i32::from_be_bytes([
+                blob[pos + 8], blob[pos + 9], blob[pos + 10], blob[pos + 11],
+            ]) as usize;
+            pos += 12 + batch_length;
+        }
+        assert_eq!(pos, blob.len());
+    }
+
+    /// v0/v1 message sets have a different header layout. Writing at offset 12
+    /// there would corrupt real data, so they are left completely alone.
+    #[test]
+    fn a_non_v2_batch_is_never_rewritten() {
+        let mut fake = real_batch(0, 1);
+        fake[MAGIC_OFFSET] = 1;
+        let before = fake.clone();
+
+        assert_eq!(stamp_leader_epoch(&mut fake, 5), 0);
+        assert_eq!(fake, before);
+    }
+
+    /// A clipped trailing batch is left whole rather than half-rewritten.
+    #[test]
+    fn a_partial_trailing_batch_is_left_alone() {
+        let first = real_batch(0, 2);
+        let second = real_batch(2, 2);
+        let mut blob = first.clone();
+        blob.extend_from_slice(&second[..second.len() / 2]);
+        let tail_before = blob[first.len()..].to_vec();
+
+        assert_eq!(stamp_leader_epoch(&mut blob, 4), 1, "only the complete batch");
+        assert_eq!(read_leader_epoch(&blob), Some(4));
+        assert_eq!(&blob[first.len()..], tail_before.as_slice());
+    }
+
+    /// A negative epoch means "unknown" and must never be written — that is the
+    /// value producers already send, and stamping it would be a no-op that
+    /// silently claimed success.
+    #[test]
+    fn an_undefined_epoch_is_not_stamped() {
+        let original = real_batch(0, 1);
+        let mut untouched = original.clone();
+
+        assert_eq!(stamp_leader_epoch(&mut untouched, UNDEFINED_EPOCH), 0);
+        assert_eq!(untouched, original);
+    }
+
+    #[test]
+    fn an_empty_blob_stamps_nothing() {
+        let mut empty: Vec<u8> = Vec::new();
+        assert_eq!(stamp_leader_epoch(&mut empty, 3), 0);
+        assert_eq!(read_leader_epoch(&empty), None);
+    }
+
+    /// Round trip: what the leader stamps is what the epoch cache observes.
+    #[test]
+    fn a_stamped_batch_feeds_the_epoch_history() {
+        let mut wire = real_batch(100, 4);
+        stamp_leader_epoch(&mut wire, 6);
+
+        let store = LeaderEpochStore::new();
+        let epoch = read_leader_epoch(&wire).unwrap();
+        store.observe_append("orders", 0, epoch, 100);
+
+        assert_eq!(store.latest_epoch("orders", 0), Some(6));
+        assert_eq!(store.end_offset_for_epoch("orders", 0, 6, 104), (6, 104));
+    }
+}
