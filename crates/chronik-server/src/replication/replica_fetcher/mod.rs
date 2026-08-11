@@ -9,7 +9,9 @@
 //!
 //! See `docs/ROADMAP_REPLICATION.md` for the phase plan.
 
+pub mod apply;
 pub mod connection;
 pub mod protocol;
 
+pub use apply::{apply_fetched_records, plan_batches, ApplyRefusal, BatchAction, BatchFrame};
 pub use connection::LeaderConnection;
