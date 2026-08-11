@@ -202,10 +202,11 @@ if [ "$MODE" = "k8s" ] && [ "$FAIL" -eq 0 ]; then
   say ""
   say "-- ISR honesty: killing a replica, ISR must shrink"
 
-  admin_ip=$($KUBECTL get pod "${PODS}-1" -n "$NS" -o jsonpath='{.status.podIP}' 2>/dev/null)
+  # curl from a BROKER pod, not the Kafka client pod: the apache/kafka image has
+  # no curl, while the chronik image installs it (Dockerfile.binary).
   isr_of() { # $1=topic
-    $KUBECTL exec -n "$NS" "$CLIENT" -- sh -c \
-      "curl -s -m 15 http://$admin_ip:6092/admin/status" 2>/dev/null \
+    $KUBECTL exec -n "$NS" "${PODS}-1" -- \
+      curl -s -m 15 http://localhost:6092/admin/status 2>/dev/null \
       | tr '{' '\n' | grep "\"topic\":\"$1\"" | grep -o '"isr":\[[^]]*\]' | tr '\n' ' '
   }
 

@@ -118,6 +118,10 @@ impl IsrTracker {
     /// anyone, and the caller (`is_unknown_for_all`) handles that case
     /// separately. Treating unknown as dead here would wrongly empty ISR before
     /// the first heartbeat.
+    pub fn is_node_alive(&self, node_id: u64) -> bool {
+        self.node_is_alive(node_id)
+    }
+
     fn node_is_alive(&self, node_id: u64) -> bool {
         let Some(last) = self.node_last_seen_ms.get(&node_id) else {
             return true;

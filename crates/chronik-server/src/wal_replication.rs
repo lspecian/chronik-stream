@@ -779,6 +779,45 @@ impl WalReplicationManager {
                 }
             }
         }
+
+        self.prune_unresponsive_connections();
+    }
+
+    /// Drop connections to followers that have stopped answering heartbeats.
+    ///
+    /// A TCP write succeeds into the local send buffer long after the peer is
+    /// gone, so a restarted follower leaves a stale entry in `connections`. The
+    /// connection manager only redials when `contains_key` is false, so it never
+    /// reconnects and replication to that follower stops **permanently** — a
+    /// follower restart silently cost us a replica until the leader restarted.
+    /// Observed directly: after one pod restart, new topics landed only on the
+    /// partitions that node led.
+    ///
+    /// The heartbeat reply is the signal that actually detects this, since it is
+    /// application-level rather than relying on TCP noticing.
+    fn prune_unresponsive_connections(&self) {
+        let (Some(tracker), Some(config)) = (&self.isr_tracker, &self.cluster_config) else {
+            return;
+        };
+
+        for peer in config.peer_nodes() {
+            if peer.id == config.node_id {
+                continue;
+            }
+            if !self.connections.contains_key(&peer.wal) {
+                continue; // already gone; the manager will redial
+            }
+            if tracker.is_node_alive(peer.id) {
+                continue;
+            }
+
+            warn!(
+                "Follower node {} ({}) stopped answering heartbeats — dropping connection to force reconnect",
+                peer.id, peer.wal
+            );
+            self.connections.remove(&peer.wal);
+            tracker.remove_node(peer.id);
+        }
     }
 
     /// Background worker for managing connections to followers
@@ -786,6 +825,14 @@ impl WalReplicationManager {
         info!("WAL replication connection manager started");
 
         while !self.shutdown.load(Ordering::Relaxed) {
+            // Retire connections whose follower has stopped answering, so the
+            // loop below redials them. Runs here rather than alongside the
+            // heartbeat because heartbeats only fire when the queue is empty AND
+            // any successful send resets their timer — with one live and one dead
+            // follower under load they would never fire, and the dead one would
+            // never be reconnected.
+            self.prune_unresponsive_connections();
+
             for follower_addr in &self.followers {
                 // Check if we have an active connection
                 if !self.connections.contains_key(follower_addr) {
