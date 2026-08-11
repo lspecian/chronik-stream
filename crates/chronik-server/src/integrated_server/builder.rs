@@ -1303,6 +1303,15 @@ impl IntegratedKafkaServerBuilder {
             fetch_handler.set_isr_ack_tracker(isr_ack_tracker.clone());
         }
 
+        // RP-2.3: consumers see only what the in-sync set holds. Tied to pull,
+        // because under push the follower positions come from ACK frames whose
+        // delivery this roadmap has already had to fix three times — bounding
+        // consumer visibility on that data would turn a reporting bug into a
+        // stall.
+        if crate::replication::replica_fetcher::ReplicationMode::from_env().is_pull() {
+            fetch_handler.set_hw_from_isr(true);
+        }
+
         self.fetch_handler = Some(Arc::new(fetch_handler));
 
         info!("✅ FetchHandler initialized");

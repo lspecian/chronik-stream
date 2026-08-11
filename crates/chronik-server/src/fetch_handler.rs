@@ -125,6 +125,9 @@ pub struct FetchHandler {
     /// approximate the same information.
     isr_tracker: Option<Arc<crate::isr_tracker::IsrTracker>>,
     isr_ack_tracker: Option<Arc<crate::isr_ack_tracker::IsrAckTracker>>,
+    /// RP-2.3: cap consumer reads at the in-sync watermark. Off unless pull
+    /// replication is active — see `consumer_visible_watermark`.
+    hw_from_isr: bool,
 }
 
 impl FetchHandler {
@@ -148,6 +151,7 @@ impl FetchHandler {
             config: FetchHandlerConfig::default(),
             isr_tracker: None,
             isr_ack_tracker: None,
+            hw_from_isr: false,
         }
     }
 
@@ -174,6 +178,7 @@ impl FetchHandler {
             config: FetchHandlerConfig::default(),
             isr_tracker: None,
             isr_ack_tracker: None,
+            hw_from_isr: false,
         }
     }
 
@@ -200,6 +205,7 @@ impl FetchHandler {
             config: FetchHandlerConfig::default(),
             isr_tracker: None,
             isr_ack_tracker: None,
+            hw_from_isr: false,
         }
     }
 
@@ -231,6 +237,7 @@ impl FetchHandler {
             config,
             isr_tracker: None,
             isr_ack_tracker: None,
+            hw_from_isr: false,
         }
     }
 
@@ -252,6 +259,15 @@ impl FetchHandler {
     pub fn set_isr_ack_tracker(&mut self, tracker: Arc<crate::isr_ack_tracker::IsrAckTracker>) {
         self.isr_ack_tracker = Some(tracker);
         info!("ISR ACK tracker wired to FetchHandler — follower fetches now settle acks=all");
+    }
+
+    /// RP-2.3: bound consumer reads by `min(LEO across ISR)` instead of the
+    /// leader's own write position.
+    pub fn set_hw_from_isr(&mut self, enabled: bool) {
+        self.hw_from_isr = enabled;
+        if enabled {
+            info!("Consumer high watermark now follows the in-sync set, not the leader's write position");
+        }
     }
 
     /// Handle a fetch request
@@ -455,6 +471,58 @@ impl FetchHandler {
         Ok(high_watermark)
     }
 
+    /// RP-2.3: cap a consumer's view at what the in-sync set actually holds.
+    ///
+    /// Gated on pull replication. Under push, follower positions come from ACK
+    /// frames whose delivery this roadmap has already had to fix three times;
+    /// bounding consumer visibility on that data would convert a reporting bug
+    /// into a stall. Under pull the position is the follower's own fetch offset,
+    /// which cannot be stale without the follower having stopped — in which case
+    /// it leaves ISR and stops constraining the watermark.
+    ///
+    /// Single-node is unaffected: there is no ISR tracker and no replicas.
+    async fn consumer_visible_watermark(
+        &self,
+        topic: &str,
+        partition: i32,
+        leader_leo: i64,
+    ) -> i64 {
+        if !self.hw_from_isr {
+            return leader_leo;
+        }
+        let Some(ref tracker) = self.isr_tracker else {
+            return leader_leo;
+        };
+
+        let assignments = match self.metadata_store.get_partition_assignments(topic).await {
+            Ok(a) => a,
+            Err(e) => {
+                debug!("No assignments for {} ({}); serving the leader's position", topic, e);
+                return leader_leo;
+            }
+        };
+        let Some(assignment) = assignments.iter().find(|a| a.partition == partition as u32) else {
+            return leader_leo;
+        };
+
+        let replicas: Vec<u64> = assignment.replicas.iter().map(|&id| id as u64).collect();
+        let watermark = tracker.replicated_watermark(
+            topic,
+            partition,
+            leader_leo,
+            &replicas,
+            assignment.leader_id as u64,
+        );
+
+        if watermark < leader_leo {
+            debug!(
+                "{}-{}: consumers capped at {} (leader is at {}) — the in-sync set is behind",
+                topic, partition, watermark, leader_leo
+            );
+        }
+        watermark
+    }
+
     /// Get the partition's log start offset (low watermark) for a fetch.
     ///
     /// Advanced by the Kafka DeleteRecords API; records below it were deleted.
@@ -613,6 +681,7 @@ impl FetchHandler {
         max_wait_ms: i32,
         min_bytes: i32,
         wait_deadline: Instant,
+        replica_id: i32,
     ) -> Result<FetchResponsePartition> {
         // v2.2.7.2: Log no data available case
         info!(
@@ -640,10 +709,22 @@ impl FetchHandler {
                 while start_time.elapsed() < wait_duration {
                     // Check if new data is available
                     if let Ok(new_segments) = self.metadata_store.list_segments(topic, Some(partition as u32)).await {
-                        let new_high_watermark = new_segments.iter()
+                        let discovered = new_segments.iter()
                             .map(|s| s.end_offset + 1)
                             .max()
                             .unwrap_or(high_watermark);
+
+                        // RP-2.3: this loop discovers a new watermark from the
+                        // segment index, which knows nothing about replication.
+                        // Without re-applying the cap, a consumer that parked in
+                        // the long poll would be handed records the in-sync set
+                        // does not hold — the exact visibility the cap exists to
+                        // prevent, reached by a different route.
+                        let new_high_watermark = if replica_id >= 0 {
+                            discovered
+                        } else {
+                            self.consumer_visible_watermark(topic, partition, discovered).await
+                        };
 
                         if new_high_watermark > fetch_offset {
                             // New data available, fetch it
@@ -808,7 +889,21 @@ impl FetchHandler {
         }
 
         // Phase 2: Get high watermark from ProduceHandler with metadata_store fallback
-        let high_watermark = self.get_high_watermark_for_fetch(topic, partition, fetch_offset).await?;
+        let leader_leo = self.get_high_watermark_for_fetch(topic, partition, fetch_offset).await?;
+
+        // RP-2.3: a follower reads up to the leader's log end; a consumer only up
+        // to what the in-sync set holds. Serving a consumer past that would show
+        // it a record that disappears if the leader is lost — the leader's write
+        // position is not a durability statement.
+        //
+        // A follower must NOT be capped this way, or replication deadlocks: the
+        // watermark cannot advance until followers fetch, and they cannot fetch
+        // past a watermark that is waiting on them.
+        let high_watermark = if replica_id >= 0 {
+            leader_leo
+        } else {
+            self.consumer_visible_watermark(topic, partition, leader_leo).await
+        };
 
         // Log start offset (low watermark). Advanced by the Kafka DeleteRecords API;
         // records below it have been deleted and must not be served. Sourced from
@@ -847,6 +942,7 @@ impl FetchHandler {
                 max_wait_ms,
                 min_bytes,
                 wait_deadline,
+                replica_id,
             )
             .await
         }

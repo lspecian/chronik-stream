@@ -371,6 +371,52 @@ impl IsrTracker {
 
         Some(leader_offset - last_offset)
     }
+
+    /// RP-2.3: the high watermark a *consumer* may read up to.
+    ///
+    /// Kafka's rule: `HW = min(LEO across the in-sync set)`. A record is only
+    /// visible once every in-sync replica holds it, so a consumer can never read
+    /// a record that would vanish if the leader were lost. Today's HW is the
+    /// leader's own write position, which over-reports exactly that.
+    ///
+    /// Two exclusions matter, and getting either wrong breaks the cluster in a
+    /// way that looks like a hang:
+    ///
+    /// - **Replicas outside ISR do not hold the watermark back.** A dead replica
+    ///   is frozen at its last offset; letting it bound the HW would stall every
+    ///   consumer on the partition until an operator intervened. That is the
+    ///   scenario `min.insync.replicas` exists to police, not the HW.
+    /// - **Knowing nothing means no constraint.** Before any follower has
+    ///   reported — a freshly started cluster — bounding the HW at 0 would hide
+    ///   the entire log. Return the leader's position and let ISR reporting catch
+    ///   up.
+    pub fn replicated_watermark(
+        &self,
+        topic: &str,
+        partition: i32,
+        leader_leo: i64,
+        replicas: &[u64],
+        leader_id: u64,
+    ) -> i64 {
+        let mut watermark = leader_leo;
+        let mut any_in_sync_follower = false;
+
+        for &node_id in replicas.iter().filter(|&&id| id != leader_id) {
+            if self.sync_state(node_id, topic, partition, leader_leo) != SyncState::InSync {
+                continue;
+            }
+            let Some(lag) = self.get_follower_lag(node_id, topic, partition, leader_leo) else {
+                continue;
+            };
+            any_in_sync_follower = true;
+            watermark = watermark.min(leader_leo - lag);
+        }
+
+        if !any_in_sync_follower {
+            return leader_leo;
+        }
+        watermark.clamp(0, leader_leo)
+    }
 }
 
 impl Default for IsrTracker {
@@ -612,5 +658,82 @@ mod tests {
             "a replica that stopped reporting has unknown distance, not zero"
         );
         assert_eq!(tracker.sync_state(2, "t", 0, 100), SyncState::Lagging);
+    }
+
+    /// RP-2.3: a consumer must not see a record that only the leader holds.
+    #[test]
+    fn watermark_is_bounded_by_the_slowest_in_sync_follower() {
+        let tracker = IsrTracker::new(1000, 10_000);
+
+        tracker.update_follower_offset(2, "t", 0, 90);
+        tracker.record_node_alive(2);
+        tracker.update_follower_offset(3, "t", 0, 75);
+        tracker.record_node_alive(3);
+
+        assert_eq!(
+            tracker.replicated_watermark("t", 0, 100, &[1, 2, 3], 1),
+            75,
+            "the watermark follows the furthest-behind in-sync replica"
+        );
+    }
+
+    /// A replica that has dropped out of ISR must NOT pin the watermark. If it
+    /// did, one dead node would stall every consumer on the partition until an
+    /// operator intervened — turning a survivable failure into an outage.
+    #[test]
+    fn a_replica_outside_isr_does_not_hold_the_watermark_back() {
+        let tracker = IsrTracker::new(1000, 10_000);
+
+        tracker.update_follower_offset(2, "t", 0, 100);
+        tracker.record_node_alive(2);
+        tracker.update_follower_offset(3, "t", 0, 10);
+        tracker.record_node_alive(3);
+
+        // Node 3 stops answering entirely.
+        let stale = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            - 10_000 * 3 - 5_000;
+        tracker.node_last_seen_ms.insert(3, stale);
+
+        assert_eq!(tracker.sync_state(3, "t", 0, 100), SyncState::Lagging);
+        assert_eq!(
+            tracker.replicated_watermark("t", 0, 100, &[1, 2, 3], 1),
+            100,
+            "a dead replica must not stall consumers"
+        );
+    }
+
+    /// Before any follower has reported, bounding the watermark at 0 would hide
+    /// the whole log. Nothing known means no constraint.
+    #[test]
+    fn an_unreported_partition_is_not_bounded_to_zero() {
+        let tracker = IsrTracker::new(1000, 10_000);
+
+        assert_eq!(
+            tracker.replicated_watermark("t", 0, 500, &[1, 2, 3], 1),
+            500,
+            "no follower data must not be read as 'nothing is replicated'"
+        );
+    }
+
+    /// A single-node partition has no followers to wait for.
+    #[test]
+    fn a_lone_leader_is_its_own_watermark() {
+        let tracker = IsrTracker::new(1000, 10_000);
+        assert_eq!(tracker.replicated_watermark("t", 0, 42, &[1], 1), 42);
+    }
+
+    /// A follower reporting ahead of the leader (an in-flight write the leader
+    /// has not yet counted) must not push the watermark past the leader's log.
+    #[test]
+    fn the_watermark_never_exceeds_the_leader() {
+        let tracker = IsrTracker::new(1000, 10_000);
+
+        tracker.update_follower_offset(2, "t", 0, 150);
+        tracker.record_node_alive(2);
+
+        assert_eq!(tracker.replicated_watermark("t", 0, 100, &[1, 2], 1), 100);
     }
 }
