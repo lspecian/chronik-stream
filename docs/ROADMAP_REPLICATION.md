@@ -11,7 +11,8 @@
 | RP-2 | Follower fetch | `TESTED` | — | 2.1–2.4 all validated on a 3-node cluster, behind `CHRONIK_REPLICATION_MODE=pull` |
 | RP-3 | Leader epochs & truncation | `TESTED (partly)` | — | Handshake proven end-to-end on a cluster; the **truncate** branch still needs manufactured divergence |
 | RP-5 | Partition leader failover | `TESTED` | — | Built and validated: leadership moves, RF preserved, ISR shrinks, writes recover |
-| RP-6 | Failover recovery latency | `NOT STARTED` | — | A returning replica waits on metadata anti-entropy (up to 5 min) to learn it is no longer leader |
+| RP-6 | Failover recovery latency | `TESTED` | — | Catalog is pushed on rejoin; verified on cluster |
+| RP-7 | Assignments have no single authority | `NOT STARTED` | — | ⛔ **The real blocker.** Three nodes, three views of one partition; every node gossips its own |
 | RP-4 | Delete the push stack | `NOT STARTED` | — | ~2,500 lines removed |
 
 ---
@@ -498,9 +499,15 @@ Leadership moves to a live replica in ~45s (one liveness window plus a tick), th
 2. **Failover shrank the replica set.** Writing the *live* replicas back as the assignment meant a partition returned from a transient failure at RF=2, and the returning node was no longer a replica at all — so it never resumed replicating and never ran the handshake. Repeat the failure and RF reaches 1 with nothing reporting it. Failover moves leadership; it is not a reassignment. ISR is what shrinks, and `IsrTracker` already does that.
 3. **It was silent.** Nothing logged what the controller believed, so a no-op and a healthy cluster were the same observation. It now logs the live set on change.
 
-4. **A returning node undid the failover, and every read went to zero.** The worst result of this effort, and it is a *metadata* bug that only working failover could expose.
+4. **A returning node undid the failover.** A *metadata* bug that only working failover could expose.
 
-   Measured by the conformance suite: `distinct consumed 0 / acknowledged 400`. Node 1 led partition 0; it was held down; the partition failed over to node 2; node 2 accepted 400 acknowledged records. Node 1 came back, replayed its own metadata WAL — stale by exactly the change that demoted it — and its `PartitionAssigned` event overwrote the newer one **on every node**. All three then agreed the leader was node 1, which held no data for that partition. Consumers routed to the leader read nothing. The records were intact on node 2 the whole time; metadata had simply pointed away from them.
+   Node 1 led partition 0; it was held down; the partition failed over to node 2; node 2 accepted the records. Node 1 came back, replayed its own metadata WAL — stale by exactly the change that demoted it — and its `PartitionAssigned` event overwrote the newer one **on every node**. All three then agreed the leader was node 1, which held no data for that partition.
+
+   ⚠️ **Correction to an earlier claim in this document.** This was first written up as also causing `distinct consumed 0 / acknowledged 400`. That attribution was wrong, and the correction matters more than the original claim. Measuring afterwards: the data was on the correct leader and *was* readable — `Processed a total of 272 messages`. Two separate mistakes produced the "zero reads":
+   - the earlier probe used `--partition N --from-beginning`, and `kafka-console-consumer` ignores `--from-beginning` when `--partition` is given, starting at *latest* — so it read an empty tail and I recorded a broker failure that had not happened;
+   - the suite's topic-wide consume is genuinely flaky: two identical invocations, seconds apart, returned **272** and then **0**. That is the subscribe path, not replication — see the `#36` finding below.
+
+   The epoch guard is still correct and still needed — it demonstrably stopped the revert on the node that had the data (9 stale assignments rejected in one run). It simply does not fix what the count of readable records suggested it did.
 
    The apply path was a blind `insert` — last writer wins regardless of age. Nothing in the metadata model expressed that one assignment supersedes another.
 
@@ -578,6 +585,30 @@ So the shape of the fix is: elect a **live** replica other than the failed leade
   **The fix is not "ratchet the other way".** Both directions are wrong because count is being used as a proxy for authority. What matters is whether the config came from an explicit `CreateTopics` or from auto-creation; that distinction needs to be carried on the event and to win regardless of count. This is the same shape as the assignment bug above — replicated state without a marker saying which copy is authoritative.
 - The conformance suite asserts `consumed == produced` for acks=1. Without idempotence — which the Java producer silently disables when `acks=1` is set explicitly — duplicates are permitted by the protocol, so that assertion is stricter than the contract. The honest check is *distinct* count equals produced. Left as-is for now because the observed duplication is a broker-side artefact worth failing on, but the assertion should be split before it is trusted.
 - **A broker that is healthy and serving can sit at `0/1 Running` indefinitely.** After a restart, one node served replica fetches normally, with no errors in its log, while never passing its readiness probe. Worth a look: readiness that disagrees with reality makes every k8s-level test ambiguous, which is how RP-0.3 wasted three attempts.
+
+---
+
+## Phase RP-7: Assignments have no single authority (found 2026-08-12)
+
+**Status**: `NOT STARTED`. **The real remaining blocker** — larger than RP-3 or RP-5, and the reason RP-0.4 still fails.
+
+After a failover and the old leader's return, the three nodes held **three different views of the same partition**:
+
+| node | its view of `repltrunc-0` | reality |
+|---|---|---|
+| 2 | `leader:2` | correct — holds all 272 records |
+| 1 | `leader:1, isr:[1,3]` | wrong — holds nothing, and is therefore serving fetches as a leader with an empty log |
+| 3 | `leader:1, isr:[1,2,3]` | wrong — so it fetches from node 1, which has nothing, and stays empty |
+
+The epoch guard (RP-5 finding 4) stops any node *regressing* to an older assignment, and it worked: node 2 rejected 9 stale ones and kept the correct leadership. But a guard cannot deliver an update to a node that never received it, and nothing makes one node's view authoritative.
+
+**Every node runs the anti-entropy broadcast**, so each re-publishes *its own* view on a timer. That is gossip without a tiebreak: node 1 broadcasts `leader:1`, node 2 broadcasts `leader:2`, and which one a third node ends up with depends on arrival order and on whether the epoch guard happens to reject it. Convergence is not guaranteed in either direction.
+
+The consequence is worse than a stale read. A node that believes it leads a partition it has no data for **serves fetches for it** (node 1 logged 17,259 fetch-starts for a partition whose log is empty), and a follower pointed at it replicates nothing. The partition is under-replicated while every node reports `under_replicated: false`.
+
+**The fix is an authority, not a better merge.** Assignments are Raft-managed state and the Raft leader is the only node entitled to publish them. Concretely: only the Raft leader should run the assignment half of anti-entropy, and a node that is not the Raft leader should treat its own assignments as a cache to be corrected rather than a view to be broadcast. RP-6's rejoin push is the right shape — it just needs to be the *only* shape.
+
+⚠️ This makes RP-0.4 and the RP-3.3 divergence test unreliable until fixed: both depend on all nodes agreeing who leads the partition under test.
 
 ---
 
