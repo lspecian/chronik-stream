@@ -92,6 +92,10 @@ pub struct IntegratedKafkaServerBuilder {
 
     // Partition leader failover (Stage 17, RP-5). Held for the same reason.
     partition_failover: Option<Arc<crate::partition_failover::PartitionFailoverController>>,
+
+    // RP-6: woken when a node rejoins, so the catalog anti-entropy loop
+    // re-broadcasts immediately instead of up to 5 minutes later.
+    metadata_rejoin_notify: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl IntegratedKafkaServerBuilder {
@@ -128,6 +132,7 @@ impl IntegratedKafkaServerBuilder {
             metadata_uploader: None,
             replica_fetcher: None,
             partition_failover: None,
+            metadata_rejoin_notify: None,
         }
     }
 
@@ -414,6 +419,26 @@ impl IntegratedKafkaServerBuilder {
             .and_then(|v| v.parse::<u64>().ok())
             .filter(|&n| n > 0)
             .unwrap_or(300);
+
+        // RP-6: a node rejoining is exactly when someone needs the catalog, and
+        // waiting up to `rebroadcast_secs` for it is what made failover recovery
+        // take minutes.
+        //
+        // A node that was leading a partition when it died comes back believing
+        // it still leads: it recovers metadata from its own WAL, which is stale
+        // by precisely the change that demoted it. `plan_assignments` skips
+        // partitions led by this node, so it fetches nothing for them and cannot
+        // run the RP-3.3 handshake for them either — it does not know it is a
+        // follower. It stays that way until the next anti-entropy pass, default
+        // 300s.
+        //
+        // The failover controller already watches liveness and already runs only
+        // on the Raft leader, so it can say "someone just came back". Waking this
+        // loop then is a targeted fix; shortening the interval would trade a
+        // constant broadcast cost against a window that would still exist.
+        let rejoin_notify = Arc::new(tokio::sync::Notify::new());
+        self.metadata_rejoin_notify = Some(rejoin_notify.clone());
+
         tokio::spawn(async move {
             // First pass early: covers the common fast-startup case.
             tokio::time::sleep(std::time::Duration::from_secs(45)).await;
@@ -425,7 +450,15 @@ impl IntegratedKafkaServerBuilder {
                         "Re-broadcast topic metadata for follower sync (anti-entropy)"
                     );
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(rebroadcast_secs)).await;
+
+                // `notify_one` stores a permit, so a rejoin that lands while the
+                // broadcast above is still running is not lost.
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(rebroadcast_secs)) => {}
+                    _ = rejoin_notify.notified() => {
+                        tracing::info!("Node rejoined — re-broadcasting the catalog now rather than waiting for anti-entropy");
+                    }
+                }
             }
         });
 
@@ -1775,6 +1808,7 @@ impl IntegratedKafkaServerBuilder {
             cluster_config.node_id,
             raft.clone(),
             metadata_store.clone(),
+            self.metadata_rejoin_notify.clone(),
         );
         controller.start();
         self.partition_failover = Some(controller);

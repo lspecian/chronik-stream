@@ -154,6 +154,24 @@ pub fn plan_failover(
     plan
 }
 
+/// Nodes present now that were absent before — the ones that just came back.
+///
+/// `previous` is `None` on the first observation after becoming Raft leader.
+/// Everyone looks new then, but nobody has rejoined: treating that as a rejoin
+/// would fire a full catalog broadcast on every Raft leadership change, which
+/// on a large catalog is exactly the burst the anti-entropy interval exists to
+/// space out.
+pub fn rejoined_nodes(previous: Option<&[u64]>, current: &[u64]) -> Vec<u64> {
+    let Some(previous) = previous else {
+        return Vec::new();
+    };
+    current
+        .iter()
+        .copied()
+        .filter(|id| !previous.contains(id))
+        .collect()
+}
+
 /// Tracks which nodes have been heard from, and moves partitions off the ones
 /// that have not.
 pub struct PartitionFailoverController {
@@ -169,6 +187,9 @@ pub struct PartitionFailoverController {
     /// Last live set logged, so the line above prints on change rather than
     /// every tick.
     last_reported_live: parking_lot::Mutex<Option<Vec<u64>>>,
+    /// Woken when a node rejoins, so the catalog anti-entropy loop re-broadcasts
+    /// immediately (RP-6).
+    rejoin_notify: Option<Arc<tokio::sync::Notify>>,
     tick: Duration,
     liveness_window: Duration,
     shutdown: Arc<AtomicBool>,
@@ -180,6 +201,7 @@ impl PartitionFailoverController {
         node_id: u64,
         raft: Arc<RaftCluster>,
         metadata_store: Arc<dyn MetadataStore>,
+        rejoin_notify: Option<Arc<tokio::sync::Notify>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             node_id,
@@ -188,6 +210,7 @@ impl PartitionFailoverController {
             last_active: DashMap::new(),
             leader_since: parking_lot::Mutex::new(None),
             last_reported_live: parking_lot::Mutex::new(None),
+            rejoin_notify,
             tick: env_secs("CHRONIK_FAILOVER_TICK_SECS").unwrap_or(DEFAULT_TICK),
             liveness_window: env_secs("CHRONIK_FAILOVER_LIVENESS_SECS")
                 .unwrap_or(DEFAULT_LIVENESS_WINDOW),
@@ -249,7 +272,8 @@ impl PartitionFailoverController {
         info!("Partition failover controller stopped on node {}", self.node_id);
     }
 
-    /// Log the live set whenever it changes.
+    /// Log the live set whenever it changes, and push the catalog when a node
+    /// rejoins (RP-6).
     ///
     /// The first build of this controller shipped as a silent no-op on a real
     /// cluster: the planner was correct and its liveness input was a constant,
@@ -260,9 +284,31 @@ impl PartitionFailoverController {
         sorted.sort_unstable();
 
         let mut last = self.last_reported_live.lock();
-        if last.as_deref() != Some(sorted.as_slice()) {
-            info!("Partition failover: live nodes {:?}", sorted);
-            *last = Some(sorted);
+        if last.as_deref() == Some(sorted.as_slice()) {
+            return;
+        }
+
+        // A node present now that was absent before has just come back, and its
+        // metadata is stale by whatever happened while it was away — including,
+        // if it was a partition leader, the failover that demoted it. Until it
+        // learns that, it believes it still leads and replicates nothing for
+        // those partitions. Waking the anti-entropy loop turns a wait of up to
+        // `CHRONIK_METADATA_REBROADCAST_SECS` (default 300s) into one pass.
+        let rejoined = rejoined_nodes(last.as_deref(), &sorted);
+
+        info!("Partition failover: live nodes {:?}", sorted);
+        *last = Some(sorted);
+        drop(last);
+
+        if !rejoined.is_empty() {
+            if let Some(notify) = &self.rejoin_notify {
+                info!(
+                    "Node(s) {:?} rejoined — asking for an immediate catalog re-broadcast so they \
+                     learn any leadership that moved while they were away",
+                    rejoined
+                );
+                notify.notify_one();
+            }
         }
     }
 
@@ -585,6 +631,38 @@ mod tests {
             vec![1, 2, 3],
             "and the replica set is still RF=3"
         );
+    }
+
+    // ---- RP-6: pushing the catalog to a node that just came back ----
+
+    /// The case RP-6 exists for: a node that was away returns, and its metadata
+    /// is stale by exactly the failover that demoted it.
+    #[test]
+    fn a_returning_node_is_detected_as_rejoined() {
+        assert_eq!(rejoined_nodes(Some(&[2, 3]), &[1, 2, 3]), vec![1]);
+    }
+
+    /// A node leaving is not a rejoin — it needs no catalog, and broadcasting
+    /// on every departure would double the burst during an outage.
+    #[test]
+    fn a_departing_node_is_not_a_rejoin() {
+        assert_eq!(rejoined_nodes(Some(&[1, 2, 3]), &[2, 3]), Vec::<u64>::new());
+        assert_eq!(rejoined_nodes(Some(&[1, 2, 3]), &[1, 2, 3]), Vec::<u64>::new());
+    }
+
+    /// The first observation after this node becomes Raft leader must not count
+    /// as everyone rejoining, or every leadership change would trigger a full
+    /// catalog broadcast.
+    #[test]
+    fn the_first_observation_is_not_a_rejoin() {
+        assert_eq!(rejoined_nodes(None, &[1, 2, 3]), Vec::<u64>::new());
+    }
+
+    /// Two nodes returning together are both reported, so a single broadcast
+    /// covers them.
+    #[test]
+    fn several_nodes_returning_at_once_are_all_reported() {
+        assert_eq!(rejoined_nodes(Some(&[3]), &[1, 2, 3]), vec![1, 2]);
     }
 
     /// Repeated failures must not erode the replica set. This is the property
