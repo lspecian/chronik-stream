@@ -2441,11 +2441,37 @@ impl RaftCluster {
                 // This enables metadata queries to check leadership without locking raft_node
                 let current_leader_id_val = raft_lock.raft.leader_id;
                 let current_state = raft_lock.raft.state;
-                self.cached_leader_id.store(current_leader_id_val, Ordering::Relaxed);
-                self.cached_is_leader.store(
+                let current_term_val = raft_lock.raft.term;
+
+                // Say out loud when consensus changes hands.
+                //
+                // Raft's own logs go through slog → the `log` crate, and in
+                // practice nothing from raft-rs has ever appeared in this
+                // service's output — so leadership, terms and elections have
+                // been entirely invisible. Diagnosing "did a new leader get
+                // elected?" meant inferring it from downstream symptoms, which
+                // is how a partition that never failed over looked like four
+                // different bugs in turn.
+                //
+                // These transitions are rare by nature, so logging every one at
+                // info costs nothing and answers the question directly.
+                let previous_leader = self.cached_leader_id.swap(current_leader_id_val, Ordering::Relaxed);
+                let was_leader = self.cached_is_leader.swap(
                     current_state == raft::StateRole::Leader,
                     Ordering::Relaxed
                 );
+                let is_leader_now = current_state == raft::StateRole::Leader;
+
+                if previous_leader != current_leader_id_val || was_leader != is_leader_now {
+                    tracing::info!(
+                        "Raft leadership: node {} is now {:?} at term {} (leader is {}, was {})",
+                        self.node_id,
+                        current_state,
+                        current_term_val,
+                        current_leader_id_val,
+                        previous_leader
+                    );
+                }
 
                 // METRICS: Calculate total lock hold time (including I/O)
                 let lock_released_at = std::time::Instant::now();
