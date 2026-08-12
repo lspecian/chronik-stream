@@ -145,8 +145,16 @@ say "-- writing $ORPHAN_N record(s) only node $OLD can have (acks=1)"
 LEADER_B=$(broker_of "$OLD")
 produce $((PREFIX_N + 1)) $((PREFIX_N + ORPHAN_N)) 1 orphan "$LEADER_B"
 sleep 3
-orphans_here=$(count_tag orphan "$LEADER_B")
-say "   leader holds ${orphans_here:-0} orphan record(s)"
+
+# Check the leader's LOG, not what a consumer can see.
+#
+# A consumer deliberately cannot see these. RP-2.3 caps consumer-visible
+# offsets at what the in-sync set holds, and the frozen followers are still in
+# ISR for their liveness window — so these records are invisible to a reader by
+# design, which is the feature working. Asking a consumer about them reports
+# zero and reads exactly like "the write failed".
+orphans_here=$(grep -ao "orphan-" "$DIR/data/alt-node$OLD/wal/$TOPIC"/*/*.log 2>/dev/null | wc -l)
+say "   leader's log holds ${orphans_here:-0} orphan marker(s) on disk"
 [ "${orphans_here:-0}" -ge 1 ] || { fail "no orphans landed — no divergence to test"; exit 1; }
 
 # 4. Kill the leader, thaw the followers. They hold quorum and must elect.
