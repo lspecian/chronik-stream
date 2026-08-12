@@ -138,6 +138,57 @@ fn env_i32(key: &str) -> Option<i32> {
     std::env::var(key).ok().and_then(|v| v.trim().parse().ok())
 }
 
+/// The local partition state a follower needs, narrowed to three questions.
+///
+/// The fetcher used to hold an `Arc<ProduceHandler>` for this. That is a large
+/// object with a dozen production construction sites and **none in any test**,
+/// which is precisely why the truncation path below went untested: you could not
+/// build one to drive it. Six attempts to prove that path on a real cluster
+/// failed in the test rig rather than the product, and the cheapest of those
+/// attempts cost more than this trait.
+///
+/// Three methods is the whole surface. `ProduceHandler` implements it; a test
+/// can implement it in a dozen lines.
+#[async_trait::async_trait]
+pub trait FollowerState: Send + Sync {
+    /// Leader-epoch history for this node's own log.
+    fn leader_epochs(&self) -> Arc<crate::replication::leader_epoch::LeaderEpochStore>;
+
+    /// Where this node's log currently ends for a partition.
+    async fn local_log_end(&self, topic: &str, partition: i32) -> i64;
+
+    /// Move the partition's offsets *down* after its log was truncated.
+    async fn reset_after_truncation(
+        &self,
+        topic: &str,
+        partition: i32,
+        new_end: i64,
+    ) -> chronik_common::Result<()>;
+}
+
+#[async_trait::async_trait]
+impl FollowerState for crate::produce_handler::ProduceHandler {
+    fn leader_epochs(&self) -> Arc<crate::replication::leader_epoch::LeaderEpochStore> {
+        crate::produce_handler::ProduceHandler::leader_epochs(self)
+    }
+
+    async fn local_log_end(&self, topic: &str, partition: i32) -> i64 {
+        self.get_high_watermark(topic, partition)
+            .await
+            .unwrap_or(0)
+            .max(0)
+    }
+
+    async fn reset_after_truncation(
+        &self,
+        topic: &str,
+        partition: i32,
+        new_end: i64,
+    ) -> chronik_common::Result<()> {
+        self.reset_offsets_after_truncation(topic, partition, new_end).await
+    }
+}
+
 /// One partition this node replicates, and who to get it from.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct FollowedPartition {
@@ -202,7 +253,12 @@ pub struct ReplicaFetcher {
     config: ReplicaFetcherConfig,
     metadata_store: Arc<dyn MetadataStore>,
     wal_manager: Arc<chronik_wal::WalManager>,
+    /// Kept concrete because the apply path hands it to `apply_fetched_records`,
+    /// which updates the transaction index as well as offsets.
     produce_handler: Option<Arc<crate::produce_handler::ProduceHandler>>,
+    /// The same handler in production, narrowed to what reconciliation needs —
+    /// and substitutable in tests. See [`FollowerState`].
+    follower_state: Option<Arc<dyn FollowerState>>,
     /// node id → Kafka address, from the cluster config.
     peers: HashMap<u64, String>,
     /// Follower LEO per partition, the offset the next fetch asks from.
@@ -226,6 +282,7 @@ impl ReplicaFetcher {
             metadata_store,
             wal_manager,
             produce_handler: None,
+            follower_state: None,
             peers,
             positions: Arc::new(DashMap::new()),
             shutdown: Arc::new(AtomicBool::new(false)),
@@ -239,9 +296,20 @@ impl ReplicaFetcher {
         handler: Arc<crate::produce_handler::ProduceHandler>,
     ) -> Arc<Self> {
         if let Some(inner) = Arc::get_mut(&mut self) {
+            inner.follower_state = Some(handler.clone() as Arc<dyn FollowerState>);
             inner.produce_handler = Some(handler);
         } else {
             warn!("ReplicaFetcher already shared; produce handler not attached");
+        }
+        self
+    }
+
+    /// Attach local state without a `ProduceHandler` — the seam that makes the
+    /// reconciliation path drivable from a test.
+    #[cfg(test)]
+    fn with_follower_state(mut self: Arc<Self>, state: Arc<dyn FollowerState>) -> Arc<Self> {
+        if let Some(inner) = Arc::get_mut(&mut self) {
+            inner.follower_state = Some(state);
         }
         self
     }
@@ -508,12 +576,11 @@ impl ReplicaFetcher {
             OffsetForLeaderEpochRequest, OffsetForLeaderPartition, OffsetForLeaderTopic,
         };
 
-        let Some(handler) = self.produce_handler.as_ref() else {
-            // Without a produce handler there is no epoch history to reconcile
-            // against. This is the unit-test shape, not a deployed one.
+        let Some(state) = self.follower_state.as_ref() else {
+            // No local state to reconcile against.
             return Ok(());
         };
-        let epochs = handler.leader_epochs();
+        let epochs = state.leader_epochs();
 
         let mut by_topic: BTreeMap<String, Vec<OffsetForLeaderPartition>> = BTreeMap::new();
         for followed in partitions {
@@ -622,14 +689,11 @@ impl ReplicaFetcher {
         let new_end = outcome.new_log_end_offset.unwrap_or(0);
         self.positions.insert((topic.to_string(), partition), new_end);
 
-        if let Some(handler) = &self.produce_handler {
-            handler
+        if let Some(state) = &self.follower_state {
+            state
                 .leader_epochs()
                 .truncate_from_end(topic, partition, new_end);
-            if let Err(e) = handler
-                .reset_offsets_after_truncation(topic, partition, new_end)
-                .await
-            {
+            if let Err(e) = state.reset_after_truncation(topic, partition, new_end).await {
                 warn!(
                     "{}-{}: truncated the log to {} but could not reset the watermark: {}",
                     topic, partition, new_end, e
@@ -700,12 +764,8 @@ impl ReplicaFetcher {
             return *offset;
         }
 
-        let offset = match &self.produce_handler {
-            Some(handler) => handler
-                .get_high_watermark(topic, partition)
-                .await
-                .unwrap_or(0)
-                .max(0),
+        let offset = match &self.follower_state {
+            Some(state) => state.local_log_end(topic, partition).await,
             None => 0,
         };
 
@@ -1007,6 +1067,320 @@ mod tests {
     fn an_unknown_replication_mode_falls_back_to_push() {
         assert_eq!(ReplicationMode::parse("pulll"), ReplicationMode::Push);
         assert_eq!(ReplicationMode::parse("off"), ReplicationMode::Push);
+    }
+
+    // ---- RP-3.3: the cut itself, end to end ----
+    //
+    // A real WAL on disk, a real socket, the broker's own API-23 codec on the
+    // far end, and the fetcher's own reconciliation path driven start to finish.
+    // This is what six cluster attempts were trying to establish; each failed in
+    // the harness rather than the product, and none of them could assert *which*
+    // records survived. These can.
+
+    /// Minimal local state: an epoch history, a log end, and a record of the
+    /// reset the fetcher asks for.
+    struct FakeState {
+        epochs: Arc<crate::replication::leader_epoch::LeaderEpochStore>,
+        log_end: i64,
+        reset_to: Arc<std::sync::Mutex<Option<(String, i32, i64)>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl FollowerState for FakeState {
+        fn leader_epochs(&self) -> Arc<crate::replication::leader_epoch::LeaderEpochStore> {
+            Arc::clone(&self.epochs)
+        }
+        async fn local_log_end(&self, _topic: &str, _partition: i32) -> i64 {
+            self.log_end
+        }
+        async fn reset_after_truncation(
+            &self,
+            topic: &str,
+            partition: i32,
+            new_end: i64,
+        ) -> chronik_common::Result<()> {
+            *self.reset_to.lock().unwrap() = Some((topic.to_string(), partition, new_end));
+            Ok(())
+        }
+    }
+
+    /// A leader that answers "your epoch ended at `end_offset`", using the
+    /// broker's own codec so this cannot drift from what a real leader sends.
+    async fn spawn_epoch_leader(end_offset: i64) -> String {
+        use chronik_protocol::offset_for_leader_epoch_types::{
+            encode_response, parse_request, OffsetForLeaderEpochResponse,
+            OffsetForLeaderPartitionResponse, OffsetForLeaderTopicResponse,
+        };
+        use chronik_protocol::parser::{parse_request_header, write_response_header, Decoder, ResponseHeader};
+        use bytes::{Bytes, BytesMut};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    loop {
+                        let mut len = [0u8; 4];
+                        if socket.read_exact(&mut len).await.is_err() {
+                            return;
+                        }
+                        let mut payload = vec![0u8; i32::from_be_bytes(len) as usize];
+                        if socket.read_exact(&mut payload).await.is_err() {
+                            return;
+                        }
+
+                        let mut wire = Bytes::from(payload);
+                        let header = parse_request_header(&mut wire).unwrap();
+                        let mut decoder = Decoder::new(&mut wire);
+                        let request = parse_request(&mut decoder).unwrap();
+
+                        let topics = request
+                            .topics
+                            .iter()
+                            .map(|t| OffsetForLeaderTopicResponse {
+                                name: t.name.clone(),
+                                partitions: t
+                                    .partitions
+                                    .iter()
+                                    .map(|p| OffsetForLeaderPartitionResponse {
+                                        error_code: 0,
+                                        partition: p.partition,
+                                        end_offset,
+                                    })
+                                    .collect(),
+                            })
+                            .collect();
+
+                        let mut body = BytesMut::new();
+                        encode_response(&mut body, &OffsetForLeaderEpochResponse { topics });
+
+                        let mut response = BytesMut::new();
+                        write_response_header(
+                            &mut response,
+                            &ResponseHeader { correlation_id: header.correlation_id },
+                        );
+                        response.extend_from_slice(&body);
+
+                        let mut framed = BytesMut::new();
+                        framed.extend_from_slice(&(response.len() as i32).to_be_bytes());
+                        framed.extend_from_slice(&response);
+                        if socket.write_all(&framed).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        addr
+    }
+
+    /// Build a follower holding `records` single-record batches, all stamped
+    /// with `epoch`, and point it at a leader on `addr`.
+    async fn follower_with_log(
+        dir: &std::path::Path,
+        topic: &str,
+        partition: i32,
+        records: i64,
+        epoch: i32,
+        addr: &str,
+    ) -> (Arc<ReplicaFetcher>, Arc<FakeState>, Arc<chronik_wal::WalManager>) {
+        let mut config = chronik_wal::config::WalConfig::default();
+        config.data_dir = dir.to_path_buf();
+        let wal = Arc::new(chronik_wal::WalManager::new(config).await.unwrap());
+
+        let epochs = Arc::new(crate::replication::leader_epoch::LeaderEpochStore::new());
+        for offset in 0..records {
+            wal.append_canonical(
+                topic.to_string(),
+                partition,
+                format!("value-{offset}").into_bytes(),
+                offset,
+                offset,
+                1,
+            )
+            .await
+            .unwrap();
+            epochs.observe_append(topic, partition, epoch, offset);
+        }
+
+        let state = Arc::new(FakeState {
+            epochs,
+            log_end: records,
+            reset_to: Arc::new(std::sync::Mutex::new(None)),
+        });
+
+        let metadata: Arc<dyn MetadataStore> =
+            Arc::new(chronik_common::metadata::InMemoryMetadataStore::new());
+        let fetcher = ReplicaFetcher::new(
+            2,
+            ReplicaFetcherConfig::default(),
+            metadata,
+            Arc::clone(&wal),
+            HashMap::from([(1u64, addr.to_string())]),
+        )
+        .with_follower_state(Arc::clone(&state) as Arc<dyn FollowerState>);
+
+        (fetcher, state, wal)
+    }
+
+    async fn readable_offsets(wal: &chronik_wal::WalManager, topic: &str, partition: i32) -> Vec<i64> {
+        wal.read_from(topic, partition, 0, usize::MAX)
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|r| match r {
+                chronik_wal::WalRecord::V2 { base_offset, .. } => Some(*base_offset),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The case this whole phase exists for: our log runs past where the
+    /// leader's history for our epoch ended, so the tail must go.
+    #[tokio::test]
+    async fn a_divergent_tail_is_cut_and_the_position_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let (topic, partition) = ("orders", 0);
+
+        // The leader says epoch 0 ended at 60; we hold 100 records.
+        let addr = spawn_epoch_leader(60).await;
+        let (fetcher, state, wal) =
+            follower_with_log(dir.path(), topic, partition, 100, 0, &addr).await;
+
+        let mut connection = LeaderConnection::new(addr);
+        let followed = vec![FollowedPartition {
+            topic: topic.to_string(),
+            partition,
+            leader: 1,
+        }];
+
+        fetcher
+            .reconcile_with_leader(&mut connection, &followed)
+            .await
+            .expect("reconciliation should succeed");
+
+        let surviving = readable_offsets(&wal, topic, partition).await;
+        assert_eq!(
+            surviving,
+            (0..60).collect::<Vec<_>>(),
+            "everything at or above the divergence point must be gone, and nothing below it"
+        );
+
+        assert_eq!(
+            fetcher.positions.get(&(topic.to_string(), partition)).map(|o| *o),
+            Some(60),
+            "the next fetch must resume exactly where the log now ends"
+        );
+
+        assert_eq!(
+            *state.reset_to.lock().unwrap(),
+            Some((topic.to_string(), partition, 60)),
+            "the watermark must be walked back too, or this node advertises records it discarded"
+        );
+
+        assert_eq!(
+            state.epochs.snapshot(topic, partition).len(),
+            1,
+            "epoch history must survive a cut that did not remove its only entry"
+        );
+    }
+
+    /// The common case — caught up, or behind. Nothing may be touched.
+    #[tokio::test]
+    async fn a_log_that_is_a_prefix_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (topic, partition) = ("orders", 0);
+
+        // The leader's epoch ran to 500; we only hold 100.
+        let addr = spawn_epoch_leader(500).await;
+        let (fetcher, state, wal) =
+            follower_with_log(dir.path(), topic, partition, 100, 0, &addr).await;
+
+        let mut connection = LeaderConnection::new(addr);
+        let followed = vec![FollowedPartition {
+            topic: topic.to_string(),
+            partition,
+            leader: 1,
+        }];
+
+        fetcher
+            .reconcile_with_leader(&mut connection, &followed)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            readable_offsets(&wal, topic, partition).await,
+            (0..100).collect::<Vec<_>>(),
+            "a follower that is merely behind must not lose a single record"
+        );
+        assert_eq!(*state.reset_to.lock().unwrap(), None, "nothing to reset");
+    }
+
+    /// `-1` means "I cannot answer", not offset -1 and not "delete everything".
+    /// Acting on it would destroy a correct log through the machinery built to
+    /// protect it.
+    #[tokio::test]
+    async fn an_unanswerable_epoch_leaves_the_log_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let (topic, partition) = ("orders", 0);
+
+        let addr = spawn_epoch_leader(-1).await;
+        let (fetcher, state, wal) =
+            follower_with_log(dir.path(), topic, partition, 100, 0, &addr).await;
+
+        let mut connection = LeaderConnection::new(addr);
+        let followed = vec![FollowedPartition {
+            topic: topic.to_string(),
+            partition,
+            leader: 1,
+        }];
+
+        fetcher
+            .reconcile_with_leader(&mut connection, &followed)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            readable_offsets(&wal, topic, partition).await,
+            (0..100).collect::<Vec<_>>(),
+            "an abstaining leader must not cost us the log"
+        );
+        assert_eq!(*state.reset_to.lock().unwrap(), None);
+    }
+
+    /// A follower with no epoch history cannot reconcile, and must not guess.
+    /// It also must not send a query it has nothing to ask about.
+    #[tokio::test]
+    async fn a_log_without_epoch_history_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (topic, partition) = ("orders", 0);
+
+        // Records stamped -1: pre-RP-3 data, so `observe_append` records nothing.
+        let addr = spawn_epoch_leader(10).await;
+        let (fetcher, state, wal) =
+            follower_with_log(dir.path(), topic, partition, 100, -1, &addr).await;
+
+        let mut connection = LeaderConnection::new(addr);
+        let followed = vec![FollowedPartition {
+            topic: topic.to_string(),
+            partition,
+            leader: 1,
+        }];
+
+        fetcher
+            .reconcile_with_leader(&mut connection, &followed)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            readable_offsets(&wal, topic, partition).await,
+            (0..100).collect::<Vec<_>>(),
+            "an unstamped log must not be truncated on a guess"
+        );
+        assert_eq!(*state.reset_to.lock().unwrap(), None);
     }
 
     // ---- RP-3.3: deciding whether to discard a divergent tail ----
