@@ -135,6 +135,18 @@ k8s_setup() {
   local ready; ready=$($KUBECTL get pods -n "$NS" --no-headers 2>/dev/null | grep -c "^$PODS.* 1/1 *Running")
   [ "$ready" -ge 3 ] || { say "SKIP: need 3 running $PODS pods in $NS (found $ready)"; exit 1; }
 
+  # A pod that is Terminating still answers `get`, and reports phase Running
+  # right up until it disappears. Treating that as "the client is ready" runs
+  # the whole suite against a pod that dies underneath it: produce and consume
+  # silently return nothing, and every result is meaningless. Wait it out.
+  local waited=0
+  while [ -n "$($KUBECTL get pod "$CLIENT" -n "$NS" -o jsonpath='{.metadata.deletionTimestamp}' 2>/dev/null)" ]; do
+    [ "$waited" -eq 0 ] && say "-- waiting for a terminating $CLIENT to go away"
+    waited=$((waited + 1))
+    [ "$waited" -gt 60 ] && { say "SKIP: $CLIENT stuck terminating"; exit 1; }
+    sleep 2
+  done
+
   if ! $KUBECTL get pod "$CLIENT" -n "$NS" >/dev/null 2>&1; then
     say "-- creating client pod $CLIENT"
     $KUBECTL run "$CLIENT" -n "$NS" --restart=Never --image=docker.io/apache/kafka:3.7.0 \
