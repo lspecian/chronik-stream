@@ -79,13 +79,31 @@ leader_of() { # $1 = api port to ask
     | grep -o '"leader":[0-9]*' | head -1 | tr -cd '0-9'
 }
 
-produce() { # $1=first $2=last $3=acks $4=tag
+# Clients must only ever be pointed at brokers that can answer.
+#
+# A SIGSTOPped process still *accepts* TCP connections — the kernel completes
+# the handshake from the listen backlog — while never replying. So a bootstrap
+# list containing a frozen broker does not fail over; it hangs indefinitely.
+# Observed: kcat blocked for ten minutes against a frozen node while the live
+# leader sat there ready to serve.
+#
+# Hence an explicit broker argument on every call, plus hard timeouts so a
+# mistake costs seconds rather than a whole run.
+KCAT_TIMEOUTS=(-X socket.timeout.ms=4000 -X metadata.request.timeout.ms=4000)
+
+produce() { # $1=first $2=last $3=acks $4=tag $5=brokers
   seq "$1" "$2" | sed "s/^/$4-/" \
-    | kcat -P -b "$BOOT" -t "$TOPIC" -X request.required.acks="$3" 2>/dev/null
+    | timeout 60 kcat -P -b "$5" -t "$TOPIC" -X request.required.acks="$3" \
+        "${KCAT_TIMEOUTS[@]}" 2>/dev/null
 }
 
-count_tag() { # $1 = tag
-  kcat -C -b "$BOOT" -t "$TOPIC" -o beginning -e -q 2>/dev/null | grep -c "^$1-"
+count_tag() { # $1=tag $2=brokers
+  timeout 60 kcat -C -b "$2" -t "$TOPIC" -o beginning -e -q \
+    "${KCAT_TIMEOUTS[@]}" 2>/dev/null | grep -c "^$1-"
+}
+
+broker_of() { # $1 = node id → its kafka address
+  echo "localhost:$((9391 + $1))"
 }
 
 say "== RP-3.3 local divergence test: $TOPIC =="
@@ -100,9 +118,9 @@ sleep 12
 say "-- three nodes up on 9392-9394"
 
 # 1. Common prefix, acknowledged by the full ISR.
-produce 1 "$PREFIX_N" -1 prefix
+produce 1 "$PREFIX_N" -1 prefix "$BOOT"
 sleep 5
-seen=$(count_tag prefix)
+seen=$(count_tag prefix "$BOOT")
 if [ "${seen:-0}" -lt "$PREFIX_N" ]; then
   fail "setup did not take: only ${seen:-0} of $PREFIX_N prefix records readable"
   exit 1
@@ -124,9 +142,10 @@ sleep 2
 
 # 3. Records only the leader can have.
 say "-- writing $ORPHAN_N record(s) only node $OLD can have (acks=1)"
-produce $((PREFIX_N + 1)) $((PREFIX_N + ORPHAN_N)) 1 orphan
+LEADER_B=$(broker_of "$OLD")
+produce $((PREFIX_N + 1)) $((PREFIX_N + ORPHAN_N)) 1 orphan "$LEADER_B"
 sleep 3
-orphans_here=$(count_tag orphan)
+orphans_here=$(count_tag orphan "$LEADER_B")
 say "   leader holds ${orphans_here:-0} orphan record(s)"
 [ "${orphans_here:-0}" -ge 1 ] || { fail "no orphans landed — no divergence to test"; exit 1; }
 
@@ -151,7 +170,8 @@ done
 say "-- leadership moved to node $NEW"
 
 # 5. Different records over the same offsets.
-produce $((PREFIX_N + 1)) $((PREFIX_N + WINNER_N)) -1 winner
+SURVIVORS=$(for n in 1 2 3; do [ "$n" = "$OLD" ] || printf "%s," "$(broker_of $n)"; done | sed "s/,$//")
+produce $((PREFIX_N + 1)) $((PREFIX_N + WINNER_N)) -1 winner "$SURVIVORS"
 sleep 5
 say "-- wrote $WINNER_N committed record(s) over those offsets"
 
@@ -169,8 +189,8 @@ grep -aE "truncated to|diverged from the leader|log is a prefix|not truncating|R
 truncated=0
 grep -qaE "truncated to|diverged from the leader" "$LOGS/alt-node$OLD.log" 2>/dev/null && truncated=1
 
-winners=$(count_tag winner)
-orphans=$(count_tag orphan)
+winners=$(count_tag winner "$BOOT")
+orphans=$(count_tag orphan "$BOOT")
 say ""
 say "   committed (winner) records readable: ${winners:-0} / $WINNER_N"
 say "   uncommitted (orphan) records readable: ${orphans:-0} (must be 0)"
