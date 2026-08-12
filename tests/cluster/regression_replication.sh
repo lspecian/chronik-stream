@@ -352,22 +352,39 @@ if [ "$MODE" = "k8s" ] && [ "$FAIL" -eq 0 ]; then
          --property parse.key=true --property key.separator=:" >/dev/null 2>&1
   }
 
-  leader_of() { # partition leader for $trunc_topic, or empty
-    $KUBECTL exec -n "$NS" "${PODS}-1" -- \
+  # Leader of ONE named partition, observed from a node that is not the one
+  # being killed.
+  #
+  # This used to take `head -1` of every partition line for the topic, which
+  # silently watched a different partition than the one whose leader was
+  # unseated: a topic created with `--partitions 1` came back with three, so
+  # the probe reported "no new leader" while failover had worked perfectly.
+  # Never assume the partition count you asked for.
+  leader_of() { # $1 = partition
+    $KUBECTL exec -n "$NS" "$OBSERVER" -- \
       curl -s -m 15 http://localhost:6092/admin/status 2>/dev/null \
       | tr '{' '\n' | grep "\"topic\":\"$trunc_topic\"" \
+      | grep "\"partition\":$1," \
       | grep -o '"leader":[0-9]*' | head -1 | tr -cd '0-9'
   }
 
-  # One partition: one leader to unseat, one log to reason about.
   $KUBECTL exec -n "$NS" "$CLIENT" -- /opt/kafka/bin/kafka-topics.sh \
     --bootstrap-server "$BOOT" --create --topic "$trunc_topic" \
     --partitions 1 --replication-factor 3 >/dev/null 2>&1
 
   produce_range 1 "$BEFORE_N"
+  produced_total="$BEFORE_N"
   sleep 5
 
-  old_leader=$(leader_of)
+  # Track partition 0 specifically, and observe from node 1 unless node 1 is
+  # the one we are about to unseat (a status endpoint on a dead node reports
+  # nothing, which reads exactly like "no leader" — a trap this suite fell into).
+  OBSERVER="${PODS}-1"
+  target_partition=0
+  old_leader=$(leader_of "$target_partition")
+  if [ "$old_leader" = "1" ]; then
+    OBSERVER="${PODS}-2"
+  fi
   if [ -z "$old_leader" ]; then
     fail "RP-3.3: no leader reported for $trunc_topic — cannot stage a leader change"
   else
@@ -381,20 +398,24 @@ if [ "$MODE" = "k8s" ] && [ "$FAIL" -eq 0 ]; then
       $KUBECTL cordon "$victim_node" >/dev/null 2>&1
       $KUBECTL delete pod "${PODS}-${old_leader}" -n "$NS" --wait=false >/dev/null 2>&1
 
-      # Wait for a different node to take the partition.
+      # Wait for a different node to take the partition (RP-5 failover).
       new_leader=""
       deadline=$((SECONDS + 180))
       while [ "$SECONDS" -lt "$deadline" ]; do
         sleep 5
-        now=$(leader_of)
+        now=$(leader_of "$target_partition")
         if [ -n "$now" ] && [ "$now" != "$old_leader" ]; then new_leader="$now"; break; fi
       done
 
       if [ -z "$new_leader" ]; then
-        fail "RP-3.3: no new leader elected within 180s of node $old_leader going down"
+        fail "RP-3.3: partition $target_partition still led by node $old_leader 180s after it went down — no failover"
       else
         say "   leader after:  node $new_leader"
         produce_range $((BEFORE_N + 1)) $((BEFORE_N + AFTER_N))
+        # Only count what was actually written. Asserting against a total that
+        # includes records a failed branch never produced turns one failure
+        # into two, and the second one is fiction.
+        produced_total=$((BEFORE_N + AFTER_N))
       fi
 
       # Bring the old leader back as a follower. This is the moment under test.
@@ -428,11 +449,18 @@ if [ "$MODE" = "k8s" ] && [ "$FAIL" -eq 0 ]; then
       done
 
       # Nothing acknowledged may be lost. Over-truncation shows up here.
-      expected=$((BEFORE_N + AFTER_N))
-      got=$($consume "$trunc_topic")
-      say "   consumed $got / acknowledged $expected"
-      [ "${got:-0}" -eq "$expected" ] \
-        || fail "RP-3.3: consumed $got of $expected acknowledged records — the failover lost data"
+      #
+      # Compared on DISTINCT records, not raw lines: acks=1 without idempotence
+      # permits duplicates, and a subscribing consumer here has been observed
+      # re-reading a partition after a rebalance (issue #36). Neither is data
+      # loss, which is what this assertion is for. A surplus is reported, not
+      # failed.
+      got=$(pod_sh "$CLIENT" \
+        "/opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server $BOOT --topic $trunc_topic \
+           --from-beginning --timeout-ms 30000 2>/dev/null | sort -u | wc -l" 2>/dev/null | tr -cd '0-9')
+      say "   distinct consumed $got / acknowledged $produced_total"
+      [ "${got:-0}" -ge "$produced_total" ] \
+        || fail "RP-3.3: only $got of $produced_total acknowledged records survived — the failover lost data"
 
       # Witness that the reconcile path actually ran. Informational: whether a
       # divergent tail existed at all depends on timing, and a run where the old

@@ -9,8 +9,9 @@
 | RP-0 | Replication conformance suite | `TESTED` | — | Placement + ISR honesty; fails pre-#29, passes after |
 | RP-1 | Harden the current mechanism | `TESTED` | — | 1.1–1.4 + 3 bugs found by cluster validation |
 | RP-2 | Follower fetch | `TESTED` | — | 2.1–2.4 all validated on a 3-node cluster, behind `CHRONIK_REPLICATION_MODE=pull` |
-| RP-3 | Leader epochs & truncation | `CODE COMPLETE` | — | 3.1–3.3 built & unit-tested; cluster validation **blocked by RP-5** |
-| RP-5 | Partition leader failover | `NOT STARTED` | — | ⛔ **Does not exist.** Blocks RP-3.3 validation; pre-existing, both modes |
+| RP-3 | Leader epochs & truncation | `TESTED (partly)` | — | Handshake proven end-to-end on a cluster; the **truncate** branch still needs manufactured divergence |
+| RP-5 | Partition leader failover | `TESTED` | — | Built and validated: leadership moves, RF preserved, ISR shrinks, writes recover |
+| RP-6 | Failover recovery latency | `NOT STARTED` | — | A returning replica waits on metadata anti-entropy (up to 5 min) to learn it is no longer leader |
 | RP-4 | Delete the push stack | `NOT STARTED` | — | ~2,500 lines removed |
 
 ---
@@ -394,11 +395,32 @@ The current epoch is answered with the leader's **log end offset**, not RP-2.3's
 - [x] Follower truncates its log to that point before resuming fetch
 - [x] WAL suffix truncation primitive (the gate below — it did not exist)
 - [x] Conformance test written (RP-0.4)
-- [ ] ⛔ **Test cannot run: partition leader failover does not exist** (see RP-5)
+- [x] Handshake proven end-to-end on a 3-node cluster
+- [ ] The **truncate** branch specifically — needs manufactured divergence (see below)
 
-**Status**: `CODE COMPLETE`, unit- and integration-tested, **never exercised on a cluster and currently unable to be**. The only phase where a bug **destroys** data rather than stalling it, so this gap matters.
+**Status**: `TESTED (partly)`. The exchange runs on real hardware; the branch that actually deletes data has not been triggered because nothing has yet produced a divergent log.
 
-Deployed to a 3-node cluster in pull mode. Placement is correct at acks=0/1/all and ISR honesty passes, but the truncation path **never fired**, because producing divergence requires a new leader to accept writes the old one never had — and leadership never moves. See RP-5.
+Verified on a cluster, all three steps of the chain, from one follower restart:
+
+```
+Leader-epoch history rebuilt for 1 partition(s), 1 leadership transition(s), in 254µs
+OffsetForLeaderEpoch hshake-0: epoch 0 ends at 100 (log end 100)      ← leader answered
+hshake-0: log is a prefix of the leader's (ours ends at 100,
+          the epoch ran to 100) — nothing to truncate                 ← follower decided
+```
+
+and again across five partitions at once on a replica returning from a failover.
+
+#### Two ordering bugs that made this inert, both silent
+
+1. **The epoch warm-up ran after the replica fetcher started.** `warm_up_leader_epochs` was called after all 17 builder stages; the fetcher starts at stage 16. Measured: the fetcher logged `Replicating 1 partition(s)` **553µs before** the warm-up finished, so its first reconcile read an empty epoch store, found nothing to ask about, skipped the handshake and cleared its reconcile flag. The history then arrived too late to matter, and a returning replica would never truncate. The warm-up now runs before stage 16.
+2. **The warm-up enumerated partitions from `list_topics()`**, which races catalog recovery at startup — a topic not yet in the catalog was skipped even though its log was on disk. It now enumerates from the WAL directory, which is what it rebuilds from. And it logs unconditionally: it previously printed only when it warmed something, so "warmed nothing" and "never ran" were the same observation.
+
+#### What is still untested: the cut itself
+
+Every cluster run so far ends in `log is a prefix — nothing to truncate`, which is the **correct** outcome for the failure being staged. Killing a leader does not produce divergence when writes are acknowledged by the full ISR: the survivors already hold everything the dead node had.
+
+Real divergence needs the leader to accept writes its followers never received, then lose the election — i.e. a **network partition**, not a node kill: partition the leader from its followers, produce with `acks=1` so it acknowledges alone, then let the others elect a new leader and heal the partition. That is the test still owed. Until it runs, the truncation branch has 12 integration tests and 15 unit tests behind it and no hardware.
 
 #### The storage half: `WalManager::truncate_to`
 
@@ -446,9 +468,41 @@ Cost is a WAL scan per partition at startup. Kafka avoids it with a `leader-epoc
 
 ---
 
-## Phase RP-5: Partition leader failover (BLOCKER, found 2026-08-12)
+## Phase RP-5: Partition leader failover — `TESTED` (built 2026-08-12)
 
-**Status**: `NOT STARTED`. Blocks RP-3.3's cluster validation, and is a live correctness gap in its own right.
+**Status**: `TESTED` on a 3-node cluster. Built because it blocked RP-3.3's validation, and because it was a live correctness gap in its own right.
+
+### Result
+
+Same probe that previously showed leadership frozen for 150 seconds, against the new build:
+
+```
+initial: "leader":1,"replicas":[1,2,3],"isr":[1,2,3]
+  t=30s  "leader":1,"replicas":[1,2,3],"isr":[1,2,3]
+  t=45s  "leader":2,"replicas":[1,2,3],"isr":[2,3]     ← failover
+produce (acks=all, leader down): 0 errors  (was 63)
+```
+
+Leadership moves to a live replica in ~45s (one liveness window plus a tick), the replica set stays RF=3, ISR shrinks honestly to the live members, and writes resume. In the conformance suite the same thing shows as `leader after: node 2` with `distinct consumed 400 / acknowledged 400` — **no acknowledged record lost across a failover**.
+
+### How it works
+
+- **Liveness comes from Raft** (`RaftCluster::sample_active_peers`). The data path cannot supply it: followers report to their leader, so a leader's death is exactly the case with nobody left to observe it — which is also why ISR never shrank before. Raft heartbeats run between all members regardless of who leads what. Kafka's controller tracks broker liveness the same way, and for the same reason.
+- **Only the Raft leader acts**, and not until a full liveness window after being elected. Two nodes electing independently would hand one partition to two leaders — the divergence RP-3.3 exists to clean up after. A newly elected leader has heard from nobody yet, so without the grace period its first pass would fail every partition in the cluster over at once.
+- **`plan_failover` is pure**, because it decides where writes go. A healthy cluster must plan *nothing*: every failover bumps a leader epoch, and an epoch bump sends followers into the RP-3.3 handshake, so churn here would leave the cluster permanently reconciling. A test asserts the plan converges after one pass.
+- **Persisted through `assign_partition`**, which derives the epoch — so a real leader change bumps it exactly once. That bump is what makes RP-3.3 reachable at all.
+
+### Three bugs found by running it, not by writing it
+
+1. **The liveness input was a constant.** `recent_active` is set when a peer replies and cleared only by `check_quorum_active`, which Raft calls only when `check_quorum` is enabled — and this cluster leaves it at the default `false`. Nothing ever cleared the flag, so every peer that had ever been seen read alive forever, *including after it died*. The controller deployed clean and did nothing. The sampler now owns the reset, which leaves consensus behaviour untouched; enabling `check_quorum` instead would make a leader step down whenever it missed a quorum of replies for one election timeout, and this config is already tuned around election storms.
+2. **Failover shrank the replica set.** Writing the *live* replicas back as the assignment meant a partition returned from a transient failure at RF=2, and the returning node was no longer a replica at all — so it never resumed replicating and never ran the handshake. Repeat the failure and RF reaches 1 with nothing reporting it. Failover moves leadership; it is not a reassignment. ISR is what shrinks, and `IsrTracker` already does that.
+3. **It was silent.** Nothing logged what the controller believed, so a no-op and a healthy cluster were the same observation. It now logs the live set on change.
+
+### What was removed
+
+Both stubs that reported success while doing nothing: `elect_leader_from_isr` (the module is now an honest shim; the push stack still wires the type, RP-4 deletes both) and `propose_set_partition_leader` (no callers).
+
+### The original measurement
 
 ### What was measured
 
@@ -502,6 +556,20 @@ So the shape of the fix is: elect a **live** replica other than the failed leade
 - **A subscribing consumer can read a partition twice.** One conformance run consumed 490 records of 300 produced at acks=1; a later topic held 400 readable records for 200 produced. Reading the same topic with an explicit `--partition` returns **exactly** the right count, and the WAL holds one copy — so the log is correct and the duplication is in the subscribe/consumer-group path, most likely a rebalance re-reading from the beginning. Intermittent: five consecutive direct reproductions were clean. This is issue #36, now with a sharper characterisation.
 - The conformance suite asserts `consumed == produced` for acks=1. Without idempotence — which the Java producer silently disables when `acks=1` is set explicitly — duplicates are permitted by the protocol, so that assertion is stricter than the contract. The honest check is *distinct* count equals produced. Left as-is for now because the observed duplication is a broker-side artefact worth failing on, but the assertion should be split before it is trusted.
 - **A broker that is healthy and serving can sit at `0/1 Running` indefinitely.** After a restart, one node served replica fetches normally, with no errors in its log, while never passing its readiness probe. Worth a look: readiness that disagrees with reality makes every k8s-level test ambiguous, which is how RP-0.3 wasted three attempts.
+
+---
+
+## Phase RP-6: Failover recovery latency (found 2026-08-12)
+
+**Status**: `NOT STARTED`. Not a correctness bug — the cluster converges — but it makes failover recovery take minutes instead of seconds, and it is the reason RP-0.4 still fails.
+
+A node that was leading a partition when it died comes back believing it is *still* the leader: it recovers metadata from its own WAL, which is stale by exactly the change that demoted it. `plan_assignments` skips partitions whose leader is this node, so it fetches nothing for them. It learns the truth only from the metadata anti-entropy re-broadcast — first pass at 45s, then `CHRONIK_METADATA_REBROADCAST_SECS`, default **300s**.
+
+Measured: after a failover the returning replica held nothing for that topic, while a topic from an earlier run — with ~10 minutes to heal — had fully converged on all three nodes. So it heals; it just takes an anti-entropy period, and RP-0.4's 150s convergence window is not enough.
+
+**The fix is a catch-up read, not a shorter timer.** A node starting up should ask the Raft leader for current assignments rather than trusting a local copy that is stale precisely when it matters most. Shortening the re-broadcast interval trades a constant broadcast cost against a window that would still exist.
+
+⚠️ This interacts with RP-3.3: the returning node cannot run the truncation handshake for a partition it does not know it follows. So a divergent replica stays divergent — serving nothing, but also repairing nothing — for up to the anti-entropy period.
 
 ---
 
