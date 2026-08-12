@@ -9,7 +9,7 @@
 | RP-0 | Replication conformance suite | `TESTED` | — | Placement + ISR honesty; fails pre-#29, passes after |
 | RP-1 | Harden the current mechanism | `TESTED` | — | 1.1–1.4 + 3 bugs found by cluster validation |
 | RP-2 | Follower fetch | `TESTED` | — | 2.1–2.4 all validated on a 3-node cluster, behind `CHRONIK_REPLICATION_MODE=pull` |
-| RP-3 | Leader epochs & truncation | `IN PROGRESS` | — | 3.1+3.2 code complete & unit-tested; 3.3 (truncation) remains |
+| RP-3 | Leader epochs & truncation | `CODE COMPLETE` | — | 3.1–3.3 all built & unit-tested; **none of it has run on a cluster** |
 | RP-4 | Delete the push stack | `NOT STARTED` | — | ~2,500 lines removed |
 
 ---
@@ -379,7 +379,7 @@ The case that matters most is the one that must *not* bump — re-asserting the 
 ### RP-3.2: Implement `OffsetForLeaderEpoch`
 
 - [x] Serve API 23: given an epoch, return its last offset
-- [ ] Follower queries on leader change to find the divergence point (RP-3.3)
+- [x] Follower queries on leader change to find the divergence point (RP-3.3)
 
 **Status**: `CODE COMPLETE` — v0 only, matching the advertised range. Advertising more than is implemented hands clients malformed frames, so the two move together.
 
@@ -389,30 +389,48 @@ The current epoch is answered with the leader's **log end offset**, not RP-2.3's
 
 ### RP-3.3: Truncation on leader change
 
-- [ ] Follower detects a leader/epoch change and asks the new leader where its epoch ended
-- [ ] Follower truncates its log to that point before resuming fetch
+- [x] Follower detects a leader/epoch change and asks the new leader where its epoch ended
+- [x] Follower truncates its log to that point before resuming fetch
+- [x] WAL suffix truncation primitive (the gate below — it did not exist)
 - [ ] Test: leader killed mid-produce, new leader elected, follower with extra records truncates and converges (un-ignores RP-0.3)
 
-**Status**: `NOT STARTED` — the remaining core of RP-3, and the only phase where a bug **destroys** data rather than stalling it.
+**Status**: `CODE COMPLETE`, unit- and integration-tested, **never run on a cluster**. The only phase where a bug **destroys** data rather than stalling it, so the cluster test is not a formality.
 
-What exists to build on: the follower's Fetch client already speaks v11, which carries `current_leader_epoch`; `LeaderEpochStore` answers "what is my latest epoch?" and supports `truncate_from_end`; and the leader now answers API 23.
+#### The storage half: `WalManager::truncate_to`
 
-#### ⛔ The gate: the WAL cannot truncate its tail
+The gate was that **no suffix truncation existed anywhere in the storage layer**. `truncate_before` is a documented no-op; `delete_records_before` removes segments *below* a low watermark, the opposite operation. Now built, split so the decisions are testable without a filesystem:
 
-**There is no suffix truncation anywhere in the storage layer.** `WalManager::truncate_before` is a documented **no-op** (`manager.rs`, "v1.3.53+: No-op, GroupCommitWal manages truncation internally via rotation"), and `delete_records_before` removes whole segments *below* a low watermark — front truncation, the opposite operation. Nothing can discard records at and above an offset, which is the entire physical act RP-3.3 exists to perform.
+- **`chronik-wal/src/truncate.rs`** plans over bytes. The rule: *no record containing an offset at or above the target survives*. A target landing inside a batch therefore takes that whole batch, and the log ends **below** what was asked for — callers resume from the returned offset, not their target. Erring low costs a re-fetch; erring high keeps a divergent log and calls it converged.
+- **`GroupCommitWal::truncate_to`** does the surgery, because it owns the writer and can stop it first: hold the partition's pending and file locks (the same two `commit_batch` takes, in the same order), drop buffered writes, cut, then rotate to a fresh segment so the survivor stays immutable and no deleted segment id is reused.
 
-So the protocol exchange is the easy half. The hard half is a storage primitive that does not exist.
+Placement reads only each segment's **first** record — ids ascend with write order so offsets do too, so at most one segment straddles the target and needs scanning. Scanning every segment would be linear in the size of the log, and DV-2c's was 43 GB.
 
-**It is implementable.** WAL records are self-delimiting — `magic(2) version(1) flags(1) length(4) crc(4)` then body, and the read path already advances a cursor by the parsed size — so the byte offset where a given record begins is recoverable by a forward scan. Sketch:
+**Two bugs the tests caught, both silent:**
 
-1. delete whole segment files whose lowest offset is `>= N`;
-2. in the segment straddling `N`, scan forward to the first record with `base_offset >= N` and `set_len()` the file at that byte;
-3. reset the partition's in-memory position (`next_offset`, high watermark) to `N`;
-4. `LeaderEpochCache::truncate_from_end(N)`.
+1. The straddling segment is the last one *below* the target, not the first one at or above it — that is the segment *after*. Truncating a 3-segment log to offset 5 deleted segments 1 and 2 and left offsets 5–9 alive in segment 0.
+2. The delete loop unlinked zero-length segments, which is normally the one the writer holds open. Writes would have kept succeeding and fsyncing into an orphaned inode — accepted, durable, readable by nobody.
 
-**The complication is `GroupCommitWal`.** It owns the write path, buffers records before flushing, and manages the active segment and rotation. Truncating files underneath it would race in-flight writes and leave its in-memory position disagreeing with what is on disk. Truncation therefore has to go *through* the writer — quiesce the partition, discard its buffered batches, truncate, reset position — not around it.
+**The in-flight race.** `commit_batch` drains the pending queue and *then* takes the writer lock, so a batch can be off the queue but not yet on disk when a truncation runs. Writing it afterwards restores exactly the records that were just discarded. A truncation epoch — read at drain, re-read under the writer lock — discards those batches and fails their callers. The test pins the commit worker in that window by holding the writer lock itself, and fails without the guard.
 
-This is a genuine storage change on a destructive path, and should be budgeted and reviewed as one rather than treated as wiring.
+**`update_high_watermark` could not do this.** It is deliberately monotonic (the v2.2.9 fix, stopping stale WAL data from walking a watermark backwards), so it silently ignores the one update truncation needs. `reset_offsets_after_truncation` is the narrow exception, and moves `next_offset` too — unused on a follower, but if that replica is later elected it assigns offsets from there, and a stale value leaves a hole.
+
+#### The protocol half: `reconcile_with_leader`
+
+A follower runs the epoch handshake **before its first fetch from a leader** and again whenever it sees divergence. The first case matters most: the fetch task is rebuilt whenever assignments change, which includes a leader change — the one moment a follower can hold records the new leader never committed.
+
+`plan_reconciliation` is pure, because it is the decision that deletes data. Every branch that *does not* truncate is as load-bearing as the one that does: an error code, or the `-1` meaning "I cannot answer", must never be read as an offset. Reconciliation failure is not swallowed — the loop **does not fetch** until it succeeds, since an unreconciled fetch is how divergence becomes permanent.
+
+Divergence now re-triggers the handshake instead of halting the partition, and `OFFSET_OUT_OF_RANGE` does too: retention having moved past us and a real divergence look identical from the fetch offset alone, and the epoch query is what distinguishes them.
+
+#### ⚠️ Known hazard: truncation is local to the WAL
+
+`WalIndexer` uploads sealed segments to the object store on **followers as well as leaders** — only the metadata registration is leader-gated. If a follower's divergent tail was already published, truncating the local WAL does not retract it: re-indexing the shortened segment writes a *different* `{min}-{max}` key rather than replacing the old one, so the divergent object survives.
+
+Latent rather than active today, because object-store use is opt-in (`CHRONIK_COLUMNAR_USE_OBJECT_STORE`, default off, local-first). **Before that default changes**, either gate raw-segment upload on leadership, or hold a follower's uploads until the records are known committed. Recorded rather than fixed here: it is an indexer change, not a truncation change, and guessing at it would widen a destructive commit.
+
+#### Open: the leader does not fence stale epochs
+
+The Fetch request carries `current_leader_epoch`, and this broker *parses* it — but never validates it. So the follower leaves it `-1`: populating it would cost a metadata read per fetch and fence nothing. Divergence is caught after the fact by the handshake instead of being refused up front. Real fencing needs the leader to reject stale epochs first; the follower side is then one line.
 
 #### ✅ Done: history survives restart
 

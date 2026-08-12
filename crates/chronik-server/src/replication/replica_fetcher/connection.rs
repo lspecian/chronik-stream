@@ -19,8 +19,15 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
+use chronik_protocol::offset_for_leader_epoch_types::{
+    encode_request as encode_epoch_request, parse_response as parse_epoch_response,
+    OffsetForLeaderEpochRequest, OffsetForLeaderEpochResponse,
+};
+use chronik_protocol::parser::Decoder;
+
 use super::protocol::{
-    decode_fetch_response, encode_fetch_request, frame_request, FetchRequestSpec, FetchResponseFrame,
+    decode_fetch_response, encode_epoch_request_header, encode_fetch_request, frame_request,
+    FetchRequestSpec, FetchResponseFrame, OFFSET_FOR_LEADER_EPOCH_API_VERSION,
 };
 
 /// Ceiling on a response frame, independent of what the leader claims. A
@@ -35,6 +42,11 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// hung. The leader may legitimately hold a long-poll open for the full
 /// `max_wait_ms`; anything beyond that plus this margin is a stall.
 const READ_TIMEOUT_SLACK: Duration = Duration::from_secs(30);
+
+/// Budget for an epoch query. Unlike a fetch there is no long poll — the leader
+/// answers from memory — so a slow reply means a struggling leader, and waiting
+/// on it stalls the truncation that has to happen before replication resumes.
+const EPOCH_QUERY_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// A lazily-connected, self-healing link to one leader's Kafka port.
 pub struct LeaderConnection {
@@ -98,32 +110,9 @@ impl LeaderConnection {
         spec: &FetchRequestSpec,
         read_budget: Duration,
     ) -> Result<FetchResponseFrame> {
-        self.ensure_connected().await?;
-        let stream = self
-            .stream
-            .as_mut()
-            .expect("ensure_connected leaves a stream in place");
-
-        let body = encode_fetch_request(spec);
-        let framed = frame_request(&body);
-
-        stream
-            .write_all(&framed)
-            .await
-            .map_err(|e| Error::Network(format!("Fetch write to {} failed: {e}", self.addr)))?;
-        stream
-            .flush()
-            .await
-            .map_err(|e| Error::Network(format!("Fetch flush to {} failed: {e}", self.addr)))?;
-
-        let payload = timeout(read_budget, read_frame(stream, &self.addr))
-            .await
-            .map_err(|_| {
-                Error::Network(format!(
-                    "Fetch to {} timed out after {:?}",
-                    self.addr, read_budget
-                ))
-            })??;
+        let payload = self
+            .round_trip("Fetch", &encode_fetch_request(spec), read_budget)
+            .await?;
 
         let response = decode_fetch_response(payload)?;
 
@@ -135,6 +124,94 @@ impl LeaderConnection {
         }
 
         Ok(response)
+    }
+
+    /// Ask the leader where a set of leader epochs ended (API 23, RP-3.3).
+    ///
+    /// A follower issues this before it resumes fetching from a leader it has
+    /// not been following, and again whenever the fetched records disagree with
+    /// its own log. The answer is what it truncates to, so an error here must
+    /// stay an error — a follower that guesses discards a correct log or keeps a
+    /// divergent one, which is the damage epochs exist to prevent.
+    pub async fn offset_for_leader_epoch(
+        &mut self,
+        request: &OffsetForLeaderEpochRequest,
+    ) -> Result<OffsetForLeaderEpochResponse> {
+        let correlation_id = self.take_correlation_id();
+
+        match self.epoch_query_once(request, correlation_id).await {
+            Ok(response) => Ok(response),
+            Err(e) => {
+                self.disconnect();
+                Err(e)
+            }
+        }
+    }
+
+    async fn epoch_query_once(
+        &mut self,
+        request: &OffsetForLeaderEpochRequest,
+        correlation_id: i32,
+    ) -> Result<OffsetForLeaderEpochResponse> {
+        let mut body = encode_epoch_request_header(correlation_id);
+        encode_epoch_request(&mut body, request);
+
+        let mut payload = self
+            .round_trip("OffsetForLeaderEpoch", &body, EPOCH_QUERY_TIMEOUT)
+            .await?;
+
+        // Response header v0: a bare correlation id. API 23 only becomes
+        // flexible at v4, and this client speaks v0.
+        if payload.len() < 4 {
+            return Err(Error::Protocol(format!(
+                "OffsetForLeaderEpoch response from {} was {} bytes, too short for a header",
+                self.addr,
+                payload.len()
+            )));
+        }
+        let echoed = i32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+        if echoed != correlation_id {
+            return Err(Error::Protocol(format!(
+                "OffsetForLeaderEpoch response from {} carried correlation id {} but {} was sent",
+                self.addr, echoed, correlation_id
+            )));
+        }
+        let _ = payload.split_to(4);
+
+        let mut decoder = Decoder::new(&mut payload);
+        parse_epoch_response(&mut decoder)
+    }
+
+    /// Write one framed request and read one framed response.
+    ///
+    /// Only one request is ever in flight, so this is the whole request
+    /// pipeline: any failure here means the byte stream is out of sync and the
+    /// caller drops the socket.
+    async fn round_trip(&mut self, what: &str, body: &[u8], read_budget: Duration) -> Result<Bytes> {
+        self.ensure_connected().await?;
+        let stream = self
+            .stream
+            .as_mut()
+            .expect("ensure_connected leaves a stream in place");
+
+        let framed = frame_request(body);
+        stream
+            .write_all(&framed)
+            .await
+            .map_err(|e| Error::Network(format!("{what} write to {} failed: {e}", self.addr)))?;
+        stream
+            .flush()
+            .await
+            .map_err(|e| Error::Network(format!("{what} flush to {} failed: {e}", self.addr)))?;
+
+        timeout(read_budget, read_frame(stream, &self.addr))
+            .await
+            .map_err(|_| {
+                Error::Network(format!(
+                    "{what} to {} timed out after {read_budget:?}",
+                    self.addr
+                ))
+            })?
     }
 
     async fn ensure_connected(&mut self) -> Result<()> {
@@ -444,6 +521,157 @@ mod tests {
             err.to_string().contains("correlation"),
             "error should name the mismatch, got: {err}"
         );
+        assert!(!conn.is_connected());
+    }
+
+    /// The epoch query is the request that decides what gets deleted, so its
+    /// wire form is checked against the *broker's own* parser and encoder — the
+    /// same anti-drift rule as the fetch codec. A stand-in leader that agreed
+    /// with this client but not with a real broker would prove nothing.
+    #[tokio::test]
+    async fn an_epoch_query_round_trips_against_the_brokers_own_codec() {
+        use chronik_protocol::offset_for_leader_epoch_types::{
+            encode_response as encode_epoch_response, parse_request as parse_epoch_request,
+            OffsetForLeaderEpochResponse, OffsetForLeaderPartition,
+            OffsetForLeaderPartitionResponse, OffsetForLeaderTopic, OffsetForLeaderTopicResponse,
+        };
+        use chronik_protocol::parser::Decoder;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let seen_epoch = Arc::new(AtomicI32::new(-99));
+        let seen_epoch_for_task = Arc::clone(&seen_epoch);
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut len_buf = [0u8; 4];
+            socket.read_exact(&mut len_buf).await.unwrap();
+            let len = i32::from_be_bytes(len_buf) as usize;
+            let mut payload = vec![0u8; len];
+            socket.read_exact(&mut payload).await.unwrap();
+
+            // Parse exactly as the broker does: header, then body.
+            let mut wire = Bytes::from(payload);
+            let header = parse_request_header(&mut wire).unwrap();
+            assert_eq!(header.api_key as i16, 23);
+            assert_eq!(header.api_version, 0);
+
+            let mut decoder = Decoder::new(&mut wire);
+            let request = parse_epoch_request(&mut decoder).unwrap();
+            assert_eq!(
+                decoder.remaining(),
+                0,
+                "the broker must consume the whole request this client sends"
+            );
+            seen_epoch_for_task.store(
+                request.topics[0].partitions[0].leader_epoch,
+                Ordering::SeqCst,
+            );
+
+            let mut body = BytesMut::new();
+            encode_epoch_response(
+                &mut body,
+                &OffsetForLeaderEpochResponse {
+                    topics: vec![OffsetForLeaderTopicResponse {
+                        name: "orders".to_string(),
+                        partitions: vec![OffsetForLeaderPartitionResponse {
+                            error_code: 0,
+                            partition: 0,
+                            end_offset: 42,
+                        }],
+                    }],
+                },
+            );
+
+            let mut framed = BytesMut::new();
+            let mut response = BytesMut::new();
+            write_response_header(
+                &mut response,
+                &ResponseHeader {
+                    correlation_id: header.correlation_id,
+                },
+            );
+            response.extend_from_slice(&body);
+            framed.extend_from_slice(&(response.len() as i32).to_be_bytes());
+            framed.extend_from_slice(&response);
+            socket.write_all(&framed).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let mut conn = LeaderConnection::new(addr);
+        let response = conn
+            .offset_for_leader_epoch(&OffsetForLeaderEpochRequest {
+                topics: vec![OffsetForLeaderTopic {
+                    name: "orders".to_string(),
+                    partitions: vec![OffsetForLeaderPartition {
+                        partition: 0,
+                        leader_epoch: 7,
+                    }],
+                }],
+            })
+            .await
+            .expect("the epoch query should round trip");
+
+        assert_eq!(seen_epoch.load(Ordering::SeqCst), 7);
+        assert_eq!(response.topics[0].partitions[0].end_offset, 42);
+    }
+
+    /// A stale correlation id on the epoch exchange must be fatal for the same
+    /// reason it is on fetch: the stream is out of sync, and the next answer
+    /// read would be attributed to the wrong partition — here, deciding what to
+    /// delete.
+    #[tokio::test]
+    async fn a_mismatched_correlation_id_on_an_epoch_query_is_fatal() {
+        use chronik_protocol::offset_for_leader_epoch_types::{
+            encode_response as encode_epoch_response, OffsetForLeaderEpochResponse,
+            OffsetForLeaderPartition, OffsetForLeaderTopic,
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut len_buf = [0u8; 4];
+            socket.read_exact(&mut len_buf).await.unwrap();
+            let len = i32::from_be_bytes(len_buf) as usize;
+            let mut payload = vec![0u8; len];
+            socket.read_exact(&mut payload).await.unwrap();
+
+            let mut body = BytesMut::new();
+            encode_epoch_response(&mut body, &OffsetForLeaderEpochResponse { topics: vec![] });
+
+            let mut response = BytesMut::new();
+            write_response_header(
+                &mut response,
+                &ResponseHeader {
+                    correlation_id: 123_456,
+                },
+            );
+            response.extend_from_slice(&body);
+
+            let mut framed = BytesMut::new();
+            framed.extend_from_slice(&(response.len() as i32).to_be_bytes());
+            framed.extend_from_slice(&response);
+            socket.write_all(&framed).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let mut conn = LeaderConnection::new(addr);
+        let err = conn
+            .offset_for_leader_epoch(&OffsetForLeaderEpochRequest {
+                topics: vec![OffsetForLeaderTopic {
+                    name: "orders".to_string(),
+                    partitions: vec![OffsetForLeaderPartition {
+                        partition: 0,
+                        leader_epoch: 1,
+                    }],
+                }],
+            })
+            .await
+            .expect_err("a stale correlation id must not be accepted");
+
+        assert!(err.to_string().contains("correlation"), "got: {err}");
         assert!(!conn.is_connected());
     }
 

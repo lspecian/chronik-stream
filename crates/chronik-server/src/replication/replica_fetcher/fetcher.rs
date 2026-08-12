@@ -429,7 +429,31 @@ impl ReplicaFetcher {
     ) {
         let mut connection = LeaderConnection::new(addr);
 
+        // Reconcile before the first fetch. This task exists because the
+        // supervisor saw an assignment change, which includes a leader change —
+        // the one moment a follower can be holding records the new leader never
+        // committed. Appending on top of those interleaves two histories.
+        let mut needs_reconcile = true;
+
         while !self.shutdown.load(Ordering::Relaxed) {
+            if needs_reconcile {
+                match self.reconcile_with_leader(&mut connection, &partitions).await {
+                    Ok(()) => needs_reconcile = false,
+                    Err(e) => {
+                        self.fetch_errors.fetch_add(1, Ordering::Relaxed);
+                        warn!(
+                            "Could not reconcile with leader {} at {}: {}. \
+                             Not fetching until this succeeds — appending first could interleave two histories.",
+                            leader,
+                            connection.addr(),
+                            e
+                        );
+                        sleep(self.config.retry_backoff).await;
+                        continue;
+                    }
+                }
+            }
+
             let spec = match self.build_request(&partitions).await {
                 Some(spec) => spec,
                 None => {
@@ -442,7 +466,11 @@ impl ReplicaFetcher {
                 Ok(response) => {
                     for topic in response.topics {
                         for partition in topic.partitions {
-                            self.handle_partition_response(&topic.name, partition).await;
+                            if self.handle_partition_response(&topic.name, partition).await
+                                == PartitionOutcome::Diverged
+                            {
+                                needs_reconcile = true;
+                            }
                         }
                     }
                 }
@@ -458,6 +486,146 @@ impl ReplicaFetcher {
                 }
             }
         }
+    }
+
+    /// Ask the leader where this follower's epochs ended, and truncate to the
+    /// answer (RP-3.3).
+    ///
+    /// This is the whole point of leader epochs. Two logs can agree on every
+    /// offset and disagree on the records at them — a follower that accepted
+    /// writes from a leader which then lost the election holds records that were
+    /// never committed. Offsets alone cannot find where they parted; the epoch
+    /// history can, because it records which leader wrote which range.
+    ///
+    /// Errors propagate: the caller does not fetch until this succeeds. An
+    /// unreconciled fetch is how divergence becomes permanent.
+    async fn reconcile_with_leader(
+        &self,
+        connection: &mut LeaderConnection,
+        partitions: &[FollowedPartition],
+    ) -> chronik_common::Result<()> {
+        use chronik_protocol::offset_for_leader_epoch_types::{
+            OffsetForLeaderEpochRequest, OffsetForLeaderPartition, OffsetForLeaderTopic,
+        };
+
+        let Some(handler) = self.produce_handler.as_ref() else {
+            // Without a produce handler there is no epoch history to reconcile
+            // against. This is the unit-test shape, not a deployed one.
+            return Ok(());
+        };
+        let epochs = handler.leader_epochs();
+
+        let mut by_topic: BTreeMap<String, Vec<OffsetForLeaderPartition>> = BTreeMap::new();
+        for followed in partitions {
+            // No history means nothing to reconcile: either the log is empty, or
+            // it predates epoch stamping. Truncating on that basis would be a
+            // guess, and a guess here destroys data.
+            let Some(epoch) = epochs.latest_epoch(&followed.topic, followed.partition) else {
+                continue;
+            };
+            by_topic
+                .entry(followed.topic.clone())
+                .or_default()
+                .push(OffsetForLeaderPartition {
+                    partition: followed.partition,
+                    leader_epoch: epoch,
+                });
+        }
+
+        if by_topic.is_empty() {
+            return Ok(());
+        }
+
+        let request = OffsetForLeaderEpochRequest {
+            topics: by_topic
+                .into_iter()
+                .map(|(name, partitions)| OffsetForLeaderTopic { name, partitions })
+                .collect(),
+        };
+
+        let response = connection.offset_for_leader_epoch(&request).await?;
+
+        for topic in response.topics {
+            for answer in topic.partitions {
+                self.apply_epoch_answer(&topic.name, answer).await;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Act on one partition's "your epoch ended here".
+    async fn apply_epoch_answer(
+        &self,
+        topic: &str,
+        answer: chronik_protocol::offset_for_leader_epoch_types::OffsetForLeaderPartitionResponse,
+    ) {
+        let partition = answer.partition;
+        let local_end = self.position_of(topic, partition).await;
+
+        match plan_reconciliation(answer.error_code, answer.end_offset, local_end) {
+            ReconcileAction::Resume => debug!(
+                "{}-{}: log is a prefix of the leader's (ours ends at {}, the epoch ran to {}) — nothing to truncate",
+                topic, partition, local_end, answer.end_offset
+            ),
+            ReconcileAction::Abstain { reason } => warn!(
+                "{}-{}: not truncating — {}. Replication will resolve this through the fetch \
+                 offset instead if it can.",
+                topic, partition, reason
+            ),
+            ReconcileAction::Truncate { to } => {
+                self.truncate_partition(topic, partition, to, local_end).await
+            }
+        }
+    }
+
+    /// Discard this replica's divergent tail and reset everything that tracked it.
+    async fn truncate_partition(&self, topic: &str, partition: i32, target: i64, local_end: i64) {
+        warn!(
+            "{}-{}: diverged from the leader. Local log ends at {}, but the leader's history \
+             for our epoch ends at {} — discarding offsets {}..{}.",
+            topic, partition, local_end, target, target, local_end
+        );
+
+        let outcome = match self.wal_manager.truncate_to(topic, partition, target).await {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                // The divergent records are still on disk. Refuse to fetch past
+                // them rather than append on top of a log known to be wrong.
+                error!(
+                    "{}-{}: could not truncate to {}: {}. Replication of this partition is \
+                     stalled — its log diverges from the leader's and cannot be repaired here.",
+                    topic, partition, target, e
+                );
+                self.fetch_errors.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        };
+
+        // The log may end below the target: a target inside a batch takes that
+        // whole batch. Resume from where it actually ends.
+        let new_end = outcome.new_log_end_offset.unwrap_or(0);
+        self.positions.insert((topic.to_string(), partition), new_end);
+
+        if let Some(handler) = &self.produce_handler {
+            handler
+                .leader_epochs()
+                .truncate_from_end(topic, partition, new_end);
+            if let Err(e) = handler
+                .reset_offsets_after_truncation(topic, partition, new_end)
+                .await
+            {
+                warn!(
+                    "{}-{}: truncated the log to {} but could not reset the watermark: {}",
+                    topic, partition, new_end, e
+                );
+            }
+        }
+
+        info!(
+            "{}-{}: truncated to {} ({} segment(s) removed, {} bytes discarded); resuming replication",
+            topic, partition, new_end, outcome.segments_deleted, outcome.bytes_discarded
+        );
     }
 
     /// Build one Fetch covering every partition this leader owns.
@@ -476,7 +644,13 @@ impl ReplicaFetcher {
                     partition: followed.partition,
                     fetch_offset: offset,
                     log_start_offset: 0,
-                    // RP-3 will populate this so a stale leader can fence us.
+                    // Left unset: this broker parses `current_leader_epoch` on
+                    // the leader side but never validates it, so populating it
+                    // would cost a metadata read per fetch and fence nothing.
+                    // Divergence is caught by the epoch handshake in
+                    // `reconcile_with_leader` instead. Wiring real fencing means
+                    // the leader rejecting stale epochs first; see
+                    // docs/ROADMAP_REPLICATION.md.
                     current_leader_epoch: -1,
                     max_bytes: self.config.partition_max_bytes,
                 });
@@ -532,17 +706,17 @@ impl ReplicaFetcher {
         &self,
         topic: &str,
         partition: super::protocol::FetchedPartition,
-    ) {
+    ) -> PartitionOutcome {
         let index = partition.partition;
 
         if partition.error_code != 0 {
-            self.handle_partition_error(topic, index, partition.error_code)
+            return self
+                .handle_partition_error(topic, index, partition.error_code)
                 .await;
-            return;
         }
 
         if partition.records.is_empty() {
-            return; // caught up
+            return PartitionOutcome::Fine; // caught up
         }
 
         let expected = self.position_of(topic, index).await;
@@ -567,6 +741,7 @@ impl ReplicaFetcher {
                         topic, index, leo, partition.high_watermark
                     );
                 }
+                PartitionOutcome::Fine
             }
             Err(ApplyRefusal::Gap { expected, found }) => {
                 // The leader's log starts past where this replica is: retention
@@ -579,41 +754,123 @@ impl ReplicaFetcher {
                     topic, index, expected, found, found, expected, found
                 );
                 self.positions.insert((topic.to_string(), index), found);
+                PartitionOutcome::Fine
             }
             Err(refusal @ ApplyRefusal::Straddle { .. }) => {
-                // Divergence. Blindly appending would interleave two histories;
-                // resolving it needs the epoch history RP-3 adds. Stop this
-                // partition rather than corrupt it.
-                error!(
-                    "{}-{}: replication halted — {}. This needs leader-epoch truncation (RP-3).",
+                // Divergence caught mid-stream: the leader sent a batch that
+                // starts below our LEO and ends above it, so the two logs hold
+                // different records at the same offsets. Appending would
+                // interleave two histories. Re-run the epoch handshake and
+                // truncate to whatever the leader says.
+                warn!(
+                    "{}-{}: {} — reconciling with the leader before fetching again.",
                     topic, index, refusal
                 );
-                self.fetch_errors.fetch_add(1, Ordering::Relaxed);
+                PartitionOutcome::Diverged
             }
             Err(refusal) => {
                 self.fetch_errors.fetch_add(1, Ordering::Relaxed);
                 warn!("{}-{}: could not apply fetched records — {}", topic, index, refusal);
+                PartitionOutcome::Fine
             }
         }
     }
 
-    async fn handle_partition_error(&self, topic: &str, partition: i32, error_code: i16) {
+    async fn handle_partition_error(
+        &self,
+        topic: &str,
+        partition: i32,
+        error_code: i16,
+    ) -> PartitionOutcome {
         match error_code {
             // The leader moved. The supervisor re-reads assignments on its own
             // schedule and will repoint or stop this task.
-            5 | 6 => debug!(
-                "{}-{}: leader has moved (error {}), waiting for the assignment refresh",
-                topic, partition, error_code
-            ),
-            // Our fetch offset is not in the leader's log at all.
-            1 => warn!(
-                "{}-{}: offset out of range on the leader; will resync on the next assignment refresh",
-                topic, partition
-            ),
-            3 => debug!("{}-{}: leader does not know this partition yet", topic, partition),
-            other => warn!("{}-{}: leader returned error {}", topic, partition, other),
+            5 | 6 => {
+                debug!(
+                    "{}-{}: leader has moved (error {}), waiting for the assignment refresh",
+                    topic, partition, error_code
+                );
+                PartitionOutcome::Fine
+            }
+            // Our fetch offset is not in the leader's log at all. That is either
+            // retention having moved past us or a divergence — the epoch
+            // handshake distinguishes them, so ask rather than guess.
+            1 => {
+                warn!(
+                    "{}-{}: offset out of range on the leader; reconciling to find out where our logs part",
+                    topic, partition
+                );
+                PartitionOutcome::Diverged
+            }
+            // Fencing: our epoch is stale or ahead of the leader's.
+            74 | 75 => {
+                warn!(
+                    "{}-{}: leader rejected our epoch (error {}); reconciling",
+                    topic, partition, error_code
+                );
+                PartitionOutcome::Diverged
+            }
+            3 => {
+                debug!("{}-{}: leader does not know this partition yet", topic, partition);
+                PartitionOutcome::Fine
+            }
+            other => {
+                warn!("{}-{}: leader returned error {}", topic, partition, other);
+                PartitionOutcome::Fine
+            }
         }
     }
+}
+
+/// What a follower does with a leader's answer to "where did my epoch end?".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReconcileAction {
+    /// The local log is a prefix of the leader's. Keep fetching.
+    Resume,
+    /// The answer cannot be acted on. Leave the log alone — every alternative
+    /// here destroys data on a guess.
+    Abstain { reason: String },
+    /// Discard everything at and above this offset.
+    Truncate { to: i64 },
+}
+
+/// Decide what to do with one epoch answer.
+///
+/// Pure, because this is the decision that deletes data. Every branch that
+/// *does not* truncate is as important as the one that does: acting on an
+/// error code, or on the `-1` that means "I cannot answer", would discard a
+/// correct log — which is the failure leader epochs exist to prevent, arrived
+/// at through the machinery meant to prevent it.
+pub fn plan_reconciliation(error_code: i16, end_offset: i64, local_log_end: i64) -> ReconcileAction {
+    if error_code != 0 {
+        return ReconcileAction::Abstain {
+            reason: format!("the leader answered the epoch query with error {error_code}"),
+        };
+    }
+
+    // -1 is the leader saying it cannot speak to our epoch: newer than anything
+    // it holds, or aged out of its history. It is not an offset.
+    if end_offset < 0 {
+        return ReconcileAction::Abstain {
+            reason: "the leader cannot say where our epoch ended".to_string(),
+        };
+    }
+
+    if end_offset >= local_log_end {
+        return ReconcileAction::Resume;
+    }
+
+    ReconcileAction::Truncate { to: end_offset }
+}
+
+/// What one partition's slice of a fetch response means for the loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PartitionOutcome {
+    /// Applied, idle, or a condition that resolves itself.
+    Fine,
+    /// This follower's log disagrees with the leader's. It must run the epoch
+    /// handshake and truncate before fetching this leader again.
+    Diverged,
 }
 
 #[cfg(test)]
@@ -735,5 +992,88 @@ mod tests {
     fn an_unknown_replication_mode_falls_back_to_push() {
         assert_eq!(ReplicationMode::parse("pulll"), ReplicationMode::Push);
         assert_eq!(ReplicationMode::parse("off"), ReplicationMode::Push);
+    }
+
+    // ---- RP-3.3: deciding whether to discard a divergent tail ----
+
+    /// The case truncation exists for: the leader's history for our epoch ends
+    /// before our log does, so we hold records it never committed.
+    #[test]
+    fn a_log_that_runs_past_the_leaders_epoch_is_truncated() {
+        assert_eq!(
+            plan_reconciliation(0, 100, 150),
+            ReconcileAction::Truncate { to: 100 }
+        );
+    }
+
+    /// The common case once a follower is caught up, and the case on every
+    /// ordinary restart: our log is a prefix, so nothing is discarded.
+    #[test]
+    fn a_log_that_is_a_prefix_of_the_leaders_is_left_alone() {
+        assert_eq!(plan_reconciliation(0, 150, 100), ReconcileAction::Resume);
+        assert_eq!(
+            plan_reconciliation(0, 100, 100),
+            ReconcileAction::Resume,
+            "equal is a prefix, not a divergence"
+        );
+    }
+
+    /// `-1` means "I cannot answer", not offset -1 and not offset 0. Treating it
+    /// as an offset would truncate a correct log to nothing — the exact data
+    /// loss this machinery exists to prevent, reached through the machinery.
+    #[test]
+    fn an_unanswerable_epoch_never_truncates() {
+        assert!(matches!(
+            plan_reconciliation(0, -1, 500),
+            ReconcileAction::Abstain { .. }
+        ));
+    }
+
+    /// An error is not a truncation instruction either.
+    #[test]
+    fn an_error_never_truncates() {
+        for error_code in [1i16, 6, 74, 75] {
+            assert!(
+                matches!(
+                    plan_reconciliation(error_code, 0, 500),
+                    ReconcileAction::Abstain { .. }
+                ),
+                "error {error_code} must not be read as 'truncate to 0'"
+            );
+        }
+    }
+
+    /// An empty local log has nothing to discard whatever the leader says.
+    #[test]
+    fn an_empty_log_is_never_truncated() {
+        assert_eq!(plan_reconciliation(0, 0, 0), ReconcileAction::Resume);
+        assert_eq!(plan_reconciliation(0, 90, 0), ReconcileAction::Resume);
+    }
+
+    /// Truncating to 0 is legitimate when the leader committed nothing in our
+    /// epoch and we hold records — it must not be confused with the error cases
+    /// above, which also carry a zero.
+    #[test]
+    fn a_genuine_zero_still_truncates() {
+        assert_eq!(
+            plan_reconciliation(0, 0, 40),
+            ReconcileAction::Truncate { to: 0 }
+        );
+    }
+
+    /// The property: the plan never discards anything the leader confirmed.
+    #[test]
+    fn truncation_never_cuts_below_what_the_leader_confirmed() {
+        for end_offset in -1i64..40 {
+            for local_end in 0i64..40 {
+                if let ReconcileAction::Truncate { to } =
+                    plan_reconciliation(0, end_offset, local_end)
+                {
+                    assert_eq!(to, end_offset, "the cut must be exactly where the epoch ended");
+                    assert!(to >= 0, "a negative answer is not an offset");
+                    assert!(to < local_end, "truncating at or above our end is a no-op, not a cut");
+                }
+            }
+        }
     }
 }

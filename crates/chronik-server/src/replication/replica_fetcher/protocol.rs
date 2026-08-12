@@ -145,6 +145,26 @@ pub fn encode_fetch_request(spec: &FetchRequestSpec) -> BytesMut {
     buf
 }
 
+/// OffsetForLeaderEpoch API key.
+pub const OFFSET_FOR_LEADER_EPOCH_API_KEY: i16 = 23;
+
+/// Version this client speaks. v0 only, matching what the broker advertises —
+/// the body codec lives in `chronik_protocol::offset_for_leader_epoch_types`,
+/// and advertising past what is implemented hands peers malformed frames.
+pub const OFFSET_FOR_LEADER_EPOCH_API_VERSION: i16 = 0;
+
+/// Request header v1 for an OffsetForLeaderEpoch call. The body is appended by
+/// `chronik_protocol::offset_for_leader_epoch_types::encode_request`, which the
+/// broker's own parser is tested against.
+pub fn encode_epoch_request_header(correlation_id: i32) -> BytesMut {
+    let mut buf = BytesMut::with_capacity(64);
+    buf.put_i16(OFFSET_FOR_LEADER_EPOCH_API_KEY);
+    buf.put_i16(OFFSET_FOR_LEADER_EPOCH_API_VERSION);
+    buf.put_i32(correlation_id);
+    put_nullable_string(&mut buf, Some(REPLICA_CLIENT_ID));
+    buf
+}
+
 /// Wrap an encoded request in the 4-byte big-endian length prefix Kafka uses.
 pub fn frame_request(body: &[u8]) -> BytesMut {
     let mut framed = BytesMut::with_capacity(body.len() + 4);

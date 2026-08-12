@@ -905,6 +905,50 @@ impl ProduceHandler {
     /// they've explicitly created the partition (which only happens on leader).
     ///
     /// See integrated_server.rs:632 for recovery flow.
+    /// Force a partition's offsets *down* after its log was truncated (RP-3.3).
+    ///
+    /// [`Self::update_high_watermark`] is deliberately monotonic — the v2.2.9
+    /// fix, which stops stale WAL data from walking a watermark backwards — so
+    /// it silently ignores exactly the update truncation needs. Going through it
+    /// would leave this node advertising records it no longer has.
+    ///
+    /// `next_offset` moves too. On a follower it is unused, because the apply
+    /// path takes offsets from the leader; but if this replica is later elected
+    /// it assigns offsets from there, and a stale value would leave a hole
+    /// between the log end and the first record it writes.
+    ///
+    /// Only truncation may call this. Every other path must keep the monotonic
+    /// guarantee.
+    pub async fn reset_offsets_after_truncation(
+        &self,
+        topic: &str,
+        partition: i32,
+        new_log_end: i64,
+    ) -> Result<()> {
+        let key = (topic.to_string(), partition);
+        let Some(state) = self.partition_states.get(&key) else {
+            // No state to walk back. Creating one at the truncated end keeps
+            // the two consistent for whatever comes next.
+            return self.update_high_watermark(topic, partition, new_log_end).await;
+        };
+
+        let previous = state.value().high_watermark.load(Ordering::SeqCst) as i64;
+        state
+            .value()
+            .high_watermark
+            .store(new_log_end.max(0) as u64, Ordering::SeqCst);
+        state
+            .value()
+            .next_offset
+            .store(new_log_end.max(0) as u64, Ordering::SeqCst);
+
+        info!(
+            "Truncation reset {}-{} watermark {} → {}",
+            topic, partition, previous, new_log_end
+        );
+        Ok(())
+    }
+
     pub async fn update_high_watermark(
         &self,
         topic: &str,
