@@ -9,7 +9,7 @@
 | RP-0 | Replication conformance suite | `TESTED` | — | Placement + ISR honesty; fails pre-#29, passes after |
 | RP-1 | Harden the current mechanism | `TESTED` | — | 1.1–1.4 + 3 bugs found by cluster validation |
 | RP-2 | Follower fetch | `TESTED` | — | 2.1–2.4 all validated on a 3-node cluster, behind `CHRONIK_REPLICATION_MODE=pull` |
-| RP-3 | Leader epochs & truncation | `NOT STARTED` | — | The hard part. Gated behind RP-0 |
+| RP-3 | Leader epochs & truncation | `IN PROGRESS` | — | 3.1+3.2 code complete & unit-tested; 3.3 (truncation) remains |
 | RP-4 | Delete the push stack | `NOT STARTED` | — | ~2,500 lines removed |
 
 ---
@@ -362,25 +362,42 @@ Scaffolding that already exists: `partition_leader_epoch` is in the RecordBatch 
 
 ### RP-3.1: Populate leader epoch
 
-- [ ] Leader stamps the current epoch into `partition_leader_epoch` on append
-- [ ] Epoch increments on leader election, persisted in metadata
-- [ ] Epoch→start-offset history retained per partition
+- [x] Leader stamps the current epoch into `partition_leader_epoch` on append
+- [x] Epoch increments on leader change, persisted in metadata
+- [x] Epoch→start-offset history retained per partition
 
-**Status**: —
+**Status**: `CODE COMPLETE` — unit-tested, not yet exercised on a cluster.
+
+**The epoch lives on `PartitionAssignment`**, so it is already durable (metadata WAL), already replicated, and already re-broadcast by the anti-entropy loop. `assign_partition` derives it rather than accepting it from callers: there are a dozen construction sites across the tree, and each would be a chance to skip the bump or reuse a value.
+
+The case that matters most is the one that must *not* bump — re-asserting the same leader. The anti-entropy loop rewrites every assignment every few minutes; if that manufactured a leadership change, every follower would conclude it had to truncate, repeatedly, on a healthy cluster.
+
+**The history is derived from the log**, not stored separately: each batch carries the epoch of the leader that wrote it, so every replica builds the same history by watching its own appends. That is what makes the truncation exchange a single request.
+
+**Stamping is CRC-safe.** Kafka's CRC-32C starts at ATTRIBUTES (offset 21); `partition_leader_epoch` is at offset 12, before the CRC field and outside its input — deliberately, so a broker can assign it without re-checksumming. That is tested against a real encoded batch rather than asserted in a comment. ⚠️ A stale comment in `produce_handler.rs` claimed the CRC started at `partition_leader_epoch`; it was corrected in place, since RP-3 depends on the opposite being true.
 
 ### RP-3.2: Implement `OffsetForLeaderEpoch`
 
-- [ ] Serve API 23: given an epoch, return its last offset
-- [ ] Follower queries on leader change to find the divergence point
+- [x] Serve API 23: given an epoch, return its last offset
+- [ ] Follower queries on leader change to find the divergence point (RP-3.3)
 
-**Status**: —
+**Status**: `CODE COMPLETE` — v0 only, matching the advertised range. Advertising more than is implemented hands clients malformed frames, so the two move together.
+
+An epoch the node cannot speak to — newer than anything it holds, or aged out — is answered `-1`, never a plausible-looking offset. A guess there makes a follower discard a correct log or keep a divergent one, which is the exact damage epochs exist to prevent.
+
+The current epoch is answered with the leader's **log end offset**, not RP-2.3's replicated watermark: a follower may read that far, and capping it would deadlock replication.
 
 ### RP-3.3: Truncation on leader change
 
-- [ ] Follower truncates its log to the divergence point before resuming fetch
+- [ ] Follower detects a leader/epoch change and asks the new leader where its epoch ended
+- [ ] Follower truncates its log to that point before resuming fetch
 - [ ] Test: leader killed mid-produce, new leader elected, follower with extra records truncates and converges (un-ignores RP-0.3)
 
-**Status**: —
+**Status**: `NOT STARTED` — the remaining core of RP-3, and the only phase where a bug **destroys** data rather than stalling it.
+
+What exists to build on: the follower's Fetch client already speaks v11, which carries `current_leader_epoch`; `LeaderEpochStore` answers "what is my latest epoch?" and supports `truncate_from_end`; and the leader now answers API 23. What is missing is the client half of the exchange, the actual log truncation, and populating the epoch cache during WAL recovery (today it is built only from live appends, so a restarted follower starts with no history).
+
+⚠️ **Test methodology**: by RP-2's lesson, killing the leader must genuinely keep it down — deleting a pod brings it back in ~4s. Cordon the node. And beware the inverse trap RP-2 hit: better behaviour can silently invalidate a test that used to pass for the wrong reason.
 
 ---
 
