@@ -568,6 +568,14 @@ So the shape of the fix is: elect a **live** replica other than the failed leade
 
 ⚠️ Do not fix by having each node elect independently. The `am_i_leader()` Raft guard is already there and is correct — a split election would hand two nodes the same partition, which is precisely the divergence RP-3.3 exists to clean up after.
 
+### ⚠️ Known limitation: a one-way partition looks alive
+
+RP-5's liveness is Raft's `recent_active`, which is set when the leader **receives any message** from a peer. A node that can send but not receive therefore still looks alive: it stops hearing heartbeats, starts campaigning, and its outbound vote requests mark it active on the very node deciding whether it is dead.
+
+Observed while building the divergence test — an Ingress-only NetworkPolicy on the leader was not an isolation at all, and failover never fired. The test now cuts both directions.
+
+Symmetric failures (the case that matters most — a node down, a host lost) work correctly, which is what the conformance suite exercises. But an asymmetric partition leaves a node holding leadership it cannot serve. The principled signal is replica *progress* rather than packet arrival; the difficulty is that an idle partition makes no progress either, so it needs care. Not fixed; recorded so the guarantee is not overstated.
+
 ### Other findings from the same run (not replication bugs, not chased)
 
 - **A subscribing consumer can read a partition twice.** One conformance run consumed 490 records of 300 produced at acks=1; a later topic held 400 readable records for 200 produced. Reading the same topic with an explicit `--partition` returns **exactly** the right count, and the WAL holds one copy — so the log is correct and the duplication is in the subscribe/consumer-group path, most likely a rebalance re-reading from the beginning. Intermittent: five consecutive direct reproductions were clean. This is issue #36, now with a sharper characterisation.

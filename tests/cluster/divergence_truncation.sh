@@ -98,9 +98,18 @@ OBS="${PODS}-1"; [ "$OLD" = "1" ] && OBS="${PODS}-2"
 say "-- leader is node $OLD (observing from $OBS)"
 
 # 2. Isolate the leader from the other brokers, leaving the client reachable.
-#    Selecting a pod with an ingress rule denies everything not listed, so
-#    naming only the client cuts every broker-to-broker link to it.
-say "-- isolating node $OLD from its peers (NetworkPolicy)"
+#
+#    BOTH directions. An Ingress-only policy is not an isolation: the node stops
+#    receiving, starts campaigning because it hears no heartbeats, and those
+#    outbound messages still reach its peers — which marks it *recently active*
+#    on the Raft leader and makes it look alive. Observed exactly that: node 1
+#    was cut off inbound, node 2 held Raft leadership, and the failover
+#    controller never saw node 1 as dead, so leadership never moved and the test
+#    stalled at its deadline.
+#
+#    Egress must therefore be cut too. DNS is allowed explicitly, since blocking
+#    it makes the broker fail in ways unrelated to the partition being tested.
+say "-- isolating node $OLD from its peers, both directions (NetworkPolicy)"
 cat <<YAML | $KUBECTL apply -f - >/dev/null 2>&1
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -111,12 +120,22 @@ spec:
   podSelector:
     matchLabels:
       chronik.io/node-id: "$OLD"
-  policyTypes: [Ingress]
+  policyTypes: [Ingress, Egress]
   ingress:
     - from:
         - podSelector:
             matchLabels:
               run: $CLIENT
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              run: $CLIENT
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
 YAML
 
 # 3. Records that exist ONLY on the isolated leader. acks=1 means it
