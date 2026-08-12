@@ -575,6 +575,22 @@ Measured: after a failover the returning replica held nothing for that topic, wh
 
 ## Phase RP-4: Delete the Push Stack
 
+**Scope, now that Open Question 2 is decided**: delete the **data** push path only. Metadata keeps the push transport, so `WalReceiver` and `wal_replication.rs` survive in reduced form rather than being removed.
+
+Concrete targets:
+
+| Target | Where | Note |
+|---|---|---|
+| `ProduceHandler::wal_replication_manager` + `set_wal_replication_manager` | `produce_handler.rs` (fields at ~463/1195/1248, use at ~2430/2594/3978) | The produce-path fan-out, including `serialized_for_replication` which exists only to feed it |
+| The `else` branch building the data `WalReplicationManager` | `builder.rs` `wire_raft_dependencies` | Pull becomes unconditional |
+| `ReplicationMode` | `replica_fetcher/fetcher.rs` | Enum, `from_env`, and every `is_pull()` gate (builder stages 15/16, `set_hw_from_isr`) |
+| `LeaderElector` shim | `leader_election.rs` (72 lines) | Superseded by RP-5; delete with its wiring |
+| Election trigger machinery | `wal_replication.rs` `run_election_worker`, `monitor_timeouts`, `last_heartbeat`; `replication/connection_state.rs` `setup_timeout_monitoring` | Fed only the elector. ⚠️ `last_heartbeat` is also used by `consumer_group.rs` and `leader_lease.rs` for unrelated purposes — do not follow the name blindly |
+
+⚠️ **Removing `ReplicationMode` removes the escape hatch.** Push is currently still the default; every phase from RP-2 on was validated with `CHRONIK_REPLICATION_MODE=pull` explicitly set. Flip the default to pull and soak it *before* deleting the switch, so the two changes fail separately.
+
+
+
 **Expected impact**: ~2,500 lines removed, one replication mechanism instead of two
 **Effort**: 2-3 days
 **Risk**: low once RP-2/RP-3 are soaked
