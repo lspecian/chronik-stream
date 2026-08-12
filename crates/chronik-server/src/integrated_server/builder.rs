@@ -89,6 +89,9 @@ pub struct IntegratedKafkaServerBuilder {
     // Follower-pull replication (Stage 16, RP-2.4). Held so the fetcher lives
     // as long as the server rather than being dropped at the end of build().
     replica_fetcher: Option<Arc<crate::replication::replica_fetcher::ReplicaFetcher>>,
+
+    // Partition leader failover (Stage 17, RP-5). Held for the same reason.
+    partition_failover: Option<Arc<crate::partition_failover::PartitionFailoverController>>,
 }
 
 impl IntegratedKafkaServerBuilder {
@@ -124,6 +127,7 @@ impl IntegratedKafkaServerBuilder {
             leader_elector: None,
             metadata_uploader: None,
             replica_fetcher: None,
+            partition_failover: None,
         }
     }
 
@@ -1720,12 +1724,50 @@ impl IntegratedKafkaServerBuilder {
         Ok(())
     }
 
+    /// Stage 17: partition leader failover (RP-5).
+    ///
+    /// Independent of the replication mode. A partition whose leader dies must
+    /// move to a live replica under push and pull alike — the measured failure
+    /// that motivated this reproduced identically under both.
+    ///
+    /// Every node runs the controller; it acts only while it is the Raft
+    /// leader, which is what stops two nodes handing the same partition to
+    /// different replicas.
+    async fn init_partition_failover(&mut self) -> Result<()> {
+        let Some(ref cluster_config) = self.config.cluster_config else {
+            debug!("Stage 17: single-node mode, no partition failover");
+            return Ok(());
+        };
+
+        let Some(raft) = self.raft_cluster_for_metadata.as_ref() else {
+            warn!(
+                "Stage 17: cluster mode without a Raft cluster — partition leader failover is \
+                 DISABLED. A partition whose leader dies will stay unavailable."
+            );
+            return Ok(());
+        };
+
+        let metadata_store = self.metadata_store.as_ref()
+            .context("metadata_store not initialized")?;
+
+        let controller = crate::partition_failover::PartitionFailoverController::new(
+            cluster_config.node_id,
+            raft.clone(),
+            metadata_store.clone(),
+        );
+        controller.start();
+        self.partition_failover = Some(controller);
+
+        info!("✅ Partition leader failover active (node {})", cluster_config.node_id);
+        Ok(())
+    }
+
     /// Build the IntegratedKafkaServer
     ///
     /// This orchestrates all initialization stages in order.
     /// Complexity: < 25 (orchestration only, delegates to stage functions)
     pub async fn build(mut self) -> Result<IntegratedKafkaServer> {
-        info!("🔧 Starting IntegratedKafkaServer build process (16 stages)...");
+        info!("🔧 Starting IntegratedKafkaServer build process (17 stages)...");
 
         // Stage 1: Directories
         self.init_directories().await
@@ -1791,7 +1833,11 @@ impl IntegratedKafkaServerBuilder {
         self.init_replica_fetcher().await
             .context("Stage 16 failed: ReplicaFetcher initialization")?;
 
-        info!("✅ All 16 stages complete - assembling IntegratedKafkaServer");
+        // Stage 17: partition leader failover (cluster mode)
+        self.init_partition_failover().await
+            .context("Stage 17 failed: partition failover controller")?;
+
+        info!("✅ All 17 stages complete - assembling IntegratedKafkaServer");
 
         // HP-1.5: warm up the hot text index from WAL tail so queries are
         // not blind for the first ~30s after startup.

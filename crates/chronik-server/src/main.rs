@@ -47,6 +47,7 @@ mod isr_tracker;
 mod isr_ack_tracker;
 // v2.2.7 Phase 5: Automatic leader election per partition
 mod leader_election;
+mod partition_failover;
 // v2.2.7: HTTP Admin API for cluster management
 mod admin_api;
 // v2.2.22: Unified API (SQL, Vector Search, Admin on single port)

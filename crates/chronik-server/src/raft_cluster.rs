@@ -1314,6 +1314,44 @@ impl RaftCluster {
         voters
     }
 
+    /// Sample which peers Raft has heard from recently (RP-5).
+    ///
+    /// This is the cluster's only real liveness signal. Replication traffic
+    /// cannot supply one for a partition *leader*: followers report to their
+    /// leader, so when the leader dies there is nobody left to notice. Raft
+    /// heartbeats run between all members regardless of who leads what, which
+    /// is why Kafka's controller watches broker liveness the same way rather
+    /// than inferring it from the data path.
+    ///
+    /// Only meaningful on the Raft leader — `recent_active` is maintained by
+    /// the leader as it receives responses — so this returns `None` elsewhere
+    /// rather than an empty set that would read as "everything is dead".
+    ///
+    /// ⚠️ This is a **sample, not a verdict**. `quorum_recently_active` clears
+    /// `recent_active` on every election-timeout tick, so a healthy peer reads
+    /// `false` for part of every cycle. Callers must accumulate these samples
+    /// over a window; treating one `false` as death would fail every partition
+    /// over on a timer.
+    pub async fn sample_active_peers(&self) -> Option<Vec<u64>> {
+        if !self.am_i_leader().await {
+            return None;
+        }
+
+        let raft = self.raft_node.lock().await;
+        if raft.raft.state != raft::StateRole::Leader {
+            // Lost leadership between the cached check and the lock.
+            return None;
+        }
+
+        let mut active = vec![self.node_id];
+        for (id, progress) in raft.raft.prs().iter() {
+            if *id != self.node_id && progress.recent_active {
+                active.push(*id);
+            }
+        }
+        Some(active)
+    }
+
     /// Get node information (ID -> address mapping)
     ///
     /// # Returns
@@ -1353,29 +1391,6 @@ impl RaftCluster {
         // }
 
         // partitions
-    }
-
-    /// Propose a partition leader change
-    ///
-    /// Helper method for leader election.
-    pub async fn propose_set_partition_leader(
-        &self,
-        topic: &str,
-        partition: i32,
-        leader: u64,
-    ) -> Result<()> {
-        // v2.2.9 Option 4: Partition metadata moved to WalMetadataStore
-        // This function is no longer needed - partition leaders handled by WalMetadataStore
-        tracing::warn!("propose_set_partition_leader called but partition metadata now in WalMetadataStore");
-        Ok(())
-
-        // let cmd = MetadataCommand::SetPartitionLeader {
-        //     topic: topic.to_string(),
-        //     partition,
-        //     leader,
-        // };
-
-        // self.propose(cmd).await
     }
 
     /// Check if THIS node is the Raft leader
