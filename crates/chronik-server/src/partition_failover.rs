@@ -190,6 +190,9 @@ pub struct PartitionFailoverController {
     /// Woken when a node rejoins, so the catalog anti-entropy loop re-broadcasts
     /// immediately (RP-6).
     rejoin_notify: Option<Arc<tokio::sync::Notify>>,
+    /// Whether we have already said we hold failover authority, so the line
+    /// prints on transition rather than every tick.
+    announced_authority: AtomicBool,
     tick: Duration,
     liveness_window: Duration,
     shutdown: Arc<AtomicBool>,
@@ -211,6 +214,7 @@ impl PartitionFailoverController {
             leader_since: parking_lot::Mutex::new(None),
             last_reported_live: parking_lot::Mutex::new(None),
             rejoin_notify,
+            announced_authority: AtomicBool::new(false),
             tick: env_secs("CHRONIK_FAILOVER_TICK_SECS").unwrap_or(DEFAULT_TICK),
             liveness_window: env_secs("CHRONIK_FAILOVER_LIVENESS_SECS")
                 .unwrap_or(DEFAULT_LIVENESS_WINDOW),
@@ -242,8 +246,19 @@ impl PartitionFailoverController {
             tokio::time::sleep(self.tick).await;
 
             let active = match self.raft.sample_active_peers().await {
-                Some(active) => active,
+                Some(active) => {
+                    // Say once that this node has taken over deciding failover.
+                    // "Is the controller even sampling?" cost six round trips of
+                    // inference to answer on a cluster; it should cost one grep.
+                    if !self.announced_authority.swap(true, Ordering::Relaxed) {
+                        info!(
+                            "This node is the Raft leader — it now decides partition failover"
+                        );
+                    }
+                    active
+                }
                 None => {
+                    self.announced_authority.store(false, Ordering::Relaxed);
                     // Not the Raft leader. Drop the samples: they age while we
                     // are not watching, and acting on stale ones the moment we
                     // are elected would fail partitions over on evidence

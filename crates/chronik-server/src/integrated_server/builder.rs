@@ -466,8 +466,14 @@ impl IntegratedKafkaServerBuilder {
             tokio::time::sleep(std::time::Duration::from_secs(45)).await;
             let mut warned_not_authority = false;
             loop {
+                // `is_leader()` (state under the lock), not `am_i_leader()`
+                // (cached atomic): the cache is refreshed only inside the
+                // message loop's has_ready branch, so on a quiet cluster it can
+                // sit stale — and a stale `false` here would mean *no* node
+                // re-asserts the catalog, which is worse than the gossip this
+                // gate replaced.
                 let may_broadcast = match &broadcast_authority {
-                    Some(raft) => raft.am_i_leader().await,
+                    Some(raft) => raft.is_leader().await,
                     None => true,
                 };
 

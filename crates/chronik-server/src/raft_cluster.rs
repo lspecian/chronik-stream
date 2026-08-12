@@ -1353,14 +1353,15 @@ impl RaftCluster {
     /// Callers accumulate over a window; treating one absence as death would
     /// fail every partition over on a timer.
     pub async fn sample_active_peers(&self) -> Option<Vec<u64>> {
-        if !self.am_i_leader().await {
-            return None;
-        }
-
+        // Deliberately NOT `am_i_leader()`. That reads `cached_is_leader`, which
+        // is refreshed only inside the message loop's `has_ready()` branch — so
+        // on a quiet cluster it can sit stale, and a caller that gates on it
+        // silently does nothing. The state under the lock is the truth, and one
+        // lock every couple of seconds is not a cost worth trading correctness
+        // for.
         let mut raft = self.raft_node.lock().await;
         if raft.raft.state != raft::StateRole::Leader {
-            // Lost leadership between the cached check and the lock. Leave the
-            // flags alone: they are not ours to clear when we are not leading.
+            // Not leading: the flags are not ours to read or clear.
             return None;
         }
 
