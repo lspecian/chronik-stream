@@ -414,9 +414,11 @@ So the protocol exchange is the easy half. The hard half is a storage primitive 
 
 This is a genuine storage change on a destructive path, and should be budgeted and reviewed as one rather than treated as wiring.
 
-#### Also missing
+#### ✅ Done: history survives restart
 
-Populating the epoch cache during **WAL recovery**: it is currently built only from live appends, so a restarted follower begins with no history and would answer every `OffsetForLeaderEpoch` with UNDEFINED. Kafka keeps a `leader-epoch-checkpoint` file for exactly this; rebuilding by scanning the WAL on startup is the cheaper first step, at the cost of a startup scan.
+The epoch cache is rebuilt from the WAL at startup (`warm_up_leader_epochs`), replaying each partition through the same `observe_append` the live path uses — so a recovered node answers truncation queries identically to the one that wrote the log. A pre-RP-3 log (all `-1`) rebuilds to *no* history rather than a fabricated epoch at offset 0.
+
+Cost is a WAL scan per partition at startup. Kafka avoids it with a `leader-epoch-checkpoint` file; that is the answer if startup time becomes a problem.
 
 ⚠️ **Test methodology**: by RP-2's lesson, killing the leader must genuinely keep it down — deleting a pod brings it back in ~4s. Cordon the node. And beware the inverse trap RP-2 hit: better behaviour can silently invalidate a test that used to pass for the wrong reason.
 
