@@ -633,6 +633,7 @@ impl ProduceHandler {
             is_leader: false,  // Deprecated field
             replicas,
             leader_id,
+            leader_epoch: 0, // assigned by the metadata store
         };
 
         // Write AssignPartition event to metadata_store
@@ -668,6 +669,7 @@ impl ProduceHandler {
             is_leader: false,  // Deprecated field
             replicas: current.replicas.clone(),
             leader_id: leader,
+            leader_epoch: 0, // assigned by the metadata store
         };
 
         self.metadata_store.assign_partition(assignment).await?;
@@ -700,6 +702,7 @@ impl ProduceHandler {
             is_leader: false,  // Deprecated field
             replicas: isr,
             leader_id: current.leader_id,
+            leader_epoch: 0, // assigned by the metadata store
         };
 
         self.metadata_store.assign_partition(assignment).await?;
@@ -3574,6 +3577,7 @@ impl ProduceHandler {
                             is_leader: true,
                             replicas: vec![self.config.node_id as u64],
                             leader_id: self.config.node_id as u64,
+                            leader_epoch: 0, // assigned by the metadata store
                         };
 
                         if let Err(e) = self.metadata_store.assign_partition(assignment).await {
@@ -5144,6 +5148,7 @@ mod tests {
                 is_leader: true,
                 replicas: vec![1, 2],
                 leader_id: 1,
+                leader_epoch: 0, // assigned by the metadata store
             })
             .await
             .unwrap();

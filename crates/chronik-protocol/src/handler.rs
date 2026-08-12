@@ -3505,6 +3505,7 @@ impl ProtocolHandler {
                 is_leader: true, // deprecated field, kept for compatibility
                 replicas: all_replicas.clone(),
                 leader_id: broker_id as u64,
+                leader_epoch: 0, // assigned by the metadata store
             }).await
                 .map_err(|e| Error::Internal(format!("assign_partition failed: {:?}", e)))?;
 
@@ -5830,6 +5831,7 @@ impl ProtocolHandler {
                     is_leader: true, // Deprecated field
                     replicas: all_replicas.clone(),  // FIXED: All brokers as replicas for cluster mode
                     leader_id: broker_id as u64,
+                    leader_epoch: 0, // assigned by the metadata store
                 });
             }
             
@@ -6338,6 +6340,7 @@ impl ProtocolHandler {
                             is_leader: true,  // Deprecated field
                             replicas: all_replicas.clone(),  // FIXED: All brokers as replicas for cluster mode
                             leader_id: broker_id as u64,
+                            leader_epoch: 0, // assigned by the metadata store
                         });
                     }
                     

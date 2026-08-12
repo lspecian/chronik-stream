@@ -329,6 +329,18 @@ pub struct PartitionAssignment {
     pub is_leader: bool,  // Deprecated: leader determined by leader_id field
     pub replicas: Vec<u64>,  // All replica node IDs (leader is first)
     pub leader_id: u64,  // Leader node ID
+
+    /// Leader epoch (RP-3): increments every time this partition changes leader.
+    ///
+    /// Callers do NOT set this — `assign_partition` computes it, so the rule
+    /// "increments if and only if the leader changed" lives in exactly one
+    /// place and cannot be got wrong at one of the dozen call sites.
+    ///
+    /// `#[serde(default)]` keeps existing metadata WALs readable: events written
+    /// before this field existed decode with epoch 0. Metadata events are JSON,
+    /// so this is additive.
+    #[serde(default)]
+    pub leader_epoch: i32,
 }
 
 /// Group member information

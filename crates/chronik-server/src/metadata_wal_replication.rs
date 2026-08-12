@@ -206,6 +206,7 @@ impl MetadataWalReplicator {
                     is_leader: true,  // Deprecated field
                     replicas: replicas.clone(),
                     leader_id: leader,
+                    leader_epoch: 0, // assigned by the metadata store
                 };
 
                 // Create MetadataEvent for replication (same format as WAL writes)

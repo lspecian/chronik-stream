@@ -512,6 +512,7 @@ async fn handle_rebalance(
                 is_leader: true,
                 replicas: replicas.clone(),
                 leader_id,
+                leader_epoch: 0, // assigned by the metadata store
             };
 
             if let Err(e) = state.metadata_store.assign_partition(assignment).await {

@@ -206,6 +206,7 @@ impl PartitionRebalancer {
                 is_leader: true, // Deprecated field
                 replicas: new_replicas.clone(),
                 leader_id,
+                leader_epoch: 0, // assigned by the metadata store
             };
 
             self.metadata_store

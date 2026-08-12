@@ -259,6 +259,7 @@ impl IntegratedKafkaServer {
                     is_leader: true,  // Deprecated field
                     replicas: replicas.clone(),
                     leader_id,
+                    leader_epoch: 0, // assigned by the metadata store
                 };
 
                 // Persist assignment via metadata store (will replicate via Raft)

@@ -910,7 +910,25 @@ impl MetadataStore for WalMetadataStore {
         self.write_and_apply(event).await
     }
 
-    async fn assign_partition(&self, assignment: PartitionAssignment) -> Result<()> {
+    async fn assign_partition(&self, mut assignment: PartitionAssignment) -> Result<()> {
+        // RP-3: the leader epoch is derived here, never supplied by the caller.
+        // There are a dozen construction sites for PartitionAssignment across
+        // the tree — rebalancer, admin API, auto-create, protocol handler — and
+        // each would be a chance to skip the bump or reuse a value. Owning it in
+        // one place makes "increments if and only if the leader changed" a
+        // property of the store rather than a convention.
+        //
+        // A leader that has not changed keeps its epoch: re-asserting the same
+        // assignment (anti-entropy re-broadcast, an idempotent rebalance pass)
+        // must not manufacture leadership changes, or every follower would think
+        // it had to truncate.
+        let key = (assignment.topic.clone(), assignment.partition);
+        assignment.leader_epoch = match self.state.partition_assignments.get(&key) {
+            Some(previous) if previous.leader_id == assignment.leader_id => previous.leader_epoch,
+            Some(previous) => previous.leader_epoch.saturating_add(1),
+            None => 0,
+        };
+
         let event = MetadataEvent::new_with_node(
             MetadataEventPayload::PartitionAssigned {
                 assignment: assignment.clone(),
@@ -1468,6 +1486,7 @@ mod catalog_healing_tests {
                     is_leader: true,
                     replicas: vec![1, 2, 3],
                     leader_id: (partition as u64 % 3) + 1,
+                    leader_epoch: 0, // assigned by the metadata store
                 })
                 .await
                 .unwrap();
@@ -1532,6 +1551,7 @@ mod catalog_healing_tests {
                 is_leader: true,
                 replicas: vec![1, 2, 3],
                 leader_id: 1,
+                leader_epoch: 0, // assigned by the metadata store
             })
             .await
             .unwrap();
@@ -1553,5 +1573,126 @@ mod catalog_healing_tests {
             last_topic < first_assignment,
             "assignments must follow the topics they belong to"
         );
+    }
+}
+
+#[cfg(test)]
+mod leader_epoch_tests {
+    use super::*;
+
+    fn store() -> WalMetadataStore {
+        let wal_append: WalAppendFn = Arc::new(|_bytes| Box::pin(async { Ok(0i64) }));
+        WalMetadataStore::new(1, wal_append)
+    }
+
+    fn assignment(topic: &str, partition: u32, leader: u64) -> PartitionAssignment {
+        PartitionAssignment {
+            topic: topic.to_string(),
+            partition,
+            broker_id: leader as i32,
+            is_leader: true,
+            replicas: vec![1, 2, 3],
+            leader_id: leader,
+            leader_epoch: 999, // deliberately wrong: the store must overwrite it
+        }
+    }
+
+    async fn epoch_of(store: &WalMetadataStore, topic: &str, partition: u32) -> i32 {
+        store
+            .get_partition_assignments(topic)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|a| a.partition == partition)
+            .expect("assignment exists")
+            .leader_epoch
+    }
+
+    /// The epoch is derived by the store, never taken from the caller. There are
+    /// a dozen construction sites across the tree and each would otherwise be a
+    /// chance to pass a stale or invented value.
+    #[tokio::test]
+    async fn the_store_owns_the_epoch_and_ignores_what_callers_pass() {
+        let store = store();
+        store.assign_partition(assignment("orders", 0, 1)).await.unwrap();
+
+        assert_eq!(epoch_of(&store, "orders", 0).await, 0, "a first assignment starts at 0");
+    }
+
+    /// Every leadership change bumps the epoch — that is the whole signal a
+    /// follower uses to know its log may have diverged.
+    #[tokio::test]
+    async fn a_leadership_change_bumps_the_epoch() {
+        let store = store();
+        store.assign_partition(assignment("orders", 0, 1)).await.unwrap();
+        store.assign_partition(assignment("orders", 0, 2)).await.unwrap();
+        store.assign_partition(assignment("orders", 0, 3)).await.unwrap();
+
+        assert_eq!(epoch_of(&store, "orders", 0).await, 2);
+    }
+
+    /// Re-asserting the SAME leader must not bump. The anti-entropy loop
+    /// re-broadcasts every assignment every few minutes, and an idempotent
+    /// rebalance pass re-writes them too — if either manufactured a leadership
+    /// change, every follower would think it had to truncate, repeatedly, on a
+    /// perfectly healthy cluster.
+    #[tokio::test]
+    async fn re_asserting_the_same_leader_does_not_bump() {
+        let store = store();
+        store.assign_partition(assignment("orders", 0, 1)).await.unwrap();
+        for _ in 0..10 {
+            store.assign_partition(assignment("orders", 0, 1)).await.unwrap();
+        }
+
+        assert_eq!(epoch_of(&store, "orders", 0).await, 0);
+    }
+
+    /// Leadership moving away and back is two changes, not zero. Reusing the
+    /// earlier epoch would make two different logs claim the same leadership
+    /// period, and the truncation query would then answer with the wrong offset.
+    #[tokio::test]
+    async fn leadership_returning_to_a_previous_node_still_bumps() {
+        let store = store();
+        store.assign_partition(assignment("orders", 0, 1)).await.unwrap();
+        store.assign_partition(assignment("orders", 0, 2)).await.unwrap();
+        store.assign_partition(assignment("orders", 0, 1)).await.unwrap();
+
+        assert_eq!(epoch_of(&store, "orders", 0).await, 2);
+    }
+
+    /// Epochs are per partition. A busy partition changing leaders must not
+    /// advance a quiet one, or the quiet partition's followers would truncate
+    /// against a history they never had.
+    #[tokio::test]
+    async fn epochs_are_tracked_per_partition() {
+        let store = store();
+        store.assign_partition(assignment("orders", 0, 1)).await.unwrap();
+        store.assign_partition(assignment("orders", 1, 1)).await.unwrap();
+
+        store.assign_partition(assignment("orders", 0, 2)).await.unwrap();
+        store.assign_partition(assignment("orders", 0, 3)).await.unwrap();
+
+        assert_eq!(epoch_of(&store, "orders", 0).await, 2);
+        assert_eq!(epoch_of(&store, "orders", 1).await, 0);
+    }
+
+    /// Metadata events are JSON, and the field is `#[serde(default)]`, so events
+    /// written before RP-3 must still decode — with epoch 0 rather than an
+    /// error. A metadata WAL that fails to replay is an unrecoverable cluster.
+    #[test]
+    fn assignments_written_before_epochs_existed_still_decode() {
+        let legacy = r#"{
+            "topic": "orders",
+            "partition": 0,
+            "broker_id": 1,
+            "is_leader": true,
+            "replicas": [1, 2, 3],
+            "leader_id": 1
+        }"#;
+
+        let decoded: PartitionAssignment =
+            serde_json::from_str(legacy).expect("pre-RP-3 assignments must still decode");
+        assert_eq!(decoded.leader_epoch, 0);
+        assert_eq!(decoded.leader_id, 1);
     }
 }
