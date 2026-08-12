@@ -464,6 +464,9 @@ pub struct ProduceHandler {
     /// ISR ACK tracker for acks=-1 quorum support (v2.2.7 Phase 4)
     /// Tracks pending acks=-1 requests and notifies when ISR quorum reached
     isr_ack_tracker: Option<Arc<crate::isr_ack_tracker::IsrAckTracker>>,
+    /// RP-3: this node's view of each partition's leadership history, built
+    /// from the epochs stamped on the batches it appends.
+    leader_epochs: Arc<crate::replication::leader_epoch::LeaderEpochStore>,
     /// Leader elector for partition leader failover (v2.2.7 Phase 5)
     /// Used to record heartbeats when handling produce requests as leader
     leader_elector: Option<Arc<crate::leader_election::LeaderElector>>,
@@ -1147,6 +1150,7 @@ impl ProduceHandler {
             raft_cluster: None,  // v2.2.7 Phase 3: Initialize as None (set via set_raft_cluster)
             wal_replication_manager: None,  // v2.2.0 Phase 1: Initialize as None
             isr_ack_tracker: None,  // v2.2.7 Phase 4: Initialize as None (set via set_isr_ack_tracker)
+            leader_epochs: Arc::new(crate::replication::leader_epoch::LeaderEpochStore::new()),
             leader_elector: None,  // v2.2.7 Phase 5: Initialize as None (set via set_leader_elector)
             event_bus: None,  // v2.2.7.2: Initialize as None (set via set_event_bus)
             leadership_cache: Arc::new(DashMap::new()),  // Optimization #4: Empty cache, populated on first access
@@ -1203,6 +1207,46 @@ impl ProduceHandler {
     }
 
     /// Set the ISR ACK tracker for acks=-1 quorum support (v2.2.7 Phase 4)
+    /// RP-3: expose this node's leadership history, for serving
+    /// `OffsetForLeaderEpoch` and for a follower deciding where to truncate.
+    pub fn leader_epochs(&self) -> Arc<crate::replication::leader_epoch::LeaderEpochStore> {
+        self.leader_epochs.clone()
+    }
+
+    /// Stamp the current leader epoch onto a batch and record it in this node's
+    /// leadership history.
+    ///
+    /// Returns the batch unchanged when the epoch is unknown — a partition with
+    /// no assignment yet, or a single-node deployment that never elects. Writing
+    /// a made-up epoch would be worse than writing none: a follower would later
+    /// ask about an epoch that never existed and be told to truncate against it.
+    async fn stamp_and_record_leader_epoch(
+        &self,
+        topic: &str,
+        partition: i32,
+        base_offset: i64,
+        bytes: Bytes,
+    ) -> Bytes {
+        let epoch = match self
+            .metadata_store
+            .get_partition_leader_epoch(topic, partition as u32)
+            .await
+        {
+            Ok(Some(epoch)) if epoch >= 0 => epoch,
+            _ => return bytes,
+        };
+
+        let mut stamped = bytes.to_vec();
+        if crate::replication::leader_epoch::stamp_leader_epoch(&mut stamped, epoch) == 0 {
+            return bytes; // not a v2 batch — left exactly as it arrived
+        }
+
+        self.leader_epochs
+            .observe_append(topic, partition, epoch, base_offset);
+
+        Bytes::from(stamped)
+    }
+
     pub fn set_isr_ack_tracker(&mut self, tracker: Arc<crate::isr_ack_tracker::IsrAckTracker>) {
         info!("Setting IsrAckTracker for ProduceHandler - enables acks=-1 quorum");
         self.isr_ack_tracker = Some(tracker);
@@ -2147,9 +2191,18 @@ impl ProduceHandler {
                 incoming_base_offset, base_offset
             );
 
-            // CRITICAL FIX (v1.3.59): Kafka v2 CRC is calculated from partition_leader_epoch onwards.
-            // The base_offset field (first 8 bytes) is NOT included in CRC calculation.
-            // Therefore, we can update ONLY base_offset and keep everything else byte-identical.
+            // CRITICAL FIX (v1.3.59): the base_offset field (first 8 bytes) is NOT
+            // included in the CRC, so it can be rewritten while everything else
+            // stays byte-identical.
+            //
+            // The original note here said the CRC "is calculated from
+            // partition_leader_epoch onwards". That is not the Kafka spec, and
+            // kafka_records.rs was corrected to start at ATTRIBUTES (offset 21) —
+            // the earlier range was self-consistent with this crate's own decoder
+            // but made batches Chronik itself emitted look corrupt to real
+            // clients. The conclusion above holds under either reading; the
+            // reason given for it did not, and RP-3 now relies on the correct one
+            // to stamp partition_leader_epoch (offset 12) without re-checksumming.
 
             // Create a copy and update ONLY the first 8 bytes
             let mut updated_bytes = records_data.to_vec();
@@ -2162,6 +2215,20 @@ impl ProduceHandler {
 
             (bytes, kafka_batch)
         };
+
+        // RP-3: stamp this leader's epoch onto the batch, so the log records the
+        // leadership under which each record was written. That history is what
+        // lets a follower discover *where* two logs diverged rather than
+        // comparing lengths and guessing.
+        //
+        // Safe against the CRC: Kafka's CRC-32C starts at the attributes field
+        // (offset 21), and partition_leader_epoch lives at offset 12 — before the
+        // CRC field and outside its input, exactly so a broker can assign it
+        // without re-checksumming. This is therefore applied to the same
+        // byte-preserved batch the consumer will get back.
+        let re_encoded_bytes = self
+            .stamp_and_record_leader_epoch(topic, partition, base_offset as i64, re_encoded_bytes)
+            .await;
 
         // Validate producer info for idempotence. Control batches (COMMIT/ABORT
         // end-transaction markers) carry the transaction's producer id/epoch but are
@@ -3866,6 +3933,7 @@ impl Clone for ProduceHandler {
             raft_cluster: self.raft_cluster.clone(),  // v2.2.7 Phase 3
             wal_replication_manager: self.wal_replication_manager.clone(),  // v2.2.0 Phase 1
             isr_ack_tracker: self.isr_ack_tracker.clone(),  // v2.2.7 Phase 4
+            leader_epochs: self.leader_epochs.clone(),
             leader_elector: self.leader_elector.clone(),  // v2.2.7 Phase 5
             event_bus: self.event_bus.clone(),  // v2.2.7.2
             leadership_cache: Arc::clone(&self.leadership_cache),  // Optimization #4
@@ -5220,5 +5288,79 @@ mod tests {
         }
 
         batch.encode().unwrap().to_vec()
+    }
+
+    /// RP-3: a produced batch must come out of the leader carrying the leader's
+    /// epoch, and that epoch must be recorded in the node's leadership history.
+    ///
+    /// The wiring has several places to silently do nothing — no assignment for
+    /// the partition, a non-v2 batch, an epoch of -1 — and each of them returns
+    /// the batch untouched by design. This pins the case where it must act.
+    #[tokio::test]
+    async fn a_produced_batch_carries_the_leader_epoch() {
+        use chronik_common::metadata::traits::PartitionAssignment;
+
+        let (handler, _temp) = create_test_handler().await;
+
+        let mut topic_config = TopicConfig::default();
+        topic_config.partition_count = 1;
+        let _ = handler.metadata_store.create_topic("epoch-topic", topic_config).await;
+
+        // Leadership starts elsewhere and moves HERE, so the current epoch is 1
+        // rather than the default 0 — a test that passed with 0 could not
+        // distinguish "stamped" from "left at its initial value". The final
+        // leader must be this node or the produce is rejected as NOT_LEADER.
+        for leader in [2u64, 1u64] {
+            handler.metadata_store
+                .assign_partition(PartitionAssignment {
+                    topic: "epoch-topic".to_string(),
+                    partition: 0,
+                    broker_id: leader as i32,
+                    is_leader: true,
+                    replicas: vec![1, 2],
+                    leader_id: leader,
+                    leader_epoch: 0,
+                })
+                .await
+                .unwrap();
+        }
+
+        let records_data = create_test_record_batch(0, 0, vec![("k", "v")]);
+        let request = ProduceRequest {
+            transactional_id: None,
+            acks: 1,
+            timeout_ms: 30000,
+            topics: vec![ProduceRequestTopic {
+                name: "epoch-topic".to_string(),
+                partitions: vec![ProduceRequestPartition { index: 0, records: records_data }],
+            }],
+        };
+
+        let response = handler.handle_produce(request, 1).await.unwrap();
+        assert_eq!(response.topics[0].partitions[0].error_code, 0, "produce must succeed");
+
+        // Assert against the store's own current epoch rather than a literal:
+        // topic creation seeds an assignment of its own, so the absolute number
+        // depends on plumbing this test has no reason to pin. What must hold is
+        // that the batch was stamped with whatever the partition's current epoch
+        // is — and that it is not still 0, or the assertion could not tell
+        // "stamped" from "left at its initial value".
+        let current = handler
+            .metadata_store
+            .get_partition_leader_epoch("epoch-topic", 0)
+            .await
+            .unwrap()
+            .expect("the partition has an assignment");
+        assert!(current > 0, "leadership changed, so the epoch must have moved off 0");
+
+        // observe_append only runs when stamp_leader_epoch actually rewrote bytes,
+        // so a recorded epoch here also proves the batch on the wire carries it.
+        // The byte-level guarantee (and that the CRC survives) is pinned
+        // separately in replication::leader_epoch::stamp_tests.
+        assert_eq!(
+            handler.leader_epochs().latest_epoch("epoch-topic", 0),
+            Some(current),
+            "the append must be stamped with, and recorded under, the current leader epoch"
+        );
     }
 }

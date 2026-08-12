@@ -415,6 +415,12 @@ pub trait MetadataStore: Send + Sync {
     // Partition leader query operations (for Kafka Metadata API)
     async fn get_partition_leader(&self, topic: &str, partition: u32) -> Result<Option<i32>>;
     async fn get_partition_replicas(&self, topic: &str, partition: u32) -> Result<Option<Vec<i32>>>;
+
+    /// Current leader epoch for a partition (RP-3).
+    ///
+    /// On the produce hot path, so implementations must make this an O(1)
+    /// lookup rather than scanning a topic's assignments.
+    async fn get_partition_leader_epoch(&self, topic: &str, partition: u32) -> Result<Option<i32>>;
     
     // Consumer group operations
     async fn create_consumer_group(&self, metadata: ConsumerGroupMetadata) -> Result<()>;

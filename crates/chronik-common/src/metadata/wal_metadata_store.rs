@@ -958,6 +958,12 @@ impl MetadataStore for WalMetadataStore {
         Ok(self.state.partition_assignments.get(&key).map(|a| a.leader_id as i32))
     }
 
+    async fn get_partition_leader_epoch(&self, topic: &str, partition: u32) -> Result<Option<i32>> {
+        // Lock-free O(1) get — this is called once per produced batch.
+        let key = (topic.to_string(), partition);
+        Ok(self.state.partition_assignments.get(&key).map(|a| a.leader_epoch))
+    }
+
     async fn get_partition_replicas(&self, topic: &str, partition: u32) -> Result<Option<Vec<i32>>> {
         // v2.2.14 PERFORMANCE FIX: DashMap lock-free get (no .await)
         let key = (topic.to_string(), partition);

@@ -174,9 +174,21 @@ impl MetadataStore for InMemoryMetadataStore {
         }
     }
     
-    async fn assign_partition(&self, assignment: PartitionAssignment) -> Result<()> {
+    async fn assign_partition(&self, mut assignment: PartitionAssignment) -> Result<()> {
         let mut assignments = self.partition_assignments.write().await;
         let key = (assignment.topic.clone(), assignment.partition);
+
+        // RP-3: derive the leader epoch exactly as WalMetadataStore does —
+        // increment on a leadership change, hold steady when the same leader is
+        // re-asserted. Both implementations back the same trait, and a store
+        // whose epochs never move would make every test written against it agree
+        // with a broker that does not exist.
+        assignment.leader_epoch = match assignments.get(&key) {
+            Some(previous) if previous.leader_id == assignment.leader_id => previous.leader_epoch,
+            Some(previous) => previous.leader_epoch.saturating_add(1),
+            None => 0,
+        };
+
         assignments.insert(key, assignment);
         Ok(())
     }
@@ -199,6 +211,14 @@ impl MetadataStore for InMemoryMetadataStore {
                 None
             }
         }))
+    }
+
+    async fn get_partition_leader_epoch(&self, topic: &str, partition: u32) -> Result<Option<i32>> {
+        let assignments = self.partition_assignments.read().await;
+        Ok(assignments
+            .values()
+            .find(|a| a.topic == topic && a.partition == partition)
+            .map(|a| a.leader_epoch))
     }
 
     async fn get_partition_replicas(&self, topic: &str, partition: u32) -> Result<Option<Vec<i32>>> {
