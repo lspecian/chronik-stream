@@ -214,6 +214,31 @@ pub async fn apply_canonical_batch(
     // or read_committed served from this node computes a different LSO and
     // aborted list than the leader would.
     if let Some(handler) = produce_handler {
+        // RP-3: record the epoch this batch was written under, exactly as the
+        // leader did when it produced it.
+        //
+        // Without this a follower builds no epoch history at all while it
+        // replicates — `observe_append` was called only from the leader's
+        // produce path and from the startup WAL scan. A replica promoted by
+        // failover could then answer `OffsetForLeaderEpoch` only for epochs it
+        // had produced under itself, and returned "I cannot say" for the very
+        // history it had just finished replicating.
+        //
+        // Measured on a cluster: after a failover the new leader answered -1 and
+        // the returning replica logged "not truncating — the leader cannot say
+        // where our epoch ended". Truncation after a leader change was therefore
+        // impossible, which is the one case RP-3.3 exists for.
+        //
+        // The epoch travels in the batch itself, so a follower learns the same
+        // history from the same bytes. Batches predating RP-3 carry -1 and
+        // `observe_append` ignores those.
+        handler.leader_epochs().observe_append(
+            topic,
+            partition,
+            canonical.partition_leader_epoch,
+            base_offset,
+        );
+
         let first_key = canonical.records.first().and_then(|r| r.key.as_deref());
         handler.transaction_index().apply_log_batch(
             topic,
