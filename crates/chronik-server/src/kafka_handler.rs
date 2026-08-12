@@ -1559,9 +1559,12 @@ impl KafkaProtocolHandler {
                     log_end_offset,
                 );
 
-                tracing::debug!(
-                    "OffsetForLeaderEpoch {}-{}: epoch {} ends at {}",
-                    topic.name, ask.partition, ask.leader_epoch, end_offset
+                // Info, not debug: a follower only asks this when leadership
+                // changed or its log disagreed, so it is rare and it is the
+                // record of a truncation decision being made.
+                tracing::info!(
+                    "OffsetForLeaderEpoch {}-{}: epoch {} ends at {} (log end {})",
+                    topic.name, ask.partition, ask.leader_epoch, end_offset, log_end_offset
                 );
 
                 partitions.push(OffsetForLeaderPartitionResponse {

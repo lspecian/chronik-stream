@@ -533,8 +533,23 @@ impl ReplicaFetcher {
         }
 
         if by_topic.is_empty() {
+            // Worth saying out loud: this is the state in which a follower can
+            // never truncate. It is legitimate for an empty or pre-RP-3 log,
+            // and it is also what a bug looks like — the epoch warm-up running
+            // after the fetcher started produced exactly this, silently.
+            debug!(
+                "Nothing to reconcile with this leader: none of the {} followed partition(s) \
+                 have leader-epoch history",
+                partitions.len()
+            );
             return Ok(());
         }
+
+        let asked: usize = by_topic.values().map(|p| p.len()).sum();
+        info!(
+            "Reconciling {} partition(s) with the leader before fetching (leader-epoch handshake)",
+            asked
+        );
 
         let request = OffsetForLeaderEpochRequest {
             topics: by_topic

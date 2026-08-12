@@ -1850,6 +1850,21 @@ impl IntegratedKafkaServerBuilder {
         self.init_wal_receiver().await
             .context("Stage 15 failed: WAL Receiver initialization")?;
 
+        // RP-3: the leader-epoch history is derived from the log and therefore
+        // empty after a restart. Rebuild it before serving, or this node answers
+        // every OffsetForLeaderEpoch with UNDEFINED.
+        //
+        // ⚠️ This MUST run before the replica fetcher starts (stage 16). It used
+        // to run after all stages, and the ordering silently disabled RP-3.3: on
+        // a real cluster the fetcher logged "Replicating 1 partition(s)" 553µs
+        // *before* the warm-up finished, so its first reconcile pass read an
+        // empty epoch store, found nothing to ask about, skipped the handshake
+        // and cleared its reconcile flag. The history then arrived too late to
+        // matter. A returning replica would never truncate.
+        if let Err(e) = self.warm_up_leader_epochs().await {
+            warn!("Leader-epoch warm-up failed (continuing): {}", e);
+        }
+
         // Stage 16: ReplicaFetcher (cluster mode, pull replication only)
         self.init_replica_fetcher().await
             .context("Stage 16 failed: ReplicaFetcher initialization")?;
@@ -1864,13 +1879,6 @@ impl IntegratedKafkaServerBuilder {
         // not blind for the first ~30s after startup.
         if let Err(e) = self.warm_up_hot_text_index().await {
             warn!("Hot text index warm-up failed (continuing): {}", e);
-        }
-
-        // RP-3: the leader-epoch history is derived from the log and therefore
-        // empty after a restart. Rebuild it before serving, or this node answers
-        // every OffsetForLeaderEpoch with UNDEFINED.
-        if let Err(e) = self.warm_up_leader_epochs().await {
-            warn!("Leader-epoch warm-up failed (continuing): {}", e);
         }
 
         // Create the final server instance using the new_from_components constructor
