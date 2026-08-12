@@ -419,9 +419,20 @@ and again across five partitions at once on a replica returning from a failover.
 
 #### What is still untested: the cut itself
 
-Every cluster run so far ends in `log is a prefix — nothing to truncate`, which is the **correct** outcome for the failure being staged. Killing a leader does not produce divergence when writes are acknowledged by the full ISR: the survivors already hold everything the dead node had.
+The truncation branch has 12 integration tests and 15 unit tests behind it and **no hardware**, after six attempts with `divergence_truncation.sh`. Every one failed in the harness rather than the product, and the sequence is worth recording so the seventh does not repeat them:
 
-Real divergence needs the leader to accept writes its followers never received, then lose the election — i.e. a **network partition**, not a node kill: partition the leader from its followers, produce with `acks=1` so it acknowledges alone, then let the others elect a new leader and heal the partition. That is the test still owed. Until it runs, the truncation branch has 12 integration tests and 15 unit tests behind it and no hardware.
+| # | What went wrong | Fix |
+|---|---|---|
+| 1 | `pod_sh` lacked the quote-level probe; every produce exited 127 and the topic stayed empty — then two confident failures were reported against a cluster that had never been given a record | copied the probe from `regression_replication.sh`; the test now proves its prefix landed before measuring anything |
+| 2 | Ingress-only policy: the "isolated" node kept campaigning outward, which marked it *recently active* on the Raft leader | cut both directions |
+| 3 | A NetworkPolicy does not partition an existing cluster — Calico allows established connections | apply the policy, then restart the pods it selects |
+| 4 | Isolating the *leader* left it serving the client only partially (20 of 60 records), so the divergent tail was unpredictable | isolate the **followers**; a healthy leader accepts every `acks=1` write and the deaf followers cannot fetch them |
+| 5 | Verification read via subscribe, which returns 272 or 0 for the same command (#36) | read partition 0 explicitly with `--offset earliest` |
+| 6 | The victim's k8s node stayed cordoned, so the old leader could never rejoin | uncordon on heal |
+
+The final run created **real divergence for the first time** — 20 orphan records on the old leader, leadership moved to node 2, the old leader rejoined — and it still did not truncate, logging nothing at all. The orphans were gone from its log afterwards, but *without a truncation line*, which means it re-replicated rather than cut. What is not yet established is whether its WAL still held those orphans when it came back.
+
+**Stop extending this script.** Six rounds of environmental yak-shaving have produced one real product finding (followers not recording epochs) and five harness bugs. The remaining gap is ~40 lines of glue — `apply_epoch_answer` → `truncate_partition` → reset positions, epoch cache and watermark — and the honest way to cover it is an **in-process test**: a real `WalManager` over a tempdir, a fake leader on a socket answering API 23 with a lower end offset (the pattern `connection.rs` tests already use), and assertions on the WAL and the resumed position. Deterministic, seconds to run, and it tests this code rather than Kubernetes. The cluster has already proven the surrounding machinery: the handshake runs end to end, failover moves leadership, and a returning replica reconciles.
 
 #### The storage half: `WalManager::truncate_to`
 
