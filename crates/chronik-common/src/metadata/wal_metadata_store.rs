@@ -388,6 +388,52 @@ impl MetadataState {
             MetadataEventPayload::PartitionAssigned { assignment } => {
                 // v2.2.14: DashMap provides synchronous lock-free insert (no .await needed)
                 let key = (assignment.topic.clone(), assignment.partition);
+
+                // RP-5: an assignment carrying an OLDER leader epoch describes a
+                // leadership that has already been superseded, and applying it
+                // would move the partition back to a node that has since lost it.
+                //
+                // This was blind last-writer-wins, and it undid failover on a
+                // real cluster. Node 1 died, the partition failed over to node 2,
+                // node 2 took 200 acknowledged records — then node 1 came back,
+                // replayed its own metadata WAL (stale by exactly the change that
+                // demoted it), and its assignment overwrote the newer one on every
+                // node. All three then agreed the leader was node 1, which held
+                // no data for that partition, and consumers reading from it got
+                // **zero of 400 acknowledged records**. The data was intact on
+                // node 2 the whole time; metadata had simply pointed away from it.
+                //
+                // Leader epochs are monotonic per partition and already derived in
+                // exactly one place (`assign_partition`), so they are the
+                // causality token this needs. Equal epochs still apply: the
+                // anti-entropy loop re-asserts unchanged assignments constantly,
+                // and those are idempotent.
+                //
+                // The `get` guard must not be held across the `insert` — a DashMap
+                // Ref live at that point deadlocks the shard.
+                let superseded = self
+                    .partition_assignments
+                    .get(&key)
+                    .map(|existing| assignment.leader_epoch < existing.leader_epoch)
+                    .unwrap_or(false);
+
+                if superseded {
+                    let current = self
+                        .partition_assignments
+                        .get(&key)
+                        .map(|e| (e.leader_id, e.leader_epoch));
+                    tracing::warn!(
+                        "Ignoring stale assignment for {}-{}: it names leader {} at epoch {}, \
+                         but this node already holds {:?} — a returning node must not undo a failover",
+                        assignment.topic,
+                        assignment.partition,
+                        assignment.leader_id,
+                        assignment.leader_epoch,
+                        current
+                    );
+                    return Ok(());
+                }
+
                 self.partition_assignments.insert(key, assignment.clone());
                 Ok(())
             }
@@ -1612,6 +1658,89 @@ mod leader_epoch_tests {
             .find(|a| a.partition == partition)
             .expect("assignment exists")
             .leader_epoch
+    }
+
+    /// Apply an assignment the way a replicated event does — carrying its own
+    /// epoch, rather than having one derived. This is the path a re-broadcast
+    /// or a returning node's replay takes.
+    async fn apply_event(store: &WalMetadataStore, assignment: PartitionAssignment) {
+        let event = MetadataEvent::new_with_node(
+            MetadataEventPayload::PartitionAssigned { assignment },
+            2,
+        );
+        store.apply_replicated_event(event).await.unwrap();
+    }
+
+    fn assignment_at(topic: &str, partition: u32, leader: u64, epoch: i32) -> PartitionAssignment {
+        let mut a = assignment(topic, partition, leader);
+        a.leader_epoch = epoch;
+        a
+    }
+
+    /// The bug this guard exists for, reproduced on a cluster: node 1 died, the
+    /// partition failed over to node 2, node 2 took 400 acknowledged records —
+    /// then node 1 came back, replayed its own metadata WAL (stale by exactly
+    /// the change that demoted it) and its assignment overwrote the newer one
+    /// everywhere. All three nodes agreed the leader was node 1, which held no
+    /// data, and consumers read **zero of 400** acknowledged records.
+    #[tokio::test]
+    async fn a_returning_node_cannot_undo_a_failover() {
+        let store = store();
+
+        // The cluster failed the partition over to node 2.
+        apply_event(&store, assignment_at("orders", 0, 2, 1)).await;
+
+        // Node 1 comes back and replays what it knew before it died.
+        apply_event(&store, assignment_at("orders", 0, 1, 0)).await;
+
+        let assignments = store.get_partition_assignments("orders").await.unwrap();
+        let current = assignments.iter().find(|a| a.partition == 0).unwrap();
+        assert_eq!(
+            current.leader_id, 2,
+            "a stale assignment must not move the partition back to a node that lost it"
+        );
+        assert_eq!(current.leader_epoch, 1);
+    }
+
+    /// Anti-entropy re-asserts unchanged assignments constantly. Those carry the
+    /// same epoch and must still apply, or a node that missed the original event
+    /// could never be healed by a re-broadcast.
+    #[tokio::test]
+    async fn an_equal_epoch_still_applies() {
+        let store = store();
+        apply_event(&store, assignment_at("orders", 0, 2, 3)).await;
+
+        let mut replacement = assignment_at("orders", 0, 2, 3);
+        replacement.replicas = vec![2, 3, 1];
+        apply_event(&store, replacement).await;
+
+        let assignments = store.get_partition_assignments("orders").await.unwrap();
+        let current = assignments.iter().find(|a| a.partition == 0).unwrap();
+        assert_eq!(current.replicas, vec![2, 3, 1], "a same-epoch re-assertion must apply");
+    }
+
+    /// Newer leadership must always win, which is the ordinary failover path.
+    #[tokio::test]
+    async fn a_newer_epoch_wins() {
+        let store = store();
+        apply_event(&store, assignment_at("orders", 0, 1, 0)).await;
+        apply_event(&store, assignment_at("orders", 0, 3, 1)).await;
+
+        let assignments = store.get_partition_assignments("orders").await.unwrap();
+        let current = assignments.iter().find(|a| a.partition == 0).unwrap();
+        assert_eq!(current.leader_id, 3);
+        assert_eq!(current.leader_epoch, 1);
+    }
+
+    /// A partition nobody has seen before is accepted whatever its epoch —
+    /// there is nothing to supersede.
+    #[tokio::test]
+    async fn a_first_assignment_is_always_accepted() {
+        let store = store();
+        apply_event(&store, assignment_at("orders", 0, 2, 7)).await;
+
+        let assignments = store.get_partition_assignments("orders").await.unwrap();
+        assert_eq!(assignments.iter().find(|a| a.partition == 0).unwrap().leader_id, 2);
     }
 
     /// The epoch is derived by the store, never taken from the caller. There are
