@@ -6,6 +6,31 @@
 
 ---
 
+> ## ⚠️ These numbers were measured with replication silently disabled
+>
+> **Added 2026-08-12.** Every figure in this report was produced on v2.2.25,
+> which carried the bug fixed in PR #29: `produce_to_partition` returned before
+> reaching the WAL replication hook on any path where `acks != 0`, so `acks=1`
+> and `acks=all` replicated **nothing**. The bug was reproduced directly on the
+> v2.2.25 image behind this report.
+>
+> The cluster therefore held one copy of the data while reporting `isr:[1,2,3]`.
+> These are the throughput of a 3-node cluster doing the work of a single node,
+> and they are **not comparable** to any measurement taken after the fix.
+>
+> For scale: an early post-fix measurement with replication actually running
+> reached ~66K records/s at `acks=1`. That figure is **also** not a headline
+> number — it was taken over 1 GbE with the load generator co-located on a
+> broker, and whether it is network-bound or sender-bound has not been settled.
+> It is quoted here only to show that the gap is large, not to replace the
+> numbers above.
+>
+> **Nothing in this report should be cited until it is re-measured.** Tracked in
+> `docs/ROADMAP_REPLICATION.md`, which gates release on re-measuring against the
+> new replication mechanism.
+
+---
+
 ## Executive Summary
 
 Chronik Stream was stress-tested on a 3-node bare metal cluster running MicroK8s. Using a realistic HTTP ingestor pipeline with k6 load generators simulating thousands of concurrent virtual users, the system achieved:

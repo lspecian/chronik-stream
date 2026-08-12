@@ -144,13 +144,17 @@ Validated on a 3-node bare metal cluster (Dell Xeon E5-2667v4, 32 cores, 256GB R
 
 ### Streaming Throughput
 
-| Configuration | Messages/sec | Throughput | Errors |
-|---------------|-------------|------------|--------|
-| Cluster, 12 ingestors, 256B | **837,284 msg/s** | 245 MB/s | 0.00% |
-| Cluster, 36 ingestors, 1KB | 420,609 msg/s | **411 MB/s** | 0.00% |
-| Standalone, acks=1 | 309,000 msg/s | — | 0.00% |
-
-Zero data loss across 1B+ messages. See [BARE_METAL_PERFORMANCE.md](BARE_METAL_PERFORMANCE.md).
+> ⚠️ **Withdrawn pending re-measurement (2026-08-12).** The cluster figures
+> previously published here were measured on v2.2.25, which carried a bug
+> (fixed in PR #29) that made `acks=1` and `acks=all` replicate **nothing**.
+> The cluster was reporting `isr:[1,2,3]` while holding a single copy, so those
+> numbers describe a 3-node cluster doing one node's work. They are not
+> comparable to anything measured after the fix, and are not reproduced here.
+>
+> Re-measurement against the rebuilt replication path is a release gate — see
+> [docs/ROADMAP_REPLICATION.md](docs/ROADMAP_REPLICATION.md). The historical
+> report is kept, with the same caveat, in
+> [BARE_METAL_PERFORMANCE.md](BARE_METAL_PERFORMANCE.md).
 
 ### Search Quality (WANDS Benchmark — v2.4.0)
 

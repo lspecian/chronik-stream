@@ -1,5 +1,11 @@
 # Baseline Performance Results
 
+> **Scope (noted 2026-08-12):** these are **single-node** `chronik-bench` runs.
+> Replication is not exercised, so they are unaffected by the PR #29 bug that
+> invalidated the cluster figures in `BARE_METAL_PERFORMANCE.md` — and equally,
+> they say nothing about replicated throughput. Do not read them as cluster
+> numbers.
+
 ## Test Date: 2025-11-29 (v2.2.9 Searchable Feature)
 
 ### Test Configuration
