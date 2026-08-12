@@ -691,3 +691,76 @@ mod stamp_tests {
         assert_eq!(store.end_offset_for_epoch("orders", 0, 6, 104), (6, 104));
     }
 }
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+
+    /// The history is derived from the log, so a restart starts it empty. What
+    /// matters is that replaying appends in order rebuilds exactly the same
+    /// history the live path built — otherwise a restarted node would answer
+    /// OffsetForLeaderEpoch differently from the one that wrote the log.
+    #[test]
+    fn replaying_a_log_rebuilds_the_same_history() {
+        let live = LeaderEpochStore::new();
+        let appends = [
+            (1, 0i64), (1, 10), (1, 20),   // epoch 1 wrote 0..29
+            (2, 30), (2, 40),              // epoch 2 took over at 30
+            (5, 50),                       // epoch 5 at 50 (3 and 4 never wrote)
+        ];
+        for (epoch, offset) in appends {
+            live.observe_append("orders", 0, epoch, offset);
+        }
+
+        // Restart: a fresh store replays the same batches out of the WAL.
+        let recovered = LeaderEpochStore::new();
+        for (epoch, offset) in appends {
+            recovered.observe_append("orders", 0, epoch, offset);
+        }
+
+        assert_eq!(recovered.snapshot("orders", 0), live.snapshot("orders", 0));
+        assert_eq!(
+            recovered.end_offset_for_epoch("orders", 0, 1, 60),
+            live.end_offset_for_epoch("orders", 0, 1, 60),
+            "a recovered node must answer truncation queries identically"
+        );
+        assert_eq!(recovered.end_offset_for_epoch("orders", 0, 1, 60), (1, 30));
+    }
+
+    /// An upgraded cluster's existing log carries -1 everywhere. Replaying it
+    /// must leave NO history rather than inventing an epoch at offset 0 — a
+    /// fabricated entry would answer a real query with a real-looking offset.
+    #[test]
+    fn replaying_a_pre_epoch_log_leaves_no_history() {
+        let store = LeaderEpochStore::new();
+        for offset in [0i64, 10, 20, 30] {
+            store.observe_append("legacy", 0, -1, offset);
+        }
+
+        assert!(store.snapshot("legacy", 0).is_empty());
+        assert_eq!(store.latest_epoch("legacy", 0), None);
+        assert_eq!(
+            store.end_offset_for_epoch("legacy", 0, 0, 40),
+            (UNDEFINED_EPOCH, UNDEFINED_OFFSET),
+            "an un-stamped log must not answer epoch queries"
+        );
+    }
+
+    /// A log that upgraded mid-life — unstamped batches, then stamped ones —
+    /// must record history from the first stamped batch, not from offset 0.
+    #[test]
+    fn a_log_that_upgraded_mid_life_records_from_the_first_stamped_batch() {
+        let store = LeaderEpochStore::new();
+        for offset in [0i64, 10, 20] {
+            store.observe_append("mixed", 0, -1, offset);
+        }
+        store.observe_append("mixed", 0, 3, 30);
+        store.observe_append("mixed", 0, 3, 40);
+
+        assert_eq!(
+            store.snapshot("mixed", 0),
+            vec![EpochEntry { epoch: 3, start_offset: 30 }],
+            "history starts where stamping started, not at the log start"
+        );
+    }
+}

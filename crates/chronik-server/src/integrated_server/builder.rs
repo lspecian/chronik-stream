@@ -734,6 +734,92 @@ impl IntegratedKafkaServerBuilder {
     /// (searchable topic, partition) and inserts their entries. No disk I/O
     /// writes — only WAL reads. Errors are logged but non-fatal; startup
     /// continues even if warm-up fails.
+    /// RP-3: rebuild each partition's leader-epoch history from the WAL.
+    ///
+    /// The history is derived from the log, so it lives only in memory and is
+    /// empty after a restart — which would make this node answer every
+    /// `OffsetForLeaderEpoch` with UNDEFINED and leave a returning replica no
+    /// way to find its divergence point. Rebuilding it is therefore part of
+    /// coming back up, not an optimisation.
+    ///
+    /// This scans each partition's WAL. It is bounded (indexed segments are
+    /// reclaimed) but not free; Kafka keeps a `leader-epoch-checkpoint` file to
+    /// avoid the scan entirely, which is the eventual answer if startup time
+    /// becomes a problem.
+    async fn warm_up_leader_epochs(&self) -> Result<()> {
+        let Some(produce_handler) = self.produce_handler_base.as_ref() else {
+            return Ok(());
+        };
+        let Some(wal_manager) = self.wal_manager.as_ref() else {
+            return Ok(());
+        };
+        let Some(metadata_store) = self.metadata_store.as_ref() else {
+            return Ok(());
+        };
+
+        use chronik_storage::CanonicalRecord;
+        use chronik_wal::record::WalRecord;
+
+        let epochs = produce_handler.leader_epochs();
+        let start = std::time::Instant::now();
+        let topics = match metadata_store.list_topics().await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("leader-epoch warm-up: failed to list topics: {}", e);
+                return Ok(());
+            }
+        };
+
+        let mut partitions_warmed = 0usize;
+        let mut transitions = 0usize;
+
+        for topic_meta in topics {
+            for partition in 0..topic_meta.config.partition_count as i32 {
+                let records = match wal_manager
+                    .read_from(&topic_meta.name, partition, 0, usize::MAX)
+                    .await
+                {
+                    Ok(r) if !r.is_empty() => r,
+                    _ => continue,
+                };
+
+                let before = epochs.snapshot(&topic_meta.name, partition).len();
+                for wal_record in &records {
+                    if let WalRecord::V2 { canonical_data, base_offset, .. } = wal_record {
+                        let canonical: CanonicalRecord = match bincode::deserialize(canonical_data) {
+                            Ok(c) => c,
+                            Err(_) => continue,
+                        };
+                        // Batches written before RP-3 carry -1; observe_append
+                        // ignores those rather than inventing an epoch 0 at their
+                        // offset, so an upgraded cluster simply has no history
+                        // until its first stamped append.
+                        epochs.observe_append(
+                            &topic_meta.name,
+                            partition,
+                            canonical.partition_leader_epoch,
+                            *base_offset,
+                        );
+                    }
+                }
+
+                let after = epochs.snapshot(&topic_meta.name, partition).len();
+                if after > 0 {
+                    partitions_warmed += 1;
+                    transitions += after - before;
+                }
+            }
+        }
+
+        if partitions_warmed > 0 {
+            info!(
+                "Leader-epoch history rebuilt for {} partition(s), {} leadership transition(s), in {:?}",
+                partitions_warmed, transitions, start.elapsed()
+            );
+        }
+        Ok(())
+    }
+
     async fn warm_up_hot_text_index(&self) -> Result<()> {
         let Some(hot_idx) = self.hot_text_index.as_ref() else {
             return Ok(());
@@ -1711,6 +1797,13 @@ impl IntegratedKafkaServerBuilder {
         // not blind for the first ~30s after startup.
         if let Err(e) = self.warm_up_hot_text_index().await {
             warn!("Hot text index warm-up failed (continuing): {}", e);
+        }
+
+        // RP-3: the leader-epoch history is derived from the log and therefore
+        // empty after a restart. Rebuild it before serving, or this node answers
+        // every OffsetForLeaderEpoch with UNDEFINED.
+        if let Err(e) = self.warm_up_leader_epochs().await {
+            warn!("Leader-epoch warm-up failed (continuing): {}", e);
         }
 
         // Create the final server instance using the new_from_components constructor
