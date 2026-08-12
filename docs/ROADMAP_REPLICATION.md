@@ -395,7 +395,28 @@ The current epoch is answered with the leader's **log end offset**, not RP-2.3's
 
 **Status**: `NOT STARTED` — the remaining core of RP-3, and the only phase where a bug **destroys** data rather than stalling it.
 
-What exists to build on: the follower's Fetch client already speaks v11, which carries `current_leader_epoch`; `LeaderEpochStore` answers "what is my latest epoch?" and supports `truncate_from_end`; and the leader now answers API 23. What is missing is the client half of the exchange, the actual log truncation, and populating the epoch cache during WAL recovery (today it is built only from live appends, so a restarted follower starts with no history).
+What exists to build on: the follower's Fetch client already speaks v11, which carries `current_leader_epoch`; `LeaderEpochStore` answers "what is my latest epoch?" and supports `truncate_from_end`; and the leader now answers API 23.
+
+#### ⛔ The gate: the WAL cannot truncate its tail
+
+**There is no suffix truncation anywhere in the storage layer.** `WalManager::truncate_before` is a documented **no-op** (`manager.rs`, "v1.3.53+: No-op, GroupCommitWal manages truncation internally via rotation"), and `delete_records_before` removes whole segments *below* a low watermark — front truncation, the opposite operation. Nothing can discard records at and above an offset, which is the entire physical act RP-3.3 exists to perform.
+
+So the protocol exchange is the easy half. The hard half is a storage primitive that does not exist.
+
+**It is implementable.** WAL records are self-delimiting — `magic(2) version(1) flags(1) length(4) crc(4)` then body, and the read path already advances a cursor by the parsed size — so the byte offset where a given record begins is recoverable by a forward scan. Sketch:
+
+1. delete whole segment files whose lowest offset is `>= N`;
+2. in the segment straddling `N`, scan forward to the first record with `base_offset >= N` and `set_len()` the file at that byte;
+3. reset the partition's in-memory position (`next_offset`, high watermark) to `N`;
+4. `LeaderEpochCache::truncate_from_end(N)`.
+
+**The complication is `GroupCommitWal`.** It owns the write path, buffers records before flushing, and manages the active segment and rotation. Truncating files underneath it would race in-flight writes and leave its in-memory position disagreeing with what is on disk. Truncation therefore has to go *through* the writer — quiesce the partition, discard its buffered batches, truncate, reset position — not around it.
+
+This is a genuine storage change on a destructive path, and should be budgeted and reviewed as one rather than treated as wiring.
+
+#### Also missing
+
+Populating the epoch cache during **WAL recovery**: it is currently built only from live appends, so a restarted follower begins with no history and would answer every `OffsetForLeaderEpoch` with UNDEFINED. Kafka keeps a `leader-epoch-checkpoint` file for exactly this; rebuilding by scanning the WAL on startup is the cheaper first step, at the cost of a startup scan.
 
 ⚠️ **Test methodology**: by RP-2's lesson, killing the leader must genuinely keep it down — deleting a pod brings it back in ~4s. Cordon the node. And beware the inverse trap RP-2 hit: better behaviour can silently invalidate a test that used to pass for the wrong reason.
 
