@@ -8,16 +8,19 @@
 # the dead node had.
 #
 # Real divergence needs a leader that accepted writes its followers never
-# received, and which then loses the election. That is a network partition, not
-# a node failure — so this isolates the leader with a NetworkPolicy (Calico
-# enforces them here) rather than killing it:
+# received, and which then loses the election:
 #
-#   1. produce a common prefix at acks=all      → all three replicas agree
-#   2. cut the leader off from the other brokers, leaving the client reachable
-#   3. produce at acks=1 to the isolated leader → records that exist ONLY there
-#   4. the surviving two hold quorum, RP-5 moves leadership to one of them
-#   5. produce at acks=all to the new leader    → different records, SAME offsets
-#   6. heal the partition
+#   1. produce a common prefix at acks=all   → all three replicas agree
+#   2. cut the FOLLOWERS off from the leader (policy, then restart them)
+#   3. produce at acks=1 to the leader       → records only it can have
+#   4. kill the leader; the followers still hold quorum with each other
+#   5. produce at acks=all to the new leader → different records, SAME offsets
+#   6. heal, and let the old leader rejoin
+#
+# The followers are isolated rather than the leader because a severed leader
+# serves the client only partially — one run took 20 of 60 records before the
+# producer gave up — which makes step 3 unpredictable. A healthy leader with
+# deaf followers accepts every acks=1 write, and nothing else can have them.
 #
 # The old leader now holds a tail that the new leader never committed, at
 # offsets the new leader has filled with something else. Two logs that agree on
@@ -139,27 +142,21 @@ if [ -z "$OLD" ]; then fail "no leader for $TOPIC"; exit 1; fi
 OBS="${PODS}-1"; [ "$OLD" = "1" ] && OBS="${PODS}-2"
 say "-- leader is node $OLD (observing from $OBS)"
 
-# 2. Isolate the leader from the other brokers, leaving the client reachable.
+# 2. Cut the followers off from the leader.
 #
-#    BOTH directions, and then RESTART the node — that second part is what makes
-#    this work at all.
+#    **A NetworkPolicy does not partition a cluster that has already formed.**
+#    Calico allows established connections, so the pre-existing gRPC channels
+#    keep carrying Raft straight through a policy applied afterwards; only *new*
+#    connections are blocked. A `/dev/tcp` probe therefore reports the peer as
+#    unreachable while the cluster carries on talking normally — a very
+#    convincing false negative. The policy must be followed by restarting the
+#    pods it selects, so their connections are re-made under it.
 #
-#    **A NetworkPolicy does not partition an existing cluster.** Calico allows
-#    established connections, so the pre-existing gRPC channels between brokers
-#    keep carrying Raft traffic straight through a policy applied afterwards.
-#    Only *new* connections are blocked, which is why a `/dev/tcp` probe reports
-#    the peer as unreachable while the cluster carries on talking normally.
+#    That cost two runs and one wrong conclusion: with the "isolated" node still
+#    reachable over its old channels no election happened, and the obvious
+#    reading was that Raft leader election was broken. It is not — killing the
+#    leader's pod elects a new one in about three seconds.
 #
-#    That cost two wasted runs and produced a false conclusion — with the
-#    "isolated" leader still reachable over its old channels, no election
-#    happened, and the obvious reading was that Raft leader election was broken.
-#    It is not: killing the leader's pod elects a new one in about three seconds.
-#
-#    So: apply the policy first, then delete the pod. It comes back with every
-#    broker-to-broker connection denied from birth, while the client is still
-#    allowed in. Its WAL survives on the PVC, and its metadata still names it
-#    leader — which is exactly the state needed to accept writes nobody else
-#    will ever see.
 #    Isolate the FOLLOWERS, not the leader.
 #
 #    Cutting off the leader looked like the obvious move and does not work: a
