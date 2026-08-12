@@ -498,6 +498,16 @@ Leadership moves to a live replica in ~45s (one liveness window plus a tick), th
 2. **Failover shrank the replica set.** Writing the *live* replicas back as the assignment meant a partition returned from a transient failure at RF=2, and the returning node was no longer a replica at all — so it never resumed replicating and never ran the handshake. Repeat the failure and RF reaches 1 with nothing reporting it. Failover moves leadership; it is not a reassignment. ISR is what shrinks, and `IsrTracker` already does that.
 3. **It was silent.** Nothing logged what the controller believed, so a no-op and a healthy cluster were the same observation. It now logs the live set on change.
 
+4. **A returning node undid the failover, and every read went to zero.** The worst result of this effort, and it is a *metadata* bug that only working failover could expose.
+
+   Measured by the conformance suite: `distinct consumed 0 / acknowledged 400`. Node 1 led partition 0; it was held down; the partition failed over to node 2; node 2 accepted 400 acknowledged records. Node 1 came back, replayed its own metadata WAL — stale by exactly the change that demoted it — and its `PartitionAssigned` event overwrote the newer one **on every node**. All three then agreed the leader was node 1, which held no data for that partition. Consumers routed to the leader read nothing. The records were intact on node 2 the whole time; metadata had simply pointed away from them.
+
+   The apply path was a blind `insert` — last writer wins regardless of age. Nothing in the metadata model expressed that one assignment supersedes another.
+
+   Leader epochs already express exactly that: monotonic per partition, derived in one place. They are now the causality token — an assignment carrying an older epoch is ignored. Equal epochs still apply, because anti-entropy re-asserts unchanged assignments constantly and a node that missed the original event must still be healable by a re-broadcast.
+
+   ⚠️ **This is the generalisable lesson of the phase.** Every replicated piece of state needs a version that says which of two copies is newer. Partition assignments had one (`leader_epoch`) and were not using it. Worth auditing the other replicated metadata — topic configs in particular, given the partition-count disagreement recorded below — for the same shape.
+
 ### What was removed
 
 Both stubs that reported success while doing nothing: `elect_leader_from_isr` (the module is now an honest shim; the push stack still wires the type, RP-4 deletes both) and `propose_set_partition_leader` (no callers).
