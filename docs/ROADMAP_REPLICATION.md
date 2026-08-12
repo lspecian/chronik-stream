@@ -596,10 +596,18 @@ Measured: after a failover the returning replica held nothing for that topic, wh
 Answer before the phase that depends on them.
 
 1. **Is today's 66K rec/s network-bound or sender-bound?** (blocks any perf claim, and RP-1.4/RP-2 sizing) — 1 GbE links, and the load generator was co-located with a broker. Re-run `acks=1` with the client off broker nodes while sampling per-node NIC utilisation. If we are at ~110 MB/s, the transport is not the constraint and no sender work is justified.
-2. **Does `__chronik_metadata` move to pull, or keep a minimal push transport?** (blocks RP-4) — it is the one topic where push currently works correctly, including retry.
+2. ~~**Does `__chronik_metadata` move to pull, or keep a minimal push transport?**~~ — **DECIDED 2026-08-12: keep the push transport for metadata; RP-4 deletes only the data path.**
+
+   Metadata is not a partitioned topic with replicas and a leader epoch; it is a single Raft-managed log whose leadership is Raft's, and it is the store that *holds* the partition assignments the pull path reads. Moving it to pull would make the mechanism that discovers who leads a partition depend on already knowing who leads a partition. The push transport works correctly there today, including retry, and `MetadataWalReplicator` is built on it.
+
+   This shrinks RP-4 from "delete `wal_replication.rs`" to "delete the data push path": `ProduceHandler::set_wal_replication_manager` and its produce-path use, the `else` branch in `wire_raft_dependencies` that builds the data `WalReplicationManager`, the `ReplicationMode` switch (pull becomes unconditional), and the `LeaderElector` shim plus the election trigger machinery in `WalReceiver` that RP-5 superseded. `WalReceiver` itself stays, serving metadata.
 3. **What lag bound defines ISR?** (blocks RP-1.2) — Kafka uses time (`replica.lag.time.max.ms`). Offset-based lag misbehaves with uneven partition rates.
 4. **Does HW-from-ISR change observable consumer behaviour in existing tests?** (blocks RP-2.3) — consumers currently see the leader's write position; under Kafka semantics they would see less during follower lag.
-5. **How does an existing cluster upgrade across the push→pull boundary?** (blocks release, not any phase) — a pull follower cannot replicate from a push leader, so a rolling upgrade breaks replication mid-roll. Options: accept a full-cluster restart in the release notes; or keep the push *receive* path for one release so new leaders can still feed old followers. The second reintroduces coexistence, which we rejected for the steady state — but a bounded upgrade window is a different question from a permanent flag. **Decide before RP-4 deletes the receive path.**
+5. **How does an existing cluster upgrade across the push→pull boundary?** (blocks release, not any phase) — a pull follower cannot replicate from a push leader, so a rolling upgrade breaks replication mid-roll.
+
+   **Leaning: accept a full-cluster restart, and say so in the release notes.** Two reasons, both from this effort. First, the version being upgraded *from* did not replicate at all on `acks=1`/`acks=all` (PR #29), so there is no working replication to preserve across the roll — the "safe rolling upgrade" being protected is protecting a mechanism that was not running. Second, keeping the push receive path for one release means shipping the coexistence we rejected, in the release where the new path is least soaked, and every bug found in RP-1/RP-2/RP-5 was found by *removing* ambiguity about which mechanism was live.
+
+   Not yet decided, because it depends on whether any deployment is running RF>1 on a version new enough to replicate correctly. **Confirm that before RP-4 lands.**
 
 ---
 
