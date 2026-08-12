@@ -160,7 +160,20 @@ say "-- leader is node $OLD (observing from $OBS)"
 #    allowed in. Its WAL survives on the PVC, and its metadata still names it
 #    leader — which is exactly the state needed to accept writes nobody else
 #    will ever see.
-say "-- isolating node $OLD from its peers, both directions (NetworkPolicy)"
+#    Isolate the FOLLOWERS, not the leader.
+#
+#    Cutting off the leader looked like the obvious move and does not work: a
+#    leader severed from the cluster serves the client only partially — one run
+#    accepted 20 of 60 records before the producer gave up — so the "records only
+#    it has" step produces an unpredictable amount, and the node comes back in a
+#    state that is hard to reason about.
+#
+#    Isolating the followers leaves the leader completely healthy: it holds
+#    leadership, the client reaches it normally, and `acks=1` writes land in full
+#    because the leader acknowledges alone. The followers simply cannot fetch
+#    them. They keep talking to *each other*, so they still hold quorum and can
+#    elect between themselves the moment the leader goes away.
+say "-- isolating the followers from node $OLD (they keep quorum with each other)"
 cat <<YAML | $KUBECTL apply -f - >/dev/null 2>&1
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -169,16 +182,30 @@ metadata:
   namespace: $NS
 spec:
   podSelector:
-    matchLabels:
-      chronik.io/node-id: "$OLD"
+    matchExpressions:
+      - key: chronik.io/node-id
+        operator: NotIn
+        values: ["$OLD"]
+      - key: chronik.io/cluster-name
+        operator: Exists
   policyTypes: [Ingress, Egress]
   ingress:
     - from:
+        - podSelector:
+            matchExpressions:
+              - key: chronik.io/node-id
+                operator: NotIn
+                values: ["$OLD"]
         - podSelector:
             matchLabels:
               run: $CLIENT
   egress:
     - to:
+        - podSelector:
+            matchExpressions:
+              - key: chronik.io/node-id
+                operator: NotIn
+                values: ["$OLD"]
         - podSelector:
             matchLabels:
               run: $CLIENT
@@ -189,34 +216,41 @@ spec:
           port: 53
 YAML
 
-# 2b. Restart the isolated node so its connections are re-made under the policy.
-say "-- restarting node $OLD so its peer connections are denied from birth"
-$KUBECTL delete pod "${PODS}-${OLD}" -n "$NS" --wait=false >/dev/null 2>&1
+# 2b. Restart the followers so their connections are re-made under the policy.
+#     A policy alone cannot sever the fetch connections they already hold.
+say "-- restarting the followers so their connections to node $OLD are denied from birth"
+for n in 1 2 3; do
+  [ "$n" = "$OLD" ] && continue
+  $KUBECTL delete pod "${PODS}-${n}" -n "$NS" --wait=false >/dev/null 2>&1
+done
 for i in $(seq 1 40); do
-  phase=$($KUBECTL get pod "${PODS}-${OLD}" -n "$NS" -o jsonpath='{.status.phase}' 2>/dev/null)
-  [ "$phase" = "Running" ] && break
+  r=$($KUBECTL get pods -n "$NS" --no-headers 2>/dev/null | grep -c "^${PODS}-.* 1/1 *Running")
+  [ "$r" -ge 3 ] && break
   sleep 5
 done
-sleep 20   # let it finish recovery and settle into believing it still leads
+sleep 15
 
-# 3. Records that exist ONLY on the isolated leader.
-#
-#    Bootstrapped directly at that pod, not through the headless service: the
-#    service would hand us a surviving node's metadata, which by now names a
-#    different leader, and the write would go there instead — the opposite of
-#    what this test needs. Talking to the isolated node makes it answer with its
-#    own (stale) view, so it accepts the write as leader. acks=1 means it
-#    acknowledges alone, and being cut off, nothing else can ever have them.
+# 3. Records that only the leader can have: it is healthy and reachable, and
+#    acks=1 means it acknowledges alone. The followers cannot fetch them.
 say "-- writing $ORPHAN_N record(s) only node $OLD can have"
-pod_sh "seq $((PREFIX_N + 1)) $((PREFIX_N + ORPHAN_N)) | awk '{print \$1\":orphan-\"\$1}' | \
-  timeout 90 /opt/kafka/bin/kafka-console-producer.sh \
-    --bootstrap-server ${PODS}-${OLD}.${PODS}-headless:9092 --topic $TOPIC \
-    --producer-property acks=1 --property parse.key=true --property key.separator=:" \
-  >/dev/null 2>&1
-orphans_written=$?
-say "   (producer exit $orphans_written)"
+produce $((PREFIX_N + 1)) $((PREFIX_N + ORPHAN_N)) 1 orphan
+sleep 5
+orphan_on_leader=$(pod_sh "/opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server $BOOT \
+  --topic $TOPIC --partition 0 --offset earliest --timeout-ms 25000 2>/dev/null | grep -c '^orphan-'" \
+  2>/dev/null | tr -cd '0-9')
+say "   leader now holds ${orphan_on_leader:-0} orphan record(s)"
+if [ "${orphan_on_leader:-0}" -lt 1 ]; then
+  fail "no orphan records landed — there is no divergence to test"
+  exit 1
+fi
 
-# 4. The surviving two hold quorum; RP-5 should move leadership.
+# 4. Kill the leader. The isolated followers still hold quorum with each other.
+say "-- killing node $OLD so the followers must take over without those records"
+victim_node=$($KUBECTL get pod "${PODS}-${OLD}" -n "$NS" -o jsonpath='{.spec.nodeName}' 2>/dev/null)
+$KUBECTL cordon "$victim_node" >/dev/null 2>&1
+$KUBECTL delete pod "${PODS}-${OLD}" -n "$NS" --wait=false >/dev/null 2>&1
+
+# 5. Wait for the survivors to elect and for RP-5 to move the partition.
 NEW=""
 deadline=$((SECONDS + 240))
 while [ "$SECONDS" -lt "$deadline" ]; do
@@ -226,7 +260,7 @@ while [ "$SECONDS" -lt "$deadline" ]; do
 done
 
 if [ -z "$NEW" ]; then
-  fail "leadership never moved off the isolated node $OLD — cannot create divergence"
+  fail "leadership never moved off node $OLD — cannot create divergence"
   exit 1
 fi
 say "-- leadership moved to node $NEW"
@@ -236,10 +270,15 @@ produce $((PREFIX_N + 1)) $((PREFIX_N + WINNER_N)) all winner
 say "-- wrote $WINNER_N committed record(s) over those offsets"
 sleep 5
 
-# 6. Heal.
-say "-- healing the partition"
+# 6. Heal: drop the policy and let the old leader back.
+say "-- healing, and letting node $OLD rejoin"
 cleanup
-sleep 5
+[ -n "$victim_node" ] && $KUBECTL uncordon "$victim_node" >/dev/null 2>&1
+for i in $(seq 1 60); do
+  r=$($KUBECTL get pods -n "$NS" --no-headers 2>/dev/null | grep -c "^${PODS}-.* 1/1 *Running")
+  [ "$r" -ge 3 ] && break
+  sleep 5
+done
 
 # The returning leader must discard its uncommitted tail.
 say "-- waiting for node $OLD to reconcile"
@@ -263,9 +302,16 @@ $KUBECTL logs -n "$NS" "${PODS}-${OLD}" --since=15m 2>/dev/null \
   || fail "node $OLD never truncated — it is still holding records the cluster never committed"
 
 # Committed records must survive; uncommitted ones must not.
-survived=$(pod_sh "/opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server $BOOT \
-  --topic $TOPIC --from-beginning --timeout-ms 30000 2>/dev/null | sort -u > /tmp/d.txt; \
-  grep -c '^winner-' /tmp/d.txt" 2>/dev/null | tr -cd '0-9')
+#
+# Read partition 0 explicitly rather than subscribing to the topic. The
+# subscribe path here is unreliable — two identical invocations seconds apart
+# have returned 272 records and then 0 (issue #36) — and a flaky reader turns
+# every assertion below into a coin toss. An explicit partition assignment with
+# `--offset earliest` has been consistent.
+pod_sh "/opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server $BOOT \
+  --topic $TOPIC --partition 0 --offset earliest --timeout-ms 30000 2>/dev/null | sort -u > /tmp/d.txt" \
+  >/dev/null 2>&1
+survived=$(pod_sh "grep -c '^winner-' /tmp/d.txt" 2>/dev/null | tr -cd '0-9')
 orphans=$(pod_sh "grep -c '^orphan-' /tmp/d.txt" 2>/dev/null | tr -cd '0-9')
 
 say ""
