@@ -1327,28 +1327,58 @@ impl RaftCluster {
     /// the leader as it receives responses — so this returns `None` elsewhere
     /// rather than an empty set that would read as "everything is dead".
     ///
-    /// ⚠️ This is a **sample, not a verdict**. `quorum_recently_active` clears
-    /// `recent_active` on every election-timeout tick, so a healthy peer reads
-    /// `false` for part of every cycle. Callers must accumulate these samples
-    /// over a window; treating one `false` as death would fail every partition
-    /// over on a timer.
+    /// Each call reports who has been heard from **since the previous call**,
+    /// and then clears the flags so the next one measures a fresh interval.
+    /// That reset is the whole reason this is meaningful:
+    ///
+    /// `recent_active` is set when a peer replies and is cleared only by
+    /// `check_quorum_active`, which Raft calls only when `check_quorum` is
+    /// enabled. This cluster leaves it at its default of `false` — deliberately,
+    /// since the config is already tuned around election storms (see
+    /// `election_tick` above), and turning it on would make a leader step down
+    /// whenever it misses a quorum of replies for one election timeout. With it
+    /// off, nothing ever clears the flag: **a peer that has ever been seen reads
+    /// alive forever, including after it dies.** That is exactly what made the
+    /// first RP-5 build a no-op on a real cluster — the planner was correct and
+    /// its input was a constant.
+    ///
+    /// So the reset is owned here instead, which leaves consensus behaviour
+    /// untouched. It does mean this must be the *only* consumer of the flags:
+    /// two callers would steal each other's evidence. Enabling `check_quorum`
+    /// later would make Raft a second consumer — survivable, since the caller
+    /// accumulates over a window much longer than an election timeout, but it
+    /// should be a deliberate decision rather than a surprise.
+    ///
+    /// Still a **sample, not a verdict**: a live peer can miss one interval.
+    /// Callers accumulate over a window; treating one absence as death would
+    /// fail every partition over on a timer.
     pub async fn sample_active_peers(&self) -> Option<Vec<u64>> {
         if !self.am_i_leader().await {
             return None;
         }
 
-        let raft = self.raft_node.lock().await;
+        let mut raft = self.raft_node.lock().await;
         if raft.raft.state != raft::StateRole::Leader {
-            // Lost leadership between the cached check and the lock.
+            // Lost leadership between the cached check and the lock. Leave the
+            // flags alone: they are not ours to clear when we are not leading.
             return None;
         }
 
-        let mut active = vec![self.node_id];
+        let self_id = self.node_id;
+        let mut active = vec![self_id];
         for (id, progress) in raft.raft.prs().iter() {
-            if *id != self.node_id && progress.recent_active {
+            if *id != self_id && progress.recent_active {
                 active.push(*id);
             }
         }
+
+        // Clear for the next interval. Raft does not do this for us here.
+        for (id, progress) in raft.raft.mut_prs().iter_mut() {
+            if *id != self_id {
+                progress.recent_active = false;
+            }
+        }
+
         Some(active)
     }
 

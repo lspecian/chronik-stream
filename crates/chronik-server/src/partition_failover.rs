@@ -153,6 +153,9 @@ pub struct PartitionFailoverController {
     /// Failover is suppressed until a full liveness window has passed since
     /// then — see `grace_expired`.
     leader_since: parking_lot::Mutex<Option<Instant>>,
+    /// Last live set logged, so the line above prints on change rather than
+    /// every tick.
+    last_reported_live: parking_lot::Mutex<Option<Vec<u64>>>,
     tick: Duration,
     liveness_window: Duration,
     shutdown: Arc<AtomicBool>,
@@ -171,6 +174,7 @@ impl PartitionFailoverController {
             metadata_store,
             last_active: DashMap::new(),
             leader_since: parking_lot::Mutex::new(None),
+            last_reported_live: parking_lot::Mutex::new(None),
             tick: env_secs("CHRONIK_FAILOVER_TICK_SECS").unwrap_or(DEFAULT_TICK),
             liveness_window: env_secs("CHRONIK_FAILOVER_LIVENESS_SECS")
                 .unwrap_or(DEFAULT_LIVENESS_WINDOW),
@@ -222,12 +226,31 @@ impl PartitionFailoverController {
                 continue;
             }
 
+            self.report_live_set(now);
+
             if let Err(e) = self.reconcile(now).await {
                 warn!("Partition failover pass failed: {}", e);
             }
         }
 
         info!("Partition failover controller stopped on node {}", self.node_id);
+    }
+
+    /// Log the live set whenever it changes.
+    ///
+    /// The first build of this controller shipped as a silent no-op on a real
+    /// cluster: the planner was correct and its liveness input was a constant,
+    /// so nothing was ever planned and nothing was ever logged. "Who does this
+    /// think is alive" must be answerable from a log rather than a rebuild.
+    fn report_live_set(&self, now: Instant) {
+        let mut sorted: Vec<u64> = self.live_nodes(now).into_iter().collect();
+        sorted.sort_unstable();
+
+        let mut last = self.last_reported_live.lock();
+        if last.as_deref() != Some(sorted.as_slice()) {
+            info!("Partition failover: live nodes {:?}", sorted);
+            *last = Some(sorted);
+        }
     }
 
     /// Forget everything observed while we were Raft leader.
@@ -268,6 +291,9 @@ impl PartitionFailoverController {
     async fn reconcile(&self, now: Instant) -> chronik_common::Result<()> {
         let live = self.live_nodes(now);
         if live.is_empty() {
+            // We are the Raft leader, so we are alive by definition; an empty
+            // set means the sampler is broken, not that the cluster is gone.
+            warn!("Partition failover: no node looks alive, including this one — not acting");
             return Ok(());
         }
 
