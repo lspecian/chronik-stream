@@ -65,7 +65,19 @@ pub struct Failover {
     pub from: u64,
     /// The replica taking over. Always live, always a replica, never `from`.
     pub to: u64,
-    /// Replicas still alive — the honest ISR for the new leader to start from.
+    /// The partition's replica set, **unchanged**.
+    ///
+    /// Failover moves leadership; it is not a reassignment. Dropping the dead
+    /// node here would shrink the replica set permanently — the partition would
+    /// come back from a transient failure at RF=2, then RF=1 after the next one,
+    /// silently eroding the durability the cluster was configured for. It also
+    /// leaves the returning node no longer a replica, so it never resumes
+    /// replicating and never runs the RP-3.3 truncation handshake.
+    ///
+    /// What legitimately shrinks on failure is ISR, and `IsrTracker` already
+    /// does that from its own liveness (RP-2.1).
+    pub replicas: Vec<u64>,
+    /// Replicas currently alive. Reported, not written — diagnostics only.
     pub live_replicas: Vec<u64>,
 }
 
@@ -128,6 +140,7 @@ pub fn plan_failover(
                 partition: assignment.partition,
                 from: assignment.leader_id,
                 to,
+                replicas: assignment.replicas.clone(),
                 live_replicas,
             }),
             None => plan.stranded.push(Stranded {
@@ -327,7 +340,8 @@ impl PartitionFailoverController {
             partition: failover.partition,
             broker_id: failover.to as i32,
             is_leader: true,
-            replicas: failover.live_replicas.clone(),
+            // Unchanged — see `Failover::replicas`.
+            replicas: failover.replicas.clone(),
             leader_id: failover.to,
             // Derived by the store, never by callers.
             leader_epoch: 0,
@@ -440,17 +454,31 @@ mod tests {
         assert!(plan.stranded.is_empty());
     }
 
-    /// The dead node must leave ISR as part of the same change. It staying in
-    /// was why `/admin/status` reported `isr:[1,2,3]` with a node down and
-    /// `under_replicated: false`.
+    /// The replica set survives a failover, so the node that died is still a
+    /// replica when it returns.
+    ///
+    /// Caught on a real cluster: the first version wrote the *live* replicas
+    /// back as the replica set, so a partition came back from a transient
+    /// failure at RF=2 and the returning node was no longer a replica at all —
+    /// it never resumed replicating, and so never ran the RP-3.3 handshake.
+    /// Repeat the failure and RF reaches 1 without anything reporting it.
     #[test]
-    fn the_dead_node_is_dropped_from_the_replica_set() {
+    fn the_replica_set_survives_so_the_dead_node_can_rejoin() {
         let assignments = vec![assignment("orders", 0, 3, &[3, 1, 2])];
 
         let plan = plan_failover(&assignments, &live(&[1, 2]));
 
+        assert_eq!(
+            plan.failovers[0].replicas,
+            vec![3, 1, 2],
+            "failover moves leadership; it is not a reassignment"
+        );
+        assert!(
+            plan.failovers[0].replicas.contains(&3),
+            "the node that died must still be a replica when it comes back"
+        );
+        // Liveness is still reported, just not written as the replica set.
         assert_eq!(plan.failovers[0].live_replicas, vec![1, 2]);
-        assert!(!plan.failovers[0].live_replicas.contains(&3));
     }
 
     /// Replica order is the preferred-leader order, so the choice must follow it
@@ -545,12 +573,38 @@ mod tests {
 
         // Write the plan back the way the controller does.
         assignments[0].leader_id = first.failovers[0].to;
-        assignments[0].replicas = first.failovers[0].live_replicas.clone();
+        assignments[0].replicas = first.failovers[0].replicas.clone();
 
         assert_eq!(
             plan_failover(&assignments, &alive),
             FailoverPlan::default(),
             "a second pass over the applied state must be a no-op"
+        );
+        assert_eq!(
+            assignments[0].replicas,
+            vec![1, 2, 3],
+            "and the replica set is still RF=3"
+        );
+    }
+
+    /// Repeated failures must not erode the replica set. This is the property
+    /// that the first cluster run violated silently.
+    #[test]
+    fn repeated_failovers_do_not_erode_the_replica_set() {
+        let mut assignments = vec![assignment("orders", 0, 1, &[1, 2, 3])];
+
+        for (dead, alive_now) in [(1u64, vec![2u64, 3]), (2, vec![3])] {
+            let plan = plan_failover(&assignments, &live(&alive_now));
+            assert_eq!(plan.failovers.len(), 1, "leader {dead} should have moved");
+            assignments[0].leader_id = plan.failovers[0].to;
+            assignments[0].replicas = plan.failovers[0].replicas.clone();
+        }
+
+        assert_eq!(assignments[0].leader_id, 3);
+        assert_eq!(
+            assignments[0].replicas,
+            vec![1, 2, 3],
+            "two failures in a row must still leave RF=3"
         );
     }
 
