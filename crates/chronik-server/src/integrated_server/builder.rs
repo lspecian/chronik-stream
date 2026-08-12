@@ -439,16 +439,54 @@ impl IntegratedKafkaServerBuilder {
         let rejoin_notify = Arc::new(tokio::sync::Notify::new());
         self.metadata_rejoin_notify = Some(rejoin_notify.clone());
 
+        // RP-7: only the Raft leader may re-assert the catalog.
+        //
+        // Every node used to run this loop, so every node re-published *its own*
+        // view on a timer. That is gossip with no tiebreak, and it does not
+        // converge: measured after a failover, three nodes held three different
+        // views of one partition — node 2 (which had the data) said `leader:2`,
+        // while nodes 1 and 3 said `leader:1`. Node 1 then served 17,259 fetches
+        // as leader of a partition whose log was empty, and node 3 replicated
+        // from it and stayed empty, while all three reported
+        // `under_replicated: false`.
+        //
+        // The epoch guard in `apply_replicated_event` stops a node *regressing*
+        // to an older assignment, but a guard cannot deliver an update to a node
+        // that never received one, and nothing made any view authoritative.
+        //
+        // Assignments are Raft-managed state, so the Raft leader is the only
+        // node entitled to publish them. Off the leader this loop stays quiet
+        // and the local catalog is a cache to be corrected, not a view to be
+        // broadcast. When there is no Raft cluster at all (single node) there is
+        // nothing to disagree with, so it always runs.
+        let broadcast_authority = self.raft_cluster_for_metadata.clone();
+
         tokio::spawn(async move {
             // First pass early: covers the common fast-startup case.
             tokio::time::sleep(std::time::Duration::from_secs(45)).await;
+            let mut warned_not_authority = false;
             loop {
-                let count = broadcast_store.broadcast_all_topics().await;
-                if count > 0 {
-                    tracing::info!(
-                        topics_broadcast = count,
-                        "Re-broadcast topic metadata for follower sync (anti-entropy)"
-                    );
+                let may_broadcast = match &broadcast_authority {
+                    Some(raft) => raft.am_i_leader().await,
+                    None => true,
+                };
+
+                if !may_broadcast {
+                    if !warned_not_authority {
+                        tracing::debug!(
+                            "Not the Raft leader — leaving catalog anti-entropy to the node that is"
+                        );
+                        warned_not_authority = true;
+                    }
+                } else {
+                    warned_not_authority = false;
+                    let count = broadcast_store.broadcast_all_topics().await;
+                    if count > 0 {
+                        tracing::info!(
+                            topics_broadcast = count,
+                            "Re-broadcast topic metadata for follower sync (anti-entropy)"
+                        );
+                    }
                 }
 
                 // `notify_one` stores a permit, so a rejoin that lands while the

@@ -385,6 +385,52 @@ impl FetchHandler {
     /// Returns None if valid, Some(error_response) if invalid
     ///
     /// Complexity: < 15 (two metadata checks + error construction)
+    /// NOT_LEADER_OR_FOLLOWER when metadata says another node leads this
+    /// partition (RP-7).
+    ///
+    /// Narrow on purpose. It rejects only when an assignment exists *and* names
+    /// a different node: no assignment, an assignment naming this node, or an
+    /// unset node id all serve as before, so single-node deployments and
+    /// not-yet-assigned topics are unaffected.
+    ///
+    /// The alternative — serving an empty log because our catalog is stale — is
+    /// indistinguishable from "you are caught up", and that is what let a
+    /// returning node answer 17,259 fetches for a partition it no longer led
+    /// while the cluster reported itself healthy.
+    async fn reject_if_not_leader(
+        &self,
+        topic: &str,
+        partition: i32,
+    ) -> Option<FetchResponsePartition> {
+        let this_node = self.config.node_id as u64;
+        if this_node == 0 {
+            return None; // no cluster identity — nothing to compare against
+        }
+
+        let assignments = self.metadata_store.get_partition_assignments(topic).await.ok()?;
+        let assignment = assignments.iter().find(|a| a.partition == partition as u32)?;
+
+        if assignment.leader_id == this_node {
+            return None;
+        }
+
+        debug!(
+            "{}-{}: refusing to serve — metadata says node {} leads this partition, not node {}",
+            topic, partition, assignment.leader_id, this_node
+        );
+
+        Some(FetchResponsePartition {
+            partition,
+            error_code: 6, // NOT_LEADER_OR_FOLLOWER
+            high_watermark: -1,
+            last_stable_offset: -1,
+            log_start_offset: -1,
+            aborted: None,
+            preferred_read_replica: -1,
+            records: vec![],
+        })
+    }
+
     async fn validate_topic_and_partition(
         &self,
         topic: &str,
@@ -885,6 +931,27 @@ impl FetchHandler {
 
         // Phase 1: Validate topic and partition existence
         if let Some(error_response) = self.validate_topic_and_partition(topic, partition).await? {
+            return Ok(error_response);
+        }
+
+        // RP-7: refuse to serve a partition this node does not lead.
+        //
+        // A node whose catalog is stale can believe it still leads a partition
+        // that failed over while it was away. Measured: a returning node served
+        // 17,259 fetches as leader of a partition whose log was empty — every
+        // consumer routed there saw an empty topic, and a follower pointed at it
+        // replicated nothing, while all three nodes reported
+        // `under_replicated: false`. Answering "no records" is indistinguishable
+        // from "caught up", which is what made it silent.
+        //
+        // NOT_LEADER_OR_FOLLOWER is the Kafka-correct answer: clients refresh
+        // metadata and retry against the real leader, and a replica fetcher
+        // treats it as a signal to re-read assignments rather than as data.
+        //
+        // Deliberately narrow — this rejects only when metadata *positively*
+        // names a different node. No assignment, or one naming this node, still
+        // serves, so single-node and not-yet-assigned topics are untouched.
+        if let Some(error_response) = self.reject_if_not_leader(topic, partition).await {
             return Ok(error_response);
         }
 
