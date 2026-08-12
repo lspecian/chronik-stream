@@ -12,7 +12,7 @@
 | RP-3 | Leader epochs & truncation | `TESTED (partly)` | — | Handshake proven end-to-end on a cluster; the **truncate** branch still needs manufactured divergence |
 | RP-5 | Partition leader failover | `TESTED` | — | Built and validated: leadership moves, RF preserved, ISR shrinks, writes recover |
 | RP-6 | Failover recovery latency | `TESTED` | — | Catalog is pushed on rejoin; verified on cluster |
-| RP-7 | Assignments have no single authority | `NOT STARTED` | — | ⛔ **The real blocker.** Three nodes, three views of one partition; every node gossips its own |
+| RP-7 | Assignment authority | `TESTED` | — | Only the Raft leader publishes; fetch refuses when it does not lead. **Full conformance suite now PASSES, RP-0.4 included** |
 | RP-4 | Delete the push stack | `NOT STARTED` | — | ~2,500 lines removed |
 
 ---
@@ -588,9 +588,27 @@ So the shape of the fix is: elect a **live** replica other than the failed leade
 
 ---
 
-## Phase RP-7: Assignments have no single authority (found 2026-08-12)
+## Phase RP-7: Assignment authority — `TESTED` (found and fixed 2026-08-12)
 
-**Status**: `NOT STARTED`. **The real remaining blocker** — larger than RP-3 or RP-5, and the reason RP-0.4 still fails.
+**Status**: `TESTED`. This was the last blocker: with it in place the conformance suite passes end to end for the first time, RP-0.4 included.
+
+```
+-- convergence after a leader change (RP-3.3)
+   leader before: node 1 → leader after: node 2
+   node1: [0 1 2]   node2: [0 1 2]   node3: [0 1 2]
+   distinct consumed 400 / acknowledged 400
+== PASS: every replica holds every partition at acks=0, 1 and all; ISR tracks reality ==
+```
+
+### The fix, in two halves
+
+**Publication.** Every node ran the catalog anti-entropy loop, so every node re-published *its own* view on a timer — gossip with no tiebreak, which does not converge. Assignments are Raft-managed state, so only the Raft leader re-asserts the catalog now; off the leader the local copy is a cache to be corrected, not a view to broadcast. With no Raft cluster there is nothing to disagree with, so it always runs.
+
+**Consumption.** A node with a stale catalog served the partition anyway, and "no records" is indistinguishable from "you are caught up" — which is what made this silent. Fetch answers `NOT_LEADER_OR_FOLLOWER` when metadata positively names a different node, so clients refresh and retry against the real leader and a replica fetcher re-reads assignments instead of accepting emptiness as data. Deliberately narrow: no assignment, an assignment naming this node, or an unset node id all serve as before.
+
+### What it looked like before
+
+
 
 After a failover and the old leader's return, the three nodes held **three different views of the same partition**:
 
