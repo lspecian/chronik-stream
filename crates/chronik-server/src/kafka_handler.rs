@@ -138,6 +138,7 @@ impl KafkaProtocolHandler {
             ApiKey::OffsetDelete => self.handle_offset_delete_request(header, buf).await,
             ApiKey::ListGroups => self.handle_list_groups_request(header, buf).await,
             ApiKey::EndTxn => self.handle_end_txn_request(header, buf).await,
+            ApiKey::OffsetForLeaderEpoch => self.handle_offset_for_leader_epoch_request(header, buf).await,
             _ => self.handle_default_request(request_bytes, header.api_key, header.api_version).await,
         }
     }
@@ -1512,6 +1513,85 @@ impl KafkaProtocolHandler {
     /// Supports LATEST (-1), EARLIEST (-2), and specific timestamp queries.
     /// Complexity: < 15 (clean orchestration using helper methods)
     #[instrument(skip(self, buf))]
+    /// OffsetForLeaderEpoch (API 23) — RP-3.2.
+    ///
+    /// A replica that has been away asks "where did epoch N end?" and truncates
+    /// to the answer before resuming. Answering this wrongly is worse than not
+    /// answering: a bogus offset makes a follower discard a correct log or keep
+    /// a divergent one, which is the exact damage leader epochs exist to
+    /// prevent. So an epoch this node cannot speak to is answered -1, and the
+    /// asker falls back rather than acting on a number that means something
+    /// else.
+    async fn handle_offset_for_leader_epoch_request(
+        &self,
+        header: chronik_protocol::parser::RequestHeader,
+        mut buf: Bytes,
+    ) -> Result<Response> {
+        use chronik_protocol::offset_for_leader_epoch_types::{
+            encode_response, parse_request, OffsetForLeaderEpochResponse,
+            OffsetForLeaderPartitionResponse, OffsetForLeaderTopicResponse,
+        };
+        use chronik_protocol::parser::Decoder;
+
+        let mut decoder = Decoder::new(&mut buf);
+        let request = parse_request(&mut decoder)?;
+
+        let epochs = self.produce_handler.leader_epochs();
+        let mut topics = Vec::with_capacity(request.topics.len());
+
+        for topic in &request.topics {
+            let mut partitions = Vec::with_capacity(topic.partitions.len());
+            for ask in &topic.partitions {
+                // The current epoch has not ended, so it ends at the log end
+                // offset — which is this leader's own write position, not the
+                // replicated watermark. A follower is allowed to see that far;
+                // capping it here would stall replication (RP-2.3).
+                let log_end_offset = self
+                    .produce_handler
+                    .get_high_watermark(&topic.name, ask.partition)
+                    .await
+                    .unwrap_or(0);
+
+                let (_epoch, end_offset) = epochs.end_offset_for_epoch(
+                    &topic.name,
+                    ask.partition,
+                    ask.leader_epoch,
+                    log_end_offset,
+                );
+
+                tracing::debug!(
+                    "OffsetForLeaderEpoch {}-{}: epoch {} ends at {}",
+                    topic.name, ask.partition, ask.leader_epoch, end_offset
+                );
+
+                partitions.push(OffsetForLeaderPartitionResponse {
+                    error_code: 0,
+                    partition: ask.partition,
+                    end_offset,
+                });
+            }
+            topics.push(OffsetForLeaderTopicResponse {
+                name: topic.name.clone(),
+                partitions,
+            });
+        }
+
+        let mut body_buf = BytesMut::new();
+        encode_response(&mut body_buf, &OffsetForLeaderEpochResponse { topics });
+
+        Ok(Response {
+            header: ResponseHeader { correlation_id: header.correlation_id },
+            body: body_buf.freeze(),
+            // v0 only — matches the advertised range in parser.rs. v1 adds a
+            // leader epoch to the response and v2 a throttle time; advertising
+            // more than is implemented hands clients malformed frames, so the
+            // two move together or not at all.
+            is_flexible: false,
+            api_key: ApiKey::OffsetForLeaderEpoch,
+            throttle_time_ms: None,
+        })
+    }
+
     async fn handle_list_offsets_request(
         &self,
         header: chronik_protocol::parser::RequestHeader,

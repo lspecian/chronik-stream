@@ -18,6 +18,7 @@ pub mod handler;
 pub mod handlers;
 pub mod kafka_protocol;
 pub mod metadata_fix;
+pub mod offset_for_leader_epoch_types;
 pub mod parser;
 pub mod records;
 pub mod types;
