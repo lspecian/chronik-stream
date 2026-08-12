@@ -417,7 +417,33 @@ and again across five partitions at once on a replica returning from a failover.
 1. **The epoch warm-up ran after the replica fetcher started.** `warm_up_leader_epochs` was called after all 17 builder stages; the fetcher starts at stage 16. Measured: the fetcher logged `Replicating 1 partition(s)` **553µs before** the warm-up finished, so its first reconcile read an empty epoch store, found nothing to ask about, skipped the handshake and cleared its reconcile flag. The history then arrived too late to matter, and a returning replica would never truncate. The warm-up now runs before stage 16.
 2. **The warm-up enumerated partitions from `list_topics()`**, which races catalog recovery at startup — a topic not yet in the catalog was skipped even though its log was on disk. It now enumerates from the WAL directory, which is what it rebuilds from. And it logs unconditionally: it previously printed only when it warmed something, so "warmed nothing" and "never ran" were the same observation.
 
-#### What is still untested: the cut itself
+#### ✅ The cut is proven — in-process, with exact assertions
+
+`fetcher.rs` now drives the whole reconciliation path against a real WAL on disk and a fake leader on a real socket answering with the broker's own API-23 codec. A follower holding 100 records is told its epoch ended at 60, and must afterwards hold **exactly** 0–59, resume from 60, and have walked its watermark back to 60. Verified to fail: with the truncation call removed it reports *"everything at or above the divergence point must be gone, and nothing below it."*
+
+Three companions cover the branches that must **not** delete anything — a follower merely behind, a leader answering `-1`, and a log with no epoch history. Those matter more than the happy path, because that is where a bug destroys data rather than stalling it.
+
+The blocker had been a dependency, not the feature: `ReplicaFetcher` held an `Arc<ProduceHandler>` — twelve production construction sites, none in any test — when it needed three facts. `FollowerState` is those three methods. That coupling is *why* this went untested for so long.
+
+#### Why the system-level version is so hard to stage — and why that is good news
+
+Six Kubernetes attempts and three local ones failed to produce divergence. The local runs finally explained why, and the reason is architectural rather than accidental.
+
+**Consensus and data replication share the same three nodes.** Freezing the followers to stop them fetching also removes the Raft quorum, so the leader immediately steps down:
+
+```
+22:19:38  node 1 is now Candidate at term 2 (leader is 0, was 2)
+```
+
+and then correctly refuses writes. A minority partition must not accept writes, so the very condition needed to create divergence — a leader accepting records its followers never see — is the condition under which this cluster stops accepting records at all.
+
+Kafka separates these: the controller quorum is independent of a partition's replica set, so a leader can lose its followers while the controller still considers it leader. That gap is where unclean-leader divergence lives. **Chronik's coupling makes that window much narrower** — roughly one election timeout (~2s here) between the followers becoming unreachable and the leader stepping down. One run did land 40 orphan records inside exactly that window, so the window is real, just small.
+
+That is a genuine durability advantage worth stating plainly, and it does not make RP-3.3 unnecessary: the window exists, an operator can widen it by raising the election timeout, and a follower that returns after any unclean change still needs to reconcile. It does mean the cut is defence in depth rather than a routine path.
+
+To stage it deliberately, the data path must be blocked **without** the consensus path — cut the Kafka port between brokers while leaving the Raft port up. `SIGSTOP` cannot express that; a port-level firewall rule or a test-only fetch pause could.
+
+#### Other findings from these runs
 
 The truncation branch has 12 integration tests and 15 unit tests behind it and **no hardware**, after six attempts with `divergence_truncation.sh`. Every one failed in the harness rather than the product, and the sequence is worth recording so the seventh does not repeat them:
 
