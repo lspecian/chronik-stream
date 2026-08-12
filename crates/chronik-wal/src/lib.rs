@@ -23,6 +23,7 @@ pub mod periodic_flusher;
 pub mod group_commit;
 pub mod io_priority; // I/O priority control for WAL vs Tantivy
 pub mod io_uring_thread; // Dedicated io_uring thread (hybrid tokio + tokio-uring)
+pub mod truncate; // Suffix truncation — discarding a divergent tail (RP-3.3)
 
 // Future-ready modules
 pub mod audit;
@@ -45,6 +46,7 @@ pub use fsync::{FsyncBatcher, FsyncStats};
 pub use compaction::{WalCompactor, CompactionConfig, CompactionStats};
 pub use periodic_flusher::{PeriodicFlusherConfig, spawn_periodic_flusher};
 pub use group_commit::{GroupCommitWal, GroupCommitConfig, PartitionMetrics};
+pub use truncate::TruncateOutcome;
 
 #[cfg(feature = "raft-storage")]
 pub use raft_storage_impl::RaftWalStorage;

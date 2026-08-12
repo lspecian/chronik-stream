@@ -660,6 +660,27 @@ impl WalManager {
         Ok(0)
     }
     
+    /// Discard every record at or above `target_offset` — suffix truncation.
+    ///
+    /// The mirror image of [`Self::delete_records_before`], and the only
+    /// operation here that removes records from the *tail*. A follower calls it
+    /// when it learns its log diverged from the leader's (RP-3.3).
+    ///
+    /// Returns where the log actually ends, which may be **below**
+    /// `target_offset` when the target fell inside a batch — resume from the
+    /// returned offset, not the requested one. See
+    /// [`GroupCommitWal::truncate_to`] for the full contract.
+    pub async fn truncate_to(
+        &self,
+        topic: &str,
+        partition: i32,
+        target_offset: i64,
+    ) -> Result<crate::truncate::TruncateOutcome> {
+        self.group_commit_wal
+            .truncate_to(topic, partition, target_offset)
+            .await
+    }
+
     /// Physically delete WAL segment files that fall entirely below `log_start_offset`.
     ///
     /// This backs the Kafka DeleteRecords API: after a partition's log start offset is

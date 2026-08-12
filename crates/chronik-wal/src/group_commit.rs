@@ -26,6 +26,7 @@ use tracing::{debug, info, warn, error, trace, instrument};
 
 use crate::error::{Result, WalError};
 use crate::record::WalRecord;
+use crate::truncate::{SegmentVerdict, TruncateOutcome};
 use chronik_monitoring::MetricsRecorder;
 
 #[cfg(all(target_os = "linux", feature = "async-io"))]
@@ -351,6 +352,17 @@ struct PartitionCommitQueue {
 
     /// Partition number (for rotation)
     partition: i32,
+
+    /// Bumped by every suffix truncation (RP-3.3).
+    ///
+    /// `commit_batch` drains the pending queue and *then* takes the writer
+    /// lock, so a batch can be in flight — off the queue, not yet on disk —
+    /// when a truncation acquires both locks and cuts the log. Writing that
+    /// batch afterwards would re-append records the truncation just decided
+    /// were divergent. The worker reads this counter when it drains and again
+    /// once it holds the writer; a change between the two means the batch
+    /// straddles a truncation and must be dropped rather than written.
+    truncation_epoch: Arc<AtomicU64>,
 }
 
 /// Commit metrics for observability
@@ -778,6 +790,7 @@ impl GroupCommitWal {
             segment_size_bytes: Arc::new(AtomicU64::new(0)),
             topic: topic.to_string(),
             partition,
+            truncation_epoch: Arc::new(AtomicU64::new(0)),
         });
 
         // Start per-partition commit worker
@@ -914,7 +927,7 @@ impl GroupCommitWal {
 
         // OPTIMIZATION P3: Drain queue and pre-combine all writes into single buffer
         // This minimizes lock hold time and enables single write syscall
-        let (batch, combined_buffer) = {
+        let (batch, combined_buffer, drained_at_epoch) = {
             let mut pending = queue.pending.lock().await;
 
             if pending.is_empty() {
@@ -938,7 +951,9 @@ impl GroupCommitWal {
                 }
             }
 
-            (batch, combined)
+            // Read under the same lock that guards the drain, so the epoch and
+            // the batch describe the same instant.
+            (batch, combined, queue.truncation_epoch.load(Ordering::SeqCst))
         }; // Lock released here - much shorter critical section!
 
         let batch_count = batch.len();
@@ -948,6 +963,30 @@ impl GroupCommitWal {
 
         // OPTIMIZATION P3: Single write instead of loop
         let mut file = queue.file.lock().await;
+
+        // RP-3.3: a truncation ran while this batch was in flight. Its records
+        // are at or above the cut by construction — the truncation drained the
+        // queue for exactly that reason — so writing them now would undo it.
+        if queue.truncation_epoch.load(Ordering::SeqCst) != drained_at_epoch {
+            drop(file);
+            queue.total_queued_bytes.fetch_sub(total_bytes as u64, Ordering::Relaxed);
+            warn!(
+                topic = %queue.topic,
+                partition = queue.partition,
+                writes = batch_count,
+                bytes = total_bytes,
+                "Discarding in-flight batch: the log was truncated beneath it"
+            );
+            for write in batch {
+                if let Some(tx) = write.response_tx {
+                    let _ = tx.send(Err(WalError::CommitFailed(
+                        "log truncated while this write was in flight".into(),
+                    )));
+                }
+            }
+            return Ok(());
+        }
+
         file.write_all(&combined_buffer).await?;
 
         debug!("🔄 COMMIT_FSYNC: Starting fsync for {} bytes", total_bytes);
@@ -1245,6 +1284,321 @@ impl GroupCommitWal {
         .await
     }
 
+    /// Discard every record at or above `target_offset` from a partition's WAL.
+    ///
+    /// This is the destructive half of RP-3.3: a follower that fetched records
+    /// from a leader which then lost the election holds a tail that was never
+    /// committed, and must remove it before it can converge. Nothing else in
+    /// this crate removes records from the tail — `delete_records_before` and
+    /// rotation both work from the front.
+    ///
+    /// # Guarantees
+    ///
+    /// - No record containing an offset at or above `target_offset` survives.
+    /// - The log ends on a record boundary.
+    /// - The returned [`TruncateOutcome::new_log_end_offset`] is where the log
+    ///   *actually* ends, which is **at or below** `target_offset`: a target
+    ///   landing inside a batch takes that whole batch, since keeping it would
+    ///   keep records above the target. Resume from the returned value.
+    /// - A target at or above the current end changes nothing on disk.
+    ///
+    /// # Quiescing
+    ///
+    /// The partition is stopped for the duration by holding its pending-queue
+    /// and writer locks — the same two `commit_batch` takes, in the same order.
+    /// Buffered writes are dropped and their callers told so; they describe a
+    /// log that no longer exists. A batch already drained by the commit worker
+    /// is caught by the truncation epoch instead, since it is past the queue
+    /// lock by then.
+    ///
+    /// # What this does not undo
+    ///
+    /// Truncation is local to this node's WAL. If the `WalIndexer` already
+    /// uploaded a sealed segment covering the discarded records, that object
+    /// remains in the store under its own `{min}-{max}` key — re-indexing the
+    /// shortened segment writes a *different* key rather than replacing it.
+    /// Callers must not truncate a partition whose divergent tail has been
+    /// published; see `docs/ROADMAP_REPLICATION.md` (RP-3.3).
+    pub async fn truncate_to(
+        &self,
+        topic: &str,
+        partition: i32,
+        target_offset: i64,
+    ) -> Result<TruncateOutcome> {
+        let queue = self.get_or_create_queue(topic, partition).await?;
+
+        // Bump before taking any lock: a batch the commit worker has already
+        // drained is past the queue lock and can only be caught here.
+        queue.truncation_epoch.fetch_add(1, Ordering::SeqCst);
+
+        // Lock order matches commit_batch (pending → file); taking both is what
+        // makes the partition quiet.
+        let mut pending = queue.pending.lock().await;
+        let mut file = queue.file.lock().await;
+
+        let dropped: Vec<PendingWrite> = pending.drain(..).collect();
+        queue.total_queued_bytes.store(0, Ordering::Relaxed);
+
+        // Everything committed so far must be visible to the scan below.
+        file.sync_all().await?;
+
+        let mut outcome = self
+            .truncate_partition_files(topic, partition, target_offset)
+            .await?;
+        outcome.buffered_writes_dropped = dropped.len();
+
+        if outcome.touched_disk() {
+            // The segment that survived a cut is now immutable. Reopening it
+            // for append would hand the indexer a file that shrank and then
+            // grew, which its "same id, same size ⇒ already done" bookkeeping
+            // reads as new work over old bytes. A fresh segment also keeps
+            // segment ids monotonic, so no deleted id is ever reused.
+            Self::rotate_to_new_segment(
+                &queue,
+                &mut file,
+                &self.base_dir,
+                #[cfg(all(target_os = "linux", feature = "async-io"))]
+                &self.io_uring_handle,
+            )
+            .await?;
+
+            info!(
+                topic = %topic,
+                partition = partition,
+                requested = target_offset,
+                new_end = ?outcome.new_log_end_offset,
+                segments_deleted = outcome.segments_deleted,
+                bytes_discarded = outcome.bytes_discarded,
+                buffered_dropped = outcome.buffered_writes_dropped,
+                "Truncated WAL suffix"
+            );
+        } else {
+            debug!(
+                topic = %topic,
+                partition = partition,
+                requested = target_offset,
+                "WAL suffix truncation was a no-op — log already ends at or below the target"
+            );
+        }
+
+        drop(file);
+        drop(pending);
+
+        // Only after the locks are released, so a woken caller cannot re-enter
+        // the partition while it is still being rebuilt.
+        for write in dropped {
+            if let Some(tx) = write.response_tx {
+                let _ = tx.send(Err(WalError::CommitFailed(
+                    "log truncated before this write was committed".into(),
+                )));
+            }
+        }
+
+        Ok(outcome)
+    }
+
+    /// The file surgery behind [`Self::truncate_to`]. Caller must hold the
+    /// partition's writer lock.
+    ///
+    /// Segment ids and offsets both increase with write order, so the target
+    /// can be placed by reading only each segment's *first* record: segments
+    /// entirely below it are kept untouched, segments entirely at or above it
+    /// are deleted whole, and at most one segment straddles the target and is
+    /// scanned. That matters — a full scan of every segment would be linear in
+    /// the size of the log, and these reach tens of gigabytes.
+    async fn truncate_partition_files(
+        &self,
+        topic: &str,
+        partition: i32,
+        target_offset: i64,
+    ) -> Result<TruncateOutcome> {
+        let partition_dir = self.base_dir.join(topic).join(partition.to_string());
+        if !partition_dir.exists() {
+            return Ok(TruncateOutcome::untouched(None));
+        }
+
+        let mut segments: Vec<(u64, PathBuf)> = Vec::new();
+        let prefix = format!("wal_{}_", partition);
+        let mut entries = tokio::fs::read_dir(&partition_dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if let Some(id) = name
+                    .strip_prefix(&prefix)
+                    .and_then(|rest| rest.strip_suffix(".log"))
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
+                    segments.push((id, path));
+                }
+            }
+        }
+        segments.sort_by_key(|(id, _)| *id);
+
+        // Place the target. The segment that can straddle it is the *last* one
+        // whose first record sits below it — not the first one at or above it,
+        // which is the segment after the straddler. Getting this backwards
+        // leaves the straddler's own above-target records alive.
+        let mut straddler: Option<usize> = None;
+        for (index, (_, path)) in segments.iter().enumerate() {
+            match Self::first_record_offset(path).await? {
+                // An empty segment carries no offsets and cannot place
+                // anything. The active segment is routinely empty.
+                None => continue,
+                Some(base) if base < target_offset => straddler = Some(index),
+                // Ids ascend with write order, so offsets do too: from here on
+                // every segment starts at or above the target.
+                Some(_) => break,
+            }
+        }
+
+        let mut outcome = TruncateOutcome::untouched(None);
+        let mut last_kept_offset: Option<i64> = None;
+
+        // Where wholesale deletion starts. With no straddler, nothing on disk
+        // is below the target and the whole log goes.
+        let delete_from = match straddler {
+            None => 0,
+            Some(index) => {
+                let (segment_id, path) = &segments[index];
+                let data = tokio::fs::read(path).await?;
+
+                match crate::truncate::plan_segment_truncation(&data, target_offset) {
+                    SegmentVerdict::Empty => {}
+                    SegmentVerdict::KeepWhole { last_offset } => {
+                        last_kept_offset = Some(last_offset);
+                    }
+                    SegmentVerdict::DeleteWhole => {
+                        outcome.bytes_discarded += data.len() as u64;
+                        outcome.segments_deleted += 1;
+                        self.remove_truncated_segment(topic, partition, *segment_id, path)
+                            .await?;
+                    }
+                    SegmentVerdict::Cut {
+                        keep_bytes,
+                        last_offset,
+                    } => {
+                        last_kept_offset = Some(last_offset);
+                        outcome.bytes_discarded += data.len() as u64 - keep_bytes;
+
+                        let file = std::fs::OpenOptions::new().write(true).open(path)?;
+                        file.set_len(keep_bytes)?;
+                        file.sync_all()?;
+                        drop(file);
+
+                        // The registry advertises sizes to the indexer; a stale
+                        // one sends it reading past the new end of the file.
+                        self.resize_sealed_segment(topic, partition, *segment_id, keep_bytes);
+                    }
+                }
+                index + 1
+            }
+        };
+
+        for (segment_id, path) in &segments[delete_from..] {
+            let size = tokio::fs::metadata(path).await.map(|m| m.len()).unwrap_or(0);
+            if size == 0 {
+                // Nothing to discard, and this is usually the segment the
+                // writer is holding open. Unlinking it would leave the writer
+                // appending into an orphaned inode — bytes accepted, fsynced,
+                // and unreadable by anyone.
+                continue;
+            }
+            outcome.bytes_discarded += size;
+            outcome.segments_deleted += 1;
+            self.remove_truncated_segment(topic, partition, *segment_id, path)
+                .await?;
+        }
+
+        // If the straddler kept nothing, the log now ends in an earlier segment.
+        if last_kept_offset.is_none() {
+            for (_, path) in segments[..delete_from.saturating_sub(1)].iter().rev() {
+                if let Some(last) = Self::last_record_offset(path).await? {
+                    last_kept_offset = Some(last);
+                    break;
+                }
+            }
+        }
+
+        outcome.new_log_end_offset = last_kept_offset.map(|last| last + 1);
+        Ok(outcome)
+    }
+
+    /// Delete a segment file and forget it, so nothing later reads a path that
+    /// is gone or indexes a segment that was discarded.
+    async fn remove_truncated_segment(
+        &self,
+        topic: &str,
+        partition: i32,
+        segment_id: u64,
+        path: &Path,
+    ) -> Result<()> {
+        self.sealed_segments
+            .remove(&format!("{}:{}:{}", topic, partition, segment_id));
+        match tokio::fs::remove_file(path).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Correct a sealed segment's recorded size after it was shortened.
+    fn resize_sealed_segment(&self, topic: &str, partition: i32, segment_id: u64, size: u64) {
+        if let Some(mut entry) = self
+            .sealed_segments
+            .get_mut(&format!("{}:{}:{}", topic, partition, segment_id))
+        {
+            entry.size_bytes = size;
+        }
+    }
+
+    /// The base offset of a segment's first record, reading only as much of the
+    /// file as that record occupies. `None` for an empty or torn segment.
+    async fn first_record_offset(path: &Path) -> Result<Option<i64>> {
+        use tokio::io::AsyncReadExt;
+
+        let mut file = match tokio::fs::File::open(path).await {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+
+        let mut header = [0u8; crate::truncate::RECORD_HEADER_LEN];
+        if file.read_exact(&mut header).await.is_err() {
+            return Ok(None); // shorter than one header: empty or torn
+        }
+        let size = match crate::truncate::declared_record_size(&header) {
+            Some(size) => size,
+            None => return Ok(None),
+        };
+
+        let mut buf = vec![0u8; size];
+        buf[..crate::truncate::RECORD_HEADER_LEN].copy_from_slice(&header);
+        if file
+            .read_exact(&mut buf[crate::truncate::RECORD_HEADER_LEN..])
+            .await
+            .is_err()
+        {
+            return Ok(None); // record is truncated on disk
+        }
+
+        Ok(crate::truncate::first_record_range(&buf).map(|(base, _)| base))
+    }
+
+    /// The highest offset a segment holds. Only needed to report where the log
+    /// ends when the straddling segment kept nothing.
+    async fn last_record_offset(path: &Path) -> Result<Option<i64>> {
+        let data = match tokio::fs::read(path).await {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        // i64::MAX keeps every record, so the plan reports the segment's end.
+        match crate::truncate::plan_segment_truncation(&data, i64::MAX) {
+            SegmentVerdict::KeepWhole { last_offset } => Ok(Some(last_offset)),
+            _ => Ok(None),
+        }
+    }
+
     /// Get metrics for a partition
     pub fn get_metrics(&self, topic: &str, partition: i32) -> Option<PartitionMetrics> {
         let key = (topic.to_string(), partition);
@@ -1515,4 +1869,100 @@ pub struct PartitionMetrics {
     pub total_bytes: u64,
     pub avg_fsync_time_us: u64,
     pub backpressure_events: u64,
+}
+
+#[cfg(test)]
+mod truncation_race_tests {
+    use super::*;
+
+    /// The one interleaving that can silently resurrect truncated records.
+    ///
+    /// `commit_batch` drains the pending queue and *then* takes the writer
+    /// lock, so a batch can be off the queue but not yet on disk when a
+    /// truncation runs. Holding the writer lock from the test pins the worker
+    /// in exactly that window: it has drained, it is blocked, and the epoch
+    /// moves underneath it. Without the guard it would write afterwards, and
+    /// the records the truncation just removed would be back on disk with
+    /// nothing to indicate they had ever gone.
+    #[tokio::test]
+    async fn a_batch_drained_before_a_truncation_is_not_written_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = GroupCommitWal::new(dir.path().to_path_buf(), GroupCommitConfig::default());
+        let (topic, partition) = ("race", 0);
+
+        let queue = wal.get_or_create_queue(topic, partition).await.unwrap();
+        let segment = dir
+            .path()
+            .join(topic)
+            .join(partition.to_string())
+            .join(format!("wal_{}_0.log", partition));
+
+        // Block the writer before anything can reach it.
+        let file_guard = queue.file.lock().await;
+
+        let record = WalRecord::new_v2(topic.to_string(), partition, vec![7u8; 64], 0, 0, 1);
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut pending = queue.pending.lock().await;
+            pending.push_back(PendingWrite {
+                data: Bytes::from(record.to_bytes().unwrap()),
+                response_tx: Some(tx),
+                base_offset: 0,
+                last_offset: 0,
+            });
+        }
+        queue.write_notify.notify_one();
+
+        // Wait for the commit worker to drain the queue. It cannot get further
+        // than the writer lock, which this test holds.
+        for _ in 0..1_000 {
+            if queue.pending.lock().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(
+            queue.pending.lock().await.is_empty(),
+            "the commit worker never drained the queue; the race is not set up"
+        );
+
+        // A truncation runs while that batch is in flight.
+        queue.truncation_epoch.fetch_add(1, Ordering::SeqCst);
+        drop(file_guard);
+
+        let result = tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .expect("the waiter must be answered, not left hanging")
+            .expect("the response channel must not be dropped silently");
+        assert!(
+            result.is_err(),
+            "a write discarded by a truncation must be reported as failed, not as committed"
+        );
+
+        // Give the worker a moment to do anything else it might have planned.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let size = std::fs::metadata(&segment).map(|m| m.len()).unwrap_or(0);
+        assert_eq!(size, 0, "the stale batch was written to disk anyway");
+    }
+
+    /// The guard must not fire when no truncation happened, or every ordinary
+    /// commit would be dropped and the WAL would accept nothing at all.
+    #[tokio::test]
+    async fn an_ordinary_batch_still_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = GroupCommitWal::new(dir.path().to_path_buf(), GroupCommitConfig::default());
+        let (topic, partition) = ("no-race", 0);
+
+        let record = WalRecord::new_v2(topic.to_string(), partition, vec![1u8; 32], 0, 0, 1);
+        wal.append(topic.to_string(), partition, record, 1)
+            .await
+            .expect("a write with no truncation in sight must commit");
+
+        let segment = dir
+            .path()
+            .join(topic)
+            .join(partition.to_string())
+            .join(format!("wal_{}_0.log", partition));
+        assert!(std::fs::metadata(&segment).unwrap().len() > 0);
+    }
 }
