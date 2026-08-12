@@ -9,7 +9,8 @@
 | RP-0 | Replication conformance suite | `TESTED` | — | Placement + ISR honesty; fails pre-#29, passes after |
 | RP-1 | Harden the current mechanism | `TESTED` | — | 1.1–1.4 + 3 bugs found by cluster validation |
 | RP-2 | Follower fetch | `TESTED` | — | 2.1–2.4 all validated on a 3-node cluster, behind `CHRONIK_REPLICATION_MODE=pull` |
-| RP-3 | Leader epochs & truncation | `CODE COMPLETE` | — | 3.1–3.3 all built & unit-tested; **none of it has run on a cluster** |
+| RP-3 | Leader epochs & truncation | `CODE COMPLETE` | — | 3.1–3.3 built & unit-tested; cluster validation **blocked by RP-5** |
+| RP-5 | Partition leader failover | `NOT STARTED` | — | ⛔ **Does not exist.** Blocks RP-3.3 validation; pre-existing, both modes |
 | RP-4 | Delete the push stack | `NOT STARTED` | — | ~2,500 lines removed |
 
 ---
@@ -392,9 +393,12 @@ The current epoch is answered with the leader's **log end offset**, not RP-2.3's
 - [x] Follower detects a leader/epoch change and asks the new leader where its epoch ended
 - [x] Follower truncates its log to that point before resuming fetch
 - [x] WAL suffix truncation primitive (the gate below — it did not exist)
-- [ ] Test: leader killed mid-produce, new leader elected, follower with extra records truncates and converges (un-ignores RP-0.3)
+- [x] Conformance test written (RP-0.4)
+- [ ] ⛔ **Test cannot run: partition leader failover does not exist** (see RP-5)
 
-**Status**: `CODE COMPLETE`, unit- and integration-tested, **never run on a cluster**. The only phase where a bug **destroys** data rather than stalling it, so the cluster test is not a formality.
+**Status**: `CODE COMPLETE`, unit- and integration-tested, **never exercised on a cluster and currently unable to be**. The only phase where a bug **destroys** data rather than stalling it, so this gap matters.
+
+Deployed to a 3-node cluster in pull mode. Placement is correct at acks=0/1/all and ISR honesty passes, but the truncation path **never fired**, because producing divergence requires a new leader to accept writes the old one never had — and leadership never moves. See RP-5.
 
 #### The storage half: `WalManager::truncate_to`
 
@@ -439,6 +443,65 @@ The epoch cache is rebuilt from the WAL at startup (`warm_up_leader_epochs`), re
 Cost is a WAL scan per partition at startup. Kafka avoids it with a `leader-epoch-checkpoint` file; that is the answer if startup time becomes a problem.
 
 ⚠️ **Test methodology**: by RP-2's lesson, killing the leader must genuinely keep it down — deleting a pod brings it back in ~4s. Cordon the node. And beware the inverse trap RP-2 hit: better behaviour can silently invalidate a test that used to pass for the wrong reason.
+
+---
+
+## Phase RP-5: Partition leader failover (BLOCKER, found 2026-08-12)
+
+**Status**: `NOT STARTED`. Blocks RP-3.3's cluster validation, and is a live correctness gap in its own right.
+
+### What was measured
+
+On a 3-node cluster, a topic's partition leader was held down by cordoning its node (the RP-0.3 method — deleting the pod brings it back in ~4s). Observed from a **surviving** node, for 150 seconds:
+
+```
+initial: "leader":1,"replicas":[1,2,3],"isr":[1,2,3],"under_replicated":false
+  t=15s  "leader":1,"replicas":[1,2,3],"isr":[1,2,3],"under_replicated":false
+  ...
+  t=150s "leader":1,"replicas":[1,2,3],"isr":[1,2,3],"under_replicated":false
+produce (acks=all, 60s cap): 64 connection errors, zero records written
+```
+
+The leader never moves, the dead node stays in ISR, the partition reports `under_replicated: false`, and **writes to it are unavailable until that exact node returns**.
+
+**Reproduced identically under `CHRONIK_REPLICATION_MODE=push` on the same build**, so this is not a pull regression — it is pre-existing and affects both mechanisms.
+
+### Why: the election is a stub that re-elects the dead node
+
+The machinery *runs*. `WalReceiver::monitor_timeouts` fired and the worker logged:
+
+```
+WARN  Triggering leader election for pfail2-…-0: WAL stream timeout (30s)
+INFO  ✅ Elected new leader for pfail2-…-0: node 1 (reason: WAL stream timeout (30s))
+```
+
+Node 1 was the node that was down. `LeaderElector::elect_leader_from_isr` (`leader_election.rs`):
+
+1. **ignores ISR**, despite the name — its own comment says *"For now, treat all replicas as in-sync (ISR = replicas). Proper ISR tracking will be added later"*;
+2. returns `replicas[0]`, which is by construction the incumbent leader, so the "new" leader is always the old one;
+3. never consults liveness, so a dead replica is as electable as a live one;
+4. **never persists the result** — the Raft proposal is commented out with *"let the system self-heal via produce requests"*;
+5. logs `✅ Elected new leader` regardless.
+
+This is the founding bug of this roadmap in a different costume: a mechanism that reports success while doing nothing. `docs`/`CLAUDE.md` advertise "automatic leader election" and "fault tolerance (can lose minority of nodes)" — true for *Raft/metadata* leadership, which does fail over, and false for *partition* leadership.
+
+### Why RP-3 makes this tractable
+
+The pieces RP-3 added are what a correct election needs:
+
+- `assign_partition` already derives the leader epoch and **bumps it when the leader changes** (and deliberately does not when it is re-asserted, so anti-entropy cannot cause spurious truncations);
+- a bumped epoch propagates to followers, which re-plan and run the RP-3.3 handshake;
+- `IsrTracker::get_follower_lag` already returns `None` for a node that is not alive (RP-2.1), which is the liveness signal the election lacks.
+
+So the shape of the fix is: elect a **live** replica other than the failed leader, persist it through `assign_partition`, and let the epoch bump do the rest. The hard part is not the selection — it is that **nothing currently tracks the liveness of a partition's leader**. Followers ACK to the leader, so a dead leader has no one to evict it; that is also why ISR stayed `[1,2,3]` above. Leader liveness has to come from somewhere else (Raft membership is the obvious candidate).
+
+⚠️ Do not fix by having each node elect independently. The `am_i_leader()` Raft guard is already there and is correct — a split election would hand two nodes the same partition, which is precisely the divergence RP-3.3 exists to clean up after.
+
+### Other findings from the same run (not replication bugs, not chased)
+
+- **A subscribing consumer can read a partition twice.** One conformance run consumed 490 records of 300 produced at acks=1; a later topic held 400 readable records for 200 produced. Reading the same topic with an explicit `--partition` returns **exactly** the right count, and the WAL holds one copy — so the log is correct and the duplication is in the subscribe/consumer-group path, most likely a rebalance re-reading from the beginning. Intermittent: five consecutive direct reproductions were clean. This is issue #36, now with a sharper characterisation.
+- The conformance suite asserts `consumed == produced` for acks=1. Without idempotence — which the Java producer silently disables when `acks=1` is set explicitly — duplicates are permitted by the protocol, so that assertion is stricter than the contract. The honest check is *distinct* count equals produced. Left as-is for now because the observed duplication is a broker-side artefact worth failing on, but the assertion should be split before it is trusted.
+- **A broker that is healthy and serving can sit at `0/1 Running` indefinitely.** After a restart, one node served replica fetches normally, with no errors in its log, while never passing its readiness probe. Worth a look: readiness that disagrees with reality makes every k8s-level test ambiguous, which is how RP-0.3 wasted three attempts.
 
 ---
 
