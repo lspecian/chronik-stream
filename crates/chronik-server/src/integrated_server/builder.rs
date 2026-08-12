@@ -766,28 +766,36 @@ impl IntegratedKafkaServerBuilder {
 
         let epochs = produce_handler.leader_epochs();
         let start = std::time::Instant::now();
-        let topics = match metadata_store.list_topics().await {
-            Ok(t) => t,
-            Err(e) => {
-                warn!("leader-epoch warm-up: failed to list topics: {}", e);
-                return Ok(());
-            }
-        };
 
+        // Enumerate from the WAL directory, not from metadata.
+        //
+        // This used to iterate `list_topics()`, which races metadata recovery:
+        // if a topic was not in the catalog yet at this moment, its partition
+        // was skipped, the epoch history stayed empty, and the follower then
+        // skipped the RP-3.3 handshake entirely — silently, because the
+        // completion line only printed when it warmed at least one partition.
+        // Observed on a cluster: a returning node warmed nothing and never sent
+        // an epoch query. The log on disk is what we are rebuilding from, so it
+        // is also the right thing to enumerate.
+        let _ = metadata_store; // kept for signature stability; no longer read here
         let mut partitions_warmed = 0usize;
         let mut transitions = 0usize;
 
-        for topic_meta in topics {
-            for partition in 0..topic_meta.config.partition_count as i32 {
+        {
+            for tp in wal_manager.get_partitions() {
+                let (topic_name, partition) = (tp.topic.clone(), tp.partition);
+                if topic_name.starts_with("__") {
+                    continue; // Raft's own topics carry no partition epochs
+                }
                 let records = match wal_manager
-                    .read_from(&topic_meta.name, partition, 0, usize::MAX)
+                    .read_from(&topic_name, partition, 0, usize::MAX)
                     .await
                 {
                     Ok(r) if !r.is_empty() => r,
                     _ => continue,
                 };
-
-                let before = epochs.snapshot(&topic_meta.name, partition).len();
+                let before = epochs.snapshot(&topic_name, partition).len();
+                let mut unstamped = 0usize;
                 for wal_record in &records {
                     if let WalRecord::V2 { canonical_data, base_offset, .. } = wal_record {
                         let canonical: CanonicalRecord = match bincode::deserialize(canonical_data) {
@@ -798,8 +806,11 @@ impl IntegratedKafkaServerBuilder {
                         // ignores those rather than inventing an epoch 0 at their
                         // offset, so an upgraded cluster simply has no history
                         // until its first stamped append.
+                        if canonical.partition_leader_epoch < 0 {
+                            unstamped += 1;
+                        }
                         epochs.observe_append(
-                            &topic_meta.name,
+                            &topic_name,
                             partition,
                             canonical.partition_leader_epoch,
                             *base_offset,
@@ -807,20 +818,30 @@ impl IntegratedKafkaServerBuilder {
                     }
                 }
 
-                let after = epochs.snapshot(&topic_meta.name, partition).len();
+                let after = epochs.snapshot(&topic_name, partition).len();
                 if after > 0 {
                     partitions_warmed += 1;
                     transitions += after - before;
+                } else if unstamped > 0 {
+                    // Worth naming: a partition whose log carries no epochs
+                    // cannot take part in truncation, so it will silently skip
+                    // the RP-3.3 handshake for as long as that remains true.
+                    debug!(
+                        "leader-epoch warm-up: {}-{} has {} unstamped batch(es) and no epoch history",
+                        topic_name, partition, unstamped
+                    );
                 }
             }
         }
 
-        if partitions_warmed > 0 {
-            info!(
-                "Leader-epoch history rebuilt for {} partition(s), {} leadership transition(s), in {:?}",
-                partitions_warmed, transitions, start.elapsed()
-            );
-        }
+        // Logged unconditionally. The previous version printed only when it
+        // warmed something, so "warmed nothing" and "never ran" were the same
+        // observation — which is how a returning replica silently skipped
+        // truncation on a real cluster.
+        info!(
+            "Leader-epoch history rebuilt for {} partition(s), {} leadership transition(s), in {:?}",
+            partitions_warmed, transitions, start.elapsed()
+        );
         Ok(())
     }
 
