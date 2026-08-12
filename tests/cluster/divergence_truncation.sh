@@ -58,10 +58,35 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Run a shell pipeline inside the client pod. Quoting through
-# ssh → kubectl → sh is where this suite has silently produced nothing before,
-# so the payload is passed as a single argument to sh -c.
-pod_sh() { $KUBECTL exec -n "$NS" "$CLIENT" -- sh -c "$1"; }
+# Run a shell pipeline inside the client pod.
+#
+# This needs the same quote-level probe `regression_replication.sh` carries, and
+# for the same reason: with `REPL_KUBECTL` as an ssh wrapper, the payload passes
+# through an extra shell and loses one level of quoting, so a pipeline silently
+# becomes nonsense. This script originally shipped without it and every produce
+# failed with exit 127 — the topic ended up empty, and the two assertions at the
+# end then "failed" against a cluster that had never been given any data. A
+# harness that reports on work it never did is worse than one that crashes.
+sh_quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+pod_sh() {
+  local payload="$1"
+  [ "${QUOTE_LEVEL:-0}" -ge 1 ] && payload=$(sh_quote "$1")
+  $KUBECTL exec -n "$NS" "$CLIENT" -- bash -c "$payload"
+}
+
+# Probe it by running something whose correct output cannot happen by accident.
+detect_quote_level() {
+  local want='probe-2-ok' script='echo probe-$((1+1))-ok'
+  QUOTE_LEVEL=0
+  [ "$(pod_sh "$script" 2>/dev/null | tr -d '\r\n')" = "$want" ] && return 0
+  QUOTE_LEVEL=1
+  [ "$(pod_sh "$script" 2>/dev/null | tr -d '\r\n')" = "$want" ] && return 0
+  say "ABORT: cannot run a shell pipeline inside $CLIENT via REPL_KUBECTL."
+  say "       Without this, produce silently does nothing and every result below"
+  say "       is meaningless."
+  exit 1
+}
 
 status_of() { # $1 = pod to ask
   $KUBECTL exec -n "$NS" "$1" -- curl -s -m 15 http://localhost:6092/admin/status 2>/dev/null
@@ -80,6 +105,8 @@ produce() { # $1=first $2=last $3=acks $4=tag
 }
 
 say "== RP-3.3 divergence test: $TOPIC =="
+detect_quote_level
+say "-- client shell ready (quote level $QUOTE_LEVEL)"
 
 $KUBECTL exec -n "$NS" "$CLIENT" -- /opt/kafka/bin/kafka-topics.sh \
   --bootstrap-server "$BOOT" --create --topic "$TOPIC" \
@@ -88,6 +115,21 @@ $KUBECTL exec -n "$NS" "$CLIENT" -- /opt/kafka/bin/kafka-topics.sh \
 # 1. Common prefix. acks=all, so all three replicas hold it.
 produce 1 "$PREFIX_N" all prefix
 sleep 6
+
+# Prove the setup before testing anything with it.
+#
+# The first version of this script asserted its way to two confident failures
+# against a topic that had never received a single record. Everything below
+# depends on this prefix existing on all three replicas, so check it and abort
+# loudly rather than measure an empty cluster.
+prefix_seen=$(pod_sh "/opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server $BOOT \
+  --topic $TOPIC --partition 0 --offset earliest --timeout-ms 25000 2>/dev/null | grep -c '^prefix-'" \
+  2>/dev/null | tr -cd '0-9')
+if [ "${prefix_seen:-0}" -lt "$PREFIX_N" ]; then
+  fail "setup did not take: only ${prefix_seen:-0} of $PREFIX_N prefix records are readable — refusing to draw conclusions from an empty topic"
+  exit 1
+fi
+say "-- prefix confirmed: $prefix_seen record(s) on the log"
 
 # Ask a node we are NOT about to isolate — a status endpoint behind a partition
 # reports nothing, which reads exactly like "no leader".
