@@ -99,16 +99,25 @@ say "-- leader is node $OLD (observing from $OBS)"
 
 # 2. Isolate the leader from the other brokers, leaving the client reachable.
 #
-#    BOTH directions. An Ingress-only policy is not an isolation: the node stops
-#    receiving, starts campaigning because it hears no heartbeats, and those
-#    outbound messages still reach its peers — which marks it *recently active*
-#    on the Raft leader and makes it look alive. Observed exactly that: node 1
-#    was cut off inbound, node 2 held Raft leadership, and the failover
-#    controller never saw node 1 as dead, so leadership never moved and the test
-#    stalled at its deadline.
+#    BOTH directions, and then RESTART the node — that second part is what makes
+#    this work at all.
 #
-#    Egress must therefore be cut too. DNS is allowed explicitly, since blocking
-#    it makes the broker fail in ways unrelated to the partition being tested.
+#    **A NetworkPolicy does not partition an existing cluster.** Calico allows
+#    established connections, so the pre-existing gRPC channels between brokers
+#    keep carrying Raft traffic straight through a policy applied afterwards.
+#    Only *new* connections are blocked, which is why a `/dev/tcp` probe reports
+#    the peer as unreachable while the cluster carries on talking normally.
+#
+#    That cost two wasted runs and produced a false conclusion — with the
+#    "isolated" leader still reachable over its old channels, no election
+#    happened, and the obvious reading was that Raft leader election was broken.
+#    It is not: killing the leader's pod elects a new one in about three seconds.
+#
+#    So: apply the policy first, then delete the pod. It comes back with every
+#    broker-to-broker connection denied from birth, while the client is still
+#    allowed in. Its WAL survives on the PVC, and its metadata still names it
+#    leader — which is exactly the state needed to accept writes nobody else
+#    will ever see.
 say "-- isolating node $OLD from its peers, both directions (NetworkPolicy)"
 cat <<YAML | $KUBECTL apply -f - >/dev/null 2>&1
 apiVersion: networking.k8s.io/v1
@@ -138,11 +147,32 @@ spec:
           port: 53
 YAML
 
-# 3. Records that exist ONLY on the isolated leader. acks=1 means it
-#    acknowledges alone; nothing else can have them.
-sleep 5
-produce $((PREFIX_N + 1)) $((PREFIX_N + ORPHAN_N)) 1 orphan
-say "-- wrote $ORPHAN_N record(s) that only node $OLD has"
+# 2b. Restart the isolated node so its connections are re-made under the policy.
+say "-- restarting node $OLD so its peer connections are denied from birth"
+$KUBECTL delete pod "${PODS}-${OLD}" -n "$NS" --wait=false >/dev/null 2>&1
+for i in $(seq 1 40); do
+  phase=$($KUBECTL get pod "${PODS}-${OLD}" -n "$NS" -o jsonpath='{.status.phase}' 2>/dev/null)
+  [ "$phase" = "Running" ] && break
+  sleep 5
+done
+sleep 20   # let it finish recovery and settle into believing it still leads
+
+# 3. Records that exist ONLY on the isolated leader.
+#
+#    Bootstrapped directly at that pod, not through the headless service: the
+#    service would hand us a surviving node's metadata, which by now names a
+#    different leader, and the write would go there instead — the opposite of
+#    what this test needs. Talking to the isolated node makes it answer with its
+#    own (stale) view, so it accepts the write as leader. acks=1 means it
+#    acknowledges alone, and being cut off, nothing else can ever have them.
+say "-- writing $ORPHAN_N record(s) only node $OLD can have"
+pod_sh "seq $((PREFIX_N + 1)) $((PREFIX_N + ORPHAN_N)) | awk '{print \$1\":orphan-\"\$1}' | \
+  timeout 90 /opt/kafka/bin/kafka-console-producer.sh \
+    --bootstrap-server ${PODS}-${OLD}.${PODS}-headless:9092 --topic $TOPIC \
+    --producer-property acks=1 --property parse.key=true --property key.separator=:" \
+  >/dev/null 2>&1
+orphans_written=$?
+say "   (producer exit $orphans_written)"
 
 # 4. The surviving two hold quorum; RP-5 should move leadership.
 NEW=""

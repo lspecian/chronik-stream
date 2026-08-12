@@ -568,6 +568,22 @@ So the shape of the fix is: elect a **live** replica other than the failed leade
 
 ⚠️ Do not fix by having each node elect independently. The `am_i_leader()` Raft guard is already there and is correct — a split election would hand two nodes the same partition, which is precisely the divergence RP-3.3 exists to clean up after.
 
+### ⚠️ Test methodology: a NetworkPolicy does not partition an existing cluster
+
+**Calico allows established connections.** A policy applied after the cluster has formed blocks *new* connections only — the pre-existing gRPC channels between brokers keep carrying Raft traffic through it. A probe with `/dev/tcp` is blocked (new connection) while the cluster continues talking normally, which makes the partition look real when it is not.
+
+This produced a false conclusion that is worth recording as a warning: with the "isolated" leader still reachable over its established channels, no election happened, and the obvious reading was *"Raft leader election does not work on partition"*. It does. Killing the leader's pod instead:
+
+```
+15:16:35  pod deleted
+15:16:38.640  node 1 is now Candidate at term 7 (leader is 0, was 3)
+15:16:38.739  node 1 is now Leader    at term 7 (leader is 1, was 0)
+```
+
+**Three seconds, clean.** Consensus failover is healthy; the test harness was not partitioning anything.
+
+To genuinely partition a running cluster you have to break established flows — an in-pod `iptables` DROP (needs `NET_ADMIN`), killing the conntrack entries, or blocking at the host. A NetworkPolicy alone only works if applied *before* the connections form.
+
 ### ⚠️ Known limitation: a one-way partition looks alive
 
 RP-5's liveness is Raft's `recent_active`, which is set when the leader **receives any message** from a peer. A node that can send but not receive therefore still looks alive: it stops hearing heartbeats, starts campaigning, and its outbound vote requests mark it active on the very node deciding whether it is dead.
