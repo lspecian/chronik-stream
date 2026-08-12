@@ -36,6 +36,12 @@
 #   - the topic is RF=3
 #   - EVERY node's WAL holds EVERY partition that any node holds
 #   - consumed record count equals produced count (acks=0 exempt: no guarantee)
+#
+# Plus, in k8s mode only (both need a replica held genuinely down, which takes
+# cordoning the node — see the notes at each):
+#   RP-0.3  ISR shrinks when a replica dies
+#   RP-0.4  a replica that loses leadership converges after rejoining, without
+#           losing anything acknowledged (the RP-3.3 truncation path)
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -315,6 +321,131 @@ if [ "$MODE" = "k8s" ] && [ "$FAIL" -eq 0 ]; then
     [ "$r" -ge 3 ] && break
     sleep 5
   done
+fi
+
+# ------------------------- RP-0.4: convergence after a leader change (RP-3.3) --
+# A replica that was leader, accepted writes, and then lost the election holds
+# records the new leader never committed. It must discard them and converge —
+# and must not, in doing so, drop anything that was acknowledged.
+#
+# Both directions matter and they fail differently. Keeping the divergent tail
+# leaves two logs that agree on offsets and disagree on records, which no later
+# check can detect. Over-truncating loses acknowledged data outright. The
+# assertions below are the observable form of each: every node holds the
+# partition, and every acknowledged record is still readable.
+#
+# Same methodology trap as RP-0.3: the old leader has to genuinely stay down
+# while the new one takes writes, and deleting a pod does not achieve that —
+# it is back in ~4s. Cordon the node.
+if [ "$MODE" = "k8s" ] && [ "$FAIL" -eq 0 ]; then
+  say ""
+  say "-- convergence after a leader change (RP-3.3)"
+
+  trunc_topic="repltrunc-$$"
+  BEFORE_N=200
+  AFTER_N=200
+
+  produce_range() { # $1=first $2=last — acks=all, so every record here is a promise
+    pod_sh "$CLIENT" \
+      "seq $1 $2 | awk '{print \$1\":rec \"\$1}' | /opt/kafka/bin/kafka-console-producer.sh \
+         --bootstrap-server $BOOT --topic $trunc_topic --producer-property acks=all \
+         --property parse.key=true --property key.separator=:" >/dev/null 2>&1
+  }
+
+  leader_of() { # partition leader for $trunc_topic, or empty
+    $KUBECTL exec -n "$NS" "${PODS}-1" -- \
+      curl -s -m 15 http://localhost:6092/admin/status 2>/dev/null \
+      | tr '{' '\n' | grep "\"topic\":\"$trunc_topic\"" \
+      | grep -o '"leader":[0-9]*' | head -1 | tr -cd '0-9'
+  }
+
+  # One partition: one leader to unseat, one log to reason about.
+  $KUBECTL exec -n "$NS" "$CLIENT" -- /opt/kafka/bin/kafka-topics.sh \
+    --bootstrap-server "$BOOT" --create --topic "$trunc_topic" \
+    --partitions 1 --replication-factor 3 >/dev/null 2>&1
+
+  produce_range 1 "$BEFORE_N"
+  sleep 5
+
+  old_leader=$(leader_of)
+  if [ -z "$old_leader" ]; then
+    fail "RP-3.3: no leader reported for $trunc_topic — cannot stage a leader change"
+  else
+    say "   leader before: node $old_leader"
+    victim_node=$($KUBECTL get pod "${PODS}-${old_leader}" -n "$NS" -o jsonpath='{.spec.nodeName}' 2>/dev/null)
+
+    if [ -z "$victim_node" ]; then
+      fail "RP-3.3: cannot determine which k8s node ${PODS}-${old_leader} runs on — refusing to guess"
+    else
+      say "   holding ${PODS}-${old_leader} down (cordoning $victim_node)"
+      $KUBECTL cordon "$victim_node" >/dev/null 2>&1
+      $KUBECTL delete pod "${PODS}-${old_leader}" -n "$NS" --wait=false >/dev/null 2>&1
+
+      # Wait for a different node to take the partition.
+      new_leader=""
+      deadline=$((SECONDS + 180))
+      while [ "$SECONDS" -lt "$deadline" ]; do
+        sleep 5
+        now=$(leader_of)
+        if [ -n "$now" ] && [ "$now" != "$old_leader" ]; then new_leader="$now"; break; fi
+      done
+
+      if [ -z "$new_leader" ]; then
+        fail "RP-3.3: no new leader elected within 180s of node $old_leader going down"
+      else
+        say "   leader after:  node $new_leader"
+        produce_range $((BEFORE_N + 1)) $((BEFORE_N + AFTER_N))
+      fi
+
+      # Bring the old leader back as a follower. This is the moment under test.
+      say "   restoring ${PODS}-${old_leader}"
+      $KUBECTL uncordon "$victim_node" >/dev/null 2>&1
+      for i in $(seq 1 60); do
+        r=$($KUBECTL get pods -n "$NS" --no-headers 2>/dev/null | grep -c "^${PODS}-.* 1/1 *Running")
+        [ "$r" -ge 3 ] && break
+        sleep 5
+      done
+
+      # Converged when every node holds the partition again.
+      deadline=$((SECONDS + SETTLE + 60))
+      while [ "$SECONDS" -lt "$deadline" ]; do
+        union=$(for n in 1 2 3; do $placement "$n" "$trunc_topic"; echo; done \
+                | tr ' ' '\n' | grep -v '^$' | sort -nu | tr '\n' ' ' | sed 's/ $//')
+        ok=1
+        [ -z "$union" ] && ok=0
+        for n in 1 2 3; do
+          [ "$($placement "$n" "$trunc_topic")" = "$union" ] || ok=0
+        done
+        [ "$ok" -eq 1 ] && break
+        sleep 5
+      done
+
+      for n in 1 2 3; do
+        got=$($placement "$n" "$trunc_topic")
+        say "   node$n: [$got]"
+        [ "$got" = "$union" ] \
+          || fail "RP-3.3: node$n holds [$got] but the cluster holds [$union] — the returning replica did not converge"
+      done
+
+      # Nothing acknowledged may be lost. Over-truncation shows up here.
+      expected=$((BEFORE_N + AFTER_N))
+      got=$($consume "$trunc_topic")
+      say "   consumed $got / acknowledged $expected"
+      [ "${got:-0}" -eq "$expected" ] \
+        || fail "RP-3.3: consumed $got of $expected acknowledged records — the failover lost data"
+
+      # Witness that the reconcile path actually ran. Informational: whether a
+      # divergent tail existed at all depends on timing, and a run where the old
+      # leader's log was already a prefix is a pass, not a miss. But a run where
+      # the handshake never happened proves nothing about truncation, and saying
+      # so is the difference between "tested" and "did not crash".
+      say "   reconcile evidence on the returning replica:"
+      $KUBECTL logs -n "$NS" "${PODS}-${old_leader}" --tail=4000 2>/dev/null \
+        | grep -E "truncat|diverged|reconcil|epoch ended|prefix of the leader" \
+        | tail -5 | sed 's/^/     /' \
+        || say "     (none found — the handshake may not have been exercised this run)"
+    fi
+  fi
 fi
 
 $teardown
