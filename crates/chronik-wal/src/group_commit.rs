@@ -1480,9 +1480,15 @@ impl GroupCommitWal {
                         last_kept_offset = Some(last_offset);
                         outcome.bytes_discarded += data.len() as u64 - keep_bytes;
 
-                        let file = std::fs::OpenOptions::new().write(true).open(path)?;
-                        file.set_len(keep_bytes)?;
-                        file.sync_all()?;
+                        // Async throughout: `sync_all` on a segment can stall
+                        // for milliseconds, and this runs on the runtime that
+                        // is also serving every other partition's commits.
+                        let file = tokio::fs::OpenOptions::new()
+                            .write(true)
+                            .open(path)
+                            .await?;
+                        file.set_len(keep_bytes).await?;
+                        file.sync_all().await?;
                         drop(file);
 
                         // The registry advertises sizes to the indexer; a stale
