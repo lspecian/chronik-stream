@@ -1,79 +1,48 @@
-# Chronik Stream: Bare Metal Performance Report
+# Chronik Stream: Bare Metal Performance
 
-**Date**: 2026-02-22
-**Version**: v2.2.25 (pre-release, includes spin-loop fix)
-**Test Environment**: 3-node Kubernetes cluster on bare metal Dell servers
+**Status: not measured.** This report has no numbers in it, on purpose.
 
----
-
-> ## ⚠️ These numbers were measured with replication silently disabled
+> ### The previous report was deleted, not annotated
 >
-> **Added 2026-08-12.** Every figure in this report was produced on v2.2.25,
-> which carried the bug fixed in PR #29: `produce_to_partition` returned before
-> reaching the WAL replication hook on any path where `acks != 0`, so `acks=1`
-> and `acks=all` replicated **nothing**. The bug was reproduced directly on the
-> v2.2.25 image behind this report.
+> Every figure it contained — 837,284 msg/s at 256 B, 411 MB/s at 1 KB, the
+> scaling projections built on them — was measured on v2.2.25, which carried the
+> bug fixed in PR #29: `produce_to_partition` returned before reaching the
+> replication hook on any path where `acks != 0`, so `acks=1` and `acks=all`
+> replicated **nothing**.
 >
-> The cluster therefore held one copy of the data while reporting `isr:[1,2,3]`.
-> These are the throughput of a 3-node cluster doing the work of a single node,
-> and they are **not comparable** to any measurement taken after the fix.
+> Every one of those runs used `acks=all`. The cluster held one copy of the data
+> while reporting `isr:[1,2,3]`, so the report measured a 3-node cluster doing
+> the work of a single node and called the result "fully replicated, strongest
+> durability guarantee". Its headline finding — *"zero data loss across 1B+
+> messages... genuine durability"* — was measuring a durability guarantee that
+> was not being provided.
 >
-> For scale: an early post-fix measurement with replication actually running
-> reached ~66K records/s at `acks=1`. That figure is **also** not a headline
-> number — it was taken over 1 GbE with the load generator co-located on a
-> broker, and whether it is network-bound or sender-bound has not been settled.
-> It is quoted here only to show that the gap is large, not to replace the
-> numbers above.
->
-> **Nothing in this report should be cited until it is re-measured.** Tracked in
-> `docs/ROADMAP_REPLICATION.md`, which gates release on re-measuring against the
-> new replication mechanism.
->
-> ### First measurement with replication actually running (2026-08-13)
->
-> Not a replacement for the numbers below — a different machine and a smaller
-> shape — but the first figures taken with follower-pull replication genuinely
-> moving data, and the first where all three acks levels store every record:
->
-> | | throughput | records stored |
-> |---|---|---|
-> | `acks=0` | 1,058,201 msg/s | 200,001 / 200,000 |
-> | `acks=1` | 694,444 msg/s | 200,001 / 200,000 |
-> | `acks=all` | 488,997 msg/s | 200,001 / 200,000 |
->
-> 200,000 records × 100 B, 3 partitions, RF=3, `min_insync_replicas=2`, median
-> of three rounds, WAL profile left at its default. Reproduce with
-> `tests/cluster/perf_replication.sh`.
->
-> **Scope, stated plainly**: three broker processes on ONE machine, sharing its
-> disk, cores and loopback. That understates network cost and overstates disk
-> contention against three separate machines, so it is a lower bound rather than
-> a headline. It is comparable *across* acks levels, because the three runs are
-> identical apart from that setting — and that comparison is the point:
-> `acks=all` now costs about 2.2× `acks=0` while replicating to two followers,
-> where before the fix it cost nothing because it replicated nothing.
->
-> Round-to-round spread is roughly ±30% on a shared machine, which is why the
-> script reports a median of three and why a single figure from it should not be
-> quoted to two significant figures.
+> Carrying those tables with a warning on top was the wrong call: a warning is
+> read once, tables are cited forever. They are gone. What was still true —
+> hardware, method, and the spin-loop bug found during the runs — is kept below.
 
 ---
 
-## Executive Summary
+## What is owed here
 
-Chronik Stream was stress-tested on a 3-node bare metal cluster running MicroK8s. Using a realistic HTTP ingestor pipeline with k6 load generators simulating thousands of concurrent virtual users, the system achieved:
+A re-measurement on the Dell cluster, with follower-pull replication running, of:
 
-| Configuration | Messages/sec | Throughput | Errors |
-|---------------|-------------|------------|--------|
-| 12 ingestors, 256B messages | **837,284 msg/s** | 214 MB/s | 0.00% |
-| 12 ingestors, 1KB messages | 270,000 msg/s | **270 MB/s** | 0.00% |
-| 36 ingestors, 1KB messages | 420,609 msg/s | **411 MB/s** | 0.00% |
+- Throughput and latency at `acks=0`, `acks=1` and `acks=all`, 256 B and 1 KB.
+- The same across ingestor counts, to see whether the old "scales 12 → 36 pods"
+  claim survives now that replication actually moves bytes.
+- Consume throughput, which the old report never isolated from the HTTP pipeline.
 
-Peak throughput reached **837K messages/sec** with small messages and **411 MB/s** with 1KB messages. Zero data loss across all tests. CPU returns to idle within seconds of load completion.
+Until then, the only valid figures are in `BASELINE_PERFORMANCE.md`, taken on a
+single developer machine and labelled as such.
+
+⚠️ One finding from those local runs should be settled **before** a bare-metal
+run, or it will dominate the results: `acks=all` sustains only 2,300–4,000 msg/s
+when each producer waits per message, against 15,000 for `acks=1`, and degrades
+within a single run. Recorded in `docs/ROADMAP_REPLICATION.md`.
 
 ---
 
-## Hardware Specifications
+## Hardware (unchanged, still the target)
 
 ### Cluster Nodes (x3: dell-1, dell-2, dell-3)
 
@@ -85,7 +54,7 @@ Peak throughput reached **837K messages/sec** with small messages and **411 MB/s
 | Memory | 256 GB DDR4 per node (768 GB total) |
 | Storage | 1.8TB PERC H730P RAID + 1TB Kingston NVMe SSD |
 | Filesystem | ext4 on RAID |
-| Network | 1 GbE (eno3/eno4) |
+| Network | **1 GbE** (eno3/eno4) |
 | OS | Ubuntu 24.04.3 LTS, Kernel 6.8.0-94-generic |
 
 ### Software Stack
@@ -97,228 +66,24 @@ Peak throughput reached **837K messages/sec** with small messages and **411 MB/s
 | CNI | Calico |
 | Container Registry | Harbor (self-hosted) |
 | Load Generator | Grafana k6 (k6-operator) |
-| Chronik Stream | v2.2.25-fix-spinloop |
+
+⚠️ **1 GbE is 125 MB/s per link.** With replication genuinely running, every
+byte produced at RF=3 crosses the network twice more than it did in the old
+runs. Whether the next measurement is network-bound or sender-bound is Open
+Question 1 in the replication roadmap, and it should be answered *with NIC
+utilisation sampled*, not inferred from throughput alone.
 
 ---
 
-## Test Architecture
-
-```
-                    k6 Load Generators (8 pods)
-                    8000 Virtual Users peak
-                            |
-                            v
-                    ┌───────────────┐
-                    │  K8s Service  │
-                    │  (ClusterIP)  │
-                    └───────┬───────┘
-                            |
-              ┌─────────────┼─────────────┐
-              v             v             v
-        ┌──────────┐  ┌──────────┐  ┌──────────┐
-        │ Ingestor │  │ Ingestor │  │ Ingestor │  x12-36 pods
-        │ (Rust)   │  │ (Rust)   │  │ (Rust)   │  HTTP → Kafka
-        └────┬─────┘  └────┬─────┘  └────┬─────┘
-             |             |             |
-             v             v             v
-        ┌──────────┐  ┌──────────┐  ┌──────────┐
-        │ Chronik  │  │ Chronik  │  │ Chronik  │  3-node Raft cluster
-        │ Node 1   │  │ Node 2   │  │ Node 3   │  WAL + replication
-        │ (dell-2) │  │ (dell-1) │  │ (dell-3) │
-        └──────────┘  └──────────┘  └──────────┘
-             |             |             |
-             v             v             v
-        ┌──────────┐  ┌──────────┐  ┌──────────┐
-        │Consumer 1│  │Consumer 2│  │Consumer 3│  Kafka consumers
-        │ (dell-2) │  │ (dell-1) │  │ (dell-3) │  verifying integrity
-        └──────────┘  └──────────┘  └──────────┘
-```
-
-### Data Pipeline
-
-1. **k6** sends HTTP POST requests with JSON batches to the ingestor service
-2. **Ingestor** (Rust, using rdkafka/librdkafka) converts JSON to Kafka produce requests
-3. **Chronik** receives via Kafka wire protocol, writes to WAL (fsync), replicates via Raft
-4. **Consumer** (Rust, using rdkafka) reads back via Kafka fetch protocol, verifies integrity
-
-This is a realistic microservice ingestion pattern — not a synthetic benchmark.
-
----
-
-## Chronik Cluster Configuration
-
-| Parameter | Value |
-|-----------|-------|
-| Replicas | 3 nodes |
-| Replication Factor | 3 |
-| Min In-Sync Replicas | 2 |
-| Kafka Acks | `all` (fully replicated) |
-| WAL Profile | `high` (50ms batch interval) |
-| Produce Profile | `extreme` |
-| Topic Partitions | 3 (1 per node) |
-| Resources per node | 32 CPU limit, 64Gi memory limit |
-| Storage | 100Gi PVC per node |
-
----
-
-## Test Results
-
-### Test 1: Maximum Message Rate (256-byte messages)
-
-**Configuration**: 12 ingestors, 8 k6 runners, 100 messages per batch, acks=all
-
-**k6 Stages**: 30s→200, 1m→1000, 2m→3000, 5m→5000, 3m→8000, 2m→3000, 1m→0 VUs
-
-| Runner | Messages/sec | Data Rate | Errors |
-|--------|-------------|-----------|--------|
-| 1 | 112,695 | 33 MB/s | 0.00% |
-| 2 | 109,123 | 32 MB/s | 0.00% |
-| 3 | 97,098 | 28 MB/s | 0.00% |
-| 4 | 103,112 | 30 MB/s | 0.00% |
-| 5 | 108,224 | 32 MB/s | 0.00% |
-| 6 | 99,124 | 29 MB/s | 0.00% |
-| 7 | 97,993 | 29 MB/s | 0.00% |
-| 8 | 109,920 | 32 MB/s | 0.00% |
-| **Total** | **837,284** | **245 MB/s** | **0.00%** |
-
-**Latency** (per batch of 100 messages):
-- Median: 282ms
-- p90: 941ms
-- p95: 1.22s
-
-**Peak cluster CPU utilization**: ~50% (significant headroom remaining)
-
----
-
-### Test 2: Throughput Focused (1KB messages, 12 ingestors)
-
-**Configuration**: 12 ingestors, 8 k6 runners, 200 messages per batch, 1KB messages, acks=all
-
-| Runner | Payload Rate | Wire Rate | Errors |
-|--------|-------------|-----------|--------|
-| 1 | 26 MB/s | 28 MB/s | 0.00% |
-| 2 | 27 MB/s | 29 MB/s | 0.00% |
-| 3 | 39 MB/s | 40 MB/s | 0.00% |
-| 4 | 48 MB/s | 50 MB/s | 0.00% |
-| 5 | 43 MB/s | 44 MB/s | 0.00% |
-| 6 | 38 MB/s | 39 MB/s | 0.00% |
-| 7 | 28 MB/s | 29 MB/s | 0.00% |
-| 8 | 34 MB/s | 35 MB/s | 0.00% |
-| **Total** | **270 MB/s** | **294 MB/s** | **0.00%** |
-
----
-
-### Test 3: Scaled Ingestors (1KB messages, 36 ingestors)
-
-**Configuration**: 36 ingestors, 8 k6 runners, 200 messages per batch, 1KB messages, acks=all
-
-| Runner | Messages/sec | Payload Rate | Errors |
-|--------|-------------|-------------|--------|
-| 1 | 60,400 | 59 MB/s | 0.00% |
-| 2 | 37,349 | 36 MB/s | 0.00% |
-| 3 | 65,142 | 64 MB/s | 0.00% |
-| 4 | 39,835 | 39 MB/s | 0.00% |
-| 5 | 57,233 | 56 MB/s | 0.00% |
-| 6 | 64,332 | 63 MB/s | 0.00% |
-| 7 | 36,156 | 35 MB/s | 0.00% |
-| 8 | 60,166 | 59 MB/s | 0.00% |
-| **Total** | **420,609** | **411 MB/s** | **0.00%** |
-
-**Latency** (per batch of 200 x 1KB messages):
-- Median: 284ms - 843ms (varies by runner)
-- p90: 10s (WAL flush saturation at peak)
-- p95: 10.1s - 10.5s
-
-**Peak cluster CPU utilization**: ~80% on busiest node
-
----
-
-## CPU Recovery Verification
-
-A critical bug (closed-socket spin loop) was discovered and fixed during this test cycle. The fix was validated by confirming CPU returns to idle after load:
-
-| Phase | dell-1 | dell-2 | dell-3 |
-|-------|--------|--------|--------|
-| Before test | 98% idle | 96% idle | 75% idle |
-| During peak (8000 VUs) | 43% idle | 21% idle | 50% idle |
-| After test completes | **99% idle** | **97% idle** | **70% idle** |
-
-**Before the fix**: CPU stayed at 0% idle permanently after any test — closed TCP connections caused infinite `recvfrom()` spin loops consuming all 32 cores per node.
-
-**After the fix**: CPU returns to baseline within seconds of load completion. The fix changed `Ok(None) => continue` to `Ok(None) => break` in the TCP/TLS connection handler loop.
-
----
-
-## Message Integrity Verification
-
-End-to-end message integrity was verified:
-
-1. **Produce**: Single message produced via HTTP ingestor → Chronik → WAL
-2. **Consume**: Consumer (rdkafka) read back the message with correct byte count
-3. **Stress**: 733M+ messages produced with 0.00% error rate across all tests
-4. **Consumer verification**: Messages consumed with correct payloads, zero corruption
-
-```
-Produce: {"key": "sanity-1", "value": "integrity-check"} → offset 0, partition 2
-Consume: consumed=1, bytes=15, errors=0 ✓
-```
-
----
-
-## Bottleneck Analysis
-
-### Where time is spent
-
-```
-k6 (JSON encode) → HTTP → Ingestor (JSON decode → Kafka produce) → Chronik (WAL write + Raft replicate) → ack
-     ~5ms              ~1ms        ~50-200ms (await Kafka ack)           ~50-500ms (WAL fsync)
-```
-
-### Identified bottlenecks (in order)
-
-1. **HTTP/JSON overhead** — Each batch encodes/decodes 200KB of JSON per request. The ingestor must parse JSON, create Kafka records, and await acks serially per batch.
-
-2. **WAL flush latency** — At 411 MB/s the WAL profile (`high`, 50ms batch interval) becomes the ceiling. p90 latency jumps to 10s, indicating WAL flush queuing.
-
-3. **Network** — 1 GbE = 125 MB/s per link. With 3 nodes doing Raft replication, network becomes relevant above ~400 MB/s aggregate.
-
-4. **Partition count** — Only 3 partitions (1 per node). Increasing to 9-12 would parallelize WAL writes within each node.
-
-### What is NOT the bottleneck
-
-- **CPU**: Cluster never exceeded 80% utilization on any node. Significant headroom.
-- **Memory**: 220+ GB free per node throughout all tests.
-- **Storage I/O**: NVMe SSDs and RAID arrays showed no wait time (`wa: 0.0%`).
-
----
-
-## Scaling Projections
-
-| Lever | Current | Projected | Expected Impact |
-|-------|---------|-----------|-----------------|
-| Ingestors | 36 | 48 | +20% throughput (diminishing returns due to WAL saturation) |
-| WAL profile | `high` (50ms) | `ultra` (100ms) | +30-50% throughput (larger batches) |
-| Partitions | 3 | 12 | +50-100% throughput (parallel WAL writes) |
-| Network | 1 GbE | 10 GbE | Removes network ceiling entirely |
-| Direct Kafka | HTTP ingestor | librdkafka native | +200-300% (eliminates JSON/HTTP overhead) |
-| Nodes | 3 | 6 | ~2x throughput (linear scaling) |
-
-**Conservative estimate with tuning (same hardware)**: 600-800 MB/s achievable with partition increase + WAL profile tuning + 10GbE.
-
-**With direct Kafka producers (no HTTP)**: 800+ MB/s achievable on current hardware.
-
----
-
-## Test Methodology
+## Method (unchanged, still valid)
 
 ### Load Generator
 
 - **Tool**: Grafana k6 via k6-operator on Kubernetes
 - **Parallelism**: 8 runner pods, each running independent VU ramps
-- **VU Profile**: Ramp from 0 → 8000 virtual users over ~12 minutes, then ramp down
-- **Batch Size**: 100-200 messages per HTTP request
-- **Message Sizes**: 256 bytes and 1KB
-- **Acks**: `all` (fully replicated, strongest durability guarantee)
+- **VU Profile**: Ramp 0 → 8000 virtual users over ~12 minutes, then ramp down
+- **Batch Size**: 100–200 messages per HTTP request
+- **Message Sizes**: 256 bytes and 1 KB
 
 ### Ingestor
 
@@ -335,40 +100,30 @@ k6 (JSON encode) → HTTP → Ingestor (JSON decode → Kafka produce) → Chron
 
 ### Reproducibility
 
-All test infrastructure is defined as Kubernetes manifests in `tests/k8s-perf/`:
-
 ```bash
-# Deploy the full test stack
-./tests/k8s-perf/run-all.sh
-
-# Clean up
-./tests/k8s-perf/cleanup.sh
+./tests/k8s-perf/run-all.sh    # deploy the full test stack
+./tests/k8s-perf/cleanup.sh    # tear it down
 ```
 
----
-
-## Key Findings
-
-1. **Zero data loss**: Across 1B+ messages produced in all tests combined, 0 messages were lost. Chronik's WAL + Raft replication provides genuine durability.
-
-2. **Linear scaling with ingestors**: Throughput scaled from 270 MB/s (12 pods) to 411 MB/s (36 pods) — a 52% improvement from 3x more ingestors, indicating the system handles concurrent connections well.
-
-3. **CPU efficiency**: At peak 837K msg/s, cluster CPU utilization stayed below 50%. The system is I/O-bound (WAL fsync + network), not CPU-bound.
-
-4. **Clean shutdown behavior**: After fixing the spin-loop bug, CPU returns to idle within seconds of load completion. No resource leaks or zombie connections.
-
-5. **Real-world pipeline**: These numbers are through a full HTTP → JSON → Kafka pipeline with `acks=all` replication — not synthetic single-connection benchmarks. Real applications would see similar throughput.
+**Verify replication before trusting any number.** The old report's central
+error was assuming `acks=all` implied replication. Check the bytes on disk on
+each node, not `isr:` in a status response — `tests/cluster/regression_replication.sh`
+is the pattern: produce, then count records in each node's log.
 
 ---
 
-## Appendix: Bug Fix During Testing
+## Appendix: Bug Fix During The Original Testing
 
 ### Closed-Socket Spin Loop (v2.2.25)
 
+Kept because the bug and its fix are real, whatever happened to the numbers.
+
 **Symptom**: After stress tests, all 32 CPU cores on each node pinned at 100% permanently.
 
-**Root Cause**: In `server.rs`, when `read_request_frame()` returned `Ok(None)` (connection closed/EOF), the handler loop used `continue` instead of `break`, causing infinite `recvfrom()` system calls on dead file descriptors (~17,000 calls/sec per FD, ~100 dead FDs per node).
+**Root Cause**: In `server.rs`, when `read_request_frame()` returned `Ok(None)`
+(connection closed/EOF), the handler loop used `continue` instead of `break`,
+causing infinite `recvfrom()` system calls on dead file descriptors (~17,000
+calls/sec per FD, ~100 dead FDs per node).
 
-**Fix**: Changed `Ok(None) => continue` to `Ok(None) => break` in both TCP and TLS connection handlers.
-
-**Impact**: Without this fix, any production deployment would accumulate CPU waste over time as clients connect and disconnect. The fix ensures connections are properly cleaned up.
+**Fix**: `Ok(None) => continue` became `Ok(None) => break` in both the TCP and
+TLS connection handlers.

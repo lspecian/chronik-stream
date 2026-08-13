@@ -15,6 +15,7 @@
 | RP-7 | Assignment authority | `TESTED` | — | Only the Raft leader publishes; fetch refuses when it does not lead. **Full conformance suite now PASSES, RP-0.4 included** |
 | RP-8 | `acks=all` latency (#36) | `TESTED` | — | Three waits removed from the write path: new topic 7,000ms → 23ms, steady state 505ms → 17ms. The reported "duplication" was a client retry after a timeout |
 | RP-4 | Delete the push stack | `TESTED` | — | Data push path deleted: mode switch, produce fan-out, LeaderElector and the election machinery. Metadata keeps the transport (OQ2). One mechanism |
+| RP-9 | `acks=all` round-trip throughput | 🔶 `OPEN` | — | 4–7× slower than `acks=1` at concurrency and degrades within a run, while reaching 489K msg/s batched. Settle before any bare-metal run |
 
 ---
 
@@ -946,6 +947,50 @@ Concrete targets:
 **Verified after deletion**, all on the default configuration: 1,658 unit tests; replication conformance 600/600 across acks=0, 1 and all with every replica holding every partition; divergence 3/3 with 3,358 bytes cut; `acks=all` 26ms to a new topic, 16ms steady state.
 
 > There was never a push/pull coexistence flag, and now there is not even a switch. One mechanism.
+
+---
+
+## RP-9: `acks=all` round-trip throughput — `OPEN` (found 2026-08-13)
+
+RP-8 fixed `acks=all` **latency**: 505ms per request became 17ms. Throughput at
+concurrency is a separate question, and it has a separate problem.
+
+`chronik-bench`, 64 concurrent producers each waiting for its own
+acknowledgement, 256 B, 3 partitions, one machine, default WAL profile:
+
+| | single node | 3 nodes, RF=3 |
+|---|---:|---:|
+| `acks=0` | 195,000 msg/s | 119,000 msg/s |
+| `acks=1` | 16,700 msg/s | 15,000 msg/s |
+| `acks=all` | 16,700 msg/s | **2,300–4,000 msg/s** |
+
+Single-node `acks=all` matches `acks=1` exactly, which is correct — with no
+followers the in-sync set is the leader alone. On the cluster it is **4–7×
+slower than `acks=1`**, and it degrades *within* a 10-second run: 3,993 msg/s in
+the first interval, 2,285 in the second, p99 rising 34 → 49 ms. It reproduces on
+a freshly created cluster with a single topic, so it is not accumulated state.
+
+**The same cluster reaches 489,000 msg/s at `acks=all` when the client batches**
+(`kcat`, 200,000 records, `perf_replication.sh`). So the broker's ingest is not
+the constraint; the per-round-trip path is.
+
+**Leading hypothesis, not established.** `acks=all` throughput is bounded by the
+follower's fetch loop: one in-flight request per leader, `min_bytes=1`, so the
+leader answers the moment anything lands and each round trip carries only what
+accumulated during the previous one. That is exactly what makes the *latency*
+good — it is why #36's per-request cost fell to 17ms — so raising `min_bytes`
+would trade the fix back. If the hypothesis holds, the answer is pipelining
+(more than one fetch in flight per leader), not bigger batches.
+
+**Do not start a bare-metal run before settling this**, or it will dominate
+every number taken there.
+
+Two measurements that would separate the candidates:
+1. `min_insync_replicas=1` on a 3-node cluster — quorum is the leader alone, so
+   the ISR wait remains but the follower round trip does not. Fast ⇒ the loop;
+   still slow ⇒ the wait itself (`IsrAckTracker` contention or waiter growth).
+2. Instrument registration → satisfaction inside `IsrAckTracker`, which would
+   also show whether the in-run degradation is waiters accumulating.
 
 ---
 

@@ -1,263 +1,121 @@
-# Baseline Performance Results
+# Baseline Performance
 
-> **Scope (noted 2026-08-12):** these are **single-node** `chronik-bench` runs.
-> Replication is not exercised, so they are unaffected by the PR #29 bug that
-> invalidated the cluster figures in `BARE_METAL_PERFORMANCE.md` — and equally,
-> they say nothing about replicated throughput. Do not read them as cluster
-> numbers.
+**Measured 2026-08-13** on the branch where follower-pull replication became the only data-replication mechanism.
+
+> ### Everything measured before this date was deleted, not archived
 >
-> For replicated throughput, see the 2026-08-13 block in
-> `BARE_METAL_PERFORMANCE.md`, or run `tests/cluster/perf_replication.sh`, which
-> measures all three acks levels on a real 3-node cluster with follower-pull
-> replication running.
-
-## Test Date: 2025-11-29 (v2.2.9 Searchable Feature)
-
-### Test Configuration
-- **Concurrency**: 128 producers
-- **Message Size**: 256 bytes
-- **Duration**: 30 seconds
-- **Compression**: None
-- **WAL Profile**: high (50ms batch interval)
-- **Command**: `./target/release/chronik-bench -c 128 -s 256 -d 30s -m produce`
+> Every cluster figure this repo published was taken while replication was
+> silently disabled: `acks=1` and `acks=all` replicated **nothing** until PR #29,
+> so a "3-node cluster at acks=1" number described one node writing to its own
+> disk. The single-node figures alongside them were valid when taken but came
+> from v2.2.9/v2.2.10 in November 2025, on different hardware, several hundred
+> commits ago.
+>
+> They are gone rather than annotated. A table of invalid numbers with a warning
+> above it is worse than no table: the warning is read once and the numbers get
+> cited forever. The tell was visible in the old data and nobody caught it —
+> standalone `acks=all` was reported *faster* than `acks=1` (347,585 vs 309,590
+> msg/s), which is only possible if `acks=all` was not waiting for anything.
 
 ---
 
-## v2.2.9 Searchable vs Non-Searchable Benchmarks (2025-11-29)
+## Hardware
 
-### Summary Table
+These numbers come from **one developer machine**, not a server. Stated up front
+because it is the single most important caveat: the 3-node shape runs three
+brokers on this one box, sharing its disk, cores and loopback.
 
-| Configuration | Throughput | p50 | p99 | Total Messages |
-|--------------|------------|-----|-----|----------------|
-| **Standalone Non-Searchable** | 197,793 msg/s | 0.58 ms | 0.59 ms | 6,922,860 |
-| **Standalone Searchable** | 192,064 msg/s | 0.59 ms | 2.15 ms | 5,762,217 |
-| **Cluster Non-Searchable** | 183,133 msg/s | 0.61 ms | 2.85 ms | 5,494,200 |
-| **Cluster Searchable** | 123,406 msg/s | 0.59 ms | 14.43 ms | 3,702,347 |
+| | |
+|---|---|
+| CPU | AMD Ryzen 9 5900HX (8 cores / 16 threads) |
+| Memory | 30 GB (≈20 GB in use by other work during the runs) |
+| Storage | NVMe SSD |
+| OS | Linux 6.11 |
 
-### Performance Analysis
+Bare-metal numbers on the Dell cluster are **not yet re-measured** — see
+`BARE_METAL_PERFORMANCE.md`.
 
-#### Standalone vs Cluster
+## Method
 
-| Metric | Standalone | Cluster | Ratio |
-|--------|----------:|--------:|------:|
-| Non-Searchable Throughput | 197,793 msg/s | 183,133 msg/s | 92.6% |
-| Searchable Throughput | 192,064 msg/s | 123,406 msg/s | 64.3% |
+`chronik-bench`, 64 concurrent producers, 256-byte messages, 10s measured after
+a 3s warmup, 3 partitions, no compression, **WAL profile left at its default**
+(`low`, 2 ms). Rates below are the *sustained* per-interval rate, not the
+harness's summary figure, which divides by an elapsed time that includes warmup
+and drain.
 
-**Key Finding**: The 3-node cluster achieves **92.6%** of standalone throughput for non-searchable topics.
+Reproduce: `tests/cluster/perf_matrix.sh`.
 
-#### Searchable Indexing Impact
+`chronik-bench` measures **round-trip throughput at a fixed concurrency** — each
+producer waits for its acknowledgement. It is not a maximum-batched-throughput
+benchmark; for that, see the kcat figures at the bottom.
 
-| Configuration | Non-Searchable | Searchable | Overhead |
-|--------------|---------------:|-----------:|---------:|
-| Standalone | 197,793 msg/s | 192,064 msg/s | 2.9% |
-| Cluster | 183,133 msg/s | 123,406 msg/s | 32.6% |
+## Single node
 
-**Key Finding**:
-- Standalone searchable topics have minimal overhead (only 3%)
-- Cluster searchable topics have higher overhead (33%) due to combined indexing + replication costs
+No replication to do, so this is the ceiling of the local write path.
 
-#### Latency Impact
+| acks | throughput | p50 | p99 |
+|---|---:|---:|---:|
+| 0 | **195,000 msg/s** (~47 MB/s) | 0.05 ms | 7.6 ms |
+| 1 | 16,700 msg/s (~4.1 MB/s) | 3.83 ms | 5.3 ms |
+| all | 16,700 msg/s (~4.1 MB/s) | 3.83 ms | 5.3 ms |
 
-| Configuration | p99 Non-Searchable | p99 Searchable | Increase |
-|--------------|-------------------:|---------------:|---------:|
-| Standalone | 0.59ms | 2.15ms | 3.6x |
-| Cluster | 2.85ms | 14.43ms | 5.1x |
+`acks=1` and `acks=all` are identical here, and that is correct: with no
+followers the in-sync set is the leader alone, so `acks=all` waits for its own
+fsync and nothing more. The 12× gap to `acks=0` is that fsync.
 
-### Detailed Latency Breakdown
+## Three nodes, RF=3, min_insync_replicas=2
 
-#### Standalone Non-Searchable
-```
-p50:    0.58ms
-p90:    0.58ms
-p95:    0.59ms
-p99:    0.59ms
-p99.9:  0.64ms
-max:    5.40ms
-```
+Follower-pull replication running; every record reaches all three nodes.
 
-#### Standalone Searchable
-```
-p50:    0.59ms
-p90:    1.03ms
-p95:    1.27ms
-p99:    2.15ms
-p99.9:  2.98ms
-max:    9.70ms
-```
+| acks | throughput | p50 | p99 |
+|---|---:|---:|---:|
+| 0 | **119,000 msg/s** (~29 MB/s) | 0.19 ms | 13.0 ms |
+| 1 | 15,000 msg/s (~3.7 MB/s) | 3.66 ms | 15.6 ms |
+| all | 2,300–4,000 msg/s | — | 34–49 ms |
 
-#### Cluster Non-Searchable (3 nodes, acks=1)
-```
-p50:    0.61ms
-p90:    1.01ms
-p95:    1.27ms
-p99:    2.85ms
-p99.9:  3.60ms
-max:   12.22ms
-```
+`acks=0` and `acks=1` cost roughly what the single-node shape costs, plus
+contention from two extra brokers on the same disk.
 
-#### Cluster Searchable (3 nodes, acks=1)
-```
-p50:    0.59ms
-p90:    1.09ms
-p95:    1.64ms
-p99:   14.43ms
-p99.9: 17.38ms
-max:   23.21ms
-```
+⚠️ **`acks=all` is 4–7× slower than `acks=1` and degrades within a run** — 3,993
+msg/s in the first interval, 2,285 in the second, p99 rising 34 → 49 ms. That is
+a genuine open issue, recorded in `docs/ROADMAP_REPLICATION.md`, not a
+measurement artefact: it reproduces on a freshly created cluster with a single
+topic.
 
-### Recommendations
+The likely shape: `acks=all` throughput is bounded by the follower's fetch loop,
+which issues one request per leader at a time with `min_bytes=1`. That is
+latency-optimal — the leader answers the moment anything lands, which is what
+made #36's per-request latency fall from 505 ms to 17 ms — and it means each
+round trip carries only what accumulated during the previous one. Raising
+`min_bytes` would trade the latency win back for batch size. **Not yet
+investigated properly; do not treat this explanation as established.**
 
-1. **For maximum throughput**: Use standalone mode with non-searchable topics (~200K msg/s)
+## Batched throughput, for contrast
 
-2. **For searchable requirements**:
-   - Standalone mode maintains 97% throughput with searchable enabled
-   - Accept the 33% throughput reduction in cluster mode if search is required
+The same 3-node cluster measured with `kcat`, which batches thousands of records
+per request instead of waiting per message (`tests/cluster/perf_replication.sh`,
+200,000 × 100 B, median of three):
 
-3. **For low-latency requirements**:
-   - Non-searchable topics maintain sub-1ms p99 in standalone
-   - Cluster non-searchable maintains sub-3ms p99
-   - Avoid searchable topics if p99 < 5ms is required
+| acks | throughput |
+|---|---:|
+| 0 | 1,058,201 msg/s |
+| 1 | 694,444 msg/s |
+| all | 488,997 msg/s |
 
-4. **For high availability**:
-   - Cluster mode with non-searchable topics provides best balance
-   - 183K msg/s with 3-way replication and 2.85ms p99
+All three stored 200,001 records with zero client errors. These answer a
+different question — how fast the broker ingests when the client batches — and
+should never be compared against the round-trip table above.
 
----
+That `acks=all` reaches 489K msg/s when batched, while managing 2–4K when each
+message waits for its own acknowledgement, is the clearest statement of the open
+issue: the per-round-trip path, not the broker's raw ingest, is what is slow.
 
-## v2.2.10 Benchmark Results (2025-11-28)
+## What is not measured here
 
-### Summary Table
-
-| Mode | acks | Throughput | Bandwidth | p50 | p99 | p99.9 |
-|------|------|------------|-----------|-----|-----|-------|
-| **Standalone** | 1 | 309,590 msg/s | 75.58 MB/s | 0.33 ms | 0.59 ms | 4.37 ms |
-| **Standalone** | all | 347,585 msg/s | 84.86 MB/s | 0.34 ms | 0.56 ms | 0.88 ms |
-| **Cluster (3-node)** | 1 | 188,165 msg/s | 45.94 MB/s | 0.59 ms | 2.81 ms | 3.65 ms |
-| **Cluster (3-node)** | all | 165,808 msg/s | 40.48 MB/s | 0.71 ms | 1.80 ms | 2.64 ms |
-
-### Detailed Results
-
-#### Standalone Mode - acks=1
-
-| Metric | Value |
-|--------|-------|
-| **Message Rate** | **309,590 msg/s** |
-| **Total Messages** | 10,835,762 |
-| **Bandwidth** | 75.58 MB/s |
-| **Data Transferred** | 2.58 GB |
-| **Success Rate** | 100% (0 failures) |
-
-**Latency Distribution:**
-
-| Percentile | Latency (μs) | Latency (ms) |
-|------------|--------------|--------------|
-| p50 | 327 | 0.33 |
-| p90 | 417 | 0.42 |
-| p95 | 451 | 0.45 |
-| p99 | 590 | 0.59 |
-| p99.9 | 4,371 | 4.37 |
-| max | 15,895 | 15.89 |
-
-#### Standalone Mode - acks=all
-
-| Metric | Value |
-|--------|-------|
-| **Message Rate** | **347,585 msg/s** |
-| **Total Messages** | 10,428,006 |
-| **Bandwidth** | 84.86 MB/s |
-| **Data Transferred** | 2.49 GB |
-| **Success Rate** | 100% (0 failures) |
-
-**Latency Distribution:**
-
-| Percentile | Latency (μs) | Latency (ms) |
-|------------|--------------|--------------|
-| p50 | 341 | 0.34 |
-| p90 | 435 | 0.43 |
-| p95 | 468 | 0.47 |
-| p99 | 556 | 0.56 |
-| p99.9 | 882 | 0.88 |
-| max | 431,615 | 431.62 |
-
-#### Cluster Mode (3-node) - acks=1
-
-| Metric | Value |
-|--------|-------|
-| **Message Rate** | **188,165 msg/s** |
-| **Total Messages** | 5,645,145 |
-| **Bandwidth** | 45.94 MB/s |
-| **Data Transferred** | 1.35 GB |
-| **Success Rate** | 100% (0 failures) |
-
-**Latency Distribution:**
-
-| Percentile | Latency (μs) | Latency (ms) |
-|------------|--------------|--------------|
-| p50 | 588 | 0.59 |
-| p90 | 981 | 0.98 |
-| p95 | 1,227 | 1.23 |
-| p99 | 2,807 | 2.81 |
-| p99.9 | 3,645 | 3.65 |
-| max | 17,055 | 17.05 |
-
-#### Cluster Mode (3-node) - acks=all
-
-| Metric | Value |
-|--------|-------|
-| **Message Rate** | **165,808 msg/s** |
-| **Total Messages** | 4,974,495 |
-| **Bandwidth** | 40.48 MB/s |
-| **Data Transferred** | 1.19 GB |
-| **Success Rate** | 100% (0 failures) |
-
-**Latency Distribution:**
-
-| Percentile | Latency (μs) | Latency (ms) |
-|------------|--------------|--------------|
-| p50 | 710 | 0.71 |
-| p90 | 1,162 | 1.16 |
-| p95 | 1,347 | 1.35 |
-| p99 | 1,801 | 1.80 |
-| p99.9 | 2,635 | 2.64 |
-| max | 6,195 | 6.20 |
-
-### Key Observations
-
-1. **Standalone acks=all faster than acks=1** (347K vs 310K msg/s)
-   - Expected: single-node has no replication overhead
-   - acks=all just waits for leader (which is the only node)
-
-2. **Cluster acks=1 vs acks=all**:
-   - acks=1: 188K msg/s (leader-only acknowledgment)
-   - acks=all: 166K msg/s (waits for all replicas)
-   - ~12% overhead for full replication guarantees
-
-3. **Cluster vs Standalone ratio**:
-   - acks=1: 188K/310K = **61%** of standalone performance
-   - acks=all: 166K/348K = **48%** of standalone performance
-   - Expected due to Raft consensus + WAL replication overhead
-
-4. **Latency is excellent across all modes**:
-   - Standalone p99 < 1ms
-   - Cluster p99 < 3ms even with full replication
-
----
-
-## Historical Results
-
-### v2.2.9 (2025-11-25)
-
-#### Standalone - acks=1
-
-| Metric | Value |
-|--------|-------|
-| **Average Message Rate** | **333,321 msg/s** |
-| **Peak Message Rate** | **348,258 msg/s** |
-| **Total Messages** | 10,000,168 |
-| **Bandwidth** | 81.38 MB/s |
-| **p99 Latency** | 0.81 ms |
-
----
-
-**Build Version**: v2.2.9
-**Test System**: Ubuntu Linux 6.11.0-28-generic
+- **Bare metal.** All of the above is one machine. `BARE_METAL_PERFORMANCE.md`
+  covers what is owed on the Dell cluster.
+- **Consume throughput.** `chronik-bench -m consume` exists; these runs are
+  produce-only.
+- **Searchable / columnar / vector topics.** The old report measured a 33%
+  cluster overhead for searchable topics; that figure is void with the rest and
+  has not been re-taken.
