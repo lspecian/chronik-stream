@@ -91,9 +91,18 @@ leader_of() { # $1 = api port to ask
 # mistake costs seconds rather than a whole run.
 KCAT_TIMEOUTS=(-X socket.timeout.ms=4000 -X metadata.request.timeout.ms=4000)
 
+# Everything goes to partition 0, deliberately.
+#
+# Without `-p 0` the records spread across the topic's partitions while the
+# rest of this test — the leader lookup, the reconciliation log line, the
+# on-disk orphan count — only ever looks at partition 0. Whether the divergence
+# landed where the test was looking then came down to the partitioner. One run
+# in four logged `truncated to 0 (0 segment(s) removed, 0 bytes discarded)` and
+# still reported PASS: the branch ran against an empty partition 0 and deleted
+# nothing, while the orphans sat in partition 1 unexamined.
 produce() { # $1=first $2=last $3=acks $4=tag $5=brokers
   seq "$1" "$2" | sed "s/^/$4-/" \
-    | timeout 60 kcat -P -b "$5" -t "$TOPIC" -X request.required.acks="$3" \
+    | timeout 60 kcat -P -b "$5" -t "$TOPIC" -p 0 -X request.required.acks="$3" \
         "${KCAT_TIMEOUTS[@]}" 2>/dev/null
 }
 
@@ -153,7 +162,7 @@ sleep 3
 # ISR for their liveness window — so these records are invisible to a reader by
 # design, which is the feature working. Asking a consumer about them reports
 # zero and reads exactly like "the write failed".
-orphans_here=$(grep -ao "orphan-" "$DIR/data/alt-node$OLD/wal/$TOPIC"/*/*.log 2>/dev/null | wc -l)
+orphans_here=$(grep -ao "orphan-" "$DIR/data/alt-node$OLD/wal/$TOPIC"/0/*.log 2>/dev/null | wc -l)
 say "   leader's log holds ${orphans_here:-0} orphan marker(s) on disk"
 [ "${orphans_here:-0}" -ge 1 ] || { fail "no orphans landed — no divergence to test"; exit 1; }
 
@@ -194,16 +203,34 @@ say "-- reconciliation on node $OLD:"
 grep -aE "truncated to|diverged from the leader|log is a prefix|not truncating|Reconciling" \
   "$LOGS/alt-node$OLD.log" 2>/dev/null | tail -5 | sed 's/^/     /'
 
-truncated=0
-grep -qaE "truncated to|diverged from the leader" "$LOGS/alt-node$OLD.log" 2>/dev/null && truncated=1
+# How many bytes the cut actually removed.
+#
+# The presence of a truncation message is NOT evidence that anything was cut.
+# Observed: `truncated to 0 (0 segment(s) removed, 0 bytes discarded)` — the
+# branch ran, deleted nothing, and this test reported PASS. A path that is
+# silently inert while looking healthy is the exact failure mode RP-3.3 keeps
+# producing (the epoch warm-up ran too late for months and logged nothing about
+# it). So the assertion is on the bytes.
+discarded=$(grep -aoE "truncated to [0-9]+ \([0-9]+ segment\(s\) removed, [0-9]+ bytes discarded\)" \
+  "$LOGS/alt-node$OLD.log" 2>/dev/null | tail -1 \
+  | grep -oE "[0-9]+ bytes" | grep -oE "^[0-9]+")
+discarded="${discarded:-0}"
+
+# And the records must be gone from the returning node's own disk, not merely
+# invisible to a consumer — a partition this node no longer leads would read as
+# clean either way.
+orphans_left=$(grep -ao "orphan-" "$DIR/data/alt-node$OLD/wal/$TOPIC"/0/*.log 2>/dev/null | wc -l)
 
 winners=$(count_tag winner "$BOOT")
 orphans=$(count_tag orphan "$BOOT")
 say ""
+say "   bytes discarded by the cut: ${discarded} (must be > 0; $orphans_here orphan marker(s) were on disk)"
+say "   orphan markers left on node $OLD's disk: ${orphans_left:-0} (must be 0)"
 say "   committed (winner) records readable: ${winners:-0} / $WINNER_N"
 say "   uncommitted (orphan) records readable: ${orphans:-0} (must be 0)"
 
-[ "$truncated" -eq 1 ] || fail "node $OLD never truncated — it still holds records the cluster never committed"
+[ "$discarded" -gt 0 ] || fail "node $OLD logged a truncation that discarded nothing — the cut did not run against the diverged log"
+[ "${orphans_left:-0}" -eq 0 ] || fail "${orphans_left} orphan marker(s) still on node $OLD's disk after truncation"
 [ "${winners:-0}" -ge "$WINNER_N" ] || fail "only ${winners:-0} of $WINNER_N committed records survived — truncation took too much"
 [ "${orphans:-0}" -eq 0 ] || fail "${orphans} record(s) the cluster never committed are still readable"
 

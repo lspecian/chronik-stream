@@ -9,7 +9,7 @@
 | RP-0 | Replication conformance suite | `TESTED` | — | Placement + ISR honesty; fails pre-#29, passes after |
 | RP-1 | Harden the current mechanism | `TESTED` | — | 1.1–1.4 + 3 bugs found by cluster validation |
 | RP-2 | Follower fetch | `TESTED` | — | 2.1–2.4 all validated on a 3-node cluster, behind `CHRONIK_REPLICATION_MODE=pull` |
-| RP-3 | Leader epochs & truncation | `TESTED (partly)` | — | Handshake proven end-to-end on a cluster; the **truncate** branch still needs manufactured divergence |
+| RP-3 | Leader epochs & truncation | `TESTED (partly)` | — | Cut proven in-process. Divergence can now be staged on a cluster (2026-08-13) — and doing so found **three defects in the repair path**, incl. a follower that spins 1,600×/s forever without repairing. See RP-3.3 |
 | RP-5 | Partition leader failover | `TESTED` | — | Built and validated: leadership moves, RF preserved, ISR shrinks, writes recover |
 | RP-6 | Failover recovery latency | `TESTED` | — | Catalog is pushed on rejoin; verified on cluster |
 | RP-7 | Assignment authority | `TESTED` | — | Only the Raft leader publishes; fetch refuses when it does not lead. **Full conformance suite now PASSES, RP-0.4 included** |
@@ -398,9 +398,36 @@ The current epoch is answered with the leader's **log end offset**, not RP-2.3's
 - [x] WAL suffix truncation primitive (the gate below — it did not exist)
 - [x] Conformance test written (RP-0.4)
 - [x] Handshake proven end-to-end on a 3-node cluster
-- [ ] The **truncate** branch specifically — needs manufactured divergence (see below)
+- [x] The **truncate** branch, in-process, with exact assertions
+- [ ] The **truncate** branch on a real cluster — divergence can now be staged, and staging it found three defects (below)
 
-**Status**: `TESTED (partly)`. The exchange runs on real hardware; the branch that actually deletes data has not been triggered because nothing has yet produced a divergent log.
+**Status**: `TESTED (partly)`. The in-process cut is proven. The *system* path is not: `tests/cluster/local_divergence.sh` now manufactures divergence reliably, and doing so exposed three separate ways the repair fails to happen.
+
+#### ⚠️ Staging divergence works now — and the repair does not (found 2026-08-13)
+
+The earlier note below ("six Kubernetes attempts and three local ones failed to produce divergence") is superseded. `SIGSTOP` on both followers, an `acks=1` write to the leader, then `SIGKILL` the leader does produce a divergent log, repeatably. The test just could not see it: it spread records across three partitions while looking only at partition 0, so which partition diverged came down to the partitioner. With `-p 0` pinning, 40 orphan records land on the returning node's disk every run.
+
+With that fixed, the test's pass condition turned out to be too weak as well — it asserted that a truncation *message* appeared, not that anything was cut. A run logging `truncated to 0 (0 segment(s) removed, 0 bytes discarded)` reported PASS. It now asserts on bytes discarded and on the orphans being gone from the returning node's own disk.
+
+Three defects then surface, in two different shapes depending on timing:
+
+**D1 — reconciliation concludes "nothing to truncate" while the follower is demonstrably diverged, and spins forever.** Observed **37,166 iterations in one run**, ~1,600/second, indefinitely:
+
+```
+fetched batch spans [110, 149] across the local log end 140 — logs have diverged — reconciling
+Reconciling 1 partition(s) with the leader before fetching (leader-epoch handshake)
+log is a prefix of the leader's (ours ends at 140, the epoch ran to 470) — nothing to truncate
+```
+
+The follower has *concrete evidence* of divergence — a fetched batch straddling its log end — and then discards it in favour of an epoch comparison that says everything is fine. `plan_reconciliation` returns `Resume` whenever the leader's epoch end is at or above the local log end, which is true here (470 ≥ 140), so it resumes, refetches the same batch, detects the same divergence, and loops. The orphan records stay on disk permanently and that partition never replicates again.
+
+The epoch being asked about is the problem: the follower asks where *its* epoch ended in the leader's history, but the records it needs to discard were written by the old leader in an epoch the new leader never had. The answer cannot bound a tail it knows nothing about.
+
+**D2 — the detect → reconcile → resume cycle has no backoff.** Even when reconciliation is correct, a cycle that makes no progress should not spin at network speed. D1 is what makes it infinite; the missing backoff is what makes it a hot loop that burns a core.
+
+**D3 — a no-op truncation resets the partition's log end to 0.** `TruncateOutcome::new_log_end_offset` is `None` for two different situations — "nothing survived, the log is empty" and "I did not touch anything" — and `truncate_partition.rs` collapses both with `unwrap_or(0)`. Observed: `WAL suffix truncation was a no-op` immediately followed by `Truncation reset watermark 140 → 0`. The follower then re-replicates the entire partition from scratch, and does so against a WAL that still physically holds records 0..139.
+
+**All three are in the repair path, not the detection path.** Detection works — the follower notices divergence promptly and correctly, in both shapes. What follows is what fails.
 
 Verified on a cluster, all three steps of the chain, from one follower restart:
 
@@ -694,7 +721,9 @@ The consequence is worse than a stale read. A node that believes it leads a part
 
 ## Phase RP-6: Failover recovery latency (found 2026-08-12)
 
-**Status**: `NOT STARTED`. Not a correctness bug — the cluster converges — but it makes failover recovery take minutes instead of seconds, and it is the reason RP-0.4 still fails.
+**Status**: `TESTED` — the catalog is now pushed to a rejoining node and this was verified on the cluster. The description below is the original finding, kept because it explains what the fix is for.
+
+Not a correctness bug — the cluster converges — but it makes failover recovery take minutes instead of seconds, and it is the reason RP-0.4 still fails.
 
 A node that was leading a partition when it died comes back believing it is *still* the leader: it recovers metadata from its own WAL, which is stale by exactly the change that demoted it. `plan_assignments` skips partitions whose leader is this node, so it fetches nothing for them. It learns the truth only from the metadata anti-entropy re-broadcast — first pass at 45s, then `CHRONIK_METADATA_REBROADCAST_SECS`, default **300s**.
 
