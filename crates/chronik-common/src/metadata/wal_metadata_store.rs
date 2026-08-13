@@ -973,7 +973,23 @@ impl MetadataStore for WalMetadataStore {
             .state
             .partition_assignments
             .get(&key)
-            .map(|p| (p.leader_id, p.leader_epoch));
+            .map(|p| (p.leader_id, p.leader_epoch, p.isr.clone()));
+
+        // An empty `isr` means "I do not know", not "nobody is in sync".
+        //
+        // Most callers — the rebalancer, auto-create, the admin API, failover
+        // itself — construct an assignment to say something about *placement*
+        // and have no idea which replicas are caught up. Letting their silence
+        // erase a published in-sync set would leave failover choosing from
+        // nothing moments after a leader change, which is precisely when it must
+        // choose well. Only a caller that actually measured the set overwrites it.
+        if assignment.isr.is_empty() {
+            if let Some((_, _, previous_isr)) = &previous_seen {
+                assignment.isr = previous_isr.clone();
+            }
+        }
+
+        let previous_seen = previous_seen.map(|(leader_id, epoch, _)| (leader_id, epoch));
         assignment.leader_epoch = match previous_seen {
             Some((leader_id, epoch)) if leader_id == assignment.leader_id => epoch,
             Some((_, epoch)) => epoch.saturating_add(1),
@@ -1569,6 +1585,7 @@ mod catalog_healing_tests {
                     replicas: vec![1, 2, 3],
                     leader_id: (partition as u64 % 3) + 1,
                     leader_epoch: 0, // assigned by the metadata store
+                    isr: Vec::new(),
                 })
                 .await
                 .unwrap();
@@ -1634,6 +1651,7 @@ mod catalog_healing_tests {
                 replicas: vec![1, 2, 3],
                 leader_id: 1,
                 leader_epoch: 0, // assigned by the metadata store
+                isr: Vec::new(),
             })
             .await
             .unwrap();
@@ -1676,6 +1694,7 @@ mod leader_epoch_tests {
             replicas: vec![1, 2, 3],
             leader_id: leader,
             leader_epoch: 999, // deliberately wrong: the store must overwrite it
+            isr: Vec::new(),
         }
     }
 

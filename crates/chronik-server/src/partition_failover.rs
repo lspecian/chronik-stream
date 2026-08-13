@@ -134,7 +134,34 @@ pub fn plan_failover(
             .filter(|id| live.contains(id))
             .collect();
 
-        match live_replicas.first().copied() {
+        // Elect only from the IN-SYNC set, never from "whoever answers".
+        //
+        // Reachable is not the same as holding the data. Measured: a replica
+        // that had never replicated a single record of a partition was elected
+        // its leader on liveness alone, began writing at offset 0, and destroyed
+        // 100 records that had been acknowledged at `acks=all` — acknowledged
+        // only because the in-sync set held them. Every downstream symptom (the
+        // new leader answering `epoch … ends at -1`, a returning replica unable
+        // to reconcile, a fetch loop spinning without repairing) followed from
+        // that one choice.
+        //
+        // An empty published set means "not reported yet", not "nobody is in
+        // sync" — a partition whose leader never got to publish, or metadata
+        // predating the field. Falling back to the replica set there keeps
+        // upgrades and freshly created topics working; it is the same exposure
+        // as before this check existed, narrowed to the case where there is
+        // genuinely nothing better to go on.
+        let eligible: Vec<u64> = if assignment.isr.is_empty() {
+            live_replicas.clone()
+        } else {
+            live_replicas
+                .iter()
+                .copied()
+                .filter(|id| assignment.isr.contains(id))
+                .collect()
+        };
+
+        match eligible.first().copied() {
             Some(to) => plan.failovers.push(Failover {
                 topic: assignment.topic.clone(),
                 partition: assignment.partition,
@@ -143,6 +170,10 @@ pub fn plan_failover(
                 replicas: assignment.replicas.clone(),
                 live_replicas,
             }),
+            // Live replicas may exist and still none be eligible. Leaving the
+            // partition offline is the correct trade: unavailability is
+            // recoverable, discarding acknowledged writes is not. Kafka makes
+            // the same choice — `unclean.leader.election.enable` defaults false.
             None => plan.stranded.push(Stranded {
                 topic: assignment.topic.clone(),
                 partition: assignment.partition,
@@ -376,8 +407,10 @@ impl PartitionFailoverController {
 
         for stranded in &plan.stranded {
             warn!(
-                "{}-{}: leader {} is unreachable and no replica is alive. This partition is \
-                 unavailable until a replica returns — it cannot be failed over.",
+                "{}-{}: leader {} is unreachable and no IN-SYNC replica is available. This \
+                 partition stays unavailable until one returns. It is not failed over on \
+                 purpose: a replica that is merely reachable may hold none of the acknowledged \
+                 records, and promoting it would destroy them rather than serve them.",
                 stranded.topic, stranded.partition, stranded.leader
             );
         }
@@ -406,6 +439,12 @@ impl PartitionFailoverController {
             leader_id: failover.to,
             // Derived by the store, never by callers.
             leader_epoch: 0,
+            // Empty means "unknown", which the store reads as "leave what is
+            // published". The set this election was made FROM must survive the
+            // election: the new leader republishes from its own measurements
+            // shortly, and until then the old set is the only evidence anyone
+            // has about who holds the data.
+            isr: Vec::new(),
         };
 
         match self.metadata_store.assign_partition(assignment).await {
@@ -474,6 +513,22 @@ mod tests {
             replicas: replicas.to_vec(),
             leader_id: leader,
             leader_epoch: 0,
+            // No published set: "unknown". The tests that care set it.
+            isr: Vec::new(),
+        }
+    }
+
+    /// An assignment whose leader has published which replicas are caught up.
+    fn assignment_with_isr(
+        topic: &str,
+        partition: u32,
+        leader: u64,
+        replicas: &[u64],
+        isr: &[u64],
+    ) -> PartitionAssignment {
+        PartitionAssignment {
+            isr: isr.to_vec(),
+            ..assignment(topic, partition, leader, replicas)
         }
     }
 
@@ -723,5 +778,84 @@ mod tests {
 
         assert!(plan.failovers.is_empty());
         assert_eq!(plan.stranded.len(), 1);
+    }
+
+    /// A replica that is alive but NOT in sync must never be elected.
+    ///
+    /// This is the bug this rule exists for, measured on a three-node cluster:
+    /// node 2 was reachable, held zero records of the partition, was elected its
+    /// leader, and began writing at offset 0 — destroying 100 records that had
+    /// been acknowledged at `acks=all`. Reachable is not caught up.
+    #[test]
+    fn a_live_replica_that_is_not_in_sync_is_not_elected() {
+        // Leader 1 died. Node 2 is alive but out of sync; node 3 is in sync.
+        let assignments = vec![assignment_with_isr("orders", 0, 1, &[1, 2, 3], &[1, 3])];
+
+        let plan = plan_failover(&assignments, &live(&[2, 3]));
+
+        assert_eq!(plan.failovers.len(), 1);
+        assert_eq!(
+            plan.failovers[0].to, 3,
+            "elected node 2, which is reachable but holds none of the committed records"
+        );
+    }
+
+    /// When the only live replicas are out of sync, the partition goes offline.
+    ///
+    /// Unavailability is recoverable; discarding acknowledged writes is not.
+    /// Kafka makes the same trade — `unclean.leader.election.enable` is false by
+    /// default — and a partition that returns nothing is at least honest, where
+    /// one served by a replica missing its records is not.
+    #[test]
+    fn no_in_sync_replica_alive_strands_the_partition() {
+        let assignments = vec![assignment_with_isr("orders", 0, 1, &[1, 2, 3], &[1])];
+
+        let plan = plan_failover(&assignments, &live(&[2, 3]));
+
+        assert!(
+            plan.failovers.is_empty(),
+            "promoted an out-of-sync replica rather than leaving the partition offline"
+        );
+        assert_eq!(plan.stranded.len(), 1);
+    }
+
+    /// An unpublished set means "not measured yet", not "nobody is in sync".
+    ///
+    /// Metadata written before the field existed, and partitions whose leader
+    /// died before it could publish, both look like this. Stranding every such
+    /// partition would turn an upgrade into an outage, so the replica set is
+    /// still the fallback — the exposure that existed before this rule, and no
+    /// more than that.
+    #[test]
+    fn an_unpublished_set_falls_back_to_the_replica_set() {
+        let assignments = vec![assignment("orders", 0, 1, &[1, 2, 3])];
+
+        let plan = plan_failover(&assignments, &live(&[2, 3]));
+
+        assert_eq!(plan.failovers.len(), 1);
+        assert_eq!(plan.failovers[0].to, 2);
+    }
+
+    /// Election follows replica order among eligible candidates, not ISR order,
+    /// so the choice is stable and matches Kafka's preferred-replica ordering.
+    #[test]
+    fn election_follows_replica_order_among_the_in_sync() {
+        let assignments = vec![assignment_with_isr("orders", 0, 1, &[1, 2, 3], &[3, 2, 1])];
+
+        let plan = plan_failover(&assignments, &live(&[2, 3]));
+
+        assert_eq!(plan.failovers[0].to, 2);
+    }
+
+    /// Failing over must not shrink the replica set — the same rule that already
+    /// applies to `replicas`, now checked alongside the in-sync filter so a
+    /// future edit cannot satisfy one and break the other.
+    #[test]
+    fn electing_from_the_in_sync_set_still_preserves_every_replica() {
+        let assignments = vec![assignment_with_isr("orders", 0, 1, &[1, 2, 3], &[1, 3])];
+
+        let plan = plan_failover(&assignments, &live(&[3]));
+
+        assert_eq!(plan.failovers[0].replicas, vec![1, 2, 3]);
     }
 }

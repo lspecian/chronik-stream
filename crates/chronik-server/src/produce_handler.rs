@@ -637,6 +637,7 @@ impl ProduceHandler {
             replicas,
             leader_id,
             leader_epoch: 0, // assigned by the metadata store
+            isr: Vec::new(), // placement only — the leader publishes the in-sync set
         };
 
         // Write AssignPartition event to metadata_store
@@ -673,6 +674,7 @@ impl ProduceHandler {
             replicas: current.replicas.clone(),
             leader_id: leader,
             leader_epoch: 0, // assigned by the metadata store
+            isr: Vec::new(), // leadership only — leaves the published set intact
         };
 
         self.metadata_store.assign_partition(assignment).await?;
@@ -698,14 +700,24 @@ impl ProduceHandler {
             .find(|a| a.partition == partition as u32)
             .ok_or_else(|| Error::Storage(format!("Partition not found: {}-{}", topic, partition)))?;
 
+        // The in-sync set goes in `isr`; `replicas` is the assignment and does
+        // not change because a follower fell behind.
+        //
+        // This used to write the in-sync set into `replicas`, which permanently
+        // shrank the replica set every time a follower lagged: a partition at
+        // RF=3 whose follower dropped out became RF=2 in metadata, and the
+        // follower was no longer a replica to catch up to. Same shape as the bug
+        // that made failover shrink RF, in a second place — there was nowhere
+        // else to put the value until `PartitionAssignment::isr` existed.
         let assignment = PartitionAssignment {
             topic: topic.to_string(),
             partition: partition as u32,
             broker_id: -1,  // Deprecated field
             is_leader: false,  // Deprecated field
-            replicas: isr,
+            replicas: current.replicas.clone(),
             leader_id: current.leader_id,
             leader_epoch: 0, // assigned by the metadata store
+            isr,
         };
 
         self.metadata_store.assign_partition(assignment).await?;
@@ -3716,6 +3728,8 @@ impl ProduceHandler {
                             replicas: vec![self.config.node_id as u64],
                             leader_id: self.config.node_id as u64,
                             leader_epoch: 0, // assigned by the metadata store
+                            // Sole replica: trivially in sync with itself.
+                            isr: vec![self.config.node_id as u64],
                         };
 
                         if let Err(e) = self.metadata_store.assign_partition(assignment).await {
@@ -5288,6 +5302,7 @@ mod tests {
                 replicas: vec![1, 2],
                 leader_id: 1,
                 leader_epoch: 0, // assigned by the metadata store
+                isr: Vec::new(),
             })
             .await
             .unwrap();
@@ -5391,6 +5406,7 @@ mod tests {
                     replicas: vec![1, 2],
                     leader_id: leader,
                     leader_epoch: 0,
+                    isr: Vec::new(),
                 })
                 .await
                 .unwrap();

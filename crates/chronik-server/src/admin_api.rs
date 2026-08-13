@@ -513,6 +513,7 @@ async fn handle_rebalance(
                 replicas: replicas.clone(),
                 leader_id,
                 leader_epoch: 0, // assigned by the metadata store
+                isr: Vec::new(), // placement only — the leader publishes the in-sync set
             };
 
             if let Err(e) = state.metadata_store.assign_partition(assignment).await {
@@ -604,41 +605,28 @@ async fn collect_partition_info_from_metadata(
                             .map(|(hw, _)| hw)  // Extract high watermark from (hw, log_start_offset) tuple
                             .unwrap_or(0);
 
-                        // Get ISR from tracker - includes replicas that have caught up
-                        let tracked_isr = tracker.get_isr(
+                        // One definition of "in sync", shared with the publisher
+                        // that failover elects from. Two definitions would let an
+                        // operator read one set while the cluster acted on another.
+                        //
+                        // `None` means the tracker has heard nothing at all for
+                        // this partition — a freshly started cluster before any
+                        // report — which is "unknown", not "empty". Earlier this
+                        // fell back on *any* empty ISR, so a partition whose
+                        // followers had all fallen behind (or were never receiving
+                        // data at all, as when acks!=0 silently skipped
+                        // replication — see #29) reported a full, healthy ISR.
+                        // That is the opposite of the truth, and it is why the
+                        // replication outage stayed invisible for nine months.
+                        crate::isr_publisher::in_sync_replicas(
+                            tracker,
                             &assignment.topic,
                             assignment.partition as i32,
                             leader_offset,
                             &assignment.replicas,
-                        );
-
-                        // Fall back to "ISR = replicas" ONLY when the tracker has
-                        // heard nothing at all for this partition — i.e. a freshly
-                        // started cluster before any ACK. Previously any empty ISR
-                        // took this branch, so a partition whose followers had all
-                        // fallen behind (or were never receiving data at all, as
-                        // when acks!=0 silently skipped replication — see #29)
-                        // reported a full, healthy ISR. That is the opposite of the
-                        // truth, and it is why the replication outage stayed
-                        // invisible for nine months.
-                        let nothing_known = tracker.is_unknown_for_all(
-                            &assignment.topic,
-                            assignment.partition as i32,
-                            &assignment.replicas,
                             assignment.leader_id,
-                        );
-
-                        if nothing_known {
-                            assignment.replicas.clone()
-                        } else {
-                            // The leader is in-sync with itself by definition; it
-                            // never ACKs to itself so the tracker cannot know it.
-                            let mut isr_with_leader = tracked_isr;
-                            if !isr_with_leader.contains(&assignment.leader_id) {
-                                isr_with_leader.insert(0, assignment.leader_id);
-                            }
-                            isr_with_leader
-                        }
+                        )
+                        .unwrap_or_else(|| assignment.replicas.clone())
                     } else {
                         // No tracker available - fall back to ISR = replicas
                         assignment.replicas.clone()

@@ -93,6 +93,9 @@ pub struct IntegratedKafkaServerBuilder {
     // Partition leader failover (Stage 17, RP-5). Held for the same reason.
     partition_failover: Option<Arc<crate::partition_failover::PartitionFailoverController>>,
 
+    // Publishes the in-sync set that Stage 17 elects from (Stage 18).
+    isr_publisher: Option<Arc<crate::isr_publisher::IsrPublisher>>,
+
     // RP-6: woken when a node rejoins, so the catalog anti-entropy loop
     // re-broadcasts immediately instead of up to 5 minutes later.
     metadata_rejoin_notify: Option<Arc<tokio::sync::Notify>>,
@@ -132,6 +135,7 @@ impl IntegratedKafkaServerBuilder {
             metadata_uploader: None,
             replica_fetcher: None,
             partition_failover: None,
+            isr_publisher: None,
             metadata_rejoin_notify: None,
         }
     }
@@ -1876,6 +1880,45 @@ impl IntegratedKafkaServerBuilder {
         Ok(())
     }
 
+    /// Stage 18: publish the in-sync set (RP-5 fix).
+    ///
+    /// Failover elects from what this writes. Without it the in-sync set exists
+    /// only in the partition leader's memory, so it vanishes at the moment it is
+    /// needed — and failover falls back to electing whoever is merely reachable,
+    /// which promoted a replica holding none of the partition and destroyed
+    /// `acks=all`-acknowledged records.
+    async fn init_isr_publisher(&mut self) -> Result<()> {
+        let Some(ref cluster_config) = self.config.cluster_config else {
+            debug!("Stage 18: single-node mode, nothing to keep in sync");
+            return Ok(());
+        };
+
+        let metadata_store = self.metadata_store.as_ref()
+            .context("metadata_store not initialized")?;
+        let produce_handler = self.produce_handler_base.as_ref()
+            .context("produce_handler not initialized")?;
+
+        let Some(isr_tracker) = self.isr_tracker.as_ref() else {
+            warn!(
+                "Stage 18: no ISR tracker — the in-sync set will not be published, so a failover \
+                 cannot tell a caught-up replica from a reachable one."
+            );
+            return Ok(());
+        };
+
+        let publisher = crate::isr_publisher::IsrPublisher::new(
+            cluster_config.node_id,
+            metadata_store.clone(),
+            isr_tracker.clone(),
+            produce_handler.clone(),
+        );
+        publisher.start();
+        self.isr_publisher = Some(publisher);
+
+        info!("✅ In-sync set publication active (node {})", cluster_config.node_id);
+        Ok(())
+    }
+
     /// Build the IntegratedKafkaServer
     ///
     /// This orchestrates all initialization stages in order.
@@ -1965,6 +2008,10 @@ impl IntegratedKafkaServerBuilder {
         // Stage 17: partition leader failover (cluster mode)
         self.init_partition_failover().await
             .context("Stage 17 failed: partition failover controller")?;
+
+        // Stage 18: publish the in-sync set that Stage 17 elects from
+        self.init_isr_publisher().await
+            .context("Stage 18 failed: ISR publisher")?;
 
         info!("✅ All 17 stages complete - assembling IntegratedKafkaServer");
 

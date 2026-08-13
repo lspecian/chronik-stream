@@ -341,6 +341,26 @@ pub struct PartitionAssignment {
     /// so this is additive.
     #[serde(default)]
     pub leader_epoch: i32,
+
+    /// The in-sync replica set: which replicas actually hold this partition's
+    /// committed records.
+    ///
+    /// Published here so it OUTLIVES the leader that measured it. It is computed
+    /// from follower fetch positions, which only the partition leader sees — so
+    /// keeping it solely in that node's memory means it vanishes at exactly the
+    /// moment it is needed, when that node dies and someone must choose a
+    /// successor.
+    ///
+    /// Without it, failover elected on liveness alone and put a replica holding
+    /// *none* of the partition in charge of it, destroying 100 records that had
+    /// been acknowledged at `acks=all`. Being reachable is not the same as
+    /// holding the data.
+    ///
+    /// Empty means "not reported yet", not "nobody is in sync" — an older
+    /// metadata WAL decodes this way, and a partition whose leader has not yet
+    /// published must not be read as having an empty in-sync set.
+    #[serde(default)]
+    pub isr: Vec<u64>,
 }
 
 /// Group member information

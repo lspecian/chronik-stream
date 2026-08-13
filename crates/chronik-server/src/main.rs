@@ -48,6 +48,9 @@ mod isr_ack_tracker;
 // v2.2.7 Phase 5: Automatic leader election per partition
 mod leader_election;
 mod partition_failover;
+// Publishes each partition's in-sync set into metadata, so it outlives the
+// leader that measured it and failover can elect from it.
+mod isr_publisher;
 // v2.2.7: HTTP Admin API for cluster management
 mod admin_api;
 // v2.2.22: Unified API (SQL, Vector Search, Admin on single port)

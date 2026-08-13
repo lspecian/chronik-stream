@@ -207,6 +207,7 @@ impl PartitionRebalancer {
                 replicas: new_replicas.clone(),
                 leader_id,
                 leader_epoch: 0, // assigned by the metadata store
+                isr: Vec::new(), // placement only — the leader publishes the in-sync set
             };
 
             self.metadata_store

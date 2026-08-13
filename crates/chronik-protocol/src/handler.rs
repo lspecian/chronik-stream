@@ -3506,6 +3506,9 @@ impl ProtocolHandler {
                 replicas: all_replicas.clone(),
                 leader_id: broker_id as u64,
                 leader_epoch: 0, // assigned by the metadata store
+                // Placement only: this caller has not measured who is caught up.
+                // Empty means "unknown" and leaves any published set intact.
+                isr: Vec::new(),
             }).await
                 .map_err(|e| Error::Internal(format!("assign_partition failed: {:?}", e)))?;
 
@@ -5832,6 +5835,7 @@ impl ProtocolHandler {
                     replicas: all_replicas.clone(),  // FIXED: All brokers as replicas for cluster mode
                     leader_id: broker_id as u64,
                     leader_epoch: 0, // assigned by the metadata store
+                    isr: Vec::new(), // placement only — the leader publishes this
                 });
             }
             
@@ -6341,6 +6345,7 @@ impl ProtocolHandler {
                             replicas: all_replicas.clone(),  // FIXED: All brokers as replicas for cluster mode
                             leader_id: broker_id as u64,
                             leader_epoch: 0, // assigned by the metadata store
+                            isr: Vec::new(), // placement only — the leader publishes this
                         });
                     }
                     

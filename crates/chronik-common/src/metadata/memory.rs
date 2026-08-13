@@ -68,6 +68,7 @@ impl MetadataStore for InMemoryMetadataStore {
                 replicas: vec![1],  // Single node for standalone mode
                 leader_id: 1,  // Node 1 is leader for standalone mode
                 leader_epoch: 0, // assigned by the metadata store
+                isr: vec![1],  // single node: it is trivially in sync with itself
             };
             let key = (name.to_string(), partition);
             partition_assignments.insert(key, assignment);

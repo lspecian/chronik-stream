@@ -207,6 +207,7 @@ impl MetadataWalReplicator {
                     replicas: replicas.clone(),
                     leader_id: leader,
                     leader_epoch: 0, // assigned by the metadata store
+                    isr: Vec::new(), // placement only — the leader publishes the in-sync set
                 };
 
                 // Create MetadataEvent for replication (same format as WAL writes)

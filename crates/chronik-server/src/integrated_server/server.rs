@@ -260,6 +260,7 @@ impl IntegratedKafkaServer {
                     replicas: replicas.clone(),
                     leader_id,
                     leader_epoch: 0, // assigned by the metadata store
+                    isr: Vec::new(), // placement only — the leader publishes this
                 };
 
                 // Persist assignment via metadata store (will replicate via Raft)
