@@ -31,7 +31,7 @@ mod coordinator_manager;
 mod wal_integration;
 mod metadata_dr;
 mod wal_replication;  // v2.2.0: PostgreSQL-style WAL streaming
-mod replication;  // Phase 2.3: Extracted replication modules (connection_state, frame_reader, record_processor)
+mod replication;  // Phase 2.3: Extracted replication modules (frame_reader, record_processor)
 // v2.2.7 Phase 2: Raft for metadata coordination only (NOT data replication)
 mod raft_metadata;
 mod raft_cluster;
@@ -45,8 +45,6 @@ mod metadata_events;       // Event-based architecture for metadata WAL replicat
 mod isr_tracker;
 // v2.2.7 Phase 4: ISR ACK tracking for acks=-1 quorum support
 mod isr_ack_tracker;
-// v2.2.7 Phase 5: Automatic leader election per partition
-mod leader_election;
 mod partition_failover;
 // Publishes each partition's in-sync set into metadata, so it outlives the
 // leader that measured it and failover can elect from it.

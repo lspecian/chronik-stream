@@ -25,62 +25,6 @@ use super::apply::{apply_fetched_records, ApplyRefusal};
 use super::connection::LeaderConnection;
 use super::protocol::{FetchPartitionRequest, FetchRequestSpec, FetchTopicRequest};
 
-/// Which replication mechanism moves partition data.
-///
-/// These are mutually exclusive by construction: running both would deliver
-/// every record twice and the follower would refuse the duplicates as gaps.
-/// There is no coexistence mode, and there is no external consumer of the
-/// replication protocol, so switching is an image redeploy rather than a
-/// runtime toggle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReplicationMode {
-    /// Leader pushes to followers over the WAL replication port (the mechanism
-    /// RP-1 hardened). Default until pull is soaked.
-    Push,
-    /// Followers fetch from their leader over the Kafka port (RP-2.4).
-    Pull,
-}
-
-impl ReplicationMode {
-    /// Read `CHRONIK_REPLICATION_MODE`, defaulting to **pull**.
-    ///
-    /// Pull became the default on 2026-08-13, ahead of RP-4 deleting the push
-    /// data path entirely. The two changes are deliberately separate so they can
-    /// fail separately: everything from RP-2 onwards was validated with
-    /// `CHRONIK_REPLICATION_MODE=pull` set explicitly, so flipping the default
-    /// puts anyone who sets nothing on that same validated path — while
-    /// `CHRONIK_REPLICATION_MODE=push` is still there to fall back to until the
-    /// switch itself is removed.
-    ///
-    /// An unrecognised value warns and uses pull rather than quietly selecting a
-    /// mechanism the operator did not ask for.
-    pub fn from_env() -> Self {
-        match std::env::var("CHRONIK_REPLICATION_MODE") {
-            Ok(v) => Self::parse(&v),
-            Err(_) => ReplicationMode::Pull,
-        }
-    }
-
-    pub fn parse(raw: &str) -> Self {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "pull" | "fetch" | "follower-pull" | "" => ReplicationMode::Pull,
-            "push" => ReplicationMode::Push,
-            other => {
-                warn!(
-                    "CHRONIK_REPLICATION_MODE='{}' is not recognised; using pull (the default). \
-                     Valid values: pull, push",
-                    other
-                );
-                ReplicationMode::Pull
-            }
-        }
-    }
-
-    pub fn is_pull(&self) -> bool {
-        matches!(self, ReplicationMode::Pull)
-    }
-}
-
 /// Pause after a fetch that returned nothing, so the loop cannot spin through
 /// the brief window where the leader's log end is ahead of what it can serve.
 /// Deliberately far below `max_wait_ms`: this is a spin guard, not a poll
@@ -1247,25 +1191,6 @@ mod tests {
             plan_assignments(3, &reversed, &peers()),
             "the same assignments must produce the same plan regardless of order"
         );
-    }
-
-    /// Pull is the default as of 2026-08-13; push remains selectable until RP-4
-    /// removes the switch with the code behind it.
-    #[test]
-    fn replication_mode_defaults_to_pull() {
-        assert_eq!(ReplicationMode::parse(""), ReplicationMode::Pull);
-        assert_eq!(ReplicationMode::parse("pull"), ReplicationMode::Pull);
-        assert_eq!(ReplicationMode::parse("  PULL  "), ReplicationMode::Pull);
-        assert_eq!(ReplicationMode::parse("push"), ReplicationMode::Push);
-    }
-
-    /// A typo must not silently disable replication — that is the failure this
-    /// whole roadmap exists because of. It now lands on pull, the default and
-    /// the mechanism every phase since RP-2 was validated against.
-    #[test]
-    fn an_unknown_replication_mode_falls_back_to_the_default() {
-        assert_eq!(ReplicationMode::parse("pulll"), ReplicationMode::Pull);
-        assert_eq!(ReplicationMode::parse("off"), ReplicationMode::Pull);
     }
 
     // ---- RP-3.3: the cut itself, end to end ----

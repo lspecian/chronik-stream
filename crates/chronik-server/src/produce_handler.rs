@@ -460,7 +460,6 @@ pub struct ProduceHandler {
     /// WAL replication manager for PostgreSQL-style streaming (v2.2.0+)
     /// CRITICAL: Option<Arc<>> NOT Arc<RwLock<>> to avoid hot path locks!
     /// Fire-and-forget async replication, never blocks produce path
-    wal_replication_manager: Option<Arc<WalReplicationManager>>,
     /// ISR ACK tracker for acks=-1 quorum support (v2.2.7 Phase 4)
     /// Tracks pending acks=-1 requests and notifies when ISR quorum reached
     isr_ack_tracker: Option<Arc<crate::isr_ack_tracker::IsrAckTracker>>,
@@ -469,7 +468,6 @@ pub struct ProduceHandler {
     leader_epochs: Arc<crate::replication::leader_epoch::LeaderEpochStore>,
     /// Leader elector for partition leader failover (v2.2.7 Phase 5)
     /// Used to record heartbeats when handling produce requests as leader
-    leader_elector: Option<Arc<crate::leader_election::LeaderElector>>,
     /// Metadata event bus for high watermark replication (v2.2.7.2)
     /// Emits HighWatermarkUpdated events to replicate watermarks < 10ms via metadata WAL
     event_bus: Option<Arc<crate::metadata_events::MetadataEventBus>>,
@@ -1227,10 +1225,8 @@ impl ProduceHandler {
             topic_creation_cache: Arc::new(RwLock::new(HashMap::new())),
             wal_manager: None,
             raft_cluster: None,  // v2.2.7 Phase 3: Initialize as None (set via set_raft_cluster)
-            wal_replication_manager: None,  // v2.2.0 Phase 1: Initialize as None
             isr_ack_tracker: None,  // v2.2.7 Phase 4: Initialize as None (set via set_isr_ack_tracker)
             leader_epochs: Arc::new(crate::replication::leader_epoch::LeaderEpochStore::new()),
-            leader_elector: None,  // v2.2.7 Phase 5: Initialize as None (set via set_leader_elector)
             event_bus: None,  // v2.2.7.2: Initialize as None (set via set_event_bus)
             leadership_cache: Arc::new(DashMap::new()),  // Optimization #4: Empty cache, populated on first access
             pipelined_pool: Arc::new(PipelinedConnectionPool::new(10000)),  // v2.2.9: Async pipelined connection pool (capacity increased from 1000 → 10000 to prevent channel blocking)
@@ -1279,11 +1275,6 @@ impl ProduceHandler {
         self.raft_cluster = Some(raft_cluster);
     }
 
-    /// Set the WAL replication manager for PostgreSQL-style streaming (v2.2.0+)
-    pub fn set_wal_replication_manager(&mut self, replication_manager: Arc<WalReplicationManager>) {
-        info!("Setting WalReplicationManager for ProduceHandler");
-        self.wal_replication_manager = Some(replication_manager);
-    }
 
     /// Set the ISR ACK tracker for acks=-1 quorum support (v2.2.7 Phase 4)
     /// RP-3: expose this node's leadership history, for serving
@@ -1331,11 +1322,6 @@ impl ProduceHandler {
         self.isr_ack_tracker = Some(tracker);
     }
 
-    /// Set the leader elector for partition leader failover (v2.2.7 Phase 5)
-    pub fn set_leader_elector(&mut self, elector: Arc<crate::leader_election::LeaderElector>) {
-        info!("Setting LeaderElector for ProduceHandler - enables heartbeat tracking");
-        self.leader_elector = Some(elector);
-    }
 
     /// Start metadata event listener background task (v2.2.14 refactoring)
     ///
@@ -2436,8 +2422,6 @@ impl ProduceHandler {
         }
 
         // v2.2.0: Store serialized WAL data for replication (zero-copy optimization)
-        let serialized_for_replication: Option<Vec<u8>>;
-
         // The async-response path (acks != 0) used to `return` straight from inside
         // the WAL block, which silently skipped every post-write side effect below —
         // most importantly the WAL replication hook, so `acks=1` / `acks=all` never
@@ -2460,10 +2444,6 @@ impl ProduceHandler {
             debug!("✅ WAL_MGR_FOUND: Entering WAL write path for topic={} partition={}", topic, partition);
             use chronik_storage::canonical_record::CanonicalRecord;
 
-            // PERFORMANCE OPTIMIZATION (v2.2.7): Skip wire bytes preservation if no replication
-            // This avoids an expensive .to_vec() clone when replication is disabled
-            let needs_replication = self.wal_replication_manager.is_some();
-
             // Convert to CanonicalRecord and serialize (ONCE - reused for replication)
             // from_kafka_batch() now automatically preserves compressed_records_wire_bytes
             // for BOTH compressed and uncompressed batches (v2.2.7 fix)
@@ -2480,15 +2460,6 @@ impl ProduceHandler {
 
                     match bincode::serialize(&canonical_record) {
                         Ok(serialized) => {
-                            // v2.2.7: ALWAYS populate serialized_for_replication when wal_replication_manager exists
-                            // The wire bytes optimization (line 1375-1377) only affects CRC preservation, not replication!
-                            // BUG FIX: Previously set to None when !needs_replication, breaking replication entirely
-                            serialized_for_replication = if needs_replication {
-                                Some(serialized.clone())
-                            } else {
-                                None  // No replication manager = no data to replicate
-                            };
-
                             // v2.2.10 CRITICAL PERFORMANCE FIX #7: Async response delivery for acks=1
                             // OLD (v2.2.9): Synchronous WAL fsync blocking → 2,197 msg/s (168x slower)
                             // NEW (v2.2.10): Async callback-based responses → 300,000+ msg/s (150x+ improvement)
@@ -2620,48 +2591,10 @@ impl ProduceHandler {
         } else {
             error!("❌ WAL_MGR_NONE: wal_manager is None! topic={} partition={} - WAL WRITES SKIPPED!",
                    topic, partition);
-            serialized_for_replication = None;
         }
 
-        // v2.2.7 Phase 3: WAL Replication Hook with ISR-aware routing
-        // Zero-copy optimization: Reuse serialized WAL data from above (no re-parsing!)
-        // This is called AFTER WAL write completes, so data is durable locally
-        if let Some(ref wal_repl_mgr) = self.wal_replication_manager {
-            debug!("🔍 DEBUG: WAL replication manager exists for {}-{}", topic, partition);
-            if let Some(serialized_data) = serialized_for_replication {
-                debug!("🔍 DEBUG: Serialized data exists ({} bytes), spawning replication task for {}-{} offset={}",
-                    serialized_data.len(), topic, partition, base_offset);
-
-                // Clone necessary metadata (cheap - just strings and ints)
-                let topic_clone = topic.to_string();
-                let partition_clone = partition;
-                let base_offset_clone = base_offset as i64;
-                let repl_mgr_clone = Arc::clone(wal_repl_mgr);
-
-                // Get current high watermark for ISR filtering
-                let high_watermark = partition_state.high_watermark.load(Ordering::SeqCst) as i64;
-
-                // Spawn background task (fire-and-forget, never blocks)
-                // v2.2.7: Use replicate_partition for ISR-aware routing
-                tokio::spawn(async move {
-                    debug!("🚀 DEBUG: Calling replicate_partition for {}-{} offset={}",
-                        topic_clone, partition_clone, base_offset_clone);
-                    repl_mgr_clone.replicate_partition(
-                        topic_clone,
-                        partition_clone,
-                        base_offset_clone,
-                        high_watermark,  // For ISR filtering
-                        serialized_data,
-                    ).await;
-                    // Errors are logged inside replicate_partition, we don't block produce
-                });
-            } else {
-                // WAL manager was None, nothing to replicate
-                debug!("⚠️ DEBUG: Skipping replication for {}-{}: serialized_for_replication is None!", topic, partition);
-            }
-        } else {
-            debug!("⚠️ DEBUG: Skipping replication for {}-{}: wal_replication_manager is None!", topic, partition);
-        }
+        // RP-4: nothing is pushed here. Followers fetch this record from the
+        // leader's log (RP-2.4), so the produce path's job ends at the WAL.
 
         // v2.2.7 FIX: Removed duplicate buffering code that was always running
         // (lines 1491-1499 were duplicate of lines 1475-1488)
@@ -4023,10 +3956,8 @@ impl Clone for ProduceHandler {
             topic_creation_cache: Arc::clone(&self.topic_creation_cache),
             wal_manager: self.wal_manager.clone(),
             raft_cluster: self.raft_cluster.clone(),  // v2.2.7 Phase 3
-            wal_replication_manager: self.wal_replication_manager.clone(),  // v2.2.0 Phase 1
             isr_ack_tracker: self.isr_ack_tracker.clone(),  // v2.2.7 Phase 4
             leader_epochs: self.leader_epochs.clone(),
-            leader_elector: self.leader_elector.clone(),  // v2.2.7 Phase 5
             event_bus: self.event_bus.clone(),  // v2.2.7.2
             leadership_cache: Arc::clone(&self.leadership_cache),  // Optimization #4
             pipelined_pool: Arc::clone(&self.pipelined_pool),  // v2.2.9: Async pipelined connection pool
@@ -5122,18 +5053,17 @@ mod tests {
         // via the public handle_fetch API in separate integration tests.
     }
 
-    /// Build a ProduceHandler in the exact shape cluster mode uses: a real WAL, a
-    /// WalReplicationManager, and a ResponsePipeline wired to the GroupCommitWal
-    /// commit callback.
+    /// Build a ProduceHandler in the exact shape cluster mode uses: a real WAL
+    /// and a ResponsePipeline wired to the GroupCommitWal commit callback.
     ///
     /// The ResponsePipeline is the part that matters. `use_async_responses` is
     /// `response_pipeline.is_some() && acks != 0`, so a handler *without* one takes
     /// the synchronous path and replicates fine — which is why every pre-existing
     /// test missed this bug. Only this wiring reproduces the async path.
-    async fn handler_with_replication(
+    async fn handler_with_pipeline(
         temp_dir: &tempfile::TempDir,
         metadata_store: Arc<InMemoryMetadataStore>,
-    ) -> (ProduceHandler, Arc<crate::wal_replication::WalReplicationManager>) {
+    ) -> ProduceHandler {
         use chronik_wal::config::{CompressionType as WalCompression, WalConfig};
 
         let wal_config = WalConfig {
@@ -5177,8 +5107,6 @@ mod tests {
         // No followers: with `metadata_store: None` the manager falls back to
         // replicate_serialized(), which still enqueues. We assert on the queue,
         // not on a socket, so no peer is needed.
-        let repl_mgr = crate::wal_replication::WalReplicationManager::new(Vec::new());
-        handler.set_wal_replication_manager(repl_mgr.clone());
 
         // Mirror builder.rs `setup_response_pipeline`: without the commit callback
         // the async path's oneshot never resolves.
@@ -5197,83 +5125,7 @@ mod tests {
         wal_manager.group_commit_wal().set_commit_callback(commit_callback);
         handler.set_response_pipeline(response_pipeline);
 
-        (handler, repl_mgr)
-    }
-
-    /// Regression test for the WAL-replication hook being skipped on the
-    /// async-response path.
-    ///
-    /// `produce_to_partition` used to `return` from inside the WAL block once the
-    /// ResponsePipeline callback fired, jumping over the replication hook that sits
-    /// after it. Since that path is taken whenever `acks != 0`, `acks=1` and
-    /// `acks=all` replicated **nothing** while `acks=0` replicated normally — the
-    /// durability contract exactly inverted. Verified on a live 3-node RF=3 cluster:
-    /// an acks=1 topic existed only on its leader, an acks=0 topic on all three.
-    ///
-    /// Asserting on `total_queued` is the tightest check available: a record that
-    /// never reaches the queue can never reach a follower.
-    #[tokio::test]
-    async fn test_replication_fires_for_every_acks_mode() {
-        use tempfile::TempDir;
-
-        for acks in [0i16, 1, -1] {
-            let temp_dir = TempDir::new().unwrap();
-            let metadata_store = Arc::new(InMemoryMetadataStore::new());
-            let (mut handler, repl_mgr) =
-                handler_with_replication(&temp_dir, metadata_store.clone()).await;
-
-            let mut topic_config = TopicConfig::default();
-            topic_config.partition_count = 1;
-            metadata_store
-                .create_topic("repl-topic", topic_config)
-                .await
-                .unwrap();
-
-            let before = repl_mgr.total_queued();
-
-            let request = ProduceRequest {
-                transactional_id: None,
-                acks,
-                timeout_ms: 5000,
-                topics: vec![ProduceRequestTopic {
-                    name: "repl-topic".to_string(),
-                    partitions: vec![ProduceRequestPartition {
-                        index: 0,
-                        records: create_simple_record_batch(0, vec!["m1", "m2"]),
-                    }],
-                }],
-            };
-
-            // Bound the wait: before the fix the acks!=0 paths simply never enqueued,
-            // so poll rather than sleeping a fixed amount, and fail loudly.
-            let response = tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                handler.handle_produce(request, 1),
-            )
-            .await
-            .unwrap_or_else(|_| panic!("produce timed out for acks={}", acks))
-            .unwrap();
-            assert_eq!(
-                response.topics[0].partitions[0].error_code, 0,
-                "produce failed for acks={}",
-                acks
-            );
-
-            // The hook spawns a fire-and-forget task, so give it a bounded chance to land.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while repl_mgr.total_queued() == before && std::time::Instant::now() < deadline {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-
-            assert!(
-                repl_mgr.total_queued() > before,
-                "acks={} produced no replication traffic (queued stayed at {}). \
-                 The produce path returned before the WAL replication hook, so this \
-                 data would exist only on the leader despite RF>1.",
-                acks,
-                before
-            );
-        }
+        handler
     }
 
     /// RP-1.3: `acks=all` must not answer the client until follower ACKs arrive.
@@ -5289,8 +5141,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let metadata_store = Arc::new(InMemoryMetadataStore::new());
-        let (mut handler, _repl) =
-            handler_with_replication(&temp_dir, metadata_store.clone()).await;
+        let mut handler = handler_with_pipeline(&temp_dir, metadata_store.clone()).await;
 
         // Two replicas, and require both (leader + one follower) to acknowledge.
         handler.config.min_insync_replicas = 2;

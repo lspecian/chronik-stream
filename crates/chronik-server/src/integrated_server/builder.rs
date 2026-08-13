@@ -81,7 +81,6 @@ pub struct IntegratedKafkaServerBuilder {
 
     // Replication and leader election (Stage 4)
     wal_replication_manager: Option<Arc<crate::wal_replication::WalReplicationManager>>,
-    leader_elector: Option<Arc<crate::leader_election::LeaderElector>>,
 
     // Metadata DR (Stage 5)
     metadata_uploader: Option<Arc<chronik_common::metadata::MetadataUploader>>,
@@ -131,7 +130,6 @@ impl IntegratedKafkaServerBuilder {
             hot_vector_index: None,
             hot_vector_batcher_slot: None,
             wal_replication_manager: None,
-            leader_elector: None,
             metadata_uploader: None,
             replica_fetcher: None,
             partition_failover: None,
@@ -690,7 +688,7 @@ impl IntegratedKafkaServerBuilder {
         info!("✅ EventBus, IsrAckTracker, and IsrTracker wired");
 
         // Step 4: Wire Raft dependencies (cluster mode only)
-        let leader_elector = self.wire_raft_dependencies(&mut produce_handler_inner, &isr_ack_tracker, &isr_tracker, metadata_store);
+        self.wire_raft_dependencies(&mut produce_handler_inner, &isr_ack_tracker, &isr_tracker, metadata_store);
 
         // Step 5: Setup response pipeline with WAL callback
         let response_pipeline = self.setup_response_pipeline(&mut produce_handler_inner, wal_manager);
@@ -719,7 +717,6 @@ impl IntegratedKafkaServerBuilder {
         self.isr_ack_tracker = Some(isr_ack_tracker);
         self.isr_tracker = Some(isr_tracker);
         self.response_pipeline = Some(response_pipeline);
-        self.leader_elector = leader_elector;
 
         info!("✅ ProduceHandler initialized with all dependencies and wiring");
         Ok(())
@@ -1146,54 +1143,27 @@ impl IntegratedKafkaServerBuilder {
     }
 
     /// Helper: Wire Raft-related dependencies to ProduceHandler
+    ///
+    /// RP-4: there is no data-push manager to wire any more. Followers fetch
+    /// (RP-2.4); the leader does not push. Metadata keeps its own manager from
+    /// stage 6 and is unaffected.
     fn wire_raft_dependencies(
         &self,
         produce_handler: &mut crate::produce_handler::ProduceHandler,
-        isr_ack_tracker: &Arc<crate::isr_ack_tracker::IsrAckTracker>,
-        isr_tracker: &Arc<crate::isr_tracker::IsrTracker>,
-        metadata_store: &Arc<dyn MetadataStore>,
-    ) -> Option<Arc<crate::leader_election::LeaderElector>> {
+        _isr_ack_tracker: &Arc<crate::isr_ack_tracker::IsrAckTracker>,
+        _isr_tracker: &Arc<crate::isr_tracker::IsrTracker>,
+        _metadata_store: &Arc<dyn MetadataStore>,
+    ) {
         let raft_cluster = match self.raft_cluster_for_metadata.as_ref() {
             Some(c) => c,
             None => {
                 info!("⚠️  Raft clustering disabled - single-node mode");
-                return None;
+                return;
             }
         };
 
-        // Wire RaftCluster
         produce_handler.set_raft_cluster(Arc::clone(raft_cluster));
-
-        // Create and wire LeaderElector
-        let elector = Arc::new(crate::leader_election::LeaderElector::new(
-            raft_cluster.clone(),
-            metadata_store.clone(),
-        ));
-        produce_handler.set_leader_elector(elector.clone());
-        info!("✓ LeaderElector ready (event-driven mode)");
-
-        // RP-2.4: under pull replication the leader does not push data — followers
-        // fetch it. Wiring both would deliver every record twice, and the follower
-        // would reject the second copy as a gap. Metadata keeps its own manager
-        // (stage 6) and is unaffected either way.
-        let mode = crate::replication::replica_fetcher::ReplicationMode::from_env();
-        if mode.is_pull() {
-            info!("✅ Pull replication: leader will serve followers via Fetch, not push");
-        } else {
-            // Create and wire WalReplicationManager for data messages
-            let data_wal_repl_manager = crate::wal_replication::WalReplicationManager::new_with_dependencies(
-                Vec::new(),
-                Some(raft_cluster.clone()),
-                Some(isr_tracker.clone()),
-                Some(isr_ack_tracker.clone()),
-                self.config.cluster_config.clone().map(Arc::new),
-                Some(metadata_store.clone()),
-            );
-            produce_handler.set_wal_replication_manager(data_wal_repl_manager);
-            info!("✅ Data WAL replication manager wired (replica cache enabled)");
-        }
-
-        Some(elector)
+        info!("✅ Pull replication: followers fetch from the leader; nothing is pushed");
     }
 
     /// Helper: Setup ResponsePipeline with WAL commit callback
@@ -1522,14 +1492,11 @@ impl IntegratedKafkaServerBuilder {
             fetch_handler.set_isr_ack_tracker(isr_ack_tracker.clone());
         }
 
-        // RP-2.3: consumers see only what the in-sync set holds. Tied to pull,
-        // because under push the follower positions come from ACK frames whose
-        // delivery this roadmap has already had to fix three times — bounding
-        // consumer visibility on that data would turn a reporting bug into a
-        // stall.
-        if crate::replication::replica_fetcher::ReplicationMode::from_env().is_pull() {
-            fetch_handler.set_hw_from_isr(true);
-        }
+        // RP-2.3: consumers see only what the in-sync set holds. Unconditional
+        // since RP-4 — follower positions are their own fetch offsets, which
+        // cannot be stale without the follower having stopped, in which case it
+        // leaves ISR and stops constraining the watermark.
+        fetch_handler.set_hw_from_isr(true);
 
         self.fetch_handler = Some(Arc::new(fetch_handler));
 
@@ -1746,7 +1713,6 @@ impl IntegratedKafkaServerBuilder {
                 .context("wal_manager not initialized")?;
             let isr_ack_tracker = self.isr_ack_tracker.as_ref()
                 .context("isr_ack_tracker not initialized")?;
-            let leader_elector = self.leader_elector.as_ref();
             let raft_cluster = self.raft_cluster_for_metadata.as_ref();
             let produce_handler = self.produce_handler_base.as_ref()
                 .context("produce_handler not initialized")?;
@@ -1760,11 +1726,6 @@ impl IntegratedKafkaServerBuilder {
                 isr_ack_tracker.clone(),
                 cluster_config.node_id,
             );
-
-            // Wire up leader elector if available
-            if let Some(elector) = leader_elector {
-                wal_receiver.set_leader_elector(elector.clone());
-            }
 
             // Wire up Raft cluster if available
             if let Some(raft) = raft_cluster {
@@ -1796,17 +1757,9 @@ impl IntegratedKafkaServerBuilder {
 
     /// Stage 16: Start follower-pull replication (RP-2.4).
     ///
-    /// Cluster mode only, and only when `CHRONIK_REPLICATION_MODE=pull`. Push
-    /// remains the default until pull is soaked on a real cluster; the two are
-    /// mutually exclusive, since running both would deliver every record twice
-    /// and the follower would reject the duplicates as gaps.
+    /// Cluster mode only. This is the sole data-replication mechanism as of
+    /// RP-4 — there is no push path left to choose between.
     async fn init_replica_fetcher(&mut self) -> Result<()> {
-        let mode = crate::replication::replica_fetcher::ReplicationMode::from_env();
-        if !mode.is_pull() {
-            debug!("Stage 16: push replication selected, no replica fetcher");
-            return Ok(());
-        }
-
         let Some(ref cluster_config) = self.config.cluster_config else {
             info!("Stage 16: single-node mode, nothing to replicate");
             return Ok(());
@@ -2052,7 +2005,6 @@ impl IntegratedKafkaServerBuilder {
         let metadata_store = self.metadata_store.unwrap();
         let wal_indexer = self.wal_indexer.unwrap();
         let metadata_uploader = self.metadata_uploader;
-        let leader_elector = self.leader_elector;
         let isr_tracker = self.isr_tracker;
         let hot_text_index = self.hot_text_index;
         let hot_vector_index = self.hot_vector_index;
@@ -2064,7 +2016,6 @@ impl IntegratedKafkaServerBuilder {
             metadata_store,
             wal_indexer,
             metadata_uploader,
-            leader_elector,
             isr_tracker,
             hot_text_index,
             hot_vector_index,

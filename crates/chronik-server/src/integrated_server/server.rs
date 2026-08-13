@@ -100,7 +100,6 @@ pub struct IntegratedKafkaServer {
     wal_indexer: Arc<WalIndexer>,
     metadata_uploader: Option<Arc<chronik_common::metadata::MetadataUploader>>,
     /// v2.2.7 Phase 5: Leader election per partition
-    leader_elector: Option<Arc<crate::leader_election::LeaderElector>>,
     /// v2.2.22: ISR tracker for admin API (tracks follower offsets from WAL ACKs)
     isr_tracker: Option<Arc<crate::isr_tracker::IsrTracker>>,
     /// HP-1.3: Shared hot text index (NRT search), exposed so the unified API
@@ -123,7 +122,6 @@ impl Clone for IntegratedKafkaServer {
             metadata_store: self.metadata_store.clone(),
             wal_indexer: self.wal_indexer.clone(),
             metadata_uploader: self.metadata_uploader.clone(),
-            leader_elector: self.leader_elector.clone(),
             isr_tracker: self.isr_tracker.clone(),
             hot_text_index: self.hot_text_index.clone(),
             hot_vector_index: self.hot_vector_index.clone(),
@@ -141,7 +139,6 @@ impl IntegratedKafkaServer {
         metadata_store: Arc<dyn MetadataStore>,
         wal_indexer: Arc<WalIndexer>,
         metadata_uploader: Option<Arc<chronik_common::metadata::MetadataUploader>>,
-        leader_elector: Option<Arc<crate::leader_election::LeaderElector>>,
         isr_tracker: Option<Arc<crate::isr_tracker::IsrTracker>>,
         hot_text_index: Option<Arc<chronik_search::hot_text_index::HotTextIndex>>,
         hot_vector_index: Option<Arc<chronik_columnar::hot_vector_index::HotVectorIndex>>,
@@ -155,7 +152,6 @@ impl IntegratedKafkaServer {
             metadata_store,
             wal_indexer,
             metadata_uploader,
-            leader_elector,
             isr_tracker,
             hot_text_index,
             hot_vector_index,

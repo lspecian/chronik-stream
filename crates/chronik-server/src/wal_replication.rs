@@ -1873,7 +1873,6 @@ pub struct WalReceiver {
     node_id: u64,
 
     /// Leader elector for triggering elections on timeout (v2.2.7)
-    leader_elector: Option<Arc<crate::leader_election::LeaderElector>>,
 
     /// Last heartbeat timestamp per partition (v2.2.7)
     last_heartbeat: Arc<DashMap<(String, i32), std::time::Instant>>,
@@ -1900,7 +1899,6 @@ impl WalReceiver {
             shutdown: Arc::new(AtomicBool::new(false)),
             isr_ack_tracker: None,
             node_id: 0, // Default node ID (standalone mode)
-            leader_elector: None,
             last_heartbeat: Arc::new(DashMap::new()),
             raft_cluster: None,
             produce_handler: None,
@@ -1922,7 +1920,6 @@ impl WalReceiver {
             shutdown: Arc::new(AtomicBool::new(false)),
             isr_ack_tracker: Some(isr_ack_tracker),
             node_id,
-            leader_elector: None,
             last_heartbeat: Arc::new(DashMap::new()),
             raft_cluster: None,
             produce_handler: None,
@@ -1930,11 +1927,6 @@ impl WalReceiver {
         }
     }
 
-    /// Set leader elector for event-driven elections (v2.2.7)
-    pub fn set_leader_elector(&mut self, elector: Arc<crate::leader_election::LeaderElector>) {
-        info!("WalReceiver: Enabling event-driven leader election");
-        self.leader_elector = Some(elector);
-    }
 
     /// Set Raft cluster for metadata WAL replication (Phase 2.3)
     pub fn set_raft_cluster(&mut self, raft_cluster: Arc<RaftCluster>) {
@@ -1984,7 +1976,6 @@ impl WalReceiver {
                     let isr_ack_tracker = self.isr_ack_tracker.clone();
                     let node_id = self.node_id;
                     let last_heartbeat = Arc::clone(&self.last_heartbeat);
-                    let leader_elector = self.leader_elector.clone();
                     let raft_cluster = self.raft_cluster.clone();
 
                     let produce_handler_for_conn = self.produce_handler.clone();
@@ -1998,7 +1989,6 @@ impl WalReceiver {
                             isr_ack_tracker,
                             node_id,
                             last_heartbeat,
-                            leader_elector,
                             raft_cluster,
                             produce_handler_for_conn,
                             metadata_store_for_conn,
@@ -2031,39 +2021,12 @@ impl WalReceiver {
         isr_ack_tracker: Option<Arc<crate::isr_ack_tracker::IsrAckTracker>>,
         node_id: u64,
         last_heartbeat: Arc<DashMap<(String, i32), std::time::Instant>>,
-        leader_elector: Option<Arc<crate::leader_election::LeaderElector>>,
         raft_cluster: Option<Arc<RaftCluster>>,
         produce_handler: Option<Arc<crate::produce_handler::ProduceHandler>>,
         metadata_store: Option<Arc<dyn chronik_common::metadata::MetadataStore>>,
     ) -> Result<()> {
         let mut buffer = BytesMut::with_capacity(64 * 1024); // 64KB buffer
 
-        // v2.2.7 DEADLOCK FIX: Spawn timeout monitor with channel-based elections
-        // The monitor sends election requests to a channel instead of calling directly,
-        // preventing deadlocks with raft_node lock
-        if let Some(ref elector) = leader_elector {
-            // Create election trigger channel
-            let (election_tx, election_rx) = mpsc::unbounded_channel();
-
-            // Spawn election worker that can safely lock raft_node
-            let elector_clone = Arc::clone(elector);
-            tokio::spawn(async move {
-                Self::run_election_worker(election_rx, elector_clone).await;
-            });
-
-            // Spawn timeout monitor that sends to channel (non-blocking)
-            let last_heartbeat_clone = Arc::clone(&last_heartbeat);
-            let shutdown_clone = Arc::clone(&shutdown);
-            tokio::spawn(async move {
-                Self::monitor_timeouts(
-                    election_tx,
-                    last_heartbeat_clone,
-                    shutdown_clone,
-                ).await;
-            });
-
-            info!("WAL timeout monitoring ENABLED with channel-based elections (deadlock-free)");
-        }
 
         while !shutdown.load(Ordering::Relaxed) {
             // Read frame header (8 bytes: magic + version + length)
@@ -2501,94 +2464,6 @@ impl WalReceiver {
         info!("🔍 DEBUG send_ack: Flush complete, ACK sent successfully");
 
         Ok(())
-    }
-
-    /// Election worker task - processes election triggers from channel (v2.2.7 deadlock fix)
-    ///
-    /// This task runs independently and can safely lock raft_node because it doesn't
-    /// hold any other locks. The timeout monitor sends election requests to this worker
-    /// via the channel, avoiding deadlocks.
-    pub async fn run_election_worker(
-        mut election_rx: mpsc::UnboundedReceiver<ElectionTriggerMessage>,
-        leader_elector: Arc<crate::leader_election::LeaderElector>,
-    ) {
-        info!("Started election worker task (non-blocking elections)");
-
-        while let Some(msg) = election_rx.recv().await {
-            debug!(
-                "Election worker: Processing trigger for {}-{}: {}",
-                msg.topic, msg.partition, msg.reason
-            );
-
-            // This is safe because the worker doesn't hold any locks
-            // It can wait for raft_node lock without blocking other operations
-            let result = leader_elector.trigger_election_on_timeout(
-                &msg.topic,
-                msg.partition,
-                &msg.reason,
-            ).await;
-
-            if let Err(e) = result {
-                debug!(
-                    "Election trigger failed for {}-{}: {} (this is normal if not leader)",
-                    msg.topic, msg.partition, e
-                );
-            }
-        }
-
-        info!("Election worker stopped");
-    }
-
-    /// Monitor partition heartbeat timeouts and trigger elections (v2.2.7)
-    pub async fn monitor_timeouts(
-        election_tx: mpsc::UnboundedSender<ElectionTriggerMessage>,
-        last_heartbeat: Arc<DashMap<(String, i32), std::time::Instant>>,
-        shutdown: Arc<AtomicBool>,
-    ) {
-        info!("Started WAL timeout monitor for event-driven elections (channel-based)");
-
-        while !shutdown.load(Ordering::Relaxed) {
-            // Check every 5 seconds
-            sleep(Duration::from_secs(5)).await;
-
-            let now = std::time::Instant::now();
-
-            // v2.2.7 DEADLOCK FIX: Collect keys to remove FIRST, then remove after iteration
-            // CRITICAL: Cannot call remove() while iterating - causes DashMap shard lock deadlock!
-            let mut to_remove = Vec::new();
-
-            // Check each partition for timeout
-            for entry in last_heartbeat.iter() {
-                let (topic, partition) = entry.key();
-                let last_seen = *entry.value();
-
-                if now.duration_since(last_seen) > HEARTBEAT_TIMEOUT {
-                    warn!(
-                        "WAL stream timeout detected for {}-{} ({}s since last heartbeat)",
-                        topic, partition, now.duration_since(last_seen).as_secs()
-                    );
-
-                    // v2.2.7 DEADLOCK FIX: Send to channel instead of calling directly
-                    // This never blocks, preventing deadlock with raft_node lock
-                    let _ = election_tx.send(ElectionTriggerMessage {
-                        topic: topic.to_string(),
-                        partition: *partition,
-                        reason: format!("WAL stream timeout ({}s)", now.duration_since(last_seen).as_secs()),
-                    });
-
-                    // Collect key for removal (cannot remove during iteration!)
-                    to_remove.push((topic.clone(), *partition));
-                }
-            }
-
-            // Remove timed-out entries AFTER iteration completes (avoids iterator invalidation deadlock)
-            for key in to_remove {
-                last_heartbeat.remove(&key);
-                debug!("Removed {}-{} from heartbeat tracking after timeout", key.0, key.1);
-            }
-        }
-
-        info!("Stopped WAL timeout monitor");
     }
 
     /// Shutdown the receiver

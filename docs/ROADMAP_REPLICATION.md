@@ -14,7 +14,7 @@
 | RP-6 | Failover recovery latency | `TESTED` | — | Catalog is pushed on rejoin; verified on cluster |
 | RP-7 | Assignment authority | `TESTED` | — | Only the Raft leader publishes; fetch refuses when it does not lead. **Full conformance suite now PASSES, RP-0.4 included** |
 | RP-8 | `acks=all` latency (#36) | `TESTED` | — | Three waits removed from the write path: new topic 7,000ms → 23ms, steady state 505ms → 17ms. The reported "duplication" was a client retry after a timeout |
-| RP-4 | Delete the push stack | `IN PROGRESS` | — | Pull is now the DEFAULT and the whole suite passes with no env var set. Deleting the switch and the push data path is gated on Open Question 5 |
+| RP-4 | Delete the push stack | `TESTED` | — | Data push path deleted: mode switch, produce fan-out, LeaderElector and the election machinery. Metadata keeps the transport (OQ2). One mechanism |
 
 ---
 
@@ -927,23 +927,25 @@ Concrete targets:
 
 ✅ **Default flipped 2026-08-13.** `from_env` returns `Pull` when nothing is set, and an unrecognised value now warns and uses pull rather than quietly selecting the mechanism the operator did not ask for. Every cluster test had its `CHRONIK_REPLICATION_MODE=pull` removed so they exercise the default rather than a setting no deployment will have; all pass — replication conformance 600/600 on all three acks modes, divergence 3/3, `acks=all` 23ms to a new topic. Verified independently that a cluster started with no environment at all replicates: 300 records produced, 900 markers on each of the three nodes' disks.
 
-`CHRONIK_REPLICATION_MODE=push` still selects the old path. It stays until the soak below is done and Open Question 5 is answered, so the flip and the deletion can fail separately.
+✅ **Deleted 2026-08-13**, once Open Question 5 was answered: there are no production deployments, so there is no upgrade path to protect and no reason to carry the old mechanism for a release.
 
+**What went:**
 
+- [x] `ReplicationMode` — the enum, `from_env`, `is_pull()`, and all four gates. Pull is not a mode; it is how replication works.
+- [x] The produce-path fan-out — `ProduceHandler::wal_replication_manager`, `set_wal_replication_manager`, and the hook that spawned a `replicate_partition` task per batch. With it went `serialized_for_replication` and the `needs_replication` clone-avoidance it existed to feed.
+- [x] The `else` branch in `wire_raft_dependencies` that built the data `WalReplicationManager`.
+- [x] `LeaderElector` (the whole file) — an honest shim documenting that `elect_leader_from_isr` never worked, superseded by RP-5.
+- [x] The election trigger machinery — `run_election_worker`, `monitor_timeouts`, `WalReceiver::set_leader_elector` and its plumbing, plus `replication/connection_state.rs`, which turned out to have no callers at all once `setup_timeout_monitoring` went.
+- [x] `test_replication_fires_for_every_acks_mode`, which asserted on the push queue's `total_queued`. Its invariant — every acks mode reaches every replica — is now covered end to end by `regression_replication.sh`, which checks the records on each node's disk rather than a counter on the way out.
 
-**Expected impact**: ~2,500 lines removed, one replication mechanism instead of two
-**Effort**: 2-3 days
-**Risk**: low once RP-2/RP-3 are soaked
-**Depends on**: RP-3 `TESTED`, plus a soak on a real cluster
+**What stayed, deliberately:**
 
-- [ ] Remove `WalReplicationManager`, `WalReceiver`, custom frame format, heartbeats, reconnect/backoff, ACK frames, `partition_followers` discovery
-- [ ] Retire WAL replication port 9291 from configs, CRD and operator
-- [ ] Keep the metadata path working — `broadcast_metadata` currently rides the same transport; either port `__chronik_metadata` to pull as well, or keep a minimal transport solely for it (**decide in RP-2**)
-- [ ] Update `docs/DISTRIBUTED_QUERY_LAYER.md`, `CLAUDE.md`, and cluster docs
+- `WalReplicationManager` and `WalReceiver` themselves, serving **metadata** (Open Question 2). Metadata is a single Raft-managed log, not a partitioned topic with a leader epoch, and it holds the assignments the pull path reads — moving it to pull would make the mechanism that discovers who leads a partition depend on already knowing who leads a partition.
+- **WAL replication port 9291.** The original checklist said retire it; that is wrong now that metadata keeps the transport. It is no longer a *data* port, and the docs say so.
 
-**Status**: —
+**Verified after deletion**, all on the default configuration: 1,658 unit tests; replication conformance 600/600 across acks=0, 1 and all with every replica holding every partition; divergence 3/3 with 3,358 bytes cut; `acks=all` 26ms to a new topic, 16ms steady state.
 
-> No push/pull coexistence flag. There is no external consumer of the replication protocol, so rollback is an image redeploy, not a config toggle.
+> There was never a push/pull coexistence flag, and now there is not even a switch. One mechanism.
 
 ---
 
@@ -959,11 +961,13 @@ Answer before the phase that depends on them.
    This shrinks RP-4 from "delete `wal_replication.rs`" to "delete the data push path": `ProduceHandler::set_wal_replication_manager` and its produce-path use, the `else` branch in `wire_raft_dependencies` that builds the data `WalReplicationManager`, the `ReplicationMode` switch (pull becomes unconditional), and the `LeaderElector` shim plus the election trigger machinery in `WalReceiver` that RP-5 superseded. `WalReceiver` itself stays, serving metadata.
 3. **What lag bound defines ISR?** (blocks RP-1.2) — Kafka uses time (`replica.lag.time.max.ms`). Offset-based lag misbehaves with uneven partition rates.
 4. **Does HW-from-ISR change observable consumer behaviour in existing tests?** (blocks RP-2.3) — consumers currently see the leader's write position; under Kafka semantics they would see less during follower lag.
-5. **How does an existing cluster upgrade across the push→pull boundary?** (blocks release, not any phase) — a pull follower cannot replicate from a push leader, so a rolling upgrade breaks replication mid-roll.
+5. ~~**How does an existing cluster upgrade across the push→pull boundary?**~~ — **ANSWERED 2026-08-13: there is no upgrade path, because there is nothing to upgrade.**
 
-   **Leaning: accept a full-cluster restart, and say so in the release notes.** Two reasons, both from this effort. First, the version being upgraded *from* did not replicate at all on `acks=1`/`acks=all` (PR #29), so there is no working replication to preserve across the roll — the "safe rolling upgrade" being protected is protecting a mechanism that was not running. Second, keeping the push receive path for one release means shipping the coexistence we rejected, in the release where the new path is least soaked, and every bug found in RP-1/RP-2/RP-5 was found by *removing* ambiguity about which mechanism was live.
+   There are no production deployments. Anyone running Chronik starts fresh on the latest version. So the push data path is deleted outright rather than kept for a release: no coexistence, no migration shim, no rolling-upgrade story to protect.
 
-   Not yet decided, because it depends on whether any deployment is running RF>1 on a version new enough to replicate correctly. **Confirm that before RP-4 lands.**
+   That was also the leaning on the merits. The version being upgraded *from* did not replicate at all on `acks=1`/`acks=all` (PR #29), so a "safe rolling upgrade" would have been protecting a mechanism that was not running. And keeping the push receive path for one release means shipping the coexistence we rejected, in the release where the new path is least soaked — while every bug found in RP-1/RP-2/RP-5 was found by *removing* ambiguity about which mechanism was live.
+
+   **Release note required**: a cluster carrying data written by an older version should be recreated, not upgraded in place.
 
 ---
 

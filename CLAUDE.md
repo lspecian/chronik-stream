@@ -426,7 +426,7 @@ After successful persistence, old WAL segments are truncated.
 
 The `chronik-server` binary now has a single `start` command that auto-detects mode:
 - **Single-Node** (default) - Standalone Kafka server with WAL durability
-- **Cluster** (from config) - Multi-node cluster with Raft + WAL replication (requires config file)
+- **Cluster** (from config) - Multi-node cluster: Raft for consensus, follower-pull for partition data (requires config file)
 
 **Removed in v2.2.0**: `standalone`, `raft-cluster`, `ingest`, `search`, `all` subcommands
 
@@ -489,12 +489,12 @@ min_insync_replicas = 2
 
 [node.addresses]
 kafka = "0.0.0.0:9092"    # Where to bind
-wal = "0.0.0.0:9291"      # WAL replication receiver
+wal = "0.0.0.0:9291"      # Metadata replication receiver (partition data is pulled over the Kafka port)
 raft = "0.0.0.0:5001"     # Raft consensus
 
 [node.advertise]
 kafka = "localhost:9092"   # What clients connect to
-wal = "localhost:9291"     # What followers connect to
+wal = "localhost:9291"     # What peers connect to for metadata
 raft = "localhost:5001"    # What peers connect to
 
 [[peers]]
@@ -557,7 +557,7 @@ Add a new node to a running cluster without downtime:
 - Node 4 joins Raft cluster
 - Partition rebalancer detects new capacity
 - Partitions redistribute across all 4 nodes
-- WAL replication connects to new node
+- The new node begins fetching from its partition leaders
 - Zero client interruptions
 
 #### Node Removal (Priority 4 - NEW!)
