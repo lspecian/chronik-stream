@@ -13,6 +13,7 @@
 | RP-5 | Partition leader failover | `TESTED` | — | Built and validated: leadership moves, RF preserved, ISR shrinks, writes recover |
 | RP-6 | Failover recovery latency | `TESTED` | — | Catalog is pushed on rejoin; verified on cluster |
 | RP-7 | Assignment authority | `TESTED` | — | Only the Raft leader publishes; fetch refuses when it does not lead. **Full conformance suite now PASSES, RP-0.4 included** |
+| RP-8 | `acks=all` latency (#36) | `TESTED` | — | Three waits removed from the write path: new topic 7,000ms → 23ms, steady state 505ms → 17ms. The reported "duplication" was a client retry after a timeout |
 | RP-4 | Delete the push stack | `NOT STARTED` | — | ~2,500 lines removed |
 
 ---
@@ -702,6 +703,50 @@ Measured: after a failover the returning replica held nothing for that topic, wh
 **The fix is a catch-up read, not a shorter timer.** A node starting up should ask the Raft leader for current assignments rather than trusting a local copy that is stale precisely when it matters most. Shortening the re-broadcast interval trades a constant broadcast cost against a window that would still exist.
 
 ⚠️ This interacts with RP-3.3: the returning node cannot run the truncation handshake for a partition it does not know it follows. So a divergent replica stays divergent — serving nothing, but also repairing nothing — for up to the anti-entropy period.
+
+---
+
+## Phase RP-8: `acks=all` latency — `TESTED` (found and fixed 2026-08-13)
+
+**Issue #36** reported duplicate records: 300 produced, 585 consumed, partition end offsets confirming the extras were genuinely appended. It reads as a write-side duplication bug. It is not.
+
+**`acks=all` was slow enough to time clients out, and the retry appended the batch a second time.** A non-idempotent producer that times out cannot know whether the broker took the write, so it resends; the broker had taken it. Fix the latency and the duplication goes with it — reproduced exactly, 600 records on the broker for 300 produced, three runs out of three, and 300 every time after.
+
+### Measured
+
+| | before | after |
+|---|---|---|
+| First `acks=all` write to a NEW topic | ~7,000ms | **23ms** |
+| Steady-state `acks=all`, per request | 505ms (flat) | **17ms** |
+| `acks=1`, same shape | 12ms | 13ms |
+| 300 records, `socket.timeout.ms=5000` | 600 appended | **300 appended** |
+
+`acks=all` now costs roughly one replication round trip more than `acks=1`, which is what it is supposed to cost.
+
+### Three faults, each independently putting a wait on the critical path
+
+**1. Followers were served the high watermark as if it were the log end.** `get_high_watermark_for_fetch` returns the high watermark, and the follower branch used it under a variable named `leader_leo`. Under `acks=all` the high watermark cannot advance until the followers acknowledge — so the follower was told "no data" for exactly the records the producer was blocked waiting for it to acknowledge. A closed loop: the high watermark is a *result* of replication and cannot also be its input. RP-2.3's own comment says a follower must not be capped this way; the code capped it anyway.
+
+Nothing deadlocked outright only because a background segment flush eventually published the records by another route, which is where the original ~700ms came from.
+
+**2. The fetch wait was taken per partition, in request order.** One shared deadline bounded the total, but the *first* partition examined could spend all of it. A follower replicates every partition it holds from one leader in a single request (RP-2.4), so one idle partition ahead of an active one delayed every record on the active one by the full `max_wait_ms` — a flat 505ms, exactly `max_wait_ms` + the empty-fetch backoff. The wait now belongs to the request: serve everything without waiting, and only if the whole request came back empty, wait once for *any* partition to get data. That is also what Kafka's contract says the wait is.
+
+**3. The long poll had a second, weaker reader.** It read with `fetch_records` while the direct path reads with `fetch_raw_bytes` first, so it could sit through its entire budget failing to read a record that the very next request returned immediately. The wait is now detection-only; `fetch_data_available_path` is the one reader.
+
+**And the one that actually timed clients out:** the follower re-read partition assignments only on its `refresh_interval` tick, default **10 seconds**. A partition created at t=0 was not replicated until t=10s, and every `acks=all` produce to it blocked for the whole gap, waiting on a follower that had not been told the partition existed. The supervisor now wakes on metadata events (`TopicCreated`, `PartitionAssigned`) with the tick kept as a backstop for a lagged receiver.
+
+### Two things the measurements ruled out
+
+- **Not the poll interval.** Identical end-to-end latency at 1ms and at 10ms. The residual is the follower's apply plus its next fetch, not detection.
+- **Not the local write path.** Single-node `acks=all`, where the leader's own ack is the quorum, costs the same as `acks=0`: 300 records in 6ms.
+
+### Also fixed here
+
+- `get_follower_lag` could return a negative number. A follower replicates the leader's log end while `/admin/status` measures it against the high watermark, which trails until that follower acknowledges — so a healthy replica routinely reported lag -7. "How far behind" has no negative values.
+- `FollowerState::local_log_end` read the high watermark. The two coincide on a node that has only ever followed, but part on a node that was a leader and accepted writes which never reached quorum — which is precisely the divergent tail RP-3.3 exists to cut. Reading the watermark reported a log end *below* the records needing truncation, so `plan_reconciliation` would have concluded "my log is a prefix of the leader's" and resumed, leaving the tail in place. Verified after the change: the local divergence test cuts at 44 from a true log end of 139.
+- The `acks=all` produce path logged four lines per request at `info!` and a fifth at `warn!` for reaching quorum. They were written when this path was believed rare and broken; it is now the fast path.
+
+**Regression test**: `tests/cluster/acks_all_latency.sh` — asserts both shapes, since only one of them was the client-visible failure.
 
 ---
 

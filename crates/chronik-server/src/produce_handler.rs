@@ -803,6 +803,29 @@ impl ProduceHandler {
         }
     }
 
+    /// The partition's log end offset: one past the last record this node has
+    /// accepted, committed or not.
+    ///
+    /// This is what a replicating follower must be told it may read up to, and
+    /// it is emphatically NOT the high watermark. The high watermark is a
+    /// statement about the in-sync set, and under `acks=all` it does not advance
+    /// until the followers acknowledge — so answering a follower's fetch with the
+    /// high watermark tells it "no data" for exactly the records the producer is
+    /// blocked waiting for it to acknowledge (#36). The write then completes only
+    /// when some unrelated background timer publishes the records by another
+    /// route, which measured at ~700ms per request.
+    ///
+    /// `next_offset` is advanced by the same atomic `fetch_add` that assigns the
+    /// batch its offsets, so it is already correct by the time the WAL write
+    /// returns.
+    pub async fn get_log_end_offset(&self, topic: &str, partition: i32) -> i64 {
+        let key = (topic.to_string(), partition);
+        match self.partition_states.get(&key) {
+            Some(state) => state.value().next_offset.load(Ordering::SeqCst) as i64,
+            None => 0,
+        }
+    }
+
     /// Get the current log start offset (low watermark) for a partition.
     ///
     /// This reflects Kafka DeleteRecords: records below this offset have been
@@ -2823,7 +2846,7 @@ impl ProduceHandler {
                                         .config
                                         .min_insync_replicas
                                         .clamp(1, replicas.len().max(1));
-                                    info!("📊 ISR for {}-{} from metadata_store: {:?}, quorum={} (min_insync={})",
+                                    debug!("📊 ISR for {}-{} from metadata_store: {:?}, quorum={} (min_insync={})",
                                         topic, partition, replicas, size, self.config.min_insync_replicas);
                                     size
                                 }
@@ -2843,7 +2866,10 @@ impl ProduceHandler {
                         }
                     };
 
-                    info!(
+                    // These four lines fire on every `acks=all` produce. They were
+                    // `info!` while the path was believed to be rare and broken;
+                    // it is now the fast path, so they are `debug!`.
+                    debug!(
                         "🎯 acks=-1: About to register wait for {}-{} offset {} (base_offset={}, quorum={})",
                         topic, partition, base_offset, base_offset, quorum_size
                     );
@@ -2864,7 +2890,7 @@ impl ProduceHandler {
                         tx,
                     );
 
-                    info!(
+                    debug!(
                         "✅ acks=-1: Registered {}-{} offset {} for ISR quorum tracking (quorum={})",
                         topic, partition, base_offset, quorum_size
                     );
@@ -2872,7 +2898,7 @@ impl ProduceHandler {
                     // v2.2.7 FIX: Leader always records its own ACK immediately (cluster AND standalone)
                     // In standalone mode (quorum=1), this is the only ACK needed
                     // In cluster mode (quorum=N), leader counts as 1/N ACKs, then waits for followers
-                    info!("🏁 Recording leader self-ACK for {}-{} offset {} (quorum={}/{})",
+                    debug!("🏁 Recording leader self-ACK for {}-{} offset {} (quorum={}/{})",
                         topic, partition, ack_offset, 1, quorum_size);
                     tracker.record_ack(topic, partition, ack_offset, self.config.node_id as u64);
 
@@ -2890,7 +2916,8 @@ impl ProduceHandler {
                             let new_watermark = (last_offset + 1) as i64;
                             let prev_watermark = partition_state.high_watermark.fetch_max(new_watermark as u64, Ordering::SeqCst) as i64;
 
-                            warn!(
+                            // Reaching quorum is the expected outcome, not a warning.
+                            debug!(
                                 "🔥 WATERMARK UPDATE [acks=-1, quorum reached]: topic={}, partition={}, old={}, new={}, last_offset={}, actually_updated={}",
                                 topic, partition, old_watermark, new_watermark, last_offset, prev_watermark < new_watermark
                             );

@@ -1815,6 +1815,21 @@ impl IntegratedKafkaServerBuilder {
         )
         .with_produce_handler(produce_handler.clone());
 
+        // Learn about new and reassigned partitions when they happen, not on the
+        // next 10s tick. A follower that has not yet heard of a partition cannot
+        // acknowledge writes to it, and `acks=all` blocks until it does.
+        let fetcher = match self.metadata_event_bus.as_ref() {
+            Some(bus) => fetcher.with_metadata_events(bus.clone()),
+            None => {
+                warn!(
+                    "No metadata event bus: the replica fetcher will only notice new partitions \
+                     on its {:?} refresh tick, and acks=all writes to a new topic will block until then",
+                    crate::replication::replica_fetcher::ReplicaFetcherConfig::from_env().refresh_interval
+                );
+                fetcher
+            }
+        };
+
         fetcher.start();
         self.replica_fetcher = Some(fetcher);
 

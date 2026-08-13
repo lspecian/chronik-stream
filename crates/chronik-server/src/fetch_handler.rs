@@ -276,34 +276,80 @@ impl FetchHandler {
         request: FetchRequest,
         correlation_id: i32,
     ) -> Result<FetchResponse> {
-        let mut response_topics = Vec::new();
-
-        // `max_wait_ms` bounds the REQUEST, not each partition in it. Partitions
-        // are served serially, so giving every idle partition the full budget
-        // made a 10-partition fetch take 10x max_wait_ms to come back — the
-        // client's own timeout would fire first. A shared deadline keeps the
-        // whole response inside the budget the client asked for; partitions
-        // reached after it expires return whatever is already available and the
-        // client picks the rest up on its next fetch.
+        // `max_wait_ms` bounds the REQUEST, and the wait belongs to the request
+        // as a whole — not to each partition in turn.
         //
-        // This also makes follower-pull viable (RP-2.4), where one request
-        // covers every partition a follower replicates from one leader.
+        // Serving partitions serially, each free to park on its own, made a
+        // 10-partition fetch take 10x max_wait_ms. Sharing one deadline across
+        // them fixed the total but not the shape: the FIRST partition examined
+        // could still spend the entire budget waiting, and a partition is
+        // examined in request order, not in order of who has data. One idle
+        // partition ahead of an active one in the same request therefore delayed
+        // every record on that active partition by the full max_wait_ms.
+        //
+        // Measured: `acks=all` cost a flat 505ms per produce on a three-node
+        // cluster with three topics, because the follower replicating them sends
+        // ONE request covering all three (RP-2.4) and the idle ones were reached
+        // first. The producer waits for the follower, the follower is parked
+        // behind an unrelated idle partition, and nothing is wrong with either
+        // (#36).
+        //
+        // So: serve everything without waiting, and only if the whole request
+        // came back empty, wait once — for ANY partition to get data — and serve
+        // everything again. That is also what Kafka's contract says the wait is:
+        // a property of the request, satisfied by the first partition to have
+        // something to send.
         let wait_deadline =
             Instant::now() + Duration::from_millis(request.max_wait_ms.max(0) as u64);
 
-        for topic_request in request.topics {
-            let mut response_partitions = Vec::new();
+        let mut response_topics = self.serve_all_partitions(&request).await?;
 
-            for partition_request in topic_request.partitions {
+        if request.max_wait_ms > 0 && !any_records(&response_topics) {
+            if self.wait_for_any_partition(&request, wait_deadline).await {
+                response_topics = self.serve_all_partitions(&request).await?;
+            }
+        }
+
+
+        // Record fetch metrics
+        let mut fetched_bytes: u64 = 0;
+        for t in &response_topics {
+            for p in &t.partitions {
+                fetched_bytes += p.records.len() as u64;
+            }
+        }
+        MetricsRecorder::record_fetch(true, fetched_bytes);
+
+        Ok(FetchResponse {
+            header: chronik_protocol::parser::ResponseHeader { correlation_id },
+            throttle_time_ms: 0,
+            error_code: 0,
+            session_id: 0,
+            topics: response_topics,
+        })
+    }
+
+    /// Serve every partition in the request, without waiting for any of them.
+    ///
+    /// Waiting is the caller's job (`wait_for_any_partition`) precisely so that
+    /// one partition cannot spend the request's budget on behalf of the others.
+    async fn serve_all_partitions(
+        &self,
+        request: &FetchRequest,
+    ) -> Result<Vec<FetchResponseTopic>> {
+        let mut response_topics = Vec::with_capacity(request.topics.len());
+
+        for topic_request in &request.topics {
+            let mut response_partitions = Vec::with_capacity(topic_request.partitions.len());
+
+            for partition_request in &topic_request.partitions {
                 let mut partition_response = self.fetch_partition(
                     &topic_request.name,
                     partition_request.partition,
                     partition_request.fetch_offset,
                     partition_request.partition_max_bytes,
                     request.max_wait_ms,
-                    request.min_bytes,
                     request.replica_id,
-                    wait_deadline,
                 ).await?;
 
                 // EOS layer 6: for read_committed (isolation_level == 1) report the real
@@ -351,29 +397,108 @@ impl FetchHandler {
 
                 response_partitions.push(partition_response);
             }
-            
+
             response_topics.push(FetchResponseTopic {
-                name: topic_request.name,
+                name: topic_request.name.clone(),
                 partitions: response_partitions,
             });
         }
-        
-        // Record fetch metrics
-        let mut fetched_bytes: u64 = 0;
-        for t in &response_topics {
-            for p in &t.partitions {
-                fetched_bytes += p.records.len() as u64;
+
+        Ok(response_topics)
+    }
+
+    /// Wait until ANY partition in the request has something past its fetch
+    /// offset, or the request's deadline passes. Returns whether it found any.
+    ///
+    /// Detection only — no records are read here. The one reader is
+    /// `fetch_data_available_path`, reached through `serve_all_partitions`. Two
+    /// readers is exactly what went wrong before: the copy that lived inside the
+    /// long poll used `fetch_records` while the direct path used
+    /// `fetch_raw_bytes` first, so the poll could sit through its whole budget
+    /// failing to read a record the very next request returned immediately.
+    async fn wait_for_any_partition(
+        &self,
+        request: &FetchRequest,
+        wait_deadline: Instant,
+    ) -> bool {
+        // 10ms is not a latency floor worth tuning: measured at 1ms and at 10ms,
+        // end-to-end `acks=all` latency was identical, because the cost that
+        // remains is the follower's apply and its next fetch, not this detection.
+        let poll_interval = Duration::from_millis(10);
+
+        loop {
+            for topic_request in &request.topics {
+                for partition_request in &topic_request.partitions {
+                    if self
+                        .has_data_beyond(
+                            &topic_request.name,
+                            partition_request.partition,
+                            partition_request.fetch_offset,
+                            request.replica_id,
+                        )
+                        .await
+                    {
+                        return true;
+                    }
+                }
+            }
+
+            let remaining = wait_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            tokio::time::sleep(poll_interval.min(remaining)).await;
+        }
+    }
+
+    /// Is there anything to send for this partition past `fetch_offset`?
+    ///
+    /// Consults the live log by the rule that governs this reader (follower →
+    /// log end, consumer → in-sync position) AND the segment index, because
+    /// neither subsumes the other: the live path has no in-memory state for a
+    /// partition that has not been produced to since startup, and the segment
+    /// index is written by a background flusher some time after the fact.
+    ///
+    /// Consulting only the segment index — which is what the old long poll did —
+    /// meant a parked fetch could not see a record until it had been flushed,
+    /// however long it had already been durable.
+    async fn has_data_beyond(
+        &self,
+        topic: &str,
+        partition: i32,
+        fetch_offset: i64,
+        replica_id: i32,
+    ) -> bool {
+        if let Ok(live_end) = self
+            .readable_end_offset(topic, partition, fetch_offset, replica_id)
+            .await
+        {
+            if live_end > fetch_offset {
+                return true;
             }
         }
-        MetricsRecorder::record_fetch(true, fetched_bytes);
 
-        Ok(FetchResponse {
-            header: chronik_protocol::parser::ResponseHeader { correlation_id },
-            throttle_time_ms: 0,
-            error_code: 0,
-            session_id: 0,
-            topics: response_topics,
-        })
+        let Ok(segments) = self
+            .metadata_store
+            .list_segments(topic, Some(partition as u32))
+            .await
+        else {
+            return false;
+        };
+        let segment_end = segments.iter().map(|s| s.end_offset + 1).max().unwrap_or(0);
+        if segment_end <= fetch_offset {
+            return false;
+        }
+
+        // The segment index knows nothing about replication, so a consumer must
+        // not be woken by records the in-sync set does not hold — the exact
+        // visibility RP-2.3 caps, reached by a different route.
+        if replica_id >= 0 {
+            return true;
+        }
+        self.consumer_visible_watermark(topic, partition, segment_end)
+            .await
+            > fetch_offset
     }
 
     // ============================================================================
@@ -508,8 +633,10 @@ impl FetchHandler {
             }
         }
 
-        // v2.2.7.2: Log watermark details for debugging
-        info!(
+        // Per-fetch, and the long poll now re-evaluates it every 10ms, so this
+        // cannot be `info!` — it would emit a hundred lines per second for every
+        // parked consumer and every follower.
+        debug!(
             "📊 WATERMARK: topic={}, partition={}, high_watermark={}, fetch_offset={}, gap={} (from ProduceHandler)",
             topic, partition, high_watermark, fetch_offset, high_watermark - fetch_offset
         );
@@ -567,6 +694,52 @@ impl FetchHandler {
             );
         }
         watermark
+    }
+
+    /// How far this fetch may read, from the live log.
+    ///
+    /// The two callers ask the same question at different moments — once when
+    /// the request arrives, and again on every tick of the long poll — and they
+    /// must agree, or a request parks waiting for a number that a different rule
+    /// already moved past.
+    ///
+    /// A follower is bounded by the leader's LOG END; a consumer by what the
+    /// in-sync set holds. Serving a follower the high watermark instead is what
+    /// made `acks=all` cost ~700ms per request (#36): the producer waits for the
+    /// follower to acknowledge offset N, and the follower is told the log ends
+    /// below N, so neither side can move. The high watermark is a *result* of
+    /// replication and cannot also be its input.
+    async fn readable_end_offset(
+        &self,
+        topic: &str,
+        partition: i32,
+        fetch_offset: i64,
+        replica_id: i32,
+    ) -> Result<i64> {
+        if replica_id < 0 {
+            let leader_leo = self
+                .get_high_watermark_for_fetch(topic, partition, fetch_offset)
+                .await?;
+            return Ok(self
+                .consumer_visible_watermark(topic, partition, leader_leo)
+                .await);
+        }
+
+        let log_end = match self.produce_handler {
+            Some(ref handler) => handler.get_log_end_offset(topic, partition).await,
+            None => 0,
+        };
+
+        // A node that has not produced since starting has no in-memory partition
+        // state and reports 0. That is a "don't know", not "empty" — fall back to
+        // the watermark path, which reads persisted metadata.
+        if log_end == 0 {
+            return self
+                .get_high_watermark_for_fetch(topic, partition, fetch_offset)
+                .await;
+        }
+
+        Ok(log_end)
     }
 
     /// Get the partition's log start offset (low watermark) for a fetch.
@@ -711,118 +884,6 @@ impl FetchHandler {
         Ok(self.build_success_response(partition, high_watermark, log_start_offset, records_bytes))
     }
 
-    /// Handle fetch when no data available (fetch_offset >= high_watermark)
-    ///
-    /// Implements wait logic with polling or immediate empty response
-    ///
-    /// Complexity: < 25 (polling loop + timeout handling + response construction)
-    async fn fetch_no_data_path(
-        &self,
-        topic: &str,
-        partition: i32,
-        fetch_offset: i64,
-        high_watermark: i64,
-        log_start_offset: i64,
-        max_bytes: i32,
-        max_wait_ms: i32,
-        min_bytes: i32,
-        wait_deadline: Instant,
-        replica_id: i32,
-    ) -> Result<FetchResponsePartition> {
-        // v2.2.7.2: Log no data available case
-        info!(
-            "⏸️  NO DATA: topic={}, partition={}, fetch_offset={}, high_watermark={} (waiting...)",
-            topic, partition, fetch_offset, high_watermark
-        );
-
-        // The wait budget belongs to the request and is shared across every
-        // partition in it, so what is left here is whatever earlier partitions
-        // did not already spend. Once it is gone, later partitions return
-        // immediately instead of each adding another max_wait_ms to the
-        // response time.
-        let start_time = Instant::now();
-        let wait_duration = wait_deadline.saturating_duration_since(start_time);
-
-        // No data available yet - implement wait logic
-        if max_wait_ms > 0 && min_bytes > 0 && !wait_duration.is_zero() {
-
-            // Try to wait for data with timeout
-            let result = timeout(wait_duration, async {
-                // Poll for new data periodically
-                let poll_interval = Duration::from_millis(10);
-                let mut accumulated_bytes = 0;
-
-                while start_time.elapsed() < wait_duration {
-                    // Check if new data is available
-                    if let Ok(new_segments) = self.metadata_store.list_segments(topic, Some(partition as u32)).await {
-                        let discovered = new_segments.iter()
-                            .map(|s| s.end_offset + 1)
-                            .max()
-                            .unwrap_or(high_watermark);
-
-                        // RP-2.3: this loop discovers a new watermark from the
-                        // segment index, which knows nothing about replication.
-                        // Without re-applying the cap, a consumer that parked in
-                        // the long poll would be handed records the in-sync set
-                        // does not hold — the exact visibility the cap exists to
-                        // prevent, reached by a different route.
-                        let new_high_watermark = if replica_id >= 0 {
-                            discovered
-                        } else {
-                            self.consumer_visible_watermark(topic, partition, discovered).await
-                        };
-
-                        if new_high_watermark > fetch_offset {
-                            // New data available, fetch it
-                            if let Ok(records) = self.fetch_records(
-                                topic,
-                                partition,
-                                fetch_offset,
-                                new_high_watermark,
-                                max_bytes,
-                            ).await {
-                                // Calculate approximate bytes
-                                accumulated_bytes = records.iter()
-                                    .map(|r| r.value.len() + r.key.as_ref().map(|k| k.len()).unwrap_or(0))
-                                    .sum();
-
-                                if accumulated_bytes >= min_bytes as usize {
-                                    return Ok((records, new_high_watermark));
-                                }
-                            }
-                        }
-                    }
-
-                    tokio::time::sleep(poll_interval).await;
-                }
-
-                Err::<(Vec<chronik_storage::Record>, i64), Error>(
-                    Error::Internal("Timeout waiting for min_bytes".into())
-                )
-            }).await;
-
-            match result {
-                Ok(Ok((records, new_hw))) => {
-                    // Got enough data within timeout
-                    let records_bytes = self.encode_kafka_records(&records, 0)?;
-
-                    return Ok(self.build_success_response(partition, new_hw, log_start_offset, records_bytes));
-                }
-                _ => {
-                    // Timeout or error - return empty response with proper empty batch
-                    let empty_records = self.encode_kafka_records(&[], 0)?;
-
-                    return Ok(self.build_success_response(partition, high_watermark, log_start_offset, empty_records));
-                }
-            }
-        } else {
-            // No wait requested, return empty immediately with proper empty batch
-            let empty_records = self.encode_kafka_records(&[], 0)?;
-
-            Ok(self.build_success_response(partition, high_watermark, log_start_offset, empty_records))
-        }
-    }
-
     /// Build error FetchResponsePartition
     ///
     /// Complexity: < 5 (simple struct construction)
@@ -888,9 +949,7 @@ impl FetchHandler {
         fetch_offset: i64,
         max_bytes: i32,
         max_wait_ms: i32,
-        min_bytes: i32,
         replica_id: i32,
-        wait_deadline: Instant,
     ) -> Result<FetchResponsePartition> {
         // RP-2.1: a fetch carrying a replica id is a *follower* replicating, not a
         // consumer reading. Kafka clients send -1 here; only a broker sets it to
@@ -924,9 +983,9 @@ impl FetchHandler {
 
         // v2.2.7.2: Enhanced tracing to debug large batch consumption stalls
         let fetch_start = Instant::now();
-        info!(
-            "🔍 FETCH START: topic={}, partition={}, offset={}, max_bytes={}, max_wait_ms={}, min_bytes={}",
-            topic, partition, fetch_offset, max_bytes, max_wait_ms, min_bytes
+        debug!(
+            "🔍 FETCH START: topic={}, partition={}, offset={}, max_bytes={}, max_wait_ms={}",
+            topic, partition, fetch_offset, max_bytes, max_wait_ms
         );
 
         // Phase 1: Validate topic and partition existence
@@ -955,9 +1014,8 @@ impl FetchHandler {
             return Ok(error_response);
         }
 
-        // Phase 2: Get high watermark from ProduceHandler with metadata_store fallback
-        let leader_leo = self.get_high_watermark_for_fetch(topic, partition, fetch_offset).await?;
-
+        // Phase 2: how far this fetch may read.
+        //
         // RP-2.3: a follower reads up to the leader's log end; a consumer only up
         // to what the in-sync set holds. Serving a consumer past that would show
         // it a record that disappears if the leader is lost — the leader's write
@@ -965,12 +1023,11 @@ impl FetchHandler {
         //
         // A follower must NOT be capped this way, or replication deadlocks: the
         // watermark cannot advance until followers fetch, and they cannot fetch
-        // past a watermark that is waiting on them.
-        let high_watermark = if replica_id >= 0 {
-            leader_leo
-        } else {
-            self.consumer_visible_watermark(topic, partition, leader_leo).await
-        };
+        // past a watermark that is waiting on them. Both branches live in
+        // `readable_end_offset`, which the long poll below re-evaluates.
+        let high_watermark = self
+            .readable_end_offset(topic, partition, fetch_offset, replica_id)
+            .await?;
 
         // Log start offset (low watermark). Advanced by the Kafka DeleteRecords API;
         // records below it have been deleted and must not be served. Sourced from
@@ -998,20 +1055,16 @@ impl FetchHandler {
             )
             .await
         } else {
-            // No data available - wait or return empty
-            self.fetch_no_data_path(
-                topic,
+            // Nothing past this offset. Returning empty is the whole of it —
+            // waiting for something to arrive belongs to the request, not to one
+            // partition of it, and happens in `wait_for_any_partition`.
+            let empty_records = self.encode_kafka_records(&[], 0)?;
+            Ok(self.build_success_response(
                 partition,
-                fetch_offset,
                 high_watermark,
                 log_start_offset,
-                max_bytes,
-                max_wait_ms,
-                min_bytes,
-                wait_deadline,
-                replica_id,
-            )
-            .await
+                empty_records,
+            ))
         }
     }
 
@@ -2932,6 +2985,16 @@ impl FetchHandler {
 /// serving path produced it. The batch content is left byte-identical; only the CRC
 /// field (bytes 17-20 of each batch, little-endian) is (re)written. Non-v2 or partial
 /// trailing bytes are left untouched.
+/// Does this response carry anything at all?
+///
+/// The question a fetch's wait is really asking: Kafka holds a request open
+/// until *some* partition has data, not until a particular one does.
+fn any_records(topics: &[FetchResponseTopic]) -> bool {
+    topics
+        .iter()
+        .any(|t| t.partitions.iter().any(|p| !p.records.is_empty()))
+}
+
 /// Length of the leading run of record batches whose base_offset is strictly below
 /// `offset`. Batches are offset-ordered and self-delimiting (base_offset i64 at [0..8],
 /// batch_length i32 at [8..12] counting everything after those 12 bytes). Used to

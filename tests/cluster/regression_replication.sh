@@ -81,10 +81,15 @@ local_produce() { # $1=topic $2=acks — explicit partitions so all three carry 
 }
 local_consume() { timeout 60 kcat -b localhost:9092 -t "$1" -C -e -q 2>/dev/null | wc -l; }
 # Replication factor, or 0 if it cannot be determined.
+#
+# The metadata line is `partition 0, leader 1, replicas: 1,2,3, isrs: 1,2,3`, so
+# the pattern must END on a digit. `[0-9,]+` also swallows the comma that
+# separates the replica list from `isrs`, which counts one replica too many and
+# fails a healthy RF=3 topic as RF=4.
 local_rf() {
   local commas
   commas=$(timeout 20 kcat -b localhost:9092 -L -t "$1" 2>/dev/null \
-    | grep -oE 'replicas: [0-9,]+' | head -1 | awk -F: '{print $2}' | tr -cd ',' | wc -c)
+    | grep -oE 'replicas: [0-9]+(,[0-9]+)*' | head -1 | awk -F: '{print $2}' | tr -cd ',' | wc -c)
   [ "$commas" -gt 0 ] && echo $((commas + 1)) || echo 0
 }
 

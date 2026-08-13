@@ -71,6 +71,12 @@ impl ReplicationMode {
     }
 }
 
+/// Pause after a fetch that returned nothing, so the loop cannot spin through
+/// the brief window where the leader's log end is ahead of what it can serve.
+/// Deliberately far below `max_wait_ms`: this is a spin guard, not a poll
+/// interval, and it must not add latency to replication.
+const EMPTY_FETCH_BACKOFF: Duration = Duration::from_millis(5);
+
 /// Tuning for the fetch loop.
 #[derive(Debug, Clone)]
 pub struct ReplicaFetcherConfig {
@@ -172,7 +178,25 @@ impl FollowerState for crate::produce_handler::ProduceHandler {
         crate::produce_handler::ProduceHandler::leader_epochs(self)
     }
 
+    /// The LOG END, not the high watermark — the difference is the whole point.
+    ///
+    /// The two coincide on a node that has only ever followed, because the apply
+    /// path moves both together. They part on a node that was a LEADER and
+    /// accepted writes which never reached quorum: those records sit above its
+    /// high watermark, and they are exactly the divergent tail this fetcher
+    /// exists to cut.
+    ///
+    /// Reading the high watermark here reported a log end BELOW the records that
+    /// need truncating, so `plan_reconciliation` would conclude "my log is a
+    /// prefix of the leader's" and resume — leaving the uncommitted tail in place
+    /// forever, silently, which is the failure RP-3.3 is for.
     async fn local_log_end(&self, topic: &str, partition: i32) -> i64 {
+        let log_end = self.get_log_end_offset(topic, partition).await;
+        if log_end > 0 {
+            return log_end;
+        }
+        // No in-memory state yet (nothing produced since start): fall back to the
+        // recovered watermark rather than claiming an empty log.
         self.get_high_watermark(topic, partition)
             .await
             .unwrap_or(0)
@@ -261,6 +285,17 @@ pub struct ReplicaFetcher {
     follower_state: Option<Arc<dyn FollowerState>>,
     /// node id → Kafka address, from the cluster config.
     peers: HashMap<u64, String>,
+    /// Wakes the supervisor the moment assignments change, instead of leaving it
+    /// to the next `refresh_interval` tick.
+    ///
+    /// Without this, a partition created at t=0 is not replicated until the tick
+    /// at t=10s, and an `acks=all` produce to it blocks for that whole time —
+    /// waiting for a follower ack from a follower that does not yet know the
+    /// partition exists. Measured: 7s for the first write to a new topic, which
+    /// is past the default `socket.timeout.ms` of clients that lower it, and a
+    /// timed-out produce that the broker did append is retried and appended
+    /// twice (#36).
+    metadata_events: Option<Arc<crate::metadata_events::MetadataEventBus>>,
     /// Follower LEO per partition, the offset the next fetch asks from.
     positions: Arc<DashMap<(String, i32), i64>>,
     shutdown: Arc<AtomicBool>,
@@ -284,6 +319,7 @@ impl ReplicaFetcher {
             produce_handler: None,
             follower_state: None,
             peers,
+            metadata_events: None,
             positions: Arc::new(DashMap::new()),
             shutdown: Arc::new(AtomicBool::new(false)),
             batches_applied: Arc::new(AtomicU64::new(0)),
@@ -300,6 +336,20 @@ impl ReplicaFetcher {
             inner.produce_handler = Some(handler);
         } else {
             warn!("ReplicaFetcher already shared; produce handler not attached");
+        }
+        self
+    }
+
+    /// Subscribe the supervisor to metadata changes, so a new or reassigned
+    /// partition starts replicating immediately rather than at the next tick.
+    pub fn with_metadata_events(
+        mut self: Arc<Self>,
+        bus: Arc<crate::metadata_events::MetadataEventBus>,
+    ) -> Arc<Self> {
+        if let Some(inner) = Arc::get_mut(&mut self) {
+            inner.metadata_events = Some(bus);
+        } else {
+            warn!("ReplicaFetcher already shared; metadata events not attached");
         }
         self
     }
@@ -344,6 +394,7 @@ impl ReplicaFetcher {
 
         let mut running: HashMap<u64, tokio::task::JoinHandle<()>> = HashMap::new();
         let mut current: BTreeMap<u64, Vec<FollowedPartition>> = BTreeMap::new();
+        let mut events = self.metadata_events.as_ref().map(|bus| bus.subscribe());
 
         while !self.shutdown.load(Ordering::Relaxed) {
             let desired = match self.read_assignments().await {
@@ -354,7 +405,7 @@ impl ReplicaFetcher {
                 }
                 Err(e) => {
                     warn!("Could not read partition assignments: {}", e);
-                    sleep(self.config.refresh_interval).await;
+                    self.await_assignment_change(&mut events).await;
                     continue;
                 }
             };
@@ -393,13 +444,53 @@ impl ReplicaFetcher {
                 current = desired;
             }
 
-            sleep(self.config.refresh_interval).await;
+            self.await_assignment_change(&mut events).await;
         }
 
         for (_, handle) in running.drain() {
             handle.abort();
         }
         info!("Follower-pull replication stopped on node {}", self.node_id);
+    }
+
+    /// Wait before re-reading assignments: until metadata says something
+    /// changed, or the refresh interval elapses, whichever comes first.
+    ///
+    /// The interval alone is a poor answer to "when should a follower notice a
+    /// new partition?". At the default 10s, a partition created at t=0 is not
+    /// replicated until t=10s, and every `acks=all` produce to it blocks for the
+    /// whole gap — the producer is waiting on a follower that has not been told
+    /// the partition exists. That is not a slow path, it is a stall, and clients
+    /// that lower `socket.timeout.ms` below it time out, retry, and get their
+    /// records appended twice (#36).
+    ///
+    /// The interval stays as a floor for the case where no bus is attached and
+    /// as a backstop if an event is ever missed — a lagged broadcast receiver
+    /// drops messages under load, and this must not depend on catching every one.
+    async fn await_assignment_change(
+        &self,
+        events: &mut Option<tokio::sync::broadcast::Receiver<crate::metadata_events::MetadataEvent>>,
+    ) {
+        let Some(rx) = events.as_mut() else {
+            sleep(self.config.refresh_interval).await;
+            return;
+        };
+
+        match tokio::time::timeout(self.config.refresh_interval, rx.recv()).await {
+            Ok(Ok(event)) => {
+                debug!("Re-reading assignments: metadata changed ({:?})", event);
+            }
+            // Lagged: events were dropped, so assignments may well have changed.
+            // Re-reading is the correct response to not knowing.
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(n))) => {
+                debug!("Re-reading assignments: missed {} metadata event(s)", n);
+            }
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                *events = None;
+                sleep(self.config.refresh_interval).await;
+            }
+            Err(_) => {} // the interval elapsed; re-read on the tick as before
+        }
     }
 
     /// Say so, loudly, when this node ends up replicating nothing.
@@ -532,14 +623,29 @@ impl ReplicaFetcher {
 
             match connection.fetch(spec).await {
                 Ok(response) => {
+                    let mut got_records = false;
                     for topic in response.topics {
                         for partition in topic.partitions {
+                            got_records |= !partition.records.is_empty();
                             if self.handle_partition_response(&topic.name, partition).await
                                 == PartitionOutcome::Diverged
                             {
                                 needs_reconcile = true;
                             }
                         }
+                    }
+
+                    // A response carrying nothing normally means the leader held
+                    // this request for its full `max_wait_ms` and there was still
+                    // no data — already paced, nothing to add.
+                    //
+                    // It can also come back instantly: the leader assigns a
+                    // batch's offsets before it writes them, so for a moment its
+                    // log end is past what it can actually serve. Without a pause
+                    // this loop would spin at network speed through that window.
+                    // It is short, so the backoff only has to be non-zero.
+                    if !got_records {
+                        sleep(EMPTY_FETCH_BACKOFF).await;
                     }
                 }
                 Err(e) => {

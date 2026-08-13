@@ -369,7 +369,16 @@ impl IsrTracker {
             return None;
         }
 
-        Some(leader_offset - last_offset)
+        // Never negative. A follower replicates the leader's LOG END, while the
+        // offset it is compared against here is a high watermark — which by
+        // definition trails until the followers acknowledge. So a perfectly
+        // healthy replica is routinely *ahead* of the number it is measured
+        // against, and the raw subtraction reports that as lag -7.
+        //
+        // "How far behind" has no negative values. Both callers want that
+        // question answered: `/admin/status` renders it for an operator, and
+        // `replicated_watermark` subtracts it and clamps at the leader anyway.
+        Some((leader_offset - last_offset).max(0))
     }
 
     /// RP-2.3: the high watermark a *consumer* may read up to.
@@ -454,6 +463,27 @@ mod tests {
 
         // Out of sync if lag > max_lag_entries
         assert!(!tracker.is_in_sync(2, "orders", 0, 2000)); // lag = 1050 > 1000
+    }
+
+    /// A follower ahead of the offset it is compared against reports lag 0, not
+    /// a negative number.
+    ///
+    /// This is the normal case, not an edge case: a follower replicates the
+    /// leader's log end, while `/admin/status` measures it against the high
+    /// watermark, which trails until that very follower acknowledges. Before
+    /// `acks=all` was fixed the two could not diverge this way, because the
+    /// follower was never shown records above the watermark (#36).
+    #[test]
+    fn follower_ahead_of_the_watermark_reports_no_lag() {
+        let tracker = IsrTracker::new(1000, 10_000);
+        tracker.update_follower_offset(2, "orders", 0, 507);
+
+        // Leader's watermark is 500; the follower already holds 507.
+        assert_eq!(tracker.get_follower_lag(2, "orders", 0, 500), Some(0));
+
+        // Genuinely behind still reports the real distance.
+        tracker.update_follower_offset(3, "orders", 0, 460);
+        assert_eq!(tracker.get_follower_lag(3, "orders", 0, 500), Some(40));
     }
 
     #[test]
