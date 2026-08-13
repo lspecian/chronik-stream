@@ -10,7 +10,7 @@
 | RP-1 | Harden the current mechanism | `TESTED` | — | 1.1–1.4 + 3 bugs found by cluster validation |
 | RP-2 | Follower fetch | `TESTED` | — | 2.1–2.4 all validated on a 3-node cluster, behind `CHRONIK_REPLICATION_MODE=pull` |
 | RP-3 | Leader epochs & truncation | `TESTED (partly)` | — | Cut proven in-process. Divergence can now be staged on a cluster (2026-08-13) — and doing so found **three defects in the repair path**, incl. a follower that spins 1,600×/s forever without repairing. See RP-3.3 |
-| RP-5 | Partition leader failover | `TESTED` | — | Built and validated: leadership moves, RF preserved, ISR shrinks, writes recover |
+| RP-5 | Partition leader failover | 🔴 `BROKEN` | — | **Elects replicas that hold none of the partition's data.** Leadership moves and writes recover, but `acks=all`-acknowledged records are destroyed. Unclean leader election — see RP-3.3 "D0" |
 | RP-6 | Failover recovery latency | `TESTED` | — | Catalog is pushed on rejoin; verified on cluster |
 | RP-7 | Assignment authority | `TESTED` | — | Only the Raft leader publishes; fetch refuses when it does not lead. **Full conformance suite now PASSES, RP-0.4 included** |
 | RP-8 | `acks=all` latency (#36) | `TESTED` | — | Three waits removed from the write path: new topic 7,000ms → 23ms, steady state 505ms → 17ms. The reported "duplication" was a client retry after a timeout |
@@ -428,6 +428,46 @@ The epoch being asked about is the problem: the follower asks where *its* epoch 
 **D3 — a no-op truncation resets the partition's log end to 0.** `TruncateOutcome::new_log_end_offset` is `None` for two different situations — "nothing survived, the log is empty" and "I did not touch anything" — and `truncate_partition.rs` collapses both with `unwrap_or(0)`. Observed: `WAL suffix truncation was a no-op` immediately followed by `Truncation reset watermark 140 → 0`. The follower then re-replicates the entire partition from scratch, and does so against a WAL that still physically holds records 0..139.
 
 **All three are in the repair path, not the detection path.** Detection works — the follower notices divergence promptly and correctly, in both shapes. What follows is what fails.
+
+#### 🔴 D0 — and none of that is the real bug: failover elects replicas that hold no data
+
+Chasing D1 to its source found something worse. The leader's own answer, from the same run:
+
+```
+OffsetForLeaderEpoch dtr-511245-0: epoch 0 ends at -1 (log end 40)
+```
+
+`log end 40`. The new leader had **40** records for a partition that had 140. Counting the actual bytes on each node's disk for partition 0:
+
+| node | committed prefix (`acks=all`) | uncommitted orphans | written after failover |
+|---|---|---|---|
+| 1 — old leader | 100 | 40 | 0 |
+| **2 — new leader** | **0** | 0 | 40 |
+| 3 | 100 | 0 | 0 |
+
+**Node 2 was elected leader of a partition it had never replicated a single record of**, and then accepted writes starting at offset 0. Its log now shares offsets 0..39 with 100 committed records and contains entirely different data at them.
+
+100 records acknowledged at `acks=all` — acknowledged, by definition, only because the in-sync set held them — are gone from the cluster's authoritative history. They survive on node 3 by luck, and node 3 is now a follower of node 2: the moment it reconciles, it will be told to discard them and match the new leader. The truncation machinery working *correctly* is what would complete the data loss.
+
+**This is an unclean leader election.** `plan_failover` picks `live_replicas.first()` — liveness, nothing else:
+
+```rust
+let live_replicas: Vec<u64> = assignment.replicas.iter().copied()
+    .filter(|id| live.contains(id)).collect();
+match live_replicas.first().copied() { Some(to) => …failover… }
+```
+
+Being reachable is not the same as holding the data. Kafka elects only from the **in-sync set**, and when the in-sync set is empty it leaves the partition offline rather than electing a replica that will destroy committed records — that is what `unclean.leader.election.enable=false` means, and it is the default.
+
+It is also the *cause* of D1: the epoch handshake cannot work when the new leader has no epoch history for records it never replicated. Every downstream symptom — `epoch 0 ends at -1`, `the leader cannot say where our epoch ended`, the 37,166-iteration spin — is this bug wearing a different hat.
+
+**Why the ISR was not consulted: it is not in metadata.** ISR lives in each partition leader's in-memory `IsrTracker` and dies with that leader. The failover controller runs on the Raft leader, which for a partition led by someone else has no way to learn who was in sync. `PartitionAssignment` carries `replicas` and `leader_epoch` but no `isr`.
+
+**Fix**: publish the in-sync set into the partition assignment, and elect only from it.
+
+- The partition leader already computes its ISR for `/admin/status`; it republishes it when it changes. Re-asserting an assignment with the same `leader_id` deliberately does **not** bump the leader epoch (`assign_partition`), so an ISR update cannot masquerade as a leadership change.
+- `plan_failover` chooses from `live ∩ isr`, in replica order.
+- No in-sync replica alive ⇒ **stranded**, and the partition stays offline. Losing availability is the correct trade against losing acknowledged writes; Kafka makes the same one.
 
 Verified on a cluster, all three steps of the chain, from one follower restart:
 

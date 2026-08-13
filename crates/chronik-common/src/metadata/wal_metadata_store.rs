@@ -969,11 +969,41 @@ impl MetadataStore for WalMetadataStore {
         // must not manufacture leadership changes, or every follower would think
         // it had to truncate.
         let key = (assignment.topic.clone(), assignment.partition);
-        assignment.leader_epoch = match self.state.partition_assignments.get(&key) {
-            Some(previous) if previous.leader_id == assignment.leader_id => previous.leader_epoch,
-            Some(previous) => previous.leader_epoch.saturating_add(1),
+        let previous_seen = self
+            .state
+            .partition_assignments
+            .get(&key)
+            .map(|p| (p.leader_id, p.leader_epoch));
+        assignment.leader_epoch = match previous_seen {
+            Some((leader_id, epoch)) if leader_id == assignment.leader_id => epoch,
+            Some((_, epoch)) => epoch.saturating_add(1),
             None => 0,
         };
+
+        // A leader change is rare and consequential — it is the event that tells
+        // every follower to re-run the RP-3.3 epoch handshake — so say it out
+        // loud, including the case where this node had no previous assignment
+        // and therefore starts the epoch at 0. That case is indistinguishable
+        // from "no leader change" in the data, and it silently disarms epoch
+        // truncation for the partition: every record ends up carrying epoch 0,
+        // so `end_offset_for_epoch` always answers "current epoch, log end" and
+        // no follower ever truncates.
+        match previous_seen {
+            Some((leader_id, _)) if leader_id != assignment.leader_id => {
+                tracing::info!(
+                    "{}-{}: leader {} → {}, epoch {}",
+                    assignment.topic, assignment.partition,
+                    leader_id, assignment.leader_id, assignment.leader_epoch
+                );
+            }
+            None => {
+                tracing::info!(
+                    "{}-{}: first assignment on this node — leader {} at epoch 0",
+                    assignment.topic, assignment.partition, assignment.leader_id
+                );
+            }
+            _ => {}
+        }
 
         let event = MetadataEvent::new_with_node(
             MetadataEventPayload::PartitionAssigned {
