@@ -28,6 +28,34 @@
 > **Nothing in this report should be cited until it is re-measured.** Tracked in
 > `docs/ROADMAP_REPLICATION.md`, which gates release on re-measuring against the
 > new replication mechanism.
+>
+> ### First measurement with replication actually running (2026-08-13)
+>
+> Not a replacement for the numbers below — a different machine and a smaller
+> shape — but the first figures taken with follower-pull replication genuinely
+> moving data, and the first where all three acks levels store every record:
+>
+> | | throughput | records stored |
+> |---|---|---|
+> | `acks=0` | 1,058,201 msg/s | 200,001 / 200,000 |
+> | `acks=1` | 694,444 msg/s | 200,001 / 200,000 |
+> | `acks=all` | 488,997 msg/s | 200,001 / 200,000 |
+>
+> 200,000 records × 100 B, 3 partitions, RF=3, `min_insync_replicas=2`, median
+> of three rounds, WAL profile left at its default. Reproduce with
+> `tests/cluster/perf_replication.sh`.
+>
+> **Scope, stated plainly**: three broker processes on ONE machine, sharing its
+> disk, cores and loopback. That understates network cost and overstates disk
+> contention against three separate machines, so it is a lower bound rather than
+> a headline. It is comparable *across* acks levels, because the three runs are
+> identical apart from that setting — and that comparison is the point:
+> `acks=all` now costs about 2.2× `acks=0` while replicating to two followers,
+> where before the fix it cost nothing because it replicated nothing.
+>
+> Round-to-round spread is roughly ±30% on a shared machine, which is why the
+> script reports a median of three and why a single figure from it should not be
+> quoted to two significant figures.
 
 ---
 

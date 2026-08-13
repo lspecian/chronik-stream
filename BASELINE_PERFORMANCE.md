@@ -5,6 +5,11 @@
 > invalidated the cluster figures in `BARE_METAL_PERFORMANCE.md` — and equally,
 > they say nothing about replicated throughput. Do not read them as cluster
 > numbers.
+>
+> For replicated throughput, see the 2026-08-13 block in
+> `BARE_METAL_PERFORMANCE.md`, or run `tests/cluster/perf_replication.sh`, which
+> measures all three acks levels on a real 3-node cluster with follower-pull
+> replication running.
 
 ## Test Date: 2025-11-29 (v2.2.9 Searchable Feature)
 
