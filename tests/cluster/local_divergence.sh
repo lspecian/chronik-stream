@@ -47,6 +47,16 @@ pid_of() { cat "$LOGS/alt-node$1.pid" 2>/dev/null; }
 
 start_node() { # $1 = node id
   mkdir -p "$LOGS" "$DIR/data/alt-node$1"
+  # Deliberately no indexer overrides: this runs the default configuration.
+  #
+  # Two thirds of runs used to fail here with the cut reporting "nothing to
+  # discard", and the reason was not truncation at all — the returning node's
+  # WAL directory had been deleted by the indexer's orphan reclamation, which
+  # fired because message-WAL recovery completes before the metadata catalog is
+  # populated and every live topic is briefly missing from it. The segment
+  # inventory said it plainly: one segment, id 0, zero bytes, milliseconds after
+  # recovery reported 140 records loaded. Reclamation now needs the topic to be
+  # missing on several consecutive passes, so this test exercises the real path.
   CHRONIK_REPLICATION_MODE=pull \
   CHRONIK_UNIFIED_API_PORT=$((6391 + $1)) \
   RUST_LOG=info \

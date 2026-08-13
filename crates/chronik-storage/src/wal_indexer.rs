@@ -39,6 +39,14 @@ use tokio::sync::RwLock;
 use tokio::time::{interval, Duration};
 use tracing::{info, warn, error, debug, instrument};
 use std::collections::{HashMap, HashSet};
+
+/// Consecutive indexing passes a topic must be missing from metadata before its
+/// WAL directory is reclaimed.
+///
+/// One pass is not enough: a restarting node finishes message-WAL recovery
+/// before its metadata catalog is populated, so every live topic is briefly
+/// missing and reclaiming on first sight deletes live data.
+const ORPHAN_CONFIRM_PASSES: u32 = 3;
 use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
@@ -299,6 +307,24 @@ pub struct WalIndexer {
     /// trait so chronik-storage need not depend on the server's IsrTracker.
     replication_progress: Arc<RwLock<Option<Arc<dyn ReplicationProgress>>>>,
 
+    /// How many consecutive passes each topic has looked absent from metadata.
+    ///
+    /// Reclaiming a topic's WAL directory the first time it cannot be found in
+    /// the catalog is unsafe on startup: message-WAL recovery completes before
+    /// the metadata catalog is populated, so a perfectly live topic looks
+    /// orphaned for a moment. Measured on a restarting node — 2ms after
+    /// `WAL recovery complete - 1 partitions loaded`:
+    ///
+    /// ```text
+    /// WalIndexer: topic absent from metadata (orphaned) — reclaiming WAL storage topic=…
+    /// Topic '…' cleanup: removed 0 partition queues, 1 sealed segments, wal_dir=true
+    /// ```
+    ///
+    /// That deleted 140 live records. They came back only because two other
+    /// replicas still had them; on a single node, or if the timing had caught
+    /// every replica, they would simply be gone.
+    absent_topic_passes: Arc<RwLock<HashMap<String, u32>>>,
+
     /// HP-1.4/HP-2.6: Listeners notified after each successful cold Tantivy
     /// commit. Each listener evicts its in-memory view of offsets that are
     /// now in cold storage. Multiple listeners are supported so both the hot
@@ -412,6 +438,7 @@ impl WalIndexer {
             is_leader: is_leader.unwrap_or_else(|| Arc::new(AtomicBool::new(true))),
             hot_buffer: Arc::new(RwLock::new(None)),
             replication_progress: Arc::new(RwLock::new(None)),
+            absent_topic_passes: Arc::new(RwLock::new(HashMap::new())),
             cold_flush_listener: Arc::new(RwLock::new(Vec::new())),
             hot_vector_index: Arc::new(RwLock::new(None)),
         }
@@ -612,6 +639,7 @@ impl WalIndexer {
         let is_leader = Arc::clone(&self.is_leader);
         let hot_buffer = Arc::clone(&self.hot_buffer);
         let replication_progress = Arc::clone(&self.replication_progress);
+        let absent_topic_passes = Arc::clone(&self.absent_topic_passes);
         let cold_flush_listener = Arc::clone(&self.cold_flush_listener);
         let hot_vector_index = Arc::clone(&self.hot_vector_index);
         let snapshot_interval = self.config.snapshot_interval_secs();
@@ -684,6 +712,7 @@ impl WalIndexer {
                     &is_leader,
                     &hot_buffer,
                     &replication_progress,
+                    &absent_topic_passes,
                     &cold_flush_listener,
                     &hot_vector_index,
                 ).await {
@@ -741,6 +770,7 @@ impl WalIndexer {
             &self.is_leader,
             &self.hot_buffer,
             &self.replication_progress,
+            &self.absent_topic_passes,
             &self.cold_flush_listener,
             &self.hot_vector_index,
         ).await
@@ -760,6 +790,7 @@ impl WalIndexer {
         is_leader: &Arc<AtomicBool>,
         hot_buffer: &Arc<RwLock<Option<Arc<HotDataBuffer>>>>,
         replication_progress: &Arc<RwLock<Option<Arc<dyn ReplicationProgress>>>>,
+        absent_topic_passes: &Arc<RwLock<HashMap<String, u32>>>,
         cold_flush_listener: &Arc<RwLock<Vec<Arc<dyn ColdFlushListener>>>>,
         hot_vector_index: &Arc<RwLock<Option<Arc<chronik_columnar::hot_vector_index::HotVectorIndex>>>>,
     ) -> Result<IndexingStats> {
@@ -861,9 +892,23 @@ impl WalIndexer {
                     orphan_topics.insert(topic);
                 }
             }
+
+            // Absent once is not absent. Message-WAL recovery finishes before
+            // the metadata catalog is populated, so on a restarting node every
+            // live topic is briefly missing from the catalog — and deleting its
+            // WAL directory on that basis destroys live data. Require the topic
+            // to be missing on `ORPHAN_CONFIRM_PASSES` consecutive passes, which
+            // spans several indexing intervals; a genuinely deleted topic is
+            // still reclaimed, just not within milliseconds of a restart.
+            {
+                let mut passes = absent_topic_passes.write().await;
+                orphan_topics = Self::confirm_orphans(&mut passes, orphan_topics);
+            }
+
             if !orphan_topics.is_empty() {
                 for t in &orphan_topics {
-                    warn!(topic = %t, "WalIndexer: topic absent from metadata (orphaned) — reclaiming WAL storage");
+                    warn!(topic = %t, passes = ORPHAN_CONFIRM_PASSES,
+                        "WalIndexer: topic absent from metadata on every recent pass (orphaned) — reclaiming WAL storage");
                     wal_manager.cleanup_topic(t).await;
                 }
                 segments_to_index
@@ -950,6 +995,39 @@ impl WalIndexer {
     /// pass would lose the data from BOTH the WAL and the object store.
     fn may_delete_wal_segment(delete_after_index: bool, errors_at_start: usize, errors_now: usize) -> bool {
         delete_after_index && errors_now == errors_at_start
+    }
+
+    /// Which of this pass's missing topics may actually have their WAL deleted.
+    ///
+    /// A topic must be missing from metadata on `ORPHAN_CONFIRM_PASSES`
+    /// consecutive passes. Any topic that reappears has its count cleared, so
+    /// the passes must be consecutive rather than cumulative.
+    ///
+    /// One pass is not enough because message-WAL recovery completes before the
+    /// metadata catalog is populated: on a restarting node every live topic is
+    /// briefly absent, and reclaiming on first sight deleted 140 live records
+    /// two milliseconds after recovery reported them loaded.
+    fn confirm_orphans(
+        passes: &mut HashMap<String, u32>,
+        candidates: HashSet<String>,
+    ) -> HashSet<String> {
+        // A topic present this time starts again from zero.
+        passes.retain(|topic, _| candidates.contains(topic));
+
+        let mut confirmed = HashSet::new();
+        for topic in candidates {
+            let seen = passes.entry(topic.clone()).or_insert(0);
+            *seen += 1;
+            if *seen >= ORPHAN_CONFIRM_PASSES {
+                confirmed.insert(topic);
+            } else {
+                debug!(
+                    topic = %topic, pass = *seen,
+                    "Topic missing from metadata — waiting for confirmation before reclaiming its WAL"
+                );
+            }
+        }
+        confirmed
     }
 
     /// RP-1.1 retention interlock: whether every record in this pass has reached
@@ -2418,6 +2496,67 @@ mod tests {
         assert_eq!(config.interval_secs, 30);
         assert_eq!(config.min_segment_age_secs, 10);
         assert!(config.delete_after_index);
+    }
+
+    fn topics(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A topic missing from metadata once is NOT reclaimed.
+    ///
+    /// This is the restart case: message-WAL recovery finishes before the
+    /// catalog is populated, so a live topic is briefly missing. Reclaiming on
+    /// first sight deleted 140 live records two milliseconds after recovery
+    /// reported them loaded — they returned only because other replicas had
+    /// them.
+    #[test]
+    fn a_topic_missing_once_is_not_reclaimed() {
+        let mut passes = HashMap::new();
+        assert!(WalIndexer::confirm_orphans(&mut passes, topics(&["orders"])).is_empty());
+    }
+
+    /// Missing on enough consecutive passes and it is reclaimed — a genuinely
+    /// deleted topic must not pin its WAL forever.
+    #[test]
+    fn a_topic_missing_on_every_pass_is_eventually_reclaimed() {
+        let mut passes = HashMap::new();
+        for _ in 1..ORPHAN_CONFIRM_PASSES {
+            assert!(WalIndexer::confirm_orphans(&mut passes, topics(&["orders"])).is_empty());
+        }
+        assert_eq!(
+            WalIndexer::confirm_orphans(&mut passes, topics(&["orders"])),
+            topics(&["orders"])
+        );
+    }
+
+    /// The passes must be CONSECUTIVE. A topic that reappears — metadata caught
+    /// up, or it was recreated — starts again from zero, so intermittent
+    /// absence never accumulates into a deletion.
+    #[test]
+    fn a_topic_that_reappears_starts_over() {
+        let mut passes = HashMap::new();
+        for _ in 1..ORPHAN_CONFIRM_PASSES {
+            WalIndexer::confirm_orphans(&mut passes, topics(&["orders"]));
+        }
+
+        // Seen again: not a candidate this pass.
+        WalIndexer::confirm_orphans(&mut passes, topics(&[]));
+
+        assert!(
+            WalIndexer::confirm_orphans(&mut passes, topics(&["orders"])).is_empty(),
+            "an intermittently-missing topic must never accumulate its way to deletion"
+        );
+    }
+
+    /// Topics are counted independently.
+    #[test]
+    fn confirmation_is_per_topic() {
+        let mut passes = HashMap::new();
+        for _ in 1..ORPHAN_CONFIRM_PASSES {
+            WalIndexer::confirm_orphans(&mut passes, topics(&["old"]));
+        }
+        let confirmed = WalIndexer::confirm_orphans(&mut passes, topics(&["old", "new"]));
+        assert_eq!(confirmed, topics(&["old"]), "'new' has only been missing once");
     }
 
     /// Follower progress stub: returns whatever the test dictates per partition.

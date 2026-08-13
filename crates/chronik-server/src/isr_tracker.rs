@@ -21,6 +21,11 @@
 use dashmap::DashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Reported as the replicated position when a partition has followers but none
+/// are live: below every real offset, so any retention check that compares
+/// against it holds rather than deletes.
+const UNREPLICATED: i64 = -1;
+
 /// Partition key (topic, partition)
 type PartitionKey = (String, i32);
 
@@ -310,17 +315,40 @@ impl IsrTracker {
             .unwrap_or_default()
             .as_millis() as u64;
 
-        self.follower_offsets
-            .iter()
-            .filter(|entry| {
-                let (_, (t, p)) = entry.key();
-                t == topic && *p == partition
-            })
-            .filter(|entry| {
-                now_ms.saturating_sub(entry.value().last_update_ms) <= self.max_lag_ms
-            })
-            .map(|entry| entry.value().last_offset)
-            .min()
+        let mut known_follower = false;
+        let mut min_live: Option<i64> = None;
+
+        for entry in self.follower_offsets.iter() {
+            let (_, (t, p)) = entry.key();
+            if t != topic || *p != partition {
+                continue;
+            }
+            known_follower = true;
+
+            if now_ms.saturating_sub(entry.value().last_update_ms) <= self.max_lag_ms {
+                let offset = entry.value().last_offset;
+                min_live = Some(min_live.map_or(offset, |m: i64| m.min(offset)));
+            }
+        }
+
+        match (known_follower, min_live) {
+            // This partition HAS followers and not one of them is live.
+            //
+            // Nothing is provably replicated, so report a position below every
+            // real offset rather than `None`. The caller reads `None` as "no
+            // interlock" and goes on to delete WAL segments — so returning it
+            // here switched the retention guard off at the exact moment it was
+            // needed: when the followers are gone is precisely when the leader's
+            // copy is the only copy.
+            //
+            // Measured: with both followers frozen, the indexer archived and
+            // deleted a WAL segment whose tail no follower had ever received.
+            (true, None) => Some(UNREPLICATED),
+            // No follower has ever reported for this partition: RF=1, or a
+            // cluster that has not replicated it yet. Unchanged — `None` means
+            // "no interlock", which is what single-node deployments rely on.
+            _ => min_live,
+        }
     }
 
     /// Drop everything known about a node, across all partitions.
@@ -463,6 +491,58 @@ mod tests {
 
         // Out of sync if lag > max_lag_entries
         assert!(!tracker.is_in_sync(2, "orders", 0, 2000)); // lag = 1050 > 1000
+    }
+
+    /// A partition whose followers have all gone silent must report that
+    /// NOTHING is provably replicated, not "no constraint".
+    ///
+    /// The WAL retention interlock treats `None` as "no followers to wait for"
+    /// and deletes indexed segments. Returning `None` here when the followers
+    /// merely stopped answering therefore switched the guard off exactly when
+    /// the leader's copy was the only copy — measured with both followers
+    /// frozen, where the indexer archived and deleted a segment whose tail no
+    /// follower had ever received.
+    #[test]
+    fn a_partition_whose_followers_are_all_silent_reports_nothing_replicated() {
+        let tracker = IsrTracker::new(1000, 10_000);
+        let long_ago_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            - 60_000; // silent for a minute, well past max_lag_ms
+
+        tracker.follower_offsets.insert(
+            (2, ("orders".to_string(), 0)),
+            FollowerState { last_offset: 500, last_update_ms: long_ago_ms },
+        );
+
+        assert_eq!(
+            tracker.min_acked_offset_of_live_followers("orders", 0),
+            Some(-1),
+            "a silent follower must not read as 'nothing to wait for'"
+        );
+    }
+
+    /// A partition nobody has ever reported on keeps the old meaning: no
+    /// interlock. Single-node deployments have no followers and must not have
+    /// their WAL pinned forever.
+    #[test]
+    fn a_partition_with_no_followers_at_all_imposes_no_interlock() {
+        let tracker = IsrTracker::new(1000, 10_000);
+        assert_eq!(tracker.min_acked_offset_of_live_followers("orders", 0), None);
+    }
+
+    /// With live followers it is still the minimum of their positions.
+    #[test]
+    fn live_followers_report_their_slowest() {
+        let tracker = IsrTracker::new(1000, 10_000);
+        tracker.update_follower_offset(2, "orders", 0, 900);
+        tracker.update_follower_offset(3, "orders", 0, 750);
+
+        assert_eq!(
+            tracker.min_acked_offset_of_live_followers("orders", 0),
+            Some(750)
+        );
     }
 
     /// A follower ahead of the offset it is compared against reports lag 0, not

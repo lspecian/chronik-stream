@@ -9,8 +9,8 @@
 | RP-0 | Replication conformance suite | `TESTED` | — | Placement + ISR honesty; fails pre-#29, passes after |
 | RP-1 | Harden the current mechanism | `TESTED` | — | 1.1–1.4 + 3 bugs found by cluster validation |
 | RP-2 | Follower fetch | `TESTED` | — | 2.1–2.4 all validated on a 3-node cluster, behind `CHRONIK_REPLICATION_MODE=pull` |
-| RP-3 | Leader epochs & truncation | `TESTED (partly)` | — | Cut proven in-process. Divergence can now be staged on a cluster (2026-08-13) — and doing so found **three defects in the repair path**, incl. a follower that spins 1,600×/s forever without repairing. See RP-3.3 |
-| RP-5 | Partition leader failover | 🔴 `BROKEN` | — | **Elects replicas that hold none of the partition's data.** Leadership moves and writes recover, but `acks=all`-acknowledged records are destroyed. Unclean leader election — see RP-3.3 "D0" |
+| RP-3 | Leader epochs & truncation | `TESTED` | — | Cut proven in-process AND on a cluster: `local_divergence.sh` passes 3/3 deterministically on the default config. Finding it exposed the indexer deleting a live topic's WAL on restart — see RP-3.3 |
+| RP-5 | Partition leader failover | `TESTED` | — | Elects only from the in-sync set; the set is published to metadata so it outlives the leader that measured it. Unclean election fixed — see RP-3.3 "D0" | **Elects replicas that hold none of the partition's data.** Leadership moves and writes recover, but `acks=all`-acknowledged records are destroyed. Unclean leader election — see RP-3.3 "D0" |
 | RP-6 | Failover recovery latency | `TESTED` | — | Catalog is pushed on rejoin; verified on cluster |
 | RP-7 | Assignment authority | `TESTED` | — | Only the Raft leader publishes; fetch refuses when it does not lead. **Full conformance suite now PASSES, RP-0.4 included** |
 | RP-8 | `acks=all` latency (#36) | `TESTED` | — | Three waits removed from the write path: new topic 7,000ms → 23ms, steady state 505ms → 17ms. The reported "duplication" was a client retry after a timeout |
@@ -463,7 +463,33 @@ D2 is now fixed: the repair cycle backs off, doubling from 10ms to a 5s cap, res
 
 D3 is half fixed. A truncation that had no work to do now reports the real log end instead of `None`, and the survivor scan covers every remaining segment rather than a range that excluded the straddler. Two integration tests pin it: a no-op reports the end, and genuinely emptying the log still reports `None`, so the distinction cannot be flattened again.
 
-#### ⚠️ Remaining: the truncation runs against a partition queue that is empty
+#### ✅ RESOLVED — and the cause was the indexer deleting a live topic's WAL on restart
+
+`local_divergence.sh` now passes **3 runs of 3, deterministically**, with identical bytes discarded each time (3,358) and **no test-only configuration** — it runs the default path.
+
+The remaining two-in-three failure was never in truncation. Truncation was right to report "nothing to do": the records were not there. The segment inventory added to the no-op path said so in one line —
+
+```
+truncation inventory topic=localdiv-1023834 partition=0 segment=0 bytes=0 first_offset=-1
+```
+
+— one segment, zero bytes, milliseconds after the node reported recovering 140 records. Two log lines earlier:
+
+```
+WAL recovery complete - 1 partitions loaded
+WalIndexer: topic absent from metadata (orphaned) — reclaiming WAL storage topic=localdiv-1023834
+Topic 'localdiv-1023834' cleanup: removed 0 partition queues, 1 sealed segments, wal_dir=true
+```
+
+**The WalIndexer deleted the entire topic's WAL directory two milliseconds after recovery loaded it.** Message-WAL recovery completes before the metadata catalog is populated, so on a restarting node every live topic is briefly absent from metadata — and orphan reclamation deleted on first sight.
+
+This is not a replication bug and not confined to this test. **Any restart where the indexer's pass beats catalog population destroys that node's WAL for the affected topics.** Here the data returned only because two other replicas still had it. On a single node, or with the timing catching every replica, it is gone.
+
+Reclamation now requires a topic to be missing from metadata on `ORPHAN_CONFIRM_PASSES` (3) **consecutive** passes, with any reappearance resetting the count, so intermittent absence can never accumulate into a deletion. A genuinely deleted topic is still reclaimed, just not within milliseconds of a restart. Four unit tests cover it: missing once is not reclaimed, missing throughout eventually is, a reappearance starts over, and the count is per topic.
+
+The segment inventory stays at `info!` — a truncation happens once per divergence and deletes data, so when it reports "nothing to do" the inputs are the only way to tell a correct no-op from a scan looking at the wrong files. That one line is what turned three sessions of speculation into a five-minute diagnosis.
+
+RP-1.1's retention interlock had the same shape of hole and is fixed alongside: `min_acked_offset_of_live_followers` returned `None` when a partition's followers existed but none were live, and the indexer reads `None` as "no interlock". So the guard switched itself off exactly when the leader's copy was the only copy. It now reports a position below every real offset in that case, and `None` only when no follower has ever reported (RF=1, single node) — where "no interlock" is correct.
 
 Three runs of `local_divergence.sh`, after all of the above: **1 pass, 2 failures**, and the failures are all the same shape. The committed records survive and the orphans do leave the disk every time — but by the expensive route, not the surgical one:
 

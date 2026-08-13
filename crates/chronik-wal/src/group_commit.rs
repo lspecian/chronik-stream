@@ -1458,6 +1458,26 @@ impl GroupCommitWal {
         // whose first record sits below it — not the first one at or above it,
         // which is the segment after the straddler. Getting this backwards
         // leaves the straddler's own above-target records alive.
+        // What the scan is actually working with. A truncation that removes
+        // nothing is indistinguishable from one that had nothing to remove
+        // unless the inventory is visible, and the caller acts on the answer by
+        // discarding a log.
+        for (id, path) in &segments {
+            let size = tokio::fs::metadata(path).await.map(|m| m.len()).unwrap_or(0);
+            // Computed before the macro: a `?`-formatted temporary held across
+            // an await makes the whole future non-Send.
+            let first = Self::first_record_offset(path).await?;
+            // `info!`, not `debug!`: a truncation happens once per divergence,
+            // it deletes data, and when it reports "nothing to do" the inputs
+            // are the only way to tell a correct no-op from a scan that was
+            // looking at the wrong files.
+            info!(
+                topic = %topic, partition = partition, segment = id, bytes = size,
+                first_offset = first.unwrap_or(-1),
+                "truncation inventory"
+            );
+        }
+
         let mut straddler: Option<usize> = None;
         for (index, (_, path)) in segments.iter().enumerate() {
             match Self::first_record_offset(path).await? {

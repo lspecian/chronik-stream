@@ -1614,7 +1614,12 @@ impl IntegratedKafkaServerBuilder {
             interval_secs: self.config.wal_indexing_interval_secs,
             min_segment_age_secs: 10,
             max_segments_per_run: 100,
-            delete_after_index: true,
+            // Reclaiming WAL space after indexing. Off by env for tests that
+            // need the WAL to stay put — RP-3.3's divergence test cannot observe
+            // a truncation of records the indexer has already archived away.
+            delete_after_index: std::env::var("CHRONIK_WAL_DELETE_AFTER_INDEX")
+                .map(|v| v != "false" && v != "0")
+                .unwrap_or(true),
             object_store: storage_config.object_store_config.clone(),
             index_base_path: format!("{}/tantivy_indexes", self.config.data_dir),
             parallel_indexing: false, // Start with serial processing
