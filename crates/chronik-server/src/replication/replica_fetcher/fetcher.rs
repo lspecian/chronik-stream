@@ -42,26 +42,36 @@ pub enum ReplicationMode {
 }
 
 impl ReplicationMode {
-    /// Read `CHRONIK_REPLICATION_MODE`. Anything unrecognised falls back to
-    /// push with a warning — an unfamiliar value must not silently disable
-    /// replication.
+    /// Read `CHRONIK_REPLICATION_MODE`, defaulting to **pull**.
+    ///
+    /// Pull became the default on 2026-08-13, ahead of RP-4 deleting the push
+    /// data path entirely. The two changes are deliberately separate so they can
+    /// fail separately: everything from RP-2 onwards was validated with
+    /// `CHRONIK_REPLICATION_MODE=pull` set explicitly, so flipping the default
+    /// puts anyone who sets nothing on that same validated path — while
+    /// `CHRONIK_REPLICATION_MODE=push` is still there to fall back to until the
+    /// switch itself is removed.
+    ///
+    /// An unrecognised value warns and uses pull rather than quietly selecting a
+    /// mechanism the operator did not ask for.
     pub fn from_env() -> Self {
         match std::env::var("CHRONIK_REPLICATION_MODE") {
             Ok(v) => Self::parse(&v),
-            Err(_) => ReplicationMode::Push,
+            Err(_) => ReplicationMode::Pull,
         }
     }
 
     pub fn parse(raw: &str) -> Self {
         match raw.trim().to_ascii_lowercase().as_str() {
-            "pull" | "fetch" | "follower-pull" => ReplicationMode::Pull,
-            "push" | "" => ReplicationMode::Push,
+            "pull" | "fetch" | "follower-pull" | "" => ReplicationMode::Pull,
+            "push" => ReplicationMode::Push,
             other => {
                 warn!(
-                    "CHRONIK_REPLICATION_MODE='{}' is not recognised; using push. Valid values: push, pull",
+                    "CHRONIK_REPLICATION_MODE='{}' is not recognised; using pull (the default). \
+                     Valid values: pull, push",
                     other
                 );
-                ReplicationMode::Push
+                ReplicationMode::Pull
             }
         }
     }
@@ -1239,20 +1249,23 @@ mod tests {
         );
     }
 
+    /// Pull is the default as of 2026-08-13; push remains selectable until RP-4
+    /// removes the switch with the code behind it.
     #[test]
-    fn replication_mode_defaults_to_push() {
-        assert_eq!(ReplicationMode::parse("push"), ReplicationMode::Push);
-        assert_eq!(ReplicationMode::parse(""), ReplicationMode::Push);
+    fn replication_mode_defaults_to_pull() {
+        assert_eq!(ReplicationMode::parse(""), ReplicationMode::Pull);
         assert_eq!(ReplicationMode::parse("pull"), ReplicationMode::Pull);
         assert_eq!(ReplicationMode::parse("  PULL  "), ReplicationMode::Pull);
+        assert_eq!(ReplicationMode::parse("push"), ReplicationMode::Push);
     }
 
     /// A typo must not silently disable replication — that is the failure this
-    /// whole roadmap exists because of.
+    /// whole roadmap exists because of. It now lands on pull, the default and
+    /// the mechanism every phase since RP-2 was validated against.
     #[test]
-    fn an_unknown_replication_mode_falls_back_to_push() {
-        assert_eq!(ReplicationMode::parse("pulll"), ReplicationMode::Push);
-        assert_eq!(ReplicationMode::parse("off"), ReplicationMode::Push);
+    fn an_unknown_replication_mode_falls_back_to_the_default() {
+        assert_eq!(ReplicationMode::parse("pulll"), ReplicationMode::Pull);
+        assert_eq!(ReplicationMode::parse("off"), ReplicationMode::Pull);
     }
 
     // ---- RP-3.3: the cut itself, end to end ----

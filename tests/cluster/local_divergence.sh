@@ -57,7 +57,6 @@ start_node() { # $1 = node id
   # inventory said it plainly: one segment, id 0, zero bytes, milliseconds after
   # recovery reported 140 records loaded. Reclamation now needs the topic to be
   # missing on several consecutive passes, so this test exercises the real path.
-  CHRONIK_REPLICATION_MODE=pull \
   CHRONIK_UNIFIED_API_PORT=$((6391 + $1)) \
   RUST_LOG=info \
   "$BIN" start --config "$DIR/altport-node$1.toml" \

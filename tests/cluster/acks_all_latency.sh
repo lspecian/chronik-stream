@@ -53,7 +53,7 @@ command -v kcat >/dev/null || { say "SKIP: kcat not installed"; exit 0; }
 
 start_node() {
   mkdir -p "$LOGS" "$DIR/data/alt-node$1"
-  CHRONIK_REPLICATION_MODE=pull CHRONIK_UNIFIED_API_PORT=$((6391 + $1)) RUST_LOG=info \
+  CHRONIK_UNIFIED_API_PORT=$((6391 + $1)) RUST_LOG=info \
     "$BIN" start --config "$DIR/altport-node$1.toml" > "$LOGS/alt-node$1.log" 2>&1 &
   echo $! > "$LOGS/alt-node$1.pid"
 }

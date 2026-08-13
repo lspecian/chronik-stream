@@ -14,7 +14,7 @@
 | RP-6 | Failover recovery latency | `TESTED` | — | Catalog is pushed on rejoin; verified on cluster |
 | RP-7 | Assignment authority | `TESTED` | — | Only the Raft leader publishes; fetch refuses when it does not lead. **Full conformance suite now PASSES, RP-0.4 included** |
 | RP-8 | `acks=all` latency (#36) | `TESTED` | — | Three waits removed from the write path: new topic 7,000ms → 23ms, steady state 505ms → 17ms. The reported "duplication" was a client retry after a timeout |
-| RP-4 | Delete the push stack | `NOT STARTED` | — | ~2,500 lines removed |
+| RP-4 | Delete the push stack | `IN PROGRESS` | — | Pull is now the DEFAULT and the whole suite passes with no env var set. Deleting the switch and the push data path is gated on Open Question 5 |
 
 ---
 
@@ -923,7 +923,11 @@ Concrete targets:
 | `LeaderElector` shim | `leader_election.rs` (72 lines) | Superseded by RP-5; delete with its wiring |
 | Election trigger machinery | `wal_replication.rs` `run_election_worker`, `monitor_timeouts`, `last_heartbeat`; `replication/connection_state.rs` `setup_timeout_monitoring` | Fed only the elector. ⚠️ `last_heartbeat` is also used by `consumer_group.rs` and `leader_lease.rs` for unrelated purposes — do not follow the name blindly |
 
-⚠️ **Removing `ReplicationMode` removes the escape hatch.** Push is currently still the default; every phase from RP-2 on was validated with `CHRONIK_REPLICATION_MODE=pull` explicitly set. Flip the default to pull and soak it *before* deleting the switch, so the two changes fail separately.
+⚠️ **Removing `ReplicationMode` removes the escape hatch.** Every phase from RP-2 on was validated with `CHRONIK_REPLICATION_MODE=pull` explicitly set. Flip the default to pull and soak it *before* deleting the switch, so the two changes fail separately.
+
+✅ **Default flipped 2026-08-13.** `from_env` returns `Pull` when nothing is set, and an unrecognised value now warns and uses pull rather than quietly selecting the mechanism the operator did not ask for. Every cluster test had its `CHRONIK_REPLICATION_MODE=pull` removed so they exercise the default rather than a setting no deployment will have; all pass — replication conformance 600/600 on all three acks modes, divergence 3/3, `acks=all` 23ms to a new topic. Verified independently that a cluster started with no environment at all replicates: 300 records produced, 900 markers on each of the three nodes' disks.
+
+`CHRONIK_REPLICATION_MODE=push` still selects the old path. It stays until the soak below is done and Open Question 5 is answered, so the flip and the deletion can fail separately.
 
 
 
