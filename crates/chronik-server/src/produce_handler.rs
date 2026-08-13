@@ -3657,8 +3657,15 @@ impl ProduceHandler {
             config: std::collections::HashMap::new(),
         };
         
-        // Attempt to create the topic
-        let result = match self.metadata_store.create_topic(topic_name, topic_config).await {
+        // Attempt to create the topic.
+        //
+        // `auto_create_topic`, not `create_topic`: this config is a guess made
+        // because a client named a topic that does not exist, and the store
+        // records that so a later explicit `CreateTopics` wins over it — and,
+        // more importantly, so this never overwrites one. The default carries 3
+        // partitions, which used to silently widen a topic someone had created
+        // with `--partitions 1`.
+        let result = match self.metadata_store.auto_create_topic(topic_name, topic_config).await {
             Ok(metadata) => {
                 // v2.2.7 FIX: Partition initialization happens through PartitionAssignment module below
                 // which has proper metadata WAL writes and replication (in raft_metadata_store.rs)

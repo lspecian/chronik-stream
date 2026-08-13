@@ -131,18 +131,55 @@ impl MetadataState {
     /// Apply a metadata event to update state
     async fn apply_event(&self, event: &MetadataEvent) -> Result<()> {
         match &event.payload {
-            MetadataEventPayload::TopicCreated { name, config } => {
+            MetadataEventPayload::TopicCreated { name, config, auto_created } => {
                 let mut topics = self.topics.write().await;
                 if let Some(existing) = topics.get_mut(name) {
-                    // v2.3.2 CRITICAL FIX: If incoming partition count is HIGHER, this
-                    // is either a topic recreation with more partitions or an explicit
-                    // CreateTopics overriding an auto-created topic. Update the partition
-                    // count and add offsets for new partitions.
+                    // Provenance settles this, not size.
                     //
-                    // NOTE: Only update when incoming > existing, never downgrade.
-                    // Auto-create events with fewer partitions must NOT overwrite
-                    // an explicit CreateTopics with more partitions.
-                    if config.partition_count > existing.config.partition_count {
+                    // An auto-create must never change a config someone asked
+                    // for. Comparing partition counts and keeping the larger got
+                    // this right in one direction only: `TopicConfig::default()`
+                    // carries 3 partitions, so an auto-create racing a topic
+                    // created with `--partitions 1` silently widened it to 3.
+                    // Measured on a cluster — `/admin/status` reported three
+                    // partitions with real leaders and ISRs while every record
+                    // sat in partition 0, because the producer had seen one
+                    // partition when it wrote. A consumer then subscribes to
+                    // partitions the producer never knew about.
+                    //
+                    // The config-key merge below still runs, so an auto-create
+                    // can still contribute keys the explicit config never set.
+                    if *auto_created && !existing.auto_created {
+                        tracing::debug!(
+                            topic = %name,
+                            existing_partitions = existing.config.partition_count,
+                            incoming_partitions = config.partition_count,
+                            "Ignoring auto-create for a topic that was created explicitly"
+                        );
+                    } else if !*auto_created && existing.auto_created {
+                        // The other direction: what is here was guessed, and this
+                        // was asked for. It wins whatever the counts say — which
+                        // is the point of tracking provenance, because an
+                        // explicit `--partitions 1` landing on an auto-created 3
+                        // must be able to narrow it.
+                        let old_count = existing.config.partition_count;
+                        tracing::info!(
+                            topic = %name,
+                            auto_created_partitions = old_count,
+                            explicit_partitions = config.partition_count,
+                            "Explicit topic config replaces the auto-created one"
+                        );
+                        existing.config = config.clone();
+                        existing.auto_created = false;
+                        existing.updated_at = event.timestamp;
+                        drop(topics);
+
+                        let mut offsets = self.partition_offsets.write().await;
+                        for partition in 0..config.partition_count {
+                            offsets.entry((name.clone(), partition)).or_insert((0, 0));
+                        }
+                        return Ok(());
+                    } else if config.partition_count > existing.config.partition_count {
                         let old_count = existing.config.partition_count;
                         tracing::info!(
                             topic = %name,
@@ -192,6 +229,7 @@ impl MetadataState {
                     config: config.clone(),
                     created_at: event.timestamp,
                     updated_at: event.timestamp,
+                    auto_created: *auto_created,
                 };
 
                 topics.insert(name.clone(), metadata);
@@ -728,6 +766,7 @@ impl WalMetadataStore {
                 MetadataEventPayload::TopicCreated {
                     name: name.clone(),
                     config: meta.config.clone(),
+                    auto_created: meta.auto_created,
                 },
                 self.node_id,
             );
@@ -766,12 +805,40 @@ impl WalMetadataStore {
         );
         count
     }
-}
 
-#[async_trait]
-impl MetadataStore for WalMetadataStore {
-    async fn create_topic(&self, name: &str, config: TopicConfig) -> Result<TopicMetadata> {
-        // Check if topic already exists
+    /// Both with-assignments create paths, differing only in provenance.
+    async fn with_assignments_inner(
+        &self,
+        topic_name: &str,
+        config: TopicConfig,
+        assignments: Vec<PartitionAssignment>,
+        offsets: Vec<(u32, i64, i64)>,
+        auto_created: bool,
+    ) -> Result<TopicMetadata> {
+        let topic_metadata = self.create_topic_inner(topic_name, config, auto_created).await?;
+
+        for assignment in assignments {
+            self.assign_partition(assignment).await?;
+        }
+
+        // Offsets are already initialised to (0, 0) by the TopicCreated apply;
+        // this only matters when the caller supplied different values.
+        for (partition, high_watermark, log_start_offset) in offsets {
+            if high_watermark != 0 || log_start_offset != 0 {
+                self.update_partition_offset(topic_name, partition, high_watermark, log_start_offset).await?;
+            }
+        }
+
+        Ok(topic_metadata)
+    }
+
+    /// Both create paths, differing only in whether the config was asked for.
+    async fn create_topic_inner(
+        &self,
+        name: &str,
+        config: TopicConfig,
+        auto_created: bool,
+    ) -> Result<TopicMetadata> {
         {
             let topics = self.state.topics.read().await;
             if topics.contains_key(name) {
@@ -779,22 +846,31 @@ impl MetadataStore for WalMetadataStore {
             }
         }
 
-        // Create event
         let event = MetadataEvent::new_with_node(
             MetadataEventPayload::TopicCreated {
                 name: name.to_string(),
-                config: config.clone(),
+                config,
+                auto_created,
             },
             self.node_id,
         );
 
-        // Write to WAL and apply
         self.write_and_apply(event).await?;
 
-        // Return created topic metadata
         let topics = self.state.topics.read().await;
         topics.get(name).cloned()
             .ok_or_else(|| MetadataError::NotFound(format!("Topic {} not found after creation", name)))
+    }
+}
+
+#[async_trait]
+impl MetadataStore for WalMetadataStore {
+    async fn create_topic(&self, name: &str, config: TopicConfig) -> Result<TopicMetadata> {
+        self.create_topic_inner(name, config, false).await
+    }
+
+    async fn auto_create_topic(&self, name: &str, config: TopicConfig) -> Result<TopicMetadata> {
+        self.create_topic_inner(name, config, true).await
     }
 
     async fn get_topic(&self, name: &str) -> Result<Option<TopicMetadata>> {
@@ -1255,24 +1331,16 @@ impl MetadataStore for WalMetadataStore {
         assignments: Vec<PartitionAssignment>,
         offsets: Vec<(u32, i64, i64)>
     ) -> Result<TopicMetadata> {
-        // Create topic first
-        let topic_metadata = self.create_topic(topic_name, config).await?;
+        self.with_assignments_inner(topic_name, config, assignments, offsets, false).await
+    }
 
-        // Create partition assignments by emitting PartitionAssigned events
-        for assignment in assignments {
-            self.assign_partition(assignment).await?;
-        }
-
-        // Initialize partition offsets (high watermark and log start offset)
-        // Note: offsets are already initialized to (0, 0) in TopicCreated event handler,
-        // but we update them here in case caller provided different values
-        for (partition, high_watermark, log_start_offset) in offsets {
-            if high_watermark != 0 || log_start_offset != 0 {
-                self.update_partition_offset(topic_name, partition, high_watermark, log_start_offset).await?;
-            }
-        }
-
-        Ok(topic_metadata)
+    async fn auto_create_topic_with_assignments(&self,
+        topic_name: &str,
+        config: TopicConfig,
+        assignments: Vec<PartitionAssignment>,
+        offsets: Vec<(u32, i64, i64)>
+    ) -> Result<TopicMetadata> {
+        self.with_assignments_inner(topic_name, config, assignments, offsets, true).await
     }
 
     async fn commit_transactional_offsets(
@@ -1508,6 +1576,7 @@ mod replication_filter_tests {
         assert!(replicate_to_followers(&MetadataEventPayload::TopicCreated {
             name: "t".to_string(),
             config: TopicConfig::default(),
+            auto_created: false,
         }));
         assert!(replicate_to_followers(&MetadataEventPayload::TopicDeleted {
             name: "t".to_string(),
@@ -1878,5 +1947,130 @@ mod leader_epoch_tests {
             serde_json::from_str(legacy).expect("pre-RP-3 assignments must still decode");
         assert_eq!(decoded.leader_epoch, 0);
         assert_eq!(decoded.leader_id, 1);
+    }
+}
+
+#[cfg(test)]
+mod topic_provenance_tests {
+    use super::*;
+
+    fn store() -> WalMetadataStore {
+        let wal_append: WalAppendFn = Arc::new(|_bytes| Box::pin(async { Ok(0i64) }));
+        WalMetadataStore::new(1, wal_append)
+    }
+
+    fn config_with(partition_count: u32) -> TopicConfig {
+        TopicConfig { partition_count, ..Default::default() }
+    }
+
+    async fn partitions_of(store: &WalMetadataStore, topic: &str) -> u32 {
+        store.get_topic(topic).await.unwrap().expect("topic exists").config.partition_count
+    }
+
+    /// An auto-create must not widen a topic somebody created explicitly.
+    ///
+    /// This is the reported bug: `TopicConfig::default()` carries 3 partitions,
+    /// the apply path kept whichever config had more, and a topic created with
+    /// `--partitions 1` silently became 3. `/admin/status` then reported three
+    /// partitions with real leaders while every record sat in partition 0,
+    /// because the producer had seen one partition when it wrote.
+    #[tokio::test]
+    async fn an_auto_create_does_not_widen_an_explicit_topic() {
+        let store = store();
+        store.create_topic("orders", config_with(1)).await.unwrap();
+
+        // The racing auto-create, carrying the default 3.
+        store
+            .apply_replicated_event(MetadataEvent::new_with_node(
+                MetadataEventPayload::TopicCreated {
+                    name: "orders".to_string(),
+                    config: config_with(3),
+                    auto_created: true,
+                },
+                2,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            partitions_of(&store, "orders").await,
+            1,
+            "an auto-create silently widened a topic that was asked for with 1 partition"
+        );
+    }
+
+    /// The other direction: an explicit create replaces an auto-created config
+    /// even when it has FEWER partitions. Provenance decides, not size.
+    #[tokio::test]
+    async fn an_explicit_create_narrows_an_auto_created_topic() {
+        let store = store();
+        store.auto_create_topic("logs", config_with(3)).await.unwrap();
+
+        store
+            .apply_replicated_event(MetadataEvent::new_with_node(
+                MetadataEventPayload::TopicCreated {
+                    name: "logs".to_string(),
+                    config: config_with(1),
+                    auto_created: false,
+                },
+                2,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(partitions_of(&store, "logs").await, 1);
+        assert!(
+            !store.get_topic("logs").await.unwrap().unwrap().auto_created,
+            "the topic is no longer a guess once someone has asked for it"
+        );
+    }
+
+    /// Two explicit events still ratchet upward — a genuine expansion is not
+    /// blocked by the provenance rule.
+    #[tokio::test]
+    async fn explicit_expansion_still_applies() {
+        let store = store();
+        store.create_topic("events", config_with(1)).await.unwrap();
+
+        store
+            .apply_replicated_event(MetadataEvent::new_with_node(
+                MetadataEventPayload::TopicCreated {
+                    name: "events".to_string(),
+                    config: config_with(6),
+                    auto_created: false,
+                },
+                2,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(partitions_of(&store, "events").await, 6);
+    }
+
+    /// Provenance is recorded, so a follower applying the replicated event
+    /// reaches the same decision the leader did.
+    #[tokio::test]
+    async fn provenance_is_recorded_on_the_topic() {
+        let store = store();
+        store.auto_create_topic("guessed", config_with(3)).await.unwrap();
+        store.create_topic("asked-for", config_with(3)).await.unwrap();
+
+        assert!(store.get_topic("guessed").await.unwrap().unwrap().auto_created);
+        assert!(!store.get_topic("asked-for").await.unwrap().unwrap().auto_created);
+    }
+
+    /// Events written before the field existed decode as explicit — the side
+    /// that is protected — so an upgrade cannot start discarding configs.
+    #[test]
+    fn a_legacy_topic_created_event_decodes_as_explicit() {
+        let legacy = r#"{"type":"TopicCreated","name":"old","config":{"partition_count":1,"replication_factor":1,"retention_ms":null,"segment_bytes":1073741824,"config":{}}}"#;
+        let decoded: MetadataEventPayload =
+            serde_json::from_str(legacy).expect("pre-provenance events must still decode");
+        match decoded {
+            MetadataEventPayload::TopicCreated { auto_created, .. } => {
+                assert!(!auto_created, "an unmarked event must read as explicit");
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 }

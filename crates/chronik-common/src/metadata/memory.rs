@@ -52,6 +52,7 @@ impl MetadataStore for InMemoryMetadataStore {
             config: config.clone(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            auto_created: false,
         };
         
         topics.insert(name.to_string(), metadata.clone());
@@ -328,7 +329,7 @@ impl MetadataStore for InMemoryMetadataStore {
                 let log_start = offsets.get(&key).map(|(_, ls)| *ls).unwrap_or(0);
                 offsets.insert(key, (new_watermark, log_start));
             }
-            MetadataEventPayload::TopicCreated { name, config } => {
+            MetadataEventPayload::TopicCreated { name, config, .. } => {
                 let mut topics = self.topics.write().await;
                 if !topics.contains_key(&name) {
                     let metadata = TopicMetadata {
@@ -337,6 +338,7 @@ impl MetadataStore for InMemoryMetadataStore {
                         config: config.into(),
                         created_at: chrono::Utc::now(),
                         updated_at: chrono::Utc::now(),
+                        auto_created: false,
                     };
                     topics.insert(name, metadata);
                 }
@@ -375,6 +377,7 @@ impl MetadataStore for InMemoryMetadataStore {
             config,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            auto_created: false,
         };
         
         // Create topic metadata

@@ -6120,16 +6120,26 @@ impl ProtocolHandler {
                 let mut sorted_assignments = assignments;
                 sorted_assignments.sort_by_key(|a| a.partition);
 
-                // v2.3.2 FIX: Use the ACTUAL number of partitions, which is the max of
-                // partition_count (from TopicConfig, may be stale on followers) and the
-                // actual number of PartitionAssignment entries (replicated via Raft).
-                // This handles the case where auto_create_topics(3) runs first, then
-                // CreateTopics(6) expands partitions - the TopicUpdated event isn't
-                // replicated but PartitionAssigned events ARE, so assignments > partition_count.
-                let effective_partition_count = std::cmp::max(
-                    topic_meta.config.partition_count,
-                    sorted_assignments.len() as u32,
-                );
+                // How many partitions to tell the client about.
+                //
+                // For an AUTO-CREATED topic, take the larger of the config and
+                // the assignments actually present: `partition_count` can be
+                // stale on a follower while the `PartitionAssigned` events have
+                // arrived, and under-reporting there hides real partitions.
+                //
+                // For a topic someone CREATED EXPLICITLY, the config is the
+                // answer, full stop. Taking the max there is how a topic made
+                // with `--partitions 1` came back as 3: a racing auto-create had
+                // left three assignments behind, and every client was then told
+                // about two partitions the producer had never written to.
+                let effective_partition_count = if topic_meta.auto_created {
+                    std::cmp::max(
+                        topic_meta.config.partition_count,
+                        sorted_assignments.len() as u32,
+                    )
+                } else {
+                    topic_meta.config.partition_count
+                };
 
                 tracing::info!("METADATA→PARTITIONS: topic={} partition_count={} assignments_count={} effective={}",
                               topic_meta.name, topic_meta.config.partition_count, sorted_assignments.len(), effective_partition_count);
@@ -6355,8 +6365,12 @@ impl ProtocolHandler {
                         offsets.push((partition, 0i64, 0i64)); // partition, high_watermark, log_start_offset
                     }
                     
-                    // Create topic with assignments
-                    match metadata_store.create_topic_with_assignments(
+                    // Create topic with assignments.
+                    //
+                    // The `auto_` variant: this partition count is a default,
+                    // not a request, and recording that is what stops it
+                    // overwriting a topic someone created with a different one.
+                    match metadata_store.auto_create_topic_with_assignments(
                         topic_name,
                         config,
                         assignments,

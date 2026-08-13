@@ -305,7 +305,7 @@ impl IntegratedKafkaServerBuilder {
 
         // Convert common MetadataEvent to server MetadataEvent
         let server_event = match &common_event.payload {
-            MetadataEventPayload::TopicCreated { name, config } => {
+            MetadataEventPayload::TopicCreated { name, config, auto_created } => {
                 Some(ServerEvent::TopicCreated {
                     topic: name.clone(),
                     num_partitions: config.partition_count as i32,

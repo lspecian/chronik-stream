@@ -294,6 +294,9 @@ impl MetadataWalReplicator {
                         chronik_common::metadata::MetadataEventPayload::TopicCreated {
                             name: topic.clone(),
                             config: topic_meta.config,
+                            // Carry the provenance so a follower applies the
+                            // same precedence the leader did.
+                            auto_created: topic_meta.auto_created,
                         },
                     );
 

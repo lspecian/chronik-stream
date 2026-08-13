@@ -246,6 +246,15 @@ pub struct TopicMetadata {
     pub config: TopicConfig,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+
+    /// Whether this topic's config came from auto-creation rather than an
+    /// explicit `CreateTopics`.
+    ///
+    /// Kept so a later auto-create cannot overwrite a config someone asked for
+    /// deliberately. `#[serde(default)]` is false — topics recorded before this
+    /// field existed read as explicit, which is the side that is protected.
+    #[serde(default)]
+    pub auto_created: bool,
 }
 
 /// Segment metadata (Tantivy indexes)
@@ -404,6 +413,20 @@ pub struct ConsumerOffset {
 pub trait MetadataStore: Send + Sync {
     // Topic operations
     async fn create_topic(&self, name: &str, config: TopicConfig) -> Result<TopicMetadata>;
+
+    /// Create a topic that nobody asked for, because a produce or fetch named it.
+    ///
+    /// Separate from `create_topic` so the store can record that this config was
+    /// GUESSED. `TopicConfig::default()` carries 3 partitions, and without that
+    /// distinction an auto-create racing an explicit `--partitions 1` silently
+    /// widened the topic to 3 — the apply path compared partition counts and
+    /// kept the larger, which is the wrong tiebreak in this direction.
+    ///
+    /// Defaults to `create_topic`, so a store with no notion of provenance
+    /// behaves exactly as before.
+    async fn auto_create_topic(&self, name: &str, config: TopicConfig) -> Result<TopicMetadata> {
+        self.create_topic(name, config).await
+    }
     async fn get_topic(&self, name: &str) -> Result<Option<TopicMetadata>>;
     async fn list_topics(&self) -> Result<Vec<TopicMetadata>>;
     async fn update_topic(&self, name: &str, config: TopicConfig) -> Result<TopicMetadata>;
@@ -567,10 +590,25 @@ pub trait MetadataStore: Send + Sync {
     async fn init_system_state(&self) -> Result<()>;
     
     // Batch/transactional operations
-    async fn create_topic_with_assignments(&self, 
-        topic_name: &str, 
+    async fn create_topic_with_assignments(&self,
+        topic_name: &str,
         config: TopicConfig,
         assignments: Vec<PartitionAssignment>,
         offsets: Vec<(u32, i64, i64)> // (partition, high_watermark, log_start_offset)
     ) -> Result<TopicMetadata>;
+
+    /// As `create_topic_with_assignments`, for a topic nobody asked for.
+    ///
+    /// The auto-create path in the protocol handler goes through the
+    /// with-assignments variant, so provenance has to be expressible here too —
+    /// marking it only on `create_topic` left every auto-created topic recorded
+    /// as explicit, which is the state the precedence rule depends on.
+    async fn auto_create_topic_with_assignments(&self,
+        topic_name: &str,
+        config: TopicConfig,
+        assignments: Vec<PartitionAssignment>,
+        offsets: Vec<(u32, i64, i64)>
+    ) -> Result<TopicMetadata> {
+        self.create_topic_with_assignments(topic_name, config, assignments, offsets).await
+    }
 }
