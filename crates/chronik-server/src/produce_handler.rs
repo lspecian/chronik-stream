@@ -1375,10 +1375,10 @@ impl ProduceHandler {
                                 // The ProduceHandler may want to update its local state here
                                 // For now, we just log it as the primary purpose is metadata WAL replication
                             }
-                            MetadataEvent::PartitionAssigned { topic, partition, replicas, leader } => {
+                            MetadataEvent::PartitionAssigned { topic, partition, replicas, leader, leader_epoch, .. } => {
                                 debug!(
-                                    "Received PartitionAssigned event: {}-{} → leader {}, replicas {:?}",
-                                    topic, partition, leader, replicas
+                                    "Received PartitionAssigned event: {}-{} → leader {} at epoch {}, replicas {:?}",
+                                    topic, partition, leader, leader_epoch, replicas
                                 );
                                 // Could update partition_states or leadership_cache here if needed
                             }

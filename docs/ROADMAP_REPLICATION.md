@@ -429,6 +429,38 @@ The epoch being asked about is the problem: the follower asks where *its* epoch 
 
 **All three are in the repair path, not the detection path.** Detection works — the follower notices divergence promptly and correctly, in both shapes. What follows is what fails.
 
+#### ✅ Two of the three causes are fixed (2026-08-13) — the divergent tail is now discarded
+
+D1's stall had two causes beneath it, both now fixed, and the orphan records are gone from the returning node's disk (`orphan markers on disk now: 0`, from 120).
+
+**The replicated assignment was rebuilt without its epoch.** `metadata_wal_replication` reconstructs a `PartitionAssignment` from the bus event and shipped `leader_epoch: 0` regardless of the real value, because the bus event carried only `topic`, `partition`, `replicas` and `leader`. The receiving node applies that verbatim. So **every follower's copy of every assignment read epoch 0 forever**, however many times leadership had actually changed — and leader-epoch truncation cannot work when every record in the cluster claims the same epoch: a follower asks about epoch 0, a promoted replica that also believes it is on epoch 0 answers "that is current, it ends at my log end", and nothing ever truncates. The event now carries the whole assignment, `isr` included, so the D0 fix propagates too. Without this, the in-sync set would have stayed on the node that measured it and failover would have kept electing blind.
+
+**The rejoin catalog broadcast raced the connection it needed.** A metadata send to a follower with no live connection is dropped — this transport is fire-and-forget. RP-6 triggers the re-broadcast on *liveness*, which a returning node regains about **26ms before** its TCP connection is re-established:
+
+```
+09:21:54.368  ⚠️  No connection to follower localhost:9591 (connections: ["localhost:9593"])
+09:21:54.394  Attempting to connect to follower: localhost:9591 (failures: 35)
+09:21:54.395  ✅ Connected to follower: localhost:9591
+```
+
+The whole catalog was published into that gap and lost. Measured: a restarted node received **zero** metadata events over 90 seconds, kept believing it still led a partition that had failed over, and therefore never replicated that partition, never ran the handshake, and held its divergent tail indefinitely — the next anti-entropy pass would have repaired it 300s later. The catalog is now re-asserted when a follower connection comes up, which is the condition the broadcast actually depends on.
+
+#### ⚠️ What remains: a false-divergence loop from two disagreeing log ends
+
+Repair now happens, but the fetch loop still spins afterwards, and the two numbers in its own log lines do not match:
+
+```
+Reconciling 1 partition(s) with the leader before fetching (leader-epoch handshake)
+dtr-855200-0: log is a prefix of the leader's (ours ends at 91, the epoch ran to 91) — nothing to truncate
+dtr-855200-0: fetched batch spans [91, 130] across the local log end 100 — logs have diverged — reconciling
+```
+
+`local_log_end` reports **91** to the reconcile path while the apply path's expected position is **100**, at the same instant, for the same partition. Reconcile compares 91 against the leader's 91, correctly concludes "prefix, nothing to truncate", and resumes — and the apply path then rejects the batch it fetches as a straddle, because it is measuring against 100.
+
+A fetch that lands inside a batch is also normal and must not be read as divergence: the leader serves whole batches, so a request at offset 100 returns the batch based at 91. Refusing that as a "straddle" turns an ordinary mid-batch read into a permanent repair loop.
+
+So the remaining work is one invariant: **a follower has exactly one log end**, and a batch whose base is below it is trimmed, not treated as evidence of divergence. D2 (no backoff on a repair cycle that makes no progress) still stands as its own defence — a cycle that cannot progress should slow down whatever the cause.
+
 #### 🔴 D0 — and none of that is the real bug: failover elects replicas that hold no data
 
 Chasing D1 to its source found something worse. The leader's own answer, from the same run:

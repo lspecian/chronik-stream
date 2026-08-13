@@ -322,6 +322,11 @@ impl IntegratedKafkaServerBuilder {
                     partition: assignment.partition as i32,
                     replicas: assignment.replicas.clone(),
                     leader: assignment.leader_id,
+                    // Every field, because followers rebuild the assignment from
+                    // exactly these. Dropping one here sets it to its default on
+                    // every other node.
+                    leader_epoch: assignment.leader_epoch,
+                    isr: assignment.isr.clone(),
                 })
             }
             MetadataEventPayload::HighWatermarkUpdated { topic, partition, new_watermark } => {
@@ -379,6 +384,10 @@ impl IntegratedKafkaServerBuilder {
             self.config.cluster_config.clone().map(Arc::new),
             Some(metadata_store.clone()),
         );
+
+        // Kept so the catalog can be re-asserted when a follower link comes back
+        // up — see `set_catalog_resync_notify` below.
+        let metadata_transport = wal_replication_manager.clone();
 
         // Create metadata WAL replicator
         let metadata_wal_replicator = Arc::new(
@@ -442,6 +451,18 @@ impl IntegratedKafkaServerBuilder {
         // constant broadcast cost against a window that would still exist.
         let rejoin_notify = Arc::new(tokio::sync::Notify::new());
         self.metadata_rejoin_notify = Some(rejoin_notify.clone());
+
+        // Liveness is not the right trigger on its own. A returning node is live
+        // ~26ms before its replication connection is re-established, and a
+        // metadata send with no connection is dropped — so the rejoin broadcast
+        // was published into a gap and lost, leaving the returning node with a
+        // stale catalog until the next anti-entropy pass 300s later. Measured: a
+        // restarted node received zero metadata events, still believed it led a
+        // partition that had failed over, and so never replicated it at all.
+        //
+        // Firing on connect as well means the catalog is re-asserted at a moment
+        // the link demonstrably exists.
+        metadata_transport.set_catalog_resync_notify(rejoin_notify.clone());
 
         // RP-7: only the Raft leader may re-assert the catalog.
         //

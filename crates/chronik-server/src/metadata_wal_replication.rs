@@ -194,11 +194,18 @@ impl MetadataWalReplicator {
             // v2.2.9 Phase 7 FIX #4: Replicate PartitionAssigned events to followers via WalReplicationManager
             // The leader receives this from local event bus AFTER write_and_apply() completes
             // So local state is ALREADY applied - we just need to replicate to followers
-            MetadataEvent::PartitionAssigned { topic, partition, replicas, leader } => {
-                tracing::info!("📡 Replicating PartitionAssigned to followers: {}-{}, leader={}, replicas={:?}",
-                    topic, partition, leader, replicas);
+            MetadataEvent::PartitionAssigned { topic, partition, replicas, leader, leader_epoch, isr } => {
+                tracing::info!("📡 Replicating PartitionAssigned to followers: {}-{}, leader={}, epoch={}, replicas={:?}, isr={:?}",
+                    topic, partition, leader, leader_epoch, replicas, isr);
 
-                // Create the partition assignment struct for serialization
+                // Rebuild the assignment exactly as it was, and ship THAT.
+                //
+                // The receiving node applies this verbatim — it does not re-derive
+                // anything — so every field must be the real one. `leader_epoch`
+                // was hard-coded to 0 here, which meant every follower's copy of
+                // every assignment read epoch 0 no matter how many times
+                // leadership had changed, and leader-epoch truncation could never
+                // fire anywhere except on the node that performed the assignment.
                 let assignment = chronik_common::metadata::PartitionAssignment {
                     topic: topic.clone(),
                     partition: partition as u32,
@@ -206,8 +213,8 @@ impl MetadataWalReplicator {
                     is_leader: true,  // Deprecated field
                     replicas: replicas.clone(),
                     leader_id: leader,
-                    leader_epoch: 0, // assigned by the metadata store
-                    isr: Vec::new(), // placement only — the leader publishes the in-sync set
+                    leader_epoch,
+                    isr: isr.clone(),
                 };
 
                 // Create MetadataEvent for replication (same format as WAL writes)

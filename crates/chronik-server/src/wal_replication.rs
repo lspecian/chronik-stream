@@ -187,6 +187,23 @@ pub struct WalReplicationManager {
     /// Cluster config for auto-discovering followers (v2.2.7 Phase 6)
     cluster_config: Option<Arc<chronik_config::ClusterConfig>>,
 
+    /// Woken when a follower connection is (re)established, so the catalog is
+    /// re-broadcast at a moment the connection demonstrably exists.
+    ///
+    /// A metadata send to a follower with no live connection is DROPPED — this
+    /// transport is fire-and-forget. The rejoin re-broadcast (RP-6) is triggered
+    /// by liveness, which a returning node regains ~26ms before its TCP
+    /// connection is re-established, so the whole catalog was published into a
+    /// gap and lost. Measured: a restarted node received **zero** metadata
+    /// events, kept its stale copy — including believing it still led a
+    /// partition that had failed over — and therefore never replicated that
+    /// partition, never ran the RP-3.3 handshake, and kept a divergent tail
+    /// indefinitely. The next anti-entropy pass would have fixed it 300s later.
+    ///
+    /// Converging on connect is the honest trigger: "the link is up" is the
+    /// condition the broadcast actually depends on.
+    catalog_resync: parking_lot::Mutex<Option<Arc<tokio::sync::Notify>>>,
+
     /// Last known Raft leader ID (for Phase 3 dynamic leader change detection)
     last_known_leader: Arc<AtomicU64>,
 
@@ -232,6 +249,16 @@ impl WalReplicationManager {
     /// If followers is empty and cluster_config is provided, followers will be auto-discovered.
     ///
     /// v2.2.9 Phase 7: Added metadata_store parameter for querying partition replicas/ISR (Option 4)
+    /// Ask for a catalog re-broadcast whenever a follower connection comes up.
+    ///
+    /// Takes `&self` deliberately: the manager is already inside an `Arc` by the
+    /// time the builder knows about the anti-entropy loop, and needing `&mut`
+    /// here would mean either restructuring construction or silently skipping
+    /// the wiring — the second of which is how this class of bug survives.
+    pub fn set_catalog_resync_notify(&self, notify: Arc<tokio::sync::Notify>) {
+        *self.catalog_resync.lock() = Some(notify);
+    }
+
     pub fn new_with_dependencies(
         followers: Vec<String>,
         raft_cluster: Option<Arc<RaftCluster>>,
@@ -288,6 +315,7 @@ impl WalReplicationManager {
             election_tx: None, // Not used in WalReplicationManager (only in WalReceiver)
             metadata_store,     // v2.2.9 Phase 7: Option 4 metadata store
             replicas_cache: Arc::new(DashMap::new()), // v2.2.14: Replica cache for 6.2x speedup
+            catalog_resync: parking_lot::Mutex::new(None),
         });
 
 
@@ -889,6 +917,22 @@ impl WalReplicationManager {
 
                             // Store write-half connection (for send_to_followers)
                             self.connections.insert(follower_addr.clone(), write_half);
+
+                            // The link is up: re-assert the catalog now.
+                            //
+                            // Anything published while this connection was down
+                            // was dropped on the floor — including the rejoin
+                            // broadcast that exists precisely for this moment,
+                            // which fires on liveness and therefore loses its
+                            // race with the reconnect it depends on.
+                            if let Some(notify) = self.catalog_resync.lock().clone() {
+                                debug!(
+                                    "Connection to {} established — asking for a catalog re-broadcast \
+                                     so anything published while it was down is re-sent",
+                                    follower_addr
+                                );
+                                notify.notify_waiters();
+                            }
                         }
                         Ok(Err(e)) => {
                             // Increment failure counter
@@ -1513,10 +1557,10 @@ impl WalReplicationManager {
         use crate::metadata_events::MetadataEvent;
 
         match event {
-            MetadataEvent::PartitionAssigned { topic, partition, replicas, leader } => {
+            MetadataEvent::PartitionAssigned { topic, partition, replicas, leader, leader_epoch, isr } => {
                 info!(
-                    "📡 PartitionAssigned event: {}-{} => replicas={:?}, leader={}",
-                    topic, partition, replicas, leader
+                    "📡 PartitionAssigned event: {}-{} => replicas={:?}, leader={} (epoch {}, isr {:?})",
+                    topic, partition, replicas, leader, leader_epoch, isr
                 );
 
                 // Get my node ID to filter out self

@@ -15,12 +15,34 @@ use tracing::{debug, warn};
 /// Metadata events that trigger WAL replication
 #[derive(Debug, Clone)]
 pub enum MetadataEvent {
-    /// Partition assignment changed
+    /// Partition assignment changed.
+    ///
+    /// Carries the WHOLE assignment, not a summary of it. This event is not
+    /// only a local notification: the replicator rebuilds a `PartitionAssignment`
+    /// from these fields and ships it to every follower, which applies it
+    /// verbatim. Any field missing here is a field that silently becomes its
+    /// default on every other node in the cluster.
+    ///
+    /// It carried only `replicas` and `leader`, so `leader_epoch` was rebuilt as
+    /// `0` on the wire — every follower's copy of every assignment read epoch 0
+    /// forever, no matter how many times leadership actually changed. That
+    /// disarms leader-epoch truncation cluster-wide: a follower asks about
+    /// epoch 0, and a promoted replica that also believes it is on epoch 0
+    /// answers "that is the current epoch, it ends at my log end", so nothing
+    /// ever truncates.
     PartitionAssigned {
         topic: String,
         partition: i32,
         replicas: Vec<u64>,
         leader: u64,
+        /// Increments on a genuine leader change. Followers need it to tell a
+        /// new assignment from a stale one, and to answer `OffsetForLeaderEpoch`
+        /// correctly if they are promoted.
+        leader_epoch: i32,
+        /// Which replicas hold the committed records. Failover elects from this,
+        /// and the node that runs failover is usually not the node that measured
+        /// it — so it has to survive the trip.
+        isr: Vec<u64>,
     },
 
     /// Partition leader changed
@@ -157,6 +179,8 @@ mod tests {
             partition: 0,
             replicas: vec![1, 2, 3],
             leader: 1,
+            leader_epoch: 7,
+            isr: vec![1, 3],
         };
 
         let count = bus.publish(event.clone());
@@ -168,11 +192,21 @@ mod tests {
             .expect("Should receive event");
 
         match received {
-            MetadataEvent::PartitionAssigned { topic, partition, replicas, leader } => {
+            MetadataEvent::PartitionAssigned {
+                topic, partition, replicas, leader, leader_epoch, isr,
+            } => {
                 assert_eq!(topic, "test");
                 assert_eq!(partition, 0);
                 assert_eq!(replicas, vec![1, 2, 3]);
                 assert_eq!(leader, 1);
+                // These two travel to every follower, which applies them
+                // verbatim. Asserting them here is asserting that a leadership
+                // change and an in-sync set survive the trip at all: when
+                // `leader_epoch` was rebuilt as 0 on the way out, every
+                // follower in the cluster read epoch 0 forever and leader-epoch
+                // truncation could not fire anywhere.
+                assert_eq!(leader_epoch, 7, "the leader epoch must survive the bus");
+                assert_eq!(isr, vec![1, 3], "the in-sync set must survive the bus");
             }
             _ => panic!("Wrong event type"),
         }
