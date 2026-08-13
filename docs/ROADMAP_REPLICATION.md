@@ -15,7 +15,7 @@
 | RP-7 | Assignment authority | `TESTED` | — | Only the Raft leader publishes; fetch refuses when it does not lead. **Full conformance suite now PASSES, RP-0.4 included** |
 | RP-8 | `acks=all` latency (#36) | `TESTED` | — | Three waits removed from the write path: new topic 7,000ms → 23ms, steady state 505ms → 17ms. The reported "duplication" was a client retry after a timeout |
 | RP-4 | Delete the push stack | `TESTED` | — | Data push path deleted: mode switch, produce fan-out, LeaderElector and the election machinery. Metadata keeps the transport (OQ2). One mechanism |
-| RP-9 | `acks=all` round-trip throughput | 🔶 `OPEN` | — | 4–7× slower than `acks=1` at concurrency and degrades within a run, while reaching 489K msg/s batched. Settle before any bare-metal run |
+| RP-9 | `acks=all` round-trip throughput | 🔶 `PARTLY` | — | Latency fixed: 17ms → 13ms, level with `acks=1`, by waking parked fetches on append instead of a 10ms timer. Throughput at concurrency still ~2,200 msg/s; six causes eliminated |
 
 ---
 
@@ -1019,16 +1019,51 @@ fetch, that fetch waits behind the producers' own requests on the leader, and
 the loop settles at whatever rate the leader can interleave both. Nothing is
 individually slow, which is why four reasonable hypotheses all measured flat.
 
-### What would actually move it
+### Three improvements attempted (2026-08-13)
 
-- **Give replica fetches priority over client requests.** Kafka separates them,
-  and this measurement is what that separation is for. Most promising.
-- **Pipeline the follower**: more than one fetch in flight per leader, so ack
-  latency stops being one serialised round trip.
-- Reduce the leader's per-request cost generally — helps both sides of the loop.
+**1. Event-driven wake-up — kept, and it fixed the latency.** The long poll now
+registers on a per-partition `Notify` that the produce path signals, instead of
+re-checking every 10ms. `acks=all` single-record latency went **17ms → 13-14ms,
+level with `acks=1`** — the timer was in the latency path after all.
 
-Not yet attempted. Whichever is chosen, the cycle instrumentation above is how
-to tell whether it worked.
+It took two attempts, and the first is the interesting part: it made things
+*worse* (1,863 msg/s, p99 exactly 102ms against my 100ms fallback), because the
+notification was routed through `ProduceHandler::fetch_handler` — **which is
+`None` in every production build.** `set_fetch_handler` and
+`new_with_fetch_handler` are only ever called from tests. The notifier is now an
+explicitly shared map, handed to both handlers by the builder.
+
+⚠️ That gap deserves its own look: **`update_buffer_with_raw_batch` goes through
+the same dead field**, so the produce path has never updated the fetch buffer on
+a real broker. Reads fall back to the WAL, which is why nothing visibly broke.
+
+**2. `num.replica.fetchers` — kept, no measured effect here.** Partitions are now
+split across `CHRONIK_REPLICA_FETCHERS` (default 4) independent fetch tasks per
+leader, each with its own connection and in-flight request. Throughput did not
+move at 3 partitions (2,067 vs 2,040) or at 12 (1,997 vs 2,042) — because with
+RF=3 across 3 nodes each follower-leader pair holds exactly one partition, so
+there was nothing to split. Kept because it is the right shape for a cluster with
+real partition counts, and it is tested.
+
+**3. Concurrent partition serving — REVERTED.** No throughput change (2,369 vs
+2,210, inside the spread) and it broke RP-3.3: the divergence test went from
+consistently passing to **2 runs in 3**, failing with committed records
+unreadable after a follower returned. `fetch_partition` is not a pure read — it
+records the follower's position with the ISR trackers — so overlapping those side
+effects across partitions is not free. Isolated by reverting it alone and
+watching the test return to 3/3.
+
+### Still open: throughput at concurrency
+
+Latency is now at parity with `acks=1`. **Throughput at 64 concurrent producers
+is unchanged at ~2,200 msg/s**, and none of the above moved it. Six candidate
+causes are eliminated and the cycle is instrumented; what remains is the fetch
+waiting on a leader that is simultaneously serving producers, while the brokers
+sit at ~570% of 1600% available CPU — scheduling and serialisation, not capacity.
+
+The untried idea, and the most promising: **give replica fetches priority over
+client requests.** Kafka separates the two, and this measurement is what that
+separation is for.
 
 **Do not start a bare-metal run before settling this**, or it will dominate
 every number taken there.

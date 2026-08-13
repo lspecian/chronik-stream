@@ -65,6 +65,12 @@ pub struct IntegratedKafkaServerBuilder {
     segment_reader: Option<Arc<SegmentReader>>,
     wal_manager: Option<Arc<WalManager>>,
     produce_handler_base: Option<Arc<ProduceHandler>>,
+
+    /// Shared by the produce path and the fetch long poll, so an append wakes a
+    /// parked follower instead of it noticing on a timer (RP-9). Created here
+    /// because the two handlers are built in different stages and neither can be
+    /// mutated once it is inside an `Arc`.
+    append_notify: Arc<dashmap::DashMap<(String, i32), Arc<tokio::sync::Notify>>>,
     wal_produce_handler: Option<Arc<WalProduceHandler>>,
     fetch_handler: Option<Arc<FetchHandler>>,
     isr_ack_tracker: Option<Arc<crate::isr_ack_tracker::IsrAckTracker>>,
@@ -119,6 +125,7 @@ impl IntegratedKafkaServerBuilder {
             segment_reader: None,
             wal_manager: None,
             produce_handler_base: None,
+            append_notify: Arc::new(dashmap::DashMap::new()),
             wal_produce_handler: None,
             fetch_handler: None,
             isr_ack_tracker: None,
@@ -676,6 +683,7 @@ impl IntegratedKafkaServerBuilder {
 
         // Step 3: Wire event bus and ISR trackers
         produce_handler_inner.set_event_bus(metadata_event_bus.clone());
+        produce_handler_inner.set_append_notify(Arc::clone(&self.append_notify));
         let isr_ack_tracker = crate::isr_ack_tracker::IsrAckTracker::new();
         let isr_tracker = Arc::new(crate::isr_tracker::IsrTracker::default());
         produce_handler_inner.set_isr_ack_tracker(isr_ack_tracker.clone());
@@ -1491,6 +1499,7 @@ impl IntegratedKafkaServerBuilder {
         if let Some(ref isr_ack_tracker) = self.isr_ack_tracker {
             fetch_handler.set_isr_ack_tracker(isr_ack_tracker.clone());
         }
+        fetch_handler.set_append_notify(Arc::clone(&self.append_notify));
 
         // RP-2.3: consumers see only what the in-sync set holds. Unconditional
         // since RP-4 — follower positions are their own fetch offsets, which

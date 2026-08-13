@@ -448,6 +448,16 @@ pub struct ProduceHandler {
     memory_limit_bytes: u64,
     replication_sender: Option<mpsc::Sender<ReplicationRequest>>,
     fetch_handler: Option<Arc<FetchHandler>>,
+
+    /// Shared with `FetchHandler`: the wake-up handles a parked long poll
+    /// registers on, so an append is announced rather than discovered on a timer.
+    ///
+    /// Deliberately NOT reached through `fetch_handler` above. That field is
+    /// `None` in every production build — `set_fetch_handler` and
+    /// `new_with_fetch_handler` are only ever called from tests — so anything
+    /// routed through it silently does nothing on a real broker, which is
+    /// exactly what happened on the first attempt at this (RP-9).
+    append_notify: Arc<dashmap::DashMap<(String, i32), Arc<tokio::sync::Notify>>>,
     /// Track in-flight topic creation requests to prevent duplicates
     topic_creation_cache: Arc<RwLock<HashMap<String, Arc<Mutex<Option<chronik_common::metadata::TopicMetadata>>>>>>,
     /// WAL manager for inline durability writes (v1.3.47+)
@@ -1222,6 +1232,7 @@ impl ProduceHandler {
             memory_limit_bytes,
             replication_sender: None,
             fetch_handler: None,
+            append_notify: Arc::new(dashmap::DashMap::new()),
             topic_creation_cache: Arc::new(RwLock::new(HashMap::new())),
             wal_manager: None,
             raft_cluster: None,  // v2.2.7 Phase 3: Initialize as None (set via set_raft_cluster)
@@ -1265,6 +1276,17 @@ impl ProduceHandler {
     }
     
     /// Set the fetch handler for updating buffers
+    /// Share the append notifier with the `FetchHandler`.
+    ///
+    /// Both sides must hold the SAME map or the wake-up goes nowhere: the
+    /// produce path signals into it, the long poll registers on it.
+    pub fn set_append_notify(
+        &mut self,
+        notify: Arc<dashmap::DashMap<(String, i32), Arc<tokio::sync::Notify>>>,
+    ) {
+        self.append_notify = notify;
+    }
+
     pub fn set_fetch_handler(&mut self, fetch_handler: Arc<FetchHandler>) {
         self.fetch_handler = Some(fetch_handler);
     }
@@ -2595,6 +2617,17 @@ impl ProduceHandler {
 
         // RP-4: nothing is pushed here. Followers fetch this record from the
         // leader's log (RP-2.4), so the produce path's job ends at the WAL.
+        //
+        // RP-9: but it does have to say the record EXISTS. A follower parked in
+        // a long poll would otherwise find out on the next timer tick, and under
+        // `acks=all` that tick is the critical path — every producer is blocked
+        // waiting for the follower, so nothing new is written until the previous
+        // batch is acknowledged, and the follower's fetch therefore almost
+        // always arrives at an idle partition and parks. Waking it here is what
+        // turns replication from a timer loop into a round trip.
+        if let Some(notify) = self.append_notify.get(&(topic.to_string(), partition)) {
+            notify.notify_waiters();
+        }
 
         // v2.2.7 FIX: Removed duplicate buffering code that was always running
         // (lines 1491-1499 were duplicate of lines 1475-1488)
@@ -3953,6 +3986,7 @@ impl Clone for ProduceHandler {
             memory_limit_bytes: self.memory_limit_bytes,
             replication_sender: self.replication_sender.clone(),
             fetch_handler: self.fetch_handler.clone(),
+            append_notify: Arc::clone(&self.append_notify),
             topic_creation_cache: Arc::clone(&self.topic_creation_cache),
             wal_manager: self.wal_manager.clone(),
             raft_cluster: self.raft_cluster.clone(),  // v2.2.7 Phase 3

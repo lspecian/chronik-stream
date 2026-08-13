@@ -9,6 +9,7 @@ use chronik_storage::kafka_records::{KafkaRecordBatch, KafkaRecord, RecordHeader
 use chronik_storage::tantivy_segment::TantivySegmentReader;
 use chronik_storage::canonical_record::CanonicalRecord;
 use chronik_wal::{WalManager, WalRecord};
+use dashmap::DashMap;
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
@@ -125,6 +126,23 @@ pub struct FetchHandler {
     /// approximate the same information.
     isr_tracker: Option<Arc<crate::isr_tracker::IsrTracker>>,
     isr_ack_tracker: Option<Arc<crate::isr_ack_tracker::IsrAckTracker>>,
+
+    /// Woken when a partition is appended to, so a parked fetch learns about new
+    /// records instead of discovering them on a timer.
+    ///
+    /// The long poll used to check every 10ms. That is not a small cost, because
+    /// each check asks the metadata store for the partition's segments — so
+    /// polling faster does not help: at 1ms the checks cost about as much as the
+    /// interval saves, which is exactly what measurement showed (3,887 vs 3,935
+    /// msg/s, indistinguishable).
+    ///
+    /// The interval is also directly in the `acks=all` critical path under load.
+    /// Every producer is blocked waiting for the follower, so no new record
+    /// exists until the previous batch is acknowledged — meaning the follower's
+    /// fetch almost always arrives at an idle partition and parks. Its wake-up
+    /// latency is therefore the loop period, and the loop period is the cap on
+    /// replicated throughput (RP-9).
+    append_notify: Arc<DashMap<(String, i32), Arc<tokio::sync::Notify>>>,
     /// RP-2.3: cap consumer reads at the in-sync watermark. Off unless pull
     /// replication is active — see `consumer_visible_watermark`.
     hw_from_isr: bool,
@@ -151,6 +169,7 @@ impl FetchHandler {
             config: FetchHandlerConfig::default(),
             isr_tracker: None,
             isr_ack_tracker: None,
+            append_notify: Arc::new(DashMap::new()),
             hw_from_isr: false,
         }
     }
@@ -178,6 +197,7 @@ impl FetchHandler {
             config: FetchHandlerConfig::default(),
             isr_tracker: None,
             isr_ack_tracker: None,
+            append_notify: Arc::new(DashMap::new()),
             hw_from_isr: false,
         }
     }
@@ -205,6 +225,7 @@ impl FetchHandler {
             config: FetchHandlerConfig::default(),
             isr_tracker: None,
             isr_ack_tracker: None,
+            append_notify: Arc::new(DashMap::new()),
             hw_from_isr: false,
         }
     }
@@ -237,6 +258,7 @@ impl FetchHandler {
             config,
             isr_tracker: None,
             isr_ack_tracker: None,
+            append_notify: Arc::new(DashMap::new()),
             hw_from_isr: false,
         }
     }
@@ -334,27 +356,25 @@ impl FetchHandler {
     /// Waiting is the caller's job (`wait_for_any_partition`) precisely so that
     /// one partition cannot spend the request's budget on behalf of the others.
     ///
-    /// Partitions are served CONCURRENTLY. They are independent reads against
-    /// independent logs, and doing them one after another multiplied the
-    /// request's cost by the partition count: serving one partition measured
-    /// 2.5–4ms, so a 3-partition fetch spent ~10ms on the leader before the
-    /// follower could even begin applying. That is most of a follower's 16ms
-    /// replication cycle, and since `acks=all` cannot complete until the
-    /// follower's *next* fetch reports its new position, it capped replicated
-    /// throughput at roughly (partitions × per-partition cost)⁻¹ × batch size —
-    /// measured at ~60 cycles/s and ~2,000 msg/s (RP-9).
+    /// Partitions are served one at a time, and an attempt to serve them
+    /// concurrently was **reverted**.
     ///
-    /// ⚠️ This did **not** move that benchmark: 2,369 msg/s concurrent against
-    /// 2,210 serial, which is inside the run-to-run spread. The cycle turned out
-    /// to be dominated by the fetch waiting on a leader that is simultaneously
-    /// serving 64 producers, not by the leader's own per-partition work. Kept
-    /// anyway — independent reads against independent logs have no reason to
-    /// serialise, and the serial version scales badly with partition count even
-    /// though 3 partitions did not expose it.
+    /// The reasoning for concurrency was sound on paper — independent reads
+    /// against independent logs, and serving one partition measures 2.5–4ms, so
+    /// a 3-partition fetch spends ~10ms here. It made no difference to
+    /// replicated throughput (2,369 vs 2,210 msg/s, inside the run-to-run
+    /// spread), because the follower's cycle is dominated by waiting on a leader
+    /// that is also serving producers, not by this loop.
     ///
-    /// Order is preserved: `join_all` returns results in the order the futures
-    /// were created, and a Fetch response must answer partitions in the order
-    /// the request listed them.
+    /// And it broke RP-3.3: the divergence test went from passing consistently
+    /// to 2 runs in 3, failing with committed records unreadable after a
+    /// follower returned. `fetch_partition` is not a pure read — it records the
+    /// follower's position with the ISR trackers — so overlapping those side
+    /// effects across partitions is not free. No measured benefit and a
+    /// reproducible correctness cost is an easy call.
+    ///
+    /// If this is revisited, the entry price is understanding what those side
+    /// effects do when interleaved, not just that the reads are independent.
     async fn serve_all_partitions(
         &self,
         request: &FetchRequest,
@@ -362,17 +382,20 @@ impl FetchHandler {
         let mut response_topics = Vec::with_capacity(request.topics.len());
 
         for topic_request in &request.topics {
-            let served = futures::future::join_all(topic_request.partitions.iter().map(|pr| {
-                self.fetch_partition(
-                    &topic_request.name,
-                    pr.partition,
-                    pr.fetch_offset,
-                    pr.partition_max_bytes,
-                    request.max_wait_ms,
-                    request.replica_id,
-                )
-            }))
-            .await;
+            let mut served = Vec::with_capacity(topic_request.partitions.len());
+            for pr in &topic_request.partitions {
+                served.push(
+                    self.fetch_partition(
+                        &topic_request.name,
+                        pr.partition,
+                        pr.fetch_offset,
+                        pr.partition_max_bytes,
+                        request.max_wait_ms,
+                        request.replica_id,
+                    )
+                    .await,
+                );
+            }
 
             let mut response_partitions = Vec::with_capacity(topic_request.partitions.len());
 
@@ -434,6 +457,33 @@ impl FetchHandler {
         Ok(response_topics)
     }
 
+    /// The map the produce path signals into. Both sides must hold the same one.
+    pub fn append_notify_handle(
+        &self,
+    ) -> Arc<DashMap<(String, i32), Arc<tokio::sync::Notify>>> {
+        Arc::clone(&self.append_notify)
+    }
+
+    /// Replace the append notifier with one shared with the produce path.
+    pub fn set_append_notify(
+        &mut self,
+        notify: Arc<DashMap<(String, i32), Arc<tokio::sync::Notify>>>,
+    ) {
+        self.append_notify = notify;
+    }
+
+    /// The wake-up handle for a partition, created on first use.
+    ///
+    /// Only a *waiter* creates one, so a partition nobody is parked on costs
+    /// nothing — and `notify_appended` above skips partitions with no entry
+    /// rather than allocating one per append.
+    fn notify_for(&self, topic: &str, partition: i32) -> Arc<tokio::sync::Notify> {
+        self.append_notify
+            .entry((topic.to_string(), partition))
+            .or_insert_with(|| Arc::new(tokio::sync::Notify::new()))
+            .clone()
+    }
+
     /// Wait until ANY partition in the request has something past its fetch
     /// offset, or the request's deadline passes. Returns whether it found any.
     ///
@@ -448,13 +498,31 @@ impl FetchHandler {
         request: &FetchRequest,
         wait_deadline: Instant,
     ) -> bool {
-        // 10ms, and measured not to matter — three times now. At 1ms versus
-        // 10ms, neither `acks=all` latency (#36) nor replicated throughput
-        // (RP-9) moved, because under load the follower's fetch takes the
-        // data-available path and never reaches this loop.
-        let poll_interval = Duration::from_millis(10);
+        // A backstop, not the mechanism. An append wakes this directly; the
+        // timer only covers a wake-up that never arrives — a record made visible
+        // by a background segment flush rather than by the produce path, or a
+        // notify lost to a race this code has not thought of. It is deliberately
+        // slow, because being the fallback is the whole of its job.
+        const IDLE_RECHECK: Duration = Duration::from_millis(100);
 
         loop {
+            // Register for the wake-up BEFORE looking. `Notify::notified()`
+            // captures notifications from the moment the future is created, so
+            // an append landing between the check below and the await is not
+            // lost. Checking first and registering after is the classic missed
+            // wake-up, and here it would cost a producer the full recheck
+            // interval.
+            let waits: Vec<_> = request
+                .topics
+                .iter()
+                .flat_map(|t| {
+                    t.partitions
+                        .iter()
+                        .map(move |p| self.notify_for(&t.name, p.partition))
+                })
+                .collect();
+            let notified: Vec<_> = waits.iter().map(|n| n.notified()).collect();
+
             for topic_request in &request.topics {
                 for partition_request in &topic_request.partitions {
                     if self
@@ -475,7 +543,17 @@ impl FetchHandler {
             if remaining.is_zero() {
                 return false;
             }
-            tokio::time::sleep(poll_interval.min(remaining)).await;
+
+            // Whichever partition grows first wins; `select_all` needs a
+            // non-empty set, and a request with no partitions has nothing to
+            // wait for anyway.
+            if notified.is_empty() {
+                return false;
+            }
+            let any_append = futures::future::select_all(
+                notified.into_iter().map(Box::pin).collect::<Vec<_>>(),
+            );
+            let _ = tokio::time::timeout(remaining.min(IDLE_RECHECK), any_append).await;
         }
     }
 

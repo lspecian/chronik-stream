@@ -65,6 +65,15 @@ pub struct ReplicaFetcherConfig {
     pub refresh_interval: Duration,
     /// Backoff after a failed fetch, before retrying the same leader.
     pub retry_backoff: Duration,
+    /// How many independent fetch tasks to run per leader, each with its own
+    /// connection and its own in-flight request (Kafka's `num.replica.fetchers`).
+    ///
+    /// One means a strictly serial fetch → apply → fetch loop, and since
+    /// `acks=all` completes only when the *next* fetch reports the new position,
+    /// that loop's period is the floor on replicated write latency. Measured at
+    /// ~60 cycles/s while the brokers sat at ~570% of 1600% available CPU: the
+    /// machine had capacity, the protocol had no concurrency (RP-9).
+    pub fetcher_count: usize,
 }
 
 impl Default for ReplicaFetcherConfig {
@@ -76,6 +85,7 @@ impl Default for ReplicaFetcherConfig {
             partition_max_bytes: 10 * 1024 * 1024,
             refresh_interval: Duration::from_secs(10),
             retry_backoff: Duration::from_millis(500),
+            fetcher_count: 4,
         }
     }
 }
@@ -105,12 +115,39 @@ impl ReplicaFetcherConfig {
                 config.retry_backoff = Duration::from_millis(v as u64);
             }
         }
+        if let Some(v) = env_i32("CHRONIK_REPLICA_FETCHERS") {
+            if v > 0 {
+                config.fetcher_count = v as usize;
+            }
+        }
         config
     }
 }
 
 fn env_i32(key: &str) -> Option<i32> {
     std::env::var(key).ok().and_then(|v| v.trim().parse().ok())
+}
+
+/// Deal one leader's partitions across up to `fetchers` fetch tasks.
+///
+/// Round-robin, so a leader with four partitions and four fetchers gives each
+/// one partition rather than three getting one and the fourth getting nothing.
+/// Never returns an empty group — a task with no partitions would loop building
+/// requests it cannot send — so the result is at most `partitions.len()` groups.
+///
+/// Pure, because the alternative is discovering the distribution by reading log
+/// lines on a running cluster.
+pub fn split_for_fetchers(
+    partitions: &[FollowedPartition],
+    fetchers: usize,
+) -> Vec<Vec<FollowedPartition>> {
+    let groups = fetchers.max(1).min(partitions.len().max(1));
+    let mut out: Vec<Vec<FollowedPartition>> = vec![Vec::new(); groups];
+    for (index, partition) in partitions.iter().enumerate() {
+        out[index % groups].push(partition.clone());
+    }
+    out.retain(|group| !group.is_empty());
+    out
 }
 
 /// The local partition state a follower needs, narrowed to three questions.
@@ -361,7 +398,7 @@ impl ReplicaFetcher {
             self.peers.len()
         );
 
-        let mut running: HashMap<u64, tokio::task::JoinHandle<()>> = HashMap::new();
+        let mut running: HashMap<(u64, usize), tokio::task::JoinHandle<()>> = HashMap::new();
         let mut current: BTreeMap<u64, Vec<FollowedPartition>> = BTreeMap::new();
         let mut events = self.metadata_events.as_ref().map(|bus| bus.subscribe());
 
@@ -383,8 +420,8 @@ impl ReplicaFetcher {
                 // Assignments changed: stop every task and rebuild. A follower
                 // has at most a handful of leaders, so a full rebuild costs one
                 // reconnect and avoids the state machine a diff would need.
-                for (leader, handle) in running.drain() {
-                    debug!("Stopping fetch task for leader {}", leader);
+                for ((leader, index), handle) in running.drain() {
+                    debug!("Stopping fetch task {} for leader {}", index, leader);
                     handle.abort();
                 }
 
@@ -393,21 +430,45 @@ impl ReplicaFetcher {
                         Some(addr) => addr.clone(),
                         None => continue,
                     };
+
+                    // Split this leader's partitions across several fetch tasks,
+                    // each with its own connection and its own in-flight request.
+                    //
+                    // One task per leader makes replication a strictly serial
+                    // loop — fetch, apply, fetch — and `acks=all` cannot complete
+                    // until the *next* fetch reports the new position, so that
+                    // loop's period is the floor on replicated write latency.
+                    // Measured: ~60 cycles/s, and the cycle is almost entirely
+                    // the fetch waiting on a leader that is busy serving
+                    // producers (RP-9). The brokers were at ~570% CPU of 1600%
+                    // available, so the machine had the capacity; what it lacked
+                    // was concurrent requests.
+                    //
+                    // This is Kafka's `num.replica.fetchers`, and it splits by
+                    // partition for the same reason Kafka does: a single
+                    // partition's log is a sequential stream whose next fetch
+                    // offset is only known after the previous response is
+                    // applied, so it cannot be pipelined — but different
+                    // partitions are independent and can be fetched at once.
+                    let groups = split_for_fetchers(partitions, self.config.fetcher_count);
                     info!(
-                        "Replicating {} partition(s) from leader {} at {}",
+                        "Replicating {} partition(s) from leader {} at {} across {} fetcher(s)",
                         partitions.len(),
                         leader,
-                        addr
+                        addr,
+                        groups.len()
                     );
-                    let this = Arc::clone(&self);
-                    let partitions = partitions.clone();
-                    let leader = *leader;
-                    running.insert(
-                        leader,
-                        tokio::spawn(async move {
-                            this.run_leader_loop(leader, addr, partitions).await;
-                        }),
-                    );
+                    for (index, group) in groups.into_iter().enumerate() {
+                        let this = Arc::clone(&self);
+                        let addr = addr.clone();
+                        let leader = *leader;
+                        running.insert(
+                            (leader, index),
+                            tokio::spawn(async move {
+                                this.run_leader_loop(leader, addr, group).await;
+                            }),
+                        );
+                    }
                 }
 
                 current = desired;
@@ -1128,6 +1189,69 @@ mod tests {
             (2, "node2:9092".to_string()),
             (3, "node3:9092".to_string()),
         ])
+    }
+
+    fn followed(n: usize) -> Vec<FollowedPartition> {
+        (0..n)
+            .map(|i| FollowedPartition {
+                topic: "orders".to_string(),
+                partition: i as i32,
+                leader: 1,
+            })
+            .collect()
+    }
+
+    /// Partitions are dealt round-robin, so four partitions across four fetchers
+    /// is one each — not three on one task and an idle fourth.
+    #[test]
+    fn partitions_are_dealt_evenly_across_fetchers() {
+        let groups = split_for_fetchers(&followed(4), 4);
+        assert_eq!(groups.len(), 4);
+        assert!(groups.iter().all(|g| g.len() == 1));
+    }
+
+    /// Every partition is fetched exactly once. Losing one here means a replica
+    /// that silently never receives it — this roadmap's founding bug.
+    #[test]
+    fn every_partition_is_assigned_exactly_once() {
+        for fetchers in 1..=6 {
+            let groups = split_for_fetchers(&followed(5), fetchers);
+            let mut seen: Vec<i32> = groups.iter().flatten().map(|p| p.partition).collect();
+            seen.sort();
+            assert_eq!(seen, vec![0, 1, 2, 3, 4], "with {} fetcher(s)", fetchers);
+        }
+    }
+
+    /// Never an empty group: a fetch task with no partitions would loop building
+    /// requests it cannot send.
+    #[test]
+    fn more_fetchers_than_partitions_does_not_make_idle_tasks() {
+        let groups = split_for_fetchers(&followed(2), 8);
+        assert_eq!(groups.len(), 2);
+        assert!(groups.iter().all(|g| !g.is_empty()));
+    }
+
+    /// A single fetcher keeps the old shape exactly: one task, all partitions.
+    #[test]
+    fn one_fetcher_is_the_previous_behaviour() {
+        let groups = split_for_fetchers(&followed(5), 1);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 5);
+    }
+
+    /// Zero is not a valid count and must not produce zero tasks — that would
+    /// stop replication silently, which is the failure mode this whole effort
+    /// exists to end.
+    #[test]
+    fn zero_fetchers_still_replicates() {
+        let groups = split_for_fetchers(&followed(3), 0);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 3);
+    }
+
+    #[test]
+    fn no_partitions_produces_no_tasks() {
+        assert!(split_for_fetchers(&[], 4).is_empty());
     }
 
     /// The core placement rule: fetch what you are assigned, from whoever leads
