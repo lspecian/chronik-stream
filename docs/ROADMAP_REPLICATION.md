@@ -8,9 +8,9 @@
 |-------|------|--------|---------|-------|
 | RP-0 | Replication conformance suite | `TESTED` | — | Placement + ISR honesty; fails pre-#29, passes after |
 | RP-1 | Harden the current mechanism | `TESTED` | — | 1.1–1.4 + 3 bugs found by cluster validation |
-| RP-2 | Follower fetch | `TESTED` | — | 2.1–2.4 all validated on a 3-node cluster, behind `CHRONIK_REPLICATION_MODE=pull` |
+| RP-2 | Follower fetch | `TESTED` | — | 2.1–2.4 all validated on a 3-node cluster; pull is now the default, no env var needed |
 | RP-3 | Leader epochs & truncation | `TESTED` | — | Cut proven in-process AND on a cluster: `local_divergence.sh` passes 3/3 deterministically on the default config. Finding it exposed the indexer deleting a live topic's WAL on restart — see RP-3.3 |
-| RP-5 | Partition leader failover | `TESTED` | — | Elects only from the in-sync set; the set is published to metadata so it outlives the leader that measured it. Unclean election fixed — see RP-3.3 "D0" | **Elects replicas that hold none of the partition's data.** Leadership moves and writes recover, but `acks=all`-acknowledged records are destroyed. Unclean leader election — see RP-3.3 "D0" |
+| RP-5 | Partition leader failover | `TESTED` | — | Elects only from the in-sync set, which is published to metadata so it outlives the leader that measured it. The unclean election that destroyed acks=all-acknowledged records is fixed — see RP-3.3 "D0" |
 | RP-6 | Failover recovery latency | `TESTED` | — | Catalog is pushed on rejoin; verified on cluster |
 | RP-7 | Assignment authority | `TESTED` | — | Only the Raft leader publishes; fetch refuses when it does not lead. **Full conformance suite now PASSES, RP-0.4 included** |
 | RP-8 | `acks=all` latency (#36) | `TESTED` | — | Three waits removed from the write path: new topic 7,000ms → 23ms, steady state 505ms → 17ms. The reported "duplication" was a client retry after a timeout |
