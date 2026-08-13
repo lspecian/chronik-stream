@@ -77,6 +77,21 @@ impl ReplicationMode {
 /// interval, and it must not add latency to replication.
 const EMPTY_FETCH_BACKOFF: Duration = Duration::from_millis(5);
 
+/// Longest pause between attempts to repair a partition that keeps re-detecting
+/// divergence. Capped so a partition that becomes repairable is picked up again
+/// within a few seconds rather than sitting out a long backoff.
+const MAX_REPAIR_BACKOFF: Duration = Duration::from_secs(5);
+
+/// How long to wait after the Nth consecutive failed repair round.
+///
+/// Doubling from 10ms: a repair that succeeds on the second or third attempt —
+/// the normal case, where reconciliation needs one round trip to settle — is
+/// delayed imperceptibly, while one that never succeeds stops consuming a core.
+fn repair_backoff(round: u32) -> Duration {
+    let millis = 10u64.saturating_mul(1u64 << round.min(9));
+    Duration::from_millis(millis).min(MAX_REPAIR_BACKOFF)
+}
+
 /// Tuning for the fetch loop.
 #[derive(Debug, Clone)]
 pub struct ReplicaFetcherConfig {
@@ -594,6 +609,11 @@ impl ReplicaFetcher {
         // committed. Appending on top of those interleaves two histories.
         let mut needs_reconcile = true;
 
+        // Consecutive fetches that found divergence again. Reset by any fetch
+        // that does not — so a partition repaired on the second attempt pays
+        // nothing, and one that never repairs backs off instead of spinning.
+        let mut repair_rounds: u32 = 0;
+
         while !self.shutdown.load(Ordering::Relaxed) {
             if needs_reconcile {
                 match self.reconcile_with_leader(&mut connection, &partitions).await {
@@ -624,6 +644,7 @@ impl ReplicaFetcher {
             match connection.fetch(spec).await {
                 Ok(response) => {
                     let mut got_records = false;
+                    let mut diverged = false;
                     for topic in response.topics {
                         for partition in topic.partitions {
                             got_records |= !partition.records.is_empty();
@@ -631,8 +652,33 @@ impl ReplicaFetcher {
                                 == PartitionOutcome::Diverged
                             {
                                 needs_reconcile = true;
+                                diverged = true;
                             }
                         }
+                    }
+
+                    // Detect → reconcile → resume → detect the same thing again
+                    // is a cycle that makes no progress, and it ran at network
+                    // speed: 37,166 iterations in a single run, ~1,600/second,
+                    // indefinitely, burning a core while repairing nothing.
+                    //
+                    // The causes are fixed elsewhere; this is the guard that
+                    // should have made them survivable. A repair loop that
+                    // cannot advance must slow down whatever the reason —
+                    // including reasons not yet found.
+                    if diverged {
+                        let round = repair_rounds.saturating_add(1);
+                        repair_rounds = round;
+                        if round % 20 == 0 {
+                            warn!(
+                                "Replication from leader {} has re-detected divergence {} times \
+                                 without making progress — the repair is not converging.",
+                                leader, round
+                            );
+                        }
+                        sleep(repair_backoff(round)).await;
+                    } else {
+                        repair_rounds = 0;
                     }
 
                     // A response carrying nothing normally means the leader held
@@ -792,7 +838,22 @@ impl ReplicaFetcher {
 
         // The log may end below the target: a target inside a batch takes that
         // whole batch. Resume from where it actually ends.
+        //
+        // `None` means the log holds no records at all, which is a real outcome
+        // — everything above the target, nothing below it — and only then is 0
+        // right. It must not be reached by a truncation that simply had no work
+        // to do; that path now reports the real log end, because collapsing "I
+        // do not know" into 0 threw away a healthy log and re-replicated the
+        // whole partition.
         let new_end = outcome.new_log_end_offset.unwrap_or(0);
+        if outcome.new_log_end_offset.is_none() && !outcome.touched_disk() {
+            warn!(
+                "{}-{}: truncation to {} changed nothing and could not say where the log ends. \
+                 Treating it as empty and restarting replication from 0 — if this partition had \
+                 records, they are about to be re-fetched.",
+                topic, partition, target
+            );
+        }
         self.positions.insert((topic.to_string(), partition), new_end);
 
         if let Some(state) = &self.follower_state {
@@ -858,12 +919,31 @@ impl ReplicaFetcher {
         })
     }
 
-    /// The offset this follower's log next accepts.
+    /// The offset this follower's log next accepts — the ONE answer.
     ///
-    /// Cached after the first read, then advanced by the apply path. The first
-    /// read comes from the local watermark, which WAL recovery restores on
-    /// startup — that is what makes catch-up after a restart free rather than a
-    /// mechanism of its own.
+    /// Every caller that needs "where does our log end" goes through here,
+    /// including `reconcile_with_leader`, which used to ask `local_log_end`
+    /// instead. Two sources for one fact drifted apart, and the broker logged
+    /// both, one line apart, for the same partition at the same instant:
+    ///
+    /// ```text
+    /// log is a prefix of the leader's (ours ends at 91, the epoch ran to 91) — nothing to truncate
+    /// fetched batch spans [91, 130] across the local log end 100 — logs have diverged
+    /// ```
+    ///
+    /// Reconcile compared 91 and correctly resumed; the apply path measured
+    /// against 100 and rejected the very batch that fetch returned. Neither was
+    /// wrong about its own number, and the loop could not terminate because each
+    /// kept being right.
+    ///
+    /// The authority is this map, advanced by the apply path as batches land,
+    /// and NOT `ProduceHandler`'s offsets. Those are maintained by the produce
+    /// path; on a follower they are updated as a side effect of applying, and
+    /// reading them here instead — tried, measured — leaves the fetch position
+    /// stuck at 0, so the follower re-fetches offset 0 forever, never reports
+    /// progress, and consumers capped at the in-sync watermark see almost
+    /// nothing (1 of 100 records). The seeding read below is where local state
+    /// legitimately comes in: after a restart it is the only thing that knows.
     async fn position_of(&self, topic: &str, partition: i32) -> i64 {
         let key = (topic.to_string(), partition);
         if let Some(offset) = self.positions.get(&key) {

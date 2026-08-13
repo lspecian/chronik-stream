@@ -228,8 +228,10 @@ impl TruncateOutcome {
     }
 
     /// Whether any bytes were removed. A truncation that changed nothing must
-    /// not disturb the writer.
-    pub(crate) fn touched_disk(&self) -> bool {
+    /// not disturb the writer — and callers need to distinguish that from one
+    /// that emptied the log, because the two report the same `None` log end and
+    /// only one of them means "start again from 0".
+    pub fn touched_disk(&self) -> bool {
         self.segments_deleted > 0 || self.bytes_discarded > 0
     }
 }

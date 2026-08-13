@@ -459,7 +459,29 @@ dtr-855200-0: fetched batch spans [91, 130] across the local log end 100 — log
 
 A fetch that lands inside a batch is also normal and must not be read as divergence: the leader serves whole batches, so a request at offset 100 returns the batch based at 91. Refusing that as a "straddle" turns an ordinary mid-batch read into a permanent repair loop.
 
-So the remaining work is one invariant: **a follower has exactly one log end**, and a batch whose base is below it is trimmed, not treated as evidence of divergence. D2 (no backoff on a repair cycle that makes no progress) still stands as its own defence — a cycle that cannot progress should slow down whatever the cause.
+D2 is now fixed: the repair cycle backs off, doubling from 10ms to a 5s cap, reset by any fetch that does not re-detect divergence. A repair that settles on the second or third round pays nothing; one that never settles stops consuming a core, whatever the cause — including causes not yet found.
+
+D3 is half fixed. A truncation that had no work to do now reports the real log end instead of `None`, and the survivor scan covers every remaining segment rather than a range that excluded the straddler. Two integration tests pin it: a no-op reports the end, and genuinely emptying the log still reports `None`, so the distinction cannot be flattened again.
+
+#### ⚠️ Remaining: the truncation runs against a partition queue that is empty
+
+Three runs of `local_divergence.sh`, after all of the above: **1 pass, 2 failures**, and the failures are all the same shape. The committed records survive and the orphans do leave the disk every time — but by the expensive route, not the surgical one:
+
+```
+localdiv-947111-0: diverged from the leader. Local log ends at 140, but the leader's history … ends at 100
+localdiv-947111-0: truncation to 100 changed nothing and could not say where the log ends
+localdiv-947111-0: truncated to 0 (0 segment(s) removed, 0 bytes discarded); resuming replication
+```
+
+The log ends at 140, the target is 100, and the cut removes nothing. The evidence rules out the obvious explanations:
+
+- The partition directory exists and holds `wal_0_0.log` at 11,202 bytes — both "no partition directory" and "no segment files" warnings were added and neither fires.
+- The two parsers cannot disagree: `first_record_offset` and `plan_segment_truncation` both go through `parse_record_span`.
+- A parse failure cannot produce this outcome either — it would leave `straddler` unset, and the delete loop would then remove the whole 11,202-byte file and report those bytes discarded. Zero bytes were discarded.
+
+What fits every observation: **at truncation time the partition's queue is freshly created and empty**. `truncate_to` calls `get_or_create_queue` before scanning, which creates the directory and a new zero-length segment; the scan then sees exactly one empty file, skips it (the delete loop deliberately never unlinks a zero-length segment, because that is usually the one the writer holds open), and correctly reports "empty". The 11,202-byte file on disk is written *afterwards*, by the re-replication that the `None` outcome triggers.
+
+So the returning node's recovered log and the queue that truncation operates on are not the same thing, on roughly two runs in three. The next step is to establish which — recovery not adopting the existing segment into the group-commit queue, or the queue being created against a path the recovered data is not under — and the cheapest way to see it is to log the queue's segment inventory (names and sizes) at the moment of truncation.
 
 #### 🔴 D0 — and none of that is the real bug: failover elects replicas that hold no data
 

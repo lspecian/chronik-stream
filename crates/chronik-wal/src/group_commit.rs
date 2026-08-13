@@ -1414,6 +1414,16 @@ impl GroupCommitWal {
     ) -> Result<TruncateOutcome> {
         let partition_dir = self.base_dir.join(topic).join(partition.to_string());
         if !partition_dir.exists() {
+            // Not "the log is empty" — "I looked in the wrong place, or there is
+            // genuinely nothing here". The caller cannot tell those apart from
+            // the outcome alone, and it acts on the answer by discarding a log,
+            // so say which directory was searched.
+            warn!(
+                topic = %topic,
+                partition = partition,
+                dir = %partition_dir.display(),
+                "Truncation found no partition directory — reporting an empty log"
+            );
             return Ok(TruncateOutcome::untouched(None));
         }
 
@@ -1433,6 +1443,16 @@ impl GroupCommitWal {
             }
         }
         segments.sort_by_key(|(id, _)| *id);
+
+        if segments.is_empty() {
+            warn!(
+                topic = %topic,
+                partition = partition,
+                dir = %partition_dir.display(),
+                prefix = %prefix,
+                "Truncation found no segment files — reporting an empty log"
+            );
+        }
 
         // Place the target. The segment that can straddle it is the *last* one
         // whose first record sits below it — not the first one at or above it,
@@ -1500,7 +1520,8 @@ impl GroupCommitWal {
             }
         };
 
-        for (segment_id, path) in &segments[delete_from..] {
+        let mut deleted: Vec<usize> = Vec::new();
+        for (index, (segment_id, path)) in segments.iter().enumerate().skip(delete_from) {
             let size = tokio::fs::metadata(path).await.map(|m| m.len()).unwrap_or(0);
             if size == 0 {
                 // Nothing to discard, and this is usually the segment the
@@ -1511,13 +1532,29 @@ impl GroupCommitWal {
             }
             outcome.bytes_discarded += size;
             outcome.segments_deleted += 1;
+            deleted.push(index);
             self.remove_truncated_segment(topic, partition, *segment_id, path)
                 .await?;
         }
 
-        // If the straddler kept nothing, the log now ends in an earlier segment.
+        // Where the log ends now: the last record in the last SURVIVING segment.
+        //
+        // Scan every survivor, not `segments[..delete_from - 1]`. That range
+        // excluded the straddler and everything the delete loop skipped for
+        // being empty, so in the case where nothing was cut at all it looked at
+        // no files, found nothing, and reported "the log is empty".
+        //
+        // `None` then means two incompatible things — "nothing survived" and "I
+        // did not touch anything" — and the caller collapses both to offset 0.
+        // A truncation that legitimately had no work to do therefore told the
+        // follower its log was empty, and the follower re-replicated the whole
+        // partition from scratch instead of keeping the records it already had.
+        // Observed on two of three divergence runs.
         if last_kept_offset.is_none() {
-            for (_, path) in segments[..delete_from.saturating_sub(1)].iter().rev() {
+            for (index, (_, path)) in segments.iter().enumerate().rev() {
+                if deleted.contains(&index) {
+                    continue;
+                }
                 if let Some(last) = Self::last_record_offset(path).await? {
                     last_kept_offset = Some(last);
                     break;

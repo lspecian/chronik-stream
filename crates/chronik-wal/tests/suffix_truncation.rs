@@ -81,6 +81,55 @@ async fn truncating_removes_the_tail_and_keeps_the_head() {
     );
 }
 
+/// A truncation with nothing to do must report where the log actually ends —
+/// never `None`.
+///
+/// `None` means "the log holds no records", and the caller acts on it by
+/// restarting replication from offset 0. A no-op reported it too, so a follower
+/// whose log was already at or below the target was told its log was empty and
+/// re-replicated the entire partition from scratch. It reproduced on two of
+/// three divergence runs; the data came out correct, by the most expensive route
+/// available.
+#[tokio::test]
+async fn a_truncation_with_nothing_to_do_still_reports_the_log_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = WalManager::new(config_at(dir.path())).await.unwrap();
+    let (topic, partition) = ("trunc-noop", 0);
+
+    append(&manager, topic, partition, 0..20).await;
+
+    // Target above the log end: there is nothing above it to remove.
+    let outcome = manager.truncate_to(topic, partition, 50).await.unwrap();
+
+    assert!(!outcome.touched_disk(), "nothing should have been removed");
+    assert_eq!(
+        outcome.new_log_end_offset,
+        Some(20),
+        "a no-op must report the real log end, not 'empty'"
+    );
+    assert_eq!(
+        readable_offsets(&manager, topic, partition).await,
+        (0..20).collect::<Vec<_>>(),
+        "the log must be untouched"
+    );
+}
+
+/// Emptying the log is a real outcome and must still be reported as `None`, so
+/// the fix above does not paper over the case where 0 genuinely is the answer.
+#[tokio::test]
+async fn truncating_everything_away_reports_an_empty_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = WalManager::new(config_at(dir.path())).await.unwrap();
+    let (topic, partition) = ("trunc-all", 0);
+
+    append(&manager, topic, partition, 0..20).await;
+
+    let outcome = manager.truncate_to(topic, partition, 0).await.unwrap();
+
+    assert_eq!(outcome.new_log_end_offset, None);
+    assert!(readable_offsets(&manager, topic, partition).await.is_empty());
+}
+
 /// A truncation reaching back past segment boundaries must delete the whole
 /// segments above the cut, not just shorten the last one.
 #[tokio::test]
