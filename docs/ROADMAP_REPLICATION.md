@@ -974,23 +974,64 @@ a freshly created cluster with a single topic, so it is not accumulated state.
 (`kcat`, 200,000 records, `perf_replication.sh`). So the broker's ingest is not
 the constraint; the per-round-trip path is.
 
-**Leading hypothesis, not established.** `acks=all` throughput is bounded by the
-follower's fetch loop: one in-flight request per leader, `min_bytes=1`, so the
-leader answers the moment anything lands and each round trip carries only what
-accumulated during the previous one. That is exactly what makes the *latency*
-good — it is why #36's per-request cost fell to 17ms — so raising `min_bytes`
-would trade the fix back. If the hypothesis holds, the answer is pipelining
-(more than one fetch in flight per leader), not bigger batches.
+### Measured, not guessed
+
+**It is the follower round trip, and the ISR wait is innocent.** Same wait
+machinery, only the quorum differs:
+
+| | sustained | p99 |
+|---|---:|---:|
+| `min_insync_replicas=2` (leader + a follower) | 3,935 → 2,210 msg/s | 40 → 54 ms |
+| `min_insync_replicas=1` (leader alone) | 21,174 → 20,076 msg/s | 8.3 → 9.5 ms |
+
+Ten times. `IsrAckTracker` registration, the wait, and its release are all still
+on the path at `min_insync=1`; the only thing removed is waiting for a follower.
+
+**The follower completes ~60 fetch cycles per second**, carrying ~35 records
+each. 60 × 35 ≈ 2,100 msg/s, which is the observed number to within noise. So
+the question was never "why is each record slow" — it is "why is each cycle
+16ms".
+
+**Four candidate answers, each measured and each wrong:**
+
+| candidate | test | result |
+|---|---|---|
+| Follower fsyncs per applied batch | apply with `acks=0` | 2,181 vs 2,210 msg/s — no change |
+| Leader's 10ms long-poll interval | 1ms vs 10ms | 3,887 vs 3,935 msg/s — no change |
+| Leader serves partitions serially | serve concurrently | 2,369 vs 2,210 msg/s — no change |
+| Cycle carries too few records | 12 partitions vs 3 | 2,043 vs 2,036 msg/s — no change |
+
+**The answer, from instrumenting the cycle** (now permanent, at `debug`):
+
+```
+build 1.2µs   fetch  8.5ms   apply 45µs    total  8.5ms
+build 531ns   fetch  3.4ms   apply 18µs    total  3.4ms
+build 2.6µs   fetch 16.1ms   apply 15µs    total 16.1ms
+```
+
+The fetch is the entire cycle. Building the request is nanoseconds and applying
+the batch is microseconds — the follower is not slow, it is **waiting**. The
+leader's own per-partition serve time is 0.2–4ms, so the rest is the fetch
+queueing behind the 64 concurrent produce requests that same leader is serving.
+
+`acks=all` is therefore a feedback loop: producers wait on the follower's next
+fetch, that fetch waits behind the producers' own requests on the leader, and
+the loop settles at whatever rate the leader can interleave both. Nothing is
+individually slow, which is why four reasonable hypotheses all measured flat.
+
+### What would actually move it
+
+- **Give replica fetches priority over client requests.** Kafka separates them,
+  and this measurement is what that separation is for. Most promising.
+- **Pipeline the follower**: more than one fetch in flight per leader, so ack
+  latency stops being one serialised round trip.
+- Reduce the leader's per-request cost generally — helps both sides of the loop.
+
+Not yet attempted. Whichever is chosen, the cycle instrumentation above is how
+to tell whether it worked.
 
 **Do not start a bare-metal run before settling this**, or it will dominate
 every number taken there.
-
-Two measurements that would separate the candidates:
-1. `min_insync_replicas=1` on a 3-node cluster — quorum is the leader alone, so
-   the ISR wait remains but the follower round trip does not. Fast ⇒ the loop;
-   still slow ⇒ the wait itself (`IsrAckTracker` contention or waiter growth).
-2. Instrument registration → satisfaction inside `IsrAckTracker`, which would
-   also show whether the in-run degradation is waiters accumulating.
 
 ---
 

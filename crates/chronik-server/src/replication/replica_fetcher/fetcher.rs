@@ -568,6 +568,10 @@ impl ReplicaFetcher {
         // nothing, and one that never repairs backs off instead of spinning.
         let mut repair_rounds: u32 = 0;
 
+        // Cycle counter, so the timing breakdown above is sampled rather than
+        // logged on every round trip.
+        let mut cycles: u64 = 0;
+
         while !self.shutdown.load(Ordering::Relaxed) {
             if needs_reconcile {
                 match self.reconcile_with_leader(&mut connection, &partitions).await {
@@ -587,6 +591,17 @@ impl ReplicaFetcher {
                 }
             }
 
+            // Where the replication cycle's time goes.
+            //
+            // `acks=all` cannot complete until the follower's NEXT fetch reports
+            // a position past the record, so the cycle time here is the floor on
+            // replicated write latency and the cap on replicated throughput.
+            // Measured at ~60 cycles/s (16ms each) while fsync, the leader's poll
+            // interval, serial partition serving and partition count were all
+            // ruled out one at a time — so the breakdown is logged rather than
+            // guessed at again (RP-9).
+            let cycle_start = std::time::Instant::now();
+
             let spec = match self.build_request(&partitions).await {
                 Some(spec) => spec,
                 None => {
@@ -594,9 +609,11 @@ impl ReplicaFetcher {
                     continue;
                 }
             };
+            let built = cycle_start.elapsed();
 
             match connection.fetch(spec).await {
                 Ok(response) => {
+                    let fetched = cycle_start.elapsed();
                     let mut got_records = false;
                     let mut diverged = false;
                     for topic in response.topics {
@@ -609,6 +626,19 @@ impl ReplicaFetcher {
                                 diverged = true;
                             }
                         }
+                    }
+
+                    let applied = cycle_start.elapsed();
+                    cycles = cycles.wrapping_add(1);
+                    if cycles % 200 == 0 {
+                        debug!(
+                            "replication cycle {}: build {:?}, fetch {:?}, apply {:?}, total {:?}",
+                            cycles,
+                            built,
+                            fetched - built,
+                            applied - fetched,
+                            applied
+                        );
                     }
 
                     // Detect → reconcile → resume → detect the same thing again

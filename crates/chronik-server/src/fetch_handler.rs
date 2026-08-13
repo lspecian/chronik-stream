@@ -333,6 +333,28 @@ impl FetchHandler {
     ///
     /// Waiting is the caller's job (`wait_for_any_partition`) precisely so that
     /// one partition cannot spend the request's budget on behalf of the others.
+    ///
+    /// Partitions are served CONCURRENTLY. They are independent reads against
+    /// independent logs, and doing them one after another multiplied the
+    /// request's cost by the partition count: serving one partition measured
+    /// 2.5–4ms, so a 3-partition fetch spent ~10ms on the leader before the
+    /// follower could even begin applying. That is most of a follower's 16ms
+    /// replication cycle, and since `acks=all` cannot complete until the
+    /// follower's *next* fetch reports its new position, it capped replicated
+    /// throughput at roughly (partitions × per-partition cost)⁻¹ × batch size —
+    /// measured at ~60 cycles/s and ~2,000 msg/s (RP-9).
+    ///
+    /// ⚠️ This did **not** move that benchmark: 2,369 msg/s concurrent against
+    /// 2,210 serial, which is inside the run-to-run spread. The cycle turned out
+    /// to be dominated by the fetch waiting on a leader that is simultaneously
+    /// serving 64 producers, not by the leader's own per-partition work. Kept
+    /// anyway — independent reads against independent logs have no reason to
+    /// serialise, and the serial version scales badly with partition count even
+    /// though 3 partitions did not expose it.
+    ///
+    /// Order is preserved: `join_all` returns results in the order the futures
+    /// were created, and a Fetch response must answer partitions in the order
+    /// the request listed them.
     async fn serve_all_partitions(
         &self,
         request: &FetchRequest,
@@ -340,17 +362,22 @@ impl FetchHandler {
         let mut response_topics = Vec::with_capacity(request.topics.len());
 
         for topic_request in &request.topics {
-            let mut response_partitions = Vec::with_capacity(topic_request.partitions.len());
-
-            for partition_request in &topic_request.partitions {
-                let mut partition_response = self.fetch_partition(
+            let served = futures::future::join_all(topic_request.partitions.iter().map(|pr| {
+                self.fetch_partition(
                     &topic_request.name,
-                    partition_request.partition,
-                    partition_request.fetch_offset,
-                    partition_request.partition_max_bytes,
+                    pr.partition,
+                    pr.fetch_offset,
+                    pr.partition_max_bytes,
                     request.max_wait_ms,
                     request.replica_id,
-                ).await?;
+                )
+            }))
+            .await;
+
+            let mut response_partitions = Vec::with_capacity(topic_request.partitions.len());
+
+            for partition_response in served {
+                let mut partition_response = partition_response?;
 
                 // EOS layer 6: for read_committed (isolation_level == 1) report the real
                 // Last Stable Offset and the aborted-transactions list from the per-
@@ -421,9 +448,10 @@ impl FetchHandler {
         request: &FetchRequest,
         wait_deadline: Instant,
     ) -> bool {
-        // 10ms is not a latency floor worth tuning: measured at 1ms and at 10ms,
-        // end-to-end `acks=all` latency was identical, because the cost that
-        // remains is the follower's apply and its next fetch, not this detection.
+        // 10ms, and measured not to matter — three times now. At 1ms versus
+        // 10ms, neither `acks=all` latency (#36) nor replicated throughput
+        // (RP-9) moved, because under load the follower's fetch takes the
+        // data-available path and never reaches this loop.
         let poll_interval = Duration::from_millis(10);
 
         loop {
