@@ -1285,7 +1285,20 @@ numbers — are all fixed.
 
 Answer before the phase that depends on them.
 
-1. **Is today's 66K rec/s network-bound or sender-bound?** (blocks any perf claim, and RP-1.4/RP-2 sizing) — 1 GbE links, and the load generator was co-located with a broker. Re-run `acks=1` with the client off broker nodes while sampling per-node NIC utilisation. If we are at ~110 MB/s, the transport is not the constraint and no sender work is justified.
+1. ~~**Is today's 66K rec/s network-bound or sender-bound?**~~ — **ANSWERED 2026-08-14: it depends on the acks level, and that split is the answer.**
+
+   Measured on the Dells with the client on a fourth machine and per-node NIC utilisation sampled during each run (`tests/cluster/baremetal.sh`, `BARE_METAL_PERFORMANCE.md`). The link is 1 GbE, ~940 Mbit/s usable:
+
+   | | node-1 NIC peak | share of line rate |
+   |---|---:|---:|
+   | 256 B `acks=0` | 627 Mbit/s | 67% |
+   | 256 B `acks=1` | 667 Mbit/s | 71% |
+   | 1 KB `acks=0` | 720 Mbit/s | 77% |
+   | 1 KB `acks=1` | **759 Mbit/s** | **81%** |
+   | 256 B `acks=all` | 52 Mbit/s | 6% |
+   | 1 KB `acks=all` | 138 Mbit/s | 15% |
+
+   **`acks=0` and `acks=1` are transport-bound.** At 67–81% of line rate, sender-side work is not justified for them; a 10 GbE link is the change that matters. **`acks=all` is not** — at 6–15% it is bounded by the replication round trip, which is what RP-9 was about. One number never described the cluster, and the question could not be answered while the client shared a machine with a broker.
 2. ~~**Does `__chronik_metadata` move to pull, or keep a minimal push transport?**~~ — **DECIDED 2026-08-12: keep the push transport for metadata; RP-4 deletes only the data path.**
 
    Metadata is not a partitioned topic with replicas and a leader epoch; it is a single Raft-managed log whose leadership is Raft's, and it is the store that *holds* the partition assignments the pull path reads. Moving it to pull would make the mechanism that discovers who leads a partition depend on already knowing who leads a partition. The push transport works correctly there today, including retry, and `MetadataWalReplicator` is built on it.

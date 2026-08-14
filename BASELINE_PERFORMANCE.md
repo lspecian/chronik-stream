@@ -129,8 +129,12 @@ records and paying one per record. The broker's ingest was never the constraint.
 
 ## What is not measured here
 
-- **Bare metal.** All of the above is one machine. `BARE_METAL_PERFORMANCE.md`
-  covers what is owed on the Dell cluster.
+- **Bare metal.** All of the above is one machine, with the client sharing it
+  with all three brokers. `BARE_METAL_PERFORMANCE.md` has the Dell cluster
+  measured on real hardware over a real network, with the client on a separate
+  machine: `acks=1` and `acks=all` are **2.8× and 2.0× faster** there, while
+  `acks=0` is identical because it is the one mode that waits for nothing and so
+  measures the client rather than the cluster.
 - **Consume throughput.** `chronik-bench -m consume` exists; these runs are
   produce-only.
 - **Searchable / columnar / vector topics.** The old report measured a 33%
