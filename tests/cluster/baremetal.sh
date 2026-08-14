@@ -180,8 +180,52 @@ bench() {
   done
 }
 
+# The OTHER regime: how fast the cluster ingests when the client batches.
+#
+# Not `chronik-bench --linger-ms`. That benchmark awaits each message's delivery
+# before sending the next, so a producer never has more than one message in
+# flight and there is nothing for linger to accumulate — it only adds dead time.
+# Measured, at 256 B `acks=0`: 5,359 msg/s with `--linger-ms 10` against 110,427
+# with 0, and the NIC fell from 627 to 18 Mbit/s. 64 producers / 10 ms = 6,400,
+# which is the whole of it. Linger cannot batch a workload that is synchronous
+# by construction.
+#
+# `kcat` pipes records in without waiting on any of them, so librdkafka batches
+# them for real. Same method as `perf_replication.sh`, pointed at the Dells.
+batched() {
+  command -v kcat >/dev/null || { say "SKIP: kcat not installed"; exit 0; }
+  local records="${PERF_RECORDS:-200000}"
+  local payload; payload=$(head -c "${PERF_SIZE:-256}" /dev/zero | tr '\0' 'x')
+  mkdir -p "$(dirname "$RESULTS")"
+  say "== bare metal, BATCHED: kcat, $records records x ${PERF_SIZE:-256}B, median of $RUNS =="
+  say "   the client does not wait per message; this is the ingest ceiling"
+  say ""
+  for acks in $ACKS_LEVELS; do
+    local rates=()
+    for run in $(seq 1 "$RUNS"); do
+      up
+      local topic="bmb-$acks-$run-$$"
+      echo warmup | timeout 60 kcat -P -b "$BOOT" -t "$topic" -X request.required.acks="$acks" 2>/dev/null
+      sleep 8
+      local t0 t1 ms
+      t0=$(date +%s%3N)
+      seq 1 "$records" | sed "s/\$/ $payload/" \
+        | timeout 900 kcat -P -b "$BOOT" -t "$topic" -X request.required.acks="$acks" 2>/dev/null
+      t1=$(date +%s%3N)
+      ms=$((t1 - t0)); [ "$ms" -le 0 ] && ms=1
+      rates+=("$(( records * 1000 / ms ))")
+      down
+      sleep "$SETTLE"
+    done
+    printf '  batched %-4s acks=%-4s %10s msg/s   (%s)\n' \
+      "${PERF_SIZE:-256}B" "$acks" "$(median "${rates[@]}")" "$(printf '%s ' "${rates[@]}")" \
+      | tee -a "$RESULTS"
+  done
+}
+
 case "${1:-all}" in
   deploy) deploy ;;
+  batched) batched ;;
   up)     up ;;
   down)   down ;;
   bench)  bench ;;

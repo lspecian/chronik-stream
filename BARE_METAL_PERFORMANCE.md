@@ -40,13 +40,24 @@ Round trip is the harder question and the one this work needed: replication cost
 only appears when someone is waiting for it, and a batched pipeline hides it
 almost completely. But it means **a reader who remembers 837K and sees 110K
 below is comparing a batched aggregate to an unbatched round trip, not a
-regression.** The old number was also invalid for a separate reason — it was
-measured with replication silently disabled — but even had it been sound, it
-would not belong in the same table as these.
+regression.**
 
-⏳ A batched bare-metal row is owed here, so both regimes appear side by side
-rather than one being described in prose. `PERF_LINGER=10 ./tests/cluster/baremetal.sh bench`
-produces it.
+Measured in the old number's own regime, the gap is mostly gone and the rest is
+accounted for:
+
+| | msg/s | |
+|---|---:|---|
+| old report, `acks=all` | 837,284 | batched, **replication disabled**, 12–36 ingestor pods, in-cluster over loopback |
+| today, batched `acks=1` | 386,100 | replication running, **one** client, over a real 1 GbE link |
+| today, batched `acks=all` | 99,403 | as above, and waiting for a follower on every batch |
+
+Against `acks=1` — the closest analogue, since the old run was not replicating
+whatever its flag said — 837K versus 386K is 2.2×, and that is one load
+generator on one machine against a dozen-plus in-cluster pods with no network
+hop. Against `acks=all` it is 8.4×, and the difference is replication actually
+happening. Neither is a regression in the broker.
+
+Both regimes are measured below, on the same hardware, in the same session.
 
 ## What was measured
 
@@ -81,6 +92,41 @@ Reproduce: `./tests/cluster/baremetal.sh all`
 | 0 | **72,451 msg/s** | 70.75 MB/s | 10.68 ms | 720 Mbit/s | 81,411 · 70,718 · 72,451 |
 | 1 | 12,727 msg/s | 12.43 MB/s | 39.45 ms | **759 Mbit/s** | 12,727 · 14,859 · 10,758 |
 | all | 10,624 msg/s | 10.38 MB/s | 9.86 ms | 138 Mbit/s | 10,409 · 10,624 · 10,791 |
+
+### Batched, 256-byte messages — the other regime
+
+`kcat` piping 200,000 records without waiting on any of them, so librdkafka
+batches for real. Median of three, fresh cluster each.
+Reproduce: `./tests/cluster/baremetal.sh batched`
+
+| acks | batched | round trip (from above) | what batching is worth |
+|---|---:|---:|---:|
+| 0 | 355,871 msg/s | 110,427 msg/s | 3.2× |
+| 1 | 386,100 msg/s | 22,690 msg/s | **17×** |
+| all | 99,403 msg/s | 12,475 msg/s | **8×** |
+
+Samples: `acks=0` 346,620 · 355,871 · 418,410 — `acks=1` 387,596 · 386,100 ·
+339,558 — `acks=all` 77,669 · 136,239 · 99,403.
+
+Two things fall out of this table.
+
+**Batched `acks=0` and `acks=1` are the same number.** 356K and 386K are within
+each other's spread. Once a batch carries thousands of records, the leader's
+fsync amortises to nothing per record — so *waiting for the leader's disk costs
+nothing when you batch, and costs 5× when you do not* (110,427 → 22,690).
+
+**Replication is the cost that does not amortise away.** `acks=all` batched is
+99K against `acks=1`'s 386K — still a 3.9× drop, because a batch is not
+acknowledged until a follower has fetched it, and that round trip happens per
+batch no matter how large the batch is.
+
+⚠️ **`--linger-ms` cannot produce these numbers, and trying it is a trap.**
+`chronik-bench` awaits each message's delivery before sending the next, so a
+producer never has more than one message in flight and linger has nothing to
+accumulate — it only adds dead time. Measured at 256 B `acks=0`: **5,359 msg/s
+with `--linger-ms 10` against 110,427 with 0**, NIC falling from 627 to 18
+Mbit/s. 64 producers ÷ 10 ms = 6,400, which is the whole of the result. A
+synchronous benchmark cannot be batched by a client setting.
 
 ---
 
