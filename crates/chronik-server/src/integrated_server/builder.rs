@@ -1193,7 +1193,12 @@ impl IntegratedKafkaServerBuilder {
                 // Update in-memory high watermark (fast, O(1), stays synchronous)
                 let new_watermark = max_offset + 1;
                 if let Some(state) = partition_states.get(&(topic.to_string(), partition)) {
-                    state.high_watermark.store(new_watermark as u64, Ordering::Release);
+                    // Raises the log end with it. On a follower this callback is
+                    // the *only* thing that moved the watermark, and it ran
+                    // ahead of the replication path that moves the log end —
+                    // which then found the watermark already high enough and
+                    // skipped. See `PartitionState::raise_watermark`.
+                    state.raise_watermark(new_watermark.max(0) as u64);
                     debug!("✅ WAL_CALLBACK: Updated high watermark {}-{} = {}", topic, partition, new_watermark);
                 }
                 // Notify ResponsePipeline asynchronously to avoid blocking the worker

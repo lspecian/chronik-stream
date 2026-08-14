@@ -386,6 +386,35 @@ pub(crate) struct PartitionState {
     last_flush: Arc<Mutex<Instant>>,
 }
 
+impl PartitionState {
+    /// Raise the high watermark, and the log end along with it.
+    ///
+    /// The two are separate atomics but not separate facts: a partition cannot
+    /// have acknowledged records past the end of its own log, so the log end is
+    /// always at least the watermark.
+    ///
+    /// They used to be coupled the other way — through a single "is the
+    /// watermark increasing?" guard, with the log end updated only inside it.
+    /// Once any other path raised the watermark, every later call took the
+    /// `else` branch and the log end could never catch up. Captured from a
+    /// failing run:
+    ///
+    /// ```text
+    /// Created partition state for t-0 with watermark 79
+    /// WM_SKIP t-0: 100 <= 100 (current), log end stays 79
+    /// ```
+    ///
+    /// That replica held 100 replicated records and reported a log end of 79.
+    /// Elected, it assigned offsets from 79 and overwrote 21 records it already
+    /// had; the returning ex-leader was told its epoch ended at 79 and truncated
+    /// committed data to match. Raising both, independently and monotonically,
+    /// is what makes that unrepresentable.
+    pub(crate) fn raise_watermark(&self, watermark: u64) {
+        self.high_watermark.fetch_max(watermark, Ordering::SeqCst);
+        self.next_offset.fetch_max(watermark, Ordering::SeqCst);
+    }
+}
+
 /// Record to be produced
 #[derive(Debug, Clone)]
 struct ProduceRecord {
@@ -1002,17 +1031,22 @@ impl ProduceHandler {
         let key = (topic.to_string(), partition);
 
         if let Some(state) = self.partition_states.get(&key) {
-            // Partition exists - update watermark only if it's increasing
-            // v2.2.9 MONOTONICITY FIX: Watermarks should never decrease (prevent stale WAL data from overwriting)
-            let current = state.value().high_watermark.load(Ordering::SeqCst) as i64;
-            if high_watermark > current {
-                state.value().high_watermark.store(high_watermark as u64, Ordering::SeqCst);
-                debug!("✅ Updated watermark for {}-{} from {} to {}", topic, partition, current, high_watermark);
-                Ok(())
-            } else {
-                debug!("⏭️  Skipped watermark update for {}-{}: {} <= {} (current)", topic, partition, high_watermark, current);
-                Ok(())
-            }
+            // Both fields, each monotonic, neither gating the other.
+            //
+            // v2.2.9 made the watermark monotonic, correctly — stale WAL data
+            // must not walk it back. But the log end was later updated *inside*
+            // that guard, so a watermark that was already high enough silently
+            // skipped the log end too. See `PartitionState::raise_watermark`
+            // for what that cost on failover.
+            state.value().raise_watermark(high_watermark.max(0) as u64);
+            debug!(
+                "Watermark for {}-{} is now {}, log end {}",
+                topic,
+                partition,
+                state.value().high_watermark.load(Ordering::SeqCst),
+                state.value().next_offset.load(Ordering::SeqCst)
+            );
+            Ok(())
         } else {
             // v2.2.9 FOLLOWER FIX: Partition doesn't exist yet (follower receiving replicated data)
             // Create partition state with initial watermark
@@ -1439,7 +1473,7 @@ impl ProduceHandler {
     /// Called from GroupCommitWal callback after successful fsync
     pub fn update_high_watermark_from_wal(&self, topic: &str, partition: i32, new_watermark: i64) {
         if let Some(state) = self.partition_states.get(&(topic.to_string(), partition)) {
-            state.high_watermark.store(new_watermark as u64, std::sync::atomic::Ordering::Release);
+            state.raise_watermark(new_watermark.max(0) as u64);
             debug!("Updated high watermark: {}-{} = {}", topic, partition, new_watermark);
         }
     }
@@ -5340,6 +5374,89 @@ mod tests {
             handler.leader_epochs().latest_epoch("epoch-topic", 0),
             Some(current),
             "the append must be stamped with, and recorded under, the current leader epoch"
+        );
+    }
+
+    /// A follower's log end has to follow what it replicates.
+    ///
+    /// Nothing else advances `next_offset` on a replica — the apply path takes
+    /// its offsets from the leader — so when this method only moved the
+    /// watermark, a replica that had replicated N records still reported the log
+    /// end of its *first* batch. Elect that replica and it assigns offsets from
+    /// there, overwriting records it already holds; the returning ex-leader is
+    /// then told its epoch ended at that offset and truncates committed data to
+    /// match. It stayed hidden while a test's records arrived in one batch.
+    #[tokio::test]
+    async fn replicating_a_second_batch_advances_the_log_end_not_just_the_watermark() {
+        let (handler, _tmp) = create_test_handler().await;
+
+        // First replicated batch: no partition state yet, so it is created here.
+        handler.update_high_watermark("test-topic", 0, 44).await.unwrap();
+        assert_eq!(handler.get_log_end_offset("test-topic", 0).await, 44);
+
+        // Second batch, against existing state — the case that used to move only
+        // the watermark.
+        handler.update_high_watermark("test-topic", 0, 100).await.unwrap();
+        assert_eq!(
+            handler.get_log_end_offset("test-topic", 0).await,
+            100,
+            "the log end must track every replicated batch, not just the first"
+        );
+    }
+
+    /// The mechanism, exactly as captured from a failing divergence run:
+    ///
+    /// ```text
+    /// Created partition state for t-0 with watermark 79
+    /// WM_SKIP t-0: 100 <= 100 (current), log end stays 79
+    /// ```
+    ///
+    /// The WAL commit callback raises the watermark on its own. When the log end
+    /// was only updated inside an "is the watermark increasing?" guard, that
+    /// callback getting there first pinned the log end forever — and an elected
+    /// replica then assigned offsets over records it already held.
+    #[tokio::test]
+    async fn a_watermark_raised_elsewhere_does_not_strand_the_log_end() {
+        let (handler, _tmp) = create_test_handler().await;
+
+        // First replicated batch creates the state at 79.
+        handler.update_high_watermark("test-topic", 0, 79).await.unwrap();
+        assert_eq!(handler.get_log_end_offset("test-topic", 0).await, 79);
+
+        // The WAL commit callback runs for records already on disk and moves the
+        // watermark by itself.
+        handler.update_high_watermark_from_wal("test-topic", 0, 100);
+
+        // Replication now reports the same 100. Under the old guard this was
+        // "not increasing" and the log end stayed at 79.
+        handler.update_high_watermark("test-topic", 0, 100).await.unwrap();
+        assert_eq!(
+            handler.get_log_end_offset("test-topic", 0).await,
+            100,
+            "the log end must reach the watermark whichever path raised it"
+        );
+    }
+
+    /// The leader assigns offsets ahead of the watermark, and a watermark update
+    /// must never drag its log end backwards.
+    #[tokio::test]
+    async fn a_watermark_update_never_lowers_the_log_end() {
+        let (handler, _tmp) = create_test_handler().await;
+
+        handler.update_high_watermark("test-topic", 0, 100).await.unwrap();
+        let state = handler
+            .partition_states
+            .get(&("test-topic".to_string(), 0))
+            .unwrap()
+            .clone();
+        // Stand in for a leader that has assigned offsets it has not yet acked.
+        state.next_offset.store(150, Ordering::SeqCst);
+
+        handler.update_high_watermark("test-topic", 0, 120).await.unwrap();
+        assert_eq!(
+            handler.get_log_end_offset("test-topic", 0).await,
+            150,
+            "the watermark caught up, but the log end must stay where the leader put it"
         );
     }
 }

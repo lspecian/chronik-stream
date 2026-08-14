@@ -12,11 +12,16 @@ use chronik_wal::{WalManager, WalRecord};
 use dashmap::DashMap;
 use std::collections::HashMap;
 use std::io::Cursor;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tokio::time::timeout;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
+
+/// Replica fetches served, process-wide. Only ever used to sample the timing
+/// breakdown in `handle_fetch` rather than log every round trip (RP-9).
+static REPLICA_FETCH_SAMPLES: AtomicU64 = AtomicU64::new(0);
 
 /// In-memory buffer for recent records
 /// CRITICAL v1.3.32: Store RAW Kafka batch bytes to preserve CRC
@@ -321,14 +326,37 @@ impl FetchHandler {
         // everything again. That is also what Kafka's contract says the wait is:
         // a property of the request, satisfied by the first partition to have
         // something to send.
+        let started = Instant::now();
         let wait_deadline =
-            Instant::now() + Duration::from_millis(request.max_wait_ms.max(0) as u64);
+            started + Duration::from_millis(request.max_wait_ms.max(0) as u64);
 
         let mut response_topics = self.serve_all_partitions(&request).await?;
+        let first_serve = started.elapsed();
+        let mut waited = Duration::ZERO;
 
         if request.max_wait_ms > 0 && !any_records(&response_topics) {
             if self.wait_for_any_partition(&request, wait_deadline).await {
+                waited = started.elapsed() - first_serve;
                 response_topics = self.serve_all_partitions(&request).await?;
+            }
+        }
+
+        // A replica fetch's cost is the floor on `acks=all` latency and the cap
+        // on its throughput: the producer cannot be acknowledged until the
+        // follower's NEXT fetch reports a position past the record. The
+        // follower's own view of this call (RP-9) is the request as a whole, so
+        // split it here into the part spent serving and the part spent parked.
+        if request.replica_id >= 0 {
+            let n = REPLICA_FETCH_SAMPLES.fetch_add(1, Ordering::Relaxed) + 1;
+            if n % 200 == 0 {
+                debug!(
+                    "replica fetch {} from node {}: serve {:?}, wait {:?}, total {:?}",
+                    n,
+                    request.replica_id,
+                    first_serve,
+                    waited,
+                    started.elapsed()
+                );
             }
         }
 
@@ -908,8 +936,8 @@ impl FetchHandler {
         fetch_start: Instant,
     ) -> Result<FetchResponsePartition> {
         // v2.2.7.2: Log data available path
-        info!(
-            "✅ DATA AVAILABLE: topic={}, partition={}, fetch_offset={}, high_watermark={}, available={}",
+        debug!(
+            "DATA AVAILABLE: topic={}, partition={}, fetch_offset={}, high_watermark={}, available={}",
             topic, partition, fetch_offset, high_watermark, high_watermark - fetch_offset
         );
 
@@ -921,7 +949,7 @@ impl FetchHandler {
         };
 
         // CRITICAL CRC FIX v1.3.32: Try to fetch raw Kafka bytes first to preserve CRC
-        info!("📦 FETCH RAW: Trying raw bytes (CRC-preserving) for {}-{}", topic, partition);
+        debug!("FETCH RAW: trying raw bytes (CRC-preserving) for {}-{}", topic, partition);
         let raw_bytes_result = timeout(fetch_timeout, async {
             self.fetch_raw_bytes(
                 topic,
@@ -934,7 +962,7 @@ impl FetchHandler {
 
         let records_bytes = match raw_bytes_result {
             Ok(Ok(Some(raw_bytes))) => {
-                tracing::info!("✓ CRC-PRESERVED: Fetched {} bytes of raw Kafka data for {}-{}",
+                tracing::debug!("CRC-PRESERVED: fetched {} bytes of raw Kafka data for {}-{}",
                     raw_bytes.len(), topic, partition);
 
                 // HEX DUMP: Outgoing raw bytes to consumer
@@ -947,7 +975,7 @@ impl FetchHandler {
             }
             Ok(Ok(None)) | Ok(Err(_)) | Err(_) => {
                 // Fall back to parsed records (will recompute CRC)
-                tracing::warn!("⚠ CRC-RECOMPUTED: No raw bytes available, falling back to parsed records for {}-{}",
+                tracing::debug!("CRC-RECOMPUTED: no raw bytes available, falling back to parsed records for {}-{}",
                     topic, partition);
 
                 let fetch_result = timeout(fetch_timeout, async {
@@ -1192,7 +1220,7 @@ impl FetchHandler {
             None => return Ok(None),
         };
 
-        tracing::info!("RAW→TANTIVY: Checking Tantivy segment index for {}-{}", topic, partition);
+        tracing::debug!("RAW→TANTIVY: checking Tantivy segment index for {}-{}", topic, partition);
 
         match self.fetch_from_tantivy(
             segment_index,
@@ -1203,14 +1231,14 @@ impl FetchHandler {
             max_bytes,
         ).await {
             Ok(Some(bytes)) => {
-                tracing::info!(
-                    "RAW→TANTIVY: Returning {} bytes from Tantivy segments",
+                tracing::debug!(
+                    "RAW→TANTIVY: returning {} bytes from Tantivy segments",
                     bytes.len()
                 );
                 Ok(Some(bytes))
             }
             Ok(None) => {
-                tracing::info!("RAW→TANTIVY: No matching Tantivy segments found");
+                tracing::debug!("RAW→TANTIVY: no matching Tantivy segments found");
                 Ok(None)
             }
             Err(e) => {
@@ -1233,11 +1261,11 @@ impl FetchHandler {
         high_watermark: i64,
         max_bytes: i32,
     ) -> Result<Option<Vec<u8>>> {
-        tracing::info!("RAW→SEGMENTS: Buffer and WAL empty or no match, trying segments");
+        tracing::debug!("RAW→SEGMENTS: buffer and WAL empty or no match, trying segments");
         let segments = self.get_segments_for_range(topic, partition, fetch_offset, high_watermark).await?;
 
         if segments.is_empty() {
-            tracing::info!("RAW→SEGMENTS: No segments found for range");
+            tracing::debug!("RAW→SEGMENTS: no segments found for range");
             return Ok(None);
         }
 
@@ -1247,8 +1275,8 @@ impl FetchHandler {
             let segment_data = self.object_store.get(&segment_info.object_key).await?;
             let segment = Segment::deserialize(segment_data)?;
 
-            tracing::info!(
-                "RAW→SEGMENT: Segment {} has {} bytes of raw_kafka_batches",
+            tracing::debug!(
+                "RAW→SEGMENT: segment {} has {} bytes of raw_kafka_batches",
                 segment_info.segment_id, segment.raw_kafka_batches.len()
             );
 
@@ -2020,8 +2048,16 @@ impl FetchHandler {
 
         let max_records = std::cmp::max(10000, max_bytes as usize / 10);
 
+        let read_start = Instant::now();
         let wal_records = wal_manager.read_from(topic, partition, fetch_offset, max_records).await
             .map_err(|e| Error::Internal(format!("WAL read failed: {}", e)))?;
+        let read_took = read_start.elapsed();
+        if read_took > Duration::from_millis(1) {
+            debug!(
+                "RAW→WAL: read_from({}-{}, offset {}) took {:?} for {} records",
+                topic, partition, fetch_offset, read_took, wal_records.len()
+            );
+        }
 
         if wal_records.is_empty() {
             return Ok(None);
@@ -2049,8 +2085,12 @@ impl FetchHandler {
                                     concatenated_bytes.extend_from_slice(&kafka_batch_bytes);
                                     batches_concatenated += 1;
 
-                                    warn!(
-                                        "RAW→WAL: ✓ APPENDED reconstructed batch offsets {}-{} ({} bytes)",
+                                    // Per batch, on every fetch. At `warn` this
+                                    // wrote 23MB of logs per node in a 25-second
+                                    // replication run — the logging itself was a
+                                    // measurable share of fetch latency (RP-9).
+                                    trace!(
+                                        "RAW→WAL: appended reconstructed batch offsets {}-{} ({} bytes)",
                                         base_offset, last_offset, kafka_batch_bytes.len()
                                     );
                                 }
@@ -2060,8 +2100,8 @@ impl FetchHandler {
                                 }
                             }
                         } else {
-                            warn!(
-                                "RAW→WAL: ✗ SKIPPED batch offsets {}-{} (condition failed: last_offset >= fetch_offset: {}, base_offset < high_watermark: {})",
+                            trace!(
+                                "RAW→WAL: skipped batch offsets {}-{} (last_offset >= fetch_offset: {}, base_offset < high_watermark: {})",
                                 base_offset, last_offset,
                                 last_offset >= fetch_offset,
                                 base_offset < high_watermark
@@ -2080,8 +2120,8 @@ impl FetchHandler {
             return Ok(None);
         }
 
-        info!(
-            "RAW→WAL: Concatenated {} original batches, total {} bytes for {}-{}",
+        debug!(
+            "RAW→WAL: concatenated {} original batches, total {} bytes for {}-{}",
             batches_concatenated, concatenated_bytes.len(), topic, partition
         );
 
@@ -2098,7 +2138,7 @@ impl FetchHandler {
         high_watermark: i64,
         max_bytes: i32,
     ) -> Result<Vec<chronik_storage::Record>> {
-        info!(
+        debug!(
             "fetch_records_from_segments called - topic: {}, partition: {}, fetch_offset: {}, high_watermark: {}",
             topic, partition, fetch_offset, high_watermark
         );
@@ -2206,7 +2246,7 @@ impl FetchHandler {
             }
         }
         
-        tracing::info!(
+        tracing::debug!(
             "fetch_records complete - fetched {} records from {}-{} starting at offset {} (current_offset: {})",
             records.len(), topic, partition, fetch_offset, current_offset
         );
@@ -2223,7 +2263,7 @@ impl FetchHandler {
         high_watermark: i64,
         max_bytes: i32,
     ) -> Result<Option<Vec<u8>>> {
-        tracing::info!(
+        tracing::debug!(
             "fetch_raw_bytes - topic: {}, partition: {}, fetch_offset: {}, high_watermark: {}",
             topic, partition, fetch_offset, high_watermark
         );

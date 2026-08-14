@@ -232,10 +232,26 @@ impl WalManager {
         offset: i64,
         max_records: usize,
     ) -> Result<Vec<WalRecord>> {
-        info!(
+        debug!(
             "Reading from WAL (GroupCommitWal): topic={}, partition={}, offset={}, max_records={}",
             topic, partition, offset, max_records
         );
+
+        // Reads that want the end of the log — a follower replicating, a
+        // consumer keeping up — are answered from memory. The scan below reads
+        // and parses the whole active segment, so without this every such fetch
+        // costs O(segment size) and grows until rotation (RP-9).
+        if let Some(cached) = self
+            .group_commit_wal
+            .read_tail(topic, partition, offset, max_records)
+            .await
+        {
+            debug!(
+                "WAL read served from tail cache: {} records for {}/{} from offset {}",
+                cached.len(), topic, partition, offset
+            );
+            return Ok(cached);
+        }
 
         let mut records = Vec::new();
 
@@ -368,38 +384,45 @@ impl WalManager {
                     }
                 };
 
-                let mut canonical_data = vec![0u8; canonical_data_len];
-                if let Err(e) = std::io::Read::read_exact(&mut rdr, &mut canonical_data) {
-                    debug!("Failed to read canonical data at cursor {}: {} - skipping rest of file (likely truncated)", cursor, e);
+                // Read the offsets BEFORE copying the payload.
+                //
+                // They sit after `canonical_data` on the wire, so the obvious
+                // parse allocates and copies every record's payload and only
+                // then discovers the record is below the requested offset and
+                // throws it away. A fetch near the end of a 250MB segment paid
+                // that for the whole file — measured at 2.5–4.5ms to return two
+                // records, which was the whole of `acks=all`'s fetch latency
+                // (RP-9). Their positions are known from the length, so a skip
+                // costs three reads out of the buffer and no allocation at all.
+                let record_slice = &file_data[record_start..];
+                let payload_at = rdr.position() as usize;
+                let meta_at = match payload_at.checked_add(canonical_data_len) {
+                    Some(p) => p,
+                    None => {
+                        debug!("Implausible canonical_data_len at cursor {} - skipping rest of file", cursor);
+                        break;
+                    }
+                };
+                if meta_at + 20 > record_slice.len() {
+                    debug!("Truncated record at cursor {} - skipping rest of file", cursor);
                     break;
                 }
 
-                let base_offset = match rdr.read_i64::<LittleEndian>() {
-                    Ok(o) => o,
-                    Err(e) => {
-                        debug!("Failed to read base_offset at cursor {}: {} - skipping rest of file", cursor, e);
-                        break;
-                    }
-                };
-
-                let last_offset = match rdr.read_i64::<LittleEndian>() {
-                    Ok(o) => o,
-                    Err(e) => {
-                        debug!("Failed to read last_offset at cursor {}: {} - skipping rest of file", cursor, e);
-                        break;
-                    }
-                };
-
-                let record_count = match rdr.read_i32::<LittleEndian>() {
-                    Ok(c) => c,
-                    Err(e) => {
-                        debug!("Failed to read record_count at cursor {}: {} - skipping rest of file", cursor, e);
-                        break;
-                    }
-                };
+                let base_offset = i64::from_le_bytes(
+                    record_slice[meta_at..meta_at + 8].try_into().expect("8 bytes"),
+                );
+                let last_offset = i64::from_le_bytes(
+                    record_slice[meta_at + 8..meta_at + 16].try_into().expect("8 bytes"),
+                );
+                let record_count = i32::from_le_bytes(
+                    record_slice[meta_at + 16..meta_at + 20].try_into().expect("4 bytes"),
+                );
 
                 // Filter by offset range
                 let should_include = last_offset >= offset;
+
+                // Advance past the whole record either way.
+                rdr.set_position((meta_at + 20) as u64);
 
                 if !should_include {
                     skipped_batches += 1;
@@ -412,7 +435,7 @@ impl WalManager {
                         crc32,
                         topic: record_topic,
                         partition: record_partition,
-                        canonical_data,
+                        canonical_data: record_slice[payload_at..meta_at].to_vec(),
                         base_offset,
                         last_offset,
                         record_count,

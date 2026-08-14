@@ -171,9 +171,9 @@ pub fn plan_batches(bytes: &[u8], expected_offset: i64) -> std::result::Result<V
 /// Append one batch to the follower's local log, with the same side effects the
 /// leader's produce path applies.
 ///
-/// Shared with the push receive path deliberately: while both mechanisms exist,
-/// a record must land identically whichever way it arrived, and when RP-4
-/// deletes push this stays put.
+/// `wait_for_fsync` is what the caller uses to amortise the group commit across
+/// a multi-batch response; see `apply_fetched_records`. It never means "skip the
+/// fsync" — only "do not wait for this one here".
 pub async fn apply_canonical_batch(
     wal_manager: &Arc<chronik_wal::WalManager>,
     topic: &str,
@@ -181,6 +181,7 @@ pub async fn apply_canonical_batch(
     canonical: &CanonicalRecord,
     produce_handler: Option<&Arc<crate::produce_handler::ProduceHandler>>,
     metadata_store: Option<&Arc<dyn MetadataStore>>,
+    wait_for_fsync: bool,
 ) -> Result<i64> {
     let record_count = canonical.records.len() as i32;
     if record_count == 0 {
@@ -201,7 +202,7 @@ pub async fn apply_canonical_batch(
             base_offset,
             last_offset,
             record_count,
-            1, // fsync on the follower, matching the push receive path
+            if wait_for_fsync { 1 } else { 0 },
         )
         .await
         .map_err(|e| {
@@ -292,8 +293,22 @@ pub async fn apply_fetched_records(
 ) -> std::result::Result<i64, ApplyRefusal> {
     let actions = plan_batches(records, expected_offset)?;
 
+    // A response routinely carries several batches, and waiting for each one's
+    // fsync in turn cost one group-commit interval apiece — measured as the
+    // whole of the follower's apply time once the read side was fixed (RP-9).
+    //
+    // They all go to the same partition queue, in order, from this one task, so
+    // enqueuing them and waiting on the last is equivalent: the commit that
+    // includes the final write cannot have skipped the ones already ahead of it
+    // in the queue. Every batch is still fsynced before this function returns,
+    // and so before the follower's next fetch reports the new position — which
+    // is what `acks=all` is waiting on.
+    let last_apply = actions
+        .iter()
+        .rposition(|a| matches!(a, BatchAction::Apply(_)));
+
     let mut leo = expected_offset;
-    for action in actions {
+    for (index, action) in actions.into_iter().enumerate() {
         let frame = match action {
             BatchAction::Skip(frame) => {
                 debug!(
@@ -304,6 +319,7 @@ pub async fn apply_fetched_records(
             }
             BatchAction::Apply(frame) => frame,
         };
+        let wait_for_fsync = Some(index) == last_apply;
 
         let wire = &records[frame.start..frame.end];
         let canonical = CanonicalRecord::from_kafka_batch(wire).map_err(|e| {
@@ -320,6 +336,7 @@ pub async fn apply_fetched_records(
             &canonical,
             produce_handler,
             metadata_store,
+            wait_for_fsync,
         )
         .await
         {

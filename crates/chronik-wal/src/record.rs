@@ -538,6 +538,53 @@ impl WalRecord {
         }
     }
 
+    /// First offset this record carries.
+    ///
+    /// V1 holds a single record, so its base and last offsets are the same one.
+    /// Unlike `get_offset`, this answers for both formats, which is what an
+    /// offset-ranged read needs.
+    pub fn get_base_offset(&self) -> i64 {
+        match self {
+            WalRecord::V1 { offset, .. } => *offset,
+            WalRecord::V2 { base_offset, .. } => *base_offset,
+        }
+    }
+
+    /// Last offset this record carries. See `get_base_offset`.
+    pub fn get_last_offset(&self) -> i64 {
+        match self {
+            WalRecord::V1 { offset, .. } => *offset,
+            WalRecord::V2 { last_offset, .. } => *last_offset,
+        }
+    }
+
+    /// How many Kafka messages this record carries — one for V1, the batch's
+    /// count for V2.
+    pub fn get_record_count(&self) -> i32 {
+        match self {
+            WalRecord::V1 { .. } => 1,
+            WalRecord::V2 { record_count, .. } => *record_count,
+        }
+    }
+
+    /// Approximate heap cost of holding this record, for callers that cache
+    /// records under a byte budget. The payload dominates; the fixed header is
+    /// counted so that a run of tiny records still accrues a bound.
+    pub fn heap_size(&self) -> usize {
+        const HEADER: usize = 64;
+        match self {
+            WalRecord::V1 { key, value, headers, .. } => {
+                HEADER
+                    + key.as_ref().map_or(0, |k| k.len())
+                    + value.len()
+                    + headers.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>()
+            }
+            WalRecord::V2 { topic, canonical_data, .. } => {
+                HEADER + topic.len() + canonical_data.len()
+            }
+        }
+    }
+
     /// Get topic-partition (only available for V2)
     pub fn get_topic_partition(&self) -> Option<(&str, i32)> {
         match self {

@@ -14,7 +14,7 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::RwLock;  // v2.2.10: For interior mutability of commit_callback
 use std::time::{Duration, Instant};
 use bytes::Bytes;
@@ -363,6 +363,216 @@ struct PartitionCommitQueue {
     /// once it holds the writer; a change between the two means the batch
     /// straddles a truncation and must be dropped rather than written.
     truncation_epoch: Arc<AtomicU64>,
+
+    /// The most recently appended records, so reading the tail of the log costs
+    /// no I/O. See `TailCache`.
+    tail: Mutex<TailCache>,
+
+    /// Highest offset the commit worker has written and fsynced.
+    ///
+    /// The cache is filled at *append* time, which is the only point where
+    /// arrival order is still known — but a queued write is not yet on disk,
+    /// and some never get there: `commit_batch` discards a batch that straddles
+    /// a truncation. Serving those from memory would let a replica read records
+    /// no file will ever hold. So the cache may only answer at or below this,
+    /// which makes it strictly an accelerator over durable state.
+    committed_through: Arc<AtomicI64>,
+}
+
+/// A bounded, in-memory suffix of a partition's log.
+///
+/// Every fetch — a follower replicating, a consumer keeping up — asks for
+/// records near the log end, and `read_from` answered by reading the *entire*
+/// active segment file off disk and parsing it from byte zero, materialising
+/// every record's payload before discarding the ones below the requested
+/// offset. Segments rotate at 250MB, so that cost grew with the segment: on a
+/// three-node cluster it measured 2.5–4.5ms to return 2 records, it was the
+/// whole of `acks=all`'s fetch latency, and it is why replicated throughput
+/// visibly degraded *within* a ten-second run (RP-9).
+///
+/// Records are pushed in append order and evicted from the front, so the cache
+/// is always a contiguous suffix of the log. That is what makes it safe to
+/// serve from: either it covers the requested offset, or the read falls back to
+/// the file. A truncation clears it (RP-3.3) — a cut log must not be answered
+/// from records the cut removed.
+///
+/// The file remains the source of truth. This never acknowledges a write, and
+/// nothing here changes when a record is considered durable.
+struct TailCache {
+    /// Held in offset order, which is not always arrival order.
+    records: VecDeque<WalRecord>,
+    bytes: usize,
+    max_bytes: usize,
+    /// Lowest offset from which the cache runs gap-free to the end. A read
+    /// below this cannot be served, because the answer would skip a hole.
+    contiguous_from: Option<i64>,
+}
+
+/// Per-partition budget for `TailCache`, from `CHRONIK_WAL_TAIL_CACHE_BYTES`.
+///
+/// The total is this times the number of partitions this node writes, so a node
+/// carrying thousands of partitions should lower it. `0` disables the cache and
+/// sends every read back to the file scan.
+fn tail_cache_bytes() -> usize {
+    const DEFAULT: usize = 2 * 1024 * 1024;
+    match std::env::var("CHRONIK_WAL_TAIL_CACHE_BYTES") {
+        Ok(v) => v.trim().parse().unwrap_or(DEFAULT),
+        Err(_) => DEFAULT,
+    }
+}
+
+impl TailCache {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            records: VecDeque::new(),
+            bytes: 0,
+            max_bytes,
+            contiguous_from: None,
+        }
+    }
+
+    /// Walk back from the log end while each record continues the next, and
+    /// return where that run starts. Only needed after an out-of-order arrival.
+    fn recompute_contiguous_from(&mut self) {
+        let mut start = None;
+        let mut expected: Option<i64> = None;
+        for record in self.records.iter().rev() {
+            match expected {
+                Some(e) if record.get_last_offset() + 1 != e => break,
+                _ => {}
+            }
+            expected = Some(record.get_base_offset());
+            start = expected;
+        }
+        self.contiguous_from = start;
+    }
+
+    /// Record just appended to the log, with the serialised size already known.
+    ///
+    /// Contiguity is *enforced*, not assumed. Offsets are assigned before the
+    /// WAL append, and two produces to the same partition can therefore reach
+    /// this point in an order that does not match their offsets. A cache that
+    /// merely assumed order would then answer "I cover offset N" out of records
+    /// that skip past it, and a caller asking for the whole log would silently
+    /// receive part of it — which is exactly how this cache first went wrong,
+    /// as an intermittent failure of the RP-3.3 divergence test.
+    ///
+    /// So anything that is not the next offset drops the cache. The file is
+    /// still authoritative; the only cost of being wrong here is a miss.
+    fn push(&mut self, record: WalRecord, size: usize) {
+        if self.max_bytes == 0 {
+            return;
+        }
+
+        let base = record.get_base_offset();
+
+        // The overwhelming majority: this append continues the log end.
+        if self
+            .records
+            .back()
+            .map_or(true, |b| b.get_last_offset() + 1 == base)
+        {
+            if self.records.is_empty() {
+                self.contiguous_from = Some(base);
+            }
+            self.records.push_back(record);
+            self.bytes += size;
+        } else {
+            // Out of order, and legitimately so: offsets are assigned before
+            // the WAL append, so two produces to one partition can reach this
+            // point in an order that does not match their offsets. Under 64
+            // concurrent producers that is not an edge case, it is most of
+            // them.
+            //
+            // An earlier version refused these and held the cache empty, which
+            // is safe but useless — the cache never served a single read and
+            // the fetch path fell back to the full-segment scan it exists to
+            // avoid. Ordering the record into place keeps the cache a true
+            // mirror of the log without giving up on it.
+            let pos = self.records.partition_point(|r| r.get_base_offset() < base);
+            if self
+                .records
+                .get(pos)
+                .is_some_and(|r| r.get_base_offset() == base)
+            {
+                return; // already held; a duplicate must not double-count bytes
+            }
+            self.records.insert(pos, record);
+            self.bytes += size;
+            self.recompute_contiguous_from();
+        }
+
+        while self.bytes > self.max_bytes && self.records.len() > 1 {
+            if let Some(evicted) = self.records.pop_front() {
+                self.bytes = self.bytes.saturating_sub(evicted.heap_size());
+            }
+            // Dropping the front can only raise where the gap-free run starts.
+            if let Some(front) = self.records.front() {
+                let front_base = front.get_base_offset();
+                self.contiguous_from = Some(match self.contiguous_from {
+                    Some(c) => c.max(front_base),
+                    None => front_base,
+                });
+            }
+        }
+    }
+
+    /// Forget everything, including where the log was. Used when the log itself
+    /// moved under us — a truncation, or an append that never landed — so the
+    /// next append re-anchors the cache wherever the log now ends.
+    fn clear(&mut self) {
+        self.records.clear();
+        self.bytes = 0;
+        self.contiguous_from = None;
+    }
+
+    /// Records from `offset` onward, or `None` if the cache does not reach back
+    /// that far — in which case the caller must read the file.
+    ///
+    /// Answering a read the cache only partly covers would silently drop the
+    /// records below its start, so "partly" has to count as a miss.
+    /// `durable_through` is the highest offset the commit worker has fsynced;
+    /// records above it are queued, not written, and must not be served.
+    fn read_from(
+        &self,
+        offset: i64,
+        max_records: usize,
+        durable_through: i64,
+    ) -> Option<Vec<WalRecord>> {
+        // Serve only from within the gap-free run that reaches the log end.
+        // Below it the cache has a hole, and a short answer there would be read
+        // as the whole of the log.
+        if offset < self.contiguous_from? {
+            return None;
+        }
+
+        let mut out = Vec::new();
+        let mut messages = 0usize;
+        for record in &self.records {
+            if record.get_last_offset() < offset {
+                continue;
+            }
+            // Stop at the durable end rather than skipping past it: the records
+            // beyond are a contiguous run too, and serving the ones after a
+            // not-yet-committed batch would leave a hole in the answer.
+            if record.get_last_offset() > durable_through {
+                break;
+            }
+            if messages >= max_records {
+                break;
+            }
+            messages += record.get_record_count().max(1) as usize;
+            out.push(record.clone());
+        }
+
+        // Nothing durable to give. Say "miss" rather than "empty": the file may
+        // well have records this cache is not yet allowed to serve, and an
+        // empty answer would be taken for the end of the log.
+        if out.is_empty() {
+            return None;
+        }
+        Some(out)
+    }
 }
 
 /// Commit metrics for observability
@@ -602,13 +812,31 @@ impl GroupCommitWal {
         // Get or create partition queue
         let queue = self.get_or_create_queue(&topic, partition).await?;
 
-        // Handle acks=0 (fire-and-forget)
-        if acks == 0 {
-            return self.enqueue_nowait(queue, data.into(), base_offset, last_offset).await;
+        // Cache the tail before enqueuing, not after: `enqueue_and_wait` does
+        // not return until the commit worker has fsynced, and a follower's fetch
+        // for this offset can arrive in that window. Ordering is still the
+        // append order — this is the same task that is about to enqueue — and a
+        // record that fails to enqueue is removed again below.
+        let heap = record.heap_size();
+        {
+            let mut tail = queue.tail.lock().await;
+            tail.push(record, heap);
         }
 
-        // Handle acks=1 or acks=-1 (wait for commit)
-        self.enqueue_and_wait(queue, data.into(), data_len, base_offset, last_offset).await
+        // Handle acks=0 (fire-and-forget)
+        let result = if acks == 0 {
+            self.enqueue_nowait(Arc::clone(&queue), data.into(), base_offset, last_offset).await
+        } else {
+            self.enqueue_and_wait(Arc::clone(&queue), data.into(), data_len, base_offset, last_offset).await
+        };
+
+        if result.is_err() {
+            // The log does not have this record, so neither may the cache — it
+            // is only ever allowed to be a suffix of what was written.
+            queue.tail.lock().await.clear();
+        }
+
+        result
     }
 
     /// Enqueue without waiting (acks=0 mode)
@@ -791,6 +1019,8 @@ impl GroupCommitWal {
             topic: topic.to_string(),
             partition,
             truncation_epoch: Arc::new(AtomicU64::new(0)),
+            tail: Mutex::new(TailCache::new(tail_cache_bytes())),
+            committed_through: Arc::new(AtomicI64::new(i64::MIN)),
         });
 
         // Start per-partition commit worker
@@ -970,6 +1200,12 @@ impl GroupCommitWal {
         if queue.truncation_epoch.load(Ordering::SeqCst) != drained_at_epoch {
             drop(file);
             queue.total_queued_bytes.fetch_sub(total_bytes as u64, Ordering::Relaxed);
+            // These records are not going to disk, so the tail cache must not
+            // keep answering reads with them. `truncate_to` clears the cache,
+            // but a batch already drained is past that point — it is dropped
+            // *here*, after the clear, and would otherwise be left in memory as
+            // records no replica could ever fetch from the file.
+            queue.tail.lock().await.clear();
             warn!(
                 topic = %queue.topic,
                 partition = queue.partition,
@@ -1003,6 +1239,11 @@ impl GroupCommitWal {
 
         // Update queue size atomically (lock-free)
         queue.total_queued_bytes.fetch_sub(total_bytes as u64, Ordering::Relaxed);
+
+        // These records are now on disk, so the tail cache may serve them.
+        if let Some(max_offset) = batch.iter().map(|w| w.last_offset).max() {
+            queue.committed_through.fetch_max(max_offset, Ordering::SeqCst);
+        }
 
         let fsync_duration = start.elapsed();
 
@@ -1319,6 +1560,32 @@ impl GroupCommitWal {
     /// shortened segment writes a *different* key rather than replacing it.
     /// Callers must not truncate a partition whose divergent tail has been
     /// published; see `docs/ROADMAP_REPLICATION.md` (RP-3.3).
+    /// Records from `offset` onward, served out of the partition's in-memory
+    /// tail without touching the file.
+    ///
+    /// `None` means the cache cannot answer — the partition is unknown here, or
+    /// the request reaches further back than the cache holds — and the caller
+    /// must fall back to reading segments. See `TailCache`.
+    pub async fn read_tail(
+        &self,
+        topic: &str,
+        partition: i32,
+        offset: i64,
+        max_records: usize,
+    ) -> Option<Vec<WalRecord>> {
+        // Clone the Arc out and drop the map reference before awaiting: holding
+        // a DashMap guard across an await is how this codebase has deadlocked
+        // before.
+        let queue = {
+            let entry = self.partition_queues.get(&(topic.to_string(), partition))?;
+            Arc::clone(entry.value())
+        };
+
+        let durable_through = queue.committed_through.load(Ordering::SeqCst);
+        let tail = queue.tail.lock().await;
+        tail.read_from(offset, max_records, durable_through)
+    }
+
     pub async fn truncate_to(
         &self,
         topic: &str,
@@ -1338,6 +1605,18 @@ impl GroupCommitWal {
 
         let dropped: Vec<PendingWrite> = pending.drain(..).collect();
         queue.total_queued_bytes.store(0, Ordering::Relaxed);
+
+        // A cut log must not be answered out of records the cut removed. The
+        // cache holds only a suffix, which is exactly the part a truncation
+        // takes, so there is nothing worth salvaging — drop it and let the next
+        // read rebuild from the file.
+        queue.tail.lock().await.clear();
+        // The log is now durable only up to the cut. Leaving this where it was
+        // would let records cached after the truncation be served before they
+        // are written, because they sit below the old, higher mark.
+        queue
+            .committed_through
+            .store(target_offset.saturating_sub(1), Ordering::SeqCst);
 
         // Everything committed so far must be visible to the scan below.
         file.sync_all().await?;
@@ -2027,5 +2306,233 @@ mod truncation_race_tests {
             .join(partition.to_string())
             .join(format!("wal_{}_0.log", partition));
         assert!(std::fs::metadata(&segment).unwrap().len() > 0);
+    }
+}
+
+#[cfg(test)]
+mod tail_cache_tests {
+    use super::*;
+
+    fn record(base: i64, last: i64, payload: usize) -> WalRecord {
+        WalRecord::new_v2(
+            "t".to_string(),
+            0,
+            vec![0u8; payload],
+            base,
+            last,
+            (last - base + 1) as i32,
+        )
+    }
+
+    fn push(cache: &mut TailCache, base: i64, last: i64, payload: usize) {
+        let r = record(base, last, payload);
+        let size = r.heap_size();
+        cache.push(r, size);
+    }
+
+    #[test]
+    fn serves_a_read_that_starts_inside_what_it_holds() {
+        let mut cache = TailCache::new(1 << 20);
+        push(&mut cache, 0, 9, 16);
+        push(&mut cache, 10, 19, 16);
+        push(&mut cache, 20, 29, 16);
+
+        let got = cache.read_from(10, 1000, i64::MAX).expect("cache starts at 0, so it covers 10");
+        assert_eq!(
+            got.iter().map(|r| r.get_base_offset()).collect::<Vec<_>>(),
+            vec![10, 20],
+            "the batch ending at 9 is entirely below the requested offset"
+        );
+    }
+
+    /// The rule the whole design rests on: answering a read the cache only
+    /// partly covers would silently drop the records below its start, and the
+    /// caller would take the short answer as the whole log.
+    #[test]
+    fn a_read_starting_before_the_cache_is_a_miss_not_a_short_answer() {
+        let mut cache = TailCache::new(1 << 20);
+        push(&mut cache, 100, 109, 16);
+        push(&mut cache, 110, 119, 16);
+
+        assert!(
+            cache.read_from(50, 1000, i64::MAX).is_none(),
+            "offset 50 predates the cache; the file must answer this"
+        );
+        assert!(cache.read_from(100, 1000, i64::MAX).is_some(), "its own start is covered");
+    }
+
+    #[test]
+    fn eviction_keeps_the_cache_a_contiguous_suffix() {
+        // Budget for roughly two records, so the third evicts the first.
+        let one = record(0, 0, 512).heap_size();
+        let mut cache = TailCache::new(one * 2 + one / 2);
+        push(&mut cache, 0, 9, 512);
+        push(&mut cache, 10, 19, 512);
+        push(&mut cache, 20, 29, 512);
+
+        assert!(
+            cache.read_from(0, 1000, i64::MAX).is_none(),
+            "offset 0 was evicted, so the cache can no longer answer for it"
+        );
+        let got = cache.read_from(10, 1000, i64::MAX).expect("the surviving suffix still answers");
+        assert_eq!(
+            got.iter().map(|r| r.get_base_offset()).collect::<Vec<_>>(),
+            vec![10, 20],
+            "what survives eviction is contiguous and reaches the log end"
+        );
+    }
+
+    /// Offsets are assigned before the WAL append, so two produces to one
+    /// partition can arrive here out of order. The cache must not then claim to
+    /// cover a range it has a hole in — a caller asking for the whole log would
+    /// get part of it and treat that as all of it.
+    #[test]
+    fn a_gap_is_served_from_above_it_and_missed_from_below() {
+        let mut cache = TailCache::new(1 << 20);
+        push(&mut cache, 0, 9, 16);
+        push(&mut cache, 30, 39, 16); // 10..29 never arrived
+
+        assert!(
+            cache.read_from(0, 1000, i64::MAX).is_none(),
+            "offset 0 must miss: answering it would silently skip 10..29"
+        );
+        let got = cache.read_from(30, 1000, i64::MAX).expect("above the gap it reaches the log end");
+        assert_eq!(got.len(), 1);
+
+        // Filling the hole makes the whole range answerable again.
+        push(&mut cache, 10, 29, 16);
+        let got = cache.read_from(0, 1000, i64::MAX).expect("no hole left");
+        assert_eq!(
+            got.iter().map(|r| r.get_base_offset()).collect::<Vec<_>>(),
+            vec![0, 10, 30],
+            "and it comes back in offset order, not arrival order"
+        );
+    }
+
+    /// Offsets are assigned before the WAL append, so two produces to one
+    /// partition routinely reach the cache in an order that does not match
+    /// their offsets — under concurrency that is most of them, not an edge
+    /// case. Refusing those emptied the cache permanently and every fetch fell
+    /// back to the full-segment scan the cache exists to avoid.
+    #[test]
+    fn out_of_order_arrival_is_ordered_into_place() {
+        let mut cache = TailCache::new(1 << 20);
+        push(&mut cache, 10, 19, 16);
+        push(&mut cache, 0, 9, 16); // overtook its predecessor
+
+        let got = cache.read_from(0, 1000, i64::MAX).expect("both records are held, and they join up");
+        assert_eq!(
+            got.iter().map(|r| r.get_base_offset()).collect::<Vec<_>>(),
+            vec![0, 10]
+        );
+    }
+
+    /// The cache is filled at append time, before the commit worker has written
+    /// anything — and some queued writes never reach the file at all, because
+    /// `commit_batch` discards a batch that straddles a truncation. Serving
+    /// those would let a replica read records no file will ever hold.
+    #[test]
+    fn records_past_the_durable_end_are_not_served() {
+        let mut cache = TailCache::new(1 << 20);
+        push(&mut cache, 0, 9, 16);
+        push(&mut cache, 10, 19, 16);
+        push(&mut cache, 20, 29, 16);
+
+        // Only the first two batches have been fsynced.
+        let got = cache.read_from(0, 1000, 19).expect("the durable part is servable");
+        assert_eq!(
+            got.iter().map(|r| r.get_last_offset()).collect::<Vec<_>>(),
+            vec![9, 19],
+            "the queued-but-unwritten batch must be withheld"
+        );
+    }
+
+    /// "Nothing durable yet" is a miss, not an empty log — an empty answer
+    /// would be read as the end of the log while the file still has records.
+    #[test]
+    fn a_cache_with_nothing_durable_yet_reports_a_miss() {
+        let mut cache = TailCache::new(1 << 20);
+        push(&mut cache, 0, 9, 16);
+
+        assert!(
+            cache.read_from(0, 1000, i64::MIN).is_none(),
+            "before the commit worker writes anything the file must answer"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_append_is_ignored() {
+        let mut cache = TailCache::new(1 << 20);
+        push(&mut cache, 0, 9, 16);
+        push(&mut cache, 20, 29, 16);
+        push(&mut cache, 20, 29, 16); // same batch again
+
+        let got = cache.read_from(20, 1000, i64::MAX).expect("covered");
+        assert_eq!(got.len(), 1, "the duplicate must not be stored twice");
+    }
+
+    #[test]
+    fn a_cleared_cache_answers_nothing() {
+        let mut cache = TailCache::new(1 << 20);
+        push(&mut cache, 0, 9, 16);
+        cache.clear();
+        assert!(
+            cache.read_from(0, 1000, i64::MAX).is_none(),
+            "truncation clears the cache; every read must go back to the file"
+        );
+    }
+
+    #[test]
+    fn a_zero_budget_disables_the_cache_entirely() {
+        let mut cache = TailCache::new(0);
+        push(&mut cache, 0, 9, 16);
+        assert!(cache.read_from(0, 1000, i64::MAX).is_none());
+    }
+
+    #[test]
+    fn max_records_counts_messages_not_batches() {
+        let mut cache = TailCache::new(1 << 20);
+        push(&mut cache, 0, 9, 16);   // 10 messages
+        push(&mut cache, 10, 19, 16); // 10 messages
+        push(&mut cache, 20, 29, 16); // 10 messages
+
+        let got = cache.read_from(0, 15, i64::MAX).expect("covered");
+        assert_eq!(
+            got.len(),
+            2,
+            "the limit is in messages, so it stops after the batch that crosses it"
+        );
+    }
+
+    /// The cache exists to answer without I/O, and a truncation must reach it
+    /// even though the records it holds were never rejected by the writer.
+    #[tokio::test]
+    async fn truncation_invalidates_the_tail_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = GroupCommitWal::new(dir.path().to_path_buf(), GroupCommitConfig::default());
+
+        for i in 0..5i64 {
+            wal.append("t".to_string(), 0, record(i * 10, i * 10 + 9, 64), 1)
+                .await
+                .unwrap();
+        }
+        assert!(
+            wal.read_tail("t", 0, 0, 1000).await.is_some(),
+            "appends populate the cache"
+        );
+
+        wal.truncate_to("t", 0, 20).await.unwrap();
+
+        assert!(
+            wal.read_tail("t", 0, 0, 1000).await.is_none(),
+            "after a cut the cache must not answer — the file is authoritative again"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_partition_is_a_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = GroupCommitWal::new(dir.path().to_path_buf(), GroupCommitConfig::default());
+        assert!(wal.read_tail("never-written", 0, 0, 10).await.is_none());
     }
 }

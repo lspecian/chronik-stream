@@ -124,6 +124,46 @@ broker_of() { # $1 = node id → its kafka address
   echo "localhost:$((9391 + $1))"
 }
 
+# Every replica must hold the whole prefix ON DISK before the freeze.
+#
+# `sleep 5` stood in for this, and the check that followed it consumed through
+# the *leader* — which says nothing about the followers, who are the ones about
+# to be frozen. Observed: a run froze a replica that had reached offset 43 of
+# 100, that replica won the election, stamped its new epoch at 43, and told the
+# returning old leader to discard everything above it. 40 committed records
+# "vanished" and the test reported a truncation bug that was really a setup
+# race.
+#
+# Replication is the thing this test interrupts, so it waits for replication
+# rather than for a clock.
+
+# Counts DISTINCT records, not marker occurrences.
+#
+# A record's payload appears in the WAL more than once — the canonical batch and
+# the preserved wire bytes both carry it — so `grep -c "prefix-"` returned 300
+# for 100 records. A threshold of 100 against that was satisfied when a replica
+# held barely a third of the prefix, which is exactly the state this wait exists
+# to prevent: measured, two replicas were frozen holding 75 of 100 while the
+# check reported all three complete.
+records_on_node() { # $1 = node, $2 = tag
+  grep -aoE "$2-[0-9]+" "$DIR/data/alt-node$1/wal/$TOPIC"/0/*.log 2>/dev/null \
+    | sort -u | wc -l
+}
+
+wait_for_replication() { # $1 = tag, $2 = expected count
+  for _ in $(seq 1 60); do
+    behind=""
+    for n in 1 2 3; do
+      have=$(records_on_node "$n" "$1")
+      [ "${have:-0}" -lt "$2" ] && behind="$behind node$n=${have:-0}"
+    done
+    [ -z "$behind" ] && return 0
+    sleep 1
+  done
+  say "   still behind after 60s:$behind"
+  return 1
+}
+
 say "== RP-3.3 local divergence test: $TOPIC =="
 rm -rf "$DIR/data/alt-node"{1,2,3}
 mkdir -p "$LOGS"
@@ -137,13 +177,16 @@ say "-- three nodes up on 9392-9394"
 
 # 1. Common prefix, acknowledged by the full ISR.
 produce 1 "$PREFIX_N" -1 prefix "$BOOT"
-sleep 5
 seen=$(count_tag prefix "$BOOT")
 if [ "${seen:-0}" -lt "$PREFIX_N" ]; then
   fail "setup did not take: only ${seen:-0} of $PREFIX_N prefix records readable"
   exit 1
 fi
-say "-- prefix confirmed: $seen record(s)"
+if ! wait_for_replication prefix "$PREFIX_N"; then
+  fail "setup did not take: a replica never received the full prefix"
+  exit 1
+fi
+say "-- prefix confirmed: $seen record(s), on disk on all three replicas"
 
 OLD=$(leader_of 6392)
 [ -z "$OLD" ] && OLD=$(leader_of 6393)
@@ -171,7 +214,7 @@ sleep 3
 # ISR for their liveness window — so these records are invisible to a reader by
 # design, which is the feature working. Asking a consumer about them reports
 # zero and reads exactly like "the write failed".
-orphans_here=$(grep -ao "orphan-" "$DIR/data/alt-node$OLD/wal/$TOPIC"/0/*.log 2>/dev/null | wc -l)
+orphans_here=$(records_on_node "$OLD" orphan)
 say "   leader's log holds ${orphans_here:-0} orphan marker(s) on disk"
 [ "${orphans_here:-0}" -ge 1 ] || { fail "no orphans landed — no divergence to test"; exit 1; }
 
@@ -228,7 +271,7 @@ discarded="${discarded:-0}"
 # And the records must be gone from the returning node's own disk, not merely
 # invisible to a consumer — a partition this node no longer leads would read as
 # clean either way.
-orphans_left=$(grep -ao "orphan-" "$DIR/data/alt-node$OLD/wal/$TOPIC"/0/*.log 2>/dev/null | wc -l)
+orphans_left=$(records_on_node "$OLD" orphan)
 
 winners=$(count_tag winner "$BOOT")
 orphans=$(count_tag orphan "$BOOT")

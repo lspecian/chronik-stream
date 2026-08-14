@@ -74,32 +74,51 @@ run_bench() { # $1=bootstrap $2=acks $3=topic
     -p "$PARTITIONS" --acks "$2" -m produce 2>&1
 }
 
+# Pull the published numbers out of chronik-bench's summary box.
+#
+# Anchored on the exact labels the reporter prints, because loose patterns
+# quietly matched the wrong things: "throughput" appears only as a section
+# HEADING (so the message rate came out empty and printed as "?"), a bare
+# `MB/s` search also caught `Data transferred: N MB`, and `p99` matched the
+# `p99.9` line one row below — which is why every row reported an identical
+# "p99 99.9ms". A number that is wrong in the same way every time reads as a
+# real measurement, so this parses the labels exactly and says so when it
+# cannot.
 report() { # $1=label $2=output
   local msgs mb p99
-  msgs=$(printf '%s' "$2" | grep -oiE "throughput[^0-9]*([0-9,]+\.?[0-9]*) *msg" | grep -oE "[0-9,]+\.?[0-9]*" | tail -1)
-  mb=$(printf '%s' "$2" | grep -oiE "([0-9,]+\.?[0-9]*) *MB/s" | grep -oE "[0-9,]+\.?[0-9]*" | tail -1)
-  p99=$(printf '%s' "$2" | grep -oiE "p99[^0-9]*([0-9]+\.?[0-9]*)" | grep -oE "[0-9]+\.?[0-9]*" | tail -1)
+  msgs=$(printf '%s' "$2" | sed -n 's/.*Message rate: *\([0-9,]*\) msg\/s.*/\1/p' | tail -1)
+  mb=$(printf '%s' "$2" | sed -n 's/.*Bandwidth: *\([0-9.,]*\) MB\/s.*/\1/p' | tail -1)
+  p99=$(printf '%s' "$2" | sed -n 's/.*p99: .*(\ *\([0-9.]*\) ms).*/\1/p' | tail -1)
   printf '  %-34s %14s msg/s  %10s MB/s  p99 %sms\n' "$1" "${msgs:-?}" "${mb:-?}" "${p99:-?}"
 }
 
 say "== chronik-bench: $CONCURRENCY producers, ${SIZE}B, $DURATION, $PARTITIONS partitions =="
 say ""
 
+# Each acks level gets a FRESH cluster.
+#
+# Running all three against one cluster made the last one look worst simply for
+# being last: `acks=all` followed a minute of `acks=0` and `acks=1` traffic and
+# measured 2,407 msg/s where the same build on a fresh cluster measures 3,837.
+# The rows are meant to be comparable to each other, so the only thing that may
+# differ between them is the acks level.
 say "-- single node (no replication)"
-single_up
-wait_for_port 9092 || { say "single node never came up"; exit 1; }
-sleep 6
 for acks in 0 1 all; do
+  single_up
+  wait_for_port 9092 || { say "single node never came up"; exit 1; }
+  sleep 6
   report "acks=$acks" "$(run_bench localhost:9092 "$acks" "bench-single-$acks-$$")"
+  stop_all
+  sleep 2
 done
-stop_all
-sleep 2
 
 say ""
 say "-- 3 nodes, RF=3, min_insync=2 (follower-pull replication running)"
-cluster_up
-for p in 9392 9393 9394; do wait_for_port "$p" || { say "cluster never came up"; exit 1; }; done
-sleep 12
 for acks in 0 1 all; do
+  cluster_up
+  for p in 9392 9393 9394; do wait_for_port "$p" || { say "cluster never came up"; exit 1; }; done
+  sleep 12
   report "acks=$acks" "$(run_bench localhost:9392,localhost:9393,localhost:9394 "$acks" "bench-cluster-$acks-$$")"
+  stop_all
+  sleep 2
 done

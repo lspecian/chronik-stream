@@ -15,7 +15,7 @@
 | RP-7 | Assignment authority | `TESTED` | — | Only the Raft leader publishes; fetch refuses when it does not lead. **Full conformance suite now PASSES, RP-0.4 included** |
 | RP-8 | `acks=all` latency (#36) | `TESTED` | — | Three waits removed from the write path: new topic 7,000ms → 23ms, steady state 505ms → 17ms. The reported "duplication" was a client retry after a timeout |
 | RP-4 | Delete the push stack | `TESTED` | — | Data push path deleted: mode switch, produce fan-out, LeaderElector and the election machinery. Metadata keeps the transport (OQ2). One mechanism |
-| RP-9 | `acks=all` round-trip throughput | 🔶 `PARTLY` | — | Latency fixed: 17ms → 13ms, level with `acks=1`, by waking parked fetches on append instead of a 10ms timer. Throughput at concurrency still ~2,200 msg/s; six causes eliminated |
+| RP-9 | `acks=all` round-trip throughput | 🔶 `PARTLY` | — | Cause found and fixed: every fetch re-read and re-parsed the whole active WAL segment from byte zero. Latency 17ms → 13ms; sustained throughput ~1,400 → 3,763 msg/s and no longer decays during a run. Three bugs fell out, one of them **data loss on failover** (divergence 7/10 → 10/10) |
 
 ---
 
@@ -1053,19 +1053,189 @@ records the follower's position with the ISR trackers — so overlapping those s
 effects across partitions is not free. Isolated by reverting it alone and
 watching the test return to 3/3.
 
-### Still open: throughput at concurrency
+### The cause: every fetch re-read the whole segment (found 2026-08-14)
 
-Latency is now at parity with `acks=1`. **Throughput at 64 concurrent producers
-is unchanged at ~2,200 msg/s**, and none of the above moved it. Six candidate
-causes are eliminated and the cycle is instrumented; what remains is the fetch
-waiting on a leader that is simultaneously serving producers, while the brokers
-sit at ~570% of 1600% available CPU — scheduling and serialisation, not capacity.
+The instrumentation above says the follower is "waiting", and the natural
+reading — that it queues behind the producers on a busy leader — was wrong. The
+leader was *working*. Timing the leader's own side of a replica fetch settled
+it in one run:
 
-The untried idea, and the most promising: **give replica fetches priority over
-client requests.** Kafka separates the two, and this measurement is what that
-separation is for.
+```
+replica fetch 4000 from node 3: serve 8.15ms,  wait 0ns
+replica fetch 4000 from node 1: serve 14.45ms, wait 0ns
+replica fetch 3800 from node 1: serve 7.00ms,  wait 0ns
+```
 
-**Do not start a bare-metal run before settling this**, or it will dominate
+`wait 0ns` on every sample. The leader never parked — it had the data — and
+still took 7–14ms to hand it over.
+
+`WalManager::read_from` was the whole of it. For every fetch it ran
+`read_dir` on the partition directory, `tokio::fs::read` the **entire** active
+segment file, and parsed from byte zero — allocating and copying each record's
+payload *before* the offset filter discarded it, because the offsets sit after
+the payload on the wire. Measured: **2.5–4.5ms to return 2 records.**
+
+Segments rotate at 250MB, so the cost grew with the segment. That is the
+"degrades within a 10-second run" observation above, which had been recorded as
+unexplained: 3,993 msg/s in the first interval, 2,285 in the second. It was not
+`acks=all` decaying, it was the file getting longer.
+
+And it was never replication-specific. Every consumer fetch that misses the
+in-memory buffer takes the same path — and that buffer is populated through
+`ProduceHandler::fetch_handler`, which is `None` in every production build, so
+the miss is universal. Reads fall back to the WAL, which is why nothing looked
+broken.
+
+### What was changed
+
+**A bounded per-partition WAL tail cache** (`CHRONIK_WAL_TAIL_CACHE_BYTES`,
+default 2MB, `0` disables). Reads that want the end of the log — a follower
+replicating, a consumer keeping up — are answered from memory. It lives in
+`GroupCommitWal`, the one owner of both append and truncation, so it cannot
+drift from the log.
+
+Two properties are enforced rather than assumed, and both were learned the hard
+way:
+
+- **It is a gap-free suffix.** Offsets are assigned before the WAL append, so
+  under 64 concurrent producers records reach the cache out of order constantly.
+  The first attempt *refused* out-of-order arrivals and held the cache empty
+  until the log caught up. That is safe and useless: the cache served zero reads
+  in a 30-second run, every fetch fell back to the scan, and throughput sat at
+  1,660 msg/s while looking like the fix was in. Records are now ordered into
+  place, and reads below the gap-free run miss rather than getting a short
+  answer.
+- **It only serves what is durable.** The cache is filled at append time — the
+  only point where arrival order is known — but a queued write is not on disk,
+  and some never get there: `commit_batch` discards a batch that straddles a
+  truncation. A `committed_through` watermark, advanced by the commit worker,
+  bounds what the cache may answer. This costs throughput (6,200 → 3,800 msg/s)
+  and is not optional: without it a replica can read records no file will ever
+  hold.
+
+**The file fallback no longer copies what it skips.** The offsets are read from
+their known positions and the payload is copied only for records that survive
+the filter. It did not move this benchmark — the remaining cost is the
+whole-file read, not the parse — but it removes an allocation and memcpy of
+every record in the segment on every miss.
+
+**The follower's fsync is amortised across a fetch response.** Batches were
+applied one at a time, each awaiting its own group commit — one interval apiece.
+They all go to the same partition queue, in order, from one task, so enqueuing
+them and waiting on the last is equivalent. Every batch is still fsynced before
+the follower reports its new position, which is what `acks=all` waits on.
+3,593 → 6,619 msg/s at the time it was measured.
+
+**Per-fetch logging was writing 23MB per node per 25-second run.** The read path
+logged at `info` per fetch and, in one case, `warn` **per batch** — neither
+filtered at a normal production level. The logging was itself a measurable share
+of fetch latency.
+
+### Three bugs found on the way, none of them about throughput
+
+**1. A replica's log end could be stranded below its own log — data loss on
+failover.** `PartitionState` keeps `high_watermark` and `next_offset` as separate
+atomics, and v2.2.9 correctly made the watermark monotonic so stale WAL data
+could not walk it back. But the log end was updated *inside* that guard. Two
+paths raise the watermark — the replication apply path and the WAL commit
+callback — and when the callback got there first, every later call took the
+"not increasing" branch and the log end stopped moving. Permanently.
+
+Captured from a failing run, on the replica that was about to be elected:
+
+```
+Created partition state for t-0 with watermark 79
+WM_SKIP t-0: 100 <= 100 (current), log end stays 79
+```
+
+It held 100 replicated records and reported a log end of 79. Elected, it
+assigned offsets from 79 and overwrote 21 records it already had. The returning
+ex-leader asked where its epoch ended, was told 79, and truncated 61 committed
+records to match — which is how this surfaced: "only 0 of 40 committed records
+survived", in **3 runs out of 10**.
+
+The fix is `PartitionState::raise_watermark`: both fields, each monotonic,
+neither gating the other. A partition cannot have acknowledged records past the
+end of its own log, so the log end is always at least the watermark — and the
+three paths that raise a watermark now go through one place that says so.
+Divergence went **7/10 → 10/10**.
+
+Nothing about this was specific to replication throughput. It was found because
+the speed-ups changed the batching enough to make it reproducible, and because
+the divergence test was made strict enough to stop hiding it (bug 2).
+
+**2. The divergence test froze replicas mid-catch-up, then blamed the product.**
+Two faults, one on top of the other. It produced a prefix, slept 5 seconds, and
+confirmed the count by consuming through the *leader* — which says nothing about
+the followers it was about to freeze. Replacing the sleep with an on-disk check
+was still not enough: a record's payload appears in the WAL more than once (the
+canonical batch and the preserved wire bytes both carry it), so `grep -c
+"prefix-"` returns 300 for 100 records and a threshold of 100 was satisfied at
+barely a third of the prefix.
+
+Measured from a captured failure: two replicas were frozen holding **75 of 100**
+records while the check reported all three complete. The replica that won the
+election therefore had a legitimately short log, and RP-3.3 correctly told the
+returning ex-leader to truncate to match. The product was right and the test was
+wrong — which is worth stating plainly, because for several runs the evidence
+was read the other way round.
+
+The wait now counts distinct records.
+
+**3. `perf_matrix.sh` was misreporting its own numbers.** The message rate came
+out empty and printed as `?` (it searched for "throughput", which appears only
+as a section heading), the bandwidth pattern also matched `Data transferred: N
+MB`, and the p99 pattern matched the `p99.9` line one row below — so every row
+reported an identical "p99 99.9ms". A number that is wrong the same way every
+time reads as a real measurement.
+
+### Measured
+
+`chronik-bench`, 64 concurrent producers, 256B, 3 partitions, one machine,
+30-second runs, fresh cluster:
+
+| | before | after |
+|---|---:|---:|
+| 3 nodes RF=3, `acks=all`, 30s run | ~1,400 msg/s | **3,763 msg/s** |
+| 3 nodes RF=3, `acks=1`, 30s run | — | 12,175 msg/s |
+| follower fetch, leader-side serve | 7–14ms | 0.15–0.4ms |
+| `read_from` returning 2 records | 2.5–4.5ms | served from memory |
+| batched (`kcat`), `acks=all` | 488,997 msg/s | 542,005 msg/s |
+
+The 10s and 30s figures used to differ because the segment grew during the run.
+They no longer do, which is the more important half of this: the number is now
+stable rather than a function of how long you look. `acks=all` is now 3.2×
+`acks=1` rather than 4–7×.
+
+`acks=all` single-record latency is unchanged at 13–14ms, level with `acks=1`.
+
+`perf_matrix.sh` now restarts the cluster between acks levels. Sharing one
+cluster made whichever ran last look worst for being last — `acks=all` measured
+2,407 msg/s after a minute of other traffic against 3,763 on a fresh cluster —
+and the rows exist to be compared with each other.
+
+### Still open
+
+`acks=1` on the same shape is 6,531 msg/s and single-node `acks=1` is 14,175, so
+replication still costs roughly half the write path and there is a further ~2×
+between the cluster and one node.
+
+What remains is the fallback: a cache miss still reads the **entire** segment
+file. The durable gate makes misses routine — a follower asking for an offset
+the leader has assigned but not yet fsynced misses by design — so the fallback's
+cost is now on the common path rather than the rare one.
+
+The structural fix is an offset index: a sparse (offset → byte position) map
+maintained as records are appended, so a read seeks to the nearest entry and
+reads only the slice it needs instead of the whole file. That removes the last
+O(segment) term from the read path, for consumers as much as for replication.
+
+A second, smaller item: `readable_end_offset` reports the *assigned* log end to
+followers, so the leader advertises offsets it cannot yet serve. Reporting the
+durable end instead would let the fetch park and be woken when the data lands,
+removing the empty-fetch window that `EMPTY_FETCH_BACKOFF` exists to absorb.
+
+**Do not start a bare-metal run before settling these**, or they will dominate
 every number taken there.
 
 ---

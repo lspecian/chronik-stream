@@ -633,6 +633,11 @@ impl ReplicaFetcher {
         // logged on every round trip.
         let mut cycles: u64 = 0;
 
+        // Cycles that came back carrying nothing. A high share of these under
+        // sustained load means the leader is waking us for records it cannot yet
+        // serve, and each one costs `EMPTY_FETCH_BACKOFF` (RP-9).
+        let mut empties: u64 = 0;
+
         while !self.shutdown.load(Ordering::Relaxed) {
             if needs_reconcile {
                 match self.reconcile_with_leader(&mut connection, &partitions).await {
@@ -691,14 +696,19 @@ impl ReplicaFetcher {
 
                     let applied = cycle_start.elapsed();
                     cycles = cycles.wrapping_add(1);
+                    if !got_records {
+                        empties = empties.wrapping_add(1);
+                    }
                     if cycles % 200 == 0 {
                         debug!(
-                            "replication cycle {}: build {:?}, fetch {:?}, apply {:?}, total {:?}",
+                            "replication cycle {}: build {:?}, fetch {:?}, apply {:?}, total {:?}, empty {}/{}",
                             cycles,
                             built,
                             fetched - built,
                             applied - fetched,
-                            applied
+                            applied,
+                            empties,
+                            cycles
                         );
                     }
 

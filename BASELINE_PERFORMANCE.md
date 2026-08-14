@@ -37,11 +37,16 @@ Bare-metal numbers on the Dell cluster are **not yet re-measured** — see
 
 ## Method
 
-`chronik-bench`, 64 concurrent producers, 256-byte messages, 10s measured after
-a 3s warmup, 3 partitions, no compression, **WAL profile left at its default**
-(`low`, 2 ms). Rates below are the *sustained* per-interval rate, not the
-harness's summary figure, which divides by an elapsed time that includes warmup
-and drain.
+`chronik-bench`, 64 concurrent producers, 256-byte messages, 30s measured after
+a warmup, 3 partitions, no compression, **WAL profile left at its default**
+(`low`, 2 ms). Rates below are the harness's summary figure: total messages over
+the measured window, which excludes the warmup phase.
+
+30 seconds, not 10, for a reason. `acks=all` throughput used to fall during a
+run — every fetch re-read the whole active WAL segment, so the cost grew with
+the file (see RP-9) — and a 10-second run reported a number that a 30-second run
+did not reproduce. The read path is fixed and the two now agree, but the longer
+window is what proves it.
 
 Reproduce: `tests/cluster/perf_matrix.sh`.
 
@@ -53,11 +58,11 @@ benchmark; for that, see the kcat figures at the bottom.
 
 No replication to do, so this is the ceiling of the local write path.
 
-| acks | throughput | p50 | p99 |
-|---|---:|---:|---:|
-| 0 | **195,000 msg/s** (~47 MB/s) | 0.05 ms | 7.6 ms |
-| 1 | 16,700 msg/s (~4.1 MB/s) | 3.83 ms | 5.3 ms |
-| all | 16,700 msg/s (~4.1 MB/s) | 3.83 ms | 5.3 ms |
+| acks | throughput | p99 |
+|---|---:|---:|
+| 0 | **169,156 msg/s** (41.3 MB/s) | 7.81 ms |
+| 1 | 14,370 msg/s (3.51 MB/s) | 5.53 ms |
+| all | 14,352 msg/s (3.50 MB/s) | 5.50 ms |
 
 `acks=1` and `acks=all` are identical here, and that is correct: with no
 followers the in-sync set is the leader alone, so `acks=all` waits for its own
@@ -67,28 +72,34 @@ fsync and nothing more. The 12× gap to `acks=0` is that fsync.
 
 Follower-pull replication running; every record reaches all three nodes.
 
-| acks | throughput | p50 | p99 |
-|---|---:|---:|---:|
-| 0 | **119,000 msg/s** (~29 MB/s) | 0.19 ms | 13.0 ms |
-| 1 | 15,000 msg/s (~3.7 MB/s) | 3.66 ms | 15.6 ms |
-| all | 2,300–4,000 msg/s | — | 34–49 ms |
+| acks | throughput | p99 |
+|---|---:|---:|
+| 0 | **131,328 msg/s** (32.1 MB/s) | 4.72 ms |
+| 1 | 12,175 msg/s (2.97 MB/s) | 10.94 ms |
+| all | 3,763 msg/s (0.92 MB/s) | 54.81 ms |
 
 `acks=0` and `acks=1` cost roughly what the single-node shape costs, plus
 contention from two extra brokers on the same disk.
 
-⚠️ **`acks=all` is 4–7× slower than `acks=1` and degrades within a run** — 3,993
-msg/s in the first interval, 2,285 in the second, p99 rising 34 → 49 ms. That is
-a genuine open issue, recorded in `docs/ROADMAP_REPLICATION.md`, not a
-measurement artefact: it reproduces on a freshly created cluster with a single
-topic.
+`acks=all` is **3.2× slower than `acks=1`**, which is the cost of the follower
+round trip: a producer cannot be acknowledged until a follower's *next* fetch
+reports a position past the record, so each write pays a fetch plus the
+follower's own fsync on top of the leader's.
 
-The likely shape: `acks=all` throughput is bounded by the follower's fetch loop,
-which issues one request per leader at a time with `min_bytes=1`. That is
-latency-optimal — the leader answers the moment anything lands, which is what
-made #36's per-request latency fall from 505 ms to 17 ms — and it means each
-round trip carries only what accumulated during the previous one. Raising
-`min_bytes` would trade the latency win back for batch size. **Not yet
-investigated properly; do not treat this explanation as established.**
+It used to be 4–7× slower *and* to decay during a run — 3,993 msg/s in the first
+interval, 2,285 in the second. That was not `acks=all` degrading; every fetch
+re-read and re-parsed the whole active WAL segment from byte zero, so the cost
+grew with the file. Fixed in RP-9; the figure above is stable across a 30-second
+run and no longer depends on how long you look.
+
+Single-record `acks=all` latency is 14 ms, level with `acks=1`'s 13 ms
+(`tests/cluster/acks_all_latency.sh`). The remaining throughput gap is
+concurrency behaviour, not per-request latency.
+
+**Each row above is measured on a freshly started cluster.** Running all three
+against one cluster made whichever ran last look worst for being last:
+`acks=all` after a minute of `acks=0` and `acks=1` traffic measured 2,407 msg/s
+against the same build's 3,763 on a fresh one.
 
 ## Batched throughput, for contrast
 
@@ -98,17 +109,18 @@ per request instead of waiting per message (`tests/cluster/perf_replication.sh`,
 
 | acks | throughput |
 |---|---:|
-| 0 | 1,058,201 msg/s |
-| 1 | 694,444 msg/s |
-| all | 488,997 msg/s |
+| 0 | 961,538 msg/s |
+| 1 | 772,200 msg/s |
+| all | 542,005 msg/s |
 
 All three stored 200,001 records with zero client errors. These answer a
 different question — how fast the broker ingests when the client batches — and
 should never be compared against the round-trip table above.
 
-That `acks=all` reaches 489K msg/s when batched, while managing 2–4K when each
-message waits for its own acknowledgement, is the clearest statement of the open
-issue: the per-round-trip path, not the broker's raw ingest, is what is slow.
+That `acks=all` reaches 542K msg/s when batched while managing 3.8K when each
+message waits for its own acknowledgement is not a contradiction: it is the
+difference between amortising one replication round trip over thousands of
+records and paying one per record. The broker's ingest was never the constraint.
 
 ## What is not measured here
 
