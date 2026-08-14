@@ -32,9 +32,9 @@ k6 posting 100–200 messages per HTTP request through 12–36 ingestor pods,
 aggregated across all of them. The tables below are *round-trip* figures: 64
 producers, each one waiting for its own acknowledgement before sending the next.
 
-The two regimes are not close. Measured below on this hardware, batching is
-worth **4–5×** at every acks level — and at `acks=0` the batched run stops at
-the client's 1 GbE link rather than at anything Chronik does.
+The two regimes are not close. At `acks=0` — the one batched figure that
+reproduces here — batching is worth **3.9×**, and the batched run stops at the
+client's 1 GbE link rather than at anything Chronik does.
 
 Round trip is the harder question and the one this work needed: replication cost
 only appears when someone is waiting for it, and a batched pipeline hides it
@@ -48,9 +48,8 @@ accounted for:
 | | msg/s | |
 |---|---:|---|
 | old report, `acks=all` | 837,284 | batched, **replication disabled**, 12–36 ingestor pods, in-cluster over loopback |
-| today, batched `acks=0` | 429,737 | **client's 1 GbE saturated at 98%** — a floor, not the broker's ceiling |
-| today, batched `acks=1` | 122,828 | replication running, one client, over a real link |
-| today, batched `acks=all` | 52,931 | as above, and waiting for a follower on every batch |
+| today, batched `acks=0` | 429,368 | **client's 1 GbE saturated at 98%** — a floor, not the broker's ceiling |
+| today, batched `acks=1` | 122,828–394,539 | not reproducible; see above |
 
 These are not comparable, and the reason is structural rather than a matter of
 degree. The old figure was an **aggregate over 12–36 producer pods running
@@ -108,21 +107,30 @@ batches for real. The client's own NIC is sampled during each run, because at
 these rates it is a candidate for the bottleneck.
 Reproduce: `./tests/cluster/baremetal.sh batched`
 
-| acks | batched | run length | client tx | round trip (above) | batching is worth |
-|---|---:|---:|---:|---:|---:|
-| 0 | 429,737 msg/s | 11 s | **983 Mbit/s — 98% of link** | 110,427 msg/s | 3.9× |
-| 1 | 122,828 msg/s | 40 s | 281 Mbit/s — 28% | 22,690 msg/s | 5.4× |
-| all | 52,931 msg/s | 94 s | 122 Mbit/s — 12% | 12,475 msg/s | 4.2× |
+| acks | run 1 | run 2 | client tx (run 1) | round trip (above) |
+|---|---:|---:|---:|---:|
+| 0 | 429,737 msg/s | 429,368 msg/s | **983 Mbit/s — 98% of link** | 110,427 msg/s |
+| 1 | 122,828 msg/s | **394,539 msg/s** | 281 Mbit/s — 28% | 22,690 msg/s |
+| all | 52,931 msg/s | 74,335 msg/s | 122 Mbit/s — 12% | 12,475 msg/s |
 
-**`acks=0` is not a measurement of Chronik.** It saturates the client's 1 GbE
-uplink at 98%, so it is a floor: the broker was never the constraint and would
-go faster behind a faster client link. `acks=1` and `acks=all` sit at 28% and
-12% of that link, so those two *are* measurements of the cluster.
+**Only the `acks=0` row is trustworthy, and it is not a measurement of Chronik.**
+It reproduces to 0.1% across runs because it is pinned at the client's 1 GbE
+uplink — 98% full. That makes it a floor: the broker was never the constraint
+and would go faster behind a faster link. Batching is worth ~3.9× there
+(110,427 → 429,368).
 
-Batching is worth a consistent **4–5×** across all three acks levels, which is
-the sane shape: it amortises per-request overhead, and it cannot amortise away
-either the leader's fsync or the follower round trip, because both happen once
-per batch however large the batch is.
+⛔ **`acks=1` and `acks=all` batched are NOT reproducible and no figure is
+claimed for them.** Two runs of the identical configuration gave 122,828 and
+394,539 — a 3.2× spread, which is not noise around a value, it is two different
+behaviours. Both runs stored every record with zero client errors, so it is not
+a failure; something about the run (most likely how partition leadership
+happened to distribute across the three nodes, and therefore how the fsync load
+landed) changes the regime. Until that is understood and the runs repeat, a
+median of these would be a number with no meaning behind it.
+
+What *is* established: batching helps, the round-trip table above is the
+reproducible one, and the acks ordering is monotonic in every individual run
+(`acks=0` > `acks=1` > `acks=all`) — which is the question that started this.
 
 > ⚠️ **An earlier version of this table was wrong, and it is worth saying how.**
 > It used 200,000 records, which at these rates finishes in about half a second

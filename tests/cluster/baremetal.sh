@@ -40,7 +40,8 @@ ACKS_LEVELS="${PERF_ACKS:-0 1 all}"
 # This run takes two hours, and the first attempt lost four of its six rows to a
 # `tail` on the calling side. A measurement that expensive should not exist only
 # in a pipe.
-RESULTS="${PERF_RESULTS:-$ROOT/tests/cluster/logs/baremetal-results.txt}"
+LOGS="$ROOT/tests/cluster/logs"
+RESULTS="${PERF_RESULTS:-$LOGS/baremetal-results.txt}"
 
 say() { printf '%s\n' "$*"; }
 sshq() { timeout 120 ssh -o ConnectTimeout=8 -o BatchMode=yes "ubuntu@$1" "$2"; }
@@ -212,17 +213,42 @@ batched() {
   say "   the client does not wait per message; this is the ingest ceiling"
   say ""
   for acks in $ACKS_LEVELS; do
-    local rates=() secs=()
+    local rates=() secs=() errs_total=0 stored_last=""
     for run in $(seq 1 "$RUNS"); do
       up
       local topic="bmb-$acks-$run-$$"
       echo warmup | timeout 60 kcat -P -b "$BOOT" -t "$topic" -X request.required.acks="$acks" 2>/dev/null
       sleep 8
+      # Client errors are part of the result, not noise to be discarded.
+      #
+      # A run that produces N records and stores fewer is either a broker losing
+      # acknowledged writes or a client giving up, and throwing stderr away makes
+      # those indistinguishable — which is how a *failed* run becomes a
+      # throughput number. The local equivalent of this measurement returned
+      # 5,555 msg/s at `acks=all` with 76,952 `REQTMOUT` errors and 543,430
+      # records missing; without the error count that reads as a throughput
+      # result rather than a collapse.
+      local errfile="$LOGS/bmb-$acks-$run.err"
       local t0 t1 ms
       t0=$(date +%s%3N)
       seq 1 "$records" | sed "s/\$/ $payload/" \
-        | timeout 900 kcat -P -b "$BOOT" -t "$topic" -X request.required.acks="$acks" 2>/dev/null
+        | timeout 900 kcat -P -b "$BOOT" -t "$topic" -X request.required.acks="$acks" 2>"$errfile"
       t1=$(date +%s%3N)
+      local errs; errs=$(grep -c . "$errfile" 2>/dev/null); errs=${errs:-0}
+      errs_total=$((errs_total + errs))
+      # Summed across every partition, not partition 0.
+      #
+      # Querying one partition of a three-partition topic reported "stored
+      # 1,656,764/5,000,000" for a run that had in fact stored all five million —
+      # a two-thirds shortfall that was purely the query. A correctness check
+      # that cries wolf gets ignored, which is worse than not having it.
+      local stored=0 p end
+      for p in 0 1 2; do
+        end=$(timeout 30 kcat -Q -b "$BOOT" -t "$topic:$p:-1" 2>/dev/null \
+          | sed -n 's/.*:\([0-9]*\)$/\1/p' | tail -1)
+        stored=$(( stored + ${end:-0} ))
+      done
+      stored_last="$stored"
       ms=$((t1 - t0)); [ "$ms" -le 0 ] && ms=1
       rates+=("$(( records * 1000 / ms ))")
       secs+=("$(( ms / 1000 ))")
@@ -232,8 +258,10 @@ batched() {
     local window; window=$(median "${secs[@]}")
     local warn=""
     [ "$window" -lt 10 ] && warn="  ⚠ WINDOW TOO SHORT — raise PERF_RECORDS"
-    printf '  batched %-4s acks=%-4s %10s msg/s over %ss   (%s)%s\n' \
+    [ "$errs_total" -gt 0 ] && warn="$warn  ⚠ NOT A THROUGHPUT RESULT: $errs_total client error(s)"
+    printf '  batched %-4s acks=%-4s %10s msg/s over %ss   stored %s/%s  errors %s   (%s)%s\n' \
       "${PERF_SIZE:-256}B" "$acks" "$(median "${rates[@]}")" "$window" \
+      "${stored_last:-?}" "$records" "$errs_total" \
       "$(printf '%s ' "${rates[@]}")" "$warn" \
       | tee -a "$RESULTS"
   done
