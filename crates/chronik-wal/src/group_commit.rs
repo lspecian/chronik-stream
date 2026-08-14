@@ -1560,6 +1560,22 @@ impl GroupCommitWal {
     /// shortened segment writes a *different* key rather than replacing it.
     /// Callers must not truncate a partition whose divergent tail has been
     /// published; see `docs/ROADMAP_REPLICATION.md` (RP-3.3).
+    /// The offset this partition's log ends at *on disk* — one past the highest
+    /// offset the commit worker has written and fsynced.
+    ///
+    /// `None` when nothing has been committed under this process, in which case
+    /// the caller has no better answer here than whatever it already had.
+    pub fn durable_end_offset(&self, topic: &str, partition: i32) -> Option<i64> {
+        let queue = {
+            let entry = self.partition_queues.get(&(topic.to_string(), partition))?;
+            Arc::clone(entry.value())
+        };
+        match queue.committed_through.load(Ordering::SeqCst) {
+            i64::MIN => None,
+            through => Some(through + 1),
+        }
+    }
+
     /// Records from `offset` onward, served out of the partition's in-memory
     /// tail without touching the file.
     ///

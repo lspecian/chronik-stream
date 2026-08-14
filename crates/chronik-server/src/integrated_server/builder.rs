@@ -1188,8 +1188,20 @@ impl IntegratedKafkaServerBuilder {
         let response_pipeline_clone = response_pipeline.clone();
         let partition_states = produce_handler.partition_states.clone();
         let callback_handle = tokio::runtime::Handle::current();
+        let commit_notify = Arc::clone(&self.append_notify);
         let commit_callback: chronik_wal::group_commit::CommitCallback = Arc::new(
             move |topic: &str, partition: i32, min_offset: i64, max_offset: i64| {
+                // A parked follower fetch is waiting for exactly this moment.
+                //
+                // The produce path signals on append, which is when the record
+                // gets its offset — but a follower is served from the durable
+                // end (`readable_end_offset`), so waking it before the commit
+                // only has it look, find nothing new, and park again. This is
+                // the wake that has something behind it.
+                if let Some(notify) = commit_notify.get(&(topic.to_string(), partition)) {
+                    notify.notify_waiters();
+                }
+
                 // Update in-memory high watermark (fast, O(1), stays synchronous)
                 let new_watermark = max_offset + 1;
                 if let Some(state) = partition_states.get(&(topic.to_string(), partition)) {

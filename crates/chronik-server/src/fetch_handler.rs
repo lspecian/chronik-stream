@@ -873,6 +873,29 @@ impl FetchHandler {
                 .await;
         }
 
+        // Bounded by what this leader can actually serve, not by what it has
+        // assigned.
+        //
+        // Offsets are handed out before the WAL writes them, so for a moment the
+        // log end runs ahead of the log. A follower told the assigned end asks
+        // for an offset inside that gap and gets an empty response — it cannot
+        // tell "not yet written" from "nothing there" — so it backs off and asks
+        // again. Measured after the read path was fixed: 1-2% of fetch cycles
+        // came back empty, each costing `EMPTY_FETCH_BACKOFF`.
+        //
+        // Reporting the durable end instead turns that into a park: the request
+        // waits inside the long poll and the commit worker wakes it the moment
+        // the record is on disk. Nothing is withheld that could have been sent —
+        // the records in the gap were not servable either way.
+        //
+        // `None` means nothing has committed under this process yet, which is a
+        // "don't know" and leaves the assigned end as the best answer available.
+        if let Some(ref wal) = self.wal_manager {
+            if let Some(durable_end) = wal.durable_end_offset(topic, partition) {
+                return Ok(log_end.min(durable_end));
+            }
+        }
+
         Ok(log_end)
     }
 

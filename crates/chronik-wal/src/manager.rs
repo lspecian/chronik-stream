@@ -222,6 +222,18 @@ impl WalManager {
     }
 
 
+    /// One past the highest offset this partition has fsynced.
+    ///
+    /// A leader assigns offsets before it writes them, so its *assigned* log end
+    /// runs ahead of what it can actually serve. Followers are told the
+    /// assigned end, ask for an offset inside that gap, and get an empty
+    /// response — which they can only respond to by backing off and asking
+    /// again. This is the number that says what a fetch can really be answered
+    /// with. `None` means nothing has been committed under this process.
+    pub fn durable_end_offset(&self, topic: &str, partition: i32) -> Option<i64> {
+        self.group_commit_wal.durable_end_offset(topic, partition)
+    }
+
     /// Read records from a specific offset
     #[instrument(skip(self), fields(
         topic = topic,

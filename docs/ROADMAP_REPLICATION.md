@@ -1240,28 +1240,44 @@ reproducible on one box — `acks=all` gave 2,912, 2,970, 6,587 and 3,066 across
 four runs — and a harness that prints one number per row invites reading noise
 as signal.
 
+### The leader now advertises what it can serve
+
+`readable_end_offset` reported the *assigned* log end to followers. Offsets are
+handed out before the WAL writes them, so a follower was routinely told about
+records that did not exist yet, asked for one, and got an empty response it
+could not distinguish from "nothing there" — so it backed off and asked again.
+The durable gate made that common: **1-2% of fetch cycles came back empty**.
+
+It is now bounded by `WalManager::durable_end_offset`, and the commit worker
+signals the same per-partition `Notify` the produce path uses, so a fetch parks
+inside the long poll and is woken when the record is actually on disk. Nothing
+is withheld that could have been sent; the records in that gap were not servable
+either way.
+
+**Empty cycles: 116-248 per 11,200 → 1-2 per 10,800.**
+
+Throughput did not move — 6,103 / 6,078 / 6,030 msg/s against a 6,197 median
+before — and that is the honest result: the empties were not costing much. What
+did change is the spread. Three runs now land within **1.2%** of each other where
+four previous runs ranged over **17%** (5,475-6,409). The backoff rhythm was a
+source of run-to-run variance, and removing it makes the number reproducible,
+which matters more here than another few hundred msg/s.
+
 ### Still open
 
-The read path no longer has an O(segment) term. What is left is the shape of the
-round trip itself.
+The read path no longer has an O(segment) term and the leader no longer
+advertises what it cannot serve. What is left is the shape of the round trip.
 
-`acks=all` at 6,197 against `acks=1` at 8,029 is a 1.3× gap, and single-node
+`acks=all` at ~6,100 against `acks=1` at 8,029 is a 1.3× gap, and single-node
 `acks=1` is 14,476 — so most of the remaining distance is the cluster, not the
 acks level. Three brokers and a load generator on one box share a disk, and the
 `acks=0` rows (164,914 single vs 111,146 clustered) put a number on that
 contention without any replication in the way.
 
-One concrete item remains from this work: `readable_end_offset` reports the
-*assigned* log end to followers, so the leader advertises offsets it cannot yet
-serve. The durable gate turns that into a routine miss — ~1-2% of fetch cycles
-now come back empty, up from ~0.02%. Reporting the durable end instead would let
-the fetch park and be woken when the data lands, removing the window that
-`EMPTY_FETCH_BACKOFF` exists to absorb. It is worth doing, and it is a smaller
-effect than anything fixed above.
-
-**A bare-metal run is now worth taking.** The two effects that would have
-dominated it — a read cost that grew with the segment, and a harness that could
-not reproduce its own numbers — are both fixed.
+**A bare-metal run is now worth taking.** The three effects that would have
+dominated it — a read cost that grew with the segment, a leader advertising
+offsets it could not serve, and a harness that could not reproduce its own
+numbers — are all fixed.
 
 ---
 
