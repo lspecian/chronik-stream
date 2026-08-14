@@ -89,13 +89,17 @@ up() {
 
 down() {
   for host in "${HOSTS[@]}"; do
-    # Matched on the full binary path, deliberately.
+    # Matched on the CONFIG PATH, which is the only thing that is both unique to
+    # these processes and actually present in their command line.
     #
-    # These machines also run Chronik inside Kubernetes, and a pattern like
-    # `chronik-server start` matches those container processes too — from the
-    # host, where their PIDs are visible. Killing a live cluster while cleaning
-    # up a benchmark is not a mistake worth risking for a shorter pattern.
-    sshq "$host" "pkill -9 -f '$REMOTE/chronik-server' >/dev/null 2>&1; sync; echo stopped"
+    # Two ways to get this wrong, and this harness has had both. `chronik-server
+    # start` also matches the Kubernetes containers on these machines, whose
+    # PIDs are visible from the host — that risks killing a live cluster while
+    # cleaning up a benchmark. Matching the full binary path is safe but matches
+    # *nothing*: `up` starts them as `./chronik-server` after a `cd`, so the
+    # command line never contains the directory. Teardown silently did nothing,
+    # and three brokers were found still running a day later.
+    sshq "$host" "pkill -9 -f 'config $REMOTE/node.toml' >/dev/null 2>&1; sync; echo stopped"
   done
   # Do not return while a listener is still held: the next run would measure a
   # broker that is going away. Same hazard as perf_matrix.sh.
@@ -150,8 +154,16 @@ bench() {
         local nicfile; nicfile=$(mktemp)
         ( nic_peak "${HOSTS[0]}" 30 > "$nicfile" ) &
         local nicpid=$!
-        local out; out=$("$BENCH" -b "$BOOT" -t "bm-$size-$acks-$run-$$" \
-          -c "$CONCURRENCY" -s "$size" -d "$DURATION" -p 3 --acks "$acks" -m produce 2>&1)
+        # `--linger-ms 0` is deliberate, not an oversight: every producer waits
+        # for its own acknowledgement, so the run measures the ROUND TRIP rather
+        # than the ingest ceiling. `PERF_LINGER=10` measures the other regime —
+        # what the same cluster does when the client batches — and the gap
+        # between the two is the cost of asking per message instead of per
+        # batch. The report the numbers here replaced measured the batched
+        # regime and described it as the cluster's throughput.
+        local out; out=$("$BENCH" -b "$BOOT" -t "bm${PERF_LINGER:-0}-$size-$acks-$run-$$" \
+          -c "$CONCURRENCY" -s "$size" -d "$DURATION" -p 3 --acks "$acks" \
+          --linger-ms "${PERF_LINGER:-0}" -m produce 2>&1)
         wait $nicpid 2>/dev/null
         peak=$(cat "$nicfile" 2>/dev/null); rm -f "$nicfile"
         msgs+=("$(extract "$out" msgs)")
