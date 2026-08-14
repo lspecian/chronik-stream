@@ -42,6 +42,16 @@ a warmup, 3 partitions, no compression, **WAL profile left at its default**
 (`low`, 2 ms). Rates below are the harness's summary figure: total messages over
 the measured window, which excludes the warmup phase.
 
+**Every figure is the median of three runs, each on a freshly started cluster.**
+A single measurement is not reproducible on this box: three brokers, a load
+generator and the page cache share one machine, and whatever ran before leaves
+the disk busy. `acks=all` on the cluster measured 2,912, 2,970, 6,587 and 3,066
+msg/s across four runs of the harness while the same configuration measured on
+its own gave 5,475–6,409 four times running. The harness now tears each cluster
+down, waits for the ports to close and the disk to drain, and reports a median —
+`perf_matrix.sh` prints the individual samples next to it so the spread is
+visible rather than implied.
+
 30 seconds, not 10, for a reason. `acks=all` throughput used to fall during a
 run — every fetch re-read the whole active WAL segment, so the cost grew with
 the file (see RP-9) — and a 10-second run reported a number that a 30-second run
@@ -60,9 +70,9 @@ No replication to do, so this is the ceiling of the local write path.
 
 | acks | throughput | p99 |
 |---|---:|---:|
-| 0 | **169,156 msg/s** (41.3 MB/s) | 7.81 ms |
-| 1 | 14,370 msg/s (3.51 MB/s) | 5.53 ms |
-| all | 14,352 msg/s (3.50 MB/s) | 5.50 ms |
+| 0 | **164,914 msg/s** (40.3 MB/s) | 7.71 ms |
+| 1 | 14,476 msg/s (3.53 MB/s) | 5.30 ms |
+| all | 14,307 msg/s (3.49 MB/s) | 5.55 ms |
 
 `acks=1` and `acks=all` are identical here, and that is correct: with no
 followers the in-sync set is the leader alone, so `acks=all` waits for its own
@@ -74,32 +84,27 @@ Follower-pull replication running; every record reaches all three nodes.
 
 | acks | throughput | p99 |
 |---|---:|---:|
-| 0 | **131,328 msg/s** (32.1 MB/s) | 4.72 ms |
-| 1 | 12,175 msg/s (2.97 MB/s) | 10.94 ms |
-| all | 3,763 msg/s (0.92 MB/s) | 54.81 ms |
+| 0 | **111,146 msg/s** (27.1 MB/s) | 14.49 ms |
+| 1 | 8,029 msg/s (1.96 MB/s) | 10.72 ms |
+| all | 6,197 msg/s (1.51 MB/s) | 41.05 ms |
 
 `acks=0` and `acks=1` cost roughly what the single-node shape costs, plus
 contention from two extra brokers on the same disk.
 
-`acks=all` is **3.2× slower than `acks=1`**, which is the cost of the follower
+`acks=all` is **1.3× slower than `acks=1`**, which is the cost of the follower
 round trip: a producer cannot be acknowledged until a follower's *next* fetch
 reports a position past the record, so each write pays a fetch plus the
 follower's own fsync on top of the leader's.
 
-It used to be 4–7× slower *and* to decay during a run — 3,993 msg/s in the first
-interval, 2,285 in the second. That was not `acks=all` degrading; every fetch
-re-read and re-parsed the whole active WAL segment from byte zero, so the cost
-grew with the file. Fixed in RP-9; the figure above is stable across a 30-second
-run and no longer depends on how long you look.
+It used to be **4–7× slower** and to decay during a run — 3,993 msg/s in the
+first interval, 2,285 in the second. That was not `acks=all` degrading; every
+fetch re-read and re-parsed the whole active WAL segment from byte zero, so the
+cost grew with the file. RP-9 replaced that with a bounded tail cache and a
+sparse offset index, taking the sustained figure from ~1,400 to 6,197 msg/s and
+making it stable across the run rather than a function of how long you look.
 
-Single-record `acks=all` latency is 14 ms, level with `acks=1`'s 13 ms
-(`tests/cluster/acks_all_latency.sh`). The remaining throughput gap is
-concurrency behaviour, not per-request latency.
-
-**Each row above is measured on a freshly started cluster.** Running all three
-against one cluster made whichever ran last look worst for being last:
-`acks=all` after a minute of `acks=0` and `acks=1` traffic measured 2,407 msg/s
-against the same build's 3,763 on a fresh one.
+Single-record `acks=all` latency is 14 ms, level with `acks=1`'s 12 ms
+(`tests/cluster/acks_all_latency.sh`).
 
 ## Batched throughput, for contrast
 

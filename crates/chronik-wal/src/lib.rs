@@ -24,6 +24,7 @@ pub mod group_commit;
 pub mod io_priority; // I/O priority control for WAL vs Tantivy
 pub mod io_uring_thread; // Dedicated io_uring thread (hybrid tokio + tokio-uring)
 pub mod truncate; // Suffix truncation — discarding a divergent tail (RP-3.3)
+pub mod segment_index; // Sparse offset → byte position, so reads seek (RP-9)
 
 // Future-ready modules
 pub mod audit;

@@ -12,6 +12,7 @@ use crate::{
     checkpoint::CheckpointManager,
     fsync::FsyncBatcher,
     group_commit::{GroupCommitWal, GroupCommitConfig},
+    segment_index::PartitionIndex,
     RecoveryResult,
 };
 
@@ -32,6 +33,10 @@ pub struct WalManager {
     /// Group commit WAL for zero-loss durability with PostgreSQL-style batching
     /// This is the ONLY WAL system now - old partitions-based WAL removed
     group_commit_wal: Arc<GroupCommitWal>,
+    /// Sparse offset → byte position per partition, so a read seeks into the
+    /// segments instead of scanning them (RP-9). Built as the log grows and
+    /// rebuilt whenever a file shrinks under it.
+    read_index: dashmap::DashMap<(String, i32), Arc<tokio::sync::Mutex<PartitionIndex>>>,
 }
 
 impl WalManager {
@@ -77,6 +82,7 @@ impl WalManager {
             checkpoint_manager: tokio::sync::Mutex::new(checkpoint_manager),
             fsync_batcher,
             group_commit_wal,
+            read_index: dashmap::DashMap::new(),
         })
     }
     
@@ -253,10 +259,17 @@ impl WalManager {
             return Ok(cached);
         }
 
-        let mut records = Vec::new();
-
-        // Read from partition directory to find all WAL segment files
-        // Format: wal_{partition}_{segment_id}.log (e.g., wal_1_0.log, wal_1_1.log, wal_1_2.log)
+        // Everything else seeks.
+        //
+        // This used to enumerate the partition directory, read each segment
+        // file in full, and parse it from byte zero — materialising every
+        // record's payload before the offset filter discarded it, because the
+        // offsets trail the payload on the wire. It cost O(segment size) per
+        // fetch and grew with the file until rotation at 250MB.
+        //
+        // `PartitionIndex` keeps a sparse offset → byte position map per
+        // segment, extended as the log grows, so each byte is parsed once ever
+        // rather than once per read. See `segment_index`.
         let partition_dir = self.config.data_dir
             .join(topic)
             .join(partition.to_string());
@@ -268,189 +281,26 @@ impl WalManager {
             ));
         }
 
-        // Find all WAL segment files for this partition
-        let mut wal_files = Vec::new();
-        let mut entries = tokio::fs::read_dir(&partition_dir).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            let path = entry.path();
-            if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
-                // Match pattern: wal_{partition}_{segment_id}.log
-                if filename.starts_with(&format!("wal_{}_", partition)) && filename.ends_with(".log") {
-                    wal_files.push(path);
-                }
-            }
-        }
+        let index = self
+            .read_index
+            .entry((topic.to_string(), partition))
+            .or_insert_with(|| {
+                Arc::new(tokio::sync::Mutex::new(PartitionIndex::new(
+                    partition_dir,
+                    partition,
+                )))
+            })
+            .clone();
 
-        if wal_files.is_empty() {
-            debug!("No WAL files found in partition directory: {:?}", partition_dir);
-            return Ok(records);
-        }
+        let records = {
+            let mut index = index.lock().await;
+            index.read_from(offset, max_records).await?
+        };
 
-        // Sort by segment ID (extract from filename)
-        wal_files.sort_by_key(|path| {
-            path.file_name()
-                .and_then(|n| n.to_str())
-                .and_then(|s| {
-                    // Extract segment_id from wal_{partition}_{segment_id}.log
-                    s.strip_prefix(&format!("wal_{}_", partition))
-                        .and_then(|rest| rest.strip_suffix(".log"))
-                        .and_then(|seg_id| seg_id.parse::<u64>().ok())
-                })
-                .unwrap_or(0)
-        });
-
-        debug!("Found {} WAL segment files for {}/{}: {:?}", wal_files.len(), topic, partition, wal_files);
-
-        // Read from all segment files until we have enough individual messages.
-        // Note: max_records counts individual Kafka messages, NOT WAL batch records.
-        // Each WAL batch may contain 100-2000 messages (via record_count field).
-        let mut total_message_count: usize = 0;
-        for wal_file_path in &wal_files {
-            if total_message_count >= max_records {
-                break;
-            }
-
-            let file_data = tokio::fs::read(&wal_file_path).await?;
-            if file_data.is_empty() {
-                continue;
-            }
-
-            debug!("Reading {} bytes from GroupCommitWal file: {:?}", file_data.len(), wal_file_path);
-
-            // Parse V2 WAL records from file
-            let mut cursor = 0;
-            let mut skipped_batches = 0;
-
-            while cursor < file_data.len() && total_message_count < max_records {
-                use byteorder::{LittleEndian, ReadBytesExt};
-                use std::io::Cursor as IoCursor;
-
-                if cursor + 12 > file_data.len() {
-                    break;
-                }
-
-                let record_start = cursor;
-                let mut rdr = IoCursor::new(&file_data[cursor..]);
-
-                let magic = rdr.read_u16::<LittleEndian>().unwrap();
-                let version = rdr.read_u8().unwrap();
-                let flags = rdr.read_u8().unwrap();
-                let length = rdr.read_u32::<LittleEndian>().unwrap() as usize;
-                let crc32 = rdr.read_u32::<LittleEndian>().unwrap();
-
-                if magic != 0xCA7E || version != 2 || length == 0 {
-                    debug!("Invalid WAL record at cursor {}: magic={:x}, version={}, length={}", cursor, magic, version, length);
-                    break;
-                }
-
-                // Parse V2 record body
-                // CRITICAL FIX: Handle truncated WAL files gracefully instead of panicking
-                // During cluster startup or crashes, WAL files may be incomplete
-                let topic_len = match rdr.read_u16::<LittleEndian>() {
-                    Ok(len) => len as usize,
-                    Err(e) => {
-                        debug!("Failed to read topic_len at cursor {}: {} - skipping rest of file (likely truncated)", cursor, e);
-                        break;
-                    }
-                };
-
-                let mut topic_bytes = vec![0u8; topic_len];
-                if let Err(e) = std::io::Read::read_exact(&mut rdr, &mut topic_bytes) {
-                    debug!("Failed to read topic bytes at cursor {}: {} - skipping rest of file (likely truncated)", cursor, e);
-                    break;
-                }
-
-                let record_topic = match String::from_utf8(topic_bytes) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        debug!("Invalid UTF-8 in topic at cursor {}: {} - skipping rest of file", cursor, e);
-                        break;
-                    }
-                };
-
-                let record_partition = match rdr.read_i32::<LittleEndian>() {
-                    Ok(p) => p,
-                    Err(e) => {
-                        debug!("Failed to read partition at cursor {}: {} - skipping rest of file", cursor, e);
-                        break;
-                    }
-                };
-
-                let canonical_data_len = match rdr.read_u32::<LittleEndian>() {
-                    Ok(len) => len as usize,
-                    Err(e) => {
-                        debug!("Failed to read canonical_data_len at cursor {}: {} - skipping rest of file", cursor, e);
-                        break;
-                    }
-                };
-
-                // Read the offsets BEFORE copying the payload.
-                //
-                // They sit after `canonical_data` on the wire, so the obvious
-                // parse allocates and copies every record's payload and only
-                // then discovers the record is below the requested offset and
-                // throws it away. A fetch near the end of a 250MB segment paid
-                // that for the whole file — measured at 2.5–4.5ms to return two
-                // records, which was the whole of `acks=all`'s fetch latency
-                // (RP-9). Their positions are known from the length, so a skip
-                // costs three reads out of the buffer and no allocation at all.
-                let record_slice = &file_data[record_start..];
-                let payload_at = rdr.position() as usize;
-                let meta_at = match payload_at.checked_add(canonical_data_len) {
-                    Some(p) => p,
-                    None => {
-                        debug!("Implausible canonical_data_len at cursor {} - skipping rest of file", cursor);
-                        break;
-                    }
-                };
-                if meta_at + 20 > record_slice.len() {
-                    debug!("Truncated record at cursor {} - skipping rest of file", cursor);
-                    break;
-                }
-
-                let base_offset = i64::from_le_bytes(
-                    record_slice[meta_at..meta_at + 8].try_into().expect("8 bytes"),
-                );
-                let last_offset = i64::from_le_bytes(
-                    record_slice[meta_at + 8..meta_at + 16].try_into().expect("8 bytes"),
-                );
-                let record_count = i32::from_le_bytes(
-                    record_slice[meta_at + 16..meta_at + 20].try_into().expect("4 bytes"),
-                );
-
-                // Filter by offset range
-                let should_include = last_offset >= offset;
-
-                // Advance past the whole record either way.
-                rdr.set_position((meta_at + 20) as u64);
-
-                if !should_include {
-                    skipped_batches += 1;
-                } else {
-                    let record = WalRecord::V2 {
-                        magic,
-                        version,
-                        flags,
-                        length: length as u32,
-                        crc32,
-                        topic: record_topic,
-                        partition: record_partition,
-                        canonical_data: record_slice[payload_at..meta_at].to_vec(),
-                        base_offset,
-                        last_offset,
-                        record_count,
-                    };
-                    total_message_count += record_count.max(1) as usize;
-                    records.push(record);
-                }
-
-                cursor = record_start + rdr.position() as usize;
-            }
-
-            debug!("Completed reading segment {:?}: {} records (skipped {} batches)", wal_file_path, records.len(), skipped_batches);
-        }
-
-        info!("WAL read completed: found {} total records from {} segment files", records.len(), wal_files.len());
+        debug!(
+            "WAL read completed: {} records for {}/{} from offset {}",
+            records.len(), topic, partition, offset
+        );
         Ok(records)
     }
 

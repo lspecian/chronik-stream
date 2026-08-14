@@ -15,7 +15,7 @@
 | RP-7 | Assignment authority | `TESTED` | — | Only the Raft leader publishes; fetch refuses when it does not lead. **Full conformance suite now PASSES, RP-0.4 included** |
 | RP-8 | `acks=all` latency (#36) | `TESTED` | — | Three waits removed from the write path: new topic 7,000ms → 23ms, steady state 505ms → 17ms. The reported "duplication" was a client retry after a timeout |
 | RP-4 | Delete the push stack | `TESTED` | — | Data push path deleted: mode switch, produce fan-out, LeaderElector and the election machinery. Metadata keeps the transport (OQ2). One mechanism |
-| RP-9 | `acks=all` round-trip throughput | 🔶 `PARTLY` | — | Cause found and fixed: every fetch re-read and re-parsed the whole active WAL segment from byte zero. Latency 17ms → 13ms; sustained throughput ~1,400 → 3,763 msg/s and no longer decays during a run. Three bugs fell out, one of them **data loss on failover** (divergence 7/10 → 10/10) |
+| RP-9 | `acks=all` round-trip throughput | `TESTED` | — | Every fetch re-read and re-parsed the whole active WAL segment from byte zero. Fixed with a durable-gated tail cache and a sparse offset index: ~1,400 → **6,197 msg/s**, now 1.3× `acks=1` rather than 4–7×, and stable across a run. Three bugs fell out, one of them **data loss on failover** (divergence 7/10 → 10/10) |
 
 ---
 
@@ -1115,9 +1115,27 @@ way:
 
 **The file fallback no longer copies what it skips.** The offsets are read from
 their known positions and the payload is copied only for records that survive
-the filter. It did not move this benchmark — the remaining cost is the
-whole-file read, not the parse — but it removes an allocation and memcpy of
-every record in the segment on every miss.
+the filter. On its own it did not move the benchmark — the remaining cost was
+the whole-file read, not the parse — but it removes an allocation and memcpy of
+every record in the segment on every miss, and it is what the index below is
+built on.
+
+**And the fallback now seeks instead of scanning** (`segment_index.rs`). A
+sparse offset → byte position map per segment, one mark per 64KiB, extended as
+the file grows so every byte is parsed once ever rather than once per read. A
+read binary-searches the marks, opens the file at the nearest one at or below
+the offset it wants, and reads forward in bounded chunks only as far as it
+needs. Segments that cannot contain the offset are skipped without being opened.
+
+This is what made the durable gate affordable. The gate makes misses routine —
+a follower asking for an offset the leader has assigned but not yet fsynced
+misses by design — so the fallback's cost sits on the common path, and it was
+the dominant term once the cache was in. **3,763 → 6,197 msg/s.**
+
+The index is a pure accelerator and is rebuilt whenever the file could have
+moved under it: a shrink (which is what a truncation looks like from the read
+side) resets it, and a torn tail from a crash stops the scan without discarding
+the records before it. Being wrong costs a rescan, never a wrong answer.
 
 **The follower's fsync is amortised across a fetch response.** Batches were
 applied one at a time, each awaiting its own group commit — one interval apiece.
@@ -1194,49 +1212,56 @@ time reads as a real measurement.
 `chronik-bench`, 64 concurrent producers, 256B, 3 partitions, one machine,
 30-second runs, fresh cluster:
 
+Medians of three runs, each on a freshly started cluster:
+
 | | before | after |
 |---|---:|---:|
-| 3 nodes RF=3, `acks=all`, 30s run | ~1,400 msg/s | **3,763 msg/s** |
-| 3 nodes RF=3, `acks=1`, 30s run | — | 12,175 msg/s |
-| follower fetch, leader-side serve | 7–14ms | 0.15–0.4ms |
-| `read_from` returning 2 records | 2.5–4.5ms | served from memory |
+| 3 nodes RF=3, `acks=all`, 30s run | ~1,400 msg/s | **6,197 msg/s** |
+| 3 nodes RF=3, `acks=1`, 30s run | — | 8,029 msg/s |
+| follower fetch, leader-side serve | 7–14ms | 0.11–0.4ms |
+| `read_from` returning 2 records | 2.5–4.5ms | memory, or a seek |
 | batched (`kcat`), `acks=all` | 488,997 msg/s | 542,005 msg/s |
 
 The 10s and 30s figures used to differ because the segment grew during the run.
 They no longer do, which is the more important half of this: the number is now
-stable rather than a function of how long you look. `acks=all` is now 3.2×
+stable rather than a function of how long you look. `acks=all` is now **1.3×**
 `acks=1` rather than 4–7×.
 
 `acks=all` single-record latency is unchanged at 13–14ms, level with `acks=1`.
 
-`perf_matrix.sh` now restarts the cluster between acks levels. Sharing one
-cluster made whichever ran last look worst for being last — `acks=all` measured
-2,407 msg/s after a minute of other traffic against 3,763 on a fresh cluster —
-and the rows exist to be compared with each other.
+`perf_matrix.sh` needed three fixes of its own before any of this was
+measurable. It restarts the cluster between acks levels (sharing one made
+whichever ran last look worst for being last); it waits for the ports to close
+and the disk to drain between measurements (a `kill -9` and a 2-second sleep
+left the next shape measuring a half-dead cluster, and an `acks=0` run leaves
+several hundred MB still flushing); and every row is now a median of three with
+the individual samples printed beside it. A single run of this benchmark is not
+reproducible on one box — `acks=all` gave 2,912, 2,970, 6,587 and 3,066 across
+four runs — and a harness that prints one number per row invites reading noise
+as signal.
 
 ### Still open
 
-`acks=1` on the same shape is 6,531 msg/s and single-node `acks=1` is 14,175, so
-replication still costs roughly half the write path and there is a further ~2×
-between the cluster and one node.
+The read path no longer has an O(segment) term. What is left is the shape of the
+round trip itself.
 
-What remains is the fallback: a cache miss still reads the **entire** segment
-file. The durable gate makes misses routine — a follower asking for an offset
-the leader has assigned but not yet fsynced misses by design — so the fallback's
-cost is now on the common path rather than the rare one.
+`acks=all` at 6,197 against `acks=1` at 8,029 is a 1.3× gap, and single-node
+`acks=1` is 14,476 — so most of the remaining distance is the cluster, not the
+acks level. Three brokers and a load generator on one box share a disk, and the
+`acks=0` rows (164,914 single vs 111,146 clustered) put a number on that
+contention without any replication in the way.
 
-The structural fix is an offset index: a sparse (offset → byte position) map
-maintained as records are appended, so a read seeks to the nearest entry and
-reads only the slice it needs instead of the whole file. That removes the last
-O(segment) term from the read path, for consumers as much as for replication.
+One concrete item remains from this work: `readable_end_offset` reports the
+*assigned* log end to followers, so the leader advertises offsets it cannot yet
+serve. The durable gate turns that into a routine miss — ~1-2% of fetch cycles
+now come back empty, up from ~0.02%. Reporting the durable end instead would let
+the fetch park and be woken when the data lands, removing the window that
+`EMPTY_FETCH_BACKOFF` exists to absorb. It is worth doing, and it is a smaller
+effect than anything fixed above.
 
-A second, smaller item: `readable_end_offset` reports the *assigned* log end to
-followers, so the leader advertises offsets it cannot yet serve. Reporting the
-durable end instead would let the fetch park and be woken when the data lands,
-removing the empty-fetch window that `EMPTY_FETCH_BACKOFF` exists to absorb.
-
-**Do not start a bare-metal run before settling these**, or they will dominate
-every number taken there.
+**A bare-metal run is now worth taking.** The two effects that would have
+dominated it — a read cost that grew with the segment, and a harness that could
+not reproduce its own numbers — are both fixed.
 
 ---
 

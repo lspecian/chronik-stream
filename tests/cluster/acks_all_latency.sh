@@ -74,6 +74,27 @@ wait_for_port() {
   return 1
 }
 
+# Do not start until this test's ports belong to nobody.
+#
+# These scripts share ports 9392-9394, and a broker left over from the previous
+# one still holds its listener for a moment after `kill -9`. This test's nodes
+# then fail to bind while `wait_for_port` connects happily to the corpse, and
+# the first write to a new topic waits out a 2-second metadata retry against a
+# broker that is going away: measured 2,014ms straight after another cluster
+# test, against 15-17ms standalone. That is the harness, not the broker.
+wait_for_free_ports() {
+  for _ in $(seq 1 60); do
+    busy=0
+    for port in 9392 9393 9394; do
+      (exec 3<>/dev/tcp/127.0.0.1/$port) 2>/dev/null && { exec 3<&-; busy=1; }
+    done
+    [ "$busy" -eq 0 ] && return 0
+    sleep 1
+  done
+  say "   WARNING: ports 9392-9394 are still held; measuring anyway"
+  return 0
+}
+
 now_ms() { date +%s%3N; }
 
 # One record, one request, one round trip.
@@ -107,6 +128,7 @@ steady_state_ms() { # $1=acks value → echoes median ms
 
 say "== acks=all latency on a 3-node cluster (RF=3, min_insync_replicas=2) =="
 rm -rf "$DIR/data/alt-node"{1,2,3}
+wait_for_free_ports
 for n in 1 2 3; do start_node "$n"; done
 for p in 9392 9393 9394; do
   wait_for_port "$p" || { fail "node on $p never came up"; exit 1; }
