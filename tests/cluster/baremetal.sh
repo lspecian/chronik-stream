@@ -194,14 +194,25 @@ bench() {
 # them for real. Same method as `perf_replication.sh`, pointed at the Dells.
 batched() {
   command -v kcat >/dev/null || { say "SKIP: kcat not installed"; exit 0; }
-  local records="${PERF_RECORDS:-200000}"
+  # Five million, not the 200,000 `perf_replication.sh` uses.
+  #
+  # 200,000 x 256B finishes in about half a second at these rates, and half a
+  # second measures the client's send buffer draining, not the cluster's
+  # throughput. It reported `acks=0` at 355,871 and `acks=1` at 386,100 — i.e.
+  # acknowledging every batch on the leader's disk looked FREE, and slightly
+  # faster than not acknowledging at all, which cannot be true. Over a proper
+  # window the same runs give 429,737 and 122,828.
+  #
+  # The run length is printed with every row so a too-short window is visible
+  # instead of silently becoming a number.
+  local records="${PERF_RECORDS:-5000000}"
   local payload; payload=$(head -c "${PERF_SIZE:-256}" /dev/zero | tr '\0' 'x')
   mkdir -p "$(dirname "$RESULTS")"
   say "== bare metal, BATCHED: kcat, $records records x ${PERF_SIZE:-256}B, median of $RUNS =="
   say "   the client does not wait per message; this is the ingest ceiling"
   say ""
   for acks in $ACKS_LEVELS; do
-    local rates=()
+    local rates=() secs=()
     for run in $(seq 1 "$RUNS"); do
       up
       local topic="bmb-$acks-$run-$$"
@@ -214,11 +225,16 @@ batched() {
       t1=$(date +%s%3N)
       ms=$((t1 - t0)); [ "$ms" -le 0 ] && ms=1
       rates+=("$(( records * 1000 / ms ))")
+      secs+=("$(( ms / 1000 ))")
       down
       sleep "$SETTLE"
     done
-    printf '  batched %-4s acks=%-4s %10s msg/s   (%s)\n' \
-      "${PERF_SIZE:-256}B" "$acks" "$(median "${rates[@]}")" "$(printf '%s ' "${rates[@]}")" \
+    local window; window=$(median "${secs[@]}")
+    local warn=""
+    [ "$window" -lt 10 ] && warn="  ⚠ WINDOW TOO SHORT — raise PERF_RECORDS"
+    printf '  batched %-4s acks=%-4s %10s msg/s over %ss   (%s)%s\n' \
+      "${PERF_SIZE:-256}B" "$acks" "$(median "${rates[@]}")" "$window" \
+      "$(printf '%s ' "${rates[@]}")" "$warn" \
       | tee -a "$RESULTS"
   done
 }

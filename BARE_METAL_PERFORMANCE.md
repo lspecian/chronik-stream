@@ -32,9 +32,9 @@ k6 posting 100–200 messages per HTTP request through 12–36 ingestor pods,
 aggregated across all of them. The tables below are *round-trip* figures: 64
 producers, each one waiting for its own acknowledgement before sending the next.
 
-The two regimes are not close. On the developer machine, the same broker build
-measures **542,005 msg/s batched at `acks=all` and ~6,100 msg/s unbatched** — a
-factor of ~87 on identical hardware, from one client setting.
+The two regimes are not close. Measured below on this hardware, batching is
+worth **4–5×** at every acks level — and at `acks=0` the batched run stops at
+the client's 1 GbE link rather than at anything Chronik does.
 
 Round trip is the harder question and the one this work needed: replication cost
 only appears when someone is waiting for it, and a batched pipeline hides it
@@ -48,14 +48,22 @@ accounted for:
 | | msg/s | |
 |---|---:|---|
 | old report, `acks=all` | 837,284 | batched, **replication disabled**, 12–36 ingestor pods, in-cluster over loopback |
-| today, batched `acks=1` | 386,100 | replication running, **one** client, over a real 1 GbE link |
-| today, batched `acks=all` | 99,403 | as above, and waiting for a follower on every batch |
+| today, batched `acks=0` | 429,737 | **client's 1 GbE saturated at 98%** — a floor, not the broker's ceiling |
+| today, batched `acks=1` | 122,828 | replication running, one client, over a real link |
+| today, batched `acks=all` | 52,931 | as above, and waiting for a follower on every batch |
 
-Against `acks=1` — the closest analogue, since the old run was not replicating
-whatever its flag said — 837K versus 386K is 2.2×, and that is one load
-generator on one machine against a dozen-plus in-cluster pods with no network
-hop. Against `acks=all` it is 8.4×, and the difference is replication actually
-happening. Neither is a regression in the broker.
+These are not comparable, and the reason is structural rather than a matter of
+degree. The old figure was an **aggregate over 12–36 producer pods running
+inside the cluster**, with no client-side network hop to limit any of them.
+Today's is **one** producer on one machine behind a single 1 GbE link — and at
+`acks=0` that link is 98% full, which means the measurement stopped at the wire
+and never reached the broker.
+
+What can be said: the old run was not replicating whatever its flag claimed, so
+it was doing strictly less work per record than any row here. How much less is
+not recoverable from a number taken on a different topology, and the honest
+answer to "did throughput drop 7.6×" is that the two runs never measured the
+same quantity.
 
 Both regimes are measured below, on the same hardware, in the same session.
 
@@ -95,30 +103,38 @@ Reproduce: `./tests/cluster/baremetal.sh all`
 
 ### Batched, 256-byte messages — the other regime
 
-`kcat` piping 200,000 records without waiting on any of them, so librdkafka
-batches for real. Median of three, fresh cluster each.
+`kcat` piping 5,000,000 records without waiting on any of them, so librdkafka
+batches for real. The client's own NIC is sampled during each run, because at
+these rates it is a candidate for the bottleneck.
 Reproduce: `./tests/cluster/baremetal.sh batched`
 
-| acks | batched | round trip (from above) | what batching is worth |
-|---|---:|---:|---:|
-| 0 | 355,871 msg/s | 110,427 msg/s | 3.2× |
-| 1 | 386,100 msg/s | 22,690 msg/s | **17×** |
-| all | 99,403 msg/s | 12,475 msg/s | **8×** |
+| acks | batched | run length | client tx | round trip (above) | batching is worth |
+|---|---:|---:|---:|---:|---:|
+| 0 | 429,737 msg/s | 11 s | **983 Mbit/s — 98% of link** | 110,427 msg/s | 3.9× |
+| 1 | 122,828 msg/s | 40 s | 281 Mbit/s — 28% | 22,690 msg/s | 5.4× |
+| all | 52,931 msg/s | 94 s | 122 Mbit/s — 12% | 12,475 msg/s | 4.2× |
 
-Samples: `acks=0` 346,620 · 355,871 · 418,410 — `acks=1` 387,596 · 386,100 ·
-339,558 — `acks=all` 77,669 · 136,239 · 99,403.
+**`acks=0` is not a measurement of Chronik.** It saturates the client's 1 GbE
+uplink at 98%, so it is a floor: the broker was never the constraint and would
+go faster behind a faster client link. `acks=1` and `acks=all` sit at 28% and
+12% of that link, so those two *are* measurements of the cluster.
 
-Two things fall out of this table.
+Batching is worth a consistent **4–5×** across all three acks levels, which is
+the sane shape: it amortises per-request overhead, and it cannot amortise away
+either the leader's fsync or the follower round trip, because both happen once
+per batch however large the batch is.
 
-**Batched `acks=0` and `acks=1` are the same number.** 356K and 386K are within
-each other's spread. Once a batch carries thousands of records, the leader's
-fsync amortises to nothing per record — so *waiting for the leader's disk costs
-nothing when you batch, and costs 5× when you do not* (110,427 → 22,690).
-
-**Replication is the cost that does not amortise away.** `acks=all` batched is
-99K against `acks=1`'s 386K — still a 3.9× drop, because a batch is not
-acknowledged until a follower has fetched it, and that round trip happens per
-batch no matter how large the batch is.
+> ⚠️ **An earlier version of this table was wrong, and it is worth saying how.**
+> It used 200,000 records, which at these rates finishes in about half a second
+> — long enough to measure the client's send buffer draining and nothing else.
+> It reported `acks=0` at 355,871 and `acks=1` at **386,100**, i.e.
+> acknowledging every batch on the leader's disk came out *free, and slightly
+> faster than not acknowledging at all*. That cannot be true, and it is what
+> gave it away. Over a proper window the same runs give 429,737 and 122,828 — a
+> 3.5× gap in the direction physics requires. The harness now defaults to
+> 5,000,000 records and prints the run length beside every row, with a warning
+> under ten seconds, so a too-short window is visible instead of silently
+> becoming a number.
 
 ⚠️ **`--linger-ms` cannot produce these numbers, and trying it is a trap.**
 `chronik-bench` awaits each message's delivery before sending the next, so a
