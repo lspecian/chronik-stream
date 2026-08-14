@@ -24,6 +24,30 @@ running, replacing a report that was deleted rather than annotated.
 
 ---
 
+## Read this before comparing against the old numbers
+
+**These measure a different thing than the deleted report did, and the numbers
+are not comparable.** The old headline — 837,284 msg/s — was a *batched* figure:
+k6 posting 100–200 messages per HTTP request through 12–36 ingestor pods,
+aggregated across all of them. The tables below are *round-trip* figures: 64
+producers, each one waiting for its own acknowledgement before sending the next.
+
+The two regimes are not close. On the developer machine, the same broker build
+measures **542,005 msg/s batched at `acks=all` and ~6,100 msg/s unbatched** — a
+factor of ~87 on identical hardware, from one client setting.
+
+Round trip is the harder question and the one this work needed: replication cost
+only appears when someone is waiting for it, and a batched pipeline hides it
+almost completely. But it means **a reader who remembers 837K and sees 110K
+below is comparing a batched aggregate to an unbatched round trip, not a
+regression.** The old number was also invalid for a separate reason — it was
+measured with replication silently disabled — but even had it been sound, it
+would not belong in the same table as these.
+
+⏳ A batched bare-metal row is owed here, so both regimes appear side by side
+rather than one being described in prose. `PERF_LINGER=10 ./tests/cluster/baremetal.sh bench`
+produces it.
+
 ## What was measured
 
 Three brokers, one per Dell, as plain host processes — no Kubernetes in the
@@ -31,9 +55,10 @@ path. **The load generator runs on a fourth machine.** That is the part every
 previous bare-metal number here lacked: the client was co-located with a broker,
 so a network-bound result and a sender-bound one were indistinguishable (OQ1).
 
-`chronik-bench`, 64 concurrent producers each awaiting its own acknowledgement,
-3 partitions, RF=3, `min_insync_replicas=2`, 30-second runs, WAL profile left at
-its default. **Every figure is the median of three runs, each on a freshly
+`chronik-bench` with **`--linger-ms 0`**, 64 concurrent producers each awaiting
+its own acknowledgement before sending again, 3 partitions, RF=3,
+`min_insync_replicas=2`, 30-second runs, WAL profile left at its default. The
+zero linger is the whole point: it makes every message a round trip. **Every figure is the median of three runs, each on a freshly
 started cluster**, with the individual samples kept beside it.
 
 Replication was verified before measuring, not assumed: 100 records produced at
