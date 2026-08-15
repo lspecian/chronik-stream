@@ -45,9 +45,38 @@ regression.**
 Measured in the old number's own regime, the gap is mostly gone and the rest is
 accounted for:
 
+### The old test, re-run on the current build
+
+Rather than argue from a different benchmark, the original harness was run again:
+`tests/k8s-perf`, the same 12 in-cluster ingestor pods with the same producer
+settings (`batch.num.messages=10000`, `linger.ms=5`, **snappy**, `acks=all`),
+the same k6 max-load ramp to 5,000 VUs, 256-byte payloads. The only difference
+from the original is that replication now actually happens.
+
 | | msg/s | |
 |---|---:|---|
-| old report, `acks=all` | 837,284 | batched, **replication disabled**, 12–36 ingestor pods, in-cluster over loopback |
+| original claim, `acks=all` | **837,284** | `d0a198c`, "12 ingestors, 256B, acks=all", 245 MB/s |
+| `tests/k8s-perf/REPORT.md`, the harness's own report | ~5,400 sustained, ~9,824 aggregate | 8,000 VUs, 1 KB |
+| **this build, same harness, 2026-08-15** | **7,085** | 4,111,750 messages, **0 errors**, 5,004 VUs, 256 B |
+
+**Today's number lands between the two figures the harness itself reported.** It
+is the 837,284 that cannot be reconciled — it is ~100× above what this stack
+documents anywhere else in the repo, including its own report file written from
+the same runs. Whatever produced it, this harness does not.
+
+So there is no throughput regression to explain. The current build, with
+replication genuinely running, performs normally for the setup that number was
+attributed to.
+
+Replication was verified during the run, not assumed: a probe record at
+`acks=all` appeared in all three nodes' WALs before the load started, and after
+4.1M messages each node held ~2.9–3.1 GB of the topic. p95 batch latency reached
+17 s at 5,000 VUs, so this is a saturation ceiling, not a comfortable rate.
+
+### Against the single-client measurements above
+
+| | msg/s | |
+|---|---:|---|
 | today, batched `acks=0` | 429,368 | **client's 1 GbE saturated at 98%** — a floor, not the broker's ceiling |
 | today, batched `acks=1` | 122,828–394,539 | not reproducible; see above |
 
