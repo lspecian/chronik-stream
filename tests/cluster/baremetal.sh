@@ -62,8 +62,21 @@ deploy() {
       local p=0
       for peer in "${HOSTS[@]}"; do
         p=$((p + 1))
+        # `REPL_NET=1` puts inter-broker traffic on the 10 GbE fabric while
+        # clients keep reaching the brokers on the 1 GbE management address.
+        #
+        # The split works because a follower fetches from `[[peers]].kafka`,
+        # which is a different config field from the `[advertise].kafka` that
+        # clients receive in metadata. It is worth doing because replication is
+        # the larger half of a leader's traffic: at RF=3 the leader sends every
+        # record twice more than it received it, so its egress is 2x its
+        # ingress and both were sharing one 1 GbE port.
+        local paddr="$peer"
+        if [ "${REPL_NET:-0}" = "1" ]; then
+          paddr="172.16.10.${peer##*.}"
+        fi
         printf '\n[[peers]]\nid = %s\nkafka = "%s:9092"\nwal = "%s:9291"\nraft = "%s:5001"\n' \
-          "$p" "$peer" "$peer" "$peer"
+          "$p" "$paddr" "$paddr" "$paddr"
       done
     } | sshq "$host" "cat > $REMOTE/node.toml"
     timeout 600 scp -q "$BIN" "ubuntu@$host:$REMOTE/chronik-server" || { say "copy to $host failed"; exit 1; }
