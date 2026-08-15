@@ -575,6 +575,14 @@ struct ReplicationRequest {
 /// reservation permanently; under sustained load the leaked bytes accumulated
 /// until the counter pinned at `memory_limit_bytes` and the handler rejected
 /// every produce with "Memory limit exceeded".
+///
+/// This guard is why `acks=1` throughput appears to have "regressed" 3-4x in
+/// v2.10.8, and the appearance is backwards: before it, the leaked reservations
+/// pinned the counter at the limit and the handler REJECTED most produces, which
+/// a rate counter cannot distinguish from serving them. Measured on dell-32, same
+/// 15s run: guarded stored 301.7 MB while reporting 16,519 msg/s; unguarded
+/// reported 61,625 msg/s and stored 50.0 MB. See RP-11 in
+/// docs/ROADMAP_REPLICATION.md — do not "optimise" this away.
 struct MemoryReservation {
     counter: Arc<AtomicU64>,
     bytes: u64,
@@ -589,6 +597,31 @@ impl MemoryReservation {
 impl Drop for MemoryReservation {
     fn drop(&mut self) {
         self.counter.fetch_sub(self.bytes, Ordering::Release);
+    }
+}
+
+/// Map a failed produce to the error code the client will see.
+///
+/// The catch-all arm MUST NOT be `ErrorCode::None`. It was, and that meant every
+/// failure outside the four transactional cases below — memory-limit rejection,
+/// WAL write error, storage I/O error — came back to the producer as SUCCESS.
+/// The records were not stored and the client was told they were durable, which
+/// is silent data loss in the one code path that must never lie about it. It was
+/// caught with a leaking build on dell-32 (2026-08-15): the broker logged 228,825
+/// "Memory limit exceeded" rejections while the producer reported
+/// "Failed: 0 (0.00%)" and 50 MB reached the disk against a claimed 924,375
+/// records.
+///
+/// `KafkaStorageError` is the standard "broker could not persist this" code and
+/// is retriable, so a client backs off and resends rather than dropping the
+/// batch — at-least-once instead of silently-never.
+fn produce_error_code(e: &Error) -> i16 {
+    match e {
+        Error::DuplicateSequenceNumber(_) => ErrorCode::DuplicateSequenceNumber.code(),
+        Error::InvalidProducerEpoch(_) => ErrorCode::InvalidProducerEpoch.code(),
+        Error::OutOfOrderSequenceNumber(_) => ErrorCode::OutOfOrderSequenceNumber.code(),
+        Error::InvalidTransactionState(_) => ErrorCode::InvalidTxnState.code(),
+        _ => ErrorCode::KafkaStorageError.code(),
     }
 }
 
@@ -2008,13 +2041,7 @@ impl ProduceHandler {
 
                                 metrics.produce_errors.fetch_add(1, Ordering::Relaxed);
 
-                                let error_code = match e {
-                                    Error::DuplicateSequenceNumber(_) => ErrorCode::DuplicateSequenceNumber.code(),
-                                    Error::InvalidProducerEpoch(_) => ErrorCode::InvalidProducerEpoch.code(),
-                                    Error::OutOfOrderSequenceNumber(_) => ErrorCode::OutOfOrderSequenceNumber.code(),
-                                    Error::InvalidTransactionState(_) => ErrorCode::InvalidTxnState.code(),
-                                    _ => ErrorCode::None.code(),
-                                };
+                                let error_code = produce_error_code(&e);
 
                                 ProduceResponsePartition {
                                     index: partition_data.index,
@@ -4061,6 +4088,50 @@ mod tests {
             assert_eq!(counter.load(Ordering::SeqCst), 1000, "held while guard alive");
         } // drop
         assert_eq!(counter.load(Ordering::SeqCst), 0, "released exactly once on drop");
+    }
+
+    // Regression: a produce that FAILED must never be reported to the client as
+    // having succeeded. The catch-all arm returned ErrorCode::None, so a broker
+    // that had just rejected a batch answered the producer with success — 228,825
+    // rejections seen as "Failed: 0 (0.00%)" on dell-32, with 50 MB on disk
+    // against a claimed 924,375 records.
+    #[test]
+    fn produce_failure_is_never_reported_as_success() {
+        // The exact rejection that was being silently acknowledged.
+        let mem_limit = Error::Internal("Memory limit exceeded".into());
+        assert_ne!(
+            produce_error_code(&mem_limit),
+            ErrorCode::None.code(),
+            "a rejected produce must not be reported as success"
+        );
+        assert_eq!(produce_error_code(&mem_limit), ErrorCode::KafkaStorageError.code());
+
+        // Storage and I/O failures are equally not-success.
+        for e in [
+            Error::Internal("WAL write failed".into()),
+            Error::Storage("segment write failed".into()),
+        ] {
+            assert_ne!(produce_error_code(&e), ErrorCode::None.code(), "{e:?} reported as success");
+        }
+
+        // The four transactional cases keep their precise codes: clients rely on
+        // these to distinguish a retriable storage fault from a fenced producer.
+        assert_eq!(
+            produce_error_code(&Error::DuplicateSequenceNumber("x".into())),
+            ErrorCode::DuplicateSequenceNumber.code()
+        );
+        assert_eq!(
+            produce_error_code(&Error::InvalidProducerEpoch("x".into())),
+            ErrorCode::InvalidProducerEpoch.code()
+        );
+        assert_eq!(
+            produce_error_code(&Error::OutOfOrderSequenceNumber("x".into())),
+            ErrorCode::OutOfOrderSequenceNumber.code()
+        );
+        assert_eq!(
+            produce_error_code(&Error::InvalidTransactionState("x".into())),
+            ErrorCode::InvalidTxnState.code()
+        );
     }
 
     #[test]

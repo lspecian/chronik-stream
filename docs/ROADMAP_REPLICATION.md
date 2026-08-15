@@ -17,7 +17,7 @@
 | RP-4 | Delete the push stack | `TESTED` | — | Data push path deleted: mode switch, produce fan-out, LeaderElector and the election machinery. Metadata keeps the transport (OQ2). One mechanism |
 | RP-9 | `acks=all` round-trip throughput | `TESTED` | — | Every fetch re-read and re-parsed the whole active WAL segment from byte zero. Fixed with a durable-gated tail cache and a sparse offset index: ~1,400 → **6,197 msg/s**, now 1.3× `acks=1` rather than 4–7×, and stable across a run. Three bugs fell out, one of them **data loss on failover** (divergence 7/10 → 10/10) |
 | RP-10 | Replication cannot leave the client network | `TESTED` | — | `[[peers]].kafka` served both the client-facing Metadata list and the follower fetch path, so a dedicated fabric was unconfigurable. Added a per-peer `replication` address: `acks=1` **+31%** (21,802 → 28,587 msg/s), p99 −29%, client link 690 → 46 Mbit/s |
-| RP-11 | **17× produce regression shipped in v2.10.8** | ⛔ `OPEN` | — | `acks=1` single-node fell 186,841 → 11,155 msg/s at `e8547ca` (#21, the MemoryReservation RAII guard) and every release since carries it, including v2.11.0. Not replication — one node. Reverting restores it; the micro-mechanism is unresolved |
+| RP-11 | **The "17× produce regression" was a benchmark reading a bug** | ✅ `RESOLVED` | — | Not a regression: pre-#21 leaked reservations pinned the memory counter and the broker REJECTED most produces instantly, which a rate counter cannot tell from serving them (61,625 msg/s claimed, 50 MB on disk; guarded: 16,519 msg/s, 301.7 MB). Found a real bug behind it — every non-transactional produce failure was returned to the client as SUCCESS |
 
 ---
 
@@ -1365,98 +1365,115 @@ Gates: 1,693 unit tests; conformance 600/600; divergence 5/5; `acks=all` latency
 14 ms to a new topic, 13 ms steady.
 
 ---
-## RP-11: a 17× produce regression, shipped in v2.10.8 — `OPEN` (found 2026-08-15)
+## RP-11: the "17× produce regression" was a benchmark reading a bug — `RESOLVED` (2026-08-15)
 
-**`acks=1` single-node produce throughput fell 17× between v2.10.7 and v2.10.8,
-and every release since carries it — including v2.11.0 and the v2.10.10 running
-on the Thunderbird cluster.** It has nothing to do with replication: this is one
-node, no peers, no followers.
+**There is no produce regression. v2.10.8 did not make Chronik slower; it made
+Chronik stop silently dropping messages, and the benchmark had been counting the
+drops as throughput.** An earlier revision of this section claimed a 17×
+regression caused by `e8547ca` (#21). That was wrong, and the way it was wrong is
+worth keeping.
 
-| | acks=1 msg/s | p50 |
-|---|---:|---:|
-| v2.10.7 | **186,841** | 261 µs |
-| v2.10.8 | **11,155** | 4,315 µs |
+### What the numbers looked like
 
-`chronik-bench`, 64 producers, 256 B, 3 partitions, single node. Throughput is
-concurrency ÷ latency, so the 17× throughput and the 17× latency are one fact.
+`acks=1`, single node, no replication, 64 producers, 256 B, 3 partitions:
 
-### How it was found
+| build | reported msg/s |
+|---|---:|
+| v2.10.7 and every earlier tag | ~186,000 |
+| v2.10.8 and every later tag | ~11,000 |
 
-Not by reading code — by running the old binary. Every cheap explanation was
-eliminated by measurement first: WAL profile (byte-identical between versions),
-hot text and vector indexing (env-disabled: no change), the RP-9 tail cache
-(env-disabled: no change), premature acknowledgement (crash-after-ack: both
-builds 20,000/20,000), `spawn_blocking` and io_uring (identical), and CPU
-saturation — the *slow* build uses **less** CPU (122% vs 212%) for 17× less work.
-It is waiting, not computing.
+Bisected cleanly to `e8547ca`, "release in-flight memory reservation on all exit
+paths (#21)", which replaced a hand-written `fetch_sub` with a `MemoryReservation`
+RAII guard. Reverting it restored the throughput; A-B-A alternation held. All of
+that is true and all of it is beside the point.
 
-Then a bisect over release tags:
+### What was actually happening
 
+Stop trusting the rate counter and count what reached the disk. Same 15s run,
+same hardware:
+
+| build | reported msg/s | claimed records | **bytes on disk** | broker rejections |
+|---|---:|---:|---:|---:|
+| guarded (v2.10.8+, correct) | 16,519 | 247,785 | **301.7 MB** | **0** |
+| unguarded (pre-#21 shape) | 61,625 | 924,375 | **50.0 MB** | **228,825** |
+
+The "fast" build reports 3.7× the throughput and writes 6× less data. At 256 B a
+record, 301.7 MB for 247,785 records is ~1.2 KB each with WAL and index overhead
+— plausible. 50 MB for a claimed 924,375 records is 54 bytes each — impossible.
+
+Pre-#21, the 17 `?` early-returns in `produce_to_partition` leaked their
+reservation. Under sustained load the leaked bytes accumulated until
+`memory_used_bytes` pinned at the 32 MB `buffer_memory` ceiling, after which the
+handler rejected nearly every produce — **instantly**. An instant rejection and a
+fast success are the same event to a rate counter. The old numbers were measuring
+how quickly the broker could say no.
+
+So #21 is correct, the guard stays, and ~16,500 msg/s is what this path has
+always actually delivered on this hardware. **Every acks=1 produce figure
+published before v2.10.8 was inflated by an unknown amount** — the inflation
+depends on how quickly the leak reached the ceiling, so old numbers cannot be
+retroactively corrected, only discarded.
+
+### The second bug, which is the serious one
+
+The producer was told **none of this was happening**. Against 228,825 broker-side
+rejections, `chronik-bench` reported `Failed: 0 (0.00%)`. The cause, in the
+produce error mapping:
+
+```rust
+let error_code = match e {
+    Error::DuplicateSequenceNumber(_)  => ...,
+    Error::InvalidProducerEpoch(_)     => ...,
+    Error::OutOfOrderSequenceNumber(_) => ...,
+    Error::InvalidTransactionState(_)  => ...,
+    _ => ErrorCode::None.code(),   // every other failure = SUCCESS
+};
 ```
-v2.5.0    204,939  FAST      v2.10.5   187,292  FAST
-v2.7.4    197,867  FAST      v2.10.7   186,841  FAST
-v2.9.0    185,317  FAST      v2.10.8    11,155  SLOW  ←
-v2.10.1   186,482  FAST      v2.10.9    11,173  SLOW
-                             v2.11.0    11,065  SLOW
-                             HEAD       11,989  SLOW
-```
 
-v2.10.7 → v2.10.8 is two commits, one of them a release chore. The other is
-**`e8547ca` — "fix(produce): release in-flight memory reservation on all exit
-paths (#21)"**, which replaced an explicit `fetch_sub` in `produce_to_partition`
-with a `MemoryReservation` RAII guard.
+Every produce failure outside those four transactional cases — memory-limit
+rejection, WAL write error, storage I/O error — was returned to the client as
+`ErrorCode::None`. Success. The records were not stored and the producer was told
+they were durable. That is silent data loss in a broker whose headline guarantee
+is that it does not lose messages, and it is not specific to the leak: any
+storage or I/O failure on the produce path has always been acknowledged as a
+write.
 
-### Proof it is causal
+Fixed by mapping the catch-all to `KafkaStorageError` (56) — the standard
+"broker could not persist this" code, and retriable, so clients back off and
+resend rather than dropping the batch. Verified on the wire with a build that
+leaks (to force rejections) and carries the fix (to report them): the producer
+now reports `Failed: 64 (0.12%)` and logs real delivery errors where it
+previously reported `Failed: 0`. Regression test:
+`produce_failure_is_never_reported_as_success`.
 
-Reverting `e8547ca` on top of v2.10.8: **187,880 msg/s, p50 261 µs.** And on
-HEAD, removing the guard restores it, reproducibly:
+### The measurement failure behind all of it
 
-```
-round 1:  no-guard=199,351   with-guard=11,834
-round 2:  round 199,072      with-guard=11,898
-```
+Two machine-level facts distorted this investigation, and the branch's earlier
+performance numbers with it:
 
-### What the mechanism is NOT
+- **rimini's TSC is dead.** The kernel marks it unstable 2.1s into boot
+  ("most likely due to broken BIOS") and falls back to HPET, which is not in the
+  vDSO — so every `clock_gettime` is a syscall plus an MMIO read. Measured:
+  **1,213.8 ns/call on rimini against 23.8 ns on dell-33**, 51×. That is what
+  inflated the gap to "17×"; on TSC hardware the same A/B is 2.1×. Anything
+  timed on this box carries an unknown handicap.
+- **The Dells are dual-socket** (2× Xeon E5-2667 v4) against rimini's
+  single-socket Ryzen, so a contended atomic behaves differently on each. Neither
+  box is a neutral reference for the other.
 
-Three hypotheses, each tested and each wrong:
+The deeper failure was not the hardware. Four mechanisms were proposed for the
+"regression" — `Arc` cache-line contention, `Drop`-in-async codegen, release
+timing, refcount traffic on a NUMA interconnect — and each was disproved by
+experiment while the conclusion they were all trying to explain went unchallenged.
+The question that broke it open was not "why is the guard slow" but "is the fast
+build doing the work", and it cost one `du`.
 
-- **Not the memory limit.** No "Memory limit exceeded" in the logs, 0 client
-  failures, and the arithmetic says in-flight bytes are ~12 KB against a 32 MB
-  ceiling in both the fast and slow cases.
-- **Not the `Arc`.** The guard's `Arc<AtomicU64>` puts the strong count in the
-  same cache line as the counter, which looked like textbook false sharing
-  against the CAS reserve loop. Rewriting the guard to borrow (`&'a AtomicU64`,
-  no clone, no refcount traffic) left it at **11,923**.
-- **Not the presence of a `Drop` type across `.await` points.** A guard whose
-  `Drop` body is empty measures **201,803 msg/s** — fast. So it is the
-  `fetch_sub` executing in the destructor, not the destructor existing.
-
-### What is unresolved
-
-An explicit `drop(_mem_reservation)` at the exact line the pre-#21 code released
-at measures **11,834** — slow — while an inline `fetch_sub` at that same line
-measures **199,351** — fast. Same atomic, same source position, opposite result.
-The `drop()` is at function scope and reachable (verified). I could not
-reconcile this without a profiler, and would be guessing to name a cause.
-
-### What to do
-
-The fix has to be leak-free *and* fast, and the two known-good shapes are:
-
-1. Release explicitly on the success path and on each error path — what #21 set
-   out to avoid, because there are 17 `?` returns to keep in sync.
-2. Split the function: reserve in a thin outer wrapper, `await` an inner
-   function that holds no guard, release unconditionally on the way out. Leak-free
-   on every path including errors, and no `Drop` value in the hot inner frame.
-
-(2) is the better shape. It was not attempted here because it means restructuring
-a ~700-line function, which deserves its own change with the gates run against it
-rather than being appended to a measurement session.
-
-**Do not treat any published produce number from v2.10.8 onward as
-representative until this is fixed.**
+**Rule going forward: no produce throughput number is reportable unless the run
+also reports bytes landed and broker-side rejections.** `tests/cluster/` harnesses
+that report msg/s alone can be read backwards, exactly as this was.
 
 ---
+
 
 ## Open Questions
 
