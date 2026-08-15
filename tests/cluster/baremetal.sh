@@ -62,37 +62,21 @@ deploy() {
       local p=0
       for peer in "${HOSTS[@]}"; do
         p=$((p + 1))
-        # ⛔ `REPL_NET=1` DOES NOT WORK against the broker as it stands, and the
-        # reason is worth keeping.
+        # `REPL_NET=1` puts replication on the 10 GbE fabric and leaves clients
+        # on the 1 GbE address — worth doing because at RF=3 a leader sends
+        # every record twice more than it received it, so its egress is twice
+        # its ingress and both otherwise share one port.
         #
-        # The intent was to put inter-broker traffic on the 10 GbE fabric while
-        # clients kept reaching the brokers on the 1 GbE address — worth doing,
-        # because replication is the larger half of a leader's traffic: at RF=3
-        # a leader sends every record twice more than it received it, so its
-        # egress is 2x its ingress and both share one port.
-        #
-        # It assumed `[[peers]].kafka` (what a follower fetches from) and
-        # `[advertise].kafka` (what clients are told) were independent. They are
-        # not. `cluster/broker_registration.rs` builds the broker list published
-        # in Metadata responses from `peers[].kafka`, so setting this makes the
-        # cluster advertise 172.16.10.x to *clients* as well:
-        #
-        #     $ kcat -L -b 192.168.1.31:9092
-        #      broker 1 at 172.16.10.31:9092 (controller)
-        #      broker 2 at 172.16.10.32:9092
-        #      broker 3 at 172.16.10.33:9092
-        #
-        # A client with no route to that subnet then hangs after bootstrap —
-        # observed as `chronik-bench` running for 25 minutes on a `-d 30s` job.
-        # `[advertise].kafka` is documented as "what clients connect to" and is
-        # not used for this. Fixing that is the prerequisite for a
-        # replication-only fabric; see docs/ROADMAP_REPLICATION.md.
-        local paddr="$peer"
-        if [ "${REPL_NET:-0}" = "1" ]; then
-          paddr="172.16.10.${peer##*.}"
-        fi
+        # It sets `replication`, NOT `kafka`. An earlier version pointed `kafka`
+        # at the 10 G subnet and broke the cluster for clients: that field is
+        # what gets published in Metadata responses, so the brokers advertised
+        # 172.16.10.x to a load generator with no route to it, and every client
+        # hung after bootstrap (RP-10).
         printf '\n[[peers]]\nid = %s\nkafka = "%s:9092"\nwal = "%s:9291"\nraft = "%s:5001"\n' \
-          "$p" "$paddr" "$paddr" "$paddr"
+          "$p" "$peer" "$peer" "$peer"
+        if [ "${REPL_NET:-0}" = "1" ]; then
+          printf 'replication = "172.16.10.%s:9092"\n' "${peer##*.}"
+        fi
       done
     } | sshq "$host" "cat > $REMOTE/node.toml"
     timeout 600 scp -q "$BIN" "ubuntu@$host:$REMOTE/chronik-server" || { say "copy to $host failed"; exit 1; }

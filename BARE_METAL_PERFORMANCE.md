@@ -427,3 +427,44 @@ client on a separate machine:
 `acks=0` and `acks=1` are pressed against the link; `acks=all` is not, which is
 the same split Open Question 1 found and is why the 10 G is expected to help the
 first two and do little for the third.
+
+---
+
+## The 10 GbE fabric: what moving replication off the client link buys
+
+Each Dell has two 10 G ports. They were cabled and negotiating at 10000 Mbit/s
+but unaddressed, so nothing used them. Now `172.16.10.31/32/33` on `eno1` via
+`/etc/netplan/60-10gbe.yaml` (a separate file, not an edit to the cloud-init
+one), measured with `iperf3` at **9.14 Gbit/s**. Kubernetes is untouched: `eno3`
+keeps the `192.168.1.x` addresses Calico and Thunderbird are bound to.
+
+Replication is pointed at it with the per-peer `replication` field added in
+RP-10. Clients keep the `kafka` address. Same binary, same client, same machine
+— the only difference is which network the followers fetch over.
+
+| acks | replication on 1 GbE | on 10 GbE | change | node-1 NIC peak |
+|---|---:|---:|---:|---|
+| 0 | 104,937 msg/s | 106,690 msg/s | +1.7% | **693 → 131 Mbit/s** |
+| 1 | 21,802 msg/s | **28,587 msg/s** | **+31%** | **690 → 46 Mbit/s** |
+| all | 11,499 msg/s | 11,877 msg/s | +3.3% | 54 → 19 Mbit/s |
+
+p99 at `acks=1` fell from 6.94 ms to **4.91 ms** (−29%).
+
+**`acks=1` was genuinely transport-bound and is now not.** Its 31% gain is the
+whole reason to have a separate fabric: at RF=3 a leader sends every record twice
+more than it received it, so its egress was double its ingress and both shared
+one 1 GbE port.
+
+**`acks=0` was not transport-bound, despite looking like it.** It sat at 693
+Mbit/s — 69% of line rate — which reads as "nearly saturated", and yet freeing
+the link moved throughput by 1.7%. The 69% was replication traffic riding along,
+not the client path straining. A high link utilisation is not by itself evidence
+that the link is the constraint, and this is the measurement that shows it.
+
+**`acks=all` barely moved (+3.3%)**, as expected: it was already at 5% of the
+link, so it is bounded by the replication round trip rather than by bandwidth.
+The same split Open Question 1 found.
+
+The 1 GbE is now carrying 46–131 Mbit/s where it carried 690–693. The headroom
+is real, but taking it needs load the current harness cannot generate — one
+client on one 1 GbE link.

@@ -1803,11 +1803,26 @@ impl IntegratedKafkaServerBuilder {
         // A follower fetches over the leader's *Kafka* port, not the WAL
         // replication port — the whole point of pull is that replication is an
         // ordinary Fetch.
+        //
+        // `replication` overrides which address that Fetch goes to, defaulting
+        // to `kafka`. The two cannot be the same field: `kafka` is what the
+        // cluster publishes to clients in Metadata responses, so using it for a
+        // dedicated replication fabric advertises an address clients cannot
+        // reach (RP-10).
         let peers: std::collections::HashMap<u64, String> = cluster_config
             .peers
             .iter()
             .filter(|peer| peer.id != cluster_config.node_id)
-            .map(|peer| (peer.id, peer.kafka.clone()))
+            .map(|peer| {
+                let addr = peer.replication.clone().unwrap_or_else(|| peer.kafka.clone());
+                if peer.replication.is_some() {
+                    info!(
+                        "Replicating from node {} over {} (clients use {})",
+                        peer.id, addr, peer.kafka
+                    );
+                }
+                (peer.id, addr)
+            })
             .collect();
 
         if peers.is_empty() {
