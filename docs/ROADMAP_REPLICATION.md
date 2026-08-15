@@ -1451,12 +1451,12 @@ previously reported `Failed: 0`. Regression test:
 Two machine-level facts distorted this investigation, and the branch's earlier
 performance numbers with it:
 
-- **rimini's TSC was dead** (fixed 2026-08-16, see below). The kernel marked it
-  unstable 2.1s into boot ("most likely due to broken BIOS") and fell back to
-  HPET, which is not in the vDSO — so every `clock_gettime` was a syscall plus an
+- **The dev workstation's TSC was dead** (fixed 2026-08-16, see below). The
+  kernel marked it unstable 2.1s into boot ("most likely due to broken BIOS")
+  and fell back to HPET, which is not in the vDSO — so every `clock_gettime` was a syscall plus an
   MMIO read. Measured **1,213.8 ns/call against 23.8 ns on dell-33**, 51×.
   Anything timed on this box before that date carries an unknown handicap.
-- **The Dells are dual-socket** (2× Xeon E5-2667 v4) against rimini's
+- **The Dells are dual-socket** (2× Xeon E5-2667 v4) against the dev workstation's
   single-socket Ryzen, so a contended atomic behaves differently on each. Neither
   box is a neutral reference for the other.
 
@@ -1469,7 +1469,7 @@ build doing the work", and it cost one `du`.
 
 ### Follow-up on restored hardware (2026-08-16)
 
-`tsc=nowatchdog` on rimini's kernel cmdline restored the TSC: `clock_gettime`
+`tsc=nowatchdog` on the dev workstation's kernel cmdline restored the TSC: `clock_gettime`
 went **1,213.8 ns → 19.6 ns**, and the kernel no longer condemns the TSC at all
 (the watchdog was comparing it against a flaky HPET; `constant_tsc` and
 `nonstop_tsc` are both present, so the hardware was never the problem).
@@ -1483,13 +1483,13 @@ Re-measuring on the repaired box corrects an attribution made above:
 | leaking + error-mapping fix, TSC | **815** | 98.9 MB | 253 |
 
 **The clock repair did not move `acks=1` at all.** That path is not clock-bound,
-it is fsync-bound: rimini syncs at 7.4 MB/s (~1,810 fsync/s) against dell-32's
+it is fsync-bound: the workstation syncs at 7.4 MB/s (~1,810 fsync/s) against dell-32's
 29.5 MB/s (~7,194/s), and their `acks=1` numbers — 12,582 and 16,519 — line up
 with that ordering, not with CPU or clock. So the earlier line blaming HPET for
 the "17× vs 2.1×" spread was wrong: that spread is a machine difference, mostly
 storage. HPET inflated *absolute* numbers on this box; it did not manufacture the
 ratio. `acks=0`, which does not wait for durability, does follow the CPU —
-rimini now does **138,556 msg/s** against dell-32's 94,800.
+the workstation now does **138,556 msg/s** against dell-32's 94,800.
 
 The third row is the useful one. That build leaks reservations *and* carries the
 error-mapping fix, so its rejections now reach the client, which retries with
