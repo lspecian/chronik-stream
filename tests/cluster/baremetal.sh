@@ -62,15 +62,31 @@ deploy() {
       local p=0
       for peer in "${HOSTS[@]}"; do
         p=$((p + 1))
-        # `REPL_NET=1` puts inter-broker traffic on the 10 GbE fabric while
-        # clients keep reaching the brokers on the 1 GbE management address.
+        # ⛔ `REPL_NET=1` DOES NOT WORK against the broker as it stands, and the
+        # reason is worth keeping.
         #
-        # The split works because a follower fetches from `[[peers]].kafka`,
-        # which is a different config field from the `[advertise].kafka` that
-        # clients receive in metadata. It is worth doing because replication is
-        # the larger half of a leader's traffic: at RF=3 the leader sends every
-        # record twice more than it received it, so its egress is 2x its
-        # ingress and both were sharing one 1 GbE port.
+        # The intent was to put inter-broker traffic on the 10 GbE fabric while
+        # clients kept reaching the brokers on the 1 GbE address — worth doing,
+        # because replication is the larger half of a leader's traffic: at RF=3
+        # a leader sends every record twice more than it received it, so its
+        # egress is 2x its ingress and both share one port.
+        #
+        # It assumed `[[peers]].kafka` (what a follower fetches from) and
+        # `[advertise].kafka` (what clients are told) were independent. They are
+        # not. `cluster/broker_registration.rs` builds the broker list published
+        # in Metadata responses from `peers[].kafka`, so setting this makes the
+        # cluster advertise 172.16.10.x to *clients* as well:
+        #
+        #     $ kcat -L -b 192.168.1.31:9092
+        #      broker 1 at 172.16.10.31:9092 (controller)
+        #      broker 2 at 172.16.10.32:9092
+        #      broker 3 at 172.16.10.33:9092
+        #
+        # A client with no route to that subnet then hangs after bootstrap —
+        # observed as `chronik-bench` running for 25 minutes on a `-d 30s` job.
+        # `[advertise].kafka` is documented as "what clients connect to" and is
+        # not used for this. Fixing that is the prerequisite for a
+        # replication-only fabric; see docs/ROADMAP_REPLICATION.md.
         local paddr="$peer"
         if [ "${REPL_NET:-0}" = "1" ]; then
           paddr="172.16.10.${peer##*.}"

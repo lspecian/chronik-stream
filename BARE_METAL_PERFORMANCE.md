@@ -390,3 +390,40 @@ calls/sec per FD, ~100 dead FDs per node).
 
 **Fix**: `Ok(None) => continue` became `Ok(None) => break` in both the TCP and
 TLS connection handlers.
+
+---
+
+## The 10 GbE fabric: configured, and blocked by RP-10
+
+The three Dells each have two 10 G ports. They were cabled and negotiating at
+10000 Mbit/s but had no addresses, so nothing used them. Now addressed
+(`172.16.10.31/32/33` on `eno1`, via `/etc/netplan/60-10gbe.yaml` rather than an
+edit to the cloud-init file) and measured with `iperf3` at **9.14 Gbit/s**.
+Kubernetes is untouched: `eno3` keeps the `192.168.1.x` addresses Calico and the
+Thunderbird cluster are bound to.
+
+It is worth using. With replication on the same 1 GbE port as client traffic, a
+leader's link runs at **690–693 Mbit/s — 69% of line rate** at `acks=0` and
+`acks=1` (measured below), and RF=3 means a leader's egress is twice its
+ingress. Moving that off the client path is the single biggest lever left on
+this hardware.
+
+**It cannot be configured today.** `[[peers]].kafka` and `[advertise].kafka` look
+independent but are not: the broker list in Metadata responses is built from the
+peers list, so pointing peers at the 10 G subnet advertises it to *clients*, who
+then cannot route to it. Recorded as RP-10 in `docs/ROADMAP_REPLICATION.md`.
+
+### Baseline for the comparison, once RP-10 is fixed
+
+Replication on 1 GbE, 256 B, RF=3, `min_insync_replicas=2`, median of 2 runs,
+client on a separate machine:
+
+| acks | throughput | p99 | node-1 NIC peak |
+|---|---:|---:|---:|
+| 0 | 104,937 msg/s | 8.52 ms | **693 Mbit/s — 69% of link** |
+| 1 | 21,802 msg/s | 6.94 ms | **690 Mbit/s — 69%** |
+| all | 11,499 msg/s | 8.99 ms | 54 Mbit/s — 5% |
+
+`acks=0` and `acks=1` are pressed against the link; `acks=all` is not, which is
+the same split Open Question 1 found and is why the 10 G is expected to help the
+first two and do little for the third.

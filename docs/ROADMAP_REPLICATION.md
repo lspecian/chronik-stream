@@ -16,6 +16,7 @@
 | RP-8 | `acks=all` latency (#36) | `TESTED` | — | Three waits removed from the write path: new topic 7,000ms → 23ms, steady state 505ms → 17ms. The reported "duplication" was a client retry after a timeout |
 | RP-4 | Delete the push stack | `TESTED` | — | Data push path deleted: mode switch, produce fan-out, LeaderElector and the election machinery. Metadata keeps the transport (OQ2). One mechanism |
 | RP-9 | `acks=all` round-trip throughput | `TESTED` | — | Every fetch re-read and re-parsed the whole active WAL segment from byte zero. Fixed with a durable-gated tail cache and a sparse offset index: ~1,400 → **6,197 msg/s**, now 1.3× `acks=1` rather than 4–7×, and stable across a run. Three bugs fell out, one of them **data loss on failover** (divergence 7/10 → 10/10) |
+| RP-10 | `[advertise].kafka` never reaches clients | ⛔ `OPEN` | — | The broker list in Metadata is built from `[[peers]].kafka`, so `[advertise]` is unused and a separate replication fabric cannot be configured. Blocks putting replication on the 10 GbE link |
 
 ---
 
@@ -1278,6 +1279,58 @@ contention without any replication in the way.
 dominated it — a read cost that grew with the segment, a leader advertising
 offsets it could not serve, and a harness that could not reproduce its own
 numbers — are all fixed.
+
+---
+
+## RP-10: `[advertise].kafka` never reaches clients — `OPEN` (found 2026-08-15)
+
+The config has two distinct fields for a broker's Kafka address:
+`[advertise].kafka`, documented as "what clients connect to", and
+`[[peers]].kafka`, which is what a follower fetches from. They are not
+independent. `cluster/broker_registration.rs` builds the broker list published
+in **Metadata responses** from the peers list:
+
+```rust
+for peer in &init_config.cluster_config.peers {
+    let (host, port) = parse_kafka_address(&peer.kafka);
+    let broker_metadata = create_broker_metadata(peer.id, host, port);
+```
+
+So `[advertise].kafka` is not used for the cluster's broker list at all, and a
+client is handed whatever `[[peers]]` contains.
+
+Found while trying to put replication on a 10 GbE fabric and leave clients on
+1 GbE — which the two-field config appears to support, and which is worth doing:
+at RF=3 a leader's egress is twice its ingress, and today both share one port
+(measured at 690–693 Mbit/s of a 1 GbE link at `acks=0` and `acks=1`).
+
+Pointing `[[peers]]` at the 10 G subnet made the cluster advertise it to clients:
+
+```
+$ kcat -L -b 192.168.1.31:9092
+ broker 1 at 172.16.10.31:9092 (controller)
+ broker 2 at 172.16.10.32:9092
+ broker 3 at 172.16.10.33:9092
+```
+
+The load generator has no route to that subnet, so every client hung after
+bootstrap — seen as `chronik-bench` running 25 minutes on a `-d 30s` job.
+
+**The fix is not a one-liner**, which is why this is a roadmap item rather than a
+patch. Each node knows its *own* advertise address but the `[[peers]]` list
+carries no advertise field for the others, so a node cannot register its peers
+under addresses it has never been told. Two shapes work:
+
+1. Each node registers **only itself**, using its own `[advertise].kafka`, and
+   the registration reaches the others through metadata replication. Closest to
+   how Kafka does it, and it makes `[advertise]` mean what it says.
+2. Add an explicit per-peer advertise field to the config, keeping bulk
+   registration. Simpler, but it duplicates in config what the cluster already
+   knows about itself.
+
+Until then a separate replication fabric is not configurable, and
+`tests/cluster/baremetal.sh`'s `REPL_NET=1` is documented as non-working rather
+than removed, so the next person does not rediscover it the same way.
 
 ---
 
