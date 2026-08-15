@@ -17,6 +17,7 @@
 | RP-4 | Delete the push stack | `TESTED` | — | Data push path deleted: mode switch, produce fan-out, LeaderElector and the election machinery. Metadata keeps the transport (OQ2). One mechanism |
 | RP-9 | `acks=all` round-trip throughput | `TESTED` | — | Every fetch re-read and re-parsed the whole active WAL segment from byte zero. Fixed with a durable-gated tail cache and a sparse offset index: ~1,400 → **6,197 msg/s**, now 1.3× `acks=1` rather than 4–7×, and stable across a run. Three bugs fell out, one of them **data loss on failover** (divergence 7/10 → 10/10) |
 | RP-10 | Replication cannot leave the client network | `TESTED` | — | `[[peers]].kafka` served both the client-facing Metadata list and the follower fetch path, so a dedicated fabric was unconfigurable. Added a per-peer `replication` address: `acks=1` **+31%** (21,802 → 28,587 msg/s), p99 −29%, client link 690 → 46 Mbit/s |
+| RP-11 | **17× produce regression shipped in v2.10.8** | ⛔ `OPEN` | — | `acks=1` single-node fell 186,841 → 11,155 msg/s at `e8547ca` (#21, the MemoryReservation RAII guard) and every release since carries it, including v2.11.0. Not replication — one node. Reverting restores it; the micro-mechanism is unresolved |
 
 ---
 
@@ -1364,6 +1365,99 @@ Gates: 1,693 unit tests; conformance 600/600; divergence 5/5; `acks=all` latency
 14 ms to a new topic, 13 ms steady.
 
 ---
+## RP-11: a 17× produce regression, shipped in v2.10.8 — `OPEN` (found 2026-08-15)
+
+**`acks=1` single-node produce throughput fell 17× between v2.10.7 and v2.10.8,
+and every release since carries it — including v2.11.0 and the v2.10.10 running
+on the Thunderbird cluster.** It has nothing to do with replication: this is one
+node, no peers, no followers.
+
+| | acks=1 msg/s | p50 |
+|---|---:|---:|
+| v2.10.7 | **186,841** | 261 µs |
+| v2.10.8 | **11,155** | 4,315 µs |
+
+`chronik-bench`, 64 producers, 256 B, 3 partitions, single node. Throughput is
+concurrency ÷ latency, so the 17× throughput and the 17× latency are one fact.
+
+### How it was found
+
+Not by reading code — by running the old binary. Every cheap explanation was
+eliminated by measurement first: WAL profile (byte-identical between versions),
+hot text and vector indexing (env-disabled: no change), the RP-9 tail cache
+(env-disabled: no change), premature acknowledgement (crash-after-ack: both
+builds 20,000/20,000), `spawn_blocking` and io_uring (identical), and CPU
+saturation — the *slow* build uses **less** CPU (122% vs 212%) for 17× less work.
+It is waiting, not computing.
+
+Then a bisect over release tags:
+
+```
+v2.5.0    204,939  FAST      v2.10.5   187,292  FAST
+v2.7.4    197,867  FAST      v2.10.7   186,841  FAST
+v2.9.0    185,317  FAST      v2.10.8    11,155  SLOW  ←
+v2.10.1   186,482  FAST      v2.10.9    11,173  SLOW
+                             v2.11.0    11,065  SLOW
+                             HEAD       11,989  SLOW
+```
+
+v2.10.7 → v2.10.8 is two commits, one of them a release chore. The other is
+**`e8547ca` — "fix(produce): release in-flight memory reservation on all exit
+paths (#21)"**, which replaced an explicit `fetch_sub` in `produce_to_partition`
+with a `MemoryReservation` RAII guard.
+
+### Proof it is causal
+
+Reverting `e8547ca` on top of v2.10.8: **187,880 msg/s, p50 261 µs.** And on
+HEAD, removing the guard restores it, reproducibly:
+
+```
+round 1:  no-guard=199,351   with-guard=11,834
+round 2:  round 199,072      with-guard=11,898
+```
+
+### What the mechanism is NOT
+
+Three hypotheses, each tested and each wrong:
+
+- **Not the memory limit.** No "Memory limit exceeded" in the logs, 0 client
+  failures, and the arithmetic says in-flight bytes are ~12 KB against a 32 MB
+  ceiling in both the fast and slow cases.
+- **Not the `Arc`.** The guard's `Arc<AtomicU64>` puts the strong count in the
+  same cache line as the counter, which looked like textbook false sharing
+  against the CAS reserve loop. Rewriting the guard to borrow (`&'a AtomicU64`,
+  no clone, no refcount traffic) left it at **11,923**.
+- **Not the presence of a `Drop` type across `.await` points.** A guard whose
+  `Drop` body is empty measures **201,803 msg/s** — fast. So it is the
+  `fetch_sub` executing in the destructor, not the destructor existing.
+
+### What is unresolved
+
+An explicit `drop(_mem_reservation)` at the exact line the pre-#21 code released
+at measures **11,834** — slow — while an inline `fetch_sub` at that same line
+measures **199,351** — fast. Same atomic, same source position, opposite result.
+The `drop()` is at function scope and reachable (verified). I could not
+reconcile this without a profiler, and would be guessing to name a cause.
+
+### What to do
+
+The fix has to be leak-free *and* fast, and the two known-good shapes are:
+
+1. Release explicitly on the success path and on each error path — what #21 set
+   out to avoid, because there are 17 `?` returns to keep in sync.
+2. Split the function: reserve in a thin outer wrapper, `await` an inner
+   function that holds no guard, release unconditionally on the way out. Leak-free
+   on every path including errors, and no `Drop` value in the hot inner frame.
+
+(2) is the better shape. It was not attempted here because it means restructuring
+a ~700-line function, which deserves its own change with the gates run against it
+rather than being appended to a measurement session.
+
+**Do not treat any published produce number from v2.10.8 onward as
+representative until this is fixed.**
+
+---
+
 ## Open Questions
 
 Answer before the phase that depends on them.
