@@ -45,6 +45,51 @@ regression.**
 Measured in the old number's own regime, the gap is mostly gone and the rest is
 accounted for:
 
+### Saturation sweep: where is the ceiling?
+
+36 ingestors, 8 k6 runners, 100 messages per batch, 256 B, `acks=all`, constant
+VUs for 3 minutes per step (constant, not a ramp — a ramp reports one average
+across every load level it passed through).
+
+| VUs | msg/s | batch latency | errors | broker CPU |
+|---:|---:|---:|---:|---|
+| 1,000 | 8,500 | 11.28 s | 0 | |
+| 3,000 | 23,741 | 12.04 s | 0 | |
+| 6,000 | 42,396 | 13.36 s | 0 | |
+| 12,000 | 82,643 | 13.62 s | 0 | 238m / 265m / 256m |
+| 24,000 | **160,329** | 14.21 s | 0 | |
+| 48,000 | — | — | — | **k6 runners OOMKilled** |
+
+**No saturation point was found.** Throughput is linear in VUs across a 24×
+range (8,500 → 160,329) while latency rises only 26% (11.3 → 14.2 s), and not
+one message errored at any level. The run ended because the *load generator* ran
+out of memory at 6,000 VUs per runner, not because the cluster did.
+
+At 12,000 VUs each broker was using **~0.25 of a core** — of 32 available. At
+24,000 VUs the nodes were at 10–29% CPU. Chronik was never the constraint at any
+point on this curve.
+
+Two things the sweep had to fix before it measured anything real:
+
+- **k6 was the bottleneck, not Chronik.** Building each 256-byte payload
+  character-by-character in JS costs ~25,600 `charAt`/`random` calls per request;
+  the runners burned 2–3 cores each while the brokers sat at 148–431 millicores.
+  Precomputing a pool of 64 random payloads at init dropped the runners to ~500
+  millicores. (A pool, not one constant string — the ingestor produces with
+  `compression.type=snappy`, and identical payloads would compress to nothing
+  and inflate the result into fiction.)
+- **The flat ~12 s latency is queueing in the ingestor pipeline, not the
+  broker.** It follows Little's Law exactly: at 1,000 VUs, ~100,800 records in
+  flight ÷ 8,500 msg/s ≈ 11.9 s. Latency barely moves as throughput rises 19×,
+  which is the signature of a fixed pipeline delay rather than a saturating
+  resource.
+
+So the honest ceiling statement is: **≥160,329 msg/s at `acks=all` with zero
+errors, and that is a floor, not a limit.** What this harness measures is the
+HTTP-ingestor pipeline. The direct-to-Kafka figures earlier in this file
+(429,368 msg/s at `acks=0`, saturating the client's 1 GbE) are the better guide
+to what the broker itself does.
+
 ### The old test, re-run on the current build
 
 Rather than argue from a different benchmark, the original harness was run again:
@@ -53,20 +98,33 @@ settings (`batch.num.messages=10000`, `linger.ms=5`, **snappy**, `acks=all`),
 the same k6 max-load ramp to 5,000 VUs, 256-byte payloads. The only difference
 from the original is that replication now actually happens.
 
+The original spec, recovered from `390e4ab`, is exact: **12 ingestors, 8 k6
+runners, 100 messages per batch, `acks=all`**, stages 30s→200, 1m→1000, 2m→3000,
+5m→5000, 3m→8000, 2m→3000, 1m→0 VUs. Reproduced to the parameter:
+
 | | msg/s | |
 |---|---:|---|
-| original claim, `acks=all` | **837,284** | `d0a198c`, "12 ingestors, 256B, acks=all", 245 MB/s |
-| `tests/k8s-perf/REPORT.md`, the harness's own report | ~5,400 sustained, ~9,824 aggregate | 8,000 VUs, 1 KB |
-| **this build, same harness, 2026-08-15** | **7,085** | 4,111,750 messages, **0 errors**, 5,004 VUs, 256 B |
+| original claim, `acks=all` | **837,284** | 8 runners × ~104,660, 245 MB/s, median 282 ms |
+| **this build, that exact config** | **25,647** | 22,681,100 messages, **0 errors**, 8 runners |
+| this build, 36 ingestors, 24,000 VUs | **160,329** | 0 errors, and still not saturated |
 
-**Today's number lands between the two figures the harness itself reported.** It
-is the 837,284 that cannot be reconciled — it is ~100× above what this stack
-documents anywhere else in the repo, including its own report file written from
-the same runs. Whatever produced it, this harness does not.
+⚠️ A first attempt at this comparison reported **7,085 msg/s** and was wrong: it
+used the repo's `max-load-test.js`, which batches **10** messages per request,
+not 100, with 6 runners instead of 8 and a peak of 5,000 VUs instead of 8,000.
+Correcting the batch size alone moved it 7,085 → 25,647. That is a caution about
+this whole comparison: the answer is extremely sensitive to harness parameters,
+and "same harness" is not the same as "same configuration".
 
-So there is no throughput regression to explain. The current build, with
-replication genuinely running, performs normally for the setup that number was
-attributed to.
+**The gap to 837,284 is still unexplained, but it is not the broker.** At every
+load level measured the brokers ran at well under one core of the 32 available,
+and throughput scaled linearly until the load generator itself died. To reach
+837,284 through this pipeline at the measured ~6.7 msg/s per VU would need
+~125,000 VUs; the original reports achieving it at 8,000, which is ~15× more
+work per VU than anything reproducible here.
+
+What can be said with evidence: there is no throughput regression attributable to
+this build. Chronik is not the limiting component anywhere on the measured
+curve.
 
 Replication was verified during the run, not assumed: a probe record at
 `acks=all` appeared in all three nodes' WALs before the load started, and after
