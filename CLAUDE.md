@@ -826,39 +826,21 @@ s3://{bucket}/{prefix}/snapshots/{topic}/{partition}/{snapshot_id}.snap
 #### Example Usage
 
 ```bash
-# Start Raft cluster with snapshots enabled (default)
-cargo run --bin chronik-server -- \
-  --node-id 1 \
-  --advertised-addr localhost \
-  --kafka-port 9092 \
-  raft-cluster \
-  --raft-addr 0.0.0.0:9192 \
-  --peers "2@localhost:9193,3@localhost:9194" \
-  --bootstrap
+# Start a cluster node with snapshots enabled (default).
+# NOTE: the `raft-cluster` subcommand and the `--node-id` / `--advertised-addr`
+# top-level flags were REMOVED in v2.2.0. Cluster mode is `start --config`.
+./target/release/chronik-server start --config cluster-node1.toml
 
 # Disable snapshots for testing
-CHRONIK_SNAPSHOT_ENABLED=false cargo run --bin chronik-server -- \
-  --node-id 1 \
-  --advertised-addr localhost \
-  --kafka-port 9092 \
-  raft-cluster \
-  --raft-addr 0.0.0.0:9192 \
-  --peers "2@localhost:9193,3@localhost:9194" \
-  --bootstrap
+CHRONIK_SNAPSHOT_ENABLED=false \
+  ./target/release/chronik-server start --config cluster-node1.toml
 
 # Custom snapshot configuration
 CHRONIK_SNAPSHOT_LOG_THRESHOLD=50000 \
 CHRONIK_SNAPSHOT_TIME_THRESHOLD_SECS=7200 \
 CHRONIK_SNAPSHOT_COMPRESSION=zstd \
 CHRONIK_SNAPSHOT_RETENTION_COUNT=5 \
-cargo run --bin chronik-server -- \
-  --node-id 1 \
-  --advertised-addr localhost \
-  --kafka-port 9092 \
-  raft-cluster \
-  --raft-addr 0.0.0.0:9192 \
-  --peers "2@localhost:9193,3@localhost:9194" \
-  --bootstrap
+  ./target/release/chronik-server start --config cluster-node1.toml
 ```
 
 #### Monitoring
@@ -1103,7 +1085,7 @@ Producer → WAL (fsync) → Response  (~2-10ms)
 
 Key environment variables:
 - `RUST_LOG` - Log level (debug, info, warn, error)
-- `CHRONIK_KAFKA_PORT` - Kafka port (default: 9092)
+- `CHRONIK_KAFKA_PORT` / `--kafka-port` - Kafka listen port, single-node mode only (default: 9092). In cluster mode the port comes from `[node.addresses] kafka` in the config file and this is ignored.
 - `CHRONIK_BIND_ADDR` - Bind address (default: 0.0.0.0)
 - `CHRONIK_ADVERTISED_ADDR` - **CRITICAL** for Docker/remote access
 - `CHRONIK_ADVERTISED_PORT` - Port advertised to clients

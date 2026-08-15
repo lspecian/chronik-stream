@@ -78,6 +78,10 @@ use chronik_config::{ClusterConfig, NodeConfig};
 use chronik_columnar::ColumnarQueryEngine;
 use serde_json;
 
+/// Default Kafka listen port, used when neither `--kafka-port` nor a cluster
+/// config file says otherwise.
+const DEFAULT_KAFKA_PORT: u16 = 9092;
+
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "chronik-server",
@@ -178,6 +182,11 @@ enum Commands {
         /// Advertised address for clients (overrides config)
         #[arg(long, env = "CHRONIK_ADVERTISE")]
         advertise: Option<String>,
+
+        /// Kafka listen port (single-node mode only; in cluster mode the port
+        /// comes from `[node.addresses] kafka` in the config file).
+        #[arg(long, env = "CHRONIK_KAFKA_PORT", default_value_t = DEFAULT_KAFKA_PORT)]
+        kafka_port: u16,
 
         /// Node ID (overrides config file)
         #[arg(long, env = "CHRONIK_NODE_ID")]
@@ -1020,10 +1029,15 @@ async fn main() -> Result<()> {
         cfg!(feature = "dynamic-config")
     );
 
-    // Show deprecation warnings for old environment variables
-    if std::env::var("CHRONIK_KAFKA_PORT").is_ok() {
-        warn!("CHRONIK_KAFKA_PORT is deprecated. Use cluster config file instead.");
-    }
+    // Show deprecation warnings for old environment variables.
+    //
+    // CHRONIK_KAFKA_PORT is NOT among them: it is the only way to move the Kafka
+    // port in single-node mode, where the port used to be hardcoded to 9092 and
+    // the variable was warned about and then ignored. That silently broke any
+    // deployment that set it — including chronik-operator, which passes the CRD's
+    // `spec.kafka_port` through this exact variable. It is now honoured in
+    // single-node mode; cluster mode warns below, where the config file is
+    // authoritative and the variable really would be ignored.
     if std::env::var("CHRONIK_REPLICATION_FOLLOWERS").is_ok() {
         warn!("CHRONIK_REPLICATION_FOLLOWERS is deprecated. WAL replication now auto-discovers from cluster config file.");
         warn!("If using cluster config file (recommended), remove CHRONIK_REPLICATION_FOLLOWERS from environment.");
@@ -1049,7 +1063,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
 
-        Commands::Start { config, bind, advertise, node_id, disable_hot_text } => {
+        Commands::Start { config, bind, advertise, node_id, disable_hot_text, kafka_port } => {
             // HP-1.6: CLI flag translates to the env var the builder reads.
             // Setting here (before any builder code runs) keeps the env-var
             // path authoritative and avoids threading another arg through
@@ -1057,7 +1071,7 @@ async fn main() -> Result<()> {
             if *disable_hot_text {
                 std::env::set_var("CHRONIK_HOT_TEXT_ENABLED", "false");
             }
-            run_start_command(&cli, config.clone(), bind.clone(), advertise.clone(), *node_id).await
+            run_start_command(&cli, config.clone(), bind.clone(), advertise.clone(), *node_id, *kafka_port).await
         }
 
         Commands::Cluster { action } => {
@@ -1077,6 +1091,7 @@ async fn run_start_command(
     bind: String,
     advertise: Option<String>,
     node_id_override: Option<u64>,
+    kafka_port: u16,
 ) -> Result<()> {
     // Load cluster config (from file or env)
     let cluster_config = if let Some(path) = config_path {
@@ -1086,11 +1101,33 @@ async fn run_start_command(
     };
 
     if let Some(config) = cluster_config {
+        // In cluster mode every address comes from the config file, so a port
+        // given on the command line or in CHRONIK_KAFKA_PORT is ignored. Warn
+        // only when the two actually DISAGREE: chronik-operator legitimately
+        // sets both from the same CRD field, and a warning that fires when they
+        // agree is noise that trains people to ignore it.
+        if kafka_port != DEFAULT_KAFKA_PORT {
+            let configured = config
+                .bind
+                .as_ref()
+                .map(|b| b.kafka.as_str())
+                .and_then(|a| a.rsplit(':').next())
+                .and_then(|p| p.parse::<u16>().ok());
+            if configured.is_some_and(|c| c != kafka_port) {
+                warn!(
+                    "--kafka-port/CHRONIK_KAFKA_PORT is {} but the config file binds Kafka on {}. \
+                     The config file wins in cluster mode — set the port in `[node.addresses] kafka` \
+                     instead, or clients will be sent to a port nothing is listening on.",
+                    kafka_port,
+                    configured.unwrap()
+                );
+            }
+        }
         info!("Starting in CLUSTER mode (node_id={})", config.node_id);
         run_cluster_mode(cli, config, bind, advertise).await
     } else {
         info!("Starting in SINGLE-NODE mode");
-        run_single_node_mode(cli, bind, advertise).await
+        run_single_node_mode(cli, bind, advertise, kafka_port).await
     }
 }
 
@@ -1409,11 +1446,15 @@ async fn run_single_node_mode(
     cli: &Cli,
     bind: String,
     advertise: Option<String>,
+    kafka_port: u16,
 ) -> Result<()> {
+    // The listen port defaults to `kafka_port`, so an --advertise without an
+    // explicit port advertises what we actually bind. Advertising a port we are
+    // not listening on sends clients somewhere nothing is accepting.
     let (advertised_host, advertised_port) = parse_advertise_addr(
         advertise.as_deref(),
         &bind,
-        9092, // Default Kafka port
+        kafka_port,
     )?;
 
     // Parse object store configuration from environment (for Tier 3: Tantivy archives)
@@ -1454,7 +1495,7 @@ async fn run_single_node_mode(
         None,
     ).await?;
 
-    let kafka_addr = format!("{}:9092", bind);
+    let kafka_addr = format!("{}:{}", bind, kafka_port);
     info!("Kafka protocol listening on {}", kafka_addr);
     info!("Metrics endpoint available at http://{}:13092/metrics", bind);
 
@@ -2291,3 +2332,50 @@ async fn handle_compaction_command(cli: &Cli, action: CompactAction) -> Result<(
     Ok(())
 }
 
+
+#[cfg(test)]
+mod port_tests {
+    use super::*;
+
+    // Regression: the single-node Kafka port must follow --kafka-port /
+    // CHRONIK_KAFKA_PORT. It used to be `format!("{}:9092", bind)` — hardcoded —
+    // while CHRONIK_KAFKA_PORT was warned about and then ignored, so any
+    // deployment that set it silently listened on the wrong port. That includes
+    // chronik-operator, which passes the CRD's `spec.kafka_port` through that
+    // variable and points the Service's target_port at it.
+    #[test]
+    fn advertised_port_follows_the_listen_port() {
+        // No --advertise: whatever we bind is what we advertise. Advertising a
+        // port we are not listening on sends clients somewhere nothing accepts.
+        for port in [9092u16, 19095, 1] {
+            let (_host, advertised) =
+                parse_advertise_addr(None, "127.0.0.1", port).expect("parses");
+            assert_eq!(
+                advertised, port as i32,
+                "advertised port must match the listen port"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_advertise_port_still_wins() {
+        // An operator advertising through a load balancer or NodePort needs the
+        // advertised port to differ from the listen port on purpose.
+        let (host, advertised) =
+            parse_advertise_addr(Some("kafka.example.com:31092"), "0.0.0.0", 9092).expect("parses");
+        assert_eq!(host, "kafka.example.com");
+        assert_eq!(advertised, 31092);
+
+        // A bare host with no port inherits the listen port, not a hardcoded 9092.
+        let (host, advertised) =
+            parse_advertise_addr(Some("kafka.example.com"), "0.0.0.0", 19095).expect("parses");
+        assert_eq!(host, "kafka.example.com");
+        assert_eq!(advertised, 19095, "bare host must inherit the real listen port");
+    }
+
+    #[test]
+    fn default_kafka_port_is_unchanged() {
+        // Existing deployments that set nothing must keep landing on 9092.
+        assert_eq!(DEFAULT_KAFKA_PORT, 9092);
+    }
+}

@@ -39,9 +39,9 @@ say() { printf '%s\n' "$*"; }
 SINGLE_DIR="$DIR/data/perf-single"
 single_up() {
   rm -rf "$SINGLE_DIR"; mkdir -p "$SINGLE_DIR" "$LOGS"
-  # Default Kafka port: `start` has no port flag and CHRONIK_KAFKA_PORT is
-  # deprecated, so the single-node shape uses 9092 while the cluster shape uses
-  # the shifted ports. They never run at the same time.
+  # Single-node uses 9092 while the cluster shape uses the shifted ports; they
+  # never run at the same time. `--kafka-port` exists since 2026-08-16 if these
+  # ever need to overlap.
   CHRONIK_UNIFIED_API_PORT=6492 CHRONIK_ADVERTISED_ADDR=localhost \
     RUST_LOG=warn "$BIN" start --data-dir "$SINGLE_DIR" > "$LOGS/perf-single.log" 2>&1 &
   echo $! > "$LOGS/perf-single.pid"
