@@ -90,6 +90,14 @@ deploy() {
 }
 
 up() {
+  # ⏱ THIS TAKES ~6.5 MINUTES AND IS NOT HUNG. `down` waits for each host's
+  # listener to disappear and this waits for each to appear, both with 60s
+  # ceilings, plus a 15s settle — and `bench` calls `up` once per run, so a
+  # 3-acks x 3-run matrix spends about an hour here before the last row lands.
+  # Nothing prints between the "started" lines and the first result row. Judging
+  # it dead at the five-minute mark and killing it wastes the whole run; it was
+  # misdiagnosed exactly that way on 2026-08-16.
+  #
   # Stop whatever is already there first. `bench` calls `up` once per run, and
   # without this the second run starts a broker on a host that still has one —
   # the newcomer then dies on the metrics port rather than the Kafka port, so the
