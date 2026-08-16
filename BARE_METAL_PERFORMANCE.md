@@ -524,9 +524,23 @@ the blocking `crossbeam::recv_timeout` inside `tokio_uring`'s async runtime,
 which spins on `sched_yield`: 200,507 yields per 12 s against 2,014 on the
 standard path.
 
-**If it is revisited**, the design has to change with it: submit an entire
-group-commit batch as one linked write→fsync submission, one ring per core rather
-than one global thread, registered buffers to remove the copy, and no channel
-round-trip on the hot path. That is worth doing when the workload becomes
-I/O-bound — cloud block storage at 125–250 MB/s rather than this 1.4 GB/s NVMe —
-and not before.
+**The obvious defects were fixed and measured, and they are not the cause.** The
+blocking receive is now async (`sched_yield` fell from 200,507 per 12s to 2,099),
+writes run concurrently across partitions instead of one at a time, and `Bytes`
+is submitted through an `IoBuf` impl instead of a `to_vec` copy. Throughput did
+not move: 150,493 msg/s against 233,319 standard at 1024 producers; 2,597 against
+3,309 at 8.
+
+The remaining gap is architectural. `tokio-uring` submits one operation per
+`io_uring_enter` — 54,035 calls for ~31,000 messages — so it delivers no syscall
+amortisation, while still paying a cross-thread channel round-trip per operation
+that standard I/O does not. Its API exposes no linked SQEs, no registered
+buffers, and no batched submission, so this cannot be fixed within the library.
+
+**A version that could win** would drop `tokio-uring` for the raw `io-uring`
+crate and hand-write the driver: an entire group-commit batch submitted as one
+linked write→fsync, one ring per core rather than one global thread, registered
+buffers, and no channel on the hot path. That is roughly 500-700 lines of new
+queue- and buffer-lifetime management on the durability path. Worth it when the
+workload is I/O-bound — cloud block storage at 125-250 MB/s rather than this
+1.4 GB/s NVMe — and not before.
