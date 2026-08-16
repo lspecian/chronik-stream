@@ -29,7 +29,11 @@ read -r -a HOSTS <<< "${NODES[0]}"
 BOOT=$(printf '%s:9092,' "${HOSTS[@]}"); BOOT=${BOOT%,}
 
 DURATION="${PERF_DURATION:-30s}"
-CONCURRENCY="${PERF_CONCURRENCY:-64}"
+# 64 producers under-loads a broker by roughly an order of magnitude: single-node
+# `acks=1` measures 13,582 msg/s at 64 and 228,874 at 1024, climbing near-linearly
+# in between. Every figure this harness produced at 64 was a point on that line,
+# not a ceiling.
+CONCURRENCY="${PERF_CONCURRENCY:-1024}"
 RUNS="${PERF_RUNS:-3}"
 SETTLE="${PERF_SETTLE:-20}"
 SIZES="${PERF_SIZES:-256 1024}"
@@ -86,10 +90,21 @@ deploy() {
 }
 
 up() {
+  # Stop whatever is already there first. `bench` calls `up` once per run, and
+  # without this the second run starts a broker on a host that still has one —
+  # the newcomer then dies on the metrics port rather than the Kafka port, so the
+  # symptom is a cluster that never forms while the Kafka port looks free.
+  down
+  sleep 2
   for host in "${HOSTS[@]}"; do
+    # `setsid` and `< /dev/null` are both load-bearing. With plain `nohup … &`
+    # the broker is still in the ssh session's process group and dies when the
+    # session closes — intermittently, so some hosts come up and others silently
+    # do not, and the cluster then waits forever for a quorum that will not form.
     sshq "$host" "rm -rf $REMOTE/data && mkdir -p $REMOTE/data && \
       cd $REMOTE && RUST_LOG=warn CHRONIK_UNIFIED_API_PORT=6092 \
-      nohup ./chronik-server start --config $REMOTE/node.toml > $REMOTE/node.log 2>&1 & echo started"
+      setsid nohup ./chronik-server start --config $REMOTE/node.toml \
+      > $REMOTE/node.log 2>&1 < /dev/null & echo started"
   done
   for host in "${HOSTS[@]}"; do
     for _ in $(seq 1 60); do
@@ -286,6 +301,10 @@ case "${1:-all}" in
   up)     up ;;
   down)   down ;;
   bench)  bench ;;
-  all)    deploy; bench; down ;;
+  # `up` was missing here, so `all` benchmarked against whatever happened to be
+  # left running from a previous invocation — or against a partially-formed
+  # cluster, which is what it did on 2026-08-16: one node up, two down, and the
+  # run hung waiting for a bootstrap that was never started.
+  all)    deploy; up; bench; down ;;
   *)      say "usage: $0 {deploy|up|bench|down|all}"; exit 1 ;;
 esac
