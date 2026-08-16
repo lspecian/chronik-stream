@@ -35,6 +35,12 @@ Zero client-reported failures for all three. Chronik is **2.5× Redpanda** and
 **4.6× Kafka** on throughput, and writes **4.4× more bytes per message** than
 Redpanda to get there.
 
+📌 **These Chronik numbers are from before the io_uring fix** and understate it by
+roughly 50% — see "Profiling the produce path" below, where disabling the io_uring
+WAL path took 1024-producer throughput from 152,851 to 228,874 msg/s. The
+comparison has not been re-run; when it is, Chronik's margin should widen
+substantially. Kafka and Redpanda are unaffected.
+
 ### Durability, verified rather than assumed
 
 The comparison only means anything if the acknowledgements are worth the same.
@@ -137,10 +143,14 @@ per profile, 1024 producers, `acks=1`:
 | ultra | 154,658 | 5.23 | 7.47 | 2009.6 |
 
 **No measurable difference — 0.7% spread across a 50× range of commit windows.**
-Under saturation the batch fills by *size* long before the timer expires, so the
-window never binds. The profile matters at low load, where it sets how long a
-lone record waits for company; it is not a throughput lever, and there is no
-throughput left on the table here.
+
+⚠️ This section first explained that away as "the batch fills by size at
+saturation; the profile matters at *low* load." That was asserted, then tested,
+and it is also wrong. At 8 producers, where no batch can fill: low=2.45 ms,
+medium=2.46 ms, high=2.45 ms p50 — a 25× range of windows, same answer. Nor did
+`CHRONIK_PRODUCE_PROFILE` move it (2.44 / 2.46 / 2.45 ms). The commit timer never
+binds at any load, because the floor was somewhere else entirely — see
+"Profiling the produce path" below.
 
 ⚠️ A first attempt at this sweep reported low=153,106 against medium=68,569 and
 high=68,516, which looked like a dramatic result and was an artifact: a
