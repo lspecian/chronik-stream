@@ -18,6 +18,7 @@
 | RP-9 | `acks=all` round-trip throughput | `TESTED` | — | Every fetch re-read and re-parsed the whole active WAL segment from byte zero. Fixed with a durable-gated tail cache and a sparse offset index: ~1,400 → **6,197 msg/s**, now 1.3× `acks=1` rather than 4–7×, and stable across a run. Three bugs fell out, one of them **data loss on failover** (divergence 7/10 → 10/10) |
 | RP-10 | Replication cannot leave the client network | `TESTED` | — | `[[peers]].kafka` served both the client-facing Metadata list and the follower fetch path, so a dedicated fabric was unconfigurable. Added a per-peer `replication` address: `acks=1` **+31%** (21,802 → 28,587 msg/s), p99 −29%, client link 690 → 46 Mbit/s |
 | RP-11 | **The "17× produce regression" was a benchmark reading a bug** | ✅ `RESOLVED` | — | Not a regression: pre-#21 leaked reservations pinned the memory counter and the broker REJECTED most produces instantly, which a rate counter cannot tell from serving them (61,625 msg/s claimed, 50 MB on disk; guarded: 16,519 msg/s, 301.7 MB). Found a real bug behind it — every non-transactional produce failure was returned to the client as SUCCESS |
+| RP-12 | **Cluster produce throughput is bimodal** | ⛔ `OPEN` | — | One run in 3-6 collapses to a tenth (~8,000 vs ~85,000 msg/s) on `acks=1` and `acks=all`, never on `acks=0` or single-node. Not formation (survives a 104s settle), not elections. Correlates with a 3-4x higher replica-fetch timeout rate. **Blocks merge** |
 
 ---
 
@@ -1452,6 +1453,78 @@ Current single-node ceilings, and the io_uring default that follows from them,
 are in `BARE_METAL_PERFORMANCE.md`.
 
 ---
+## RP-12: cluster produce throughput is bimodal — `OPEN` (found 2026-08-16)
+
+**One cluster run in three to six collapses to a tenth of its normal throughput,
+and it is not a measurement artefact.** This blocks merging the branch: it is an
+intermittency in the path the branch rebuilt.
+
+### The shape of it
+
+Three brokers on one host, RF=3, `min_insync_replicas=2`, 1024 producers, 256 B,
+30s, fresh cluster per run. `acks=1`:
+
+```
+run 1  76,020  ok      run 5  85,623  ok
+run 2   8,262  LOW     run 6  63,346  ok
+run 3  85,201  ok      run 7  84,481  ok
+run 4   8,517  LOW     run 8  86,149  ok
+```
+
+There is no middle: runs land at ~85,000 or ~8,000. `acks=all` does the same
+(41,434 · 40,686 · 6,277). **`acks=0` and every single-node shape never do it** —
+only the modes that wait on replication.
+
+### What it is not
+
+- **Not cluster formation.** The first hypothesis, and it is dead: a collapse
+  reproduces with a **104-second settle** (7,511 against ~89,000 on the other
+  five runs), eight times what `perf_matrix` allows. The cluster has ample time
+  to form.
+- **Not leader elections.** Election-related log lines are identical across good
+  and bad runs — 11 or 12 every time.
+- **Not a retry storm by volume.** Replica-fetch request counts barely move:
+  4,750 and 4,458 on the low runs against 4,267 and 4,066 on the good ones.
+
+### What correlates
+
+Replica fetches that exceed the 500 ms long-poll window, **3–4× more often**:
+
+| run | fetch reqs | fetch timeouts | rate |
+|---|---:|---:|---:|
+| LOW 8,262 | 4,750 | 203 | **4.27%** |
+| LOW 8,517 | 4,458 | 116 | **2.60%** |
+| ok 85,201 | 4,267 | 56 | 1.31% |
+| ok 86,149 | 4,066 | 46 | 1.13% |
+
+At 500 ms each, ~200 timeouts is ~100 seconds of cumulative stall across three
+nodes inside a 30-second run.
+
+On timeout, `fetch_handler.rs:1024` returns `vec![]` — an empty response — and
+the follower immediately re-fetches. Request volume staying flat while the
+timeout rate triples says the followers are not fetching *more*, they are being
+served *slower*, and the system settles into one of two stable states.
+
+### What is not yet established
+
+**Whether the timeouts cause the collapse or merely accompany it.** A leader slow
+for some other reason would produce exactly this signature. Deciding it means
+finding what `fetch_records` contends with on the produce path — whether a fetch
+stalled inside that 500 ms window holds something a producer needs.
+
+Two candidates worth eliminating first: the fetch path taking a lock the produce
+path also wants, and the tail cache missing under concurrent append so fetches
+fall back to the scan that RP-9 was supposed to remove from the hot path.
+
+### Reproduce
+
+`tests/cluster/bimodal_repro.sh` — 8 runs at `RUST_LOG=info`, preserving all three
+brokers' logs per run tagged ok/LOW, which is how the correlation above was
+found. Evidence from the run that produced this section is in
+`/tmp/outlier-evidence/`.
+
+---
+
 
 ## Open Questions
 
