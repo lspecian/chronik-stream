@@ -192,3 +192,50 @@ Neither Kafka nor Redpanda had tiered storage enabled in those runs, while
 Chronik produced its tier-2 artifact throughout. Chronik was doing strictly more
 work for the same numbers. A stricter comparison would either enable tiering on
 all three or disable indexing on Chronik.
+
+## Profiling the produce path: io_uring was the bottleneck
+
+`p50` sat at 5.26 ms and would not move for any configuration — commit window
+2 ms→100 ms, partitions 3→48, produce profile low-latency→high-throughput,
+object store on NVMe or tmpfs. A constant that survives every knob is structural.
+
+Nothing was saturated at 154k msg/s: broker at **1.4 of 16 cores**, system **75%
+idle**, disk at **14%** of bandwidth. So the producers were waiting, not queueing
+behind a busy resource. `strace -c` at 8 producers, 12 seconds:
+
+```
+80.87%  futex        280,559 calls (25,656 errors)
+ 9.38%  epoll_wait    77,510
+ 3.85%  write        384,824
+ 2.13%  sched_yield  200,507          ← ~93 per message
+ 0.45%  io_uring_enter 43,568
+```
+
+~130 futex and ~93 `sched_yield` per message is a spin-wait. `perf record` on the
+`sched_yield` tracepoint tied 123,073 of 123,095 samples to the io_uring path —
+the `wal-io_uring` thread runs `crossbeam::channel::recv_timeout`, a **blocking**
+call, inside `tokio_uring::start`'s async runtime, and crossbeam spins with
+`sched_yield` before parking.
+
+Toggling the path, interleaved median-of-3 with cooldowns, 1024 producers:
+
+| | msg/s | p50 | on disk |
+|---|---:|---:|---:|
+| io_uring (old default) | 152,851 | 5.30 ms | 1,985 MB |
+| **standard tokio file I/O** | **228,874** | **3.42 ms** | 2,969 MB |
+
+**+50% throughput, −35% latency.** At a single producer the gap is far larger:
+194 msg/s at 3.99 ms against **1,132 at 0.69 ms** — 5.8×.
+
+The fix is to honour configuration that already existed.
+`AsyncIoConfig::use_io_uring` has defaulted to `false` ("opt-in for now") the
+whole time; `GroupCommitWal` never read it, gating instead on the compile-time
+`async-io` feature, which **is** on by default. So every deployment ran the slow
+path while the config said otherwise, under a log line advertising *"✨ io_uring
+thread spawned for 10x faster WAL writes"*. `CHRONIK_WAL_IO_URING=true` opts back
+in, and now warns what it costs.
+
+One hypothesis was tested and wrong before the fix landed: the 1 ms
+`recv_timeout` looked like the obvious culprit, but dropping it to 50 µs changed
+p50 by nothing (2.45 ms either way). The cost is the blocking-call-in-async-runtime
+structure, not the poll period.

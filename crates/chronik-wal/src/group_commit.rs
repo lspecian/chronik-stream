@@ -132,6 +132,22 @@ pub struct GroupCommitConfig {
     /// Enable metrics collection
     pub enable_metrics: bool,
 
+    /// Route WAL writes through the io_uring thread instead of standard tokio
+    /// file I/O. **Off by default, and it should stay that way.** Measured on a
+    /// 16-thread Ryzen with NVMe, 1024 producers, `acks=1`, interleaved
+    /// median-of-3: io_uring ran 153,124 msg/s at 5.30 ms p50 against 228,886 at
+    /// 3.42 ms without it — 33% less throughput for 55% more latency. At a single
+    /// producer the gap is far worse: 194 msg/s / 3.99 ms against 1,132 / 0.69 ms.
+    ///
+    /// `AsyncIoConfig::use_io_uring` in config.rs has defaulted to false ("opt-in
+    /// for now") the whole time. `GroupCommitWal` never read it, gating instead on
+    /// the compile-time `async-io` feature, which IS on by default — so every
+    /// deployment has run the slower path while the config said otherwise, under a
+    /// log line advertising "10x faster WAL writes".
+    ///
+    /// Set `CHRONIK_WAL_IO_URING=true` to opt in and re-measure on your hardware.
+    pub use_io_uring: bool,
+
     /// Enable segment rotation (for S3 archival)
     pub enable_rotation: bool,
 
@@ -223,6 +239,17 @@ impl GroupCommitConfig {
         }
     }
 
+    /// Opt in to the io_uring write path. Off unless `CHRONIK_WAL_IO_URING` is
+    /// truthy — see [`GroupCommitConfig::use_io_uring`] for the measurements.
+    fn io_uring_from_env() -> bool {
+        std::env::var("CHRONIK_WAL_IO_URING")
+            .map(|v| {
+                let v = v.trim();
+                v.eq_ignore_ascii_case("true") || v == "1" || v.eq_ignore_ascii_case("yes")
+            })
+            .unwrap_or(false)
+    }
+
     /// Low resource profile (containers, small VMs: <= 1 CPU, < 512MB RAM)
     pub fn low_resource() -> Self {
         Self {
@@ -231,6 +258,7 @@ impl GroupCommitConfig {
             max_wait_time_ms: 2,            // 2ms latency
             max_queue_depth: 2_500,         // 2.5K queue depth
             enable_metrics: true,
+            use_io_uring: Self::io_uring_from_env(),
             enable_rotation: true,          // Enable S3 archival
             rotation_size_bytes: Self::parse_rotation_size(),
             rotation_age_secs: 30 * 60,     // 30 minutes
@@ -245,6 +273,7 @@ impl GroupCommitConfig {
             max_wait_time_ms: 10,           // 10ms latency
             max_queue_depth: 10_000,        // 10K queue depth
             enable_metrics: true,
+            use_io_uring: Self::io_uring_from_env(),
             enable_rotation: true,          // Enable S3 archival
             rotation_size_bytes: Self::parse_rotation_size(),
             rotation_age_secs: 30 * 60,     // 30 minutes
@@ -260,6 +289,7 @@ impl GroupCommitConfig {
             max_wait_time_ms: 50,           // 50ms latency (reduce disk I/O)
             max_queue_depth: 50_000,        // 50K queue depth
             enable_metrics: true,
+            use_io_uring: Self::io_uring_from_env(),
             enable_rotation: true,          // Enable S3 archival
             rotation_size_bytes: Self::parse_rotation_size(),
             rotation_age_secs: 30 * 60,     // 30 minutes
@@ -276,6 +306,7 @@ impl GroupCommitConfig {
             max_wait_time_ms: 100,          // 100ms latency (20x high profile - maximum batching)
             max_queue_depth: 100_000,       // 100K queue depth (4x high profile)
             enable_metrics: true,
+            use_io_uring: Self::io_uring_from_env(),
             enable_rotation: true,          // Enable S3 archival
             rotation_size_bytes: 512 * 1024 * 1024,  // 512MB (larger for ultra)
             rotation_age_secs: 30 * 60,     // 30 minutes
@@ -295,6 +326,7 @@ impl GroupCommitConfig {
             max_wait_time_ms,
             max_queue_depth,
             enable_metrics: true,
+            use_io_uring: Self::io_uring_from_env(),
             enable_rotation: true,
             rotation_size_bytes: 256 * 1024 * 1024,
             rotation_age_secs: 30 * 60,
@@ -626,14 +658,24 @@ impl GroupCommitWal {
     pub fn new(base_dir: PathBuf, config: GroupCommitConfig) -> Self {
         // Spawn io_uring thread if available
         #[cfg(all(target_os = "linux", feature = "async-io"))]
-        let io_uring_handle = match IoUringThreadHandle::spawn() {
-            Ok(handle) => {
-                info!("✨ io_uring thread spawned for 10x faster WAL writes");
-                Some(StdArc::new(handle))
-            }
-            Err(e) => {
-                warn!("Failed to spawn io_uring thread, falling back to standard I/O: {}", e);
-                None
+        let io_uring_handle = if !config.use_io_uring {
+            // Default. Standard tokio file I/O measured 228,886 msg/s at 3.42ms p50
+            // against io_uring's 153,124 at 5.30ms. See GroupCommitConfig::use_io_uring.
+            None
+        } else {
+            match IoUringThreadHandle::spawn() {
+                Ok(handle) => {
+                    warn!(
+                        "io_uring WAL path enabled via CHRONIK_WAL_IO_URING. It measured SLOWER \
+                         than standard tokio file I/O here: 153k msg/s vs 229k at 1024 producers, \
+                         5.30ms vs 3.42ms p50. Re-measure on your hardware before keeping it on."
+                    );
+                    Some(StdArc::new(handle))
+                }
+                Err(e) => {
+                    warn!("Failed to spawn io_uring thread, falling back to standard I/O: {}", e);
+                    None
+                }
             }
         };
 
@@ -663,14 +705,24 @@ impl GroupCommitWal {
     pub fn with_callback(base_dir: PathBuf, config: GroupCommitConfig, callback: CommitCallback) -> Self {
         // Spawn io_uring thread if available
         #[cfg(all(target_os = "linux", feature = "async-io"))]
-        let io_uring_handle = match IoUringThreadHandle::spawn() {
-            Ok(handle) => {
-                info!("✨ io_uring thread spawned for 10x faster WAL writes");
-                Some(StdArc::new(handle))
-            }
-            Err(e) => {
-                warn!("Failed to spawn io_uring thread, falling back to standard I/O: {}", e);
-                None
+        let io_uring_handle = if !config.use_io_uring {
+            // Default. Standard tokio file I/O measured 228,886 msg/s at 3.42ms p50
+            // against io_uring's 153,124 at 5.30ms. See GroupCommitConfig::use_io_uring.
+            None
+        } else {
+            match IoUringThreadHandle::spawn() {
+                Ok(handle) => {
+                    warn!(
+                        "io_uring WAL path enabled via CHRONIK_WAL_IO_URING. It measured SLOWER \
+                         than standard tokio file I/O here: 153k msg/s vs 229k at 1024 producers, \
+                         5.30ms vs 3.42ms p50. Re-measure on your hardware before keeping it on."
+                    );
+                    Some(StdArc::new(handle))
+                }
+                Err(e) => {
+                    warn!("Failed to spawn io_uring thread, falling back to standard I/O: {}", e);
+                    None
+                }
             }
         };
 
