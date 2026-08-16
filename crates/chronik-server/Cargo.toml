@@ -136,6 +136,11 @@ minimal = []
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# For tests/integration/*, wired in via tests/integration_suite.rs. These files
+# were unreachable by cargo until 2026-08-16 and had no declared dependencies.
+rdkafka = { workspace = true }
+serde_json = { workspace = true }
+futures = { workspace = true }
 
 [lints]
 workspace = true

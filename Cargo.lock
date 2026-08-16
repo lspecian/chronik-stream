@@ -2081,6 +2081,7 @@ dependencies = [
  "parking_lot",
  "prost 0.12.6",
  "raft",
+ "rdkafka",
  "reqwest 0.11.27",
  "rustls 0.23.34",
  "rustls-pemfile 2.2.0",

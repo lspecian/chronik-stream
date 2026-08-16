@@ -195,8 +195,10 @@ fn test_canonical_with_headers() {
     record.push(4); // value length (varint 2)
     record.extend_from_slice(b"v1");
 
-    // Headers: 2 headers
-    record.push(2); // headers count (varint 2)
+    // Headers: 2 headers. Zigzag, like the key and value lengths above — a bare
+    // 2 here decodes as 1, which is what this test asserted against for as long
+    // as nothing could run it.
+    record.push(4); // headers count (zigzag varint for 2)
 
     // Header 1: "user-id" = "12345"
     record.push(14); // key length (varint 7)
