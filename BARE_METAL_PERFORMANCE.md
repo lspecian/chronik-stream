@@ -84,6 +84,11 @@ Two things the sweep had to fix before it measured anything real:
   which is the signature of a fixed pipeline delay rather than a saturating
   resource.
 
+📌 Every cluster figure in this document was measured with the io_uring WAL path
+active, which was the default until 2026-08-16 and costs roughly a third of
+single-node produce throughput (see "io_uring is disabled by default"). They are
+floors, not ceilings, and have not been re-run.
+
 So the honest ceiling statement is: **≥160,329 msg/s at `acks=all` with zero
 errors, and that is a floor, not a limit.** What this harness measures is the
 HTTP-ingestor pipeline. The direct-to-Kafka figures earlier in this file
@@ -108,12 +113,12 @@ runners, 100 messages per batch, `acks=all`**, stages 30s→200, 1m→1000, 2m�
 | **this build, that exact config** | **25,647** | 22,681,100 messages, **0 errors**, 8 runners |
 | this build, 36 ingestors, 24,000 VUs | **160,329** | 0 errors, and still not saturated |
 
-⚠️ A first attempt at this comparison reported **7,085 msg/s** and was wrong: it
-used the repo's `max-load-test.js`, which batches **10** messages per request,
-not 100, with 6 runners instead of 8 and a peak of 5,000 VUs instead of 8,000.
-Correcting the batch size alone moved it 7,085 → 25,647. That is a caution about
-this whole comparison: the answer is extremely sensitive to harness parameters,
-and "same harness" is not the same as "same configuration".
+⚠️ **These figures are extremely sensitive to harness configuration, and "same
+harness" is not "same configuration".** The repo's `max-load-test.js` batches
+**10** messages per request; the 837,284 run used **100**, with 8 runners and a
+peak of 8,000 VUs rather than 6 and 5,000. Batch size alone swings the result
+3.6× (7,085 → 25,647 msg/s). Confirm batch size, runner count and VU peak match
+before comparing any two runs from this stack.
 
 **The gap to 837,284 is still unexplained, but it is not the broker.** At every
 load level measured the brokers ran at well under one core of the 32 available,
@@ -219,17 +224,15 @@ What *is* established: batching helps, the round-trip table above is the
 reproducible one, and the acks ordering is monotonic in every individual run
 (`acks=0` > `acks=1` > `acks=all`) — which is the question that started this.
 
-> ⚠️ **An earlier version of this table was wrong, and it is worth saying how.**
-> It used 200,000 records, which at these rates finishes in about half a second
-> — long enough to measure the client's send buffer draining and nothing else.
-> It reported `acks=0` at 355,871 and `acks=1` at **386,100**, i.e.
-> acknowledging every batch on the leader's disk came out *free, and slightly
-> faster than not acknowledging at all*. That cannot be true, and it is what
-> gave it away. Over a proper window the same runs give 429,737 and 122,828 — a
-> 3.5× gap in the direction physics requires. The harness now defaults to
-> 5,000,000 records and prints the run length beside every row, with a warning
-> under ten seconds, so a too-short window is visible instead of silently
-> becoming a number.
+> ⚠️ **A run shorter than ten seconds measures the client's send buffer
+> draining, not the broker.** At these rates 200,000 records complete in about
+> half a second, which yields `acks=1` at 386,100 against `acks=0` at 355,871 —
+> acknowledging every batch on the leader's disk coming out *free, and faster
+> than not acknowledging at all*. That is the tell. Over a proper window the same
+> runs give 429,737 and 122,828, a 3.5× gap in the direction physics requires.
+> The harness defaults to 5,000,000 records and prints run length beside every
+> row, warning under ten seconds, so a too-short window is visible rather than
+> silently becoming a number.
 
 ⚠️ **`--linger-ms` cannot produce these numbers, and trying it is a trap.**
 `chronik-bench` awaits each message's delivery before sending the next, so a
@@ -514,22 +517,13 @@ collapse 42,818 I/O syscalls/s to ~1,161 and save ~0.65 core-seconds per second,
 on a machine already running 16 cores at 14% utilisation. It optimises the
 resource that is not scarce.
 
-The current implementation also inverts io_uring's design. Each write crosses a
-crossbeam channel to a single dedicated thread, copies the buffer
-(`Bytes` → `Vec<u8>`, because `IoBuf` needs ownership), is awaited **one at a
-time** in a sequential loop, and returns through a oneshot — two cross-thread
-wake-ups and a memcpy per write, with no batched submission, no linked
-write→fsync, no registered buffers, and no SQPOLL. The command loop also calls
-the blocking `crossbeam::recv_timeout` inside `tokio_uring`'s async runtime,
-which spins on `sched_yield`: 200,507 yields per 12 s against 2,014 on the
-standard path.
-
-**The obvious defects were fixed and measured, and they are not the cause.** The
-blocking receive is now async (`sched_yield` fell from 200,507 per 12s to 2,099),
-writes run concurrently across partitions instead of one at a time, and `Bytes`
-is submitted through an `IoBuf` impl instead of a `to_vec` copy. Throughput did
-not move: 150,493 msg/s against 233,319 standard at 1024 producers; 2,597 against
-3,309 at 8.
+**The implementation's obvious defects were fixed, and they are not the cause.**
+The command loop's blocking `crossbeam::recv_timeout` inside `tokio_uring`'s
+runtime is now an async receive (`sched_yield` fell from 200,507 per 12 s to
+2,099); writes run concurrently across partitions instead of one at a time in a
+sequential loop; and `Bytes` is submitted through an `IoBuf` impl instead of a
+`to_vec` copy per write. Throughput did not move — 150,493 msg/s against 233,319
+standard at 1024 producers, 2,597 against 3,309 at 8.
 
 The remaining gap is architectural. `tokio-uring` submits one operation per
 `io_uring_enter` — 54,035 calls for ~31,000 messages — so it delivers no syscall

@@ -232,7 +232,7 @@ Every one surfaced only by running the conformance suite against a real 3-node c
 
 2. **A replica that died while caught up never left ISR.** Fixing (1) — plus not ageing out caught-up replicas — meant a dead node stayed in-sync forever: the lag bound does not fire for a caught-up replica and it never ACKs again. Observed: a node killed for 60s still reported `isr=[1,2,3]`. Followers now answer heartbeats with a liveness ACK, carried on the existing ACK frame with an empty topic.
 
-   ⚠️ The first attempt at this used **connection state** and did nothing on a real cluster: a TCP write succeeds into the local send buffer long after the peer is gone. Application-level liveness is the only thing that works here.
+   ⚠️ **Connection state cannot detect this.** A TCP write succeeds into the local send buffer long after the peer is gone, so a healthy-looking socket proves nothing. Application-level liveness is the only signal that works here.
 
 3. **A restarted follower was never reconnected — replication to it stopped permanently.** Same root cause: the stale connection stayed in `connections`, so the reconnect loop's `contains_key` check passed and never redialled. Newly created topics landed only on partitions that node led, with nothing reporting a problem. Connections to followers that stop answering heartbeats are now retired so the existing reconnect path fires. Pruning runs on the connection-manager loop, not beside the heartbeat send — heartbeats only fire when the queue is empty and any successful send resets their timer, so with one live and one dead follower under load they would never fire.
 
@@ -1101,10 +1101,10 @@ way:
 
 - **It is a gap-free suffix.** Offsets are assigned before the WAL append, so
   under 64 concurrent producers records reach the cache out of order constantly.
-  The first attempt *refused* out-of-order arrivals and held the cache empty
-  until the log caught up. That is safe and useless: the cache served zero reads
-  in a 30-second run, every fetch fell back to the scan, and throughput sat at
-  1,660 msg/s while looking like the fix was in. Records are now ordered into
+  ⚠️ **Refusing out-of-order arrivals is safe and useless.** Holding the cache
+  empty until the log catches up serves zero reads in a 30-second run: every
+  fetch falls back to the scan and throughput sits at 1,660 msg/s while the
+  cache looks healthy. Records are now ordered into
   place, and reads below the gap-free run miss rather than getting a short
   answer.
 - **It only serves what is durable.** The cache is filled at append time — the
@@ -1365,32 +1365,17 @@ Gates: 1,693 unit tests; conformance 600/600; divergence 5/5; `acks=all` latency
 14 ms to a new topic, 13 ms steady.
 
 ---
+
 ## RP-11: the "17× produce regression" was a benchmark reading a bug — `RESOLVED` (2026-08-15)
 
-**There is no produce regression. v2.10.8 did not make Chronik slower; it made
+**There is no produce regression.** v2.10.8 did not make Chronik slower; it made
 Chronik stop silently dropping messages, and the benchmark had been counting the
-drops as throughput.** An earlier revision of this section claimed a 17×
-regression caused by `e8547ca` (#21). That was wrong, and the way it was wrong is
-worth keeping.
+drops as throughput.
 
-### What the numbers looked like
-
-`acks=1`, single node, no replication, 64 producers, 256 B, 3 partitions:
-
-| build | reported msg/s |
-|---|---:|
-| v2.10.7 and every earlier tag | ~186,000 |
-| v2.10.8 and every later tag | ~11,000 |
-
-Bisected cleanly to `e8547ca`, "release in-flight memory reservation on all exit
-paths (#21)", which replaced a hand-written `fetch_sub` with a `MemoryReservation`
-RAII guard. Reverting it restored the throughput; A-B-A alternation held. All of
-that is true and all of it is beside the point.
-
-### What was actually happening
+### Evidence
 
 Stop trusting the rate counter and count what reached the disk. Same 15s run,
-same hardware:
+`acks=1`, single node, no replication:
 
 | build | reported msg/s | claimed records | **bytes on disk** | broker rejections |
 |---|---:|---:|---:|---:|
@@ -1398,27 +1383,26 @@ same hardware:
 | unguarded (pre-#21 shape) | 61,625 | 924,375 | **50.0 MB** | **228,825** |
 
 The "fast" build reports 3.7× the throughput and writes 6× less data. At 256 B a
-record, 301.7 MB for 247,785 records is ~1.2 KB each with WAL and index overhead
-— plausible. 50 MB for a claimed 924,375 records is 54 bytes each — impossible.
+record, 301.7 MB for 247,785 records is ~1.2 KB each with WAL and index overhead;
+50 MB for a claimed 924,375 records is 54 bytes each, which 256-byte records
+cannot be.
 
-Pre-#21, the 17 `?` early-returns in `produce_to_partition` leaked their
+Pre-#21, the 17 `?` early-returns in `produce_to_partition` leaked their memory
 reservation. Under sustained load the leaked bytes accumulated until
 `memory_used_bytes` pinned at the 32 MB `buffer_memory` ceiling, after which the
 handler rejected nearly every produce — **instantly**. An instant rejection and a
-fast success are the same event to a rate counter. The old numbers were measuring
-how quickly the broker could say no.
+fast success are the same event to a rate counter.
 
-So #21 is correct, the guard stays, and ~16,500 msg/s is what this path has
-always actually delivered on this hardware. **Every acks=1 produce figure
-published before v2.10.8 was inflated by an unknown amount** — the inflation
-depends on how quickly the leak reached the ceiling, so old numbers cannot be
-retroactively corrected, only discarded.
+`e8547ca` (#21) is therefore correct and the `MemoryReservation` guard stays.
+**Every `acks=1` figure published before v2.10.8 is inflated by an unknown
+amount** — the inflation depends on how quickly the leak reached the ceiling, so
+those numbers cannot be corrected, only discarded.
 
-### The second bug, which is the serious one
+### The serious bug behind it
 
-The producer was told **none of this was happening**. Against 228,825 broker-side
-rejections, `chronik-bench` reported `Failed: 0 (0.00%)`. The cause, in the
-produce error mapping:
+Against 228,825 broker-side rejections, the producer reported `Failed: 0 (0.00%)`.
+The produce error mapping sent everything outside four transactional cases to
+`ErrorCode::None`:
 
 ```rust
 let error_code = match e {
@@ -1430,82 +1414,44 @@ let error_code = match e {
 };
 ```
 
-Every produce failure outside those four transactional cases — memory-limit
-rejection, WAL write error, storage I/O error — was returned to the client as
-`ErrorCode::None`. Success. The records were not stored and the producer was told
-they were durable. That is silent data loss in a broker whose headline guarantee
-is that it does not lose messages, and it is not specific to the leak: any
-storage or I/O failure on the produce path has always been acknowledged as a
-write.
+So a memory-limit rejection, a WAL write error or a storage I/O error was
+returned to the client as success: the records were not stored and the producer
+was told they were durable. This is not specific to the leak — any storage or I/O
+failure on the produce path was acknowledged as a write.
 
-Fixed by mapping the catch-all to `KafkaStorageError` (56) — the standard
-"broker could not persist this" code, and retriable, so clients back off and
-resend rather than dropping the batch. Verified on the wire with a build that
-leaks (to force rejections) and carries the fix (to report them): the producer
-now reports `Failed: 64 (0.12%)` and logs real delivery errors where it
-previously reported `Failed: 0`. Regression test:
-`produce_failure_is_never_reported_as_success`.
+Fixed by mapping the catch-all to `KafkaStorageError` (56), the standard "broker
+could not persist this" code, which is retriable so clients back off and resend
+rather than dropping the batch. Verified on the wire with a build that leaks (to
+force rejections) and carries the fix (to report them): the producer reports
+`Failed: 64 (0.12%)` and logs real delivery errors where it previously reported
+zero. Regression test: `produce_failure_is_never_reported_as_success`.
 
-### The measurement failure behind all of it
+A leaking broker with the mapping fixed measures **815 msg/s** rather than the
+199,000 it used to claim — the rejections now reach the client, which retries
+with backoff. The two bugs compounded: the leak caused the rejections, the
+mapping hid them, so nothing ever retried.
 
-Two machine-level facts distorted this investigation, and the branch's earlier
-performance numbers with it:
+### Rules this establishes for every produce measurement
 
-- **The dev workstation's TSC was dead** (fixed 2026-08-16, see below). The
-  kernel marked it unstable 2.1s into boot ("most likely due to broken BIOS")
-  and fell back to HPET, which is not in the vDSO — so every `clock_gettime` was a syscall plus an
-  MMIO read. Measured **1,213.8 ns/call against 23.8 ns on dell-33**, 51×.
-  Anything timed on this box before that date carries an unknown handicap.
-- **The Dells are dual-socket** (2× Xeon E5-2667 v4) against the dev workstation's
-  single-socket Ryzen, so a contended atomic behaves differently on each. Neither
-  box is a neutral reference for the other.
+1. **No throughput number is reportable without bytes landed and broker-side
+   rejections beside it.** A rejected produce returns faster than a served one,
+   so msg/s alone reads a failing broker as a winning one.
+2. **Load the broker before quoting a ceiling.** `acks=1` scales near-linearly
+   with producer count; at 64 producers the broker is under-loaded by roughly an
+   order of magnitude (13,582 msg/s against 228,874 at 1024).
+3. **Know the host.** Two machine facts move these numbers independently of the
+   code: `acks=1` is fsync-bound, so a host that syncs at 7.4 MB/s and one at
+   29.5 MB/s are not comparable; and a dual-socket box behaves differently from a
+   single-socket one under contended atomics. On a host whose kernel has fallen
+   back to the HPET clocksource, every timing carries a 51× `clock_gettime`
+   penalty (1,213.8 ns against 23.8 ns) — check
+   `/sys/devices/system/clocksource/clocksource0/current_clocksource` before
+   trusting any latency figure.
 
-The deeper failure was not the hardware. Four mechanisms were proposed for the
-"regression" — `Arc` cache-line contention, `Drop`-in-async codegen, release
-timing, refcount traffic on a NUMA interconnect — and each was disproved by
-experiment while the conclusion they were all trying to explain went unchallenged.
-The question that broke it open was not "why is the guard slow" but "is the fast
-build doing the work", and it cost one `du`.
-
-### Follow-up on restored hardware (2026-08-16)
-
-`tsc=nowatchdog` on the dev workstation's kernel cmdline restored the TSC: `clock_gettime`
-went **1,213.8 ns → 19.6 ns**, and the kernel no longer condemns the TSC at all
-(the watchdog was comparing it against a flaky HPET; `constant_tsc` and
-`nonstop_tsc` are both present, so the hardware was never the problem).
-
-Re-measuring on the repaired box corrects an attribution made above:
-
-| | acks=1 msg/s | on disk | rejections |
-|---|---:|---:|---:|
-| guarded, HPET (before) | ~12,000 | — | 0 |
-| guarded, TSC (after) | **12,582** | 233.5 MB | 0 |
-| leaking + error-mapping fix, TSC | **815** | 98.9 MB | 253 |
-
-**The clock repair did not move `acks=1` at all.** That path is not clock-bound,
-it is fsync-bound: the workstation syncs at 7.4 MB/s (~1,810 fsync/s) against dell-32's
-29.5 MB/s (~7,194/s), and their `acks=1` numbers — 12,582 and 16,519 — line up
-with that ordering, not with CPU or clock. So the earlier line blaming HPET for
-the "17× vs 2.1×" spread was wrong: that spread is a machine difference, mostly
-storage. HPET inflated *absolute* numbers on this box; it did not manufacture the
-ratio. `acks=0`, which does not wait for durability, does follow the CPU —
-the workstation now does **138,556 msg/s** against dell-32's 94,800.
-
-The third row is the useful one. That build leaks reservations *and* carries the
-error-mapping fix, so its rejections now reach the client, which retries with
-backoff — and a leaking broker measures **815 msg/s instead of 199,000**. The two
-bugs were compounding: the leak caused the rejections, and the error mapping hid
-them so nothing ever retried. Fixing the mapping converts a fast lie into a slow
-truth, which is what a broken broker is supposed to look like.
-
-
-
-**Rule going forward: no produce throughput number is reportable unless the run
-also reports bytes landed and broker-side rejections.** `tests/cluster/` harnesses
-that report msg/s alone can be read backwards, exactly as this was.
+Current single-node ceilings, and the io_uring default that follows from them,
+are in `BARE_METAL_PERFORMANCE.md`.
 
 ---
-
 
 ## Open Questions
 
