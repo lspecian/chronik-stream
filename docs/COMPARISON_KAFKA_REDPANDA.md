@@ -89,13 +89,16 @@ ceiling — it was one point on a straight line.
 
 Kafka and Redpanda have one copy on disk because the log *is* the storage.
 Chronik writes each record to the WAL for durability and again into segments for
-serving and tiering. That is most of the 7.3× amplification, and it is being paid
-on the hot path while still outrunning both competitors — so removing it is the
-single largest optimisation available:
+serving and tiering. That is most of the 7.3× amplification.
 
 1. **Eliminate the double write.** Seal WAL segments *as* the served segments, or
-   have segment construction reference WAL bytes instead of copying them.
-   Plausibly worth a large fraction of the remaining gap, and halves disk usage.
+   have segment construction reference WAL bytes instead of copying them. ⚠️ This
+   was first written here as "the single largest optimisation available", which
+   the measurement below contradicts: the second write is off the produce path
+   and this disk has 7× the bandwidth it needs, so removing it buys **no
+   throughput here**. It is a cost, cloud-disk, and CPU optimisation — still
+   worth doing, for different reasons than first claimed. See "Tiering: a cost
+   problem" below.
 2. ~~**Group commit window.**~~ Measured — see below. All four profiles land
    within 0.7% of each other at saturation. Not a lever.
 3. ~~**`is_topic_vector_enabled` is uncached.**~~ Fixed: it now carries the same
