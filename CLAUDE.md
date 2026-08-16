@@ -1093,6 +1093,9 @@ Key environment variables:
 - `CHRONIK_PRODUCE_PROFILE` - ProduceHandler flush profile: `low-latency`, `balanced` (default), `high-throughput`
 - `CHRONIK_WAL_PROFILE` - WAL commit profile: `low`, `medium`, `high`, `ultra` (auto-detected by default)
 - `CHRONIK_WAL_ROTATION_SIZE` - Segment seal threshold: `100KB`, `250MB` (default), `1GB`, or raw bytes `268435456`
+- `CHRONIK_METRICS_PORT` - Prometheus `/metrics` port, single-node mode (default: 13092). Set it when running more than one broker on a host, or the second logs a bind failure for a listener it cannot move.
+- `CHRONIK_REPLICA_LAG_TIME_MAX_MS` - How long a replica may stay measurably behind before leaving ISR (default: 10000). Kafka's `replica.lag.time.max.ms` equivalent; Kafka defaults to 30s, this is deliberately tighter so under-replication surfaces sooner. Cluster mode only.
+- `CHRONIK_REPLICA_LAG_MAX_ENTRIES` - Secondary record-count bound on follower lag (default: 10000). Time is the primary bound.
 - `CHRONIK_ADMIN_API_KEY` - API key for admin API authentication (Priority 2, **REQUIRED for production**)
 - `CHRONIK_ADMIN_TLS_CERT` - Path to TLS certificate for admin API (Priority 2, optional)
 - `CHRONIK_ADMIN_TLS_KEY` - Path to TLS private key for admin API (Priority 2, optional)

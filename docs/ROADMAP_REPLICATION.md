@@ -194,9 +194,15 @@ Worth doing **regardless of whether pull ever happens**.
 - [x] ISR = replicas within a lag bound, with a timeout for silent followers
 - [x] `/admin/status` reports the real ISR
 - [x] Under-replicated signal — `total_dropped()` accessor (RP-1.4)
-- [ ] Metadata responses report the real ISR (admin only so far)
+- [x] Metadata responses report the real ISR (was admin only) — 2026-08-17
+- [x] The lag bound is operator-tunable (`CHRONIK_REPLICA_LAG_TIME_MAX_MS`) — OQ3, 2026-08-17
 
-**Status**: `CODE COMPLETE`. Three defects, all making ISR read healthier than reality:
+**Status**: `CODE COMPLETE`. Four defects, all making ISR read healthier than reality:
+
+0. **Metadata reported the assignment as the in-sync set.** `isr_nodes: replica_nodes.clone()`, annotated "for now, all replicas are in-sync" — the same inversion as defect 1 below, left in the surface that matters most. `/admin/status` is where an operator looks *after* being alerted; **Metadata** is where every Kafka client and monitoring tool reads ISR (`kafka-topics --describe`, Kafka UI, Cruise Control), so the alert never fired. Metadata now reports the set the leader published into the assignment (`isr_publisher`), which is readable by a node that is not the leader — the structural fix RP-2 promised. `offline_replicas` is derived from the difference instead of always being empty. Falls back to the assignment only when nothing has been measured, matching `in_sync_replicas`'s "unknown is not empty" rule; an empty ISR would otherwise make `min.insync.replicas` unsatisfiable and stop producers writing to a brand-new partition.
+
+   Found the same way as everything else in this phase: by writing the test. `InMemoryMetadataStore::get_partition_replicas` was also still returning the deprecated single `broker_id` rather than the replica set — the bug `WalMetadataStore` fixed in v2.2.9 — so an RF=3 partition read back as RF=1 and every test written against that store agreed with a broker that does not exist.
+
 
 1. **Empty ISR reported as "all replicas in-sync".** `/admin/status` fell back to the assignment whenever the tracker returned nothing, so a partition replicating to *nobody* showed a full ISR. That inversion is why #29 stayed invisible for nine months. The fallback now applies only when the tracker has heard nothing at all for the partition (`is_unknown_for_all`) — genuinely a fresh cluster.
 2. **Caught-up followers aged out.** The time bound was applied unconditionally, so every replica of an *idle* partition dropped out of ISR after `max_lag_ms` despite holding exactly the leader's data. It now measures how long a replica has been *behind*, matching `replica.lag.time.max.ms`.
@@ -323,9 +329,21 @@ Also open, and related: `/admin/status` falls back to reporting the assignment a
 - [x] `HW = min(LEO across ISR)` — was the **leader's own write position** from `ProduceHandler`
 - [x] Consumers observe only up to HW; followers still read to the leader's LEO
 - [x] `acks=all` completes when the quorum has reached the batch's offset
-- [ ] Test: HW does not advance while a follower is behind
+- [x] Test: HW does not advance while a follower is behind — 5 unit tests, 2026-08-17
 
 **Status**: `TESTED` on a 3-node cluster under pull. Both halves are done: `acks=all` settles off follower fetch offsets, and consumers are capped at `min(LEO across ISR)`.
+
+The rule and both of its exclusions are pinned by unit tests in `isr_tracker.rs`, because each exclusion turns into an outage if it regresses and none of them is visible in a passing cluster run:
+
+| Test | What breaks without it |
+|---|---|
+| `watermark_is_bounded_by_the_slowest_in_sync_follower` | consumers read records held only by the leader |
+| `a_replica_outside_isr_does_not_hold_the_watermark_back` | one dead node stalls every consumer on the partition |
+| `an_unreported_partition_is_not_bounded_to_zero` | a fresh cluster hides its entire log |
+| `a_lone_leader_is_its_own_watermark` | single-node deployments stop serving reads |
+| `the_watermark_never_exceeds_the_leader` | a follower reporting an in-flight write exposes offsets the leader has not counted |
+
+OQ4 is answered in the same place: the behaviour change is real and deliberate, and carries a release note rather than a flag.
 
 The `acks=all` half forced a latent bug into the open. `IsrAckTracker` matched an **exact** `(topic, partition, offset)`, which only worked because push emitted one ACK per pushed batch. A follower's fetch offset is a watermark that skips across many batch boundaries and rarely lands on a registered offset, so under pull every `acks=all` produce would have waited out the full 30s timeout. Replica progress is monotonic — a replica reporting N holds everything below N — so waits are now released by any report at or above their offset. That is strictly more correct under push too: a follower demonstrably at 500 satisfies a wait at 437 even if the ACK for 437 was lost or coalesced.
 
@@ -1593,8 +1611,21 @@ Answer before the phase that depends on them.
    Metadata is not a partitioned topic with replicas and a leader epoch; it is a single Raft-managed log whose leadership is Raft's, and it is the store that *holds* the partition assignments the pull path reads. Moving it to pull would make the mechanism that discovers who leads a partition depend on already knowing who leads a partition. The push transport works correctly there today, including retry, and `MetadataWalReplicator` is built on it.
 
    This shrinks RP-4 from "delete `wal_replication.rs`" to "delete the data push path": `ProduceHandler::set_wal_replication_manager` and its produce-path use, the `else` branch in `wire_raft_dependencies` that builds the data `WalReplicationManager`, the `ReplicationMode` switch (pull becomes unconditional), and the `LeaderElector` shim plus the election trigger machinery in `WalReceiver` that RP-5 superseded. `WalReceiver` itself stays, serving metadata.
-3. **What lag bound defines ISR?** (blocks RP-1.2) — Kafka uses time (`replica.lag.time.max.ms`). Offset-based lag misbehaves with uneven partition rates.
-4. **Does HW-from-ISR change observable consumer behaviour in existing tests?** (blocks RP-2.3) — consumers currently see the leader's write position; under Kafka semantics they would see less during follower lag.
+3. ~~**What lag bound defines ISR?**~~ — **ANSWERED 2026-08-17: time, as Kafka does, and it is now operator-tunable.**
+
+   A replica leaves ISR when it has been *measurably behind* for longer than `max_lag_ms`, not when it has been silent for that long — an idle partition's replicas hold exactly the leader's data and must not age out (RP-1.2 defect 2). A record-count bound remains as a secondary guard; Kafka dropped its equivalent (`replica.lag.max.messages`) in 0.9 for the reason this question anticipated: one fixed count cannot suit partitions with different write rates.
+
+   The gap was not the rule but its reach — the bound was compiled in via `IsrTracker::default()`, so a cluster whose followers sit on a slower link had no answer short of a rebuild. Now `CHRONIK_REPLICA_LAG_TIME_MAX_MS` (default 10,000) and `CHRONIK_REPLICA_LAG_MAX_ENTRIES` (default 10,000), read once at startup and logged.
+
+   **The default stays at 10s rather than moving to Kafka's 30s.** ISR is the signal an operator reads to learn that acknowledged data is at risk; a 30s window means a third of a minute of writes land looking fully replicated when they are not. 10s is also the value the cluster conformance suite is validated at — raising it is a behaviour change that must be re-validated, not a default to flip in passing.
+
+4. ~~**Does HW-from-ISR change observable consumer behaviour?**~~ — **ANSWERED 2026-08-17: yes, and that is the point. It needs a release note, not a flag.**
+
+   Consumers now see up to `min(LEO across ISR)` instead of the leader's own write position, so during follower lag a consumer reads *less* than it used to. That is the correct Kafka semantic: a record only becomes visible once every in-sync replica holds it, so a consumer can never read a record that would vanish if the leader were lost.
+
+   It was considered behind a default-off flag. Rejected: the pre-change behaviour is that consumers can read records which are not replicated anywhere else, and shipping a flag to preserve that would be shipping a known way to lose acknowledged reads. The two exclusions that keep it from becoming an outage are already implemented and tested — a replica *outside* ISR does not hold the watermark back (one dead node would otherwise stall every consumer on the partition), and a partition nobody has measured yet imposes no bound at all (a fresh cluster would otherwise hide its whole log).
+
+   **Release note required**: consumers may observe a briefly lower end offset while a follower is catching up. The end offset is now the replicated position, not the leader's write position. `acks=all` producers are unaffected — they already waited for the quorum.
 5. ~~**How does an existing cluster upgrade across the push→pull boundary?**~~ — **ANSWERED 2026-08-13: there is no upgrade path, because there is nothing to upgrade.**
 
    There are no production deployments. Anyone running Chronik starts fresh on the latest version. So the push data path is deleted outright rather than kept for a release: no coexistence, no migration shim, no rolling-upgrade story to protect.

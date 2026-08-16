@@ -685,7 +685,7 @@ impl IntegratedKafkaServerBuilder {
         produce_handler_inner.set_event_bus(metadata_event_bus.clone());
         produce_handler_inner.set_append_notify(Arc::clone(&self.append_notify));
         let isr_ack_tracker = crate::isr_ack_tracker::IsrAckTracker::new();
-        let isr_tracker = Arc::new(crate::isr_tracker::IsrTracker::default());
+        let isr_tracker = Arc::new(crate::isr_tracker::IsrTracker::from_env());
         produce_handler_inner.set_isr_ack_tracker(isr_ack_tracker.clone());
         // Reap `acks=all` waits that never reach quorum. The producer's own
         // timeout releases the caller but leaves the registration behind, so

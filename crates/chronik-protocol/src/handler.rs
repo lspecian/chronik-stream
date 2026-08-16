@@ -6122,6 +6122,20 @@ impl ProtocolHandler {
                 tracing::info!("METADATA→PARTITIONS: topic={} partition_count={} assignments_count={} effective={}",
                               topic_meta.name, topic_meta.config.partition_count, sorted_assignments.len(), effective_partition_count);
 
+                // The measured in-sync set, per partition.
+                //
+                // The leader publishes it into the assignment (see
+                // `isr_publisher`) precisely so it can be read by a node that is
+                // not the leader — which is the situation any Metadata request
+                // may be answered in. Empty means nobody has measured it yet: a
+                // partition never written to, or single-node, where the
+                // assignment is the honest answer.
+                let published_isr: std::collections::HashMap<u32, Vec<i32>> = sorted_assignments
+                    .iter()
+                    .filter(|a| !a.isr.is_empty())
+                    .map(|a| (a.partition, a.isr.iter().map(|&id| id as i32).collect()))
+                    .collect();
+
                 // Create partitions for ALL effective partitions, using assignments where available
                 for partition_id in 0..effective_partition_count {
                     // Get leader for this partition (queries the leader-flagged assignment)
@@ -6162,14 +6176,43 @@ impl ProtocolHandler {
                         }
                     };
 
+                    // Report the in-sync set the leader actually measured.
+                    //
+                    // This was `replica_nodes.clone()` — the assignment — with
+                    // the note "for now, all replicas are in-sync". That is the
+                    // same inversion RP-1.2 removed from `/admin/status`: a
+                    // partition replicating to nobody reported a full ISR, so
+                    // the one signal that says "you are about to lose data if
+                    // this leader dies" read healthy in exactly the case it
+                    // exists to flag. `/admin/status` was fixed; Metadata was
+                    // not, and Metadata is where every Kafka client and every
+                    // monitoring tool looks — `kafka-topics --describe`, Kafka
+                    // UI, Cruise Control.
+                    //
+                    // Falling back to the assignment when nothing has been
+                    // measured keeps single-node and brand-new partitions
+                    // correct; see `isr_publisher::in_sync_replicas`, which
+                    // documents the same "unknown is not the same as empty"
+                    // rule.
+                    let isr_nodes = published_isr
+                        .get(&partition_id)
+                        .cloned()
+                        .unwrap_or_else(|| replica_nodes.clone());
+
+                    let offline_replicas: Vec<i32> = replica_nodes
+                        .iter()
+                        .copied()
+                        .filter(|id| !isr_nodes.contains(id))
+                        .collect();
+
                     let partition_metadata = MetadataPartition {
                         error_code: 0,
                         partition_index: partition_id as i32,
                         leader_id,
                         leader_epoch: 0,
                         replica_nodes: replica_nodes.clone(),
-                        isr_nodes: replica_nodes.clone(), // For now, all replicas are in-sync
-                        offline_replicas: vec![],
+                        isr_nodes,
+                        offline_replicas,
                     };
 
                     tracing::info!("METADATA_PARTITION_FINAL: topic={} partition={} error_code={} leader_id={} replicas={:?} isr={:?}",

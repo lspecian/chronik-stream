@@ -226,10 +226,16 @@ impl MetadataStore for InMemoryMetadataStore {
     async fn get_partition_replicas(&self, topic: &str, partition: u32) -> Result<Option<Vec<i32>>> {
         let assignments = self.partition_assignments.read().await;
 
-        // Get all assignments for this partition
+        // Return the replica set, not the deprecated single `broker_id`.
+        //
+        // Assignments are keyed by (topic, partition), so mapping `broker_id`
+        // across them always yielded exactly one node however many replicas the
+        // partition had — an RF=3 partition read back as RF=1. `WalMetadataStore`
+        // fixed this in v2.2.9; this store kept the old behaviour, so every test
+        // written against it agreed with a broker that does not exist.
         let replicas: Vec<i32> = assignments.values()
             .filter(|a| a.topic == topic && a.partition == partition)
-            .map(|a| a.broker_id)
+            .flat_map(|a| a.replicas.iter().map(|&id| id as i32))
             .collect();
 
         if replicas.is_empty() {

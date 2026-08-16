@@ -171,3 +171,211 @@ async fn test_metadata_after_topic_creation() {
     
     println!("Metadata test completed successfully!");
 }
+/// RP-1.2: Metadata must report the in-sync set the leader measured, not the
+/// assignment.
+///
+/// This was `isr_nodes: replica_nodes.clone()` with the note "for now, all
+/// replicas are in-sync" — the same inversion RP-1.2 removed from
+/// `/admin/status`, where a partition replicating to nobody reported a full ISR.
+/// Metadata is where every Kafka client and monitoring tool reads ISR
+/// (`kafka-topics --describe`, Kafka UI, Cruise Control), so the one signal that
+/// says "acknowledged data is at risk" read healthy in exactly the case it
+/// exists to flag.
+#[tokio::test]
+async fn metadata_reports_the_measured_isr_not_the_assignment() {
+    use chronik_common::metadata::{PartitionAssignment, TopicConfig};
+
+    let metadata_store = Arc::new(InMemoryMetadataStore::new());
+    let handler = ProtocolHandler::with_metadata_store(metadata_store.clone());
+
+    for broker_id in 1..=3 {
+        metadata_store
+            .register_broker(chronik_common::metadata::BrokerMetadata {
+                broker_id,
+                host: "localhost".to_string(),
+                port: 9092 + broker_id,
+                rack: None,
+                status: BrokerStatus::Online,
+                created_at: chronik_common::Utc::now(),
+                updated_at: chronik_common::Utc::now(),
+            })
+            .await
+            .unwrap();
+    }
+
+    metadata_store
+        .create_topic(
+            "replicated",
+            TopicConfig {
+                partition_count: 1,
+                replication_factor: 3,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // Three replicas assigned; node 3 has fallen out of the in-sync set.
+    metadata_store
+        .assign_partition(PartitionAssignment {
+            topic: "replicated".to_string(),
+            partition: 0,
+            broker_id: 1,
+            is_leader: true,
+            replicas: vec![1, 2, 3],
+            leader_id: 1,
+            leader_epoch: 0,
+            isr: vec![1, 2],
+        })
+        .await
+        .unwrap();
+
+    let response = handler
+        .handle_request(&encode_metadata_request_v0())
+        .await
+        .unwrap();
+
+    let mut body = response.body;
+    let mut decoder = chronik_protocol::parser::Decoder::new(&mut body);
+
+    // brokers
+    let broker_count = decoder.read_i32().unwrap();
+    for _ in 0..broker_count {
+        let _id = decoder.read_i32().unwrap();
+        let _host = decoder.read_string().unwrap();
+        let _port = decoder.read_i32().unwrap();
+    }
+
+    let topic_count = decoder.read_i32().unwrap();
+    let mut checked = false;
+
+    for _ in 0..topic_count {
+        let _err = decoder.read_i16().unwrap();
+        let name = decoder.read_string().unwrap().unwrap_or_default();
+        let partition_count = decoder.read_i32().unwrap();
+
+        for _ in 0..partition_count {
+            let _p_err = decoder.read_i16().unwrap();
+            let _index = decoder.read_i32().unwrap();
+            let _leader = decoder.read_i32().unwrap();
+
+            let replica_count = decoder.read_i32().unwrap();
+            let replicas: Vec<i32> = (0..replica_count)
+                .map(|_| decoder.read_i32().unwrap())
+                .collect();
+
+            let isr_count = decoder.read_i32().unwrap();
+            let isr: Vec<i32> = (0..isr_count).map(|_| decoder.read_i32().unwrap()).collect();
+
+            if name == "replicated" {
+                assert_eq!(replicas, vec![1, 2, 3], "all three are still assigned");
+                assert_eq!(
+                    isr,
+                    vec![1, 2],
+                    "Metadata reported the assignment as the in-sync set; node 3 is not in sync"
+                );
+                checked = true;
+            }
+        }
+    }
+
+    assert!(checked, "topic `replicated` missing from the Metadata response");
+}
+
+/// A partition nobody has measured yet — single-node, or never written to —
+/// must still report its replicas rather than an empty ISR.
+///
+/// An empty in-sync set is a hard error for clients: `min.insync.replicas`
+/// cannot be satisfied and producers refuse to write. "Unknown" and "nobody is
+/// in sync" are different answers, and only the leader can tell them apart.
+#[tokio::test]
+async fn metadata_falls_back_to_replicas_when_isr_was_never_measured() {
+    use chronik_common::metadata::{PartitionAssignment, TopicConfig};
+
+    let metadata_store = Arc::new(InMemoryMetadataStore::new());
+    let handler = ProtocolHandler::with_metadata_store(metadata_store.clone());
+
+    metadata_store
+        .register_broker(chronik_common::metadata::BrokerMetadata {
+            broker_id: 1,
+            host: "localhost".to_string(),
+            port: 9092,
+            rack: None,
+            status: BrokerStatus::Online,
+            created_at: chronik_common::Utc::now(),
+            updated_at: chronik_common::Utc::now(),
+        })
+        .await
+        .unwrap();
+
+    metadata_store
+        .create_topic(
+            "fresh",
+            TopicConfig {
+                partition_count: 1,
+                replication_factor: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    metadata_store
+        .assign_partition(PartitionAssignment {
+            topic: "fresh".to_string(),
+            partition: 0,
+            broker_id: 1,
+            is_leader: true,
+            replicas: vec![1],
+            leader_id: 1,
+            leader_epoch: 0,
+            isr: vec![], // nothing measured yet
+        })
+        .await
+        .unwrap();
+
+    let response = handler
+        .handle_request(&encode_metadata_request_v0())
+        .await
+        .unwrap();
+
+    let mut body = response.body;
+    let mut decoder = chronik_protocol::parser::Decoder::new(&mut body);
+
+    let broker_count = decoder.read_i32().unwrap();
+    for _ in 0..broker_count {
+        let _id = decoder.read_i32().unwrap();
+        let _host = decoder.read_string().unwrap();
+        let _port = decoder.read_i32().unwrap();
+    }
+
+    let topic_count = decoder.read_i32().unwrap();
+    for _ in 0..topic_count {
+        let _err = decoder.read_i16().unwrap();
+        let name = decoder.read_string().unwrap().unwrap_or_default();
+        let partition_count = decoder.read_i32().unwrap();
+
+        for _ in 0..partition_count {
+            let _p_err = decoder.read_i16().unwrap();
+            let _index = decoder.read_i32().unwrap();
+            let _leader = decoder.read_i32().unwrap();
+
+            let replica_count = decoder.read_i32().unwrap();
+            for _ in 0..replica_count {
+                let _ = decoder.read_i32().unwrap();
+            }
+
+            let isr_count = decoder.read_i32().unwrap();
+            let isr: Vec<i32> = (0..isr_count).map(|_| decoder.read_i32().unwrap()).collect();
+
+            if name == "fresh" {
+                assert_eq!(
+                    isr,
+                    vec![1],
+                    "an unmeasured partition must not report an empty ISR — \
+                     producers would be unable to write to it"
+                );
+            }
+        }
+    }
+}

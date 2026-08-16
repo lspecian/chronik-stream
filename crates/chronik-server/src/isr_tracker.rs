@@ -456,9 +456,71 @@ impl IsrTracker {
     }
 }
 
+/// How long a replica may stay measurably behind before it leaves ISR.
+///
+/// Kafka's `replica.lag.time.max.ms` defaults to 30s. This is deliberately
+/// tighter: ISR is the signal an operator reads to learn that acknowledged data
+/// is at risk, and a 30s window means a third of a minute of writes land looking
+/// fully replicated when they are not. The cluster conformance suite is
+/// validated at this value — raise it toward Kafka's default if your followers
+/// are on a link where 10s of lag is routine, and re-run that suite.
+const DEFAULT_REPLICA_LAG_TIME_MAX_MS: u64 = 10_000;
+
+/// How far behind in records a replica may fall before it leaves ISR.
+///
+/// Kafka removed the equivalent (`replica.lag.max.messages`) in 0.9 because a
+/// single fixed count cannot suit partitions with different write rates: it
+/// ejects healthy replicas on a busy partition and tolerates hopeless ones on a
+/// quiet partition. Time is the primary bound here for the same reason; this
+/// count is a secondary guard.
+const DEFAULT_REPLICA_LAG_MAX_ENTRIES: u64 = 10_000;
+
+impl IsrTracker {
+    /// Build from the environment, so the bound is operator-tunable.
+    ///
+    /// It was `IsrTracker::default()` at the one call site that matters, which
+    /// left the bound hardcoded with no way to change it — Kafka exposes exactly
+    /// this knob, and a cluster whose followers sit on a slower link had no
+    /// answer short of a rebuild.
+    pub fn from_env() -> Self {
+        fn env_u64(key: &str, default: u64) -> u64 {
+            match std::env::var(key) {
+                Ok(raw) => match raw.parse::<u64>() {
+                    Ok(v) if v > 0 => v,
+                    _ => {
+                        tracing::warn!(
+                            "{}={:?} is not a positive integer — using {}",
+                            key, raw, default
+                        );
+                        default
+                    }
+                },
+                Err(_) => default,
+            }
+        }
+
+        let max_lag_ms = env_u64(
+            "CHRONIK_REPLICA_LAG_TIME_MAX_MS",
+            DEFAULT_REPLICA_LAG_TIME_MAX_MS,
+        );
+        let max_lag_entries = env_u64(
+            "CHRONIK_REPLICA_LAG_MAX_ENTRIES",
+            DEFAULT_REPLICA_LAG_MAX_ENTRIES,
+        );
+
+        tracing::info!(
+            max_lag_ms,
+            max_lag_entries,
+            "ISR lag bounds (CHRONIK_REPLICA_LAG_TIME_MAX_MS / _MAX_ENTRIES)"
+        );
+
+        Self::new(max_lag_entries, max_lag_ms)
+    }
+}
+
 impl Default for IsrTracker {
     fn default() -> Self {
-        Self::new(10_000, 10_000) // Default: 10K entries, 10s timeout
+        Self::new(DEFAULT_REPLICA_LAG_MAX_ENTRIES, DEFAULT_REPLICA_LAG_TIME_MAX_MS)
     }
 }
 
@@ -826,6 +888,42 @@ mod tests {
             500,
             "no follower data must not be read as 'nothing is replicated'"
         );
+    }
+
+    /// OQ3: the lag bound is time-based and operator-tunable.
+    ///
+    /// Kafka exposes `replica.lag.time.max.ms`; this had no equivalent — the
+    /// bound was compiled in, so a cluster whose followers sit on a slower link
+    /// could not widen it. A bad value must fall back to the default rather than
+    /// panic or, worse, parse to 0 and eject every replica instantly.
+    #[test]
+    fn lag_bound_reads_the_environment_and_rejects_nonsense() {
+        // Defaults when unset.
+        std::env::remove_var("CHRONIK_REPLICA_LAG_TIME_MAX_MS");
+        std::env::remove_var("CHRONIK_REPLICA_LAG_MAX_ENTRIES");
+        let tracker = IsrTracker::from_env();
+        assert_eq!(tracker.max_lag_ms, DEFAULT_REPLICA_LAG_TIME_MAX_MS);
+
+        // Honours a valid override, and liveness stays a multiple of it.
+        std::env::set_var("CHRONIK_REPLICA_LAG_TIME_MAX_MS", "30000");
+        let tracker = IsrTracker::from_env();
+        assert_eq!(tracker.max_lag_ms, 30_000);
+        assert_eq!(tracker.node_liveness_ms, 90_000);
+
+        // Zero would eject every replica the instant it fell one record behind.
+        std::env::set_var("CHRONIK_REPLICA_LAG_TIME_MAX_MS", "0");
+        assert_eq!(
+            IsrTracker::from_env().max_lag_ms,
+            DEFAULT_REPLICA_LAG_TIME_MAX_MS
+        );
+
+        std::env::set_var("CHRONIK_REPLICA_LAG_TIME_MAX_MS", "soon");
+        assert_eq!(
+            IsrTracker::from_env().max_lag_ms,
+            DEFAULT_REPLICA_LAG_TIME_MAX_MS
+        );
+
+        std::env::remove_var("CHRONIK_REPLICA_LAG_TIME_MAX_MS");
     }
 
     /// A single-node partition has no followers to wait for.
