@@ -468,3 +468,65 @@ The same split Open Question 1 found.
 The 1 GbE is now carrying 46–131 Mbit/s where it carried 690–693. The headroom
 is real, but taking it needs load the current harness cannot generate — one
 client on one 1 GbE link.
+
+## Single-node produce ceiling, and why io_uring is off
+
+Measured 2026-08-16 on the dev workstation (8-core/16-thread Ryzen, single
+socket, NVMe). `chronik-bench`, 256 B payloads, 3 partitions, `acks=1`,
+interleaved median-of-3. Bytes landed on disk reported alongside throughput.
+
+| | msg/s | p50 |
+|---|---:|---:|
+| `acks=1`, 1024 producers | **228,874** | 3.42 ms |
+| `acks=0`, 1024 producers | **513,260** | — |
+
+Throughput scales close to linearly with producer count up to ~1024. Figures
+taken at low concurrency (64 producers → ~13,500 msg/s) measure the load
+generator, not the broker.
+
+Durability at `acks=1` is verified, not assumed: 200,000 records acknowledged,
+`SIGKILL` with no flush, restart on the same data directory — 200,000 unique
+records recovered, zero lost, zero duplicates, across four runs.
+
+### io_uring is disabled by default
+
+`AsyncIoConfig::use_io_uring` has always defaulted to `false`. `GroupCommitWal`
+now honours it; previously it gated only on the compile-time `async-io` feature,
+which is on by default, so the io_uring path ran regardless. Set
+`CHRONIK_WAL_IO_URING=true` to opt in.
+
+It is off because it costs throughput here:
+
+| | msg/s | p50 |
+|---|---:|---:|
+| io_uring | 152,851 | 5.30 ms |
+| standard tokio file I/O | **228,874** | **3.42 ms** |
+
+At a single producer the gap is 5.8× (194 msg/s at 3.99 ms against 1,132 at
+0.69 ms).
+
+**Why it does not pay.** io_uring's advantage is amortising I/O syscalls at high
+IOPS. After group commit there are few left to amortise — at 229k msg/s the
+broker issues 11,618 `fsync` per 10 s, i.e. **197 messages per fsync**, and I/O
+syscalls (`write` + `fsync`) account for **6.3%** of syscall time. `futex` —
+thread wake-ups and scheduling — is **92%**. Perfect io_uring batching would
+collapse 42,818 I/O syscalls/s to ~1,161 and save ~0.65 core-seconds per second,
+on a machine already running 16 cores at 14% utilisation. It optimises the
+resource that is not scarce.
+
+The current implementation also inverts io_uring's design. Each write crosses a
+crossbeam channel to a single dedicated thread, copies the buffer
+(`Bytes` → `Vec<u8>`, because `IoBuf` needs ownership), is awaited **one at a
+time** in a sequential loop, and returns through a oneshot — two cross-thread
+wake-ups and a memcpy per write, with no batched submission, no linked
+write→fsync, no registered buffers, and no SQPOLL. The command loop also calls
+the blocking `crossbeam::recv_timeout` inside `tokio_uring`'s async runtime,
+which spins on `sched_yield`: 200,507 yields per 12 s against 2,014 on the
+standard path.
+
+**If it is revisited**, the design has to change with it: submit an entire
+group-commit batch as one linked write→fsync submission, one ring per core rather
+than one global thread, registered buffers to remove the copy, and no channel
+round-trip on the hot path. That is worth doing when the workload becomes
+I/O-bound — cloud block storage at 125–250 MB/s rather than this 1.4 GB/s NVMe —
+and not before.
