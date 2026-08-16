@@ -2,6 +2,10 @@
 //! 
 //! This test validates the WAL recovery system by simulating ungraceful shutdowns
 //! and verifying that the system can recover completely without data loss or corruption.
+
+#[path = "common.rs"]
+mod common;
+
 use rdkafka::producer::Producer;
 
 use std::collections::HashSet;
@@ -56,13 +60,28 @@ impl TestServer {
         tokio::fs::create_dir_all(&self.data_dir).await
             .context("Failed to create data directory")?;
         
-        let mut cmd = Command::new("./target/release/chronik-server");
-        cmd.env("CHRONIK_PORT", self.port.to_string())
+        // `start` is required (v2.2.0 CLI) and the Kafka port variable is
+        // CHRONIK_KAFKA_PORT — `CHRONIK_PORT` was never read, so this spawned a
+        // broker on the default port and then waited for one that never
+        // appeared on `self.port`.
+        // `./target/release/...` was relative to the test's working directory,
+        // which is the package dir — not the workspace root — so the binary was
+        // never where this looked for it.
+        let mut cmd = Command::new(common::server_binary());
+        cmd.arg("start")
+           .env("CHRONIK_KAFKA_PORT", self.port.to_string())
            .env("CHRONIK_METRICS_PORT", (self.port + 1).to_string())
            .env("CHRONIK_DATA_DIR", &self.data_dir)
            .env("RUST_LOG", "info,chronik_server::wal_integration=debug")
-           .stdout(std::process::Stdio::piped())
-           .stderr(std::process::Stdio::piped());
+           // Do NOT pipe: nothing here ever reads the child's output, and a
+           // pipe nobody drains blocks the writer once its ~64KB buffer fills.
+           // At this log level the broker filled it during startup and froze
+           // mid-write — still holding an open listener, so the port accepted
+           // connections while no request was ever answered. rdkafka reported
+           // "ApiVersionRequest timed out... probably due to broker version
+           // < 0.10", which points at everything except the real cause.
+           .stdout(std::process::Stdio::null())
+           .stderr(std::process::Stdio::null());
         
         let process = cmd.spawn()
             .context("Failed to spawn server process")?;
@@ -80,15 +99,20 @@ impl TestServer {
         let start = Instant::now();
         let endpoint = format!("localhost:{}", self.port);
         
+        // Readiness is a TCP connection, not a constructed client.
+        //
+        // This used to call `ClientConfig::create::<FutureProducer>()` and treat
+        // Ok as ready — but building an rdkafka producer only validates config
+        // and returns immediately; it never touches the network. The check
+        // therefore passed on the first attempt whether or not a broker existed,
+        // and the test went on to block on a produce that could never complete.
         while start.elapsed() < SERVER_STARTUP_TIMEOUT {
-            // Try to connect with a simple producer to test readiness
-            match ClientConfig::new()
-                .set("bootstrap.servers", &endpoint)
-                .set("message.timeout.ms", "3000")
-                .create::<FutureProducer>()
-            {
-                Ok(_producer) => {
+            match tokio::net::TcpStream::connect(&endpoint).await {
+                Ok(_) => {
                     debug!("Server is ready for connections");
+                    // Give the broker a moment past accept() to finish wiring up
+                    // its handlers before the first request.
+                    tokio::time::sleep(Duration::from_millis(500)).await;
                     return Ok(());
                 }
                 Err(_) => {
@@ -234,6 +258,7 @@ struct WalInspectionResult {
 /// Main WAL recovery test
 #[tokio::test]
 async fn test_wal_recovery_after_crash() -> Result<()> {
+    let _serial = common::exclusive().await;
     // Initialize logging
     let _ = env_logger::builder()
         .filter_level(log::LevelFilter::Info)
@@ -549,6 +574,7 @@ struct RecoveryTestStats {
 // Additional test for multiple crash/recovery cycles
 #[tokio::test]
 async fn test_multiple_crash_recovery_cycles() -> Result<()> {
+    let _serial = common::exclusive().await;
     info!("Starting multiple crash/recovery cycles test");
     
     let temp_dir = TempDir::new()?;

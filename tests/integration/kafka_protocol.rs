@@ -384,7 +384,13 @@ async fn test_kafka_offset_management() -> Result<()> {
     // Commit stored offsets
     consumer.commit_consumer_state(rdkafka::consumer::CommitMode::Sync)
         .expect("Failed to commit offsets");
-    
+
+    // Leave the group before the replacement joins. Without this the first
+    // consumer stays a member, the two split the partitions, and the second can
+    // never receive all the uncommitted records however long it waits — the
+    // test would be measuring a two-member split, not a resume from commit.
+    drop(consumer);
+
     // Create new consumer with same group - should start from committed offset
     let consumer2: StreamConsumer = ClientConfig::new()
         .set("bootstrap.servers", &bootstrap_servers)
@@ -408,8 +414,11 @@ async fn test_kafka_offset_management() -> Result<()> {
     //
     // What offset commit does guarantee, and what is checked here: across the
     // commit and the consumer restart the group sees every record exactly once.
+    // Generous window: the first consumer is still a group member until it
+    // leaves, so consumer 2 owns nothing until the group rebalances. A short
+    // window here measures rebalance latency, not offset-commit correctness.
     let mut received: Vec<String> = Vec::new();
-    let consume_timeout = Duration::from_secs(10);
+    let consume_timeout = Duration::from_secs(45);
     let start = std::time::Instant::now();
 
     while received.len() < 10 && start.elapsed() < consume_timeout {

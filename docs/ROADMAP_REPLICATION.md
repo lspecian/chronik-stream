@@ -1526,6 +1526,50 @@ found. Evidence from the run that produced this section is in
 ---
 
 
+## RP-13: a replacement group member sometimes gets only part of the partitions — `OPEN` (found 2026-08-17)
+
+**Blocks the merge.** Found by running `tests/integration` for the first time,
+in the same pass that fixed the SyncGroup starvation bug below.
+
+### The shape of it
+
+`consumer_groups::test_consumer_group_offset_commit`: 30 records over 3
+partitions, one consumer reads 15 and commits, is dropped, and a replacement
+joins the same group. The replacement should receive the other 15. Across runs
+of identical code it received:
+
+```
+15  (pass)      10  (fail)      5  (fail)
+```
+
+with a 45-second window it polls to exhaustion — so this is not the window being
+too short. 10 and 5 are two-partitions'-worth and one-partition's-worth: the
+replacement is being given a subset of the group's partitions and never
+converges to the rest.
+
+### Why it is not the bug already fixed
+
+The starvation fix (`ConsumerGroup::completed_assignments`) covers a follower
+whose SyncGroup arrives after the leader completed a rebalance — a member
+*joining*. This is a member *leaving* and being replaced, and it still
+reproduces with that fix in place. Same family, different path.
+
+### What to do next
+
+Instrument the coordinator across LeaveGroup → rebalance → SyncGroup for the
+replacement and record which partitions each generation assigns, as was done for
+the starvation bug (`RUST_LOG=chronik_server::consumer_group=info` prints the
+computed assignment per member). The question to answer first: does the
+coordinator compute a full assignment and the replacement receive part of it, or
+does it compute a partial one?
+
+The test is deliberately left failing rather than `#[ignore]`d. It reproduces a
+real defect at roughly one run in two, and hiding it would return this suite to
+the state that let 24 files rot.
+
+---
+
+
 ## Open Questions
 
 Answer before the phase that depends on them.

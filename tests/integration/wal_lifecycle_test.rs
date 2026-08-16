@@ -1,5 +1,17 @@
 //! WAL Lifecycle Integration Test
-//! 
+//!
+//! # Currently `#[ignore]`d — it starts no broker
+//!
+//! It produces to a hardcoded `localhost:19092` and expects something to already
+//! be listening there, but nothing in this file (or in the suite) starts a
+//! broker on that port. Left running it does not fail — it retries the refused
+//! connection forever, which is how it hung a suite run for 25 minutes before
+//! being killed. Unlike its siblings it does not use `TestCluster`, so pointing
+//! it at one is a rewrite rather than a repair.
+//!
+//! Start a broker on 19092 and run with `--ignored`, or port it to
+//! `TestCluster` (see `wal_recovery_test.rs`, which manages its own process).
+//!
 //! This test validates the complete write→flush→fetch lifecycle through the WAL system.
 //! Tests message ordering, offset guarantees, and data consistency using embedded Kafka producers.
 use rdkafka::producer::Producer;
@@ -32,6 +44,7 @@ const MESSAGE_SIZE: usize = 100;
 
 /// WAL Lifecycle Test Suite
 #[tokio::test]
+#[ignore = "needs a broker on 19092 that this test never starts; see module docs"]
 async fn test_wal_write_flush_fetch_lifecycle() -> Result<()> {
     // Initialize test logging
     let _ = env_logger::builder()
@@ -407,6 +420,7 @@ struct TestStatistics {
 
 // Additional stress test for concurrent WAL operations
 #[tokio::test]
+#[ignore = "needs a broker on 19092 that this test never starts; see module docs"]
 async fn test_concurrent_wal_operations() -> Result<()> {
     info!("Starting concurrent WAL operations stress test");
     

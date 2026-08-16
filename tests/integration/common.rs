@@ -81,7 +81,7 @@ pub struct TestCluster {
 /// `Command::new("chronik-server")` searched `$PATH`, which on a developer
 /// machine either finds nothing or — worse — finds an installed build of a
 /// different version than the one the test was compiled against.
-fn server_binary() -> PathBuf {
+pub fn server_binary() -> PathBuf {
     if let Ok(explicit) = std::env::var("CHRONIK_TEST_BIN") {
         return PathBuf::from(explicit);
     }
