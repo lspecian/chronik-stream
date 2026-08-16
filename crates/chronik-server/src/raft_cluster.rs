@@ -43,6 +43,17 @@ pub struct RaftCluster {
     /// Node ID in the cluster
     node_id: u64,
 
+    /// Membership this node was started with — self plus the configured peers.
+    ///
+    /// The state machine only learns node addresses from AddNode conf-changes,
+    /// which a cluster started from a config file never issues: its peers are
+    /// static and already known. `/admin/status` therefore reported
+    /// `"nodes": []` on every node of a healthy multi-node cluster, so an
+    /// operator could not see membership at all. Kept here as the answer when
+    /// the state machine has nothing, and superseded by it as soon as a
+    /// conf-change lands.
+    configured_nodes: Vec<(u64, String)>,
+
     /// Metadata state machine (shared with Raft)
     /// v2.2.7 DEADLOCK FIX: Uses ArcSwap for lock-free atomic pointer swapping
     /// - Reads: Zero-cost via .load() - just atomic pointer dereference
@@ -416,7 +427,12 @@ impl RaftCluster {
     ///
     /// **Refactored**: Reduced from 255 lines (~70-90 complexity) to ~70 lines (<25 complexity)
     /// Complexity: < 25 (simple orchestration of extracted helpers)
-    pub async fn bootstrap(node_id: u64, peers: Vec<(u64, String)>, data_dir: PathBuf) -> Result<Self> {
+    pub async fn bootstrap(
+        node_id: u64,
+        peers: Vec<(u64, String)>,
+        self_addr: String,
+        data_dir: PathBuf,
+    ) -> Result<Self> {
         tracing::info!(
             "Bootstrapping Raft cluster: node_id={}, peers={:?}",
             node_id,
@@ -461,9 +477,17 @@ impl RaftCluster {
             pending_partitions,
         ) = Self::create_channels_and_caches();
 
+        // Self plus the configured peers, in node-id order so the reported
+        // membership is stable rather than reordering between calls.
+        let mut configured_nodes: Vec<(u64, String)> = peers.clone();
+        configured_nodes.push((node_id, self_addr));
+        configured_nodes.sort_by_key(|(id, _)| *id);
+        configured_nodes.dedup_by_key(|(id, _)| *id);
+
         // Phase 9: Construct and return RaftCluster
         Ok(Self {
             node_id,
+            configured_nodes,
             state_machine,
             raft_node: Arc::new(tokio::sync::Mutex::new(raft_node)), // v2.2.7: tokio::Mutex (required for async context)
             storage: Arc::new(storage_for_async),
@@ -1389,7 +1413,22 @@ impl RaftCluster {
     /// Vector of (node_id, address) tuples
     pub fn get_node_info(&self) -> Vec<(u64, String)> {
         let sm = self.state_machine.load();
-        sm.nodes.iter().map(|(id, addr)| (*id, addr.clone())).collect()
+        if !sm.nodes.is_empty() {
+            let mut nodes: Vec<(u64, String)> = sm
+                .nodes
+                .iter()
+                .map(|(id, addr)| (*id, addr.clone()))
+                .collect();
+            nodes.sort_by_key(|(id, _)| *id);
+            return nodes;
+        }
+
+        // The state machine records a node only when an AddNode conf-change is
+        // applied. A cluster brought up from a config file has static peers and
+        // never issues one, so this was empty for the entire life of every
+        // config-file cluster — and `/admin/status` reported no members at all
+        // while happily reporting their partitions.
+        self.configured_nodes.clone()
     }
 
     /// Get all partition information
@@ -2719,14 +2758,14 @@ mod tests {
             (3, "localhost:9094".to_string()),
         ];
 
-        let cluster = RaftCluster::bootstrap(1, peers, PathBuf::from("/tmp/raft-test")).await.unwrap();
+        let cluster = RaftCluster::bootstrap(1, peers, "localhost:5001".to_string(), PathBuf::from("/tmp/raft-test")).await.unwrap();
 
         assert_eq!(cluster.node_id(), 1);
     }
 
     #[tokio::test]
     async fn test_metadata_queries() {
-        let cluster = RaftCluster::bootstrap(1, vec![], PathBuf::from("/tmp/raft-test2")).await.unwrap();
+        let cluster = RaftCluster::bootstrap(1, vec![], "localhost:5001".to_string(), PathBuf::from("/tmp/raft-test2")).await.unwrap();
 
         // v2.2.9: Partition assignments moved to WalMetadataStore.
         // Raft state machine only manages cluster membership (nodes, brokers).
@@ -2748,7 +2787,7 @@ mod tests {
     async fn test_raft_bootstrap_single_node() {
         // Raft is always compiled in — verify single-node bootstrap works
         let temp = tempfile::TempDir::new().unwrap();
-        let result = RaftCluster::bootstrap(1, vec![], temp.path().to_path_buf()).await;
+        let result = RaftCluster::bootstrap(1, vec![], "localhost:5001".to_string(), temp.path().to_path_buf()).await;
         assert!(result.is_ok(), "Single-node Raft bootstrap should succeed");
     }
 }
@@ -2790,6 +2829,7 @@ pub async fn run_raft_cluster(config: RaftClusterConfig) -> Result<()> {
     let raft_cluster = Arc::new(RaftCluster::bootstrap(
         config.node_id,
         raft_peers,
+        config.raft_addr.clone(),
         PathBuf::from(&config.data_dir)
     ).await?);
 

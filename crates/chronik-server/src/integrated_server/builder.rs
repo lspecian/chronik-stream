@@ -194,6 +194,7 @@ impl IntegratedKafkaServerBuilder {
                 crate::raft_cluster::RaftCluster::bootstrap(
                     self.config.node_id as u64,
                     Vec::new(), // Empty peers = single-node mode
+                    format!("{}:{}", self.config.advertised_host, self.config.advertised_port),
                     data_dir.clone(),
                 )
                 .await
