@@ -964,12 +964,29 @@ impl FetchHandler {
             topic, partition, fetch_offset, high_watermark, high_watermark - fetch_offset
         );
 
-        // Data is available, fetch it
-        let fetch_timeout = if max_wait_ms > 0 {
-            Duration::from_millis(max_wait_ms as u64)
-        } else {
-            Duration::from_secs(30) // Default timeout
-        };
+        // Data is available, fetch it.
+        //
+        // `max_wait_ms` is NOT the budget for this read. In Kafka it bounds how
+        // long the broker waits for `min_bytes` to *become* available; once data
+        // exists the broker returns it. Using it as a deadline on the read itself
+        // meant that when a busy leader took longer than the client's poll budget
+        // to serve records that were already there, the read was thrown away and
+        // an EMPTY response returned — so the follower immediately re-fetched and
+        // the leader redid the same work.
+        //
+        // That is a positive feedback loop, and it made cluster throughput
+        // bimodal: a run settled at either ~85,000 msg/s or ~8,000, never in
+        // between, on `acks=1` and `acks=all` but never `acks=0` or single-node.
+        // Raising the follower's window tenfold
+        // (CHRONIK_REPLICA_FETCH_MAX_WAIT_MS=5000) removed the collapse
+        // completely — 8 runs of 8 clean at 89,291-97,316 against 2-in-8
+        // collapsing at the 500ms default — which is what identified this line.
+        // See RP-12 in docs/ROADMAP_REPLICATION.md.
+        //
+        // What remains is a safety net against a genuinely stuck read, which is
+        // what the old `else` branch already used, applied to both branches.
+        const READ_SAFETY_DEADLINE: Duration = Duration::from_secs(30);
+        let fetch_timeout = READ_SAFETY_DEADLINE;
 
         // CRITICAL CRC FIX v1.3.32: Try to fetch raw Kafka bytes first to preserve CRC
         debug!("FETCH RAW: trying raw bytes (CRC-preserving) for {}-{}", topic, partition);
@@ -1021,7 +1038,13 @@ impl FetchHandler {
                         vec![]
                     }
                     Err(_) => {
-                        tracing::warn!("Fetch timeout after {}ms for {}-{}", max_wait_ms, topic, partition);
+                        // 30s safety deadline, not the client's max_wait — see the
+                        // READ_SAFETY_DEADLINE comment above. Reaching this means a read
+                        // is genuinely stuck, not merely slow.
+                        tracing::warn!(
+                            "Fetch read exceeded the {}s safety deadline for {}-{} — returning empty",
+                            READ_SAFETY_DEADLINE.as_secs(), topic, partition
+                        );
                         vec![]
                     }
                 };

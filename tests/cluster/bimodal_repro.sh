@@ -44,7 +44,7 @@ for run in $(seq 1 "$RUNS"); do
   rm -rf "$DIR/data/alt-node"{1,2,3}
   for n in 1 2 3; do
     mkdir -p "$LOGS" "$DIR/data/alt-node$n"
-    CHRONIK_UNIFIED_API_PORT=$((6391 + n)) RUST_LOG=info \
+    CHRONIK_UNIFIED_API_PORT=$((6391 + n)) RUST_LOG="${LOGLEVEL:-info}" \
       "$BIN" start --config "$DIR/altport-node$n.toml" > "$LOGS/perfm-node$n.log" 2>&1 &
     echo $! > "$LOGS/alt-node$n.pid"
   done

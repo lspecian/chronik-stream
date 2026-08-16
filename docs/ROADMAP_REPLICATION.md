@@ -18,7 +18,7 @@
 | RP-9 | `acks=all` round-trip throughput | `TESTED` | — | Every fetch re-read and re-parsed the whole active WAL segment from byte zero. Fixed with a durable-gated tail cache and a sparse offset index: ~1,400 → **6,197 msg/s**, now 1.3× `acks=1` rather than 4–7×, and stable across a run. Three bugs fell out, one of them **data loss on failover** (divergence 7/10 → 10/10) |
 | RP-10 | Replication cannot leave the client network | `TESTED` | — | `[[peers]].kafka` served both the client-facing Metadata list and the follower fetch path, so a dedicated fabric was unconfigurable. Added a per-peer `replication` address: `acks=1` **+31%** (21,802 → 28,587 msg/s), p99 −29%, client link 690 → 46 Mbit/s |
 | RP-11 | **The "17× produce regression" was a benchmark reading a bug** | ✅ `RESOLVED` | — | Not a regression: pre-#21 leaked reservations pinned the memory counter and the broker REJECTED most produces instantly, which a rate counter cannot tell from serving them (61,625 msg/s claimed, 50 MB on disk; guarded: 16,519 msg/s, 301.7 MB). Found a real bug behind it — every non-transactional produce failure was returned to the client as SUCCESS |
-| RP-12 | **Cluster produce throughput is bimodal** | ⛔ `OPEN` | — | One run in 3-6 collapses to a tenth (~8,000 vs ~85,000 msg/s) on `acks=1` and `acks=all`, never on `acks=0` or single-node. Not formation (survives a 104s settle), not elections. Correlates with a 3-4x higher replica-fetch timeout rate. **Blocks merge** |
+| RP-12 | **Cluster produce throughput was bimodal** | `TESTED` | — | One run in 3-6 collapsed to a tenth (~8,000 vs ~85,000 msg/s) on `acks=1`/`acks=all`. Cause: the client's `max_wait_ms` was used as a deadline on reading data that already existed, so a slow read was DISCARDED and refetched — positive feedback. Now a 30s stuck-read safety net. 8/8 clean after, was 2-in-8 |
 
 ---
 
@@ -1453,7 +1453,7 @@ Current single-node ceilings, and the io_uring default that follows from them,
 are in `BARE_METAL_PERFORMANCE.md`.
 
 ---
-## RP-12: cluster produce throughput is bimodal — `OPEN` (found 2026-08-16)
+## RP-12: cluster produce throughput is bimodal — `TESTED` (found and fixed 2026-08-16)
 
 **One cluster run in three to six collapses to a tenth of its normal throughput,
 and it is not a measurement artefact.** This blocks merging the branch: it is an
@@ -1568,3 +1568,43 @@ Read before starting; both are cautionary and specific.
 - `archive/failed-raft-data-replication-v2.2-v2.3` — 12 commits, 2025-10-29. See `docs/CRITICAL_BUG_RAFT_BATCHING.md` on that branch for the root cause and the unfinished 1-2 hour fix
 - #29 (`0b4e871`) — the async-return bug, its regression test, and the A/B methodology used to prove it
 - `docs/DISTRIBUTED_QUERY_LAYER.md` — Known Limitation #5 documents the *same* "assignment ≠ reality" mistake in the vector fan-out path, found 2026-03-04 and fixed for vector only; the SQL twin (#22) survived five more months
+
+### RP-12 resolution (2026-08-16)
+
+**Cause: `fetch_handler.rs` used the client's `max_wait_ms` as a deadline on
+reading data that was already available.** In Kafka that value bounds how long a
+broker waits for data to *appear*; once it exists the broker returns it. Here,
+when a busy leader took longer than the follower's 500 ms poll budget to serve
+records already on disk, the read was thrown away and an empty response returned
+— so the follower immediately re-fetched and the leader redid the same work.
+That is positive feedback, which is why throughput was bimodal rather than merely
+noisy: below the tipping point fetches complete, above it the cluster falls into
+the wasteful mode and stays there.
+
+Established by intervention, not correlation. Raising only the follower's window
+(`CHRONIK_REPLICA_FETCH_MAX_WAIT_MS=5000`) removed the collapse entirely:
+
+| | collapses | throughput |
+|---|---|---|
+| 500 ms (default) | **2 of 8** | ~85,000, with 8,262 and 8,517 |
+| 5000 ms | **0 of 8** | 89,291–97,316 |
+
+The fix is not that setting — that was the probe. The read now carries a
+30-second safety net against a genuinely stuck read (what the old `else` branch
+already used), decoupled from the client's poll budget. Verified at the **default
+500 ms**, the exact condition that produced the collapse: **8 runs of 8 clean**,
+83,509–95,596.
+
+Two hypotheses were falsified on the way and are recorded so they are not
+re-tried: tail-cache misses (identical in good and bad runs, 956/894 against
+857/817) and lock contention on `FetchHandler::state` (the read guard is scoped to
+`fetch_from_buffer` and released before the WAL I/O, and the produce path never
+takes it).
+
+Found separately and still open: `update_buffer_with_raw_batch` has no callers
+outside `fetch_handler.rs`, so the produce path never populates the in-memory
+fetch buffer — `buffer_hit` was 0 across every run captured, and every replica
+fetch falls through to WAL. Dead fast-path code, unrelated to this collapse.
+
+---
+
