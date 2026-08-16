@@ -150,19 +150,21 @@ Both faults made a **healthy broker look broken** — on the one test whose job 
 
 ### RP-0.2: Unit-level guards
 
-- [ ] Port `test_replication_fires_for_every_acks_mode` (already on main from #29) into the suite
-- [ ] Assert ISR reported by `/admin/status` matches physical placement
-- [ ] Assert a produce that reaches no follower is counted in `total_dropped`, never `total_sent`
+- [x] ~~Port `test_replication_fires_for_every_acks_mode` into the suite~~ — **superseded.** RP-4 deleted that test with the push path it asserted on: it checked `total_queued`, a counter on the way *out*. Its invariant — every acks mode reaches every replica — is now checked by `regression_replication.sh` against the records on each node's disk, which is the stronger claim.
+- [x] Assert ISR reported by `/admin/status` matches physical placement — `regression_replication.sh` ("ISR honesty"), which kills a replica and requires the reported ISR to shrink.
+- [x] ~~Assert a produce that reaches no follower is counted in `total_dropped`~~ — **obsolete.** RP-4 removed the data push path, so a produce no longer traverses the queue those counters describe; they now cover metadata replication only. The property they stood in for — a record that reached no follower must not be reported as replicated — is what ISR honesty and `local_divergence.sh` check directly.
 
-**Status**: —
+**Status**: `DONE` 2026-08-17 — two of three were superseded by the mechanism change rather than implemented, which is the honest outcome and worth stating plainly: these were written against the push transport.
 
 ### RP-0.3: Failure-mode coverage
 
-- [ ] Follower down during produce → records land after it returns (currently **fails**: no catch-up. Mark `#[ignore]` with a link to RP-2 until then)
+- [ ] Follower down during produce → records land after it returns
 - [ ] Follower restarted mid-produce → converges
-- [ ] Leader killed mid-produce → no divergence after election (currently **fails**: no leader epochs. `#[ignore]` until RP-3)
+- [x] Leader killed mid-produce → no divergence after election — `local_divergence.sh`, which stages the divergence with `SIGSTOP`/`SIGKILL`, kills the old leader mid-produce and requires the divergent tail to be cut (`bytes discarded > 0`) with every committed record still readable. The "`#[ignore]` until RP-3" note is spent: RP-3 shipped.
 
-**Status**: —
+**Status**: **one real gap left, and it is the same gap three times.** The first two boxes here and RP-2.4's "follower down 5 minutes, restarted, converges" are one property — a follower that misses writes catches up unattended — asserted at three durations. The mechanism exists and is `TESTED` (RP-2.4: resume from local LEO on restart), but nothing in `tests/cluster/` takes a follower away *during* a produce and then checks that the records arrive. `regression_replication.sh` kills a replica only to watch ISR shrink, and never brings it back.
+
+Not merge-blocking: catch-up is exercised on every cluster start, and a follower that fails to converge would fail the placement assertions. But it is the one durable claim in this roadmap resting on inference rather than a harness.
 
 > Deliberately includes tests that fail today. They define the target and un-ignore as phases land.
 
@@ -216,7 +218,7 @@ Added `SyncState{InSync,Lagging,Unknown}` so "never heard from" is distinguishab
 - [x] Change the guard to `acks == 1` so `acks=-1` reaches its ISR quorum arm
 - [x] Timeout returns `NOT_ENOUGH_REPLICAS` rather than hanging
 - [x] Test: `acks=-1` response stays pending until a follower ACK arrives
-- [ ] Measure the latency cost — this moves `acks=-1` off the async fast path
+- [x] Measure the latency cost — this moves `acks=-1` off the async fast path. `acks_all_latency.sh`, 2026-08-17: `acks=all` **13ms** steady state against a 250ms budget, **14ms** for the first write to a new topic against 2000ms; `acks=1` 12ms on the same run. So the cost of leaving the fast path is ~1ms, not the tens of ms feared — it settles on the replication round trip, which on a local 3-node cluster is fast. The budgets exist to catch it silently reverting to a background timer.
 
 **Status**: `CODE COMPLETE`. The quorum arm was fully written and **unreachable since v2.2.10** — `use_async_responses = response_pipeline.is_some() && acks != 0` sent `acks=-1` down the fast path, which answers on the leader's own fsync. Now `acks == 1`, so `acks=-1` falls through and waits. Only viable because #29 made followers actually receive data; before that this would have hung to timeout on every request.
 
@@ -359,7 +361,7 @@ The same rewrite closed a memory leak: `cleanup_expired()` had **no caller anywh
 - [x] Long-poll so steady-state streaming needs no extra round trip
 - [x] Append fetched records to the local WAL (shared apply path with the push receiver)
 - [x] On restart, resume from local LEO → **catch-up, for free**
-- [ ] Test: follower down 5 minutes, restarted, converges without operator action
+- [ ] Test: follower down 5 minutes, restarted, converges without operator action — **the one real gap left in this roadmap.** Same property as RP-0.3's first two boxes, at a third duration. The mechanism is `TESTED`; what is missing is a harness that removes a follower *during* a produce and then asserts the records arrive. `regression_replication.sh` kills a replica only to watch ISR shrink and never brings it back.
 
 **Status**: `TESTED` on a 3-node cluster, behind `CHRONIK_REPLICATION_MODE=pull` (default remains `push`). Conformance suite passes in **both** modes: placement correct at acks=0/1/all with 300/300 consumed, and ISR shrinks honestly when a replica is held down.
 
@@ -421,9 +423,9 @@ The current epoch is answered with the leader's **log end offset**, not RP-2.3's
 - [x] Conformance test written (RP-0.4)
 - [x] Handshake proven end-to-end on a 3-node cluster
 - [x] The **truncate** branch, in-process, with exact assertions
-- [ ] The **truncate** branch on a real cluster — divergence can now be staged, and staging it found three defects (below)
+- [x] The **truncate** branch on a real cluster — `local_divergence.sh`, passing as of 2026-08-17: `bytes discarded by the cut > 0`, 0 orphan markers left on disk, 40/40 committed records readable, 0 uncommitted records readable. Staging it found four defects (D0-D3 below); all are resolved.
 
-**Status**: `TESTED (partly)`. The in-process cut is proven. The *system* path is not: `tests/cluster/local_divergence.sh` now manufactures divergence reliably, and doing so exposed three separate ways the repair fails to happen.
+**Status**: `TESTED`. Both the in-process cut and the system path are proven. Reaching that took four separate fixes, because staging divergence reliably is what made the repair path observable at all — the section below is kept in full, since every one of those defects was invisible until divergence could be manufactured on demand.
 
 #### ⚠️ Staging divergence works now — and the repair does not (found 2026-08-13)
 
