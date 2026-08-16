@@ -529,6 +529,12 @@ pub struct ProduceHandler {
     /// Key: topic name, Value: (is_searchable, last_updated)
     /// TTL: 60 seconds to pick up config changes within reasonable time
     searchable_topic_cache: Arc<DashMap<String, (bool, std::time::Instant)>>,
+    /// Same shape as `searchable_topic_cache`, for the hot-vector check.
+    /// Key: topic name, Value: (is_vector_hot_enabled, last_updated)
+    /// Without it, `is_topic_vector_enabled` hit the metadata store on EVERY
+    /// produce — a full `TopicMetadata` fetch and clone per batch, on the hot
+    /// path, to answer a question whose answer changes about never.
+    vector_topic_cache: Arc<DashMap<String, (bool, std::time::Instant)>>,
     /// Hot path NRT search — in-memory Tantivy shadowing the WAL tail.
     /// Fire-and-forget from the produce path; never blocks acks.
     /// See `docs/ROADMAP_HOT_PATH.md` (HP-1.2).
@@ -1310,6 +1316,7 @@ impl ProduceHandler {
             pipelined_pool: Arc::new(PipelinedConnectionPool::new(10000)),  // v2.2.9: Async pipelined connection pool (capacity increased from 1000 → 10000 to prevent channel blocking)
             response_pipeline: None,  // v2.2.10: Initialize as None (set via set_response_pipeline) - CRITICAL FIX #7
             searchable_topic_cache: Arc::new(DashMap::new()),  // v2.2.16: Cache for topic searchability
+            vector_topic_cache: Arc::new(DashMap::new()),      // same, for the hot-vector check
             hot_text_index: None,  // HP-1.2: Wired via set_hot_text_index
             hot_vector_batcher: None,  // HP-2.3: Wired via set_hot_vector_batcher
             watermark_flusher,  // v2.7.1: debounced metadata watermark updates
@@ -3305,10 +3312,34 @@ impl ProduceHandler {
     ///
     /// Best-effort: if the metadata call fails the request is simply not
     /// enqueued (cold path still embeds it later).
+    /// Cached, 60s TTL — mirrors [`Self::is_topic_searchable`], including its
+    /// rule about not caching a miss.
+    ///
+    /// This ran uncached on every produce: `get_topic` against the metadata
+    /// store, which fetches and clones a whole `TopicMetadata` to read two
+    /// booleans that change roughly never. `is_topic_searchable` right next to
+    /// it had been cached since v2.2.16; this one was simply missed.
     async fn is_topic_vector_enabled(&self, topic: &str) -> bool {
+        const CACHE_TTL_SECS: u64 = 60;
+
+        if let Some(entry) = self.vector_topic_cache.get(topic) {
+            let (enabled, last_updated) = *entry;
+            if last_updated.elapsed().as_secs() < CACHE_TTL_SECS {
+                return enabled;
+            }
+        }
+
         match self.metadata_store.get_topic(topic).await {
             Ok(Some(meta)) => {
-                meta.config.is_vector_enabled() && meta.config.is_vector_hot_enabled()
+                let enabled =
+                    meta.config.is_vector_enabled() && meta.config.is_vector_hot_enabled();
+                // Only cache a hit. Caching a miss would pin `false` for 60s
+                // against a topic that auto-create is about to bring into
+                // existence with vectors enabled — the same race
+                // `is_topic_searchable` avoids.
+                self.vector_topic_cache
+                    .insert(topic.to_string(), (enabled, std::time::Instant::now()));
+                enabled
             }
             _ => false,
         }
@@ -4058,6 +4089,7 @@ impl Clone for ProduceHandler {
             pipelined_pool: Arc::clone(&self.pipelined_pool),  // v2.2.9: Async pipelined connection pool
             response_pipeline: self.response_pipeline.clone(),  // v2.2.10: Async response delivery (CRITICAL FIX #7)
             searchable_topic_cache: Arc::clone(&self.searchable_topic_cache),  // v2.2.16: Share cache
+            vector_topic_cache: Arc::clone(&self.vector_topic_cache),
             hot_text_index: self.hot_text_index.clone(),  // HP-1.2
             hot_vector_batcher: self.hot_vector_batcher.clone(),  // HP-2.3
             watermark_flusher: self.watermark_flusher.clone(),  // v2.7.1: Cheap Arc-shared clone

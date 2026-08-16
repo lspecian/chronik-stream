@@ -96,13 +96,15 @@ single largest optimisation available:
 1. **Eliminate the double write.** Seal WAL segments *as* the served segments, or
    have segment construction reference WAL bytes instead of copying them.
    Plausibly worth a large fraction of the remaining gap, and halves disk usage.
-2. **Group commit window.** The default `low_resource` profile flushes every 2 ms.
-   Longer windows amortise fsync over more records; `CHRONIK_WAL_PROFILE` already
-   exposes medium/high/ultra. Untested here — changing it needs a deliberate
-   latency-vs-throughput decision, not a default flip.
-3. **`is_topic_vector_enabled` is uncached** — a metadata store lookup on every
-   produce, where the sibling `is_topic_searchable` has a 60 s TTL cache. Small,
-   but it is pure overhead on the hot path.
+2. ~~**Group commit window.**~~ Measured — see below. All four profiles land
+   within 0.7% of each other at saturation. Not a lever.
+3. ~~**`is_topic_vector_enabled` is uncached.**~~ Fixed: it now carries the same
+   60 s TTL cache as its sibling `is_topic_searchable`, which had one since
+   v2.2.16. It runs on every produce, ungated, so it was a `TopicMetadata` fetch
+   and clone per batch. **No measurable throughput change** (153,106 → 153,802,
+   inside the noise band) — the metadata store is already in-memory, so what this
+   removes is an allocation, not I/O. Kept because it is correct and consistent,
+   not because it showed up.
 
 ## What this does not measure
 
@@ -117,3 +119,28 @@ single largest optimisation available:
 - **JVM warmup.** Kafka improved 19,748 → 24,707 going from a 12 s to a 60 s run.
   A longer run would likely help it further; 60 s is where this comparison stops.
 - **Consume, latency percentiles, and mixed workloads** — produce throughput only.
+
+## WAL profile: a low-load latency knob, not a throughput knob
+
+`CHRONIK_WAL_PROFILE` sets the group-commit window and batch size
+(low=2 ms/500, medium=10 ms/2k, high=50 ms/10k, ultra=100 ms/20k). Median of 3
+per profile, 1024 producers, `acks=1`:
+
+| profile | msg/s | p50 ms | p99 ms | disk MB |
+|---|---:|---:|---:|---:|
+| low (default) | 153,802 | 5.26 | 7.55 | 1998.2 |
+| medium | 153,676 | 5.27 | 7.45 | 1996.8 |
+| high | 154,691 | 5.23 | 7.32 | 2010.5 |
+| ultra | 154,658 | 5.23 | 7.47 | 2009.6 |
+
+**No measurable difference — 0.7% spread across a 50× range of commit windows.**
+Under saturation the batch fills by *size* long before the timer expires, so the
+window never binds. The profile matters at low load, where it sets how long a
+lone record waits for company; it is not a throughput lever, and there is no
+throughput left on the table here.
+
+⚠️ A first attempt at this sweep reported low=153,106 against medium=68,569 and
+high=68,516, which looked like a dramatic result and was an artifact: a
+`cargo build` was running during those two measurements and took the CPU. Same
+lesson as RP-11 — the surprising number was measuring the harness, not the
+system. Re-run on a quiet machine with a fixed binary, the effect vanishes.
