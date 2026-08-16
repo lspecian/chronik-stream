@@ -5,45 +5,52 @@
 //! - Add node endpoint
 //! - Leader discovery
 
-use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::sleep;
 
-/// Test Admin API health endpoint
+/// Admin API lives on the Unified API. The port-per-node scheme these tests used
+/// (`10000 + node_id`) is the deprecated legacy listener kept only for cluster
+/// backward compatibility.
+const ADMIN_PORTS: [u16; 3] = [6092, 6093, 6094];
+
+fn admin_url(port: u16, path: &str) -> String {
+    format!("http://localhost:{}/admin/{}", port, path)
+}
+
+/// Health endpoint reports the fields an operator needs to find the leader.
 #[tokio::test]
+#[ignore = "requires a running cluster: ./tests/cluster/start.sh, then --ignored"]
 async fn test_admin_api_health_endpoint() {
-    // This test requires a running cluster node
-    // For now, we'll create a minimal test that verifies the endpoint structure
-
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()
         .unwrap();
 
-    // Try to connect to a hypothetical node (will fail if no cluster running)
-    // This is intentionally a smoke test
-    match client.get("http://localhost:10001/admin/health").send().await {
-        Ok(response) => {
-            println!("Health endpoint responded with status: {}", response.status());
-            if response.status().is_success() {
-                let text = response.text().await.unwrap();
-                println!("Health response: {}", text);
-                // Verify JSON structure
-                assert!(text.contains("node_id"));
-                assert!(text.contains("is_leader"));
-                assert!(text.contains("cluster_nodes"));
-            }
-        }
-        Err(e) => {
-            println!("Expected failure (no cluster running): {}", e);
-            // This is expected if no cluster is running
-        }
+    let response = client
+        .get(admin_url(ADMIN_PORTS[0], "health"))
+        .send()
+        .await
+        .expect("admin health endpoint unreachable");
+
+    assert!(
+        response.status().is_success(),
+        "admin health returned {}",
+        response.status()
+    );
+
+    let health: serde_json::Value = response.json().await.expect("health response is not JSON");
+    for field in ["node_id", "is_leader", "cluster_nodes"] {
+        assert!(
+            health.get(field).is_some(),
+            "health response is missing `{}`: {}",
+            field,
+            health
+        );
     }
 }
 
 /// Test Admin API add-node endpoint (requires running cluster)
 #[tokio::test]
-#[ignore] // Requires running 3-node cluster
+#[ignore = "requires a running 3-node cluster: ./tests/cluster/start.sh, then --ignored"]
 async fn test_admin_api_add_node_endpoint() {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
@@ -53,8 +60,8 @@ async fn test_admin_api_add_node_endpoint() {
     // Step 1: Find the leader
     let mut leader_port = None;
     for node_id in 1..=3 {
-        let admin_port = 10000 + node_id;
-        let health_url = format!("http://localhost:{}/admin/health", admin_port);
+        let admin_port = ADMIN_PORTS[(node_id - 1) as usize];
+        let health_url = admin_url(admin_port, "health");
 
         match client.get(&health_url).send().await {
             Ok(response) if response.status().is_success() => {
@@ -72,7 +79,7 @@ async fn test_admin_api_add_node_endpoint() {
     assert!(leader_port.is_some(), "No leader found in cluster");
 
     // Step 2: Send add-node request to leader
-    let add_node_url = format!("http://localhost:{}/admin/add-node", leader_port.unwrap());
+    let add_node_url = admin_url(leader_port.unwrap(), "add-node");
 
     let request_body = serde_json::json!({
         "node_id": 4,
@@ -103,7 +110,7 @@ async fn test_admin_api_add_node_endpoint() {
 
 /// Test leader discovery logic
 #[tokio::test]
-#[ignore] // Requires running 3-node cluster
+#[ignore = "requires a running 3-node cluster: ./tests/cluster/start.sh, then --ignored"]
 async fn test_leader_discovery() {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
@@ -115,8 +122,8 @@ async fn test_leader_discovery() {
 
     // Query all nodes
     for node_id in 1..=3 {
-        let admin_port = 10000 + node_id;
-        let health_url = format!("http://localhost:{}/admin/health", admin_port);
+        let admin_port = ADMIN_PORTS[(node_id - 1) as usize];
+        let health_url = admin_url(admin_port, "health");
 
         match client.get(&health_url).send().await {
             Ok(response) if response.status().is_success() => {
@@ -134,6 +141,9 @@ async fn test_leader_discovery() {
                     follower_count += 1;
                 }
             }
+            Ok(response) => {
+                println!("Node {} returned {}", node_id, response.status());
+            }
             Err(e) => {
                 println!("Node {} unreachable: {}", node_id, e);
             }
@@ -150,7 +160,7 @@ async fn test_leader_discovery() {
 
 /// Test error handling for invalid requests
 #[tokio::test]
-#[ignore] // Requires running cluster
+#[ignore = "requires a running cluster: ./tests/cluster/start.sh, then --ignored"]
 async fn test_admin_api_error_handling() {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
@@ -160,8 +170,8 @@ async fn test_admin_api_error_handling() {
     // Find leader
     let mut leader_port = None;
     for node_id in 1..=3 {
-        let admin_port = 10000 + node_id;
-        let health_url = format!("http://localhost:{}/admin/health", admin_port);
+        let admin_port = ADMIN_PORTS[(node_id - 1) as usize];
+        let health_url = admin_url(admin_port, "health");
 
         match client.get(&health_url).send().await {
             Ok(response) if response.status().is_success() => {
@@ -176,7 +186,7 @@ async fn test_admin_api_error_handling() {
     }
 
     assert!(leader_port.is_some(), "No leader found");
-    let add_node_url = format!("http://localhost:{}/admin/add-node", leader_port.unwrap());
+    let add_node_url = admin_url(leader_port.unwrap(), "add-node");
 
     // Test 1: Invalid address format (missing port)
     let invalid_request = serde_json::json!({

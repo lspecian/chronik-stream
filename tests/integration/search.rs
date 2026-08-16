@@ -1,6 +1,11 @@
 //! Search functionality tests
 
-use super::common::*;
+#[path = "common.rs"]
+mod common;
+#[path = "test_setup.rs"]
+mod test_setup;
+
+use common::*;
 use chronik_common::Result;
 use rdkafka::{
     ClientConfig,
@@ -13,7 +18,7 @@ use tokio::time::sleep;
 
 #[tokio::test]
 async fn test_search_query_types() -> Result<()> {
-    super::test_setup::init();
+    test_setup::init();
     
     let cluster = TestCluster::start(TestClusterConfig::default()).await?;
     let bootstrap_servers = cluster.bootstrap_servers();
@@ -146,7 +151,7 @@ async fn test_search_query_types() -> Result<()> {
 
 #[tokio::test]
 async fn test_search_aggregations() -> Result<()> {
-    super::test_setup::init();
+    test_setup::init();
     
     let cluster = TestCluster::start(TestClusterConfig::default()).await?;
     let search_endpoint = cluster.search_endpoint();
@@ -289,7 +294,7 @@ async fn test_search_aggregations() -> Result<()> {
 
 #[tokio::test]
 async fn test_search_pagination_sorting() -> Result<()> {
-    super::test_setup::init();
+    test_setup::init();
     
     let cluster = TestCluster::start(TestClusterConfig::default()).await?;
     let search_endpoint = cluster.search_endpoint();
@@ -394,7 +399,7 @@ async fn test_search_pagination_sorting() -> Result<()> {
 
 #[tokio::test]
 async fn test_search_highlighting() -> Result<()> {
-    super::test_setup::init();
+    test_setup::init();
     
     let cluster = TestCluster::start(TestClusterConfig::default()).await?;
     let search_endpoint = cluster.search_endpoint();
@@ -461,7 +466,7 @@ async fn setup_search_test_data(cluster: &TestCluster, topic: &str) -> Result<()
         .create_topics(&[new_topic], &AdminOptions::new())
         .await
         .expect("Failed to create topics")[0]
-        .expect("Failed to create topic");
+        .as_ref().expect("Failed to create topic");
     
     // Produce test documents
     let producer: FutureProducer = ClientConfig::new()
@@ -555,7 +560,7 @@ async fn setup_pagination_test_data(cluster: &TestCluster, topic: &str) -> Resul
         .create_topics(&[new_topic], &AdminOptions::new())
         .await
         .expect("Failed to create topics")[0]
-        .expect("Failed to create topic");
+        .as_ref().expect("Failed to create topic");
     
     let producer: FutureProducer = ClientConfig::new()
         .set("bootstrap.servers", &bootstrap_servers)

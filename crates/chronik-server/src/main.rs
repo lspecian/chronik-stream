@@ -82,6 +82,10 @@ use serde_json;
 /// config file says otherwise.
 const DEFAULT_KAFKA_PORT: u16 = 9092;
 
+/// Prometheus `/metrics` port for single-node mode. Override with
+/// `CHRONIK_METRICS_PORT` when running more than one broker on a host.
+const DEFAULT_METRICS_PORT: u16 = 13092;
+
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "chronik-server",
@@ -1488,16 +1492,26 @@ async fn run_single_node_mode(
         .await?;
     info!("Single-node server initialized successfully");
 
-    // Initialize monitoring
+    // Initialize monitoring.
+    //
+    // The port was hardcoded, so two single-node brokers on one host always
+    // collided on it — the second logged a bind error for a listener the
+    // operator never chose and could not move. Kafka survives the collision
+    // (the metrics server no longer aborts the process) but /metrics is lost.
+    let metrics_port: u16 = std::env::var("CHRONIK_METRICS_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_METRICS_PORT);
+
     let _metrics_registry = init_monitoring(
         "chronik-server",
-        13092, // Default metrics port for single-node
+        metrics_port,
         None,
     ).await?;
 
     let kafka_addr = format!("{}:{}", bind, kafka_port);
     info!("Kafka protocol listening on {}", kafka_addr);
-    info!("Metrics endpoint available at http://{}:13092/metrics", bind);
+    info!("Metrics endpoint available at http://{}:{}/metrics", bind, metrics_port);
 
     // v2.4.0: Create SearchApi and integrate into Unified API
     // SearchApi is shared between the search router (Elasticsearch-compatible endpoints)

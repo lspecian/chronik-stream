@@ -29,6 +29,34 @@ impl SyncResponseBuilder {
                 &member.assignment
             };
 
+            // A follower reaching this path after the leader completed the
+            // rebalance reads working state that the NEXT rebalance clears. If
+            // it lost that race the field is empty, so fall back to the record
+            // kept for this generation — the assignment the leader actually
+            // made. Without this the member is told it owns nothing, and since
+            // the group is already Stable nothing ever corrects it: its
+            // partitions simply go unconsumed.
+            let member_assignment = if member_assignment.is_empty()
+                && group.completed_generation == group.generation_id
+            {
+                match group.completed_assignments.get(member_id) {
+                    Some(recorded) if !recorded.is_empty() => {
+                        warn!(
+                            group_id = %group.group_id,
+                            member_id = %member_id,
+                            generation = group.generation_id,
+                            assignment = ?recorded,
+                            "Member's working assignment was cleared by a concurrent rebalance; \
+                             serving the assignment recorded for this generation"
+                        );
+                        recorded
+                    }
+                    _ => member_assignment,
+                }
+            } else {
+                member_assignment
+            };
+
             info!(
                 group_id = %group.group_id,
                 member_id = %member_id,
@@ -104,6 +132,81 @@ mod tests {
         assert_eq!(response.error_code, 0);
         assert_eq!(response.member_epoch, 0);
         assert!(response.assignment.is_empty());
+    }
+
+    /// A follower whose working assignment was cleared by a concurrent
+    /// rebalance still gets the partitions the leader assigned it.
+    ///
+    /// Reproduces the 3-member case where consumer-2 was assigned partitions
+    /// 2 and 3, its SyncGroup arrived after the leader had finished, and it was
+    /// told it owned nothing — leaving those partitions unconsumed with the
+    /// group Stable and nothing to trigger a correction.
+    #[test]
+    fn test_fallback_serves_recorded_assignment_when_member_state_was_cleared() {
+        let mut members = HashMap::new();
+        members.insert("member-2".to_string(), GroupMember {
+            member_id: "member-2".to_string(),
+            member_epoch: 1,
+            assignment: HashMap::new(), // cleared by trigger_rebalance
+            ..Default::default()
+        });
+
+        let mut recorded = HashMap::new();
+        recorded.insert(
+            "member-2".to_string(),
+            HashMap::from([("t".to_string(), vec![2, 3])]),
+        );
+
+        let group = ConsumerGroup {
+            group_id: "g".to_string(),
+            generation_id: 3,
+            members,
+            assignment_strategy: AssignmentStrategy::Range,
+            completed_assignments: recorded,
+            completed_generation: 3,
+            ..Default::default()
+        };
+
+        let response = SyncResponseBuilder::build_fallback_response(&group, "member-2");
+        assert_eq!(response.error_code, 0);
+        assert!(
+            !response.assignment.is_empty(),
+            "member was told it owns nothing despite an assignment recorded for generation 3"
+        );
+    }
+
+    /// A record from an older generation must never be served.
+    #[test]
+    fn test_fallback_ignores_stale_generation_record() {
+        let mut members = HashMap::new();
+        members.insert("member-2".to_string(), GroupMember {
+            member_id: "member-2".to_string(),
+            assignment: HashMap::new(),
+            ..Default::default()
+        });
+
+        let mut recorded = HashMap::new();
+        recorded.insert(
+            "member-2".to_string(),
+            HashMap::from([("t".to_string(), vec![2, 3])]),
+        );
+
+        let group = ConsumerGroup {
+            group_id: "g".to_string(),
+            generation_id: 4,     // group has moved on
+            members,
+            assignment_strategy: AssignmentStrategy::Range,
+            completed_assignments: recorded,
+            completed_generation: 3, // record is from the previous generation
+            ..Default::default()
+        };
+
+        let response = SyncResponseBuilder::build_fallback_response(&group, "member-2");
+        assert_eq!(
+            response.assignment,
+            encode_assignment(&HashMap::new()),
+            "a stale generation's assignment must not be served"
+        );
     }
 
     #[test]

@@ -654,7 +654,19 @@ pub fn write_response_header_flexible(buf: &mut BytesMut, header: &ResponseHeade
     }
 }
 
-/// Check if an API version uses flexible versions
+/// Check if an API version uses flexible versions.
+///
+/// This is the single source of truth for flexibility, used by request-header
+/// parsing, response-header writing, and `make_response`. It is deliberately
+/// exhaustive over the APIs we advertise: an API that falls through to the
+/// catch-all gets a NON-flexible header, which is the safe default only because
+/// every unlisted API advertises a max version below its flexible cutoff.
+///
+/// Keep an entry here in step with `supported_api_versions()`. Raising an API's
+/// advertised max past its flexible cutoff without adding it below produces a
+/// response the client cannot parse — the byte stream shifts by the one tagged-
+/// fields byte the header should have carried, and every field after it is read
+/// from the wrong offset. That failure is silent on our side: we log a success.
 pub fn is_flexible_version(api_key: ApiKey, api_version: i16) -> bool {
     match api_key {
         ApiKey::Produce => api_version >= 9,
@@ -670,13 +682,41 @@ pub fn is_flexible_version(api_key: ApiKey, api_version: i16) -> bool {
         ApiKey::SyncGroup => api_version >= 4,
         ApiKey::DescribeGroups => api_version >= 5,
         ApiKey::ListGroups => api_version >= 3,
+        // NOTE: the Kafka spec marks SaslHandshake "flexibleVersions": "none".
+        // Left as-is rather than corrected because there is no SASL client in
+        // the test bed to prove the change, and the current form is what
+        // existing deployments have negotiated against.
         ApiKey::SaslHandshake => api_version >= 1,
         ApiKey::SaslAuthenticate => api_version >= 2,  // v2+ uses flexible encoding
         ApiKey::ApiVersions => api_version >= 3,
         ApiKey::CreateTopics => api_version >= 5,
         ApiKey::DeleteTopics => api_version >= 4,
         ApiKey::DescribeConfigs => api_version >= 4,
+        ApiKey::AlterConfigs => api_version >= 2,
+        ApiKey::IncrementalAlterConfigs => api_version >= 1,
         ApiKey::DescribeCluster => api_version >= 1,  // v1 uses flexible encoding
+        // Admin APIs
+        ApiKey::DeleteRecords => api_version >= 2,
+        ApiKey::DeleteGroups => api_version >= 2,
+        ApiKey::CreatePartitions => api_version >= 2,
+        ApiKey::ElectLeaders => api_version >= 2,
+        ApiKey::DescribeLogDirs => api_version >= 2,
+        ApiKey::AlterReplicaLogDirs => api_version >= 2,
+        ApiKey::OffsetForLeaderEpoch => api_version >= 4,
+        ApiKey::AlterPartitionReassignments => true,   // flexible at every version
+        ApiKey::ListPartitionReassignments => true,    // flexible at every version
+        ApiKey::DescribeClientQuotas => api_version >= 1,
+        ApiKey::AlterClientQuotas => api_version >= 1,
+        ApiKey::DescribeUserScramCredentials => true,  // flexible at every version
+        ApiKey::AlterUserScramCredentials => true,     // flexible at every version
+        ApiKey::DescribeProducers => true,             // flexible at every version
+        ApiKey::DescribeTransactions => true,          // flexible at every version
+        ApiKey::ListTransactions => true,              // flexible at every version
+        ApiKey::OffsetDelete => false,                 // never flexible
+        ApiKey::CreateDelegationToken => api_version >= 2,
+        ApiKey::RenewDelegationToken => api_version >= 2,
+        ApiKey::ExpireDelegationToken => api_version >= 2,
+        ApiKey::DescribeDelegationToken => api_version >= 2,
         // Transaction APIs
         ApiKey::InitProducerId => api_version >= 2,  // v2+ uses flexible encoding
         ApiKey::AddPartitionsToTxn => api_version >= 3,  // v3+ uses flexible encoding
@@ -897,6 +937,126 @@ mod tests {
                 assert!(message.contains("999"));
             }
             Err(e) => panic!("Expected ProtocolWithCorrelation error, got: {:?}", e),
+        }
+    }
+
+    /// Every API's flexible cutoff, checked on both sides of the boundary.
+    ///
+    /// A wrong answer here is not a caught error — it shifts the response by
+    /// one byte and the client silently misreads every field after the header.
+    /// CreateTopics v4 got this wrong and librdkafka's AdminClient reported
+    /// zero results for topics that had in fact been created.
+    #[test]
+    fn test_flexible_version_cutoffs() {
+        // (api, last non-flexible version, first flexible version)
+        let cutoffs = [
+            (ApiKey::Produce, 8, 9),
+            (ApiKey::Fetch, 11, 12),
+            (ApiKey::ListOffsets, 5, 6),
+            (ApiKey::Metadata, 8, 9),
+            (ApiKey::OffsetCommit, 7, 8),
+            (ApiKey::OffsetFetch, 5, 6),
+            (ApiKey::FindCoordinator, 2, 3),
+            (ApiKey::JoinGroup, 5, 6),
+            (ApiKey::Heartbeat, 3, 4),
+            (ApiKey::LeaveGroup, 3, 4),
+            (ApiKey::SyncGroup, 3, 4),
+            (ApiKey::DescribeGroups, 4, 5),
+            (ApiKey::ListGroups, 2, 3),
+            (ApiKey::CreateTopics, 4, 5),
+            (ApiKey::DeleteTopics, 3, 4),
+            (ApiKey::DeleteRecords, 1, 2),
+            (ApiKey::DeleteGroups, 1, 2),
+            (ApiKey::CreatePartitions, 1, 2),
+            (ApiKey::DescribeConfigs, 3, 4),
+            (ApiKey::AlterConfigs, 1, 2),
+            (ApiKey::IncrementalAlterConfigs, 0, 1),
+            (ApiKey::DescribeAcls, 1, 2),
+            (ApiKey::CreateAcls, 1, 2),
+            (ApiKey::DeleteAcls, 1, 2),
+            (ApiKey::InitProducerId, 1, 2),
+            (ApiKey::AddPartitionsToTxn, 2, 3),
+            (ApiKey::AddOffsetsToTxn, 2, 3),
+            (ApiKey::EndTxn, 2, 3),
+            (ApiKey::TxnOffsetCommit, 2, 3),
+            (ApiKey::SaslAuthenticate, 1, 2),
+            (ApiKey::ElectLeaders, 1, 2),
+            (ApiKey::DescribeLogDirs, 1, 2),
+            (ApiKey::OffsetForLeaderEpoch, 3, 4),
+        ];
+
+        for (api, last_rigid, first_flexible) in cutoffs {
+            assert!(
+                !is_flexible_version(api, last_rigid),
+                "{:?} v{} must NOT be flexible",
+                api,
+                last_rigid
+            );
+            assert!(
+                is_flexible_version(api, first_flexible),
+                "{:?} v{} must be flexible",
+                api,
+                first_flexible
+            );
+        }
+
+        // OffsetDelete is never flexible at any version.
+        assert!(!is_flexible_version(ApiKey::OffsetDelete, 0));
+        assert!(!is_flexible_version(ApiKey::OffsetDelete, 5));
+    }
+
+    /// Anything we advertise above its flexible cutoff must have an entry in
+    /// `is_flexible_version`; otherwise the catch-all silently answers "rigid"
+    /// for a version that is not.
+    ///
+    /// This is the check that would have caught CreateTopics before a client
+    /// did: advertised max 7, flexible from 5, so v5-v7 depend on the entry
+    /// existing.
+    #[test]
+    fn test_advertised_versions_have_flexibility_entries() {
+        // APIs whose advertised max is at or above their flexible cutoff.
+        let must_be_flexible_at_max = [
+            (ApiKey::Produce, 9),
+            (ApiKey::Fetch, 13),
+            (ApiKey::ListOffsets, 7),
+            (ApiKey::Metadata, 12),
+            (ApiKey::OffsetCommit, 8),
+            (ApiKey::OffsetFetch, 8),
+            (ApiKey::FindCoordinator, 4),
+            (ApiKey::JoinGroup, 9),
+            (ApiKey::Heartbeat, 4),
+            (ApiKey::LeaveGroup, 5),
+            (ApiKey::SyncGroup, 5),
+            (ApiKey::DescribeGroups, 5),
+            (ApiKey::ListGroups, 4),
+            (ApiKey::CreateTopics, 7),
+            (ApiKey::DescribeConfigs, 4),
+            (ApiKey::AlterConfigs, 2),
+            (ApiKey::AddPartitionsToTxn, 3),
+            (ApiKey::AddOffsetsToTxn, 3),
+            (ApiKey::EndTxn, 3),
+            (ApiKey::TxnOffsetCommit, 3),
+            (ApiKey::SaslAuthenticate, 2),
+            (ApiKey::InitProducerId, 4),
+            (ApiKey::DescribeCluster, 1),
+        ];
+
+        let advertised = supported_api_versions();
+        for (api, expected_max) in must_be_flexible_at_max {
+            let range = advertised
+                .get(&api)
+                .unwrap_or_else(|| panic!("{:?} is not advertised", api));
+            assert_eq!(
+                range.max, expected_max,
+                "{:?} advertised max changed; re-check its flexible cutoff",
+                api
+            );
+            assert!(
+                is_flexible_version(api, range.max),
+                "{:?} advertises v{} which is flexible, but is_flexible_version says otherwise",
+                api,
+                range.max
+            );
         }
     }
 }

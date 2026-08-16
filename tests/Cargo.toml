@@ -1,84 +1,97 @@
 [package]
 name = "chronik-integration-tests"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
 
-[workspace]
-# Empty workspace to make this package standalone
-
-[[test]]
-name = "integration"
-path = "integration/mod.rs"
-
-[[test]]
-name = "raft_single_partition"
-path = "integration/raft_single_partition.rs"
-
-[[test]]
-name = "raft_multi_partition"
-path = "integration/raft_multi_partition.rs"
-
-[[test]]
-name = "raft_cluster_bootstrap"
-path = "integration/raft_cluster_bootstrap.rs"
-
-# Removed obsolete test files that tested old RaftReplicaManager architecture
-# (no longer exists, replaced by RaftGroupManager)
-# - raft_cluster_integration.rs (10 compilation errors)
-# - raft_cluster_e2e.rs (35 compilation errors)
-# - raft_produce_path_test.rs (13 compilation errors)
-# - raft_network_test.rs (4 compilation errors)
-# - raft_snapshot_test.rs (import errors)
-# - raft_phase4_integration.rs (3 compilation errors)
-# - wal_raft_storage.rs (16 compilation errors)
+# This package is a WORKSPACE MEMBER on purpose.
 #
-# Core Raft functionality is fully tested by:
-# - raft_single_partition.rs (7/7 tests passing)
-# - raft_cluster_bootstrap.rs (6/6 tests passing)
-# - raft_multi_partition.rs (3/6 tests passing)
-# Total: 16/19 tests passing (84% pass rate)
+# It used to carry `[workspace]` of its own plus `exclude = ["tests"]` in the
+# root manifest, which pinned it to an independent dependency set: `raft = "0.7"`
+# from crates.io while the workspace vendors raft, `tonic = "0.12"` against the
+# workspace's 0.11. Nothing tied it to the tree it tests, so it drifted until 24
+# of 27 files no longer compiled — and because it was outside the workspace,
+# `cargo test --workspace` never said so.
+#
+# Every dependency below is `workspace = true` for the same reason. A test suite
+# that resolves its own versions is testing a different program.
 
 [dependencies]
-chronik-common = { path = "../crates/chronik-common" }
-chronik-protocol = { path = "../crates/chronik-protocol" }
-chronik-raft = { path = "../crates/chronik-raft" }
-chronik-storage = { path = "../crates/chronik-storage" }
-chronik-wal = { path = "../crates/chronik-wal" }
-raft = { version = "0.7", default-features = false, features = ["prost-codec"] }
-parking_lot = "0.12"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-anyhow = "1.0"
-tokio = { version = "1.35", features = ["full"] }
-futures = "0.3"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-tempfile = "3.8"
-bytes = { version = "1.5", features = ["serde"] }
-crc32fast = "1.3"
-byteorder = "1.5"
-async-trait = "0.1"
-tonic = "0.12"
-bincode = "1.3"
-
-# Test dependencies
-testcontainers = "0.15"
-rdkafka = { version = "0.36", features = ["cmake-build", "ssl", "zstd"] }
-reqwest = { version = "0.11", features = ["json"] }
-aws-sdk-s3 = "1.15"
-aws-credential-types = "1.1"
-opendal = { version = "0.45", default-features = false, features = ["rustls", "services-s3", "services-gcs", "services-azblob", "layers-metrics"] }
-
-# For time measurements
-chrono = { version = "0.4", features = ["serde"] }
-
-# Additional dependencies for WAL testing
-base64 = "0.21"
-log = "0.4"
-env_logger = "0.11"
-libc = "0.2"
 
 [dev-dependencies]
-# Additional test utilities
-pretty_assertions = "1.4"
-env_logger = "0.11"
+chronik-common = { path = "../crates/chronik-common" }
+chronik-protocol = { path = "../crates/chronik-protocol" }
+chronik-storage = { path = "../crates/chronik-storage" }
+chronik-wal = { path = "../crates/chronik-wal" }
+chronik-config = { path = "../crates/chronik-config" }
+
+tokio = { workspace = true }
+async-trait = { workspace = true }
+anyhow = { workspace = true }
+futures = { workspace = true }
+bytes = { workspace = true }
+byteorder = { workspace = true }
+crc32fast = { workspace = true }
+bincode = { workspace = true }
+chrono = { workspace = true }
+parking_lot = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+
+rdkafka = { workspace = true }
+reqwest = { workspace = true }
+
+# The WAL suites drive rdkafka's C library and read `log`-crate output from it.
+base64 = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+libc = { workspace = true }
+
+# Test targets are declared one at a time, never by glob, so a file that stops
+# compiling fails the build here instead of quietly dropping out of coverage.
+
+[[test]]
+name = "canonical_crc"
+path = "integration/canonical_crc_test.rs"
+
+[[test]]
+name = "batch_round_trip"
+path = "integration/test_batch_round_trip.rs"
+
+[[test]]
+name = "vector_search"
+path = "integration/vector_search_test.rs"
+
+[[test]]
+name = "admin_api"
+path = "integration/admin_api_test.rs"
+
+[[test]]
+name = "partition_assignment_persistence"
+path = "integration/partition_assignment_persistence.rs"
+
+[[test]]
+name = "consumer_groups"
+path = "integration/consumer_groups.rs"
+
+[[test]]
+name = "kafka_protocol"
+path = "integration/kafka_protocol.rs"
+
+[[test]]
+name = "wal_recovery"
+path = "integration/wal_recovery_test.rs"
+
+[[test]]
+name = "wal_lifecycle"
+path = "integration/wal_lifecycle_test.rs"
+
+[[test]]
+name = "data_flow"
+path = "integration/data_flow.rs"
+

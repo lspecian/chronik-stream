@@ -2,6 +2,7 @@
 //! 
 //! This test validates the complete write→flush→fetch lifecycle through the WAL system.
 //! Tests message ordering, offset guarantees, and data consistency using embedded Kafka producers.
+use rdkafka::producer::Producer;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -19,12 +20,7 @@ use tokio::time::timeout;
 use tempfile::TempDir;
 use tracing::{info, debug, warn};
 
-use chronik_common::{
-    TopicPartition, 
-    ProducerRecord, 
-    ConsumerRecord,
-    metadata::TopicMetadata,
-};
+use chronik_common::metadata::TopicMetadata;
 
 /// Test configuration
 const TEST_TOPIC: &str = "wal-lifecycle-test";
@@ -149,7 +145,7 @@ async fn produce_test_messages(stats: &mut TestStatistics) -> Result<Vec<TestMes
         match timeout(Duration::from_secs(5), producer.send(record, Duration::from_secs(0))).await {
             Ok(Ok(delivery)) => {
                 debug!("Message {} delivered to partition {} offset {}", 
-                       i, delivery.1, delivery.2);
+                       i, delivery.0, delivery.1);
                 produced_messages.push(message);
                 stats.messages_produced += 1;
             }

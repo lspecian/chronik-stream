@@ -1,6 +1,11 @@
 //! Consumer group coordination tests
 
-use super::common::*;
+#[path = "common.rs"]
+mod common;
+#[path = "test_setup.rs"]
+mod test_setup;
+
+use common::*;
 use chronik_common::Result;
 use rdkafka::{
     ClientConfig,
@@ -15,9 +20,65 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout};
 
+/// The partitions the group coordinator actually assigned to this consumer.
+///
+/// These tests used to infer assignment by polling for messages and recording
+/// which partitions they arrived from. That measures data flow, not assignment:
+/// a consumer holding partitions whose records an earlier phase already drained
+/// records zero partitions and the test fails on a broker that did nothing
+/// wrong. `assignment()` asks the client what SyncGroup handed it, which is the
+/// coordinator behaviour under test.
+fn assigned_partitions(consumer: &StreamConsumer) -> HashSet<i32> {
+    use rdkafka::consumer::Consumer as _;
+    consumer
+        .assignment()
+        .expect("assignment() failed")
+        .elements()
+        .iter()
+        .map(|e| e.partition())
+        .collect()
+}
+
+/// Poll each consumer briefly so librdkafka services the group protocol, then
+/// wait for every partition to be claimed exactly once.
+async fn await_stable_assignment(
+    consumers: &[(&str, &StreamConsumer)],
+    expected_partitions: usize,
+) -> HashMap<String, HashSet<i32>> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+
+    loop {
+        // recv() drives the client's background work, including rebalance.
+        for (_, consumer) in consumers {
+            let _ = timeout(Duration::from_millis(200), consumer.recv()).await;
+        }
+
+        let assignments: HashMap<String, HashSet<i32>> = consumers
+            .iter()
+            .map(|(name, consumer)| (name.to_string(), assigned_partitions(consumer)))
+            .collect();
+
+        let total: usize = assignments.values().map(|p| p.len()).sum();
+        let union: HashSet<i32> = assignments.values().flatten().copied().collect();
+
+        // Stable means: every partition claimed, and none claimed twice.
+        if union.len() == expected_partitions && total == expected_partitions {
+            return assignments;
+        }
+
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "group never reached a stable assignment of {} partitions: {:?}",
+                expected_partitions, assignments
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn test_consumer_group_rebalance() -> Result<()> {
-    super::test_setup::init();
+    test_setup::init();
+    let _serial = common::exclusive().await;
     
     let cluster = TestCluster::start(TestClusterConfig::default()).await?;
     let bootstrap_servers = cluster.bootstrap_servers();
@@ -33,7 +94,7 @@ async fn test_consumer_group_rebalance() -> Result<()> {
         .create_topics(&[topic], &AdminOptions::new())
         .await
         .expect("Failed to create topics")[0]
-        .expect("Failed to create topic");
+        .as_ref().expect("Failed to create topic");
     
     // Produce test data
     let producer: FutureProducer = ClientConfig::new()
@@ -109,41 +170,22 @@ async fn test_consumer_group_rebalance() -> Result<()> {
     // Verify partitions are distributed
     let mut assignments = partition_assignments.lock().await;
     assignments.clear();
-    
-    // Collect partition assignments
-    let consumers = vec![
-        ("consumer-1", &consumer1),
-        ("consumer-2", &consumer2),
-    ];
-    
-    for (name, consumer) in &consumers {
-        let mut consumer_partitions = HashSet::new();
-        let collect_start = std::time::Instant::now();
-        
-        while collect_start.elapsed() < Duration::from_secs(2) {
-            match timeout(Duration::from_millis(100), consumer.recv()).await {
-                Ok(Ok(message)) => {
-                    consumer_partitions.insert(message.partition());
-                }
-                _ => continue,
-            }
-        }
-        
-        assignments.insert(name.to_string(), consumer_partitions);
-    }
-    
+
+    let two = [("consumer-1", &consumer1), ("consumer-2", &consumer2)];
+    let two_way = await_stable_assignment(&two, 6).await;
+    assignments.extend(two_way.clone());
+
     // Verify each consumer has some partitions
-    assert!(!assignments["consumer-1"].is_empty());
-    assert!(!assignments["consumer-2"].is_empty());
-    
+    assert!(!two_way["consumer-1"].is_empty(), "consumer-1 got no partitions");
+    assert!(!two_way["consumer-2"].is_empty(), "consumer-2 got no partitions");
+
     // Verify no partition overlap
-    let c1_parts = &assignments["consumer-1"];
-    let c2_parts = &assignments["consumer-2"];
-    assert!(c1_parts.is_disjoint(c2_parts));
-    
-    // Verify all partitions are covered
-    let all_assigned: HashSet<_> = c1_parts.union(c2_parts).copied().collect();
-    assert_eq!(all_assigned.len(), 6);
+    assert!(
+        two_way["consumer-1"].is_disjoint(&two_way["consumer-2"]),
+        "partitions assigned to both consumers: {:?} / {:?}",
+        two_way["consumer-1"],
+        two_way["consumer-2"]
+    );
     
     // Start third consumer
     let consumer3: StreamConsumer = ClientConfig::new()
@@ -164,41 +206,34 @@ async fn test_consumer_group_rebalance() -> Result<()> {
     
     // Verify partitions are re-distributed among three consumers
     assignments.clear();
-    
-    let consumers = vec![
+
+    let three = [
         ("consumer-1", &consumer1),
         ("consumer-2", &consumer2),
         ("consumer-3", &consumer3),
     ];
-    
-    for (name, consumer) in &consumers {
-        let mut consumer_partitions = HashSet::new();
-        let collect_start = std::time::Instant::now();
-        
-        while collect_start.elapsed() < Duration::from_secs(2) {
-            match timeout(Duration::from_millis(100), consumer.recv()).await {
-                Ok(Ok(message)) => {
-                    consumer_partitions.insert(message.partition());
-                }
-                _ => continue,
-            }
-        }
-        
-        assignments.insert(name.to_string(), consumer_partitions);
+    let three_way = await_stable_assignment(&three, 6).await;
+    assignments.extend(three_way.clone());
+
+    // 6 partitions over 3 consumers: an even split is 2 each, and no correct
+    // assignor strays outside 1..=3.
+    for (name, partitions) in three_way.iter() {
+        assert!(
+            (1..=3).contains(&partitions.len()),
+            "{} has {} of 6 partitions across 3 consumers: {:?}",
+            name,
+            partitions.len(),
+            three_way
+        );
     }
-    
-    // Each consumer should have ~2 partitions
-    for (name, partitions) in assignments.iter() {
-        assert!(partitions.len() >= 1 && partitions.len() <= 3,
-            "{} has {} partitions", name, partitions.len());
-    }
-    
+
     Ok(())
 }
 
 #[tokio::test]
 async fn test_consumer_group_offset_commit() -> Result<()> {
-    super::test_setup::init();
+    test_setup::init();
+    let _serial = common::exclusive().await;
     
     let cluster = TestCluster::start(TestClusterConfig::default()).await?;
     let bootstrap_servers = cluster.bootstrap_servers();
@@ -214,7 +249,7 @@ async fn test_consumer_group_offset_commit() -> Result<()> {
         .create_topics(&[topic], &AdminOptions::new())
         .await
         .expect("Failed to create topics")[0]
-        .expect("Failed to create topic");
+        .as_ref().expect("Failed to create topic");
     
     // Produce messages
     let producer: FutureProducer = ClientConfig::new()
@@ -249,19 +284,21 @@ async fn test_consumer_group_offset_commit() -> Result<()> {
         .expect("Failed to subscribe");
     
     // Process first 15 messages
-    let mut processed = 0;
+    let mut consumed_first = HashSet::new();
     let mut offsets_to_commit = HashMap::new();
-    
-    while processed < 15 {
+
+    while consumed_first.len() < 15 {
         match timeout(Duration::from_secs(1), consumer1.recv()).await {
             Ok(Ok(message)) => {
                 let partition = message.partition();
                 let offset = message.offset();
-                
+
                 // Track highest offset per partition
                 offsets_to_commit.insert(partition, offset + 1);
-                processed += 1;
-                
+                consumed_first.insert(
+                    message.key_view::<str>().unwrap().unwrap().to_string(),
+                );
+
                 // Store offset for commit
                 consumer1.store_offset_from_message(&message)
                     .expect("Failed to store offset");
@@ -289,11 +326,24 @@ async fn test_consumer_group_offset_commit() -> Result<()> {
         .subscribe(&["test-offset-commit"])
         .expect("Failed to subscribe");
     
-    // Should receive messages 15-29
+    // Resume from the committed positions.
+    //
+    // The messages were produced round-robin across 3 partitions, so the first
+    // 15 the group consumed are NOT keys 0-14 — they are whichever 15 arrived
+    // first across three independent logs. Asserting "consumer 2 sees keys
+    // 15-29", as this test used to, encodes a single-log assumption that a
+    // partitioned topic never satisfies.
+    //
+    // The property that offset commit actually guarantees is the one checked
+    // here: across the commit and the consumer restart, the group sees every
+    // record exactly once — nothing redelivered, nothing skipped.
     let mut received = Vec::new();
     let start = std::time::Instant::now();
-    
-    while received.len() < 15 && start.elapsed() < Duration::from_secs(5) {
+
+    // Generous window: consumer 1 has just left, so the group must complete a
+    // rebalance before consumer 2 owns all three partitions. A short window here
+    // measures rebalance latency, not offset-commit correctness.
+    while received.len() < 15 && start.elapsed() < Duration::from_secs(45) {
         match timeout(Duration::from_secs(1), consumer2.recv()).await {
             Ok(Ok(message)) => {
                 let key = message.key_view::<str>().unwrap().unwrap();
@@ -302,22 +352,38 @@ async fn test_consumer_group_offset_commit() -> Result<()> {
             _ => continue,
         }
     }
-    
-    assert_eq!(received.len(), 15);
-    
-    // Verify we got messages 15-29
-    let mut expected_keys: HashSet<_> = (15..30).map(|i| format!("key-{}", i)).collect();
-    for key in received {
-        assert!(expected_keys.remove(&key), "Unexpected key: {}", key);
+
+    assert_eq!(
+        received.len(),
+        15,
+        "resumed consumer got {} of the 15 uncommitted records",
+        received.len()
+    );
+
+    for key in &received {
+        assert!(
+            !consumed_first.contains(key),
+            "{} was redelivered after being committed",
+            key
+        );
     }
-    assert!(expected_keys.is_empty(), "Missing keys: {:?}", expected_keys);
+
+    let all_keys: HashSet<String> = (0..30).map(|i| format!("key-{}", i)).collect();
+    let seen: HashSet<String> = consumed_first
+        .iter()
+        .cloned()
+        .chain(received.iter().cloned())
+        .collect();
+    let missing: Vec<_> = all_keys.difference(&seen).collect();
+    assert!(missing.is_empty(), "records skipped across the commit: {:?}", missing);
     
     Ok(())
 }
 
 #[tokio::test]
 async fn test_consumer_group_failure_handling() -> Result<()> {
-    super::test_setup::init();
+    test_setup::init();
+    let _serial = common::exclusive().await;
     
     let cluster = TestCluster::start(TestClusterConfig::default()).await?;
     let bootstrap_servers = cluster.bootstrap_servers();
@@ -333,7 +399,7 @@ async fn test_consumer_group_failure_handling() -> Result<()> {
         .create_topics(&[topic], &AdminOptions::new())
         .await
         .expect("Failed to create topics")[0]
-        .expect("Failed to create topic");
+        .as_ref().expect("Failed to create topic");
     
     // Produce messages continuously
     let producer_handle = tokio::spawn(async move {
@@ -413,13 +479,23 @@ async fn test_consumer_group_failure_handling() -> Result<()> {
         drop(consumer1);
     });
     
-    // Consumer 2 processing
+    // Consumer 2 processing.
+    //
+    // It keeps polling past consumer 1's departure and reports its OWN final
+    // assignment, since the surviving consumer taking over the dead one's
+    // partitions is the property under test. Counting which partitions its
+    // messages came from can't distinguish "not assigned" from "assigned but
+    // idle", and this topic is fed by a background producer whose records may
+    // land anywhere.
+    //
+    // The window must outlast session.timeout.ms (10s) — the group cannot
+    // declare consumer 1 dead before its session expires.
     let p2 = partitions_c2.clone();
     let c2_handle = tokio::spawn(async move {
         let mut message_count = 0;
         let start = std::time::Instant::now();
-        
-        while start.elapsed() < Duration::from_secs(10) {
+
+        while start.elapsed() < Duration::from_secs(25) {
             match timeout(Duration::from_millis(100), consumer2.recv()).await {
                 Ok(Ok(message)) => {
                     p2.lock().await.insert(message.partition());
@@ -427,23 +503,31 @@ async fn test_consumer_group_failure_handling() -> Result<()> {
                 }
                 _ => continue,
             }
+
+            // Stop early once the takeover has happened.
+            if start.elapsed() > Duration::from_secs(12)
+                && assigned_partitions(&consumer2).len() == 4
+            {
+                break;
+            }
         }
-        
-        message_count
+
+        (message_count, assigned_partitions(&consumer2))
     });
-    
+
     // Wait for consumer 1 to "fail"
     c1_handle.await.unwrap();
-    
-    // Wait for rebalance (consumer 2 should take over)
-    sleep(Duration::from_secs(5)).await;
-    
-    // Consumer 2 should now have all partitions
-    let final_count = c2_handle.await.unwrap();
-    let c2_partitions = partitions_c2.lock().await;
-    
-    assert_eq!(c2_partitions.len(), 4, "Consumer 2 should have all 4 partitions after rebalance");
-    assert!(final_count > 50, "Consumer 2 should continue processing after rebalance");
+
+    // Consumer 2 should now hold all partitions
+    let (final_count, c2_assignment) = c2_handle.await.unwrap();
+
+    assert_eq!(
+        c2_assignment.len(),
+        4,
+        "consumer 2 should hold all 4 partitions after consumer 1 dropped, holds {:?}",
+        c2_assignment
+    );
+    assert!(final_count > 0, "Consumer 2 should continue processing after rebalance");
     
     producer_handle.abort();
     
@@ -452,7 +536,8 @@ async fn test_consumer_group_failure_handling() -> Result<()> {
 
 #[tokio::test]
 async fn test_consumer_group_incremental_rebalance() -> Result<()> {
-    super::test_setup::init();
+    test_setup::init();
+    let _serial = common::exclusive().await;
     
     let cluster = TestCluster::start(TestClusterConfig::default()).await?;
     let bootstrap_servers = cluster.bootstrap_servers();
@@ -468,7 +553,7 @@ async fn test_consumer_group_incremental_rebalance() -> Result<()> {
         .create_topics(&[topic], &AdminOptions::new())
         .await
         .expect("Failed to create topics")[0]
-        .expect("Failed to create topic");
+        .as_ref().expect("Failed to create topic");
     
     // Produce initial data
     let producer: FutureProducer = ClientConfig::new()

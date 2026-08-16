@@ -105,6 +105,11 @@ impl FollowerSync {
         pending_sync_arc: Arc<tokio::sync::Mutex<std::collections::HashMap<String, oneshot::Sender<SyncGroupResponse>>>>,
         group_id: &str,
     ) {
+        // Record the assignment for this generation (see
+        // `ConsumerGroup::completed_assignments`) before applying it to members.
+        group.completed_assignments = computed_assignments.clone();
+        group.completed_generation = group.generation_id;
+
         // Apply assignments to group members
         for (mid, assignment) in &computed_assignments {
             if let Some(member) = group.members.get_mut(mid) {

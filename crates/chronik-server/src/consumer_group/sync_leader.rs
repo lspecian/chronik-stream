@@ -83,6 +83,12 @@ impl LeaderAssignment {
             "Leader computed assignments for all members"
         );
 
+        // Record the assignment for this generation before touching member
+        // state. This copy is what a late follower's SyncGroup reads, so it must
+        // survive the next rebalance clearing `member.assignment`.
+        group.completed_assignments = computed_assignments.clone();
+        group.completed_generation = group.generation_id;
+
         // Apply assignments to all members
         for (mid, assignment) in computed_assignments {
             if let Some(member) = group.members.get_mut(mid) {

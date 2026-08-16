@@ -104,61 +104,39 @@ pub struct ProtocolHandler {
 impl ProtocolHandler {
     /// Helper to create a Response with proper flexible tracking
     fn make_response(header: &RequestHeader, api_key: ApiKey, body: Bytes) -> Response {
-        // CRITICAL: ApiVersions is special - the response BODY uses flexible encoding
-        // but the response HEADER does not! This is unique to ApiVersions.
+        // Whether the response HEADER carries tagged fields. The body's own
+        // encoding is already settled by the time it reaches here.
         //
-        // For clarity: is_flexible here means "should the header have tagged fields"
-        // The body encoding (flexible vs non-flexible) is already handled when creating the body
+        // This used to be a hand-maintained `else if` chain, one arm per API,
+        // defaulting to `true`. That default is wrong for every API whose
+        // advertised max version sits below its flexible cutoff, and the chain
+        // grew an arm each time a client tripped over one: ACLs v0-v1, then
+        // IncrementalAlterConfigs v0, then DeleteTopics v0-v3. Each fix was
+        // correct and each left the next instance in place.
         //
-        // IMPORTANT: DescribeCluster v0 uses NON-flexible format for both header AND body
-        // Even though the client may have negotiated ApiVersions v3+ and sends flexible REQUEST headers,
-        // DescribeCluster v0 responses must use NON-flexible headers (headerVersion=1)
+        // CreateTopics v0-v4 was the next instance — and it mattered, because
+        // librdkafka's AdminClient caps CreateTopics at v4. Every
+        // librdkafka-based client (confluent-kafka-python/go/.NET) received a
+        // response header one byte longer than the schema allows, parsed the
+        // topic-results array from the wrong offset, and reported zero results
+        // for a topic the broker had in fact created. The broker logged success
+        // throughout.
         //
-        // The Kafka protocol specifies:
-        // - DescribeCluster v0: headerVersion=1 (non-flexible)
-        // - DescribeCluster v1: headerVersion=2 (flexible)
-        //
-        // Metadata response header versions:
-        // - Metadata v0-v8: headerVersion=0 (non-flexible, no tagged fields)
-        // - Metadata v9+: headerVersion=1 (flexible, has tagged fields)
-        //
-        // This is DIFFERENT from most other APIs where ApiVersions v3+ negotiation affects all headers.
-        // DescribeCluster and Metadata are special in that their header versions are tied to the API version itself.
+        // So flexibility is now read from `is_flexible_version`, which request
+        // parsing and `write_response_header_flexible` already used. One table,
+        // consulted everywhere, instead of two that can disagree.
         let header_has_tagged_fields = if api_key == ApiKey::ApiVersions {
-            false  // ApiVersions response header NEVER has tagged fields
+            // The one true exception: the ApiVersions response BODY is flexible
+            // from v3, but its HEADER never is — a client that has not yet
+            // learned our versions must be able to parse the reply.
+            false
         } else if api_key == ApiKey::DescribeCluster && header.api_version == 0 {
-            false  // DescribeCluster v0 uses NON-flexible headers
-        } else if api_key == ApiKey::Metadata && header.api_version < 9 {
-            false  // Metadata v0-v8 use NON-flexible headers
-        } else if api_key == ApiKey::AddPartitionsToTxn && header.api_version < 3 {
-            false  // AddPartitionsToTxn v0-v2 use NON-flexible headers (v3+ use flexible)
-        } else if api_key == ApiKey::EndTxn && header.api_version < 3 {
-            false  // EndTxn v0-v2 use NON-flexible headers (v3+ use flexible)
-        } else if api_key == ApiKey::CreatePartitions && header.api_version < 2 {
-            false  // CreatePartitions v0-v1 use NON-flexible headers (v2+ use flexible)
-        } else if (api_key == ApiKey::DescribeAcls || api_key == ApiKey::CreateAcls || api_key == ApiKey::DeleteAcls) && header.api_version < 2 {
-            // ACL APIs v0-v1 use NON-flexible headers (headerVersion=0); flexible
-            // starts at v2. Without this, a v3-negotiated connection gets a flexible
-            // response header (extra tagged-fields byte) on a non-flexible v0-v1 ACL
-            // body, shifting the body by one byte and crashing the Java AdminClient
-            // parser (observed: "reading byte array of 13824 bytes, only 56 available").
-            false
-        } else if api_key == ApiKey::IncrementalAlterConfigs && header.api_version < 1 {
-            // IncrementalAlterConfigs v0 uses a NON-flexible header (flexible starts at
-            // v1). Same latent bug as the ACL APIs: a flexible header on a non-flexible
-            // v0 body shifts the response, so the Java AdminClient reads a bogus
-            // resource_type/name, can't match the result to the requested resource, and
-            // throws NullPointerException even though the broker applied the change.
-            false
-        } else if api_key == ApiKey::DeleteTopics && header.api_version < 4 {
-            // DeleteTopics v0-v3 use NON-flexible headers (flexible starts at v4). We
-            // advertise max v6; v4+ get a flexible header (the default below) matching
-            // the flexible v4+/v6 body encoding in delete_topics_types.rs.
+            // Kept explicit. The spec marks DescribeCluster flexible at 0+, but
+            // we advertise min=1 so v0 is unreachable, and this arm was added
+            // against an observed client failure rather than from the schema.
             false
         } else {
-            // For other APIs and DescribeCluster v1+/Metadata v9+, use flexible headers
-            // when the client has negotiated ApiVersions v3+
-            true
+            crate::parser::is_flexible_version(api_key, header.api_version)
         };
 
         // DescribeCluster v0 does NOT include throttle_time_ms in the response

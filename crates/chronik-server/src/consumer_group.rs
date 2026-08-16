@@ -200,6 +200,28 @@ pub struct ConsumerGroup {
     // Async waiting mechanism for SyncGroup responses (followers wait for leader to compute assignments)
     #[serde(skip)]
     pub pending_sync_futures: Arc<Mutex<HashMap<String, oneshot::Sender<SyncGroupResponse>>>>,
+
+    /// The assignment that completed a generation, kept immutable for that
+    /// generation's lifetime.
+    ///
+    /// `GroupMember::assignment` is working state: `trigger_rebalance` clears it
+    /// for every member when the next rebalance starts. A follower whose
+    /// SyncGroup arrives after the leader finished reads its assignment from
+    /// that field on the fallback path — so whether it received its partitions
+    /// depended on winning a race against the next rebalance's clear.
+    ///
+    /// Losing that race is silent and permanent: the member gets an empty
+    /// assignment, the group is already Stable so nothing retries, and its
+    /// partitions stay unowned until something else forces a rebalance.
+    /// Observed with a 3-member group where consumer-2 was assigned partitions
+    /// 2 and 3, received `{}`, and those partitions went unconsumed.
+    #[serde(default)]
+    pub completed_assignments: HashMap<String, HashMap<String, Vec<i32>>>,
+
+    /// Generation `completed_assignments` belongs to. A stale record must never
+    /// be served for a newer generation.
+    #[serde(default)]
+    pub completed_generation: i32,
 }
 
 impl ConsumerGroup {
@@ -223,6 +245,8 @@ impl ConsumerGroup {
             last_persisted: None,
             pending_join_futures: Arc::new(Mutex::new(HashMap::new())),
             pending_sync_futures: Arc::new(Mutex::new(HashMap::new())),
+            completed_assignments: HashMap::new(),
+            completed_generation: 0,
         }
     }
     
@@ -596,6 +620,8 @@ impl Default for ConsumerGroup {
             last_persisted: None,
             pending_join_futures: Arc::new(Mutex::new(HashMap::new())),
             pending_sync_futures: Arc::new(Mutex::new(HashMap::new())),
+            completed_assignments: HashMap::new(),
+            completed_generation: 0,
         }
     }
 }
@@ -707,6 +733,8 @@ impl GroupManager {
                 last_persisted: group.last_persisted,
                 pending_join_futures: Arc::new(Mutex::new(HashMap::new())),
                 pending_sync_futures: Arc::new(Mutex::new(HashMap::new())),
+                completed_assignments: group.completed_assignments.clone(),
+                completed_generation: group.completed_generation,
             }))
         } else {
             // Try to load from metadata store

@@ -2,6 +2,7 @@
 //! 
 //! This test validates the WAL recovery system by simulating ungraceful shutdowns
 //! and verifying that the system can recover completely without data loss or corruption.
+use rdkafka::producer::Producer;
 
 use std::collections::HashSet;
 use std::fs;
