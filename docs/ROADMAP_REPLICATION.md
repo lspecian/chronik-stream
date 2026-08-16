@@ -1546,9 +1546,9 @@ found. Evidence from the run that produced this section is in
 ---
 
 
-## RP-13: a replacement group member sometimes gets only part of the partitions — `OPEN` (found 2026-08-17)
+## RP-13: a replacement group member got only part of the partitions — `RESOLVED` (found and fixed 2026-08-17)
 
-**Blocks the merge.** Found by running `tests/integration` for the first time,
+**Was the last merge blocker.** Found by running `tests/integration` for the first time,
 in the same pass that fixed the SyncGroup starvation bug below.
 
 ### The shape of it
@@ -1586,6 +1586,54 @@ does it compute a partial one?
 The test is deliberately left failing rather than `#[ignore]`d. It reproduces a
 real defect at roughly one run in two, and hiding it would return this suite to
 the state that let 24 files rot.
+
+### ✅ RESOLVED (2026-08-17) — LeaveGroup acknowledged departures and removed nobody
+
+The instrumentation answered it in one line. Generation 1's assignment covered
+**two** members: the replacement, and the consumer that had already been dropped.
+The coordinator computed a correct assignment — for a group it believed still had
+the departed consumer in it, so 3 partitions were split with a member that was
+gone.
+
+**`handle_leave_group` built a SUCCESS response and returned.** It never removed
+anything. `GroupManager::leave_group` — which removes the member, triggers the
+rebalance through `remove_member`, and persists the result — was implemented,
+correct, and reachable only from a unit test. Nothing in the protocol path had
+ever called it.
+
+So a consumer that closed cleanly stayed a member until its session timed out,
+45s on librdkafka's default. The cost is not the delay but what the coordinator
+does during it: it keeps assigning partitions to a member that is gone. Every
+consumer restart in a group opened that window, and the visible symptom is a
+consumer silently receiving a fraction of its topic.
+
+#### The fix uncovered a worse bug underneath it
+
+Wiring LeaveGroup up made the last-member-leaves branch reachable for the first
+time, and it **marked the group `Dead` in the metadata store**. The in-memory
+entry is dropped on that path, so the next JoinGroup reloads the group from
+metadata and JoinGroup rejects every state it does not handle:
+
+```
+error_handler: Invalid input: Invalid group state: Dead   (on every retry, forever)
+```
+
+A consumer restarting after a clean shutdown could never rejoin its own group.
+`Dead` means the group has been deleted and its offsets are gone; a group whose
+last consumer went away is `Empty` — it exists, with committed offsets, and
+nobody consuming. Kafka reaches `Dead` through DeleteGroups or offset expiry,
+never through the last member leaving. Now it persists `Empty`, which JoinGroup
+already accepts.
+
+That bug had been latent for as long as LeaveGroup was a no-op: nothing ever
+reached the branch that contained it.
+
+**Verified**: the failing test now passes on three consecutive runs of a defect
+that reproduced roughly one run in two, plus the full 4-test consumer-group suite
+each time. Three unit tests pin the pieces — a departure removes the member, a
+repeat departure reports `UNKNOWN_MEMBER_ID` rather than a success a client
+cannot distinguish from the first attempt, and the last member leaving leaves the
+group `Empty` and rejoinable.
 
 ---
 
