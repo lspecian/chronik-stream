@@ -258,7 +258,7 @@ Every one surfaced only by running the conformance suite against a real 3-node c
 
 - [x] Branch on `replica_id >= 0` in the fetch path
 - [x] Record the follower position — its fetch offset IS its LEO
-- [ ] Followers fetch above the high watermark; consumers remain capped at HW (needs RP-2.3)
+- [x] Followers fetch above the high watermark; consumers remain capped at HW — unblocked by RP-2.3, 2026-08-17. `readable_end_offset` splits on `replica_id`: a follower reads to the leader's log end, a consumer to `consumer_visible_watermark`. The long-poll wake path splits the same way, so a consumer is not woken by records the in-sync set does not hold.
 - [x] Test: follower fetch records progress, consumer fetch does not
 
 **Status**: `TESTED` on a 3-node cluster. Wired in cluster mode only, so single-node is untouched. The fetch doubles as a liveness signal, which under push needed a separate heartbeat-ACK mechanism — and that mechanism had two bugs only a live cluster exposed.
@@ -1700,4 +1700,22 @@ Re-run against the current build:
 ⚠️ `divergence_truncation.sh` exits **0** when it skips, so it reports success to
 any runner that only checks the exit code. Worth fixing before it is wired into
 CI, where a skip that looks like a pass is how coverage quietly disappears.
+
+### Re-run 2026-08-17 — after the ISR, protocol and consumer-group changes
+
+Four more changes landed in paths this suite covers: Metadata now reports the
+measured ISR, `make_response` decides header flexibility for every API from one
+table, the consumer-group coordinator records assignments per generation, and the
+metrics port moved. The first of those changes exactly what
+`regression_replication` asserts on, so unit tests were not sufficient evidence.
+
+| harness | result | |
+|---|---|---|
+| `regression_replication.sh` | **PASS** | consumed 600 / produced 600; every replica holds every partition at `acks=0`, `1` and `all`; ISR tracks reality |
+| `local_divergence.sh` | **PASS** | 0 orphan markers on disk; 40/40 committed records readable; 0 uncommitted records readable |
+| `acks_all_latency.sh` | **PASS** | `acks=all` 14ms first write to a new topic (budget 2000ms), 13ms steady state (budget 250ms); `acks=1` 12ms |
+
+`acks=all` at 13ms against a 250ms budget confirms it still settles on the
+replication round trip and not on a timer — the RP-8 property most at risk from a
+change to how the watermark is computed.
 
