@@ -144,3 +144,48 @@ high=68,516, which looked like a dramatic result and was an artifact: a
 `cargo build` was running during those two measurements and took the CPU. Same
 lesson as RP-11 — the surprising number was measuring the harness, not the
 system. Re-run on a quiet machine with a fixed binary, the effect vanishes.
+
+## Tiering: a cost problem, not a throughput problem
+
+The obvious conclusion from the 7.3× write amplification is "remove the double
+write and go faster." Measured, that is wrong here.
+
+**The tier-2 write is not on the produce path.** `WalIndexer` is a background task
+(30 s interval, 10 s minimum segment age); produce acks never wait on it. It
+competes for disk bandwidth and CPU, nothing more.
+
+**And there is bandwidth to spare.** The NVMe sustains 1.4 GB/s; the 60 s
+benchmark demanded 203 MB/s — 14% of capacity. Confirmed by making the second
+write nearly free, pointing the object store at tmpfs instead of the NVMe:
+
+| | msg/s |
+|---|---:|
+| segments on NVMe | 153,775 |
+| segments on tmpfs | 154,361 |
+
+Identical. Eliminating the tier-2 write entirely would buy **no throughput on
+this hardware**.
+
+Where it does cost:
+
+- **Cloud disks.** AWS gp3 gives 125 MB/s by default; at 203 MB/s Chronik would
+  be throttled by its own amplification, and halving it would be a real speedup.
+  This box's NVMe hides the problem.
+- **Object-store bills.** Every byte is PUT to S3/GCS/Azure. 4.4× Redpanda's
+  bytes per message is 4.4× the storage and request cost, forever.
+- **CPU and memory.** `upload_raw_segment` does `bincode::serialize` over the
+  whole segment's `CanonicalRecord`s — a full re-encode of data already
+  serialised once in the WAL, held in memory while it happens.
+
+So this is an efficiency and cost-of-ownership project, and should be prioritised
+as one — not sold as a latency or throughput win. The throughput question lives
+somewhere else entirely: 1024 producers at 5.26 ms p50 is 195k/s by Little's Law
+against 154k measured, and ~5 ms is roughly 10× this disk's fsync. That gap is
+queueing, and finding it needs a profiler, not an architecture change.
+
+### Fairness note on the comparison above
+
+Neither Kafka nor Redpanda had tiered storage enabled in those runs, while
+Chronik produced its tier-2 artifact throughout. Chronik was doing strictly more
+work for the same numbers. A stricter comparison would either enable tiering on
+all three or disable indexing on Chronik.
