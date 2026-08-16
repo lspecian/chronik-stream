@@ -1,6 +1,8 @@
 # Baseline Performance
 
-**Measured 2026-08-13** on the branch where follower-pull replication became the only data-replication mechanism.
+**Measured 2026-08-13, throughput tables re-measured 2026-08-16** at 1024
+producers with the io_uring WAL path disabled, on the branch where follower-pull
+replication became the only data-replication mechanism.
 
 > ### Everything measured before this date was deleted, not archived
 >
@@ -32,12 +34,12 @@ brokers on this one box, sharing its disk, cores and loopback.
 | Storage | NVMe SSD |
 | OS | Linux 6.11 |
 
-Bare-metal numbers on the Dell cluster are **not yet re-measured** — see
+Bare-metal numbers on the Dell cluster were re-measured 2026-08-16 — see
 `BARE_METAL_PERFORMANCE.md`.
 
 ## Method
 
-`chronik-bench`, 64 concurrent producers, 256-byte messages, 30s measured after
+`chronik-bench`, 1024 concurrent producers, 256-byte messages, 30s measured after
 a warmup, 3 partitions, no compression, **WAL profile left at its default**
 (`low`, 2 ms). Rates below are the harness's summary figure: total messages over
 the measured window, which excludes the warmup phase.
@@ -68,30 +70,63 @@ benchmark; for that, see the kcat figures at the bottom.
 
 No replication to do, so this is the ceiling of the local write path.
 
+| acks | throughput | p99 | samples |
+|---|---:|---:|---|
+| 0 | **515,903 msg/s** (125.95 MB/s) | 8.07 ms | 515,903 · 393,683 · 519,468 |
+| 1 | **230,071 msg/s** (56.17 MB/s) | 9.73 ms | 230,971 · 218,485 · 230,071 |
+| all | **222,059 msg/s** (54.21 MB/s) | 7.13 ms | 225,230 · 222,059 · 217,377 |
+
+`acks=1` and `acks=all` are within 4% here, and that is correct: with no
+followers the in-sync set is the leader alone, so `acks=all` waits for its own
+fsync and nothing more. The remaining **2.2× gap to `acks=0`** is that fsync.
+
+An independent run at the same concurrency measured `acks=1` at 228,874 msg/s,
+so these are reproducible across harnesses, not an artefact of one.
+
+<details><summary>Superseded: the same table at 64 producers with io_uring on</summary>
+
 | acks | throughput | p99 |
 |---|---:|---:|
-| 0 | **164,914 msg/s** (40.3 MB/s) | 7.71 ms |
-| 1 | 14,476 msg/s (3.53 MB/s) | 5.30 ms |
-| all | 14,307 msg/s (3.49 MB/s) | 5.55 ms |
+| 0 | 164,914 msg/s | 7.71 ms |
+| 1 | 14,476 msg/s | 5.30 ms |
+| all | 14,307 msg/s | 5.55 ms |
 
-`acks=1` and `acks=all` are identical here, and that is correct: with no
-followers the in-sync set is the leader alone, so `acks=all` waits for its own
-fsync and nothing more. The 12× gap to `acks=0` is that fsync.
+`acks=1` is understated **16×** there. Three causes, all established since: 64
+producers under-loads the broker by roughly an order of magnitude; the io_uring
+WAL path cost about a third of produce throughput; and these were taken while
+this machine's kernel had fallen back to the HPET clocksource, where every
+`clock_gettime` is a syscall costing 1,213 ns against 19.6 ns on TSC. The old
+text called the `acks=0` gap "12×, and that is fsync" — it is 2.2×, and most of
+what it was attributing to fsync was overhead.
+
+</details>
 
 ## Three nodes, RF=3, min_insync_replicas=2
 
 Follower-pull replication running; every record reaches all three nodes.
 
-| acks | throughput | p99 |
-|---|---:|---:|
-| 0 | **111,146 msg/s** (27.1 MB/s) | 14.49 ms |
-| 1 | 8,029 msg/s (1.96 MB/s) | 10.72 ms |
-| all | 6,197 msg/s (1.51 MB/s) | 41.05 ms |
+| acks | throughput | p99 | samples |
+|---|---:|---:|---|
+| 0 | **171,398 msg/s** (41.85 MB/s) | 38.17 ms | 171,149 · 172,276 · 171,398 |
+| 1 | **85,948 msg/s** (20.98 MB/s) | 24.72 ms | **7,758** · 85,948 · 89,111 |
+| all | **40,686 msg/s** (9.93 MB/s) | 112.06 ms | 41,434 · 40,686 · **6,277** |
+
+⚠️ **Two of these samples are ten times below their neighbours and that is not
+explained.** `acks=1` produced 7,758 once against 85,948 and 89,111; `acks=all`
+produced 6,277 once against 41,434 and 40,686. A median of three absorbs a single
+outlier, which is exactly why it is reported that way — but a 10× collapse on one
+run in three is a reliability signal, not noise to be smoothed over, and it
+appears only in the modes that wait for replication. The single-node rows and
+`acks=0` show nothing like it. Candidate causes not yet separated: a node slow to
+rejoin the in-sync set after the previous run's teardown, or leadership settling
+after cluster formation (compare RP-6, where a returning ex-leader can wait on
+metadata anti-entropy). **This should be understood before the cluster numbers
+are quoted as a floor.**
 
 `acks=0` and `acks=1` cost roughly what the single-node shape costs, plus
 contention from two extra brokers on the same disk.
 
-`acks=all` is **1.3× slower than `acks=1`**, which is the cost of the follower
+`acks=all` is **2.1× slower than `acks=1`**, which is the cost of the follower
 round trip: a producer cannot be acknowledged until a follower's *next* fetch
 reports a position past the record, so each write pays a fetch plus the
 follower's own fsync on top of the leader's.
@@ -100,8 +135,8 @@ It used to be **4–7× slower** and to decay during a run — 3,993 msg/s in th
 first interval, 2,285 in the second. That was not `acks=all` degrading; every
 fetch re-read and re-parsed the whole active WAL segment from byte zero, so the
 cost grew with the file. RP-9 replaced that with a bounded tail cache and a
-sparse offset index, taking the sustained figure from ~1,400 to 6,197 msg/s and
-making it stable across the run rather than a function of how long you look.
+sparse offset index, and the sustained figure is now 40,686 msg/s — stable across
+the run rather than a function of how long you look.
 
 Single-record `acks=all` latency is 14 ms, level with `acks=1`'s 12 ms
 (`tests/cluster/acks_all_latency.sh`).
@@ -122,7 +157,7 @@ All three stored 200,001 records with zero client errors. These answer a
 different question — how fast the broker ingests when the client batches — and
 should never be compared against the round-trip table above.
 
-That `acks=all` reaches 542K msg/s when batched while managing 3.8K when each
+That `acks=all` reaches 542K msg/s when batched while managing 40.7K when each
 message waits for its own acknowledgement is not a contradiction: it is the
 difference between amortising one replication round trip over thousands of
 records and paying one per record. The broker's ingest was never the constraint.
@@ -132,9 +167,9 @@ records and paying one per record. The broker's ingest was never the constraint.
 - **Bare metal.** All of the above is one machine, with the client sharing it
   with all three brokers. `BARE_METAL_PERFORMANCE.md` has the Dell cluster
   measured on real hardware over a real network, with the client on a separate
-  machine: `acks=1` and `acks=all` are **2.8× and 2.0× faster** there, while
-  `acks=0` is identical because it is the one mode that waits for nothing and so
-  measures the client rather than the cluster.
+  machine: the Dell cluster is SLOWER at every acks level than this one machine (42,804 vs
+  85,948 at `acks=1`), because there the client crosses a 1 GbE link that
+  `acks=1` saturates at 943 Mbit/s, while here everything shares loopback.
 - **Consume throughput.** `chronik-bench -m consume` exists; these runs are
   produce-only.
 - **Searchable / columnar / vector topics.** The old report measured a 33%

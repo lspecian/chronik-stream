@@ -952,7 +952,7 @@ Concrete targets:
 
 ---
 
-## RP-9: `acks=all` round-trip throughput — `OPEN` (found 2026-08-13)
+## RP-9: `acks=all` round-trip throughput — `TESTED` (found 2026-08-13, resolved 2026-08-14)
 
 RP-8 fixed `acks=all` **latency**: 505ms per request became 17ms. Throughput at
 concurrency is a separate question, and it has a separate problem.

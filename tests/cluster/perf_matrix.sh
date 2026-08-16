@@ -26,7 +26,11 @@ BENCH="$ROOT/target/release/chronik-bench"
 DIR="$ROOT/tests/cluster"
 LOGS="$DIR/logs"
 DURATION="${PERF_DURATION:-30s}"
-CONCURRENCY="${PERF_CONCURRENCY:-64}"
+# 64 under-loads a broker by roughly an order of magnitude — single-node `acks=1`
+# measures 13,582 msg/s at 64 producers and 228,874 at 1024, climbing
+# near-linearly in between — so figures taken at 64 are a point on that line
+# rather than a ceiling. Same correction as baremetal.sh.
+CONCURRENCY="${PERF_CONCURRENCY:-1024}"
 SIZE="${PERF_SIZE:-256}"
 PARTITIONS="${PERF_PARTITIONS:-3}"
 RUNS="${PERF_RUNS:-3}"
