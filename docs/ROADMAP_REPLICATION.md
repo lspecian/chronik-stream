@@ -1608,3 +1608,21 @@ fetch falls through to WAL. Dead fast-path code, unrelated to this collapse.
 
 ---
 
+
+## Cluster re-validation, 2026-08-16
+
+The suite last ran 2026-08-13, before RP-10, RP-11, RP-12, the io_uring default
+change and the metrics-port crash fix — five changes to the paths it covers.
+Re-run against the current build:
+
+| harness | result | |
+|---|---|---|
+| `regression_replication.sh` | **PASS** | consumed 600 / produced 600; every replica holds every partition at `acks=0`, `1` and `all`; ISR tracks reality |
+| `local_divergence.sh` | **PASS** | the divergent tail was discarded and every committed record survived |
+| `acks_all_latency.sh` | **PASS** | `acks=all` completes on the replication round trip, not a background timer |
+| `divergence_truncation.sh` | *skipped* | needs `REPL_NS` — a Kubernetes namespace with network policies. Superseded by `local_divergence.sh`, which manufactures the same divergence deterministically with `SIGSTOP`/`SIGKILL` and covers the truncate branch |
+
+⚠️ `divergence_truncation.sh` exits **0** when it skips, so it reports success to
+any runner that only checks the exit code. Worth fixing before it is wired into
+CI, where a skip that looks like a pass is how coverage quietly disappears.
+
