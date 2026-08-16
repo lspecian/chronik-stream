@@ -29,7 +29,7 @@ running, replacing a report that was deleted rather than annotated.
 **These measure a different thing than the deleted report did, and the numbers
 are not comparable.** The old headline — 837,284 msg/s — was a *batched* figure:
 k6 posting 100–200 messages per HTTP request through 12–36 ingestor pods,
-aggregated across all of them. The tables below are *round-trip* figures: 64
+aggregated across all of them. The tables below are *round-trip* figures: 1024
 producers, each one waiting for its own acknowledgement before sending the next.
 
 The two regimes are not close. At `acks=0` — the one batched figure that
@@ -38,7 +38,7 @@ client's 1 GbE link rather than at anything Chronik does.
 
 Round trip is the harder question and the one this work needed: replication cost
 only appears when someone is waiting for it, and a batched pipeline hides it
-almost completely. But it means **a reader who remembers 837K and sees 110K
+almost completely. But it means **a reader who remembers 837K and sees 162K
 below is comparing a batched aggregate to an unbatched round trip, not a
 regression.**
 
@@ -84,10 +84,10 @@ Two things the sweep had to fix before it measured anything real:
   which is the signature of a fixed pipeline delay rather than a saturating
   resource.
 
-📌 Every cluster figure in this document was measured with the io_uring WAL path
-active, which was the default until 2026-08-16 and costs roughly a third of
-single-node produce throughput (see "io_uring is disabled by default"). They are
-floors, not ceilings, and have not been re-run.
+📌 The 256-byte matrix was re-measured 2026-08-16 at 1024 producers with io_uring
+off. The 1 KB matrix, the k6/Kubernetes figures and the batched table below were
+not, and were taken at 64 producers with the io_uring path active — they are
+floors, not ceilings.
 
 So the honest ceiling statement is: **≥160,329 msg/s at `acks=all` with zero
 errors, and that is a floor, not a limit.** What this harness measures is the
@@ -165,7 +165,7 @@ path. **The load generator runs on a fourth machine.** That is the part every
 previous bare-metal number here lacked: the client was co-located with a broker,
 so a network-bound result and a sender-bound one were indistinguishable (OQ1).
 
-`chronik-bench` with **`--linger-ms 0`**, 64 concurrent producers each awaiting
+`chronik-bench` with **`--linger-ms 0`**, 1024 concurrent producers each awaiting
 its own acknowledgement before sending again, 3 partitions, RF=3,
 `min_insync_replicas=2`, 30-second runs, WAL profile left at its default. The
 zero linger is the whole point: it makes every message a round trip. **Every figure is the median of three runs, each on a freshly
@@ -178,11 +178,34 @@ Reproduce: `./tests/cluster/baremetal.sh all`
 
 ### 256-byte messages
 
+Re-measured 2026-08-16 at **1024 producers** with the io_uring WAL path off (see
+"io_uring is disabled by default"). Median of three, each on a freshly started
+cluster.
+
 | acks | throughput | bandwidth | p99 | node-1 NIC peak | samples |
 |---|---:|---:|---:|---:|---|
-| 0 | **110,427 msg/s** | 26.96 MB/s | 7.96 ms | 627 Mbit/s | 45,589 · 114,628 · 110,427 |
-| 1 | 22,690 msg/s | 5.54 MB/s | 6.79 ms | 667 Mbit/s | 23,698 · 22,690 · 22,006 |
-| all | 12,475 msg/s | 3.05 MB/s | 8.57 ms | 52 Mbit/s | 12,919 · 12,475 · 11,997 |
+| 0 | **162,230 msg/s** | 39.61 MB/s | 36.64 ms | 573 Mbit/s | 167,343 · 158,179 · 162,230 |
+| 1 | **42,804 msg/s** | 10.45 MB/s | 111.36 ms | **943 Mbit/s — 98% of link** | 42,804 · 41,782 · 43,719 |
+| all | **18,589 msg/s** | 4.54 MB/s | 409.60 ms | 124 Mbit/s | 19,260 · 18,589 · 16,726 |
+
+**`acks=1` is now pinned to the network**, not the broker: 943 Mbit/s against a
+1 GbE link's ~940 Mbit/s of usable line rate. Any further gain there needs a
+faster fabric, not broker work.
+
+<details><summary>Superseded: the same matrix at 64 producers with io_uring on</summary>
+
+| acks | throughput | bandwidth | p99 | node-1 NIC peak |
+|---|---:|---:|---:|---:|
+| 0 | 110,427 msg/s | 26.96 MB/s | 7.96 ms | 627 Mbit/s |
+| 1 | 22,690 msg/s | 5.54 MB/s | 6.79 ms | 667 Mbit/s |
+| all | 12,475 msg/s | 3.05 MB/s | 8.57 ms | 52 Mbit/s |
+
+Two changes account for the gap — 64 producers under-loads the broker by roughly
+an order of magnitude, and the io_uring path cost about a third of produce
+throughput. The lower `p99` here is the tell that this was a lighter load, not a
+faster one.
+
+</details>
 
 ### 1 KB messages
 
@@ -201,9 +224,13 @@ Reproduce: `./tests/cluster/baremetal.sh batched`
 
 | acks | run 1 | run 2 | client tx (run 1) | round trip (above) |
 |---|---:|---:|---:|---:|
-| 0 | 429,737 msg/s | 429,368 msg/s | **983 Mbit/s — 98% of link** | 110,427 msg/s |
-| 1 | 122,828 msg/s | **394,539 msg/s** | 281 Mbit/s — 28% | 22,690 msg/s |
-| all | 52,931 msg/s | 74,335 msg/s | 122 Mbit/s — 12% | 12,475 msg/s |
+| 0 | 429,737 msg/s | 429,368 msg/s | **983 Mbit/s — 98% of link** | 162,230 msg/s |
+| 1 | 122,828 msg/s | **394,539 msg/s** | 281 Mbit/s — 28% | 42,804 msg/s |
+| all | 52,931 msg/s | 74,335 msg/s | 122 Mbit/s — 12% | 18,589 msg/s |
+
+The batched columns predate the io_uring change and the concurrency correction;
+the round-trip column is the re-measured 2026-08-16 figure, so the batching
+multiplier here is now an upper bound rather than a like-for-like ratio.
 
 **Only the `acks=0` row is trustworthy, and it is not a measurement of Chronik.**
 It reproduces to 0.1% across runs because it is pinned at the client's 1 GbE
