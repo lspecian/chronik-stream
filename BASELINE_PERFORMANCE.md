@@ -56,7 +56,7 @@ visible rather than implied.
 
 30 seconds, not 10, for a reason. `acks=all` throughput used to fall during a
 run — every fetch re-read the whole active WAL segment, so the cost grew with
-the file (see RP-9) — and a 10-second run reported a number that a 30-second run
+the file — and a 10-second run reported a number that a 30-second run
 did not reproduce. The read path is fixed and the two now agree, but the longer
 window is what proves it.
 
@@ -119,8 +119,8 @@ run in three is a reliability signal, not noise to be smoothed over, and it
 appears only in the modes that wait for replication. The single-node rows and
 `acks=0` show nothing like it. Candidate causes not yet separated: a node slow to
 rejoin the in-sync set after the previous run's teardown, or leadership settling
-after cluster formation (compare RP-6, where a returning ex-leader can wait on
-metadata anti-entropy). **This should be understood before the cluster numbers
+after cluster formation (a returning ex-leader can wait on metadata
+anti-entropy before it learns it was demoted). **This should be understood before the cluster numbers
 are quoted as a floor.**
 
 `acks=0` and `acks=1` cost roughly what the single-node shape costs, plus
@@ -134,7 +134,7 @@ follower's own fsync on top of the leader's.
 It used to be **4–7× slower** and to decay during a run — 3,993 msg/s in the
 first interval, 2,285 in the second. That was not `acks=all` degrading; every
 fetch re-read and re-parsed the whole active WAL segment from byte zero, so the
-cost grew with the file. RP-9 replaced that with a bounded tail cache and a
+cost grew with the file. That was replaced with a bounded tail cache and a
 sparse offset index, and the sustained figure is now 40,686 msg/s — stable across
 the run rather than a function of how long you look.
 
