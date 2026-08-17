@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.12.0] - 2026-08-17
+
 ### ⚠️ Breaking / behaviour changes
 
 Replication was rebuilt on this release (follower-pull). Two changes are visible
