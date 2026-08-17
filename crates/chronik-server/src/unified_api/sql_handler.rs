@@ -128,6 +128,94 @@ pub struct SqlErrorResponse {
 struct TopicParquetSource {
     topic: String,
     metadata_store: std::sync::Arc<dyn chronik_common::metadata::traits::MetadataStore>,
+    /// Restricts the scan to the partitions this node answers for. `None` in
+    /// single-node mode, where there is nobody to double-count with.
+    ownership: Option<std::sync::Arc<dyn chronik_columnar::PartitionOwnership>>,
+}
+
+/// Answers "which partitions of this topic does this node lead?" for the query
+/// layer, from the router's partition map.
+///
+/// Leadership is the ownership rule because it partitions the work exactly once:
+/// every replica holds every partition it replicates, so a replica-based rule
+/// either double-counts rows or, when each node serves only what it happens to
+/// see locally, drops them (#22).
+#[derive(Clone)]
+struct LeadPartitions {
+    router: std::sync::Arc<super::query_router::QueryRouter>,
+    /// Needed to map a topic the router has not seen yet.
+    ///
+    /// The partition map is populated lazily, and "unknown topic" resolves to
+    /// "serve everything" — which on three nodes means every node serving every
+    /// partition and the merge counting each row three times. Refreshing on a
+    /// miss keeps that answer rare and correct rather than merely safe-looking.
+    metadata_store: std::sync::Arc<dyn chronik_common::metadata::traits::MetadataStore>,
+}
+
+impl std::fmt::Debug for LeadPartitions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LeadPartitions").finish()
+    }
+}
+
+#[async_trait::async_trait]
+impl chronik_columnar::PartitionOwnership for LeadPartitions {
+    async fn owned_partitions(&self, topic: &str) -> Option<HashSet<i32>> {
+        if let Some(led) = self.router.led_partitions(topic).await {
+            return Some(led);
+        }
+
+        // Unknown topic: map it and ask again. A topic created after the map was
+        // first populated would otherwise stay unknown for the life of the
+        // process.
+        self.router
+            .refresh_partition_map(self.metadata_store.as_ref(), topic)
+            .await;
+        self.router.led_partitions(topic).await
+    }
+}
+
+/// Keep only Parquet files belonging to `owned` partitions.
+///
+/// Columnar output is laid out Hive-style — `.../{topic}/partition=N/...` — so
+/// the partition is recoverable from the path without consulting metadata. A
+/// path whose partition cannot be parsed is **kept**: dropping it would silently
+/// lose data, and an unexpected layout should surface as a duplicate-row bug
+/// rather than as missing rows.
+fn retain_owned_partitions(paths: Vec<String>, owned: &HashSet<i32>) -> Vec<String> {
+    paths
+        .into_iter()
+        .filter(|path| match partition_of_parquet_path(path) {
+            Some(partition) => owned.contains(&partition),
+            None => {
+                warn!(
+                    path = %path,
+                    "Parquet path has no partition= component; serving it rather than dropping data"
+                );
+                true
+            }
+        })
+        .collect()
+}
+
+/// Extract `N` from a `partition=N` path component.
+fn partition_of_parquet_path(path: &str) -> Option<i32> {
+    path.split('/')
+        .find_map(|part| part.strip_prefix("partition="))
+        .and_then(|n| n.parse().ok())
+}
+
+/// The ownership rule for this deployment: leadership in a cluster, none
+/// (serve everything) without a router.
+fn query_ownership(
+    state: &UnifiedApiState,
+) -> Option<std::sync::Arc<dyn chronik_columnar::PartitionOwnership>> {
+    state.query_router.as_ref().map(|router| {
+        std::sync::Arc::new(LeadPartitions {
+            router: router.clone(),
+            metadata_store: state.metadata_store.clone(),
+        }) as std::sync::Arc<dyn chronik_columnar::PartitionOwnership>
+    })
 }
 
 impl std::fmt::Debug for TopicParquetSource {
@@ -142,7 +230,17 @@ impl std::fmt::Debug for TopicParquetSource {
 #[async_trait::async_trait]
 impl chronik_columnar::ParquetPathSource for TopicParquetSource {
     async fn parquet_paths(&self) -> Vec<String> {
-        resolve_parquet_paths(self.metadata_store.as_ref(), &self.topic).await
+        let paths = resolve_parquet_paths(self.metadata_store.as_ref(), &self.topic).await;
+
+        // Resolved per scan, not at registration, so a leadership change takes
+        // effect on the next query rather than requiring re-registration.
+        match &self.ownership {
+            Some(ownership) => match ownership.owned_partitions(&self.topic).await {
+                Some(owned) => retain_owned_partitions(paths, &owned),
+                None => paths,
+            },
+            None => paths,
+        }
     }
 }
 
@@ -313,6 +411,7 @@ impl SqlHandler {
                     let source = std::sync::Arc::new(TopicParquetSource {
                         topic: topic.clone(),
                         metadata_store: state.metadata_store.clone(),
+                        ownership: query_ownership(state),
                     });
 
                     match engine
@@ -348,12 +447,21 @@ impl SqlHandler {
             if !has_hot {
                 if let Some(hot_buffer) = &state.hot_buffer {
                     if hot_buffer.is_enabled() {
-                        let provider = std::sync::Arc::new(
-                            chronik_columnar::LiveHotTableProvider::new(
+                        // The hot table needs the same ownership rule as the cold
+                        // one. Without it, every replica would serve every
+                        // partition's un-flushed records and the fan-out would
+                        // count them once per replica.
+                        let provider = std::sync::Arc::new(match query_ownership(state) {
+                            Some(ownership) => chronik_columnar::LiveHotTableProvider::with_ownership(
+                                hot_buffer.clone(),
+                                topic.clone(),
+                                ownership,
+                            ),
+                            None => chronik_columnar::LiveHotTableProvider::new(
                                 hot_buffer.clone(),
                                 topic.clone(),
                             ),
-                        );
+                        });
                         match engine.register_table_provider(&hot_table_name, provider) {
                             Ok(()) => {
                                 info!(
@@ -482,6 +590,7 @@ impl SqlHandler {
                 let source = std::sync::Arc::new(TopicParquetSource {
                     topic: topic.to_string(),
                     metadata_store: state.metadata_store.clone(),
+                    ownership: query_ownership(state),
                 });
                 if let Err(e) = engine
                     .register_live_parquet_table(
@@ -617,22 +726,73 @@ pub async fn execute_sql(
             // Distributed fan-out: merge SQL results from all peer nodes
             let response = if let Some(ref router) = state.query_router {
                 if !super::query_router::is_forwarded_request(&headers) {
-                    // Check if all data is local (RF=N) — skip fan-out if so
-                    // Only refresh partition map if not yet populated (avoids RwLock contention)
-                    if !router.has_partition_map().await {
-                        router.refresh_all_partition_maps(state.metadata_store.as_ref()).await;
-                    }
-                    if router.all_topics_local().await {
-                        debug!("All partitions local (RF=N), skipping SQL fan-out");
+                    // Skip the fan-out only when this node LEADS every partition.
+                    //
+                    // This used to skip when the node was a *replica* of every
+                    // partition (`all_topics_local`), which at RF=node_count is
+                    // always true — so on a full-replication cluster the query
+                    // never fanned out and returned only what this node happened
+                    // to see locally. That is #22: partial results, and different
+                    // ones depending on which node answered, because the cold
+                    // table is built from segment metadata registered by each
+                    // partition's leader and filtered by local path existence.
+                    //
+                    // Leadership is the right condition on both sides: if this
+                    // node leads everything there is nothing to merge, and if it
+                    // does not, the providers restrict each node to its own led
+                    // partitions so the union covers every partition exactly once
+                    // — no gaps, no double-counting.
+                    // Refresh unconditionally, not just when the map is empty.
+                    //
+                    // `has_partition_map()` is true as soon as ONE topic is
+                    // mapped, so the old guard meant a topic created later was
+                    // never mapped — and an unmapped topic is invisible to the
+                    // leadership check, which would then happily skip the fan-out
+                    // and miss that topic's data entirely. These are in-memory
+                    // metadata reads and this is a query path, not the produce
+                    // path.
+                    router.refresh_all_partition_maps(state.metadata_store.as_ref()).await;
+                    if router.leads_all_partitions().await {
+                        debug!("This node leads every partition, skipping SQL fan-out");
                         response
                     } else {
                         let all_peers = router.all_peers();
                         if !all_peers.is_empty() {
-                            let peers: Vec<SqlResponse> = router
-                                .fan_out_post("/_sql", &fan_out_request, &all_peers)
-                                .await;
-                            debug!(peer_count = peers.len(), "Merging SQL results from peers");
-                            super::query_router::merge_sql_responses(response, peers, row_limit)
+                            // How the results combine depends on the query, and
+                            // getting it wrong is silent. Decide before paying
+                            // for the fan-out so an unmergeable query fails fast
+                            // instead of returning a plausible wrong answer.
+                            match super::query_router::sql_merge_strategy(&request.query) {
+                                super::query_router::SqlMerge::Unsupported(why) => {
+                                    warn!(query = %request.query, reason = why,
+                                          "Refusing to merge a distributed SQL result");
+                                    let error_response = SqlErrorResponse {
+                                        error: format!(
+                                            "This query cannot be answered across a cluster: {}",
+                                            why
+                                        ),
+                                        error_type: "DistributedQueryUnsupported".to_string(),
+                                    };
+                                    return (StatusCode::BAD_REQUEST, Json(error_response))
+                                        .into_response();
+                                }
+                                strategy => {
+                                    let peers: Vec<SqlResponse> = router
+                                        .fan_out_post("/_sql", &fan_out_request, &all_peers)
+                                        .await;
+                                    debug!(peer_count = peers.len(), "Merging SQL results from peers");
+                                    match strategy {
+                                        super::query_router::SqlMerge::ScalarAggregate(how) => {
+                                            super::query_router::merge_scalar_aggregate(
+                                                response, peers, &how,
+                                            )
+                                        }
+                                        _ => super::query_router::merge_sql_responses(
+                                            response, peers, row_limit,
+                                        ),
+                                    }
+                                }
+                            }
                         } else {
                             response
                         }
@@ -1000,5 +1160,74 @@ mod tests {
             registry.should_probe_cold("other", 60_000),
             "throttling is per-topic"
         );
+    }
+}
+
+#[cfg(test)]
+mod partition_ownership_tests {
+    use super::*;
+
+    fn owned(ids: &[i32]) -> HashSet<i32> {
+        ids.iter().copied().collect()
+    }
+
+    #[test]
+    fn partition_is_parsed_from_the_hive_style_path() {
+        assert_eq!(
+            partition_of_parquet_path("/data/columnar/orders/partition=3/seg-0.parquet"),
+            Some(3)
+        );
+        assert_eq!(
+            partition_of_parquet_path("s3://bucket/columnar/orders/partition=11/seg.parquet"),
+            Some(11)
+        );
+        assert_eq!(partition_of_parquet_path("/data/columnar/orders/seg.parquet"), None);
+        assert_eq!(
+            partition_of_parquet_path("/data/columnar/orders/partition=abc/seg.parquet"),
+            None
+        );
+    }
+
+    /// #22: a node must scan only the partitions it leads, or the fan-out counts
+    /// every row once per replica.
+    #[test]
+    fn only_led_partitions_are_scanned() {
+        let paths = vec![
+            "/d/columnar/t/partition=0/a.parquet".to_string(),
+            "/d/columnar/t/partition=1/b.parquet".to_string(),
+            "/d/columnar/t/partition=2/c.parquet".to_string(),
+        ];
+
+        let kept = retain_owned_partitions(paths, &owned(&[0, 2]));
+        assert_eq!(
+            kept,
+            vec![
+                "/d/columnar/t/partition=0/a.parquet".to_string(),
+                "/d/columnar/t/partition=2/c.parquet".to_string(),
+            ]
+        );
+    }
+
+    /// Leading nothing means serving nothing — the peers that lead those
+    /// partitions answer for them. Returning rows here would double-count.
+    #[test]
+    fn leading_no_partitions_serves_nothing() {
+        let paths = vec!["/d/columnar/t/partition=0/a.parquet".to_string()];
+        assert!(retain_owned_partitions(paths, &owned(&[])).is_empty());
+    }
+
+    /// An unparseable path is kept, deliberately.
+    ///
+    /// Dropping it would silently lose data if the layout ever changes; keeping
+    /// it surfaces as duplicate rows, which is loud. Given a choice between two
+    /// wrong behaviours, prefer the one an operator will notice.
+    #[test]
+    fn a_path_without_a_partition_component_is_kept_not_dropped() {
+        let paths = vec![
+            "/d/columnar/t/legacy.parquet".to_string(),
+            "/d/columnar/t/partition=5/x.parquet".to_string(),
+        ];
+        let kept = retain_owned_partitions(paths, &owned(&[0]));
+        assert_eq!(kept, vec!["/d/columnar/t/legacy.parquet".to_string()]);
     }
 }

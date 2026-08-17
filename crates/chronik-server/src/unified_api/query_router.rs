@@ -9,7 +9,7 @@
 //! Design inspired by Elasticsearch scatter-gather, Milvus multi-level reduction,
 //! and CockroachDB DistSQL patterns. See docs/DISTRIBUTED_QUERY_LAYER.md.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -418,7 +418,20 @@ impl QueryRouter {
     /// Check if all partitions for ALL known topics are local (no fan-out needed).
     ///
     /// Returns true when every partition of every topic in the partition map
-    /// has this node as a replica. Used by SQL handler to skip fan-out when RF=N.
+    /// has this node as a replica.
+    ///
+    /// # Do not use this to decide whether to skip a query fan-out
+    ///
+    /// It answers "am I a replica of everything", which at RF=node_count is
+    /// always true and says nothing about whether this node can *answer* for
+    /// everything. `/_sql` used it that way and returned partial,
+    /// non-deterministic results (#22): a node's cold table is built from
+    /// Parquet segment metadata registered by each partition's leader, filtered
+    /// by whether those paths resolve on the local filesystem, so what any one
+    /// node can see is a subset that varies by node.
+    ///
+    /// Use [`Self::leads_all_partitions`] instead — leadership partitions the
+    /// work exactly once, which is what a distributed read needs.
     pub async fn all_topics_local(&self) -> bool {
         let map = self.partition_map.read().await;
         if map.replicas.is_empty() {
@@ -432,6 +445,46 @@ impl QueryRouter {
             }
         }
         true
+    }
+
+    /// Does this node lead every partition of every known topic?
+    ///
+    /// The safe condition for skipping a query fan-out: if this node leads
+    /// everything, no peer can hold a partition it does not already answer for,
+    /// so there is nothing to merge and nothing to double-count. True on a
+    /// single node; false on any real cluster, where leadership is spread.
+    pub async fn leads_all_partitions(&self) -> bool {
+        let map = self.partition_map.read().await;
+        if map.leaders.is_empty() {
+            return false;
+        }
+        for leaders in map.leaders.values() {
+            for leader in leaders.values() {
+                if *leader != self.self_node_id {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Partitions of `topic` this node leads, and therefore answers for.
+    ///
+    /// `None` means "no opinion — serve everything", which is the correct answer
+    /// when the topic is absent from the partition map: a topic that has not been
+    /// mapped yet must not silently return zero rows, because a query that
+    /// under-reports looks like data loss while one that over-reports on a
+    /// single-node deployment is merely the pre-existing behaviour.
+    pub async fn led_partitions(&self, topic: &str) -> Option<HashSet<i32>> {
+        let map = self.partition_map.read().await;
+        let leaders = map.leaders.get(topic)?;
+        Some(
+            leaders
+                .iter()
+                .filter(|(_, leader)| **leader == self.self_node_id)
+                .map(|(partition, _)| *partition as i32)
+                .collect(),
+        )
     }
 
     /// Refresh partition maps for all topics from the metadata store.
@@ -731,6 +784,219 @@ pub fn merge_sql_responses(
         execution_time_ms,
         truncated,
     }
+}
+
+/// How a fanned-out query's per-node results may be combined.
+///
+/// Concatenation is right for a projection — each node now serves a disjoint set
+/// of partitions, so the rows do not overlap. It is **wrong** for an aggregate:
+/// `SELECT COUNT(*)` fanned across three nodes returns three partial counts, and
+/// concatenating them produces three rows where the caller asked for one number.
+#[derive(Debug, PartialEq)]
+pub enum SqlMerge {
+    /// Rows from each node are disjoint; append them.
+    Concatenate,
+    /// One row per node; combine column by column with these functions, in the
+    /// order the columns appear.
+    ScalarAggregate(Vec<AggMerge>),
+    /// Cannot be combined without changing the query. Better to say so than to
+    /// return a number that looks right.
+    Unsupported(&'static str),
+}
+
+/// How one aggregate column combines across nodes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AggMerge {
+    Sum,
+    Min,
+    Max,
+}
+
+/// Decide how to merge, from the query itself.
+///
+/// Deliberately conservative: anything not recognised as safely combinable is
+/// [`SqlMerge::Unsupported`] rather than guessed at. `AVG` is the clearest
+/// example — averaging three nodes' averages is not the average unless every
+/// node held the same number of rows, which is exactly what a partitioned topic
+/// does not guarantee. Computing it properly needs `SUM` and `COUNT` carried
+/// separately, which means rewriting the query, not merging its output.
+pub fn sql_merge_strategy(sql: &str) -> SqlMerge {
+    use chronik_columnar::datafusion::sql::parser::{DFParser, Statement};
+    use chronik_columnar::datafusion::sql::sqlparser::ast::{
+        Expr as SqlExpr, GroupByExpr, SelectItem, SetExpr, Statement as AstStatement,
+    };
+
+    let Ok(statements) = DFParser::parse_sql(sql) else {
+        return SqlMerge::Concatenate; // unparseable here; the engine will reject it
+    };
+    let Some(Statement::Statement(ast)) = statements.front() else {
+        return SqlMerge::Concatenate;
+    };
+    let AstStatement::Query(query) = ast.as_ref() else {
+        return SqlMerge::Concatenate;
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        // UNION and friends: the operands were each evaluated per node, so the
+        // shape is not something this function can reason about.
+        return SqlMerge::Concatenate;
+    };
+
+    let grouped = match &select.group_by {
+        GroupByExpr::Expressions(exprs, _) => !exprs.is_empty(),
+        GroupByExpr::All(_) => true,
+    };
+
+    // Collect the aggregate function of each projected column, if any.
+    let mut aggs: Vec<Option<AggMerge>> = Vec::new();
+    for item in &select.projection {
+        let expr = match item {
+            SelectItem::UnnamedExpr(expr) => expr,
+            SelectItem::ExprWithAlias { expr, .. } => expr,
+            // `*` is never an aggregate.
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {
+                aggs.push(None);
+                continue;
+            }
+        };
+
+        aggs.push(match expr {
+            SqlExpr::Function(f) => {
+                let name = f.name.to_string().to_ascii_uppercase();
+                match name.as_str() {
+                    "COUNT" | "SUM" => Some(AggMerge::Sum),
+                    "MIN" => Some(AggMerge::Min),
+                    "MAX" => Some(AggMerge::Max),
+                    "AVG" | "MEAN" => {
+                        return SqlMerge::Unsupported(
+                            "AVG cannot be merged across nodes: averaging per-node averages is \
+                             only correct when every node holds the same number of rows. Use \
+                             SUM(x) and COUNT(x) and divide.",
+                        )
+                    }
+                    // Unknown function: it may or may not be an aggregate, and
+                    // assuming wrong is how a query silently returns nonsense.
+                    _ => None,
+                }
+            }
+            _ => None,
+        });
+    }
+
+    let any_agg = aggs.iter().any(Option::is_some);
+
+    if grouped {
+        if any_agg {
+            return SqlMerge::Unsupported(
+                "GROUP BY cannot be merged across nodes: each node groups only its own \
+                 partitions, so the same key appears once per node and the groups would need \
+                 re-aggregating by key.",
+            );
+        }
+        // GROUP BY with no aggregate is a DISTINCT in disguise; concatenating
+        // can repeat a key across nodes, so it is not safe either.
+        return SqlMerge::Unsupported(
+            "GROUP BY cannot be merged across nodes: the same key may be produced by more \
+             than one node.",
+        );
+    }
+
+    if !any_agg {
+        if select.distinct.is_some() {
+            return SqlMerge::Unsupported(
+                "SELECT DISTINCT cannot be merged across nodes: each node de-duplicates only \
+                 its own partitions, so a value held by two nodes appears twice.",
+            );
+        }
+        return SqlMerge::Concatenate;
+    }
+
+    // Mixing aggregates with bare columns without GROUP BY is not valid SQL the
+    // engine would accept, but if it did there is no sound merge.
+    if aggs.iter().any(Option::is_none) {
+        return SqlMerge::Unsupported(
+            "mixing aggregate and non-aggregate columns cannot be merged across nodes.",
+        );
+    }
+
+    SqlMerge::ScalarAggregate(aggs.into_iter().map(Option::unwrap).collect())
+}
+
+/// Combine one row per node into a single row of aggregates.
+///
+/// Each node computed its aggregate over the partitions it leads, so the parts
+/// are disjoint and combining them is exact — a summed COUNT is the true count,
+/// not an estimate.
+pub fn merge_scalar_aggregate(
+    local: SqlResponse,
+    peers: Vec<SqlResponse>,
+    how: &[AggMerge],
+) -> SqlResponse {
+    let columns = local.columns.clone();
+    let execution_time_ms = local.execution_time_ms;
+
+    let mut rows: Vec<HashMap<String, serde_json::Value>> = Vec::new();
+    rows.extend(local.rows);
+    for peer in peers {
+        rows.extend(peer.rows);
+    }
+
+    let mut merged: HashMap<String, serde_json::Value> = HashMap::new();
+    for (idx, column) in columns.iter().enumerate() {
+        let op = how.get(idx).copied().unwrap_or(AggMerge::Sum);
+        let mut acc: Option<serde_json::Value> = None;
+
+        for row in &rows {
+            let Some(value) = row.get(column) else { continue };
+            if value.is_null() {
+                continue;
+            }
+            acc = Some(match acc {
+                None => value.clone(),
+                Some(current) => combine_numbers(&current, value, op),
+            });
+        }
+
+        merged.insert(
+            column.clone(),
+            acc.unwrap_or(serde_json::Value::Null),
+        );
+    }
+
+    SqlResponse {
+        columns,
+        rows: vec![merged],
+        row_count: 1,
+        execution_time_ms,
+        truncated: false,
+    }
+}
+
+/// Combine two JSON numbers. Non-numeric values keep the accumulator, since
+/// there is no meaningful sum of two strings.
+fn combine_numbers(a: &serde_json::Value, b: &serde_json::Value, op: AggMerge) -> serde_json::Value {
+    // Integers stay integers: a summed COUNT rendered as 60.0 is a worse answer
+    // than 60, and JSON has no separate integer type to fall back on.
+    if let (Some(x), Some(y)) = (a.as_i64(), b.as_i64()) {
+        let out = match op {
+            AggMerge::Sum => x.saturating_add(y),
+            AggMerge::Min => x.min(y),
+            AggMerge::Max => x.max(y),
+        };
+        return serde_json::Value::from(out);
+    }
+
+    if let (Some(x), Some(y)) = (a.as_f64(), b.as_f64()) {
+        let out = match op {
+            AggMerge::Sum => x + y,
+            AggMerge::Min => x.min(y),
+            AggMerge::Max => x.max(y),
+        };
+        return serde_json::Number::from_f64(out)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null);
+    }
+
+    a.clone()
 }
 
 /// Merge Elasticsearch-compatible SearchResponse results from multiple nodes.
@@ -1449,5 +1715,221 @@ mod tests {
         assert_eq!(router.peers.len(), 1);
         assert_eq!(router.peers[0].url, "http://remote-host:16099");
         std::env::remove_var("CHRONIK_UNIFIED_API_PORT_NODE_99");
+    }
+}
+
+#[cfg(test)]
+mod partition_ownership_tests {
+    use super::*;
+
+    /// A router with a known partition map and no peers to talk to.
+    fn router_with(self_node_id: u64, leaders: &[(&str, &[(u32, u64)])]) -> QueryRouter {
+        let mut map = PartitionMap::default();
+        for (topic, entries) in leaders {
+            let per_topic: HashMap<u32, u64> = entries.iter().copied().collect();
+            // Replicas: everyone replicates everything (RF = node_count), which
+            // is the configuration #22 is about.
+            let replicas: HashMap<u32, Vec<u64>> =
+                entries.iter().map(|(p, _)| (*p, vec![1, 2, 3])).collect();
+            map.leaders.insert(topic.to_string(), per_topic);
+            map.replicas.insert(topic.to_string(), replicas);
+        }
+
+        QueryRouter {
+            client: Client::new(),
+            peers: Vec::new(),
+            self_node_id,
+            partition_map: Arc::new(RwLock::new(map)),
+            config: QueryRouterConfig::default(),
+            peer_metrics: Arc::new(HashMap::new()),
+        }
+    }
+
+    /// #22, stated as a test: at RF=node_count every node is a replica of every
+    /// partition, so the old predicate said "everything is local, skip the
+    /// fan-out" — on every node. Each then answered from whatever it could see
+    /// locally, which is a partial and node-dependent subset.
+    #[tokio::test]
+    async fn replica_based_locality_is_true_for_every_node_at_full_replication() {
+        let leaders: &[(u32, u64)] = &[(0, 1), (1, 2), (2, 3)];
+
+        for node in [1u64, 2, 3] {
+            let router = router_with(node, &[("orders", leaders)]);
+            assert!(
+                router.all_topics_local().await,
+                "node {} is a replica of every partition, which is why this predicate \
+                 cannot decide whether to fan out",
+                node
+            );
+            assert!(
+                !router.leads_all_partitions().await,
+                "node {} leads only one of three partitions and must fan out",
+                node
+            );
+        }
+    }
+
+    /// The three nodes' led sets must partition the topic: every partition
+    /// covered, none twice. That is what makes the merged result correct.
+    #[tokio::test]
+    async fn led_partitions_cover_every_partition_exactly_once() {
+        let leaders: &[(u32, u64)] = &[(0, 1), (1, 2), (2, 3), (3, 1)];
+
+        let mut seen: Vec<i32> = Vec::new();
+        for node in [1u64, 2, 3] {
+            let router = router_with(node, &[("orders", leaders)]);
+            let led = router.led_partitions("orders").await.expect("topic is mapped");
+            seen.extend(led);
+        }
+
+        seen.sort_unstable();
+        assert_eq!(seen, vec![0, 1, 2, 3], "partitions must be covered exactly once");
+    }
+
+    /// A single node leads everything, so there is nothing to merge and no
+    /// reason to pay for a fan-out.
+    #[tokio::test]
+    async fn a_lone_node_skips_the_fan_out() {
+        let router = router_with(1, &[("orders", &[(0, 1), (1, 1), (2, 1)])]);
+        assert!(router.leads_all_partitions().await);
+    }
+
+    /// An unmapped topic means "no opinion — serve everything", not "serve
+    /// nothing". Returning an empty set here would make a query silently
+    /// under-report while the map was still being populated, which is
+    /// indistinguishable from data loss.
+    #[tokio::test]
+    async fn an_unmapped_topic_has_no_ownership_opinion() {
+        let router = router_with(1, &[("orders", &[(0, 1)])]);
+        assert!(router.led_partitions("not-a-topic").await.is_none());
+    }
+
+    /// With no map at all, neither predicate may claim the node can answer
+    /// alone — a fresh node must not decide to skip the fan-out before it knows
+    /// anything.
+    #[tokio::test]
+    async fn an_empty_map_never_claims_to_lead_everything() {
+        let router = router_with(1, &[]);
+        assert!(!router.leads_all_partitions().await);
+        assert!(!router.all_topics_local().await);
+    }
+}
+
+#[cfg(test)]
+mod sql_merge_tests {
+    use super::*;
+
+    fn row(pairs: &[(&str, i64)]) -> HashMap<String, serde_json::Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), serde_json::Value::from(*v)))
+            .collect()
+    }
+
+    fn resp(columns: &[&str], rows: Vec<HashMap<String, serde_json::Value>>) -> SqlResponse {
+        SqlResponse {
+            columns: columns.iter().map(|c| c.to_string()).collect(),
+            row_count: rows.len(),
+            rows,
+            execution_time_ms: 1,
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn a_projection_is_concatenated() {
+        assert_eq!(
+            sql_merge_strategy("SELECT _offset, _value FROM orders"),
+            SqlMerge::Concatenate
+        );
+        assert_eq!(sql_merge_strategy("SELECT * FROM orders"), SqlMerge::Concatenate);
+    }
+
+    #[test]
+    fn count_and_sum_are_summed_min_and_max_are_extrema() {
+        assert_eq!(
+            sql_merge_strategy("SELECT COUNT(*) FROM orders"),
+            SqlMerge::ScalarAggregate(vec![AggMerge::Sum])
+        );
+        assert_eq!(
+            sql_merge_strategy("SELECT SUM(amount), MIN(amount), MAX(amount) FROM orders"),
+            SqlMerge::ScalarAggregate(vec![AggMerge::Sum, AggMerge::Min, AggMerge::Max])
+        );
+    }
+
+    /// The whole point of this analysis: three partial counts must become one
+    /// total, not three rows.
+    #[test]
+    fn partial_counts_become_one_total() {
+        let local = resp(&["c"], vec![row(&[("c", 0)])]);
+        let peers = vec![
+            resp(&["c"], vec![row(&[("c", 59)])]),
+            resp(&["c"], vec![row(&[("c", 1)])]),
+        ];
+
+        let merged = merge_scalar_aggregate(local, peers, &[AggMerge::Sum]);
+        assert_eq!(merged.row_count, 1, "a scalar aggregate returns one row");
+        assert_eq!(merged.rows[0]["c"], serde_json::Value::from(60));
+    }
+
+    /// A summed COUNT must stay an integer — 60, not 60.0.
+    #[test]
+    fn summed_counts_stay_integers() {
+        let merged = merge_scalar_aggregate(
+            resp(&["c"], vec![row(&[("c", 2)])]),
+            vec![resp(&["c"], vec![row(&[("c", 3)])])],
+            &[AggMerge::Sum],
+        );
+        assert!(merged.rows[0]["c"].is_i64(), "got {:?}", merged.rows[0]["c"]);
+        assert_eq!(merged.rows[0]["c"], serde_json::Value::from(5));
+    }
+
+    #[test]
+    fn min_and_max_pick_extremes_not_sums() {
+        let local = resp(&["lo", "hi"], vec![row(&[("lo", 5), ("hi", 5)])]);
+        let peers = vec![resp(&["lo", "hi"], vec![row(&[("lo", 2), ("hi", 9)])])];
+        let merged = merge_scalar_aggregate(local, peers, &[AggMerge::Min, AggMerge::Max]);
+        assert_eq!(merged.rows[0]["lo"], serde_json::Value::from(2));
+        assert_eq!(merged.rows[0]["hi"], serde_json::Value::from(9));
+    }
+
+    /// AVG must be refused, not approximated.
+    ///
+    /// The average of per-node averages equals the true average only when every
+    /// node holds the same number of rows — which a partitioned topic does not
+    /// guarantee. Returning a number here would be wrong in a way nobody can see.
+    #[test]
+    fn avg_is_refused_rather_than_approximated() {
+        match sql_merge_strategy("SELECT AVG(amount) FROM orders") {
+            SqlMerge::Unsupported(why) => assert!(why.contains("AVG")),
+            other => panic!("AVG must not be merged: {:?}", other),
+        }
+    }
+
+    /// GROUP BY needs re-aggregation by key, which merging output rows cannot do.
+    #[test]
+    fn group_by_is_refused() {
+        match sql_merge_strategy("SELECT k, COUNT(*) FROM orders GROUP BY k") {
+            SqlMerge::Unsupported(why) => assert!(why.contains("GROUP BY")),
+            other => panic!("GROUP BY must not be merged: {:?}", other),
+        }
+    }
+
+    /// DISTINCT de-duplicates per node, so a value on two nodes survives twice.
+    #[test]
+    fn distinct_is_refused() {
+        match sql_merge_strategy("SELECT DISTINCT k FROM orders") {
+            SqlMerge::Unsupported(why) => assert!(why.contains("DISTINCT")),
+            other => panic!("DISTINCT must not be merged: {:?}", other),
+        }
+    }
+
+    /// A null from a node that holds no rows must not erase another node's value.
+    #[test]
+    fn a_node_with_no_rows_does_not_erase_the_answer() {
+        let local = resp(&["c"], vec![HashMap::from([("c".to_string(), serde_json::Value::Null)])]);
+        let peers = vec![resp(&["c"], vec![row(&[("c", 7)])])];
+        let merged = merge_scalar_aggregate(local, peers, &[AggMerge::Sum]);
+        assert_eq!(merged.rows[0]["c"], serde_json::Value::from(7));
     }
 }
