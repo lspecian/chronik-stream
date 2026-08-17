@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.12.2] - 2026-08-17
+
+### Fixed
+
+- **`DescribeCluster` responses were unparseable by Java clients** (#35), which
+  broke `kafka-topics.sh --describe` and any tool built on the Java AdminClient.
+  `throttle_time_ms` — the first field of the response at every version — was
+  never written, so the client read four bytes of other fields as the throttle and
+  then took a byte of the cluster id as a string length. The AdminClient's I/O
+  thread died on the malformed reply, and every subsequent call on that client
+  failed with "The AdminClient thread has exited". The clusterId was never null;
+  it never arrived. v1 was additionally missing `endpoint_type` (KIP-919).
+- **Nineteen APIs were advertised in ApiVersions without an implementation.** A
+  client that saw one listed would send it and receive a bare error code rather
+  than that API's response schema, losing its entire AdminClient — not just that
+  call. `kafka-topics.sh --describe` hit this via
+  `listPartitionReassignments`. Unimplemented APIs are no longer advertised, so
+  clients take their documented unsupported path and complete.
+- **The cluster reported two different identities.** Metadata answered
+  `chronik-stream` while `DescribeCluster` answered a base64 id, so a client
+  cross-checking the two saw a cluster disagreeing with itself. There is now a
+  single definition.
+
 ## [2.12.1] - 2026-08-17
 
 ### Fixed

@@ -28,7 +28,7 @@ members = [
 ]
 
 [workspace.package]
-version = "2.12.1"
+version = "2.12.2"
 edition = "2021"
 authors = ["Chronik Stream Contributors"]
 license = "Apache-2.0"
