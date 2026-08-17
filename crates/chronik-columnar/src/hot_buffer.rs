@@ -209,6 +209,22 @@ impl PartitionedMemTable {
     pub fn new(schema: SchemaRef, partition_batches: HashMap<i32, RecordBatch>) -> Self {
         Self { schema, partition_batches }
     }
+
+    /// Drop every partition this node does not answer for.
+    ///
+    /// See [`PartitionOwnership`]: a distributed query must read each partition
+    /// exactly once, and every replica holds every partition it replicates.
+    pub fn retaining(mut self, owned: &std::collections::HashSet<i32>) -> Self {
+        self.partition_batches.retain(|partition, _| owned.contains(partition));
+        self
+    }
+
+    /// Partitions this table will scan. Exposed for tests and diagnostics.
+    pub fn partitions(&self) -> Vec<i32> {
+        let mut ids: Vec<i32> = self.partition_batches.keys().copied().collect();
+        ids.sort_unstable();
+        ids
+    }
 }
 
 #[async_trait::async_trait]
@@ -281,19 +297,62 @@ impl TableProvider for PartitionedMemTable {
 /// re-registration. Freshness is bounded by
 /// [`HotBufferConfig::refresh_interval_ms`], which the buffer's own cache
 /// enforces, so scanning per query costs at most one WAL read per interval.
+/// Which partitions of a topic this node answers for in a distributed query.
+///
+/// # Why a query needs this at all
+///
+/// With replication, every replica of a partition holds that partition's
+/// records — that is the point of replication. But a distributed query must read
+/// each partition exactly **once**: read it zero times and rows go missing, read
+/// it on two nodes and every row is counted twice. `COUNT(*)` at RF=3 returns
+/// three times the truth.
+///
+/// So a query needs an ownership rule, and holding a replica is not one. The
+/// rule here is **leadership**: a node answers for the partitions it leads, which
+/// partitions exactly one node at a time by construction.
+///
+/// Returning `None` means "all of them" — a single node, or a deployment with no
+/// cluster, where there is nobody to double-count with.
+#[async_trait::async_trait]
+pub trait PartitionOwnership: Send + Sync + std::fmt::Debug {
+    async fn owned_partitions(&self, topic: &str) -> Option<std::collections::HashSet<i32>>;
+}
+
 pub struct LiveHotTableProvider {
     buffer: Arc<HotDataBuffer>,
     topic: String,
     schema: SchemaRef,
+    /// Resolved on every scan, not at registration: leadership moves, and a
+    /// provider that pinned it would keep serving a partition it no longer leads
+    /// (double-counting) or keep skipping one it now does (missing rows).
+    ownership: Option<Arc<dyn PartitionOwnership>>,
 }
 
 impl LiveHotTableProvider {
     /// Create a live provider for `topic` backed by `buffer`.
+    ///
+    /// Serves every partition present in the buffer. Correct for single-node;
+    /// use [`Self::with_ownership`] in a cluster.
     pub fn new(buffer: Arc<HotDataBuffer>, topic: impl Into<String>) -> Self {
         Self {
             buffer,
             topic: topic.into(),
             schema: Arc::new(HotDataBuffer::hot_buffer_schema()),
+            ownership: None,
+        }
+    }
+
+    /// Serve only the partitions `ownership` says this node answers for.
+    pub fn with_ownership(
+        buffer: Arc<HotDataBuffer>,
+        topic: impl Into<String>,
+        ownership: Arc<dyn PartitionOwnership>,
+    ) -> Self {
+        Self {
+            buffer,
+            topic: topic.into(),
+            schema: Arc::new(HotDataBuffer::hot_buffer_schema()),
+            ownership: Some(ownership),
         }
     }
 
@@ -333,7 +392,19 @@ impl TableProvider for LiveHotTableProvider {
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         match self.buffer.get_topic_mem_table(&self.topic).await {
-            Ok(Some(table)) => table.scan(state, projection, filters, limit).await,
+            Ok(Some(table)) => {
+                // Restrict to the partitions this node answers for, resolved now
+                // rather than at registration so a leadership change takes effect
+                // on the next query.
+                let table = match &self.ownership {
+                    Some(ownership) => match ownership.owned_partitions(&self.topic).await {
+                        Some(owned) => table.retaining(&owned),
+                        None => table,
+                    },
+                    None => table,
+                };
+                table.scan(state, projection, filters, limit).await
+            }
             Ok(None) => self.empty_scan(projection),
             Err(e) => {
                 // Missing partition directories are already handled per
@@ -1122,5 +1193,65 @@ mod tests {
         // DataFusion still applies them post-scan for correctness
         assert_eq!(result[0], TableProviderFilterPushDown::Inexact);
         assert_eq!(result[1], TableProviderFilterPushDown::Inexact);
+    }
+}
+
+#[cfg(test)]
+mod partition_ownership_tests {
+    use super::*;
+
+    /// One row per partition, so a scan's partition set is visible in the data.
+    fn batch_for(partition: i32) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_partition", DataType::Int32, false),
+            Field::new("_offset", DataType::Int64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![partition])),
+                Arc::new(Int64Array::from(vec![0i64])),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn table_with(partitions: &[i32]) -> PartitionedMemTable {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_partition", DataType::Int32, false),
+            Field::new("_offset", DataType::Int64, false),
+        ]));
+        let batches: HashMap<i32, RecordBatch> =
+            partitions.iter().map(|p| (*p, batch_for(*p))).collect();
+        PartitionedMemTable::new(schema, batches)
+    }
+
+    /// #22 on the hot side: un-flushed records live on every replica too, so a
+    /// replica that served all of them would have its rows counted once per
+    /// replica by the fan-out.
+    #[test]
+    fn retaining_keeps_only_the_owned_partitions() {
+        let owned: std::collections::HashSet<i32> = [0, 2].into_iter().collect();
+        let table = table_with(&[0, 1, 2, 3]).retaining(&owned);
+        assert_eq!(table.partitions(), vec![0, 2]);
+    }
+
+    /// Owning nothing serves nothing — the peers that lead those partitions
+    /// answer for them.
+    #[test]
+    fn retaining_nothing_leaves_an_empty_scan() {
+        let owned = std::collections::HashSet::new();
+        let table = table_with(&[0, 1]).retaining(&owned);
+        assert!(table.partitions().is_empty());
+    }
+
+    /// Ownership naming a partition this node does not hold is not an error:
+    /// the node simply has nothing for it yet (indexing lag, or a leadership
+    /// change that arrived before the data).
+    #[test]
+    fn owning_a_partition_with_no_local_data_is_not_an_error() {
+        let owned: std::collections::HashSet<i32> = [0, 7].into_iter().collect();
+        let table = table_with(&[0]).retaining(&owned);
+        assert_eq!(table.partitions(), vec![0]);
     }
 }

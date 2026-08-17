@@ -67,7 +67,7 @@ pub use vector_index::{
     ScalarQuantizer,
 };
 pub use vector_cache::QueryEmbeddingCache;
-pub use hot_buffer::{HotDataBuffer, HotBufferConfig, HotBufferStats, LiveHotTableProvider};
+pub use hot_buffer::{HotDataBuffer, HotBufferConfig, HotBufferStats, LiveHotTableProvider, PartitionOwnership, PartitionedMemTable};
 pub use live_parquet::{
     LiveParquetTableProvider, ParquetPathSource, StaticParquetPaths, DEFAULT_PARQUET_REFRESH_MS,
 };

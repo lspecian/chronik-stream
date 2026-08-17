@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.12.1] - 2026-08-17
+
+### Fixed
+
+- **`/_sql` returned a partial, node-dependent view of a topic at
+  RF=node_count** (#22). The fan-out was skipped whenever this node was a
+  *replica* of every partition — always true at full replication — so each node
+  answered from whatever it could see locally, which is a subset that varies by
+  node. Query ownership is now **leadership**, which covers every partition
+  exactly once: a node serves only the partitions it leads, resolved per scan, and
+  the fan-out is skipped only when it leads all of them. Applies to both the cold
+  (Parquet) and hot (WAL buffer) sides.
+- **Distributed SQL aggregates were merged by concatenating rows.** `SELECT
+  COUNT(*)` on a cluster returned one partial count per node instead of one
+  total. `COUNT`/`SUM` now sum and `MIN`/`MAX` take extrema. Queries that cannot
+  be combined soundly are **refused with a reason** rather than answered wrongly:
+  `AVG` (averaging per-node averages is only correct when every node holds the
+  same number of rows — use `SUM`/`COUNT`), `GROUP BY`, and `SELECT DISTINCT`.
+  Cluster deployments only; a single node skips the fan-out and is unaffected.
+
+### Added
+
+- `tests/cluster/sql_fanout.sh` — asserts every node returns the whole topic
+  exactly once at RF=3, checking both failure modes (rows missing, and rows
+  counted more than once).
+
 ## [2.12.0] - 2026-08-17
 
 ### ⚠️ Breaking / behaviour changes
