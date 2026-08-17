@@ -139,9 +139,10 @@ async fn test_metadata_returns_created_topics() {
     assert_eq!(port, 9092);
     let _rack = decoder.read_string().unwrap(); // nullable
     
-    // cluster_id
+    // cluster_id — compared against the shared constant, not a literal, so
+    // Metadata and DescribeCluster cannot drift apart again.
     let cluster_id = decoder.read_string().unwrap().unwrap();
-    assert_eq!(cluster_id, "chronik-stream");
+    assert_eq!(cluster_id, chronik_protocol::handler::CLUSTER_ID);
     
     // controller_id
     let controller_id = decoder.read_i32().unwrap();
