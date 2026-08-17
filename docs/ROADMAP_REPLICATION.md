@@ -158,13 +158,30 @@ Both faults made a **healthy broker look broken** — on the one test whose job 
 
 ### RP-0.3: Failure-mode coverage
 
-- [ ] Follower down during produce → records land after it returns
-- [ ] Follower restarted mid-produce → converges
+- [x] Follower down during produce → records land after it returns — `follower_catchup.sh`, 2026-08-17
+- [x] Follower restarted mid-produce → converges — same harness
 - [x] Leader killed mid-produce → no divergence after election — `local_divergence.sh`, which stages the divergence with `SIGSTOP`/`SIGKILL`, kills the old leader mid-produce and requires the divergent tail to be cut (`bytes discarded > 0`) with every committed record still readable. The "`#[ignore]` until RP-3" note is spent: RP-3 shipped.
 
-**Status**: **one real gap left, and it is the same gap three times.** The first two boxes here and RP-2.4's "follower down 5 minutes, restarted, converges" are one property — a follower that misses writes catches up unattended — asserted at three durations. The mechanism exists and is `TESTED` (RP-2.4: resume from local LEO on restart), but nothing in `tests/cluster/` takes a follower away *during* a produce and then checks that the records arrive. `regression_replication.sh` kills a replica only to watch ISR shrink, and never brings it back.
+**Status**: `DONE` 2026-08-17. These two boxes and RP-2.4's "follower down 5 minutes, restarted, converges" were one property at three durations — a follower that misses writes catches up unattended — and it was the last claim in this roadmap resting on inference rather than a harness. `tests/cluster/follower_catchup.sh` now asserts it:
 
-Not merge-blocking: catch-up is exercised on every cluster start, and a follower that fails to converge would fail the placement assertions. But it is the one durable claim in this roadmap resting on inference rather than a harness.
+```
+   all three replicas hold the prefix on disk
+   leader=node1, taking down follower node2
+   gap records on node2's disk while down: 0 (must be 0)
+   ISR after 40s down: "isr":[1,3]
+   node2 now holds prefix=100/100 gap=120/120
+   records readable via node2: 220 / 220
+   ISR after node2 returned: "isr":[1,2,3]
+```
+
+Four things had to be checked together, because any one alone passes on a broker that is broken:
+
+- **The gap is real.** A replica that replicated everything during the outage and one that replicated nothing look identical at the end. Asserting it holds *zero* gap records while down is what makes the convergence below mean anything.
+- **Nothing intervenes.** No reassignment, no admin call — the only event is the process starting, since "without operator action" is the property.
+- **On its own disk, and readable through it.** Bytes present but a watermark that never advanced is still a broken replica.
+- **ISR shrinks and recovers.** A replica that holds every record but is never readmitted leaves the partition permanently under-replicated to `acks=all` and to failover, which elects from ISR.
+
+The outage default is 40s rather than the box's 5 minutes: catch-up resumes from the local LEO whether that is seconds or hours stale, so duration is not what the property depends on — but it must exceed the 30s ISR liveness window or the ISR assertions are not deterministic. The first version sampled ISR ~10s after the kill, printed an unshrunk `isr:[1,2,3]`, and looked like it had caught a bug when it had only asked too early. `CATCHUP_OUTAGE_SECS` raises it for a long soak.
 
 > Deliberately includes tests that fail today. They define the target and un-ignore as phases land.
 
@@ -361,7 +378,7 @@ The same rewrite closed a memory leak: `cleanup_expired()` had **no caller anywh
 - [x] Long-poll so steady-state streaming needs no extra round trip
 - [x] Append fetched records to the local WAL (shared apply path with the push receiver)
 - [x] On restart, resume from local LEO → **catch-up, for free**
-- [ ] Test: follower down 5 minutes, restarted, converges without operator action — **the one real gap left in this roadmap.** Same property as RP-0.3's first two boxes, at a third duration. The mechanism is `TESTED`; what is missing is a harness that removes a follower *during* a produce and then asserts the records arrive. `regression_replication.sh` kills a replica only to watch ISR shrink and never brings it back.
+- [x] Test: follower down, restarted, converges without operator action — `tests/cluster/follower_catchup.sh` (see RP-0.3 for what it asserts and why each part is needed). Raise `CATCHUP_OUTAGE_SECS` for the 5-minute soak; the default 40s is set by the ISR liveness window, not by catch-up.
 
 **Status**: `TESTED` on a 3-node cluster, behind `CHRONIK_REPLICATION_MODE=pull` (default remains `push`). Conformance suite passes in **both** modes: placement correct at acks=0/1/all with 300/300 consumed, and ISR shrinks honestly when a replica is held down.
 
@@ -1675,14 +1692,14 @@ Answer before the phase that depends on them.
 
    It was considered behind a default-off flag. Rejected: the pre-change behaviour is that consumers can read records which are not replicated anywhere else, and shipping a flag to preserve that would be shipping a known way to lose acknowledged reads. The two exclusions that keep it from becoming an outage are already implemented and tested — a replica *outside* ISR does not hold the watermark back (one dead node would otherwise stall every consumer on the partition), and a partition nobody has measured yet imposes no bound at all (a fresh cluster would otherwise hide its whole log).
 
-   **Release note required**: consumers may observe a briefly lower end offset while a follower is catching up. The end offset is now the replicated position, not the leader's write position. `acks=all` producers are unaffected — they already waited for the quorum.
+   **Release note written** (CHANGELOG, Unreleased → Breaking / behaviour changes): consumers may observe a briefly lower end offset while a follower is catching up. The end offset is now the replicated position, not the leader's write position. `acks=all` producers are unaffected — they already waited for the quorum.
 5. ~~**How does an existing cluster upgrade across the push→pull boundary?**~~ — **ANSWERED 2026-08-13: there is no upgrade path, because there is nothing to upgrade.**
 
    There are no production deployments. Anyone running Chronik starts fresh on the latest version. So the push data path is deleted outright rather than kept for a release: no coexistence, no migration shim, no rolling-upgrade story to protect.
 
    That was also the leaning on the merits. The version being upgraded *from* did not replicate at all on `acks=1`/`acks=all` (PR #29), so a "safe rolling upgrade" would have been protecting a mechanism that was not running. And keeping the push receive path for one release means shipping the coexistence we rejected, in the release where the new path is least soaked — while every bug found in RP-1/RP-2/RP-5 was found by *removing* ambiguity about which mechanism was live.
 
-   **Release note required**: a cluster carrying data written by an older version should be recreated, not upgraded in place.
+   **Release note written** (CHANGELOG, Unreleased → Breaking / behaviour changes): a cluster carrying data written by an older version should be recreated, not upgraded in place.
 
 ---
 
