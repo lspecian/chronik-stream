@@ -732,7 +732,27 @@ pub fn is_flexible_version(api_key: ApiKey, api_version: i16) -> bool {
     }
 }
 
-/// Get supported API versions
+/// Get supported API versions.
+///
+/// # Advertise only what can actually be answered
+///
+/// ApiVersions is a promise. A client that sees an API listed here will send it,
+/// and if the only thing behind it is the catch-all — which returns a bare error
+/// code, not that API's response schema — the client cannot parse the reply. The
+/// Java AdminClient does not degrade gracefully from that: its single I/O thread
+/// dies on the `SchemaException`, and every subsequent call on that client fails
+/// with "The AdminClient thread has exited", including calls to APIs that work
+/// perfectly well.
+///
+/// That is how #35 presented. `kafka-topics.sh --describe` calls
+/// `listPartitionReassignments`, which was advertised and unimplemented; the
+/// malformed reply killed the client thread, and the *next* call's failure was
+/// what the user saw. Nineteen APIs were advertised on that basis.
+///
+/// An API left out of this map is reported as unsupported, and clients have a
+/// documented path for that — `kafka-topics.sh --describe` simply omits
+/// reassignment information and completes. Silence is a better answer than a
+/// corrupt one.
 pub fn supported_api_versions() -> HashMap<ApiKey, VersionRange> {
     let mut versions = HashMap::new();
     
@@ -797,26 +817,50 @@ pub fn supported_api_versions() -> HashMap<ApiKey, VersionRange> {
     // Used by Kafka UI / AKHQ "Clear messages" and the Java AdminClient.
     versions.insert(ApiKey::DeleteRecords, VersionRange { min: 0, max: 1 });
     versions.insert(ApiKey::OffsetForLeaderEpoch, VersionRange { min: 0, max: 0 });
-    versions.insert(ApiKey::AlterReplicaLogDirs, VersionRange { min: 0, max: 0 });
+    // NOT advertised: only the catch-all answers it, and that body does not match
+    // this API's response schema. See the note above supported_api_versions.
+    // versions.insert(ApiKey::AlterReplicaLogDirs, VersionRange { min: 0, max: 0 });
     versions.insert(ApiKey::DescribeLogDirs, VersionRange { min: 0, max: 0 });
     versions.insert(ApiKey::SaslAuthenticate, VersionRange { min: 0, max: 2 });
     // CreatePartitions: implemented v0-v1 (non-flexible; v2 adds flexible encoding).
     versions.insert(ApiKey::CreatePartitions, VersionRange { min: 0, max: 1 });
-    versions.insert(ApiKey::CreateDelegationToken, VersionRange { min: 0, max: 0 });
-    versions.insert(ApiKey::RenewDelegationToken, VersionRange { min: 0, max: 0 });
-    versions.insert(ApiKey::ExpireDelegationToken, VersionRange { min: 0, max: 0 });
-    versions.insert(ApiKey::DescribeDelegationToken, VersionRange { min: 0, max: 0 });
+    // NOT advertised: only the catch-all answers it, and that body does not match
+    // this API's response schema. See the note above supported_api_versions.
+    // versions.insert(ApiKey::CreateDelegationToken, VersionRange { min: 0, max: 0 });
+    // NOT advertised: only the catch-all answers it, and that body does not match
+    // this API's response schema. See the note above supported_api_versions.
+    // versions.insert(ApiKey::RenewDelegationToken, VersionRange { min: 0, max: 0 });
+    // NOT advertised: only the catch-all answers it, and that body does not match
+    // this API's response schema. See the note above supported_api_versions.
+    // versions.insert(ApiKey::ExpireDelegationToken, VersionRange { min: 0, max: 0 });
+    // NOT advertised: only the catch-all answers it, and that body does not match
+    // this API's response schema. See the note above supported_api_versions.
+    // versions.insert(ApiKey::DescribeDelegationToken, VersionRange { min: 0, max: 0 });
     // DeleteGroups: implemented v0-v1 (non-flexible; v2 adds flexible encoding).
     versions.insert(ApiKey::DeleteGroups, VersionRange { min: 0, max: 1 });
-    versions.insert(ApiKey::ElectLeaders, VersionRange { min: 0, max: 0 });
+    // NOT advertised: only the catch-all answers it, and that body does not match
+    // this API's response schema. See the note above supported_api_versions.
+    // versions.insert(ApiKey::ElectLeaders, VersionRange { min: 0, max: 0 });
     versions.insert(ApiKey::IncrementalAlterConfigs, VersionRange { min: 0, max: 0 });
-    versions.insert(ApiKey::AlterPartitionReassignments, VersionRange { min: 0, max: 0 });
-    versions.insert(ApiKey::ListPartitionReassignments, VersionRange { min: 0, max: 0 });
+    // NOT advertised: only the catch-all answers it, and that body does not match
+    // this API's response schema. See the note above supported_api_versions.
+    // versions.insert(ApiKey::AlterPartitionReassignments, VersionRange { min: 0, max: 0 });
+    // NOT advertised: only the catch-all answers it, and that body does not match
+    // this API's response schema. See the note above supported_api_versions.
+    // versions.insert(ApiKey::ListPartitionReassignments, VersionRange { min: 0, max: 0 });
     versions.insert(ApiKey::OffsetDelete, VersionRange { min: 0, max: 0 });
-    versions.insert(ApiKey::DescribeClientQuotas, VersionRange { min: 0, max: 0 });
-    versions.insert(ApiKey::AlterClientQuotas, VersionRange { min: 0, max: 0 });
-    versions.insert(ApiKey::DescribeUserScramCredentials, VersionRange { min: 0, max: 0 });
-    versions.insert(ApiKey::AlterUserScramCredentials, VersionRange { min: 0, max: 0 });
+    // NOT advertised: only the catch-all answers it, and that body does not match
+    // this API's response schema. See the note above supported_api_versions.
+    // versions.insert(ApiKey::DescribeClientQuotas, VersionRange { min: 0, max: 0 });
+    // NOT advertised: only the catch-all answers it, and that body does not match
+    // this API's response schema. See the note above supported_api_versions.
+    // versions.insert(ApiKey::AlterClientQuotas, VersionRange { min: 0, max: 0 });
+    // NOT advertised: only the catch-all answers it, and that body does not match
+    // this API's response schema. See the note above supported_api_versions.
+    // versions.insert(ApiKey::DescribeUserScramCredentials, VersionRange { min: 0, max: 0 });
+    // NOT advertised: only the catch-all answers it, and that body does not match
+    // this API's response schema. See the note above supported_api_versions.
+    // versions.insert(ApiKey::AlterUserScramCredentials, VersionRange { min: 0, max: 0 });
     
     // KRaft consensus APIs (NOT IMPLEMENTED - placeholder for librdkafka compatibility)
     // Note: Skipping APIs 52-55, 59, 62-64 to match CP Kafka 7.5.0
@@ -824,20 +868,34 @@ pub fn supported_api_versions() -> HashMap<ApiKey, VersionRange> {
     // versions.insert(ApiKey::BeginQuorumEpoch, VersionRange { min: 0, max: 0 });  // API 53 - not in CP Kafka
     // versions.insert(ApiKey::EndQuorumEpoch, VersionRange { min: 0, max: 0 });  // API 54 - not in CP Kafka
     // versions.insert(ApiKey::DescribeQuorum, VersionRange { min: 0, max: 0 });  // API 55 - not in CP Kafka
-    versions.insert(ApiKey::AlterPartition, VersionRange { min: 0, max: 0 });
-    versions.insert(ApiKey::UpdateFeatures, VersionRange { min: 0, max: 0 });
-    versions.insert(ApiKey::Envelope, VersionRange { min: 0, max: 0 });
+    // NOT advertised: only the catch-all answers it, and that body does not match
+    // this API's response schema. See the note above supported_api_versions.
+    // versions.insert(ApiKey::AlterPartition, VersionRange { min: 0, max: 0 });
+    // NOT advertised: only the catch-all answers it, and that body does not match
+    // this API's response schema. See the note above supported_api_versions.
+    // versions.insert(ApiKey::UpdateFeatures, VersionRange { min: 0, max: 0 });
+    // NOT advertised: only the catch-all answers it, and that body does not match
+    // this API's response schema. See the note above supported_api_versions.
+    // versions.insert(ApiKey::Envelope, VersionRange { min: 0, max: 0 });
     // versions.insert(ApiKey::FetchSnapshot, VersionRange { min: 0, max: 0 });  // API 59 - not in CP Kafka
     versions.insert(ApiKey::DescribeCluster, VersionRange { min: 1, max: 1 });  // Only advertise v1 to force flexible encoding
-    versions.insert(ApiKey::DescribeProducers, VersionRange { min: 0, max: 0 });
+    // NOT advertised: only the catch-all answers it, and that body does not match
+    // this API's response schema. See the note above supported_api_versions.
+    // versions.insert(ApiKey::DescribeProducers, VersionRange { min: 0, max: 0 });
     // versions.insert(ApiKey::BrokerRegistration, VersionRange { min: 0, max: 0 });  // API 62 - not in CP Kafka
     // versions.insert(ApiKey::BrokerHeartbeat, VersionRange { min: 0, max: 0 });  // API 63 - not in CP Kafka
     // versions.insert(ApiKey::UnregisterBroker, VersionRange { min: 0, max: 0 });  // API 64 - not in CP Kafka
     
     // Transaction coordination APIs (NOT IMPLEMENTED - placeholder for librdkafka compatibility)
-    versions.insert(ApiKey::DescribeTransactions, VersionRange { min: 0, max: 0 });
-    versions.insert(ApiKey::ListTransactions, VersionRange { min: 0, max: 0 });
-    versions.insert(ApiKey::AllocateProducerIds, VersionRange { min: 0, max: 0 });
+    // NOT advertised: only the catch-all answers it, and that body does not match
+    // this API's response schema. See the note above supported_api_versions.
+    // versions.insert(ApiKey::DescribeTransactions, VersionRange { min: 0, max: 0 });
+    // NOT advertised: only the catch-all answers it, and that body does not match
+    // this API's response schema. See the note above supported_api_versions.
+    // versions.insert(ApiKey::ListTransactions, VersionRange { min: 0, max: 0 });
+    // NOT advertised: only the catch-all answers it, and that body does not match
+    // this API's response schema. See the note above supported_api_versions.
+    // versions.insert(ApiKey::AllocateProducerIds, VersionRange { min: 0, max: 0 });
     
     // Consumer group coordination v2 (NOT IMPLEMENTED - placeholder for librdkafka compatibility)
     // versions.insert(ApiKey::ConsumerGroupHeartbeat, VersionRange { min: 0, max: 0 });  // API 68 - not in CP Kafka

@@ -101,6 +101,16 @@ pub struct ProtocolHandler {
     sasl_authenticator: Arc<Mutex<crate::sasl::SaslAuthenticator>>,
 }
 
+/// This cluster's identity, as reported by both Metadata and DescribeCluster.
+///
+/// One constant, because it was two: Metadata answered `"chronik-stream"` while
+/// DescribeCluster answered this value, so a client that read the id from one API
+/// and checked it against the other saw a cluster that disagreed with itself.
+///
+/// The 22-character base64 shape matches what Kafka generates, which matters
+/// because some tooling validates it rather than treating it as an opaque string.
+pub const CLUSTER_ID: &str = "MkU0OEEwNTlFRkY4QjE2OQ";
+
 impl ProtocolHandler {
     /// Helper to create a Response with proper flexible tracking
     fn make_response(header: &RequestHeader, api_key: ApiKey, body: Bytes) -> Response {
@@ -4643,11 +4653,15 @@ impl ProtocolHandler {
         // Build response based on version
         if header.api_version == 0 {
             // v0: NON-FLEXIBLE encoding
+            //
+            // throttle_time_ms is the FIRST field of DescribeClusterResponse at
+            // every version. Omitting it shifted the whole body by four bytes,
+            // and the Java AdminClient died on the misread — see the v1 arm.
+            encoder.write_i32(0); // Throttle time
             encoder.write_i16(0); // Error code: NONE
             encoder.write_string(None); // Error message: null
 
-            let cluster_id = "MkU0OEEwNTlFRkY4QjE2OQ";
-            encoder.write_string(Some(cluster_id)); // Cluster ID as nullable string
+            encoder.write_string(Some(CLUSTER_ID)); // Cluster ID as nullable string
 
             encoder.write_i32(self.broker_id); // Controller ID
 
@@ -4669,11 +4683,29 @@ impl ProtocolHandler {
 
         } else if header.api_version == 1 {
             // v1: FLEXIBLE/COMPACT encoding
+            //
+            // Two fields were missing here, and the first one broke every Java
+            // AdminClient that tried to describe this cluster (#35):
+            //
+            //   throttle_time_ms  — the first field at EVERY version. Without it
+            //     the client read the four bytes of `error_code || error_message
+            //     || cluster_id_len` as the throttle, then took a byte of the
+            //     cluster id as a string length. Observed exactly:
+            //     "Error reading byte array of 84 byte(s): only 49 byte(s)
+            //     available", where 84 came from 'U' in the cluster id. The
+            //     AdminClient thread then died and every subsequent call failed
+            //     with "The AdminClient thread has exited", which is why this was
+            //     reported as a null clusterId — the id never arrived at all.
+            //
+            //   endpoint_type — added at v1 by KIP-919, immediately after
+            //     error_message. Fixing only the throttle would have left the
+            //     body one byte short of the schema.
+            encoder.write_i32(0); // Throttle time
             encoder.write_i16(0); // Error code: NONE
             encoder.write_compact_string(None); // Error message: null (compact nullable string)
+            encoder.write_i8(1); // Endpoint type: 1 = brokers (v1+, KIP-919)
 
-            let cluster_id = "MkU0OEEwNTlFRkY4QjE2OQ";
-            encoder.write_compact_string(Some(cluster_id)); // Cluster ID as compact nullable string
+            encoder.write_compact_string(Some(CLUSTER_ID)); // Cluster ID as compact nullable string
 
             encoder.write_i32(self.broker_id); // Controller ID (still i32 in v1)
 
@@ -4707,7 +4739,7 @@ impl ProtocolHandler {
 
         let body_bytes = body_buf.freeze();
 
-        let cluster_id = "MkU0OEEwNTlFRkY4QjE2OQ";
+        let cluster_id = CLUSTER_ID;
         tracing::info!("DescribeCluster v{} response: cluster_id={}, controller={}, broker={}:{}, body_size={}",
                       header.api_version, cluster_id, self.broker_id, self.advertised_host, self.advertised_port, body_bytes.len());
 

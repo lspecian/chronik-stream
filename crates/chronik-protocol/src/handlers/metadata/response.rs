@@ -26,7 +26,7 @@ impl MetadataResponseBuilder {
         let response = MetadataResponse {
             throttle_time_ms: 0,
             brokers,
-            cluster_id: Some("chronik-stream".to_string()),
+            cluster_id: Some(crate::handler::CLUSTER_ID.to_string()),
             controller_id: broker_id,
             topics,
             cluster_authorized_operations: if api_version >= 8 { Some(-2147483648) } else { None },
@@ -442,7 +442,14 @@ mod tests {
         assert_eq!(response.brokers.len(), 1);
         assert_eq!(response.topics.len(), 1);
         assert_eq!(response.controller_id, 1);
-        assert_eq!(response.cluster_id, Some("chronik-stream".to_string()));
+        // Asserted against the shared constant, not a literal: Metadata and
+        // DescribeCluster used to report different ids, and a test that pins one
+        // of them by hand is how they drifted apart in the first place.
+        assert_eq!(
+            response.cluster_id,
+            Some(crate::handler::CLUSTER_ID.to_string()),
+            "Metadata must report the same cluster id as DescribeCluster"
+        );
     }
 
     #[test]
