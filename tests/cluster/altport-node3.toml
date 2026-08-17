@@ -1,0 +1,40 @@
+# Local 3-node cluster on SHIFTED ports — same cluster as node{1,2,3}.toml,
+# moved off 9092/9291/5001 so it can run beside a server already using them
+# (the LongMemEval pilot holds 9092 and 6092 on this machine).
+#
+# Use: ./tests/cluster/start.sh --alt-ports
+# Kafka 9392-9394, WAL 9591-9593, Raft 5101-5103, unified API 6392-6394.
+
+enabled = true
+node_id = 3
+data_dir = "/home/ubuntu/Development/chronik-stream/tests/cluster/data/alt-node3"
+replication_factor = 3
+min_insync_replicas = 2
+
+[bind]
+kafka = "0.0.0.0:9394"
+wal = "0.0.0.0:9593"
+raft = "0.0.0.0:5103"
+
+[advertise]
+kafka = "localhost:9394"
+wal = "localhost:9593"
+raft = "localhost:5103"
+
+[[peers]]
+id = 1
+kafka = "localhost:9392"
+wal = "localhost:9591"
+raft = "localhost:5101"
+
+[[peers]]
+id = 2
+kafka = "localhost:9393"
+wal = "localhost:9592"
+raft = "localhost:5102"
+
+[[peers]]
+id = 3
+kafka = "localhost:9394"
+wal = "localhost:9593"
+raft = "localhost:5103"

@@ -65,6 +65,12 @@ pub struct IntegratedKafkaServerBuilder {
     segment_reader: Option<Arc<SegmentReader>>,
     wal_manager: Option<Arc<WalManager>>,
     produce_handler_base: Option<Arc<ProduceHandler>>,
+
+    /// Shared by the produce path and the fetch long poll, so an append wakes a
+    /// parked follower instead of it noticing on a timer (RP-9). Created here
+    /// because the two handlers are built in different stages and neither can be
+    /// mutated once it is inside an `Arc`.
+    append_notify: Arc<dashmap::DashMap<(String, i32), Arc<tokio::sync::Notify>>>,
     wal_produce_handler: Option<Arc<WalProduceHandler>>,
     fetch_handler: Option<Arc<FetchHandler>>,
     isr_ack_tracker: Option<Arc<crate::isr_ack_tracker::IsrAckTracker>>,
@@ -81,10 +87,23 @@ pub struct IntegratedKafkaServerBuilder {
 
     // Replication and leader election (Stage 4)
     wal_replication_manager: Option<Arc<crate::wal_replication::WalReplicationManager>>,
-    leader_elector: Option<Arc<crate::leader_election::LeaderElector>>,
 
     // Metadata DR (Stage 5)
     metadata_uploader: Option<Arc<chronik_common::metadata::MetadataUploader>>,
+
+    // Follower-pull replication (Stage 16, RP-2.4). Held so the fetcher lives
+    // as long as the server rather than being dropped at the end of build().
+    replica_fetcher: Option<Arc<crate::replication::replica_fetcher::ReplicaFetcher>>,
+
+    // Partition leader failover (Stage 17, RP-5). Held for the same reason.
+    partition_failover: Option<Arc<crate::partition_failover::PartitionFailoverController>>,
+
+    // Publishes the in-sync set that Stage 17 elects from (Stage 18).
+    isr_publisher: Option<Arc<crate::isr_publisher::IsrPublisher>>,
+
+    // RP-6: woken when a node rejoins, so the catalog anti-entropy loop
+    // re-broadcasts immediately instead of up to 5 minutes later.
+    metadata_rejoin_notify: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl IntegratedKafkaServerBuilder {
@@ -106,6 +125,7 @@ impl IntegratedKafkaServerBuilder {
             segment_reader: None,
             wal_manager: None,
             produce_handler_base: None,
+            append_notify: Arc::new(dashmap::DashMap::new()),
             wal_produce_handler: None,
             fetch_handler: None,
             isr_ack_tracker: None,
@@ -117,8 +137,11 @@ impl IntegratedKafkaServerBuilder {
             hot_vector_index: None,
             hot_vector_batcher_slot: None,
             wal_replication_manager: None,
-            leader_elector: None,
             metadata_uploader: None,
+            replica_fetcher: None,
+            partition_failover: None,
+            isr_publisher: None,
+            metadata_rejoin_notify: None,
         }
     }
 
@@ -171,6 +194,7 @@ impl IntegratedKafkaServerBuilder {
                 crate::raft_cluster::RaftCluster::bootstrap(
                     self.config.node_id as u64,
                     Vec::new(), // Empty peers = single-node mode
+                    format!("{}:{}", self.config.advertised_host, self.config.advertised_port),
                     data_dir.clone(),
                 )
                 .await
@@ -287,7 +311,7 @@ impl IntegratedKafkaServerBuilder {
 
         // Convert common MetadataEvent to server MetadataEvent
         let server_event = match &common_event.payload {
-            MetadataEventPayload::TopicCreated { name, config } => {
+            MetadataEventPayload::TopicCreated { name, config, auto_created } => {
                 Some(ServerEvent::TopicCreated {
                     topic: name.clone(),
                     num_partitions: config.partition_count as i32,
@@ -304,6 +328,11 @@ impl IntegratedKafkaServerBuilder {
                     partition: assignment.partition as i32,
                     replicas: assignment.replicas.clone(),
                     leader: assignment.leader_id,
+                    // Every field, because followers rebuild the assignment from
+                    // exactly these. Dropping one here sets it to its default on
+                    // every other node.
+                    leader_epoch: assignment.leader_epoch,
+                    isr: assignment.isr.clone(),
                 })
             }
             MetadataEventPayload::HighWatermarkUpdated { topic, partition, new_watermark } => {
@@ -362,6 +391,10 @@ impl IntegratedKafkaServerBuilder {
             Some(metadata_store.clone()),
         );
 
+        // Kept so the catalog can be re-asserted when a follower link comes back
+        // up — see `set_catalog_resync_notify` below.
+        let metadata_transport = wal_replication_manager.clone();
+
         // Create metadata WAL replicator
         let metadata_wal_replicator = Arc::new(
             crate::metadata_wal_replication::MetadataWalReplicator::new(
@@ -377,12 +410,18 @@ impl IntegratedKafkaServerBuilder {
 
         info!("✅ Metadata replication initialized with event listener");
 
-        // Periodically re-broadcast all topic metadata to followers.
+        // Periodically re-broadcast the catalog to followers.
         //
         // This is the catalog anti-entropy loop. It re-publishes TopicCreated
-        // events to the event bus so the MetadataWalReplicator sends them to
-        // followers, letting any node that missed events (down, disconnected,
-        // still recovering) converge within one period.
+        // *and* PartitionAssigned events to the event bus so the
+        // MetadataWalReplicator sends them to followers, letting any node that
+        // missed events (down, disconnected, still recovering) converge within
+        // one period.
+        //
+        // Assignments matter as much as topics: they carry the partition leader,
+        // and a follower that does not know who leads a partition cannot fetch it
+        // at all under follower-pull. Healing topics alone left a node knowing
+        // every topic and replicating nothing.
         //
         // This MUST be periodic, not a fixed number of startup shots: the old
         // 45s/120s two-shot was tuned for fast startups and permanently missed
@@ -399,18 +438,102 @@ impl IntegratedKafkaServerBuilder {
             .and_then(|v| v.parse::<u64>().ok())
             .filter(|&n| n > 0)
             .unwrap_or(300);
+
+        // RP-6: a node rejoining is exactly when someone needs the catalog, and
+        // waiting up to `rebroadcast_secs` for it is what made failover recovery
+        // take minutes.
+        //
+        // A node that was leading a partition when it died comes back believing
+        // it still leads: it recovers metadata from its own WAL, which is stale
+        // by precisely the change that demoted it. `plan_assignments` skips
+        // partitions led by this node, so it fetches nothing for them and cannot
+        // run the RP-3.3 handshake for them either — it does not know it is a
+        // follower. It stays that way until the next anti-entropy pass, default
+        // 300s.
+        //
+        // The failover controller already watches liveness and already runs only
+        // on the Raft leader, so it can say "someone just came back". Waking this
+        // loop then is a targeted fix; shortening the interval would trade a
+        // constant broadcast cost against a window that would still exist.
+        let rejoin_notify = Arc::new(tokio::sync::Notify::new());
+        self.metadata_rejoin_notify = Some(rejoin_notify.clone());
+
+        // Liveness is not the right trigger on its own. A returning node is live
+        // ~26ms before its replication connection is re-established, and a
+        // metadata send with no connection is dropped — so the rejoin broadcast
+        // was published into a gap and lost, leaving the returning node with a
+        // stale catalog until the next anti-entropy pass 300s later. Measured: a
+        // restarted node received zero metadata events, still believed it led a
+        // partition that had failed over, and so never replicated it at all.
+        //
+        // Firing on connect as well means the catalog is re-asserted at a moment
+        // the link demonstrably exists.
+        metadata_transport.set_catalog_resync_notify(rejoin_notify.clone());
+
+        // RP-7: only the Raft leader may re-assert the catalog.
+        //
+        // Every node used to run this loop, so every node re-published *its own*
+        // view on a timer. That is gossip with no tiebreak, and it does not
+        // converge: measured after a failover, three nodes held three different
+        // views of one partition — node 2 (which had the data) said `leader:2`,
+        // while nodes 1 and 3 said `leader:1`. Node 1 then served 17,259 fetches
+        // as leader of a partition whose log was empty, and node 3 replicated
+        // from it and stayed empty, while all three reported
+        // `under_replicated: false`.
+        //
+        // The epoch guard in `apply_replicated_event` stops a node *regressing*
+        // to an older assignment, but a guard cannot deliver an update to a node
+        // that never received one, and nothing made any view authoritative.
+        //
+        // Assignments are Raft-managed state, so the Raft leader is the only
+        // node entitled to publish them. Off the leader this loop stays quiet
+        // and the local catalog is a cache to be corrected, not a view to be
+        // broadcast. When there is no Raft cluster at all (single node) there is
+        // nothing to disagree with, so it always runs.
+        let broadcast_authority = self.raft_cluster_for_metadata.clone();
+
         tokio::spawn(async move {
             // First pass early: covers the common fast-startup case.
             tokio::time::sleep(std::time::Duration::from_secs(45)).await;
+            let mut warned_not_authority = false;
             loop {
-                let count = broadcast_store.broadcast_all_topics().await;
-                if count > 0 {
-                    tracing::info!(
-                        topics_broadcast = count,
-                        "Re-broadcast topic metadata for follower sync (anti-entropy)"
-                    );
+                // `is_leader()` (state under the lock), not `am_i_leader()`
+                // (cached atomic): the cache is refreshed only inside the
+                // message loop's has_ready branch, so on a quiet cluster it can
+                // sit stale — and a stale `false` here would mean *no* node
+                // re-asserts the catalog, which is worse than the gossip this
+                // gate replaced.
+                let may_broadcast = match &broadcast_authority {
+                    Some(raft) => raft.is_leader().await,
+                    None => true,
+                };
+
+                if !may_broadcast {
+                    if !warned_not_authority {
+                        tracing::debug!(
+                            "Not the Raft leader — leaving catalog anti-entropy to the node that is"
+                        );
+                        warned_not_authority = true;
+                    }
+                } else {
+                    warned_not_authority = false;
+                    let count = broadcast_store.broadcast_all_topics().await;
+                    if count > 0 {
+                        tracing::info!(
+                            topics_broadcast = count,
+                            "Re-broadcast topic metadata for follower sync (anti-entropy)"
+                        );
+                    }
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(rebroadcast_secs)).await;
+
+                // `notify_one` stores a permit, so a rejoin that lands while the
+                // broadcast above is still running is not lost.
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(rebroadcast_secs)) => {}
+                    _ = rejoin_notify.notified() => {
+                        tracing::info!("Node rejoined — re-broadcasting the catalog now rather than waiting for anti-entropy");
+                    }
+                }
             }
         });
 
@@ -561,13 +684,20 @@ impl IntegratedKafkaServerBuilder {
 
         // Step 3: Wire event bus and ISR trackers
         produce_handler_inner.set_event_bus(metadata_event_bus.clone());
+        produce_handler_inner.set_append_notify(Arc::clone(&self.append_notify));
         let isr_ack_tracker = crate::isr_ack_tracker::IsrAckTracker::new();
-        let isr_tracker = Arc::new(crate::isr_tracker::IsrTracker::default());
+        let isr_tracker = Arc::new(crate::isr_tracker::IsrTracker::from_env());
         produce_handler_inner.set_isr_ack_tracker(isr_ack_tracker.clone());
+        // Reap `acks=all` waits that never reach quorum. The producer's own
+        // timeout releases the caller but leaves the registration behind, so
+        // without this the map grows for the life of the process — which it did,
+        // once per acks=all produce, for as long as replication was silently not
+        // running.
+        isr_ack_tracker.start_cleanup_task();
         info!("✅ EventBus, IsrAckTracker, and IsrTracker wired");
 
         // Step 4: Wire Raft dependencies (cluster mode only)
-        let leader_elector = self.wire_raft_dependencies(&mut produce_handler_inner, &isr_ack_tracker, &isr_tracker, metadata_store);
+        self.wire_raft_dependencies(&mut produce_handler_inner, &isr_ack_tracker, &isr_tracker, metadata_store);
 
         // Step 5: Setup response pipeline with WAL callback
         let response_pipeline = self.setup_response_pipeline(&mut produce_handler_inner, wal_manager);
@@ -596,7 +726,6 @@ impl IntegratedKafkaServerBuilder {
         self.isr_ack_tracker = Some(isr_ack_tracker);
         self.isr_tracker = Some(isr_tracker);
         self.response_pipeline = Some(response_pipeline);
-        self.leader_elector = leader_elector;
 
         info!("✅ ProduceHandler initialized with all dependencies and wiring");
         Ok(())
@@ -717,6 +846,113 @@ impl IntegratedKafkaServerBuilder {
     /// (searchable topic, partition) and inserts their entries. No disk I/O
     /// writes — only WAL reads. Errors are logged but non-fatal; startup
     /// continues even if warm-up fails.
+    /// RP-3: rebuild each partition's leader-epoch history from the WAL.
+    ///
+    /// The history is derived from the log, so it lives only in memory and is
+    /// empty after a restart — which would make this node answer every
+    /// `OffsetForLeaderEpoch` with UNDEFINED and leave a returning replica no
+    /// way to find its divergence point. Rebuilding it is therefore part of
+    /// coming back up, not an optimisation.
+    ///
+    /// This scans each partition's WAL. It is bounded (indexed segments are
+    /// reclaimed) but not free; Kafka keeps a `leader-epoch-checkpoint` file to
+    /// avoid the scan entirely, which is the eventual answer if startup time
+    /// becomes a problem.
+    async fn warm_up_leader_epochs(&self) -> Result<()> {
+        let Some(produce_handler) = self.produce_handler_base.as_ref() else {
+            return Ok(());
+        };
+        let Some(wal_manager) = self.wal_manager.as_ref() else {
+            return Ok(());
+        };
+        let Some(metadata_store) = self.metadata_store.as_ref() else {
+            return Ok(());
+        };
+
+        use chronik_storage::CanonicalRecord;
+        use chronik_wal::record::WalRecord;
+
+        let epochs = produce_handler.leader_epochs();
+        let start = std::time::Instant::now();
+
+        // Enumerate from the WAL directory, not from metadata.
+        //
+        // This used to iterate `list_topics()`, which races metadata recovery:
+        // if a topic was not in the catalog yet at this moment, its partition
+        // was skipped, the epoch history stayed empty, and the follower then
+        // skipped the RP-3.3 handshake entirely — silently, because the
+        // completion line only printed when it warmed at least one partition.
+        // Observed on a cluster: a returning node warmed nothing and never sent
+        // an epoch query. The log on disk is what we are rebuilding from, so it
+        // is also the right thing to enumerate.
+        let _ = metadata_store; // kept for signature stability; no longer read here
+        let mut partitions_warmed = 0usize;
+        let mut transitions = 0usize;
+
+        {
+            for tp in wal_manager.get_partitions() {
+                let (topic_name, partition) = (tp.topic.clone(), tp.partition);
+                if topic_name.starts_with("__") {
+                    continue; // Raft's own topics carry no partition epochs
+                }
+                let records = match wal_manager
+                    .read_from(&topic_name, partition, 0, usize::MAX)
+                    .await
+                {
+                    Ok(r) if !r.is_empty() => r,
+                    _ => continue,
+                };
+                let before = epochs.snapshot(&topic_name, partition).len();
+                let mut unstamped = 0usize;
+                for wal_record in &records {
+                    if let WalRecord::V2 { canonical_data, base_offset, .. } = wal_record {
+                        let canonical: CanonicalRecord = match bincode::deserialize(canonical_data) {
+                            Ok(c) => c,
+                            Err(_) => continue,
+                        };
+                        // Batches written before RP-3 carry -1; observe_append
+                        // ignores those rather than inventing an epoch 0 at their
+                        // offset, so an upgraded cluster simply has no history
+                        // until its first stamped append.
+                        if canonical.partition_leader_epoch < 0 {
+                            unstamped += 1;
+                        }
+                        epochs.observe_append(
+                            &topic_name,
+                            partition,
+                            canonical.partition_leader_epoch,
+                            *base_offset,
+                        );
+                    }
+                }
+
+                let after = epochs.snapshot(&topic_name, partition).len();
+                if after > 0 {
+                    partitions_warmed += 1;
+                    transitions += after - before;
+                } else if unstamped > 0 {
+                    // Worth naming: a partition whose log carries no epochs
+                    // cannot take part in truncation, so it will silently skip
+                    // the RP-3.3 handshake for as long as that remains true.
+                    debug!(
+                        "leader-epoch warm-up: {}-{} has {} unstamped batch(es) and no epoch history",
+                        topic_name, partition, unstamped
+                    );
+                }
+            }
+        }
+
+        // Logged unconditionally. The previous version printed only when it
+        // warmed something, so "warmed nothing" and "never ran" were the same
+        // observation — which is how a returning replica silently skipped
+        // truncation on a real cluster.
+        info!(
+            "Leader-epoch history rebuilt for {} partition(s), {} leadership transition(s), in {:?}",
+            partitions_warmed, transitions, start.elapsed()
+        );
+        Ok(())
+    }
+
     async fn warm_up_hot_text_index(&self) -> Result<()> {
         let Some(hot_idx) = self.hot_text_index.as_ref() else {
             return Ok(());
@@ -902,50 +1138,41 @@ impl IntegratedKafkaServerBuilder {
             auto_create_topics_enable: self.config.auto_create_topics,
             num_partitions: self.config.num_partitions,
             default_replication_factor: self.config.replication_factor,
+            // RP-1.3: how many ACKs `acks=all` waits for, the leader's included.
+            // Single-node has no cluster config and no followers, so 1 is both
+            // correct and unchanged behaviour there.
+            min_insync_replicas: self
+                .config
+                .cluster_config
+                .as_ref()
+                .map(|c| c.min_insync_replicas)
+                .unwrap_or(1),
             flush_profile,
         }
     }
 
     /// Helper: Wire Raft-related dependencies to ProduceHandler
+    ///
+    /// RP-4: there is no data-push manager to wire any more. Followers fetch
+    /// (RP-2.4); the leader does not push. Metadata keeps its own manager from
+    /// stage 6 and is unaffected.
     fn wire_raft_dependencies(
         &self,
         produce_handler: &mut crate::produce_handler::ProduceHandler,
-        isr_ack_tracker: &Arc<crate::isr_ack_tracker::IsrAckTracker>,
-        isr_tracker: &Arc<crate::isr_tracker::IsrTracker>,
-        metadata_store: &Arc<dyn MetadataStore>,
-    ) -> Option<Arc<crate::leader_election::LeaderElector>> {
+        _isr_ack_tracker: &Arc<crate::isr_ack_tracker::IsrAckTracker>,
+        _isr_tracker: &Arc<crate::isr_tracker::IsrTracker>,
+        _metadata_store: &Arc<dyn MetadataStore>,
+    ) {
         let raft_cluster = match self.raft_cluster_for_metadata.as_ref() {
             Some(c) => c,
             None => {
                 info!("⚠️  Raft clustering disabled - single-node mode");
-                return None;
+                return;
             }
         };
 
-        // Wire RaftCluster
         produce_handler.set_raft_cluster(Arc::clone(raft_cluster));
-
-        // Create and wire LeaderElector
-        let elector = Arc::new(crate::leader_election::LeaderElector::new(
-            raft_cluster.clone(),
-            metadata_store.clone(),
-        ));
-        produce_handler.set_leader_elector(elector.clone());
-        info!("✓ LeaderElector ready (event-driven mode)");
-
-        // Create and wire WalReplicationManager for data messages
-        let data_wal_repl_manager = crate::wal_replication::WalReplicationManager::new_with_dependencies(
-            Vec::new(),
-            Some(raft_cluster.clone()),
-            Some(isr_tracker.clone()),
-            Some(isr_ack_tracker.clone()),
-            self.config.cluster_config.clone().map(Arc::new),
-            Some(metadata_store.clone()),
-        );
-        produce_handler.set_wal_replication_manager(data_wal_repl_manager);
-        info!("✅ Data WAL replication manager wired (replica cache enabled)");
-
-        Some(elector)
+        info!("✅ Pull replication: followers fetch from the leader; nothing is pushed");
     }
 
     /// Helper: Setup ResponsePipeline with WAL commit callback
@@ -962,12 +1189,29 @@ impl IntegratedKafkaServerBuilder {
         let response_pipeline_clone = response_pipeline.clone();
         let partition_states = produce_handler.partition_states.clone();
         let callback_handle = tokio::runtime::Handle::current();
+        let commit_notify = Arc::clone(&self.append_notify);
         let commit_callback: chronik_wal::group_commit::CommitCallback = Arc::new(
             move |topic: &str, partition: i32, min_offset: i64, max_offset: i64| {
+                // A parked follower fetch is waiting for exactly this moment.
+                //
+                // The produce path signals on append, which is when the record
+                // gets its offset — but a follower is served from the durable
+                // end (`readable_end_offset`), so waking it before the commit
+                // only has it look, find nothing new, and park again. This is
+                // the wake that has something behind it.
+                if let Some(notify) = commit_notify.get(&(topic.to_string(), partition)) {
+                    notify.notify_waiters();
+                }
+
                 // Update in-memory high watermark (fast, O(1), stays synchronous)
                 let new_watermark = max_offset + 1;
                 if let Some(state) = partition_states.get(&(topic.to_string(), partition)) {
-                    state.high_watermark.store(new_watermark as u64, Ordering::Release);
+                    // Raises the log end with it. On a follower this callback is
+                    // the *only* thing that moved the watermark, and it ran
+                    // ahead of the replication path that moves the log end —
+                    // which then found the watermark already high enough and
+                    // skipped. See `PartitionState::raise_watermark`.
+                    state.raise_watermark(new_watermark.max(0) as u64);
                     debug!("✅ WAL_CALLBACK: Updated high watermark {}-{} = {}", topic, partition, new_watermark);
                 }
                 // Notify ResponsePipeline asynchronously to avoid blocking the worker
@@ -1254,15 +1498,34 @@ impl IntegratedKafkaServerBuilder {
 
         // Create FetchHandler with WAL and ProduceHandler integration
         // FetchHandler needs ProduceHandler to get the real-time high watermark
-        let fetch_handler = Arc::new(FetchHandler::new_with_wal(
+        let mut fetch_handler = FetchHandler::new_with_wal(
             segment_reader.clone(),
             metadata_store.clone(),
             object_store.clone(),
             wal_manager.clone(),
             produce_handler_base.clone(),
-        ));
+        );
 
-        self.fetch_handler = Some(fetch_handler);
+        // RP-2.1: follower fetches report replication progress. Cluster mode only
+        // — there is no ISR tracker in single-node, and no followers to report.
+        if let Some(ref isr_tracker) = self.isr_tracker {
+            fetch_handler.set_isr_tracker(isr_tracker.clone());
+        }
+
+        // RP-2.3: under pull, a follower's fetch offset is what releases an
+        // `acks=all` producer — there is no ACK frame to do it.
+        if let Some(ref isr_ack_tracker) = self.isr_ack_tracker {
+            fetch_handler.set_isr_ack_tracker(isr_ack_tracker.clone());
+        }
+        fetch_handler.set_append_notify(Arc::clone(&self.append_notify));
+
+        // RP-2.3: consumers see only what the in-sync set holds. Unconditional
+        // since RP-4 — follower positions are their own fetch offsets, which
+        // cannot be stale without the follower having stopped, in which case it
+        // leaves ISR and stops constraining the watermark.
+        fetch_handler.set_hw_from_isr(true);
+
+        self.fetch_handler = Some(Arc::new(fetch_handler));
 
         info!("✅ FetchHandler initialized");
         Ok(())
@@ -1345,7 +1608,12 @@ impl IntegratedKafkaServerBuilder {
             interval_secs: self.config.wal_indexing_interval_secs,
             min_segment_age_secs: 10,
             max_segments_per_run: 100,
-            delete_after_index: true,
+            // Reclaiming WAL space after indexing. Off by env for tests that
+            // need the WAL to stay put — RP-3.3's divergence test cannot observe
+            // a truncation of records the indexer has already archived away.
+            delete_after_index: std::env::var("CHRONIK_WAL_DELETE_AFTER_INDEX")
+                .map(|v| v != "false" && v != "0")
+                .unwrap_or(true),
             object_store: storage_config.object_store_config.clone(),
             index_base_path: format!("{}/tantivy_indexes", self.config.data_dir),
             parallel_indexing: false, // Start with serial processing
@@ -1472,7 +1740,6 @@ impl IntegratedKafkaServerBuilder {
                 .context("wal_manager not initialized")?;
             let isr_ack_tracker = self.isr_ack_tracker.as_ref()
                 .context("isr_ack_tracker not initialized")?;
-            let leader_elector = self.leader_elector.as_ref();
             let raft_cluster = self.raft_cluster_for_metadata.as_ref();
             let produce_handler = self.produce_handler_base.as_ref()
                 .context("produce_handler not initialized")?;
@@ -1486,11 +1753,6 @@ impl IntegratedKafkaServerBuilder {
                 isr_ack_tracker.clone(),
                 cluster_config.node_id,
             );
-
-            // Wire up leader elector if available
-            if let Some(elector) = leader_elector {
-                wal_receiver.set_leader_elector(elector.clone());
-            }
 
             // Wire up Raft cluster if available
             if let Some(raft) = raft_cluster {
@@ -1520,12 +1782,170 @@ impl IntegratedKafkaServerBuilder {
         Ok(())
     }
 
+    /// Stage 16: Start follower-pull replication (RP-2.4).
+    ///
+    /// Cluster mode only. This is the sole data-replication mechanism as of
+    /// RP-4 — there is no push path left to choose between.
+    async fn init_replica_fetcher(&mut self) -> Result<()> {
+        let Some(ref cluster_config) = self.config.cluster_config else {
+            info!("Stage 16: single-node mode, nothing to replicate");
+            return Ok(());
+        };
+
+        info!("Stage 16: Starting follower-pull replication");
+
+        let metadata_store = self.metadata_store.as_ref()
+            .context("metadata_store not initialized")?;
+        let wal_manager = self.wal_manager.as_ref()
+            .context("wal_manager not initialized")?;
+        let produce_handler = self.produce_handler_base.as_ref()
+            .context("produce_handler not initialized")?;
+
+        // A follower fetches over the leader's *Kafka* port, not the WAL
+        // replication port — the whole point of pull is that replication is an
+        // ordinary Fetch.
+        //
+        // `replication` overrides which address that Fetch goes to, defaulting
+        // to `kafka`. The two cannot be the same field: `kafka` is what the
+        // cluster publishes to clients in Metadata responses, so using it for a
+        // dedicated replication fabric advertises an address clients cannot
+        // reach (RP-10).
+        let peers: std::collections::HashMap<u64, String> = cluster_config
+            .peers
+            .iter()
+            .filter(|peer| peer.id != cluster_config.node_id)
+            .map(|peer| {
+                let addr = peer.replication.clone().unwrap_or_else(|| peer.kafka.clone());
+                if peer.replication.is_some() {
+                    info!(
+                        "Replicating from node {} over {} (clients use {})",
+                        peer.id, addr, peer.kafka
+                    );
+                }
+                (peer.id, addr)
+            })
+            .collect();
+
+        if peers.is_empty() {
+            warn!("Pull replication requested but no peers are configured — nothing to fetch from");
+            return Ok(());
+        }
+
+        let fetcher = crate::replication::replica_fetcher::ReplicaFetcher::new(
+            cluster_config.node_id,
+            crate::replication::replica_fetcher::ReplicaFetcherConfig::from_env(),
+            metadata_store.clone(),
+            wal_manager.clone(),
+            peers,
+        )
+        .with_produce_handler(produce_handler.clone());
+
+        // Learn about new and reassigned partitions when they happen, not on the
+        // next 10s tick. A follower that has not yet heard of a partition cannot
+        // acknowledge writes to it, and `acks=all` blocks until it does.
+        let fetcher = match self.metadata_event_bus.as_ref() {
+            Some(bus) => fetcher.with_metadata_events(bus.clone()),
+            None => {
+                warn!(
+                    "No metadata event bus: the replica fetcher will only notice new partitions \
+                     on its {:?} refresh tick, and acks=all writes to a new topic will block until then",
+                    crate::replication::replica_fetcher::ReplicaFetcherConfig::from_env().refresh_interval
+                );
+                fetcher
+            }
+        };
+
+        fetcher.start();
+        self.replica_fetcher = Some(fetcher);
+
+        info!("✅ Follower-pull replication started (node {})", cluster_config.node_id);
+        Ok(())
+    }
+
+    /// Stage 17: partition leader failover (RP-5).
+    ///
+    /// Independent of the replication mode. A partition whose leader dies must
+    /// move to a live replica under push and pull alike — the measured failure
+    /// that motivated this reproduced identically under both.
+    ///
+    /// Every node runs the controller; it acts only while it is the Raft
+    /// leader, which is what stops two nodes handing the same partition to
+    /// different replicas.
+    async fn init_partition_failover(&mut self) -> Result<()> {
+        let Some(ref cluster_config) = self.config.cluster_config else {
+            debug!("Stage 17: single-node mode, no partition failover");
+            return Ok(());
+        };
+
+        let Some(raft) = self.raft_cluster_for_metadata.as_ref() else {
+            warn!(
+                "Stage 17: cluster mode without a Raft cluster — partition leader failover is \
+                 DISABLED. A partition whose leader dies will stay unavailable."
+            );
+            return Ok(());
+        };
+
+        let metadata_store = self.metadata_store.as_ref()
+            .context("metadata_store not initialized")?;
+
+        let controller = crate::partition_failover::PartitionFailoverController::new(
+            cluster_config.node_id,
+            raft.clone(),
+            metadata_store.clone(),
+            self.metadata_rejoin_notify.clone(),
+        );
+        controller.start();
+        self.partition_failover = Some(controller);
+
+        info!("✅ Partition leader failover active (node {})", cluster_config.node_id);
+        Ok(())
+    }
+
+    /// Stage 18: publish the in-sync set (RP-5 fix).
+    ///
+    /// Failover elects from what this writes. Without it the in-sync set exists
+    /// only in the partition leader's memory, so it vanishes at the moment it is
+    /// needed — and failover falls back to electing whoever is merely reachable,
+    /// which promoted a replica holding none of the partition and destroyed
+    /// `acks=all`-acknowledged records.
+    async fn init_isr_publisher(&mut self) -> Result<()> {
+        let Some(ref cluster_config) = self.config.cluster_config else {
+            debug!("Stage 18: single-node mode, nothing to keep in sync");
+            return Ok(());
+        };
+
+        let metadata_store = self.metadata_store.as_ref()
+            .context("metadata_store not initialized")?;
+        let produce_handler = self.produce_handler_base.as_ref()
+            .context("produce_handler not initialized")?;
+
+        let Some(isr_tracker) = self.isr_tracker.as_ref() else {
+            warn!(
+                "Stage 18: no ISR tracker — the in-sync set will not be published, so a failover \
+                 cannot tell a caught-up replica from a reachable one."
+            );
+            return Ok(());
+        };
+
+        let publisher = crate::isr_publisher::IsrPublisher::new(
+            cluster_config.node_id,
+            metadata_store.clone(),
+            isr_tracker.clone(),
+            produce_handler.clone(),
+        );
+        publisher.start();
+        self.isr_publisher = Some(publisher);
+
+        info!("✅ In-sync set publication active (node {})", cluster_config.node_id);
+        Ok(())
+    }
+
     /// Build the IntegratedKafkaServer
     ///
     /// This orchestrates all initialization stages in order.
     /// Complexity: < 25 (orchestration only, delegates to stage functions)
     pub async fn build(mut self) -> Result<IntegratedKafkaServer> {
-        info!("🔧 Starting IntegratedKafkaServer build process (15 stages)...");
+        info!("🔧 Starting IntegratedKafkaServer build process (17 stages)...");
 
         // Stage 1: Directories
         self.init_directories().await
@@ -1587,7 +2007,34 @@ impl IntegratedKafkaServerBuilder {
         self.init_wal_receiver().await
             .context("Stage 15 failed: WAL Receiver initialization")?;
 
-        info!("✅ All 15 stages complete - assembling IntegratedKafkaServer");
+        // RP-3: the leader-epoch history is derived from the log and therefore
+        // empty after a restart. Rebuild it before serving, or this node answers
+        // every OffsetForLeaderEpoch with UNDEFINED.
+        //
+        // ⚠️ This MUST run before the replica fetcher starts (stage 16). It used
+        // to run after all stages, and the ordering silently disabled RP-3.3: on
+        // a real cluster the fetcher logged "Replicating 1 partition(s)" 553µs
+        // *before* the warm-up finished, so its first reconcile pass read an
+        // empty epoch store, found nothing to ask about, skipped the handshake
+        // and cleared its reconcile flag. The history then arrived too late to
+        // matter. A returning replica would never truncate.
+        if let Err(e) = self.warm_up_leader_epochs().await {
+            warn!("Leader-epoch warm-up failed (continuing): {}", e);
+        }
+
+        // Stage 16: ReplicaFetcher (cluster mode, pull replication only)
+        self.init_replica_fetcher().await
+            .context("Stage 16 failed: ReplicaFetcher initialization")?;
+
+        // Stage 17: partition leader failover (cluster mode)
+        self.init_partition_failover().await
+            .context("Stage 17 failed: partition failover controller")?;
+
+        // Stage 18: publish the in-sync set that Stage 17 elects from
+        self.init_isr_publisher().await
+            .context("Stage 18 failed: ISR publisher")?;
+
+        info!("✅ All 17 stages complete - assembling IntegratedKafkaServer");
 
         // HP-1.5: warm up the hot text index from WAL tail so queries are
         // not blind for the first ~30s after startup.
@@ -1600,7 +2047,6 @@ impl IntegratedKafkaServerBuilder {
         let metadata_store = self.metadata_store.unwrap();
         let wal_indexer = self.wal_indexer.unwrap();
         let metadata_uploader = self.metadata_uploader;
-        let leader_elector = self.leader_elector;
         let isr_tracker = self.isr_tracker;
         let hot_text_index = self.hot_text_index;
         let hot_vector_index = self.hot_vector_index;
@@ -1612,7 +2058,6 @@ impl IntegratedKafkaServerBuilder {
             metadata_store,
             wal_indexer,
             metadata_uploader,
-            leader_elector,
             isr_tracker,
             hot_text_index,
             hot_vector_index,

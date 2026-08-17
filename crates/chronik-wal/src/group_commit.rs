@@ -14,7 +14,7 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::RwLock;  // v2.2.10: For interior mutability of commit_callback
 use std::time::{Duration, Instant};
 use bytes::Bytes;
@@ -26,6 +26,7 @@ use tracing::{debug, info, warn, error, trace, instrument};
 
 use crate::error::{Result, WalError};
 use crate::record::WalRecord;
+use crate::truncate::{SegmentVerdict, TruncateOutcome};
 use chronik_monitoring::MetricsRecorder;
 
 #[cfg(all(target_os = "linux", feature = "async-io"))]
@@ -131,6 +132,22 @@ pub struct GroupCommitConfig {
     /// Enable metrics collection
     pub enable_metrics: bool,
 
+    /// Route WAL writes through the io_uring thread instead of standard tokio
+    /// file I/O. **Off by default, and it should stay that way.** Measured on a
+    /// 16-thread Ryzen with NVMe, 1024 producers, `acks=1`, interleaved
+    /// median-of-3: io_uring ran 153,124 msg/s at 5.30 ms p50 against 228,886 at
+    /// 3.42 ms without it — 33% less throughput for 55% more latency. At a single
+    /// producer the gap is far worse: 194 msg/s / 3.99 ms against 1,132 / 0.69 ms.
+    ///
+    /// `AsyncIoConfig::use_io_uring` in config.rs has defaulted to false ("opt-in
+    /// for now") the whole time. `GroupCommitWal` never read it, gating instead on
+    /// the compile-time `async-io` feature, which IS on by default — so every
+    /// deployment has run the slower path while the config said otherwise, under a
+    /// log line advertising "10x faster WAL writes".
+    ///
+    /// Set `CHRONIK_WAL_IO_URING=true` to opt in and re-measure on your hardware.
+    pub use_io_uring: bool,
+
     /// Enable segment rotation (for S3 archival)
     pub enable_rotation: bool,
 
@@ -222,6 +239,17 @@ impl GroupCommitConfig {
         }
     }
 
+    /// Opt in to the io_uring write path. Off unless `CHRONIK_WAL_IO_URING` is
+    /// truthy — see [`GroupCommitConfig::use_io_uring`] for the measurements.
+    fn io_uring_from_env() -> bool {
+        std::env::var("CHRONIK_WAL_IO_URING")
+            .map(|v| {
+                let v = v.trim();
+                v.eq_ignore_ascii_case("true") || v == "1" || v.eq_ignore_ascii_case("yes")
+            })
+            .unwrap_or(false)
+    }
+
     /// Low resource profile (containers, small VMs: <= 1 CPU, < 512MB RAM)
     pub fn low_resource() -> Self {
         Self {
@@ -230,6 +258,7 @@ impl GroupCommitConfig {
             max_wait_time_ms: 2,            // 2ms latency
             max_queue_depth: 2_500,         // 2.5K queue depth
             enable_metrics: true,
+            use_io_uring: Self::io_uring_from_env(),
             enable_rotation: true,          // Enable S3 archival
             rotation_size_bytes: Self::parse_rotation_size(),
             rotation_age_secs: 30 * 60,     // 30 minutes
@@ -244,6 +273,7 @@ impl GroupCommitConfig {
             max_wait_time_ms: 10,           // 10ms latency
             max_queue_depth: 10_000,        // 10K queue depth
             enable_metrics: true,
+            use_io_uring: Self::io_uring_from_env(),
             enable_rotation: true,          // Enable S3 archival
             rotation_size_bytes: Self::parse_rotation_size(),
             rotation_age_secs: 30 * 60,     // 30 minutes
@@ -259,6 +289,7 @@ impl GroupCommitConfig {
             max_wait_time_ms: 50,           // 50ms latency (reduce disk I/O)
             max_queue_depth: 50_000,        // 50K queue depth
             enable_metrics: true,
+            use_io_uring: Self::io_uring_from_env(),
             enable_rotation: true,          // Enable S3 archival
             rotation_size_bytes: Self::parse_rotation_size(),
             rotation_age_secs: 30 * 60,     // 30 minutes
@@ -275,6 +306,7 @@ impl GroupCommitConfig {
             max_wait_time_ms: 100,          // 100ms latency (20x high profile - maximum batching)
             max_queue_depth: 100_000,       // 100K queue depth (4x high profile)
             enable_metrics: true,
+            use_io_uring: Self::io_uring_from_env(),
             enable_rotation: true,          // Enable S3 archival
             rotation_size_bytes: 512 * 1024 * 1024,  // 512MB (larger for ultra)
             rotation_age_secs: 30 * 60,     // 30 minutes
@@ -294,6 +326,7 @@ impl GroupCommitConfig {
             max_wait_time_ms,
             max_queue_depth,
             enable_metrics: true,
+            use_io_uring: Self::io_uring_from_env(),
             enable_rotation: true,
             rotation_size_bytes: 256 * 1024 * 1024,
             rotation_age_secs: 30 * 60,
@@ -351,6 +384,227 @@ struct PartitionCommitQueue {
 
     /// Partition number (for rotation)
     partition: i32,
+
+    /// Bumped by every suffix truncation (RP-3.3).
+    ///
+    /// `commit_batch` drains the pending queue and *then* takes the writer
+    /// lock, so a batch can be in flight — off the queue, not yet on disk —
+    /// when a truncation acquires both locks and cuts the log. Writing that
+    /// batch afterwards would re-append records the truncation just decided
+    /// were divergent. The worker reads this counter when it drains and again
+    /// once it holds the writer; a change between the two means the batch
+    /// straddles a truncation and must be dropped rather than written.
+    truncation_epoch: Arc<AtomicU64>,
+
+    /// The most recently appended records, so reading the tail of the log costs
+    /// no I/O. See `TailCache`.
+    tail: Mutex<TailCache>,
+
+    /// Highest offset the commit worker has written and fsynced.
+    ///
+    /// The cache is filled at *append* time, which is the only point where
+    /// arrival order is still known — but a queued write is not yet on disk,
+    /// and some never get there: `commit_batch` discards a batch that straddles
+    /// a truncation. Serving those from memory would let a replica read records
+    /// no file will ever hold. So the cache may only answer at or below this,
+    /// which makes it strictly an accelerator over durable state.
+    committed_through: Arc<AtomicI64>,
+}
+
+/// A bounded, in-memory suffix of a partition's log.
+///
+/// Every fetch — a follower replicating, a consumer keeping up — asks for
+/// records near the log end, and `read_from` answered by reading the *entire*
+/// active segment file off disk and parsing it from byte zero, materialising
+/// every record's payload before discarding the ones below the requested
+/// offset. Segments rotate at 250MB, so that cost grew with the segment: on a
+/// three-node cluster it measured 2.5–4.5ms to return 2 records, it was the
+/// whole of `acks=all`'s fetch latency, and it is why replicated throughput
+/// visibly degraded *within* a ten-second run (RP-9).
+///
+/// Records are pushed in append order and evicted from the front, so the cache
+/// is always a contiguous suffix of the log. That is what makes it safe to
+/// serve from: either it covers the requested offset, or the read falls back to
+/// the file. A truncation clears it (RP-3.3) — a cut log must not be answered
+/// from records the cut removed.
+///
+/// The file remains the source of truth. This never acknowledges a write, and
+/// nothing here changes when a record is considered durable.
+struct TailCache {
+    /// Held in offset order, which is not always arrival order.
+    records: VecDeque<WalRecord>,
+    bytes: usize,
+    max_bytes: usize,
+    /// Lowest offset from which the cache runs gap-free to the end. A read
+    /// below this cannot be served, because the answer would skip a hole.
+    contiguous_from: Option<i64>,
+}
+
+/// Per-partition budget for `TailCache`, from `CHRONIK_WAL_TAIL_CACHE_BYTES`.
+///
+/// The total is this times the number of partitions this node writes, so a node
+/// carrying thousands of partitions should lower it. `0` disables the cache and
+/// sends every read back to the file scan.
+fn tail_cache_bytes() -> usize {
+    const DEFAULT: usize = 2 * 1024 * 1024;
+    match std::env::var("CHRONIK_WAL_TAIL_CACHE_BYTES") {
+        Ok(v) => v.trim().parse().unwrap_or(DEFAULT),
+        Err(_) => DEFAULT,
+    }
+}
+
+impl TailCache {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            records: VecDeque::new(),
+            bytes: 0,
+            max_bytes,
+            contiguous_from: None,
+        }
+    }
+
+    /// Walk back from the log end while each record continues the next, and
+    /// return where that run starts. Only needed after an out-of-order arrival.
+    fn recompute_contiguous_from(&mut self) {
+        let mut start = None;
+        let mut expected: Option<i64> = None;
+        for record in self.records.iter().rev() {
+            match expected {
+                Some(e) if record.get_last_offset() + 1 != e => break,
+                _ => {}
+            }
+            expected = Some(record.get_base_offset());
+            start = expected;
+        }
+        self.contiguous_from = start;
+    }
+
+    /// Record just appended to the log, with the serialised size already known.
+    ///
+    /// Contiguity is *enforced*, not assumed. Offsets are assigned before the
+    /// WAL append, and two produces to the same partition can therefore reach
+    /// this point in an order that does not match their offsets. A cache that
+    /// merely assumed order would then answer "I cover offset N" out of records
+    /// that skip past it, and a caller asking for the whole log would silently
+    /// receive part of it — which is exactly how this cache first went wrong,
+    /// as an intermittent failure of the RP-3.3 divergence test.
+    ///
+    /// So anything that is not the next offset drops the cache. The file is
+    /// still authoritative; the only cost of being wrong here is a miss.
+    fn push(&mut self, record: WalRecord, size: usize) {
+        if self.max_bytes == 0 {
+            return;
+        }
+
+        let base = record.get_base_offset();
+
+        // The overwhelming majority: this append continues the log end.
+        if self
+            .records
+            .back()
+            .map_or(true, |b| b.get_last_offset() + 1 == base)
+        {
+            if self.records.is_empty() {
+                self.contiguous_from = Some(base);
+            }
+            self.records.push_back(record);
+            self.bytes += size;
+        } else {
+            // Out of order, and legitimately so: offsets are assigned before
+            // the WAL append, so two produces to one partition can reach this
+            // point in an order that does not match their offsets. Under 64
+            // concurrent producers that is not an edge case, it is most of
+            // them.
+            //
+            // An earlier version refused these and held the cache empty, which
+            // is safe but useless — the cache never served a single read and
+            // the fetch path fell back to the full-segment scan it exists to
+            // avoid. Ordering the record into place keeps the cache a true
+            // mirror of the log without giving up on it.
+            let pos = self.records.partition_point(|r| r.get_base_offset() < base);
+            if self
+                .records
+                .get(pos)
+                .is_some_and(|r| r.get_base_offset() == base)
+            {
+                return; // already held; a duplicate must not double-count bytes
+            }
+            self.records.insert(pos, record);
+            self.bytes += size;
+            self.recompute_contiguous_from();
+        }
+
+        while self.bytes > self.max_bytes && self.records.len() > 1 {
+            if let Some(evicted) = self.records.pop_front() {
+                self.bytes = self.bytes.saturating_sub(evicted.heap_size());
+            }
+            // Dropping the front can only raise where the gap-free run starts.
+            if let Some(front) = self.records.front() {
+                let front_base = front.get_base_offset();
+                self.contiguous_from = Some(match self.contiguous_from {
+                    Some(c) => c.max(front_base),
+                    None => front_base,
+                });
+            }
+        }
+    }
+
+    /// Forget everything, including where the log was. Used when the log itself
+    /// moved under us — a truncation, or an append that never landed — so the
+    /// next append re-anchors the cache wherever the log now ends.
+    fn clear(&mut self) {
+        self.records.clear();
+        self.bytes = 0;
+        self.contiguous_from = None;
+    }
+
+    /// Records from `offset` onward, or `None` if the cache does not reach back
+    /// that far — in which case the caller must read the file.
+    ///
+    /// Answering a read the cache only partly covers would silently drop the
+    /// records below its start, so "partly" has to count as a miss.
+    /// `durable_through` is the highest offset the commit worker has fsynced;
+    /// records above it are queued, not written, and must not be served.
+    fn read_from(
+        &self,
+        offset: i64,
+        max_records: usize,
+        durable_through: i64,
+    ) -> Option<Vec<WalRecord>> {
+        // Serve only from within the gap-free run that reaches the log end.
+        // Below it the cache has a hole, and a short answer there would be read
+        // as the whole of the log.
+        if offset < self.contiguous_from? {
+            return None;
+        }
+
+        let mut out = Vec::new();
+        let mut messages = 0usize;
+        for record in &self.records {
+            if record.get_last_offset() < offset {
+                continue;
+            }
+            // Stop at the durable end rather than skipping past it: the records
+            // beyond are a contiguous run too, and serving the ones after a
+            // not-yet-committed batch would leave a hole in the answer.
+            if record.get_last_offset() > durable_through {
+                break;
+            }
+            if messages >= max_records {
+                break;
+            }
+            messages += record.get_record_count().max(1) as usize;
+            out.push(record.clone());
+        }
+
+        // Nothing durable to give. Say "miss" rather than "empty": the file may
+        // well have records this cache is not yet allowed to serve, and an
+        // empty answer would be taken for the end of the log.
+        if out.is_empty() {
+            return None;
+        }
+        Some(out)
+    }
 }
 
 /// Commit metrics for observability
@@ -404,14 +658,24 @@ impl GroupCommitWal {
     pub fn new(base_dir: PathBuf, config: GroupCommitConfig) -> Self {
         // Spawn io_uring thread if available
         #[cfg(all(target_os = "linux", feature = "async-io"))]
-        let io_uring_handle = match IoUringThreadHandle::spawn() {
-            Ok(handle) => {
-                info!("✨ io_uring thread spawned for 10x faster WAL writes");
-                Some(StdArc::new(handle))
-            }
-            Err(e) => {
-                warn!("Failed to spawn io_uring thread, falling back to standard I/O: {}", e);
-                None
+        let io_uring_handle = if !config.use_io_uring {
+            // Default. Standard tokio file I/O measured 228,886 msg/s at 3.42ms p50
+            // against io_uring's 153,124 at 5.30ms. See GroupCommitConfig::use_io_uring.
+            None
+        } else {
+            match IoUringThreadHandle::spawn() {
+                Ok(handle) => {
+                    warn!(
+                        "io_uring WAL path enabled via CHRONIK_WAL_IO_URING. It measured SLOWER \
+                         than standard tokio file I/O here: 153k msg/s vs 229k at 1024 producers, \
+                         5.30ms vs 3.42ms p50. Re-measure on your hardware before keeping it on."
+                    );
+                    Some(StdArc::new(handle))
+                }
+                Err(e) => {
+                    warn!("Failed to spawn io_uring thread, falling back to standard I/O: {}", e);
+                    None
+                }
             }
         };
 
@@ -441,14 +705,24 @@ impl GroupCommitWal {
     pub fn with_callback(base_dir: PathBuf, config: GroupCommitConfig, callback: CommitCallback) -> Self {
         // Spawn io_uring thread if available
         #[cfg(all(target_os = "linux", feature = "async-io"))]
-        let io_uring_handle = match IoUringThreadHandle::spawn() {
-            Ok(handle) => {
-                info!("✨ io_uring thread spawned for 10x faster WAL writes");
-                Some(StdArc::new(handle))
-            }
-            Err(e) => {
-                warn!("Failed to spawn io_uring thread, falling back to standard I/O: {}", e);
-                None
+        let io_uring_handle = if !config.use_io_uring {
+            // Default. Standard tokio file I/O measured 228,886 msg/s at 3.42ms p50
+            // against io_uring's 153,124 at 5.30ms. See GroupCommitConfig::use_io_uring.
+            None
+        } else {
+            match IoUringThreadHandle::spawn() {
+                Ok(handle) => {
+                    warn!(
+                        "io_uring WAL path enabled via CHRONIK_WAL_IO_URING. It measured SLOWER \
+                         than standard tokio file I/O here: 153k msg/s vs 229k at 1024 producers, \
+                         5.30ms vs 3.42ms p50. Re-measure on your hardware before keeping it on."
+                    );
+                    Some(StdArc::new(handle))
+                }
+                Err(e) => {
+                    warn!("Failed to spawn io_uring thread, falling back to standard I/O: {}", e);
+                    None
+                }
             }
         };
 
@@ -590,13 +864,31 @@ impl GroupCommitWal {
         // Get or create partition queue
         let queue = self.get_or_create_queue(&topic, partition).await?;
 
-        // Handle acks=0 (fire-and-forget)
-        if acks == 0 {
-            return self.enqueue_nowait(queue, data.into(), base_offset, last_offset).await;
+        // Cache the tail before enqueuing, not after: `enqueue_and_wait` does
+        // not return until the commit worker has fsynced, and a follower's fetch
+        // for this offset can arrive in that window. Ordering is still the
+        // append order — this is the same task that is about to enqueue — and a
+        // record that fails to enqueue is removed again below.
+        let heap = record.heap_size();
+        {
+            let mut tail = queue.tail.lock().await;
+            tail.push(record, heap);
         }
 
-        // Handle acks=1 or acks=-1 (wait for commit)
-        self.enqueue_and_wait(queue, data.into(), data_len, base_offset, last_offset).await
+        // Handle acks=0 (fire-and-forget)
+        let result = if acks == 0 {
+            self.enqueue_nowait(Arc::clone(&queue), data.into(), base_offset, last_offset).await
+        } else {
+            self.enqueue_and_wait(Arc::clone(&queue), data.into(), data_len, base_offset, last_offset).await
+        };
+
+        if result.is_err() {
+            // The log does not have this record, so neither may the cache — it
+            // is only ever allowed to be a suffix of what was written.
+            queue.tail.lock().await.clear();
+        }
+
+        result
     }
 
     /// Enqueue without waiting (acks=0 mode)
@@ -778,6 +1070,9 @@ impl GroupCommitWal {
             segment_size_bytes: Arc::new(AtomicU64::new(0)),
             topic: topic.to_string(),
             partition,
+            truncation_epoch: Arc::new(AtomicU64::new(0)),
+            tail: Mutex::new(TailCache::new(tail_cache_bytes())),
+            committed_through: Arc::new(AtomicI64::new(i64::MIN)),
         });
 
         // Start per-partition commit worker
@@ -914,7 +1209,7 @@ impl GroupCommitWal {
 
         // OPTIMIZATION P3: Drain queue and pre-combine all writes into single buffer
         // This minimizes lock hold time and enables single write syscall
-        let (batch, combined_buffer) = {
+        let (batch, combined_buffer, drained_at_epoch) = {
             let mut pending = queue.pending.lock().await;
 
             if pending.is_empty() {
@@ -938,7 +1233,9 @@ impl GroupCommitWal {
                 }
             }
 
-            (batch, combined)
+            // Read under the same lock that guards the drain, so the epoch and
+            // the batch describe the same instant.
+            (batch, combined, queue.truncation_epoch.load(Ordering::SeqCst))
         }; // Lock released here - much shorter critical section!
 
         let batch_count = batch.len();
@@ -948,6 +1245,36 @@ impl GroupCommitWal {
 
         // OPTIMIZATION P3: Single write instead of loop
         let mut file = queue.file.lock().await;
+
+        // RP-3.3: a truncation ran while this batch was in flight. Its records
+        // are at or above the cut by construction — the truncation drained the
+        // queue for exactly that reason — so writing them now would undo it.
+        if queue.truncation_epoch.load(Ordering::SeqCst) != drained_at_epoch {
+            drop(file);
+            queue.total_queued_bytes.fetch_sub(total_bytes as u64, Ordering::Relaxed);
+            // These records are not going to disk, so the tail cache must not
+            // keep answering reads with them. `truncate_to` clears the cache,
+            // but a batch already drained is past that point — it is dropped
+            // *here*, after the clear, and would otherwise be left in memory as
+            // records no replica could ever fetch from the file.
+            queue.tail.lock().await.clear();
+            warn!(
+                topic = %queue.topic,
+                partition = queue.partition,
+                writes = batch_count,
+                bytes = total_bytes,
+                "Discarding in-flight batch: the log was truncated beneath it"
+            );
+            for write in batch {
+                if let Some(tx) = write.response_tx {
+                    let _ = tx.send(Err(WalError::CommitFailed(
+                        "log truncated while this write was in flight".into(),
+                    )));
+                }
+            }
+            return Ok(());
+        }
+
         file.write_all(&combined_buffer).await?;
 
         debug!("🔄 COMMIT_FSYNC: Starting fsync for {} bytes", total_bytes);
@@ -964,6 +1291,11 @@ impl GroupCommitWal {
 
         // Update queue size atomically (lock-free)
         queue.total_queued_bytes.fetch_sub(total_bytes as u64, Ordering::Relaxed);
+
+        // These records are now on disk, so the tail cache may serve them.
+        if let Some(max_offset) = batch.iter().map(|w| w.last_offset).max() {
+            queue.committed_through.fetch_max(max_offset, Ordering::SeqCst);
+        }
 
         let fsync_duration = start.elapsed();
 
@@ -1245,6 +1577,438 @@ impl GroupCommitWal {
         .await
     }
 
+    /// Discard every record at or above `target_offset` from a partition's WAL.
+    ///
+    /// This is the destructive half of RP-3.3: a follower that fetched records
+    /// from a leader which then lost the election holds a tail that was never
+    /// committed, and must remove it before it can converge. Nothing else in
+    /// this crate removes records from the tail — `delete_records_before` and
+    /// rotation both work from the front.
+    ///
+    /// # Guarantees
+    ///
+    /// - No record containing an offset at or above `target_offset` survives.
+    /// - The log ends on a record boundary.
+    /// - The returned [`TruncateOutcome::new_log_end_offset`] is where the log
+    ///   *actually* ends, which is **at or below** `target_offset`: a target
+    ///   landing inside a batch takes that whole batch, since keeping it would
+    ///   keep records above the target. Resume from the returned value.
+    /// - A target at or above the current end changes nothing on disk.
+    ///
+    /// # Quiescing
+    ///
+    /// The partition is stopped for the duration by holding its pending-queue
+    /// and writer locks — the same two `commit_batch` takes, in the same order.
+    /// Buffered writes are dropped and their callers told so; they describe a
+    /// log that no longer exists. A batch already drained by the commit worker
+    /// is caught by the truncation epoch instead, since it is past the queue
+    /// lock by then.
+    ///
+    /// # What this does not undo
+    ///
+    /// Truncation is local to this node's WAL. If the `WalIndexer` already
+    /// uploaded a sealed segment covering the discarded records, that object
+    /// remains in the store under its own `{min}-{max}` key — re-indexing the
+    /// shortened segment writes a *different* key rather than replacing it.
+    /// Callers must not truncate a partition whose divergent tail has been
+    /// published; see `docs/ROADMAP_REPLICATION.md` (RP-3.3).
+    /// The offset this partition's log ends at *on disk* — one past the highest
+    /// offset the commit worker has written and fsynced.
+    ///
+    /// `None` when nothing has been committed under this process, in which case
+    /// the caller has no better answer here than whatever it already had.
+    pub fn durable_end_offset(&self, topic: &str, partition: i32) -> Option<i64> {
+        let queue = {
+            let entry = self.partition_queues.get(&(topic.to_string(), partition))?;
+            Arc::clone(entry.value())
+        };
+        match queue.committed_through.load(Ordering::SeqCst) {
+            i64::MIN => None,
+            through => Some(through + 1),
+        }
+    }
+
+    /// Records from `offset` onward, served out of the partition's in-memory
+    /// tail without touching the file.
+    ///
+    /// `None` means the cache cannot answer — the partition is unknown here, or
+    /// the request reaches further back than the cache holds — and the caller
+    /// must fall back to reading segments. See `TailCache`.
+    pub async fn read_tail(
+        &self,
+        topic: &str,
+        partition: i32,
+        offset: i64,
+        max_records: usize,
+    ) -> Option<Vec<WalRecord>> {
+        // Clone the Arc out and drop the map reference before awaiting: holding
+        // a DashMap guard across an await is how this codebase has deadlocked
+        // before.
+        let queue = {
+            let entry = self.partition_queues.get(&(topic.to_string(), partition))?;
+            Arc::clone(entry.value())
+        };
+
+        let durable_through = queue.committed_through.load(Ordering::SeqCst);
+        let tail = queue.tail.lock().await;
+        tail.read_from(offset, max_records, durable_through)
+    }
+
+    pub async fn truncate_to(
+        &self,
+        topic: &str,
+        partition: i32,
+        target_offset: i64,
+    ) -> Result<TruncateOutcome> {
+        let queue = self.get_or_create_queue(topic, partition).await?;
+
+        // Bump before taking any lock: a batch the commit worker has already
+        // drained is past the queue lock and can only be caught here.
+        queue.truncation_epoch.fetch_add(1, Ordering::SeqCst);
+
+        // Lock order matches commit_batch (pending → file); taking both is what
+        // makes the partition quiet.
+        let mut pending = queue.pending.lock().await;
+        let mut file = queue.file.lock().await;
+
+        let dropped: Vec<PendingWrite> = pending.drain(..).collect();
+        queue.total_queued_bytes.store(0, Ordering::Relaxed);
+
+        // A cut log must not be answered out of records the cut removed. The
+        // cache holds only a suffix, which is exactly the part a truncation
+        // takes, so there is nothing worth salvaging — drop it and let the next
+        // read rebuild from the file.
+        queue.tail.lock().await.clear();
+        // The log is now durable only up to the cut. Leaving this where it was
+        // would let records cached after the truncation be served before they
+        // are written, because they sit below the old, higher mark.
+        queue
+            .committed_through
+            .store(target_offset.saturating_sub(1), Ordering::SeqCst);
+
+        // Everything committed so far must be visible to the scan below.
+        file.sync_all().await?;
+
+        let mut outcome = self
+            .truncate_partition_files(topic, partition, target_offset)
+            .await?;
+        outcome.buffered_writes_dropped = dropped.len();
+
+        if outcome.touched_disk() {
+            // The segment that survived a cut is now immutable. Reopening it
+            // for append would hand the indexer a file that shrank and then
+            // grew, which its "same id, same size ⇒ already done" bookkeeping
+            // reads as new work over old bytes. A fresh segment also keeps
+            // segment ids monotonic, so no deleted id is ever reused.
+            Self::rotate_to_new_segment(
+                &queue,
+                &mut file,
+                &self.base_dir,
+                #[cfg(all(target_os = "linux", feature = "async-io"))]
+                &self.io_uring_handle,
+            )
+            .await?;
+
+            info!(
+                topic = %topic,
+                partition = partition,
+                requested = target_offset,
+                new_end = ?outcome.new_log_end_offset,
+                segments_deleted = outcome.segments_deleted,
+                bytes_discarded = outcome.bytes_discarded,
+                buffered_dropped = outcome.buffered_writes_dropped,
+                "Truncated WAL suffix"
+            );
+        } else {
+            debug!(
+                topic = %topic,
+                partition = partition,
+                requested = target_offset,
+                "WAL suffix truncation was a no-op — log already ends at or below the target"
+            );
+        }
+
+        drop(file);
+        drop(pending);
+
+        // Only after the locks are released, so a woken caller cannot re-enter
+        // the partition while it is still being rebuilt.
+        for write in dropped {
+            if let Some(tx) = write.response_tx {
+                let _ = tx.send(Err(WalError::CommitFailed(
+                    "log truncated before this write was committed".into(),
+                )));
+            }
+        }
+
+        Ok(outcome)
+    }
+
+    /// The file surgery behind [`Self::truncate_to`]. Caller must hold the
+    /// partition's writer lock.
+    ///
+    /// Segment ids and offsets both increase with write order, so the target
+    /// can be placed by reading only each segment's *first* record: segments
+    /// entirely below it are kept untouched, segments entirely at or above it
+    /// are deleted whole, and at most one segment straddles the target and is
+    /// scanned. That matters — a full scan of every segment would be linear in
+    /// the size of the log, and these reach tens of gigabytes.
+    async fn truncate_partition_files(
+        &self,
+        topic: &str,
+        partition: i32,
+        target_offset: i64,
+    ) -> Result<TruncateOutcome> {
+        let partition_dir = self.base_dir.join(topic).join(partition.to_string());
+        if !partition_dir.exists() {
+            // Not "the log is empty" — "I looked in the wrong place, or there is
+            // genuinely nothing here". The caller cannot tell those apart from
+            // the outcome alone, and it acts on the answer by discarding a log,
+            // so say which directory was searched.
+            warn!(
+                topic = %topic,
+                partition = partition,
+                dir = %partition_dir.display(),
+                "Truncation found no partition directory — reporting an empty log"
+            );
+            return Ok(TruncateOutcome::untouched(None));
+        }
+
+        let mut segments: Vec<(u64, PathBuf)> = Vec::new();
+        let prefix = format!("wal_{}_", partition);
+        let mut entries = tokio::fs::read_dir(&partition_dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if let Some(id) = name
+                    .strip_prefix(&prefix)
+                    .and_then(|rest| rest.strip_suffix(".log"))
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
+                    segments.push((id, path));
+                }
+            }
+        }
+        segments.sort_by_key(|(id, _)| *id);
+
+        if segments.is_empty() {
+            warn!(
+                topic = %topic,
+                partition = partition,
+                dir = %partition_dir.display(),
+                prefix = %prefix,
+                "Truncation found no segment files — reporting an empty log"
+            );
+        }
+
+        // Place the target. The segment that can straddle it is the *last* one
+        // whose first record sits below it — not the first one at or above it,
+        // which is the segment after the straddler. Getting this backwards
+        // leaves the straddler's own above-target records alive.
+        // What the scan is actually working with. A truncation that removes
+        // nothing is indistinguishable from one that had nothing to remove
+        // unless the inventory is visible, and the caller acts on the answer by
+        // discarding a log.
+        for (id, path) in &segments {
+            let size = tokio::fs::metadata(path).await.map(|m| m.len()).unwrap_or(0);
+            // Computed before the macro: a `?`-formatted temporary held across
+            // an await makes the whole future non-Send.
+            let first = Self::first_record_offset(path).await?;
+            // `info!`, not `debug!`: a truncation happens once per divergence,
+            // it deletes data, and when it reports "nothing to do" the inputs
+            // are the only way to tell a correct no-op from a scan that was
+            // looking at the wrong files.
+            info!(
+                topic = %topic, partition = partition, segment = id, bytes = size,
+                first_offset = first.unwrap_or(-1),
+                "truncation inventory"
+            );
+        }
+
+        let mut straddler: Option<usize> = None;
+        for (index, (_, path)) in segments.iter().enumerate() {
+            match Self::first_record_offset(path).await? {
+                // An empty segment carries no offsets and cannot place
+                // anything. The active segment is routinely empty.
+                None => continue,
+                Some(base) if base < target_offset => straddler = Some(index),
+                // Ids ascend with write order, so offsets do too: from here on
+                // every segment starts at or above the target.
+                Some(_) => break,
+            }
+        }
+
+        let mut outcome = TruncateOutcome::untouched(None);
+        let mut last_kept_offset: Option<i64> = None;
+
+        // Where wholesale deletion starts. With no straddler, nothing on disk
+        // is below the target and the whole log goes.
+        let delete_from = match straddler {
+            None => 0,
+            Some(index) => {
+                let (segment_id, path) = &segments[index];
+                let data = tokio::fs::read(path).await?;
+
+                match crate::truncate::plan_segment_truncation(&data, target_offset) {
+                    SegmentVerdict::Empty => {}
+                    SegmentVerdict::KeepWhole { last_offset } => {
+                        last_kept_offset = Some(last_offset);
+                    }
+                    SegmentVerdict::DeleteWhole => {
+                        outcome.bytes_discarded += data.len() as u64;
+                        outcome.segments_deleted += 1;
+                        self.remove_truncated_segment(topic, partition, *segment_id, path)
+                            .await?;
+                    }
+                    SegmentVerdict::Cut {
+                        keep_bytes,
+                        last_offset,
+                    } => {
+                        last_kept_offset = Some(last_offset);
+                        outcome.bytes_discarded += data.len() as u64 - keep_bytes;
+
+                        // Async throughout: `sync_all` on a segment can stall
+                        // for milliseconds, and this runs on the runtime that
+                        // is also serving every other partition's commits.
+                        let file = tokio::fs::OpenOptions::new()
+                            .write(true)
+                            .open(path)
+                            .await?;
+                        file.set_len(keep_bytes).await?;
+                        file.sync_all().await?;
+                        drop(file);
+
+                        // The registry advertises sizes to the indexer; a stale
+                        // one sends it reading past the new end of the file.
+                        self.resize_sealed_segment(topic, partition, *segment_id, keep_bytes);
+                    }
+                }
+                index + 1
+            }
+        };
+
+        let mut deleted: Vec<usize> = Vec::new();
+        for (index, (segment_id, path)) in segments.iter().enumerate().skip(delete_from) {
+            let size = tokio::fs::metadata(path).await.map(|m| m.len()).unwrap_or(0);
+            if size == 0 {
+                // Nothing to discard, and this is usually the segment the
+                // writer is holding open. Unlinking it would leave the writer
+                // appending into an orphaned inode — bytes accepted, fsynced,
+                // and unreadable by anyone.
+                continue;
+            }
+            outcome.bytes_discarded += size;
+            outcome.segments_deleted += 1;
+            deleted.push(index);
+            self.remove_truncated_segment(topic, partition, *segment_id, path)
+                .await?;
+        }
+
+        // Where the log ends now: the last record in the last SURVIVING segment.
+        //
+        // Scan every survivor, not `segments[..delete_from - 1]`. That range
+        // excluded the straddler and everything the delete loop skipped for
+        // being empty, so in the case where nothing was cut at all it looked at
+        // no files, found nothing, and reported "the log is empty".
+        //
+        // `None` then means two incompatible things — "nothing survived" and "I
+        // did not touch anything" — and the caller collapses both to offset 0.
+        // A truncation that legitimately had no work to do therefore told the
+        // follower its log was empty, and the follower re-replicated the whole
+        // partition from scratch instead of keeping the records it already had.
+        // Observed on two of three divergence runs.
+        if last_kept_offset.is_none() {
+            for (index, (_, path)) in segments.iter().enumerate().rev() {
+                if deleted.contains(&index) {
+                    continue;
+                }
+                if let Some(last) = Self::last_record_offset(path).await? {
+                    last_kept_offset = Some(last);
+                    break;
+                }
+            }
+        }
+
+        outcome.new_log_end_offset = last_kept_offset.map(|last| last + 1);
+        Ok(outcome)
+    }
+
+    /// Delete a segment file and forget it, so nothing later reads a path that
+    /// is gone or indexes a segment that was discarded.
+    async fn remove_truncated_segment(
+        &self,
+        topic: &str,
+        partition: i32,
+        segment_id: u64,
+        path: &Path,
+    ) -> Result<()> {
+        self.sealed_segments
+            .remove(&format!("{}:{}:{}", topic, partition, segment_id));
+        match tokio::fs::remove_file(path).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Correct a sealed segment's recorded size after it was shortened.
+    fn resize_sealed_segment(&self, topic: &str, partition: i32, segment_id: u64, size: u64) {
+        if let Some(mut entry) = self
+            .sealed_segments
+            .get_mut(&format!("{}:{}:{}", topic, partition, segment_id))
+        {
+            entry.size_bytes = size;
+        }
+    }
+
+    /// The base offset of a segment's first record, reading only as much of the
+    /// file as that record occupies. `None` for an empty or torn segment.
+    async fn first_record_offset(path: &Path) -> Result<Option<i64>> {
+        use tokio::io::AsyncReadExt;
+
+        let mut file = match tokio::fs::File::open(path).await {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+
+        let mut header = [0u8; crate::truncate::RECORD_HEADER_LEN];
+        if file.read_exact(&mut header).await.is_err() {
+            return Ok(None); // shorter than one header: empty or torn
+        }
+        let size = match crate::truncate::declared_record_size(&header) {
+            Some(size) => size,
+            None => return Ok(None),
+        };
+
+        let mut buf = vec![0u8; size];
+        buf[..crate::truncate::RECORD_HEADER_LEN].copy_from_slice(&header);
+        if file
+            .read_exact(&mut buf[crate::truncate::RECORD_HEADER_LEN..])
+            .await
+            .is_err()
+        {
+            return Ok(None); // record is truncated on disk
+        }
+
+        Ok(crate::truncate::first_record_range(&buf).map(|(base, _)| base))
+    }
+
+    /// The highest offset a segment holds. Only needed to report where the log
+    /// ends when the straddling segment kept nothing.
+    async fn last_record_offset(path: &Path) -> Result<Option<i64>> {
+        let data = match tokio::fs::read(path).await {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        // i64::MAX keeps every record, so the plan reports the segment's end.
+        match crate::truncate::plan_segment_truncation(&data, i64::MAX) {
+            SegmentVerdict::KeepWhole { last_offset } => Ok(Some(last_offset)),
+            _ => Ok(None),
+        }
+    }
+
     /// Get metrics for a partition
     pub fn get_metrics(&self, topic: &str, partition: i32) -> Option<PartitionMetrics> {
         let key = (topic.to_string(), partition);
@@ -1515,4 +2279,328 @@ pub struct PartitionMetrics {
     pub total_bytes: u64,
     pub avg_fsync_time_us: u64,
     pub backpressure_events: u64,
+}
+
+#[cfg(test)]
+mod truncation_race_tests {
+    use super::*;
+
+    /// The one interleaving that can silently resurrect truncated records.
+    ///
+    /// `commit_batch` drains the pending queue and *then* takes the writer
+    /// lock, so a batch can be off the queue but not yet on disk when a
+    /// truncation runs. Holding the writer lock from the test pins the worker
+    /// in exactly that window: it has drained, it is blocked, and the epoch
+    /// moves underneath it. Without the guard it would write afterwards, and
+    /// the records the truncation just removed would be back on disk with
+    /// nothing to indicate they had ever gone.
+    #[tokio::test]
+    async fn a_batch_drained_before_a_truncation_is_not_written_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = GroupCommitWal::new(dir.path().to_path_buf(), GroupCommitConfig::default());
+        let (topic, partition) = ("race", 0);
+
+        let queue = wal.get_or_create_queue(topic, partition).await.unwrap();
+        let segment = dir
+            .path()
+            .join(topic)
+            .join(partition.to_string())
+            .join(format!("wal_{}_0.log", partition));
+
+        // Block the writer before anything can reach it.
+        let file_guard = queue.file.lock().await;
+
+        let record = WalRecord::new_v2(topic.to_string(), partition, vec![7u8; 64], 0, 0, 1);
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut pending = queue.pending.lock().await;
+            pending.push_back(PendingWrite {
+                data: Bytes::from(record.to_bytes().unwrap()),
+                response_tx: Some(tx),
+                base_offset: 0,
+                last_offset: 0,
+            });
+        }
+        queue.write_notify.notify_one();
+
+        // Wait for the commit worker to drain the queue. It cannot get further
+        // than the writer lock, which this test holds.
+        for _ in 0..1_000 {
+            if queue.pending.lock().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(
+            queue.pending.lock().await.is_empty(),
+            "the commit worker never drained the queue; the race is not set up"
+        );
+
+        // A truncation runs while that batch is in flight.
+        queue.truncation_epoch.fetch_add(1, Ordering::SeqCst);
+        drop(file_guard);
+
+        let result = tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .expect("the waiter must be answered, not left hanging")
+            .expect("the response channel must not be dropped silently");
+        assert!(
+            result.is_err(),
+            "a write discarded by a truncation must be reported as failed, not as committed"
+        );
+
+        // Give the worker a moment to do anything else it might have planned.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let size = std::fs::metadata(&segment).map(|m| m.len()).unwrap_or(0);
+        assert_eq!(size, 0, "the stale batch was written to disk anyway");
+    }
+
+    /// The guard must not fire when no truncation happened, or every ordinary
+    /// commit would be dropped and the WAL would accept nothing at all.
+    #[tokio::test]
+    async fn an_ordinary_batch_still_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = GroupCommitWal::new(dir.path().to_path_buf(), GroupCommitConfig::default());
+        let (topic, partition) = ("no-race", 0);
+
+        let record = WalRecord::new_v2(topic.to_string(), partition, vec![1u8; 32], 0, 0, 1);
+        wal.append(topic.to_string(), partition, record, 1)
+            .await
+            .expect("a write with no truncation in sight must commit");
+
+        let segment = dir
+            .path()
+            .join(topic)
+            .join(partition.to_string())
+            .join(format!("wal_{}_0.log", partition));
+        assert!(std::fs::metadata(&segment).unwrap().len() > 0);
+    }
+}
+
+#[cfg(test)]
+mod tail_cache_tests {
+    use super::*;
+
+    fn record(base: i64, last: i64, payload: usize) -> WalRecord {
+        WalRecord::new_v2(
+            "t".to_string(),
+            0,
+            vec![0u8; payload],
+            base,
+            last,
+            (last - base + 1) as i32,
+        )
+    }
+
+    fn push(cache: &mut TailCache, base: i64, last: i64, payload: usize) {
+        let r = record(base, last, payload);
+        let size = r.heap_size();
+        cache.push(r, size);
+    }
+
+    #[test]
+    fn serves_a_read_that_starts_inside_what_it_holds() {
+        let mut cache = TailCache::new(1 << 20);
+        push(&mut cache, 0, 9, 16);
+        push(&mut cache, 10, 19, 16);
+        push(&mut cache, 20, 29, 16);
+
+        let got = cache.read_from(10, 1000, i64::MAX).expect("cache starts at 0, so it covers 10");
+        assert_eq!(
+            got.iter().map(|r| r.get_base_offset()).collect::<Vec<_>>(),
+            vec![10, 20],
+            "the batch ending at 9 is entirely below the requested offset"
+        );
+    }
+
+    /// The rule the whole design rests on: answering a read the cache only
+    /// partly covers would silently drop the records below its start, and the
+    /// caller would take the short answer as the whole log.
+    #[test]
+    fn a_read_starting_before_the_cache_is_a_miss_not_a_short_answer() {
+        let mut cache = TailCache::new(1 << 20);
+        push(&mut cache, 100, 109, 16);
+        push(&mut cache, 110, 119, 16);
+
+        assert!(
+            cache.read_from(50, 1000, i64::MAX).is_none(),
+            "offset 50 predates the cache; the file must answer this"
+        );
+        assert!(cache.read_from(100, 1000, i64::MAX).is_some(), "its own start is covered");
+    }
+
+    #[test]
+    fn eviction_keeps_the_cache_a_contiguous_suffix() {
+        // Budget for roughly two records, so the third evicts the first.
+        let one = record(0, 0, 512).heap_size();
+        let mut cache = TailCache::new(one * 2 + one / 2);
+        push(&mut cache, 0, 9, 512);
+        push(&mut cache, 10, 19, 512);
+        push(&mut cache, 20, 29, 512);
+
+        assert!(
+            cache.read_from(0, 1000, i64::MAX).is_none(),
+            "offset 0 was evicted, so the cache can no longer answer for it"
+        );
+        let got = cache.read_from(10, 1000, i64::MAX).expect("the surviving suffix still answers");
+        assert_eq!(
+            got.iter().map(|r| r.get_base_offset()).collect::<Vec<_>>(),
+            vec![10, 20],
+            "what survives eviction is contiguous and reaches the log end"
+        );
+    }
+
+    /// Offsets are assigned before the WAL append, so two produces to one
+    /// partition can arrive here out of order. The cache must not then claim to
+    /// cover a range it has a hole in — a caller asking for the whole log would
+    /// get part of it and treat that as all of it.
+    #[test]
+    fn a_gap_is_served_from_above_it_and_missed_from_below() {
+        let mut cache = TailCache::new(1 << 20);
+        push(&mut cache, 0, 9, 16);
+        push(&mut cache, 30, 39, 16); // 10..29 never arrived
+
+        assert!(
+            cache.read_from(0, 1000, i64::MAX).is_none(),
+            "offset 0 must miss: answering it would silently skip 10..29"
+        );
+        let got = cache.read_from(30, 1000, i64::MAX).expect("above the gap it reaches the log end");
+        assert_eq!(got.len(), 1);
+
+        // Filling the hole makes the whole range answerable again.
+        push(&mut cache, 10, 29, 16);
+        let got = cache.read_from(0, 1000, i64::MAX).expect("no hole left");
+        assert_eq!(
+            got.iter().map(|r| r.get_base_offset()).collect::<Vec<_>>(),
+            vec![0, 10, 30],
+            "and it comes back in offset order, not arrival order"
+        );
+    }
+
+    /// Offsets are assigned before the WAL append, so two produces to one
+    /// partition routinely reach the cache in an order that does not match
+    /// their offsets — under concurrency that is most of them, not an edge
+    /// case. Refusing those emptied the cache permanently and every fetch fell
+    /// back to the full-segment scan the cache exists to avoid.
+    #[test]
+    fn out_of_order_arrival_is_ordered_into_place() {
+        let mut cache = TailCache::new(1 << 20);
+        push(&mut cache, 10, 19, 16);
+        push(&mut cache, 0, 9, 16); // overtook its predecessor
+
+        let got = cache.read_from(0, 1000, i64::MAX).expect("both records are held, and they join up");
+        assert_eq!(
+            got.iter().map(|r| r.get_base_offset()).collect::<Vec<_>>(),
+            vec![0, 10]
+        );
+    }
+
+    /// The cache is filled at append time, before the commit worker has written
+    /// anything — and some queued writes never reach the file at all, because
+    /// `commit_batch` discards a batch that straddles a truncation. Serving
+    /// those would let a replica read records no file will ever hold.
+    #[test]
+    fn records_past_the_durable_end_are_not_served() {
+        let mut cache = TailCache::new(1 << 20);
+        push(&mut cache, 0, 9, 16);
+        push(&mut cache, 10, 19, 16);
+        push(&mut cache, 20, 29, 16);
+
+        // Only the first two batches have been fsynced.
+        let got = cache.read_from(0, 1000, 19).expect("the durable part is servable");
+        assert_eq!(
+            got.iter().map(|r| r.get_last_offset()).collect::<Vec<_>>(),
+            vec![9, 19],
+            "the queued-but-unwritten batch must be withheld"
+        );
+    }
+
+    /// "Nothing durable yet" is a miss, not an empty log — an empty answer
+    /// would be read as the end of the log while the file still has records.
+    #[test]
+    fn a_cache_with_nothing_durable_yet_reports_a_miss() {
+        let mut cache = TailCache::new(1 << 20);
+        push(&mut cache, 0, 9, 16);
+
+        assert!(
+            cache.read_from(0, 1000, i64::MIN).is_none(),
+            "before the commit worker writes anything the file must answer"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_append_is_ignored() {
+        let mut cache = TailCache::new(1 << 20);
+        push(&mut cache, 0, 9, 16);
+        push(&mut cache, 20, 29, 16);
+        push(&mut cache, 20, 29, 16); // same batch again
+
+        let got = cache.read_from(20, 1000, i64::MAX).expect("covered");
+        assert_eq!(got.len(), 1, "the duplicate must not be stored twice");
+    }
+
+    #[test]
+    fn a_cleared_cache_answers_nothing() {
+        let mut cache = TailCache::new(1 << 20);
+        push(&mut cache, 0, 9, 16);
+        cache.clear();
+        assert!(
+            cache.read_from(0, 1000, i64::MAX).is_none(),
+            "truncation clears the cache; every read must go back to the file"
+        );
+    }
+
+    #[test]
+    fn a_zero_budget_disables_the_cache_entirely() {
+        let mut cache = TailCache::new(0);
+        push(&mut cache, 0, 9, 16);
+        assert!(cache.read_from(0, 1000, i64::MAX).is_none());
+    }
+
+    #[test]
+    fn max_records_counts_messages_not_batches() {
+        let mut cache = TailCache::new(1 << 20);
+        push(&mut cache, 0, 9, 16);   // 10 messages
+        push(&mut cache, 10, 19, 16); // 10 messages
+        push(&mut cache, 20, 29, 16); // 10 messages
+
+        let got = cache.read_from(0, 15, i64::MAX).expect("covered");
+        assert_eq!(
+            got.len(),
+            2,
+            "the limit is in messages, so it stops after the batch that crosses it"
+        );
+    }
+
+    /// The cache exists to answer without I/O, and a truncation must reach it
+    /// even though the records it holds were never rejected by the writer.
+    #[tokio::test]
+    async fn truncation_invalidates_the_tail_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = GroupCommitWal::new(dir.path().to_path_buf(), GroupCommitConfig::default());
+
+        for i in 0..5i64 {
+            wal.append("t".to_string(), 0, record(i * 10, i * 10 + 9, 64), 1)
+                .await
+                .unwrap();
+        }
+        assert!(
+            wal.read_tail("t", 0, 0, 1000).await.is_some(),
+            "appends populate the cache"
+        );
+
+        wal.truncate_to("t", 0, 20).await.unwrap();
+
+        assert!(
+            wal.read_tail("t", 0, 0, 1000).await.is_none(),
+            "after a cut the cache must not answer — the file is authoritative again"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_partition_is_a_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = GroupCommitWal::new(dir.path().to_path_buf(), GroupCommitConfig::default());
+        assert!(wal.read_tail("never-written", 0, 0, 10).await.is_none());
+    }
 }

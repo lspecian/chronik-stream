@@ -22,6 +22,7 @@ pub async fn bootstrap_raft_cluster(init_config: &ClusterInitConfig) -> Result<A
         RaftCluster::bootstrap(
             init_config.node_id,
             init_config.raft_peers.clone(),
+            init_config.self_raft_addr.clone(),
             init_config.data_dir.clone(),
         ).await?
     );
@@ -82,6 +83,7 @@ mod tests {
                 (2, "localhost:5002".to_string()),
                 (3, "localhost:5003".to_string()),
             ],
+            self_raft_addr: "localhost:5001".to_string(),
             cluster_config: Default::default(),
         };
 

@@ -1,6 +1,11 @@
 //! Kafka protocol compatibility tests
 
-use super::common::*;
+#[path = "common.rs"]
+mod common;
+#[path = "test_setup.rs"]
+mod test_setup;
+
+use common::*;
 use chronik_common::Result;
 use rdkafka::{
     ClientConfig,
@@ -15,7 +20,8 @@ use tokio::time::timeout;
 
 #[tokio::test]
 async fn test_kafka_metadata_api() -> Result<()> {
-    super::test_setup::init();
+    test_setup::init();
+    let _serial = common::exclusive().await;
     
     let cluster = TestCluster::start(TestClusterConfig::default()).await?;
     let bootstrap_servers = cluster.bootstrap_servers();
@@ -36,7 +42,7 @@ async fn test_kafka_metadata_api() -> Result<()> {
     
     // Verify broker information
     assert!(!metadata.brokers().is_empty());
-    assert_eq!(metadata.brokers().len(), cluster.ingest_addrs().len());
+    assert_eq!(metadata.brokers().len(), cluster.server_addrs().len());
     
     for broker in metadata.brokers() {
         assert!(broker.id() >= 0);
@@ -49,7 +55,8 @@ async fn test_kafka_metadata_api() -> Result<()> {
 
 #[tokio::test]
 async fn test_kafka_topic_management() -> Result<()> {
-    super::test_setup::init();
+    test_setup::init();
+    let _serial = common::exclusive().await;
     
     let cluster = TestCluster::start(TestClusterConfig::default()).await?;
     let bootstrap_servers = cluster.bootstrap_servers();
@@ -119,7 +126,8 @@ async fn test_kafka_topic_management() -> Result<()> {
 
 #[tokio::test]
 async fn test_kafka_produce_consume() -> Result<()> {
-    super::test_setup::init();
+    test_setup::init();
+    let _serial = common::exclusive().await;
     
     let cluster = TestCluster::start(TestClusterConfig::default()).await?;
     let bootstrap_servers = cluster.bootstrap_servers();
@@ -135,7 +143,7 @@ async fn test_kafka_produce_consume() -> Result<()> {
         .create_topics(&[topic], &AdminOptions::new())
         .await
         .expect("Failed to create topics")[0]
-        .expect("Failed to create topic");
+        .as_ref().expect("Failed to create topic");
     
     // Create producer
     let producer: FutureProducer = ClientConfig::new()
@@ -144,20 +152,23 @@ async fn test_kafka_produce_consume() -> Result<()> {
         .create()
         .expect("Failed to create producer");
     
-    // Produce messages
+    // Produce messages. The payloads are built up front rather than inside the
+    // loop: FutureRecord borrows its key and payload, so per-iteration Strings
+    // would be dropped while the futures they back are still in flight.
+    let payloads: Vec<(String, String)> = (0..10)
+        .map(|i| (format!("key-{}", i), format!("value-{}", i)))
+        .collect();
+
     let mut delivery_futures = Vec::new();
-    for i in 0..10 {
-        let key = format!("key-{}", i);
-        let value = format!("value-{}", i);
-        
+    for (i, (key, value)) in payloads.iter().enumerate() {
         let future = producer.send(
             FutureRecord::to("test-produce-consume")
-                .key(&key)
-                .payload(&value)
-                .partition(i % 2), // Alternate between partitions
+                .key(key)
+                .payload(value)
+                .partition((i % 2) as i32), // Alternate between partitions
             Duration::from_secs(5),
         );
-        
+
         delivery_futures.push(future);
     }
     
@@ -165,7 +176,6 @@ async fn test_kafka_produce_consume() -> Result<()> {
     for (i, future) in delivery_futures.into_iter().enumerate() {
         let (partition, offset) = future
             .await
-            .expect("Delivery failed")
             .expect("Delivery error");
         
         assert_eq!(partition, (i % 2) as i32);
@@ -215,7 +225,8 @@ async fn test_kafka_produce_consume() -> Result<()> {
 
 #[tokio::test]
 async fn test_kafka_consumer_groups() -> Result<()> {
-    super::test_setup::init();
+    test_setup::init();
+    let _serial = common::exclusive().await;
     
     let cluster = TestCluster::start(TestClusterConfig::default()).await?;
     let bootstrap_servers = cluster.bootstrap_servers();
@@ -231,7 +242,7 @@ async fn test_kafka_consumer_groups() -> Result<()> {
         .create_topics(&[topic], &AdminOptions::new())
         .await
         .expect("Failed to create topics")[0]
-        .expect("Failed to create topic");
+        .as_ref().expect("Failed to create topic");
     
     // Produce test data
     let producer: FutureProducer = ClientConfig::new()
@@ -306,7 +317,8 @@ async fn test_kafka_consumer_groups() -> Result<()> {
 
 #[tokio::test]
 async fn test_kafka_offset_management() -> Result<()> {
-    super::test_setup::init();
+    test_setup::init();
+    let _serial = common::exclusive().await;
     
     let cluster = TestCluster::start(TestClusterConfig::default()).await?;
     let bootstrap_servers = cluster.bootstrap_servers();
@@ -322,7 +334,7 @@ async fn test_kafka_offset_management() -> Result<()> {
         .create_topics(&[topic], &AdminOptions::new())
         .await
         .expect("Failed to create topics")[0]
-        .expect("Failed to create topic");
+        .as_ref().expect("Failed to create topic");
     
     // Produce messages
     let producer: FutureProducer = ClientConfig::new()
@@ -357,13 +369,13 @@ async fn test_kafka_offset_management() -> Result<()> {
         .expect("Failed to subscribe");
     
     // Consume first 10 messages and commit
-    let mut consumed = 0;
-    while consumed < 10 {
+    let mut consumed_first: std::collections::HashSet<String> = std::collections::HashSet::new();
+    while consumed_first.len() < 10 {
         match timeout(Duration::from_secs(1), consumer.recv()).await {
             Ok(Ok(message)) => {
                 consumer.store_offset_from_message(&message)
                     .expect("Failed to store offset");
-                consumed += 1;
+                consumed_first.insert(message.key_view::<str>().unwrap().unwrap().to_string());
             }
             _ => continue,
         }
@@ -372,7 +384,13 @@ async fn test_kafka_offset_management() -> Result<()> {
     // Commit stored offsets
     consumer.commit_consumer_state(rdkafka::consumer::CommitMode::Sync)
         .expect("Failed to commit offsets");
-    
+
+    // Leave the group before the replacement joins. Without this the first
+    // consumer stays a member, the two split the partitions, and the second can
+    // never receive all the uncommitted records however long it waits — the
+    // test would be measuring a two-member split, not a resume from commit.
+    drop(consumer);
+
     // Create new consumer with same group - should start from committed offset
     let consumer2: StreamConsumer = ClientConfig::new()
         .set("bootstrap.servers", &bootstrap_servers)
@@ -386,24 +404,56 @@ async fn test_kafka_offset_management() -> Result<()> {
         .subscribe(&["test-offsets"])
         .expect("Failed to subscribe");
     
-    // Should receive messages 10-19
-    let mut next_expected = 10;
-    let consume_timeout = Duration::from_secs(5);
+    // Resume from the committed offsets.
+    //
+    // The records were produced round-robin across 2 partitions, so the first
+    // 10 the group consumed are NOT keys 0-9 — they are whichever 10 arrived
+    // first across two independent logs. Asserting that the resumed consumer
+    // sees key-10, key-11, ... in order (as this test used to) treats a
+    // partitioned topic as a single ordered log, which it never is.
+    //
+    // What offset commit does guarantee, and what is checked here: across the
+    // commit and the consumer restart the group sees every record exactly once.
+    // Generous window: the first consumer is still a group member until it
+    // leaves, so consumer 2 owns nothing until the group rebalances. A short
+    // window here measures rebalance latency, not offset-commit correctness.
+    let mut received: Vec<String> = Vec::new();
+    let consume_timeout = Duration::from_secs(45);
     let start = std::time::Instant::now();
-    
-    while next_expected < 20 && start.elapsed() < consume_timeout {
+
+    while received.len() < 10 && start.elapsed() < consume_timeout {
         match timeout(Duration::from_secs(1), consumer2.recv()).await {
             Ok(Ok(message)) => {
-                let key = message.key_view::<str>().unwrap().unwrap();
-                let expected_key = format!("key-{}", next_expected);
-                assert_eq!(key, expected_key);
-                next_expected += 1;
+                received.push(message.key_view::<str>().unwrap().unwrap().to_string());
             }
             _ => continue,
         }
     }
-    
-    assert_eq!(next_expected, 20);
-    
+
+    assert_eq!(
+        received.len(),
+        10,
+        "resumed consumer got {} of the 10 uncommitted records",
+        received.len()
+    );
+
+    for key in &received {
+        assert!(
+            !consumed_first.contains(key),
+            "{} was redelivered after being committed",
+            key
+        );
+    }
+
+    let all_keys: std::collections::HashSet<String> =
+        (0..20).map(|i| format!("key-{}", i)).collect();
+    let seen: std::collections::HashSet<String> = consumed_first
+        .iter()
+        .cloned()
+        .chain(received.iter().cloned())
+        .collect();
+    let missing: Vec<_> = all_keys.difference(&seen).collect();
+    assert!(missing.is_empty(), "records skipped across the commit: {:?}", missing);
+
     Ok(())
 }

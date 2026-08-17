@@ -104,61 +104,39 @@ pub struct ProtocolHandler {
 impl ProtocolHandler {
     /// Helper to create a Response with proper flexible tracking
     fn make_response(header: &RequestHeader, api_key: ApiKey, body: Bytes) -> Response {
-        // CRITICAL: ApiVersions is special - the response BODY uses flexible encoding
-        // but the response HEADER does not! This is unique to ApiVersions.
+        // Whether the response HEADER carries tagged fields. The body's own
+        // encoding is already settled by the time it reaches here.
         //
-        // For clarity: is_flexible here means "should the header have tagged fields"
-        // The body encoding (flexible vs non-flexible) is already handled when creating the body
+        // This used to be a hand-maintained `else if` chain, one arm per API,
+        // defaulting to `true`. That default is wrong for every API whose
+        // advertised max version sits below its flexible cutoff, and the chain
+        // grew an arm each time a client tripped over one: ACLs v0-v1, then
+        // IncrementalAlterConfigs v0, then DeleteTopics v0-v3. Each fix was
+        // correct and each left the next instance in place.
         //
-        // IMPORTANT: DescribeCluster v0 uses NON-flexible format for both header AND body
-        // Even though the client may have negotiated ApiVersions v3+ and sends flexible REQUEST headers,
-        // DescribeCluster v0 responses must use NON-flexible headers (headerVersion=1)
+        // CreateTopics v0-v4 was the next instance — and it mattered, because
+        // librdkafka's AdminClient caps CreateTopics at v4. Every
+        // librdkafka-based client (confluent-kafka-python/go/.NET) received a
+        // response header one byte longer than the schema allows, parsed the
+        // topic-results array from the wrong offset, and reported zero results
+        // for a topic the broker had in fact created. The broker logged success
+        // throughout.
         //
-        // The Kafka protocol specifies:
-        // - DescribeCluster v0: headerVersion=1 (non-flexible)
-        // - DescribeCluster v1: headerVersion=2 (flexible)
-        //
-        // Metadata response header versions:
-        // - Metadata v0-v8: headerVersion=0 (non-flexible, no tagged fields)
-        // - Metadata v9+: headerVersion=1 (flexible, has tagged fields)
-        //
-        // This is DIFFERENT from most other APIs where ApiVersions v3+ negotiation affects all headers.
-        // DescribeCluster and Metadata are special in that their header versions are tied to the API version itself.
+        // So flexibility is now read from `is_flexible_version`, which request
+        // parsing and `write_response_header_flexible` already used. One table,
+        // consulted everywhere, instead of two that can disagree.
         let header_has_tagged_fields = if api_key == ApiKey::ApiVersions {
-            false  // ApiVersions response header NEVER has tagged fields
+            // The one true exception: the ApiVersions response BODY is flexible
+            // from v3, but its HEADER never is — a client that has not yet
+            // learned our versions must be able to parse the reply.
+            false
         } else if api_key == ApiKey::DescribeCluster && header.api_version == 0 {
-            false  // DescribeCluster v0 uses NON-flexible headers
-        } else if api_key == ApiKey::Metadata && header.api_version < 9 {
-            false  // Metadata v0-v8 use NON-flexible headers
-        } else if api_key == ApiKey::AddPartitionsToTxn && header.api_version < 3 {
-            false  // AddPartitionsToTxn v0-v2 use NON-flexible headers (v3+ use flexible)
-        } else if api_key == ApiKey::EndTxn && header.api_version < 3 {
-            false  // EndTxn v0-v2 use NON-flexible headers (v3+ use flexible)
-        } else if api_key == ApiKey::CreatePartitions && header.api_version < 2 {
-            false  // CreatePartitions v0-v1 use NON-flexible headers (v2+ use flexible)
-        } else if (api_key == ApiKey::DescribeAcls || api_key == ApiKey::CreateAcls || api_key == ApiKey::DeleteAcls) && header.api_version < 2 {
-            // ACL APIs v0-v1 use NON-flexible headers (headerVersion=0); flexible
-            // starts at v2. Without this, a v3-negotiated connection gets a flexible
-            // response header (extra tagged-fields byte) on a non-flexible v0-v1 ACL
-            // body, shifting the body by one byte and crashing the Java AdminClient
-            // parser (observed: "reading byte array of 13824 bytes, only 56 available").
-            false
-        } else if api_key == ApiKey::IncrementalAlterConfigs && header.api_version < 1 {
-            // IncrementalAlterConfigs v0 uses a NON-flexible header (flexible starts at
-            // v1). Same latent bug as the ACL APIs: a flexible header on a non-flexible
-            // v0 body shifts the response, so the Java AdminClient reads a bogus
-            // resource_type/name, can't match the result to the requested resource, and
-            // throws NullPointerException even though the broker applied the change.
-            false
-        } else if api_key == ApiKey::DeleteTopics && header.api_version < 4 {
-            // DeleteTopics v0-v3 use NON-flexible headers (flexible starts at v4). We
-            // advertise max v6; v4+ get a flexible header (the default below) matching
-            // the flexible v4+/v6 body encoding in delete_topics_types.rs.
+            // Kept explicit. The spec marks DescribeCluster flexible at 0+, but
+            // we advertise min=1 so v0 is unreachable, and this arm was added
+            // against an observed client failure rather than from the schema.
             false
         } else {
-            // For other APIs and DescribeCluster v1+/Metadata v9+, use flexible headers
-            // when the client has negotiated ApiVersions v3+
-            true
+            crate::parser::is_flexible_version(api_key, header.api_version)
         };
 
         // DescribeCluster v0 does NOT include throttle_time_ms in the response
@@ -3505,6 +3483,10 @@ impl ProtocolHandler {
                 is_leader: true, // deprecated field, kept for compatibility
                 replicas: all_replicas.clone(),
                 leader_id: broker_id as u64,
+                leader_epoch: 0, // assigned by the metadata store
+                // Placement only: this caller has not measured who is caught up.
+                // Empty means "unknown" and leaves any published set intact.
+                isr: Vec::new(),
             }).await
                 .map_err(|e| Error::Internal(format!("assign_partition failed: {:?}", e)))?;
 
@@ -5830,6 +5812,8 @@ impl ProtocolHandler {
                     is_leader: true, // Deprecated field
                     replicas: all_replicas.clone(),  // FIXED: All brokers as replicas for cluster mode
                     leader_id: broker_id as u64,
+                    leader_epoch: 0, // assigned by the metadata store
+                    isr: Vec::new(), // placement only — the leader publishes this
                 });
             }
             
@@ -6114,19 +6098,43 @@ impl ProtocolHandler {
                 let mut sorted_assignments = assignments;
                 sorted_assignments.sort_by_key(|a| a.partition);
 
-                // v2.3.2 FIX: Use the ACTUAL number of partitions, which is the max of
-                // partition_count (from TopicConfig, may be stale on followers) and the
-                // actual number of PartitionAssignment entries (replicated via Raft).
-                // This handles the case where auto_create_topics(3) runs first, then
-                // CreateTopics(6) expands partitions - the TopicUpdated event isn't
-                // replicated but PartitionAssigned events ARE, so assignments > partition_count.
-                let effective_partition_count = std::cmp::max(
-                    topic_meta.config.partition_count,
-                    sorted_assignments.len() as u32,
-                );
+                // How many partitions to tell the client about.
+                //
+                // For an AUTO-CREATED topic, take the larger of the config and
+                // the assignments actually present: `partition_count` can be
+                // stale on a follower while the `PartitionAssigned` events have
+                // arrived, and under-reporting there hides real partitions.
+                //
+                // For a topic someone CREATED EXPLICITLY, the config is the
+                // answer, full stop. Taking the max there is how a topic made
+                // with `--partitions 1` came back as 3: a racing auto-create had
+                // left three assignments behind, and every client was then told
+                // about two partitions the producer had never written to.
+                let effective_partition_count = if topic_meta.auto_created {
+                    std::cmp::max(
+                        topic_meta.config.partition_count,
+                        sorted_assignments.len() as u32,
+                    )
+                } else {
+                    topic_meta.config.partition_count
+                };
 
                 tracing::info!("METADATA→PARTITIONS: topic={} partition_count={} assignments_count={} effective={}",
                               topic_meta.name, topic_meta.config.partition_count, sorted_assignments.len(), effective_partition_count);
+
+                // The measured in-sync set, per partition.
+                //
+                // The leader publishes it into the assignment (see
+                // `isr_publisher`) precisely so it can be read by a node that is
+                // not the leader — which is the situation any Metadata request
+                // may be answered in. Empty means nobody has measured it yet: a
+                // partition never written to, or single-node, where the
+                // assignment is the honest answer.
+                let published_isr: std::collections::HashMap<u32, Vec<i32>> = sorted_assignments
+                    .iter()
+                    .filter(|a| !a.isr.is_empty())
+                    .map(|a| (a.partition, a.isr.iter().map(|&id| id as i32).collect()))
+                    .collect();
 
                 // Create partitions for ALL effective partitions, using assignments where available
                 for partition_id in 0..effective_partition_count {
@@ -6168,14 +6176,43 @@ impl ProtocolHandler {
                         }
                     };
 
+                    // Report the in-sync set the leader actually measured.
+                    //
+                    // This was `replica_nodes.clone()` — the assignment — with
+                    // the note "for now, all replicas are in-sync". That is the
+                    // same inversion RP-1.2 removed from `/admin/status`: a
+                    // partition replicating to nobody reported a full ISR, so
+                    // the one signal that says "you are about to lose data if
+                    // this leader dies" read healthy in exactly the case it
+                    // exists to flag. `/admin/status` was fixed; Metadata was
+                    // not, and Metadata is where every Kafka client and every
+                    // monitoring tool looks — `kafka-topics --describe`, Kafka
+                    // UI, Cruise Control.
+                    //
+                    // Falling back to the assignment when nothing has been
+                    // measured keeps single-node and brand-new partitions
+                    // correct; see `isr_publisher::in_sync_replicas`, which
+                    // documents the same "unknown is not the same as empty"
+                    // rule.
+                    let isr_nodes = published_isr
+                        .get(&partition_id)
+                        .cloned()
+                        .unwrap_or_else(|| replica_nodes.clone());
+
+                    let offline_replicas: Vec<i32> = replica_nodes
+                        .iter()
+                        .copied()
+                        .filter(|id| !isr_nodes.contains(id))
+                        .collect();
+
                     let partition_metadata = MetadataPartition {
                         error_code: 0,
                         partition_index: partition_id as i32,
                         leader_id,
                         leader_epoch: 0,
                         replica_nodes: replica_nodes.clone(),
-                        isr_nodes: replica_nodes.clone(), // For now, all replicas are in-sync
-                        offline_replicas: vec![],
+                        isr_nodes,
+                        offline_replicas,
                     };
 
                     tracing::info!("METADATA_PARTITION_FINAL: topic={} partition={} error_code={} leader_id={} replicas={:?} isr={:?}",
@@ -6338,6 +6375,8 @@ impl ProtocolHandler {
                             is_leader: true,  // Deprecated field
                             replicas: all_replicas.clone(),  // FIXED: All brokers as replicas for cluster mode
                             leader_id: broker_id as u64,
+                            leader_epoch: 0, // assigned by the metadata store
+                            isr: Vec::new(), // placement only — the leader publishes this
                         });
                     }
                     
@@ -6347,8 +6386,12 @@ impl ProtocolHandler {
                         offsets.push((partition, 0i64, 0i64)); // partition, high_watermark, log_start_offset
                     }
                     
-                    // Create topic with assignments
-                    match metadata_store.create_topic_with_assignments(
+                    // Create topic with assignments.
+                    //
+                    // The `auto_` variant: this partition count is a default,
+                    // not a request, and recording that is what stops it
+                    // overwriting a topic someone created with a different one.
+                    match metadata_store.auto_create_topic_with_assignments(
                         topic_name,
                         config,
                         assignments,

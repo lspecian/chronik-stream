@@ -1,0 +1,329 @@
+#!/usr/bin/env bash
+# RP-3.3: manufacture a genuinely divergent log, and prove the follower discards it.
+#
+# Every other failure this suite stages ends in "log is a prefix — nothing to
+# truncate", which is the *correct* outcome and therefore proves nothing about
+# the branch that deletes data. Killing a leader cannot produce divergence when
+# writes are acknowledged by the full ISR: the survivors already hold everything
+# the dead node had.
+#
+# Real divergence needs a leader that accepted writes its followers never
+# received, and which then loses the election:
+#
+#   1. produce a common prefix at acks=all   → all three replicas agree
+#   2. cut the FOLLOWERS off from the leader (policy, then restart them)
+#   3. produce at acks=1 to the leader       → records only it can have
+#   4. kill the leader; the followers still hold quorum with each other
+#   5. produce at acks=all to the new leader → different records, SAME offsets
+#   6. heal, and let the old leader rejoin
+#
+# The followers are isolated rather than the leader because a severed leader
+# serves the client only partially — one run took 20 of 60 records before the
+# producer gave up — which makes step 3 unpredictable. A healthy leader with
+# deaf followers accepts every acks=1 write, and nothing else can have them.
+#
+# The old leader now holds a tail that the new leader never committed, at
+# offsets the new leader has filled with something else. Two logs that agree on
+# offsets and disagree on records — the exact condition leader epochs exist to
+# detect. It must truncate to the divergence point and re-replicate.
+#
+# PASS:
+#   - the returning leader logs a truncation for the partition
+#   - every record acknowledged by the NEW leader is readable afterwards
+#   - the records only the isolated leader ever had are GONE (they were never
+#     committed; keeping them is the corruption this phase prevents)
+#
+# Usage:
+#   REPL_NS=rp3-test REPL_PODS=rp3 \
+#     REPL_KUBECTL="ssh ubuntu@host sudo microk8s kubectl" \
+#     ./tests/cluster/divergence_truncation.sh
+set -u
+
+KUBECTL="${REPL_KUBECTL:-kubectl}"
+NS="${REPL_NS:-}"
+PODS="${REPL_PODS:-rp3}"
+CLIENT="${REPL_CLIENT:-replcheck}"
+PREFIX_N="${DIVERGE_PREFIX:-100}"   # common prefix, acks=all
+ORPHAN_N="${DIVERGE_ORPHAN:-60}"    # written only to the isolated leader
+WINNER_N="${DIVERGE_WINNER:-60}"    # written to the new leader at the same offsets
+FAIL=0
+
+say()  { printf '%s\n' "$*"; }
+fail() { say "FAIL: $*"; FAIL=1; }
+
+[ -n "$NS" ] || { say "SKIP: set REPL_NS"; exit 0; }
+BOOT="${PODS}-headless:9092"
+TOPIC="diverge-$$"
+POLICY="isolate-leader-$$"
+
+cleanup() {
+  $KUBECTL delete networkpolicy "$POLICY" -n "$NS" --wait=false >/dev/null 2>&1
+}
+trap cleanup EXIT
+
+# Run a shell pipeline inside the client pod.
+#
+# This needs the same quote-level probe `regression_replication.sh` carries, and
+# for the same reason: with `REPL_KUBECTL` as an ssh wrapper, the payload passes
+# through an extra shell and loses one level of quoting, so a pipeline silently
+# becomes nonsense. This script originally shipped without it and every produce
+# failed with exit 127 — the topic ended up empty, and the two assertions at the
+# end then "failed" against a cluster that had never been given any data. A
+# harness that reports on work it never did is worse than one that crashes.
+sh_quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+pod_sh() {
+  local payload="$1"
+  [ "${QUOTE_LEVEL:-0}" -ge 1 ] && payload=$(sh_quote "$1")
+  $KUBECTL exec -n "$NS" "$CLIENT" -- bash -c "$payload"
+}
+
+# Probe it by running something whose correct output cannot happen by accident.
+detect_quote_level() {
+  local want='probe-2-ok' script='echo probe-$((1+1))-ok'
+  QUOTE_LEVEL=0
+  [ "$(pod_sh "$script" 2>/dev/null | tr -d '\r\n')" = "$want" ] && return 0
+  QUOTE_LEVEL=1
+  [ "$(pod_sh "$script" 2>/dev/null | tr -d '\r\n')" = "$want" ] && return 0
+  say "ABORT: cannot run a shell pipeline inside $CLIENT via REPL_KUBECTL."
+  say "       Without this, produce silently does nothing and every result below"
+  say "       is meaningless."
+  exit 1
+}
+
+status_of() { # $1 = pod to ask
+  $KUBECTL exec -n "$NS" "$1" -- curl -s -m 15 http://localhost:6092/admin/status 2>/dev/null
+}
+
+leader_of() { # $1 = pod to ask; leader of TOPIC partition 0
+  status_of "$1" | tr '{' '\n' | grep "\"topic\":\"$TOPIC\"" \
+    | grep '"partition":0,' | grep -o '"leader":[0-9]*' | head -1 | tr -cd '0-9'
+}
+
+produce() { # $1=first $2=last $3=acks $4=tag
+  pod_sh "seq $1 $2 | awk '{print \$1\":$4-\"\$1}' | \
+    /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server $BOOT --topic $TOPIC \
+      --producer-property acks=$3 --property parse.key=true --property key.separator=:" \
+    >/dev/null 2>&1
+}
+
+say "== RP-3.3 divergence test: $TOPIC =="
+detect_quote_level
+say "-- client shell ready (quote level $QUOTE_LEVEL)"
+
+$KUBECTL exec -n "$NS" "$CLIENT" -- /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server "$BOOT" --create --topic "$TOPIC" \
+  --partitions 1 --replication-factor 3 >/dev/null 2>&1
+
+# 1. Common prefix. acks=all, so all three replicas hold it.
+produce 1 "$PREFIX_N" all prefix
+sleep 6
+
+# Prove the setup before testing anything with it.
+#
+# The first version of this script asserted its way to two confident failures
+# against a topic that had never received a single record. Everything below
+# depends on this prefix existing on all three replicas, so check it and abort
+# loudly rather than measure an empty cluster.
+prefix_seen=$(pod_sh "/opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server $BOOT \
+  --topic $TOPIC --partition 0 --offset earliest --timeout-ms 25000 2>/dev/null | grep -c '^prefix-'" \
+  2>/dev/null | tr -cd '0-9')
+if [ "${prefix_seen:-0}" -lt "$PREFIX_N" ]; then
+  fail "setup did not take: only ${prefix_seen:-0} of $PREFIX_N prefix records are readable — refusing to draw conclusions from an empty topic"
+  exit 1
+fi
+say "-- prefix confirmed: $prefix_seen record(s) on the log"
+
+# Ask a node we are NOT about to isolate — a status endpoint behind a partition
+# reports nothing, which reads exactly like "no leader".
+OLD=$(leader_of "${PODS}-1")
+[ -z "$OLD" ] && OLD=$(leader_of "${PODS}-2")
+if [ -z "$OLD" ]; then fail "no leader for $TOPIC"; exit 1; fi
+OBS="${PODS}-1"; [ "$OLD" = "1" ] && OBS="${PODS}-2"
+say "-- leader is node $OLD (observing from $OBS)"
+
+# 2. Cut the followers off from the leader.
+#
+#    **A NetworkPolicy does not partition a cluster that has already formed.**
+#    Calico allows established connections, so the pre-existing gRPC channels
+#    keep carrying Raft straight through a policy applied afterwards; only *new*
+#    connections are blocked. A `/dev/tcp` probe therefore reports the peer as
+#    unreachable while the cluster carries on talking normally — a very
+#    convincing false negative. The policy must be followed by restarting the
+#    pods it selects, so their connections are re-made under it.
+#
+#    That cost two runs and one wrong conclusion: with the "isolated" node still
+#    reachable over its old channels no election happened, and the obvious
+#    reading was that Raft leader election was broken. It is not — killing the
+#    leader's pod elects a new one in about three seconds.
+#
+#    Isolate the FOLLOWERS, not the leader.
+#
+#    Cutting off the leader looked like the obvious move and does not work: a
+#    leader severed from the cluster serves the client only partially — one run
+#    accepted 20 of 60 records before the producer gave up — so the "records only
+#    it has" step produces an unpredictable amount, and the node comes back in a
+#    state that is hard to reason about.
+#
+#    Isolating the followers leaves the leader completely healthy: it holds
+#    leadership, the client reaches it normally, and `acks=1` writes land in full
+#    because the leader acknowledges alone. The followers simply cannot fetch
+#    them. They keep talking to *each other*, so they still hold quorum and can
+#    elect between themselves the moment the leader goes away.
+say "-- isolating the followers from node $OLD (they keep quorum with each other)"
+cat <<YAML | $KUBECTL apply -f - >/dev/null 2>&1
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: $POLICY
+  namespace: $NS
+spec:
+  podSelector:
+    matchExpressions:
+      - key: chronik.io/node-id
+        operator: NotIn
+        values: ["$OLD"]
+      - key: chronik.io/cluster-name
+        operator: Exists
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchExpressions:
+              - key: chronik.io/node-id
+                operator: NotIn
+                values: ["$OLD"]
+        - podSelector:
+            matchLabels:
+              run: $CLIENT
+  egress:
+    - to:
+        - podSelector:
+            matchExpressions:
+              - key: chronik.io/node-id
+                operator: NotIn
+                values: ["$OLD"]
+        - podSelector:
+            matchLabels:
+              run: $CLIENT
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+YAML
+
+# 2b. Restart the followers so their connections are re-made under the policy.
+#     A policy alone cannot sever the fetch connections they already hold.
+say "-- restarting the followers so their connections to node $OLD are denied from birth"
+for n in 1 2 3; do
+  [ "$n" = "$OLD" ] && continue
+  $KUBECTL delete pod "${PODS}-${n}" -n "$NS" --wait=false >/dev/null 2>&1
+done
+for i in $(seq 1 40); do
+  r=$($KUBECTL get pods -n "$NS" --no-headers 2>/dev/null | grep -c "^${PODS}-.* 1/1 *Running")
+  [ "$r" -ge 3 ] && break
+  sleep 5
+done
+sleep 15
+
+# 3. Records that only the leader can have: it is healthy and reachable, and
+#    acks=1 means it acknowledges alone. The followers cannot fetch them.
+say "-- writing $ORPHAN_N record(s) only node $OLD can have"
+produce $((PREFIX_N + 1)) $((PREFIX_N + ORPHAN_N)) 1 orphan
+sleep 5
+orphan_on_leader=$(pod_sh "/opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server $BOOT \
+  --topic $TOPIC --partition 0 --offset earliest --timeout-ms 25000 2>/dev/null | grep -c '^orphan-'" \
+  2>/dev/null | tr -cd '0-9')
+say "   leader now holds ${orphan_on_leader:-0} orphan record(s)"
+if [ "${orphan_on_leader:-0}" -lt 1 ]; then
+  fail "no orphan records landed — there is no divergence to test"
+  exit 1
+fi
+
+# 4. Kill the leader. The isolated followers still hold quorum with each other.
+say "-- killing node $OLD so the followers must take over without those records"
+victim_node=$($KUBECTL get pod "${PODS}-${OLD}" -n "$NS" -o jsonpath='{.spec.nodeName}' 2>/dev/null)
+$KUBECTL cordon "$victim_node" >/dev/null 2>&1
+$KUBECTL delete pod "${PODS}-${OLD}" -n "$NS" --wait=false >/dev/null 2>&1
+
+# 5. Wait for the survivors to elect and for RP-5 to move the partition.
+NEW=""
+deadline=$((SECONDS + 240))
+while [ "$SECONDS" -lt "$deadline" ]; do
+  sleep 10
+  now=$(leader_of "$OBS")
+  if [ -n "$now" ] && [ "$now" != "$OLD" ]; then NEW="$now"; break; fi
+done
+
+if [ -z "$NEW" ]; then
+  fail "leadership never moved off node $OLD — cannot create divergence"
+  exit 1
+fi
+say "-- leadership moved to node $NEW"
+
+# 5. Different records at the SAME offsets the orphans occupy.
+produce $((PREFIX_N + 1)) $((PREFIX_N + WINNER_N)) all winner
+say "-- wrote $WINNER_N committed record(s) over those offsets"
+sleep 5
+
+# 6. Heal: drop the policy and let the old leader back.
+say "-- healing, and letting node $OLD rejoin"
+cleanup
+[ -n "$victim_node" ] && $KUBECTL uncordon "$victim_node" >/dev/null 2>&1
+for i in $(seq 1 60); do
+  r=$($KUBECTL get pods -n "$NS" --no-headers 2>/dev/null | grep -c "^${PODS}-.* 1/1 *Running")
+  [ "$r" -ge 3 ] && break
+  sleep 5
+done
+
+# The returning leader must discard its uncommitted tail.
+say "-- waiting for node $OLD to reconcile"
+truncated=0
+deadline=$((SECONDS + 300))
+while [ "$SECONDS" -lt "$deadline" ]; do
+  sleep 10
+  if $KUBECTL logs -n "$NS" "${PODS}-${OLD}" --since=15m 2>/dev/null \
+     | grep -qE "truncated to|diverged from the leader"; then
+    truncated=1; break
+  fi
+done
+
+say ""
+say "-- evidence on node $OLD:"
+$KUBECTL logs -n "$NS" "${PODS}-${OLD}" --since=15m 2>/dev/null \
+  | grep -E "diverged from the leader|truncated to|log is a prefix|not truncating" \
+  | tail -5 | sed 's/^/     /'
+
+[ "$truncated" -eq 1 ] \
+  || fail "node $OLD never truncated — it is still holding records the cluster never committed"
+
+# Committed records must survive; uncommitted ones must not.
+#
+# Read partition 0 explicitly rather than subscribing to the topic. The
+# subscribe path here is unreliable — two identical invocations seconds apart
+# have returned 272 records and then 0 (issue #36) — and a flaky reader turns
+# every assertion below into a coin toss. An explicit partition assignment with
+# `--offset earliest` has been consistent.
+pod_sh "/opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server $BOOT \
+  --topic $TOPIC --partition 0 --offset earliest --timeout-ms 30000 2>/dev/null | sort -u > /tmp/d.txt" \
+  >/dev/null 2>&1
+survived=$(pod_sh "grep -c '^winner-' /tmp/d.txt" 2>/dev/null | tr -cd '0-9')
+orphans=$(pod_sh "grep -c '^orphan-' /tmp/d.txt" 2>/dev/null | tr -cd '0-9')
+
+say ""
+say "   committed (winner) records readable: ${survived:-0} / $WINNER_N"
+say "   uncommitted (orphan) records still readable: ${orphans:-0} (must be 0)"
+
+[ "${survived:-0}" -ge "$WINNER_N" ] \
+  || fail "only ${survived:-0} of $WINNER_N committed records survived — truncation took too much"
+[ "${orphans:-0}" -eq 0 ] \
+  || fail "${orphans} record(s) the cluster never committed are still readable — the divergent tail survived"
+
+say ""
+if [ "$FAIL" -eq 0 ]; then
+  say "== PASS: the divergent tail was discarded and every committed record survived =="
+else
+  say "== FAIL: see messages above =="
+fi
+exit "$FAIL"

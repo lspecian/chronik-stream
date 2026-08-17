@@ -152,6 +152,29 @@ pub struct PartitionInfo {
     pub leader: Option<u64>,
     pub replicas: Vec<u64>,
     pub isr: Vec<u64>,
+
+    /// RP-2.2: how far each follower is behind the leader, as `node_id:lag`.
+    ///
+    /// `under_replicated` alone tells you something is wrong; this tells you
+    /// which replica and by how much, which is the difference between an
+    /// actionable alert and a page with no next step. Only meaningful on the
+    /// partition leader — followers ACK to the leader, so a non-leader has no
+    /// data and reports an empty map.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub replica_lag: Vec<ReplicaLag>,
+
+    /// True when the ISR is smaller than the configured replica set.
+    ///
+    /// The single field worth alerting on: it is what should have been firing
+    /// during the nine months `acks!=0` replicated nothing.
+    pub under_replicated: bool,
+}
+
+/// Lag of one follower behind its leader, in records.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ReplicaLag {
+    pub node_id: u64,
+    pub lag: i64,
 }
 
 /// Response from rebalance request
@@ -489,6 +512,8 @@ async fn handle_rebalance(
                 is_leader: true,
                 replicas: replicas.clone(),
                 leader_id,
+                leader_epoch: 0, // assigned by the metadata store
+                isr: Vec::new(), // placement only — the leader publishes the in-sync set
             };
 
             if let Err(e) = state.metadata_store.assign_partition(assignment).await {
@@ -559,6 +584,11 @@ async fn collect_partition_info_from_metadata(
                         leader: None,
                         replicas: Vec::new(),
                         isr: Vec::new(),
+                        replica_lag: Vec::new(),
+                        // No assignment known at all — nothing to compare, so
+                        // this is "unknown", not "degraded". Reporting it as
+                        // under-replicated would page on an empty catalog.
+                        under_replicated: false,
                     });
                 }
             }
@@ -575,30 +605,66 @@ async fn collect_partition_info_from_metadata(
                             .map(|(hw, _)| hw)  // Extract high watermark from (hw, log_start_offset) tuple
                             .unwrap_or(0);
 
-                        // Get ISR from tracker - includes replicas that have caught up
-                        let tracked_isr = tracker.get_isr(
+                        // One definition of "in sync", shared with the publisher
+                        // that failover elects from. Two definitions would let an
+                        // operator read one set while the cluster acted on another.
+                        //
+                        // `None` means the tracker has heard nothing at all for
+                        // this partition — a freshly started cluster before any
+                        // report — which is "unknown", not "empty". Earlier this
+                        // fell back on *any* empty ISR, so a partition whose
+                        // followers had all fallen behind (or were never receiving
+                        // data at all, as when acks!=0 silently skipped
+                        // replication — see #29) reported a full, healthy ISR.
+                        // That is the opposite of the truth, and it is why the
+                        // replication outage stayed invisible for nine months.
+                        crate::isr_publisher::in_sync_replicas(
+                            tracker,
                             &assignment.topic,
                             assignment.partition as i32,
                             leader_offset,
                             &assignment.replicas,
-                        );
-
-                        // If tracker has data, use it; otherwise fall back to all replicas
-                        // (on cluster startup before any ACKs, ISR = replicas is correct)
-                        if tracked_isr.is_empty() {
-                            assignment.replicas.clone()
-                        } else {
-                            // Always include leader in ISR (leader is always in-sync with itself)
-                            let mut isr_with_leader = tracked_isr;
-                            if !isr_with_leader.contains(&assignment.leader_id) {
-                                isr_with_leader.insert(0, assignment.leader_id);
-                            }
-                            isr_with_leader
-                        }
+                            assignment.leader_id,
+                        )
+                        .unwrap_or_else(|| assignment.replicas.clone())
                     } else {
                         // No tracker available - fall back to ISR = replicas
                         assignment.replicas.clone()
                     };
+
+                    // RP-2.2: per-follower lag, so an under-replicated partition
+                    // names the replica that is behind and by how much. Only the
+                    // leader has this — followers report to it — so a non-leader
+                    // yields an empty list rather than a misleading zero.
+                    let replica_lag: Vec<ReplicaLag> = match isr_tracker {
+                        Some(ref tracker) => {
+                            let leader_offset = metadata_store
+                                .get_partition_offset(&assignment.topic, assignment.partition)
+                                .await
+                                .ok()
+                                .flatten()
+                                .map(|(hw, _)| hw)
+                                .unwrap_or(0);
+                            assignment
+                                .replicas
+                                .iter()
+                                .filter(|&&id| id != assignment.leader_id)
+                                .filter_map(|&node_id| {
+                                    tracker
+                                        .get_follower_lag(
+                                            node_id,
+                                            &assignment.topic,
+                                            assignment.partition as i32,
+                                            leader_offset,
+                                        )
+                                        .map(|lag| ReplicaLag { node_id, lag })
+                                })
+                                .collect()
+                        }
+                        None => Vec::new(),
+                    };
+
+                    let under_replicated = isr.len() < assignment.replicas.len();
 
                     all_partitions.push(PartitionInfo {
                         topic: assignment.topic.clone(),
@@ -606,6 +672,8 @@ async fn collect_partition_info_from_metadata(
                         leader: Some(assignment.leader_id),
                         replicas: assignment.replicas.clone(),
                         isr,
+                        replica_lag,
+                        under_replicated,
                     });
                 }
             }

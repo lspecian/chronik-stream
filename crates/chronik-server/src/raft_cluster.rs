@@ -43,6 +43,17 @@ pub struct RaftCluster {
     /// Node ID in the cluster
     node_id: u64,
 
+    /// Membership this node was started with — self plus the configured peers.
+    ///
+    /// The state machine only learns node addresses from AddNode conf-changes,
+    /// which a cluster started from a config file never issues: its peers are
+    /// static and already known. `/admin/status` therefore reported
+    /// `"nodes": []` on every node of a healthy multi-node cluster, so an
+    /// operator could not see membership at all. Kept here as the answer when
+    /// the state machine has nothing, and superseded by it as soon as a
+    /// conf-change lands.
+    configured_nodes: Vec<(u64, String)>,
+
     /// Metadata state machine (shared with Raft)
     /// v2.2.7 DEADLOCK FIX: Uses ArcSwap for lock-free atomic pointer swapping
     /// - Reads: Zero-cost via .load() - just atomic pointer dereference
@@ -416,7 +427,12 @@ impl RaftCluster {
     ///
     /// **Refactored**: Reduced from 255 lines (~70-90 complexity) to ~70 lines (<25 complexity)
     /// Complexity: < 25 (simple orchestration of extracted helpers)
-    pub async fn bootstrap(node_id: u64, peers: Vec<(u64, String)>, data_dir: PathBuf) -> Result<Self> {
+    pub async fn bootstrap(
+        node_id: u64,
+        peers: Vec<(u64, String)>,
+        self_addr: String,
+        data_dir: PathBuf,
+    ) -> Result<Self> {
         tracing::info!(
             "Bootstrapping Raft cluster: node_id={}, peers={:?}",
             node_id,
@@ -461,9 +477,17 @@ impl RaftCluster {
             pending_partitions,
         ) = Self::create_channels_and_caches();
 
+        // Self plus the configured peers, in node-id order so the reported
+        // membership is stable rather than reordering between calls.
+        let mut configured_nodes: Vec<(u64, String)> = peers.clone();
+        configured_nodes.push((node_id, self_addr));
+        configured_nodes.sort_by_key(|(id, _)| *id);
+        configured_nodes.dedup_by_key(|(id, _)| *id);
+
         // Phase 9: Construct and return RaftCluster
         Ok(Self {
             node_id,
+            configured_nodes,
             state_machine,
             raft_node: Arc::new(tokio::sync::Mutex::new(raft_node)), // v2.2.7: tokio::Mutex (required for async context)
             storage: Arc::new(storage_for_async),
@@ -1314,13 +1338,97 @@ impl RaftCluster {
         voters
     }
 
+    /// Sample which peers Raft has heard from recently (RP-5).
+    ///
+    /// This is the cluster's only real liveness signal. Replication traffic
+    /// cannot supply one for a partition *leader*: followers report to their
+    /// leader, so when the leader dies there is nobody left to notice. Raft
+    /// heartbeats run between all members regardless of who leads what, which
+    /// is why Kafka's controller watches broker liveness the same way rather
+    /// than inferring it from the data path.
+    ///
+    /// Only meaningful on the Raft leader — `recent_active` is maintained by
+    /// the leader as it receives responses — so this returns `None` elsewhere
+    /// rather than an empty set that would read as "everything is dead".
+    ///
+    /// Each call reports who has been heard from **since the previous call**,
+    /// and then clears the flags so the next one measures a fresh interval.
+    /// That reset is the whole reason this is meaningful:
+    ///
+    /// `recent_active` is set when a peer replies and is cleared only by
+    /// `check_quorum_active`, which Raft calls only when `check_quorum` is
+    /// enabled. This cluster leaves it at its default of `false` — deliberately,
+    /// since the config is already tuned around election storms (see
+    /// `election_tick` above), and turning it on would make a leader step down
+    /// whenever it misses a quorum of replies for one election timeout. With it
+    /// off, nothing ever clears the flag: **a peer that has ever been seen reads
+    /// alive forever, including after it dies.** That is exactly what made the
+    /// first RP-5 build a no-op on a real cluster — the planner was correct and
+    /// its input was a constant.
+    ///
+    /// So the reset is owned here instead, which leaves consensus behaviour
+    /// untouched. It does mean this must be the *only* consumer of the flags:
+    /// two callers would steal each other's evidence. Enabling `check_quorum`
+    /// later would make Raft a second consumer — survivable, since the caller
+    /// accumulates over a window much longer than an election timeout, but it
+    /// should be a deliberate decision rather than a surprise.
+    ///
+    /// Still a **sample, not a verdict**: a live peer can miss one interval.
+    /// Callers accumulate over a window; treating one absence as death would
+    /// fail every partition over on a timer.
+    pub async fn sample_active_peers(&self) -> Option<Vec<u64>> {
+        // Deliberately NOT `am_i_leader()`. That reads `cached_is_leader`, which
+        // is refreshed only inside the message loop's `has_ready()` branch — so
+        // on a quiet cluster it can sit stale, and a caller that gates on it
+        // silently does nothing. The state under the lock is the truth, and one
+        // lock every couple of seconds is not a cost worth trading correctness
+        // for.
+        let mut raft = self.raft_node.lock().await;
+        if raft.raft.state != raft::StateRole::Leader {
+            // Not leading: the flags are not ours to read or clear.
+            return None;
+        }
+
+        let self_id = self.node_id;
+        let mut active = vec![self_id];
+        for (id, progress) in raft.raft.prs().iter() {
+            if *id != self_id && progress.recent_active {
+                active.push(*id);
+            }
+        }
+
+        // Clear for the next interval. Raft does not do this for us here.
+        for (id, progress) in raft.raft.mut_prs().iter_mut() {
+            if *id != self_id {
+                progress.recent_active = false;
+            }
+        }
+
+        Some(active)
+    }
+
     /// Get node information (ID -> address mapping)
     ///
     /// # Returns
     /// Vector of (node_id, address) tuples
     pub fn get_node_info(&self) -> Vec<(u64, String)> {
         let sm = self.state_machine.load();
-        sm.nodes.iter().map(|(id, addr)| (*id, addr.clone())).collect()
+        if !sm.nodes.is_empty() {
+            let mut nodes: Vec<(u64, String)> = sm
+                .nodes
+                .iter()
+                .map(|(id, addr)| (*id, addr.clone()))
+                .collect();
+            nodes.sort_by_key(|(id, _)| *id);
+            return nodes;
+        }
+
+        // The state machine records a node only when an AddNode conf-change is
+        // applied. A cluster brought up from a config file has static peers and
+        // never issues one, so this was empty for the entire life of every
+        // config-file cluster — and `/admin/status` reported no members at all
+        // while happily reporting their partitions.
+        self.configured_nodes.clone()
     }
 
     /// Get all partition information
@@ -1353,29 +1461,6 @@ impl RaftCluster {
         // }
 
         // partitions
-    }
-
-    /// Propose a partition leader change
-    ///
-    /// Helper method for leader election.
-    pub async fn propose_set_partition_leader(
-        &self,
-        topic: &str,
-        partition: i32,
-        leader: u64,
-    ) -> Result<()> {
-        // v2.2.9 Option 4: Partition metadata moved to WalMetadataStore
-        // This function is no longer needed - partition leaders handled by WalMetadataStore
-        tracing::warn!("propose_set_partition_leader called but partition metadata now in WalMetadataStore");
-        Ok(())
-
-        // let cmd = MetadataCommand::SetPartitionLeader {
-        //     topic: topic.to_string(),
-        //     partition,
-        //     leader,
-        // };
-
-        // self.propose(cmd).await
     }
 
     /// Check if THIS node is the Raft leader
@@ -2395,11 +2480,37 @@ impl RaftCluster {
                 // This enables metadata queries to check leadership without locking raft_node
                 let current_leader_id_val = raft_lock.raft.leader_id;
                 let current_state = raft_lock.raft.state;
-                self.cached_leader_id.store(current_leader_id_val, Ordering::Relaxed);
-                self.cached_is_leader.store(
+                let current_term_val = raft_lock.raft.term;
+
+                // Say out loud when consensus changes hands.
+                //
+                // Raft's own logs go through slog → the `log` crate, and in
+                // practice nothing from raft-rs has ever appeared in this
+                // service's output — so leadership, terms and elections have
+                // been entirely invisible. Diagnosing "did a new leader get
+                // elected?" meant inferring it from downstream symptoms, which
+                // is how a partition that never failed over looked like four
+                // different bugs in turn.
+                //
+                // These transitions are rare by nature, so logging every one at
+                // info costs nothing and answers the question directly.
+                let previous_leader = self.cached_leader_id.swap(current_leader_id_val, Ordering::Relaxed);
+                let was_leader = self.cached_is_leader.swap(
                     current_state == raft::StateRole::Leader,
                     Ordering::Relaxed
                 );
+                let is_leader_now = current_state == raft::StateRole::Leader;
+
+                if previous_leader != current_leader_id_val || was_leader != is_leader_now {
+                    tracing::info!(
+                        "Raft leadership: node {} is now {:?} at term {} (leader is {}, was {})",
+                        self.node_id,
+                        current_state,
+                        current_term_val,
+                        current_leader_id_val,
+                        previous_leader
+                    );
+                }
 
                 // METRICS: Calculate total lock hold time (including I/O)
                 let lock_released_at = std::time::Instant::now();
@@ -2647,14 +2758,14 @@ mod tests {
             (3, "localhost:9094".to_string()),
         ];
 
-        let cluster = RaftCluster::bootstrap(1, peers, PathBuf::from("/tmp/raft-test")).await.unwrap();
+        let cluster = RaftCluster::bootstrap(1, peers, "localhost:5001".to_string(), PathBuf::from("/tmp/raft-test")).await.unwrap();
 
         assert_eq!(cluster.node_id(), 1);
     }
 
     #[tokio::test]
     async fn test_metadata_queries() {
-        let cluster = RaftCluster::bootstrap(1, vec![], PathBuf::from("/tmp/raft-test2")).await.unwrap();
+        let cluster = RaftCluster::bootstrap(1, vec![], "localhost:5001".to_string(), PathBuf::from("/tmp/raft-test2")).await.unwrap();
 
         // v2.2.9: Partition assignments moved to WalMetadataStore.
         // Raft state machine only manages cluster membership (nodes, brokers).
@@ -2676,7 +2787,7 @@ mod tests {
     async fn test_raft_bootstrap_single_node() {
         // Raft is always compiled in — verify single-node bootstrap works
         let temp = tempfile::TempDir::new().unwrap();
-        let result = RaftCluster::bootstrap(1, vec![], temp.path().to_path_buf()).await;
+        let result = RaftCluster::bootstrap(1, vec![], "localhost:5001".to_string(), temp.path().to_path_buf()).await;
         assert!(result.is_ok(), "Single-node Raft bootstrap should succeed");
     }
 }
@@ -2718,6 +2829,7 @@ pub async fn run_raft_cluster(config: RaftClusterConfig) -> Result<()> {
     let raft_cluster = Arc::new(RaftCluster::bootstrap(
         config.node_id,
         raft_peers,
+        config.raft_addr.clone(),
         PathBuf::from(&config.data_dir)
     ).await?);
 

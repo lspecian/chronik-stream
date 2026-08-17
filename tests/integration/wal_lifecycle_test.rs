@@ -1,7 +1,20 @@
 //! WAL Lifecycle Integration Test
-//! 
+//!
+//! # Currently `#[ignore]`d — it starts no broker
+//!
+//! It produces to a hardcoded `localhost:19092` and expects something to already
+//! be listening there, but nothing in this file (or in the suite) starts a
+//! broker on that port. Left running it does not fail — it retries the refused
+//! connection forever, which is how it hung a suite run for 25 minutes before
+//! being killed. Unlike its siblings it does not use `TestCluster`, so pointing
+//! it at one is a rewrite rather than a repair.
+//!
+//! Start a broker on 19092 and run with `--ignored`, or port it to
+//! `TestCluster` (see `wal_recovery_test.rs`, which manages its own process).
+//!
 //! This test validates the complete write→flush→fetch lifecycle through the WAL system.
 //! Tests message ordering, offset guarantees, and data consistency using embedded Kafka producers.
+use rdkafka::producer::Producer;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -19,12 +32,7 @@ use tokio::time::timeout;
 use tempfile::TempDir;
 use tracing::{info, debug, warn};
 
-use chronik_common::{
-    TopicPartition, 
-    ProducerRecord, 
-    ConsumerRecord,
-    metadata::TopicMetadata,
-};
+use chronik_common::metadata::TopicMetadata;
 
 /// Test configuration
 const TEST_TOPIC: &str = "wal-lifecycle-test";
@@ -36,6 +44,7 @@ const MESSAGE_SIZE: usize = 100;
 
 /// WAL Lifecycle Test Suite
 #[tokio::test]
+#[ignore = "needs a broker on 19092 that this test never starts; see module docs"]
 async fn test_wal_write_flush_fetch_lifecycle() -> Result<()> {
     // Initialize test logging
     let _ = env_logger::builder()
@@ -149,7 +158,7 @@ async fn produce_test_messages(stats: &mut TestStatistics) -> Result<Vec<TestMes
         match timeout(Duration::from_secs(5), producer.send(record, Duration::from_secs(0))).await {
             Ok(Ok(delivery)) => {
                 debug!("Message {} delivered to partition {} offset {}", 
-                       i, delivery.1, delivery.2);
+                       i, delivery.0, delivery.1);
                 produced_messages.push(message);
                 stats.messages_produced += 1;
             }
@@ -411,6 +420,7 @@ struct TestStatistics {
 
 // Additional stress test for concurrent WAL operations
 #[tokio::test]
+#[ignore = "needs a broker on 19092 that this test never starts; see module docs"]
 async fn test_concurrent_wal_operations() -> Result<()> {
     info!("Starting concurrent WAL operations stress test");
     

@@ -9,13 +9,19 @@ use chronik_storage::kafka_records::{KafkaRecordBatch, KafkaRecord, RecordHeader
 use chronik_storage::tantivy_segment::TantivySegmentReader;
 use chronik_storage::canonical_record::CanonicalRecord;
 use chronik_wal::{WalManager, WalRecord};
+use dashmap::DashMap;
 use std::collections::HashMap;
 use std::io::Cursor;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tokio::time::timeout;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
+
+/// Replica fetches served, process-wide. Only ever used to sample the timing
+/// breakdown in `handle_fetch` rather than log every round trip (RP-9).
+static REPLICA_FETCH_SAMPLES: AtomicU64 = AtomicU64::new(0);
 
 /// In-memory buffer for recent records
 /// CRITICAL v1.3.32: Store RAW Kafka batch bytes to preserve CRC
@@ -117,6 +123,34 @@ pub struct FetchHandler {
     state: Arc<RwLock<FetchState>>,
     /// Configuration for fetch behavior
     config: FetchHandlerConfig,
+    /// RP-2.1: where follower fetch positions are recorded.
+    ///
+    /// A follower's fetch offset is its log end offset, so the fetch itself is
+    /// both a progress report and a liveness signal — replacing the ACK channel,
+    /// heartbeat replies and connection probing that the push model needed to
+    /// approximate the same information.
+    isr_tracker: Option<Arc<crate::isr_tracker::IsrTracker>>,
+    isr_ack_tracker: Option<Arc<crate::isr_ack_tracker::IsrAckTracker>>,
+
+    /// Woken when a partition is appended to, so a parked fetch learns about new
+    /// records instead of discovering them on a timer.
+    ///
+    /// The long poll used to check every 10ms. That is not a small cost, because
+    /// each check asks the metadata store for the partition's segments — so
+    /// polling faster does not help: at 1ms the checks cost about as much as the
+    /// interval saves, which is exactly what measurement showed (3,887 vs 3,935
+    /// msg/s, indistinguishable).
+    ///
+    /// The interval is also directly in the `acks=all` critical path under load.
+    /// Every producer is blocked waiting for the follower, so no new record
+    /// exists until the previous batch is acknowledged — meaning the follower's
+    /// fetch almost always arrives at an idle partition and parks. Its wake-up
+    /// latency is therefore the loop period, and the loop period is the cap on
+    /// replicated throughput (RP-9).
+    append_notify: Arc<DashMap<(String, i32), Arc<tokio::sync::Notify>>>,
+    /// RP-2.3: cap consumer reads at the in-sync watermark. Off unless pull
+    /// replication is active — see `consumer_visible_watermark`.
+    hw_from_isr: bool,
 }
 
 impl FetchHandler {
@@ -138,6 +172,10 @@ impl FetchHandler {
                 segment_cache: HashMap::new(),
             })),
             config: FetchHandlerConfig::default(),
+            isr_tracker: None,
+            isr_ack_tracker: None,
+            append_notify: Arc::new(DashMap::new()),
+            hw_from_isr: false,
         }
     }
 
@@ -162,6 +200,10 @@ impl FetchHandler {
                 segment_cache: HashMap::new(),
             })),
             config: FetchHandlerConfig::default(),
+            isr_tracker: None,
+            isr_ack_tracker: None,
+            append_notify: Arc::new(DashMap::new()),
+            hw_from_isr: false,
         }
     }
 
@@ -186,6 +228,10 @@ impl FetchHandler {
                 segment_cache: HashMap::new(),
             })),
             config: FetchHandlerConfig::default(),
+            isr_tracker: None,
+            isr_ack_tracker: None,
+            append_notify: Arc::new(DashMap::new()),
+            hw_from_isr: false,
         }
     }
 
@@ -215,28 +261,174 @@ impl FetchHandler {
                 segment_cache: HashMap::new(),
             })),
             config,
+            isr_tracker: None,
+            isr_ack_tracker: None,
+            append_notify: Arc::new(DashMap::new()),
+            hw_from_isr: false,
         }
     }
+
+    /// RP-2.1: attach the ISR tracker so follower fetches record their position.
+    ///
+    /// Cluster mode only. Without it, follower fetches are served exactly as
+    /// before and nothing is recorded, so single-node is unaffected.
+    pub fn set_isr_tracker(&mut self, tracker: Arc<crate::isr_tracker::IsrTracker>) {
+        self.isr_tracker = Some(tracker);
+        info!("ISR tracker wired to FetchHandler — follower fetches now report replication progress");
+    }
+
+    /// RP-2.3: attach the ACK tracker so a follower's fetch offset settles
+    /// `acks=all` waits, the way an ACK frame does under push.
+    ///
+    /// Cluster mode only; without it, follower fetches record ISR progress but
+    /// do not release producers, which is correct for push where the ACK frame
+    /// already does that job.
+    pub fn set_isr_ack_tracker(&mut self, tracker: Arc<crate::isr_ack_tracker::IsrAckTracker>) {
+        self.isr_ack_tracker = Some(tracker);
+        info!("ISR ACK tracker wired to FetchHandler — follower fetches now settle acks=all");
+    }
+
+    /// RP-2.3: bound consumer reads by `min(LEO across ISR)` instead of the
+    /// leader's own write position.
+    pub fn set_hw_from_isr(&mut self, enabled: bool) {
+        self.hw_from_isr = enabled;
+        if enabled {
+            info!("Consumer high watermark now follows the in-sync set, not the leader's write position");
+        }
+    }
+
     /// Handle a fetch request
     pub async fn handle_fetch(
         &self,
         request: FetchRequest,
         correlation_id: i32,
     ) -> Result<FetchResponse> {
-        let mut response_topics = Vec::new();
-        
-        for topic_request in request.topics {
-            let mut response_partitions = Vec::new();
-            
-            for partition_request in topic_request.partitions {
-                let mut partition_response = self.fetch_partition(
-                    &topic_request.name,
-                    partition_request.partition,
-                    partition_request.fetch_offset,
-                    partition_request.partition_max_bytes,
-                    request.max_wait_ms,
-                    request.min_bytes,
-                ).await?;
+        // `max_wait_ms` bounds the REQUEST, and the wait belongs to the request
+        // as a whole — not to each partition in turn.
+        //
+        // Serving partitions serially, each free to park on its own, made a
+        // 10-partition fetch take 10x max_wait_ms. Sharing one deadline across
+        // them fixed the total but not the shape: the FIRST partition examined
+        // could still spend the entire budget waiting, and a partition is
+        // examined in request order, not in order of who has data. One idle
+        // partition ahead of an active one in the same request therefore delayed
+        // every record on that active partition by the full max_wait_ms.
+        //
+        // Measured: `acks=all` cost a flat 505ms per produce on a three-node
+        // cluster with three topics, because the follower replicating them sends
+        // ONE request covering all three (RP-2.4) and the idle ones were reached
+        // first. The producer waits for the follower, the follower is parked
+        // behind an unrelated idle partition, and nothing is wrong with either
+        // (#36).
+        //
+        // So: serve everything without waiting, and only if the whole request
+        // came back empty, wait once — for ANY partition to get data — and serve
+        // everything again. That is also what Kafka's contract says the wait is:
+        // a property of the request, satisfied by the first partition to have
+        // something to send.
+        let started = Instant::now();
+        let wait_deadline =
+            started + Duration::from_millis(request.max_wait_ms.max(0) as u64);
+
+        let mut response_topics = self.serve_all_partitions(&request).await?;
+        let first_serve = started.elapsed();
+        let mut waited = Duration::ZERO;
+
+        if request.max_wait_ms > 0 && !any_records(&response_topics) {
+            if self.wait_for_any_partition(&request, wait_deadline).await {
+                waited = started.elapsed() - first_serve;
+                response_topics = self.serve_all_partitions(&request).await?;
+            }
+        }
+
+        // A replica fetch's cost is the floor on `acks=all` latency and the cap
+        // on its throughput: the producer cannot be acknowledged until the
+        // follower's NEXT fetch reports a position past the record. The
+        // follower's own view of this call (RP-9) is the request as a whole, so
+        // split it here into the part spent serving and the part spent parked.
+        if request.replica_id >= 0 {
+            let n = REPLICA_FETCH_SAMPLES.fetch_add(1, Ordering::Relaxed) + 1;
+            if n % 200 == 0 {
+                debug!(
+                    "replica fetch {} from node {}: serve {:?}, wait {:?}, total {:?}",
+                    n,
+                    request.replica_id,
+                    first_serve,
+                    waited,
+                    started.elapsed()
+                );
+            }
+        }
+
+
+        // Record fetch metrics
+        let mut fetched_bytes: u64 = 0;
+        for t in &response_topics {
+            for p in &t.partitions {
+                fetched_bytes += p.records.len() as u64;
+            }
+        }
+        MetricsRecorder::record_fetch(true, fetched_bytes);
+
+        Ok(FetchResponse {
+            header: chronik_protocol::parser::ResponseHeader { correlation_id },
+            throttle_time_ms: 0,
+            error_code: 0,
+            session_id: 0,
+            topics: response_topics,
+        })
+    }
+
+    /// Serve every partition in the request, without waiting for any of them.
+    ///
+    /// Waiting is the caller's job (`wait_for_any_partition`) precisely so that
+    /// one partition cannot spend the request's budget on behalf of the others.
+    ///
+    /// Partitions are served one at a time, and an attempt to serve them
+    /// concurrently was **reverted**.
+    ///
+    /// The reasoning for concurrency was sound on paper — independent reads
+    /// against independent logs, and serving one partition measures 2.5–4ms, so
+    /// a 3-partition fetch spends ~10ms here. It made no difference to
+    /// replicated throughput (2,369 vs 2,210 msg/s, inside the run-to-run
+    /// spread), because the follower's cycle is dominated by waiting on a leader
+    /// that is also serving producers, not by this loop.
+    ///
+    /// And it broke RP-3.3: the divergence test went from passing consistently
+    /// to 2 runs in 3, failing with committed records unreadable after a
+    /// follower returned. `fetch_partition` is not a pure read — it records the
+    /// follower's position with the ISR trackers — so overlapping those side
+    /// effects across partitions is not free. No measured benefit and a
+    /// reproducible correctness cost is an easy call.
+    ///
+    /// If this is revisited, the entry price is understanding what those side
+    /// effects do when interleaved, not just that the reads are independent.
+    async fn serve_all_partitions(
+        &self,
+        request: &FetchRequest,
+    ) -> Result<Vec<FetchResponseTopic>> {
+        let mut response_topics = Vec::with_capacity(request.topics.len());
+
+        for topic_request in &request.topics {
+            let mut served = Vec::with_capacity(topic_request.partitions.len());
+            for pr in &topic_request.partitions {
+                served.push(
+                    self.fetch_partition(
+                        &topic_request.name,
+                        pr.partition,
+                        pr.fetch_offset,
+                        pr.partition_max_bytes,
+                        request.max_wait_ms,
+                        request.replica_id,
+                    )
+                    .await,
+                );
+            }
+
+            let mut response_partitions = Vec::with_capacity(topic_request.partitions.len());
+
+            for partition_response in served {
+                let mut partition_response = partition_response?;
 
                 // EOS layer 6: for read_committed (isolation_level == 1) report the real
                 // Last Stable Offset and the aborted-transactions list from the per-
@@ -283,29 +475,164 @@ impl FetchHandler {
 
                 response_partitions.push(partition_response);
             }
-            
+
             response_topics.push(FetchResponseTopic {
-                name: topic_request.name,
+                name: topic_request.name.clone(),
                 partitions: response_partitions,
             });
         }
-        
-        // Record fetch metrics
-        let mut fetched_bytes: u64 = 0;
-        for t in &response_topics {
-            for p in &t.partitions {
-                fetched_bytes += p.records.len() as u64;
+
+        Ok(response_topics)
+    }
+
+    /// The map the produce path signals into. Both sides must hold the same one.
+    pub fn append_notify_handle(
+        &self,
+    ) -> Arc<DashMap<(String, i32), Arc<tokio::sync::Notify>>> {
+        Arc::clone(&self.append_notify)
+    }
+
+    /// Replace the append notifier with one shared with the produce path.
+    pub fn set_append_notify(
+        &mut self,
+        notify: Arc<DashMap<(String, i32), Arc<tokio::sync::Notify>>>,
+    ) {
+        self.append_notify = notify;
+    }
+
+    /// The wake-up handle for a partition, created on first use.
+    ///
+    /// Only a *waiter* creates one, so a partition nobody is parked on costs
+    /// nothing — and `notify_appended` above skips partitions with no entry
+    /// rather than allocating one per append.
+    fn notify_for(&self, topic: &str, partition: i32) -> Arc<tokio::sync::Notify> {
+        self.append_notify
+            .entry((topic.to_string(), partition))
+            .or_insert_with(|| Arc::new(tokio::sync::Notify::new()))
+            .clone()
+    }
+
+    /// Wait until ANY partition in the request has something past its fetch
+    /// offset, or the request's deadline passes. Returns whether it found any.
+    ///
+    /// Detection only — no records are read here. The one reader is
+    /// `fetch_data_available_path`, reached through `serve_all_partitions`. Two
+    /// readers is exactly what went wrong before: the copy that lived inside the
+    /// long poll used `fetch_records` while the direct path used
+    /// `fetch_raw_bytes` first, so the poll could sit through its whole budget
+    /// failing to read a record the very next request returned immediately.
+    async fn wait_for_any_partition(
+        &self,
+        request: &FetchRequest,
+        wait_deadline: Instant,
+    ) -> bool {
+        // A backstop, not the mechanism. An append wakes this directly; the
+        // timer only covers a wake-up that never arrives — a record made visible
+        // by a background segment flush rather than by the produce path, or a
+        // notify lost to a race this code has not thought of. It is deliberately
+        // slow, because being the fallback is the whole of its job.
+        const IDLE_RECHECK: Duration = Duration::from_millis(100);
+
+        loop {
+            // Register for the wake-up BEFORE looking. `Notify::notified()`
+            // captures notifications from the moment the future is created, so
+            // an append landing between the check below and the await is not
+            // lost. Checking first and registering after is the classic missed
+            // wake-up, and here it would cost a producer the full recheck
+            // interval.
+            let waits: Vec<_> = request
+                .topics
+                .iter()
+                .flat_map(|t| {
+                    t.partitions
+                        .iter()
+                        .map(move |p| self.notify_for(&t.name, p.partition))
+                })
+                .collect();
+            let notified: Vec<_> = waits.iter().map(|n| n.notified()).collect();
+
+            for topic_request in &request.topics {
+                for partition_request in &topic_request.partitions {
+                    if self
+                        .has_data_beyond(
+                            &topic_request.name,
+                            partition_request.partition,
+                            partition_request.fetch_offset,
+                            request.replica_id,
+                        )
+                        .await
+                    {
+                        return true;
+                    }
+                }
+            }
+
+            let remaining = wait_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+
+            // Whichever partition grows first wins; `select_all` needs a
+            // non-empty set, and a request with no partitions has nothing to
+            // wait for anyway.
+            if notified.is_empty() {
+                return false;
+            }
+            let any_append = futures::future::select_all(
+                notified.into_iter().map(Box::pin).collect::<Vec<_>>(),
+            );
+            let _ = tokio::time::timeout(remaining.min(IDLE_RECHECK), any_append).await;
+        }
+    }
+
+    /// Is there anything to send for this partition past `fetch_offset`?
+    ///
+    /// Consults the live log by the rule that governs this reader (follower →
+    /// log end, consumer → in-sync position) AND the segment index, because
+    /// neither subsumes the other: the live path has no in-memory state for a
+    /// partition that has not been produced to since startup, and the segment
+    /// index is written by a background flusher some time after the fact.
+    ///
+    /// Consulting only the segment index — which is what the old long poll did —
+    /// meant a parked fetch could not see a record until it had been flushed,
+    /// however long it had already been durable.
+    async fn has_data_beyond(
+        &self,
+        topic: &str,
+        partition: i32,
+        fetch_offset: i64,
+        replica_id: i32,
+    ) -> bool {
+        if let Ok(live_end) = self
+            .readable_end_offset(topic, partition, fetch_offset, replica_id)
+            .await
+        {
+            if live_end > fetch_offset {
+                return true;
             }
         }
-        MetricsRecorder::record_fetch(true, fetched_bytes);
 
-        Ok(FetchResponse {
-            header: chronik_protocol::parser::ResponseHeader { correlation_id },
-            throttle_time_ms: 0,
-            error_code: 0,
-            session_id: 0,
-            topics: response_topics,
-        })
+        let Ok(segments) = self
+            .metadata_store
+            .list_segments(topic, Some(partition as u32))
+            .await
+        else {
+            return false;
+        };
+        let segment_end = segments.iter().map(|s| s.end_offset + 1).max().unwrap_or(0);
+        if segment_end <= fetch_offset {
+            return false;
+        }
+
+        // The segment index knows nothing about replication, so a consumer must
+        // not be woken by records the in-sync set does not hold — the exact
+        // visibility RP-2.3 caps, reached by a different route.
+        if replica_id >= 0 {
+            return true;
+        }
+        self.consumer_visible_watermark(topic, partition, segment_end)
+            .await
+            > fetch_offset
     }
 
     // ============================================================================
@@ -317,6 +644,52 @@ impl FetchHandler {
     /// Returns None if valid, Some(error_response) if invalid
     ///
     /// Complexity: < 15 (two metadata checks + error construction)
+    /// NOT_LEADER_OR_FOLLOWER when metadata says another node leads this
+    /// partition (RP-7).
+    ///
+    /// Narrow on purpose. It rejects only when an assignment exists *and* names
+    /// a different node: no assignment, an assignment naming this node, or an
+    /// unset node id all serve as before, so single-node deployments and
+    /// not-yet-assigned topics are unaffected.
+    ///
+    /// The alternative — serving an empty log because our catalog is stale — is
+    /// indistinguishable from "you are caught up", and that is what let a
+    /// returning node answer 17,259 fetches for a partition it no longer led
+    /// while the cluster reported itself healthy.
+    async fn reject_if_not_leader(
+        &self,
+        topic: &str,
+        partition: i32,
+    ) -> Option<FetchResponsePartition> {
+        let this_node = self.config.node_id as u64;
+        if this_node == 0 {
+            return None; // no cluster identity — nothing to compare against
+        }
+
+        let assignments = self.metadata_store.get_partition_assignments(topic).await.ok()?;
+        let assignment = assignments.iter().find(|a| a.partition == partition as u32)?;
+
+        if assignment.leader_id == this_node {
+            return None;
+        }
+
+        debug!(
+            "{}-{}: refusing to serve — metadata says node {} leads this partition, not node {}",
+            topic, partition, assignment.leader_id, this_node
+        );
+
+        Some(FetchResponsePartition {
+            partition,
+            error_code: 6, // NOT_LEADER_OR_FOLLOWER
+            high_watermark: -1,
+            last_stable_offset: -1,
+            log_start_offset: -1,
+            aborted: None,
+            preferred_read_replica: -1,
+            records: vec![],
+        })
+    }
+
     async fn validate_topic_and_partition(
         &self,
         topic: &str,
@@ -394,13 +767,136 @@ impl FetchHandler {
             }
         }
 
-        // v2.2.7.2: Log watermark details for debugging
-        info!(
+        // Per-fetch, and the long poll now re-evaluates it every 10ms, so this
+        // cannot be `info!` — it would emit a hundred lines per second for every
+        // parked consumer and every follower.
+        debug!(
             "📊 WATERMARK: topic={}, partition={}, high_watermark={}, fetch_offset={}, gap={} (from ProduceHandler)",
             topic, partition, high_watermark, fetch_offset, high_watermark - fetch_offset
         );
 
         Ok(high_watermark)
+    }
+
+    /// RP-2.3: cap a consumer's view at what the in-sync set actually holds.
+    ///
+    /// Gated on pull replication. Under push, follower positions come from ACK
+    /// frames whose delivery this roadmap has already had to fix three times;
+    /// bounding consumer visibility on that data would convert a reporting bug
+    /// into a stall. Under pull the position is the follower's own fetch offset,
+    /// which cannot be stale without the follower having stopped — in which case
+    /// it leaves ISR and stops constraining the watermark.
+    ///
+    /// Single-node is unaffected: there is no ISR tracker and no replicas.
+    async fn consumer_visible_watermark(
+        &self,
+        topic: &str,
+        partition: i32,
+        leader_leo: i64,
+    ) -> i64 {
+        if !self.hw_from_isr {
+            return leader_leo;
+        }
+        let Some(ref tracker) = self.isr_tracker else {
+            return leader_leo;
+        };
+
+        let assignments = match self.metadata_store.get_partition_assignments(topic).await {
+            Ok(a) => a,
+            Err(e) => {
+                debug!("No assignments for {} ({}); serving the leader's position", topic, e);
+                return leader_leo;
+            }
+        };
+        let Some(assignment) = assignments.iter().find(|a| a.partition == partition as u32) else {
+            return leader_leo;
+        };
+
+        let replicas: Vec<u64> = assignment.replicas.iter().map(|&id| id as u64).collect();
+        let watermark = tracker.replicated_watermark(
+            topic,
+            partition,
+            leader_leo,
+            &replicas,
+            assignment.leader_id as u64,
+        );
+
+        if watermark < leader_leo {
+            debug!(
+                "{}-{}: consumers capped at {} (leader is at {}) — the in-sync set is behind",
+                topic, partition, watermark, leader_leo
+            );
+        }
+        watermark
+    }
+
+    /// How far this fetch may read, from the live log.
+    ///
+    /// The two callers ask the same question at different moments — once when
+    /// the request arrives, and again on every tick of the long poll — and they
+    /// must agree, or a request parks waiting for a number that a different rule
+    /// already moved past.
+    ///
+    /// A follower is bounded by the leader's LOG END; a consumer by what the
+    /// in-sync set holds. Serving a follower the high watermark instead is what
+    /// made `acks=all` cost ~700ms per request (#36): the producer waits for the
+    /// follower to acknowledge offset N, and the follower is told the log ends
+    /// below N, so neither side can move. The high watermark is a *result* of
+    /// replication and cannot also be its input.
+    async fn readable_end_offset(
+        &self,
+        topic: &str,
+        partition: i32,
+        fetch_offset: i64,
+        replica_id: i32,
+    ) -> Result<i64> {
+        if replica_id < 0 {
+            let leader_leo = self
+                .get_high_watermark_for_fetch(topic, partition, fetch_offset)
+                .await?;
+            return Ok(self
+                .consumer_visible_watermark(topic, partition, leader_leo)
+                .await);
+        }
+
+        let log_end = match self.produce_handler {
+            Some(ref handler) => handler.get_log_end_offset(topic, partition).await,
+            None => 0,
+        };
+
+        // A node that has not produced since starting has no in-memory partition
+        // state and reports 0. That is a "don't know", not "empty" — fall back to
+        // the watermark path, which reads persisted metadata.
+        if log_end == 0 {
+            return self
+                .get_high_watermark_for_fetch(topic, partition, fetch_offset)
+                .await;
+        }
+
+        // Bounded by what this leader can actually serve, not by what it has
+        // assigned.
+        //
+        // Offsets are handed out before the WAL writes them, so for a moment the
+        // log end runs ahead of the log. A follower told the assigned end asks
+        // for an offset inside that gap and gets an empty response — it cannot
+        // tell "not yet written" from "nothing there" — so it backs off and asks
+        // again. Measured after the read path was fixed: 1-2% of fetch cycles
+        // came back empty, each costing `EMPTY_FETCH_BACKOFF`.
+        //
+        // Reporting the durable end instead turns that into a park: the request
+        // waits inside the long poll and the commit worker wakes it the moment
+        // the record is on disk. Nothing is withheld that could have been sent —
+        // the records in the gap were not servable either way.
+        //
+        // `None` means nothing has committed under this process yet, which is a
+        // "don't know" and leaves the assigned end as the best answer available.
+        if let Some(ref wal) = self.wal_manager {
+            if let Some(durable_end) = wal.durable_end_offset(topic, partition) {
+                return Ok(log_end.min(durable_end));
+            }
+        }
+
+        Ok(log_end)
     }
 
     /// Get the partition's log start offset (low watermark) for a fetch.
@@ -463,20 +959,37 @@ impl FetchHandler {
         fetch_start: Instant,
     ) -> Result<FetchResponsePartition> {
         // v2.2.7.2: Log data available path
-        info!(
-            "✅ DATA AVAILABLE: topic={}, partition={}, fetch_offset={}, high_watermark={}, available={}",
+        debug!(
+            "DATA AVAILABLE: topic={}, partition={}, fetch_offset={}, high_watermark={}, available={}",
             topic, partition, fetch_offset, high_watermark, high_watermark - fetch_offset
         );
 
-        // Data is available, fetch it
-        let fetch_timeout = if max_wait_ms > 0 {
-            Duration::from_millis(max_wait_ms as u64)
-        } else {
-            Duration::from_secs(30) // Default timeout
-        };
+        // Data is available, fetch it.
+        //
+        // `max_wait_ms` is NOT the budget for this read. In Kafka it bounds how
+        // long the broker waits for `min_bytes` to *become* available; once data
+        // exists the broker returns it. Using it as a deadline on the read itself
+        // meant that when a busy leader took longer than the client's poll budget
+        // to serve records that were already there, the read was thrown away and
+        // an EMPTY response returned — so the follower immediately re-fetched and
+        // the leader redid the same work.
+        //
+        // That is a positive feedback loop, and it made cluster throughput
+        // bimodal: a run settled at either ~85,000 msg/s or ~8,000, never in
+        // between, on `acks=1` and `acks=all` but never `acks=0` or single-node.
+        // Raising the follower's window tenfold
+        // (CHRONIK_REPLICA_FETCH_MAX_WAIT_MS=5000) removed the collapse
+        // completely — 8 runs of 8 clean at 89,291-97,316 against 2-in-8
+        // collapsing at the 500ms default — which is what identified this line.
+        // See RP-12 in docs/ROADMAP_REPLICATION.md.
+        //
+        // What remains is a safety net against a genuinely stuck read, which is
+        // what the old `else` branch already used, applied to both branches.
+        const READ_SAFETY_DEADLINE: Duration = Duration::from_secs(30);
+        let fetch_timeout = READ_SAFETY_DEADLINE;
 
         // CRITICAL CRC FIX v1.3.32: Try to fetch raw Kafka bytes first to preserve CRC
-        info!("📦 FETCH RAW: Trying raw bytes (CRC-preserving) for {}-{}", topic, partition);
+        debug!("FETCH RAW: trying raw bytes (CRC-preserving) for {}-{}", topic, partition);
         let raw_bytes_result = timeout(fetch_timeout, async {
             self.fetch_raw_bytes(
                 topic,
@@ -489,7 +1002,7 @@ impl FetchHandler {
 
         let records_bytes = match raw_bytes_result {
             Ok(Ok(Some(raw_bytes))) => {
-                tracing::info!("✓ CRC-PRESERVED: Fetched {} bytes of raw Kafka data for {}-{}",
+                tracing::debug!("CRC-PRESERVED: fetched {} bytes of raw Kafka data for {}-{}",
                     raw_bytes.len(), topic, partition);
 
                 // HEX DUMP: Outgoing raw bytes to consumer
@@ -502,7 +1015,7 @@ impl FetchHandler {
             }
             Ok(Ok(None)) | Ok(Err(_)) | Err(_) => {
                 // Fall back to parsed records (will recompute CRC)
-                tracing::warn!("⚠ CRC-RECOMPUTED: No raw bytes available, falling back to parsed records for {}-{}",
+                tracing::debug!("CRC-RECOMPUTED: no raw bytes available, falling back to parsed records for {}-{}",
                     topic, partition);
 
                 let fetch_result = timeout(fetch_timeout, async {
@@ -525,7 +1038,13 @@ impl FetchHandler {
                         vec![]
                     }
                     Err(_) => {
-                        tracing::warn!("Fetch timeout after {}ms for {}-{}", max_wait_ms, topic, partition);
+                        // 30s safety deadline, not the client's max_wait — see the
+                        // READ_SAFETY_DEADLINE comment above. Reaching this means a read
+                        // is genuinely stuck, not merely slow.
+                        tracing::warn!(
+                            "Fetch read exceeded the {}s safety deadline for {}-{} — returning empty",
+                            READ_SAFETY_DEADLINE.as_secs(), topic, partition
+                        );
                         vec![]
                     }
                 };
@@ -543,99 +1062,6 @@ impl FetchHandler {
         );
 
         Ok(self.build_success_response(partition, high_watermark, log_start_offset, records_bytes))
-    }
-
-    /// Handle fetch when no data available (fetch_offset >= high_watermark)
-    ///
-    /// Implements wait logic with polling or immediate empty response
-    ///
-    /// Complexity: < 25 (polling loop + timeout handling + response construction)
-    async fn fetch_no_data_path(
-        &self,
-        topic: &str,
-        partition: i32,
-        fetch_offset: i64,
-        high_watermark: i64,
-        log_start_offset: i64,
-        max_bytes: i32,
-        max_wait_ms: i32,
-        min_bytes: i32,
-    ) -> Result<FetchResponsePartition> {
-        // v2.2.7.2: Log no data available case
-        info!(
-            "⏸️  NO DATA: topic={}, partition={}, fetch_offset={}, high_watermark={} (waiting...)",
-            topic, partition, fetch_offset, high_watermark
-        );
-
-        // No data available yet - implement wait logic
-        if max_wait_ms > 0 && min_bytes > 0 {
-            // Wait for new data or timeout
-            let start_time = Instant::now();
-            let wait_duration = Duration::from_millis(max_wait_ms as u64);
-
-            // Try to wait for data with timeout
-            let result = timeout(wait_duration, async {
-                // Poll for new data periodically
-                let poll_interval = Duration::from_millis(10);
-                let mut accumulated_bytes = 0;
-
-                while start_time.elapsed() < wait_duration {
-                    // Check if new data is available
-                    if let Ok(new_segments) = self.metadata_store.list_segments(topic, Some(partition as u32)).await {
-                        let new_high_watermark = new_segments.iter()
-                            .map(|s| s.end_offset + 1)
-                            .max()
-                            .unwrap_or(high_watermark);
-
-                        if new_high_watermark > fetch_offset {
-                            // New data available, fetch it
-                            if let Ok(records) = self.fetch_records(
-                                topic,
-                                partition,
-                                fetch_offset,
-                                new_high_watermark,
-                                max_bytes,
-                            ).await {
-                                // Calculate approximate bytes
-                                accumulated_bytes = records.iter()
-                                    .map(|r| r.value.len() + r.key.as_ref().map(|k| k.len()).unwrap_or(0))
-                                    .sum();
-
-                                if accumulated_bytes >= min_bytes as usize {
-                                    return Ok((records, new_high_watermark));
-                                }
-                            }
-                        }
-                    }
-
-                    tokio::time::sleep(poll_interval).await;
-                }
-
-                Err::<(Vec<chronik_storage::Record>, i64), Error>(
-                    Error::Internal("Timeout waiting for min_bytes".into())
-                )
-            }).await;
-
-            match result {
-                Ok(Ok((records, new_hw))) => {
-                    // Got enough data within timeout
-                    let records_bytes = self.encode_kafka_records(&records, 0)?;
-
-                    return Ok(self.build_success_response(partition, new_hw, log_start_offset, records_bytes));
-                }
-                _ => {
-                    // Timeout or error - return empty response with proper empty batch
-                    let empty_records = self.encode_kafka_records(&[], 0)?;
-
-                    return Ok(self.build_success_response(partition, high_watermark, log_start_offset, empty_records));
-                }
-            }
-        } else {
-            // No wait requested, return empty immediately with proper empty batch
-            let empty_records = self.encode_kafka_records(&[], 0)?;
-
-            Ok(self.build_success_response(partition, high_watermark, log_start_offset, empty_records))
-        }
     }
 
     /// Build error FetchResponsePartition
@@ -703,13 +1129,43 @@ impl FetchHandler {
         fetch_offset: i64,
         max_bytes: i32,
         max_wait_ms: i32,
-        min_bytes: i32,
+        replica_id: i32,
     ) -> Result<FetchResponsePartition> {
+        // RP-2.1: a fetch carrying a replica id is a *follower* replicating, not a
+        // consumer reading. Kafka clients send -1 here; only a broker sets it to
+        // its own node id. The field has always been decoded and thrown away.
+        //
+        // Recording the follower's position is the whole point: its fetch offset
+        // IS its log end offset — it cannot ask for offset N without having
+        // durably written everything below N. That gives the leader progress
+        // tracking for free, where the push model needed a separate ACK channel,
+        // a liveness heartbeat, and a reconnect probe to approximate the same
+        // thing (see the RP-1 cluster findings).
+        if replica_id >= 0 {
+            if let Some(ref tracker) = self.isr_tracker {
+                tracker.update_follower_offset(replica_id as u64, topic, partition, fetch_offset);
+                tracker.record_node_alive(replica_id as u64);
+                debug!(
+                    "Follower fetch: node {} at offset {} for {}-{}",
+                    replica_id, fetch_offset, topic, partition
+                );
+            }
+
+            // RP-2.3: the same offset also settles `acks=all`. A follower asking
+            // for N holds everything below N, so this is the pull equivalent of
+            // the ACK frame the push path sends — and it is why the ack tracker
+            // had to become offset-monotonic: a fetch offset skips across many
+            // batch boundaries and rarely equals a registered wait exactly.
+            if let Some(ref tracker) = self.isr_ack_tracker {
+                tracker.record_ack(topic, partition, fetch_offset, replica_id as u64);
+            }
+        }
+
         // v2.2.7.2: Enhanced tracing to debug large batch consumption stalls
         let fetch_start = Instant::now();
-        info!(
-            "🔍 FETCH START: topic={}, partition={}, offset={}, max_bytes={}, max_wait_ms={}, min_bytes={}",
-            topic, partition, fetch_offset, max_bytes, max_wait_ms, min_bytes
+        debug!(
+            "🔍 FETCH START: topic={}, partition={}, offset={}, max_bytes={}, max_wait_ms={}",
+            topic, partition, fetch_offset, max_bytes, max_wait_ms
         );
 
         // Phase 1: Validate topic and partition existence
@@ -717,8 +1173,41 @@ impl FetchHandler {
             return Ok(error_response);
         }
 
-        // Phase 2: Get high watermark from ProduceHandler with metadata_store fallback
-        let high_watermark = self.get_high_watermark_for_fetch(topic, partition, fetch_offset).await?;
+        // RP-7: refuse to serve a partition this node does not lead.
+        //
+        // A node whose catalog is stale can believe it still leads a partition
+        // that failed over while it was away. Measured: a returning node served
+        // 17,259 fetches as leader of a partition whose log was empty — every
+        // consumer routed there saw an empty topic, and a follower pointed at it
+        // replicated nothing, while all three nodes reported
+        // `under_replicated: false`. Answering "no records" is indistinguishable
+        // from "caught up", which is what made it silent.
+        //
+        // NOT_LEADER_OR_FOLLOWER is the Kafka-correct answer: clients refresh
+        // metadata and retry against the real leader, and a replica fetcher
+        // treats it as a signal to re-read assignments rather than as data.
+        //
+        // Deliberately narrow — this rejects only when metadata *positively*
+        // names a different node. No assignment, or one naming this node, still
+        // serves, so single-node and not-yet-assigned topics are untouched.
+        if let Some(error_response) = self.reject_if_not_leader(topic, partition).await {
+            return Ok(error_response);
+        }
+
+        // Phase 2: how far this fetch may read.
+        //
+        // RP-2.3: a follower reads up to the leader's log end; a consumer only up
+        // to what the in-sync set holds. Serving a consumer past that would show
+        // it a record that disappears if the leader is lost — the leader's write
+        // position is not a durability statement.
+        //
+        // A follower must NOT be capped this way, or replication deadlocks: the
+        // watermark cannot advance until followers fetch, and they cannot fetch
+        // past a watermark that is waiting on them. Both branches live in
+        // `readable_end_offset`, which the long poll below re-evaluates.
+        let high_watermark = self
+            .readable_end_offset(topic, partition, fetch_offset, replica_id)
+            .await?;
 
         // Log start offset (low watermark). Advanced by the Kafka DeleteRecords API;
         // records below it have been deleted and must not be served. Sourced from
@@ -746,21 +1235,19 @@ impl FetchHandler {
             )
             .await
         } else {
-            // No data available - wait or return empty
-            self.fetch_no_data_path(
-                topic,
+            // Nothing past this offset. Returning empty is the whole of it —
+            // waiting for something to arrive belongs to the request, not to one
+            // partition of it, and happens in `wait_for_any_partition`.
+            let empty_records = self.encode_kafka_records(&[], 0)?;
+            Ok(self.build_success_response(
                 partition,
-                fetch_offset,
                 high_watermark,
                 log_start_offset,
-                max_bytes,
-                max_wait_ms,
-                min_bytes,
-            )
-            .await
+                empty_records,
+            ))
         }
     }
-    
+
     /// Try fetching raw bytes from Tantivy (Phase 4 for fetch_raw_bytes)
     ///
     /// Complexity: < 20 (Tantivy fetch delegation)
@@ -779,7 +1266,7 @@ impl FetchHandler {
             None => return Ok(None),
         };
 
-        tracing::info!("RAW→TANTIVY: Checking Tantivy segment index for {}-{}", topic, partition);
+        tracing::debug!("RAW→TANTIVY: checking Tantivy segment index for {}-{}", topic, partition);
 
         match self.fetch_from_tantivy(
             segment_index,
@@ -790,14 +1277,14 @@ impl FetchHandler {
             max_bytes,
         ).await {
             Ok(Some(bytes)) => {
-                tracing::info!(
-                    "RAW→TANTIVY: Returning {} bytes from Tantivy segments",
+                tracing::debug!(
+                    "RAW→TANTIVY: returning {} bytes from Tantivy segments",
                     bytes.len()
                 );
                 Ok(Some(bytes))
             }
             Ok(None) => {
-                tracing::info!("RAW→TANTIVY: No matching Tantivy segments found");
+                tracing::debug!("RAW→TANTIVY: no matching Tantivy segments found");
                 Ok(None)
             }
             Err(e) => {
@@ -820,11 +1307,11 @@ impl FetchHandler {
         high_watermark: i64,
         max_bytes: i32,
     ) -> Result<Option<Vec<u8>>> {
-        tracing::info!("RAW→SEGMENTS: Buffer and WAL empty or no match, trying segments");
+        tracing::debug!("RAW→SEGMENTS: buffer and WAL empty or no match, trying segments");
         let segments = self.get_segments_for_range(topic, partition, fetch_offset, high_watermark).await?;
 
         if segments.is_empty() {
-            tracing::info!("RAW→SEGMENTS: No segments found for range");
+            tracing::debug!("RAW→SEGMENTS: no segments found for range");
             return Ok(None);
         }
 
@@ -834,8 +1321,8 @@ impl FetchHandler {
             let segment_data = self.object_store.get(&segment_info.object_key).await?;
             let segment = Segment::deserialize(segment_data)?;
 
-            tracing::info!(
-                "RAW→SEGMENT: Segment {} has {} bytes of raw_kafka_batches",
+            tracing::debug!(
+                "RAW→SEGMENT: segment {} has {} bytes of raw_kafka_batches",
                 segment_info.segment_id, segment.raw_kafka_batches.len()
             );
 
@@ -1607,8 +2094,16 @@ impl FetchHandler {
 
         let max_records = std::cmp::max(10000, max_bytes as usize / 10);
 
+        let read_start = Instant::now();
         let wal_records = wal_manager.read_from(topic, partition, fetch_offset, max_records).await
             .map_err(|e| Error::Internal(format!("WAL read failed: {}", e)))?;
+        let read_took = read_start.elapsed();
+        if read_took > Duration::from_millis(1) {
+            debug!(
+                "RAW→WAL: read_from({}-{}, offset {}) took {:?} for {} records",
+                topic, partition, fetch_offset, read_took, wal_records.len()
+            );
+        }
 
         if wal_records.is_empty() {
             return Ok(None);
@@ -1636,8 +2131,12 @@ impl FetchHandler {
                                     concatenated_bytes.extend_from_slice(&kafka_batch_bytes);
                                     batches_concatenated += 1;
 
-                                    warn!(
-                                        "RAW→WAL: ✓ APPENDED reconstructed batch offsets {}-{} ({} bytes)",
+                                    // Per batch, on every fetch. At `warn` this
+                                    // wrote 23MB of logs per node in a 25-second
+                                    // replication run — the logging itself was a
+                                    // measurable share of fetch latency (RP-9).
+                                    trace!(
+                                        "RAW→WAL: appended reconstructed batch offsets {}-{} ({} bytes)",
                                         base_offset, last_offset, kafka_batch_bytes.len()
                                     );
                                 }
@@ -1647,8 +2146,8 @@ impl FetchHandler {
                                 }
                             }
                         } else {
-                            warn!(
-                                "RAW→WAL: ✗ SKIPPED batch offsets {}-{} (condition failed: last_offset >= fetch_offset: {}, base_offset < high_watermark: {})",
+                            trace!(
+                                "RAW→WAL: skipped batch offsets {}-{} (last_offset >= fetch_offset: {}, base_offset < high_watermark: {})",
                                 base_offset, last_offset,
                                 last_offset >= fetch_offset,
                                 base_offset < high_watermark
@@ -1667,8 +2166,8 @@ impl FetchHandler {
             return Ok(None);
         }
 
-        info!(
-            "RAW→WAL: Concatenated {} original batches, total {} bytes for {}-{}",
+        debug!(
+            "RAW→WAL: concatenated {} original batches, total {} bytes for {}-{}",
             batches_concatenated, concatenated_bytes.len(), topic, partition
         );
 
@@ -1685,7 +2184,7 @@ impl FetchHandler {
         high_watermark: i64,
         max_bytes: i32,
     ) -> Result<Vec<chronik_storage::Record>> {
-        info!(
+        debug!(
             "fetch_records_from_segments called - topic: {}, partition: {}, fetch_offset: {}, high_watermark: {}",
             topic, partition, fetch_offset, high_watermark
         );
@@ -1793,7 +2292,7 @@ impl FetchHandler {
             }
         }
         
-        tracing::info!(
+        tracing::debug!(
             "fetch_records complete - fetched {} records from {}-{} starting at offset {} (current_offset: {})",
             records.len(), topic, partition, fetch_offset, current_offset
         );
@@ -1810,7 +2309,7 @@ impl FetchHandler {
         high_watermark: i64,
         max_bytes: i32,
     ) -> Result<Option<Vec<u8>>> {
-        tracing::info!(
+        tracing::debug!(
             "fetch_raw_bytes - topic: {}, partition: {}, fetch_offset: {}, high_watermark: {}",
             topic, partition, fetch_offset, high_watermark
         );
@@ -2678,6 +3177,16 @@ impl FetchHandler {
 /// serving path produced it. The batch content is left byte-identical; only the CRC
 /// field (bytes 17-20 of each batch, little-endian) is (re)written. Non-v2 or partial
 /// trailing bytes are left untouched.
+/// Does this response carry anything at all?
+///
+/// The question a fetch's wait is really asking: Kafka holds a request open
+/// until *some* partition has data, not until a particular one does.
+fn any_records(topics: &[FetchResponseTopic]) -> bool {
+    topics
+        .iter()
+        .any(|t| t.partitions.iter().any(|p| !p.records.is_empty()))
+}
+
 /// Length of the leading run of record batches whose base_offset is strictly below
 /// `offset`. Batches are offset-ordered and self-delimiting (base_offset i64 at [0..8],
 /// batch_length i32 at [8..12] counting everything after those 12 bytes). Used to
@@ -2739,3 +3248,206 @@ fn sanitize_batch_crcs(bytes: &mut [u8]) {
 // #[cfg(test)]
 // #[path = "fetch_handler_test.rs"]
 // mod fetch_handler_test;
+
+#[cfg(test)]
+mod replica_fetch_tests {
+    use crate::isr_tracker::{IsrTracker, SyncState};
+    use std::sync::Arc;
+
+    /// RP-2.1: `replica_id` distinguishes a replicating follower from a consumer.
+    ///
+    /// Kafka clients send -1; only a broker sets it to its own node id. The field
+    /// has always been decoded and discarded, so this pins the semantics the
+    /// fetch path now depends on: a follower fetch records progress, a consumer
+    /// fetch records nothing.
+    ///
+    /// This is the property that makes pull cheaper than push. The push model
+    /// needed an ACK channel for progress, heartbeat replies for liveness, and a
+    /// reconnect probe for restarts — three mechanisms, each of which had a bug
+    /// only a live cluster exposed. A fetch offset is all three at once.
+    #[test]
+    fn follower_fetch_records_progress_consumer_fetch_does_not() {
+        let tracker = Arc::new(IsrTracker::new(1000, 10_000));
+
+        // Consumer fetch: replica_id < 0 → nothing recorded.
+        let consumer_replica_id: i32 = -1;
+        if consumer_replica_id >= 0 {
+            tracker.update_follower_offset(consumer_replica_id as u64, "orders", 0, 500);
+        }
+        assert_eq!(
+            tracker.sync_state(2, "orders", 0, 500),
+            SyncState::Unknown,
+            "a consumer fetch must not be mistaken for replication progress"
+        );
+
+        // Follower fetch from node 2 at offset 500: it cannot ask for 500 without
+        // having durably written everything below it, so 500 is its LEO.
+        let follower_replica_id: i32 = 2;
+        if follower_replica_id >= 0 {
+            tracker.update_follower_offset(follower_replica_id as u64, "orders", 0, 500);
+            tracker.record_node_alive(follower_replica_id as u64);
+        }
+
+        assert_eq!(tracker.sync_state(2, "orders", 0, 500), SyncState::InSync);
+        assert_eq!(tracker.get_isr("orders", 0, 500, &[1, 2]), vec![2]);
+    }
+
+    /// A follower that keeps fetching stays in ISR without any separate heartbeat.
+    ///
+    /// Under push this required a dedicated liveness ACK; the first attempt used
+    /// connection state and silently did nothing, because a TCP write succeeds
+    /// into the local send buffer long after the peer is gone.
+    #[test]
+    fn fetching_is_its_own_liveness_proof() {
+        let tracker = Arc::new(IsrTracker::new(1000, 10_000));
+
+        tracker.update_follower_offset(2, "orders", 0, 100);
+        tracker.record_node_alive(2);
+        assert_eq!(tracker.sync_state(2, "orders", 0, 100), SyncState::InSync);
+
+        // Next fetch arrives at a higher offset — progress and liveness together.
+        tracker.update_follower_offset(2, "orders", 0, 250);
+        tracker.record_node_alive(2);
+        assert_eq!(tracker.sync_state(2, "orders", 0, 250), SyncState::InSync);
+    }
+}
+
+#[cfg(test)]
+mod fetch_wait_budget_tests {
+    use super::*;
+    use chronik_common::metadata::memory::InMemoryMetadataStore;
+    use chronik_common::metadata::traits::TopicConfig;
+    use chronik_protocol::{FetchRequest, FetchRequestPartition, FetchRequestTopic};
+    use tempfile::TempDir;
+
+    async fn handler_with_topic(partitions: u32) -> (FetchHandler, Arc<InMemoryMetadataStore>, TempDir) {
+        let temp_dir = TempDir::new().unwrap();
+        let metadata_store = Arc::new(InMemoryMetadataStore::new());
+
+        let mut object_store_config = chronik_storage::object_store::ObjectStoreConfig::default();
+        object_store_config.backend = chronik_storage::object_store::StorageBackend::Local {
+            path: temp_dir.path().join("segments").to_str().unwrap().to_string(),
+        };
+        let object_store: Arc<dyn ObjectStoreTrait> = Arc::from(
+            chronik_storage::object_store::ObjectStoreFactory::create(object_store_config)
+                .await
+                .unwrap(),
+        );
+        let segment_reader = Arc::new(chronik_storage::SegmentReader::new(
+            chronik_storage::SegmentReaderConfig::default(),
+            object_store.clone(),
+        ));
+
+        let mut topic_config = TopicConfig::default();
+        topic_config.partition_count = partitions;
+        metadata_store
+            .create_topic("orders", topic_config)
+            .await
+            .unwrap();
+
+        let handler = FetchHandler::new(segment_reader, metadata_store.clone(), object_store);
+        (handler, metadata_store, temp_dir)
+    }
+
+    fn idle_fetch(partitions: i32, max_wait_ms: i32) -> FetchRequest {
+        FetchRequest {
+            replica_id: -1,
+            max_wait_ms,
+            min_bytes: 1,
+            max_bytes: 10 * 1024 * 1024,
+            isolation_level: 0,
+            session_id: 0,
+            session_epoch: -1,
+            topics: vec![FetchRequestTopic {
+                name: "orders".to_string(),
+                partitions: (0..partitions)
+                    .map(|partition| FetchRequestPartition {
+                        partition,
+                        current_leader_epoch: -1,
+                        fetch_offset: 0,
+                        log_start_offset: 0,
+                        partition_max_bytes: 1024 * 1024,
+                    })
+                    .collect(),
+            }],
+        }
+    }
+
+    /// `max_wait_ms` bounds the request, not each partition in it.
+    ///
+    /// Partitions are served serially, so before the shared deadline every idle
+    /// partition spent the full budget and an N-partition fetch took N ×
+    /// max_wait_ms to return — with Kafka's default 500ms, an 8-partition
+    /// consumer waited 4 seconds for an empty response and would usually hit
+    /// its own request timeout first.
+    ///
+    /// This is also what makes follower-pull viable: a follower batches every
+    /// partition it replicates from one leader into a single request.
+    #[tokio::test]
+    async fn an_idle_multi_partition_fetch_stays_within_the_request_budget() {
+        let (handler, _store, _dir) = handler_with_topic(8).await;
+
+        let max_wait_ms = 300;
+        let started = Instant::now();
+        let response = handler
+            .handle_fetch(idle_fetch(8, max_wait_ms), 1)
+            .await
+            .expect("an idle fetch still returns a response");
+        let elapsed = started.elapsed();
+
+        assert_eq!(response.topics[0].partitions.len(), 8);
+
+        // Two-sided on purpose. The upper bound is the bug: serial per-partition
+        // waiting would have taken 8 × 300ms = 2.4s. The lower bound stops the
+        // test passing for the wrong reason — if the wait were dropped entirely
+        // the response would be instant, which would also satisfy the ceiling
+        // while turning every idle follower into a busy loop.
+        assert!(
+            elapsed >= Duration::from_millis(max_wait_ms as u64 / 2),
+            "returned in {:?}: the long poll is not holding at all",
+            elapsed
+        );
+        assert!(
+            elapsed < Duration::from_millis(max_wait_ms as u64 * 3),
+            "8 idle partitions took {:?}, which means the wait budget is still being spent per partition",
+            elapsed
+        );
+    }
+
+    /// The single-partition case must keep waiting the full budget — that long
+    /// poll is what stops an idle consumer from busy-looping, and it is what
+    /// keeps a caught-up follower cheap.
+    #[tokio::test]
+    async fn a_single_idle_partition_still_long_polls() {
+        let (handler, _store, _dir) = handler_with_topic(1).await;
+
+        let max_wait_ms = 200;
+        let started = Instant::now();
+        handler
+            .handle_fetch(idle_fetch(1, max_wait_ms), 1)
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= Duration::from_millis(max_wait_ms as u64 / 2),
+            "an idle single-partition fetch returned in {:?}; the long poll is not holding",
+            elapsed
+        );
+    }
+
+    /// `max_wait_ms = 0` means "answer now". It must not wait at all, whatever
+    /// the deadline arithmetic does.
+    #[tokio::test]
+    async fn a_zero_wait_fetch_returns_immediately() {
+        let (handler, _store, _dir) = handler_with_topic(4).await;
+
+        let started = Instant::now();
+        handler.handle_fetch(idle_fetch(4, 0), 1).await.unwrap();
+
+        assert!(
+            started.elapsed() < Duration::from_millis(150),
+            "max_wait_ms=0 must not block"
+        );
+    }
+}

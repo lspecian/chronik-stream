@@ -26,6 +26,9 @@ pub struct ClusterInitConfig {
     pub wal_bind_addr: String,
     pub raft_bind_addr: String,
     pub raft_peers: Vec<(u64, String)>,
+    /// This node's own advertised Raft address, so it can report itself as a
+    /// cluster member alongside its peers rather than as a placeholder.
+    pub self_raft_addr: String,
     pub cluster_config: ClusterConfig,
 }
 
@@ -85,6 +88,7 @@ impl ClusterInitConfig {
             wal_bind_addr,
             raft_bind_addr,
             raft_peers,
+            self_raft_addr: this_node.raft.clone(),
             cluster_config: config,
         })
     }

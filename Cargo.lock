@@ -126,7 +126,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "43d5b281e737544384e969a5ccad3f1cdd24b48086a0fc1b2a5262a26b8f4f4a"
 dependencies = [
  "anstyle",
- "anstyle-parse",
+ "anstyle-parse 0.2.7",
+ "anstyle-query",
+ "anstyle-wincon",
+ "colorchoice",
+ "is_terminal_polyfill",
+ "utf8parse",
+]
+
+[[package]]
+name = "anstream"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "824a212faf96e9acacdbd09febd34438f8f711fb84e09a8916013cd7815ca28d"
+dependencies = [
+ "anstyle",
+ "anstyle-parse 1.0.0",
  "anstyle-query",
  "anstyle-wincon",
  "colorchoice",
@@ -145,6 +160,15 @@ name = "anstyle-parse"
 version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4e7644824f0aa2c7b9384579234ef10eb7efb6a0deb83f9630a49594dd9c15c2"
+dependencies = [
+ "utf8parse",
+]
+
+[[package]]
+name = "anstyle-parse"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52ce7f38b242319f7cabaa6813055467063ecdc9d355bbb4ce0c68908cd8130e"
 dependencies = [
  "utf8parse",
 ]
@@ -1651,7 +1675,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-backup"
-version = "2.11.0"
+version = "2.12.0"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -1719,7 +1743,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-columnar"
-version = "2.11.0"
+version = "2.12.0"
 dependencies = [
  "anyhow",
  "arrow 54.2.1",
@@ -1762,7 +1786,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-common"
-version = "2.11.0"
+version = "2.12.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1784,7 +1808,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-config"
-version = "2.11.0"
+version = "2.12.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1809,7 +1833,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-embeddings"
-version = "2.11.0"
+version = "2.12.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1821,6 +1845,39 @@ dependencies = [
  "tokio",
  "tracing",
  "wiremock",
+]
+
+[[package]]
+name = "chronik-integration-tests"
+version = "2.12.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64 0.21.7",
+ "bincode",
+ "byteorder",
+ "bytes",
+ "chronik-common",
+ "chronik-config",
+ "chronik-protocol",
+ "chronik-storage",
+ "chronik-wal",
+ "chrono",
+ "crc32fast",
+ "env_logger",
+ "futures",
+ "libc",
+ "log",
+ "parking_lot",
+ "rdkafka",
+ "reqwest 0.11.27",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -1854,7 +1911,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-monitoring"
-version = "2.11.0"
+version = "2.12.0"
 dependencies = [
  "anyhow",
  "axum 0.6.20",
@@ -1876,7 +1933,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-operator"
-version = "2.11.0"
+version = "2.12.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1918,7 +1975,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-protocol"
-version = "2.11.0"
+version = "2.12.0"
 dependencies = [
  "anyhow",
  "base64 0.21.7",
@@ -1942,7 +1999,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-query"
-version = "2.11.0"
+version = "2.12.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1970,7 +2027,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-raft"
-version = "2.11.0"
+version = "2.12.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2000,7 +2057,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-raft-bridge"
-version = "2.11.0"
+version = "2.12.0"
 dependencies = [
  "bytes",
  "prost 0.12.6",
@@ -2009,7 +2066,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-search"
-version = "2.11.0"
+version = "2.12.0"
 dependencies = [
  "anyhow",
  "axum 0.6.20",
@@ -2045,7 +2102,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-server"
-version = "2.11.0"
+version = "2.12.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2108,7 +2165,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-storage"
-version = "2.11.0"
+version = "2.12.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2158,7 +2215,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-wal"
-version = "2.11.0"
+version = "2.12.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2285,7 +2342,7 @@ version = "4.5.51"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75835f0c7bf681bfd05abe44e965760fea999a5286c6eb2d59883634fd02011a"
 dependencies = [
- "anstream",
+ "anstream 0.6.21",
  "anstyle",
  "clap_lex",
  "strsim",
@@ -3199,6 +3256,37 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "092966b41edc516079bdf31ec78a2e0588d1d0c08f78b91d8307215928642b2b"
 
 [[package]]
+name = "defmt"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e2953bfe4f93bbd20cc71198842756f77d161884c99ebbabc41d80231ded88d1"
+dependencies = [
+ "bitflags 1.3.2",
+ "defmt-macros",
+]
+
+[[package]]
+name = "defmt-macros"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bad9c72e7ca2137e0dc3813245a0d282fd6daad32fd800af018306a9169b5fe8"
+dependencies = [
+ "defmt-parser",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.108",
+]
+
+[[package]]
+name = "defmt-parser"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10d60334b3b2e7c9d91ef8150abfb6fa4c1c39ebbcf4a81c2e346aad939fee3e"
+dependencies = [
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "der"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3365,6 +3453,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75030f3c4f45dafd7586dd6780965a8c7e8e285a5ecb86713e63a79c5b2766f3"
 dependencies = [
  "cfg-if",
+]
+
+[[package]]
+name = "env_filter"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "900d271a03799a1ee8d1ca9b19893b48ca674a9284fefcfb85f05e74ed314217"
+dependencies = [
+ "log",
+ "regex",
+]
+
+[[package]]
+name = "env_logger"
+version = "0.11.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "de671bd27a75a797dc9ae289ba1e77276e75e2026408aab65185384e2d5cd3f6"
+dependencies = [
+ "anstream 1.0.0",
+ "anstyle",
+ "env_filter",
+ "jiff",
+ "log",
 ]
 
 [[package]]
@@ -4425,6 +4536,42 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4a5f13b858c8d314ee3e8f639011f7ccefe71f97f96e50151fb991f267928e2c"
 
 [[package]]
+name = "jiff"
+version = "0.2.35"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "668b7183bd07af9a4885f5c35b0cc5c83c4607a913c16b7e17291832910d2dcc"
+dependencies = [
+ "defmt",
+ "jiff-core",
+ "jiff-static",
+ "log",
+ "portable-atomic 1.11.1",
+ "portable-atomic-util",
+ "serde_core",
+]
+
+[[package]]
+name = "jiff-core"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7feca88439efe53da3754500c1851dedf3cb36c524dd5cf8225cc0794de95d09"
+dependencies = [
+ "defmt",
+]
+
+[[package]]
+name = "jiff-static"
+version = "0.2.35"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a69dcb3a21cfb32ce1cd056169337ca284af0766dd766e7878819b251a49204"
+dependencies = [
+ "jiff-core",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.108",
+]
+
+[[package]]
 name = "jobserver"
 version = "0.1.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4786,9 +4933,9 @@ dependencies = [
 
 [[package]]
 name = "log"
-version = "0.4.28"
+version = "0.4.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34080505efa8e45a4b816c349525ebe327ceaa8559756f0356cba97ef3bf7432"
+checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
 name = "lru"
@@ -5902,6 +6049,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f84267b20a16ea918e43c6a88433c2d54fa145c92a811b5b047ccbe153674483"
 
 [[package]]
+name = "portable-atomic-util"
+version = "0.2.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c2a106d1259c23fac8e543272398ae0e3c0b8d33c88ed73d0cc71b0f1d902618"
+dependencies = [
+ "portable-atomic 1.11.1",
+]
+
+[[package]]
 name = "potential_utf"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6442,9 +6598,9 @@ dependencies = [
 
 [[package]]
 name = "regex"
-version = "1.12.2"
+version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "843bc0191f75f3e22651ae5f1e72939ab2f72a4bc30fa80a066bd66edefc24d4"
+checksum = "f020237b6c8eed93db2e2cb53c00c60a8e1bc73da7d073199a1180401450218d"
 dependencies = [
  "aho-corasick",
  "memchr",
@@ -6454,9 +6610,9 @@ dependencies = [
 
 [[package]]
 name = "regex-automata"
-version = "0.4.13"
+version = "0.4.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5276caf25ac86c8d810222b3dbb938e512c55c6831a10f3e6ed1c93b84041f1c"
+checksum = "ad8553b9b26413251cbf30e620595c7a41b3887f03da04579c0e6b0d6a06b4b2"
 dependencies = [
  "aho-corasick",
  "memchr",
@@ -6471,9 +6627,9 @@ checksum = "8d942b98df5e658f56f20d592c7f868833fe38115e65c33003d8cd224b0155da"
 
 [[package]]
 name = "regex-syntax"
-version = "0.8.8"
+version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a2d987857b319362043e95f5353c0535c1f58eec5336fdfcf626430af7def58"
+checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "reqsign"

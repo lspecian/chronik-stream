@@ -130,6 +130,21 @@ pub struct NodeConfig {
     #[validate(custom = "validate_addr")]
     pub raft: String,
 
+    /// Optional address a *follower* fetches this node's partitions from.
+    ///
+    /// Defaults to `kafka`, which is what every deployment gets unless it says
+    /// otherwise. Setting it puts replication on a different network from
+    /// clients — worth doing because at RF=3 a leader sends every record twice
+    /// more than it received it, so its egress is twice its ingress and both
+    /// otherwise share one link.
+    ///
+    /// It exists because `kafka` cannot serve both roles: that field is the
+    /// address published to clients in Metadata responses, so pointing it at an
+    /// internal fabric makes the cluster advertise an address clients cannot
+    /// route to (RP-10). This is the field to change instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replication: Option<String>,
+
     // DEPRECATED: Kept for backward compatibility only
     /// @deprecated Use `kafka` field instead
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -229,6 +244,9 @@ impl ClusterConfig {
                 kafka: format!("{}:{}", host, kafka_port),
                 wal: format!("{}:{}", host, wal_port),
                 raft: format!("{}:{}", host, raft_port),
+                // This shorthand form has no way to express a separate
+                // replication network; a config file can set it per peer.
+                replication: None,
                 addr: None, // Deprecated
                 raft_port: None, // Deprecated
             });
@@ -455,6 +473,7 @@ mod tests {
                 kafka: "10.0.1.10:9092".to_string(),
                 wal: "10.0.1.10:9291".to_string(),
                 raft: "10.0.1.10:5001".to_string(),
+                replication: None,
                 addr: None,
                 raft_port: None,
             },
@@ -463,6 +482,7 @@ mod tests {
                 kafka: "10.0.1.11:9092".to_string(),
                 wal: "10.0.1.11:9291".to_string(),
                 raft: "10.0.1.11:5001".to_string(),
+                replication: None,
                 addr: None,
                 raft_port: None,
             },
@@ -471,6 +491,7 @@ mod tests {
                 kafka: "10.0.1.12:9092".to_string(),
                 wal: "10.0.1.12:9291".to_string(),
                 raft: "10.0.1.12:5001".to_string(),
+                replication: None,
                 addr: None,
                 raft_port: None,
             },
@@ -521,6 +542,7 @@ mod tests {
                 kafka: "10.0.1.10:9092".to_string(),
                 wal: "10.0.1.10:9291".to_string(),
                 raft: "10.0.1.10:5001".to_string(),
+                replication: None,
                 addr: None,
                 raft_port: None,
             },
@@ -529,6 +551,7 @@ mod tests {
                 kafka: "10.0.1.11:9092".to_string(),
                 wal: "10.0.1.11:9291".to_string(),
                 raft: "10.0.1.11:5001".to_string(),
+                replication: None,
                 addr: None,
                 raft_port: None,
             },
@@ -558,6 +581,7 @@ mod tests {
                 kafka: "10.0.1.10:9092".to_string(),
                 wal: "10.0.1.10:9291".to_string(),
                 raft: "10.0.1.10:5001".to_string(),
+                replication: None,
                 addr: None,
                 raft_port: None,
             },
@@ -566,6 +590,7 @@ mod tests {
                 kafka: "10.0.1.10:9092".to_string(), // Duplicate kafka address!
                 wal: "10.0.1.10:9291".to_string(), // Duplicate wal address!
                 raft: "10.0.1.10:5001".to_string(), // Duplicate raft address!
+                replication: None,
                 addr: None,
                 raft_port: None,
             },
@@ -692,6 +717,7 @@ mod tests {
             kafka: "invalid-no-port".to_string(), // Missing port
             wal: "localhost:9291".to_string(),
             raft: "localhost:5001".to_string(),
+            replication: None,
             addr: None,
             raft_port: None,
         };
@@ -727,5 +753,56 @@ mod tests {
         assert_eq!(config.replication_factor, 3);
         assert_eq!(config.min_insync_replicas, 2);
         assert_eq!(config.peers.len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod replication_address_tests {
+    use super::*;
+
+    fn node(kafka: &str, replication: Option<&str>) -> NodeConfig {
+        NodeConfig {
+            id: 1,
+            kafka: kafka.to_string(),
+            wal: "10.0.0.1:9291".to_string(),
+            raft: "10.0.0.1:5001".to_string(),
+            replication: replication.map(|s| s.to_string()),
+            addr: None,
+            raft_port: None,
+        }
+    }
+
+    /// The default has to be exactly today's behaviour, because every existing
+    /// config omits the field.
+    #[test]
+    fn a_peer_without_a_replication_address_replicates_over_its_kafka_address() {
+        let n = node("10.0.0.1:9092", None);
+        let fetch_from = n.replication.clone().unwrap_or_else(|| n.kafka.clone());
+        assert_eq!(fetch_from, "10.0.0.1:9092");
+    }
+
+    /// And when it is set, only replication moves — `kafka` still has to be the
+    /// address clients are given, or the cluster advertises a network they
+    /// cannot route to (RP-10).
+    #[test]
+    fn a_replication_address_moves_only_replication() {
+        let n = node("192.168.1.31:9092", Some("172.16.10.31:9092"));
+        let fetch_from = n.replication.clone().unwrap_or_else(|| n.kafka.clone());
+        assert_eq!(fetch_from, "172.16.10.31:9092", "followers use the internal fabric");
+        assert_eq!(n.kafka, "192.168.1.31:9092", "clients keep the routable address");
+    }
+
+    #[test]
+    fn the_field_round_trips_through_toml() {
+        let with = "id = 1\nkafka = \"192.168.1.31:9092\"\nwal = \"192.168.1.31:9291\"\n\
+                    raft = \"192.168.1.31:5001\"\nreplication = \"172.16.10.31:9092\"\n";
+        let parsed: NodeConfig = toml::from_str(with).expect("parses");
+        assert_eq!(parsed.replication.as_deref(), Some("172.16.10.31:9092"));
+
+        // Absent is the common case and must deserialize, not error.
+        let without = "id = 1\nkafka = \"192.168.1.31:9092\"\nwal = \"192.168.1.31:9291\"\n\
+                       raft = \"192.168.1.31:5001\"\n";
+        let parsed: NodeConfig = toml::from_str(without).expect("parses without the field");
+        assert_eq!(parsed.replication, None);
     }
 }

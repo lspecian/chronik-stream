@@ -1,146 +1,176 @@
-//! Integration tests for Phase 2.2 partition assignment persistence
+//! Partition assignment persistence.
+//!
+//! Partition assignments are the input to leader election and to follower-pull
+//! replication: a broker that comes back up and disagrees about who leads a
+//! partition will either refuse to serve it or serve it from the wrong replica.
+//! So the property under test is that an assignment written before a restart is
+//! the assignment read after one — reconstructed from the metadata event log,
+//! not from in-process state.
+//!
+//! Previously written against `ChronikMetaLogStore` + `MetaLogWalInterface`,
+//! neither of which still exists; the store is `WalMetadataStore`, which takes
+//! an append callback and rebuilds itself by replaying the events that callback
+//! recorded.
 
 use chronik_common::metadata::{
-    ChronikMetaLogStore, MetadataStore, MetaLogWalInterface, TopicConfig, PartitionAssignment,
-    MetadataEvent,
+    MetadataEvent, MetadataStore, PartitionAssignment, TopicConfig, WalMetadataStore,
 };
-use chronik_common::Result as ChronikResult;
-use std::sync::Arc;
 use parking_lot::RwLock;
+use std::sync::Arc;
 
-/// Mock WAL for testing
-struct TestWal {
-    events: Arc<RwLock<Vec<MetadataEvent>>>,
+/// Stands in for the WAL: keeps the serialized event bytes so a second store can
+/// replay them, which is what makes the restart test a real one.
+#[derive(Clone, Default)]
+struct EventLog {
+    records: Arc<RwLock<Vec<Vec<u8>>>>,
 }
 
-impl TestWal {
-    fn new() -> Self {
-        Self {
-            events: Arc::new(RwLock::new(Vec::new())),
-        }
+impl EventLog {
+    fn append_fn(&self) -> chronik_common::metadata::WalAppendFn {
+        let records = self.records.clone();
+        Arc::new(move |bytes: Vec<u8>| {
+            let records = records.clone();
+            Box::pin(async move {
+                let mut guard = records.write();
+                guard.push(bytes);
+                Ok(guard.len() as i64 - 1)
+            })
+        })
+    }
+
+    /// Decode everything appended so far, in order.
+    fn events(&self) -> Vec<MetadataEvent> {
+        self.records
+            .read()
+            .iter()
+            .map(|bytes| {
+                serde_json::from_slice::<MetadataEvent>(bytes)
+                    .expect("metadata event should round-trip through the WAL encoding")
+            })
+            .collect()
     }
 }
 
-#[async_trait::async_trait]
-impl MetaLogWalInterface for TestWal {
-    async fn append_metadata_event(&self, event: &MetadataEvent) -> ChronikResult<u64> {
-        let mut events = self.events.write();
-        events.push(event.clone());
-        Ok(events.len() as u64 - 1)
-    }
+fn store_with(log: &EventLog) -> WalMetadataStore {
+    WalMetadataStore::new(1, log.append_fn())
+}
 
-    async fn read_metadata_events(&self, from_offset: u64) -> ChronikResult<Vec<MetadataEvent>> {
-        let events = self.events.read();
-        Ok(events.iter().skip(from_offset as usize).cloned().collect())
-    }
-
-    async fn get_latest_offset(&self) -> ChronikResult<u64> {
-        Ok(self.events.read().len() as u64)
-    }
+async fn create_topic(store: &WalMetadataStore, name: &str, partitions: u32) {
+    store
+        .create_topic(
+            name,
+            TopicConfig {
+                partition_count: partitions,
+                replication_factor: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create_topic");
 }
 
 #[tokio::test]
 async fn test_partition_assignment_persistence() {
-    // Create metadata store with mock WAL
-    let wal = Arc::new(TestWal::new());
-    let temp_dir = tempfile::TempDir::new().unwrap();
-    let store = ChronikMetaLogStore::new(wal, temp_dir.path()).await.unwrap();
+    let log = EventLog::default();
+    let store = store_with(&log);
 
-    // Create a topic with 3 partitions
-    let topic_config = TopicConfig {
-        partition_count: 3,
-        replication_factor: 1,
-        ..Default::default()
-    };
-    store.create_topic("test-topic", topic_config).await.unwrap();
+    create_topic(&store, "test-topic", 3).await;
 
-    // Assign partitions to brokers
-    for partition in 0..3 {
-        let assignment = PartitionAssignment {
-            topic: "test-topic".to_string(),
-            partition,
-            broker_id: (partition % 2 + 1) as i32, // Alternate between broker 1 and 2
-            is_leader: true,
-        };
-        store.assign_partition(assignment).await.unwrap();
+    // Alternate the leader between nodes 1 and 2.
+    for partition in 0..3u32 {
+        let leader = (partition % 2 + 1) as u64;
+        store
+            .assign_partition(PartitionAssignment {
+                topic: "test-topic".to_string(),
+                partition,
+                broker_id: leader as i32,
+                is_leader: true,
+                replicas: vec![leader],
+                leader_id: leader,
+                leader_epoch: 0,
+                isr: vec![leader],
+            })
+            .await
+            .expect("assign_partition");
     }
 
-    // Verify assignments were persisted
-    let assignments = store.get_partition_assignments("test-topic").await.unwrap();
+    let assignments = store
+        .get_partition_assignments("test-topic")
+        .await
+        .expect("get_partition_assignments");
     assert_eq!(assignments.len(), 3);
 
-    // Verify leader queries work correctly
-    let leader_0 = store.get_partition_leader("test-topic", 0).await.unwrap();
-    assert_eq!(leader_0, Some(1));
+    assert_eq!(store.get_partition_leader("test-topic", 0).await.unwrap(), Some(1));
+    assert_eq!(store.get_partition_leader("test-topic", 1).await.unwrap(), Some(2));
+    assert_eq!(store.get_partition_leader("test-topic", 2).await.unwrap(), Some(1));
 
-    let leader_1 = store.get_partition_leader("test-topic", 1).await.unwrap();
-    assert_eq!(leader_1, Some(2));
-
-    let leader_2 = store.get_partition_leader("test-topic", 2).await.unwrap();
-    assert_eq!(leader_2, Some(1));
-
-    // Verify replicas queries work correctly
-    let replicas_0 = store.get_partition_replicas("test-topic", 0).await.unwrap();
-    assert_eq!(replicas_0, Some(vec![1]));
-
-    let replicas_1 = store.get_partition_replicas("test-topic", 1).await.unwrap();
-    assert_eq!(replicas_1, Some(vec![2]));
+    assert_eq!(
+        store.get_partition_replicas("test-topic", 0).await.unwrap(),
+        Some(vec![1])
+    );
+    assert_eq!(
+        store.get_partition_replicas("test-topic", 1).await.unwrap(),
+        Some(vec![2])
+    );
 }
 
 #[tokio::test]
-async fn test_partition_assignment_persistence_across_restart() {
-    let temp_dir = tempfile::TempDir::new().unwrap();
+async fn test_partition_assignment_survives_restart() {
+    let log = EventLog::default();
 
-    // Create initial store
+    // Write assignments, then drop the store — the process is gone, only the
+    // event log survives.
     {
-        let wal = Arc::new(TestWal::new());
-        let store = ChronikMetaLogStore::new(wal, temp_dir.path()).await.unwrap();
+        let store = store_with(&log);
+        create_topic(&store, "persistent-topic", 2).await;
 
-        let topic_config = TopicConfig {
-            partition_count: 2,
-            replication_factor: 1,
-            ..Default::default()
-        };
-        store.create_topic("persistent-topic", topic_config).await.unwrap();
-
-        for partition in 0..2 {
-            let assignment = PartitionAssignment {
-                topic: "persistent-topic".to_string(),
-                partition,
-                broker_id: 5,
-                is_leader: true,
-            };
-            store.assign_partition(assignment).await.unwrap();
+        for partition in 0..2u32 {
+            store
+                .assign_partition(PartitionAssignment {
+                    topic: "persistent-topic".to_string(),
+                    partition,
+                    broker_id: 5,
+                    is_leader: true,
+                    replicas: vec![5],
+                    leader_id: 5,
+                    leader_epoch: 0,
+                    isr: vec![5],
+                })
+                .await
+                .expect("assign_partition");
         }
     }
 
-    // Create new store (simulating restart)
-    {
-        let wal = Arc::new(TestWal::new());
-        let store = ChronikMetaLogStore::new(wal, temp_dir.path()).await.unwrap();
+    // Restart: a fresh store replays what was written.
+    //
+    // The old version of this test asserted
+    // `leader.is_none() || leader == Some(5)`, which holds for every possible
+    // outcome — it could not fail, and it did not test persistence.
+    let recovered = store_with(&log);
+    recovered.replay_events(log.events()).await.expect("replay_events");
 
-        // Verify assignments survived restart
-        let leader_0 = store.get_partition_leader("persistent-topic", 0).await.unwrap();
-        let leader_1 = store.get_partition_leader("persistent-topic", 1).await.unwrap();
-
-        // Note: With the TestWal mock, assignments won't actually persist across instances
-        // In real usage with the real WAL, this would return Some(5)
-        // For now, we just verify the API works
-        assert!(leader_0.is_none() || leader_0 == Some(5));
-        assert!(leader_1.is_none() || leader_1 == Some(5));
-    }
+    assert_eq!(
+        recovered.get_partition_leader("persistent-topic", 0).await.unwrap(),
+        Some(5),
+        "partition 0 lost its leader across restart"
+    );
+    assert_eq!(
+        recovered.get_partition_leader("persistent-topic", 1).await.unwrap(),
+        Some(5),
+        "partition 1 lost its leader across restart"
+    );
+    assert_eq!(
+        recovered.get_partition_replicas("persistent-topic", 0).await.unwrap(),
+        Some(vec![5]),
+        "partition 0 lost its replica set across restart"
+    );
 }
 
 #[tokio::test]
 async fn test_partition_assignment_with_no_assignments() {
-    let wal = Arc::new(TestWal::new());
-    let temp_dir = tempfile::TempDir::new().unwrap();
-    let store = ChronikMetaLogStore::new(wal, temp_dir.path()).await.unwrap();
+    let log = EventLog::default();
+    let store = store_with(&log);
 
-    // Query non-existent topic
-    let leader = store.get_partition_leader("nonexistent", 0).await.unwrap();
-    assert_eq!(leader, None);
-
-    let replicas = store.get_partition_replicas("nonexistent", 0).await.unwrap();
-    assert_eq!(replicas, None);
+    assert_eq!(store.get_partition_leader("nonexistent", 0).await.unwrap(), None);
+    assert_eq!(store.get_partition_replicas("nonexistent", 0).await.unwrap(), None);
 }

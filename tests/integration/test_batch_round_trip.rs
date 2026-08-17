@@ -217,19 +217,30 @@ fn test_segment_round_trip_multi_batch() {
 
     println!("Decoding {} bytes of indexed_records", total_len);
 
-    while cursor_pos < total_len {
-        match RecordBatch::decode(&deserialized.indexed_records[cursor_pos..]) {
+    // v3 segments length-prefix each batch with a u32 — that prefix is what
+    // fixed the multi-batch bug, where only the first batch was readable. This
+    // loop still read v2 concatenated batches, so it decoded 0 of 20.
+    while cursor_pos + 4 <= total_len {
+        let len = u32::from_be_bytes(
+            deserialized.indexed_records[cursor_pos..cursor_pos + 4]
+                .try_into()
+                .expect("4 bytes"),
+        ) as usize;
+        cursor_pos += 4;
+        assert!(
+            cursor_pos + len <= total_len,
+            "batch {} claims {} bytes, only {} remain",
+            batch_count + 1, len, total_len - cursor_pos
+        );
+        match RecordBatch::decode(&deserialized.indexed_records[cursor_pos..cursor_pos + len]) {
             Ok((batch, bytes_consumed)) => {
                 println!("Batch {}: {} records, {} bytes consumed",
                     batch_count + 1, batch.records.len(), bytes_consumed);
 
                 all_records.extend(batch.records);
-                cursor_pos += bytes_consumed;
+                let _ = bytes_consumed;
+                cursor_pos += len;
                 batch_count += 1;
-
-                if bytes_consumed == 0 {
-                    panic!("Zero bytes consumed at position {}", cursor_pos);
-                }
             }
             Err(e) => {
                 eprintln!("ERROR: Failed to decode batch {} at position {}/{}: {}",

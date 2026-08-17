@@ -1,0 +1,1788 @@
+# Replication Roadmap — Follower-Pull Replication
+
+**Goal**: Replace push-based fire-and-forget WAL replication with Kafka-style follower-pull, so that progress tracking, catch-up, backpressure and retention interlock become **properties of the design** rather than four separate mechanisms that can each be half-built.
+
+**Status values**: `NOT STARTED` → `IN PROGRESS` → `CODE COMPLETE` → `TESTED` → `COMPLETE`
+
+| Phase | Name | Status | Version | Notes |
+|-------|------|--------|---------|-------|
+| RP-0 | Replication conformance suite | `TESTED` | — | Placement + ISR honesty; fails pre-#29, passes after |
+| RP-1 | Harden the current mechanism | `TESTED` | — | 1.1–1.4 + 3 bugs found by cluster validation |
+| RP-2 | Follower fetch | `TESTED` | — | 2.1–2.4 all validated on a 3-node cluster; pull is now the default, no env var needed |
+| RP-3 | Leader epochs & truncation | `TESTED` | — | Cut proven in-process AND on a cluster: `local_divergence.sh` passes 3/3 deterministically on the default config. Finding it exposed the indexer deleting a live topic's WAL on restart — see RP-3.3 |
+| RP-5 | Partition leader failover | `TESTED` | — | Elects only from the in-sync set, which is published to metadata so it outlives the leader that measured it. The unclean election that destroyed acks=all-acknowledged records is fixed — see RP-3.3 "D0" |
+| RP-6 | Failover recovery latency | `TESTED` | — | Catalog is pushed on rejoin; verified on cluster |
+| RP-7 | Assignment authority | `TESTED` | — | Only the Raft leader publishes; fetch refuses when it does not lead. **Full conformance suite now PASSES, RP-0.4 included** |
+| RP-8 | `acks=all` latency (#36) | `TESTED` | — | Three waits removed from the write path: new topic 7,000ms → 23ms, steady state 505ms → 17ms. The reported "duplication" was a client retry after a timeout |
+| RP-4 | Delete the push stack | `TESTED` | — | Data push path deleted: mode switch, produce fan-out, LeaderElector and the election machinery. Metadata keeps the transport (OQ2). One mechanism |
+| RP-9 | `acks=all` round-trip throughput | `TESTED` | — | Every fetch re-read and re-parsed the whole active WAL segment from byte zero. Fixed with a durable-gated tail cache and a sparse offset index: ~1,400 → **6,197 msg/s**, now 1.3× `acks=1` rather than 4–7×, and stable across a run. Three bugs fell out, one of them **data loss on failover** (divergence 7/10 → 10/10) |
+| RP-10 | Replication cannot leave the client network | `TESTED` | — | `[[peers]].kafka` served both the client-facing Metadata list and the follower fetch path, so a dedicated fabric was unconfigurable. Added a per-peer `replication` address: `acks=1` **+31%** (21,802 → 28,587 msg/s), p99 −29%, client link 690 → 46 Mbit/s |
+| RP-11 | **The "17× produce regression" was a benchmark reading a bug** | ✅ `RESOLVED` | — | Not a regression: pre-#21 leaked reservations pinned the memory counter and the broker REJECTED most produces instantly, which a rate counter cannot tell from serving them (61,625 msg/s claimed, 50 MB on disk; guarded: 16,519 msg/s, 301.7 MB). Found a real bug behind it — every non-transactional produce failure was returned to the client as SUCCESS |
+| RP-12 | **Cluster produce throughput was bimodal** | `TESTED` | — | One run in 3-6 collapsed to a tenth (~8,000 vs ~85,000 msg/s) on `acks=1`/`acks=all`. Cause: the client's `max_wait_ms` was used as a deadline on reading data that already existed, so a slow read was DISCARDED and refetched — positive feedback. Now a 30s stuck-read safety net. 8/8 clean after, was 2-in-8 |
+
+---
+
+## Working Model
+
+**This is a breaking change. All work happens on `feat/follower-pull-replication` and nothing releases until the whole thing is complete and tested.**
+
+- **One long-lived branch.** Phases are checkpoints on that branch, not releases. No incremental merges to `main`, no intermediate tags.
+- **Rebase onto `main` regularly** — weekly at minimum, and after any release. A stale long-lived branch is its own failure mode in this repo (`origin/feat/memory-hybrid-infra-and-quality` became an unusable pre-rebase snapshot exactly this way).
+- **Escape hatch**: RP-0 and RP-1 touch the *existing* mechanism and don't depend on pull. If the effort stalls, they can be cherry-picked to `main` on their own and still leave the system better. That is a fallback, not the plan.
+- **Definition of done for release**: every RP-0 test green (including the ones that start `#[ignore]`), a soak on a real 3-node cluster, and the perf numbers in `BASELINE_PERFORMANCE.md` / `BARE_METAL_PERFORMANCE.md` re-measured against the new mechanism.
+
+### Breaking changes this ships
+
+| Change | Consequence |
+|---|---|
+| Replication protocol replaced by Fetch | **No mixed-version cluster.** A pull follower cannot replicate from a push leader, so a rolling upgrade across the boundary does not work — see Open Question 5 |
+| `HW = min(LEO across ISR)` | Consumers may observe *less* than today during follower lag. Today HW is the leader's own write position, which over-reports |
+| WAL replication port 9291 retired | Config, CRD, operator and firewall rules all change |
+| `acks=all` actually waits | Latency increases for `acks=-1` producers; some workloads will feel it |
+
+---
+
+## Why: what we actually measured (2026-08-10/11)
+
+This roadmap exists because of findings that are empirical, not theoretical. Recorded here so no future session has to rediscover them.
+
+| Finding | Evidence |
+|---|---|
+| `acks=1` and `acks=all` replicated **nothing**; `acks=0` replicated fine | Controlled A/B on a purpose-built 3-node RF=3 cluster: baseline `acks=1` placed each partition on exactly one node, fixed build placed all three on all nodes. `acks=0` placed all three in both |
+| Not a recent regression — present in v2.2.25 | Ran `harbor.lab.specian.de/chronik/chronik-server:v2.2.25-fix-spinloop` (the image behind `BARE_METAL_PERFORMANCE.md`): `acks=all` → `[0]`,`[1]`,`[2]`; `acks=0` → `[0,1,2]` on all three |
+| Live clusters ran 33 days with every partition on exactly one node | signal-stream v2.10.7, four topics, `ls /data/wal/<topic>` on each pod |
+| ISR is fiction | `/admin/status` reported `replicas:[1,2,3], isr:[1,2,3]` for every partition with zero follower copies on disk. `wal_replication.rs`: *"For now, treat all replicas as in-sync (ISR = replicas)"* |
+| No catch-up exists anywhere | The only `catch up` in the tree is metadata replication; every `backfill` is vector embeddings. Followers never pull, and nothing reconciles after the fact |
+
+Fixed in **#29** (`0b4e871`): the async-response path returned before the replication hook, and that path is taken whenever `acks != 0`.
+
+Still open: **#30** (`acks=all` doesn't wait), **#31** (ISR from assignment, not ACKs), **#33** (records dropped with no retry).
+
+### Cost of replication, measured
+
+3-node RF=3, `kafka-producer-perf-test`, 300k × 1KB, after warmup:
+
+| Config | Throughput | p50 | p99 |
+|---|---|---|---|
+| `acks=1`, replication silently off (pre-#29) | 88,054 rec/s | 289 ms | 374 ms |
+| `acks=1`, replicating (post-#29) | 66,181 rec/s | 357 ms | 514 ms |
+| `acks=0`, replicating | ~30 rec/s ⚠️ | 14 ms | 91,554 ms |
+
+**Unresolved**: whether 66K is network-bound or sender-bound. Links are 1 GbE and the load generator was co-located with a broker. **Settle this before optimising anything** — see Open Questions.
+
+---
+
+## Architectural Principle
+
+> **A follower is a consumer with a `replica_id`.**
+
+The single most important property of this design, for *this* codebase: replication rides the **same code path as consumer reads**. Every consumer test, every real client, and the 228-test protocol conformance suite then exercise the path replication depends on.
+
+That matters because of how the last two attempts died:
+
+| Attempt | Failure |
+|---|---|
+| Raft data replication (2025-10, `archive/failed-raft-data-replication-v2.2-v2.3`) | Batch notifier wired for `__raft_internal-0`, **not** for data partitions → user topics fell back to per-message Raft. Measured 61 msg/s. Root cause documented in `docs/CRITICAL_BUG_RAFT_BATCHING.md` on that branch, fix estimated at **1-2 hours**, never done, branch abandoned |
+| Push WAL replication (v2.2.9 → v2.11.0) | Replication hook unreachable for `acks != 0`; metadata replicated via a *separate* path (`broadcast_metadata`) and so kept working. Undetected for ~9 months |
+
+**Both are the same bug class: the mechanism was wired for the internal/metadata topic and silently not for user data.** A third mechanism inherits that hazard on day one unless the data path is the path everything else already uses.
+
+⚠️ **Note on the Raft verdict**: the "Raft is terrible (2-5K msg/s)" comment in `produce_handler.rs` quotes a broken implementation. The **270x** figure in `docs/BENCHMARK_RESULTS_v2_3_0.md` was *projected, never measured* — that document's real numbers (31,876 / 54,857 msg/s) are **standalone mode**, no replication. This does not mean we should return to Raft; it means the prior experiment should carry no weight in the decision either way.
+
+---
+
+## Measurement Discipline
+
+**Correctness (primary)** — every phase must keep these green:
+
+- Bytes land on followers: for each of `acks=0`, `acks=1`, `acks=-1`, produce to an RF=3 topic and assert every replica physically holds every partition
+- Consumed record count equals produced count, no duplicates
+- Reported ISR matches physical reality
+- A follower restarted mid-produce rejoins and converges
+
+**Performance (watch for regression)**:
+
+- Produce throughput and p50/p95/p99 at `acks=1` and `acks=-1`
+- Replication lag: leader LEO minus slowest follower LEO
+- Consumer fetch latency — RP-2 puts followers on the same path, so consumer reads must not regress
+- NIC utilisation per node (the currently-unexplained variable)
+
+**Negative result — do not repeat** (2026-08-10): coalescing replication frames into one write+flush per follower per batch (256 records) **regressed** `acks=1` from 66,181 → 19,641 rec/s with p99 514 ms → 10.5 s, and left `acks=0` replication partial. Zero drops, zero write failures, zero queue overflow — so it was not failure handling. Suspected head-of-line blocking on ~4 MB writes, never confirmed. The premise (single sender is the bottleneck) was never validated. Branch deleted.
+
+---
+
+## Phase RP-0: Replication Conformance Suite
+
+**Expected impact**: makes every later phase verifiable; would have caught both prior failures
+**Effort**: 2-3 days
+**Risk**: none — additive tests only
+**Depends on**: nothing
+**Written against push, must pass on the current mechanism before RP-2 begins.**
+
+### RP-0.1: Placement assertions
+
+- [x] Test helper: produce N records to an RF=3 topic at a given acks level, return per-node partition placement
+- [x] Assert every replica physically holds every partition, for `acks=0`, `acks=1`, `acks=-1`
+- [x] Assert consumed count equals produced count (acks=0 exempt — fire-and-forget has no delivery guarantee)
+- [x] Run against a real 3-node cluster, not mocks — the bug class is a *wiring* bug and mocks would have passed
+- [x] `local` mode (`tests/cluster/`, kcat) and `k8s` mode (`REPL_MODE=k8s`, kubectl injectable so no lab host is hardcoded)
+
+**Status**: `TESTED`. `tests/cluster/regression_replication.sh`. Validated in **both** directions, which is the only way to know a regression test is real:
+
+| Cluster | acks=0 | acks=1 | acks=all | Result |
+|---|---|---|---|---|
+| chronik-thunderbird v2.10.10 (pre-#29) | `[0 1 2]` on all 3 | `[0]`,`[1]`,`[2]` | `[0]`,`[1]`,`[2]` | **FAIL** (correctly) |
+| post-#29 build | `[0 1 2]` on all 3 | `[0 1 2]` on all 3 | `[0 1 2]` on all 3 | **PASS** |
+
+Asserts against the *union* of partitions across nodes rather than a fixed `0..N`, so it stays honest however the client's partitioner distributed records.
+
+⚠️ Found while building this: `kafka-topics.sh --describe` fails against Chronik — `non-nullable field clusterId was serialized as null`. DescribeCluster returns a null cluster id that the Java AdminClient refuses to deserialize, breaking standard Kafka tooling. Filed separately; the RF assertion here is best-effort as a result, and physical placement carries the test.
+
+#### The suite itself lied twice (found during RP-2.4)
+
+Both faults made a **healthy broker look broken** — on the one test whose job is to tell those apart. Recorded because a guardrail that cries wolf is worse than none.
+
+1. **Shell payloads did not survive `REPL_KUBECTL`.** When it is an ssh wrapper — the usage the header documents — ssh flattens its arguments and the remote login shell re-parses them, so `kubectl exec pod -- bash -c "a | b"` arrives as `bash -c a` with `| b` running on the *ssh host*. Every produce was a no-op and the suite reported "no partitions on any node". The quoting level is now **probed** at startup against output that cannot occur by accident, and the suite aborts loudly if no level works.
+
+2. **The ISR assertion never took the replica down.** The operator recreates a deleted pod in ~4s and the broker resumes fetching well before the pod reports Ready — so `0/1 Running` reads as an outage while the replica is fully caught up. The liveness window is 30s and keeping a replica through a 4s blip is *correct*. Delete-once, delete-in-a-loop and `SIGSTOP` on PID 1 all failed to hold it down, each looking exactly like "ISR is over-reporting". Cordoning the node the replica runs on works: the pod goes Pending and stays there.
+
+   Under push this test passed by accident — the leader had to re-establish its own outbound connection before the follower looked alive, stretching the outage past the window. Pull recovers on the follower's schedule instead. **Better behaviour silently invalidated the test**, which is a failure mode worth watching for in the rest of this roadmap.
+
+### RP-0.2: Unit-level guards
+
+- [x] ~~Port `test_replication_fires_for_every_acks_mode` into the suite~~ — **superseded.** RP-4 deleted that test with the push path it asserted on: it checked `total_queued`, a counter on the way *out*. Its invariant — every acks mode reaches every replica — is now checked by `regression_replication.sh` against the records on each node's disk, which is the stronger claim.
+- [x] Assert ISR reported by `/admin/status` matches physical placement — `regression_replication.sh` ("ISR honesty"), which kills a replica and requires the reported ISR to shrink.
+- [x] ~~Assert a produce that reaches no follower is counted in `total_dropped`~~ — **obsolete.** RP-4 removed the data push path, so a produce no longer traverses the queue those counters describe; they now cover metadata replication only. The property they stood in for — a record that reached no follower must not be reported as replicated — is what ISR honesty and `local_divergence.sh` check directly.
+
+**Status**: `DONE` 2026-08-17 — two of three were superseded by the mechanism change rather than implemented, which is the honest outcome and worth stating plainly: these were written against the push transport.
+
+### RP-0.3: Failure-mode coverage
+
+- [x] Follower down during produce → records land after it returns — `follower_catchup.sh`, 2026-08-17
+- [x] Follower restarted mid-produce → converges — same harness
+- [x] Leader killed mid-produce → no divergence after election — `local_divergence.sh`, which stages the divergence with `SIGSTOP`/`SIGKILL`, kills the old leader mid-produce and requires the divergent tail to be cut (`bytes discarded > 0`) with every committed record still readable. The "`#[ignore]` until RP-3" note is spent: RP-3 shipped.
+
+**Status**: `DONE` 2026-08-17. These two boxes and RP-2.4's "follower down 5 minutes, restarted, converges" were one property at three durations — a follower that misses writes catches up unattended — and it was the last claim in this roadmap resting on inference rather than a harness. `tests/cluster/follower_catchup.sh` now asserts it:
+
+```
+   all three replicas hold the prefix on disk
+   leader=node1, taking down follower node2
+   gap records on node2's disk while down: 0 (must be 0)
+   ISR after 40s down: "isr":[1,3]
+   node2 now holds prefix=100/100 gap=120/120
+   records readable via node2: 220 / 220
+   ISR after node2 returned: "isr":[1,2,3]
+```
+
+Four things had to be checked together, because any one alone passes on a broker that is broken:
+
+- **The gap is real.** A replica that replicated everything during the outage and one that replicated nothing look identical at the end. Asserting it holds *zero* gap records while down is what makes the convergence below mean anything.
+- **Nothing intervenes.** No reassignment, no admin call — the only event is the process starting, since "without operator action" is the property.
+- **On its own disk, and readable through it.** Bytes present but a watermark that never advanced is still a broken replica.
+- **ISR shrinks and recovers.** A replica that holds every record but is never readmitted leaves the partition permanently under-replicated to `acks=all` and to failover, which elects from ISR.
+
+The outage default is 40s rather than the box's 5 minutes: catch-up resumes from the local LEO whether that is seconds or hours stale, so duration is not what the property depends on — but it must exceed the 30s ISR liveness window or the ISR assertions are not deterministic. The first version sampled ISR ~10s after the kill, printed an unshrunk `isr:[1,2,3]`, and looked like it had caught a bug when it had only asked too early. `CATCHUP_OUTAGE_SECS` raises it for a long soak.
+
+> Deliberately includes tests that fail today. They define the target and un-ignore as phases land.
+
+---
+
+## Phase RP-1: Harden the Current Mechanism
+
+**Expected impact**: closes #30, #31, and half of #33 on the existing push transport
+**Effort**: 3-5 days
+**Risk**: low — additive, no transport change
+**Depends on**: RP-0.1 (so regressions are visible)
+
+Worth doing **regardless of whether pull ever happens**.
+
+### RP-1.1: Retention interlock
+
+- [x] Track the minimum offset any follower has acknowledged, per partition
+- [x] `delete_after_index` must not delete a WAL segment above that offset
+- [x] Metric + warning when WAL retention is held back by a lagging follower
+- [x] Test: lagging follower prevents deletion; caught-up follower permits it
+
+**Status**: `CODE COMPLETE`. `ReplicationProgress` trait in chronik-storage keeps the indexer ignorant of ISR/ACKs; impl lives on `IsrTracker`. Followers silent past `max_lag_ms` are excluded so a dead node cannot pin WAL forever (matches Kafka). No progress source = no interlock, so single-node is unchanged. 2 unit tests.
+
+> Postgres's replication-slot equivalent. Required under **every** option including doing nothing — today WAL is deleted on indexing with no regard for whether followers received it.
+
+### RP-1.2: Honest ISR (#31)
+
+- [x] Leader maintains a *running* acked offset per follower — already existed (`IsrTracker`, fed from the ACK reader). It read empty only because nothing was being replicated
+- [x] ISR = replicas within a lag bound, with a timeout for silent followers
+- [x] `/admin/status` reports the real ISR
+- [x] Under-replicated signal — `total_dropped()` accessor (RP-1.4)
+- [x] Metadata responses report the real ISR (was admin only) — 2026-08-17
+- [x] The lag bound is operator-tunable (`CHRONIK_REPLICA_LAG_TIME_MAX_MS`) — OQ3, 2026-08-17
+
+**Status**: `CODE COMPLETE`. Four defects, all making ISR read healthier than reality:
+
+0. **Metadata reported the assignment as the in-sync set.** `isr_nodes: replica_nodes.clone()`, annotated "for now, all replicas are in-sync" — the same inversion as defect 1 below, left in the surface that matters most. `/admin/status` is where an operator looks *after* being alerted; **Metadata** is where every Kafka client and monitoring tool reads ISR (`kafka-topics --describe`, Kafka UI, Cruise Control), so the alert never fired. Metadata now reports the set the leader published into the assignment (`isr_publisher`), which is readable by a node that is not the leader — the structural fix RP-2 promised. `offline_replicas` is derived from the difference instead of always being empty. Falls back to the assignment only when nothing has been measured, matching `in_sync_replicas`'s "unknown is not empty" rule; an empty ISR would otherwise make `min.insync.replicas` unsatisfiable and stop producers writing to a brand-new partition.
+
+   Found the same way as everything else in this phase: by writing the test. `InMemoryMetadataStore::get_partition_replicas` was also still returning the deprecated single `broker_id` rather than the replica set — the bug `WalMetadataStore` fixed in v2.2.9 — so an RF=3 partition read back as RF=1 and every test written against that store agreed with a broker that does not exist.
+
+
+1. **Empty ISR reported as "all replicas in-sync".** `/admin/status` fell back to the assignment whenever the tracker returned nothing, so a partition replicating to *nobody* showed a full ISR. That inversion is why #29 stayed invisible for nine months. The fallback now applies only when the tracker has heard nothing at all for the partition (`is_unknown_for_all`) — genuinely a fresh cluster.
+2. **Caught-up followers aged out.** The time bound was applied unconditionally, so every replica of an *idle* partition dropped out of ISR after `max_lag_ms` despite holding exactly the leader's data. It now measures how long a replica has been *behind*, matching `replica.lag.time.max.ms`.
+3. **Backwards clock ejected healthy replicas.** `now - last_update` on u64 wraps rather than panicking in release, turning an NTP step into a colossal apparent lag. Saturating subtraction.
+
+Added `SyncState{InSync,Lagging,Unknown}` so "never heard from" is distinguishable from "known behind" — the distinction defect 1 turned on. 5 unit tests.
+
+### RP-1.3: `acks=all` waits (#30)
+
+- [x] Verify/repair `quorum_size`
+- [x] Change the guard to `acks == 1` so `acks=-1` reaches its ISR quorum arm
+- [x] Timeout returns `NOT_ENOUGH_REPLICAS` rather than hanging
+- [x] Test: `acks=-1` response stays pending until a follower ACK arrives
+- [x] Measure the latency cost — this moves `acks=-1` off the async fast path. `acks_all_latency.sh`, 2026-08-17: `acks=all` **13ms** steady state against a 250ms budget, **14ms** for the first write to a new topic against 2000ms; `acks=1` 12ms on the same run. So the cost of leaving the fast path is ~1ms, not the tens of ms feared — it settles on the replication round trip, which on a local 3-node cluster is fast. The budgets exist to catch it silently reverting to a background timer.
+
+**Status**: `CODE COMPLETE`. The quorum arm was fully written and **unreachable since v2.2.10** — `use_async_responses = response_pipeline.is_some() && acks != 0` sent `acks=-1` down the fast path, which answers on the leader's own fsync. Now `acks == 1`, so `acks=-1` falls through and waits. Only viable because #29 made followers actually receive data; before that this would have hung to timeout on every request.
+
+`quorum_size` was `assignment.replicas.len()` — *every* assigned replica — so one slow follower blocked all writes until the 30s timeout even at RF=3/minISR=2. Now `min_insync_replicas` (leader's own ACK counted), matching Kafka. Corrects my earlier reading that it was unsatisfiable: the leader does self-ACK, so it *completed*, it was just far stricter than intended.
+
+Test asserts the produce stays outstanding while only the leader has ACKed, then completes on a follower ACK. **Confirmed it fails with the old guard restored.**
+
+### RP-1.4: Retry on send failure (#33)
+
+- [x] Re-queue data records that reached no follower, with bounded retries and backoff
+- [x] Surface `total_dropped` as a metric
+
+**Status**: `CODE COMPLETE`. Only metadata was re-queued; a data record reaching no follower was discarded silently, so a transient follower restart left a permanent under-replicated gap. Data records now retry with the same 100ms backoff, bounded at `MAX_REPLICATION_ATTEMPTS` (300 ≈ 30s) so a dead follower cannot stall the queue. The attempt counter is `#[serde(skip)]` and never enters the frame, so the wire format is unchanged. 2 unit tests.
+
+### RP-1 cluster validation — three bugs the unit tests could not have found
+
+Every one surfaced only by running the conformance suite against a real 3-node cluster. All three share a root cause worth carrying into RP-2: **the push model has no reliable signal that a follower is alive.**
+
+1. **ACK offset was in the wrong unit.** Followers ACKed the batch's *base* offset while ISR lag is measured against the leader's high watermark — an LEO. A follower that had written a batch in full still looked behind by the batch size, so it never counted as caught up. Followers now ACK `base_offset + record_count`, and the leader registers quorum waits on `last_offset + 1`. Both sides had to move together or quorum would never match.
+
+2. **A replica that died while caught up never left ISR.** Fixing (1) — plus not ageing out caught-up replicas — meant a dead node stayed in-sync forever: the lag bound does not fire for a caught-up replica and it never ACKs again. Observed: a node killed for 60s still reported `isr=[1,2,3]`. Followers now answer heartbeats with a liveness ACK, carried on the existing ACK frame with an empty topic.
+
+   ⚠️ **Connection state cannot detect this.** A TCP write succeeds into the local send buffer long after the peer is gone, so a healthy-looking socket proves nothing. Application-level liveness is the only signal that works here.
+
+3. **A restarted follower was never reconnected — replication to it stopped permanently.** Same root cause: the stale connection stayed in `connections`, so the reconnect loop's `contains_key` check passed and never redialled. Newly created topics landed only on partitions that node led, with nothing reporting a problem. Connections to followers that stop answering heartbeats are now retired so the existing reconnect path fires. Pruning runs on the connection-manager loop, not beside the heartbeat send — heartbeats only fire when the queue is empty and any successful send resets their timer, so with one live and one dead follower under load they would never fire.
+
+**Known limitation carried to RP-2**: `/admin/status` answered by a *non-leader* reports the assignment, not real ISR — only the leader receives ACKs. RP-2 fixes this structurally, since the leader learns each follower's position from its fetches.
+
+---
+
+## Phase RP-2: Follower Fetch
+
+**Expected impact**: catch-up, backpressure and progress tracking become structural
+**Effort**: 2-3 weeks
+**Risk**: medium — changes the HW computation, which affects consumer visibility
+**Depends on**: RP-0 passing on push
+
+### RP-2.1: Recognise follower fetches
+
+- [x] Branch on `replica_id >= 0` in the fetch path
+- [x] Record the follower position — its fetch offset IS its LEO
+- [x] Followers fetch above the high watermark; consumers remain capped at HW — unblocked by RP-2.3, 2026-08-17. `readable_end_offset` splits on `replica_id`: a follower reads to the leader's log end, a consumer to `consumer_visible_watermark`. The long-poll wake path splits the same way, so a consumer is not woken by records the in-sync set does not hold.
+- [x] Test: follower fetch records progress, consumer fetch does not
+
+**Status**: `TESTED` on a 3-node cluster. Wired in cluster mode only, so single-node is untouched. The fetch doubles as a liveness signal, which under push needed a separate heartbeat-ACK mechanism — and that mechanism had two bugs only a live cluster exposed.
+
+### RP-2.2: Per-follower LEO tracking
+
+- [x] Leader records each follower's fetch offset as that follower's LEO
+- [x] Feeds the ISR computation from RP-1.2 (the same `IsrTracker`, now fed from fetches as well as ACKs)
+- [x] Expose per-follower lag in `/admin/status`
+
+**Status**: `TESTED` on a 3-node cluster — with one replica killed, the leader reported `isr=[1,2]`, `under_replicated=true`, `replica_lag=[{node_id:2,lag:0}]`. `/admin/status` now carries `replica_lag` (`node_id:lag` per follower) and `under_replicated` per partition.
+
+`under_replicated` is the field worth alerting on, and it is exactly what should have been firing during the nine months `acks!=0` replicated nothing. `replica_lag` makes that alert actionable by naming the replica and the distance, instead of leaving an operator to exec into pods and list WAL directories — which is how the original outage actually had to be found.
+
+Still leader-only: followers report to the leader, so a non-leader returns an empty list rather than a misleading zero. RP-2.4 removes the asymmetry.
+
+### Bugs RP-2.4 surfaced outside replication
+
+Three defects reached from this work that were not replication bugs at all, and would have hit any user:
+
+| Bug | Effect | Fix |
+|---|---|---|
+| `max_wait_ms` applied **per partition** | `handle_fetch` serves partitions serially and gave each the full budget, so an idle N-partition fetch took N × `max_wait_ms`. At Kafka's default 500ms an 8-partition consumer waited 4s for an empty response, past its own timeout. A partition with data sat behind every idle one ahead of it. | One deadline per request; the waiting path shares it, the data path keeps its own read timeout |
+| `IsrAckTracker` never reaped | Unbounded growth, one entry per unsatisfied `acks=all` produce | Reaper started by the builder |
+| A dead replica reported `lag: 0` | Its last offset is frozen where it died, so the subtraction says "caught up". Printed beside `under_replicated: true`, it reads as a false alarm | Report no lag for a replica outside the liveness window |
+
+The conformance suite itself had **two** faults that made a healthy broker look broken — see the RP-0 section.
+
+### ✅ Was a blocker: followers did not reliably know who leads (FIXED 2026-08-12)
+
+Pull moves a dependency that push never had. Under push the *leader* drives everything, so only the leader's metadata has to be right. Under pull the **follower** must know which node leads each partition in order to fetch from it — and today, after a restart, it frequently does not.
+
+Measured on the 3-node pull cluster, same moment, same 69 partitions:
+
+| Node | Partitions with a known leader |
+|---|---|
+| 1 | 66 of 69 |
+| 2 | **0 of 69** |
+| 3 | 21 of 69 |
+
+Node 2 held no partition assignments at all, so it planned nothing and **replicated nothing**, while node 1's `/admin/status` reported `isr:[1,2,3]` for those partitions from its own healthy view. That is this roadmap's founding bug reproduced exactly, by a different route.
+
+This is a **pre-existing metadata replication defect**, not a fault in RP-2 — see the `bug-metadata-recovery-diverges-at-scale` note (a `broadcast::channel(1000)` dropping `TopicCreated`, with an uncommitted buffer fix). Push masked it. Pull cannot.
+
+Why the conformance suite still passes: it creates topics and produces immediately, and leadership for a freshly created topic propagates at creation. The divergence appears for topics that predate a restart.
+
+**Root cause**: the catalog anti-entropy loop re-broadcast `TopicCreated` and nothing else. A follower healed into a state where it knew every topic and not one partition assignment — the exact state `admin_api.rs` already had a comment describing. The assignment is what carries the partition leader.
+
+**Fix**: `broadcast_all_topics` now re-broadcasts partition assignments too, after the topics they belong to. Note the event-bus buffer must now be sized against `topics * (1 + partitions_per_topic)`, not topic count.
+
+**Verified on a 3-node pull cluster**, all three nodes restarted simultaneously:
+
+| | node 1 | node 2 | node 3 |
+|---|---|---|---|
+| immediately after restart | 3/3 | **0/0** | 9/9 |
+| after the first anti-entropy pass (~42s) | 12/12 | **12/12** | 12/12 |
+
+Converged and stable for 4+ minutes. Fetch coverage then matched leadership exactly — node 1 led 4 partitions, every fetch request carried 4, all 4 reported follower lag. Conformance suite passes after the restart.
+
+**Healing takes up to one anti-entropy period** (first pass 45s, then `CHRONIK_METADATA_REBROADCAST_SECS`, default 300s). A follower that restarts mid-cycle replicates nothing until the next pass. Acceptable for now; if it matters, trigger a re-broadcast when a follower connects.
+
+**A follower that plans nothing also says so loudly now** (`warn_if_replicating_nothing`) — silence is how this cost nine months the first time. That is observability, not the fix.
+
+Also open, and related: `/admin/status` falls back to reporting the assignment as ISR when the tracker knows nothing about a partition (`is_unknown_for_all`). Under push an idle partition legitimately never reports, so the fallback is defensible. Under pull, followers fetch continuously and silence is genuinely suspicious — **when RP-4 deletes push, that fallback should become "under-replicated", not "healthy"**.
+
+### RP-2.3: High watermark from ISR
+
+- [x] `HW = min(LEO across ISR)` — was the **leader's own write position** from `ProduceHandler`
+- [x] Consumers observe only up to HW; followers still read to the leader's LEO
+- [x] `acks=all` completes when the quorum has reached the batch's offset
+- [x] Test: HW does not advance while a follower is behind — 5 unit tests, 2026-08-17
+
+**Status**: `TESTED` on a 3-node cluster under pull. Both halves are done: `acks=all` settles off follower fetch offsets, and consumers are capped at `min(LEO across ISR)`.
+
+The rule and both of its exclusions are pinned by unit tests in `isr_tracker.rs`, because each exclusion turns into an outage if it regresses and none of them is visible in a passing cluster run:
+
+| Test | What breaks without it |
+|---|---|
+| `watermark_is_bounded_by_the_slowest_in_sync_follower` | consumers read records held only by the leader |
+| `a_replica_outside_isr_does_not_hold_the_watermark_back` | one dead node stalls every consumer on the partition |
+| `an_unreported_partition_is_not_bounded_to_zero` | a fresh cluster hides its entire log |
+| `a_lone_leader_is_its_own_watermark` | single-node deployments stop serving reads |
+| `the_watermark_never_exceeds_the_leader` | a follower reporting an in-flight write exposes offsets the leader has not counted |
+
+OQ4 is answered in the same place: the behaviour change is real and deliberate, and carries a release note rather than a flag.
+
+The `acks=all` half forced a latent bug into the open. `IsrAckTracker` matched an **exact** `(topic, partition, offset)`, which only worked because push emitted one ACK per pushed batch. A follower's fetch offset is a watermark that skips across many batch boundaries and rarely lands on a registered offset, so under pull every `acks=all` produce would have waited out the full 30s timeout. Replica progress is monotonic — a replica reporting N holds everything below N — so waits are now released by any report at or above their offset. That is strictly more correct under push too: a follower demonstrably at 500 satisfies a wait at 437 even if the ACK for 437 was lost or coalesced.
+
+The same rewrite closed a memory leak: `cleanup_expired()` had **no caller anywhere in the tree**. A wait that never reached quorum was never removed — the producer's own `timeout()` released the caller but left the registration behind. While `acks!=0` replicated nothing (#22), that was every `acks=all` produce the broker ever served. Same shape as the v2.10.8 produce-reservation leak.
+
+> `HW = min(LEO)` remains the single riskiest change in the roadmap: it alters what consumers can see. Needs its own soak before RP-4.
+
+> The single riskiest change in the roadmap: it alters what consumers can see. Needs its own soak before RP-4.
+
+### RP-2.4: Follower fetch loop
+
+- [x] Background task per **leader** (not per partition) issuing Fetch to the partition leader
+- [x] Long-poll so steady-state streaming needs no extra round trip
+- [x] Append fetched records to the local WAL (shared apply path with the push receiver)
+- [x] On restart, resume from local LEO → **catch-up, for free**
+- [x] Test: follower down, restarted, converges without operator action — `tests/cluster/follower_catchup.sh` (see RP-0.3 for what it asserts and why each part is needed). Raise `CATCHUP_OUTAGE_SECS` for the 5-minute soak; the default 40s is set by the ISR liveness window, not by catch-up.
+
+**Status**: `TESTED` on a 3-node cluster, behind `CHRONIK_REPLICATION_MODE=pull` (default remains `push`). Conformance suite passes in **both** modes: placement correct at acks=0/1/all with 300/300 consumed, and ISR shrinks honestly when a replica is held down.
+
+**Shape.** One fetch task per *leader*, not per partition — a follower batches every partition it replicates from the same leader into one long-polled Fetch, as Kafka's `ReplicaFetcherThread` does. Three leaders means three in-flight requests regardless of partition count.
+
+**The Kafka client had to be hand-rolled.** `chronik-server` deliberately excludes `rdkafka` (librdkafka does not cross-compile against musl without a vendored zlib/OpenSSL). `crates/chronik-server/src/replication/replica_fetcher/protocol.rs` encodes Fetch requests and decodes Fetch responses at **v11** — the highest non-flexible version, so no varints or tagged fields, and it still carries `current_leader_epoch` (v9) for RP-3. The risk in hand-rolling a codec is drift from the server it talks to, so its tests round-trip against the server's own `parse_fetch_request` / `encode_fetch_response` and assert the server consumes every byte.
+
+**The apply path refuses rather than guesses.** `plan_batches` is pure and classifies each fetched batch against the follower's LEO: duplicate (the leader answers with whole batches from the one *containing* the requested offset, so re-receipt is routine), gap, straddle, or partial tail (the leader cuts at a byte budget — flow control, not corruption). A refusal aborts before any append, so a blob lands whole or not at all. A straddle halts that partition, because resolving it needs RP-3's epoch history and the alternative is interleaving two histories in one log.
+
+**Ordering held: RP-2.4 preceded RP-2.3.** `HW = min(LEO across ISR)` is only safe once followers actually fetch.
+
+**What it deletes.** The three mechanisms RP-1 had to fix — ACK channel for progress, heartbeat replies for liveness, connection pruning for restart detection — are all redundant under pull. A fetch offset is progress, liveness and resume position in one value.
+
+---
+
+## Phase RP-3: Leader Epochs & Truncation
+
+**Expected impact**: removes silent log divergence on leader change
+**Effort**: 2-3 weeks
+**Risk**: high — this is where the subtle bugs live
+**Depends on**: RP-2
+
+Kafka needed KIP-101, then KIP-279 and KIP-320 to close this. Do not treat it as a detail.
+
+Scaffolding that already exists: `partition_leader_epoch` is in the RecordBatch wire format (`records.rs:83`, currently written as `-1`), and `OffsetForLeaderEpoch` is enumerated as API 23 with an advertised version range (`kafka_protocol.rs:135`, `parser.rs:759`). No protocol extension needed; the semantics are unimplemented.
+
+### RP-3.1: Populate leader epoch
+
+- [x] Leader stamps the current epoch into `partition_leader_epoch` on append
+- [x] Epoch increments on leader change, persisted in metadata
+- [x] Epoch→start-offset history retained per partition
+
+**Status**: `CODE COMPLETE` — unit-tested, not yet exercised on a cluster.
+
+**The epoch lives on `PartitionAssignment`**, so it is already durable (metadata WAL), already replicated, and already re-broadcast by the anti-entropy loop. `assign_partition` derives it rather than accepting it from callers: there are a dozen construction sites across the tree, and each would be a chance to skip the bump or reuse a value.
+
+The case that matters most is the one that must *not* bump — re-asserting the same leader. The anti-entropy loop rewrites every assignment every few minutes; if that manufactured a leadership change, every follower would conclude it had to truncate, repeatedly, on a healthy cluster.
+
+**The history is derived from the log**, not stored separately: each batch carries the epoch of the leader that wrote it, so every replica builds the same history by watching its own appends. That is what makes the truncation exchange a single request.
+
+**Stamping is CRC-safe.** Kafka's CRC-32C starts at ATTRIBUTES (offset 21); `partition_leader_epoch` is at offset 12, before the CRC field and outside its input — deliberately, so a broker can assign it without re-checksumming. That is tested against a real encoded batch rather than asserted in a comment. ⚠️ A stale comment in `produce_handler.rs` claimed the CRC started at `partition_leader_epoch`; it was corrected in place, since RP-3 depends on the opposite being true.
+
+### RP-3.2: Implement `OffsetForLeaderEpoch`
+
+- [x] Serve API 23: given an epoch, return its last offset
+- [x] Follower queries on leader change to find the divergence point (RP-3.3)
+
+**Status**: `CODE COMPLETE` — v0 only, matching the advertised range. Advertising more than is implemented hands clients malformed frames, so the two move together.
+
+An epoch the node cannot speak to — newer than anything it holds, or aged out — is answered `-1`, never a plausible-looking offset. A guess there makes a follower discard a correct log or keep a divergent one, which is the exact damage epochs exist to prevent.
+
+The current epoch is answered with the leader's **log end offset**, not RP-2.3's replicated watermark: a follower may read that far, and capping it would deadlock replication.
+
+### RP-3.3: Truncation on leader change
+
+- [x] Follower detects a leader/epoch change and asks the new leader where its epoch ended
+- [x] Follower truncates its log to that point before resuming fetch
+- [x] WAL suffix truncation primitive (the gate below — it did not exist)
+- [x] Conformance test written (RP-0.4)
+- [x] Handshake proven end-to-end on a 3-node cluster
+- [x] The **truncate** branch, in-process, with exact assertions
+- [x] The **truncate** branch on a real cluster — `local_divergence.sh`, passing as of 2026-08-17: `bytes discarded by the cut > 0`, 0 orphan markers left on disk, 40/40 committed records readable, 0 uncommitted records readable. Staging it found four defects (D0-D3 below); all are resolved.
+
+**Status**: `TESTED`. Both the in-process cut and the system path are proven. Reaching that took four separate fixes, because staging divergence reliably is what made the repair path observable at all — the section below is kept in full, since every one of those defects was invisible until divergence could be manufactured on demand.
+
+#### ⚠️ Staging divergence works now — and the repair does not (found 2026-08-13)
+
+The earlier note below ("six Kubernetes attempts and three local ones failed to produce divergence") is superseded. `SIGSTOP` on both followers, an `acks=1` write to the leader, then `SIGKILL` the leader does produce a divergent log, repeatably. The test just could not see it: it spread records across three partitions while looking only at partition 0, so which partition diverged came down to the partitioner. With `-p 0` pinning, 40 orphan records land on the returning node's disk every run.
+
+With that fixed, the test's pass condition turned out to be too weak as well — it asserted that a truncation *message* appeared, not that anything was cut. A run logging `truncated to 0 (0 segment(s) removed, 0 bytes discarded)` reported PASS. It now asserts on bytes discarded and on the orphans being gone from the returning node's own disk.
+
+Three defects then surface, in two different shapes depending on timing:
+
+**D1 — reconciliation concludes "nothing to truncate" while the follower is demonstrably diverged, and spins forever.** Observed **37,166 iterations in one run**, ~1,600/second, indefinitely:
+
+```
+fetched batch spans [110, 149] across the local log end 140 — logs have diverged — reconciling
+Reconciling 1 partition(s) with the leader before fetching (leader-epoch handshake)
+log is a prefix of the leader's (ours ends at 140, the epoch ran to 470) — nothing to truncate
+```
+
+The follower has *concrete evidence* of divergence — a fetched batch straddling its log end — and then discards it in favour of an epoch comparison that says everything is fine. `plan_reconciliation` returns `Resume` whenever the leader's epoch end is at or above the local log end, which is true here (470 ≥ 140), so it resumes, refetches the same batch, detects the same divergence, and loops. The orphan records stay on disk permanently and that partition never replicates again.
+
+The epoch being asked about is the problem: the follower asks where *its* epoch ended in the leader's history, but the records it needs to discard were written by the old leader in an epoch the new leader never had. The answer cannot bound a tail it knows nothing about.
+
+**D2 — the detect → reconcile → resume cycle has no backoff.** Even when reconciliation is correct, a cycle that makes no progress should not spin at network speed. D1 is what makes it infinite; the missing backoff is what makes it a hot loop that burns a core.
+
+**D3 — a no-op truncation resets the partition's log end to 0.** `TruncateOutcome::new_log_end_offset` is `None` for two different situations — "nothing survived, the log is empty" and "I did not touch anything" — and `truncate_partition.rs` collapses both with `unwrap_or(0)`. Observed: `WAL suffix truncation was a no-op` immediately followed by `Truncation reset watermark 140 → 0`. The follower then re-replicates the entire partition from scratch, and does so against a WAL that still physically holds records 0..139.
+
+**All three are in the repair path, not the detection path.** Detection works — the follower notices divergence promptly and correctly, in both shapes. What follows is what fails.
+
+#### ✅ Two of the three causes are fixed (2026-08-13) — the divergent tail is now discarded
+
+D1's stall had two causes beneath it, both now fixed, and the orphan records are gone from the returning node's disk (`orphan markers on disk now: 0`, from 120).
+
+**The replicated assignment was rebuilt without its epoch.** `metadata_wal_replication` reconstructs a `PartitionAssignment` from the bus event and shipped `leader_epoch: 0` regardless of the real value, because the bus event carried only `topic`, `partition`, `replicas` and `leader`. The receiving node applies that verbatim. So **every follower's copy of every assignment read epoch 0 forever**, however many times leadership had actually changed — and leader-epoch truncation cannot work when every record in the cluster claims the same epoch: a follower asks about epoch 0, a promoted replica that also believes it is on epoch 0 answers "that is current, it ends at my log end", and nothing ever truncates. The event now carries the whole assignment, `isr` included, so the D0 fix propagates too. Without this, the in-sync set would have stayed on the node that measured it and failover would have kept electing blind.
+
+**The rejoin catalog broadcast raced the connection it needed.** A metadata send to a follower with no live connection is dropped — this transport is fire-and-forget. RP-6 triggers the re-broadcast on *liveness*, which a returning node regains about **26ms before** its TCP connection is re-established:
+
+```
+09:21:54.368  ⚠️  No connection to follower localhost:9591 (connections: ["localhost:9593"])
+09:21:54.394  Attempting to connect to follower: localhost:9591 (failures: 35)
+09:21:54.395  ✅ Connected to follower: localhost:9591
+```
+
+The whole catalog was published into that gap and lost. Measured: a restarted node received **zero** metadata events over 90 seconds, kept believing it still led a partition that had failed over, and therefore never replicated that partition, never ran the handshake, and held its divergent tail indefinitely — the next anti-entropy pass would have repaired it 300s later. The catalog is now re-asserted when a follower connection comes up, which is the condition the broadcast actually depends on.
+
+#### ⚠️ What remains: a false-divergence loop from two disagreeing log ends
+
+Repair now happens, but the fetch loop still spins afterwards, and the two numbers in its own log lines do not match:
+
+```
+Reconciling 1 partition(s) with the leader before fetching (leader-epoch handshake)
+dtr-855200-0: log is a prefix of the leader's (ours ends at 91, the epoch ran to 91) — nothing to truncate
+dtr-855200-0: fetched batch spans [91, 130] across the local log end 100 — logs have diverged — reconciling
+```
+
+`local_log_end` reports **91** to the reconcile path while the apply path's expected position is **100**, at the same instant, for the same partition. Reconcile compares 91 against the leader's 91, correctly concludes "prefix, nothing to truncate", and resumes — and the apply path then rejects the batch it fetches as a straddle, because it is measuring against 100.
+
+A fetch that lands inside a batch is also normal and must not be read as divergence: the leader serves whole batches, so a request at offset 100 returns the batch based at 91. Refusing that as a "straddle" turns an ordinary mid-batch read into a permanent repair loop.
+
+D2 is now fixed: the repair cycle backs off, doubling from 10ms to a 5s cap, reset by any fetch that does not re-detect divergence. A repair that settles on the second or third round pays nothing; one that never settles stops consuming a core, whatever the cause — including causes not yet found.
+
+D3 is half fixed. A truncation that had no work to do now reports the real log end instead of `None`, and the survivor scan covers every remaining segment rather than a range that excluded the straddler. Two integration tests pin it: a no-op reports the end, and genuinely emptying the log still reports `None`, so the distinction cannot be flattened again.
+
+#### ✅ RESOLVED — and the cause was the indexer deleting a live topic's WAL on restart
+
+`local_divergence.sh` now passes **3 runs of 3, deterministically**, with identical bytes discarded each time (3,358) and **no test-only configuration** — it runs the default path.
+
+The remaining two-in-three failure was never in truncation. Truncation was right to report "nothing to do": the records were not there. The segment inventory added to the no-op path said so in one line —
+
+```
+truncation inventory topic=localdiv-1023834 partition=0 segment=0 bytes=0 first_offset=-1
+```
+
+— one segment, zero bytes, milliseconds after the node reported recovering 140 records. Two log lines earlier:
+
+```
+WAL recovery complete - 1 partitions loaded
+WalIndexer: topic absent from metadata (orphaned) — reclaiming WAL storage topic=localdiv-1023834
+Topic 'localdiv-1023834' cleanup: removed 0 partition queues, 1 sealed segments, wal_dir=true
+```
+
+**The WalIndexer deleted the entire topic's WAL directory two milliseconds after recovery loaded it.** Message-WAL recovery completes before the metadata catalog is populated, so on a restarting node every live topic is briefly absent from metadata — and orphan reclamation deleted on first sight.
+
+This is not a replication bug and not confined to this test. **Any restart where the indexer's pass beats catalog population destroys that node's WAL for the affected topics.** Here the data returned only because two other replicas still had it. On a single node, or with the timing catching every replica, it is gone.
+
+Reclamation now requires a topic to be missing from metadata on `ORPHAN_CONFIRM_PASSES` (3) **consecutive** passes, with any reappearance resetting the count, so intermittent absence can never accumulate into a deletion. A genuinely deleted topic is still reclaimed, just not within milliseconds of a restart. Four unit tests cover it: missing once is not reclaimed, missing throughout eventually is, a reappearance starts over, and the count is per topic.
+
+The segment inventory stays at `info!` — a truncation happens once per divergence and deletes data, so when it reports "nothing to do" the inputs are the only way to tell a correct no-op from a scan looking at the wrong files. That one line is what turned three sessions of speculation into a five-minute diagnosis.
+
+RP-1.1's retention interlock had the same shape of hole and is fixed alongside: `min_acked_offset_of_live_followers` returned `None` when a partition's followers existed but none were live, and the indexer reads `None` as "no interlock". So the guard switched itself off exactly when the leader's copy was the only copy. It now reports a position below every real offset in that case, and `None` only when no follower has ever reported (RF=1, single node) — where "no interlock" is correct.
+
+Three runs of `local_divergence.sh`, after all of the above: **1 pass, 2 failures**, and the failures are all the same shape. The committed records survive and the orphans do leave the disk every time — but by the expensive route, not the surgical one:
+
+```
+localdiv-947111-0: diverged from the leader. Local log ends at 140, but the leader's history … ends at 100
+localdiv-947111-0: truncation to 100 changed nothing and could not say where the log ends
+localdiv-947111-0: truncated to 0 (0 segment(s) removed, 0 bytes discarded); resuming replication
+```
+
+The log ends at 140, the target is 100, and the cut removes nothing. The evidence rules out the obvious explanations:
+
+- The partition directory exists and holds `wal_0_0.log` at 11,202 bytes — both "no partition directory" and "no segment files" warnings were added and neither fires.
+- The two parsers cannot disagree: `first_record_offset` and `plan_segment_truncation` both go through `parse_record_span`.
+- A parse failure cannot produce this outcome either — it would leave `straddler` unset, and the delete loop would then remove the whole 11,202-byte file and report those bytes discarded. Zero bytes were discarded.
+
+What fits every observation: **at truncation time the partition's queue is freshly created and empty**. `truncate_to` calls `get_or_create_queue` before scanning, which creates the directory and a new zero-length segment; the scan then sees exactly one empty file, skips it (the delete loop deliberately never unlinks a zero-length segment, because that is usually the one the writer holds open), and correctly reports "empty". The 11,202-byte file on disk is written *afterwards*, by the re-replication that the `None` outcome triggers.
+
+So the returning node's recovered log and the queue that truncation operates on are not the same thing, on roughly two runs in three. The next step is to establish which — recovery not adopting the existing segment into the group-commit queue, or the queue being created against a path the recovered data is not under — and the cheapest way to see it is to log the queue's segment inventory (names and sizes) at the moment of truncation.
+
+#### 🔴 D0 — and none of that is the real bug: failover elects replicas that hold no data
+
+Chasing D1 to its source found something worse. The leader's own answer, from the same run:
+
+```
+OffsetForLeaderEpoch dtr-511245-0: epoch 0 ends at -1 (log end 40)
+```
+
+`log end 40`. The new leader had **40** records for a partition that had 140. Counting the actual bytes on each node's disk for partition 0:
+
+| node | committed prefix (`acks=all`) | uncommitted orphans | written after failover |
+|---|---|---|---|
+| 1 — old leader | 100 | 40 | 0 |
+| **2 — new leader** | **0** | 0 | 40 |
+| 3 | 100 | 0 | 0 |
+
+**Node 2 was elected leader of a partition it had never replicated a single record of**, and then accepted writes starting at offset 0. Its log now shares offsets 0..39 with 100 committed records and contains entirely different data at them.
+
+100 records acknowledged at `acks=all` — acknowledged, by definition, only because the in-sync set held them — are gone from the cluster's authoritative history. They survive on node 3 by luck, and node 3 is now a follower of node 2: the moment it reconciles, it will be told to discard them and match the new leader. The truncation machinery working *correctly* is what would complete the data loss.
+
+**This is an unclean leader election.** `plan_failover` picks `live_replicas.first()` — liveness, nothing else:
+
+```rust
+let live_replicas: Vec<u64> = assignment.replicas.iter().copied()
+    .filter(|id| live.contains(id)).collect();
+match live_replicas.first().copied() { Some(to) => …failover… }
+```
+
+Being reachable is not the same as holding the data. Kafka elects only from the **in-sync set**, and when the in-sync set is empty it leaves the partition offline rather than electing a replica that will destroy committed records — that is what `unclean.leader.election.enable=false` means, and it is the default.
+
+It is also the *cause* of D1: the epoch handshake cannot work when the new leader has no epoch history for records it never replicated. Every downstream symptom — `epoch 0 ends at -1`, `the leader cannot say where our epoch ended`, the 37,166-iteration spin — is this bug wearing a different hat.
+
+**Why the ISR was not consulted: it is not in metadata.** ISR lives in each partition leader's in-memory `IsrTracker` and dies with that leader. The failover controller runs on the Raft leader, which for a partition led by someone else has no way to learn who was in sync. `PartitionAssignment` carries `replicas` and `leader_epoch` but no `isr`.
+
+**Fix**: publish the in-sync set into the partition assignment, and elect only from it.
+
+- The partition leader already computes its ISR for `/admin/status`; it republishes it when it changes. Re-asserting an assignment with the same `leader_id` deliberately does **not** bump the leader epoch (`assign_partition`), so an ISR update cannot masquerade as a leadership change.
+- `plan_failover` chooses from `live ∩ isr`, in replica order.
+- No in-sync replica alive ⇒ **stranded**, and the partition stays offline. Losing availability is the correct trade against losing acknowledged writes; Kafka makes the same one.
+
+Verified on a cluster, all three steps of the chain, from one follower restart:
+
+```
+Leader-epoch history rebuilt for 1 partition(s), 1 leadership transition(s), in 254µs
+OffsetForLeaderEpoch hshake-0: epoch 0 ends at 100 (log end 100)      ← leader answered
+hshake-0: log is a prefix of the leader's (ours ends at 100,
+          the epoch ran to 100) — nothing to truncate                 ← follower decided
+```
+
+and again across five partitions at once on a replica returning from a failover.
+
+#### Two ordering bugs that made this inert, both silent
+
+1. **The epoch warm-up ran after the replica fetcher started.** `warm_up_leader_epochs` was called after all 17 builder stages; the fetcher starts at stage 16. Measured: the fetcher logged `Replicating 1 partition(s)` **553µs before** the warm-up finished, so its first reconcile read an empty epoch store, found nothing to ask about, skipped the handshake and cleared its reconcile flag. The history then arrived too late to matter, and a returning replica would never truncate. The warm-up now runs before stage 16.
+2. **The warm-up enumerated partitions from `list_topics()`**, which races catalog recovery at startup — a topic not yet in the catalog was skipped even though its log was on disk. It now enumerates from the WAL directory, which is what it rebuilds from. And it logs unconditionally: it previously printed only when it warmed something, so "warmed nothing" and "never ran" were the same observation.
+
+#### ✅ The cut is proven — in-process, with exact assertions
+
+`fetcher.rs` now drives the whole reconciliation path against a real WAL on disk and a fake leader on a real socket answering with the broker's own API-23 codec. A follower holding 100 records is told its epoch ended at 60, and must afterwards hold **exactly** 0–59, resume from 60, and have walked its watermark back to 60. Verified to fail: with the truncation call removed it reports *"everything at or above the divergence point must be gone, and nothing below it."*
+
+Three companions cover the branches that must **not** delete anything — a follower merely behind, a leader answering `-1`, and a log with no epoch history. Those matter more than the happy path, because that is where a bug destroys data rather than stalling it.
+
+The blocker had been a dependency, not the feature: `ReplicaFetcher` held an `Arc<ProduceHandler>` — twelve production construction sites, none in any test — when it needed three facts. `FollowerState` is those three methods. That coupling is *why* this went untested for so long.
+
+#### Why the system-level version is so hard to stage — and why that is good news
+
+Six Kubernetes attempts and three local ones failed to produce divergence. The local runs finally explained why, and the reason is architectural rather than accidental.
+
+**Consensus and data replication share the same three nodes.** Freezing the followers to stop them fetching also removes the Raft quorum, so the leader immediately steps down:
+
+```
+22:19:38  node 1 is now Candidate at term 2 (leader is 0, was 2)
+```
+
+and then correctly refuses writes. A minority partition must not accept writes, so the very condition needed to create divergence — a leader accepting records its followers never see — is the condition under which this cluster stops accepting records at all.
+
+Kafka separates these: the controller quorum is independent of a partition's replica set, so a leader can lose its followers while the controller still considers it leader. That gap is where unclean-leader divergence lives. **Chronik's coupling makes that particular window narrower** — roughly one election timeout (~2s here) between the followers becoming unreachable and the leader stepping down.
+
+⚠️ **Corrected 2026-08-13: do not read that as "divergence is rare".** It says only that *this* route to divergence is short-lived. The ordinary route needs no partition at all: a leader acknowledges an `acks=1` write and crashes before any follower has fetched it. Quorum is intact throughout, no election timeout is involved, and the window is simply "between the ack and the next fetch". Every `acks=1` producer runs that risk on every write, by design — that is what `acks=1` means — and it is why the repair path has to work rather than be treated as a rare corner. The divergence test manufactures the partition case because it is *reproducible on demand*, not because it is the common one.
+
+That is a genuine durability advantage worth stating plainly, and it does not make RP-3.3 unnecessary: the window exists, an operator can widen it by raising the election timeout, and a follower that returns after any unclean change still needs to reconcile. It does mean the cut is defence in depth rather than a routine path.
+
+To stage it deliberately, the data path must be blocked **without** the consensus path — cut the Kafka port between brokers while leaving the Raft port up. `SIGSTOP` cannot express that; a port-level firewall rule or a test-only fetch pause could.
+
+#### Other findings from these runs
+
+The truncation branch has 12 integration tests and 15 unit tests behind it and **no hardware**, after six attempts with `divergence_truncation.sh`. Every one failed in the harness rather than the product, and the sequence is worth recording so the seventh does not repeat them:
+
+| # | What went wrong | Fix |
+|---|---|---|
+| 1 | `pod_sh` lacked the quote-level probe; every produce exited 127 and the topic stayed empty — then two confident failures were reported against a cluster that had never been given a record | copied the probe from `regression_replication.sh`; the test now proves its prefix landed before measuring anything |
+| 2 | Ingress-only policy: the "isolated" node kept campaigning outward, which marked it *recently active* on the Raft leader | cut both directions |
+| 3 | A NetworkPolicy does not partition an existing cluster — Calico allows established connections | apply the policy, then restart the pods it selects |
+| 4 | Isolating the *leader* left it serving the client only partially (20 of 60 records), so the divergent tail was unpredictable | isolate the **followers**; a healthy leader accepts every `acks=1` write and the deaf followers cannot fetch them |
+| 5 | Verification read via subscribe, which returns 272 or 0 for the same command (#36) | read partition 0 explicitly with `--offset earliest` |
+| 6 | The victim's k8s node stayed cordoned, so the old leader could never rejoin | uncordon on heal |
+
+The final run created **real divergence for the first time** — 20 orphan records on the old leader, leadership moved to node 2, the old leader rejoined — and it still did not truncate, logging nothing at all. The orphans were gone from its log afterwards, but *without a truncation line*, which means it re-replicated rather than cut. What is not yet established is whether its WAL still held those orphans when it came back.
+
+**Stop extending this script.** Six rounds of environmental yak-shaving have produced one real product finding (followers not recording epochs) and five harness bugs. The remaining gap is ~40 lines of glue — `apply_epoch_answer` → `truncate_partition` → reset positions, epoch cache and watermark — and the honest way to cover it is an **in-process test**: a real `WalManager` over a tempdir, a fake leader on a socket answering API 23 with a lower end offset (the pattern `connection.rs` tests already use), and assertions on the WAL and the resumed position. Deterministic, seconds to run, and it tests this code rather than Kubernetes. The cluster has already proven the surrounding machinery: the handshake runs end to end, failover moves leadership, and a returning replica reconciles.
+
+#### The storage half: `WalManager::truncate_to`
+
+The gate was that **no suffix truncation existed anywhere in the storage layer**. `truncate_before` is a documented no-op; `delete_records_before` removes segments *below* a low watermark, the opposite operation. Now built, split so the decisions are testable without a filesystem:
+
+- **`chronik-wal/src/truncate.rs`** plans over bytes. The rule: *no record containing an offset at or above the target survives*. A target landing inside a batch therefore takes that whole batch, and the log ends **below** what was asked for — callers resume from the returned offset, not their target. Erring low costs a re-fetch; erring high keeps a divergent log and calls it converged.
+- **`GroupCommitWal::truncate_to`** does the surgery, because it owns the writer and can stop it first: hold the partition's pending and file locks (the same two `commit_batch` takes, in the same order), drop buffered writes, cut, then rotate to a fresh segment so the survivor stays immutable and no deleted segment id is reused.
+
+Placement reads only each segment's **first** record — ids ascend with write order so offsets do too, so at most one segment straddles the target and needs scanning. Scanning every segment would be linear in the size of the log, and DV-2c's was 43 GB.
+
+**Two bugs the tests caught, both silent:**
+
+1. The straddling segment is the last one *below* the target, not the first one at or above it — that is the segment *after*. Truncating a 3-segment log to offset 5 deleted segments 1 and 2 and left offsets 5–9 alive in segment 0.
+2. The delete loop unlinked zero-length segments, which is normally the one the writer holds open. Writes would have kept succeeding and fsyncing into an orphaned inode — accepted, durable, readable by nobody.
+
+**The in-flight race.** `commit_batch` drains the pending queue and *then* takes the writer lock, so a batch can be off the queue but not yet on disk when a truncation runs. Writing it afterwards restores exactly the records that were just discarded. A truncation epoch — read at drain, re-read under the writer lock — discards those batches and fails their callers. The test pins the commit worker in that window by holding the writer lock itself, and fails without the guard.
+
+**`update_high_watermark` could not do this.** It is deliberately monotonic (the v2.2.9 fix, stopping stale WAL data from walking a watermark backwards), so it silently ignores the one update truncation needs. `reset_offsets_after_truncation` is the narrow exception, and moves `next_offset` too — unused on a follower, but if that replica is later elected it assigns offsets from there, and a stale value leaves a hole.
+
+#### The protocol half: `reconcile_with_leader`
+
+A follower runs the epoch handshake **before its first fetch from a leader** and again whenever it sees divergence. The first case matters most: the fetch task is rebuilt whenever assignments change, which includes a leader change — the one moment a follower can hold records the new leader never committed.
+
+`plan_reconciliation` is pure, because it is the decision that deletes data. Every branch that *does not* truncate is as load-bearing as the one that does: an error code, or the `-1` meaning "I cannot answer", must never be read as an offset. Reconciliation failure is not swallowed — the loop **does not fetch** until it succeeds, since an unreconciled fetch is how divergence becomes permanent.
+
+Divergence now re-triggers the handshake instead of halting the partition, and `OFFSET_OUT_OF_RANGE` does too: retention having moved past us and a real divergence look identical from the fetch offset alone, and the epoch query is what distinguishes them.
+
+#### ⚠️ Known hazard: truncation is local to the WAL
+
+`WalIndexer` uploads sealed segments to the object store on **followers as well as leaders** — only the metadata registration is leader-gated. If a follower's divergent tail was already published, truncating the local WAL does not retract it: re-indexing the shortened segment writes a *different* `{min}-{max}` key rather than replacing the old one, so the divergent object survives.
+
+Latent rather than active today, because object-store use is opt-in (`CHRONIK_COLUMNAR_USE_OBJECT_STORE`, default off, local-first). **Before that default changes**, either gate raw-segment upload on leadership, or hold a follower's uploads until the records are known committed. Recorded rather than fixed here: it is an indexer change, not a truncation change, and guessing at it would widen a destructive commit.
+
+#### Open: the leader does not fence stale epochs
+
+The Fetch request carries `current_leader_epoch`, and this broker *parses* it — but never validates it. So the follower leaves it `-1`: populating it would cost a metadata read per fetch and fence nothing. Divergence is caught after the fact by the handshake instead of being refused up front. Real fencing needs the leader to reject stale epochs first; the follower side is then one line.
+
+#### ✅ Done: history survives restart
+
+The epoch cache is rebuilt from the WAL at startup (`warm_up_leader_epochs`), replaying each partition through the same `observe_append` the live path uses — so a recovered node answers truncation queries identically to the one that wrote the log. A pre-RP-3 log (all `-1`) rebuilds to *no* history rather than a fabricated epoch at offset 0.
+
+Cost is a WAL scan per partition at startup. Kafka avoids it with a `leader-epoch-checkpoint` file; that is the answer if startup time becomes a problem.
+
+⚠️ **Test methodology**: by RP-2's lesson, killing the leader must genuinely keep it down — deleting a pod brings it back in ~4s. Cordon the node. And beware the inverse trap RP-2 hit: better behaviour can silently invalidate a test that used to pass for the wrong reason.
+
+---
+
+## Phase RP-5: Partition leader failover — `TESTED` (built 2026-08-12)
+
+**Status**: `TESTED` on a 3-node cluster. Built because it blocked RP-3.3's validation, and because it was a live correctness gap in its own right.
+
+### Result
+
+Same probe that previously showed leadership frozen for 150 seconds, against the new build:
+
+```
+initial: "leader":1,"replicas":[1,2,3],"isr":[1,2,3]
+  t=30s  "leader":1,"replicas":[1,2,3],"isr":[1,2,3]
+  t=45s  "leader":2,"replicas":[1,2,3],"isr":[2,3]     ← failover
+produce (acks=all, leader down): 0 errors  (was 63)
+```
+
+Leadership moves to a live replica in ~45s (one liveness window plus a tick), the replica set stays RF=3, ISR shrinks honestly to the live members, and writes resume. In the conformance suite the same thing shows as `leader after: node 2` with `distinct consumed 400 / acknowledged 400` — **no acknowledged record lost across a failover**.
+
+### How it works
+
+- **Liveness comes from Raft** (`RaftCluster::sample_active_peers`). The data path cannot supply it: followers report to their leader, so a leader's death is exactly the case with nobody left to observe it — which is also why ISR never shrank before. Raft heartbeats run between all members regardless of who leads what. Kafka's controller tracks broker liveness the same way, and for the same reason.
+- **Only the Raft leader acts**, and not until a full liveness window after being elected. Two nodes electing independently would hand one partition to two leaders — the divergence RP-3.3 exists to clean up after. A newly elected leader has heard from nobody yet, so without the grace period its first pass would fail every partition in the cluster over at once.
+- **`plan_failover` is pure**, because it decides where writes go. A healthy cluster must plan *nothing*: every failover bumps a leader epoch, and an epoch bump sends followers into the RP-3.3 handshake, so churn here would leave the cluster permanently reconciling. A test asserts the plan converges after one pass.
+- **Persisted through `assign_partition`**, which derives the epoch — so a real leader change bumps it exactly once. That bump is what makes RP-3.3 reachable at all.
+
+### Three bugs found by running it, not by writing it
+
+1. **The liveness input was a constant.** `recent_active` is set when a peer replies and cleared only by `check_quorum_active`, which Raft calls only when `check_quorum` is enabled — and this cluster leaves it at the default `false`. Nothing ever cleared the flag, so every peer that had ever been seen read alive forever, *including after it died*. The controller deployed clean and did nothing. The sampler now owns the reset, which leaves consensus behaviour untouched; enabling `check_quorum` instead would make a leader step down whenever it missed a quorum of replies for one election timeout, and this config is already tuned around election storms.
+2. **Failover shrank the replica set.** Writing the *live* replicas back as the assignment meant a partition returned from a transient failure at RF=2, and the returning node was no longer a replica at all — so it never resumed replicating and never ran the handshake. Repeat the failure and RF reaches 1 with nothing reporting it. Failover moves leadership; it is not a reassignment. ISR is what shrinks, and `IsrTracker` already does that.
+3. **It was silent.** Nothing logged what the controller believed, so a no-op and a healthy cluster were the same observation. It now logs the live set on change.
+
+4. **A returning node undid the failover.** A *metadata* bug that only working failover could expose.
+
+   Node 1 led partition 0; it was held down; the partition failed over to node 2; node 2 accepted the records. Node 1 came back, replayed its own metadata WAL — stale by exactly the change that demoted it — and its `PartitionAssigned` event overwrote the newer one **on every node**. All three then agreed the leader was node 1, which held no data for that partition.
+
+   ⚠️ **Correction to an earlier claim in this document.** This was first written up as also causing `distinct consumed 0 / acknowledged 400`. That attribution was wrong, and the correction matters more than the original claim. Measuring afterwards: the data was on the correct leader and *was* readable — `Processed a total of 272 messages`. Two separate mistakes produced the "zero reads":
+   - the earlier probe used `--partition N --from-beginning`, and `kafka-console-consumer` ignores `--from-beginning` when `--partition` is given, starting at *latest* — so it read an empty tail and I recorded a broker failure that had not happened;
+   - the suite's topic-wide consume is genuinely flaky: two identical invocations, seconds apart, returned **272** and then **0**. That is the subscribe path, not replication — see the `#36` finding below.
+
+   The epoch guard is still correct and still needed — it demonstrably stopped the revert on the node that had the data (9 stale assignments rejected in one run). It simply does not fix what the count of readable records suggested it did.
+
+   The apply path was a blind `insert` — last writer wins regardless of age. Nothing in the metadata model expressed that one assignment supersedes another.
+
+   Leader epochs already express exactly that: monotonic per partition, derived in one place. They are now the causality token — an assignment carrying an older epoch is ignored. Equal epochs still apply, because anti-entropy re-asserts unchanged assignments constantly and a node that missed the original event must still be healable by a re-broadcast.
+
+   ⚠️ **This is the generalisable lesson of the phase.** Every replicated piece of state needs a version that says which of two copies is newer. Partition assignments had one (`leader_epoch`) and were not using it. Worth auditing the other replicated metadata — topic configs in particular, given the partition-count disagreement recorded below — for the same shape.
+
+### What was removed
+
+Both stubs that reported success while doing nothing: `elect_leader_from_isr` (the module is now an honest shim; the push stack still wires the type, RP-4 deletes both) and `propose_set_partition_leader` (no callers).
+
+### The original measurement
+
+### What was measured
+
+On a 3-node cluster, a topic's partition leader was held down by cordoning its node (the RP-0.3 method — deleting the pod brings it back in ~4s). Observed from a **surviving** node, for 150 seconds:
+
+```
+initial: "leader":1,"replicas":[1,2,3],"isr":[1,2,3],"under_replicated":false
+  t=15s  "leader":1,"replicas":[1,2,3],"isr":[1,2,3],"under_replicated":false
+  ...
+  t=150s "leader":1,"replicas":[1,2,3],"isr":[1,2,3],"under_replicated":false
+produce (acks=all, 60s cap): 64 connection errors, zero records written
+```
+
+The leader never moves, the dead node stays in ISR, the partition reports `under_replicated: false`, and **writes to it are unavailable until that exact node returns**.
+
+**Reproduced identically under `CHRONIK_REPLICATION_MODE=push` on the same build**, so this is not a pull regression — it is pre-existing and affects both mechanisms.
+
+### Why: the election is a stub that re-elects the dead node
+
+The machinery *runs*. `WalReceiver::monitor_timeouts` fired and the worker logged:
+
+```
+WARN  Triggering leader election for pfail2-…-0: WAL stream timeout (30s)
+INFO  ✅ Elected new leader for pfail2-…-0: node 1 (reason: WAL stream timeout (30s))
+```
+
+Node 1 was the node that was down. `LeaderElector::elect_leader_from_isr` (`leader_election.rs`):
+
+1. **ignores ISR**, despite the name — its own comment says *"For now, treat all replicas as in-sync (ISR = replicas). Proper ISR tracking will be added later"*;
+2. returns `replicas[0]`, which is by construction the incumbent leader, so the "new" leader is always the old one;
+3. never consults liveness, so a dead replica is as electable as a live one;
+4. **never persists the result** — the Raft proposal is commented out with *"let the system self-heal via produce requests"*;
+5. logs `✅ Elected new leader` regardless.
+
+This is the founding bug of this roadmap in a different costume: a mechanism that reports success while doing nothing. `docs`/`CLAUDE.md` advertise "automatic leader election" and "fault tolerance (can lose minority of nodes)" — true for *Raft/metadata* leadership, which does fail over, and false for *partition* leadership.
+
+### Why RP-3 makes this tractable
+
+The pieces RP-3 added are what a correct election needs:
+
+- `assign_partition` already derives the leader epoch and **bumps it when the leader changes** (and deliberately does not when it is re-asserted, so anti-entropy cannot cause spurious truncations);
+- a bumped epoch propagates to followers, which re-plan and run the RP-3.3 handshake;
+- `IsrTracker::get_follower_lag` already returns `None` for a node that is not alive (RP-2.1), which is the liveness signal the election lacks.
+
+So the shape of the fix is: elect a **live** replica other than the failed leader, persist it through `assign_partition`, and let the epoch bump do the rest. The hard part is not the selection — it is that **nothing currently tracks the liveness of a partition's leader**. Followers ACK to the leader, so a dead leader has no one to evict it; that is also why ISR stayed `[1,2,3]` above. Leader liveness has to come from somewhere else (Raft membership is the obvious candidate).
+
+⚠️ Do not fix by having each node elect independently. The `am_i_leader()` Raft guard is already there and is correct — a split election would hand two nodes the same partition, which is precisely the divergence RP-3.3 exists to clean up after.
+
+### ⚠️ Test methodology: a NetworkPolicy does not partition an existing cluster
+
+**Calico allows established connections.** A policy applied after the cluster has formed blocks *new* connections only — the pre-existing gRPC channels between brokers keep carrying Raft traffic through it. A probe with `/dev/tcp` is blocked (new connection) while the cluster continues talking normally, which makes the partition look real when it is not.
+
+This produced a false conclusion that is worth recording as a warning: with the "isolated" leader still reachable over its established channels, no election happened, and the obvious reading was *"Raft leader election does not work on partition"*. It does. Killing the leader's pod instead:
+
+```
+15:16:35  pod deleted
+15:16:38.640  node 1 is now Candidate at term 7 (leader is 0, was 3)
+15:16:38.739  node 1 is now Leader    at term 7 (leader is 1, was 0)
+```
+
+**Three seconds, clean.** Consensus failover is healthy; the test harness was not partitioning anything.
+
+To genuinely partition a running cluster you have to break established flows — an in-pod `iptables` DROP (needs `NET_ADMIN`), killing the conntrack entries, or blocking at the host. A NetworkPolicy alone only works if applied *before* the connections form.
+
+### ⚠️ Known limitation: a one-way partition looks alive
+
+RP-5's liveness is Raft's `recent_active`, which is set when the leader **receives any message** from a peer. A node that can send but not receive therefore still looks alive: it stops hearing heartbeats, starts campaigning, and its outbound vote requests mark it active on the very node deciding whether it is dead.
+
+Observed while building the divergence test — an Ingress-only NetworkPolicy on the leader was not an isolation at all, and failover never fired. The test now cuts both directions.
+
+Symmetric failures (the case that matters most — a node down, a host lost) work correctly, which is what the conformance suite exercises. But an asymmetric partition leaves a node holding leadership it cannot serve. The principled signal is replica *progress* rather than packet arrival; the difficulty is that an idle partition makes no progress either, so it needs care. Not fixed; recorded so the guarantee is not overstated.
+
+### Other findings from the same run (not replication bugs, not chased)
+
+- **A subscribing consumer can read a partition twice.** One conformance run consumed 490 records of 300 produced at acks=1; a later topic held 400 readable records for 200 produced. Reading the same topic with an explicit `--partition` returns **exactly** the right count, and the WAL holds one copy — so the log is correct and the duplication is in the subscribe/consumer-group path, most likely a rebalance re-reading from the beginning. Intermittent: five consecutive direct reproductions were clean. This is issue #36, now with a sharper characterisation.
+
+- **A topic's partition count can disagree between nodes — and this probably *causes* the above.** A topic created with `--partitions 1` was later reported by `/admin/status` as having three, with real assignments and leaders for partitions 1 and 2, while every record sat in partition 0 and only partition 0 existed on disk. The producer had clearly seen one partition when it wrote.
+
+  That is a coherent explanation for #36: a consumer that subscribes gets partitions the producer never knew about, and a metadata refresh that changes the partition count mid-consume triggers a rebalance — which, with no committed offsets and `auto.offset.reset=earliest`, re-reads from the beginning. Duplicates without any duplicate on disk, intermittently, exactly as observed.
+
+  **Mechanism found.** `TopicCreated`'s apply path ratchets the partition count upward and never down — its own comment says *"Only update when incoming > existing, never downgrade"*, added so an auto-create with **fewer** partitions could not overwrite an explicit `CreateTopics` with more. The rule is asymmetric, and it is wrong in the other direction: an auto-create carrying the default (`TopicConfig::default()` = 3, `traits.rs:40`) silently **expands** a topic explicitly created with 1. The same comment names the race that delivers it — *"auto_create_topics() on a follower can race with the real CreateTopics event from the leader"*.
+
+  So any topic created with fewer partitions than the auto-create default can be quietly widened to the default, after which the producer's view (1) and the cluster's view (3) disagree permanently.
+
+  Confirmed to need churn: a 1-partition topic created on a quiet cluster stayed at 1 on all three nodes across 60s, and no expansion was logged. Both observed expansions happened while the cluster was in flux from cordon/uncordon.
+
+  **The fix is not "ratchet the other way".** Both directions are wrong because count is being used as a proxy for authority. What matters is whether the config came from an explicit `CreateTopics` or from auto-creation; that distinction needs to be carried on the event and to win regardless of count. This is the same shape as the assignment bug above — replicated state without a marker saying which copy is authoritative.
+
+  ✅ **FIXED 2026-08-13.** `TopicCreated` and `TopicMetadata` now carry `auto_created`, and provenance decides: an auto-create never changes a topic that was asked for, an explicit create replaces an auto-created one **whatever the counts** (so `--partitions 1` can narrow an auto-created 3), and two events of the same provenance keep the old expand-only ratchet. `#[serde(default)]` is false so events written before the field read as explicit — the side that is protected.
+
+  Both create paths needed it, not just one: the protocol handler's auto-create goes through `create_topic_with_assignments`, so marking provenance only on `create_topic` would have recorded every auto-created topic as explicit. Hence `auto_create_topic` and `auto_create_topic_with_assignments`, both defaulting to their explicit twin so a store with no notion of provenance is unchanged.
+
+  And the same heuristic had to be removed from the **client-visible** path, which is where the damage actually showed: the Metadata response reported `max(partition_count, assignments.len())`, so a racing auto-create that left three assignments behind made an explicit 1-partition topic come back as 3 to every client. The max survives for auto-created topics, where a follower's `partition_count` can be stale while its `PartitionAssigned` events have arrived; for an explicit topic the config is now the answer.
+
+  Five tests: an auto-create does not widen an explicit topic, an explicit create narrows an auto-created one, explicit expansion still applies, provenance is recorded, and a pre-provenance event decodes as explicit.
+- The conformance suite asserts `consumed == produced` for acks=1. Without idempotence — which the Java producer silently disables when `acks=1` is set explicitly — duplicates are permitted by the protocol, so that assertion is stricter than the contract. The honest check is *distinct* count equals produced. Left as-is for now because the observed duplication is a broker-side artefact worth failing on, but the assertion should be split before it is trusted.
+- **A broker that is healthy and serving can sit at `0/1 Running` indefinitely.** After a restart, one node served replica fetches normally, with no errors in its log, while never passing its readiness probe. Worth a look: readiness that disagrees with reality makes every k8s-level test ambiguous, which is how RP-0.3 wasted three attempts.
+
+---
+
+## Phase RP-7: Assignment authority — `TESTED` (found and fixed 2026-08-12)
+
+**Status**: `TESTED`. This was the last blocker: with it in place the conformance suite passes end to end for the first time, RP-0.4 included.
+
+```
+-- convergence after a leader change (RP-3.3)
+   leader before: node 1 → leader after: node 2
+   node1: [0 1 2]   node2: [0 1 2]   node3: [0 1 2]
+   distinct consumed 400 / acknowledged 400
+== PASS: every replica holds every partition at acks=0, 1 and all; ISR tracks reality ==
+```
+
+### The fix, in two halves
+
+**Publication.** Every node ran the catalog anti-entropy loop, so every node re-published *its own* view on a timer — gossip with no tiebreak, which does not converge. Assignments are Raft-managed state, so only the Raft leader re-asserts the catalog now; off the leader the local copy is a cache to be corrected, not a view to broadcast. With no Raft cluster there is nothing to disagree with, so it always runs.
+
+**Consumption.** A node with a stale catalog served the partition anyway, and "no records" is indistinguishable from "you are caught up" — which is what made this silent. Fetch answers `NOT_LEADER_OR_FOLLOWER` when metadata positively names a different node, so clients refresh and retry against the real leader and a replica fetcher re-reads assignments instead of accepting emptiness as data. Deliberately narrow: no assignment, an assignment naming this node, or an unset node id all serve as before.
+
+### What it looked like before
+
+
+
+After a failover and the old leader's return, the three nodes held **three different views of the same partition**:
+
+| node | its view of `repltrunc-0` | reality |
+|---|---|---|
+| 2 | `leader:2` | correct — holds all 272 records |
+| 1 | `leader:1, isr:[1,3]` | wrong — holds nothing, and is therefore serving fetches as a leader with an empty log |
+| 3 | `leader:1, isr:[1,2,3]` | wrong — so it fetches from node 1, which has nothing, and stays empty |
+
+The epoch guard (RP-5 finding 4) stops any node *regressing* to an older assignment, and it worked: node 2 rejected 9 stale ones and kept the correct leadership. But a guard cannot deliver an update to a node that never received it, and nothing makes one node's view authoritative.
+
+**Every node runs the anti-entropy broadcast**, so each re-publishes *its own* view on a timer. That is gossip without a tiebreak: node 1 broadcasts `leader:1`, node 2 broadcasts `leader:2`, and which one a third node ends up with depends on arrival order and on whether the epoch guard happens to reject it. Convergence is not guaranteed in either direction.
+
+The consequence is worse than a stale read. A node that believes it leads a partition it has no data for **serves fetches for it** (node 1 logged 17,259 fetch-starts for a partition whose log is empty), and a follower pointed at it replicates nothing. The partition is under-replicated while every node reports `under_replicated: false`.
+
+**The fix is an authority, not a better merge.** Assignments are Raft-managed state and the Raft leader is the only node entitled to publish them. Concretely: only the Raft leader should run the assignment half of anti-entropy, and a node that is not the Raft leader should treat its own assignments as a cache to be corrected rather than a view to be broadcast. RP-6's rejoin push is the right shape — it just needs to be the *only* shape.
+
+⚠️ This makes RP-0.4 and the RP-3.3 divergence test unreliable until fixed: both depend on all nodes agreeing who leads the partition under test.
+
+---
+
+## Phase RP-6: Failover recovery latency (found 2026-08-12)
+
+**Status**: `TESTED` — the catalog is now pushed to a rejoining node and this was verified on the cluster. The description below is the original finding, kept because it explains what the fix is for.
+
+Not a correctness bug — the cluster converges — but it makes failover recovery take minutes instead of seconds, and it is the reason RP-0.4 still fails.
+
+A node that was leading a partition when it died comes back believing it is *still* the leader: it recovers metadata from its own WAL, which is stale by exactly the change that demoted it. `plan_assignments` skips partitions whose leader is this node, so it fetches nothing for them. It learns the truth only from the metadata anti-entropy re-broadcast — first pass at 45s, then `CHRONIK_METADATA_REBROADCAST_SECS`, default **300s**.
+
+Measured: after a failover the returning replica held nothing for that topic, while a topic from an earlier run — with ~10 minutes to heal — had fully converged on all three nodes. So it heals; it just takes an anti-entropy period, and RP-0.4's 150s convergence window is not enough.
+
+**The fix is a catch-up read, not a shorter timer.** A node starting up should ask the Raft leader for current assignments rather than trusting a local copy that is stale precisely when it matters most. Shortening the re-broadcast interval trades a constant broadcast cost against a window that would still exist.
+
+⚠️ This interacts with RP-3.3: the returning node cannot run the truncation handshake for a partition it does not know it follows. So a divergent replica stays divergent — serving nothing, but also repairing nothing — for up to the anti-entropy period.
+
+---
+
+## Phase RP-8: `acks=all` latency — `TESTED` (found and fixed 2026-08-13)
+
+**Issue #36** reported duplicate records: 300 produced, 585 consumed, partition end offsets confirming the extras were genuinely appended. It reads as a write-side duplication bug. It is not.
+
+**`acks=all` was slow enough to time clients out, and the retry appended the batch a second time.** A non-idempotent producer that times out cannot know whether the broker took the write, so it resends; the broker had taken it. Fix the latency and the duplication goes with it — reproduced exactly, 600 records on the broker for 300 produced, three runs out of three, and 300 every time after.
+
+### Measured
+
+| | before | after |
+|---|---|---|
+| First `acks=all` write to a NEW topic | ~7,000ms | **23ms** |
+| Steady-state `acks=all`, per request | 505ms (flat) | **17ms** |
+| `acks=1`, same shape | 12ms | 13ms |
+| 300 records, `socket.timeout.ms=5000` | 600 appended | **300 appended** |
+
+`acks=all` now costs roughly one replication round trip more than `acks=1`, which is what it is supposed to cost.
+
+### Three faults, each independently putting a wait on the critical path
+
+**1. Followers were served the high watermark as if it were the log end.** `get_high_watermark_for_fetch` returns the high watermark, and the follower branch used it under a variable named `leader_leo`. Under `acks=all` the high watermark cannot advance until the followers acknowledge — so the follower was told "no data" for exactly the records the producer was blocked waiting for it to acknowledge. A closed loop: the high watermark is a *result* of replication and cannot also be its input. RP-2.3's own comment says a follower must not be capped this way; the code capped it anyway.
+
+Nothing deadlocked outright only because a background segment flush eventually published the records by another route, which is where the original ~700ms came from.
+
+**2. The fetch wait was taken per partition, in request order.** One shared deadline bounded the total, but the *first* partition examined could spend all of it. A follower replicates every partition it holds from one leader in a single request (RP-2.4), so one idle partition ahead of an active one delayed every record on the active one by the full `max_wait_ms` — a flat 505ms, exactly `max_wait_ms` + the empty-fetch backoff. The wait now belongs to the request: serve everything without waiting, and only if the whole request came back empty, wait once for *any* partition to get data. That is also what Kafka's contract says the wait is.
+
+**3. The long poll had a second, weaker reader.** It read with `fetch_records` while the direct path reads with `fetch_raw_bytes` first, so it could sit through its entire budget failing to read a record that the very next request returned immediately. The wait is now detection-only; `fetch_data_available_path` is the one reader.
+
+**And the one that actually timed clients out:** the follower re-read partition assignments only on its `refresh_interval` tick, default **10 seconds**. A partition created at t=0 was not replicated until t=10s, and every `acks=all` produce to it blocked for the whole gap, waiting on a follower that had not been told the partition existed. The supervisor now wakes on metadata events (`TopicCreated`, `PartitionAssigned`) with the tick kept as a backstop for a lagged receiver.
+
+### Two things the measurements ruled out
+
+- **Not the poll interval.** Identical end-to-end latency at 1ms and at 10ms. The residual is the follower's apply plus its next fetch, not detection.
+- **Not the local write path.** Single-node `acks=all`, where the leader's own ack is the quorum, costs the same as `acks=0`: 300 records in 6ms.
+
+### Also fixed here
+
+- `get_follower_lag` could return a negative number. A follower replicates the leader's log end while `/admin/status` measures it against the high watermark, which trails until that follower acknowledges — so a healthy replica routinely reported lag -7. "How far behind" has no negative values.
+- `FollowerState::local_log_end` read the high watermark. The two coincide on a node that has only ever followed, but part on a node that was a leader and accepted writes which never reached quorum — which is precisely the divergent tail RP-3.3 exists to cut. Reading the watermark reported a log end *below* the records needing truncation, so `plan_reconciliation` would have concluded "my log is a prefix of the leader's" and resumed, leaving the tail in place. Verified after the change: the local divergence test cuts at 44 from a true log end of 139.
+- The `acks=all` produce path logged four lines per request at `info!` and a fifth at `warn!` for reaching quorum. They were written when this path was believed rare and broken; it is now the fast path.
+
+**Regression test**: `tests/cluster/acks_all_latency.sh` — asserts both shapes, since only one of them was the client-visible failure.
+
+---
+
+## Phase RP-4: Delete the Push Stack
+
+**Scope, now that Open Question 2 is decided**: delete the **data** push path only. Metadata keeps the push transport, so `WalReceiver` and `wal_replication.rs` survive in reduced form rather than being removed.
+
+Concrete targets:
+
+| Target | Where | Note |
+|---|---|---|
+| `ProduceHandler::wal_replication_manager` + `set_wal_replication_manager` | `produce_handler.rs` (fields at ~463/1195/1248, use at ~2430/2594/3978) | The produce-path fan-out, including `serialized_for_replication` which exists only to feed it |
+| The `else` branch building the data `WalReplicationManager` | `builder.rs` `wire_raft_dependencies` | Pull becomes unconditional |
+| `ReplicationMode` | `replica_fetcher/fetcher.rs` | Enum, `from_env`, and every `is_pull()` gate (builder stages 15/16, `set_hw_from_isr`) |
+| `LeaderElector` shim | `leader_election.rs` (72 lines) | Superseded by RP-5; delete with its wiring |
+| Election trigger machinery | `wal_replication.rs` `run_election_worker`, `monitor_timeouts`, `last_heartbeat`; `replication/connection_state.rs` `setup_timeout_monitoring` | Fed only the elector. ⚠️ `last_heartbeat` is also used by `consumer_group.rs` and `leader_lease.rs` for unrelated purposes — do not follow the name blindly |
+
+⚠️ **Removing `ReplicationMode` removes the escape hatch.** Every phase from RP-2 on was validated with `CHRONIK_REPLICATION_MODE=pull` explicitly set. Flip the default to pull and soak it *before* deleting the switch, so the two changes fail separately.
+
+✅ **Default flipped 2026-08-13.** `from_env` returns `Pull` when nothing is set, and an unrecognised value now warns and uses pull rather than quietly selecting the mechanism the operator did not ask for. Every cluster test had its `CHRONIK_REPLICATION_MODE=pull` removed so they exercise the default rather than a setting no deployment will have; all pass — replication conformance 600/600 on all three acks modes, divergence 3/3, `acks=all` 23ms to a new topic. Verified independently that a cluster started with no environment at all replicates: 300 records produced, 900 markers on each of the three nodes' disks.
+
+✅ **Deleted 2026-08-13**, once Open Question 5 was answered: there are no production deployments, so there is no upgrade path to protect and no reason to carry the old mechanism for a release.
+
+**What went:**
+
+- [x] `ReplicationMode` — the enum, `from_env`, `is_pull()`, and all four gates. Pull is not a mode; it is how replication works.
+- [x] The produce-path fan-out — `ProduceHandler::wal_replication_manager`, `set_wal_replication_manager`, and the hook that spawned a `replicate_partition` task per batch. With it went `serialized_for_replication` and the `needs_replication` clone-avoidance it existed to feed.
+- [x] The `else` branch in `wire_raft_dependencies` that built the data `WalReplicationManager`.
+- [x] `LeaderElector` (the whole file) — an honest shim documenting that `elect_leader_from_isr` never worked, superseded by RP-5.
+- [x] The election trigger machinery — `run_election_worker`, `monitor_timeouts`, `WalReceiver::set_leader_elector` and its plumbing, plus `replication/connection_state.rs`, which turned out to have no callers at all once `setup_timeout_monitoring` went.
+- [x] `test_replication_fires_for_every_acks_mode`, which asserted on the push queue's `total_queued`. Its invariant — every acks mode reaches every replica — is now covered end to end by `regression_replication.sh`, which checks the records on each node's disk rather than a counter on the way out.
+
+**What stayed, deliberately:**
+
+- `WalReplicationManager` and `WalReceiver` themselves, serving **metadata** (Open Question 2). Metadata is a single Raft-managed log, not a partitioned topic with a leader epoch, and it holds the assignments the pull path reads — moving it to pull would make the mechanism that discovers who leads a partition depend on already knowing who leads a partition.
+- **WAL replication port 9291.** The original checklist said retire it; that is wrong now that metadata keeps the transport. It is no longer a *data* port, and the docs say so.
+
+**Verified after deletion**, all on the default configuration: 1,658 unit tests; replication conformance 600/600 across acks=0, 1 and all with every replica holding every partition; divergence 3/3 with 3,358 bytes cut; `acks=all` 26ms to a new topic, 16ms steady state.
+
+> There was never a push/pull coexistence flag, and now there is not even a switch. One mechanism.
+
+---
+
+## RP-9: `acks=all` round-trip throughput — `TESTED` (found 2026-08-13, resolved 2026-08-14)
+
+RP-8 fixed `acks=all` **latency**: 505ms per request became 17ms. Throughput at
+concurrency is a separate question, and it has a separate problem.
+
+`chronik-bench`, 64 concurrent producers each waiting for its own
+acknowledgement, 256 B, 3 partitions, one machine, default WAL profile:
+
+| | single node | 3 nodes, RF=3 |
+|---|---:|---:|
+| `acks=0` | 195,000 msg/s | 119,000 msg/s |
+| `acks=1` | 16,700 msg/s | 15,000 msg/s |
+| `acks=all` | 16,700 msg/s | **2,300–4,000 msg/s** |
+
+Single-node `acks=all` matches `acks=1` exactly, which is correct — with no
+followers the in-sync set is the leader alone. On the cluster it is **4–7×
+slower than `acks=1`**, and it degrades *within* a 10-second run: 3,993 msg/s in
+the first interval, 2,285 in the second, p99 rising 34 → 49 ms. It reproduces on
+a freshly created cluster with a single topic, so it is not accumulated state.
+
+**The same cluster reaches 489,000 msg/s at `acks=all` when the client batches**
+(`kcat`, 200,000 records, `perf_replication.sh`). So the broker's ingest is not
+the constraint; the per-round-trip path is.
+
+### Measured, not guessed
+
+**It is the follower round trip, and the ISR wait is innocent.** Same wait
+machinery, only the quorum differs:
+
+| | sustained | p99 |
+|---|---:|---:|
+| `min_insync_replicas=2` (leader + a follower) | 3,935 → 2,210 msg/s | 40 → 54 ms |
+| `min_insync_replicas=1` (leader alone) | 21,174 → 20,076 msg/s | 8.3 → 9.5 ms |
+
+Ten times. `IsrAckTracker` registration, the wait, and its release are all still
+on the path at `min_insync=1`; the only thing removed is waiting for a follower.
+
+**The follower completes ~60 fetch cycles per second**, carrying ~35 records
+each. 60 × 35 ≈ 2,100 msg/s, which is the observed number to within noise. So
+the question was never "why is each record slow" — it is "why is each cycle
+16ms".
+
+**Four candidate answers, each measured and each wrong:**
+
+| candidate | test | result |
+|---|---|---|
+| Follower fsyncs per applied batch | apply with `acks=0` | 2,181 vs 2,210 msg/s — no change |
+| Leader's 10ms long-poll interval | 1ms vs 10ms | 3,887 vs 3,935 msg/s — no change |
+| Leader serves partitions serially | serve concurrently | 2,369 vs 2,210 msg/s — no change |
+| Cycle carries too few records | 12 partitions vs 3 | 2,043 vs 2,036 msg/s — no change |
+
+**The answer, from instrumenting the cycle** (now permanent, at `debug`):
+
+```
+build 1.2µs   fetch  8.5ms   apply 45µs    total  8.5ms
+build 531ns   fetch  3.4ms   apply 18µs    total  3.4ms
+build 2.6µs   fetch 16.1ms   apply 15µs    total 16.1ms
+```
+
+The fetch is the entire cycle. Building the request is nanoseconds and applying
+the batch is microseconds — the follower is not slow, it is **waiting**. The
+leader's own per-partition serve time is 0.2–4ms, so the rest is the fetch
+queueing behind the 64 concurrent produce requests that same leader is serving.
+
+`acks=all` is therefore a feedback loop: producers wait on the follower's next
+fetch, that fetch waits behind the producers' own requests on the leader, and
+the loop settles at whatever rate the leader can interleave both. Nothing is
+individually slow, which is why four reasonable hypotheses all measured flat.
+
+### Three improvements attempted (2026-08-13)
+
+**1. Event-driven wake-up — kept, and it fixed the latency.** The long poll now
+registers on a per-partition `Notify` that the produce path signals, instead of
+re-checking every 10ms. `acks=all` single-record latency went **17ms → 13-14ms,
+level with `acks=1`** — the timer was in the latency path after all.
+
+It took two attempts, and the first is the interesting part: it made things
+*worse* (1,863 msg/s, p99 exactly 102ms against my 100ms fallback), because the
+notification was routed through `ProduceHandler::fetch_handler` — **which is
+`None` in every production build.** `set_fetch_handler` and
+`new_with_fetch_handler` are only ever called from tests. The notifier is now an
+explicitly shared map, handed to both handlers by the builder.
+
+⚠️ That gap deserves its own look: **`update_buffer_with_raw_batch` goes through
+the same dead field**, so the produce path has never updated the fetch buffer on
+a real broker. Reads fall back to the WAL, which is why nothing visibly broke.
+
+**2. `num.replica.fetchers` — kept, no measured effect here.** Partitions are now
+split across `CHRONIK_REPLICA_FETCHERS` (default 4) independent fetch tasks per
+leader, each with its own connection and in-flight request. Throughput did not
+move at 3 partitions (2,067 vs 2,040) or at 12 (1,997 vs 2,042) — because with
+RF=3 across 3 nodes each follower-leader pair holds exactly one partition, so
+there was nothing to split. Kept because it is the right shape for a cluster with
+real partition counts, and it is tested.
+
+**3. Concurrent partition serving — REVERTED.** No throughput change (2,369 vs
+2,210, inside the spread) and it broke RP-3.3: the divergence test went from
+consistently passing to **2 runs in 3**, failing with committed records
+unreadable after a follower returned. `fetch_partition` is not a pure read — it
+records the follower's position with the ISR trackers — so overlapping those side
+effects across partitions is not free. Isolated by reverting it alone and
+watching the test return to 3/3.
+
+### The cause: every fetch re-read the whole segment (found 2026-08-14)
+
+The instrumentation above says the follower is "waiting", and the natural
+reading — that it queues behind the producers on a busy leader — was wrong. The
+leader was *working*. Timing the leader's own side of a replica fetch settled
+it in one run:
+
+```
+replica fetch 4000 from node 3: serve 8.15ms,  wait 0ns
+replica fetch 4000 from node 1: serve 14.45ms, wait 0ns
+replica fetch 3800 from node 1: serve 7.00ms,  wait 0ns
+```
+
+`wait 0ns` on every sample. The leader never parked — it had the data — and
+still took 7–14ms to hand it over.
+
+`WalManager::read_from` was the whole of it. For every fetch it ran
+`read_dir` on the partition directory, `tokio::fs::read` the **entire** active
+segment file, and parsed from byte zero — allocating and copying each record's
+payload *before* the offset filter discarded it, because the offsets sit after
+the payload on the wire. Measured: **2.5–4.5ms to return 2 records.**
+
+Segments rotate at 250MB, so the cost grew with the segment. That is the
+"degrades within a 10-second run" observation above, which had been recorded as
+unexplained: 3,993 msg/s in the first interval, 2,285 in the second. It was not
+`acks=all` decaying, it was the file getting longer.
+
+And it was never replication-specific. Every consumer fetch that misses the
+in-memory buffer takes the same path — and that buffer is populated through
+`ProduceHandler::fetch_handler`, which is `None` in every production build, so
+the miss is universal. Reads fall back to the WAL, which is why nothing looked
+broken.
+
+### What was changed
+
+**A bounded per-partition WAL tail cache** (`CHRONIK_WAL_TAIL_CACHE_BYTES`,
+default 2MB, `0` disables). Reads that want the end of the log — a follower
+replicating, a consumer keeping up — are answered from memory. It lives in
+`GroupCommitWal`, the one owner of both append and truncation, so it cannot
+drift from the log.
+
+Two properties are enforced rather than assumed, and both were learned the hard
+way:
+
+- **It is a gap-free suffix.** Offsets are assigned before the WAL append, so
+  under 64 concurrent producers records reach the cache out of order constantly.
+  ⚠️ **Refusing out-of-order arrivals is safe and useless.** Holding the cache
+  empty until the log catches up serves zero reads in a 30-second run: every
+  fetch falls back to the scan and throughput sits at 1,660 msg/s while the
+  cache looks healthy. Records are now ordered into
+  place, and reads below the gap-free run miss rather than getting a short
+  answer.
+- **It only serves what is durable.** The cache is filled at append time — the
+  only point where arrival order is known — but a queued write is not on disk,
+  and some never get there: `commit_batch` discards a batch that straddles a
+  truncation. A `committed_through` watermark, advanced by the commit worker,
+  bounds what the cache may answer. This costs throughput (6,200 → 3,800 msg/s)
+  and is not optional: without it a replica can read records no file will ever
+  hold.
+
+**The file fallback no longer copies what it skips.** The offsets are read from
+their known positions and the payload is copied only for records that survive
+the filter. On its own it did not move the benchmark — the remaining cost was
+the whole-file read, not the parse — but it removes an allocation and memcpy of
+every record in the segment on every miss, and it is what the index below is
+built on.
+
+**And the fallback now seeks instead of scanning** (`segment_index.rs`). A
+sparse offset → byte position map per segment, one mark per 64KiB, extended as
+the file grows so every byte is parsed once ever rather than once per read. A
+read binary-searches the marks, opens the file at the nearest one at or below
+the offset it wants, and reads forward in bounded chunks only as far as it
+needs. Segments that cannot contain the offset are skipped without being opened.
+
+This is what made the durable gate affordable. The gate makes misses routine —
+a follower asking for an offset the leader has assigned but not yet fsynced
+misses by design — so the fallback's cost sits on the common path, and it was
+the dominant term once the cache was in. **3,763 → 6,197 msg/s.**
+
+The index is a pure accelerator and is rebuilt whenever the file could have
+moved under it: a shrink (which is what a truncation looks like from the read
+side) resets it, and a torn tail from a crash stops the scan without discarding
+the records before it. Being wrong costs a rescan, never a wrong answer.
+
+**The follower's fsync is amortised across a fetch response.** Batches were
+applied one at a time, each awaiting its own group commit — one interval apiece.
+They all go to the same partition queue, in order, from one task, so enqueuing
+them and waiting on the last is equivalent. Every batch is still fsynced before
+the follower reports its new position, which is what `acks=all` waits on.
+3,593 → 6,619 msg/s at the time it was measured.
+
+**Per-fetch logging was writing 23MB per node per 25-second run.** The read path
+logged at `info` per fetch and, in one case, `warn` **per batch** — neither
+filtered at a normal production level. The logging was itself a measurable share
+of fetch latency.
+
+### Three bugs found on the way, none of them about throughput
+
+**1. A replica's log end could be stranded below its own log — data loss on
+failover.** `PartitionState` keeps `high_watermark` and `next_offset` as separate
+atomics, and v2.2.9 correctly made the watermark monotonic so stale WAL data
+could not walk it back. But the log end was updated *inside* that guard. Two
+paths raise the watermark — the replication apply path and the WAL commit
+callback — and when the callback got there first, every later call took the
+"not increasing" branch and the log end stopped moving. Permanently.
+
+Captured from a failing run, on the replica that was about to be elected:
+
+```
+Created partition state for t-0 with watermark 79
+WM_SKIP t-0: 100 <= 100 (current), log end stays 79
+```
+
+It held 100 replicated records and reported a log end of 79. Elected, it
+assigned offsets from 79 and overwrote 21 records it already had. The returning
+ex-leader asked where its epoch ended, was told 79, and truncated 61 committed
+records to match — which is how this surfaced: "only 0 of 40 committed records
+survived", in **3 runs out of 10**.
+
+The fix is `PartitionState::raise_watermark`: both fields, each monotonic,
+neither gating the other. A partition cannot have acknowledged records past the
+end of its own log, so the log end is always at least the watermark — and the
+three paths that raise a watermark now go through one place that says so.
+Divergence went **7/10 → 10/10**.
+
+Nothing about this was specific to replication throughput. It was found because
+the speed-ups changed the batching enough to make it reproducible, and because
+the divergence test was made strict enough to stop hiding it (bug 2).
+
+**2. The divergence test froze replicas mid-catch-up, then blamed the product.**
+Two faults, one on top of the other. It produced a prefix, slept 5 seconds, and
+confirmed the count by consuming through the *leader* — which says nothing about
+the followers it was about to freeze. Replacing the sleep with an on-disk check
+was still not enough: a record's payload appears in the WAL more than once (the
+canonical batch and the preserved wire bytes both carry it), so `grep -c
+"prefix-"` returns 300 for 100 records and a threshold of 100 was satisfied at
+barely a third of the prefix.
+
+Measured from a captured failure: two replicas were frozen holding **75 of 100**
+records while the check reported all three complete. The replica that won the
+election therefore had a legitimately short log, and RP-3.3 correctly told the
+returning ex-leader to truncate to match. The product was right and the test was
+wrong — which is worth stating plainly, because for several runs the evidence
+was read the other way round.
+
+The wait now counts distinct records.
+
+**3. `perf_matrix.sh` was misreporting its own numbers.** The message rate came
+out empty and printed as `?` (it searched for "throughput", which appears only
+as a section heading), the bandwidth pattern also matched `Data transferred: N
+MB`, and the p99 pattern matched the `p99.9` line one row below — so every row
+reported an identical "p99 99.9ms". A number that is wrong the same way every
+time reads as a real measurement.
+
+### Measured
+
+`chronik-bench`, 64 concurrent producers, 256B, 3 partitions, one machine,
+30-second runs, fresh cluster:
+
+Medians of three runs, each on a freshly started cluster:
+
+| | before | after |
+|---|---:|---:|
+| 3 nodes RF=3, `acks=all`, 30s run | ~1,400 msg/s | **6,197 msg/s** |
+| 3 nodes RF=3, `acks=1`, 30s run | — | 8,029 msg/s |
+| follower fetch, leader-side serve | 7–14ms | 0.11–0.4ms |
+| `read_from` returning 2 records | 2.5–4.5ms | memory, or a seek |
+| batched (`kcat`), `acks=all` | 488,997 msg/s | 542,005 msg/s |
+
+The 10s and 30s figures used to differ because the segment grew during the run.
+They no longer do, which is the more important half of this: the number is now
+stable rather than a function of how long you look. `acks=all` is now **1.3×**
+`acks=1` rather than 4–7×.
+
+`acks=all` single-record latency is unchanged at 13–14ms, level with `acks=1`.
+
+`perf_matrix.sh` needed three fixes of its own before any of this was
+measurable. It restarts the cluster between acks levels (sharing one made
+whichever ran last look worst for being last); it waits for the ports to close
+and the disk to drain between measurements (a `kill -9` and a 2-second sleep
+left the next shape measuring a half-dead cluster, and an `acks=0` run leaves
+several hundred MB still flushing); and every row is now a median of three with
+the individual samples printed beside it. A single run of this benchmark is not
+reproducible on one box — `acks=all` gave 2,912, 2,970, 6,587 and 3,066 across
+four runs — and a harness that prints one number per row invites reading noise
+as signal.
+
+### The leader now advertises what it can serve
+
+`readable_end_offset` reported the *assigned* log end to followers. Offsets are
+handed out before the WAL writes them, so a follower was routinely told about
+records that did not exist yet, asked for one, and got an empty response it
+could not distinguish from "nothing there" — so it backed off and asked again.
+The durable gate made that common: **1-2% of fetch cycles came back empty**.
+
+It is now bounded by `WalManager::durable_end_offset`, and the commit worker
+signals the same per-partition `Notify` the produce path uses, so a fetch parks
+inside the long poll and is woken when the record is actually on disk. Nothing
+is withheld that could have been sent; the records in that gap were not servable
+either way.
+
+**Empty cycles: 116-248 per 11,200 → 1-2 per 10,800.**
+
+Throughput did not move — 6,103 / 6,078 / 6,030 msg/s against a 6,197 median
+before — and that is the honest result: the empties were not costing much. What
+did change is the spread. Three runs now land within **1.2%** of each other where
+four previous runs ranged over **17%** (5,475-6,409). The backoff rhythm was a
+source of run-to-run variance, and removing it makes the number reproducible,
+which matters more here than another few hundred msg/s.
+
+### Still open
+
+The read path no longer has an O(segment) term and the leader no longer
+advertises what it cannot serve. What is left is the shape of the round trip.
+
+`acks=all` at ~6,100 against `acks=1` at 8,029 is a 1.3× gap, and single-node
+`acks=1` is 14,476 — so most of the remaining distance is the cluster, not the
+acks level. Three brokers and a load generator on one box share a disk, and the
+`acks=0` rows (164,914 single vs 111,146 clustered) put a number on that
+contention without any replication in the way.
+
+**A bare-metal run is now worth taking.** The three effects that would have
+dominated it — a read cost that grew with the segment, a leader advertising
+offsets it could not serve, and a harness that could not reproduce its own
+numbers — are all fixed.
+
+---
+
+## RP-10: replication could not leave the client network — `TESTED` (2026-08-15)
+
+The config has two fields that look independent: `[[peers]].kafka`, which a
+follower fetches from, and `[advertise].kafka`, documented as "what clients
+connect to". They were the same address in practice, because
+`cluster/broker_registration.rs` builds the broker list published in **Metadata
+responses** from the peers list:
+
+```rust
+for peer in &init_config.cluster_config.peers {
+    let (host, port) = parse_kafka_address(&peer.kafka);
+    let broker_metadata = create_broker_metadata(peer.id, host, port);
+```
+
+So a dedicated replication network was unconfigurable. Pointing `[[peers]]` at a
+10 GbE fabric made the cluster advertise it to *clients*:
+
+```
+$ kcat -L -b 192.168.1.31:9092
+ broker 1 at 172.16.10.31:9092 (controller)
+ broker 2 at 172.16.10.32:9092
+ broker 3 at 172.16.10.33:9092
+```
+
+The load generator had no route there, so every client hung after bootstrap —
+found as `chronik-bench` running 25 minutes on a `-d 30s` job.
+
+### The fix, and the one that was rejected
+
+The obvious repair — have each node register **itself** from `[advertise].kafka`
+and let metadata replication carry it — is the wrong one here, and the code says
+why. `broker_registration.rs` already carries a comment explaining that
+registration was moved *to* bulk-from-config precisely because replication of
+`BrokerRegistered` is lossy: followers miss events published before they
+connect, and `apply_replicated_event()` does not write them to the local WAL, so
+they are lost on restart. Self-registration would have reintroduced a bug
+someone had already fixed.
+
+Instead, `NodeConfig` gains an optional `replication` address, defaulting to
+`kafka`:
+
+```toml
+[[peers]]
+id = 1
+kafka       = "192.168.1.31:9092"   # what clients are told — unchanged
+replication = "172.16.10.31:9092"   # where followers fetch from
+```
+
+Absent the field, behaviour is byte-identical to before, which is what every
+existing deployment gets. `[advertise]` is left alone: for the broker list the
+cluster needs *every* node's client address, and `[[peers]].kafka` is the only
+place that exists — so that field is the client address, and this is the one
+that moves.
+
+Verified end-to-end: clients are told `192.168.1.x`, four established
+connections per node sit on `172.16.10.x`, and 200 records at `acks=all` reached
+all three WALs.
+
+### What it bought
+
+Same binary, same client, only the follower fetch path differs:
+
+| acks | 1 GbE | 10 GbE | change | node-1 NIC peak |
+|---|---:|---:|---:|---|
+| 0 | 104,937 msg/s | 106,690 msg/s | +1.7% | 693 → 131 Mbit/s |
+| 1 | 21,802 msg/s | **28,587 msg/s** | **+31%** | 690 → 46 Mbit/s |
+| all | 11,499 msg/s | 11,877 msg/s | +3.3% | 54 → 19 Mbit/s |
+
+p99 at `acks=1`: 6.94 ms → **4.91 ms**.
+
+The `acks=0` row is the interesting one. It sat at **69% of line rate** and
+gained **1.7%** from having the link freed — so it was never transport-bound;
+the 69% was replication riding along. High link utilisation is not by itself
+evidence that the link is the constraint, and this pair of runs is the proof.
+
+`acks=all` was already at 5% of the link and moved 3.3%, which is the round-trip
+bound Open Question 1 identified rather than a bandwidth one.
+
+Gates: 1,693 unit tests; conformance 600/600; divergence 5/5; `acks=all` latency
+14 ms to a new topic, 13 ms steady.
+
+---
+
+## RP-11: the "17× produce regression" was a benchmark reading a bug — `RESOLVED` (2026-08-15)
+
+**There is no produce regression.** v2.10.8 did not make Chronik slower; it made
+Chronik stop silently dropping messages, and the benchmark had been counting the
+drops as throughput.
+
+### Evidence
+
+Stop trusting the rate counter and count what reached the disk. Same 15s run,
+`acks=1`, single node, no replication:
+
+| build | reported msg/s | claimed records | **bytes on disk** | broker rejections |
+|---|---:|---:|---:|---:|
+| guarded (v2.10.8+, correct) | 16,519 | 247,785 | **301.7 MB** | **0** |
+| unguarded (pre-#21 shape) | 61,625 | 924,375 | **50.0 MB** | **228,825** |
+
+The "fast" build reports 3.7× the throughput and writes 6× less data. At 256 B a
+record, 301.7 MB for 247,785 records is ~1.2 KB each with WAL and index overhead;
+50 MB for a claimed 924,375 records is 54 bytes each, which 256-byte records
+cannot be.
+
+Pre-#21, the 17 `?` early-returns in `produce_to_partition` leaked their memory
+reservation. Under sustained load the leaked bytes accumulated until
+`memory_used_bytes` pinned at the 32 MB `buffer_memory` ceiling, after which the
+handler rejected nearly every produce — **instantly**. An instant rejection and a
+fast success are the same event to a rate counter.
+
+`e8547ca` (#21) is therefore correct and the `MemoryReservation` guard stays.
+**Every `acks=1` figure published before v2.10.8 is inflated by an unknown
+amount** — the inflation depends on how quickly the leak reached the ceiling, so
+those numbers cannot be corrected, only discarded.
+
+### The serious bug behind it
+
+Against 228,825 broker-side rejections, the producer reported `Failed: 0 (0.00%)`.
+The produce error mapping sent everything outside four transactional cases to
+`ErrorCode::None`:
+
+```rust
+let error_code = match e {
+    Error::DuplicateSequenceNumber(_)  => ...,
+    Error::InvalidProducerEpoch(_)     => ...,
+    Error::OutOfOrderSequenceNumber(_) => ...,
+    Error::InvalidTransactionState(_)  => ...,
+    _ => ErrorCode::None.code(),   // every other failure = SUCCESS
+};
+```
+
+So a memory-limit rejection, a WAL write error or a storage I/O error was
+returned to the client as success: the records were not stored and the producer
+was told they were durable. This is not specific to the leak — any storage or I/O
+failure on the produce path was acknowledged as a write.
+
+Fixed by mapping the catch-all to `KafkaStorageError` (56), the standard "broker
+could not persist this" code, which is retriable so clients back off and resend
+rather than dropping the batch. Verified on the wire with a build that leaks (to
+force rejections) and carries the fix (to report them): the producer reports
+`Failed: 64 (0.12%)` and logs real delivery errors where it previously reported
+zero. Regression test: `produce_failure_is_never_reported_as_success`.
+
+A leaking broker with the mapping fixed measures **815 msg/s** rather than the
+199,000 it used to claim — the rejections now reach the client, which retries
+with backoff. The two bugs compounded: the leak caused the rejections, the
+mapping hid them, so nothing ever retried.
+
+### Rules this establishes for every produce measurement
+
+1. **No throughput number is reportable without bytes landed and broker-side
+   rejections beside it.** A rejected produce returns faster than a served one,
+   so msg/s alone reads a failing broker as a winning one.
+2. **Load the broker before quoting a ceiling.** `acks=1` scales near-linearly
+   with producer count; at 64 producers the broker is under-loaded by roughly an
+   order of magnitude (13,582 msg/s against 228,874 at 1024).
+3. **Know the host.** Two machine facts move these numbers independently of the
+   code: `acks=1` is fsync-bound, so a host that syncs at 7.4 MB/s and one at
+   29.5 MB/s are not comparable; and a dual-socket box behaves differently from a
+   single-socket one under contended atomics. On a host whose kernel has fallen
+   back to the HPET clocksource, every timing carries a 51× `clock_gettime`
+   penalty (1,213.8 ns against 23.8 ns) — check
+   `/sys/devices/system/clocksource/clocksource0/current_clocksource` before
+   trusting any latency figure.
+
+Current single-node ceilings, and the io_uring default that follows from them,
+are in `BARE_METAL_PERFORMANCE.md`.
+
+---
+## RP-12: cluster produce throughput is bimodal — `TESTED` (found and fixed 2026-08-16)
+
+**One cluster run in three to six collapses to a tenth of its normal throughput,
+and it is not a measurement artefact.** This blocks merging the branch: it is an
+intermittency in the path the branch rebuilt.
+
+### The shape of it
+
+Three brokers on one host, RF=3, `min_insync_replicas=2`, 1024 producers, 256 B,
+30s, fresh cluster per run. `acks=1`:
+
+```
+run 1  76,020  ok      run 5  85,623  ok
+run 2   8,262  LOW     run 6  63,346  ok
+run 3  85,201  ok      run 7  84,481  ok
+run 4   8,517  LOW     run 8  86,149  ok
+```
+
+There is no middle: runs land at ~85,000 or ~8,000. `acks=all` does the same
+(41,434 · 40,686 · 6,277). **`acks=0` and every single-node shape never do it** —
+only the modes that wait on replication.
+
+### What it is not
+
+- **Not cluster formation.** The first hypothesis, and it is dead: a collapse
+  reproduces with a **104-second settle** (7,511 against ~89,000 on the other
+  five runs), eight times what `perf_matrix` allows. The cluster has ample time
+  to form.
+- **Not leader elections.** Election-related log lines are identical across good
+  and bad runs — 11 or 12 every time.
+- **Not a retry storm by volume.** Replica-fetch request counts barely move:
+  4,750 and 4,458 on the low runs against 4,267 and 4,066 on the good ones.
+
+### What correlates
+
+Replica fetches that exceed the 500 ms long-poll window, **3–4× more often**:
+
+| run | fetch reqs | fetch timeouts | rate |
+|---|---:|---:|---:|
+| LOW 8,262 | 4,750 | 203 | **4.27%** |
+| LOW 8,517 | 4,458 | 116 | **2.60%** |
+| ok 85,201 | 4,267 | 56 | 1.31% |
+| ok 86,149 | 4,066 | 46 | 1.13% |
+
+At 500 ms each, ~200 timeouts is ~100 seconds of cumulative stall across three
+nodes inside a 30-second run.
+
+On timeout, `fetch_handler.rs:1024` returns `vec![]` — an empty response — and
+the follower immediately re-fetches. Request volume staying flat while the
+timeout rate triples says the followers are not fetching *more*, they are being
+served *slower*, and the system settles into one of two stable states.
+
+### What is not yet established
+
+**Whether the timeouts cause the collapse or merely accompany it.** A leader slow
+for some other reason would produce exactly this signature. Deciding it means
+finding what `fetch_records` contends with on the produce path — whether a fetch
+stalled inside that 500 ms window holds something a producer needs.
+
+Two candidates worth eliminating first: the fetch path taking a lock the produce
+path also wants, and the tail cache missing under concurrent append so fetches
+fall back to the scan that RP-9 was supposed to remove from the hot path.
+
+### Reproduce
+
+`tests/cluster/bimodal_repro.sh` — 8 runs at `RUST_LOG=info`, preserving all three
+brokers' logs per run tagged ok/LOW, which is how the correlation above was
+found. Evidence from the run that produced this section is in
+`/tmp/outlier-evidence/`.
+
+---
+
+
+## RP-13: a replacement group member got only part of the partitions — `RESOLVED` (found and fixed 2026-08-17)
+
+**Was the last merge blocker.** Found by running `tests/integration` for the first time,
+in the same pass that fixed the SyncGroup starvation bug below.
+
+### The shape of it
+
+`consumer_groups::test_consumer_group_offset_commit`: 30 records over 3
+partitions, one consumer reads 15 and commits, is dropped, and a replacement
+joins the same group. The replacement should receive the other 15. Across runs
+of identical code it received:
+
+```
+15  (pass)      10  (fail)      5  (fail)
+```
+
+with a 45-second window it polls to exhaustion — so this is not the window being
+too short. 10 and 5 are two-partitions'-worth and one-partition's-worth: the
+replacement is being given a subset of the group's partitions and never
+converges to the rest.
+
+### Why it is not the bug already fixed
+
+The starvation fix (`ConsumerGroup::completed_assignments`) covers a follower
+whose SyncGroup arrives after the leader completed a rebalance — a member
+*joining*. This is a member *leaving* and being replaced, and it still
+reproduces with that fix in place. Same family, different path.
+
+### What to do next
+
+Instrument the coordinator across LeaveGroup → rebalance → SyncGroup for the
+replacement and record which partitions each generation assigns, as was done for
+the starvation bug (`RUST_LOG=chronik_server::consumer_group=info` prints the
+computed assignment per member). The question to answer first: does the
+coordinator compute a full assignment and the replacement receive part of it, or
+does it compute a partial one?
+
+The test is deliberately left failing rather than `#[ignore]`d. It reproduces a
+real defect at roughly one run in two, and hiding it would return this suite to
+the state that let 24 files rot.
+
+### ✅ RESOLVED (2026-08-17) — LeaveGroup acknowledged departures and removed nobody
+
+The instrumentation answered it in one line. Generation 1's assignment covered
+**two** members: the replacement, and the consumer that had already been dropped.
+The coordinator computed a correct assignment — for a group it believed still had
+the departed consumer in it, so 3 partitions were split with a member that was
+gone.
+
+**`handle_leave_group` built a SUCCESS response and returned.** It never removed
+anything. `GroupManager::leave_group` — which removes the member, triggers the
+rebalance through `remove_member`, and persists the result — was implemented,
+correct, and reachable only from a unit test. Nothing in the protocol path had
+ever called it.
+
+So a consumer that closed cleanly stayed a member until its session timed out,
+45s on librdkafka's default. The cost is not the delay but what the coordinator
+does during it: it keeps assigning partitions to a member that is gone. Every
+consumer restart in a group opened that window, and the visible symptom is a
+consumer silently receiving a fraction of its topic.
+
+#### The fix uncovered a worse bug underneath it
+
+Wiring LeaveGroup up made the last-member-leaves branch reachable for the first
+time, and it **marked the group `Dead` in the metadata store**. The in-memory
+entry is dropped on that path, so the next JoinGroup reloads the group from
+metadata and JoinGroup rejects every state it does not handle:
+
+```
+error_handler: Invalid input: Invalid group state: Dead   (on every retry, forever)
+```
+
+A consumer restarting after a clean shutdown could never rejoin its own group.
+`Dead` means the group has been deleted and its offsets are gone; a group whose
+last consumer went away is `Empty` — it exists, with committed offsets, and
+nobody consuming. Kafka reaches `Dead` through DeleteGroups or offset expiry,
+never through the last member leaving. Now it persists `Empty`, which JoinGroup
+already accepts.
+
+That bug had been latent for as long as LeaveGroup was a no-op: nothing ever
+reached the branch that contained it.
+
+**Verified**: the failing test now passes on three consecutive runs of a defect
+that reproduced roughly one run in two, plus the full 4-test consumer-group suite
+each time. Three unit tests pin the pieces — a departure removes the member, a
+repeat departure reports `UNKNOWN_MEMBER_ID` rather than a success a client
+cannot distinguish from the first attempt, and the last member leaving leaves the
+group `Empty` and rejoinable.
+
+---
+
+
+## Open Questions
+
+Answer before the phase that depends on them.
+
+1. ~~**Is today's 66K rec/s network-bound or sender-bound?**~~ — **ANSWERED 2026-08-14: it depends on the acks level, and that split is the answer.**
+
+   Measured on the Dells with the client on a fourth machine and per-node NIC utilisation sampled during each run (`tests/cluster/baremetal.sh`, `BARE_METAL_PERFORMANCE.md`). The link is 1 GbE, ~940 Mbit/s usable:
+
+   | | node-1 NIC peak | share of line rate |
+   |---|---:|---:|
+   | 256 B `acks=0` | 627 Mbit/s | 67% |
+   | 256 B `acks=1` | 667 Mbit/s | 71% |
+   | 1 KB `acks=0` | 720 Mbit/s | 77% |
+   | 1 KB `acks=1` | **759 Mbit/s** | **81%** |
+   | 256 B `acks=all` | 52 Mbit/s | 6% |
+   | 1 KB `acks=all` | 138 Mbit/s | 15% |
+
+   **`acks=0` and `acks=1` are transport-bound.** At 67–81% of line rate, sender-side work is not justified for them; a 10 GbE link is the change that matters. **`acks=all` is not** — at 6–15% it is bounded by the replication round trip, which is what RP-9 was about. One number never described the cluster, and the question could not be answered while the client shared a machine with a broker.
+2. ~~**Does `__chronik_metadata` move to pull, or keep a minimal push transport?**~~ — **DECIDED 2026-08-12: keep the push transport for metadata; RP-4 deletes only the data path.**
+
+   Metadata is not a partitioned topic with replicas and a leader epoch; it is a single Raft-managed log whose leadership is Raft's, and it is the store that *holds* the partition assignments the pull path reads. Moving it to pull would make the mechanism that discovers who leads a partition depend on already knowing who leads a partition. The push transport works correctly there today, including retry, and `MetadataWalReplicator` is built on it.
+
+   This shrinks RP-4 from "delete `wal_replication.rs`" to "delete the data push path": `ProduceHandler::set_wal_replication_manager` and its produce-path use, the `else` branch in `wire_raft_dependencies` that builds the data `WalReplicationManager`, the `ReplicationMode` switch (pull becomes unconditional), and the `LeaderElector` shim plus the election trigger machinery in `WalReceiver` that RP-5 superseded. `WalReceiver` itself stays, serving metadata.
+3. ~~**What lag bound defines ISR?**~~ — **ANSWERED 2026-08-17: time, as Kafka does, and it is now operator-tunable.**
+
+   A replica leaves ISR when it has been *measurably behind* for longer than `max_lag_ms`, not when it has been silent for that long — an idle partition's replicas hold exactly the leader's data and must not age out (RP-1.2 defect 2). A record-count bound remains as a secondary guard; Kafka dropped its equivalent (`replica.lag.max.messages`) in 0.9 for the reason this question anticipated: one fixed count cannot suit partitions with different write rates.
+
+   The gap was not the rule but its reach — the bound was compiled in via `IsrTracker::default()`, so a cluster whose followers sit on a slower link had no answer short of a rebuild. Now `CHRONIK_REPLICA_LAG_TIME_MAX_MS` (default 10,000) and `CHRONIK_REPLICA_LAG_MAX_ENTRIES` (default 10,000), read once at startup and logged.
+
+   **The default stays at 10s rather than moving to Kafka's 30s.** ISR is the signal an operator reads to learn that acknowledged data is at risk; a 30s window means a third of a minute of writes land looking fully replicated when they are not. 10s is also the value the cluster conformance suite is validated at — raising it is a behaviour change that must be re-validated, not a default to flip in passing.
+
+4. ~~**Does HW-from-ISR change observable consumer behaviour?**~~ — **ANSWERED 2026-08-17: yes, and that is the point. It needs a release note, not a flag.**
+
+   Consumers now see up to `min(LEO across ISR)` instead of the leader's own write position, so during follower lag a consumer reads *less* than it used to. That is the correct Kafka semantic: a record only becomes visible once every in-sync replica holds it, so a consumer can never read a record that would vanish if the leader were lost.
+
+   It was considered behind a default-off flag. Rejected: the pre-change behaviour is that consumers can read records which are not replicated anywhere else, and shipping a flag to preserve that would be shipping a known way to lose acknowledged reads. The two exclusions that keep it from becoming an outage are already implemented and tested — a replica *outside* ISR does not hold the watermark back (one dead node would otherwise stall every consumer on the partition), and a partition nobody has measured yet imposes no bound at all (a fresh cluster would otherwise hide its whole log).
+
+   **Release note written** (CHANGELOG, Unreleased → Breaking / behaviour changes): consumers may observe a briefly lower end offset while a follower is catching up. The end offset is now the replicated position, not the leader's write position. `acks=all` producers are unaffected — they already waited for the quorum.
+5. ~~**How does an existing cluster upgrade across the push→pull boundary?**~~ — **ANSWERED 2026-08-13: there is no upgrade path, because there is nothing to upgrade.**
+
+   There are no production deployments. Anyone running Chronik starts fresh on the latest version. So the push data path is deleted outright rather than kept for a release: no coexistence, no migration shim, no rolling-upgrade story to protect.
+
+   That was also the leaning on the merits. The version being upgraded *from* did not replicate at all on `acks=1`/`acks=all` (PR #29), so a "safe rolling upgrade" would have been protecting a mechanism that was not running. And keeping the push receive path for one release means shipping the coexistence we rejected, in the release where the new path is least soaked — while every bug found in RP-1/RP-2/RP-5 was found by *removing* ambiguity about which mechanism was live.
+
+   **Release note written** (CHANGELOG, Unreleased → Breaking / behaviour changes): a cluster carrying data written by an older version should be recreated, not upgraded in place.
+
+---
+
+## Prior Art in This Repo
+
+Read before starting; both are cautionary and specific.
+
+- `archive/failed-raft-data-replication-v2.2-v2.3` — 12 commits, 2025-10-29. See `docs/CRITICAL_BUG_RAFT_BATCHING.md` on that branch for the root cause and the unfinished 1-2 hour fix
+- #29 (`0b4e871`) — the async-return bug, its regression test, and the A/B methodology used to prove it
+- `docs/DISTRIBUTED_QUERY_LAYER.md` — Known Limitation #5 documents the *same* "assignment ≠ reality" mistake in the vector fan-out path, found 2026-03-04 and fixed for vector only; the SQL twin (#22) survived five more months
+
+### RP-12 resolution (2026-08-16)
+
+**Cause: `fetch_handler.rs` used the client's `max_wait_ms` as a deadline on
+reading data that was already available.** In Kafka that value bounds how long a
+broker waits for data to *appear*; once it exists the broker returns it. Here,
+when a busy leader took longer than the follower's 500 ms poll budget to serve
+records already on disk, the read was thrown away and an empty response returned
+— so the follower immediately re-fetched and the leader redid the same work.
+That is positive feedback, which is why throughput was bimodal rather than merely
+noisy: below the tipping point fetches complete, above it the cluster falls into
+the wasteful mode and stays there.
+
+Established by intervention, not correlation. Raising only the follower's window
+(`CHRONIK_REPLICA_FETCH_MAX_WAIT_MS=5000`) removed the collapse entirely:
+
+| | collapses | throughput |
+|---|---|---|
+| 500 ms (default) | **2 of 8** | ~85,000, with 8,262 and 8,517 |
+| 5000 ms | **0 of 8** | 89,291–97,316 |
+
+The fix is not that setting — that was the probe. The read now carries a
+30-second safety net against a genuinely stuck read (what the old `else` branch
+already used), decoupled from the client's poll budget. Verified at the **default
+500 ms**, the exact condition that produced the collapse: **8 runs of 8 clean**,
+83,509–95,596.
+
+Two hypotheses were falsified on the way and are recorded so they are not
+re-tried: tail-cache misses (identical in good and bad runs, 956/894 against
+857/817) and lock contention on `FetchHandler::state` (the read guard is scoped to
+`fetch_from_buffer` and released before the WAL I/O, and the produce path never
+takes it).
+
+Found separately and still open: `update_buffer_with_raw_batch` has no callers
+outside `fetch_handler.rs`, so the produce path never populates the in-memory
+fetch buffer — `buffer_hit` was 0 across every run captured, and every replica
+fetch falls through to WAL. Dead fast-path code, unrelated to this collapse.
+
+---
+
+
+## Cluster re-validation, 2026-08-16
+
+The suite last ran 2026-08-13, before RP-10, RP-11, RP-12, the io_uring default
+change and the metrics-port crash fix — five changes to the paths it covers.
+Re-run against the current build:
+
+| harness | result | |
+|---|---|---|
+| `regression_replication.sh` | **PASS** | consumed 600 / produced 600; every replica holds every partition at `acks=0`, `1` and `all`; ISR tracks reality |
+| `local_divergence.sh` | **PASS** | the divergent tail was discarded and every committed record survived |
+| `acks_all_latency.sh` | **PASS** | `acks=all` completes on the replication round trip, not a background timer |
+| `divergence_truncation.sh` | *skipped* | needs `REPL_NS` — a Kubernetes namespace with network policies. Superseded by `local_divergence.sh`, which manufactures the same divergence deterministically with `SIGSTOP`/`SIGKILL` and covers the truncate branch |
+
+⚠️ `divergence_truncation.sh` exits **0** when it skips, so it reports success to
+any runner that only checks the exit code. Worth fixing before it is wired into
+CI, where a skip that looks like a pass is how coverage quietly disappears.
+
+### Re-run 2026-08-17 — after the ISR, protocol and consumer-group changes
+
+Four more changes landed in paths this suite covers: Metadata now reports the
+measured ISR, `make_response` decides header flexibility for every API from one
+table, the consumer-group coordinator records assignments per generation, and the
+metrics port moved. The first of those changes exactly what
+`regression_replication` asserts on, so unit tests were not sufficient evidence.
+
+| harness | result | |
+|---|---|---|
+| `regression_replication.sh` | **PASS** | consumed 600 / produced 600; every replica holds every partition at `acks=0`, `1` and `all`; ISR tracks reality |
+| `local_divergence.sh` | **PASS** | 0 orphan markers on disk; 40/40 committed records readable; 0 uncommitted records readable |
+| `acks_all_latency.sh` | **PASS** | `acks=all` 14ms first write to a new topic (budget 2000ms), 13ms steady state (budget 250ms); `acks=1` 12ms |
+
+`acks=all` at 13ms against a 250ms budget confirms it still settles on the
+replication round trip and not on a timer — the RP-8 property most at risk from a
+change to how the watermark is computed.
+

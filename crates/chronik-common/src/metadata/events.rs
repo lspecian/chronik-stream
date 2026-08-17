@@ -118,6 +118,26 @@ pub enum MetadataEventPayload {
     TopicCreated {
         name: String,
         config: TopicConfig,
+        /// Whether this came from auto-creation rather than an explicit
+        /// `CreateTopics`.
+        ///
+        /// Provenance, not size, is what settles a conflict between two
+        /// `TopicCreated` events for the same name. The apply path used to
+        /// compare partition counts and keep the larger, on the reasoning that
+        /// an auto-create with FEWER partitions must not overwrite an explicit
+        /// request with more. The rule is asymmetric and wrong the other way:
+        /// `TopicConfig::default()` carries 3 partitions, so an auto-create
+        /// racing a `--partitions 1` topic silently widened it to 3. Observed
+        /// on a cluster — `/admin/status` reported three partitions with real
+        /// leaders while every record sat in partition 0, because the producer
+        /// had seen one partition when it wrote.
+        ///
+        /// `#[serde(default)]` is false, so events written before this field
+        /// existed read as explicit. That is the safe default: an explicit
+        /// config is never overwritten by an auto-create, and the worst case
+        /// for an old event is the behaviour that already existed.
+        #[serde(default)]
+        auto_created: bool,
     },
     TopicUpdated {
         name: String,
@@ -424,6 +444,7 @@ mod tests {
         let payload = MetadataEventPayload::TopicCreated {
             name: "test-topic".to_string(),
             config: TopicConfig::default(),
+            auto_created: false,
         };
 
         let event = MetadataEvent::new(payload.clone());
@@ -438,6 +459,7 @@ mod tests {
         let payload = MetadataEventPayload::TopicCreated {
             name: "test-topic".to_string(),
             config: TopicConfig::default(),
+            auto_created: false,
         };
 
         let event = MetadataEvent::new_with_node(payload.clone(), 42);
@@ -454,11 +476,13 @@ mod tests {
         let event1 = MetadataEvent::new(MetadataEventPayload::TopicCreated {
             name: "topic1".to_string(),
             config: TopicConfig::default(),
+            auto_created: false,
         });
 
         let event2 = MetadataEvent::new(MetadataEventPayload::TopicCreated {
             name: "topic2".to_string(),
             config: TopicConfig::default(),
+            auto_created: false,
         });
 
         log.append(event1);
@@ -502,6 +526,7 @@ mod tests {
         let payload = MetadataEventPayload::TopicCreated {
             name: "test-topic".to_string(),
             config: TopicConfig::default(),
+            auto_created: false,
         };
 
         let event = MetadataEvent::new_with_node(payload, 1);

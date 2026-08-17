@@ -200,6 +200,28 @@ pub struct ConsumerGroup {
     // Async waiting mechanism for SyncGroup responses (followers wait for leader to compute assignments)
     #[serde(skip)]
     pub pending_sync_futures: Arc<Mutex<HashMap<String, oneshot::Sender<SyncGroupResponse>>>>,
+
+    /// The assignment that completed a generation, kept immutable for that
+    /// generation's lifetime.
+    ///
+    /// `GroupMember::assignment` is working state: `trigger_rebalance` clears it
+    /// for every member when the next rebalance starts. A follower whose
+    /// SyncGroup arrives after the leader finished reads its assignment from
+    /// that field on the fallback path — so whether it received its partitions
+    /// depended on winning a race against the next rebalance's clear.
+    ///
+    /// Losing that race is silent and permanent: the member gets an empty
+    /// assignment, the group is already Stable so nothing retries, and its
+    /// partitions stay unowned until something else forces a rebalance.
+    /// Observed with a 3-member group where consumer-2 was assigned partitions
+    /// 2 and 3, received `{}`, and those partitions went unconsumed.
+    #[serde(default)]
+    pub completed_assignments: HashMap<String, HashMap<String, Vec<i32>>>,
+
+    /// Generation `completed_assignments` belongs to. A stale record must never
+    /// be served for a newer generation.
+    #[serde(default)]
+    pub completed_generation: i32,
 }
 
 impl ConsumerGroup {
@@ -223,6 +245,8 @@ impl ConsumerGroup {
             last_persisted: None,
             pending_join_futures: Arc::new(Mutex::new(HashMap::new())),
             pending_sync_futures: Arc::new(Mutex::new(HashMap::new())),
+            completed_assignments: HashMap::new(),
+            completed_generation: 0,
         }
     }
     
@@ -596,6 +620,8 @@ impl Default for ConsumerGroup {
             last_persisted: None,
             pending_join_futures: Arc::new(Mutex::new(HashMap::new())),
             pending_sync_futures: Arc::new(Mutex::new(HashMap::new())),
+            completed_assignments: HashMap::new(),
+            completed_generation: 0,
         }
     }
 }
@@ -707,6 +733,8 @@ impl GroupManager {
                 last_persisted: group.last_persisted,
                 pending_join_futures: Arc::new(Mutex::new(HashMap::new())),
                 pending_sync_futures: Arc::new(Mutex::new(HashMap::new())),
+                completed_assignments: group.completed_assignments.clone(),
+                completed_generation: group.completed_generation,
             }))
         } else {
             // Try to load from metadata store
@@ -1400,15 +1428,37 @@ impl GroupManager {
     }
     
     /// Leave a consumer group with graceful handling
-    pub async fn leave_group(&self, group_id: String, member_id: String) -> Result<()> {
+    /// Remove a member that is leaving the group, and rebalance.
+    ///
+    /// Returns whether the member was actually in the group, so the protocol
+    /// layer can answer `UNKNOWN_MEMBER_ID` truthfully instead of reporting
+    /// success for a removal that did not happen.
+    ///
+    /// # Why this matters
+    ///
+    /// This function was correct and had exactly one caller: a unit test.
+    /// `handle_leave_group` built a SUCCESS response and returned without ever
+    /// invoking it, so a consumer that closed cleanly was told it had left and
+    /// remained a member until its session timed out — 45s on librdkafka's
+    /// default.
+    ///
+    /// The cost is not the delay but what the coordinator does during it: it
+    /// keeps assigning partitions to a member that is gone. Measured on a
+    /// 3-partition topic, a consumer replacing a departed one received 5 or 10
+    /// of 15 records rather than all 15, because the assignment was split with a
+    /// consumer that had already exited (RP-13). Every consumer restart in a
+    /// group opened that window.
+    pub async fn leave_group(&self, group_id: String, member_id: String) -> Result<bool> {
         let mut groups = self.groups.write().await;
-        
+        let mut was_member = false;
+
         if let Some(group) = groups.get_mut(&group_id) {
             // Mark member as leaving for incremental rebalance
             if let Some(member) = group.members.get_mut(&member_id) {
                 member.is_leaving = true;
+                was_member = true;
             }
-            
+
             info!(
                 group_id = %group_id,
                 member_id = %member_id,
@@ -1418,13 +1468,30 @@ impl GroupManager {
             group.remove_member(&member_id);
             
             if group.members.is_empty() {
-                // Remove empty group
+                // The last member left. The group becomes EMPTY, not DEAD.
+                //
+                // `Dead` means the group has been deleted and its offsets are
+                // gone; `Empty` means it exists with committed offsets and
+                // nobody consuming, which is what a group whose only consumer
+                // shut down actually is. Kafka reaches `Dead` through
+                // DeleteGroups or offset expiry, never through the last member
+                // leaving.
+                //
+                // Writing `Dead` here made the group permanently unusable: the
+                // in-memory entry is dropped, so the next JoinGroup reloads it
+                // from metadata, and JoinGroup rejects every state it does not
+                // handle — `Invalid group state: Dead`, on every retry, forever.
+                // A consumer restarting after a clean shutdown could never
+                // rejoin its own group.
+                //
+                // This was invisible until LeaveGroup started removing members
+                // at all: nothing ever reached this branch.
                 groups.remove(&group_id);
-                
+
                 // Clean up from metadata store
                 if let Err(e) = self.metadata_store.update_consumer_group(ConsumerGroupMetadata {
                     group_id: group_id.clone(),
-                    state: GroupState::Dead.as_str().to_string(),
+                    state: GroupState::Empty.as_str().to_string(),
                     protocol: String::new(),
                     protocol_type: String::new(),
                     generation_id: 0,
@@ -1437,7 +1504,7 @@ impl GroupManager {
                     warn!(
                         group_id = %group_id,
                         error = %e,
-                        "Failed to mark group as dead in metadata store"
+                        "Failed to mark group as empty in metadata store"
                     );
                 }
             } else {
@@ -1451,15 +1518,15 @@ impl GroupManager {
                 }
             }
         }
-        
-        Ok(())
+
+        Ok(was_member)
     }
     
     /// Heartbeat for a group member with KIP-848 support
     pub async fn heartbeat(
-        &self, 
-        group_id: String, 
-        member_id: String, 
+        &self,
+        group_id: String,
+        member_id: String,
         generation_id: i32,
         member_epoch: Option<i32>,
     ) -> Result<HeartbeatResponse> {
@@ -1879,15 +1946,51 @@ impl GroupManager {
     pub async fn handle_leave_group(&self, request: chronik_protocol::leave_group_types::LeaveGroupRequest) -> Result<chronik_protocol::leave_group_types::LeaveGroupResponse> {
         use chronik_protocol::leave_group_types::MemberResponse;
 
-        // V3+ requires per-member responses
-        let member_responses: Vec<MemberResponse> = request.members.iter().map(|member| {
-            MemberResponse {
+        // Actually remove them. This used to build the response below and
+        // return, never calling `leave_group` — which was implemented, correct,
+        // and reachable only from a unit test.
+        const UNKNOWN_MEMBER_ID: i16 = 25;
+
+        let mut member_responses: Vec<MemberResponse> = Vec::with_capacity(request.members.len());
+        for member in &request.members {
+            let error_code = match self
+                .leave_group(request.group_id.clone(), member.member_id.clone())
+                .await
+            {
+                Ok(true) => 0,
+                Ok(false) => {
+                    // Either the group is gone or this member was never in it.
+                    // A client retrying a LeaveGroup whose response it missed
+                    // lands here, and expects UNKNOWN_MEMBER_ID rather than a
+                    // success it cannot distinguish from the first attempt.
+                    warn!(
+                        group_id = %request.group_id,
+                        member_id = %member.member_id,
+                        "LeaveGroup for a member that is not in the group"
+                    );
+                    UNKNOWN_MEMBER_ID
+                }
+                Err(e) => {
+                    warn!(
+                        group_id = %request.group_id,
+                        member_id = %member.member_id,
+                        error = %e,
+                        "LeaveGroup failed"
+                    );
+                    UNKNOWN_MEMBER_ID
+                }
+            };
+
+            member_responses.push(MemberResponse {
                 member_id: member.member_id.clone(),
                 group_instance_id: member.group_instance_id.clone(),
-                error_code: 0, // SUCCESS
-            }
-        }).collect();
+                error_code,
+            });
+        }
 
+        // The top-level code stays NONE even when an individual member was
+        // unknown: v3+ carries per-member results, and a client that asked to
+        // remove someone already gone has got the outcome it wanted.
         Ok(chronik_protocol::leave_group_types::LeaveGroupResponse {
             error_code: 0,
             members: member_responses,
@@ -2569,7 +2672,137 @@ mod tests {
         assert_eq!(heartbeat_response.error_code, 0);
         
         // Leave group
-        manager.leave_group("test-group".to_string(), join_response.member_id).await.unwrap();
+        assert!(
+            manager.leave_group("test-group".to_string(), join_response.member_id).await.unwrap(),
+            "leave_group must report that the member was actually removed"
+        );
+    }
+
+    /// Join one member and complete its SyncGroup, leaving the group Stable.
+    ///
+    /// The sync is not incidental: JoinGroup rejects `CompletingRebalance`, so a
+    /// second member cannot join until the first has synced — the same order a
+    /// real client follows.
+    async fn join_one(manager: &Arc<GroupManager>, group_id: &str, client: &str) -> String {
+        let mut subscription = Vec::new();
+        subscription.extend_from_slice(&0i16.to_be_bytes());
+        subscription.extend_from_slice(&1i32.to_be_bytes());
+        subscription.extend_from_slice(&10i16.to_be_bytes());
+        subscription.extend_from_slice(b"test-topic");
+
+        let joined = manager
+            .join_group(
+                group_id.to_string(),
+                None,
+                client.to_string(),
+                "localhost".to_string(),
+                Duration::from_secs(30),
+                Duration::from_secs(300),
+                "consumer".to_string(),
+                vec![("range".to_string(), subscription)],
+                None,
+            )
+            .await
+            .unwrap();
+
+        manager
+            .sync_group(
+                group_id.to_string(),
+                joined.generation_id,
+                joined.member_id.clone(),
+                joined.member_epoch,
+                Some(vec![]),
+            )
+            .await
+            .unwrap();
+
+        joined.member_id
+    }
+
+    /// RP-13: a member that leaves is gone from the group immediately.
+    ///
+    /// `handle_leave_group` used to build a SUCCESS response without calling
+    /// `leave_group` at all, so a departed consumer stayed a member until its
+    /// session expired — 45s on librdkafka's default — and the coordinator kept
+    /// assigning it partitions the whole time. A replacement consumer received a
+    /// fraction of the partitions, which reads as data loss.
+    #[tokio::test]
+    async fn leave_group_removes_the_member_immediately() {
+        let manager = Arc::new(GroupManager::new(Arc::new(InMemoryMetadataStore::new())));
+        manager
+            .get_or_create_group("g".to_string(), "consumer".to_string())
+            .await
+            .unwrap();
+
+        let first = join_one(&manager, "g", "c1").await;
+        let second = join_one(&manager, "g", "c2").await;
+
+        assert!(manager.leave_group("g".to_string(), first.clone()).await.unwrap());
+
+        let groups = manager.groups.read().await;
+        let group = groups.get("g").expect("group should survive while a member remains");
+        assert!(!group.members.contains_key(&first), "departed member is still in the group");
+        assert!(group.members.contains_key(&second), "the remaining member was removed too");
+    }
+
+    /// Leaving twice is not an error the caller can act on, but it must be
+    /// distinguishable: a client retrying a LeaveGroup whose response it never
+    /// saw needs UNKNOWN_MEMBER_ID rather than a success it cannot tell from the
+    /// first attempt.
+    #[tokio::test]
+    async fn leaving_twice_reports_that_the_member_was_already_gone() {
+        let manager = Arc::new(GroupManager::new(Arc::new(InMemoryMetadataStore::new())));
+        manager
+            .get_or_create_group("g".to_string(), "consumer".to_string())
+            .await
+            .unwrap();
+
+        let a = join_one(&manager, "g", "c1").await;
+        let _b = join_one(&manager, "g", "c2").await;
+
+        assert!(manager.leave_group("g".to_string(), a.clone()).await.unwrap());
+        assert!(
+            !manager.leave_group("g".to_string(), a).await.unwrap(),
+            "a second leave must report the member was not present"
+        );
+    }
+
+    /// When the last member leaves, the group is EMPTY — not DEAD — so a
+    /// consumer restarting can rejoin it and resume from its committed offsets.
+    ///
+    /// This branch was unreachable until LeaveGroup started removing members.
+    /// The moment it became reachable it made the group permanently unusable:
+    /// the in-memory entry is dropped, the next JoinGroup reloads the group from
+    /// metadata, and JoinGroup rejects every state it does not handle —
+    /// `Invalid group state: Dead`, on every retry, forever. `Dead` belongs to
+    /// DeleteGroups and offset expiry, not to the last consumer shutting down.
+    #[tokio::test]
+    async fn the_last_member_leaving_makes_the_group_empty_not_dead() {
+        let metadata_store = Arc::new(InMemoryMetadataStore::new());
+        let manager = Arc::new(GroupManager::new(metadata_store.clone()));
+        manager
+            .get_or_create_group("g".to_string(), "consumer".to_string())
+            .await
+            .unwrap();
+
+        let only = join_one(&manager, "g", "c1").await;
+        assert!(manager.leave_group("g".to_string(), only).await.unwrap());
+
+        let persisted = metadata_store
+            .get_consumer_group("g")
+            .await
+            .unwrap()
+            .expect("the group must still exist so its committed offsets survive");
+
+        assert_eq!(
+            persisted.state,
+            GroupState::Empty.as_str(),
+            "a group whose last consumer left is Empty; Dead makes it unjoinable forever"
+        );
+
+        // And it can be rejoined.
+        let rejoined = join_one(&manager, "g", "c1-restarted").await;
+        assert!(!rejoined.is_empty(), "a restarted consumer could not rejoin its own group");
     }
     
     #[test]

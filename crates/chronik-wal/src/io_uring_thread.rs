@@ -6,20 +6,55 @@
 //! Architecture:
 //! - Main thread: Regular tokio runtime (multi-threaded)
 //! - WAL thread: tokio-uring runtime (single-threaded, kernel-level async I/O)
-//! - Communication: Crossbeam MPSC channels (thread-safe, wait-free)
+//! - Communication: async tokio MPSC channel
+//!
+//! The channel is deliberately `tokio::sync::mpsc` and not `crossbeam`. This loop
+//! runs *inside* `tokio_uring::start`, so a blocking receive parks the only thread
+//! that can reap io_uring completions — and crossbeam's blocking receive spins on
+//! `sched_yield` first, which measured 200,507 yields per 12s against 2,014 on the
+//! standard-I/O path. An async receive lets the runtime drive completions while it
+//! waits.
 
 #[cfg(all(target_os = "linux", feature = "async-io"))]
 use std::path::PathBuf;
 #[cfg(all(target_os = "linux", feature = "async-io"))]
 use std::thread;
 #[cfg(all(target_os = "linux", feature = "async-io"))]
-use crossbeam::channel::{unbounded, Sender, Receiver};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedSender as Sender, UnboundedReceiver as Receiver};
 #[cfg(all(target_os = "linux", feature = "async-io"))]
 use bytes::Bytes;
 #[cfg(all(target_os = "linux", feature = "async-io"))]
 use crate::Result;
 #[cfg(all(target_os = "linux", feature = "async-io"))]
 use tracing::{info, warn, error};
+
+/// `Bytes` as an io_uring buffer, so a WAL write does not have to copy.
+///
+/// The previous path did `data.to_vec()` on every write because `IoBuf` needs an
+/// owned buffer — a memcpy of the whole batch on the hot path, discarding the
+/// refcounting `Bytes` exists for.
+///
+/// # Safety
+///
+/// `IoBuf` requires that the pointer stays valid while the runtime owns the value,
+/// *even if the value is moved*. `Bytes` is a refcounted handle to a heap
+/// allocation: moving the handle does not move the bytes, and holding it keeps the
+/// allocation alive for as long as the operation runs.
+#[cfg(all(target_os = "linux", feature = "async-io"))]
+struct BytesBuf(Bytes);
+
+#[cfg(all(target_os = "linux", feature = "async-io"))]
+unsafe impl tokio_uring::buf::IoBuf for BytesBuf {
+    fn stable_ptr(&self) -> *const u8 {
+        self.0.as_ptr()
+    }
+    fn bytes_init(&self) -> usize {
+        self.0.len()
+    }
+    fn bytes_total(&self) -> usize {
+        self.0.len()
+    }
+}
 
 #[cfg(all(target_os = "linux", feature = "async-io"))]
 /// Command sent from main tokio thread to io_uring thread
@@ -59,7 +94,7 @@ impl std::fmt::Debug for IoUringThreadHandle {
 impl IoUringThreadHandle {
     /// Spawn dedicated io_uring thread
     pub fn spawn() -> Result<Self> {
-        let (cmd_tx, cmd_rx) = unbounded();
+        let (cmd_tx, cmd_rx) = unbounded_channel();
 
         thread::Builder::new()
             .name("wal-io_uring".to_string())
@@ -125,11 +160,9 @@ impl IoUringThreadHandle {
 
 #[cfg(all(target_os = "linux", feature = "async-io"))]
 /// Main event loop running in io_uring thread
-async fn run_io_uring_loop(cmd_rx: Receiver<IoUringCommand>) -> Result<()> {
+async fn run_io_uring_loop(mut cmd_rx: Receiver<IoUringCommand>) -> Result<()> {
     use tokio_uring::fs::File;
     use std::collections::HashMap;
-    use std::time::Duration;
-    use crossbeam::channel::RecvTimeoutError;
 
     let mut files: HashMap<String, File> = HashMap::new();
     // Track current file offset for append-mode WAL writes
@@ -143,20 +176,18 @@ async fn run_io_uring_loop(cmd_rx: Receiver<IoUringCommand>) -> Result<()> {
     loop {
         // BATCHED PARALLEL FSYNC: Drain all pending commands and process Sync operations in parallel
 
-        // Step 1: Get first command (with timeout for async progress)
-        let first_cmd = match cmd_rx.recv_timeout(Duration::from_millis(1)) {
-            Ok(cmd) => cmd,
-            Err(RecvTimeoutError::Timeout) => {
-                // Timeout - continue loop to allow async ops to progress
-                continue;
-            }
-            Err(RecvTimeoutError::Disconnected) => {
+        // Step 1: Await the first command. This yields to the runtime instead of
+        // parking the thread, so io_uring completions are reaped while idle.
+        let first_cmd = match cmd_rx.recv().await {
+            Some(cmd) => cmd,
+            None => {
                 info!("Command channel closed, shutting down io_uring thread");
                 break;
             }
         };
 
-        // Step 2: Drain all additional pending commands (non-blocking)
+        // Step 2: Drain everything else already queued (non-blocking), so one
+        // pass through the loop serves a whole burst.
         let mut all_cmds = vec![first_cmd];
         while let Ok(cmd) = cmd_rx.try_recv() {
             all_cmds.push(cmd);
@@ -200,46 +231,72 @@ async fn run_io_uring_loop(cmd_rx: Receiver<IoUringCommand>) -> Result<()> {
             join_all(sync_futures).await;
         }
 
-        // Step 5: Process other commands sequentially (Write, CreateFile, Shutdown)
+        // Step 5a: Writes, concurrent ACROSS partitions but strictly ordered
+        // WITHIN one. Previously every write in the burst was awaited one at a
+        // time in this loop, so a batch of N writes cost N sequential round trips
+        // through the kernel no matter which files they touched.
+        //
+        // Ordering is preserved by assigning each write its byte offset up front,
+        // in arrival order, per partition — so a partition's writes land where
+        // they would have anyway, and no two futures contend for `file_offsets`
+        // across an await.
+        let mut write_cmds = Vec::new();
+        let mut rest_cmds = Vec::new();
         for cmd in other_cmds {
             match cmd {
-                IoUringCommand::Write { partition_key, data, response } => {
-                    let result = match files.get_mut(&partition_key) {
-                        Some(file) => {
-                            // Get current file offset (or 0 for new file)
-                            let file_offset = file_offsets.get(&partition_key).copied().unwrap_or(0);
+                IoUringCommand::Write { .. } => write_cmds.push(cmd),
+                other => rest_cmds.push(other),
+            }
+        }
 
-                            // Convert Bytes to Vec<u8> for io_uring's IoBuf
-                            let buf = data.to_vec();
-                            let mut current_offset = file_offset;
-                            let mut remaining = buf;
+        if !write_cmds.is_empty() {
+            use futures::future::join_all;
 
-                            loop {
-                                let (res, buf_back) = file.write_at(remaining, current_offset).await;
-                                match res {
-                                    Ok(n) if n > 0 => {
-                                        current_offset += n as u64;
-                                        if n == buf_back.len() {
-                                            // Success - update tracked offset
-                                            file_offsets.insert(partition_key.clone(), current_offset);
-                                            break Ok(());
-                                        }
-                                        remaining = buf_back[n..].to_vec();
-                                    }
-                                    Ok(_) => break Err(crate::WalError::Io(std::io::Error::new(
-                                        std::io::ErrorKind::WriteZero,
-                                        "failed to write whole buffer"
-                                    ))),
-                                    Err(e) => break Err(crate::WalError::Io(e)),
-                                }
-                            }
-                        }
-                        None => {
-                            Err(crate::WalError::IoError(format!("File not found for partition: {}", partition_key)))
-                        }
-                    };
-                    let _ = response.send(result);
+            // Group by partition, preserving arrival order within each.
+            let mut by_partition: HashMap<String, Vec<(Bytes, tokio::sync::oneshot::Sender<Result<()>>)>> =
+                HashMap::new();
+            for cmd in write_cmds {
+                if let IoUringCommand::Write { partition_key, data, response } = cmd {
+                    by_partition.entry(partition_key).or_default().push((data, response));
                 }
+            }
+
+            let mut partition_futures = Vec::new();
+            for (partition_key, writes) in by_partition {
+                let Some(file) = files.get(&partition_key) else {
+                    for (_, response) in writes {
+                        let _ = response.send(Err(crate::WalError::IoError(format!(
+                            "File not found for partition: {}",
+                            partition_key
+                        ))));
+                    }
+                    continue;
+                };
+
+                // Reserve the byte range for this partition's whole burst now, so
+                // the offset map is consistent before any await point.
+                let start = file_offsets.get(&partition_key).copied().unwrap_or(0);
+                let total: u64 = writes.iter().map(|(d, _)| d.len() as u64).sum();
+                file_offsets.insert(partition_key.clone(), start + total);
+
+                partition_futures.push(async move {
+                    let mut offset = start;
+                    for (data, response) in writes {
+                        let len = data.len() as u64;
+                        let result = write_all_at(file, data, offset).await;
+                        offset += len;
+                        let _ = response.send(result);
+                    }
+                });
+            }
+
+            join_all(partition_futures).await;
+        }
+
+        // Step 5b: Everything else (CreateFile, Shutdown), in order.
+        for cmd in rest_cmds {
+            match cmd {
+                IoUringCommand::Write { .. } => unreachable!("writes handled above"),
 
                 IoUringCommand::CreateFile { partition_key, path, response } => {
                     let result = match File::create(&path).await {
@@ -283,4 +340,34 @@ impl IoUringThreadHandle {
             "io_uring requires Linux and async-io feature".into()
         ))
     }
+}
+
+/// Write a whole `Bytes` at `offset`, resubmitting on a short write.
+///
+/// Uses [`BytesBuf`] so the payload is submitted to the kernel directly instead of
+/// being copied into a fresh `Vec` per write. A short write resubmits the
+/// remainder as a zero-copy `Bytes` slice rather than reallocating the tail.
+#[cfg(all(target_os = "linux", feature = "async-io"))]
+async fn write_all_at(file: &tokio_uring::fs::File, data: Bytes, offset: u64) -> Result<()> {
+    let mut remaining = data;
+    let mut pos = offset;
+    while !remaining.is_empty() {
+        let len = remaining.len();
+        let (res, buf) = file.write_at(BytesBuf(remaining), pos).await;
+        match res {
+            Ok(0) => {
+                return Err(crate::WalError::Io(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "io_uring wrote zero bytes",
+                )))
+            }
+            Ok(n) => {
+                pos += n as u64;
+                remaining = buf.0.slice(n..); // refcount bump, no copy
+                debug_assert!(n <= len);
+            }
+            Err(e) => return Err(crate::WalError::Io(e)),
+        }
+    }
+    Ok(())
 }

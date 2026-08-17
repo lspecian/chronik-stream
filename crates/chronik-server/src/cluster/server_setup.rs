@@ -88,6 +88,7 @@ mod tests {
             wal_bind_addr: "0.0.0.0:9291".to_string(),
             raft_bind_addr: "0.0.0.0:5001".to_string(),
             raft_peers: vec![],
+            self_raft_addr: "localhost:5001".to_string(),
             cluster_config,
         };
 

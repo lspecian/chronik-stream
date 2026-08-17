@@ -49,6 +49,14 @@ const PROTOCOL_VERSION: u16 = 1;
 /// Maximum queue size before dropping old records
 const MAX_QUEUE_SIZE: usize = 100_000;
 
+/// RP-1.4: delivery attempts for a data record before it is dropped.
+///
+/// Bounded so a permanently dead follower cannot stall the queue forever; with
+/// the 100ms backoff between attempts this is roughly 30 seconds of retrying,
+/// long enough to ride out a follower restart. Metadata records are exempt and
+/// retry indefinitely — they are low volume and losing one diverges the catalog.
+const MAX_REPLICATION_ATTEMPTS: u32 = 300;
+
 /// Heartbeat interval (10 seconds)
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -90,6 +98,14 @@ pub struct WalReplicationRecord {
 
     /// Serialized CanonicalRecord (bincode)
     pub data: Bytes,
+
+    /// RP-1.4: local delivery attempts, for bounded retry.
+    ///
+    /// Never travels: `serialize_wal_frame` writes the wire fields explicitly, and
+    /// `#[serde(skip)]` keeps it out of any serde path, so the frame format is
+    /// unchanged and followers are unaffected.
+    #[serde(skip)]
+    pub attempts: u32,
 }
 
 /// ACK message sent from follower to leader after successful WAL write (v2.2.7 Phase 4)
@@ -101,7 +117,18 @@ pub struct WalAckMessage {
     /// Partition ID
     pub partition: i32,
 
-    /// Offset that was successfully replicated
+    /// Follower's log end offset after writing the batch — i.e. the next offset
+    /// it expects, `base_offset + record_count`.
+    ///
+    /// This is deliberately an LEO, not the batch's base offset. ISR lag is
+    /// computed against the leader's high watermark (also an LEO), so ACKing the
+    /// base offset made every follower look permanently behind by the size of
+    /// the last batch. Once a partition went idle its followers then aged out of
+    /// ISR despite holding exactly the leader's data — observed live as
+    /// `isr=[1]` on a partition all three nodes physically had.
+    ///
+    /// The leader registers its quorum waits on the same value, so the two sides
+    /// stay comparable. The wire shape is unchanged; only the meaning is.
     pub offset: i64,
 
     /// Follower node ID
@@ -160,6 +187,23 @@ pub struct WalReplicationManager {
     /// Cluster config for auto-discovering followers (v2.2.7 Phase 6)
     cluster_config: Option<Arc<chronik_config::ClusterConfig>>,
 
+    /// Woken when a follower connection is (re)established, so the catalog is
+    /// re-broadcast at a moment the connection demonstrably exists.
+    ///
+    /// A metadata send to a follower with no live connection is DROPPED — this
+    /// transport is fire-and-forget. The rejoin re-broadcast (RP-6) is triggered
+    /// by liveness, which a returning node regains ~26ms before its TCP
+    /// connection is re-established, so the whole catalog was published into a
+    /// gap and lost. Measured: a restarted node received **zero** metadata
+    /// events, kept its stale copy — including believing it still led a
+    /// partition that had failed over — and therefore never replicated that
+    /// partition, never ran the RP-3.3 handshake, and kept a divergent tail
+    /// indefinitely. The next anti-entropy pass would have fixed it 300s later.
+    ///
+    /// Converging on connect is the honest trigger: "the link is up" is the
+    /// condition the broadcast actually depends on.
+    catalog_resync: parking_lot::Mutex<Option<Arc<tokio::sync::Notify>>>,
+
     /// Last known Raft leader ID (for Phase 3 dynamic leader change detection)
     last_known_leader: Arc<AtomicU64>,
 
@@ -205,6 +249,16 @@ impl WalReplicationManager {
     /// If followers is empty and cluster_config is provided, followers will be auto-discovered.
     ///
     /// v2.2.9 Phase 7: Added metadata_store parameter for querying partition replicas/ISR (Option 4)
+    /// Ask for a catalog re-broadcast whenever a follower connection comes up.
+    ///
+    /// Takes `&self` deliberately: the manager is already inside an `Arc` by the
+    /// time the builder knows about the anti-entropy loop, and needing `&mut`
+    /// here would mean either restructuring construction or silently skipping
+    /// the wiring — the second of which is how this class of bug survives.
+    pub fn set_catalog_resync_notify(&self, notify: Arc<tokio::sync::Notify>) {
+        *self.catalog_resync.lock() = Some(notify);
+    }
+
     pub fn new_with_dependencies(
         followers: Vec<String>,
         raft_cluster: Option<Arc<RaftCluster>>,
@@ -261,6 +315,7 @@ impl WalReplicationManager {
             election_tx: None, // Not used in WalReplicationManager (only in WalReceiver)
             metadata_store,     // v2.2.9 Phase 7: Option 4 metadata store
             replicas_cache: Arc::new(DashMap::new()), // v2.2.14: Replica cache for 6.2x speedup
+            catalog_resync: parking_lot::Mutex::new(None),
         });
 
 
@@ -321,6 +376,7 @@ impl WalReplicationManager {
             record_count, // FIXED: Extract from deserialized CanonicalRecord
             timestamp_ms: chrono::Utc::now().timestamp_millis(),
             data,
+            attempts: 0,
         };
 
         // Check queue size (prevent unbounded growth)
@@ -355,6 +411,7 @@ impl WalReplicationManager {
             record_count: 1, // Metadata events are single events
             timestamp_ms: chrono::Utc::now().timestamp_millis(),
             data: Bytes::from(data),
+            attempts: 0,
         };
 
         // Check queue size (prevent unbounded growth)
@@ -513,6 +570,7 @@ impl WalReplicationManager {
             record_count: record.records.len() as u32,
             timestamp_ms: chrono::Utc::now().timestamp_millis(),
             data,
+            attempts: 0,
         };
 
         // Check queue size (prevent unbounded growth)
@@ -553,34 +611,43 @@ impl WalReplicationManager {
                 }
 
                 // Send to all active followers (fan-out)
+                let mut record = record;
                 let sent_to_any = self.send_to_followers(&record).await;
 
-                // v2.2.9 Phase 7 FIX: Re-queue metadata records that failed to send
-                if is_metadata_record && !sent_to_any {
-                    debug!("Re-queuing metadata record (no successful sends)");
-                    self.queue.push(record);
-                    sleep(Duration::from_millis(100)).await;
-                    continue;
-                }
-
-                // Count only what actually reached a follower. This used to
-                // increment unconditionally, so a data record that reached no
-                // follower — no live connection, or every write/flush failed —
-                // still counted as "sent", and the one counter that could have
-                // exposed the loss reported success instead.
-                //
-                // Data records are not re-queued (only metadata is, above), so a
-                // failure here IS a silent drop; count it as such so it is at
-                // least visible. Retry/reconciliation is tracked separately.
                 if sent_to_any {
                     self.total_sent.fetch_add(1, Ordering::Relaxed);
                     // Reset heartbeat timer (data was sent)
                     last_heartbeat = std::time::Instant::now();
                 } else {
+                    // RP-1.4: retry instead of dropping.
+                    //
+                    // Previously only metadata records were re-queued; a data record
+                    // that reached no follower — connection not yet established, or
+                    // every write/flush failed — was discarded with nothing to notice.
+                    // A transient follower restart therefore left a permanent
+                    // under-replicated gap, because nothing in the system re-sends what
+                    // a follower missed.
+                    //
+                    // Bounded: after MAX_REPLICATION_ATTEMPTS the record is dropped and
+                    // counted, so a permanently dead follower cannot stall the queue
+                    // forever. Metadata keeps retrying indefinitely as before — it is
+                    // low volume and losing it diverges the catalog.
+                    record.attempts = record.attempts.saturating_add(1);
+
+                    if is_metadata_record || record.attempts < MAX_REPLICATION_ATTEMPTS {
+                        debug!(
+                            "Re-queuing {}-{} offset {} (attempt {})",
+                            record.topic, record.partition, record.base_offset, record.attempts
+                        );
+                        self.queue.push(record);
+                        sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+
                     self.total_dropped.fetch_add(1, Ordering::Relaxed);
                     warn!(
-                        "Dropped replicated record for {}-{} offset {} — no follower received it (no retry for data records)",
-                        record.topic, record.partition, record.base_offset
+                        "Dropped replicated record for {}-{} offset {} after {} attempts — no follower received it; partition is now under-replicated",
+                        record.topic, record.partition, record.base_offset, record.attempts
                     );
                 }
             } else {
@@ -607,6 +674,31 @@ impl WalReplicationManager {
     ///
     /// Fallback: If no partition assignment found, uses static followers list.
     ///
+    /// Evict a follower from ISR because its connection is gone.
+    ///
+    /// The connection is the only liveness signal available in the push model. A
+    /// follower that was caught up when it died would otherwise stay in ISR
+    /// forever: the lag bound never fires for a caught-up replica, and it will
+    /// never ACK again, so nothing else can evict it. Heartbeats prune dead
+    /// connections every HEARTBEAT_INTERVAL, so this fires within about one
+    /// interval of a node going away.
+    ///
+    /// RP-2 removes the need for this — a follower's fetch is its own liveness
+    /// proof, which is how Kafka avoids the problem entirely.
+    fn mark_follower_down(&self, follower_addr: &str) {
+        let (Some(tracker), Some(config)) = (&self.isr_tracker, &self.cluster_config) else {
+            return;
+        };
+
+        if let Some(peer) = config.peer_nodes().iter().find(|p| p.wal == follower_addr) {
+            warn!(
+                "Follower node {} ({}) unreachable — removing from ISR",
+                peer.id, follower_addr
+            );
+            tracker.remove_node(peer.id);
+        }
+    }
+
     /// Returns: true if sent to at least one follower, false if all sends failed
     async fn send_to_followers(&self, record: &WalReplicationRecord) -> bool {
         let frame = match serialize_wal_frame(record) {
@@ -661,6 +753,7 @@ impl WalReplicationManager {
                     // Remove dead connection (connection manager will reconnect)
                     drop(conn); // Drop RefMut before removing
                     self.connections.remove(follower_addr);
+                    self.mark_follower_down(follower_addr);
                 } else {
                     // CRITICAL: Flush the TCP stream to actually send the data
                     // Without this, data sits in buffer and never reaches followers!
@@ -668,6 +761,7 @@ impl WalReplicationManager {
                         error!("Failed to flush WAL record to {}: {}", follower_addr, e);
                         drop(conn);
                         self.connections.remove(follower_addr);
+                        self.mark_follower_down(follower_addr);
                     } else {
                         info!("✅ Sent and flushed WAL record for {}-{} to follower: {} ({} bytes)",
                             record.topic, record.partition, follower_addr, frame.len());
@@ -702,14 +796,55 @@ impl WalReplicationManager {
                     debug!("Failed to send heartbeat to {}: {}", follower_addr, e);
                     drop(conn);
                     self.connections.remove(follower_addr);
+                    self.mark_follower_down(follower_addr);
                 } else if let Err(e) = conn.flush().await {
                     debug!("Failed to flush heartbeat to {}: {}", follower_addr, e);
                     drop(conn);
                     self.connections.remove(follower_addr);
+                    self.mark_follower_down(follower_addr);
                 } else {
                     debug!("Sent heartbeat to follower: {}", follower_addr);
                 }
             }
+        }
+
+        self.prune_unresponsive_connections();
+    }
+
+    /// Drop connections to followers that have stopped answering heartbeats.
+    ///
+    /// A TCP write succeeds into the local send buffer long after the peer is
+    /// gone, so a restarted follower leaves a stale entry in `connections`. The
+    /// connection manager only redials when `contains_key` is false, so it never
+    /// reconnects and replication to that follower stops **permanently** — a
+    /// follower restart silently cost us a replica until the leader restarted.
+    /// Observed directly: after one pod restart, new topics landed only on the
+    /// partitions that node led.
+    ///
+    /// The heartbeat reply is the signal that actually detects this, since it is
+    /// application-level rather than relying on TCP noticing.
+    fn prune_unresponsive_connections(&self) {
+        let (Some(tracker), Some(config)) = (&self.isr_tracker, &self.cluster_config) else {
+            return;
+        };
+
+        for peer in config.peer_nodes() {
+            if peer.id == config.node_id {
+                continue;
+            }
+            if !self.connections.contains_key(&peer.wal) {
+                continue; // already gone; the manager will redial
+            }
+            if tracker.is_node_alive(peer.id) {
+                continue;
+            }
+
+            warn!(
+                "Follower node {} ({}) stopped answering heartbeats — dropping connection to force reconnect",
+                peer.id, peer.wal
+            );
+            self.connections.remove(&peer.wal);
+            tracker.remove_node(peer.id);
         }
     }
 
@@ -718,6 +853,14 @@ impl WalReplicationManager {
         info!("WAL replication connection manager started");
 
         while !self.shutdown.load(Ordering::Relaxed) {
+            // Retire connections whose follower has stopped answering, so the
+            // loop below redials them. Runs here rather than alongside the
+            // heartbeat because heartbeats only fire when the queue is empty AND
+            // any successful send resets their timer — with one live and one dead
+            // follower under load they would never fire, and the dead one would
+            // never be reconnected.
+            self.prune_unresponsive_connections();
+
             for follower_addr in &self.followers {
                 // Check if we have an active connection
                 if !self.connections.contains_key(follower_addr) {
@@ -774,6 +917,22 @@ impl WalReplicationManager {
 
                             // Store write-half connection (for send_to_followers)
                             self.connections.insert(follower_addr.clone(), write_half);
+
+                            // The link is up: re-assert the catalog now.
+                            //
+                            // Anything published while this connection was down
+                            // was dropped on the floor — including the rejoin
+                            // broadcast that exists precisely for this moment,
+                            // which fires on liveness and therefore loses its
+                            // race with the reconnect it depends on.
+                            if let Some(notify) = self.catalog_resync.lock().clone() {
+                                debug!(
+                                    "Connection to {} established — asking for a catalog re-broadcast \
+                                     so anything published while it was down is re-sent",
+                                    follower_addr
+                                );
+                                notify.notify_waiters();
+                            }
                         }
                         Ok(Err(e)) => {
                             // Increment failure counter
@@ -916,6 +1075,21 @@ impl WalReplicationManager {
 
                 match bincode::deserialize::<WalAckMessage>(payload) {
                     Ok(ack_msg) => {
+                        // Any ACK proves the node is alive; a heartbeat reply
+                        // (empty topic) carries nothing else. This is what keeps
+                        // an idle-but-healthy replica in ISR while still evicting
+                        // one that has died.
+                        if let Some(ref tracker) = isr_tracker {
+                            tracker.record_node_alive(ack_msg.node_id);
+                        }
+                        if ack_msg.topic.is_empty() {
+                            debug!(
+                                "Liveness ACK from {} (node {})",
+                                follower_addr, ack_msg.node_id
+                            );
+                            continue;
+                        }
+
                         info!(
                             "✅ ACK RECEIVED from {}: {}-{} offset {} (node {})",
                             follower_addr,
@@ -1383,10 +1557,10 @@ impl WalReplicationManager {
         use crate::metadata_events::MetadataEvent;
 
         match event {
-            MetadataEvent::PartitionAssigned { topic, partition, replicas, leader } => {
+            MetadataEvent::PartitionAssigned { topic, partition, replicas, leader, leader_epoch, isr } => {
                 info!(
-                    "📡 PartitionAssigned event: {}-{} => replicas={:?}, leader={}",
-                    topic, partition, replicas, leader
+                    "📡 PartitionAssigned event: {}-{} => replicas={:?}, leader={} (epoch {}, isr {:?})",
+                    topic, partition, replicas, leader, leader_epoch, isr
                 );
 
                 // Get my node ID to filter out self
@@ -1566,6 +1740,13 @@ impl WalReplicationManager {
         self.total_sent.load(Ordering::Relaxed)
     }
 
+    /// Records lost without reaching any follower — queue overflow, or exhausting
+    /// the RP-1.4 retry budget. Non-zero means partitions are under-replicated,
+    /// so this belongs on a dashboard rather than only in the logs.
+    pub fn total_dropped(&self) -> u64 {
+        self.total_dropped.load(Ordering::Relaxed)
+    }
+
     pub async fn shutdown(&self) {
         info!("Shutting down WAL replication manager");
         self.shutdown.store(true, Ordering::Relaxed);
@@ -1668,6 +1849,7 @@ pub fn deserialize_wal_frame(mut data: Bytes) -> Result<WalReplicationRecord> {
         record_count,
         timestamp_ms,
         data: record_data,
+        attempts: 0,
     })
 }
 
@@ -1691,7 +1873,6 @@ pub struct WalReceiver {
     node_id: u64,
 
     /// Leader elector for triggering elections on timeout (v2.2.7)
-    leader_elector: Option<Arc<crate::leader_election::LeaderElector>>,
 
     /// Last heartbeat timestamp per partition (v2.2.7)
     last_heartbeat: Arc<DashMap<(String, i32), std::time::Instant>>,
@@ -1718,7 +1899,6 @@ impl WalReceiver {
             shutdown: Arc::new(AtomicBool::new(false)),
             isr_ack_tracker: None,
             node_id: 0, // Default node ID (standalone mode)
-            leader_elector: None,
             last_heartbeat: Arc::new(DashMap::new()),
             raft_cluster: None,
             produce_handler: None,
@@ -1740,7 +1920,6 @@ impl WalReceiver {
             shutdown: Arc::new(AtomicBool::new(false)),
             isr_ack_tracker: Some(isr_ack_tracker),
             node_id,
-            leader_elector: None,
             last_heartbeat: Arc::new(DashMap::new()),
             raft_cluster: None,
             produce_handler: None,
@@ -1748,11 +1927,6 @@ impl WalReceiver {
         }
     }
 
-    /// Set leader elector for event-driven elections (v2.2.7)
-    pub fn set_leader_elector(&mut self, elector: Arc<crate::leader_election::LeaderElector>) {
-        info!("WalReceiver: Enabling event-driven leader election");
-        self.leader_elector = Some(elector);
-    }
 
     /// Set Raft cluster for metadata WAL replication (Phase 2.3)
     pub fn set_raft_cluster(&mut self, raft_cluster: Arc<RaftCluster>) {
@@ -1802,7 +1976,6 @@ impl WalReceiver {
                     let isr_ack_tracker = self.isr_ack_tracker.clone();
                     let node_id = self.node_id;
                     let last_heartbeat = Arc::clone(&self.last_heartbeat);
-                    let leader_elector = self.leader_elector.clone();
                     let raft_cluster = self.raft_cluster.clone();
 
                     let produce_handler_for_conn = self.produce_handler.clone();
@@ -1816,7 +1989,6 @@ impl WalReceiver {
                             isr_ack_tracker,
                             node_id,
                             last_heartbeat,
-                            leader_elector,
                             raft_cluster,
                             produce_handler_for_conn,
                             metadata_store_for_conn,
@@ -1849,39 +2021,12 @@ impl WalReceiver {
         isr_ack_tracker: Option<Arc<crate::isr_ack_tracker::IsrAckTracker>>,
         node_id: u64,
         last_heartbeat: Arc<DashMap<(String, i32), std::time::Instant>>,
-        leader_elector: Option<Arc<crate::leader_election::LeaderElector>>,
         raft_cluster: Option<Arc<RaftCluster>>,
         produce_handler: Option<Arc<crate::produce_handler::ProduceHandler>>,
         metadata_store: Option<Arc<dyn chronik_common::metadata::MetadataStore>>,
     ) -> Result<()> {
         let mut buffer = BytesMut::with_capacity(64 * 1024); // 64KB buffer
 
-        // v2.2.7 DEADLOCK FIX: Spawn timeout monitor with channel-based elections
-        // The monitor sends election requests to a channel instead of calling directly,
-        // preventing deadlocks with raft_node lock
-        if let Some(ref elector) = leader_elector {
-            // Create election trigger channel
-            let (election_tx, election_rx) = mpsc::unbounded_channel();
-
-            // Spawn election worker that can safely lock raft_node
-            let elector_clone = Arc::clone(elector);
-            tokio::spawn(async move {
-                Self::run_election_worker(election_rx, elector_clone).await;
-            });
-
-            // Spawn timeout monitor that sends to channel (non-blocking)
-            let last_heartbeat_clone = Arc::clone(&last_heartbeat);
-            let shutdown_clone = Arc::clone(&shutdown);
-            tokio::spawn(async move {
-                Self::monitor_timeouts(
-                    election_tx,
-                    last_heartbeat_clone,
-                    shutdown_clone,
-                ).await;
-            });
-
-            info!("WAL timeout monitoring ENABLED with channel-based elections (deadlock-free)");
-        }
 
         while !shutdown.load(Ordering::Relaxed) {
             // Read frame header (8 bytes: magic + version + length)
@@ -1921,11 +2066,31 @@ impl WalReceiver {
                 let frame_size = 8 + total_length; // header + payload
 
                 if magic == HEARTBEAT_MAGIC {
-                    // Heartbeat frame - just consume it
                     if buffer.len() >= 8 {
                         buffer.advance(8);
                         debug!("WAL receiver: Received heartbeat");
-                        // Note: Global heartbeat - we'll track per-partition when we receive data
+
+                        // Answer it. This reply is the only liveness signal the
+                        // leader gets from a follower whose partitions are idle,
+                        // and ISR depends on it: without a beat, a replica that
+                        // died while caught up can never be evicted, because the
+                        // lag bound does not fire for a caught-up replica.
+                        //
+                        // Connection state cannot substitute — a TCP write lands
+                        // in the local send buffer long after the peer is gone.
+                        //
+                        // Carried on the existing ACK frame with an empty topic,
+                        // so the format is unchanged; the leader reads an empty
+                        // topic as "liveness only, no offset".
+                        let liveness = WalAckMessage {
+                            topic: String::new(),
+                            partition: -1,
+                            offset: -1,
+                            node_id,
+                        };
+                        if let Err(e) = Self::send_ack(&mut stream, &liveness).await {
+                            debug!("Failed to send heartbeat ACK: {}", e);
+                        }
                     }
                     continue;
                 }
@@ -2036,10 +2201,13 @@ impl WalReceiver {
                                     wal_record.topic, wal_record.partition, wal_record.base_offset, node_id
                                 );
 
+                                // ACK the follower's log end offset, not the batch's
+                                // base offset: ISR lag is measured against the leader's
+                                // high watermark, which is also an LEO. See WalAckMessage.
                                 let ack_msg = WalAckMessage {
                                     topic: wal_record.topic.clone(),
                                     partition: wal_record.partition,
-                                    offset: wal_record.base_offset,
+                                    offset: wal_record.base_offset + wal_record.record_count as i64,
                                     node_id,
                                 };
 
@@ -2298,94 +2466,6 @@ impl WalReceiver {
         Ok(())
     }
 
-    /// Election worker task - processes election triggers from channel (v2.2.7 deadlock fix)
-    ///
-    /// This task runs independently and can safely lock raft_node because it doesn't
-    /// hold any other locks. The timeout monitor sends election requests to this worker
-    /// via the channel, avoiding deadlocks.
-    pub async fn run_election_worker(
-        mut election_rx: mpsc::UnboundedReceiver<ElectionTriggerMessage>,
-        leader_elector: Arc<crate::leader_election::LeaderElector>,
-    ) {
-        info!("Started election worker task (non-blocking elections)");
-
-        while let Some(msg) = election_rx.recv().await {
-            debug!(
-                "Election worker: Processing trigger for {}-{}: {}",
-                msg.topic, msg.partition, msg.reason
-            );
-
-            // This is safe because the worker doesn't hold any locks
-            // It can wait for raft_node lock without blocking other operations
-            let result = leader_elector.trigger_election_on_timeout(
-                &msg.topic,
-                msg.partition,
-                &msg.reason,
-            ).await;
-
-            if let Err(e) = result {
-                debug!(
-                    "Election trigger failed for {}-{}: {} (this is normal if not leader)",
-                    msg.topic, msg.partition, e
-                );
-            }
-        }
-
-        info!("Election worker stopped");
-    }
-
-    /// Monitor partition heartbeat timeouts and trigger elections (v2.2.7)
-    pub async fn monitor_timeouts(
-        election_tx: mpsc::UnboundedSender<ElectionTriggerMessage>,
-        last_heartbeat: Arc<DashMap<(String, i32), std::time::Instant>>,
-        shutdown: Arc<AtomicBool>,
-    ) {
-        info!("Started WAL timeout monitor for event-driven elections (channel-based)");
-
-        while !shutdown.load(Ordering::Relaxed) {
-            // Check every 5 seconds
-            sleep(Duration::from_secs(5)).await;
-
-            let now = std::time::Instant::now();
-
-            // v2.2.7 DEADLOCK FIX: Collect keys to remove FIRST, then remove after iteration
-            // CRITICAL: Cannot call remove() while iterating - causes DashMap shard lock deadlock!
-            let mut to_remove = Vec::new();
-
-            // Check each partition for timeout
-            for entry in last_heartbeat.iter() {
-                let (topic, partition) = entry.key();
-                let last_seen = *entry.value();
-
-                if now.duration_since(last_seen) > HEARTBEAT_TIMEOUT {
-                    warn!(
-                        "WAL stream timeout detected for {}-{} ({}s since last heartbeat)",
-                        topic, partition, now.duration_since(last_seen).as_secs()
-                    );
-
-                    // v2.2.7 DEADLOCK FIX: Send to channel instead of calling directly
-                    // This never blocks, preventing deadlock with raft_node lock
-                    let _ = election_tx.send(ElectionTriggerMessage {
-                        topic: topic.to_string(),
-                        partition: *partition,
-                        reason: format!("WAL stream timeout ({}s)", now.duration_since(last_seen).as_secs()),
-                    });
-
-                    // Collect key for removal (cannot remove during iteration!)
-                    to_remove.push((topic.clone(), *partition));
-                }
-            }
-
-            // Remove timed-out entries AFTER iteration completes (avoids iterator invalidation deadlock)
-            for key in to_remove {
-                last_heartbeat.remove(&key);
-                debug!("Removed {}-{} from heartbeat tracking after timeout", key.0, key.1);
-            }
-        }
-
-        info!("Stopped WAL timeout monitor");
-    }
-
     /// Shutdown the receiver
     pub fn shutdown(&self) {
         info!("Shutting down WAL receiver");
@@ -2411,6 +2491,7 @@ mod tests {
                     kafka: "node1.example.com:9092".to_string(),
                     wal: "node1.example.com:9291".to_string(),
                     raft: "node1.example.com:5001".to_string(),
+                    replication: None,
                     addr: None,
                     raft_port: None,
                 },
@@ -2419,6 +2500,7 @@ mod tests {
                     kafka: "node2.example.com:9092".to_string(),
                     wal: "node2.example.com:9291".to_string(),
                     raft: "node2.example.com:5001".to_string(),
+                    replication: None,
                     addr: None,
                     raft_port: None,
                 },
@@ -2427,6 +2509,7 @@ mod tests {
                     kafka: "node3.example.com:9092".to_string(),
                     wal: "node3.example.com:9291".to_string(),
                     raft: "node3.example.com:5001".to_string(),
+                    replication: None,
                     addr: None,
                     raft_port: None,
                 },
@@ -2510,5 +2593,65 @@ mod tests {
             let self_wal = format!("node{}.example.com:9291", node_id);
             assert!(!manager.followers.contains(&self_wal));
         }
+    }
+
+    fn repl_record(topic: &str, partition: i32, base_offset: i64) -> WalReplicationRecord {
+        WalReplicationRecord {
+            topic: topic.to_string(),
+            partition,
+            base_offset,
+            record_count: 1,
+            timestamp_ms: 1_700_000_000_000,
+            data: Bytes::from_static(b"payload"),
+            attempts: 0,
+        }
+    }
+
+    /// RP-1.4: a data record that reaches no follower must be retried, then
+    /// eventually dropped — not discarded on the first failure.
+    ///
+    /// Only metadata used to be re-queued, so a follower restart left a permanent
+    /// under-replicated gap: nothing in the system re-sends what a follower
+    /// missed. The bound matters just as much — unbounded retry against a dead
+    /// follower would stall the queue forever.
+    #[tokio::test]
+    async fn data_records_are_retried_then_dropped_when_undeliverable() {
+        // One follower, no connection to it: every send fails.
+        let manager = WalReplicationManager::new(vec!["dead-follower:9291".to_string()]);
+
+        manager.queue.push(repl_record("orders", 0, 42));
+
+        // The worker is already running from `new`. Give it time to burn through
+        // the retry budget (300 attempts x 100ms is far longer than this test
+        // should run, so assert on the retry behaviour rather than the drop).
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+        assert_eq!(manager.total_sent(), 0, "nothing could have been delivered");
+        assert_eq!(
+            manager.total_dropped(),
+            0,
+            "record must still be retrying, not dropped after early failures"
+        );
+        assert_eq!(manager.queue.len(), 1, "record should be back on the queue");
+    }
+
+    /// The retry budget is bounded, so a permanently unreachable follower cannot
+    /// pin a record on the queue indefinitely.
+    #[tokio::test]
+    async fn retry_budget_is_bounded_for_data_records() {
+        let manager = WalReplicationManager::new(vec!["dead-follower:9291".to_string()]);
+
+        // Start one attempt short of the limit; the next failure must drop it.
+        let mut record = repl_record("orders", 0, 7);
+        record.attempts = MAX_REPLICATION_ATTEMPTS - 1;
+        manager.queue.push(record);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while manager.total_dropped() == 0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        assert_eq!(manager.total_dropped(), 1, "record should have been dropped at the budget");
+        assert_eq!(manager.queue.len(), 0, "dropped record must not stay queued");
     }
 }

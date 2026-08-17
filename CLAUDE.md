@@ -426,7 +426,7 @@ After successful persistence, old WAL segments are truncated.
 
 The `chronik-server` binary now has a single `start` command that auto-detects mode:
 - **Single-Node** (default) - Standalone Kafka server with WAL durability
-- **Cluster** (from config) - Multi-node cluster with Raft + WAL replication (requires config file)
+- **Cluster** (from config) - Multi-node cluster: Raft for consensus, follower-pull for partition data (requires config file)
 
 **Removed in v2.2.0**: `standalone`, `raft-cluster`, `ingest`, `search`, `all` subcommands
 
@@ -489,12 +489,12 @@ min_insync_replicas = 2
 
 [node.addresses]
 kafka = "0.0.0.0:9092"    # Where to bind
-wal = "0.0.0.0:9291"      # WAL replication receiver
+wal = "0.0.0.0:9291"      # Metadata replication receiver (partition data is pulled over the Kafka port)
 raft = "0.0.0.0:5001"     # Raft consensus
 
 [node.advertise]
 kafka = "localhost:9092"   # What clients connect to
-wal = "localhost:9291"     # What followers connect to
+wal = "localhost:9291"     # What peers connect to for metadata
 raft = "localhost:5001"    # What peers connect to
 
 [[peers]]
@@ -557,7 +557,7 @@ Add a new node to a running cluster without downtime:
 - Node 4 joins Raft cluster
 - Partition rebalancer detects new capacity
 - Partitions redistribute across all 4 nodes
-- WAL replication connects to new node
+- The new node begins fetching from its partition leaders
 - Zero client interruptions
 
 #### Node Removal (Priority 4 - NEW!)
@@ -826,39 +826,21 @@ s3://{bucket}/{prefix}/snapshots/{topic}/{partition}/{snapshot_id}.snap
 #### Example Usage
 
 ```bash
-# Start Raft cluster with snapshots enabled (default)
-cargo run --bin chronik-server -- \
-  --node-id 1 \
-  --advertised-addr localhost \
-  --kafka-port 9092 \
-  raft-cluster \
-  --raft-addr 0.0.0.0:9192 \
-  --peers "2@localhost:9193,3@localhost:9194" \
-  --bootstrap
+# Start a cluster node with snapshots enabled (default).
+# NOTE: the `raft-cluster` subcommand and the `--node-id` / `--advertised-addr`
+# top-level flags were REMOVED in v2.2.0. Cluster mode is `start --config`.
+./target/release/chronik-server start --config cluster-node1.toml
 
 # Disable snapshots for testing
-CHRONIK_SNAPSHOT_ENABLED=false cargo run --bin chronik-server -- \
-  --node-id 1 \
-  --advertised-addr localhost \
-  --kafka-port 9092 \
-  raft-cluster \
-  --raft-addr 0.0.0.0:9192 \
-  --peers "2@localhost:9193,3@localhost:9194" \
-  --bootstrap
+CHRONIK_SNAPSHOT_ENABLED=false \
+  ./target/release/chronik-server start --config cluster-node1.toml
 
 # Custom snapshot configuration
 CHRONIK_SNAPSHOT_LOG_THRESHOLD=50000 \
 CHRONIK_SNAPSHOT_TIME_THRESHOLD_SECS=7200 \
 CHRONIK_SNAPSHOT_COMPRESSION=zstd \
 CHRONIK_SNAPSHOT_RETENTION_COUNT=5 \
-cargo run --bin chronik-server -- \
-  --node-id 1 \
-  --advertised-addr localhost \
-  --kafka-port 9092 \
-  raft-cluster \
-  --raft-addr 0.0.0.0:9192 \
-  --peers "2@localhost:9193,3@localhost:9194" \
-  --bootstrap
+  ./target/release/chronik-server start --config cluster-node1.toml
 ```
 
 #### Monitoring
@@ -1103,7 +1085,7 @@ Producer → WAL (fsync) → Response  (~2-10ms)
 
 Key environment variables:
 - `RUST_LOG` - Log level (debug, info, warn, error)
-- `CHRONIK_KAFKA_PORT` - Kafka port (default: 9092)
+- `CHRONIK_KAFKA_PORT` / `--kafka-port` - Kafka listen port, single-node mode only (default: 9092). In cluster mode the port comes from `[node.addresses] kafka` in the config file and this is ignored.
 - `CHRONIK_BIND_ADDR` - Bind address (default: 0.0.0.0)
 - `CHRONIK_ADVERTISED_ADDR` - **CRITICAL** for Docker/remote access
 - `CHRONIK_ADVERTISED_PORT` - Port advertised to clients
@@ -1111,6 +1093,9 @@ Key environment variables:
 - `CHRONIK_PRODUCE_PROFILE` - ProduceHandler flush profile: `low-latency`, `balanced` (default), `high-throughput`
 - `CHRONIK_WAL_PROFILE` - WAL commit profile: `low`, `medium`, `high`, `ultra` (auto-detected by default)
 - `CHRONIK_WAL_ROTATION_SIZE` - Segment seal threshold: `100KB`, `250MB` (default), `1GB`, or raw bytes `268435456`
+- `CHRONIK_METRICS_PORT` - Prometheus `/metrics` port, single-node mode (default: 13092). Set it when running more than one broker on a host, or the second logs a bind failure for a listener it cannot move.
+- `CHRONIK_REPLICA_LAG_TIME_MAX_MS` - How long a replica may stay measurably behind before leaving ISR (default: 10000). Kafka's `replica.lag.time.max.ms` equivalent; Kafka defaults to 30s, this is deliberately tighter so under-replication surfaces sooner. Cluster mode only.
+- `CHRONIK_REPLICA_LAG_MAX_ENTRIES` - Secondary record-count bound on follower lag (default: 10000). Time is the primary bound.
 - `CHRONIK_ADMIN_API_KEY` - API key for admin API authentication (Priority 2, **REQUIRED for production**)
 - `CHRONIK_ADMIN_TLS_CERT` - Path to TLS certificate for admin API (Priority 2, optional)
 - `CHRONIK_ADMIN_TLS_KEY` - Path to TLS private key for admin API (Priority 2, optional)

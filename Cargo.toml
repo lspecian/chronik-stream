@@ -19,14 +19,16 @@ members = [
     "crates/chronik-operator",
     "crates/chronik-perf",
     "crates/chronik-memory",
+    # Integration tests. A member, not an exclusion — see tests/Cargo.toml for
+    # why standing outside the workspace is what let them rot unnoticed.
+    "tests",
     # NOTE (AM-1.7, AD-1): bindings/python deleted. Agent memory is now an HTTP
     # surface under /memory/v1/* (port 6092); any language with an HTTP client
     # has parity. Curl + Python examples live in examples/agent-memory/.
 ]
-exclude = ["tests"]
 
 [workspace.package]
-version = "2.11.0"
+version = "2.12.0"
 edition = "2021"
 authors = ["Chronik Stream Contributors"]
 license = "Apache-2.0"
@@ -123,6 +125,10 @@ rustls-pemfile = "2.1"
 proptest = "1.4"
 criterion = { version = "0.5", features = ["async_tokio"] }
 tempfile = "3.8"
+base64 = "0.21"
+log = "0.4"
+env_logger = "0.11"
+libc = "0.2"
 testcontainers = "0.15"
 rdkafka = { version = "0.36", features = ["cmake-build", "ssl", "zstd"] }
 reqwest = { version = "0.11", features = ["json"] }

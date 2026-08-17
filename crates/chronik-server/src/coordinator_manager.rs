@@ -509,6 +509,10 @@ mod tests {
             unimplemented!()
         }
 
+        async fn get_partition_leader_epoch(&self, _topic: &str, _partition: u32) -> chronik_common::metadata::traits::Result<Option<i32>> {
+            unimplemented!()
+        }
+
         async fn commit_transactional_offsets(
             &self,
             _transactional_id: String,

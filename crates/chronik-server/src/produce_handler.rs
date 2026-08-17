@@ -199,6 +199,15 @@ pub struct ProduceHandlerConfig {
     pub num_partitions: u32,
     /// Default replication factor for auto-created topics
     pub default_replication_factor: u32,
+    /// RP-1.3: ACKs required before an `acks=all` produce is acknowledged,
+    /// counting the leader's own.
+    ///
+    /// Waiting for *every* assigned replica (the previous behaviour) means one
+    /// slow or dead follower blocks all writes to the partition until the
+    /// replication timeout expires, even at RF=3 / minISR=2 where the write is
+    /// perfectly durable without it. Kafka waits for the in-sync set and fails
+    /// only when it falls below `min.insync.replicas`.
+    pub min_insync_replicas: usize,
     /// Flush profile for pending_batches management
     pub flush_profile: ProduceFlushProfile,
 }
@@ -223,6 +232,7 @@ impl Default for ProduceHandlerConfig {
             auto_create_topics_enable: true,
             num_partitions: 3,
             default_replication_factor: 1,
+            min_insync_replicas: 1, // single-node default: the leader alone suffices
             flush_profile: profile,
         }
     }
@@ -376,6 +386,35 @@ pub(crate) struct PartitionState {
     last_flush: Arc<Mutex<Instant>>,
 }
 
+impl PartitionState {
+    /// Raise the high watermark, and the log end along with it.
+    ///
+    /// The two are separate atomics but not separate facts: a partition cannot
+    /// have acknowledged records past the end of its own log, so the log end is
+    /// always at least the watermark.
+    ///
+    /// They used to be coupled the other way — through a single "is the
+    /// watermark increasing?" guard, with the log end updated only inside it.
+    /// Once any other path raised the watermark, every later call took the
+    /// `else` branch and the log end could never catch up. Captured from a
+    /// failing run:
+    ///
+    /// ```text
+    /// Created partition state for t-0 with watermark 79
+    /// WM_SKIP t-0: 100 <= 100 (current), log end stays 79
+    /// ```
+    ///
+    /// That replica held 100 replicated records and reported a log end of 79.
+    /// Elected, it assigned offsets from 79 and overwrote 21 records it already
+    /// had; the returning ex-leader was told its epoch ended at 79 and truncated
+    /// committed data to match. Raising both, independently and monotonically,
+    /// is what makes that unrepresentable.
+    pub(crate) fn raise_watermark(&self, watermark: u64) {
+        self.high_watermark.fetch_max(watermark, Ordering::SeqCst);
+        self.next_offset.fetch_max(watermark, Ordering::SeqCst);
+    }
+}
+
 /// Record to be produced
 #[derive(Debug, Clone)]
 struct ProduceRecord {
@@ -438,6 +477,16 @@ pub struct ProduceHandler {
     memory_limit_bytes: u64,
     replication_sender: Option<mpsc::Sender<ReplicationRequest>>,
     fetch_handler: Option<Arc<FetchHandler>>,
+
+    /// Shared with `FetchHandler`: the wake-up handles a parked long poll
+    /// registers on, so an append is announced rather than discovered on a timer.
+    ///
+    /// Deliberately NOT reached through `fetch_handler` above. That field is
+    /// `None` in every production build — `set_fetch_handler` and
+    /// `new_with_fetch_handler` are only ever called from tests — so anything
+    /// routed through it silently does nothing on a real broker, which is
+    /// exactly what happened on the first attempt at this (RP-9).
+    append_notify: Arc<dashmap::DashMap<(String, i32), Arc<tokio::sync::Notify>>>,
     /// Track in-flight topic creation requests to prevent duplicates
     topic_creation_cache: Arc<RwLock<HashMap<String, Arc<Mutex<Option<chronik_common::metadata::TopicMetadata>>>>>>,
     /// WAL manager for inline durability writes (v1.3.47+)
@@ -450,13 +499,14 @@ pub struct ProduceHandler {
     /// WAL replication manager for PostgreSQL-style streaming (v2.2.0+)
     /// CRITICAL: Option<Arc<>> NOT Arc<RwLock<>> to avoid hot path locks!
     /// Fire-and-forget async replication, never blocks produce path
-    wal_replication_manager: Option<Arc<WalReplicationManager>>,
     /// ISR ACK tracker for acks=-1 quorum support (v2.2.7 Phase 4)
     /// Tracks pending acks=-1 requests and notifies when ISR quorum reached
     isr_ack_tracker: Option<Arc<crate::isr_ack_tracker::IsrAckTracker>>,
+    /// RP-3: this node's view of each partition's leadership history, built
+    /// from the epochs stamped on the batches it appends.
+    leader_epochs: Arc<crate::replication::leader_epoch::LeaderEpochStore>,
     /// Leader elector for partition leader failover (v2.2.7 Phase 5)
     /// Used to record heartbeats when handling produce requests as leader
-    leader_elector: Option<Arc<crate::leader_election::LeaderElector>>,
     /// Metadata event bus for high watermark replication (v2.2.7.2)
     /// Emits HighWatermarkUpdated events to replicate watermarks < 10ms via metadata WAL
     event_bus: Option<Arc<crate::metadata_events::MetadataEventBus>>,
@@ -479,6 +529,12 @@ pub struct ProduceHandler {
     /// Key: topic name, Value: (is_searchable, last_updated)
     /// TTL: 60 seconds to pick up config changes within reasonable time
     searchable_topic_cache: Arc<DashMap<String, (bool, std::time::Instant)>>,
+    /// Same shape as `searchable_topic_cache`, for the hot-vector check.
+    /// Key: topic name, Value: (is_vector_hot_enabled, last_updated)
+    /// Without it, `is_topic_vector_enabled` hit the metadata store on EVERY
+    /// produce — a full `TopicMetadata` fetch and clone per batch, on the hot
+    /// path, to answer a question whose answer changes about never.
+    vector_topic_cache: Arc<DashMap<String, (bool, std::time::Instant)>>,
     /// Hot path NRT search — in-memory Tantivy shadowing the WAL tail.
     /// Fire-and-forget from the produce path; never blocks acks.
     /// See `docs/ROADMAP_HOT_PATH.md` (HP-1.2).
@@ -525,6 +581,14 @@ struct ReplicationRequest {
 /// reservation permanently; under sustained load the leaked bytes accumulated
 /// until the counter pinned at `memory_limit_bytes` and the handler rejected
 /// every produce with "Memory limit exceeded".
+///
+/// This guard is why `acks=1` throughput appears to have "regressed" 3-4x in
+/// v2.10.8, and the appearance is backwards: before it, the leaked reservations
+/// pinned the counter at the limit and the handler REJECTED most produces, which
+/// a rate counter cannot distinguish from serving them. Measured on dell-32, same
+/// 15s run: guarded stored 301.7 MB while reporting 16,519 msg/s; unguarded
+/// reported 61,625 msg/s and stored 50.0 MB. See RP-11 in
+/// docs/ROADMAP_REPLICATION.md — do not "optimise" this away.
 struct MemoryReservation {
     counter: Arc<AtomicU64>,
     bytes: u64,
@@ -539,6 +603,31 @@ impl MemoryReservation {
 impl Drop for MemoryReservation {
     fn drop(&mut self) {
         self.counter.fetch_sub(self.bytes, Ordering::Release);
+    }
+}
+
+/// Map a failed produce to the error code the client will see.
+///
+/// The catch-all arm MUST NOT be `ErrorCode::None`. It was, and that meant every
+/// failure outside the four transactional cases below — memory-limit rejection,
+/// WAL write error, storage I/O error — came back to the producer as SUCCESS.
+/// The records were not stored and the client was told they were durable, which
+/// is silent data loss in the one code path that must never lie about it. It was
+/// caught with a leaking build on dell-32 (2026-08-15): the broker logged 228,825
+/// "Memory limit exceeded" rejections while the producer reported
+/// "Failed: 0 (0.00%)" and 50 MB reached the disk against a claimed 924,375
+/// records.
+///
+/// `KafkaStorageError` is the standard "broker could not persist this" code and
+/// is retriable, so a client backs off and resends rather than dropping the
+/// batch — at-least-once instead of silently-never.
+fn produce_error_code(e: &Error) -> i16 {
+    match e {
+        Error::DuplicateSequenceNumber(_) => ErrorCode::DuplicateSequenceNumber.code(),
+        Error::InvalidProducerEpoch(_) => ErrorCode::InvalidProducerEpoch.code(),
+        Error::OutOfOrderSequenceNumber(_) => ErrorCode::OutOfOrderSequenceNumber.code(),
+        Error::InvalidTransactionState(_) => ErrorCode::InvalidTxnState.code(),
+        _ => ErrorCode::KafkaStorageError.code(),
     }
 }
 
@@ -623,6 +712,8 @@ impl ProduceHandler {
             is_leader: false,  // Deprecated field
             replicas,
             leader_id,
+            leader_epoch: 0, // assigned by the metadata store
+            isr: Vec::new(), // placement only — the leader publishes the in-sync set
         };
 
         // Write AssignPartition event to metadata_store
@@ -658,6 +749,8 @@ impl ProduceHandler {
             is_leader: false,  // Deprecated field
             replicas: current.replicas.clone(),
             leader_id: leader,
+            leader_epoch: 0, // assigned by the metadata store
+            isr: Vec::new(), // leadership only — leaves the published set intact
         };
 
         self.metadata_store.assign_partition(assignment).await?;
@@ -683,13 +776,24 @@ impl ProduceHandler {
             .find(|a| a.partition == partition as u32)
             .ok_or_else(|| Error::Storage(format!("Partition not found: {}-{}", topic, partition)))?;
 
+        // The in-sync set goes in `isr`; `replicas` is the assignment and does
+        // not change because a follower fell behind.
+        //
+        // This used to write the in-sync set into `replicas`, which permanently
+        // shrank the replica set every time a follower lagged: a partition at
+        // RF=3 whose follower dropped out became RF=2 in metadata, and the
+        // follower was no longer a replica to catch up to. Same shape as the bug
+        // that made failover shrink RF, in a second place — there was nowhere
+        // else to put the value until `PartitionAssignment::isr` existed.
         let assignment = PartitionAssignment {
             topic: topic.to_string(),
             partition: partition as u32,
             broker_id: -1,  // Deprecated field
             is_leader: false,  // Deprecated field
-            replicas: isr,
+            replicas: current.replicas.clone(),
             leader_id: current.leader_id,
+            leader_epoch: 0, // assigned by the metadata store
+            isr,
         };
 
         self.metadata_store.assign_partition(assignment).await?;
@@ -784,6 +888,29 @@ impl ProduceHandler {
         } else {
             // Partition doesn't exist yet, high watermark is 0
             Ok(0)
+        }
+    }
+
+    /// The partition's log end offset: one past the last record this node has
+    /// accepted, committed or not.
+    ///
+    /// This is what a replicating follower must be told it may read up to, and
+    /// it is emphatically NOT the high watermark. The high watermark is a
+    /// statement about the in-sync set, and under `acks=all` it does not advance
+    /// until the followers acknowledge — so answering a follower's fetch with the
+    /// high watermark tells it "no data" for exactly the records the producer is
+    /// blocked waiting for it to acknowledge (#36). The write then completes only
+    /// when some unrelated background timer publishes the records by another
+    /// route, which measured at ~700ms per request.
+    ///
+    /// `next_offset` is advanced by the same atomic `fetch_add` that assigns the
+    /// batch its offsets, so it is already correct by the time the WAL write
+    /// returns.
+    pub async fn get_log_end_offset(&self, topic: &str, partition: i32) -> i64 {
+        let key = (topic.to_string(), partition);
+        match self.partition_states.get(&key) {
+            Some(state) => state.value().next_offset.load(Ordering::SeqCst) as i64,
+            None => 0,
         }
     }
 
@@ -889,6 +1016,50 @@ impl ProduceHandler {
     /// they've explicitly created the partition (which only happens on leader).
     ///
     /// See integrated_server.rs:632 for recovery flow.
+    /// Force a partition's offsets *down* after its log was truncated (RP-3.3).
+    ///
+    /// [`Self::update_high_watermark`] is deliberately monotonic — the v2.2.9
+    /// fix, which stops stale WAL data from walking a watermark backwards — so
+    /// it silently ignores exactly the update truncation needs. Going through it
+    /// would leave this node advertising records it no longer has.
+    ///
+    /// `next_offset` moves too. On a follower it is unused, because the apply
+    /// path takes offsets from the leader; but if this replica is later elected
+    /// it assigns offsets from there, and a stale value would leave a hole
+    /// between the log end and the first record it writes.
+    ///
+    /// Only truncation may call this. Every other path must keep the monotonic
+    /// guarantee.
+    pub async fn reset_offsets_after_truncation(
+        &self,
+        topic: &str,
+        partition: i32,
+        new_log_end: i64,
+    ) -> Result<()> {
+        let key = (topic.to_string(), partition);
+        let Some(state) = self.partition_states.get(&key) else {
+            // No state to walk back. Creating one at the truncated end keeps
+            // the two consistent for whatever comes next.
+            return self.update_high_watermark(topic, partition, new_log_end).await;
+        };
+
+        let previous = state.value().high_watermark.load(Ordering::SeqCst) as i64;
+        state
+            .value()
+            .high_watermark
+            .store(new_log_end.max(0) as u64, Ordering::SeqCst);
+        state
+            .value()
+            .next_offset
+            .store(new_log_end.max(0) as u64, Ordering::SeqCst);
+
+        info!(
+            "Truncation reset {}-{} watermark {} → {}",
+            topic, partition, previous, new_log_end
+        );
+        Ok(())
+    }
+
     pub async fn update_high_watermark(
         &self,
         topic: &str,
@@ -899,17 +1070,22 @@ impl ProduceHandler {
         let key = (topic.to_string(), partition);
 
         if let Some(state) = self.partition_states.get(&key) {
-            // Partition exists - update watermark only if it's increasing
-            // v2.2.9 MONOTONICITY FIX: Watermarks should never decrease (prevent stale WAL data from overwriting)
-            let current = state.value().high_watermark.load(Ordering::SeqCst) as i64;
-            if high_watermark > current {
-                state.value().high_watermark.store(high_watermark as u64, Ordering::SeqCst);
-                debug!("✅ Updated watermark for {}-{} from {} to {}", topic, partition, current, high_watermark);
-                Ok(())
-            } else {
-                debug!("⏭️  Skipped watermark update for {}-{}: {} <= {} (current)", topic, partition, high_watermark, current);
-                Ok(())
-            }
+            // Both fields, each monotonic, neither gating the other.
+            //
+            // v2.2.9 made the watermark monotonic, correctly — stale WAL data
+            // must not walk it back. But the log end was later updated *inside*
+            // that guard, so a watermark that was already high enough silently
+            // skipped the log end too. See `PartitionState::raise_watermark`
+            // for what that cost on failover.
+            state.value().raise_watermark(high_watermark.max(0) as u64);
+            debug!(
+                "Watermark for {}-{} is now {}, log end {}",
+                topic,
+                partition,
+                state.value().high_watermark.load(Ordering::SeqCst),
+                state.value().next_offset.load(Ordering::SeqCst)
+            );
+            Ok(())
         } else {
             // v2.2.9 FOLLOWER FIX: Partition doesn't exist yet (follower receiving replicated data)
             // Create partition state with initial watermark
@@ -1129,17 +1305,18 @@ impl ProduceHandler {
             memory_limit_bytes,
             replication_sender: None,
             fetch_handler: None,
+            append_notify: Arc::new(dashmap::DashMap::new()),
             topic_creation_cache: Arc::new(RwLock::new(HashMap::new())),
             wal_manager: None,
             raft_cluster: None,  // v2.2.7 Phase 3: Initialize as None (set via set_raft_cluster)
-            wal_replication_manager: None,  // v2.2.0 Phase 1: Initialize as None
             isr_ack_tracker: None,  // v2.2.7 Phase 4: Initialize as None (set via set_isr_ack_tracker)
-            leader_elector: None,  // v2.2.7 Phase 5: Initialize as None (set via set_leader_elector)
+            leader_epochs: Arc::new(crate::replication::leader_epoch::LeaderEpochStore::new()),
             event_bus: None,  // v2.2.7.2: Initialize as None (set via set_event_bus)
             leadership_cache: Arc::new(DashMap::new()),  // Optimization #4: Empty cache, populated on first access
             pipelined_pool: Arc::new(PipelinedConnectionPool::new(10000)),  // v2.2.9: Async pipelined connection pool (capacity increased from 1000 → 10000 to prevent channel blocking)
             response_pipeline: None,  // v2.2.10: Initialize as None (set via set_response_pipeline) - CRITICAL FIX #7
             searchable_topic_cache: Arc::new(DashMap::new()),  // v2.2.16: Cache for topic searchability
+            vector_topic_cache: Arc::new(DashMap::new()),      // same, for the hot-vector check
             hot_text_index: None,  // HP-1.2: Wired via set_hot_text_index
             hot_vector_batcher: None,  // HP-2.3: Wired via set_hot_vector_batcher
             watermark_flusher,  // v2.7.1: debounced metadata watermark updates
@@ -1173,6 +1350,17 @@ impl ProduceHandler {
     }
     
     /// Set the fetch handler for updating buffers
+    /// Share the append notifier with the `FetchHandler`.
+    ///
+    /// Both sides must hold the SAME map or the wake-up goes nowhere: the
+    /// produce path signals into it, the long poll registers on it.
+    pub fn set_append_notify(
+        &mut self,
+        notify: Arc<dashmap::DashMap<(String, i32), Arc<tokio::sync::Notify>>>,
+    ) {
+        self.append_notify = notify;
+    }
+
     pub fn set_fetch_handler(&mut self, fetch_handler: Arc<FetchHandler>) {
         self.fetch_handler = Some(fetch_handler);
     }
@@ -1183,23 +1371,53 @@ impl ProduceHandler {
         self.raft_cluster = Some(raft_cluster);
     }
 
-    /// Set the WAL replication manager for PostgreSQL-style streaming (v2.2.0+)
-    pub fn set_wal_replication_manager(&mut self, replication_manager: Arc<WalReplicationManager>) {
-        info!("Setting WalReplicationManager for ProduceHandler");
-        self.wal_replication_manager = Some(replication_manager);
-    }
 
     /// Set the ISR ACK tracker for acks=-1 quorum support (v2.2.7 Phase 4)
+    /// RP-3: expose this node's leadership history, for serving
+    /// `OffsetForLeaderEpoch` and for a follower deciding where to truncate.
+    pub fn leader_epochs(&self) -> Arc<crate::replication::leader_epoch::LeaderEpochStore> {
+        self.leader_epochs.clone()
+    }
+
+    /// Stamp the current leader epoch onto a batch and record it in this node's
+    /// leadership history.
+    ///
+    /// Returns the batch unchanged when the epoch is unknown — a partition with
+    /// no assignment yet, or a single-node deployment that never elects. Writing
+    /// a made-up epoch would be worse than writing none: a follower would later
+    /// ask about an epoch that never existed and be told to truncate against it.
+    async fn stamp_and_record_leader_epoch(
+        &self,
+        topic: &str,
+        partition: i32,
+        base_offset: i64,
+        bytes: Bytes,
+    ) -> Bytes {
+        let epoch = match self
+            .metadata_store
+            .get_partition_leader_epoch(topic, partition as u32)
+            .await
+        {
+            Ok(Some(epoch)) if epoch >= 0 => epoch,
+            _ => return bytes,
+        };
+
+        let mut stamped = bytes.to_vec();
+        if crate::replication::leader_epoch::stamp_leader_epoch(&mut stamped, epoch) == 0 {
+            return bytes; // not a v2 batch — left exactly as it arrived
+        }
+
+        self.leader_epochs
+            .observe_append(topic, partition, epoch, base_offset);
+
+        Bytes::from(stamped)
+    }
+
     pub fn set_isr_ack_tracker(&mut self, tracker: Arc<crate::isr_ack_tracker::IsrAckTracker>) {
         info!("Setting IsrAckTracker for ProduceHandler - enables acks=-1 quorum");
         self.isr_ack_tracker = Some(tracker);
     }
 
-    /// Set the leader elector for partition leader failover (v2.2.7 Phase 5)
-    pub fn set_leader_elector(&mut self, elector: Arc<crate::leader_election::LeaderElector>) {
-        info!("Setting LeaderElector for ProduceHandler - enables heartbeat tracking");
-        self.leader_elector = Some(elector);
-    }
 
     /// Start metadata event listener background task (v2.2.14 refactoring)
     ///
@@ -1239,10 +1457,10 @@ impl ProduceHandler {
                                 // The ProduceHandler may want to update its local state here
                                 // For now, we just log it as the primary purpose is metadata WAL replication
                             }
-                            MetadataEvent::PartitionAssigned { topic, partition, replicas, leader } => {
+                            MetadataEvent::PartitionAssigned { topic, partition, replicas, leader, leader_epoch, .. } => {
                                 debug!(
-                                    "Received PartitionAssigned event: {}-{} → leader {}, replicas {:?}",
-                                    topic, partition, leader, replicas
+                                    "Received PartitionAssigned event: {}-{} → leader {} at epoch {}, replicas {:?}",
+                                    topic, partition, leader, leader_epoch, replicas
                                 );
                                 // Could update partition_states or leadership_cache here if needed
                             }
@@ -1295,7 +1513,7 @@ impl ProduceHandler {
     /// Called from GroupCommitWal callback after successful fsync
     pub fn update_high_watermark_from_wal(&self, topic: &str, partition: i32, new_watermark: i64) {
         if let Some(state) = self.partition_states.get(&(topic.to_string(), partition)) {
-            state.high_watermark.store(new_watermark as u64, std::sync::atomic::Ordering::Release);
+            state.raise_watermark(new_watermark.max(0) as u64);
             debug!("Updated high watermark: {}-{} = {}", topic, partition, new_watermark);
         }
     }
@@ -1830,13 +2048,7 @@ impl ProduceHandler {
 
                                 metrics.produce_errors.fetch_add(1, Ordering::Relaxed);
 
-                                let error_code = match e {
-                                    Error::DuplicateSequenceNumber(_) => ErrorCode::DuplicateSequenceNumber.code(),
-                                    Error::InvalidProducerEpoch(_) => ErrorCode::InvalidProducerEpoch.code(),
-                                    Error::OutOfOrderSequenceNumber(_) => ErrorCode::OutOfOrderSequenceNumber.code(),
-                                    Error::InvalidTransactionState(_) => ErrorCode::InvalidTxnState.code(),
-                                    _ => ErrorCode::None.code(),
-                                };
+                                let error_code = produce_error_code(&e);
 
                                 ProduceResponsePartition {
                                     index: partition_data.index,
@@ -2134,9 +2346,18 @@ impl ProduceHandler {
                 incoming_base_offset, base_offset
             );
 
-            // CRITICAL FIX (v1.3.59): Kafka v2 CRC is calculated from partition_leader_epoch onwards.
-            // The base_offset field (first 8 bytes) is NOT included in CRC calculation.
-            // Therefore, we can update ONLY base_offset and keep everything else byte-identical.
+            // CRITICAL FIX (v1.3.59): the base_offset field (first 8 bytes) is NOT
+            // included in the CRC, so it can be rewritten while everything else
+            // stays byte-identical.
+            //
+            // The original note here said the CRC "is calculated from
+            // partition_leader_epoch onwards". That is not the Kafka spec, and
+            // kafka_records.rs was corrected to start at ATTRIBUTES (offset 21) —
+            // the earlier range was self-consistent with this crate's own decoder
+            // but made batches Chronik itself emitted look corrupt to real
+            // clients. The conclusion above holds under either reading; the
+            // reason given for it did not, and RP-3 now relies on the correct one
+            // to stamp partition_leader_epoch (offset 12) without re-checksumming.
 
             // Create a copy and update ONLY the first 8 bytes
             let mut updated_bytes = records_data.to_vec();
@@ -2149,6 +2370,20 @@ impl ProduceHandler {
 
             (bytes, kafka_batch)
         };
+
+        // RP-3: stamp this leader's epoch onto the batch, so the log records the
+        // leadership under which each record was written. That history is what
+        // lets a follower discover *where* two logs diverged rather than
+        // comparing lengths and guessing.
+        //
+        // Safe against the CRC: Kafka's CRC-32C starts at the attributes field
+        // (offset 21), and partition_leader_epoch lives at offset 12 — before the
+        // CRC field and outside its input, exactly so a broker can assign it
+        // without re-checksumming. This is therefore applied to the same
+        // byte-preserved batch the consumer will get back.
+        let re_encoded_bytes = self
+            .stamp_and_record_leader_epoch(topic, partition, base_offset as i64, re_encoded_bytes)
+            .await;
 
         // Validate producer info for idempotence. Control batches (COMMIT/ABORT
         // end-transaction markers) carry the transaction's producer id/epoch but are
@@ -2277,8 +2512,6 @@ impl ProduceHandler {
         }
 
         // v2.2.0: Store serialized WAL data for replication (zero-copy optimization)
-        let serialized_for_replication: Option<Vec<u8>>;
-
         // The async-response path (acks != 0) used to `return` straight from inside
         // the WAL block, which silently skipped every post-write side effect below —
         // most importantly the WAL replication hook, so `acks=1` / `acks=all` never
@@ -2301,10 +2534,6 @@ impl ProduceHandler {
             debug!("✅ WAL_MGR_FOUND: Entering WAL write path for topic={} partition={}", topic, partition);
             use chronik_storage::canonical_record::CanonicalRecord;
 
-            // PERFORMANCE OPTIMIZATION (v2.2.7): Skip wire bytes preservation if no replication
-            // This avoids an expensive .to_vec() clone when replication is disabled
-            let needs_replication = self.wal_replication_manager.is_some();
-
             // Convert to CanonicalRecord and serialize (ONCE - reused for replication)
             // from_kafka_batch() now automatically preserves compressed_records_wire_bytes
             // for BOTH compressed and uncompressed batches (v2.2.7 fix)
@@ -2321,15 +2550,6 @@ impl ProduceHandler {
 
                     match bincode::serialize(&canonical_record) {
                         Ok(serialized) => {
-                            // v2.2.7: ALWAYS populate serialized_for_replication when wal_replication_manager exists
-                            // The wire bytes optimization (line 1375-1377) only affects CRC preservation, not replication!
-                            // BUG FIX: Previously set to None when !needs_replication, breaking replication entirely
-                            serialized_for_replication = if needs_replication {
-                                Some(serialized.clone())
-                            } else {
-                                None  // No replication manager = no data to replicate
-                            };
-
                             // v2.2.10 CRITICAL PERFORMANCE FIX #7: Async response delivery for acks=1
                             // OLD (v2.2.9): Synchronous WAL fsync blocking → 2,197 msg/s (168x slower)
                             // NEW (v2.2.10): Async callback-based responses → 300,000+ msg/s (150x+ improvement)
@@ -2341,7 +2561,17 @@ impl ProduceHandler {
                             let wal_start = Instant::now();
 
                             // Check if we should use async response delivery
-                            let use_async_responses = self.response_pipeline.is_some() && acks != 0;
+                            // RP-1.3: `acks == 1` only. `acks=-1` must fall through to the
+                            // `match acks` arm below, which registers with IsrAckTracker and
+                            // waits for follower ACKs before answering the client.
+                            //
+                            // This guard previously read `acks != 0`, which sent acks=-1 down
+                            // the fast path too — so `acks=all` returned on the leader's local
+                            // fsync and the ISR quorum code below was unreachable for nine
+                            // months. Only viable now that #29 makes followers actually receive
+                            // data; before that, waiting here would have hung until timeout on
+                            // every request.
+                            let use_async_responses = self.response_pipeline.is_some() && acks == 1;
 
                             if use_async_responses {
                                 // ASYNC PATH: Register for callback notification, write with acks=0 (non-blocking)
@@ -2451,47 +2681,20 @@ impl ProduceHandler {
         } else {
             error!("❌ WAL_MGR_NONE: wal_manager is None! topic={} partition={} - WAL WRITES SKIPPED!",
                    topic, partition);
-            serialized_for_replication = None;
         }
 
-        // v2.2.7 Phase 3: WAL Replication Hook with ISR-aware routing
-        // Zero-copy optimization: Reuse serialized WAL data from above (no re-parsing!)
-        // This is called AFTER WAL write completes, so data is durable locally
-        if let Some(ref wal_repl_mgr) = self.wal_replication_manager {
-            debug!("🔍 DEBUG: WAL replication manager exists for {}-{}", topic, partition);
-            if let Some(serialized_data) = serialized_for_replication {
-                debug!("🔍 DEBUG: Serialized data exists ({} bytes), spawning replication task for {}-{} offset={}",
-                    serialized_data.len(), topic, partition, base_offset);
-
-                // Clone necessary metadata (cheap - just strings and ints)
-                let topic_clone = topic.to_string();
-                let partition_clone = partition;
-                let base_offset_clone = base_offset as i64;
-                let repl_mgr_clone = Arc::clone(wal_repl_mgr);
-
-                // Get current high watermark for ISR filtering
-                let high_watermark = partition_state.high_watermark.load(Ordering::SeqCst) as i64;
-
-                // Spawn background task (fire-and-forget, never blocks)
-                // v2.2.7: Use replicate_partition for ISR-aware routing
-                tokio::spawn(async move {
-                    debug!("🚀 DEBUG: Calling replicate_partition for {}-{} offset={}",
-                        topic_clone, partition_clone, base_offset_clone);
-                    repl_mgr_clone.replicate_partition(
-                        topic_clone,
-                        partition_clone,
-                        base_offset_clone,
-                        high_watermark,  // For ISR filtering
-                        serialized_data,
-                    ).await;
-                    // Errors are logged inside replicate_partition, we don't block produce
-                });
-            } else {
-                // WAL manager was None, nothing to replicate
-                debug!("⚠️ DEBUG: Skipping replication for {}-{}: serialized_for_replication is None!", topic, partition);
-            }
-        } else {
-            debug!("⚠️ DEBUG: Skipping replication for {}-{}: wal_replication_manager is None!", topic, partition);
+        // RP-4: nothing is pushed here. Followers fetch this record from the
+        // leader's log (RP-2.4), so the produce path's job ends at the WAL.
+        //
+        // RP-9: but it does have to say the record EXISTS. A follower parked in
+        // a long poll would otherwise find out on the next timer tick, and under
+        // `acks=all` that tick is the critical path — every producer is blocked
+        // waiting for the follower, so nothing new is written until the previous
+        // batch is acknowledged, and the follower's fetch therefore almost
+        // always arrives at an idle partition and parks. Waking it here is what
+        // turns replication from a timer loop into a round trip.
+        if let Some(notify) = self.append_notify.get(&(topic.to_string(), partition)) {
+            notify.notify_waiters();
         }
 
         // v2.2.7 FIX: Removed duplicate buffering code that was always running
@@ -2676,11 +2879,21 @@ impl ProduceHandler {
                         Ok(assignments) => {
                             match assignments.iter().find(|a| a.partition == partition as u32) {
                                 Some(assignment) => {
-                                    // Quorum = all replicas (ISR) must ack
-                                    let isr = &assignment.replicas;
-                                    let size = isr.len();
-                                    info!("📊 ISR for {}-{} from metadata_store: {:?}, quorum={}",
-                                        topic, partition, isr, size);
+                                    // RP-1.3: wait for min_insync_replicas ACKs (leader's own
+                                    // included), not for every assigned replica.
+                                    //
+                                    // Requiring all of them means a single slow or dead follower
+                                    // blocks every write to the partition until the replication
+                                    // timeout, even at RF=3 / minISR=2 where the write is already
+                                    // durable enough. Kafka fails a produce only when the in-sync
+                                    // set drops below min.insync.replicas.
+                                    let replicas = &assignment.replicas;
+                                    let size = self
+                                        .config
+                                        .min_insync_replicas
+                                        .clamp(1, replicas.len().max(1));
+                                    debug!("📊 ISR for {}-{} from metadata_store: {:?}, quorum={} (min_insync={})",
+                                        topic, partition, replicas, size, self.config.min_insync_replicas);
                                     size
                                 }
                                 None => {
@@ -2699,23 +2912,31 @@ impl ProduceHandler {
                         }
                     };
 
-                    info!(
+                    // These four lines fire on every `acks=all` produce. They were
+                    // `info!` while the path was believed to be rare and broken;
+                    // it is now the fast path, so they are `debug!`.
+                    debug!(
                         "🎯 acks=-1: About to register wait for {}-{} offset {} (base_offset={}, quorum={})",
                         topic, partition, base_offset, base_offset, quorum_size
                     );
 
                     let (tx, rx) = tokio::sync::oneshot::channel();
-                    // CRITICAL FIX: Register for base_offset (not last_offset)
-                    // Followers ACK base_offset of the batch, so we must wait for that offset
+                    // Register on the batch's log end offset (last_offset + 1).
+                    //
+                    // Followers now ACK their LEO rather than the base offset, so
+                    // that ISR lag is comparable to the leader's high watermark
+                    // (also an LEO). Both sides must use the same value or quorum
+                    // never matches, so this moved in lockstep with WalAckMessage.
+                    let ack_offset = last_offset as i64 + 1;
                     tracker.register_wait(
                         topic.to_string(),
                         partition,
-                        base_offset as i64,
+                        ack_offset,
                         quorum_size,
                         tx,
                     );
 
-                    info!(
+                    debug!(
                         "✅ acks=-1: Registered {}-{} offset {} for ISR quorum tracking (quorum={})",
                         topic, partition, base_offset, quorum_size
                     );
@@ -2723,9 +2944,9 @@ impl ProduceHandler {
                     // v2.2.7 FIX: Leader always records its own ACK immediately (cluster AND standalone)
                     // In standalone mode (quorum=1), this is the only ACK needed
                     // In cluster mode (quorum=N), leader counts as 1/N ACKs, then waits for followers
-                    info!("🏁 Recording leader self-ACK for {}-{} offset {} (quorum={}/{})",
-                        topic, partition, base_offset, 1, quorum_size);
-                    tracker.record_ack(topic, partition, base_offset as i64, self.config.node_id as u64);
+                    debug!("🏁 Recording leader self-ACK for {}-{} offset {} (quorum={}/{})",
+                        topic, partition, ack_offset, 1, quorum_size);
+                    tracker.record_ack(topic, partition, ack_offset, self.config.node_id as u64);
 
                     // Wait for ISR quorum with configured timeout (default: 30s)
                     match timeout(REPLICATION_TIMEOUT, rx).await {
@@ -2741,7 +2962,8 @@ impl ProduceHandler {
                             let new_watermark = (last_offset + 1) as i64;
                             let prev_watermark = partition_state.high_watermark.fetch_max(new_watermark as u64, Ordering::SeqCst) as i64;
 
-                            warn!(
+                            // Reaching quorum is the expected outcome, not a warning.
+                            debug!(
                                 "🔥 WATERMARK UPDATE [acks=-1, quorum reached]: topic={}, partition={}, old={}, new={}, last_offset={}, actually_updated={}",
                                 topic, partition, old_watermark, new_watermark, last_offset, prev_watermark < new_watermark
                             );
@@ -2769,11 +2991,21 @@ impl ProduceHandler {
                             return Err(Error::Internal("ISR quorum channel closed".into()));
                         }
                         Err(_) => {
+                            // RP-1.3: report this as Kafka's NOT_ENOUGH_REPLICAS (19) rather
+                            // than a generic internal error. Clients treat 19 as retriable and
+                            // back off; an opaque error looks like a broker fault and can send
+                            // a producer into a different, less useful recovery path.
                             error!(
-                                "acks=-1: ISR quorum timeout for {}-{} offset {} after {:?}",
+                                "acks=-1: ISR quorum timeout for {}-{} offset {} after {:?} — returning NOT_ENOUGH_REPLICAS",
                                 topic, partition, last_offset, REPLICATION_TIMEOUT
                             );
-                            return Err(Error::Internal("ISR quorum timeout".into()));
+                            return Ok(ProduceResponsePartition {
+                                index: partition,
+                                error_code: chronik_protocol::produce_types::error_codes::NOT_ENOUGH_REPLICAS,
+                                base_offset: -1,
+                                log_append_time: -1,
+                                log_start_offset: 0,
+                            });
                         }
                     }
                 } else {
@@ -3080,10 +3312,34 @@ impl ProduceHandler {
     ///
     /// Best-effort: if the metadata call fails the request is simply not
     /// enqueued (cold path still embeds it later).
+    /// Cached, 60s TTL — mirrors [`Self::is_topic_searchable`], including its
+    /// rule about not caching a miss.
+    ///
+    /// This ran uncached on every produce: `get_topic` against the metadata
+    /// store, which fetches and clones a whole `TopicMetadata` to read two
+    /// booleans that change roughly never. `is_topic_searchable` right next to
+    /// it had been cached since v2.2.16; this one was simply missed.
     async fn is_topic_vector_enabled(&self, topic: &str) -> bool {
+        const CACHE_TTL_SECS: u64 = 60;
+
+        if let Some(entry) = self.vector_topic_cache.get(topic) {
+            let (enabled, last_updated) = *entry;
+            if last_updated.elapsed().as_secs() < CACHE_TTL_SECS {
+                return enabled;
+            }
+        }
+
         match self.metadata_store.get_topic(topic).await {
             Ok(Some(meta)) => {
-                meta.config.is_vector_enabled() && meta.config.is_vector_hot_enabled()
+                let enabled =
+                    meta.config.is_vector_enabled() && meta.config.is_vector_hot_enabled();
+                // Only cache a hit. Caching a miss would pin `false` for 60s
+                // against a topic that auto-create is about to bring into
+                // existence with vectors enabled — the same race
+                // `is_topic_searchable` avoids.
+                self.vector_topic_cache
+                    .insert(topic.to_string(), (enabled, std::time::Instant::now()));
+                enabled
             }
             _ => false,
         }
@@ -3459,8 +3715,15 @@ impl ProduceHandler {
             config: std::collections::HashMap::new(),
         };
         
-        // Attempt to create the topic
-        let result = match self.metadata_store.create_topic(topic_name, topic_config).await {
+        // Attempt to create the topic.
+        //
+        // `auto_create_topic`, not `create_topic`: this config is a guess made
+        // because a client named a topic that does not exist, and the store
+        // records that so a later explicit `CreateTopics` wins over it — and,
+        // more importantly, so this never overwrites one. The default carries 3
+        // partitions, which used to silently widen a topic someone had created
+        // with `--partitions 1`.
+        let result = match self.metadata_store.auto_create_topic(topic_name, topic_config).await {
             Ok(metadata) => {
                 // v2.2.7 FIX: Partition initialization happens through PartitionAssignment module below
                 // which has proper metadata WAL writes and replication (in raft_metadata_store.rs)
@@ -3529,6 +3792,9 @@ impl ProduceHandler {
                             is_leader: true,
                             replicas: vec![self.config.node_id as u64],
                             leader_id: self.config.node_id as u64,
+                            leader_epoch: 0, // assigned by the metadata store
+                            // Sole replica: trivially in sync with itself.
+                            isr: vec![self.config.node_id as u64],
                         };
 
                         if let Err(e) = self.metadata_store.assign_partition(assignment).await {
@@ -3812,17 +4078,18 @@ impl Clone for ProduceHandler {
             memory_limit_bytes: self.memory_limit_bytes,
             replication_sender: self.replication_sender.clone(),
             fetch_handler: self.fetch_handler.clone(),
+            append_notify: Arc::clone(&self.append_notify),
             topic_creation_cache: Arc::clone(&self.topic_creation_cache),
             wal_manager: self.wal_manager.clone(),
             raft_cluster: self.raft_cluster.clone(),  // v2.2.7 Phase 3
-            wal_replication_manager: self.wal_replication_manager.clone(),  // v2.2.0 Phase 1
             isr_ack_tracker: self.isr_ack_tracker.clone(),  // v2.2.7 Phase 4
-            leader_elector: self.leader_elector.clone(),  // v2.2.7 Phase 5
+            leader_epochs: self.leader_epochs.clone(),
             event_bus: self.event_bus.clone(),  // v2.2.7.2
             leadership_cache: Arc::clone(&self.leadership_cache),  // Optimization #4
             pipelined_pool: Arc::clone(&self.pipelined_pool),  // v2.2.9: Async pipelined connection pool
             response_pipeline: self.response_pipeline.clone(),  // v2.2.10: Async response delivery (CRITICAL FIX #7)
             searchable_topic_cache: Arc::clone(&self.searchable_topic_cache),  // v2.2.16: Share cache
+            vector_topic_cache: Arc::clone(&self.vector_topic_cache),
             hot_text_index: self.hot_text_index.clone(),  // HP-1.2
             hot_vector_batcher: self.hot_vector_batcher.clone(),  // HP-2.3
             watermark_flusher: self.watermark_flusher.clone(),  // v2.7.1: Cheap Arc-shared clone
@@ -3853,6 +4120,50 @@ mod tests {
             assert_eq!(counter.load(Ordering::SeqCst), 1000, "held while guard alive");
         } // drop
         assert_eq!(counter.load(Ordering::SeqCst), 0, "released exactly once on drop");
+    }
+
+    // Regression: a produce that FAILED must never be reported to the client as
+    // having succeeded. The catch-all arm returned ErrorCode::None, so a broker
+    // that had just rejected a batch answered the producer with success — 228,825
+    // rejections seen as "Failed: 0 (0.00%)" on dell-32, with 50 MB on disk
+    // against a claimed 924,375 records.
+    #[test]
+    fn produce_failure_is_never_reported_as_success() {
+        // The exact rejection that was being silently acknowledged.
+        let mem_limit = Error::Internal("Memory limit exceeded".into());
+        assert_ne!(
+            produce_error_code(&mem_limit),
+            ErrorCode::None.code(),
+            "a rejected produce must not be reported as success"
+        );
+        assert_eq!(produce_error_code(&mem_limit), ErrorCode::KafkaStorageError.code());
+
+        // Storage and I/O failures are equally not-success.
+        for e in [
+            Error::Internal("WAL write failed".into()),
+            Error::Storage("segment write failed".into()),
+        ] {
+            assert_ne!(produce_error_code(&e), ErrorCode::None.code(), "{e:?} reported as success");
+        }
+
+        // The four transactional cases keep their precise codes: clients rely on
+        // these to distinguish a retriable storage fault from a fenced producer.
+        assert_eq!(
+            produce_error_code(&Error::DuplicateSequenceNumber("x".into())),
+            ErrorCode::DuplicateSequenceNumber.code()
+        );
+        assert_eq!(
+            produce_error_code(&Error::InvalidProducerEpoch("x".into())),
+            ErrorCode::InvalidProducerEpoch.code()
+        );
+        assert_eq!(
+            produce_error_code(&Error::OutOfOrderSequenceNumber("x".into())),
+            ErrorCode::OutOfOrderSequenceNumber.code()
+        );
+        assert_eq!(
+            produce_error_code(&Error::InvalidTransactionState("x".into())),
+            ErrorCode::InvalidTxnState.code()
+        );
     }
 
     #[test]
@@ -4913,18 +5224,17 @@ mod tests {
         // via the public handle_fetch API in separate integration tests.
     }
 
-    /// Build a ProduceHandler in the exact shape cluster mode uses: a real WAL, a
-    /// WalReplicationManager, and a ResponsePipeline wired to the GroupCommitWal
-    /// commit callback.
+    /// Build a ProduceHandler in the exact shape cluster mode uses: a real WAL
+    /// and a ResponsePipeline wired to the GroupCommitWal commit callback.
     ///
     /// The ResponsePipeline is the part that matters. `use_async_responses` is
     /// `response_pipeline.is_some() && acks != 0`, so a handler *without* one takes
     /// the synchronous path and replicates fine — which is why every pre-existing
     /// test missed this bug. Only this wiring reproduces the async path.
-    async fn handler_with_replication(
+    async fn handler_with_pipeline(
         temp_dir: &tempfile::TempDir,
         metadata_store: Arc<InMemoryMetadataStore>,
-    ) -> (ProduceHandler, Arc<crate::wal_replication::WalReplicationManager>) {
+    ) -> ProduceHandler {
         use chronik_wal::config::{CompressionType as WalCompression, WalConfig};
 
         let wal_config = WalConfig {
@@ -4968,8 +5278,6 @@ mod tests {
         // No followers: with `metadata_store: None` the manager falls back to
         // replicate_serialized(), which still enqueues. We assert on the queue,
         // not on a socket, so no peer is needed.
-        let repl_mgr = crate::wal_replication::WalReplicationManager::new(Vec::new());
-        handler.set_wal_replication_manager(repl_mgr.clone());
 
         // Mirror builder.rs `setup_response_pipeline`: without the commit callback
         // the async path's oneshot never resolves.
@@ -4988,83 +5296,87 @@ mod tests {
         wal_manager.group_commit_wal().set_commit_callback(commit_callback);
         handler.set_response_pipeline(response_pipeline);
 
-        (handler, repl_mgr)
+        handler
     }
 
-    /// Regression test for the WAL-replication hook being skipped on the
-    /// async-response path.
+    /// RP-1.3: `acks=all` must not answer the client until follower ACKs arrive.
     ///
-    /// `produce_to_partition` used to `return` from inside the WAL block once the
-    /// ResponsePipeline callback fired, jumping over the replication hook that sits
-    /// after it. Since that path is taken whenever `acks != 0`, `acks=1` and
-    /// `acks=all` replicated **nothing** while `acks=0` replicated normally — the
-    /// durability contract exactly inverted. Verified on a live 3-node RF=3 cluster:
-    /// an acks=1 topic existed only on its leader, an acks=0 topic on all three.
-    ///
-    /// Asserting on `total_queued` is the tightest check available: a record that
-    /// never reaches the queue can never reach a follower.
+    /// Before this, `use_async_responses` was `acks != 0`, so `acks=-1` took the
+    /// fast path and returned on the leader's own fsync — the ISR quorum code
+    /// below it had been unreachable since v2.2.10. A producer asking for the
+    /// strongest durability got the weakest guarantee available.
     #[tokio::test]
-    async fn test_replication_fires_for_every_acks_mode() {
+    async fn acks_all_waits_for_follower_ack() {
+        use chronik_common::metadata::traits::PartitionAssignment;
         use tempfile::TempDir;
 
-        for acks in [0i16, 1, -1] {
-            let temp_dir = TempDir::new().unwrap();
-            let metadata_store = Arc::new(InMemoryMetadataStore::new());
-            let (mut handler, repl_mgr) =
-                handler_with_replication(&temp_dir, metadata_store.clone()).await;
+        let temp_dir = TempDir::new().unwrap();
+        let metadata_store = Arc::new(InMemoryMetadataStore::new());
+        let mut handler = handler_with_pipeline(&temp_dir, metadata_store.clone()).await;
 
-            let mut topic_config = TopicConfig::default();
-            topic_config.partition_count = 1;
-            metadata_store
-                .create_topic("repl-topic", topic_config)
-                .await
-                .unwrap();
+        // Two replicas, and require both (leader + one follower) to acknowledge.
+        handler.config.min_insync_replicas = 2;
+        let ack_tracker = crate::isr_ack_tracker::IsrAckTracker::new();
+        handler.set_isr_ack_tracker(ack_tracker.clone());
 
-            let before = repl_mgr.total_queued();
-
-            let request = ProduceRequest {
-                transactional_id: None,
-                acks,
-                timeout_ms: 5000,
-                topics: vec![ProduceRequestTopic {
-                    name: "repl-topic".to_string(),
-                    partitions: vec![ProduceRequestPartition {
-                        index: 0,
-                        records: create_simple_record_batch(0, vec!["m1", "m2"]),
-                    }],
-                }],
-            };
-
-            // Bound the wait: before the fix the acks!=0 paths simply never enqueued,
-            // so poll rather than sleeping a fixed amount, and fail loudly.
-            let response = tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                handler.handle_produce(request, 1),
-            )
+        let mut topic_config = TopicConfig::default();
+        topic_config.partition_count = 1;
+        metadata_store.create_topic("quorum-topic", topic_config).await.unwrap();
+        metadata_store
+            .assign_partition(PartitionAssignment {
+                topic: "quorum-topic".to_string(),
+                partition: 0,
+                broker_id: 1,
+                is_leader: true,
+                replicas: vec![1, 2],
+                leader_id: 1,
+                leader_epoch: 0, // assigned by the metadata store
+                isr: Vec::new(),
+            })
             .await
-            .unwrap_or_else(|_| panic!("produce timed out for acks={}", acks))
             .unwrap();
-            assert_eq!(
-                response.topics[0].partitions[0].error_code, 0,
-                "produce failed for acks={}",
-                acks
-            );
 
-            // The hook spawns a fire-and-forget task, so give it a bounded chance to land.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while repl_mgr.total_queued() == before && std::time::Instant::now() < deadline {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
+        let request = ProduceRequest {
+            transactional_id: None,
+            acks: -1,
+            timeout_ms: 30000,
+            topics: vec![ProduceRequestTopic {
+                name: "quorum-topic".to_string(),
+                partitions: vec![ProduceRequestPartition {
+                    index: 0,
+                    records: create_simple_record_batch(0, vec!["m1"]),
+                }],
+            }],
+        };
 
-            assert!(
-                repl_mgr.total_queued() > before,
-                "acks={} produced no replication traffic (queued stayed at {}). \
-                 The produce path returned before the WAL replication hook, so this \
-                 data would exist only on the leader despite RF>1.",
-                acks,
-                before
-            );
-        }
+        let handler = Arc::new(handler);
+        let produce = tokio::spawn({
+            let handler = handler.clone();
+            async move { handler.handle_produce(request, 1).await }
+        });
+
+        // The leader self-ACKs immediately (1 of 2). With no follower ACK the
+        // produce must still be outstanding.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            !produce.is_finished(),
+            "acks=all answered the client before any follower acknowledged"
+        );
+
+        // Follower 2 acknowledges. The ACK carries the follower's log end offset
+        // (base_offset + record_count), not the base offset — one record written
+        // from offset 0 means an LEO of 1. Quorum of 2 reached → produce completes.
+        ack_tracker.record_ack("quorum-topic", 0, 1, 2);
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(10), produce)
+            .await
+            .expect("acks=all did not complete after the follower ACK")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            response.topics[0].partitions[0].error_code, 0,
+            "produce failed after quorum was reached"
+        );
     }
 
     // Helper function to create simple test record batches (for integration tests)
@@ -5091,5 +5403,163 @@ mod tests {
         }
 
         batch.encode().unwrap().to_vec()
+    }
+
+    /// RP-3: a produced batch must come out of the leader carrying the leader's
+    /// epoch, and that epoch must be recorded in the node's leadership history.
+    ///
+    /// The wiring has several places to silently do nothing — no assignment for
+    /// the partition, a non-v2 batch, an epoch of -1 — and each of them returns
+    /// the batch untouched by design. This pins the case where it must act.
+    #[tokio::test]
+    async fn a_produced_batch_carries_the_leader_epoch() {
+        use chronik_common::metadata::traits::PartitionAssignment;
+
+        let (handler, _temp) = create_test_handler().await;
+
+        let mut topic_config = TopicConfig::default();
+        topic_config.partition_count = 1;
+        let _ = handler.metadata_store.create_topic("epoch-topic", topic_config).await;
+
+        // Leadership starts elsewhere and moves HERE, so the current epoch is 1
+        // rather than the default 0 — a test that passed with 0 could not
+        // distinguish "stamped" from "left at its initial value". The final
+        // leader must be this node or the produce is rejected as NOT_LEADER.
+        for leader in [2u64, 1u64] {
+            handler.metadata_store
+                .assign_partition(PartitionAssignment {
+                    topic: "epoch-topic".to_string(),
+                    partition: 0,
+                    broker_id: leader as i32,
+                    is_leader: true,
+                    replicas: vec![1, 2],
+                    leader_id: leader,
+                    leader_epoch: 0,
+                    isr: Vec::new(),
+                })
+                .await
+                .unwrap();
+        }
+
+        let records_data = create_test_record_batch(0, 0, vec![("k", "v")]);
+        let request = ProduceRequest {
+            transactional_id: None,
+            acks: 1,
+            timeout_ms: 30000,
+            topics: vec![ProduceRequestTopic {
+                name: "epoch-topic".to_string(),
+                partitions: vec![ProduceRequestPartition { index: 0, records: records_data }],
+            }],
+        };
+
+        let response = handler.handle_produce(request, 1).await.unwrap();
+        assert_eq!(response.topics[0].partitions[0].error_code, 0, "produce must succeed");
+
+        // Assert against the store's own current epoch rather than a literal:
+        // topic creation seeds an assignment of its own, so the absolute number
+        // depends on plumbing this test has no reason to pin. What must hold is
+        // that the batch was stamped with whatever the partition's current epoch
+        // is — and that it is not still 0, or the assertion could not tell
+        // "stamped" from "left at its initial value".
+        let current = handler
+            .metadata_store
+            .get_partition_leader_epoch("epoch-topic", 0)
+            .await
+            .unwrap()
+            .expect("the partition has an assignment");
+        assert!(current > 0, "leadership changed, so the epoch must have moved off 0");
+
+        // observe_append only runs when stamp_leader_epoch actually rewrote bytes,
+        // so a recorded epoch here also proves the batch on the wire carries it.
+        // The byte-level guarantee (and that the CRC survives) is pinned
+        // separately in replication::leader_epoch::stamp_tests.
+        assert_eq!(
+            handler.leader_epochs().latest_epoch("epoch-topic", 0),
+            Some(current),
+            "the append must be stamped with, and recorded under, the current leader epoch"
+        );
+    }
+
+    /// A follower's log end has to follow what it replicates.
+    ///
+    /// Nothing else advances `next_offset` on a replica — the apply path takes
+    /// its offsets from the leader — so when this method only moved the
+    /// watermark, a replica that had replicated N records still reported the log
+    /// end of its *first* batch. Elect that replica and it assigns offsets from
+    /// there, overwriting records it already holds; the returning ex-leader is
+    /// then told its epoch ended at that offset and truncates committed data to
+    /// match. It stayed hidden while a test's records arrived in one batch.
+    #[tokio::test]
+    async fn replicating_a_second_batch_advances_the_log_end_not_just_the_watermark() {
+        let (handler, _tmp) = create_test_handler().await;
+
+        // First replicated batch: no partition state yet, so it is created here.
+        handler.update_high_watermark("test-topic", 0, 44).await.unwrap();
+        assert_eq!(handler.get_log_end_offset("test-topic", 0).await, 44);
+
+        // Second batch, against existing state — the case that used to move only
+        // the watermark.
+        handler.update_high_watermark("test-topic", 0, 100).await.unwrap();
+        assert_eq!(
+            handler.get_log_end_offset("test-topic", 0).await,
+            100,
+            "the log end must track every replicated batch, not just the first"
+        );
+    }
+
+    /// The mechanism, exactly as captured from a failing divergence run:
+    ///
+    /// ```text
+    /// Created partition state for t-0 with watermark 79
+    /// WM_SKIP t-0: 100 <= 100 (current), log end stays 79
+    /// ```
+    ///
+    /// The WAL commit callback raises the watermark on its own. When the log end
+    /// was only updated inside an "is the watermark increasing?" guard, that
+    /// callback getting there first pinned the log end forever — and an elected
+    /// replica then assigned offsets over records it already held.
+    #[tokio::test]
+    async fn a_watermark_raised_elsewhere_does_not_strand_the_log_end() {
+        let (handler, _tmp) = create_test_handler().await;
+
+        // First replicated batch creates the state at 79.
+        handler.update_high_watermark("test-topic", 0, 79).await.unwrap();
+        assert_eq!(handler.get_log_end_offset("test-topic", 0).await, 79);
+
+        // The WAL commit callback runs for records already on disk and moves the
+        // watermark by itself.
+        handler.update_high_watermark_from_wal("test-topic", 0, 100);
+
+        // Replication now reports the same 100. Under the old guard this was
+        // "not increasing" and the log end stayed at 79.
+        handler.update_high_watermark("test-topic", 0, 100).await.unwrap();
+        assert_eq!(
+            handler.get_log_end_offset("test-topic", 0).await,
+            100,
+            "the log end must reach the watermark whichever path raised it"
+        );
+    }
+
+    /// The leader assigns offsets ahead of the watermark, and a watermark update
+    /// must never drag its log end backwards.
+    #[tokio::test]
+    async fn a_watermark_update_never_lowers_the_log_end() {
+        let (handler, _tmp) = create_test_handler().await;
+
+        handler.update_high_watermark("test-topic", 0, 100).await.unwrap();
+        let state = handler
+            .partition_states
+            .get(&("test-topic".to_string(), 0))
+            .unwrap()
+            .clone();
+        // Stand in for a leader that has assigned offsets it has not yet acked.
+        state.next_offset.store(150, Ordering::SeqCst);
+
+        handler.update_high_watermark("test-topic", 0, 120).await.unwrap();
+        assert_eq!(
+            handler.get_log_end_offset("test-topic", 0).await,
+            150,
+            "the watermark caught up, but the log end must stay where the leader put it"
+        );
     }
 }

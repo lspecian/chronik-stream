@@ -68,12 +68,24 @@ impl MetricsServer {
             .with_state(self.registry);
 
         let addr = SocketAddr::from(([0, 0, 0, 0], self.port));
-        tracing::info!("Metrics server listening on {}", addr);
 
-        // In axum 0.6, Server is re-exported from axum
-        Server::bind(&addr)
-            .serve(app.into_make_service())
-            .await?;
+        // `Server::bind` PANICS if the address is taken, and this runs inside a
+        // spawned task, so the panic aborted the whole broker: a second instance
+        // on one host, or anything else already on the metrics port, killed a
+        // healthy Kafka broker with SIGABRT and a core dump rather than a message
+        // naming the port. `try_bind` returns the error instead, and metrics are
+        // auxiliary — the broker keeps serving Kafka without them.
+        let server = Server::try_bind(&addr).map_err(|e| {
+            anyhow::anyhow!(
+                "metrics server cannot bind {}: {}. Kafka is unaffected; set a free port \
+                 to restore /metrics",
+                addr,
+                e
+            )
+        })?;
+
+        tracing::info!("Metrics server listening on {}", addr);
+        server.serve(app.into_make_service()).await?;
 
         Ok(())
     }

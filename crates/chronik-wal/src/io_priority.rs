@@ -28,8 +28,13 @@ pub type IoPriorityLevel = u8;
 ///
 /// # Example
 /// ```
-/// // Set WAL thread to best-effort priority 0 (highest within best-effort)
-/// set_io_priority(IoPriorityClass::BestEffort, 0);
+/// # #[cfg(target_os = "linux")] {
+/// use chronik_wal::io_priority::{set_io_priority, IoPriorityClass};
+///
+/// // Set WAL thread to best-effort priority 0 (highest within best-effort).
+/// // Requires CAP_SYS_ADMIN, so treat failure as non-fatal.
+/// let _ = set_io_priority(IoPriorityClass::BestEffort, 0);
+/// # }
 /// ```
 #[cfg(target_os = "linux")]
 pub fn set_io_priority(class: IoPriorityClass, level: IoPriorityLevel) -> io::Result<()> {

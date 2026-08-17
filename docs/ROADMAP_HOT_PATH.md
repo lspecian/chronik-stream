@@ -583,7 +583,7 @@ Use this section to record what happened in each work session. Append a new entr
 - HP-1.7 produce regression and RAM probes deferred (not required to validate design)
 
 **Blockers / discoveries**:
-- CLI has no `--kafka-port` / `--unified-api-port` flags; `CHRONIK_KAFKA_PORT` is deprecated. Bench script uses default 9092/6092 and assumes no conflicts.
+- ~~CLI has no `--kafka-port` flag; `CHRONIK_KAFKA_PORT` is deprecated.~~ FIXED 2026-08-16: `--kafka-port` / `CHRONIK_KAFKA_PORT` now sets the single-node Kafka listen port (it was hardcoded to 9092 and the env var was warned about, then ignored). Cluster mode still takes the port from `[node.addresses] kafka`. `--unified-api-port` is still env-only (`CHRONIK_UNIFIED_API_PORT`).
 - The "30-60s" full-text search claim in VECTOR_SEARCH_GUIDE.md / CLAUDE.md was misleading — chronik-search already had an in-process realtime indexer that gives ms-level freshness at steady state but with a cold-start delay. Hot text index's real win is eliminating that cold-start gap and keeping the floor consistent.
 
 **Next session**:

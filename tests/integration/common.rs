@@ -48,12 +48,50 @@ pub struct S3Config {
     pub secret_key: String,
 }
 
+/// Serializes tests that start their own broker.
+///
+/// Every `TestCluster` spawns real `chronik-server` processes with their own
+/// WAL, so cargo's default of running a binary's tests in parallel puts several
+/// brokers on one machine at once. That starves the short poll windows these
+/// tests use and produces failures that reproduce only under load — the worst
+/// kind, because they read as product bugs.
+///
+/// Holding this for the duration of a cluster-based test makes the outcome
+/// independent of how cargo was invoked, rather than relying on the caller to
+/// remember `--test-threads=1`.
+pub async fn exclusive() -> tokio::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(())).lock().await
+}
+
 /// Test cluster instance
 pub struct TestCluster {
     config: TestClusterConfig,
     _temp_dir: Option<TempDir>,
     server_addrs: Vec<SocketAddr>,
+    /// Unified API (port 6092 in production) — SQL, search, admin, schema
+    /// registry. One per server, allocated separately so several servers can
+    /// run on one host without colliding on the default.
+    api_addrs: Vec<SocketAddr>,
     processes: Vec<Child>,
+}
+
+/// Locate the `chronik-server` binary under test.
+///
+/// `Command::new("chronik-server")` searched `$PATH`, which on a developer
+/// machine either finds nothing or — worse — finds an installed build of a
+/// different version than the one the test was compiled against.
+pub fn server_binary() -> PathBuf {
+    if let Ok(explicit) = std::env::var("CHRONIK_TEST_BIN") {
+        return PathBuf::from(explicit);
+    }
+    // CARGO_BIN_EXE_* is only injected for binaries of the *same* package, and
+    // this is a separate test package, so derive the path from the target dir.
+    let target = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| {
+        format!("{}/../target", env!("CARGO_MANIFEST_DIR"))
+    });
+    let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
+    PathBuf::from(format!("{}/{}/chronik-server", target, profile))
 }
 
 impl TestCluster {
@@ -72,11 +110,13 @@ impl TestCluster {
 
         // Allocate ports
         let server_addrs = allocate_ports(config.num_servers)?;
+        let api_addrs = allocate_ports(config.num_servers)?;
 
         let mut cluster = Self {
             config: config.clone(),
             _temp_dir,
             server_addrs: server_addrs.clone(),
+            api_addrs,
             processes: Vec::new(),
         };
 
@@ -106,25 +146,48 @@ impl TestCluster {
             .join(",")
     }
 
-    /// Get admin endpoint for the first server
+    /// Unified API addresses, one per server
+    pub fn api_addrs(&self) -> &[SocketAddr] {
+        &self.api_addrs
+    }
+
+    /// Admin endpoint for the first server (`/admin/*` on the Unified API).
+    ///
+    /// This used to return `http://<kafka port>`, which never served HTTP.
     pub fn admin_endpoint(&self) -> String {
-        format!("http://{}", self.server_addrs[0])
+        format!("http://{}", self.api_addrs[0])
+    }
+
+    /// Search endpoint for the first server (`/_search`, `/_sql`, `/_vector`).
+    pub fn search_endpoint(&self) -> String {
+        format!("http://{}", self.api_addrs[0])
     }
 
     async fn start_server(&mut self, id: usize, addr: SocketAddr, data_dir: &PathBuf) -> Result<()> {
         let node_data_dir = data_dir.join(format!("server-{}", id));
         std::fs::create_dir_all(&node_data_dir)?;
 
-        let mut cmd = Command::new("chronik-server");
-        cmd.env("RUST_LOG", "chronik=debug")
-            .arg("--bind-addr").arg("0.0.0.0")
+        // v2.2.0 CLI: `start`, `--bind`, `--kafka-port`. The previous form
+        // (`--bind-addr`, `--wal-metadata`, and no subcommand at all) had not
+        // been valid since the CLI was redesigned, so this harness could not
+        // launch a server no matter which test called it. WAL metadata is the
+        // default now, so `enable_wal_metadata` needs no flag.
+        let mut cmd = Command::new(server_binary());
+        // Broker verbosity is overridable: the hardcoded `chronik=debug` made a
+        // full suite run emit tens of MB per invocation, which buries the test
+        // results it is supposed to help explain.
+        let broker_log = std::env::var("CHRONIK_TEST_LOG").unwrap_or_else(|_| "warn".to_string());
+
+        cmd.arg("start")
+            .env("RUST_LOG", broker_log)
+            .env("CHRONIK_UNIFIED_API_PORT", self.api_addrs[id].port().to_string())
+            // Distinct metrics port per server; the default is shared and two
+            // brokers on one host would fight over it.
+            .env("CHRONIK_METRICS_PORT", (self.api_addrs[id].port() as u32 + 10000).min(65535).to_string())
+            .arg("--bind").arg("127.0.0.1")
+            .arg("--advertise").arg(format!("127.0.0.1:{}", addr.port()))
             .arg("--kafka-port").arg(addr.port().to_string())
             .arg("--data-dir").arg(node_data_dir.to_str().unwrap());
-
-        // Enable WAL metadata if configured
-        if self.config.enable_wal_metadata {
-            cmd.arg("--wal-metadata");
-        }
 
         // Configure object storage
         match &self.config.object_storage {
@@ -161,8 +224,12 @@ impl TestCluster {
             wait_for_tcp_endpoint(addr, Duration::from_secs(30)).await?;
         }
 
-        // Give cluster a moment to stabilize
-        sleep(Duration::from_secs(2)).await;
+        // And to serve the Unified API. A test that queries /_search or /admin
+        // right after the Kafka port opens would otherwise race the HTTP
+        // listener, which starts later in the builder.
+        for addr in &self.api_addrs {
+            wait_for_http_endpoint(&format!("http://{}/health", addr), Duration::from_secs(30)).await?;
+        }
 
         Ok(())
     }

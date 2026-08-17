@@ -7,6 +7,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.12.0] - 2026-08-17
+
+### ⚠️ Breaking / behaviour changes
+
+Replication was rebuilt on this release (follower-pull). Two changes are visible
+to running deployments:
+
+- **A cluster carrying data written by an older version must be recreated, not
+  upgraded in place.** The push data path is deleted outright — there is no
+  coexistence mode and no migration shim. This is safe to state plainly because
+  the version being upgraded *from* did not replicate at all at `acks=1` or
+  `acks=all` (#29): a rolling upgrade would have been protecting a mechanism that
+  was not running.
+- **A consumer may observe a briefly lower end offset while a follower is
+  catching up.** The end offset is now the *replicated* position —
+  `min(LEO across the in-sync set)` — rather than the leader's own write
+  position. A record becomes visible once every in-sync replica holds it, so a
+  consumer can no longer read a record that would vanish if the leader were lost.
+  `acks=all` producers are unaffected; they already waited for the quorum. Two
+  exclusions keep this from stalling anything: a replica *outside* ISR does not
+  hold the watermark back, and a partition nobody has measured yet imposes no
+  bound at all.
+
+### Fixed
+
+- **CreateTopics v4 responses were unparseable by librdkafka clients.** The
+  response header carried a tagged-fields byte on a version that has no flexible
+  header, so confluent-kafka-python/-go/-.NET — all of which cap CreateTopics at
+  v4 — read the topic-results array one byte off and reported **zero results for
+  topics the broker had created**. Header flexibility is now derived for every
+  API from the single table that request parsing already used.
+- **A consumer that left a group was never removed from it.** `LeaveGroup`
+  returned SUCCESS without removing anything, so a departed consumer stayed a
+  member until its session expired (45s on librdkafka's default) and the
+  coordinator kept assigning it partitions. A replacement consumer received a
+  fraction of the topic. Every consumer restart in a group opened that window.
+- **A group whose last member left became permanently unjoinable.** It was
+  marked `Dead` in metadata; the next `JoinGroup` reloaded that state and failed
+  with `Invalid group state: Dead` on every retry, forever. A group whose last
+  consumer shut down is now `Empty` — it exists, with its committed offsets, and
+  can be rejoined.
+- **A group member could be starved of its partitions.** A follower whose
+  `SyncGroup` arrived after the leader completed a rebalance read its assignment
+  from state the next rebalance clears; losing that race left it owning nothing
+  with its partitions unconsumed, and nothing retried because the group was
+  already stable.
+- **Metadata reported the assignment as the in-sync set** (`isr_nodes` was a copy
+  of the replica list). A partition replicating to nobody reported a full ISR to
+  every tool that reads ISR from Metadata — `kafka-topics --describe`, Kafka UI,
+  Cruise Control. `offline_replicas` is now populated too.
+- **`/admin/status` reported no cluster members** (`"nodes": []`) on any cluster
+  started from a config file, while correctly reporting those nodes' partitions.
+- **The Prometheus metrics port was hardcoded**, so two single-node brokers on
+  one host always collided on 13092.
+
+### Added
+
+- `CHRONIK_REPLICA_LAG_TIME_MAX_MS` (default 10000) and
+  `CHRONIK_REPLICA_LAG_MAX_ENTRIES` (default 10000) — the ISR lag bounds, which
+  were previously compiled in. Kafka's `replica.lag.time.max.ms` defaults to 30s;
+  this default is deliberately tighter so under-replication surfaces sooner.
+- `CHRONIK_METRICS_PORT` (default 13092).
+- `tests/cluster/follower_catchup.sh` — asserts a follower that misses writes
+  rejoins and converges with no operator action, and that ISR shrinks while it is
+  down and readmits it when it returns.
+
 ## [2.11.0] - 2026-08-09
 
 ### Added
