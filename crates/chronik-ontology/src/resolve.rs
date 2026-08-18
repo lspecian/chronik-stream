@@ -104,18 +104,25 @@ pub fn filter_as_of(sources: Vec<serde_json::Value>, as_of: Option<DateTime<Utc>
     let Some(t) = as_of else {
         return sources;
     };
+    let parse = |env: &serde_json::Value, field: &str| -> Option<DateTime<Utc>> {
+        env.get(field)
+            .and_then(|v| v.as_str())
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|d| d.with_timezone(&Utc))
+    };
     sources
         .into_iter()
         .filter(|src| {
-            envelope_from_source(src)
-                .and_then(|env| {
-                    env.get("valid_from")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string)
-                })
-                .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                .map(|vf| vf.with_timezone(&Utc) <= t)
-                .unwrap_or(true)
+            let Some(env) = envelope_from_source(src) else {
+                return true; // can't inspect -> keep (lenient)
+            };
+            // Bi-temporal: effective at `t` iff valid_from <= t < valid_to.
+            // valid_to = None means still valid (the roadmap's invalidate-not-
+            // delete model — a superseded/expired edge sets valid_to instead of
+            // being removed).
+            let after_start = parse(&env, "valid_from").map(|vf| vf <= t).unwrap_or(true);
+            let before_end = parse(&env, "valid_to").map(|vt| t < vt).unwrap_or(true);
+            after_start && before_end
         })
         .collect()
 }
@@ -526,6 +533,27 @@ mod tests {
         let sources = vec![fact("Alice", "has_degree", serde_json::json!("BA"), 1)];
         assert_eq!(filter_as_of(sources.clone(), None).len(), 1);
         assert_eq!(filter_as_of(sources, Some(t("2000-01-01T00:00:00Z"))).len(), 1);
+    }
+
+    #[test]
+    fn as_of_respects_valid_to_invalidation() {
+        let ty = entity_type();
+        // Effective only 2023-01 .. 2023-12 (then invalidated via valid_to).
+        let mut f = fact("Alice", "enjoys", serde_json::json!("hiking"), 1);
+        f["valid_from"] = serde_json::json!("2023-01-01T00:00:00Z");
+        f["valid_to"] = serde_json::json!("2023-12-31T00:00:00Z");
+        // As of mid-2023: still effective.
+        assert!(assemble_instance(
+            &filter_as_of(vec![f.clone()], Some(t("2023-06-01T00:00:00Z"))),
+            "ns1", &ty, "Alice"
+        )
+        .is_some());
+        // As of 2024: invalidated (valid_to passed) -> excluded.
+        assert!(assemble_instance(
+            &filter_as_of(vec![f], Some(t("2024-06-01T00:00:00Z"))),
+            "ns1", &ty, "Alice"
+        )
+        .is_none());
     }
 
     #[test]
