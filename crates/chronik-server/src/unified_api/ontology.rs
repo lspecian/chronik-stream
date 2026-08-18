@@ -70,6 +70,72 @@ fn tenant_of(namespace: &str) -> &str {
     namespace.split(':').next().unwrap_or(namespace)
 }
 
+/// Parse an optional RFC3339 `as_of` timestamp (400 on a bad format).
+fn parse_as_of(s: Option<&str>) -> Result<Option<chrono::DateTime<chrono::Utc>>, ApiError> {
+    match s {
+        None => Ok(None),
+        Some(s) => chrono::DateTime::parse_from_rfc3339(s)
+            .map(|dt| Some(dt.with_timezone(&chrono::Utc)))
+            .map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse::new(
+                        "bad_request",
+                        format!("invalid as_of (expected RFC3339): {e}"),
+                    )),
+                )
+            }),
+    }
+}
+
+// ───────────────────────── query_objects (O-2) ─────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct QueryObjectsRequest {
+    pub namespace: String,
+    #[serde(rename = "type")]
+    pub type_name: String,
+    #[serde(default)]
+    pub as_of: Option<String>,
+    #[serde(default)]
+    pub max_facts: Option<usize>,
+}
+
+/// `POST /ontology/v1/query_objects` — list instances of a type in a namespace,
+/// each fully resolved with provenance. (O-2 read tool; filter/aggregate later.)
+pub async fn query_objects(
+    State(state): State<UnifiedApiState>,
+    Json(req): Json<QueryObjectsRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let registry = require_ontology(&state)?;
+    let tenant = tenant_of(&req.namespace);
+    let Some(ty) = registry.get(tenant, &req.type_name) else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse::new(
+                "not_found",
+                format!("no ObjectType {:?} registered for tenant {:?}", req.type_name, tenant),
+            )),
+        ));
+    };
+    let as_of = parse_as_of(req.as_of.as_deref())?;
+    let http = reqwest::Client::new();
+    let api_base = self_api_base();
+    let max = req.max_facts.unwrap_or(10_000);
+    match chronik_ontology::query_objects(&http, &api_base, &req.namespace, &ty, max, as_of).await {
+        Ok(objects) => Ok(Json(json!({
+            "namespace": req.namespace,
+            "type": req.type_name,
+            "count": objects.len(),
+            "objects": objects,
+        }))),
+        Err(e) => Err((
+            StatusCode::BAD_GATEWAY,
+            Json(ErrorResponse::new("query_failed", e.to_string())),
+        )),
+    }
+}
+
 /// `POST /ontology/v1/get_object` — resolve one instance with provenance.
 pub async fn get_object(
     State(state): State<UnifiedApiState>,

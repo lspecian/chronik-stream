@@ -19,7 +19,8 @@ pub mod traverse;
 
 pub use object_type::{AttrSpec, AttrType, BackingBinding, IdentitySpec, ObjectType};
 pub use resolve::{
-    assemble_instance, resolve_object, ObjectInstance, ResolveError, ResolvedAttr, SourceRef,
+    assemble_all_instances, assemble_instance, query_objects, resolve_object, ObjectInstance,
+    ResolveError, ResolvedAttr, SourceRef,
 };
 pub use traverse::{assemble_edges, traverse, Edge, TraverseError};
 pub use ont_types_consumer::{

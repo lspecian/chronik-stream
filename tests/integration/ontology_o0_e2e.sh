@@ -108,6 +108,12 @@ T2=$(curl -s -X POST "$API/ontology/v1/traverse" -H 'content-type: application/j
 [ "$(echo "$T2" | jq -r '[.edges[]|select(.to=="Portugal" and .depth==2)]|length')" = "1" ] \
   && ok "traverse 2-hop Alice->Acme->Portugal (depth 2)" || bad "traverse 2-hop wrong: $(echo "$T2"|jq -c '.edges')"
 
+# 9. O-2 query_objects: lists Alice among the Entity instances
+Q=$(curl -s -X POST "$API/ontology/v1/query_objects" -H 'content-type: application/json' \
+  -d "{\"namespace\":\"$NS\",\"type\":\"Entity\"}")
+[ "$(echo "$Q" | jq -r '[.objects[]|select(.id=="Alice")]|length')" = "1" ] \
+  && ok "query_objects lists Alice (count=$(echo "$Q"|jq -r '.count'))" || bad "query_objects wrong: $(echo "$Q"|jq -c '.objects|map(.id)')"
+
 echo
 echo "== O-0 exit gate: $PASS passed, $FAIL failed =="
 [ "$FAIL" -eq 0 ]

@@ -228,6 +228,92 @@ pub fn assemble_instance(
     })
 }
 
+/// PURE: assemble EVERY instance present in the backing records — the distinct
+/// identity values (by `identity.id_field`), each resolved to a full instance.
+/// (O-2 `query_objects`, read side.) One scan finds the distinct ids; each is
+/// then assembled from the same record set.
+pub fn assemble_all_instances(
+    sources: &[serde_json::Value],
+    namespace: &str,
+    ty: &ObjectType,
+) -> Vec<ObjectInstance> {
+    let mut seen = std::collections::HashSet::new();
+    let mut ids: Vec<String> = Vec::new();
+    for src in sources {
+        let Some(env) = envelope_from_source(src) else {
+            continue;
+        };
+        if env.get("tombstoned").and_then(|v| v.as_bool()).unwrap_or(false) {
+            continue;
+        }
+        if let Some(rec_ns) = env.get("namespace").and_then(|v| v.as_str()) {
+            if rec_ns != namespace {
+                continue;
+            }
+        }
+        let fbody = env.get("body").unwrap_or(&env);
+        let Some(subject) = fbody.get(&ty.identity.id_field).and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let key = if ty.identity.normalize {
+            normalize(subject)
+        } else {
+            subject.to_string()
+        };
+        if seen.insert(key) {
+            ids.push(subject.to_string());
+        }
+    }
+    ids.into_iter()
+        .filter_map(|id| assemble_instance(sources, namespace, ty, &id))
+        .collect()
+}
+
+/// List instances of a type from its backing projection (O-2 `query_objects`,
+/// read side). `max_facts` bounds the scan; `as_of` applies point-in-time.
+pub async fn query_objects(
+    http: &reqwest::Client,
+    api_base: &str,
+    namespace: &str,
+    ty: &ObjectType,
+    max_facts: usize,
+    as_of: Option<DateTime<Utc>>,
+) -> Result<Vec<ObjectInstance>, ResolveError> {
+    let tenant = namespace.split(':').next().unwrap_or(namespace);
+    let topic = format!("{}.{}", ty.backing.topic_prefix, tenant);
+    // Enumerate the namespace's records: every fact carries its `namespace` in
+    // the tokenized `_all`, so matching the namespace returns them all (the
+    // broker has no match_all). assemble_all_instances then exact-filters by
+    // namespace, so a loose superset here is harmless.
+    let req = serde_json::json!({
+        "index": topic,
+        "size": max_facts,
+        "query": {"match": {"_all": namespace}}
+    });
+    let url = format!("{}/_search", api_base.trim_end_matches('/'));
+    let resp = http
+        .post(&url)
+        .json(&req)
+        .send()
+        .await
+        .map_err(|e| ResolveError::Http(e.to_string()))?;
+    if !resp.status().is_success() {
+        if resp.status().as_u16() == 404 {
+            return Ok(vec![]);
+        }
+        return Err(ResolveError::Status(resp.status().as_u16()));
+    }
+    let parsed: SearchResponse = resp
+        .json()
+        .await
+        .map_err(|e| ResolveError::BadResponse(e.to_string()))?;
+    let sources = filter_as_of(
+        parsed.hits.hits.into_iter().map(|h| h.source).collect(),
+        as_of,
+    );
+    Ok(assemble_all_instances(&sources, namespace, ty))
+}
+
 /// Resolve one object instance by querying its backing projection over `/_search`.
 ///
 /// `api_base` is the Unified API base (e.g. `http://localhost:6092`). Returns
@@ -378,6 +464,22 @@ mod tests {
         let inst = assemble_instance(&[wrapped], "ns1", &ty, "Alice").unwrap();
         assert_eq!(inst.backing_records, 1);
         assert_eq!(inst.attributes[0].values, vec![serde_json::json!("BA")]);
+    }
+
+    #[test]
+    fn assemble_all_instances_lists_distinct_entities() {
+        let ty = entity_type();
+        let sources = vec![
+            fact("Alice", "has_degree", serde_json::json!("BA"), 1),
+            fact("Alice", "enjoys", serde_json::json!("hiking"), 2),
+            fact("Bob", "has_degree", serde_json::json!("Physics"), 3),
+        ];
+        let mut names: Vec<String> = assemble_all_instances(&sources, "ns1", &ty)
+            .into_iter()
+            .map(|i| i.id)
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["Alice".to_string(), "Bob".to_string()]);
     }
 
     #[test]
