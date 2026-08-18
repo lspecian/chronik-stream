@@ -54,9 +54,20 @@ pub struct GetObjectRequest {
     pub type_name: String,
     /// Instance id (e.g. the entity's subject).
     pub id: String,
+    /// Optional point-in-time (RFC3339). Returns the instance as of this time
+    /// (`valid_from <= as_of`). Exact only over append-only backing; best-effort
+    /// over compacted backing (see chronik_ontology::resolve::filter_as_of).
+    #[serde(default)]
+    pub as_of: Option<String>,
     /// Optional cap on backing records fetched (default 10_000).
     #[serde(default)]
     pub max_facts: Option<usize>,
+}
+
+/// The ObjectType registry is TENANT-keyed (`ont.types.{tenant}`); the tenant is
+/// the first ':'-segment of a namespace (a colon-free namespace is its own tenant).
+fn tenant_of(namespace: &str) -> &str {
+    namespace.split(':').next().unwrap_or(namespace)
 }
 
 /// `POST /ontology/v1/get_object` — resolve one instance with provenance.
@@ -65,23 +76,50 @@ pub async fn get_object(
     Json(req): Json<GetObjectRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let registry = require_ontology(&state)?;
-    let Some(ty) = registry.get(&req.namespace, &req.type_name) else {
+    let tenant = tenant_of(&req.namespace);
+    let Some(ty) = registry.get(tenant, &req.type_name) else {
         return Err((
             StatusCode::NOT_FOUND,
             Json(ErrorResponse::new(
                 "not_found",
                 format!(
-                    "no ObjectType {:?} registered for namespace {:?}",
-                    req.type_name, req.namespace
+                    "no ObjectType {:?} registered for tenant {:?}",
+                    req.type_name, tenant
                 ),
             )),
         ));
     };
 
+    // Parse the optional as-of timestamp.
+    let as_of = match req.as_of.as_deref() {
+        None => None,
+        Some(s) => match chrono::DateTime::parse_from_rfc3339(s) {
+            Ok(dt) => Some(dt.with_timezone(&chrono::Utc)),
+            Err(e) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse::new(
+                        "bad_request",
+                        format!("invalid as_of (expected RFC3339): {e}"),
+                    )),
+                ))
+            }
+        },
+    };
+
     let http = reqwest::Client::new();
     let api_base = self_api_base();
     let max = req.max_facts.unwrap_or(10_000);
-    match chronik_ontology::resolve_object(&http, &api_base, &req.namespace, &ty, &req.id, max).await
+    match chronik_ontology::resolve_object(
+        &http,
+        &api_base,
+        &req.namespace,
+        &ty,
+        &req.id,
+        max,
+        as_of,
+    )
+    .await
     {
         Ok(Some(inst)) => Ok(Json(serde_json::to_value(inst).unwrap_or_else(|_| json!({})))),
         Ok(None) => Err((
@@ -112,6 +150,7 @@ pub async fn list_types(
     Query(q): Query<ListTypesQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let registry = require_ontology(&state)?;
-    let types = registry.list_for_tenant(&q.namespace);
-    Ok(Json(json!({ "namespace": q.namespace, "types": types })))
+    let tenant = tenant_of(&q.namespace);
+    let types = registry.list_for_tenant(tenant);
+    Ok(Json(json!({ "namespace": q.namespace, "tenant": tenant, "types": types })))
 }

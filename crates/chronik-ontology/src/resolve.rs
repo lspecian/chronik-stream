@@ -9,6 +9,7 @@
 //! The HTTP call is a thin shell around [`assemble_instance`], which is pure and
 //! unit-tested without a broker.
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::object_type::ObjectType;
@@ -87,6 +88,36 @@ fn envelope_from_source(source: &serde_json::Value) -> Option<serde_json::Value>
         }
     }
     None
+}
+
+/// PURE point-in-time pre-filter: keep only records effective at or before
+/// `as_of` (by their `valid_from`). Records with a missing/unparseable
+/// `valid_from` are kept (lenient). `None` = no filter.
+///
+/// **Correctness scope (roadmap §9):** this is exact only over **append-only**
+/// backing, where every version is retained. Over a **compacted** backing
+/// (e.g. `mem.fact`), superseded versions may be physically gone, so an
+/// `as_of` in the past is best-effort — it cannot resurrect history that
+/// compaction erased. The cross-projection consistent-snapshot token is
+/// deferred (a single-projection read here).
+pub fn filter_as_of(sources: Vec<serde_json::Value>, as_of: Option<DateTime<Utc>>) -> Vec<serde_json::Value> {
+    let Some(t) = as_of else {
+        return sources;
+    };
+    sources
+        .into_iter()
+        .filter(|src| {
+            envelope_from_source(src)
+                .and_then(|env| {
+                    env.get("valid_from")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                })
+                .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+                .map(|vf| vf.with_timezone(&Utc) <= t)
+                .unwrap_or(true)
+        })
+        .collect()
 }
 
 /// PURE assembly: given the raw `_source` values of backing fact records, filter
@@ -201,6 +232,7 @@ pub fn assemble_instance(
 ///
 /// `api_base` is the Unified API base (e.g. `http://localhost:6092`). Returns
 /// `Ok(None)` when the backing topic is absent (404) or nothing matches the id.
+#[allow(clippy::too_many_arguments)]
 pub async fn resolve_object(
     http: &reqwest::Client,
     api_base: &str,
@@ -208,6 +240,7 @@ pub async fn resolve_object(
     ty: &ObjectType,
     id: &str,
     max_facts: usize,
+    as_of: Option<DateTime<Utc>>,
 ) -> Result<Option<ObjectInstance>, ResolveError> {
     // The typed memory topics are keyed by TENANT — the first ':'-segment of the
     // namespace (`agent:x:user:y` -> tenant `agent`; a colon-free namespace is
@@ -240,6 +273,7 @@ pub async fn resolve_object(
         .await
         .map_err(|e| ResolveError::BadResponse(e.to_string()))?;
     let sources: Vec<serde_json::Value> = parsed.hits.hits.into_iter().map(|h| h.source).collect();
+    let sources = filter_as_of(sources, as_of);
     Ok(assemble_instance(&sources, namespace, ty, id))
 }
 
@@ -354,6 +388,42 @@ mod tests {
         let mut other = fact("Alice", "has_degree", serde_json::json!("BA"), 7);
         other["namespace"] = serde_json::json!("different-ns");
         assert!(assemble_instance(&[other], "ns1", &ty, "Alice").is_none());
+    }
+
+    fn t(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    #[test]
+    fn as_of_filters_by_valid_from() {
+        let ty = entity_type();
+        let mk = |obj: &str, vf: &str| {
+            let mut f = fact("Alice", "enjoys", serde_json::json!(obj), 1);
+            f["valid_from"] = serde_json::json!(vf);
+            f
+        };
+        let sources = vec![
+            mk("hiking", "2024-01-01T00:00:00Z"),
+            mk("chess", "2024-06-01T00:00:00Z"),
+        ];
+        // As of March 2024: only hiking is effective yet.
+        let early = filter_as_of(sources.clone(), Some(t("2024-03-01T00:00:00Z")));
+        let inst = assemble_instance(&early, "ns1", &ty, "Alice").unwrap();
+        let hobbies = inst.attributes.iter().find(|a| a.name == "hobbies").unwrap();
+        assert_eq!(hobbies.values, vec![serde_json::json!("hiking")]);
+        // As of December 2024: both.
+        let late = filter_as_of(sources, Some(t("2024-12-01T00:00:00Z")));
+        let inst = assemble_instance(&late, "ns1", &ty, "Alice").unwrap();
+        let hobbies = inst.attributes.iter().find(|a| a.name == "hobbies").unwrap();
+        assert_eq!(hobbies.values.len(), 2);
+    }
+
+    #[test]
+    fn as_of_none_keeps_all_and_missing_valid_from_is_lenient() {
+        // None = no filter; and a record without valid_from is kept.
+        let sources = vec![fact("Alice", "has_degree", serde_json::json!("BA"), 1)];
+        assert_eq!(filter_as_of(sources.clone(), None).len(), 1);
+        assert_eq!(filter_as_of(sources, Some(t("2000-01-01T00:00:00Z"))).len(), 1);
     }
 
     #[test]
