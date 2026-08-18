@@ -204,6 +204,10 @@ pub struct UnifiedApiState {
     /// returns 503.
     #[cfg(feature = "memory")]
     pub memory_index: Option<Arc<chronik_memory::MemoryIndex>>,
+    /// O-0: the Ontology ObjectType registry (`ont.types.{tenant}` consumer).
+    /// Backs `/ontology/v1/*`; when `None` those endpoints reply 503.
+    #[cfg(feature = "memory")]
+    pub ontology_types: Option<Arc<chronik_ontology::OntTypeIndex>>,
     /// AM-2.5: Per-tenant token-bucket rate limiter. When present AND
     /// [`Self::memory_tenants`] is populated, every write / recall consumes
     /// tokens from the caller's `TenantQuotas.{ingest_msgs_per_sec,
@@ -272,6 +276,8 @@ impl UnifiedApiState {
             memory_rate_limiter: None,
             #[cfg(feature = "memory")]
             memory_index: None,
+            #[cfg(feature = "memory")]
+            ontology_types: None,
             #[cfg(feature = "memory")]
             memory_tenant_metrics: None,
             #[cfg(feature = "memory")]
@@ -347,6 +353,17 @@ impl UnifiedApiState {
         index: Arc<chronik_memory::MemoryIndex>,
     ) -> Self {
         self.memory_index = Some(index);
+        self
+    }
+
+    /// O-0: attach the Ontology ObjectType registry that backs `/ontology/v1/*`.
+    /// When missing, those endpoints reply `503 service_unavailable`.
+    #[cfg(feature = "memory")]
+    pub fn with_ontology_types(
+        mut self,
+        index: Arc<chronik_ontology::OntTypeIndex>,
+    ) -> Self {
+        self.ontology_types = Some(index);
         self
     }
 

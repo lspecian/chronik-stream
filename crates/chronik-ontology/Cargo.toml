@@ -1,0 +1,49 @@
+[package]
+name = "chronik-ontology"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Event-native Ontology layer for Chronik — user-defined Object Types materialized from projections with identity, provenance, and as-of. See docs/ROADMAP_ONTOLOGY.md."
+
+# Phase O-0 (Object Types). Boundary discipline (roadmap §9 / AD-1): the Ontology
+# is a layer ON Chronik (this crate + a Unified-API mount), never domain
+# semantics inside chronik-server. Milestone A here is the ObjectType registry —
+# the 7th instance of the "consumer-maintained keyed in-memory index rebuilt from
+# a compacted Kafka topic" pattern (see chronik-memory/src/mem_config_consumer.rs).
+
+[dependencies]
+# Async runtime
+tokio = { workspace = true }
+futures = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Kafka client (ont.types.{tenant} consumer)
+rdkafka = { workspace = true }
+
+# Time
+chrono = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Keyed in-memory index + stats lock
+dashmap = { workspace = true }
+parking_lot = { workspace = true }
+
+# Topic-name regex
+regex = "1.10"
+
+# Tracing
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio-test = "0.4"
+serde_json = { workspace = true }
+
+[features]
+default = []

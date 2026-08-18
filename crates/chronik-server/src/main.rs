@@ -708,6 +708,33 @@ fn try_create_memory_index() -> Option<Arc<chronik_memory::MemoryIndex>> {
     Some(arc)
 }
 
+/// O-0: opt-in Ontology ObjectType registry. Consumes `ont.types.{tenant}` (a
+/// compacted topic) into an in-memory index that backs `/ontology/v1/*`. Off by
+/// default; enable with `CHRONIK_ONTOLOGY_ENABLED=true`.
+#[cfg(feature = "memory")]
+fn try_create_ont_types() -> Option<Arc<chronik_ontology::OntTypeIndex>> {
+    let enabled = std::env::var("CHRONIK_ONTOLOGY_ENABLED")
+        .map(|v| v.to_lowercase() == "true" || v == "1")
+        .unwrap_or(false);
+    if !enabled {
+        return None;
+    }
+    let brokers =
+        std::env::var("CHRONIK_MEMORY_KAFKA").unwrap_or_else(|_| "localhost:9092".to_string());
+    let group_id = std::env::var("CHRONIK_ONTOLOGY_GROUP_ID")
+        .unwrap_or_else(|_| "chronik-ontology-types-consumer".to_string());
+    let config =
+        chronik_ontology::OntTypesConsumerConfig::new(brokers.clone()).with_group_id(group_id);
+    let index = chronik_ontology::OntTypeIndex::new();
+    let arc = Arc::new(index.clone());
+    info!(
+        brokers = %brokers,
+        "O-0: spawning ontology ObjectType registry consumer (ont.types.*)"
+    );
+    let _handle = chronik_ontology::spawn_ont_types_consumer(config, index);
+    Some(arc)
+}
+
 /// AM-3.4: Build the in-memory provenance-graph index backing
 /// `GET /memory/v1/{id}/lineage`. Enabled by
 /// `CHRONIK_MEMORY_LINEAGE_ENABLED=true`. The index hydrates
@@ -974,6 +1001,11 @@ fn wire_agent_memory(mut state: unified_api::UnifiedApiState) -> unified_api::Un
     if let Some(idx) = try_create_memory_lineage() {
         state = state.with_memory_lineage(idx);
         info!("✓ Agent memory lineage index wired (GET /memory/v1/*/lineage)");
+    }
+    // O-0: opt-in Ontology ObjectType registry for /ontology/v1/*.
+    if let Some(ont_types) = try_create_ont_types() {
+        state = state.with_ontology_types(ont_types);
+        info!("✓ Ontology ObjectType registry wired (/ontology/v1/*)");
     }
     state
 }

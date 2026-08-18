@@ -39,6 +39,9 @@ chronik-embeddings = { path = "../chronik-embeddings" }
 # Remove this dependency once /memory/v1/* is served through the broker's internal
 # produce/fetch handlers instead of a loopback Kafka client.
 chronik-memory = { path = "../chronik-memory", optional = true }
+# O-0 Ontology (roadmap §9 / AD-1: a layer ON Chronik, mounted under
+# /ontology/v1/*). Dogfoods the memory domain, so it rides the `memory` feature.
+chronik-ontology = { path = "../chronik-ontology", optional = true }
 
 # Query orchestration (Phase 9)
 chronik-query = { path = "../chronik-query" }
@@ -128,7 +131,7 @@ search = ["dep:chronik-search", "dep:tantivy"]
 backup = ["dep:chronik-backup"]
 # Agent Memory (/memory/v1/*). Pulls in librdkafka; incompatible with the static
 # musl target. Off by default; enable explicitly on glibc builds only.
-memory = ["dep:chronik-memory"]
+memory = ["dep:chronik-memory", "dep:chronik-ontology"]
 full = ["search", "backup", "memory"]
 
 # Minimal build without optional features (Raft is always included)
