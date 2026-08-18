@@ -232,6 +232,10 @@ pub async fn run_consumer(
         .set("group.id", &config.group_id)
         .set("enable.auto.commit", "false")
         .set("auto.offset.reset", "earliest")
+        // Pattern subscriptions only pick up NEW `ont.types.{tenant}` topics on a
+        // metadata refresh; keep it short so a freshly-created tenant's types
+        // become visible in seconds, not the librdkafka 5-minute default.
+        .set("topic.metadata.refresh.interval.ms", "5000")
         .create()
         .map_err(|e| format!("ont.types consumer create: {e}"))?;
     // A `^`-anchored topic string is treated by librdkafka as a subscription

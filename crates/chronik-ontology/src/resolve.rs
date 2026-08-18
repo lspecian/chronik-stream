@@ -117,6 +117,14 @@ pub fn assemble_instance(
         if env.get("tombstoned").and_then(|v| v.as_bool()).unwrap_or(false) {
             continue;
         }
+        // Namespace isolation: `mem.fact.{tenant}` can hold facts from several
+        // namespaces under the tenant, distinguished by the record's
+        // `namespace` field. Require a match when the field is present.
+        if let Some(rec_ns) = env.get("namespace").and_then(|v| v.as_str()) {
+            if rec_ns != namespace {
+                continue;
+            }
+        }
         // Fact fields live under the flattened `body`; fall back to the envelope
         // itself if the search layer already unwrapped them.
         let fbody = env.get("body").unwrap_or(&env);
@@ -201,7 +209,12 @@ pub async fn resolve_object(
     id: &str,
     max_facts: usize,
 ) -> Result<Option<ObjectInstance>, ResolveError> {
-    let topic = format!("{}.{}", ty.backing.topic_prefix, namespace);
+    // The typed memory topics are keyed by TENANT — the first ':'-segment of the
+    // namespace (`agent:x:user:y` -> tenant `agent`; a colon-free namespace is
+    // its own tenant). One topic can hold several namespaces, which
+    // `assemble_instance` filters on the record's `namespace` field.
+    let tenant = namespace.split(':').next().unwrap_or(namespace);
+    let topic = format!("{}.{}", ty.backing.topic_prefix, tenant);
     // BM25 recall on the id narrows the candidate set; `assemble_instance` then
     // applies the EXACT identity filter, so a loose match here is harmless.
     let req = serde_json::json!({
@@ -331,6 +344,16 @@ mod tests {
         let inst = assemble_instance(&[wrapped], "ns1", &ty, "Alice").unwrap();
         assert_eq!(inst.backing_records, 1);
         assert_eq!(inst.attributes[0].values, vec![serde_json::json!("BA")]);
+    }
+
+    #[test]
+    fn cross_namespace_facts_excluded() {
+        // mem.fact.{tenant} may mix namespaces; a same-subject fact from another
+        // namespace must not leak into this instance.
+        let ty = entity_type();
+        let mut other = fact("Alice", "has_degree", serde_json::json!("BA"), 7);
+        other["namespace"] = serde_json::json!("different-ns");
+        assert!(assemble_instance(&[other], "ns1", &ty, "Alice").is_none());
     }
 
     #[test]
