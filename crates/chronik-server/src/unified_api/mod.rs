@@ -31,6 +31,9 @@ pub mod search_handler;
 pub mod memory;
 #[cfg(feature = "memory")]
 pub mod memory_types;
+// O-0: Ontology endpoints (/ontology/v1/*). Rides the `memory` feature.
+#[cfg(feature = "memory")]
+pub mod ontology;
 
 use axum::{
     extract::State,
@@ -588,7 +591,10 @@ pub fn create_router_full(
         .route("/memory/v1/compact", post(memory::compact))
         .route("/memory/v1/recall/stream", post(memory::recall_stream))
         .route("/memory/v1/:memory_id/source", get(memory::source))
-        .route("/memory/v1/:memory_id/lineage", get(memory::lineage));
+        .route("/memory/v1/:memory_id/lineage", get(memory::lineage))
+        // O-0 Ontology (Object Types)
+        .route("/ontology/v1/get_object", post(ontology::get_object))
+        .route("/ontology/v1/types", get(ontology::list_types));
     }
 
     // Add shared state for SQL/Vector/Query/Memory endpoints

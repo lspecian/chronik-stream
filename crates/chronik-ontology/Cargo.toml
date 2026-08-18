@@ -38,6 +38,10 @@ parking_lot = { workspace = true }
 # Topic-name regex
 regex = "1.10"
 
+# HTTP client — instance resolution self-calls the Unified API /_search (the same
+# client-to-broker pattern the memory SDK uses; see recall.rs).
+reqwest = { workspace = true }
+
 # Tracing
 tracing = { workspace = true }
 
