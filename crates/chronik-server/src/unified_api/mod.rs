@@ -594,6 +594,7 @@ pub fn create_router_full(
         .route("/memory/v1/:memory_id/lineage", get(memory::lineage))
         // O-0 Ontology (Object Types)
         .route("/ontology/v1/get_object", post(ontology::get_object))
+        .route("/ontology/v1/traverse", post(ontology::traverse))
         .route("/ontology/v1/types", get(ontology::list_types));
     }
 

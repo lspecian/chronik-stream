@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# Ontology O-0 exit-gate E2E test (docs/ROADMAP_ONTOLOGY.md, Phase O-0).
+# Ontology O-0 + O-1 exit-gate E2E test (docs/ROADMAP_ONTOLOGY.md).
 #
-# Verifies the object model end-to-end against a LIVE Chronik broker started with
-# the ontology enabled:
+# Verifies the object model AND link traversal end-to-end against a LIVE Chronik
+# broker started with the ontology enabled:
 #   - registry: an ObjectType produced to ont.types.{tenant} is served by
 #     GET /ontology/v1/types
 #   - get_object: resolves an instance's attributes from its backing mem.fact
@@ -48,6 +48,9 @@ fact() { # key json
 fact "Alice|has_degree"    "{\"namespace\":\"$NS\",\"key\":\"Alice|has_degree\",\"valid_from\":\"2023-09-01T00:00:00Z\",\"confidence\":1.0,\"source\":{\"topic\":\"mem.raw.$NS\",\"offsets\":[10],\"extractor\":\"t@1\"},\"type\":\"fact\",\"body\":{\"subject\":\"Alice\",\"predicate\":\"has_degree\",\"object\":\"Business Administration\",\"text\":\"Alice degree Business Administration\"}}"
 fact "Alice|enjoys|hiking"  "{\"namespace\":\"$NS\",\"key\":\"Alice|enjoys|hiking\",\"valid_from\":\"2024-01-01T00:00:00Z\",\"confidence\":1.0,\"source\":{\"topic\":\"mem.raw.$NS\",\"offsets\":[100],\"extractor\":\"t@1\"},\"type\":\"fact\",\"body\":{\"subject\":\"Alice\",\"predicate\":\"enjoys\",\"object\":\"hiking\",\"text\":\"Alice enjoys hiking\"}}"
 fact "Alice|enjoys|chess"   "{\"namespace\":\"$NS\",\"key\":\"Alice|enjoys|chess\",\"valid_from\":\"2024-06-01T00:00:00Z\",\"confidence\":1.0,\"source\":{\"topic\":\"mem.raw.$NS\",\"offsets\":[205],\"extractor\":\"t@1\"},\"type\":\"fact\",\"body\":{\"subject\":\"Alice\",\"predicate\":\"enjoys\",\"object\":\"chess\",\"text\":\"Alice enjoys chess\"}}"
+# O-1 traversal graph: Alice --works_at--> Acme --located_in--> Portugal
+fact "Alice|works_at" "{\"namespace\":\"$NS\",\"key\":\"Alice|works_at\",\"valid_from\":\"2023-09-01T00:00:00Z\",\"confidence\":1.0,\"source\":{\"topic\":\"mem.raw.$NS\",\"offsets\":[300],\"extractor\":\"t@1\"},\"type\":\"fact\",\"body\":{\"subject\":\"Alice\",\"predicate\":\"works_at\",\"object\":\"Acme\",\"text\":\"Alice works at Acme\"}}"
+fact "Acme|located_in" "{\"namespace\":\"$NS\",\"key\":\"Acme|located_in\",\"valid_from\":\"2023-09-01T00:00:00Z\",\"confidence\":1.0,\"source\":{\"topic\":\"mem.raw.$NS\",\"offsets\":[301],\"extractor\":\"t@1\"},\"type\":\"fact\",\"body\":{\"subject\":\"Acme\",\"predicate\":\"located_in\",\"object\":\"Portugal\",\"text\":\"Acme located in Portugal\"}}"
 
 echo "== wait for registry + search indexing =="
 for _ in $(seq 1 20); do
@@ -56,7 +59,7 @@ for _ in $(seq 1 20); do
 done
 for _ in $(seq 1 20); do
   n=$(curl -s -X POST "$API/_search" -H 'content-type: application/json' -d "{\"index\":\"mem.fact.$NS\",\"size\":20,\"query\":{\"match\":{\"_all\":\"Alice\"}}}" | jq '.hits.total.value // 0')
-  [ "${n:-0}" -ge 3 ] && break
+  [ "${n:-0}" -ge 4 ] && break
   sleep 2
 done
 
@@ -91,6 +94,19 @@ EARLY=$(curl -s -X POST "$API/ontology/v1/get_object" -H 'content-type: applicat
 [ "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$API/ontology/v1/get_object" -H 'content-type: application/json' \
   -d "{\"namespace\":\"$NS\",\"type\":\"Entity\",\"id\":\"Nobody\"}")" = "404" ] \
   && ok "unknown instance -> 404" || bad "unknown instance not 404"
+
+# 7. O-1 traverse: 1-hop works_at -> Acme, provenance-carrying
+T1=$(curl -s -X POST "$API/ontology/v1/traverse" -H 'content-type: application/json' \
+  -d "{\"namespace\":\"$NS\",\"from\":\"Alice\",\"edge_type\":\"works_at\",\"depth\":1}")
+[ "$(echo "$T1" | jq -r '.edges[]|select(.edge_type=="works_at")|.to')" = "Acme" ] \
+  && [ "$(echo "$T1" | jq '[.edges[]|select((.provenance|map(.offsets|length)|add // 0)>0)]|length')" -ge 1 ] \
+  && ok "traverse 1-hop Alice-[works_at]->Acme with provenance" || bad "traverse 1-hop wrong: $(echo "$T1"|jq -c '.edges')"
+
+# 8. O-1 traverse: 2-hop reaches Portugal via Acme (depth 2)
+T2=$(curl -s -X POST "$API/ontology/v1/traverse" -H 'content-type: application/json' \
+  -d "{\"namespace\":\"$NS\",\"from\":\"Alice\",\"edge_type\":\"*\",\"depth\":2}")
+[ "$(echo "$T2" | jq -r '[.edges[]|select(.to=="Portugal" and .depth==2)]|length')" = "1" ] \
+  && ok "traverse 2-hop Alice->Acme->Portugal (depth 2)" || bad "traverse 2-hop wrong: $(echo "$T2"|jq -c '.edges')"
 
 echo
 echo "== O-0 exit gate: $PASS passed, $FAIL failed =="

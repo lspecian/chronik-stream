@@ -15,11 +15,13 @@
 pub mod object_type;
 pub mod ont_types_consumer;
 pub mod resolve;
+pub mod traverse;
 
 pub use object_type::{AttrSpec, AttrType, BackingBinding, IdentitySpec, ObjectType};
 pub use resolve::{
     assemble_instance, resolve_object, ObjectInstance, ResolveError, ResolvedAttr, SourceRef,
 };
+pub use traverse::{assemble_edges, traverse, Edge, TraverseError};
 pub use ont_types_consumer::{
     apply_event, parse_ont_type_record, run_consumer, spawn_ont_types_consumer, OntTypeApply,
     OntTypeEvent, OntTypeIndex, OntTypeKey, OntTypeRecordEnvelope, OntTypeStats,

@@ -143,6 +143,87 @@ pub struct ListTypesQuery {
     pub namespace: String,
 }
 
+// ───────────────────────── traverse (O-1) ─────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct TraverseRequest {
+    pub namespace: String,
+    /// Root node id (entity subject).
+    pub from: String,
+    /// Edge type = the fact predicate to follow; "*" = all outgoing edges.
+    #[serde(default = "default_edge_type")]
+    pub edge_type: String,
+    /// Hop count, clamped to 1..=3 (roadmap O-1).
+    #[serde(default = "default_depth")]
+    pub depth: usize,
+    /// Optional point-in-time (RFC3339).
+    #[serde(default)]
+    pub as_of: Option<String>,
+    #[serde(default)]
+    pub max_per_hop: Option<usize>,
+}
+fn default_edge_type() -> String {
+    "*".to_string()
+}
+fn default_depth() -> usize {
+    1
+}
+
+/// `POST /ontology/v1/traverse` — O-1 Link Types. Follow `(from)--[edge_type]-->`
+/// edges derived from the fact projection, 1..=3 hops, each edge provenance-carrying.
+pub async fn traverse(
+    State(state): State<UnifiedApiState>,
+    Json(req): Json<TraverseRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    // Ontology must be enabled (edges are derived, but keep the subsystem gate
+    // consistent with the other endpoints).
+    let _ = require_ontology(&state)?;
+    let as_of = match req.as_of.as_deref() {
+        None => None,
+        Some(s) => match chrono::DateTime::parse_from_rfc3339(s) {
+            Ok(dt) => Some(dt.with_timezone(&chrono::Utc)),
+            Err(e) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse::new(
+                        "bad_request",
+                        format!("invalid as_of (expected RFC3339): {e}"),
+                    )),
+                ))
+            }
+        },
+    };
+    let depth = req.depth.clamp(1, 3);
+    let http = reqwest::Client::new();
+    let api_base = self_api_base();
+    let max = req.max_per_hop.unwrap_or(10_000);
+    match chronik_ontology::traverse(
+        &http,
+        &api_base,
+        "mem.fact",
+        &req.namespace,
+        &req.from,
+        &req.edge_type,
+        depth,
+        max,
+        as_of,
+    )
+    .await
+    {
+        Ok(edges) => Ok(Json(json!({
+            "from": req.from,
+            "namespace": req.namespace,
+            "edge_type": req.edge_type,
+            "depth": depth,
+            "edges": edges,
+        }))),
+        Err(e) => Err((
+            StatusCode::BAD_GATEWAY,
+            Json(ErrorResponse::new("traverse_failed", e.to_string())),
+        )),
+    }
+}
+
 /// `GET /ontology/v1/types?namespace=…` — the ObjectTypes registered for a
 /// namespace. (Instance listing — `query_objects` — is roadmap phase O-2.)
 pub async fn list_types(
