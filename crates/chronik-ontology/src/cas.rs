@@ -115,6 +115,13 @@ impl CasLog {
     pub fn len(&self, key: &str) -> usize {
         self.inner.lock().unwrap().streams.get(key).map(|v| v.len()).unwrap_or(0)
     }
+
+    /// Snapshot `key`'s current event stream — for projecting the aggregate's
+    /// state (the read an Action's validator does before proposing). Returns an
+    /// empty vec for an aggregate with no events yet.
+    pub fn snapshot(&self, key: &str) -> Vec<serde_json::Value> {
+        self.inner.lock().unwrap().streams.get(key).cloned().unwrap_or_default()
+    }
 }
 
 /// The Action lifecycle over CAS-append (roadmap §6): propose (no effect) →
