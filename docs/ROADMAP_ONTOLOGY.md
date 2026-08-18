@@ -1,6 +1,14 @@
 # Ontology Roadmap — the event-native Ontology for agents
 
-**Status**: DRAFT (2026-07-04) — successor to [ROADMAP_MEMORY_QUALITY.md](ROADMAP_MEMORY_QUALITY.md). Work begins **after** the memory-quality sprints reach the Phase 2 gate (LongMemEval `synth_judge_rate ≥ 0.70`).
+**Status**: IN PROGRESS on `feat/ontology-o0` (read side delivered 2026-08-18; the memory-quality gate was cleared by read-time extraction @ 0.88). Was DRAFT (2026-07-04) — successor to [ROADMAP_MEMORY_QUALITY.md](ROADMAP_MEMORY_QUALITY.md).
+
+> **Delivery status (2026-08-18, `feat/ontology-o0`, dogfooding the memory domain):**
+> - **O-0 Object Types — ✅ DONE + E2E-verified.** `crates/chronik-ontology` (ObjectType registry = 7th keyed-index consumer; `get_object` resolution with provenance; `as_of`) mounted at `/ontology/v1/*` (off by default, `CHRONIK_ONTOLOGY_ENABLED`).
+> - **O-1 Link Types — ✅ core DONE.** Multi-hop `/ontology/v1/traverse` (edges = entity-object facts; 1..=3 hops, provenance, bi-temporal `valid_from<=t<valid_to`). Deferred: materialized `ont.edges` index, LLM derivation rules.
+> - **O-2 agent surface — ~partial.** `query_objects` (list instances) done as REST; the **MCP server** wrapper + `explain` remain.
+> - **O-3 Actions / O-4 — not started.** O-3 (CAS-append) is the one hard primitive — spike standalone first (§6, §9 OPEN decisions).
+>
+> 27 crate unit tests + `tests/integration/ontology_o0_e2e.sh` (9/9 on a fresh broker). See memory `ontology-o0-shipped`.
 **Version at authoring**: chronik-server 2.7.1.
 **Goal**: Give AI agents (and apps, and humans) a single governed interface — typed **Object Types**, **Link Types** (relationships), and **Action Types** (validated writeback) — that resolves to Chronik's existing projections and immutable event log. Agents reason in domain nouns and verbs, never in topics, offsets, SQL, or vector endpoints.
 **Research basis**: codebase primitive map + Palantir Foundry Ontology architecture + Zep/Graphiti bi-temporal KG + agent-writeback-safety survey (2026-07-04). Sources inline and in **References**.
