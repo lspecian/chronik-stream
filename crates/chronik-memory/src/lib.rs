@@ -146,8 +146,8 @@ pub use ranking::{
     detect_intent, half_life, intent_boost, Channel, QueryIntent, RRF_K,
 };
 pub use recall::{
-    extract_subject_candidates, RecallBuilder, RecallResult, SqlFilter, SynthesizedAnswer,
-    ABSTAIN_LITERAL,
+    answer_from_statements, extract_subject_candidates, RecallBuilder, RecallResult, SqlFilter,
+    SynthesizedAnswer, ABSTAIN_LITERAL,
 };
 pub use schema::{
     Body, ConceptBody, EventBody, FactBody, InstructionBody, MemoryRecord, MemoryType, Source,

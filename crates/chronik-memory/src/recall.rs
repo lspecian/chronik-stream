@@ -1950,6 +1950,77 @@ Answer:"
     )
 }
 
+/// Answer `question` from a set of pre-assembled factual `statements` (e.g. an
+/// ontology object's `subject — predicate: object` triples), using the SAME
+/// answer rules and abstention protocol as [`RecallBuilder::synthesize_readtime`]
+/// — only the evidence *framing* differs (structured facts vs raw transcript
+/// turns), which is exactly the variable an ontology-vs-flat A/B isolates.
+///
+/// This decouples the reader from retrieval so a caller can supply its own
+/// assembled context (the ontology layer, an eval harness, an agent tool-call).
+/// Empty `statements` abstains without an LLM call, mirroring the no-evidence
+/// short-circuit of the other synthesis paths. `supporting` is empty — the
+/// evidence here is the caller's statements, not [`RecallResult`]s.
+pub async fn answer_from_statements(
+    question: &str,
+    statements: &[String],
+    generator: Arc<dyn TextGenerator>,
+) -> Result<SynthesizedAnswer> {
+    if statements.is_empty() {
+        return Ok(SynthesizedAnswer {
+            answer: ABSTAIN_LITERAL.to_string(),
+            abstained: true,
+            supporting: vec![],
+        });
+    }
+    let prompt = build_statements_prompt(question, statements);
+    let raw = generator.complete(&prompt).await?;
+    let trimmed = raw.trim();
+    let abstained = is_abstention(trimmed);
+    let answer = if abstained {
+        ABSTAIN_LITERAL.to_string()
+    } else {
+        trimmed.to_string()
+    };
+    Ok(SynthesizedAnswer {
+        answer,
+        abstained,
+        supporting: vec![],
+    })
+}
+
+/// Reader prompt for [`answer_from_statements`]. Deliberately mirrors
+/// [`build_readtime_prompt`]'s answer rules verbatim (recency-on-conflict,
+/// arithmetic, temporal reasoning, abstention-for-absent-subject) so an
+/// ontology-context vs raw-turn A/B differs ONLY in how the evidence is
+/// presented — never in what the reader is told to do with it.
+fn build_statements_prompt(question: &str, statements: &[String]) -> String {
+    let mut facts = String::new();
+    for (i, s) in statements.iter().enumerate() {
+        facts.push_str(&format!("[{}] {}\n", i + 1, s));
+    }
+    format!(
+        "You are a precise question-answering assistant. Below are structured facts \
+assembled from the user's memory about the entities named in the question. \
+Answer the question using ONLY these facts.\n\
+\n\
+Rules:\n\
+- Each line is one asserted fact of the form `subject — predicate: object`, optionally with a date. Trust its exact wording — names, numbers, quotes, orderings.\n\
+- **Facts are settled evidence.** If a fact names, describes, or quantifies something, commit to it; do not second-guess it.\n\
+- When two facts conflict (an updated preference, a changed value), prefer the one with the most recent date.\n\
+- **Arithmetic questions** (\"how many\", \"total\", \"sum\", \"average\", \"how much\"): compute the aggregate from the value-bearing facts. Return only the computed value.\n\
+- **Temporal questions** (\"how long ago\", \"how many days\", \"when did I last\"): reason from the fact dates and any time-anchored content. Output the duration / date naturally.\n\
+- Find the fact(s) that answer the question, then compose a concise answer from them — one sentence whenever possible. No preamble, just the answer.\n\
+- **Abstention is for absent subjects, not uncertainty.** Reply EXACTLY: {ABSTAIN_LITERAL} only when none of the facts mention the specific entity or attribute the question asks about. If a fact names it, COMMIT to the best-supported answer — do NOT abstain because the evidence is partial or requires combining facts.\n\
+\n\
+Facts (relevance order):\n\
+{facts}\n\
+Question: {question}\n\
+\n\
+Answer:"
+    )
+}
+
 /// Extract typed `(topic, partition, offset)` from a wrapped Chronik `_source`
 /// when the wrapped shape is in use. Returns `None` for the direct shape (no
 /// Kafka coordinates surfaced) — id-only channels then can't boost that row,

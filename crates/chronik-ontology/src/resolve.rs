@@ -370,6 +370,150 @@ pub async fn resolve_object(
     Ok(assemble_instance(&sources, namespace, ty, id))
 }
 
+/// A schema-less, open-domain view of an entity: EVERY predicate asserted about
+/// the subject, with its object value(s) and provenance. This is the
+/// "domain-agnostic Memory" case (roadmap O-0 tagline) — unlike
+/// [`assemble_instance`], which emits only the attributes a declared
+/// [`ObjectType`] names, this passes through *all* predicates, so an entity can
+/// be resolved with no pre-declared schema (needed for open-domain corpora like
+/// LongMemEval where predicates are not known ahead of time).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EntityView {
+    pub id: String,
+    pub namespace: String,
+    /// One entry per predicate; `name` is the predicate. Reuses [`ResolvedAttr`]
+    /// so provenance carries through identically.
+    pub triples: Vec<ResolvedAttr>,
+    /// How many backing records contributed (diagnostic).
+    pub backing_records: usize,
+}
+
+/// PURE open-domain assembly: gather every `(predicate -> objects)` asserted
+/// about `id` in the backing records, carrying provenance. Same identity +
+/// namespace-isolation + tombstone rules as [`assemble_instance`], but emits
+/// all predicates rather than mapping to declared attributes. `None` when
+/// nothing matches.
+pub fn assemble_entity(
+    sources: &[serde_json::Value],
+    namespace: &str,
+    id_field: &str,
+    id: &str,
+    normalize_id: bool,
+) -> Option<EntityView> {
+    let want_id = if normalize_id { normalize(id) } else { id.to_string() };
+    use std::collections::BTreeMap;
+    let mut by_pred: BTreeMap<String, (Vec<serde_json::Value>, Vec<SourceRef>)> = BTreeMap::new();
+    let mut contributing = 0usize;
+
+    for src in sources {
+        let Some(env) = envelope_from_source(src) else {
+            continue;
+        };
+        if env.get("tombstoned").and_then(|v| v.as_bool()).unwrap_or(false) {
+            continue;
+        }
+        if let Some(rec_ns) = env.get("namespace").and_then(|v| v.as_str()) {
+            if rec_ns != namespace {
+                continue;
+            }
+        }
+        let fbody = env.get("body").unwrap_or(&env);
+        let Some(subject) = fbody.get(id_field).and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let subj_key = if normalize_id {
+            normalize(subject)
+        } else {
+            subject.to_string()
+        };
+        if subj_key != want_id {
+            continue;
+        }
+        let predicate = fbody
+            .get("predicate")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if predicate.is_empty() {
+            continue;
+        }
+        let object = fbody.get("object").cloned().unwrap_or(serde_json::Value::Null);
+        let prov = env.get("source").map(|s| SourceRef {
+            topic: s.get("topic").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            offsets: s
+                .get("offsets")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|o| o.as_i64()).collect())
+                .unwrap_or_default(),
+        });
+        let entry = by_pred.entry(predicate).or_default();
+        entry.0.push(object);
+        if let Some(p) = prov {
+            entry.1.push(p);
+        }
+        contributing += 1;
+    }
+
+    if contributing == 0 {
+        return None;
+    }
+    let triples = by_pred
+        .into_iter()
+        .map(|(pred, (values, provenance))| ResolvedAttr {
+            name: pred,
+            values,
+            provenance,
+        })
+        .collect();
+    Some(EntityView {
+        id: id.to_string(),
+        namespace: namespace.to_string(),
+        triples,
+        backing_records: contributing,
+    })
+}
+
+/// Resolve one entity **open-domain** (all predicates) over the memory dogfood
+/// backing (`mem.fact.{tenant}`, `id_field = subject`, normalized identity) via
+/// `/_search`. Mirrors [`resolve_object`]'s tenant/topic derivation and
+/// point-in-time filter. Returns `Ok(None)` on a 404 backing topic or no match.
+pub async fn resolve_entity(
+    http: &reqwest::Client,
+    api_base: &str,
+    namespace: &str,
+    id: &str,
+    max_facts: usize,
+    as_of: Option<DateTime<Utc>>,
+) -> Result<Option<EntityView>, ResolveError> {
+    let tenant = namespace.split(':').next().unwrap_or(namespace);
+    let topic = format!("mem.fact.{}", tenant);
+    let req = serde_json::json!({
+        "index": topic,
+        "size": max_facts,
+        "query": {"match": {"_all": id}}
+    });
+    let url = format!("{}/_search", api_base.trim_end_matches('/'));
+    let resp = http
+        .post(&url)
+        .json(&req)
+        .send()
+        .await
+        .map_err(|e| ResolveError::Http(e.to_string()))?;
+    if !resp.status().is_success() {
+        if resp.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        return Err(ResolveError::Status(resp.status().as_u16()));
+    }
+    let parsed: SearchResponse = resp
+        .json()
+        .await
+        .map_err(|e| ResolveError::BadResponse(e.to_string()))?;
+    let sources: Vec<serde_json::Value> = parsed.hits.hits.into_iter().map(|h| h.source).collect();
+    let sources = filter_as_of(sources, as_of);
+    Ok(assemble_entity(&sources, namespace, "subject", id, true))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -565,5 +709,43 @@ mod tests {
         let inst = assemble_instance(&sources, "ns1", &ty, "Alice").unwrap();
         assert_eq!(inst.backing_records, 1);
         assert!(inst.attributes.is_empty());
+    }
+
+    #[test]
+    fn assemble_entity_passes_through_all_predicates_with_provenance() {
+        // Open-domain: EVERY predicate is emitted (no declared schema), each
+        // carrying its source cite — including predicates no ObjectType names.
+        let sources = vec![
+            fact("Alice", "has_degree", serde_json::json!("BA"), 12),
+            fact("Alice", "enjoys", serde_json::json!("hiking"), 20),
+            fact("Alice", "enjoys", serde_json::json!("chess"), 41),
+            fact("Alice", "works_at", serde_json::json!("Acme"), 50), // undeclared
+            fact("Bob", "has_degree", serde_json::json!("Physics"), 5), // other subject
+        ];
+        let ev = assemble_entity(&sources, "ns1", "subject", "alice", true).unwrap();
+        assert_eq!(ev.backing_records, 4); // 4 Alice facts, Bob excluded
+        let preds: Vec<&str> = ev.triples.iter().map(|t| t.name.as_str()).collect();
+        // BTreeMap order: sorted predicates, all present incl. undeclared works_at.
+        assert_eq!(preds, vec!["enjoys", "has_degree", "works_at"]);
+        let enjoys = ev.triples.iter().find(|t| t.name == "enjoys").unwrap();
+        assert_eq!(enjoys.values.len(), 2); // multi objects kept
+        // Every triple cites provenance (the ≥95% gate, open-domain).
+        assert!(ev.triples.iter().all(|t| !t.provenance.is_empty()));
+    }
+
+    #[test]
+    fn assemble_entity_unknown_id_is_none() {
+        let sources = vec![fact("Alice", "has_degree", serde_json::json!("BA"), 7)];
+        assert!(assemble_entity(&sources, "ns1", "subject", "Nobody", true).is_none());
+    }
+
+    #[test]
+    fn assemble_entity_respects_namespace_and_tombstones() {
+        // Cross-namespace and tombstoned facts must not leak into the view.
+        let mut other_ns = fact("Alice", "has_degree", serde_json::json!("BA"), 7);
+        other_ns["namespace"] = serde_json::json!("different-ns");
+        let mut tomb = fact("Alice", "enjoys", serde_json::json!("hiking"), 8);
+        tomb["tombstoned"] = serde_json::json!(true);
+        assert!(assemble_entity(&[other_ns, tomb], "ns1", "subject", "Alice", true).is_none());
     }
 }

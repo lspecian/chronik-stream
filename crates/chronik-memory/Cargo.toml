@@ -67,6 +67,9 @@ serde_json = { workspace = true }
 tempfile = "3.8"
 # Mock HTTP server for AnthropicExtractor unit tests (AMS-1.3)
 wiremock = "0.6"
+# Ontology-layer efficacy A/B in tests/eval_longmemeval.rs (LONGMEMEVAL_ONTOLOGY=1).
+# chronik-ontology does NOT depend on chronik-memory, so this is cycle-free.
+chronik-ontology = { path = "../chronik-ontology" }
 
 [features]
 default = []
