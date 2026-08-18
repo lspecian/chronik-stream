@@ -411,7 +411,7 @@ Scaffolding that already exists: `partition_leader_epoch` is in the RecordBatch 
 - [x] Epoch increments on leader change, persisted in metadata
 - [x] Epoch→start-offset history retained per partition
 
-**Status**: `CODE COMPLETE` — unit-tested, not yet exercised on a cluster.
+**Status**: `TESTED`. Cluster-exercised via RP-3.3, which is what proved it: staging real divergence surfaced a bug where replicated assignments were rebuilt without their epoch, so every follower's copy read epoch 0 forever and truncation could never fire. That is not reachable by unit tests — it needs two nodes disagreeing about an epoch. `tests/cluster/local_divergence.sh` covers the path on every run.
 
 **The epoch lives on `PartitionAssignment`**, so it is already durable (metadata WAL), already replicated, and already re-broadcast by the anti-entropy loop. `assign_partition` derives it rather than accepting it from callers: there are a dozen construction sites across the tree, and each would be a chance to skip the bump or reuse a value.
 
