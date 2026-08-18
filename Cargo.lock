@@ -1932,6 +1932,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "chronik-ontology"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "dashmap 5.5.3",
+ "futures",
+ "parking_lot",
+ "rdkafka",
+ "regex",
+ "reqwest 0.11.27",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-test",
+ "tracing",
+]
+
+[[package]]
 name = "chronik-operator"
 version = "2.12.2"
 dependencies = [
@@ -2119,6 +2138,7 @@ dependencies = [
  "chronik-embeddings",
  "chronik-memory",
  "chronik-monitoring",
+ "chronik-ontology",
  "chronik-protocol",
  "chronik-query",
  "chronik-raft",
