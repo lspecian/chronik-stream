@@ -88,6 +88,154 @@ fn parse_as_of(s: Option<&str>) -> Result<Option<chrono::DateTime<chrono::Utc>>,
     }
 }
 
+// ───────────────────────── MCP tools surface (O-2) ─────────────────────────
+//
+// A minimal Model Context Protocol server over a single JSON-RPC endpoint
+// (`POST /ontology/v1/mcp`): `initialize`, `tools/list`, `tools/call`. Agents
+// invoke the ontology in domain nouns/verbs — objects, links, as-of — without
+// touching storage primitives (roadmap O-2). The tools dispatch to the same
+// resolution logic as the REST endpoints.
+
+fn mcp_tools_spec() -> serde_json::Value {
+    json!([
+        {
+            "name": "get_object",
+            "description": "Resolve one ontology object instance with per-attribute provenance, optionally as-of a point in time.",
+            "inputSchema": {"type":"object","required":["namespace","type","id"],"properties":{
+                "namespace":{"type":"string"},"type":{"type":"string"},"id":{"type":"string"},
+                "as_of":{"type":"string","description":"RFC3339 point-in-time"}}}
+        },
+        {
+            "name": "query_objects",
+            "description": "List every instance of an ObjectType in a namespace, each resolved with provenance.",
+            "inputSchema": {"type":"object","required":["namespace","type"],"properties":{
+                "namespace":{"type":"string"},"type":{"type":"string"},"as_of":{"type":"string"}}}
+        },
+        {
+            "name": "traverse",
+            "description": "Follow (from)-[edge_type]->(to) links derived from the fact graph, 1..=3 hops. edge_type='*' follows all outgoing edges.",
+            "inputSchema": {"type":"object","required":["namespace","from"],"properties":{
+                "namespace":{"type":"string"},"from":{"type":"string"},
+                "edge_type":{"type":"string","default":"*"},"depth":{"type":"integer","default":1},
+                "as_of":{"type":"string"}}}
+        },
+        {
+            "name": "list_types",
+            "description": "List the ObjectTypes registered for a namespace's tenant.",
+            "inputSchema": {"type":"object","required":["namespace"],"properties":{"namespace":{"type":"string"}}}
+        }
+    ])
+}
+
+/// Run one MCP tool by name against `arguments`; returns the structured result
+/// value (the caller wraps it in MCP `content`).
+async fn mcp_run_tool(
+    state: &UnifiedApiState,
+    name: &str,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let registry = state
+        .ontology_types
+        .clone()
+        .ok_or_else(|| "ontology is not enabled (set CHRONIK_ONTOLOGY_ENABLED=true)".to_string())?;
+    let ns = args.get("namespace").and_then(|v| v.as_str()).ok_or("missing namespace")?;
+    let tenant = tenant_of(ns);
+    let as_of = match args.get("as_of").and_then(|v| v.as_str()) {
+        None => None,
+        Some(s) => Some(
+            chrono::DateTime::parse_from_rfc3339(s)
+                .map_err(|e| format!("invalid as_of: {e}"))?
+                .with_timezone(&chrono::Utc),
+        ),
+    };
+    let http = reqwest::Client::new();
+    let api = self_api_base();
+    match name {
+        "list_types" => Ok(json!({"types": registry.list_for_tenant(tenant)})),
+        "get_object" => {
+            let ty = registry
+                .get(tenant, args.get("type").and_then(|v| v.as_str()).ok_or("missing type")?)
+                .ok_or("no such ObjectType")?;
+            let id = args.get("id").and_then(|v| v.as_str()).ok_or("missing id")?;
+            chronik_ontology::resolve_object(&http, &api, ns, &ty, id, 10_000, as_of)
+                .await
+                .map_err(|e| e.to_string())?
+                .map(|inst| serde_json::to_value(inst).unwrap_or_else(|_| json!({})))
+                .ok_or_else(|| format!("no {} instance {id:?}", ty.type_name))
+        }
+        "query_objects" => {
+            let ty = registry
+                .get(tenant, args.get("type").and_then(|v| v.as_str()).ok_or("missing type")?)
+                .ok_or("no such ObjectType")?;
+            let objs = chronik_ontology::query_objects(&http, &api, ns, &ty, 10_000, as_of)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!({"count": objs.len(), "objects": objs}))
+        }
+        "traverse" => {
+            let from = args.get("from").and_then(|v| v.as_str()).ok_or("missing from")?;
+            let edge_type = args.get("edge_type").and_then(|v| v.as_str()).unwrap_or("*");
+            let depth = args.get("depth").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+            let edges = chronik_ontology::traverse(
+                &http, &api, "mem.fact", ns, from, edge_type, depth.clamp(1, 3), 10_000, as_of,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            Ok(json!({"edges": edges}))
+        }
+        other => Err(format!("unknown tool: {other}")),
+    }
+}
+
+/// `POST /ontology/v1/mcp` — JSON-RPC 2.0 MCP tools endpoint.
+pub async fn mcp(
+    State(state): State<UnifiedApiState>,
+    body: String,
+) -> Json<serde_json::Value> {
+    let req: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+    let id = req.get("id").cloned().unwrap_or(serde_json::Value::Null);
+    let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
+    let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
+
+    // Notifications (no id) get an empty ack.
+    if method.starts_with("notifications/") {
+        return Json(json!({}));
+    }
+    let rpc_ok = |result: serde_json::Value| json!({"jsonrpc":"2.0","id":id,"result":result});
+    let rpc_err =
+        |code: i64, msg: String| json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":msg}});
+
+    match method {
+        "initialize" => Json(rpc_ok(json!({
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "chronik-ontology", "version": env!("CARGO_PKG_VERSION")}
+        }))),
+        "tools/list" => Json(rpc_ok(json!({"tools": mcp_tools_spec()}))),
+        "tools/call" => {
+            let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+            match mcp_run_tool(&state, name, &args).await {
+                Ok(v) => {
+                    let text = serde_json::to_string(&v).unwrap_or_default();
+                    Json(rpc_ok(json!({
+                        "content": [{"type": "text", "text": text}],
+                        "structuredContent": v,
+                        "isError": false
+                    })))
+                }
+                // Tool errors are reported in-band per MCP (isError), not as RPC errors.
+                Err(e) => Json(rpc_ok(json!({
+                    "content": [{"type": "text", "text": e}],
+                    "isError": true
+                }))),
+            }
+        }
+        "" => Json(rpc_err(-32600, "invalid request".into())),
+        other => Json(rpc_err(-32601, format!("method not found: {other}"))),
+    }
+}
+
 // ───────────────────────── query_objects (O-2) ─────────────────────────
 
 #[derive(Debug, Deserialize)]

@@ -114,6 +114,17 @@ Q=$(curl -s -X POST "$API/ontology/v1/query_objects" -H 'content-type: applicati
 [ "$(echo "$Q" | jq -r '[.objects[]|select(.id=="Alice")]|length')" = "1" ] \
   && ok "query_objects lists Alice (count=$(echo "$Q"|jq -r '.count'))" || bad "query_objects wrong: $(echo "$Q"|jq -c '.objects|map(.id)')"
 
+# 10. O-2 MCP: tools/list + tools/call get_object (structured, in-band isError)
+[ "$(curl -s -X POST "$API/ontology/v1/mcp" -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' | jq -r '[.result.tools[].name]|sort|join(",")')" \
+  = "get_object,list_types,query_objects,traverse" ] \
+  && ok "MCP tools/list = 4 ontology tools" || bad "MCP tools/list wrong"
+MCP=$(curl -s -X POST "$API/ontology/v1/mcp" -H 'content-type: application/json' \
+  -d "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"get_object\",\"arguments\":{\"namespace\":\"$NS\",\"type\":\"Entity\",\"id\":\"Alice\"}}}")
+[ "$(echo "$MCP" | jq -r '.result.isError')" = "false" ] \
+  && [ "$(echo "$MCP" | jq -r '.result.structuredContent.attributes[]|select(.name=="degree")|.values[0]')" = "Business Administration" ] \
+  && ok "MCP tools/call get_object -> Alice (structured, isError=false)" || bad "MCP tools/call wrong: $(echo "$MCP"|jq -c '.result')"
+
 echo
 echo "== O-0 exit gate: $PASS passed, $FAIL failed =="
 [ "$FAIL" -eq 0 ]

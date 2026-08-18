@@ -596,7 +596,8 @@ pub fn create_router_full(
         .route("/ontology/v1/get_object", post(ontology::get_object))
         .route("/ontology/v1/query_objects", post(ontology::query_objects))
         .route("/ontology/v1/traverse", post(ontology::traverse))
-        .route("/ontology/v1/types", get(ontology::list_types));
+        .route("/ontology/v1/types", get(ontology::list_types))
+        .route("/ontology/v1/mcp", post(ontology::mcp));
     }
 
     // Add shared state for SQL/Vector/Query/Memory endpoints
