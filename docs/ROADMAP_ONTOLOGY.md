@@ -5,8 +5,9 @@
 > **Delivery status (2026-08-18, `feat/ontology-o0`, dogfooding the memory domain):**
 > - **O-0 Object Types — ✅ DONE + E2E-verified.** `crates/chronik-ontology` (ObjectType registry = 7th keyed-index consumer; `get_object` resolution with provenance; `as_of`) mounted at `/ontology/v1/*` (off by default, `CHRONIK_ONTOLOGY_ENABLED`).
 > - **O-1 Link Types — ✅ core DONE.** Multi-hop `/ontology/v1/traverse` (edges = entity-object facts; 1..=3 hops, provenance, bi-temporal `valid_from<=t<valid_to`). Deferred: materialized `ont.edges` index, LLM derivation rules.
-> - **O-2 agent surface — ~partial.** `query_objects` (list instances) done as REST; the **MCP server** wrapper + `explain` remain.
-> - **O-3 Actions / O-4 — not started.** O-3 (CAS-append) is the one hard primitive — spike standalone first (§6, §9 OPEN decisions).
+> - **O-2 agent surface — ✅ core done.** `query_objects` (list instances) + an **MCP tools server** (`POST /ontology/v1/mcp`: initialize/tools/list/tools/call over get_object/query_objects/traverse/list_types). Deferred: MCP *resources* (subscribable object URIs), `explain`.
+> - **O-3 Actions — spike stage.** CAS-append is the one hard primitive (a broker produce-path change: append-only-if-offset-N). Spike standalone first (§6, §9 OPEN decisions) before touching the core produce path.
+> - **O-4 — not started** (platformization, gated on customer commitment).
 >
 > 27 crate unit tests + `tests/integration/ontology_o0_e2e.sh` (9/9 on a fresh broker). See memory `ontology-o0-shipped`.
 **Version at authoring**: chronik-server 2.7.1.

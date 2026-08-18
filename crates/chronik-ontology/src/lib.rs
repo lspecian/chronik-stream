@@ -12,10 +12,13 @@
 //! of the "consumer-maintained keyed in-memory index rebuilt from a compacted
 //! Kafka topic" pattern (cf. `chronik-memory/src/mem_config_consumer.rs`).
 
+pub mod cas;
 pub mod object_type;
 pub mod ont_types_consumer;
 pub mod resolve;
 pub mod traverse;
+
+pub use cas::{ActionApply, AppendAck, ApplyOutcome, CasConflict, CasLog};
 
 pub use object_type::{AttrSpec, AttrType, BackingBinding, IdentitySpec, ObjectType};
 pub use resolve::{
