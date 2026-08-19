@@ -735,6 +735,33 @@ fn try_create_ont_types() -> Option<Arc<chronik_ontology::OntTypeIndex>> {
     Some(arc)
 }
 
+/// O-1: opt-in materialized edge index. Consumes `mem.fact.{tenant}` into a
+/// bidirectional in-memory graph backing `/ontology/v1/neighbors` (reverse +
+/// forward traversal). Off by default; shares `CHRONIK_ONTOLOGY_ENABLED`.
+#[cfg(feature = "memory")]
+fn try_create_edge_index() -> Option<Arc<chronik_ontology::RelationshipIndex>> {
+    let enabled = std::env::var("CHRONIK_ONTOLOGY_ENABLED")
+        .map(|v| v.to_lowercase() == "true" || v == "1")
+        .unwrap_or(false);
+    if !enabled {
+        return None;
+    }
+    let brokers =
+        std::env::var("CHRONIK_MEMORY_KAFKA").unwrap_or_else(|_| "localhost:9092".to_string());
+    let group_id = std::env::var("CHRONIK_ONTOLOGY_EDGE_GROUP_ID")
+        .unwrap_or_else(|_| "chronik-ontology-edge-consumer".to_string());
+    let config =
+        chronik_ontology::EdgeConsumerConfig::new(brokers.clone()).with_group_id(group_id);
+    let index = chronik_ontology::RelationshipIndex::new();
+    let arc = Arc::new(index.clone());
+    info!(
+        brokers = %brokers,
+        "O-1: spawning ontology edge index consumer (mem.fact.*)"
+    );
+    let _handle = chronik_ontology::spawn_edge_consumer(config, index);
+    Some(arc)
+}
+
 /// AM-3.4: Build the in-memory provenance-graph index backing
 /// `GET /memory/v1/{id}/lineage`. Enabled by
 /// `CHRONIK_MEMORY_LINEAGE_ENABLED=true`. The index hydrates
@@ -1006,6 +1033,10 @@ fn wire_agent_memory(mut state: unified_api::UnifiedApiState) -> unified_api::Un
     if let Some(ont_types) = try_create_ont_types() {
         state = state.with_ontology_types(ont_types);
         info!("✓ Ontology ObjectType registry wired (/ontology/v1/*)");
+    }
+    if let Some(edge_index) = try_create_edge_index() {
+        state = state.with_edge_index(edge_index);
+        info!("✓ Ontology edge index wired (/ontology/v1/neighbors)");
     }
     state
 }

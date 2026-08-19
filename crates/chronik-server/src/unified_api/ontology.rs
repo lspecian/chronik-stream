@@ -42,6 +42,78 @@ fn require_ontology(
     })
 }
 
+fn require_edge_index(
+    state: &UnifiedApiState,
+) -> Result<Arc<chronik_ontology::RelationshipIndex>, ApiError> {
+    state.edge_index.clone().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse::new(
+                "service_unavailable",
+                "edge index is not enabled on this server (set CHRONIK_ONTOLOGY_ENABLED=true)",
+            )),
+        )
+    })
+}
+
+// ───────────────────────── neighbors (O-1 edge index) ─────────────────────────
+//
+// Forward AND reverse one-hop lookup over the materialized `RelationshipIndex`.
+// `direction=incoming` answers "what points AT this node" — the reverse lookup
+// the on-demand `/traverse` (BM25 on subject) structurally can't do cheaply.
+
+#[derive(Debug, Deserialize)]
+pub struct NeighborsRequest {
+    /// Namespace the edges belong to (the record's `namespace` field).
+    pub namespace: String,
+    /// The node to look up.
+    pub node: String,
+    /// `outgoing` (default: edges FROM node) or `incoming` (edges TO node).
+    #[serde(default)]
+    pub direction: Option<String>,
+    /// Optional edge-type filter (e.g. `blocked_by`); omit for all edge types.
+    #[serde(default)]
+    pub edge_type: Option<String>,
+    /// Optional RFC3339 point-in-time (bi-temporal edge validity).
+    #[serde(default)]
+    pub as_of: Option<String>,
+}
+
+pub async fn neighbors(
+    State(state): State<UnifiedApiState>,
+    Json(req): Json<NeighborsRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let index = require_edge_index(&state)?;
+    let as_of = parse_as_of(req.as_of.as_deref())?;
+    let edge_type = req.edge_type.as_deref();
+    let dir = req.direction.as_deref().unwrap_or("outgoing");
+    let edges = match dir {
+        "outgoing" | "out" | "forward" => {
+            index.outgoing(&req.namespace, &req.node, edge_type, as_of)
+        }
+        "incoming" | "in" | "reverse" => {
+            index.incoming(&req.namespace, &req.node, edge_type, as_of)
+        }
+        other => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new(
+                    "bad_request",
+                    format!("direction must be 'outgoing' or 'incoming' (got {other:?})"),
+                )),
+            ))
+        }
+    };
+    Ok(Json(json!({
+        "namespace": req.namespace,
+        "node": req.node,
+        "direction": dir,
+        "edge_type": req.edge_type,
+        "count": edges.len(),
+        "edges": edges,
+    })))
+}
+
 // ───────────────────────── get_object ─────────────────────────
 
 #[derive(Debug, Deserialize)]
