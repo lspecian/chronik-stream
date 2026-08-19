@@ -616,6 +616,7 @@ pub fn create_router_full(
         .route("/ontology/v1/query_objects", post(ontology::query_objects))
         .route("/ontology/v1/traverse", post(ontology::traverse))
         .route("/ontology/v1/neighbors", post(ontology::neighbors))
+        .route("/ontology/v1/explain", post(ontology::explain))
         .route("/ontology/v1/types", get(ontology::list_types))
         .route("/ontology/v1/mcp", post(ontology::mcp));
     }

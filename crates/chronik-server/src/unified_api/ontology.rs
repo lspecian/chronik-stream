@@ -206,6 +206,22 @@ fn mcp_tools_spec() -> serde_json::Value {
                 "as_of":{"type":"string"}}}
         },
         {
+            "name": "neighbors",
+            "description": "One- or multi-hop links over the materialized edge index, in either direction. direction='incoming' answers 'what points AT node' — the reverse walk /traverse can't do. depth>1 walks the graph.",
+            "inputSchema": {"type":"object","required":["namespace","node"],"properties":{
+                "namespace":{"type":"string"},"node":{"type":"string"},
+                "direction":{"type":"string","enum":["outgoing","incoming"],"default":"outgoing"},
+                "edge_type":{"type":"string"},"depth":{"type":"integer","default":1},
+                "as_of":{"type":"string"}}}
+        },
+        {
+            "name": "explain",
+            "description": "Explain WHY an object holds its values: each attribute with the source event(s) that justify it, a provenance_complete flag, and the object's incoming/outgoing edges.",
+            "inputSchema": {"type":"object","required":["namespace","type","id"],"properties":{
+                "namespace":{"type":"string"},"type":{"type":"string"},"id":{"type":"string"},
+                "as_of":{"type":"string"}}}
+        },
+        {
             "name": "list_types",
             "description": "List the ObjectTypes registered for a namespace's tenant.",
             "inputSchema": {"type":"object","required":["namespace"],"properties":{"namespace":{"type":"string"}}}
@@ -268,6 +284,55 @@ async fn mcp_run_tool(
             .await
             .map_err(|e| e.to_string())?;
             Ok(json!({"edges": edges}))
+        }
+        "explain" => {
+            let ty = registry
+                .get(tenant, args.get("type").and_then(|v| v.as_str()).ok_or("missing type")?)
+                .ok_or("no such ObjectType")?;
+            let id = args.get("id").and_then(|v| v.as_str()).ok_or("missing id")?;
+            let inst = chronik_ontology::resolve_object(&http, &api, ns, &ty, id, 10_000, as_of)
+                .await
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("no {} instance {id:?}", ty.type_name))?;
+            let provenance_complete = !inst.attributes.is_empty()
+                && inst
+                    .attributes
+                    .iter()
+                    .all(|a| a.provenance.iter().any(|p| !p.offsets.is_empty()));
+            let edges = state.edge_index.as_ref().map(|idx| {
+                json!({
+                    "outgoing": idx.outgoing(ns, id, None, as_of),
+                    "incoming": idx.incoming(ns, id, None, as_of),
+                })
+            });
+            Ok(json!({
+                "object": serde_json::to_value(&inst).unwrap_or_else(|_| json!({})),
+                "provenance_complete": provenance_complete,
+                "edges": edges,
+            }))
+        }
+        "neighbors" => {
+            let idx = state.edge_index.as_ref().ok_or("edge index not enabled")?;
+            let node = args.get("node").and_then(|v| v.as_str()).ok_or("missing node")?;
+            let edge_type = args.get("edge_type").and_then(|v| v.as_str());
+            let dir = args.get("direction").and_then(|v| v.as_str()).unwrap_or("outgoing");
+            let direction = match dir {
+                "incoming" | "in" | "reverse" => chronik_ontology::Direction::Incoming,
+                _ => chronik_ontology::Direction::Outgoing,
+            };
+            let depth = args.get("depth").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+            let walked = idx.walk(ns, node, edge_type, direction, depth.clamp(1, 5), as_of);
+            let edges: Vec<serde_json::Value> = walked
+                .into_iter()
+                .map(|(d, e)| {
+                    let mut v = serde_json::to_value(&e).unwrap_or_else(|_| json!({}));
+                    if let Some(o) = v.as_object_mut() {
+                        o.insert("depth".to_string(), json!(d));
+                    }
+                    v
+                })
+                .collect();
+            Ok(json!({"direction": dir, "count": edges.len(), "edges": edges}))
         }
         other => Err(format!("unknown tool: {other}")),
     }
@@ -434,6 +499,96 @@ pub async fn get_object(
             Json(ErrorResponse::new("resolve_failed", e.to_string())),
         )),
     }
+}
+
+// ───────────────────────── explain (O-2 provenance/lineage) ─────────────────
+//
+// Resolve an object and surface WHY each attribute holds — the source event(s)
+// (topic + offsets) that justify it — plus the object's incoming/outgoing edges
+// when the edge index is present. This is the auditability tool: an agent (or a
+// human) can see the derivation of every value, and `provenance_complete` is the
+// ≥95% cite gate in one boolean.
+
+pub async fn explain(
+    State(state): State<UnifiedApiState>,
+    Json(req): Json<GetObjectRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let registry = require_ontology(&state)?;
+    let tenant = tenant_of(&req.namespace);
+    let Some(ty) = registry.get(tenant, &req.type_name) else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse::new(
+                "not_found",
+                format!("no ObjectType {:?} registered for tenant {:?}", req.type_name, tenant),
+            )),
+        ));
+    };
+    let as_of = parse_as_of(req.as_of.as_deref())?;
+    let http = reqwest::Client::new();
+    let api_base = self_api_base();
+    let max = req.max_facts.unwrap_or(10_000);
+
+    let inst = match chronik_ontology::resolve_object(
+        &http, &api_base, &req.namespace, &ty, &req.id, max, as_of,
+    )
+    .await
+    {
+        Ok(Some(inst)) => inst,
+        Ok(None) => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse::new(
+                    "not_found",
+                    format!("no {} instance with id {:?}", req.type_name, req.id),
+                )),
+            ))
+        }
+        Err(e) => {
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorResponse::new("resolve_failed", e.to_string())),
+            ))
+        }
+    };
+
+    // Provenance-first attribute view + the cite-completeness gate.
+    let attributes: Vec<serde_json::Value> = inst
+        .attributes
+        .iter()
+        .map(|a| {
+            let cited = a.provenance.iter().any(|p| !p.offsets.is_empty());
+            json!({
+                "name": a.name,
+                "values": a.values,
+                "sources": a.provenance,
+                "cited": cited,
+            })
+        })
+        .collect();
+    let provenance_complete = !inst.attributes.is_empty()
+        && inst
+            .attributes
+            .iter()
+            .all(|a| a.provenance.iter().any(|p| !p.offsets.is_empty()));
+
+    // Lineage: incoming/outgoing edges from the materialized index, if wired.
+    let edges = state.edge_index.as_ref().map(|idx| {
+        json!({
+            "outgoing": idx.outgoing(&req.namespace, &req.id, None, as_of),
+            "incoming": idx.incoming(&req.namespace, &req.id, None, as_of),
+        })
+    });
+
+    Ok(Json(json!({
+        "namespace": inst.namespace,
+        "type": inst.type_name,
+        "id": inst.id,
+        "backing_records": inst.backing_records,
+        "attributes": attributes,
+        "provenance_complete": provenance_complete,
+        "edges": edges,
+    })))
 }
 
 // ───────────────────────── list types ─────────────────────────
