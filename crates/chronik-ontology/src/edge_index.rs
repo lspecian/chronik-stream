@@ -70,6 +70,15 @@ impl IndexedEdge {
     }
 }
 
+/// Traversal direction for [`RelationshipIndex::walk`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    /// Follow edges FROM the node (subject → object).
+    Outgoing,
+    /// Follow edges TO the node (object ← subject) — the reverse walk.
+    Incoming,
+}
+
 /// Bidirectional edge index. Cloning yields another handle to the SAME maps (one
 /// for the consumer task, one for the API/traversal caller).
 #[derive(Debug, Default, Clone)]
@@ -140,6 +149,51 @@ impl RelationshipIndex {
             .filter(|e| e.valid_at(as_of))
             .cloned()
             .collect()
+    }
+
+    /// Multi-hop breadth-first walk over the materialized index, in either
+    /// direction, cycle-safe, returning every edge discovered tagged with its
+    /// hop depth (1 = direct). This is O(edges) per hop with no `/_search` —
+    /// and, uniquely, works in the **incoming** direction, so an agent can walk
+    /// "what transitively points at X" which the on-demand traversal cannot.
+    pub fn walk(
+        &self,
+        namespace: &str,
+        start: &str,
+        edge_type: Option<&str>,
+        direction: Direction,
+        max_depth: usize,
+        as_of: Option<DateTime<Utc>>,
+    ) -> Vec<(usize, IndexedEdge)> {
+        let mut out = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(start.to_lowercase());
+        let mut frontier = vec![start.to_string()];
+        for depth in 1..=max_depth.max(1) {
+            let mut next = Vec::new();
+            for node in &frontier {
+                let edges = match direction {
+                    Direction::Outgoing => self.outgoing(namespace, node, edge_type, as_of),
+                    Direction::Incoming => self.incoming(namespace, node, edge_type, as_of),
+                };
+                for e in edges {
+                    // The endpoint to expand from next hop: the "other" side.
+                    let nbr = match direction {
+                        Direction::Outgoing => e.to.clone(),
+                        Direction::Incoming => e.from.clone(),
+                    };
+                    if visited.insert(nbr.to_lowercase()) {
+                        next.push(nbr);
+                    }
+                    out.push((depth, e));
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            frontier = next;
+        }
+        out
     }
 
     fn upsert(&self, edge: IndexedEdge) {
@@ -588,6 +642,53 @@ mod tests {
         assert_eq!(idx.edge_count(), 1); // updated in place
         // now invalidated after 2026-05-01
         assert!(idx.outgoing("ns1", "T2", None, Some(ts("2026-06-01T00:00:00Z"))).is_empty());
+    }
+
+    #[test]
+    fn walk_multi_hop_both_directions() {
+        let idx = RelationshipIndex::new();
+        let up = |s, p, o| apply_edge_event(&idx, parse_edge_from_fact("mem.fact.ns1", Some(&fact_bytes("ns1", s, p, serde_json::json!(o), None, None, false, 0))).unwrap().unwrap());
+        // chain: T3 -blocked_by-> T2 -blocked_by-> T1
+        up("T3", "blocked_by", "T2");
+        up("T2", "blocked_by", "T1");
+
+        // outgoing 2-hop from T3 reaches T2 (depth 1) and T1 (depth 2)
+        let fwd = idx.walk("ns1", "T3", Some("blocked_by"), Direction::Outgoing, 2, None);
+        let mut reached: Vec<(usize, String)> = fwd.iter().map(|(d, e)| (*d, e.to.clone())).collect();
+        reached.sort();
+        assert_eq!(reached, vec![(1, "T2".to_string()), (2, "T1".to_string())]);
+
+        // incoming 2-hop from T1 reaches T2 (depth 1) and T3 (depth 2) — the
+        // reverse walk on-demand traversal cannot do
+        let rev = idx.walk("ns1", "T1", Some("blocked_by"), Direction::Incoming, 2, None);
+        let mut back: Vec<(usize, String)> = rev.iter().map(|(d, e)| (*d, e.from.clone())).collect();
+        back.sort();
+        assert_eq!(back, vec![(1, "T2".to_string()), (2, "T3".to_string())]);
+
+        // depth 1 stops at the first hop
+        assert_eq!(idx.walk("ns1", "T3", Some("blocked_by"), Direction::Outgoing, 1, None).len(), 1);
+    }
+
+    #[test]
+    fn walk_is_cycle_safe() {
+        let idx = RelationshipIndex::new();
+        let up = |s, p, o| apply_edge_event(&idx, parse_edge_from_fact("mem.fact.ns1", Some(&fact_bytes("ns1", s, p, serde_json::json!(o), None, None, false, 0))).unwrap().unwrap());
+        // A -> B -> A cycle
+        up("A", "rel", "B");
+        up("B", "rel", "A");
+        // must terminate and not revisit
+        let w = idx.walk("ns1", "A", Some("rel"), Direction::Outgoing, 10, None);
+        assert_eq!(w.len(), 2); // A->B (d1), B->A (d2); A already visited, stop
+    }
+
+    #[test]
+    fn walk_respects_as_of() {
+        let idx = RelationshipIndex::new();
+        apply_edge_event(&idx, parse_edge_from_fact("mem.fact.ns1", Some(&fact_bytes("ns1", "T2", "blocked_by", serde_json::json!("T1"), Some("2026-01-01T00:00:00Z"), Some("2026-06-01T00:00:00Z"), false, 0))).unwrap().unwrap());
+        // during validity
+        assert_eq!(idx.walk("ns1", "T2", None, Direction::Outgoing, 3, Some(ts("2026-03-01T00:00:00Z"))).len(), 1);
+        // after invalidation
+        assert!(idx.walk("ns1", "T2", None, Direction::Outgoing, 3, Some(ts("2026-09-01T00:00:00Z"))).is_empty());
     }
 
     #[test]

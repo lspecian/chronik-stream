@@ -74,6 +74,10 @@ pub struct NeighborsRequest {
     /// Optional edge-type filter (e.g. `blocked_by`); omit for all edge types.
     #[serde(default)]
     pub edge_type: Option<String>,
+    /// Number of hops to walk (default 1). >1 does a cycle-safe BFS over the
+    /// materialized index in `direction`; each returned edge carries its depth.
+    #[serde(default)]
+    pub depth: Option<usize>,
     /// Optional RFC3339 point-in-time (bi-temporal edge validity).
     #[serde(default)]
     pub as_of: Option<String>,
@@ -87,13 +91,9 @@ pub async fn neighbors(
     let as_of = parse_as_of(req.as_of.as_deref())?;
     let edge_type = req.edge_type.as_deref();
     let dir = req.direction.as_deref().unwrap_or("outgoing");
-    let edges = match dir {
-        "outgoing" | "out" | "forward" => {
-            index.outgoing(&req.namespace, &req.node, edge_type, as_of)
-        }
-        "incoming" | "in" | "reverse" => {
-            index.incoming(&req.namespace, &req.node, edge_type, as_of)
-        }
+    let direction = match dir {
+        "outgoing" | "out" | "forward" => chronik_ontology::Direction::Outgoing,
+        "incoming" | "in" | "reverse" => chronik_ontology::Direction::Incoming,
         other => {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -104,11 +104,25 @@ pub async fn neighbors(
             ))
         }
     };
+    let depth = req.depth.unwrap_or(1).clamp(1, 5);
+    // Multi-hop BFS (depth-tagged); depth=1 is a single hop.
+    let walked = index.walk(&req.namespace, &req.node, edge_type, direction, depth, as_of);
+    let edges: Vec<serde_json::Value> = walked
+        .into_iter()
+        .map(|(hop, e)| {
+            let mut v = serde_json::to_value(&e).unwrap_or(json!({}));
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("depth".to_string(), json!(hop));
+            }
+            v
+        })
+        .collect();
     Ok(Json(json!({
         "namespace": req.namespace,
         "node": req.node,
         "direction": dir,
         "edge_type": req.edge_type,
+        "depth": depth,
         "count": edges.len(),
         "edges": edges,
     })))

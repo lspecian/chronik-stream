@@ -28,8 +28,8 @@ pub use action::{
 pub use cas::{ActionApply, AppendAck, ApplyOutcome, CasConflict, CasLog};
 
 pub use edge_index::{
-    apply_edge_event, parse_edge_from_fact, run_edge_consumer, spawn_edge_consumer, EdgeApply,
-    EdgeConsumerConfig, EdgeEvent, EdgeStats, IndexedEdge, ParseError as EdgeParseError,
+    apply_edge_event, parse_edge_from_fact, run_edge_consumer, spawn_edge_consumer, Direction,
+    EdgeApply, EdgeConsumerConfig, EdgeEvent, EdgeStats, IndexedEdge, ParseError as EdgeParseError,
     RelationshipIndex, MEM_FACT_TOPICS_REGEX,
 };
 
