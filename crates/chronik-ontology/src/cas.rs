@@ -24,7 +24,7 @@
 //! - **Idempotency:** a retry carrying the same `idempotency_key` returns the
 //!   original ack and appends nothing (safe under producer-timeout ambiguity).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 /// The aggregate key — the unit of compare-and-swap.

@@ -13,12 +13,19 @@
 //! Kafka topic" pattern (cf. `chronik-memory/src/mem_config_consumer.rs`).
 
 pub mod cas;
+pub mod edge_index;
 pub mod object_type;
 pub mod ont_types_consumer;
 pub mod resolve;
 pub mod traverse;
 
 pub use cas::{ActionApply, AppendAck, ApplyOutcome, CasConflict, CasLog};
+
+pub use edge_index::{
+    apply_edge_event, parse_edge_from_fact, run_edge_consumer, spawn_edge_consumer, EdgeApply,
+    EdgeConsumerConfig, EdgeEvent, EdgeStats, IndexedEdge, ParseError as EdgeParseError,
+    RelationshipIndex, MEM_FACT_TOPICS_REGEX,
+};
 
 pub use object_type::{AttrSpec, AttrType, BackingBinding, IdentitySpec, ObjectType};
 pub use resolve::{
