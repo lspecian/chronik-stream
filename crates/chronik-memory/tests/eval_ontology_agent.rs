@@ -303,7 +303,7 @@ fn tool_docs(surface: Surface) -> &'static str {
              list_types{} -> the object types available."
         }
         Surface::Baseline => {
-            "search{query} -> full-text search over the raw fact records; returns up to 10 matching facts as text. Chain searches to follow relationships yourself."
+            "search{query} -> full-text search over the raw fact records; returns up to 10 matching facts as text. Use PLAIN keyword queries like `C0_5 blocked_by` or `EP0 parent_of` — do NOT use field:value or other special syntax (it returns nothing). Chain searches to follow relationships yourself (search a ticket, read its blocked_by fact, then search that ticket, etc.)."
         }
     }
 }
