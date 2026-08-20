@@ -135,6 +135,9 @@ fn tenant_from_topic(topic: &str) -> Result<&str, ParseError> {
 /// The Kafka key is the `type_name`. A null value (`None`) OR an empty value
 /// (`Some(b"")`) is a tombstone — rdkafka returns `None` for a true Kafka null
 /// and `Some(&[])` for an empty-payload delete, so both must be handled.
+// The `Some(v) if v.is_empty()` guard reads clearer than a `Some(b"")` pattern
+// here, and mirrors the doc above; keep it.
+#[allow(clippy::redundant_guards)]
 pub fn parse_ont_type_record(
     topic: &str,
     key_bytes: &[u8],

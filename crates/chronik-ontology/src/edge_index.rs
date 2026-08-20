@@ -506,6 +506,7 @@ mod tests {
     }
 
     /// Build a mem.fact record value (direct envelope shape).
+    #[allow(clippy::too_many_arguments)] // a test fixture builder — clarity over arity
     fn fact_bytes(
         ns: &str,
         subject: &str,
