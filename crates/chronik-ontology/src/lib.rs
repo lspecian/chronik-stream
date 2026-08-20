@@ -15,10 +15,17 @@
 pub mod action;
 pub mod cas;
 pub mod edge_index;
+pub mod link_type;
 pub mod object_type;
 pub mod ont_types_consumer;
 pub mod resolve;
 pub mod traverse;
+
+pub use link_type::{
+    apply_event as apply_link_event, parse_ont_link_record, run_consumer as run_links_consumer,
+    spawn_ont_links_consumer, LinkType, LinkTypeIndex, OntLinkEvent, OntLinksConsumerConfig,
+    OntLinkStats, RelationTarget, ONT_LINKS_TOPICS_REGEX,
+};
 
 pub use action::{
     ActionEngine, ActionOutcome, ActionType, AuditRecord, CommandHandler, Proposal, RiskTier,

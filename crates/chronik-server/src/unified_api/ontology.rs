@@ -215,6 +215,18 @@ fn mcp_tools_spec() -> serde_json::Value {
                 "as_of":{"type":"string"}}}
         },
         {
+            "name": "relations",
+            "description": "List the named relations available (each with its inverse), so you can pick a relation by name instead of guessing a direction.",
+            "inputSchema": {"type":"object","required":["namespace"],"properties":{"namespace":{"type":"string"}}}
+        },
+        {
+            "name": "related",
+            "description": "Traverse a NAMED relation from a node (1..=5 hops), returning the neighbor nodes. Use a relation name from `relations` — e.g. `blocked_by` for a ticket's blockers, its inverse `blocks` for what a ticket blocks. No direction flag needed.",
+            "inputSchema": {"type":"object","required":["namespace","node","relation"],"properties":{
+                "namespace":{"type":"string"},"node":{"type":"string"},"relation":{"type":"string"},
+                "depth":{"type":"integer","default":1},"as_of":{"type":"string"}}}
+        },
+        {
             "name": "explain",
             "description": "Explain WHY an object holds its values: each attribute with the source event(s) that justify it, a provenance_complete flag, and the object's incoming/outgoing edges.",
             "inputSchema": {"type":"object","required":["namespace","type","id"],"properties":{
@@ -333,6 +345,29 @@ async fn mcp_run_tool(
                 })
                 .collect();
             Ok(json!({"direction": dir, "count": edges.len(), "edges": edges}))
+        }
+        "related" => {
+            let links = state.link_types.as_ref().ok_or("LinkType registry not enabled")?;
+            let index = state.edge_index.as_ref().ok_or("edge index not enabled")?;
+            let node = args.get("node").and_then(|v| v.as_str()).ok_or("missing node")?;
+            let relation = args.get("relation").and_then(|v| v.as_str()).ok_or("missing relation")?;
+            let depth = args.get("depth").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+            let (predicate, direction) = match links.resolve(tenant, relation) {
+                Some(t) => (t.predicate, t.direction),
+                None => (relation.to_string(), chronik_ontology::Direction::Outgoing),
+            };
+            let outgoing = matches!(direction, chronik_ontology::Direction::Outgoing);
+            let walked = index.walk(ns, node, Some(&predicate), direction, depth.clamp(1, 5), as_of);
+            let neighbors: Vec<String> =
+                walked.iter().map(|(_, e)| if outgoing { e.to.clone() } else { e.from.clone() }).collect();
+            Ok(json!({
+                "relation": relation, "count": neighbors.len(), "neighbors": neighbors,
+                "edges": walked.into_iter().map(|(d, e)| json!({"depth": d, "from": e.from, "edge_type": e.edge_type, "to": e.to})).collect::<Vec<_>>()
+            }))
+        }
+        "relations" => {
+            let links = state.link_types.as_ref().ok_or("LinkType registry not enabled")?;
+            Ok(json!({"relations": links.list_for_tenant(tenant)}))
         }
         other => Err(format!("unknown tool: {other}")),
     }
@@ -499,6 +534,102 @@ pub async fn get_object(
             Json(ErrorResponse::new("resolve_failed", e.to_string())),
         )),
     }
+}
+
+// ───────────────────────── related (O-1 named relations) ─────────────────────
+//
+// The inverse-aware relation traversal that removes the incoming/outgoing flag:
+// the agent names a relation (a LinkType name OR its inverse), and the registry
+// maps it to the right predicate + walk direction over the edge index. "what
+// blocks T3" -> relation `blocked_by`; "what T1 blocks" -> relation `blocks`
+// (the declared inverse). No direction reasoning required of the agent.
+
+fn require_link_types(
+    state: &UnifiedApiState,
+) -> Result<Arc<chronik_ontology::LinkTypeIndex>, ApiError> {
+    state.link_types.clone().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse::new(
+                "service_unavailable",
+                "LinkType registry is not enabled (set CHRONIK_ONTOLOGY_ENABLED=true)",
+            )),
+        )
+    })
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RelatedRequest {
+    pub namespace: String,
+    pub node: String,
+    /// A declared LinkType name or its inverse (e.g. `blocked_by` / `blocks`).
+    pub relation: String,
+    #[serde(default)]
+    pub depth: Option<usize>,
+    #[serde(default)]
+    pub as_of: Option<String>,
+}
+
+pub async fn related(
+    State(state): State<UnifiedApiState>,
+    Json(req): Json<RelatedRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let links = require_link_types(&state)?;
+    let index = require_edge_index(&state)?;
+    let as_of = parse_as_of(req.as_of.as_deref())?;
+    let tenant = tenant_of(&req.namespace);
+    let depth = req.depth.unwrap_or(1).clamp(1, 5);
+
+    // Resolve the relation name; fall back to a raw outgoing predicate if the
+    // name isn't a registered LinkType (keeps the tool usable pre-registration).
+    let target = links.resolve(tenant, &req.relation);
+    let (predicate, direction) = match &target {
+        Some(t) => (t.predicate.clone(), t.direction),
+        None => (req.relation.clone(), chronik_ontology::Direction::Outgoing),
+    };
+    let outgoing = matches!(direction, chronik_ontology::Direction::Outgoing);
+    let walked = index.walk(&req.namespace, &req.node, Some(&predicate), direction, depth, as_of);
+    let edges: Vec<serde_json::Value> = walked
+        .into_iter()
+        .map(|(hop, e)| {
+            // The neighbor is the "other" endpoint given the walk direction.
+            let neighbor = if outgoing { e.to.clone() } else { e.from.clone() };
+            json!({
+                "depth": hop, "neighbor": neighbor,
+                "from": e.from, "edge_type": e.edge_type, "to": e.to,
+                "valid_from": e.valid_from, "valid_to": e.valid_to, "provenance": e.provenance,
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "namespace": req.namespace,
+        "node": req.node,
+        "relation": req.relation,
+        "resolved": target.map(|t| json!({
+            "predicate": t.predicate,
+            "direction": if matches!(t.direction, chronik_ontology::Direction::Outgoing) { "outgoing" } else { "incoming" },
+        })),
+        "depth": depth,
+        "count": edges.len(),
+        "edges": edges,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RelationsQuery {
+    pub namespace: String,
+}
+
+pub async fn relations(
+    State(state): State<UnifiedApiState>,
+    Query(q): Query<RelationsQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let links = require_link_types(&state)?;
+    let tenant = tenant_of(&q.namespace);
+    Ok(Json(json!({
+        "namespace": q.namespace,
+        "relations": links.list_for_tenant(tenant),
+    })))
 }
 
 // ───────────────────────── explain (O-2 provenance/lineage) ─────────────────

@@ -217,6 +217,11 @@ pub struct UnifiedApiState {
     /// when `None` that endpoint replies 503.
     #[cfg(feature = "memory")]
     pub edge_index: Option<Arc<chronik_ontology::RelationshipIndex>>,
+    /// O-1: the LinkType registry (`ont.links.{tenant}` consumer). Backs
+    /// `/ontology/v1/related` — named, inverse-aware relation traversal so agents
+    /// pick a relation by name instead of a direction flag. `None` -> 503.
+    #[cfg(feature = "memory")]
+    pub link_types: Option<Arc<chronik_ontology::LinkTypeIndex>>,
     /// AM-2.5: Per-tenant token-bucket rate limiter. When present AND
     /// [`Self::memory_tenants`] is populated, every write / recall consumes
     /// tokens from the caller's `TenantQuotas.{ingest_msgs_per_sec,
@@ -289,6 +294,8 @@ impl UnifiedApiState {
             ontology_types: None,
             #[cfg(feature = "memory")]
             edge_index: None,
+            #[cfg(feature = "memory")]
+            link_types: None,
             #[cfg(feature = "memory")]
             memory_tenant_metrics: None,
             #[cfg(feature = "memory")]
@@ -386,6 +393,16 @@ impl UnifiedApiState {
         index: Arc<chronik_ontology::RelationshipIndex>,
     ) -> Self {
         self.edge_index = Some(index);
+        self
+    }
+
+    /// O-1: attach the LinkType registry that backs `/ontology/v1/related`.
+    #[cfg(feature = "memory")]
+    pub fn with_link_types(
+        mut self,
+        index: Arc<chronik_ontology::LinkTypeIndex>,
+    ) -> Self {
+        self.link_types = Some(index);
         self
     }
 
@@ -616,6 +633,8 @@ pub fn create_router_full(
         .route("/ontology/v1/query_objects", post(ontology::query_objects))
         .route("/ontology/v1/traverse", post(ontology::traverse))
         .route("/ontology/v1/neighbors", post(ontology::neighbors))
+        .route("/ontology/v1/related", post(ontology::related))
+        .route("/ontology/v1/relations", get(ontology::relations))
         .route("/ontology/v1/explain", post(ontology::explain))
         .route("/ontology/v1/types", get(ontology::list_types))
         .route("/ontology/v1/mcp", post(ontology::mcp));
