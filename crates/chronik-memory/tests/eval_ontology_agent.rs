@@ -175,6 +175,37 @@ async fn ingest(kafka: &str, api: &str, client: &reqwest::Client) {
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
+
+    // CRITICAL: wait for the ontology CONSUMERS to catch up before running tasks
+    // — the ObjectType registry (ont.types) and the edge index (mem.fact). Without
+    // this the agent races them and get_object/neighbors return empty (the tools
+    // look broken when they're just not hydrated yet).
+    for _ in 0..40 {
+        let go_ok = client
+            .post(format!("{api}/ontology/v1/get_object"))
+            .json(&serde_json::json!({"namespace": NS, "type": "Ticket", "id": "T1"}))
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false);
+        let nb_count = match client
+            .post(format!("{api}/ontology/v1/neighbors"))
+            .json(&serde_json::json!({"namespace": NS, "node": "T1", "direction": "incoming", "edge_type": "blocked_by"}))
+            .send()
+            .await
+        {
+            Ok(r) => {
+                let b: serde_json::Value = r.json().await.unwrap_or_default();
+                b.get("count").and_then(|c| c.as_u64()).unwrap_or(0)
+            }
+            Err(_) => 0,
+        };
+        if go_ok && nb_count >= 1 {
+            eprintln!("ontology consumers hydrated (registry + edge index)");
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
 }
 
 // ─────────────────────────── agent loop ────────────────────────────────────
@@ -188,12 +219,13 @@ enum Surface {
 fn tool_docs(surface: Surface) -> &'static str {
     match surface {
         Surface::Ontology => {
-            "get_object{type,id} -> an object's current attributes with provenance.\n\
+            "get_object{type,id,as_of?} -> an object's attributes with provenance; pass as_of (RFC3339, e.g. 2026-01-06T00:00:00Z) for its state at a past time.\n\
              traverse{from,edge_type,depth} -> follow OUTGOING links from a node, up to `depth` hops (edge_type='*' for all).\n\
              neighbors{node,direction,edge_type,depth} -> links in either direction; direction='incoming' lists what points AT node; depth for multi-hop.\n\
              explain{type,id} -> why an object holds its values, with its edges.\n\
              query_objects{type} -> list all instances of a type.\n\
-             list_types{} -> the object types available."
+             list_types{} -> the object types available.\n\
+             Direction guide: a ticket's OWN blockers are its OUTGOING `blocked_by`. Tickets blocked BY a ticket are its INCOMING `blocked_by` (neighbors direction=incoming). An epic's subtasks are its OUTGOING `parent_of`."
         }
         Surface::Baseline => {
             "search{query} -> full-text search over the raw fact records; returns up to 10 matching facts as text. Chain searches to follow relationships yourself."
@@ -206,6 +238,10 @@ fn build_prompt(surface: Surface, question: &str, transcript: &str) -> String {
     format!(
         "You are an agent answering a question about an issue tracker by calling tools.\n\
 The namespace is provided automatically — do NOT include it.\n\
+\n\
+Domain schema (use these EXACT names):\n\
+- Object type: `Ticket` (attributes: status, assignee, project). Tickets look like T1, T5; the epic node is E1.\n\
+- Edge types: `blocked_by` (\"A blocked_by B\" means ticket A is blocked by ticket B), `parent_of` (\"E parent_of T\" means epic E owns subtask T).\n\
 \n\
 Tools:\n{tools}\n\
 \n\
@@ -274,17 +310,28 @@ async fn execute_tool(
                         .iter()
                         .filter_map(|h| {
                             let src = h.get("_source")?;
-                            // tolerate direct + wrapped shapes
-                            let body = src.get("body").or_else(|| {
-                                src.get("value").and_then(|v| v.as_str()).and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()).map(|_| src).or(Some(src))
-                            })?;
-                            let b = body.get("body").unwrap_or(body);
-                            Some(format!(
-                                "{} {} {}",
-                                b.get("subject").and_then(|v| v.as_str()).unwrap_or(""),
-                                b.get("predicate").and_then(|v| v.as_str()).unwrap_or(""),
-                                b.get("object").and_then(|v| v.as_str()).unwrap_or("")
-                            ))
+                            // Tolerant envelope: direct shape, or wrapped as a JSON
+                            // string under value/_value/_json_content.
+                            let env = if src.get("body").is_some() || src.get("type").is_some() {
+                                src.clone()
+                            } else {
+                                ["value", "_value", "_json_content"]
+                                    .iter()
+                                    .find_map(|f| {
+                                        src.get(*f)
+                                            .and_then(|v| v.as_str())
+                                            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                                    })
+                                    .unwrap_or_else(|| src.clone())
+                            };
+                            let b = env.get("body").unwrap_or(&env);
+                            let subj = b.get("subject").and_then(|v| v.as_str());
+                            let pred = b.get("predicate").and_then(|v| v.as_str());
+                            let obj = b.get("object").and_then(|v| v.as_str());
+                            match (subj, pred, obj) {
+                                (Some(s), Some(p), Some(o)) => Some(format!("{s} {p} {o} (valid_from {})", env.get("valid_from").and_then(|v| v.as_str()).unwrap_or("?"))),
+                                _ => b.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                            }
                         })
                         .collect();
                     if texts.is_empty() { "(no results)".into() } else { texts.join("; ") }
@@ -330,7 +377,11 @@ async fn run_agent(
             Ok(r) => r,
             Err(e) => return (format!("(llm error: {e})"), step),
         };
+        let dbg = std::env::var("AGENT_DEBUG").is_ok();
         let Some(v) = extract_json(&raw) else {
+            if dbg {
+                eprintln!("    [step {step}] unparseable LLM reply: {:?}", raw.chars().take(160).collect::<String>());
+            }
             transcript.push_str("\n(Your last reply was not valid JSON. Reply with ONE JSON object only.)\n");
             continue;
         };
@@ -340,6 +391,9 @@ async fn run_agent(
         if let (Some(tool), args) = (v.get("tool").and_then(|t| t.as_str()), v.get("args").cloned().unwrap_or(serde_json::json!({}))) {
             let result = execute_tool(client, api, surface, tool, args.clone()).await;
             let truncated: String = result.chars().take(800).collect();
+            if dbg {
+                eprintln!("    [step {step}] {tool}({args}) -> {}", truncated.chars().take(240).collect::<String>());
+            }
             transcript.push_str(&format!("\nYou called {tool}({args}). Result: {truncated}\n"));
         } else {
             transcript.push_str("\n(No tool or answer in your reply. Call a tool or answer.)\n");
