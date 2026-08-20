@@ -296,7 +296,7 @@ fn tool_docs(surface: Surface) -> &'static str {
     match surface {
         Surface::Ontology => {
             "relations{} -> the named relations available (each with an inverse). Pick a relation by NAME; never reason about direction.\n\
-             related{node,relation,depth} -> traverse a NAMED relation from a node (1..=5 hops), returns the neighbor nodes. Use `blocked_by` for a ticket's blockers, the inverse `blocks` for what a ticket blocks, `parent_of` for an epic's subtasks. Set depth to follow a chain to its end.\n\
+             related{node,relation,depth} -> traverse a NAMED relation from a node, returns the neighbor nodes. Use `blocked_by` for a ticket's blockers, the inverse `blocks` for what a ticket blocks, `parent_of` for an epic's subtasks. depth follows a chain multiple hops — set it LARGE (e.g. 20) to get an ENTIRE transitive chain in one call.\n\
              get_object{type,id,as_of?} -> an object's attributes (status/assignee/project) with provenance; pass as_of (RFC3339, e.g. 2026-01-06T00:00:00Z) for its state at a past time.\n\
              query_objects{type} -> list all instances of a type.\n\
              explain{type,id} -> why an object holds its values, with its edges.\n\
