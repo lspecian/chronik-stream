@@ -404,7 +404,12 @@ async fn execute_tool(
                             let pred = b.get("predicate").and_then(|v| v.as_str());
                             let obj = b.get("object").and_then(|v| v.as_str());
                             match (subj, pred, obj) {
-                                (Some(s), Some(p), Some(o)) => Some(format!("{s} {p} {o} (valid_from {})", env.get("valid_from").and_then(|v| v.as_str()).unwrap_or("?"))),
+                                // Timestamps are structured metadata, NOT part of
+                                // the searchable text — so a full-text baseline
+                                // sees only the triple, never `valid_from`. (This
+                                // is the honest default; the ontology's as_of uses
+                                // the structured field.)
+                                (Some(s), Some(p), Some(o)) => Some(format!("{s} {p} {o}")),
                                 _ => b.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()),
                             }
                         })

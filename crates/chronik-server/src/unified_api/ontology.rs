@@ -104,7 +104,7 @@ pub async fn neighbors(
             ))
         }
     };
-    let depth = req.depth.unwrap_or(1).clamp(1, 5);
+    let depth = req.depth.unwrap_or(1).clamp(1, 32);
     // Multi-hop BFS (depth-tagged); depth=1 is a single hop.
     let walked = index.walk(&req.namespace, &req.node, edge_type, direction, depth, as_of);
     let edges: Vec<serde_json::Value> = walked
@@ -333,7 +333,7 @@ async fn mcp_run_tool(
                 _ => chronik_ontology::Direction::Outgoing,
             };
             let depth = args.get("depth").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
-            let walked = idx.walk(ns, node, edge_type, direction, depth.clamp(1, 5), as_of);
+            let walked = idx.walk(ns, node, edge_type, direction, depth.clamp(1, 32), as_of);
             let edges: Vec<serde_json::Value> = walked
                 .into_iter()
                 .map(|(d, e)| {
@@ -357,7 +357,7 @@ async fn mcp_run_tool(
                 None => (relation.to_string(), chronik_ontology::Direction::Outgoing),
             };
             let outgoing = matches!(direction, chronik_ontology::Direction::Outgoing);
-            let walked = index.walk(ns, node, Some(&predicate), direction, depth.clamp(1, 5), as_of);
+            let walked = index.walk(ns, node, Some(&predicate), direction, depth.clamp(1, 32), as_of);
             let neighbors: Vec<String> =
                 walked.iter().map(|(_, e)| if outgoing { e.to.clone() } else { e.from.clone() }).collect();
             Ok(json!({
@@ -578,7 +578,7 @@ pub async fn related(
     let index = require_edge_index(&state)?;
     let as_of = parse_as_of(req.as_of.as_deref())?;
     let tenant = tenant_of(&req.namespace);
-    let depth = req.depth.unwrap_or(1).clamp(1, 5);
+    let depth = req.depth.unwrap_or(1).clamp(1, 32);
 
     // Resolve the relation name; fall back to a raw outgoing predicate if the
     // name isn't a registered LinkType (keeps the tool usable pre-registration).
