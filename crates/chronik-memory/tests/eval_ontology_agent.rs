@@ -16,7 +16,7 @@
 //! CHRONIK_INTEGRATION=1 \
 //!   CHRONIK_API=http://localhost:6092 CHRONIK_KAFKA=localhost:9092 \
 //!   AGENT_LLM_ENDPOINT=http://192.168.1.184:8080 \
-//!   AGENT_LLM_MODEL=mlx-community/Qwen3-30B-A3B-4bit-DWQ \
+//!   AGENT_LLM_MODEL=mlx-community/Mistral-Small-3.1-Text-24B-Instruct-2503-4bit \
 //!   cargo test -p chronik-memory --test eval_ontology_agent -- --ignored --nocapture
 //! ```
 //! The broker must run with `CHRONIK_ONTOLOGY_ENABLED=true` (so the ObjectType
@@ -296,7 +296,7 @@ fn tool_docs(surface: Surface) -> &'static str {
     match surface {
         Surface::Ontology => {
             "relations{} -> the named relations available (each with an inverse). Pick a relation by NAME; never reason about direction.\n\
-             related{node,relation,depth} -> traverse a NAMED relation from a node, returns the neighbor nodes. Use `blocked_by` for a ticket's blockers, the inverse `blocks` for what a ticket blocks, `parent_of` for an epic's subtasks. depth follows a chain multiple hops — set it LARGE (e.g. 20) to get an ENTIRE transitive chain in one call.\n\
+             related{node,relation,transitive?} -> traverse a NAMED relation from a node, returns the neighbor nodes. Express INTENT, not a hop count: omit `transitive` (or set false) for DIRECT (1-hop) neighbors; set `transitive:true` to follow the ENTIRE chain (all transitive hops) in ONE call. Use `blocked_by` for a ticket's blockers, the inverse `blocks` for what a ticket blocks, `parent_of` for an epic's subtasks.\n\
              get_object{type,id,as_of?} -> an object's attributes (status/assignee/project) with provenance; pass as_of (RFC3339, e.g. 2026-01-06T00:00:00Z) for its state at a past time.\n\
              query_objects{type} -> list all instances of a type.\n\
              explain{type,id} -> why an object holds its values, with its edges.\n\
@@ -308,7 +308,23 @@ fn tool_docs(surface: Surface) -> &'static str {
     }
 }
 
-fn build_prompt(surface: Surface, question: &str, transcript: &str) -> String {
+fn build_prompt(surface: Surface, question: &str, transcript: &str, force: bool) -> String {
+    if force {
+        // Forced-termination turn: the agent has gathered tool results (in the
+        // transcript) but kept looping instead of answering. Strip the tools and
+        // demand an answer. Applied identically to BOTH arms, so it removes a shared
+        // confound (non-termination) rather than favouring either.
+        return format!(
+            "You are answering a question about an issue tracker. You have ALREADY gathered tool results (below). Do NOT call any more tools.\n\
+\n\
+Reply with EXACTLY ONE JSON object: {{\"answer\":\"...\"}} and nothing else.\n\
+List the relevant ids/names explicitly (e.g. C0_0, C0_1) with no extra commentary.\n\
+\n\
+Question: {question}\n\
+{transcript}\n\
+Your JSON answer:"
+        );
+    }
     let tools = tool_docs(surface);
     format!(
         "You are an agent answering a question about an issue tracker by calling tools.\n\
@@ -323,7 +339,7 @@ Tools:\n{tools}\n\
 Protocol: reply with EXACTLY ONE JSON object and nothing else.\n\
 - To call a tool: {{\"tool\":\"NAME\",\"args\":{{...}}}}\n\
 - When you can answer: {{\"answer\":\"...\"}}\n\
-Ticket ids look like T1, T5; the epic is E1. Keep answers short and list ids/names explicitly.\n\
+Keep answers short and list the ids/names explicitly (e.g. C0_0, C0_1) with no extra commentary.\n\
 \n\
 Question: {question}\n\
 {transcript}\n\
@@ -420,6 +436,36 @@ async fn execute_tool(
             }
         }
         Surface::Ontology => {
+            // Harness-side interface discipline (kills two confounds):
+            //  - validate/normalise relation names against the registry enum, so a
+            //    miscased or invented edge name gets a helpful error instead of a
+            //    silent empty result the model can't distinguish from "no such edge".
+            //  - express traversal INTENT (transitive vs direct) instead of a guessed
+            //    depth number: `transitive:true` -> full chain, otherwise 1 hop.
+            const RELS: [&str; 4] = ["blocked_by", "blocks", "parent_of", "subtask_of"];
+            if let Some(obj) = args.as_object_mut() {
+                for k in ["relation", "edge_type"] {
+                    if let Some(v) = obj.get(k).and_then(|v| v.as_str()) {
+                        let lc = v.trim().to_lowercase();
+                        if !RELS.contains(&lc.as_str()) {
+                            return format!(
+                                "(invalid relation {v:?}: valid relations are {}. Call `relations` to list them.)",
+                                RELS.join(", ")
+                            );
+                        }
+                        obj.insert(k.to_string(), serde_json::json!(lc));
+                    }
+                }
+                if tool == "related" {
+                    let transitive = obj.get("transitive").and_then(|v| v.as_bool()).unwrap_or(false);
+                    obj.remove("transitive");
+                    if transitive {
+                        obj.insert("depth".to_string(), serde_json::json!(32));
+                    } else if !obj.contains_key("depth") {
+                        obj.insert("depth".to_string(), serde_json::json!(1));
+                    }
+                }
+            }
             let resp = client
                 .post(format!("{api}/ontology/v1/mcp"))
                 .json(&serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":tool,"arguments":args}}))
@@ -450,14 +496,22 @@ async fn run_agent(
     question: &str,
     surface: Surface,
 ) -> (String, usize) {
+    // Forced-termination: the earlier run showed the model reaching the answer in
+    // ONE tool call, then looping until the step limit instead of answering. We
+    // force an answer-only turn once it (a) repeats an identical call or (b) has
+    // made FORCE_AFTER distinct calls. Identical for both arms.
+    const FORCE_AFTER: usize = 3;
+    let dbg = std::env::var("AGENT_DEBUG").is_ok();
     let mut transcript = String::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut tool_calls = 0usize;
+    let mut force = false;
     for step in 0..MAX_STEPS {
-        let prompt = build_prompt(surface, question, &transcript);
+        let prompt = build_prompt(surface, question, &transcript, force);
         let raw = match gen.complete(&prompt).await {
             Ok(r) => r,
             Err(e) => return (format!("(llm error: {e})"), step),
         };
-        let dbg = std::env::var("AGENT_DEBUG").is_ok();
         let Some(v) = extract_json(&raw) else {
             if dbg {
                 eprintln!("    [step {step}] unparseable LLM reply: {:?}", raw.chars().take(160).collect::<String>());
@@ -469,12 +523,37 @@ async fn run_agent(
             return (ans.to_string(), step + 1);
         }
         if let (Some(tool), args) = (v.get("tool").and_then(|t| t.as_str()), v.get("args").cloned().unwrap_or(serde_json::json!({}))) {
+            let sig = format!("{tool}({args})");
+            if force {
+                if dbg {
+                    eprintln!("    [step {step}] (forced-answer mode; ignoring tool call {tool})");
+                }
+                transcript.push_str("\n(You are in answer mode. Do NOT call tools. Reply with ONLY {\"answer\":\"...\"} using the results above.)\n");
+                continue;
+            }
+            if !seen.insert(sig.clone()) {
+                if dbg {
+                    eprintln!("    [step {step}] repeated call {sig} -> forcing answer");
+                }
+                force = true;
+                transcript.push_str(&format!("\n(You already called {tool} with those arguments; its result is above. You have enough information — now reply with ONLY {{\"answer\":\"...\"}}.)\n"));
+                continue;
+            }
             let result = execute_tool(client, api, surface, tool, args.clone()).await;
-            let truncated: String = result.chars().take(800).collect();
+            tool_calls += 1;
+            // 4000 (not 800): a large-but-correct result must be fully visible. The
+            // deep transitive walk returns ~19 edges (~1700 chars); an 800-char cap
+            // hid the tail and turned a complete tool answer into a false miss —
+            // the same truncation confound as the LLM output cap, on the input side.
+            let truncated: String = result.chars().take(4000).collect();
             if dbg {
                 eprintln!("    [step {step}] {tool}({args}) -> {}", truncated.chars().take(240).collect::<String>());
             }
             transcript.push_str(&format!("\nYou called {tool}({args}). Result: {truncated}\n"));
+            if tool_calls >= FORCE_AFTER {
+                force = true;
+                transcript.push_str("\n(You have gathered enough tool results. Now reply with ONLY {\"answer\":\"...\"} using them; do not call more tools.)\n");
+            }
         } else {
             transcript.push_str("\n(No tool or answer in your reply. Call a tool or answer.)\n");
         }
@@ -482,9 +561,128 @@ async fn run_agent(
     ("(step limit reached without an answer)".to_string(), MAX_STEPS)
 }
 
-fn scores_hit(answer: &str, gold: &[String]) -> bool {
-    let a = answer.to_lowercase();
-    gold.iter().all(|g| a.contains(&g.to_lowercase()))
+// ─────────────────────────── scoring ───────────────────────────────────────
+//
+// EXACT-MATCH SET scoring, not substring. Substring credits a firehose (an answer
+// that lists ALL statuses "hits" a point-in-time gold of one status) and is fooled
+// by truncation. Here we extract the entity/status tokens of the gold's CLASS from
+// the answer, subtract the ids named in the QUESTION (the queried subject itself),
+// and require SET EQUALITY with the gold. Strict in both directions: every gold
+// token present, and no extra token of that class.
+
+#[derive(Clone, Copy, PartialEq)]
+enum Class {
+    Ticket,  // C<g>_<i>
+    Subtask, // EP<e>_s<s>
+    User,    // U<n>
+    Status,  // open | in_progress | resolved | closed
+}
+
+const STATUSES: [&str; 4] = ["open", "in_progress", "resolved", "closed"];
+
+fn classify_gold(gold: &[String]) -> Class {
+    let g = gold.first().map(|s| s.as_str()).unwrap_or("");
+    let up = g.to_uppercase();
+    if is_subtask(&up) {
+        Class::Subtask
+    } else if is_ticket(&up) {
+        Class::Ticket
+    } else if up.starts_with('U') && up.len() > 1 && up[1..].chars().all(|c| c.is_ascii_digit()) {
+        Class::User
+    } else {
+        Class::Status
+    }
+}
+
+fn is_ticket(up: &str) -> bool {
+    // C<digits>_<digits>
+    let Some(rest) = up.strip_prefix('C') else { return false };
+    match rest.split_once('_') {
+        Some((a, b)) => !a.is_empty() && !b.is_empty() && a.chars().all(|c| c.is_ascii_digit()) && b.chars().all(|c| c.is_ascii_digit()),
+        None => false,
+    }
+}
+
+fn is_subtask(up: &str) -> bool {
+    // EP<digits>_S<digits>
+    let Some(rest) = up.strip_prefix("EP") else { return false };
+    match rest.split_once("_S") {
+        Some((a, b)) => !a.is_empty() && !b.is_empty() && a.chars().all(|c| c.is_ascii_digit()) && b.chars().all(|c| c.is_ascii_digit()),
+        None => false,
+    }
+}
+
+/// Extract the set of tokens of `class` from free text (case-insensitive).
+fn extract_ids(s: &str, class: Class) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    let mut tok = String::new();
+    let flush = |tok: &mut String, out: &mut std::collections::HashSet<String>| {
+        if !tok.is_empty() {
+            let up = tok.to_uppercase();
+            let ok = match class {
+                Class::User => up.starts_with('U') && up.len() > 1 && up[1..].chars().all(|c| c.is_ascii_digit()),
+                Class::Subtask => is_subtask(&up),
+                Class::Ticket => is_ticket(&up),
+                Class::Status => false,
+            };
+            if ok {
+                out.insert(up);
+            }
+            tok.clear();
+        }
+    };
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            tok.push(c);
+        } else {
+            flush(&mut tok, &mut out);
+        }
+    }
+    flush(&mut tok, &mut out);
+    out
+}
+
+/// Whole-word (alphanumeric-bounded) containment on a lowercased haystack.
+fn contains_word(hay_lower: &str, w: &str) -> bool {
+    let bytes = hay_lower.as_bytes();
+    let mut from = 0;
+    while let Some(pos) = hay_lower[from..].find(w) {
+        let start = from + pos;
+        let end = start + w.len();
+        let before_ok = start == 0 || !bytes[start - 1].is_ascii_alphanumeric();
+        let after_ok = end == bytes.len() || !bytes[end].is_ascii_alphanumeric();
+        if before_ok && after_ok {
+            return true;
+        }
+        from = start + 1;
+        if from >= hay_lower.len() {
+            break;
+        }
+    }
+    false
+}
+
+fn scores_hit(question: &str, answer: &str, gold: &[String]) -> bool {
+    let class = classify_gold(gold);
+    if class == Class::Status {
+        // Normalise separators so "in progress" / "in-progress" == "in_progress".
+        let norm: String = answer
+            .to_lowercase()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        let gold_set: std::collections::HashSet<String> = gold.iter().map(|g| g.to_lowercase()).collect();
+        let present: std::collections::HashSet<String> =
+            STATUSES.iter().filter(|s| contains_word(&norm, s)).map(|s| s.to_string()).collect();
+        return present == gold_set;
+    }
+    // Id classes: answer's tokens of this class, minus the ids named in the question.
+    let mut ans = extract_ids(answer, class);
+    for q in extract_ids(question, class) {
+        ans.remove(&q);
+    }
+    let gold_set: std::collections::HashSet<String> = gold.iter().map(|g| g.to_uppercase()).collect();
+    ans == gold_set
 }
 
 #[tokio::test]
@@ -497,9 +695,13 @@ async fn ontology_agent_beats_baseline() {
     let api = std::env::var("CHRONIK_API").unwrap_or_else(|_| "http://localhost:6092".into());
     let kafka = std::env::var("CHRONIK_KAFKA").unwrap_or_else(|_| "localhost:9092".into());
     let endpoint = std::env::var("AGENT_LLM_ENDPOINT").unwrap_or_else(|_| "http://192.168.1.184:8080".into());
-    let model = std::env::var("AGENT_LLM_MODEL").unwrap_or_else(|_| "mlx-community/Qwen3-30B-A3B-4bit-DWQ".into());
+    let model = std::env::var("AGENT_LLM_MODEL")
+        .unwrap_or_else(|_| "mlx-community/Mistral-Small-3.1-Text-24B-Instruct-2503-4bit".into());
 
-    let client = reqwest::Client::builder().timeout(Duration::from_secs(120)).build().unwrap();
+    // 30s (not 120s) bounds the cost of a slow tool call — notably query_objects,
+    // which full-scans every instance. Only broker/tool calls use this client; the
+    // LLM has its own. A tool that can't answer in 30s isn't useful to the agent.
+    let client = reqwest::Client::builder().timeout(Duration::from_secs(30)).build().unwrap();
     if client.get(format!("{api}/health")).send().await.map(|r| r.status().is_success()).unwrap_or(false) {
         eprintln!("broker healthy at {api}");
     } else {
@@ -515,7 +717,9 @@ async fn ontology_agent_beats_baseline() {
     );
     ingest(&kafka, &api, &client, &fixture.facts).await;
 
-    let gen: Arc<dyn TextGenerator> = Arc::new(OpenAIExtractor::for_local_server(&endpoint, &model).with_max_tokens(512));
+    // Budget raised 512 -> 2048: a truncated answer used to score a false MISS when
+    // the correct list ran past the cap. The reader step, not the cap, should decide.
+    let gen: Arc<dyn TextGenerator> = Arc::new(OpenAIExtractor::for_local_server(&endpoint, &model).with_max_tokens(2048));
     println!("== running agent tasks (LLM: {model}) ==\n");
 
     let tasks = &fixture.tasks;
@@ -523,11 +727,11 @@ async fn ontology_agent_beats_baseline() {
     let mut base_hits = 0usize;
     for t in tasks {
         let (onto_ans, onto_steps) = run_agent(&client, &api, &gen, &t.question, Surface::Ontology).await;
-        let onto_ok = scores_hit(&onto_ans, &t.gold);
+        let onto_ok = scores_hit(&t.question, &onto_ans, &t.gold);
         onto_hits += onto_ok as usize;
 
         let (base_ans, base_steps) = run_agent(&client, &api, &gen, &t.question, Surface::Baseline).await;
-        let base_ok = scores_hit(&base_ans, &t.gold);
+        let base_ok = scores_hit(&t.question, &base_ans, &t.gold);
         base_hits += base_ok as usize;
 
         println!("[{}] gold={:?}", t.id, t.gold);
