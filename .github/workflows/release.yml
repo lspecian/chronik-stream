@@ -134,13 +134,31 @@ jobs:
         run: |
           cargo build --release --target ${{ matrix.target }} \
             -p chronik-server --bin chronik-server ${{ matrix.features }}
-          
+
+      # The `chronik` developer CLI (Ontology SDK) pulls chronik-ontology ->
+      # rdkafka -> librdkafka, which only compiles on a NATIVE build (never the
+      # cross/musl targets). So it ships alongside chronik-server on the native
+      # artifacts (gnu + darwin) only.
+      - name: Build chronik CLI (native only)
+        if: "!matrix.use_cross"
+        env:
+          RUSTC_WRAPPER: ""
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+        run: |
+          cargo build --release --target ${{ matrix.target }} \
+            -p chronik-cli --bin chronik
+
       - name: Package binary
         run: |
           mkdir -p dist
           cp target/${{ matrix.target }}/release/chronik-server dist/
+          FILES="chronik-server"
+          if [ -f target/${{ matrix.target }}/release/chronik ]; then
+            cp target/${{ matrix.target }}/release/chronik dist/
+            FILES="chronik-server chronik"
+          fi
           cd dist
-          tar -czf ${{ matrix.artifact }}.tar.gz chronik-server
+          tar -czf ${{ matrix.artifact }}.tar.gz $FILES
           sha256sum ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256 || \
           shasum -a 256 ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
       

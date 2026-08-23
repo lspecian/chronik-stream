@@ -13,13 +13,22 @@
 //! Kafka topic" pattern (cf. `chronik-memory/src/mem_config_consumer.rs`).
 
 pub mod action;
+pub mod apply;
 pub mod cas;
 pub mod edge_index;
 pub mod link_type;
 pub mod object_type;
 pub mod ont_types_consumer;
 pub mod resolve;
+pub mod schema;
 pub mod traverse;
+
+pub use apply::{publish_records, ApplyError};
+pub use schema::{
+    fact_record, parse_fact_line, parse_schema, FactInput, OntRecord, OntologySchema,
+    SchemaAttribute, SchemaBacking, SchemaError, SchemaIdentity, SchemaLinkType, SchemaObjectType,
+    SCHEMA_VERSION,
+};
 
 pub use link_type::{
     apply_event as apply_link_event, parse_ont_link_record, run_consumer as run_links_consumer,

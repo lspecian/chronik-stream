@@ -1742,6 +1742,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "chronik-cli"
+version = "2.12.2"
+dependencies = [
+ "anyhow",
+ "chronik-ontology",
+ "clap",
+ "tokio",
+]
+
+[[package]]
 name = "chronik-columnar"
 version = "2.12.2"
 dependencies = [
@@ -1945,6 +1955,7 @@ dependencies = [
  "reqwest 0.11.27",
  "serde",
  "serde_json",
+ "serde_yaml",
  "thiserror 1.0.69",
  "tokio",
  "tokio-test",
