@@ -892,10 +892,26 @@ impl ProtocolHandler {
                         for _ in 0..actual_count {
                             let topic_name = decoder.read_compact_string()?
                                 .ok_or_else(|| Error::Protocol("Topic name cannot be null".into()))?;
-                            // v0-v7: No partitions in request, return empty vec (means all partitions)
+                            // PartitionIndexes: a compact array present in ALL versions
+                            // (v0-v7 too, not just v8+). Omitting it here misaligned the
+                            // decoder and broke every MULTI-topic OffsetFetch — the second
+                            // topic's name was read from the first topic's partition bytes.
+                            let partition_count = decoder.read_unsigned_varint()? as usize;
+                            let partitions = if partition_count > 0 {
+                                let actual = partition_count - 1;
+                                let mut ps = Vec::with_capacity(actual);
+                                for _ in 0..actual {
+                                    ps.push(decoder.read_i32()?);
+                                }
+                                ps
+                            } else {
+                                Vec::new()
+                            };
+                            // Topic-level tagged fields (flexible only).
+                            let _tag_count = decoder.read_unsigned_varint()?;
                             topics.push(crate::types::OffsetFetchRequestTopic {
                                 name: topic_name,
-                                partitions: Vec::new(),
+                                partitions,
                             });
                         }
                         Some(topics)
@@ -909,10 +925,19 @@ impl ProtocolHandler {
                         for _ in 0..topic_count {
                             let topic_name = decoder.read_string()?
                                 .ok_or_else(|| Error::Protocol("Topic name cannot be null".into()))?;
-                            // v0-v7: No partitions in request, return empty vec (means all partitions)
+                            // PartitionIndexes array — present in ALL versions. (Was
+                            // skipped, misaligning multi-topic requests.)
+                            let partition_count = decoder.read_i32()?;
+                            let mut partitions = Vec::new();
+                            if partition_count > 0 {
+                                partitions.reserve(partition_count as usize);
+                                for _ in 0..partition_count {
+                                    partitions.push(decoder.read_i32()?);
+                                }
+                            }
                             topics.push(crate::types::OffsetFetchRequestTopic {
                                 name: topic_name,
-                                partitions: Vec::new(),
+                                partitions,
                             });
                         }
                         Some(topics)
