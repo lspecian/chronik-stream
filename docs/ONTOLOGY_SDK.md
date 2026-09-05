@@ -35,7 +35,9 @@ chronik ontology validate my-domain.ontology.yaml
 # 2. Publish the object types + link types to the broker
 chronik ontology apply my-domain.ontology.yaml --brokers localhost:9092
 
-# 3. Feed it facts (JSONL of {subject,predicate,object,valid_from?,valid_to?})
+# 3. Feed it facts (JSONL of {subject,predicate,object,valid_from?,valid_to?}).
+#    ingest first provisions the backing as searchable (via --api, default :6092)
+#    so get_object/as_of resolve, then produces the facts.
 chronik ontology ingest my-domain.facts.jsonl --namespace mydomain
 
 # 4. Any agent now consumes the domain over MCP:
@@ -119,14 +121,17 @@ search and access-governance layers cannot do:
   `CHRONIK_MEMORY_API`) and an embedding provider (`CHRONIK_EMBEDDING_*`) — v2.12 rejects
   the `vector.enabled` fact topic without one.
 
-## Known limitation (v0)
+## Notes
 
-The broker's ontology consumers pick up **upserts to a tenant they already track**
-immediately, but a **brand-new tenant** created mid-session can lag until its topics enter
-the consumer's subscription (a consumer-group rebalance-on-new-topic limitation, tracked
-separately from the SDK). If a freshly-applied *new* namespace does not resolve, ensure
-its topics exist before the broker's ontology consumers start. Existing tenants update
-live.
+- **Fresh tenants resolve in seconds.** A brand-new namespace hydrates without a broker
+  restart — `apply` + `ingest` and the domain is queryable (registry, edge index, and
+  `get_object`/`as_of`) within a few seconds. (This relies on the OffsetFetch v0–v7
+  multi-topic fix shipped in **v2.12.3**; on older brokers a multi-topic consumer group
+  stalls and a fresh tenant will not hydrate.)
+- **`ingest` provisions the backing.** It calls the memory admin endpoint to create
+  `mem.fact.{tenant}` **searchable** before producing, so `get_object`/`as_of` (which
+  resolve via `/_search`) work. Pass `--no-init` to skip this if the namespace is already
+  provisioned; pass `--api` to point at a non-default Unified API.
 
 ## Roadmap (v0.1+)
 

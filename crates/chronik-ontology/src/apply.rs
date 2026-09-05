@@ -16,6 +16,31 @@ pub enum ApplyError {
     Producer(String),
     #[error("produce to {topic} failed: {reason}")]
     Produce { topic: String, reason: String },
+    #[error("init-namespace failed: {0}")]
+    InitNamespace(String),
+}
+
+/// Provision a tenant's memory backing so its `mem.*` topics are created
+/// **searchable** — without this, facts produced by `ingest` land in a
+/// non-searchable topic and `get_object`/`as_of` (which resolve via `/_search`)
+/// find nothing, even though `traverse`/`related` (edge index) still work. Calls
+/// the Unified-API memory admin endpoint; idempotent for an already-provisioned
+/// tenant. Must run BEFORE the first produce to `mem.fact.{tenant}` (a topic
+/// auto-created by a plain produce gets the non-searchable default).
+pub async fn init_namespace(api: &str, tenant: &str, agent: &str) -> Result<(), ApplyError> {
+    let url = format!("{}/memory/v1/admin/init-namespace", api.trim_end_matches('/'));
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .json(&serde_json::json!({ "tenant": tenant, "agent": agent }))
+        .send()
+        .await
+        .map_err(|e| ApplyError::InitNamespace(format!("request to {url}: {e}")))?;
+    if !resp.status().is_success() {
+        let code = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(ApplyError::InitNamespace(format!("{code}: {body}")));
+    }
+    Ok(())
 }
 
 fn producer(brokers: &str) -> Result<FutureProducer, ApplyError> {

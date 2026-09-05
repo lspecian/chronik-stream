@@ -68,6 +68,17 @@ enum OntologyAction {
         /// Kafka bootstrap servers
         #[arg(long, env = "CHRONIK_KAFKA", default_value = "localhost:9092")]
         brokers: String,
+
+        /// Unified API base URL — used to provision the backing topics as
+        /// searchable (so get_object/as_of resolve) before producing facts.
+        #[arg(long, env = "CHRONIK_MEMORY_API", default_value = "http://localhost:6092")]
+        api: String,
+
+        /// Skip provisioning the backing (assume the namespace is already
+        /// initialized). Facts still ingest, but get_object may find nothing on
+        /// a fresh tenant whose mem.fact topic isn't searchable.
+        #[arg(long)]
+        no_init: bool,
     },
 }
 
@@ -123,8 +134,19 @@ async fn run_ontology(action: OntologyAction) -> Result<()> {
             Ok(())
         }
 
-        OntologyAction::Ingest { file, namespace, brokers } => {
+        OntologyAction::Ingest { file, namespace, brokers, api, no_init } => {
             let tenant = namespace.split(':').next().unwrap_or(&namespace).to_string();
+            // Provision the backing as searchable BEFORE producing (a plain
+            // produce would auto-create mem.fact.{tenant} non-searchable, and
+            // get_object/as_of resolve via /_search). The agent segment only
+            // shapes the registry path; the fact topic is tenant-keyed.
+            if !no_init {
+                let agent = namespace.split(':').nth(1).unwrap_or("sdk");
+                chronik_ontology::init_namespace(&api, &tenant, agent)
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                println!("Provisioned backing for tenant '{tenant}' (searchable) via {api}.");
+            }
             let content = std::fs::read_to_string(&file)?;
 
             let mut records = Vec::new();

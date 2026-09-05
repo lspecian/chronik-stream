@@ -23,7 +23,7 @@ pub mod resolve;
 pub mod schema;
 pub mod traverse;
 
-pub use apply::{publish_records, ApplyError};
+pub use apply::{init_namespace, publish_records, ApplyError};
 pub use schema::{
     fact_record, parse_fact_line, parse_schema, FactInput, OntRecord, OntologySchema,
     SchemaAttribute, SchemaBacking, SchemaError, SchemaIdentity, SchemaLinkType, SchemaObjectType,
