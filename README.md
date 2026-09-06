@@ -58,6 +58,8 @@ Events become queryable across all modalities within seconds of ingestion. There
 
 This replaces what traditionally requires Kafka + ClickHouse + Elasticsearch + a vector database — with one Rust binary that speaks the Kafka wire protocol.
 
+**For agents (v2.13.0+):** an optional semantic **Ontology layer** (env-gated, `CHRONIK_ONTOLOGY_ENABLED`, off by default) lets you define typed objects and relationships over your streams and query them as domain nouns and verbs — `get_object` with point-in-time `as_of`, multi-hop `traverse`/`related`/`neighbors`, and an MCP tools server any agent can consume — all runtime-native, with no separate graph store to sync. Authored with the `chronik` CLI. See [docs/ONTOLOGY_SDK.md](docs/ONTOLOGY_SDK.md).
+
 ## Per-Topic Capability Model
 
 Features are orthogonal and enabled per topic. A topic with no features enabled is a pure Kafka topic. Each capability adds a background indexing path — nothing changes in the write path.

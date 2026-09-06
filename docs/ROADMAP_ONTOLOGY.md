@@ -1,6 +1,6 @@
 # Ontology Roadmap — the event-native Ontology for agents
 
-**Status**: IN PROGRESS on `feat/ontology-o0` (read side delivered 2026-08-18; the memory-quality gate was cleared by read-time extraction @ 0.88). Was DRAFT (2026-07-04) — successor to [ROADMAP_MEMORY_QUALITY.md](ROADMAP_MEMORY_QUALITY.md).
+**Status**: ✅ **SHIPPED in v2.13.0** — the read/meaning layer (O-0 object types, O-1 link types + traversal, O-2 agent surface) plus the `chronik` SDK CLI, all env-gated OFF by default (`CHRONIK_ONTOLOGY_ENABLED`). **O-3 Actions is deferred** (the engine exists as an unadvertised library spike; it is NOT broker-wired and is not part of the released surface — see O-3 below). O-4 not started. See [docs/ONTOLOGY_SDK.md](ONTOLOGY_SDK.md). Was DRAFT (2026-07-04) — successor to [ROADMAP_MEMORY_QUALITY.md](ROADMAP_MEMORY_QUALITY.md).
 
 > **Delivery status (2026-08-18, `feat/ontology-o0`, dogfooding the memory domain):**
 > - **O-0 Object Types — ✅ DONE + E2E-verified.** `crates/chronik-ontology` (ObjectType registry = 7th keyed-index consumer; `get_object` resolution with provenance; `as_of`) mounted at `/ontology/v1/*` (off by default, `CHRONIK_ONTOLOGY_ENABLED`).
