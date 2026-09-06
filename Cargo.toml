@@ -19,6 +19,8 @@ members = [
     "crates/chronik-operator",
     "crates/chronik-perf",
     "crates/chronik-memory",
+    "crates/chronik-ontology",
+    "crates/chronik-cli",
     # Integration tests. A member, not an exclusion — see tests/Cargo.toml for
     # why standing outside the workspace is what let them rot unnoticed.
     "tests",
@@ -28,7 +30,7 @@ members = [
 ]
 
 [workspace.package]
-version = "2.12.3"
+version = "2.13.0"
 edition = "2021"
 authors = ["Chronik Stream Contributors"]
 license = "Apache-2.0"

@@ -1,0 +1,20 @@
+[package]
+name = "chronik-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "chronik — developer CLI for the Chronik Ontology SDK"
+
+# The developer-facing `chronik` binary. Distinct from `chronik-server` (the
+# broker + ops CLI): this is the authoring half of the semantic-MCP SDK.
+[[bin]]
+name = "chronik"
+path = "src/main.rs"
+
+[dependencies]
+chronik-ontology = { path = "../chronik-ontology" }
+clap = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }

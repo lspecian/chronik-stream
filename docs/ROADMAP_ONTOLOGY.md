@@ -1,6 +1,15 @@
 # Ontology Roadmap — the event-native Ontology for agents
 
-**Status**: DRAFT (2026-07-04) — successor to [ROADMAP_MEMORY_QUALITY.md](ROADMAP_MEMORY_QUALITY.md). Work begins **after** the memory-quality sprints reach the Phase 2 gate (LongMemEval `synth_judge_rate ≥ 0.70`).
+**Status**: ✅ **SHIPPED in v2.13.0** — the read/meaning layer (O-0 object types, O-1 link types + traversal, O-2 agent surface) plus the `chronik` SDK CLI, all env-gated OFF by default (`CHRONIK_ONTOLOGY_ENABLED`). **O-3 Actions is deferred** (the engine exists as an unadvertised library spike; it is NOT broker-wired and is not part of the released surface — see O-3 below). O-4 not started. See [docs/ONTOLOGY_SDK.md](ONTOLOGY_SDK.md). Was DRAFT (2026-07-04) — successor to [ROADMAP_MEMORY_QUALITY.md](ROADMAP_MEMORY_QUALITY.md).
+
+> **Delivery status (2026-08-18, `feat/ontology-o0`, dogfooding the memory domain):**
+> - **O-0 Object Types — ✅ DONE + E2E-verified.** `crates/chronik-ontology` (ObjectType registry = 7th keyed-index consumer; `get_object` resolution with provenance; `as_of`) mounted at `/ontology/v1/*` (off by default, `CHRONIK_ONTOLOGY_ENABLED`).
+> - **O-1 Link Types — ✅ core DONE.** Multi-hop `/ontology/v1/traverse` (edges = entity-object facts; 1..=3 hops, provenance, bi-temporal `valid_from<=t<valid_to`). Deferred: materialized `ont.edges` index, LLM derivation rules.
+> - **O-2 agent surface — ✅ core done.** `query_objects` (list instances) + an **MCP tools server** (`POST /ontology/v1/mcp`: initialize/tools/list/tools/call over get_object/query_objects/traverse/list_types). Deferred: MCP *resources* (subscribable object URIs), `explain`.
+> - **O-3 Actions — action layer at the ontology layer (broker CAS ❌ CANCELLED).** The Action engine (propose→confirm→apply, invariants, idempotency, lost-update guard) is built over the ontology-layer coordinator/optimistic-CAS — **no core change**. The strict broker-enforced CAS-append (a produce-path change) is **cancelled**: the Tier B state-machine harness proved the full correctness contract without it (§6). Not yet productized (registry, propose/confirm/apply events, `invoke_action` MCP, audit remain to build).
+> - **O-4 — not started** (platformization, gated on customer commitment).
+>
+> 27 crate unit tests + `tests/integration/ontology_o0_e2e.sh` (9/9 on a fresh broker). See memory `ontology-o0-shipped`.
 **Version at authoring**: chronik-server 2.7.1.
 **Goal**: Give AI agents (and apps, and humans) a single governed interface — typed **Object Types**, **Link Types** (relationships), and **Action Types** (validated writeback) — that resolves to Chronik's existing projections and immutable event log. Agents reason in domain nouns and verbs, never in topics, offsets, SQL, or vector endpoints.
 **Research basis**: codebase primitive map + Palantir Foundry Ontology architecture + Zep/Graphiti bi-temporal KG + agent-writeback-safety survey (2026-07-04). Sources inline and in **References**.
@@ -49,14 +58,14 @@ Palantir's Ontology backend is a set of named services over *backing datasets/st
 |---|---|---|---|
 | **Ontology Metadata Service (OMS)** | defines which object/link/action types exist | **Type registry** = new keyed-index consumer over `ont.types.{tenant}` (§4 template) | to build (O-0) |
 | **Object Set Service (OSS)** | reads: search / filter / aggregate / load | `recall.rs` multi-channel fan-out + `query_router.rs` (`/_search`, `/_vector`, `/_sql`) | **exists** |
-| **Object Data Funnel** | indexes datasources **and Action edits** into object DBs, with **offset-tracked edit queue**, read-after-write | `WalIndexer` (indexing) + new object/edge consumers + **CAS-append** (the offset-tracked edit queue) | partial; CAS missing |
+| **Object Data Funnel** | indexes datasources **and Action edits** into object DBs, with **offset-tracked edit queue**, read-after-write | `WalIndexer` (indexing) + new object/edge consumers + **coordinator CAS** (ontology-layer, no core — broker CAS ❌ cancelled §6) | partial; coordinator to build |
 | **Object types backed by datasets/streams** | objects are indexed, not stored | Memory's typed records materialized via Tantivy/Parquet/HNSW | **exists** (generalize types) |
 | **Link Types** | schema of a relationship between two object types | **edge index** (new keyed-index consumer over `ont.edges.{tenant}`); `LineageIndex` is the prototype | to build (O-1) |
-| **Action Types** | validated set of edits committed atomically; `auto` vs `confirm`; side-effects | **command handler**: propose→confirm→apply events + **CAS-append** + audit | to build (O-3) |
+| **Action Types** | validated set of edits committed atomically; `auto` vs `confirm`; side-effects | **command handler**: propose→confirm→apply events + **coordinator CAS** (ontology-layer, no core) + audit | to build (O-3) |
 | **Functions (TS/Python, traverse links, make edits)** | server-side sandboxed compute over the ontology | out of scope early; later via `/_sql` + WASM | future (O-4+) |
 | **AIP typed tools: Action / Object Query / Function** | the only way agents touch the ontology | **MCP tools**: `invoke_action` / `query_objects` / `traverse` / `as_of` | to build (O-2) |
 
-Palantir's Object Storage V2 even describes its edit path as *"a Funnel-managed queue that has offset tracking to support simultaneous user edits"* with *read-after-write* guarantees ([os-v2](https://www.palantir.com/docs/foundry/object-backend/object-storage-v2-breaking-changes)). **That offset-tracked edit queue is precisely an optimistic-concurrency CAS-append on an event log** — which is the one primitive Chronik lacks and O-3 must build. The reference architecture independently arrives at the same design an event log makes natural.
+Palantir's Object Storage V2 even describes its edit path as *"a Funnel-managed queue that has offset tracking to support simultaneous user edits"* with *read-after-write* guarantees ([os-v2](https://www.palantir.com/docs/foundry/object-backend/object-storage-v2-breaking-changes)). **That offset-tracked edit queue is precisely an optimistic-concurrency CAS-append on an event log** — which O-3 implements as an **ontology-layer coordinator** (proven in Tier B), *not* a broker produce-path change (that is ❌ cancelled, §6). The reference architecture independently arrives at the same design an event log makes natural.
 
 ---
 
@@ -68,7 +77,7 @@ Palantir's Object Storage V2 even describes its edit path as *"a Funnel-managed 
 | **Identity** (stable object id across events) | ~Built | Deterministic `key` + compaction = supersedeable identity ([schema.rs](../crates/chronik-memory/src/schema.rs)). Fuzzy entity resolution (§5.6, §9 risk) will appear. |
 | **Provenance** (object/edge → source events) | **Built** | `source.{topic,offsets}` end-to-end (AM-2.6) + `LineageIndex` ancestor/descendant DAG (AM-3.4). |
 | **Relationships** (typed edges between objects) | **Missing** | Needs an edge index. `LineageIndex` ([lineage.rs](../crates/chronik-memory/src/lineage.rs)) is the working prototype (§4). |
-| **Actions** (validated commands that write back) | **Missing** | Needs single-aggregate **compare-and-swap append**. Transactions are stubbed; **no CAS today** — confirmed in [produce_handler.rs](../crates/chronik-server/src/produce_handler.rs) (idempotent dedup only, no expected-offset validation). |
+| **Actions** (validated commands that write back) | **Missing (buildable, no core)** | Concurrency safety via an **ontology-layer coordinator / optimistic-CAS** (proven in Tier B, `CasLog` 10/10) — **NOT** the broker CAS (that produce-path change is ❌ cancelled, §6). `produce_handler.rs` has idempotent dedup only, and we no longer need more from it. |
 
 **Sequencing consequence**: the read side (Objects + Identity + Provenance + Links-as-derived-views + the agent surface) ships and delivers agent value *before* the hard write side (Actions). We do **not** gate the whole Ontology on the CAS primitive.
 
@@ -93,7 +102,7 @@ My earlier feasibility note worried "no cross-record keyed state exists in the c
 
 **This collapses most of the risk I previously assigned to Relationships.** The edge index is not a from-scratch capability — it is the **seventh instance of an already-proven, already-tested template**, and the codebase map gives a concrete recipe: a `RelationshipIndex { outgoing, incoming: Arc<DashMap<entity, Vec<Edge>>> }` auto-populated by a consumer over `mem.fact.*` that reads `(subject, predicate, object)` triples. `LineageIndex` already does the bidirectional ancestor/descendant half; the gap is (a) auto-population from facts rather than manual `add_citation()`, and (b) general typed edges rather than only citation edges.
 
-**What remains genuinely new** (not covered by the template): the **CAS-append** primitive for Actions (§6) — the one true engine gap.
+**What remains genuinely new** (not covered by the template): the Action engine for writeback. ~~the CAS-append primitive~~ — the once-presumed "one true engine gap" (a core produce-path change) is **❌ cancelled** (§6); Tier B proved the concurrency guarantee is achievable at the ontology layer via a coordinator, so nothing left needs a core change.
 
 ---
 
@@ -141,9 +150,30 @@ Our differentiation is not the interface (the field has standardized it) — it 
 
 ---
 
-## 6. The one hard primitive — CAS-append for Actions (design sketch)
+## 6. ~~The one hard primitive — CAS-append for Actions~~ (❌ CANCELLED / WON'T DO)
 
-Everything except Actions rides the §4 template. Actions need the single missing engine capability, and the writeback-safety research hands us the design.
+> **❌ CANCELLED (2026-08-19): strict broker-enforced CAS-append will NOT be built.**
+> The original plan required an expected-offset validation *inside the core produce
+> path* (`produce_handler.rs`) — a correctness-critical change to the hottest code
+> in the broker, right after the replication rebuild. **It is no longer needed.**
+> The Tier B state-machine harness (`crates/chronik-memory/tests/eval_ontology_statemachine.rs`,
+> 10/10) proved the entire Action-correctness contract — invariant rejection,
+> **lost-update guard**, idempotent retry, and "exactly one wins" under a 12-agent
+> race — using a **coordinator / optimistic-CAS at the ONTOLOGY layer** (over
+> `chronik_ontology::CasLog`), with **zero changes to core**. A single-writer-per-
+> aggregate coordinator (or an optimistic version-check against the projected
+> state) delivers the same guarantee the broker primitive would. Broker CAS is
+> therefore demoted from "the one hard primitive" to an *optional* future
+> scale-hardening for coordinator-free multi-writer — **not on the roadmap.**
+>
+> The design sketch below is retained for historical context and because the
+> event lifecycle (propose→confirm→apply, idempotency, optimistic token) is still
+> exactly what the ontology-layer Action engine implements — just without the
+> produce-path change.
+
+Everything except Actions rides the §4 template. The Action **lifecycle** below is
+still the plan; only the *strict broker-enforced CAS* mechanism is cancelled — the
+concurrency token is enforced by the ontology-layer coordinator instead.
 
 **Primitive**: single-aggregate compare-and-swap append — "append this event to stream keyed `K` only if the stream's latest offset for `K` is still `N`." Confirmed absent today ([produce_handler.rs](../crates/chronik-server/src/produce_handler.rs) has idempotent sequence dedup but no expected-offset validation; transaction state machine is stubbed). Atomic offset allocation already exists in the produce path, and the idempotent producer's per-key sequence tracking is a working template — so this is a **localized change**, not a rewrite.
 
@@ -154,10 +184,12 @@ Everything except Actions rides the §4 template. Actions need the single missin
 
 **Per-action risk tier** (`auto | confirm | approval`) is a property of the Action Type in the registry, driving both the MCP tool schema the LLM sees and whether a human gate is required — mirroring Palantir's per-tool `auto`-vs-`confirm` and LangGraph's `interrupt_on` policy.
 
-**Spike CAS standalone first** — before building any Action semantics, prove the append-only-if-offset-N primitive under concurrency in isolation. It gates every Action; it is the long pole.
+~~**Spike CAS standalone first**~~ — ✅ DONE, and it settled the question: the standalone spike (`chronik_ontology::cas.rs`) plus the Tier B state-machine harness proved the concurrency contract holds at the ontology layer, so the broker produce-path CAS is **cancelled** (banner above). The append-only-if-offset-N token is enforced by the coordinator, not the broker.
 
-> **⚠️ OPEN DESIGN DECISION — CAS scope & atomic-append semantics (the spike MUST resolve these).**
-> `read_offset` alone is under-specified on a partitioned log. Pin before implementing Actions:
+> **✅ RESOLVED by the spike + Tier B (broker CAS cancelled).** These questions
+> were the reason to spike first; the spike (`cas.rs`) + the Tier B state-machine
+> harness answered them at the ontology-layer coordinator, so no produce-path
+> change is needed. Recorded here as the settled contract the coordinator implements:
 > - **Token scope.** Is the concurrency token `(topic, partition, offset)`, a per-aggregate sequence, or a global commit ID? All events for aggregate `K` must route to the **same partition** (partition key = `K`) so one offset is authoritative for `K`; cross-partition CAS is out of scope for v1.
 > - **Atomic multi-event append.** `ActionApplied.emitted_events` is a *batch* — the CAS check + the append of the whole batch must be atomic (all-or-nothing), never per-event.
 > - **Idempotent retry.** On a producer timeout the outcome is unknown; dedup by `idempotency_key` / `proposal_id` so a blind retry can't double-apply.
@@ -167,7 +199,7 @@ Everything except Actions rides the §4 template. Actions need the single missin
 
 ## 7. Phased plan (product-value-ordered)
 
-Each phase ships agent-visible value on its own. Ordered so the cheapest, highest-leverage, lowest-risk capability lands first and the one hard primitive (CAS) is isolated and late.
+Each phase ships agent-visible value on its own. Ordered so the cheapest, highest-leverage, lowest-risk capability lands first and the write side (Actions) is late. (The once-"one hard primitive," broker CAS, is ❌ cancelled — §6 — so no phase now requires a core change.)
 
 ### Phase O-0: Object Types — generalize Memory's typed records into user-defined objects
 **Product value**: define an Object Type; Chronik materializes instances from projections with identity + provenance + `as_of` — domain-agnostic Memory.
@@ -194,7 +226,7 @@ Each phase ships agent-visible value on its own. Ordered so the cheapest, highes
 
 ### Phase O-3: Action Types — validated writeback (the hard, isolated primitive)
 **Product value**: agents can *do* things (close an issue, reassign a deployment) with validation, audit, dry-run preview, and no lost updates.
-**Engine work**: **CAS-append** primitive (§6, spike first); Action Type definitions with pre/post validation; propose→confirm→apply event flow; per-action risk tiers; full audit (reuse Memory's `mem.audit` pattern); MCP `invoke_action` tool with the `auto`/`confirm`/`approval` gate.
+**Engine work**: ~~CAS-append primitive~~ (❌ cancelled — concurrency enforced by an **ontology-layer coordinator/optimistic-CAS**, proven in Tier B, **no core change**); Action Type definitions with pre/post validation; propose→confirm→apply event flow; per-action risk tiers; full audit (reuse Memory's `mem.audit` pattern); MCP `invoke_action` tool with the `auto`/`confirm`/`approval` gate.
 **Reuses**: Memory audit topic, idempotent-producer machinery as the CAS template, §4 template for the action-state index.
 **Grounding**: Palantir Action Types + Funnel offset-tracked edit queue; propose/confirm/apply + idempotency + optimistic concurrency (writeback-safety survey).
 **Exit**: an Action rejects an invalid command (cross-object invariant) under concurrency **without a lost update**; every applied Action is auditable to its emitted events; dry-run returns a correct preview with zero domain effect.
@@ -220,7 +252,7 @@ Unlike Memory, the Ontology has no single LongMemEval-style oracle, so the **pro
 
 ## 9. Risks & open questions
 - **Premature generalization** — do NOT build the abstract type engine before O-0 proves the object model on a real domain. (Same lesson as "ship Memory before Ontology.")
-- **CAS correctness** — Actions create a new correctness-critical write path; **isolate and spike CAS (§6) before believing in writeback.**
+- ~~**CAS correctness**~~ — ✅ retired. Actions were feared to need a core write-path change; the spike + Tier B proved the write path is safe at the ontology-layer coordinator, so **broker CAS is cancelled (§6)** and this risk no longer applies.
 - **Cross-record state is a category, not a feature** — the edge index is Chronik's entry into stateful stream processing; the §4 template de-risks the mechanics, but scope O-1 aware that this is the door to Kafka-Streams/Flink-class capability.
 - **Entity resolution creep** — deterministic keys cover most cases; fuzzy resolution (à la Memory's 0.97-cosine dedup) will appear. Decide the identity model deliberately, once, in O-0, using the deterministic-first / LLM-fallback approach in stance §5.6 (blocking → grey-zone adjudication → canonicalization). Watch both failure directions: under-merge (GraphRAG's exact-string cautionary tale) and over-merge (embedding false-positives).
 - **Boundary discipline** — the Ontology is a layer *on* Chronik (new `chronik-ontology` crate + Unified-API mount), never domain semantics inside `chronik-server`. (AD-1 precedent from Memory.)
@@ -249,7 +281,7 @@ Unlike Memory, the Ontology has no single LongMemEval-style oracle, so the **pro
 - **Entity/edge index** — auto-populated `RelationshipIndex` from `mem.fact.*` triples; `LineageIndex` is the manual prototype (O-1).
 - **Object type registry** — user-defined types vs. 5 hardcoded memory types (O-0).
 - **Action/command handler** — precondition-gated state transitions; today `TaskCurrentIndex` is latest-wins with no preconditions (O-3).
-- **CAS / conditional append** — no expected-offset validation in the produce path; transactions stubbed (O-3, §6).
+- **CAS / conditional append** — no expected-offset validation in the produce path; transactions stubbed. **Broker CAS is ❌ cancelled (§6)** — the Action engine enforces the concurrency token at the ontology-layer coordinator instead, so this gap is intentional and closed.
 
 ## Appendix B — Open research threads to resolve during design
 Resolved in the 2026-07-04 research pass (see §5): competitive landscape (near-universal fixed-tools+MCP convergence), LPG-vs-RDF (LPG wins), text-to-query reliability (numbers), MCP surface design (tools vs resources), entity-resolution approach (deterministic-first), analytics-semantic-layer contrast (no action primitive). Remaining genuinely open:

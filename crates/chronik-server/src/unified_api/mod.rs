@@ -31,6 +31,9 @@ pub mod search_handler;
 pub mod memory;
 #[cfg(feature = "memory")]
 pub mod memory_types;
+// O-0: Ontology endpoints (/ontology/v1/*). Rides the `memory` feature.
+#[cfg(feature = "memory")]
+pub mod ontology;
 
 use axum::{
     extract::State,
@@ -204,6 +207,21 @@ pub struct UnifiedApiState {
     /// returns 503.
     #[cfg(feature = "memory")]
     pub memory_index: Option<Arc<chronik_memory::MemoryIndex>>,
+    /// O-0: the Ontology ObjectType registry (`ont.types.{tenant}` consumer).
+    /// Backs `/ontology/v1/*`; when `None` those endpoints reply 503.
+    #[cfg(feature = "memory")]
+    pub ontology_types: Option<Arc<chronik_ontology::OntTypeIndex>>,
+    /// O-1: the materialized bidirectional edge graph (`mem.fact.{tenant}`
+    /// consumer). Backs `/ontology/v1/neighbors` (reverse + forward traversal —
+    /// the reverse `incoming()` lookup the on-demand traversal can't do cheaply);
+    /// when `None` that endpoint replies 503.
+    #[cfg(feature = "memory")]
+    pub edge_index: Option<Arc<chronik_ontology::RelationshipIndex>>,
+    /// O-1: the LinkType registry (`ont.links.{tenant}` consumer). Backs
+    /// `/ontology/v1/related` — named, inverse-aware relation traversal so agents
+    /// pick a relation by name instead of a direction flag. `None` -> 503.
+    #[cfg(feature = "memory")]
+    pub link_types: Option<Arc<chronik_ontology::LinkTypeIndex>>,
     /// AM-2.5: Per-tenant token-bucket rate limiter. When present AND
     /// [`Self::memory_tenants`] is populated, every write / recall consumes
     /// tokens from the caller's `TenantQuotas.{ingest_msgs_per_sec,
@@ -272,6 +290,12 @@ impl UnifiedApiState {
             memory_rate_limiter: None,
             #[cfg(feature = "memory")]
             memory_index: None,
+            #[cfg(feature = "memory")]
+            ontology_types: None,
+            #[cfg(feature = "memory")]
+            edge_index: None,
+            #[cfg(feature = "memory")]
+            link_types: None,
             #[cfg(feature = "memory")]
             memory_tenant_metrics: None,
             #[cfg(feature = "memory")]
@@ -347,6 +371,38 @@ impl UnifiedApiState {
         index: Arc<chronik_memory::MemoryIndex>,
     ) -> Self {
         self.memory_index = Some(index);
+        self
+    }
+
+    /// O-0: attach the Ontology ObjectType registry that backs `/ontology/v1/*`.
+    /// When missing, those endpoints reply `503 service_unavailable`.
+    #[cfg(feature = "memory")]
+    pub fn with_ontology_types(
+        mut self,
+        index: Arc<chronik_ontology::OntTypeIndex>,
+    ) -> Self {
+        self.ontology_types = Some(index);
+        self
+    }
+
+    /// O-1: attach the materialized edge index that backs
+    /// `/ontology/v1/neighbors`. When missing, that endpoint replies `503`.
+    #[cfg(feature = "memory")]
+    pub fn with_edge_index(
+        mut self,
+        index: Arc<chronik_ontology::RelationshipIndex>,
+    ) -> Self {
+        self.edge_index = Some(index);
+        self
+    }
+
+    /// O-1: attach the LinkType registry that backs `/ontology/v1/related`.
+    #[cfg(feature = "memory")]
+    pub fn with_link_types(
+        mut self,
+        index: Arc<chronik_ontology::LinkTypeIndex>,
+    ) -> Self {
+        self.link_types = Some(index);
         self
     }
 
@@ -571,7 +627,17 @@ pub fn create_router_full(
         .route("/memory/v1/compact", post(memory::compact))
         .route("/memory/v1/recall/stream", post(memory::recall_stream))
         .route("/memory/v1/:memory_id/source", get(memory::source))
-        .route("/memory/v1/:memory_id/lineage", get(memory::lineage));
+        .route("/memory/v1/:memory_id/lineage", get(memory::lineage))
+        // O-0 Ontology (Object Types)
+        .route("/ontology/v1/get_object", post(ontology::get_object))
+        .route("/ontology/v1/query_objects", post(ontology::query_objects))
+        .route("/ontology/v1/traverse", post(ontology::traverse))
+        .route("/ontology/v1/neighbors", post(ontology::neighbors))
+        .route("/ontology/v1/related", post(ontology::related))
+        .route("/ontology/v1/relations", get(ontology::relations))
+        .route("/ontology/v1/explain", post(ontology::explain))
+        .route("/ontology/v1/types", get(ontology::list_types))
+        .route("/ontology/v1/mcp", post(ontology::mcp));
     }
 
     // Add shared state for SQL/Vector/Query/Memory endpoints

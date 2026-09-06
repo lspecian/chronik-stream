@@ -1102,6 +1102,7 @@ Key environment variables:
 - `CHRONIK_SCHEMA_REGISTRY_AUTH_ENABLED` - Enable HTTP Basic Auth for Schema Registry (default: `false`)
 - `CHRONIK_SCHEMA_REGISTRY_USERS` - Comma-separated `user:pass` pairs for Schema Registry auth
 - `CHRONIK_UNIFIED_API_PORT` - Unified API port (default: 6092)
+- `CHRONIK_ONTOLOGY_ENABLED` - Enable the Ontology layer (`/ontology/v1/*` — typed objects, links, MCP tools for agents; v2.13.0+). Default `false`. Requires a `--features memory` build + the memory registry env (`CHRONIK_MEMORY_KAFKA`, `CHRONIK_MEMORY_API`) + an embedding provider (`CHRONIK_EMBEDDING_*`). Authored with the `chronik` CLI (`chronik ontology {validate,apply,ingest}`). See docs/ONTOLOGY_SDK.md. O-3 Actions are NOT included/wired.
 - `OPENAI_API_KEY` - OpenAI API key for vector embeddings
 - `CHRONIK_EMBEDDING_PROVIDER` - Default embedding provider: `openai`, `external`
 - `CHRONIK_COLUMNAR_FORMAT` - Default columnar format: `parquet`, `arrow`

@@ -1,0 +1,16 @@
+{"subject":"T1","predicate":"status","object":"open","valid_from":"2026-01-01T00:00:00Z","valid_to":"2026-01-05T00:00:00Z"}
+{"subject":"T1","predicate":"status","object":"in_progress","valid_from":"2026-01-05T00:00:00Z","valid_to":"2026-01-08T00:00:00Z"}
+{"subject":"T1","predicate":"status","object":"resolved","valid_from":"2026-01-08T00:00:00Z"}
+{"subject":"T1","predicate":"assignee","object":"alice","valid_from":"2026-01-01T00:00:00Z"}
+{"subject":"T1","predicate":"project","object":"core","valid_from":"2026-01-01T00:00:00Z"}
+{"subject":"T2","predicate":"status","object":"open","valid_from":"2026-01-01T00:00:00Z"}
+{"subject":"T2","predicate":"assignee","object":"bob","valid_from":"2026-01-01T00:00:00Z"}
+{"subject":"T2","predicate":"blocked_by","object":"T1","valid_from":"2026-01-01T00:00:00Z"}
+{"subject":"T3","predicate":"status","object":"open","valid_from":"2026-01-01T00:00:00Z"}
+{"subject":"T3","predicate":"assignee","object":"alice","valid_from":"2026-01-01T00:00:00Z"}
+{"subject":"T3","predicate":"blocked_by","object":"T2","valid_from":"2026-01-01T00:00:00Z"}
+{"subject":"E1","predicate":"status","object":"open","valid_from":"2026-01-01T00:00:00Z"}
+{"subject":"E1","predicate":"parent_of","object":"E1_s0","valid_from":"2026-01-01T00:00:00Z"}
+{"subject":"E1","predicate":"parent_of","object":"E1_s1","valid_from":"2026-01-01T00:00:00Z"}
+{"subject":"E1_s0","predicate":"status","object":"open","valid_from":"2026-01-01T00:00:00Z"}
+{"subject":"E1_s1","predicate":"status","object":"in_progress","valid_from":"2026-01-01T00:00:00Z"}

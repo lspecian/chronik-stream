@@ -1,0 +1,26 @@
+# Chronik Ontology SDK — example schema (an issue tracker).
+#
+#   chronik ontology validate examples/ontology/issue-tracker.ontology.yaml
+#   chronik ontology apply    examples/ontology/issue-tracker.ontology.yaml --brokers localhost:9092
+#   chronik ontology ingest   examples/ontology/issue-tracker.facts.jsonl --namespace sdkdemo
+#
+# Then any agent consumes the domain via the MCP endpoint /ontology/v1/mcp
+# (the broker must run with CHRONIK_ONTOLOGY_ENABLED=true).
+
+schema_version: 1
+namespace: sdkdemo
+
+object_types:
+  - name: Ticket
+    description: A unit of tracked work.
+    identity: { field: subject }          # a fact's `subject` is the ticket id
+    backing: { topic_prefix: mem.fact }    # attributes come from mem.fact.{tenant}
+    attributes:
+      - { name: status,   from_predicate: status }
+      - { name: assignee, from_predicate: assignee }
+      - { name: project,  from_predicate: project }
+
+link_types:
+  # `predicate` defaults to the relation name; `inverse` names the reverse read.
+  - { name: blocked_by, inverse: blocks,     description: "Ticket A is blocked by ticket B." }
+  - { name: parent_of,  inverse: subtask_of, description: "An epic owns a subtask." }

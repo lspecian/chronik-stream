@@ -555,6 +555,55 @@ fn anchored_question(item: &LongMemEvalItem) -> String {
     }
 }
 
+/// Flatten an ontology [`chronik_ontology::EntityView`] into reader statements
+/// (`subject — predicate: object`), tally the provenance-cite gate (statements
+/// whose triple carries ≥1 source offset), and optionally collect string object
+/// values as 1-hop traversal targets.
+fn collect_onto_statements(
+    ev: &chronik_ontology::EntityView,
+    statements: &mut Vec<String>,
+    stmts_total: &mut usize,
+    stmts_cited: &mut usize,
+    mut hop1_targets: Option<&mut Vec<String>>,
+) {
+    for tri in &ev.triples {
+        let cited = tri.provenance.iter().any(|p| !p.offsets.is_empty());
+        for v in &tri.values {
+            let obj = render_json_value(v);
+            if obj.trim().is_empty() {
+                continue;
+            }
+            statements.push(format!("{} — {}: {}", ev.id, tri.name, obj));
+            *stmts_total += 1;
+            if cited {
+                *stmts_cited += 1;
+            }
+            // 1-hop candidate: a short-ish string object that could name an entity.
+            if let Some(t) = hop1_targets.as_deref_mut() {
+                if let serde_json::Value::String(s) = v {
+                    let s = s.trim();
+                    if !s.is_empty()
+                        && s.chars().count() <= 64
+                        && s.chars().any(|c| c.is_alphabetic())
+                        && !t.iter().any(|x| x.eq_ignore_ascii_case(s))
+                    {
+                        t.push(s.to_string());
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Render a JSON object value as a plain string for a reader statement.
+fn render_json_value(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
 #[tokio::test]
 #[ignore = "requires ANTHROPIC_API_KEY + CHRONIK_INTEGRATION=1 + live cluster"]
 async fn evaluate_longmemeval() {
@@ -725,6 +774,37 @@ async fn evaluate_longmemeval() {
             );
         }
     }
+
+    // Ontology-layer efficacy arm (LONGMEMEVAL_ONTOLOGY=1). Tests whether
+    // resolving the question's entities into structured objects (open-domain:
+    // ALL predicates about a subject) plus a bounded 1-hop traversal, fed to the
+    // SAME reader as read-time (`answer_from_statements`), beats flat top-k
+    // recall on the SAME write-time fact graph. This is Comparison ① (fair,
+    // matched): flat `synthesize()` vs ontology assembly over identical
+    // `mem.fact` triples, same reader, same judge, one pass. Requires the
+    // write-time fact graph, so it is INCOMPATIBLE with read-time (raw-only)
+    // ingest — guarded below.
+    let use_ontology = std::env::var("LONGMEMEVAL_ONTOLOGY")
+        .map(|v| v == "1" || v == "true" || v == "on")
+        .unwrap_or(false);
+    if use_ontology && use_readtime {
+        panic!(
+            "LONGMEMEVAL_ONTOLOGY=1 needs the write-time fact graph (mem.fact), but \
+             LONGMEMEVAL_READTIME=1 ingests raw turns only — the ontology arm would \
+             resolve nothing. Run the two arms in separate passes."
+        );
+    }
+    if use_ontology {
+        eprintln!(
+            "ONTOLOGY arm ENABLED — question entities resolved into structured \
+             objects (open-domain, all predicates) + bounded 1-hop, answered via \
+             answer_from_statements; reported as onto_judge_rate (A/B vs \
+             synth_judge_rate). NOTE (v1): per-fact dates are omitted from the \
+             statements and as_of is NOT applied, so temporal/knowledge-update \
+             may under-read — v1 targets ASSEMBLY (multi-session) + TRAVERSAL \
+             (multi-hop). A judge rate needs LONGMEMEVAL_USE_LLM_JUDGE=1."
+        );
+    }
     // The SYNTH (answerer) model may be overridden independently of the judge.
     // This isolates the synth-model variable: hold the judge at the baseline
     // model (keeping synth_judge_rate comparable to a prior anchor) while
@@ -805,11 +885,12 @@ async fn evaluate_longmemeval() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(150);
     println!("Retrieval budget: fanout={fanout}, recall k={recall_k}, synth k={synth_k}");
-    let synth_gen: Option<Arc<dyn chronik_memory::embeddings::TextGenerator>> = if use_synth {
-        Some(synth_provider.build_generator(&api_key))
-    } else {
-        None
-    };
+    let synth_gen: Option<Arc<dyn chronik_memory::embeddings::TextGenerator>> =
+        if use_synth || use_ontology {
+            Some(synth_provider.build_generator(&api_key))
+        } else {
+            None
+        };
     if use_synth {
         println!(
             "SYNTHESIS mode ENABLED — recall results passed to LLM for fused answer; \
@@ -902,6 +983,26 @@ async fn evaluate_longmemeval() {
     if use_two_pass {
         println!("TWO-PASS EXTRACTOR ENABLED — Anthropic entity-scan + per-entity sweep (lever #1)");
     }
+
+    // ── Ontology arm state (LONGMEMEVAL_ONTOLOGY=1) ──────────────────────────
+    let onto_client = reqwest::Client::new();
+    let onto_max_facts: usize = std::env::var("LONGMEMEVAL_ONTO_MAX_FACTS")
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(300);
+    let onto_hop1_cap: usize = std::env::var("LONGMEMEVAL_ONTO_HOP1_CAP")
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(6);
+    let onto_subject_cap: usize = std::env::var("LONGMEMEVAL_ONTO_SUBJECT_CAP")
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+    let mut onto_substring_hits: usize = 0;
+    let mut onto_judge_hits: usize = 0;
+    let mut onto_abstain_count: usize = 0;
+    let mut total_onto_secs = 0.0_f64;
+    let mut by_type_onto: std::collections::HashMap<String, (usize, usize)> = Default::default();
+    // Provenance-cite gate (statements whose triple carries ≥1 source offset)
+    // + routing diagnostics.
+    let mut onto_stmts_total: usize = 0;
+    let mut onto_stmts_cited: usize = 0;
+    let mut onto_entities_resolved: usize = 0;
+    let mut onto_items_empty: usize = 0; // items where NO entity resolved (routing/coref miss)
 
     for (i, item) in items.iter().enumerate() {
         // Override tenant via LONGMEMEVAL_TENANT so pilots can create fresh typed
@@ -1252,6 +1353,121 @@ async fn evaluate_longmemeval() {
         }
         total_synth_secs += synth_secs;
 
+        // ── Ontology arm: resolve the question's entities into structured
+        //    objects (all triples) + a bounded 1-hop traversal, then answer via
+        //    the SAME reader (answer_from_statements) and grade with the same
+        //    judge. The ONLY variable vs the flat synth arm is context =
+        //    structured entity assembly instead of flat top-k memories. ────────
+        let (onto_sub_hit, onto_judge_hit, onto_abstained, onto_secs) = if use_ontology {
+            let gen = synth_gen.as_ref().expect("ontology arm requires a reader");
+            let t0 = Instant::now();
+            // Route: entity candidates from the question + the universal "user"
+            // subject (most LongMemEval questions concern the user).
+            let mut subjects: Vec<String> = vec!["user".to_string()];
+            for s in extract_subject_candidates(&item.question) {
+                if !subjects.iter().any(|x| x.eq_ignore_ascii_case(&s))
+                    && subjects.len() < onto_subject_cap
+                {
+                    subjects.push(s);
+                }
+            }
+            let mut statements: Vec<String> = Vec::new();
+            let mut resolved_here = 0usize;
+            let mut hop1_targets: Vec<String> = Vec::new();
+            let mut seen_subj: std::collections::HashSet<String> =
+                subjects.iter().map(|s| s.to_lowercase()).collect();
+            for subj in &subjects {
+                match chronik_ontology::resolve_entity(
+                    &onto_client, &api, mem.namespace(), subj, onto_max_facts, None,
+                )
+                .await
+                {
+                    Ok(Some(ev)) => {
+                        resolved_here += 1;
+                        collect_onto_statements(
+                            &ev, &mut statements, &mut onto_stmts_total, &mut onto_stmts_cited,
+                            Some(&mut hop1_targets),
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(e) => eprintln!(
+                        "  [warn] item {} ontology resolve({}) failed: {}",
+                        item.question_id, subj, e
+                    ),
+                }
+            }
+            // Bounded 1-hop traversal: resolve entities named as object values
+            // (Alice --works_at--> Acme --located_in--> Portugal).
+            let mut hopped = 0usize;
+            for tgt in hop1_targets {
+                if hopped >= onto_hop1_cap {
+                    break;
+                }
+                let key = tgt.to_lowercase();
+                if seen_subj.contains(&key) {
+                    continue;
+                }
+                seen_subj.insert(key);
+                if let Ok(Some(ev)) = chronik_ontology::resolve_entity(
+                    &onto_client, &api, mem.namespace(), &tgt, onto_max_facts, None,
+                )
+                .await
+                {
+                    resolved_here += 1;
+                    hopped += 1;
+                    collect_onto_statements(
+                        &ev, &mut statements, &mut onto_stmts_total, &mut onto_stmts_cited, None,
+                    );
+                }
+            }
+            onto_entities_resolved += resolved_here;
+            if resolved_here == 0 {
+                onto_items_empty += 1;
+            }
+
+            let is_abstention_question = item.question_id.ends_with("_abs");
+            let res = chronik_memory::answer_from_statements(
+                &anchored_question(item), &statements, gen.clone(),
+            )
+            .await;
+            let elapsed = t0.elapsed().as_secs_f64();
+            match res {
+                Ok(ans) => {
+                    let s_sub = answer_match(&[ans.answer.clone()], &item.answer) >= 0.999;
+                    let s_judge = if is_abstention_question {
+                        ans.abstained
+                    } else if let Some(j) = judge.as_ref() {
+                        answer_match_llm(&[ans.answer], &item.question, &item.answer, j.as_ref())
+                            .await
+                            >= 0.999
+                    } else {
+                        false
+                    };
+                    (s_sub, s_judge, ans.abstained, elapsed)
+                }
+                Err(e) => {
+                    eprintln!(
+                        "  [warn] item {} ontology answer failed: {} — miss + abstain",
+                        item.question_id, e
+                    );
+                    (false, false, true, elapsed)
+                }
+            }
+        } else {
+            (false, false, false, 0.0)
+        };
+        if use_ontology {
+            onto_substring_hits += if onto_sub_hit { 1 } else { 0 };
+            onto_judge_hits += if onto_judge_hit { 1 } else { 0 };
+            if onto_abstained {
+                onto_abstain_count += 1;
+            }
+            let e = by_type_onto.entry(item.question_type.clone()).or_insert((0, 0));
+            e.0 += if onto_judge_hit { 1 } else { 0 };
+            e.1 += 1;
+        }
+        total_onto_secs += onto_secs;
+
         // Primary metric: judge if enabled, else substring.
         let hit = if use_llm_judge { judge_hit } else { substring_hit };
 
@@ -1296,8 +1512,20 @@ async fn evaluate_longmemeval() {
             String::new()
         };
 
+        let onto_tag = if use_ontology {
+            format!(
+                " onto({}{:.2}s: sub {} judge {})",
+                if onto_abstained { "abstain " } else { "" },
+                onto_secs,
+                if onto_sub_hit { "HIT" } else { "miss" },
+                if onto_judge_hit { "HIT" } else { "miss" },
+            )
+        } else {
+            String::new()
+        };
+
         println!(
-            "  [{:>3}/{}] {:24} {:9} {:>4} turns ext={:.1}s rec={:.2}s judge={:.2}s {}{}{} (n_results={}, gold={:?})",
+            "  [{:>3}/{}] {:24} {:9} {:>4} turns ext={:.1}s rec={:.2}s judge={:.2}s {}{}{}{} (n_results={}, gold={:?})",
             i + 1,
             n_run,
             item.question_id,
@@ -1309,6 +1537,7 @@ async fn evaluate_longmemeval() {
             verdict,
             synth_tag,
             concept_tag,
+            onto_tag,
             results.len(),
             item.answer
         );
@@ -1360,12 +1589,50 @@ async fn evaluate_longmemeval() {
         );
         println!("       synth_total_secs={:.0}s", total_synth_secs);
     }
+    if use_ontology {
+        let n = n_total_runs as f32;
+        let cite = if onto_stmts_total > 0 {
+            onto_stmts_cited as f32 / onto_stmts_total as f32
+        } else {
+            0.0
+        };
+        println!(
+            "       onto_sub_rate       ={:.3} ({}/{}) — ontology-assembled answer, strict substring",
+            onto_substring_hits as f32 / n, onto_substring_hits, n_total_runs
+        );
+        println!(
+            "       onto_judge_rate     ={:.3} ({}/{}) — ontology-assembled answer, judge-graded (Comparison ① vs synth_judge_rate)",
+            onto_judge_hits as f32 / n, onto_judge_hits, n_total_runs
+        );
+        println!(
+            "       onto_abstain_rate   ={:.3} ({}/{}) — model emitted \"I don't know\"",
+            onto_abstain_count as f32 / n, onto_abstain_count, n_total_runs
+        );
+        println!(
+            "       onto_provenance_cite={:.3} ({}/{} statements carry a source offset — the ≥0.95 gate)",
+            cite, onto_stmts_cited, onto_stmts_total
+        );
+        println!(
+            "       onto_diagnostics    : {} entities resolved total; {} item(s) resolved NOTHING (routing/coreference miss)",
+            onto_entities_resolved, onto_items_empty
+        );
+        println!("       onto_total_secs={:.0}s", total_onto_secs);
+    }
     println!("\nBy question_type (primary metric):");
     let mut type_keys: Vec<_> = by_type.keys().cloned().collect();
     type_keys.sort();
     for k in type_keys {
         let (h, n) = by_type[&k];
         println!("  {:30} {:>2}/{:<2}  rate={:.2}", k, h, n, h as f32 / n as f32);
+    }
+    if use_ontology {
+        println!("\nBy question_type (ontology judge — the slice the layer targets):");
+        let mut ks: Vec<_> = by_type_onto.keys().cloned().collect();
+        ks.sort();
+        for k in ks {
+            let (h, n) = by_type_onto[&k];
+            println!("  {:30} {:>2}/{:<2}  rate={:.2}", k, h, n, h as f32 / n.max(1) as f32);
+        }
     }
 
     // AM-1.8: write metrics JSON for the nightly baseline-diff check
@@ -1382,9 +1649,16 @@ async fn evaluate_longmemeval() {
                 "raw_judge_rate": if use_llm_judge { judge_hits as f32 / n_total_runs as f32 } else { hit_rate },
                 "synth_substring_rate": if use_synth { synth_substring_hits as f32 / n_total_runs as f32 } else { 0.0 },
                 "synth_judge_rate": if use_synth { synth_judge_hits as f32 / n_total_runs as f32 } else { 0.0 },
-                "synth_abstain_rate": if use_synth { synth_abstain_count as f32 / n_total_runs as f32 } else { 0.0 }
+                "synth_abstain_rate": if use_synth { synth_abstain_count as f32 / n_total_runs as f32 } else { 0.0 },
+                "onto_judge_rate": if use_ontology { onto_judge_hits as f32 / n_total_runs as f32 } else { 0.0 },
+                "onto_sub_rate": if use_ontology { onto_substring_hits as f32 / n_total_runs as f32 } else { 0.0 },
+                "onto_abstain_rate": if use_ontology { onto_abstain_count as f32 / n_total_runs as f32 } else { 0.0 },
+                "onto_provenance_cite": if use_ontology && onto_stmts_total > 0 { onto_stmts_cited as f32 / onto_stmts_total as f32 } else { 0.0 }
             },
             "per_category_synth_judge": by_type.iter().map(|(k, (h, n))| {
+                (k.clone(), if *n > 0 { *h as f32 / *n as f32 } else { 0.0 })
+            }).collect::<std::collections::BTreeMap<_, _>>(),
+            "per_category_onto_judge": by_type_onto.iter().map(|(k, (h, n))| {
                 (k.clone(), if *n > 0 { *h as f32 / *n as f32 } else { 0.0 })
             }).collect::<std::collections::BTreeMap<_, _>>(),
             "wall_secs": total_runner_secs,
