@@ -765,11 +765,19 @@ pub fn merge_sql_responses(
     peers: Vec<SqlResponse>,
     limit: usize,
 ) -> SqlResponse {
-    let columns = local.columns.clone();
+    // #42: a projection (e.g. SELECT *) fanned across nodes can return zero rows
+    // on the coordinator when the matching partitions live on peers — leaving
+    // local.columns empty even though the peer rows are fully keyed. Carry the
+    // first non-empty column set (schema order preserved) so the merged response
+    // always describes its rows, instead of `columns: []` with populated `rows`.
+    let mut columns = local.columns.clone();
     let execution_time_ms = local.execution_time_ms;
     let mut all_rows = local.rows;
 
     for peer_resp in peers {
+        if columns.is_empty() && !peer_resp.columns.is_empty() {
+            columns = peer_resp.columns.clone();
+        }
         all_rows.extend(peer_resp.rows);
     }
 
@@ -931,12 +939,19 @@ pub fn merge_scalar_aggregate(
     peers: Vec<SqlResponse>,
     how: &[AggMerge],
 ) -> SqlResponse {
-    let columns = local.columns.clone();
+    // Same self-consistency guard as the projection merge (#42): if the
+    // coordinator produced no local aggregate row its columns are empty, so adopt
+    // the first peer's column set — otherwise the aggregate loop below has nothing
+    // to fold over.
+    let mut columns = local.columns.clone();
     let execution_time_ms = local.execution_time_ms;
 
     let mut rows: Vec<HashMap<String, serde_json::Value>> = Vec::new();
     rows.extend(local.rows);
     for peer in peers {
+        if columns.is_empty() && !peer.columns.is_empty() {
+            columns = peer.columns.clone();
+        }
         rows.extend(peer.rows);
     }
 
@@ -1843,6 +1858,34 @@ mod sql_merge_tests {
             SqlMerge::Concatenate
         );
         assert_eq!(sql_merge_strategy("SELECT * FROM orders"), SqlMerge::Concatenate);
+    }
+
+    /// #42: a fanned-out `SELECT *` can match zero rows on the coordinator (the
+    /// partitions live on peers), so its `columns` is empty. The merge must
+    /// recover the column set from a peer instead of returning populated `rows`
+    /// with `columns: []`.
+    #[test]
+    fn projection_merge_recovers_columns_from_a_peer_when_local_is_empty() {
+        let local = resp(&[], vec![]); // coordinator held no matching rows
+        let peer = resp(&["_offset", "_value"], vec![row(&[("_offset", 7), ("_value", 42)])]);
+        let merged = merge_sql_responses(local, vec![peer], 100);
+        assert_eq!(
+            merged.columns,
+            vec!["_offset", "_value"],
+            "#42: merged columns must be recovered from the peer, not left empty"
+        );
+        assert_eq!(merged.row_count, 1);
+    }
+
+    /// Same guard on the aggregate path: an empty local column set must not
+    /// silently drop the peer's aggregate.
+    #[test]
+    fn aggregate_merge_recovers_columns_when_local_is_empty() {
+        let local = resp(&[], vec![]);
+        let peer = resp(&["n"], vec![row(&[("n", 5)])]);
+        let merged = merge_scalar_aggregate(local, vec![peer], &[AggMerge::Sum]);
+        assert_eq!(merged.columns, vec!["n"]);
+        assert_eq!(merged.rows[0].get("n"), Some(&serde_json::Value::from(5)));
     }
 
     #[test]
