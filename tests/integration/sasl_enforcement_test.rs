@@ -310,3 +310,90 @@ async fn scram_rejects_unknown_user() -> Result<()> {
     assert!(result.is_err(), "SCRAM accepted an UNKNOWN user");
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Migration mode (staged rollout)
+//
+// With a single Kafka port, going straight from "no authentication" to
+// "authentication required" cuts off every client that has not been
+// reconfigured, at the same instant. CHRONIK_SASL_ENABLED=optional is the step
+// in between: credentials are verified when offered, unauthenticated clients
+// are still served and logged, so an operator can watch the logs until the
+// warnings stop and only then require it.
+// ---------------------------------------------------------------------------
+
+fn optional_auth_config() -> TestClusterConfig {
+    TestClusterConfig {
+        num_servers: 1,
+        object_storage: ObjectStorageType::Local,
+        // enable_auth drives CHRONIK_SASL_ENABLED=true; override it to
+        // "optional" through the env escape hatch below.
+        enable_auth: true,
+        sasl_users: vec![(USER.to_string(), PASSWORD.to_string())],
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn optional_mode_serves_unauthenticated_clients() -> Result<()> {
+    let _guard = exclusive().await;
+    let cluster = TestCluster::start_with_env(
+        optional_auth_config(),
+        &[("CHRONIK_SASL_ENABLED", "optional")],
+    )
+    .await?;
+
+    let producer = plaintext_producer(&cluster.bootstrap_servers())?;
+    let result = try_produce(&producer, "migration-payload").await;
+
+    assert!(
+        result.is_ok(),
+        "an unauthenticated client was refused in OPTIONAL mode: {:?} - the staged \
+         rollout is not usable, so operators have no way to enable auth without an \
+         outage",
+        result
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn optional_mode_still_accepts_valid_credentials() -> Result<()> {
+    let _guard = exclusive().await;
+    let cluster = TestCluster::start_with_env(
+        optional_auth_config(),
+        &[("CHRONIK_SASL_ENABLED", "optional")],
+    )
+    .await?;
+
+    let producer = sasl_producer(&cluster.bootstrap_servers(), USER, PASSWORD)?;
+    let result = try_produce(&producer, "migration-authenticated").await;
+
+    assert!(
+        result.is_ok(),
+        "an AUTHENTICATED client failed in OPTIONAL mode: {:?}",
+        result
+    );
+    Ok(())
+}
+
+/// Optional must not degrade into "any password works" - it is a migration
+/// step, not a weakening. A wrong password still fails the exchange.
+#[tokio::test]
+async fn optional_mode_still_rejects_wrong_credentials() -> Result<()> {
+    let _guard = exclusive().await;
+    let cluster = TestCluster::start_with_env(
+        optional_auth_config(),
+        &[("CHRONIK_SASL_ENABLED", "optional")],
+    )
+    .await?;
+
+    let producer = sasl_producer(&cluster.bootstrap_servers(), USER, "wrong-password")?;
+    let result = try_produce(&producer, "should-never-land").await;
+
+    assert!(
+        result.is_err(),
+        "a WRONG password was accepted in OPTIONAL mode - optional applies to \
+         whether credentials are required, not to whether they are checked"
+    );
+    Ok(())
+}

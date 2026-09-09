@@ -1,8 +1,19 @@
 # Security Roadmap: TLS, SASL, ACLs, Encryption at Rest
 
-**Audit as of 2026-09-06 (v2.12.3).**
-**Phase 0 + immediate actions implemented 2026-09-09** — see §2 and §3 Phase 0, both marked
-DONE below. Everything else is still open.
+**Audit as of 2026-09-06 (v2.12.3). Implementation 2026-09-09.**
+
+| Phase | State |
+|-------|-------|
+| §2 Immediate hazards | ✅ DONE |
+| 0 — Connection context + SASL enforcement | ✅ DONE |
+| 1 — SASL production (SCRAM) | 🟡 **PARTIAL** — real SCRAM-SHA-256/512 done; credential store, APIs 50/51 and mTLS principal NOT done |
+| 2 — Listener model | 🟡 **PARTIAL** — staged-rollout mode (`optional`) done; multi-listener NOT done |
+| 3 — ACLs | 🟡 **PARTIAL** — enforced on the data plane and consumer groups; Metadata filtering, OffsetCommit/Fetch, txn ids and persistence NOT done |
+| 4 — Unified API | 🟡 **PARTIAL** — authentication + HTTPS done; per-topic authorization NOT done |
+| 5 — Encryption at rest | 🟡 **PARTIAL** — object-store SSE done; WAL/segment/index encryption NOT done |
+
+Read the per-phase sections for exactly what is and is not covered. Nothing below
+is marked done that has not been proven end-to-end against a real client.
 
 ---
 
@@ -364,3 +375,91 @@ at-rest encryption — is **Phases 0–4, roughly 3 weeks.**
 - **Silent lockout.** Enabling enforcement on an existing cluster locks out every client at
   once. Phase 2's listener model is what makes a staged rollout possible; do it before
   turning enforcement on anywhere real.
+
+---
+
+## 7. Implementation log (2026-09-09)
+
+What was built, what was proven, and — as importantly — what was not.
+
+### Delivered
+
+| Area | Evidence |
+|------|----------|
+| SASL enforced (PLAIN + SCRAM-SHA-256/512) | 13 end-to-end tests against real librdkafka |
+| Real RFC 5802 SCRAM | 15 unit tests: wrong password, tampered proof, replay, unknown user |
+| Staged rollout (`CHRONIK_SASL_ENABLED=optional`) | 4 unit + 3 end-to-end tests |
+| ACLs enforced on Produce/Fetch/consumer groups | 5 end-to-end tests, incl. Fetch denial on a populated topic |
+| ACL administration + bootstrap bindings | 11 unit tests |
+| Unified API authentication + HTTPS | 8 end-to-end tests, incl. plain HTTP refused on a TLS port |
+| Object-store SSE applied on writes | `CHRONIK_S3_SSE`, PUT and multipart |
+
+### Bugs found by running things that had never run
+
+None of these were visible by reading:
+
+1. **`SaslHandshake` was encoded as flexible at v1**, which the spec forbids. librdkafka
+   rejected every handshake (`Invalid MechanismCount 553648128`). SASL PLAIN could never
+   have completed against any real client.
+2. **`SaslAuthenticate` v1 omitted `SessionLifetimeMs`**, a mandatory int64 from v1. That is
+   exactly the intermediate step of a SCRAM exchange, so SCRAM could never have completed.
+3. **rustls 0.23 panicked on the first TLS handshake** — both `ring` and `aws-lc-rs` are in
+   the tree and it refuses to guess. This is shared with the Kafka listener, so
+   `CHRONIK_TLS_CERT` on :9092 would have panicked the broker on the first TLS connection.
+4. **`SaslAuthenticate` failures returned error code 31** (CLUSTER_AUTHORIZATION_FAILED)
+   under a comment claiming SASL_AUTHENTICATION_FAILED (58).
+5. **Two functions start the Unified API and only one is reached from `main.rs`** — TLS added
+   to the other one silently did nothing.
+6. **`build_error_response()` ignores the error code** for Produce, Fetch, Metadata and
+   CreateTopics, emitting an empty *success*. A denial reported through it would have made a
+   refused write look accepted.
+
+The pattern from the replication rebuild held exactly: the dangerous defects all *reported
+success while doing nothing*, and every one surfaced by running something that had never run.
+
+### Not done — and what each costs
+
+**Phase 1 remainder.** SCRAM credentials are derived from `CHRONIK_SASL_USERS` at startup, so
+they are per-broker configuration rather than replicated cluster state. No
+`DescribeUserScramCredentials`/`AlterUserScramCredentials` (APIs 50/51), so `kafka-configs.sh`
+cannot manage users. No mTLS principal extraction, so a client certificate authenticates the
+transport but does not name a principal. No re-authentication (KIP-368): `session_lifetime_ms`
+is reported and never enforced. No inter-broker authentication — cluster traffic is unauthenticated.
+
+**Phase 2 multi-listener.** Not attempted. `advertised_host`/`advertised_port` are fixed at
+`ProtocolHandler` construction and read at ~10 sites including Metadata, DescribeCluster and
+FindCoordinator. Per-listener advertisement means threading a listener identity through all of
+them — including the DescribeCluster encoder that produced the v2.12.2 Java-client bug. The
+migration need it was meant to serve is covered by `CHRONIK_SASL_ENABLED=optional`; running
+`PLAINTEXT://` and `SASL_SSL://` side by side, and a separate inter-broker listener, are not.
+
+**Phase 3 remainder.** Metadata does not filter unauthorized topics (Kafka omits them);
+OffsetCommit/OffsetFetch, transactional ids, DeleteTopics/CreateTopics and the remaining admin
+APIs are not checked. ACLs live in memory plus `CHRONIK_ACL_BINDINGS` — rules created through
+`CreateAcls` do **not** survive restart and do **not** replicate across a cluster, so on a
+multi-node cluster each broker must carry the same bootstrap configuration.
+
+**Phase 4 remainder.** The API key authenticates the caller; it does not authorize per topic. A
+key holder can query every topic. Doing it properly means resolving the tables a SQL statement
+touches from the plan, not string-matching the query.
+
+**Phase 5 remainder.** WAL segments, Tier-2 segments, Tantivy indexes, Parquet files and the
+metadata WAL are still written in plaintext on local disk. Only object-store SSE and backups
+are covered. WAL encryption was deliberately not attempted: it sits in the durability core,
+must not disturb the three-CRC architecture or `compressed_records_wire_bytes`, has to decrypt
+during `WalManager::recover()` including across a key rotation, and conflicts with the io_uring
+zero-copy write path. It needs its own focused work with crash-recovery testing, not an
+afternoon at the end of a long change.
+
+### Before enabling any of this on a real cluster
+
+1. Turn on `CHRONIK_SASL_ENABLED=optional` first and watch for unauthenticated-client warnings.
+   Only switch to `true` once they stop.
+2. Set `CHRONIK_ACL_SUPER_USERS` before `CHRONIK_ACL_ENABLED`. Without a super user, a policy
+   mistake is unrecoverable without a restart.
+3. ACL rules must be in `CHRONIK_ACL_BINDINGS` on **every** broker — they do not replicate.
+4. Prefer SCRAM over PLAIN unless the listener is TLS. PLAIN sends the password in the clear.
+5. None of this has been benchmarked. The authorization check on Produce/Fetch is a lock-free
+   read when ACLs are disabled, but the enabled path has not been measured — and per the
+   standing rule, measure with **bytes-landed**: a denied request returns faster than a served
+   one, so msg/s alone would read a broken authorizer as a speedup.

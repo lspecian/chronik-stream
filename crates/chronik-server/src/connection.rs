@@ -70,12 +70,32 @@ impl std::fmt::Display for ConnectionId {
     }
 }
 
+/// How strictly SASL is applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaslMode {
+    /// No authentication. The default.
+    Disabled,
+    /// Authentication is offered and verified, but an unauthenticated client is
+    /// still served — and logged.
+    ///
+    /// This exists because there is no listener model yet (Phase 2 of
+    /// docs/ROADMAP_SECURITY.md): with a single port, going straight from
+    /// `Disabled` to `Required` cuts off every client that has not been
+    /// reconfigured, simultaneously. `Optional` is the staged rollout — turn it
+    /// on, watch the logs until no client is reported unauthenticated, then set
+    /// `Required`. It grants no access that `Disabled` did not already grant, so
+    /// it is never a downgrade; it is only ever a step on the way up.
+    Optional,
+    /// Authentication is required before any other API.
+    Required,
+}
+
 /// Server-wide SASL settings, resolved once at startup and shared by every
 /// connection.
 #[derive(Debug, Clone)]
 pub struct SaslConfig {
-    /// Whether clients must authenticate before issuing other requests.
-    enabled: bool,
+    /// How strictly authentication is applied.
+    mode: SaslMode,
     /// `username -> password`, from `CHRONIK_SASL_USERS`.
     users: Vec<(String, String)>,
 }
@@ -88,57 +108,92 @@ impl SaslConfig {
     /// once, and there is no listener model yet that would allow a staged
     /// rollout (Phase 2). Operators opt in deliberately.
     pub fn from_env() -> Self {
-        let enabled = std::env::var("CHRONIK_SASL_ENABLED")
-            .map(|v| {
-                let v = v.trim().to_ascii_lowercase();
-                v == "true" || v == "1" || v == "yes"
-            })
-            .unwrap_or(false);
+        // `CHRONIK_SASL_ENABLED` accepts true/1/yes (require) and, since the
+        // staged-rollout mode was added, `optional`. It stays the single knob so
+        // existing configurations keep their meaning.
+        let mode = match std::env::var("CHRONIK_SASL_ENABLED") {
+            Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" | "required" => SaslMode::Required,
+                "optional" | "warn" => SaslMode::Optional,
+                _ => SaslMode::Disabled,
+            },
+            Err(_) => SaslMode::Disabled,
+        };
 
         let users = std::env::var("CHRONIK_SASL_USERS")
             .ok()
             .map(|config| parse_users(&config))
             .unwrap_or_default();
 
-        if enabled {
-            if users.is_empty() {
+        match mode {
+            SaslMode::Required if users.is_empty() => {
                 warn!(
-                    "CHRONIK_SASL_ENABLED is set but CHRONIK_SASL_USERS provides no valid users - \
-                     every client will be rejected. Set CHRONIK_SASL_USERS='user:pass,...'."
+                    "CHRONIK_SASL_ENABLED requires authentication but CHRONIK_SASL_USERS \
+                     provides no valid users - every client will be rejected. \
+                     Set CHRONIK_SASL_USERS='user:pass,...'."
                 );
-            } else {
+            }
+            SaslMode::Required => {
                 info!(
-                    "SASL authentication ENABLED (mechanism: PLAIN, {} user(s) configured). \
-                     Unauthenticated clients may only send ApiVersions, SaslHandshake and SaslAuthenticate.",
+                    "SASL authentication REQUIRED ({} user(s) configured). Unauthenticated \
+                     clients may only send ApiVersions, SaslHandshake and SaslAuthenticate.",
                     users.len()
                 );
             }
-        } else {
-            debug!("SASL authentication disabled (set CHRONIK_SASL_ENABLED=true to require it)");
+            SaslMode::Optional => {
+                warn!(
+                    "SASL authentication is OPTIONAL ({} user(s) configured): unauthenticated \
+                     clients are still SERVED and logged. This is a migration setting - watch \
+                     for 'unauthenticated request' warnings, and set CHRONIK_SASL_ENABLED=true \
+                     once they stop.",
+                    users.len()
+                );
+            }
+            SaslMode::Disabled => {
+                debug!("SASL authentication disabled (set CHRONIK_SASL_ENABLED=true to require it)");
+            }
         }
 
-        Self { enabled, users }
+        Self { mode, users }
     }
 
     /// A configuration with authentication disabled — the default, and what
     /// tests and internal callers use when they are not exercising auth.
     pub fn disabled() -> Self {
         Self {
-            enabled: false,
+            mode: SaslMode::Disabled,
             users: Vec::new(),
         }
     }
 
-    /// Build an enabled configuration from an explicit user list (for tests).
+    /// Build a configuration requiring authentication (for tests).
     pub fn enabled_with_users(users: Vec<(String, String)>) -> Self {
         Self {
-            enabled: true,
+            mode: SaslMode::Required,
             users,
         }
     }
 
+    /// Build a configuration offering but not requiring authentication.
+    pub fn optional_with_users(users: Vec<(String, String)>) -> Self {
+        Self {
+            mode: SaslMode::Optional,
+            users,
+        }
+    }
+
+    pub fn mode(&self) -> SaslMode {
+        self.mode
+    }
+
+    /// Whether authentication is offered at all (required or optional).
     pub fn is_enabled(&self) -> bool {
-        self.enabled
+        self.mode != SaslMode::Disabled
+    }
+
+    /// Whether an unauthenticated connection is refused.
+    pub fn is_required(&self) -> bool {
+        self.mode == SaslMode::Required
     }
 
     /// Create a fresh authenticator carrying this configuration's users.
@@ -208,6 +263,9 @@ pub struct AuthRejection {
 struct ConnectionInner {
     authenticator: SaslAuthenticator,
     auth: AuthState,
+    /// Whether this connection has already been reported as unauthenticated,
+    /// so migration-mode logging is once per connection, not per request.
+    warned_unauthenticated: bool,
 }
 
 /// Per-connection identity and authentication state.
@@ -238,6 +296,7 @@ impl ConnectionContext {
             inner: Mutex::new(ConnectionInner {
                 authenticator,
                 auth,
+                warned_unauthenticated: false,
             }),
         }
     }
@@ -297,6 +356,23 @@ impl ConnectionContext {
 
         match api_key {
             API_KEY_API_VERSIONS | API_KEY_SASL_HANDSHAKE | API_KEY_SASL_AUTHENTICATE => Ok(()),
+            other if !self.sasl.is_required() => {
+                // Migration mode: serve, but make the client visible so an
+                // operator can tell when it is safe to switch to Required.
+                // Logged once per connection rather than per request, or a
+                // single busy producer would flood the log.
+                let mut inner = self.inner.lock().await;
+                if !inner.warned_unauthenticated {
+                    inner.warned_unauthenticated = true;
+                    warn!(
+                        "{} ({}) is issuing unauthenticated requests (first: API key {}). \
+                         SASL is OPTIONAL, so it is being served - it would be REFUSED with \
+                         CHRONIK_SASL_ENABLED=true.",
+                        self.id, self.peer_addr, other
+                    );
+                }
+                Ok(())
+            }
             other => {
                 warn!(
                     "{} ({}) sent API key {} before authenticating - refusing",
@@ -545,5 +621,84 @@ mod tests {
         let a = ConnectionId::next();
         let b = ConnectionId::next();
         assert_ne!(a, b);
+    }
+}
+
+#[cfg(test)]
+mod migration_mode_tests {
+    use super::*;
+
+    const API_PRODUCE: i16 = 0;
+
+    fn optional_ctx() -> ConnectionContext {
+        ConnectionContext::new(
+            SocketAddr::from(([127, 0, 0, 1], 9092)),
+            false,
+            Arc::new(SaslConfig::optional_with_users(vec![(
+                "alice".to_string(),
+                "secret".to_string(),
+            )])),
+        )
+    }
+
+    /// The point of Optional: an unauthenticated client is still served, so a
+    /// cluster can turn authentication on without cutting every client off in
+    /// the same instant.
+    #[tokio::test]
+    async fn optional_mode_serves_unauthenticated_clients() {
+        let ctx = optional_ctx();
+        assert!(!ctx.is_authenticated().await);
+        assert!(ctx.check_request_allowed(API_PRODUCE).await.is_ok());
+    }
+
+    /// ...but it is still real authentication: valid credentials work and a
+    /// wrong password is still rejected. Optional must not become "any password
+    /// is fine", which would be a downgrade rather than a migration step.
+    #[tokio::test]
+    async fn optional_mode_still_verifies_credentials() {
+        let ctx = optional_ctx();
+        ctx.sasl_handshake(1, &["PLAIN".to_string()]).await.unwrap();
+        assert!(ctx.sasl_authenticate(b"\0alice\0wrong").await.is_err());
+        assert!(!ctx.is_authenticated().await);
+
+        let ctx = optional_ctx();
+        ctx.sasl_handshake(1, &["PLAIN".to_string()]).await.unwrap();
+        assert!(ctx.sasl_authenticate(b"\0alice\0secret").await.is_ok());
+        assert!(ctx.is_authenticated().await);
+        assert_eq!(ctx.principal().await, Some("User:alice".to_string()));
+    }
+
+    /// Required still refuses, so Optional is a distinct state and not a
+    /// silent weakening of the enforced one.
+    #[tokio::test]
+    async fn required_mode_still_refuses() {
+        let ctx = ConnectionContext::new(
+            SocketAddr::from(([127, 0, 0, 1], 9092)),
+            false,
+            Arc::new(SaslConfig::enabled_with_users(vec![(
+                "alice".to_string(),
+                "secret".to_string(),
+            )])),
+        );
+        assert!(ctx.check_request_allowed(API_PRODUCE).await.is_err());
+    }
+
+    #[test]
+    fn mode_parsing_covers_the_documented_spellings() {
+        for (value, expected) in [
+            ("true", SaslMode::Required),
+            ("1", SaslMode::Required),
+            ("yes", SaslMode::Required),
+            ("required", SaslMode::Required),
+            ("optional", SaslMode::Optional),
+            ("warn", SaslMode::Optional),
+            ("false", SaslMode::Disabled),
+            ("nonsense", SaslMode::Disabled),
+        ] {
+            std::env::set_var("CHRONIK_SASL_ENABLED", value);
+            let config = SaslConfig::from_env();
+            assert_eq!(config.mode(), expected, "for CHRONIK_SASL_ENABLED={}", value);
+        }
+        std::env::remove_var("CHRONIK_SASL_ENABLED");
     }
 }
