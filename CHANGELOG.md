@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.13.2] - 2026-09-09
+
+### Fixed
+
+- **`/_sql` `COUNT(*)` over-counted from duplicate rows in the columnar layer** —
+  the true root cause of #41, found by reproducing it on a real 64-day-old
+  cluster. The same `(_partition, _offset)` could be scanned more than once, so a
+  plain `hot UNION ALL cold` counted it per copy. Two independent sources, both
+  now handled, and both distinct from the v2.13.1 fan-out fall-open:
+
+  1. **Overlapping cold Parquet segments.** The WalIndexer re-indexes WAL
+     segments it has already flushed (after a restart its in-memory "already
+     indexed" guard is empty; a follower that re-pulls a partition re-seals
+     overlapping ranges), writing a new cold segment that covers offsets an older
+     one already holds. Observed up to ~4× on a live metrics topic.
+  2. **A hot buffer that re-serves already-flushed offsets after a restart.** The
+     buffer only serves offsets above its per-partition `flushed_offset`, but
+     that lives only in memory — after a restart it resets to 0 and the buffer
+     (rebuilt from the WAL trailing window) re-serves offsets already in cold. For
+     a topic still being produced to the next flush clears it; for a *static*
+     topic it persists, doubling the count.
+
+  The SQL view now detects either condition per topic and, only then, keeps
+  exactly one row per `(_partition, _offset)` — an offset is unique within a
+  partition, so any repeat is a duplicate. A clean, steady-state topic keeps the
+  cheap plain-UNION view and pays nothing. Verified on real data: a metrics
+  topic's per-partition counts matched the Kafka high-watermarks exactly, and
+  restart-doubled static topics returned to their true counts.
+
 ## [2.13.1] - 2026-09-09
 
 ### Fixed
