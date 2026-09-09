@@ -94,6 +94,79 @@ fn sql_statement_limit(sql: &str) -> Option<usize> {
     }
 }
 
+/// Base table names referenced by a query's FROM/JOIN clauses (including one
+/// level of derived subqueries and set operations), lowercased with the
+/// internal `_hot`/`_cold` suffixes stripped so each maps back to a topic's
+/// sanitized name.
+///
+/// Returns `None` when the SQL cannot be parsed — the caller then keeps the
+/// existing behaviour rather than guessing at which topics are involved.
+fn referenced_base_tables(sql: &str) -> Option<Vec<String>> {
+    use chronik_columnar::datafusion::sql::parser::{DFParser, Statement};
+    use chronik_columnar::datafusion::sql::sqlparser::ast::{
+        Query, Select, SetExpr, Statement as AstStatement, TableFactor,
+    };
+
+    fn walk_query(query: &Query, out: &mut Vec<String>) {
+        walk_setexpr(query.body.as_ref(), out);
+    }
+    fn walk_setexpr(body: &SetExpr, out: &mut Vec<String>) {
+        match body {
+            SetExpr::Select(select) => walk_select(select, out),
+            SetExpr::Query(q) => walk_query(q, out),
+            SetExpr::SetOperation { left, right, .. } => {
+                walk_setexpr(left, out);
+                walk_setexpr(right, out);
+            }
+            _ => {}
+        }
+    }
+    fn walk_select(select: &Select, out: &mut Vec<String>) {
+        for twj in &select.from {
+            walk_table_factor(&twj.relation, out);
+            for join in &twj.joins {
+                walk_table_factor(&join.relation, out);
+            }
+        }
+    }
+    fn walk_table_factor(tf: &TableFactor, out: &mut Vec<String>) {
+        match tf {
+            TableFactor::Table { name, .. } => {
+                if let Some(ident) = name.0.last() {
+                    out.push(ident.value.clone());
+                }
+            }
+            TableFactor::Derived { subquery, .. } => walk_query(subquery, out),
+            _ => {}
+        }
+    }
+
+    let statements = DFParser::parse_sql(sql).ok()?;
+    let statement = statements.front()?;
+    let Statement::Statement(ast) = statement else {
+        return None;
+    };
+    let AstStatement::Query(query) = ast.as_ref() else {
+        return None;
+    };
+
+    let mut raw = Vec::new();
+    walk_query(query, &mut raw);
+
+    Some(
+        raw.into_iter()
+            .map(|t| {
+                let lower = t.to_lowercase();
+                lower
+                    .strip_suffix("_hot")
+                    .or_else(|| lower.strip_suffix("_cold"))
+                    .unwrap_or(&lower)
+                    .to_string()
+            })
+            .collect(),
+    )
+}
+
 fn default_timeout() -> u64 {
     30
 }
@@ -698,6 +771,53 @@ impl SqlHandler {
     }
 }
 
+/// Does a topic's SQL table name appear among a query's referenced base tables?
+///
+/// `referenced` holds base names (already lowercased, `_hot`/`_cold` stripped),
+/// so a topic matches when its sanitized, lowercased name is present.
+fn topic_matches_referenced(topic: &str, referenced: &HashSet<String>) -> bool {
+    referenced.contains(&SqlHandler::sanitize_table_name(topic).to_lowercase())
+}
+
+/// Whether leadership is unknown for any topic this query references.
+///
+/// When it is, a fan-out that sums per-node results over-counts by the
+/// replication factor: each node's providers fall open to "serve everything"
+/// (see `LeadPartitions::owned_partitions`), so summing across replicas
+/// multiplies every row by RF (#41). The coordinator must answer locally
+/// instead — complete under full replication and never a multiplied count.
+///
+/// Unparseable SQL, a query that references no known topic, or a metadata
+/// listing error all return `false`: the caller then keeps its normal fan-out
+/// path. On a healthy cluster leadership is always known (the partition map is
+/// populated from Raft), so this returns `false` there and the fan-out is
+/// unchanged — it only diverges in the degraded, unpopulated-map state.
+async fn query_topic_leadership_unknown(
+    state: &UnifiedApiState,
+    router: &super::query_router::QueryRouter,
+    sql: &str,
+) -> bool {
+    let Some(referenced) = referenced_base_tables(sql) else {
+        return false;
+    };
+    if referenced.is_empty() {
+        return false;
+    }
+    let referenced: HashSet<String> = referenced.into_iter().collect();
+    let topics = match state.metadata_store.list_topics().await {
+        Ok(topics) => topics,
+        Err(_) => return false,
+    };
+    for topic in &topics {
+        if topic_matches_referenced(&topic.name, &referenced)
+            && router.led_partitions(&topic.name).await.is_none()
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Execute SQL query endpoint
 pub async fn execute_sql(
     State(state): State<UnifiedApiState>,
@@ -754,6 +874,17 @@ pub async fn execute_sql(
                     router.refresh_all_partition_maps(state.metadata_store.as_ref()).await;
                     if router.leads_all_partitions().await {
                         debug!("This node leads every partition, skipping SQL fan-out");
+                        response
+                    } else if query_topic_leadership_unknown(&state, router, &request.query).await {
+                        // Leadership could not be resolved for a topic this query
+                        // touches, even after refreshing the map. Fanning out and
+                        // summing now would over-count by the replication factor,
+                        // because every replica's providers fall open to "serve
+                        // everything" (#41). Answer locally instead.
+                        warn!(
+                            query = %request.query,
+                            "Leadership unknown for a queried topic; serving locally to avoid a fan-out over-count (#41)"
+                        );
                         response
                     } else {
                         let all_peers = router.all_peers();
@@ -1229,5 +1360,67 @@ mod partition_ownership_tests {
         ];
         let kept = retain_owned_partitions(paths, &owned(&[0]));
         assert_eq!(kept, vec!["/d/columnar/t/legacy.parquet".to_string()]);
+    }
+}
+
+/// #41: the coordinator must not fan out and sum when it cannot tell which
+/// partitions a node leads, or every row is counted once per replica. These
+/// cover the two pure inputs to that decision: which tables a query names, and
+/// whether a topic is one of them.
+#[cfg(test)]
+mod fanout_leadership_guard_tests {
+    use super::*;
+
+    fn refs(sql: &str) -> Vec<String> {
+        referenced_base_tables(sql).expect("parseable SQL")
+    }
+
+    #[test]
+    fn count_star_names_its_topic() {
+        assert_eq!(refs("SELECT COUNT(*) FROM repro41"), vec!["repro41"]);
+    }
+
+    #[test]
+    fn hot_and_cold_suffixes_map_back_to_the_base_topic() {
+        assert_eq!(refs("SELECT * FROM orders_hot"), vec!["orders"]);
+        assert_eq!(refs("SELECT * FROM orders_cold"), vec!["orders"]);
+    }
+
+    #[test]
+    fn table_names_are_lowercased() {
+        assert_eq!(refs("SELECT * FROM Orders"), vec!["orders"]);
+    }
+
+    #[test]
+    fn a_join_names_every_table() {
+        let mut got = refs("SELECT * FROM a JOIN b ON a.id = b.id");
+        got.sort();
+        assert_eq!(got, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn a_union_names_both_sides() {
+        let mut got = refs("SELECT x FROM a UNION ALL SELECT x FROM b");
+        got.sort();
+        assert_eq!(got, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn a_derived_subquery_is_walked() {
+        assert_eq!(refs("SELECT n FROM (SELECT COUNT(*) AS n FROM events) t"), vec!["events"]);
+    }
+
+    #[test]
+    fn unparseable_sql_yields_none_so_the_caller_keeps_fanning_out() {
+        assert!(referenced_base_tables("this is not sql").is_none());
+    }
+
+    #[test]
+    fn a_topic_matches_the_sanitized_lowercased_form_of_its_name() {
+        let referenced: HashSet<String> =
+            refs("SELECT * FROM my_topic_v2").into_iter().collect();
+        // Kafka topics use `.` and `-`, which sanitize to `_`.
+        assert!(topic_matches_referenced("my.topic-v2", &referenced));
+        assert!(!topic_matches_referenced("other", &referenced));
     }
 }
