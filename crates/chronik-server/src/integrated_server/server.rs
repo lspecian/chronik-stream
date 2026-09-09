@@ -842,6 +842,12 @@ impl IntegratedKafkaServer {
             match acceptor.accept().await {
                 Ok((stream, addr)) => {
                     let is_tls = stream.is_tls();
+                    // Must be read BEFORE into_split(): the rustls session lives on
+                    // the whole stream, not on either half.
+                    let certificate_principal = stream.peer_principal();
+                    if let Some(ref principal) = certificate_principal {
+                        debug!("mTLS client {} presented certificate for {}", addr, principal);
+                    }
 
                     // Set TCP_NODELAY
                     if let Err(e) = stream.set_nodelay(true) {
@@ -859,7 +865,12 @@ impl IntegratedKafkaServer {
                     // Per-connection identity + auth state; records whether this
                     // connection is encrypted, which Phase 1 needs to derive an
                     // mTLS principal from the peer certificate.
-                    let conn_ctx = Arc::new(ConnectionContext::new(addr, is_tls, sasl_config.clone()));
+                    let conn_ctx = Arc::new(ConnectionContext::with_certificate_principal(
+                        addr,
+                        is_tls,
+                        sasl_config.clone(),
+                        certificate_principal,
+                    ));
 
                     debug!("New {} connection from {}", if is_tls { "TLS" } else { "TCP" }, addr);
 

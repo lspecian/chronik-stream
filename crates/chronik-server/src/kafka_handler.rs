@@ -74,6 +74,10 @@ impl KafkaProtocolHandler {
         // instead of having to admit an unauthenticated client to write the
         // first rule.
         let acl_store = Arc::new(AclStore::new());
+        // Persisted rules first, then config bindings on top. Rules created via
+        // CreateAcls now survive restart and reach every broker through the
+        // metadata log; bootstrap bindings remain additive.
+        acl_store.load_persisted(metadata_store.as_ref()).await;
         if let Ok(spec) = std::env::var("CHRONIK_ACL_BINDINGS") {
             let loaded = acl_store.load_bootstrap_acls(&spec).await;
             tracing::info!("Loaded {} bootstrap ACL binding(s)", loaded);
@@ -179,8 +183,8 @@ impl KafkaProtocolHandler {
             ApiKey::SyncGroup => self.handle_sync_group_request(ctx, header, buf).await,
             ApiKey::Heartbeat => self.handle_heartbeat_request(ctx, header, buf).await,
             ApiKey::LeaveGroup => self.handle_leave_group_request(ctx, header, buf).await,
-            ApiKey::OffsetCommit => self.handle_offset_commit_request(header, buf).await,
-            ApiKey::OffsetFetch => self.handle_offset_fetch_request(header, buf).await,
+            ApiKey::OffsetCommit => self.handle_offset_commit_request(ctx, header, buf).await,
+            ApiKey::OffsetFetch => self.handle_offset_fetch_request(ctx, header, buf).await,
             ApiKey::CreateTopics => self.handle_create_topics_request(header, buf, request_bytes).await,
             ApiKey::DescribeAcls => self.handle_describe_acls_request(ctx, header, buf).await,
             ApiKey::CreateAcls => self.handle_create_acls_request(ctx, header, buf).await,
@@ -534,7 +538,12 @@ impl KafkaProtocolHandler {
                 operation: AclOperation::from_i8(creation.operation),
                 permission_type: AclPermissionType::from_i8(creation.permission_type),
             };
-            match self.authorizer.store().create_acl(binding).await {
+            match self
+                .authorizer
+                .store()
+                .create_acl_durable(binding, self.metadata_store.as_ref())
+                .await
+            {
                 Ok(()) => results.push(AclCreationResult {
                     error_code: 0,
                     error_message: None,
@@ -615,7 +624,11 @@ impl KafkaProtocolHandler {
                 filter.operation = Some(operation);
             }
 
-            let removed = self.authorizer.store().delete_acls(&filter).await;
+            let removed = self
+                .authorizer
+                .store()
+                .delete_acls_durable(&filter, self.metadata_store.as_ref())
+                .await;
             filter_results.push(FilterResult {
                 error_code: 0,
                 error_message: None,
@@ -778,6 +791,139 @@ impl KafkaProtocolHandler {
             crate::error_handler::GROUP_AUTH_DENIED_MARKER,
             group_id
         )))
+    }
+
+    /// Build an OffsetCommit response denying the whole request.
+    ///
+    /// Every requested partition carries `GROUP_AUTHORIZATION_FAILED`, which is
+    /// what Kafka returns and what clients surface as
+    /// `GroupAuthorizationException`.
+    fn offset_commit_authorization_denied(
+        &self,
+        header: &chronik_protocol::parser::RequestHeader,
+        request: &chronik_protocol::OffsetCommitRequest,
+    ) -> Result<Response> {
+        use chronik_protocol::{
+            OffsetCommitResponse, OffsetCommitResponsePartition, OffsetCommitResponseTopic,
+        };
+
+        tracing::warn!(
+            "OffsetCommit DENIED for group '{}' (correlation_id={})",
+            request.group_id,
+            header.correlation_id
+        );
+
+        let topics = request
+            .topics
+            .iter()
+            .map(|topic| OffsetCommitResponseTopic {
+                name: topic.name.clone(),
+                partitions: topic
+                    .partitions
+                    .iter()
+                    .map(|p| OffsetCommitResponsePartition {
+                        partition_index: p.partition_index,
+                        error_code: ERROR_GROUP_AUTHORIZATION_FAILED,
+                    })
+                    .collect(),
+            })
+            .collect();
+
+        let response = OffsetCommitResponse {
+            header: ResponseHeader {
+                correlation_id: header.correlation_id,
+            },
+            throttle_time_ms: 0,
+            topics,
+        };
+
+        let mut body_buf = BytesMut::new();
+        self.protocol_handler
+            .encode_offset_commit_response(&mut body_buf, &response, header.api_version)?;
+
+        Ok(Response {
+            header: ResponseHeader {
+                correlation_id: header.correlation_id,
+            },
+            body: body_buf.freeze(),
+            is_flexible: header.api_version >= 8,
+            api_key: ApiKey::OffsetCommit,
+            throttle_time_ms: None,
+        })
+    }
+
+    /// Build an OffsetFetch response denying the whole request.
+    ///
+    /// This one is load-bearing beyond correctness: reporting the denial through
+    /// the generic error path produced a v7 body librdkafka could not parse
+    /// ("Protocol read buffer underflow for OffsetFetch v7 ... expected 4 bytes
+    /// > 1 remaining bytes") and then **segfaulted the client**. A malformed
+    /// denial is worse than no denial.
+    ///
+    /// `topics: None` in the request means "all topics for this group". There is
+    /// nothing to enumerate in that case, so the response is an empty topics
+    /// array; the client still learns nothing, which is the correct outcome for
+    /// a principal that may not describe the group.
+    fn offset_fetch_authorization_denied(
+        &self,
+        header: &chronik_protocol::parser::RequestHeader,
+        request: &chronik_protocol::OffsetFetchRequest,
+    ) -> Result<Response> {
+        use chronik_protocol::{
+            OffsetFetchResponse, OffsetFetchResponsePartition, OffsetFetchResponseTopic,
+        };
+
+        tracing::warn!(
+            "OffsetFetch DENIED for group '{}' (correlation_id={})",
+            request.group_id,
+            header.correlation_id
+        );
+
+        let topics = request
+            .topics
+            .as_ref()
+            .map(|topics| {
+                topics
+                    .iter()
+                    .map(|topic| OffsetFetchResponseTopic {
+                        name: topic.name.clone(),
+                        partitions: topic
+                            .partitions
+                            .iter()
+                            .map(|index| OffsetFetchResponsePartition {
+                                partition_index: *index,
+                                committed_offset: -1,
+                                metadata: None,
+                                error_code: ERROR_GROUP_AUTHORIZATION_FAILED,
+                            })
+                            .collect(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let response = OffsetFetchResponse {
+            header: ResponseHeader {
+                correlation_id: header.correlation_id,
+            },
+            throttle_time_ms: 0,
+            topics,
+            group_id: Some(request.group_id.clone()),
+        };
+
+        let mut body_buf = BytesMut::new();
+        self.protocol_handler
+            .encode_offset_fetch_response(&mut body_buf, &response, header.api_version)?;
+
+        Ok(Response {
+            header: ResponseHeader {
+                correlation_id: header.correlation_id,
+            },
+            body: body_buf.freeze(),
+            is_flexible: header.api_version >= 6,
+            api_key: ApiKey::OffsetFetch,
+            throttle_time_ms: None,
+        })
     }
 
     /// Build a Fetch response denying the whole request.
@@ -1228,11 +1374,27 @@ impl KafkaProtocolHandler {
     #[instrument(skip(self, buf))]
     async fn handle_offset_commit_request(
         &self,
+        ctx: &ConnectionContext,
         header: chronik_protocol::parser::RequestHeader,
         mut buf: Bytes,
     ) -> Result<Response> {
         debug!("Processing OffsetCommit v{} request", header.api_version);
         let request = self.protocol_handler.parse_offset_commit_request(&header, &mut buf)?;
+        // Kafka: OffsetCommit requires Read on the group. Without this a consumer
+        // denied Read could still advance the group's committed offsets.
+        //
+        // The denial is BUILT from the parsed request, not reported through
+        // authorize_group_access(): OffsetCommit's response is topics[] with
+        // per-partition error codes, so the bare error code that
+        // build_error_response() emits for it is not valid on the wire.
+        if self.authorizer.is_enabled()
+            && !self
+                .authorizer
+                .authorize_group(ctx, &request.group_id, AclOperation::Read)
+                .await
+        {
+            return self.offset_commit_authorization_denied(&header, &request);
+        }
         let response = self.group_manager.handle_offset_commit(request).await?;
 
         let mut body_buf = BytesMut::new();
@@ -1256,11 +1418,26 @@ impl KafkaProtocolHandler {
     #[instrument(skip(self, buf))]
     async fn handle_offset_fetch_request(
         &self,
+        ctx: &ConnectionContext,
         header: chronik_protocol::parser::RequestHeader,
         mut buf: Bytes,
     ) -> Result<Response> {
         debug!("Processing OffsetFetch request");
         let request = self.protocol_handler.parse_offset_fetch_request(&header, &mut buf)?;
+        // Kafka: OffsetFetch requires Describe on the group (implied by Read).
+        //
+        // Same reasoning as OffsetCommit - and this one was not theoretical:
+        // routing the denial through the generic error path produced a v7
+        // response librdkafka could not parse ("read buffer underflow ...
+        // expected 4 bytes > 1 remaining"), and then SEGFAULTED the client.
+        if self.authorizer.is_enabled()
+            && !self
+                .authorizer
+                .authorize_group(ctx, &request.group_id, AclOperation::Describe)
+                .await
+        {
+            return self.offset_fetch_authorization_denied(&header, &request);
+        }
         let response = self.group_manager.handle_offset_fetch(request).await?;
 
         let mut body_buf = BytesMut::new();

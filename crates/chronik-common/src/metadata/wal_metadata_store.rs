@@ -103,6 +103,9 @@ struct MetadataState {
     transactions: RwLock<HashMap<String, TransactionMetadata>>,
     /// Next producer id to hand out (node-namespaced, advanced past recovered ids).
     next_producer_id: AtomicI64,
+    /// ACL bindings (Security Phase 3). Replicated and recovered like topics,
+    /// so a rule survives restart and applies on every broker.
+    acls: RwLock<Vec<AclBindingRecord>>,
 }
 
 impl MetadataState {
@@ -119,6 +122,7 @@ impl MetadataState {
             parquet_segments: RwLock::new(HashMap::new()),
             transactions: RwLock::new(HashMap::new()),
             next_producer_id: AtomicI64::new(producer_id_base(node_id)),
+            acls: RwLock::new(Vec::new()),
         }
     }
 
@@ -253,6 +257,22 @@ impl MetadataState {
                     offsets.insert(key, (0, 0));
                 }
 
+                Ok(())
+            }
+
+            MetadataEventPayload::AclCreated { binding } => {
+                let mut acls = self.acls.write().await;
+                // Idempotent: replaying the log on recovery, or receiving the
+                // same event twice from replication, must not multiply the rule.
+                if !acls.iter().any(|existing| existing == binding) {
+                    acls.push(binding.clone());
+                }
+                Ok(())
+            }
+
+            MetadataEventPayload::AclDeleted { binding } => {
+                let mut acls = self.acls.write().await;
+                acls.retain(|existing| existing != binding);
                 Ok(())
             }
 
@@ -865,6 +885,28 @@ impl WalMetadataStore {
 
 #[async_trait]
 impl MetadataStore for WalMetadataStore {
+    async fn create_acl(&self, binding: AclBindingRecord) -> Result<()> {
+        // Written through the event log, so it replicates to followers and is
+        // replayed on recovery exactly like a topic.
+        let event = MetadataEvent::new_with_node(
+            MetadataEventPayload::AclCreated { binding },
+            self.node_id,
+        );
+        self.write_and_apply(event).await
+    }
+
+    async fn delete_acl(&self, binding: AclBindingRecord) -> Result<()> {
+        let event = MetadataEvent::new_with_node(
+            MetadataEventPayload::AclDeleted { binding },
+            self.node_id,
+        );
+        self.write_and_apply(event).await
+    }
+
+    async fn list_acls(&self) -> Result<Vec<AclBindingRecord>> {
+        Ok(self.state.acls.read().await.clone())
+    }
+
     async fn create_topic(&self, name: &str, config: TopicConfig) -> Result<TopicMetadata> {
         self.create_topic_inner(name, config, false).await
     }

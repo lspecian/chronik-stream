@@ -586,6 +586,28 @@ pub trait MetadataStore: Send + Sync {
     // v2.2.9 Phase 7: Apply replicated metadata events WITHOUT writing to WAL
     async fn apply_replicated_event(&self, event: super::events::MetadataEvent) -> Result<()>;
 
+    // ---- ACLs (Security Phase 3) ----
+    //
+    // Default implementations make ACLs a no-op for stores that do not persist
+    // them (the in-memory test store, for instance) rather than forcing every
+    // implementor to change. `WalMetadataStore` overrides all three, which is
+    // the store every real deployment uses.
+
+    /// Persist and replicate an ACL binding.
+    async fn create_acl(&self, _binding: AclBindingRecord) -> Result<()> {
+        Ok(())
+    }
+
+    /// Remove a persisted ACL binding.
+    async fn delete_acl(&self, _binding: AclBindingRecord) -> Result<()> {
+        Ok(())
+    }
+
+    /// Every persisted ACL binding, for rebuilding the in-memory index at startup.
+    async fn list_acls(&self) -> Result<Vec<AclBindingRecord>> {
+        Ok(Vec::new())
+    }
+
     // System initialization
     async fn init_system_state(&self) -> Result<()>;
     
@@ -611,4 +633,29 @@ pub trait MetadataStore: Send + Sync {
     ) -> Result<TopicMetadata> {
         self.create_topic_with_assignments(topic_name, config, assignments, offsets).await
     }
+}
+/// A persisted ACL binding.
+///
+/// Fields are Kafka **wire values** (the `i8` codes for resource type, pattern
+/// type, operation and permission) rather than the enums from
+/// `chronik-protocol`, because `chronik-common` does not depend on that crate
+/// and must not: the dependency runs the other way. The wire encoding is the
+/// stable interchange format here anyway — it is what `CreateAcls` carries and
+/// what `kafka-acls.sh` writes — so storing it verbatim avoids a translation
+/// table that could drift from the protocol.
+///
+/// Persisting these at all is the point: before this existed, an ACL created
+/// through `CreateAcls` lived only in one broker's memory. It answered success,
+/// then vanished on restart and was never visible to any other node — a control
+/// that reported success while doing nothing, which is the failure mode this
+/// whole security effort exists to remove.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct AclBindingRecord {
+    pub resource_type: i8,
+    pub resource_name: String,
+    pub pattern_type: i8,
+    pub principal: String,
+    pub host: String,
+    pub operation: i8,
+    pub permission_type: i8,
 }

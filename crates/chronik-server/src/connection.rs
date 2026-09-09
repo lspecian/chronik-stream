@@ -281,10 +281,33 @@ pub struct ConnectionContext {
 impl ConnectionContext {
     /// Create the context for a newly accepted connection.
     pub fn new(peer_addr: SocketAddr, tls: bool, sasl: Arc<SaslConfig>) -> Self {
-        let auth = if sasl.is_enabled() {
-            AuthState::Unauthenticated
-        } else {
-            AuthState::Disabled
+        Self::with_certificate_principal(peer_addr, tls, sasl, None)
+    }
+
+    /// Create the context for a connection that presented a client certificate.
+    ///
+    /// An mTLS peer is already authenticated by the handshake - the CA vouched
+    /// for it and rustls verified the chain - so the connection starts
+    /// Authenticated with the certificate's principal, and the pre-auth gate
+    /// lets it straight through. Requiring a SASL exchange on top would make
+    /// client certificates useless for authentication, which is the main reason
+    /// to deploy them.
+    pub fn with_certificate_principal(
+        peer_addr: SocketAddr,
+        tls: bool,
+        sasl: Arc<SaslConfig>,
+        certificate_principal: Option<String>,
+    ) -> Self {
+        let auth = match (&certificate_principal, sasl.is_enabled()) {
+            (Some(principal), _) => AuthState::Authenticated {
+                // Stored without the "User:" prefix, which principal() adds, so
+                // a certificate principal and a SASL one are the same shape.
+                principal: principal.trim_start_matches("User:").to_string(),
+                mechanism: "SSL".to_string(),
+                at: Utc::now(),
+            },
+            (None, true) => AuthState::Unauthenticated,
+            (None, false) => AuthState::Disabled,
         };
         let authenticator = sasl.new_authenticator();
 

@@ -219,3 +219,110 @@ async fn acls_disabled_by_default_allows_everything() -> Result<()> {
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Persistence
+//
+// Before ACLs were written to the metadata log, a rule created through
+// CreateAcls lived in one broker's memory: it answered success, then vanished on
+// restart and was never visible to any other node. That is the same shape as the
+// SASL handshake that verified credentials and discarded the answer, so it gets
+// the same treatment - a test that proves the rule is still in force after the
+// process is replaced.
+// ---------------------------------------------------------------------------
+
+/// A policy expressed in configuration must still apply after a restart, and the
+/// data written under it must still be there.
+#[tokio::test]
+async fn acl_policy_survives_a_restart() -> Result<()> {
+    let _guard = exclusive().await;
+    let dir = tempfile::tempdir()?;
+
+    let mut config = acl_cluster_config();
+    config.data_dir = Some(dir.path().to_path_buf());
+
+    // First broker: write to the allowed topic, and confirm the denied one is
+    // refused.
+    {
+        let cluster = TestCluster::start(config.clone()).await?;
+        let producer = producer(&cluster.bootstrap_servers())?;
+
+        try_produce(&producer, ALLOWED_TOPIC)
+            .await
+            .expect("allowed topic must accept a write");
+        assert!(
+            try_produce(&producer, DENIED_TOPIC).await.is_err(),
+            "denied topic accepted a write before restart"
+        );
+    } // cluster dropped: the broker process is killed here
+
+    // Second broker over the same data directory.
+    let cluster = TestCluster::start(config).await?;
+    let producer = producer(&cluster.bootstrap_servers())?;
+
+    assert!(
+        try_produce(&producer, ALLOWED_TOPIC).await.is_ok(),
+        "the allowed topic was refused AFTER restart - the policy did not survive"
+    );
+    assert!(
+        try_produce(&producer, DENIED_TOPIC).await.is_err(),
+        "the denied topic was accepted AFTER restart - authorization lapsed across \
+         the restart, which is exactly the silent-expiry failure this guards"
+    );
+
+    Ok(())
+}
+
+/// OffsetCommit needs Read on the group. Without the check, a consumer denied
+/// Read could still advance the group's committed offsets - it could not read
+/// the data, but it could disrupt every consumer that can.
+#[tokio::test]
+async fn offset_commit_on_an_unauthorized_group_is_denied() -> Result<()> {
+    let _guard = exclusive().await;
+    let cluster = TestCluster::start(acl_cluster_config()).await?;
+
+    // The topic must exist first, or the consumer fails with
+    // UnknownTopicOrPartition and the test passes for the wrong reason — it
+    // would prove nothing about the group check.
+    let producer = producer(&cluster.bootstrap_servers())?;
+    try_produce(&producer, ALLOWED_TOPIC)
+        .await
+        .expect("the allowed topic must accept a write");
+
+    // "acl-group" is granted Read; this one is not.
+    let consumer: StreamConsumer = ClientConfig::new()
+        .set("bootstrap.servers", &cluster.bootstrap_servers())
+        .set("security.protocol", "SASL_PLAINTEXT")
+        .set("sasl.mechanism", "SCRAM-SHA-256")
+        .set("sasl.username", USER)
+        .set("sasl.password", PASSWORD)
+        .set("group.id", "unauthorized-group")
+        .set("auto.offset.reset", "earliest")
+        .set("enable.auto.commit", "false")
+        .set("session.timeout.ms", "6000")
+        .create()?;
+
+    consumer.subscribe(&[ALLOWED_TOPIC])?;
+
+    // Joining an unauthorized group must fail; the group APIs are checked too.
+    let outcome = tokio::time::timeout(Duration::from_secs(10), consumer.recv()).await;
+
+    match outcome {
+        Ok(Err(e)) => {
+            let msg = e.to_string().to_lowercase();
+            assert!(
+                msg.contains("auth"),
+                "joining an unauthorized group failed, but not with an authorization \
+                 error: {}",
+                e
+            );
+        }
+        Ok(Ok(_)) => panic!("consumed records under a group the principal may not use"),
+        Err(_) => panic!(
+            "joining an unauthorized group neither failed nor returned records - the \
+             group denial is being swallowed"
+        ),
+    }
+
+    Ok(())
+}
