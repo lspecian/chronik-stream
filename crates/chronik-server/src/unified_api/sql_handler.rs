@@ -370,11 +370,108 @@ async fn resolve_parquet_paths(
 ///
 /// The unified view captures its base providers at CREATE time, so it must be
 /// rebuilt when a topic gains a source it did not have before (typically when
-/// the first Parquet segment appears for a topic that started hot-only).
+/// the first Parquet segment appears for a topic that started hot-only), or
+/// when its cold segments start overlapping (`cold_dedup`), which flips the
+/// view from a plain UNION to a de-duplicating one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct ViewComposition {
     has_hot: bool,
     has_cold: bool,
+    /// The same `(_partition, _offset)` can appear more than once — either
+    /// because cold Parquet segments overlap ([`cold_segments_overlap`]) or
+    /// because the hot buffer re-serves offsets already in cold after a restart
+    /// ([`hot_cold_overlap`]) — so a plain scan over-counts. When set, the view
+    /// keeps one row per `(_partition, _offset)`.
+    cold_dedup: bool,
+}
+
+/// Whether a topic's cold Parquet segments overlap in offset range within any
+/// single partition.
+///
+/// The WalIndexer is meant to flush each offset to cold exactly once, but a
+/// process that re-indexes WAL segments it has already flushed (e.g. after a
+/// restart, when the in-memory "already indexed" guard is empty, or after a
+/// follower re-pulls a partition from the start) writes a *new* Parquet segment
+/// covering offsets an older segment already holds. Both are then scanned, so
+/// every offset in the overlap is counted once per copy — the duplicate-row
+/// over-count seen on long-lived, restart-heavy clusters (#41).
+///
+/// Detecting the overlap lets the view de-duplicate only where it must: a clean
+/// topic (non-overlapping, sequential segments) keeps the cheap plain-UNION
+/// view and pays nothing. Overlap is judged per partition from the registered
+/// segment ranges (`min_offset..=max_offset`), which is all this needs —
+/// whether to turn de-duplication on.
+async fn cold_segments_overlap(
+    metadata_store: &dyn chronik_common::metadata::traits::MetadataStore,
+    topic: &str,
+) -> bool {
+    let segments = match metadata_store.list_parquet_segments(topic, None).await {
+        Ok(segments) => segments,
+        Err(_) => return false,
+    };
+
+    // Group segment offset ranges by partition.
+    let mut by_partition: HashMap<i32, Vec<(i64, i64)>> = HashMap::new();
+    for seg in segments {
+        by_partition
+            .entry(seg.partition)
+            .or_default()
+            .push((seg.min_offset, seg.max_offset));
+    }
+
+    // Within a partition, sort by start and look for any range that begins at
+    // or before the furthest end seen so far — that is an overlap.
+    for mut ranges in by_partition.into_values() {
+        ranges.sort_unstable();
+        let mut covered_to: i64 = i64::MIN;
+        for (min, max) in ranges {
+            if min <= covered_to {
+                return true;
+            }
+            covered_to = max;
+        }
+    }
+    false
+}
+
+/// Whether the hot buffer would re-serve offsets that are already in cold, so a
+/// plain `hot UNION ALL cold` double-counts them.
+///
+/// The hot buffer only serves offsets above its per-partition `flushed_offset`,
+/// which the cold-flush path advances to the highest offset written to Parquet
+/// — so in steady state hot and cold are disjoint. But `flushed_offset` lives
+/// only in memory: after a restart it resets to 0 and the buffer (rebuilt from
+/// the WAL trailing window) re-serves offsets that were already flushed to cold.
+/// For a topic still being produced to, the next flush re-advances it and the
+/// overlap clears; for a *static* topic nothing re-advances it, so the overlap —
+/// and the doubled count — persists. Detecting it lets the view de-duplicate
+/// exactly while it lasts, and go back to the cheap UNION once it clears.
+async fn hot_cold_overlap(state: &UnifiedApiState, topic: &str) -> bool {
+    let Some(hot) = state.hot_buffer.as_ref() else {
+        return false;
+    };
+    let segments = match state.metadata_store.list_parquet_segments(topic, None).await {
+        Ok(segments) => segments,
+        Err(_) => return false,
+    };
+
+    // Highest offset already in cold, per partition.
+    let mut cold_max: HashMap<i32, i64> = HashMap::new();
+    for seg in segments {
+        let entry = cold_max.entry(seg.partition).or_insert(i64::MIN);
+        if seg.max_offset > *entry {
+            *entry = seg.max_offset;
+        }
+    }
+
+    // Hot serves from `flushed_offset + 1`. If that floor is at or below cold's
+    // max for any partition, the same offset can appear in both tiers.
+    for (partition, cmax) in cold_max {
+        if hot.get_flushed_offset(topic, partition) < cmax {
+            return true;
+        }
+    }
+    false
 }
 
 /// Per-topic SQL registration bookkeeping.
@@ -555,7 +652,16 @@ impl SqlHandler {
             // ============================================================
             // Create unified VIEW (hot UNION ALL cold)
             // ============================================================
-            let composition = ViewComposition { has_hot, has_cold };
+            // A topic needs a de-duplicating view when the same
+            // (_partition, _offset) can appear more than once, or it is counted
+            // once per copy (#41). Two ways that happens: cold Parquet segments
+            // that overlap each other, and (after a restart) a hot buffer that
+            // re-serves offsets already in cold. Both are checked only when there
+            // is cold data; a clean topic keeps the cheap plain-UNION view.
+            let cold_dedup = has_cold
+                && (cold_segments_overlap(state.metadata_store.as_ref(), topic).await
+                    || (has_hot && hot_cold_overlap(state, topic).await));
+            let composition = ViewComposition { has_hot, has_cold, cold_dedup };
             let current = state.sql_tables.topics.get(topic).map(|c| *c);
             let view_exists = registered_set.contains(&base_table_name)
                 && current == Some(composition);
@@ -579,7 +685,37 @@ impl SqlHandler {
                                    _timestamp, _timestamp_type, CAST(_key AS BYTEA) AS _key, \
                                    CAST(_value AS BYTEA) AS _value";
 
-                let view_sql = if has_hot && has_cold {
+                // The output column list, shared by every view shape below.
+                let out_cols = "_topic, _partition, _offset, _timestamp, \
+                                _timestamp_type, _key, _value";
+
+                let view_sql = if cold_dedup {
+                    // #41: cold segments overlap, so the same (_partition, _offset)
+                    // can appear more than once. Keep exactly one row per
+                    // (_partition, _offset) — an offset is unique within a
+                    // partition, so any repeat is a duplicate. Hot is preferred
+                    // over cold (src 0 < 1) where both carry the same offset
+                    // during the flush hand-off; hot itself is never duplicated.
+                    let inner = if has_hot {
+                        format!(
+                            "SELECT {cols}, 0 AS __src FROM {hot} \
+                             UNION ALL \
+                             SELECT {cols}, 1 AS __src FROM {cold}",
+                            cols = common_cols, hot = hot_table_name, cold = cold_table_name
+                        )
+                    } else {
+                        format!("SELECT {cols}, 1 AS __src FROM {cold}",
+                                cols = common_cols, cold = cold_table_name)
+                    };
+                    format!(
+                        "SELECT {out} FROM (\
+                           SELECT {out}, ROW_NUMBER() OVER (\
+                             PARTITION BY _partition, _offset ORDER BY __src\
+                           ) AS __rn FROM ({inner})\
+                         ) WHERE __rn = 1",
+                        out = out_cols, inner = inner
+                    )
+                } else if has_hot && has_cold {
                     // Both hot and cold available - union them with explicit columns
                     // Hot data has priority (more recent), cold provides historical
                     format!(
@@ -622,6 +758,7 @@ impl SqlHandler {
                         view_name = %base_table_name,
                         has_hot = has_hot,
                         has_cold = has_cold,
+                        cold_dedup = cold_dedup,
                         "Registered unified hot/cold view"
                     );
                 }
@@ -1422,5 +1559,83 @@ mod fanout_leadership_guard_tests {
         // Kafka topics use `.` and `-`, which sanitize to `_`.
         assert!(topic_matches_referenced("my.topic-v2", &referenced));
         assert!(!topic_matches_referenced("other", &referenced));
+    }
+}
+
+/// #41: cold Parquet segments that overlap in offset range make a plain scan
+/// count duplicated offsets once per copy. These cover the detection that gates
+/// the de-duplicating view on.
+#[cfg(test)]
+mod cold_overlap_tests {
+    use super::*;
+    use chronik_common::metadata::{InMemoryMetadataStore, MetadataStore, ParquetSegmentMetadata};
+
+    fn seg(topic: &str, partition: i32, min: i64, max: i64) -> ParquetSegmentMetadata {
+        ParquetSegmentMetadata {
+            segment_id: format!("{}-{}-{}-{}-parquet", topic, partition, min, max),
+            topic: topic.to_string(),
+            partition,
+            min_offset: min,
+            max_offset: max,
+            record_count: (max - min + 1).max(0) as usize,
+            row_group_count: 1,
+            min_timestamp: 0,
+            max_timestamp: 0,
+            object_store_path: format!("/d/{}/partition={}/{}-{}.parquet", topic, partition, min, max),
+            size_bytes: 1,
+            created_at: 0,
+            compression: "zstd".to_string(),
+            time_partition_key: None,
+            schema_fingerprint: None,
+        }
+    }
+
+    async fn store_with(segments: &[ParquetSegmentMetadata]) -> InMemoryMetadataStore {
+        let store = InMemoryMetadataStore::new();
+        for s in segments {
+            store.persist_parquet_segment(s.clone()).await.unwrap();
+        }
+        store
+    }
+
+    #[tokio::test]
+    async fn sequential_non_overlapping_segments_do_not_need_dedup() {
+        let store = store_with(&[
+            seg("t", 0, 0, 999),
+            seg("t", 0, 1000, 1999),
+            seg("t", 1, 0, 500),
+        ])
+        .await;
+        assert!(!cold_segments_overlap(&store, "t").await);
+    }
+
+    #[tokio::test]
+    async fn nested_reindexed_segments_need_dedup() {
+        // The real #41 shape: a partition re-indexed from offset 0 several times.
+        let store = store_with(&[
+            seg("t", 0, 0, 21539),
+            seg("t", 0, 0, 47290),
+            seg("t", 0, 0, 105415),
+            seg("t", 0, 105416, 109383),
+        ])
+        .await;
+        assert!(cold_segments_overlap(&store, "t").await);
+    }
+
+    #[tokio::test]
+    async fn overlap_in_any_single_partition_triggers_dedup() {
+        let store = store_with(&[
+            seg("t", 0, 0, 999),       // p0 clean
+            seg("t", 1, 0, 999),       // p1 ...
+            seg("t", 1, 500, 1499),    // ... overlaps here
+        ])
+        .await;
+        assert!(cold_segments_overlap(&store, "t").await);
+    }
+
+    #[tokio::test]
+    async fn a_topic_with_no_segments_does_not_need_dedup() {
+        let store = InMemoryMetadataStore::new();
+        assert!(!cold_segments_overlap(&store, "t").await);
     }
 }
