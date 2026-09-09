@@ -68,12 +68,13 @@ mod cli;
 mod cluster;  // Phase 1.2: Cluster mode refactoring (complexity reduction from 288 → <25)
 mod tls;  // Phase 5: TLS encryption for Kafka protocol connections
 mod acl;  // Phase 5: Access Control Lists for authorization
+mod connection;  // Security Phase 0: per-connection identity + SASL enforcement
 mod schema_registry;  // Phase 5: Confluent-compatible Schema Registry
 
 use integrated_server::{IntegratedKafkaServer, IntegratedServerConfig, IntegratedKafkaServerBuilder};
 use chronik_wal::compaction::{WalCompactor, CompactionConfig, CompactionStrategy};
 use chronik_wal::config::{WalConfig, CompressionType};
-use chronik_storage::object_store::{ObjectStoreConfig, StorageBackend, AuthConfig, S3Credentials};
+use chronik_storage::object_store::{ObjectStoreConfig, StorageBackend, AuthConfig, S3Credentials, EncryptionConfig, EncryptionType};
 use chronik_config::{ClusterConfig, NodeConfig};
 use chronik_columnar::ColumnarQueryEngine;
 use serde_json;
@@ -293,6 +294,49 @@ fn parse_kafka_addr(addr: &str) -> Result<(String, i32)> {
     }
 }
 
+/// Parse server-side encryption configuration for the object store.
+///
+/// `CHRONIK_S3_SSE` selects the algorithm applied to every object written to
+/// S3-compatible storage (segments, Tantivy indexes, Parquet files, metadata DR
+/// uploads):
+///   - `AES256`  — SSE-S3, S3-managed keys
+///   - `aws:kms` — SSE-KMS, optionally with `CHRONIK_S3_SSE_KMS_KEY_ID`
+///
+/// Unset means objects are written unencrypted, which stays the default so
+/// existing deployments and MinIO/GCS-compatible endpoints are unaffected.
+fn parse_encryption_config_from_env() -> Option<EncryptionConfig> {
+    let sse = std::env::var("CHRONIK_S3_SSE").ok()?;
+
+    let encryption_type = match sse.trim() {
+        "AES256" | "aes256" => EncryptionType::Aes256,
+        "aws:kms" | "AWS:KMS" => EncryptionType::AwsKms,
+        other => {
+            warn!(
+                "Ignoring CHRONIK_S3_SSE='{}': expected 'AES256' or 'aws:kms'. \
+                 Objects will be written UNENCRYPTED.",
+                other
+            );
+            return None;
+        }
+    };
+
+    let kms_key_id = std::env::var("CHRONIK_S3_SSE_KMS_KEY_ID").ok();
+    info!(
+        "Object store server-side encryption enabled: {}{}",
+        sse.trim(),
+        kms_key_id
+            .as_ref()
+            .map(|k| format!(" (KMS key {})", k))
+            .unwrap_or_default()
+    );
+
+    Some(EncryptionConfig {
+        encryption_type,
+        kms_key_id,
+        customer_key: None,
+    })
+}
+
 /// Parse object store configuration from environment variables
 fn parse_object_store_config_from_env() -> Option<ObjectStoreConfig> {
     let backend_type = std::env::var("OBJECT_STORE_BACKEND").ok()?;
@@ -346,7 +390,10 @@ fn parse_object_store_config_from_env() -> Option<ObjectStoreConfig> {
                 performance: Default::default(),
                 retry: Default::default(),
                 default_metadata: None,
-                encryption: None,
+                // SSE is applied by the S3 backend on every PUT and multipart
+                // initiation. GCS/Azure/Local below leave this None because their
+                // backends do not consult it — a value there would be a dead knob.
+                encryption: parse_encryption_config_from_env(),
             };
 
             info!("S3 object store configured: bucket={}, endpoint={:?}",

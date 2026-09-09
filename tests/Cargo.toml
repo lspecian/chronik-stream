@@ -95,3 +95,7 @@ path = "integration/wal_lifecycle_test.rs"
 name = "data_flow"
 path = "integration/data_flow.rs"
 
+
+[[test]]
+name = "sasl_enforcement"
+path = "integration/sasl_enforcement_test.rs"

@@ -94,53 +94,42 @@ pub struct SaslAuthenticator {
     scram_state: Option<ScramServerState>,
 }
 
+/// Mechanisms this server will advertise and accept.
+///
+/// PLAIN only. SCRAM-SHA-256/512 were advertised, until this change, while their
+/// verification step was a stub that accepted *any* client-final message
+/// (hardcoded salt, fabricated server signature, client proof never checked) —
+/// so any password authenticated. Advertising a mechanism whose proof is not
+/// verified is worse than not offering it, because clients select it in
+/// preference to PLAIN. They return here in Phase 1 with real proof
+/// verification and a salted credential store; see docs/ROADMAP_SECURITY.md.
+const ENABLED_MECHANISMS: &[SaslMechanism] = &[SaslMechanism::Plain];
+
 impl SaslAuthenticator {
-    /// Create a new SASL authenticator
+    /// Create a new SASL authenticator, taking users from the environment.
     ///
-    /// SECURITY WARNING: By default, this creates test users with known passwords.
-    /// For production, use `new_from_env()` or `new_empty()` and add users explicitly.
+    /// Users come from `CHRONIK_SASL_USERS` (`"user1:pass1,user2:pass2"`). If it
+    /// is unset the authenticator has no users and every authentication attempt
+    /// fails — that is the intended default. Previously this silently
+    /// installed `admin/admin123`, `user/user123` and `kafka/kafka-secret`.
     pub fn new() -> Self {
-        // Check if we should skip default users (production mode)
-        if std::env::var("CHRONIK_SASL_NO_DEFAULTS").is_ok() {
-            return Self::new_empty();
-        }
-
-        // Check for custom users from environment
-        if let Ok(users_config) = std::env::var("CHRONIK_SASL_USERS") {
-            return Self::new_from_config(&users_config);
-        }
-
-        // Default users for development/testing ONLY
-        warn!("⚠️  SECURITY WARNING: Using default SASL users (admin/admin123, user/user123, kafka/kafka-secret)");
-        warn!("⚠️  Set CHRONIK_SASL_USERS='user1:pass1,user2:pass2' for custom users");
-        warn!("⚠️  Set CHRONIK_SASL_NO_DEFAULTS=1 to disable default users in production");
-
-        let mut users = HashMap::new();
-        users.insert("admin".to_string(), "admin123".to_string());
-        users.insert("user".to_string(), "user123".to_string());
-        users.insert("kafka".to_string(), "kafka-secret".to_string());
-
-        Self {
-            supported_mechanisms: vec![
-                SaslMechanism::Plain,
-                SaslMechanism::ScramSha256,
-                SaslMechanism::ScramSha512,
-            ],
-            users,
-            state: SaslState::Initial,
-            scram_state: None,
+        match std::env::var("CHRONIK_SASL_USERS") {
+            Ok(users_config) => Self::new_from_config(&users_config),
+            Err(_) => {
+                warn!(
+                    "SASL enabled but CHRONIK_SASL_USERS is not set - no users are configured, \
+                     so every authentication attempt will be rejected. \
+                     Set CHRONIK_SASL_USERS='user1:pass1,user2:pass2'."
+                );
+                Self::new_empty()
+            }
         }
     }
 
-    /// Create a new SASL authenticator with NO default users (for production)
+    /// Create a new SASL authenticator with no users.
     pub fn new_empty() -> Self {
-        info!("SASL authenticator created with no users - add users via add_user() or CHRONIK_SASL_USERS env var");
         Self {
-            supported_mechanisms: vec![
-                SaslMechanism::Plain,
-                SaslMechanism::ScramSha256,
-                SaslMechanism::ScramSha512,
-            ],
+            supported_mechanisms: ENABLED_MECHANISMS.to_vec(),
             users: HashMap::new(),
             state: SaslState::Initial,
             scram_state: None,
@@ -153,20 +142,19 @@ impl SaslAuthenticator {
         let mut users = HashMap::new();
         for pair in config.split(',') {
             let parts: Vec<&str> = pair.trim().splitn(2, ':').collect();
-            if parts.len() == 2 {
+            if parts.len() == 2 && !parts[0].is_empty() {
                 users.insert(parts[0].to_string(), parts[1].to_string());
                 info!("SASL user configured: {}", parts[0]);
             }
         }
         if users.is_empty() {
-            warn!("CHRONIK_SASL_USERS provided but no valid users parsed");
+            warn!(
+                "CHRONIK_SASL_USERS provided but no valid users parsed - \
+                 every authentication attempt will be rejected"
+            );
         }
         Self {
-            supported_mechanisms: vec![
-                SaslMechanism::Plain,
-                SaslMechanism::ScramSha256,
-                SaslMechanism::ScramSha512,
-            ],
+            supported_mechanisms: ENABLED_MECHANISMS.to_vec(),
             users,
             state: SaslState::Initial,
             scram_state: None,
@@ -221,20 +209,16 @@ impl SaslAuthenticator {
             SaslState::HandshakeComplete(mechanism) => {
                 match mechanism {
                     SaslMechanism::Plain => self.handle_plain_auth(auth_bytes),
-                    SaslMechanism::ScramSha256 | SaslMechanism::ScramSha512 => {
-                        self.handle_scram_auth(auth_bytes, *mechanism)
-                    }
-                    _ => Err(SaslError::UnsupportedMechanism(mechanism.as_str().to_string())),
+                    // Unreachable via the handshake, which only completes for a
+                    // mechanism in ENABLED_MECHANISMS. Kept as a hard refusal so
+                    // that re-adding a mechanism to that list cannot silently
+                    // reintroduce an unverified authentication path.
+                    other => Err(SaslError::UnsupportedMechanism(other.as_str().to_string())),
                 }
             }
-            SaslState::Authenticating => {
-                // Continue SCRAM authentication
-                if self.scram_state.is_some() {
-                    self.continue_scram_auth(auth_bytes)
-                } else {
-                    Err(SaslError::ProtocolError("Unexpected authenticate request".to_string()))
-                }
-            }
+            SaslState::Authenticating => Err(SaslError::ProtocolError(
+                "Multi-step SASL exchange is not supported by any enabled mechanism".to_string(),
+            )),
             _ => Err(SaslError::ProtocolError("Invalid state for authenticate".to_string())),
         }
     }
@@ -274,75 +258,6 @@ impl SaslAuthenticator {
         }
     }
 
-    /// Handle SCRAM authentication (initial)
-    fn handle_scram_auth(&mut self, auth_bytes: &[u8], mechanism: SaslMechanism) -> Result<SaslAuthenticateResponse, SaslError> {
-        // Parse client-first message
-        let client_first = String::from_utf8_lossy(auth_bytes);
-        debug!("SCRAM client-first: {}", client_first);
-
-        // Extract username from client-first message
-        // Format: n,,n=username,r=client-nonce
-        let username = client_first
-            .split(',')
-            .find(|s| s.starts_with("n="))
-            .and_then(|s| s.strip_prefix("n="))
-            .ok_or_else(|| SaslError::ProtocolError("Invalid SCRAM client-first".to_string()))?;
-
-        // Generate server nonce
-        let server_nonce = format!("server-{}", uuid::Uuid::new_v4().to_string());
-
-        // Create SCRAM state
-        self.scram_state = Some(ScramServerState {
-            username: username.to_string(),
-            client_nonce: extract_nonce(&client_first)?,
-            server_nonce: server_nonce.clone(),
-            mechanism,
-        });
-
-        self.state = SaslState::Authenticating;
-
-        // Build server-first message
-        let server_first = format!(
-            "r={}{},s={},i=4096",
-            extract_nonce(&client_first)?,
-            server_nonce,
-            base64::encode("salt")
-        );
-
-        Ok(SaslAuthenticateResponse {
-            error_code: 0,
-            error_message: None,
-            auth_bytes: Some(server_first.into_bytes()),
-            session_lifetime_ms: None,
-        })
-    }
-
-    /// Continue SCRAM authentication
-    fn continue_scram_auth(&mut self, auth_bytes: &[u8]) -> Result<SaslAuthenticateResponse, SaslError> {
-        let scram_state = self.scram_state.as_ref()
-            .ok_or_else(|| SaslError::InternalError("No SCRAM state".to_string()))?;
-
-        // Parse client-final message
-        let client_final = String::from_utf8_lossy(auth_bytes);
-        debug!("SCRAM client-final: {}", client_final);
-
-        // For this stub, we'll accept any client-final message
-        // In production, this would verify the client proof
-
-        info!("SCRAM authentication successful for user: {}", scram_state.username);
-        self.state = SaslState::Authenticated(scram_state.username.clone());
-
-        // Build server-final message
-        let server_final = format!("v={}", base64::encode("server-signature"));
-
-        Ok(SaslAuthenticateResponse {
-            error_code: 0,
-            error_message: None,
-            auth_bytes: Some(server_final.into_bytes()),
-            session_lifetime_ms: Some(3600000), // 1 hour
-        })
-    }
-
     /// Check if authenticated
     pub fn is_authenticated(&self) -> bool {
         matches!(self.state, SaslState::Authenticated(_))
@@ -357,23 +272,18 @@ impl SaslAuthenticator {
     }
 }
 
-/// SCRAM server state
+/// SCRAM server state.
+///
+/// Retained for the Phase 1 SCRAM implementation (real per-user salt, stored
+/// key, client-proof verification). Nothing sets it today — the exchange that
+/// populated it was removed because it never verified the proof.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct ScramServerState {
     username: String,
     client_nonce: String,
     server_nonce: String,
     mechanism: SaslMechanism,
-}
-
-/// Extract nonce from SCRAM message
-fn extract_nonce(message: &str) -> Result<String, SaslError> {
-    message
-        .split(',')
-        .find(|s| s.starts_with("r="))
-        .and_then(|s| s.strip_prefix("r="))
-        .map(|s| s.to_string())
-        .ok_or_else(|| SaslError::ProtocolError("Missing nonce".to_string()))
 }
 
 /// SASL handshake response
@@ -453,7 +363,8 @@ mod tests {
 
     #[test]
     fn test_plain_authentication() {
-        let mut auth = SaslAuthenticator::new();
+        // Users must be provisioned explicitly - there are no built-in defaults.
+        let mut auth = SaslAuthenticator::new_from_config("admin:admin123");
 
         // Handshake
         let response = auth.handle_handshake(1, &["PLAIN".to_string()]).unwrap();
@@ -469,7 +380,7 @@ mod tests {
 
     #[test]
     fn test_invalid_credentials() {
-        let mut auth = SaslAuthenticator::new();
+        let mut auth = SaslAuthenticator::new_from_config("admin:admin123");
 
         // Handshake
         auth.handle_handshake(1, &["PLAIN".to_string()]).unwrap();
@@ -483,10 +394,55 @@ mod tests {
 
     #[test]
     fn test_unsupported_mechanism() {
-        let mut auth = SaslAuthenticator::new();
+        let mut auth = SaslAuthenticator::new_empty();
 
         let result = auth.handle_handshake(1, &["UNKNOWN".to_string()]);
         assert!(result.is_err());
+    }
+
+    /// SCRAM must NOT be advertised or accepted while its proof verification is
+    /// unimplemented. Previously it was advertised and the client proof was
+    /// never checked, so any password authenticated.
+    #[test]
+    fn test_scram_is_not_advertised_or_accepted() {
+        let auth = SaslAuthenticator::new_from_config("admin:admin123");
+
+        assert!(
+            !auth.supported_mechanisms().contains(&SaslMechanism::ScramSha256),
+            "SCRAM-SHA-256 must not be advertised while unimplemented"
+        );
+        assert!(
+            !auth.supported_mechanisms().contains(&SaslMechanism::ScramSha512),
+            "SCRAM-SHA-512 must not be advertised while unimplemented"
+        );
+
+        // A client asking only for SCRAM must be refused, not silently accepted.
+        let mut auth = SaslAuthenticator::new_from_config("admin:admin123");
+        assert!(auth
+            .handle_handshake(1, &["SCRAM-SHA-256".to_string()])
+            .is_err());
+        assert!(!auth.is_authenticated());
+    }
+
+    /// No default users: a fresh authenticator rejects the credentials that used
+    /// to be hardcoded.
+    #[test]
+    fn test_no_default_users() {
+        for (user, pass) in [
+            ("admin", "admin123"),
+            ("user", "user123"),
+            ("kafka", "kafka-secret"),
+        ] {
+            let mut auth = SaslAuthenticator::new_empty();
+            auth.handle_handshake(1, &["PLAIN".to_string()]).unwrap();
+            let bytes = format!("\0{}\0{}", user, pass).into_bytes();
+            assert!(
+                auth.handle_authenticate(&bytes).is_err(),
+                "{} must not authenticate against an unconfigured server",
+                user
+            );
+            assert!(!auth.is_authenticated());
+        }
     }
 
     #[test]

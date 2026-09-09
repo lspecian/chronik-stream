@@ -2396,12 +2396,17 @@ impl ProtocolHandler {
             Err(e) => {
                 tracing::warn!("SASL handshake failed for mechanism '{}': {:?}", mechanism, e);
                 SaslHandshakeResponse {
-                    error_code: 33, // SASL_AUTHENTICATION_FAILED
-                    mechanisms: vec![
-                        "PLAIN".to_string(),
-                        "SCRAM-SHA-256".to_string(),
-                        "SCRAM-SHA-512".to_string(),
-                    ],
+                    error_code: 33, // UNSUPPORTED_SASL_MECHANISM
+                    // Report what the authenticator actually accepts. This used
+                    // to be a hardcoded list including SCRAM-SHA-256/512, whose
+                    // verification was a stub that accepted any password - so a
+                    // client steered by this list would pick an unverified
+                    // mechanism. Never hardcode the advertised set.
+                    mechanisms: sasl
+                        .supported_mechanisms()
+                        .iter()
+                        .map(|m| m.as_str().to_string())
+                        .collect(),
                 }
             }
         };

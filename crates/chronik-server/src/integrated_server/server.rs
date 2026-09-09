@@ -13,6 +13,7 @@ use std::io::IoSlice;
 use tracing::{info, error, debug, warn, trace};
 use crate::error_handler::{ErrorHandler, ErrorCode, ErrorRecovery, ServerError};
 use crate::tls::{TlsConfig, TlsConnectionAcceptor, MaybeTlsReadHalf, MaybeTlsWriteHalf};
+use crate::connection::{ConnectionContext, SaslConfig};
 
 // Use the local server components (moved from chronik-ingest)
 use crate::kafka_handler::KafkaProtocolHandler;
@@ -692,6 +693,8 @@ impl IntegratedKafkaServer {
         info!("Ready to accept Kafka client connections");
 
         let (produce_semaphore, control_semaphore) = Self::setup_connection_semaphores();
+        // Resolved once; every connection shares it and gets its own auth state.
+        let sasl_config = Arc::new(SaslConfig::from_env());
 
         trace!("Entering accept loop - ready to accept connections");
         loop {
@@ -709,6 +712,10 @@ impl IntegratedKafkaServer {
                     let error_handler = Arc::new(ErrorHandler::new());
                     let produce_sem = produce_semaphore.clone();
                     let control_sem = control_semaphore.clone();
+                    // Per-connection identity + auth state. Shared by every request
+                    // task on this connection so that authenticating once unlocks
+                    // the connection, and only this connection.
+                    let conn_ctx = Arc::new(ConnectionContext::new(addr, false, sasl_config.clone()));
 
                     // v2.2.14: Removed diagnostic logs from hot path
                     // Spawn a task to handle this connection with proper error handling
@@ -731,7 +738,21 @@ impl IntegratedKafkaServer {
                             };
 
                             // Parse request metadata
-                            let (_api_key, _api_version, correlation_id) = Self::parse_request_metadata(&request_buffer, request_size);
+                            let (api_key, _api_version, correlation_id) = Self::parse_request_metadata(&request_buffer, request_size);
+
+                            // Pre-authentication gate, enforced by CLOSING the
+                            // connection rather than answering.
+                            //
+                            // An error response cannot carry the refusal for the
+                            // APIs that matter: build_error_response() ignores the
+                            // error code for Produce/Fetch/Metadata and emits an
+                            // empty *success* body, so a refused Produce would read
+                            // to the client as "accepted, zero results" — silent
+                            // data loss dressed as success. Kafka closes the
+                            // connection in this situation; so do we.
+                            if conn_ctx.check_request_allowed(api_key).await.is_err() {
+                                break;
+                            }
 
                             let request_data = request_buffer[..request_size].to_vec();
 
@@ -749,6 +770,7 @@ impl IntegratedKafkaServer {
                             let control_sem_clone = control_sem.clone();
                             let error_handler_clone = error_handler.clone();
                             let addr_clone = addr;
+                            let conn_ctx_clone = conn_ctx.clone();
 
                             tokio::spawn(async move {
                                 // Select semaphore based on API key
@@ -771,7 +793,10 @@ impl IntegratedKafkaServer {
                                 // Handle request; produce response bytes (or None).
                                 // Encoding runs here (concurrent); only the WRITE
                                 // is ordered, via resp_tx → ordered writer.
-                                let bytes = match handler_clone.handle_request(&request_data).await {
+                                let bytes = match handler_clone
+                                    .handle_request_with_context(&conn_ctx_clone, &request_data)
+                                    .await
+                                {
                                     Ok(response) => Some(Self::encode_response(response)),
                                     Err(e) => Self::build_error_bytes(
                                         e,
@@ -810,6 +835,8 @@ impl IntegratedKafkaServer {
         }
 
         let (produce_semaphore, control_semaphore) = Self::setup_connection_semaphores();
+        // Resolved once; every connection shares it and gets its own auth state.
+        let sasl_config = Arc::new(SaslConfig::from_env());
 
         loop {
             match acceptor.accept().await {
@@ -829,6 +856,10 @@ impl IntegratedKafkaServer {
                     let error_handler = Arc::new(ErrorHandler::new());
                     let produce_sem = produce_semaphore.clone();
                     let control_sem = control_semaphore.clone();
+                    // Per-connection identity + auth state; records whether this
+                    // connection is encrypted, which Phase 1 needs to derive an
+                    // mTLS principal from the peer certificate.
+                    let conn_ctx = Arc::new(ConnectionContext::new(addr, is_tls, sasl_config.clone()));
 
                     debug!("New {} connection from {}", if is_tls { "TLS" } else { "TCP" }, addr);
 
@@ -849,7 +880,14 @@ impl IntegratedKafkaServer {
                                 Err(_) => break,
                             };
 
-                            let (_api_key, _api_version, correlation_id) = Self::parse_request_metadata(&request_buffer, request_size);
+                            let (api_key, _api_version, correlation_id) = Self::parse_request_metadata(&request_buffer, request_size);
+
+                            // Pre-authentication gate — see the plaintext accept
+                            // loop for why refusal closes the connection instead
+                            // of answering.
+                            if conn_ctx.check_request_allowed(api_key).await.is_err() {
+                                break;
+                            }
 
                             let request_data = request_buffer[..request_size].to_vec();
 
@@ -863,6 +901,7 @@ impl IntegratedKafkaServer {
                             let control_sem_clone = control_sem.clone();
                             let error_handler_clone = error_handler.clone();
                             let addr_clone = addr;
+                            let conn_ctx_clone = conn_ctx.clone();
 
                             tokio::spawn(async move {
                                 let semaphore_clone = Self::select_semaphore_for_request(
@@ -880,7 +919,10 @@ impl IntegratedKafkaServer {
                                     }
                                 };
 
-                                let bytes = match handler_clone.handle_request(&request_data).await {
+                                let bytes = match handler_clone
+                                    .handle_request_with_context(&conn_ctx_clone, &request_data)
+                                    .await
+                                {
                                     Ok(response) => Some(Self::encode_response(response)),
                                     Err(e) => Self::build_error_bytes(
                                         e,

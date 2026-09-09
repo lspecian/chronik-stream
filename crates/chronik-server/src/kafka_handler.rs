@@ -13,6 +13,7 @@ use crate::produce_handler::ProduceHandler;
 use crate::consumer_group::GroupManager;
 use crate::fetch_handler::FetchHandler;
 use crate::wal_integration::WalProduceHandler;
+use crate::connection::ConnectionContext;
 use bytes::{Bytes, BytesMut, BufMut, Buf};
 use tokio::sync::RwLock;
 use tracing::{debug, error, instrument};
@@ -94,24 +95,59 @@ impl KafkaProtocolHandler {
         &self.wal_handler
     }
 
-    /// Handle a Kafka protocol request
-    #[instrument(skip(self, request_bytes))]
+    /// Handle a Kafka protocol request without a connection context.
+    ///
+    /// Equivalent to [`Self::handle_request_with_context`] on a connection where
+    /// authentication is disabled. Retained for in-process callers and tests;
+    /// the server's accept loops always pass a real context so that the
+    /// pre-authentication gate applies.
     pub async fn handle_request(&self, request_bytes: &[u8]) -> Result<Response> {
+        let ctx = ConnectionContext::internal();
+        self.handle_request_with_context(&ctx, request_bytes).await
+    }
+
+    /// Handle a Kafka protocol request on behalf of a specific connection.
+    ///
+    /// The connection context carries the authentication state. Requests are
+    /// gated on it *before* routing: when SASL is enabled and the connection has
+    /// not authenticated, only `ApiVersions`, `SaslHandshake` and
+    /// `SaslAuthenticate` reach a handler.
+    #[instrument(skip(self, request_bytes))]
+    pub async fn handle_request_with_context(
+        &self,
+        ctx: &ConnectionContext,
+        request_bytes: &[u8],
+    ) -> Result<Response> {
         // Helper to detect if we should pre-create a test topic for kafka-python clients
         self.infer_expected_topics_from_context().await;
         debug!("Handling request of {} bytes", request_bytes.len());
-        
+
         // Log first few bytes to identify request type
         if request_bytes.len() >= 4 {
             let api_key = i16::from_be_bytes([request_bytes[0], request_bytes[1]]);
             let api_version = i16::from_be_bytes([request_bytes[2], request_bytes[3]]);
             tracing::info!("Request: API key={}, version={}", api_key, api_version);
         }
-        
-        
+
+
         // Parse the request header to determine which API is being called
         let mut buf = bytes::Bytes::from(request_bytes.to_vec());
         let header = parse_request_header(&mut buf)?;
+
+        // Pre-authentication gate. Runs before routing so that no handler can be
+        // reached by an unauthenticated client. Without this, SASL is advisory:
+        // credentials are checked and the answer is discarded.
+        //
+        // The rejection travels as an error so the connection's error path
+        // encodes a correctly-shaped response for whichever API was attempted;
+        // `AUTH_REQUIRED_MARKER` makes it come out as ILLEGAL_SASL_STATE.
+        if let Err(rejection) = ctx.check_request_allowed(header.api_key as i16).await {
+            return Err(Error::Unauthorized(format!(
+                "{}: {}",
+                crate::error_handler::AUTH_REQUIRED_MARKER,
+                rejection.message
+            )));
+        }
 
         // Save a copy of the buffer for metadata processing
         let _buf_copy = buf.clone();
@@ -130,8 +166,8 @@ impl KafkaProtocolHandler {
             ApiKey::OffsetCommit => self.handle_offset_commit_request(header, buf).await,
             ApiKey::OffsetFetch => self.handle_offset_fetch_request(header, buf).await,
             ApiKey::CreateTopics => self.handle_create_topics_request(header, buf, request_bytes).await,
-            ApiKey::SaslHandshake => self.handle_sasl_handshake_request(header, buf).await,
-            ApiKey::SaslAuthenticate => self.handle_sasl_authenticate_request(header, buf).await,
+            ApiKey::SaslHandshake => self.handle_sasl_handshake_request(ctx, header, buf).await,
+            ApiKey::SaslAuthenticate => self.handle_sasl_authenticate_request(ctx, header, buf).await,
             ApiKey::DeleteTopics => self.handle_delete_topics_request(request_bytes).await,
             ApiKey::DeleteRecords => self.handle_delete_records_request(header, buf).await,
             ApiKey::DeleteGroups => self.handle_delete_groups_request(header, buf).await,
@@ -1728,61 +1764,69 @@ impl KafkaProtocolHandler {
 
     /// Handle SaslHandshake API request (API key 17)
     ///
-    /// This is the first step in SASL authentication. The client sends the
-    /// mechanism it wants to use, and we respond with supported mechanisms.
-    #[instrument(skip(self, buf))]
+    /// First step of SASL authentication: the client names the mechanism it
+    /// wants and the broker answers with the mechanisms it actually accepts.
+    ///
+    /// The negotiated mechanism is recorded on the connection, so a subsequent
+    /// `SaslAuthenticate` is interpreted in the right state. Previously this
+    /// handler advertised a hardcoded list including SCRAM-SHA-256/512 whose
+    /// verification was a stub, and accepted any mechanism that merely parsed.
+    /// The advertised set now comes from the connection's authenticator, so
+    /// there is one source of truth.
+    #[instrument(skip(self, ctx, buf))]
     async fn handle_sasl_handshake_request(
         &self,
+        ctx: &ConnectionContext,
         header: chronik_protocol::parser::RequestHeader,
         mut buf: Bytes,
     ) -> Result<Response> {
         use chronik_protocol::parser::{Decoder, ResponseHeader};
-        use chronik_protocol::sasl::{SaslMechanism, encode_sasl_handshake_response, SaslHandshakeResponse};
+        use chronik_protocol::sasl::{encode_sasl_handshake_response, SaslHandshakeResponse};
 
         tracing::info!("SaslHandshake v{} request received", header.api_version);
 
-        // Parse the requested mechanism
+        // SaslHandshake is "flexibleVersions: none" in the Kafka spec: the
+        // mechanism is a regular (length-prefixed) string at every version, not
+        // a compact one. See is_flexible_version() in parser.rs.
         let mut decoder = Decoder::new(&mut buf);
-        let mechanism = if header.api_version >= 1 {
-            // v1+ uses compact strings
-            decoder.read_compact_string()?.unwrap_or_default()
-        } else {
-            // v0 uses regular strings
-            decoder.read_string()?.unwrap_or_default()
-        };
+        let mechanism = decoder.read_string()?.unwrap_or_default();
 
         tracing::info!("Client requested SASL mechanism: {}", mechanism);
 
-        // Check if we support this mechanism
-        let supported_mechanisms = vec![
-            "PLAIN".to_string(),
-            "SCRAM-SHA-256".to_string(),
-            "SCRAM-SHA-512".to_string(),
-        ];
-
-        let error_code = if SaslMechanism::from_str(&mechanism).is_some() {
-            0 // Success
-        } else {
-            33 // UNSUPPORTED_SASL_MECHANISM
-        };
-
-        // Build response
-        let response = SaslHandshakeResponse {
-            error_code,
-            enabled_mechanisms: supported_mechanisms,
+        // Delegate to the connection's authenticator: it decides whether the
+        // mechanism is enabled and moves the connection into the right state.
+        let enabled_mechanisms = ctx.enabled_mechanisms().await;
+        let response = match ctx.sasl_handshake(header.api_version, &[mechanism.clone()]).await {
+            Ok(mut resp) => {
+                resp.enabled_mechanisms = enabled_mechanisms;
+                resp
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Refusing SASL mechanism '{}' from {}: {}",
+                    mechanism,
+                    ctx.peer_addr(),
+                    e
+                );
+                SaslHandshakeResponse {
+                    error_code: 33, // UNSUPPORTED_SASL_MECHANISM
+                    enabled_mechanisms,
+                }
+            }
         };
 
         let body = encode_sasl_handshake_response(&response);
 
         tracing::info!("SaslHandshake response: error_code={}, mechanisms={:?}",
-            error_code, response.enabled_mechanisms);
+            response.error_code, response.enabled_mechanisms);
 
         Ok(Response {
             header: ResponseHeader {
                 correlation_id: header.correlation_id,
             },
             body,
-            is_flexible: header.api_version >= 1,
+            // Never flexible - see the mechanism-parse note above.
+            is_flexible: false,
             api_key: ApiKey::SaslHandshake,
             throttle_time_ms: None,
         })
@@ -1790,16 +1834,24 @@ impl KafkaProtocolHandler {
 
     /// Handle SaslAuthenticate API request (API key 36)
     ///
-    /// This is the second step in SASL authentication. The client sends
-    /// authentication credentials based on the chosen mechanism.
-    #[instrument(skip(self, buf))]
+    /// Second step of SASL authentication: the client sends credentials for the
+    /// mechanism negotiated by `SaslHandshake`.
+    ///
+    /// The credentials are verified against the **connection's** authenticator
+    /// and success is recorded on the connection, which is what makes the
+    /// pre-authentication gate in `handle_request_with_context` meaningful.
+    /// Previously this built a throwaway authenticator per request, forced it
+    /// into the PLAIN handshake state, and discarded the outcome — so
+    /// authenticating and not authenticating led to exactly the same access.
+    #[instrument(skip(self, ctx, buf))]
     async fn handle_sasl_authenticate_request(
         &self,
+        ctx: &ConnectionContext,
         header: chronik_protocol::parser::RequestHeader,
         mut buf: Bytes,
     ) -> Result<Response> {
         use chronik_protocol::parser::{Decoder, ResponseHeader};
-        use chronik_protocol::sasl::{SaslAuthenticator, encode_sasl_authenticate_response, SaslAuthenticateResponse};
+        use chronik_protocol::sasl::{encode_sasl_authenticate_response, SaslAuthenticateResponse};
 
         tracing::info!("SaslAuthenticate v{} request received", header.api_version);
 
@@ -1816,25 +1868,19 @@ impl KafkaProtocolHandler {
         let auth_bytes = auth_bytes_opt.unwrap_or_default();
         tracing::debug!("SaslAuthenticate auth_bytes len: {}", auth_bytes.len());
 
-        // Create a temporary authenticator for this request
-        // NOTE: In a full implementation, this would be per-connection state
-        // tracked in the connection handler. For now, we create a new one per request.
-        let mut authenticator = SaslAuthenticator::new();
-
-        // Force the authenticator into HandshakeComplete state for PLAIN
-        // (since we're stateless, we assume PLAIN was negotiated)
-        let _ = authenticator.handle_handshake(header.api_version, &["PLAIN".to_string()]);
-
-        // Attempt authentication
-        let response = match authenticator.handle_authenticate(&auth_bytes) {
-            Ok(auth_response) => {
-                tracing::info!("SASL authentication successful for user: {:?}", authenticator.username());
-                auth_response
-            }
+        let response = match ctx.sasl_authenticate(&auth_bytes).await {
+            Ok(auth_response) => auth_response,
             Err(e) => {
-                tracing::warn!("SASL authentication failed: {}", e);
+                tracing::warn!(
+                    "SASL authentication failed for {} ({}): {}",
+                    ctx.id(),
+                    ctx.peer_addr(),
+                    e
+                );
                 SaslAuthenticateResponse {
-                    error_code: 31, // SASL_AUTHENTICATION_FAILED
+                    // Previously 31 (CLUSTER_AUTHORIZATION_FAILED) behind a
+                    // comment claiming it was SASL_AUTHENTICATION_FAILED.
+                    error_code: crate::connection::ERROR_SASL_AUTHENTICATION_FAILED,
                     error_message: Some(format!("{}", e)),
                     auth_bytes: None,
                     session_lifetime_ms: None,

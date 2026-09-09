@@ -16,7 +16,11 @@ pub struct TestClusterConfig {
     pub data_dir: Option<PathBuf>,
     pub object_storage: ObjectStorageType,
     pub enable_tls: bool,
+    /// Require SASL authentication (sets `CHRONIK_SASL_ENABLED`).
     pub enable_auth: bool,
+    /// `(username, password)` pairs the broker will accept, passed as
+    /// `CHRONIK_SASL_USERS`. Only meaningful with `enable_auth`.
+    pub sasl_users: Vec<(String, String)>,
     pub enable_wal_metadata: bool,
 }
 
@@ -28,6 +32,7 @@ impl Default for TestClusterConfig {
             object_storage: ObjectStorageType::Local,
             enable_tls: false,
             enable_auth: false,
+            sasl_users: Vec::new(),
             enable_wal_metadata: true,
         }
     }
@@ -188,6 +193,20 @@ impl TestCluster {
             .arg("--advertise").arg(format!("127.0.0.1:{}", addr.port()))
             .arg("--kafka-port").arg(addr.port().to_string())
             .arg("--data-dir").arg(node_data_dir.to_str().unwrap());
+
+        // SASL authentication. Off unless a test asks for it, matching the
+        // broker default - enabling auth locks out every unconfigured client.
+        if self.config.enable_auth {
+            let users = self
+                .config
+                .sasl_users
+                .iter()
+                .map(|(u, p)| format!("{}:{}", u, p))
+                .collect::<Vec<_>>()
+                .join(",");
+            cmd.env("CHRONIK_SASL_ENABLED", "true")
+                .env("CHRONIK_SASL_USERS", users);
+        }
 
         // Configure object storage
         match &self.config.object_storage {

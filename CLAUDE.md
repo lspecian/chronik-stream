@@ -1097,8 +1097,11 @@ Key environment variables:
 - `CHRONIK_REPLICA_LAG_TIME_MAX_MS` - How long a replica may stay measurably behind before leaving ISR (default: 10000). Kafka's `replica.lag.time.max.ms` equivalent; Kafka defaults to 30s, this is deliberately tighter so under-replication surfaces sooner. Cluster mode only.
 - `CHRONIK_REPLICA_LAG_MAX_ENTRIES` - Secondary record-count bound on follower lag (default: 10000). Time is the primary bound.
 - `CHRONIK_ADMIN_API_KEY` - API key for admin API authentication (Priority 2, **REQUIRED for production**)
-- `CHRONIK_ADMIN_TLS_CERT` - Path to TLS certificate for admin API (Priority 2, optional)
-- `CHRONIK_ADMIN_TLS_KEY` - Path to TLS private key for admin API (Priority 2, optional)
+- `CHRONIK_ADMIN_TLS_CERT` / `CHRONIK_ADMIN_TLS_KEY` - **NOT IMPLEMENTED.** Setting either logs a warning ("axum-server crate not available") and the admin API still serves plain **HTTP**. The whole Unified API (6092) is plaintext; there is no HTTPS anywhere yet. Tracked as Phase 4 in [docs/ROADMAP_SECURITY.md](docs/ROADMAP_SECURITY.md).
+- `CHRONIK_SASL_ENABLED` - Require SASL authentication on the Kafka port (default: `false`). When `true`, an unauthenticated connection may send only ApiVersions/SaslHandshake/SaslAuthenticate; anything else closes the connection. Only **PLAIN** is offered — SCRAM is deliberately not advertised until its client-proof verification is implemented (Phase 1).
+- `CHRONIK_SASL_USERS` - `user1:pass1,user2:pass2`. There are **no default users**; with SASL enabled and this unset, every client is rejected.
+- `CHRONIK_S3_SSE` - Server-side encryption for objects written to S3-compatible storage: `AES256` (SSE-S3) or `aws:kms` (SSE-KMS). Unset = objects written unencrypted (the default). Applies to segments, Tantivy indexes, Parquet files and metadata DR uploads. GCS/Azure/local backends ignore it.
+- `CHRONIK_S3_SSE_KMS_KEY_ID` - KMS key for `CHRONIK_S3_SSE=aws:kms`. Optional; without it S3 uses the bucket's default managed key.
 - `CHRONIK_SCHEMA_REGISTRY_AUTH_ENABLED` - Enable HTTP Basic Auth for Schema Registry (default: `false`)
 - `CHRONIK_SCHEMA_REGISTRY_USERS` - Comma-separated `user:pass` pairs for Schema Registry auth
 - `CHRONIK_UNIFIED_API_PORT` - Unified API port (default: 6092)
