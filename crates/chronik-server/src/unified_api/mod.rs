@@ -18,6 +18,7 @@
 //! CHRONIK_UNIFIED_API_PORT=6092  # default
 //! ```
 
+pub mod data_auth;
 pub mod sql_handler;
 pub mod vector_handler;
 pub mod admin_handler;
@@ -580,9 +581,6 @@ pub fn create_router_full(
 ) -> Router {
     let mut router = Router::new();
 
-    // Health check endpoint (always enabled)
-    router = router.route("/health", get(health_check));
-
     // SQL endpoints
     if state.config.enable_sql {
         router = router
@@ -609,6 +607,7 @@ pub fn create_router_full(
         .route("/_query", post(query_handler::handle_query))
         .route("/_query/capabilities", get(query_handler::handle_capabilities))
         .route("/_query/profiles", get(query_handler::handle_profiles));
+
 
     // AM-1.7: Agent Memory endpoints. Registered whenever the `memory` feature
     // is compiled in; the handlers return 503 when memory_registry is None on
@@ -640,6 +639,16 @@ pub fn create_router_full(
         .route("/ontology/v1/mcp", post(ontology::mcp));
     }
 
+    // Snapshot what /health reports before `state` is moved into the router.
+    let health_snapshot = HealthResponse {
+        status: "ok".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        sql_enabled: state.query_engine.is_some(),
+        vector_enabled: state.vector_index_manager.is_some(),
+        search_enabled: state.config.enable_search,
+        admin_enabled: state.config.enable_admin,
+    };
+
     // Add shared state for SQL/Vector/Query/Memory endpoints
     let mut router = router.with_state(state);
 
@@ -648,6 +657,43 @@ pub fn create_router_full(
     if let Some(search) = search_router {
         router = router.merge(search);
     }
+
+    // Security Phase 4: require an API key on everything that reads topic data.
+    //
+    // Applied AFTER the search router is merged, because `/_search` reads topics
+    // too and a layer added earlier would not cover it — and BEFORE `/admin` and
+    // `/health`, which must keep their own behaviour: admin has its own key, and
+    // a health probe must not need credentials.
+    //
+    // `/memory/v1/*` and `/ontology/v1/*` are inside this layer as well. They
+    // carry their own tenant+key checks, so they end up requiring both; that is
+    // the safe direction, and they are off by default.
+    //
+    // This closes a complete bypass: these endpoints served topic contents to
+    // anyone who could reach the port, whatever SASL and ACLs enforced on :9092.
+    let data_auth = data_auth::DataAuthConfig::from_env();
+    if data_auth.is_enabled() {
+        router = router.layer(axum::middleware::from_fn(move |req, next| {
+            let config = data_auth.clone();
+            async move { data_auth::require_api_key(config, req, next).await }
+        }));
+    }
+
+    // Health check: registered AFTER the auth layer so liveness probes stay
+    // unauthenticated.
+    //
+    // The response is built from flags captured before `with_state`, keeping the
+    // existing `HealthResponse` contract byte for byte. Trimming it to
+    // status+version would have been a silent breaking change for anything
+    // already reading `sql_enabled`, and these flags say only which subsystems
+    // are compiled in — no topic names, no configuration values.
+    let mut router = router.route(
+        "/health",
+        get(move || {
+            let response = health_snapshot.clone();
+            async move { Json(response) }
+        }),
+    );
 
     // Merge admin router if provided
     // Admin endpoints: /admin/*, Schema Registry: /subjects/*, /schemas/*, /config/*
@@ -658,8 +704,9 @@ pub fn create_router_full(
     router
 }
 
+
 /// Health check response
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthResponse {
     pub status: String,
     pub version: String,
@@ -667,19 +714,6 @@ pub struct HealthResponse {
     pub vector_enabled: bool,
     pub search_enabled: bool,
     pub admin_enabled: bool,
-}
-
-/// Health check handler
-async fn health_check(State(state): State<UnifiedApiState>) -> impl IntoResponse {
-    let response = HealthResponse {
-        status: "ok".to_string(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        sql_enabled: state.query_engine.is_some(),
-        vector_enabled: state.vector_index_manager.is_some(),
-        search_enabled: state.config.enable_search,
-        admin_enabled: state.config.enable_admin,
-    };
-    Json(response)
 }
 
 /// Start the unified API HTTP server
@@ -850,14 +884,7 @@ pub async fn start_unified_api_full(
     }
     info!("  Health endpoint:  /health");
 
-    let handle = tokio::spawn(async move {
-        if let Err(e) = axum::Server::bind(&addr)
-            .serve(app.into_make_service())
-            .await
-        {
-            tracing::error!("Unified API server error: {}", e);
-        }
-    });
+    let handle = spawn_api_server(addr, app).await?;
 
     Ok(handle)
 }
@@ -902,16 +929,57 @@ pub async fn start_unified_api_with_state(
     let app = create_router_full(state, search_router, admin_router);
     let addr: std::net::SocketAddr = format!("{}:{}", bind_addr, port).parse()?;
 
-    let handle = tokio::spawn(async move {
-        if let Err(e) = axum::Server::bind(&addr)
-            .serve(app.into_make_service())
-            .await
-        {
-            tracing::error!("Unified API server error: {}", e);
-        }
-    });
+    let handle = spawn_api_server(addr, app).await?;
 
     Ok(handle)
+}
+
+/// Bind and serve the Unified API, over TLS when a certificate is configured.
+///
+/// There are two entry points that start this server
+/// ([`start_unified_api_full`] and [`start_unified_api_with_state`]), and only
+/// one of them is actually reached from `main.rs`. Adding TLS to a copy of this
+/// logic in each would mean the feature works or does not depending on which
+/// entry point a deployment happens to use — the same trap that had two
+/// different hardcoded SASL mechanism lists. One implementation, both callers.
+///
+/// TLS reuses the Kafka listener's configuration ([`crate::tls`]) rather than
+/// adding `axum-server`, which would bring a second rustls major version into
+/// the tree. Certificates come from `CHRONIK_API_TLS_CERT`/`_KEY`, falling back
+/// to the broker's `CHRONIK_TLS_CERT`/`_KEY` so a single-certificate deployment
+/// need not name it twice. With neither set, this serves plain HTTP.
+async fn spawn_api_server(
+    addr: std::net::SocketAddr,
+    app: Router,
+) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+    let tls_config = crate::tls::TlsConfig::from_env_with_prefix("CHRONIK_API_TLS")
+        .or_else(crate::tls::TlsConfig::from_env);
+
+    match tls_config {
+        Some(tls) => {
+            let acceptor = crate::tls::create_tls_acceptor(&tls)?;
+            let listener = tokio::net::TcpListener::bind(addr).await?;
+            info!("Unified API serving HTTPS on {}", addr);
+            Ok(tokio::spawn(async move {
+                serve_https(listener, acceptor, app).await;
+            }))
+        }
+        None => {
+            info!(
+                "Unified API serving plain HTTP on {} (set CHRONIK_API_TLS_CERT and \
+                 CHRONIK_API_TLS_KEY for HTTPS)",
+                addr
+            );
+            Ok(tokio::spawn(async move {
+                if let Err(e) = axum::Server::bind(&addr)
+                    .serve(app.into_make_service())
+                    .await
+                {
+                    tracing::error!("Unified API server error: {}", e);
+                }
+            }))
+        }
+    }
 }
 
 /// Get the unified API port from environment or default
@@ -1149,5 +1217,54 @@ mod tests {
         assert!(json.contains("\"status\":\"ok\""));
         assert!(json.contains("\"sql_enabled\":true"));
         assert!(json.contains("\"vector_enabled\":false"));
+    }
+}
+
+/// Serve the Unified API over TLS.
+///
+/// Written against hyper directly because axum 0.6's `Server` has no TLS entry
+/// point and `axum-server` would introduce a second, incompatible rustls
+/// version alongside the one `crate::tls` already uses for the Kafka listener.
+///
+/// A failed handshake logs and drops that connection only: one client with a
+/// bad certificate must not take the API down for everyone else.
+async fn serve_https(
+    listener: tokio::net::TcpListener,
+    acceptor: tokio_rustls::TlsAcceptor,
+    app: Router,
+) {
+    loop {
+        let (stream, peer) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::error!("Unified API accept failed: {}", e);
+                continue;
+            }
+        };
+
+        let acceptor = acceptor.clone();
+        let app = app.clone();
+
+        tokio::spawn(async move {
+            let tls_stream = match acceptor.accept(stream).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::debug!("Unified API TLS handshake from {} failed: {}", peer, e);
+                    return;
+                }
+            };
+
+            let service = hyper::service::service_fn(move |request| {
+                use tower::ServiceExt;
+                app.clone().oneshot(request)
+            });
+
+            if let Err(e) = hyper::server::conn::Http::new()
+                .serve_connection(tls_stream, service)
+                .await
+            {
+                tracing::debug!("Unified API connection from {} ended: {}", peer, e);
+            }
+        });
     }
 }

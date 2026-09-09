@@ -88,6 +88,9 @@ pub struct TestCluster {
     /// run on one host without colliding on the default.
     api_addrs: Vec<SocketAddr>,
     processes: Vec<Child>,
+    /// Whether the Unified API was configured for TLS, which decides how
+    /// readiness is probed.
+    tls_env_set: bool,
 }
 
 /// Locate the `chronik-server` binary under test.
@@ -137,12 +140,17 @@ impl TestCluster {
         let server_addrs = allocate_ports(config.num_servers)?;
         let api_addrs = allocate_ports(config.num_servers)?;
 
+        let tls_env_set = extra_env
+            .iter()
+            .any(|(k, _)| *k == "CHRONIK_API_TLS_CERT" || *k == "CHRONIK_TLS_CERT");
+
         let mut cluster = Self {
             config: config.clone(),
             _temp_dir,
             server_addrs: server_addrs.clone(),
             api_addrs,
             processes: Vec::new(),
+            tls_env_set,
         };
 
         // Start servers
@@ -286,8 +294,19 @@ impl TestCluster {
         // And to serve the Unified API. A test that queries /_search or /admin
         // right after the Kafka port opens would otherwise race the HTTP
         // listener, which starts later in the builder.
+        //
+        // When the API is configured for TLS an `http://` probe can never
+        // succeed, so fall back to waiting for the socket. Probing HTTP only
+        // would make every HTTPS test fail in the harness rather than in the
+        // product, which reads as a broken feature.
+        let api_is_https = self.tls_env_set;
         for addr in &self.api_addrs {
-            wait_for_http_endpoint(&format!("http://{}/health", addr), Duration::from_secs(30)).await?;
+            if api_is_https {
+                wait_for_tcp_endpoint(addr, Duration::from_secs(30)).await?;
+            } else {
+                wait_for_http_endpoint(&format!("http://{}/health", addr), Duration::from_secs(30))
+                    .await?;
+            }
         }
 
         Ok(())

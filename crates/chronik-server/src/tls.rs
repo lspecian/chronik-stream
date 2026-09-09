@@ -53,14 +53,24 @@ impl TlsConfig {
     /// - `CHRONIK_TLS_CA_CERT`: Path to CA certificate (optional, for mTLS)
     /// - `CHRONIK_TLS_REQUIRE_CLIENT_CERT`: Set to "true" to require client certs
     pub fn from_env() -> Option<Self> {
-        let cert_path = std::env::var("CHRONIK_TLS_CERT").ok()?;
-        let key_path = std::env::var("CHRONIK_TLS_KEY").ok()?;
+        Self::from_env_with_prefix("CHRONIK_TLS")
+    }
+
+    /// Read TLS configuration from environment variables under a given prefix.
+    ///
+    /// The Kafka listener uses `CHRONIK_TLS_*`; the Unified API uses
+    /// `CHRONIK_API_TLS_*` and falls back to the former, so a deployment with
+    /// one certificate for both does not have to name it twice. Reading the same
+    /// four suffixes for both keeps one code path instead of two.
+    pub fn from_env_with_prefix(prefix: &str) -> Option<Self> {
+        let cert_path = std::env::var(format!("{}_CERT", prefix)).ok()?;
+        let key_path = std::env::var(format!("{}_KEY", prefix)).ok()?;
 
         Some(Self {
             cert_path,
             key_path,
-            ca_cert_path: std::env::var("CHRONIK_TLS_CA_CERT").ok(),
-            require_client_cert: std::env::var("CHRONIK_TLS_REQUIRE_CLIENT_CERT")
+            ca_cert_path: std::env::var(format!("{}_CA_CERT", prefix)).ok(),
+            require_client_cert: std::env::var(format!("{}_REQUIRE_CLIENT_CERT", prefix))
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(false),
         })
@@ -117,8 +127,42 @@ fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
     }
 }
 
+/// Install the process-wide rustls crypto provider.
+///
+/// rustls 0.23 refuses to guess when more than one provider is compiled in, and
+/// this tree has both `ring` (pulled in by other dependencies) and `aws-lc-rs`
+/// (rustls's default). Without an explicit choice, the first TLS handshake
+/// **panics**:
+///
+/// ```text
+/// Could not automatically determine the process-level CryptoProvider
+/// from Rustls crate features
+/// ```
+///
+/// That is not hypothetical and it was not only an API-port problem: this
+/// function is the single place both the Kafka listener and the Unified API
+/// build an acceptor, so TLS on the Kafka port would have panicked the broker on
+/// the first `CHRONIK_TLS_CERT` connection. It went unnoticed because nothing
+/// had ever completed a TLS handshake against this server.
+///
+/// `install_default` returns `Err` if a provider is already installed, which is
+/// the normal case for the second and later calls, so the result is discarded.
+fn ensure_crypto_provider() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        if rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .is_err()
+        {
+            debug!("rustls crypto provider was already installed");
+        }
+    });
+}
+
 /// Create a TLS acceptor from configuration
 pub fn create_tls_acceptor(config: &TlsConfig) -> Result<TlsAcceptor> {
+    ensure_crypto_provider();
+
     info!("Loading TLS certificate from: {}", config.cert_path);
     info!("Loading TLS private key from: {}", config.key_path);
 

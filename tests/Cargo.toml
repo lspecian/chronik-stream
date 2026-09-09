@@ -103,3 +103,7 @@ path = "integration/sasl_enforcement_test.rs"
 [[test]]
 name = "acl_enforcement"
 path = "integration/acl_enforcement_test.rs"
+
+[[test]]
+name = "unified_api_auth"
+path = "integration/unified_api_auth_test.rs"

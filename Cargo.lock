@@ -2184,6 +2184,7 @@ dependencies = [
  "slog",
  "slog-stdlog",
  "socket2 0.5.10",
+ "subtle",
  "tabled",
  "tantivy",
  "tempfile",
