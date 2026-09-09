@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.13.1] - 2026-09-09
+
+### Fixed
+
+- **Distributed `/_sql` `SELECT *` returned rows with an empty `columns` list**
+  (#42). A fanned-out `SELECT *` matches no rows on the coordinator (the
+  partitions live on peers), so the merge took its column names from the empty
+  local result. Both merge paths (`merge_sql_responses` and
+  `merge_scalar_aggregate`) now recover the column names from the first peer
+  that has them.
+- **Distributed `/_sql` `COUNT(*)` could over-count by the replication factor
+  on RF>1 clusters** (#41), in the degraded state where the partition/leadership
+  map is not populated for the queried topic. There, every node's ownership
+  filter falls open to "serve everything", so the coordinator fans out and each
+  replica returns the full count, which the scalar-aggregate merge then sums.
+  The coordinator now resolves the topics a query references and, when
+  leadership is unknown for any of them, answers locally instead of fanning out
+  and summing — complete under full replication and never a multiplied count.
+  The healthy path is unchanged: on a live cluster leadership is known, so the
+  existing led-partition filtering still covers every partition exactly once
+  (verified end-to-end: a 600-row topic counts 600 across hot ∪ cold on all
+  three nodes, with no jump after the cold-Parquet flush).
+
 ## [2.12.2] - 2026-08-17
 
 ### Fixed
