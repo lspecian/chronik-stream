@@ -26,9 +26,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   2. **Hot buffer seeded from cold on restart.** `HotDataBuffer.flushed_offsets`
      lives only in memory, so after a restart it reset to 0 and the buffer
      (rebuilt from the WAL trailing window) re-served offsets already in cold.
-     It is now seeded from the cold high-water mark when it is wired up, so it
-     serves only what cold does not — no `hot UNION ALL cold` double-count, even
-     for a static topic that never flushes again.
+     It is now seeded from the cold high-water mark so it serves only what cold
+     does not — no `hot UNION ALL cold` double-count, even for a static topic
+     that never flushes again. The WalIndexer seeds it best-effort when the
+     buffer is wired up, and the SQL layer re-seeds at query time (after Parquet
+     metadata has finished recovering, which the early seed can race), which is
+     the reliable backstop.
 
   Both are contained to the columnar/SQL path and do not touch the Kafka
   produce/fetch/WAL-recovery path; WAL-segment deletion is unaffected (an
