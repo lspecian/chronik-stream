@@ -128,6 +128,12 @@ proptest = "1.4"
 criterion = { version = "0.5", features = ["async_tokio"] }
 tempfile = "3.8"
 base64 = "0.21"
+# SCRAM-SHA-256/512 (SASL): PBKDF2 key derivation, HMAC, digest, constant-time compare
+sha2 = "0.10"
+hmac = "0.12"
+pbkdf2 = "0.12"
+rand = "0.8"
+subtle = "2.5"
 log = "0.4"
 env_logger = "0.11"
 libc = "0.2"

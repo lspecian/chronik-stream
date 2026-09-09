@@ -2490,8 +2490,11 @@ impl ProtocolHandler {
             Some(&response.auth_bytes)
         });
 
-        // Session lifetime ms
-        encoder.write_i64(response.session_lifetime_ms);
+        // SessionLifetimeMs exists only from v1; writing it on a v0 response
+        // appends eight bytes the client does not expect.
+        if header.api_version >= 1 {
+            encoder.write_i64(response.session_lifetime_ms);
+        }
 
         Ok(Self::make_response(&header, ApiKey::SaslAuthenticate, body_buf.freeze()))
     }

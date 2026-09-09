@@ -1888,7 +1888,7 @@ impl KafkaProtocolHandler {
             }
         };
 
-        let body = encode_sasl_authenticate_response(&response);
+        let body = encode_sasl_authenticate_response(&response, header.api_version);
 
         tracing::info!("SaslAuthenticate response: error_code={}", response.error_code);
 

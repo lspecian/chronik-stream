@@ -148,37 +148,17 @@ async fn unknown_user_cannot_produce() -> Result<()> {
     Ok(())
 }
 
-/// SCRAM must not be offered while its proof verification is unimplemented.
-///
-/// Previously the broker advertised SCRAM-SHA-256/512 and accepted any
-/// password on them, so a client selecting SCRAM authenticated unconditionally.
-#[tokio::test]
-async fn scram_is_not_offered() -> Result<()> {
-    let _guard = exclusive().await;
-    let cluster = TestCluster::start(auth_cluster_config()).await?;
-    let bootstrap = cluster.bootstrap_servers();
-
-    let producer: FutureProducer = ClientConfig::new()
-        .set("bootstrap.servers", &bootstrap)
-        .set("security.protocol", "SASL_PLAINTEXT")
-        .set("sasl.mechanism", "SCRAM-SHA-256")
-        .set("sasl.username", USER)
-        .set("sasl.password", PASSWORD)
-        .set("message.timeout.ms", "5000")
-        .set("socket.timeout.ms", "4000")
-        .set("retries", "0")
-        .create()?;
-
-    let result = try_produce(&producer, "should-never-land").await;
-
-    assert!(
-        result.is_err(),
-        "SCRAM-SHA-256 authenticated successfully - the mechanism is advertised but its \
-         client proof is never verified, so any password is accepted"
-    );
-
-    Ok(())
-}
+// NOTE: "an unimplemented mechanism must be refused" is asserted at the unit
+// level instead (`sasl::tests` and `connection::tests`), not here. The two
+// unimplemented variants are GSSAPI and OAUTHBEARER, and neither can drive this
+// assertion end-to-end: this librdkafka is built without a GSSAPI provider, so
+// the *client* refuses to construct ("No provider for SASL mechanism GSSAPI")
+// and the broker is never contacted. A test that fails in the client tells us
+// nothing about the server.
+//
+// The server-side guarantee is structural: `ENABLED_MECHANISMS` is the single
+// source of advertised mechanisms, the handshake only completes for a mechanism
+// in it, and `handle_authenticate` hard-refuses anything else.
 
 /// No regression for the default configuration: with SASL disabled (the default)
 /// an ordinary client works exactly as before Phase 0.
@@ -203,5 +183,130 @@ async fn sasl_disabled_by_default_does_not_break_plain_clients() -> Result<()> {
         result
     );
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1: SCRAM
+//
+// SCRAM was withdrawn in Phase 0 because its verification was a stub that
+// accepted any password. These tests exist to prove the replacement is real:
+// the positive cases must authenticate against librdkafka's own SCRAM client
+// (which verifies the server signature, so a fabricated one fails), and the
+// negative cases must be refused.
+// ---------------------------------------------------------------------------
+
+fn scram_producer(
+    bootstrap: &str,
+    mechanism: &str,
+    user: &str,
+    password: &str,
+) -> Result<FutureProducer> {
+    Ok(ClientConfig::new()
+        .set("bootstrap.servers", bootstrap)
+        .set("security.protocol", "SASL_PLAINTEXT")
+        .set("sasl.mechanism", mechanism)
+        .set("sasl.username", user)
+        .set("sasl.password", password)
+        .set("message.timeout.ms", "8000")
+        .set("socket.timeout.ms", "6000")
+        .set("retries", "0")
+        .create()?)
+}
+
+#[tokio::test]
+async fn scram_sha256_authenticates_with_correct_password() -> Result<()> {
+    let _guard = exclusive().await;
+    let cluster = TestCluster::start(auth_cluster_config()).await?;
+    let producer = scram_producer(
+        &cluster.bootstrap_servers(),
+        "SCRAM-SHA-256",
+        USER,
+        PASSWORD,
+    )?;
+
+    let result = try_produce(&producer, "scram256-payload").await;
+    assert!(
+        result.is_ok(),
+        "SCRAM-SHA-256 with valid credentials failed: {:?}. librdkafka verifies the \
+         server signature, so this also proves the signature is computed correctly",
+        result
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn scram_sha512_authenticates_with_correct_password() -> Result<()> {
+    let _guard = exclusive().await;
+    let cluster = TestCluster::start(auth_cluster_config()).await?;
+    let producer = scram_producer(
+        &cluster.bootstrap_servers(),
+        "SCRAM-SHA-512",
+        USER,
+        PASSWORD,
+    )?;
+
+    let result = try_produce(&producer, "scram512-payload").await;
+    assert!(
+        result.is_ok(),
+        "SCRAM-SHA-512 with valid credentials failed: {:?}",
+        result
+    );
+    Ok(())
+}
+
+/// THE regression test for the old stub, which accepted any client-final message.
+#[tokio::test]
+async fn scram_sha256_rejects_wrong_password() -> Result<()> {
+    let _guard = exclusive().await;
+    let cluster = TestCluster::start(auth_cluster_config()).await?;
+    let producer = scram_producer(
+        &cluster.bootstrap_servers(),
+        "SCRAM-SHA-256",
+        USER,
+        "wrong-password",
+    )?;
+
+    let result = try_produce(&producer, "should-never-land").await;
+    assert!(
+        result.is_err(),
+        "SCRAM-SHA-256 accepted an INCORRECT password - the client proof is not \
+         being verified, which is exactly the stub this replaced"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn scram_sha512_rejects_wrong_password() -> Result<()> {
+    let _guard = exclusive().await;
+    let cluster = TestCluster::start(auth_cluster_config()).await?;
+    let producer = scram_producer(
+        &cluster.bootstrap_servers(),
+        "SCRAM-SHA-512",
+        USER,
+        "wrong-password",
+    )?;
+
+    let result = try_produce(&producer, "should-never-land").await;
+    assert!(
+        result.is_err(),
+        "SCRAM-SHA-512 accepted an INCORRECT password"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn scram_rejects_unknown_user() -> Result<()> {
+    let _guard = exclusive().await;
+    let cluster = TestCluster::start(auth_cluster_config()).await?;
+    let producer = scram_producer(
+        &cluster.bootstrap_servers(),
+        "SCRAM-SHA-256",
+        "mallory",
+        PASSWORD,
+    )?;
+
+    let result = try_produce(&producer, "should-never-land").await;
+    assert!(result.is_err(), "SCRAM accepted an UNKNOWN user");
     Ok(())
 }

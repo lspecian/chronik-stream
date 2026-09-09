@@ -344,16 +344,25 @@ impl ConnectionContext {
         let mut inner = self.inner.lock().await;
         let response = inner.authenticator.handle_authenticate(auth_bytes)?;
 
+        // `username()` is Some only once the exchange has fully completed. That
+        // matters for SCRAM, which takes two round trips: the intermediate step
+        // returns Ok with a server-first message and must NOT mark the
+        // connection authenticated.
         if let Some(username) = inner.authenticator.username() {
             let principal = username.to_string();
+            let mechanism = inner
+                .authenticator
+                .negotiated_mechanism()
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_else(|| "UNKNOWN".to_string());
             inner.auth = AuthState::Authenticated {
                 principal: principal.clone(),
-                mechanism: "PLAIN".to_string(),
+                mechanism: mechanism.clone(),
                 at: Utc::now(),
             };
             info!(
-                "{} ({}) authenticated as User:{}",
-                self.id, self.peer_addr, principal
+                "{} ({}) authenticated as User:{} via {}",
+                self.id, self.peer_addr, principal, mechanism
             );
         }
 
@@ -463,17 +472,33 @@ mod tests {
 
     /// SCRAM is advertised nowhere and accepted nowhere.
     #[tokio::test]
-    async fn scram_handshake_is_refused() {
+    async fn scram_is_offered_and_the_intermediate_step_does_not_authenticate() {
         let ctx = enabled_ctx();
+
+        let mechanisms = ctx.enabled_mechanisms().await;
+        assert!(mechanisms.contains(&"SCRAM-SHA-256".to_string()));
+        assert!(mechanisms.contains(&"SCRAM-SHA-512".to_string()));
 
         assert!(ctx
             .sasl_handshake(1, &["SCRAM-SHA-256".to_string()])
             .await
-            .is_err());
-        assert!(!ctx.is_authenticated().await);
-        assert!(ctx.check_request_allowed(API_PRODUCE).await.is_err());
+            .is_ok());
 
-        assert_eq!(ctx.enabled_mechanisms().await, vec!["PLAIN".to_string()]);
+        // SCRAM takes two round trips. The first returns a server-first message
+        // and MUST leave the connection unauthenticated — otherwise a client
+        // could send only client-first and then produce.
+        let server_first = ctx
+            .sasl_authenticate(b"n,,n=alice,r=clientnonce")
+            .await
+            .expect("server-first");
+        assert_eq!(server_first.error_code, 0);
+        assert!(server_first.auth_bytes.is_some());
+
+        assert!(
+            !ctx.is_authenticated().await,
+            "a half-finished SCRAM exchange must not authenticate the connection"
+        );
+        assert!(ctx.check_request_allowed(API_PRODUCE).await.is_err());
     }
 
     /// With SASL disabled the gate must be transparent, so existing deployments

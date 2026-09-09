@@ -54,6 +54,7 @@ pub mod metadata_types;
 pub mod fetch_types;
 pub mod produce_types;
 pub mod sasl;
+pub mod scram;
 
 // Temporarily disabled due to kafka-protocol crate compatibility issues
 // pub mod handler_v2;
