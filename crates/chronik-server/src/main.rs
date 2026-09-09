@@ -69,6 +69,7 @@ mod cluster;  // Phase 1.2: Cluster mode refactoring (complexity reduction from 
 mod tls;  // Phase 5: TLS encryption for Kafka protocol connections
 mod acl;  // Phase 5: Access Control Lists for authorization
 mod connection;  // Security Phase 0: per-connection identity + SASL enforcement
+mod authorizer;  // Security Phase 3: maps Kafka requests onto ACL checks
 mod schema_registry;  // Phase 5: Confluent-compatible Schema Registry
 
 use integrated_server::{IntegratedKafkaServer, IntegratedServerConfig, IntegratedKafkaServerBuilder};

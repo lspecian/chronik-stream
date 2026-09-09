@@ -99,3 +99,7 @@ path = "integration/data_flow.rs"
 [[test]]
 name = "sasl_enforcement"
 path = "integration/sasl_enforcement_test.rs"
+
+[[test]]
+name = "acl_enforcement"
+path = "integration/acl_enforcement_test.rs"

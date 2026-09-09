@@ -115,6 +115,20 @@ impl AclStore {
             info!("ACL authorization disabled (set CHRONIK_ACL_ENABLED=true to enable)");
         }
 
+        Self::with_config(enabled, allow_if_no_acl, super_users)
+    }
+
+    /// Construct a store from explicit settings rather than the environment.
+    ///
+    /// `new()` reads process-wide environment variables, which makes it unusable
+    /// from tests that run in parallel: one test setting `CHRONIK_ACL_ENABLED`
+    /// changes what another observes. Configuration is passed explicitly here so
+    /// behaviour is a function of arguments.
+    pub fn with_config(
+        enabled: bool,
+        allow_if_no_acl: bool,
+        super_users: Vec<String>,
+    ) -> Self {
         Self {
             acls: RwLock::new(HashMap::new()),
             enabled,
@@ -126,6 +140,59 @@ impl AclStore {
     /// Check if authorization is enabled
     pub fn is_enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// Whether an operation with no matching ACL is allowed.
+    pub fn allows_if_no_acl(&self) -> bool {
+        self.allow_if_no_acl
+    }
+
+    /// Load bootstrap ACLs from `CHRONIK_ACL_BINDINGS`.
+    ///
+    /// ACLs have a bootstrapping problem: the store starts empty, so enabling
+    /// authorization either permits everything (`allow_if_no_acl=true`) or locks
+    /// out every client including the one that would create the first rule.
+    /// Kafka solves it with a super-user list plus an external admin tool; this
+    /// adds the declarative half, so a deployment can express its policy in
+    /// configuration and start closed.
+    ///
+    /// Format: bindings separated by `;`, fields within a binding by `,`:
+    ///
+    /// ```text
+    /// <principal>,<resource_type>,<resource_name>,<operation>,<permission>[,<host>]
+    /// User:alice,Topic,orders,Read,Allow;User:bob,Group,analytics,Read,Allow
+    /// ```
+    ///
+    /// `resource_name` may end with `*` for a prefixed pattern
+    /// (`Topic,app-*` matches `app-orders`). `host` defaults to `*`.
+    pub async fn load_bootstrap_acls(&self, spec: &str) -> usize {
+        let mut loaded = 0;
+        for entry in spec.split(';') {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            match parse_acl_binding(entry) {
+                Ok(binding) => {
+                    let description = format!(
+                        "{} {:?} {:?} on {:?} '{}'",
+                        binding.principal,
+                        binding.permission_type,
+                        binding.operation,
+                        binding.resource_type,
+                        binding.resource_name
+                    );
+                    if let Err(e) = self.create_acl(binding).await {
+                        warn!("Bootstrap ACL '{}' rejected: {}", entry, e);
+                    } else {
+                        info!("Bootstrap ACL: {}", description);
+                        loaded += 1;
+                    }
+                }
+                Err(e) => warn!("Ignoring malformed bootstrap ACL '{}': {}", entry, e),
+            }
+        }
+        loaded
     }
 
     /// Create a new ACL binding
@@ -641,5 +708,168 @@ mod tests {
 
         std::env::remove_var("CHRONIK_ACL_ENABLED");
         std::env::remove_var("CHRONIK_ACL_ALLOW_IF_NO_ACL");
+    }
+}
+
+/// Parse one `CHRONIK_ACL_BINDINGS` entry.
+///
+/// `<principal>,<resource_type>,<resource_name>,<operation>,<permission>[,<host>]`
+fn parse_acl_binding(entry: &str) -> std::result::Result<AclBinding, String> {
+    let fields: Vec<&str> = entry.split(',').map(|f| f.trim()).collect();
+    if fields.len() < 5 {
+        return Err(format!(
+            "expected at least 5 comma-separated fields \
+             (principal,resource_type,resource_name,operation,permission), got {}",
+            fields.len()
+        ));
+    }
+
+    let principal = fields[0].to_string();
+    if principal.is_empty() {
+        return Err("principal is empty".to_string());
+    }
+    // Kafka principals are "User:name". Accept a bare name and qualify it, so a
+    // config that says `alice` behaves the way its author expects rather than
+    // silently matching nothing.
+    let principal = if principal.contains(':') || principal == "*" {
+        principal
+    } else {
+        format!("User:{}", principal)
+    };
+
+    let resource_type = match fields[1].to_ascii_lowercase().as_str() {
+        "topic" => ResourceType::Topic,
+        "group" => ResourceType::Group,
+        "cluster" => ResourceType::Cluster,
+        "transactionalid" | "transactional_id" => ResourceType::TransactionalId,
+        "delegationtoken" | "delegation_token" => ResourceType::DelegationToken,
+        other => return Err(format!("unknown resource type '{}'", other)),
+    };
+
+    // A trailing '*' means a prefixed pattern, matching kafka-acls.sh usage.
+    let raw_name = fields[2];
+    let (resource_name, pattern_type) = if raw_name.len() > 1 && raw_name.ends_with('*') {
+        (raw_name[..raw_name.len() - 1].to_string(), PatternType::Prefixed)
+    } else {
+        (raw_name.to_string(), PatternType::Literal)
+    };
+
+    let operation = match fields[3].to_ascii_lowercase().as_str() {
+        "all" => AclOperation::All,
+        "read" => AclOperation::Read,
+        "write" => AclOperation::Write,
+        "create" => AclOperation::Create,
+        "delete" => AclOperation::Delete,
+        "alter" => AclOperation::Alter,
+        "describe" => AclOperation::Describe,
+        "clusteraction" | "cluster_action" => AclOperation::ClusterAction,
+        "describeconfigs" | "describe_configs" => AclOperation::DescribeConfigs,
+        "alterconfigs" | "alter_configs" => AclOperation::AlterConfigs,
+        "idempotentwrite" | "idempotent_write" => AclOperation::IdempotentWrite,
+        other => return Err(format!("unknown operation '{}'", other)),
+    };
+
+    let permission_type = match fields[4].to_ascii_lowercase().as_str() {
+        "allow" => AclPermissionType::Allow,
+        "deny" => AclPermissionType::Deny,
+        other => return Err(format!("unknown permission '{}' (expected Allow or Deny)", other)),
+    };
+
+    let host = fields.get(5).map(|h| h.to_string()).unwrap_or_else(|| "*".to_string());
+
+    Ok(AclBinding {
+        resource_type,
+        resource_name,
+        pattern_type,
+        principal,
+        host,
+        operation,
+        permission_type,
+    })
+}
+
+#[cfg(test)]
+mod bootstrap_tests {
+    use super::*;
+
+    #[test]
+    fn parses_a_literal_binding() {
+        let b = parse_acl_binding("User:alice,Topic,orders,Read,Allow").unwrap();
+        assert_eq!(b.principal, "User:alice");
+        assert_eq!(b.resource_type, ResourceType::Topic);
+        assert_eq!(b.resource_name, "orders");
+        assert_eq!(b.pattern_type, PatternType::Literal);
+        assert_eq!(b.operation, AclOperation::Read);
+        assert_eq!(b.permission_type, AclPermissionType::Allow);
+        assert_eq!(b.host, "*");
+    }
+
+    /// A trailing '*' is a prefix pattern, not a literal topic called "app-*".
+    #[test]
+    fn parses_a_prefixed_binding() {
+        let b = parse_acl_binding("User:alice,Topic,app-*,Write,Allow").unwrap();
+        assert_eq!(b.resource_name, "app-");
+        assert_eq!(b.pattern_type, PatternType::Prefixed);
+    }
+
+    /// A bare name is qualified rather than silently matching nothing.
+    #[test]
+    fn bare_principal_is_qualified() {
+        let b = parse_acl_binding("alice,Topic,orders,Read,Allow").unwrap();
+        assert_eq!(b.principal, "User:alice");
+    }
+
+    #[test]
+    fn host_is_optional() {
+        let b = parse_acl_binding("User:alice,Topic,orders,Read,Allow,10.0.0.1").unwrap();
+        assert_eq!(b.host, "10.0.0.1");
+    }
+
+    #[test]
+    fn malformed_entries_are_errors_not_silent_allows() {
+        assert!(parse_acl_binding("User:alice,Topic,orders").is_err());
+        assert!(parse_acl_binding("User:alice,Nonsense,orders,Read,Allow").is_err());
+        assert!(parse_acl_binding("User:alice,Topic,orders,Fly,Allow").is_err());
+        assert!(parse_acl_binding("User:alice,Topic,orders,Read,Maybe").is_err());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_acls_are_enforced() {
+        let store = AclStore::with_config(true, false, Vec::new());
+        let loaded = store
+            .load_bootstrap_acls(
+                "User:alice,Topic,orders,Read,Allow;User:bob,Topic,secrets,Read,Allow",
+            )
+            .await;
+        assert_eq!(loaded, 2);
+
+        assert!(
+            store
+                .authorize("User:alice", "1.2.3.4", ResourceType::Topic, "orders", AclOperation::Read)
+                .await
+        );
+        // alice has no rule for 'secrets'
+        assert!(
+            !store
+                .authorize("User:alice", "1.2.3.4", ResourceType::Topic, "secrets", AclOperation::Read)
+                .await
+        );
+        // and no Write on 'orders'
+        assert!(
+            !store
+                .authorize("User:alice", "1.2.3.4", ResourceType::Topic, "orders", AclOperation::Write)
+                .await
+        );
+    }
+
+    /// Malformed entries must not abort the whole policy, but must be counted
+    /// out - a typo should lose one rule, not silently grant everything.
+    #[tokio::test]
+    async fn malformed_bootstrap_entries_are_skipped() {
+        let store = AclStore::with_config(true, false, Vec::new());
+        let loaded = store
+            .load_bootstrap_acls("User:alice,Topic,orders,Read,Allow;garbage;;User:bob,Bad,x,Read,Allow")
+            .await;
+        assert_eq!(loaded, 1);
     }
 }
