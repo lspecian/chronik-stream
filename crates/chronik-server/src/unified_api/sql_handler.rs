@@ -434,6 +434,37 @@ async fn cold_segments_overlap(
     false
 }
 
+/// Advance the hot buffer's per-partition `flushed_offset` to the cold
+/// high-water mark, so it serves only offsets cold does not hold.
+///
+/// `flushed_offset` is in-memory and resets to 0 on restart; the WalIndexer
+/// seeds it when the buffer is wired up, but Parquet-segment metadata may not
+/// have finished recovering that early, so some partitions are missed (and a
+/// static topic never re-flushes to correct them). This runs at query time,
+/// after recovery is complete, as the reliable backstop. It only advances a
+/// watermark, so it is safe to run repeatedly and never hides un-flushed rows.
+async fn seed_hot_flushed_from_cold(state: &UnifiedApiState, topic: &str) {
+    let Some(hot) = state.hot_buffer.as_ref() else {
+        return;
+    };
+    let segments = match state.metadata_store.list_parquet_segments(topic, None).await {
+        Ok(segments) => segments,
+        Err(_) => return,
+    };
+    let mut cold_max: HashMap<i32, i64> = HashMap::new();
+    for seg in segments {
+        let entry = cold_max.entry(seg.partition).or_insert(i64::MIN);
+        if seg.max_offset > *entry {
+            *entry = seg.max_offset;
+        }
+    }
+    for (partition, max) in cold_max {
+        if hot.get_flushed_offset(topic, partition) < max {
+            hot.set_flushed_offset(topic, partition, max);
+        }
+    }
+}
+
 /// Whether the hot buffer would re-serve offsets that are already in cold, so a
 /// plain `hot UNION ALL cold` double-counts them.
 ///
@@ -652,12 +683,21 @@ impl SqlHandler {
             // ============================================================
             // Create unified VIEW (hot UNION ALL cold)
             // ============================================================
-            // A topic needs a de-duplicating view when the same
-            // (_partition, _offset) can appear more than once, or it is counted
-            // once per copy (#41). Two ways that happens: cold Parquet segments
-            // that overlap each other, and (after a restart) a hot buffer that
-            // re-serves offsets already in cold. Both are checked only when there
-            // is cold data; a clean topic keeps the cheap plain-UNION view.
+            // Restore the "hot serves only what cold does not" invariant before
+            // anything reads the view: seed the hot buffer's flushed offset from
+            // cold. After this, hot/cold no longer overlap, so the post-restart
+            // double-count is gone at the source rather than papered over by the
+            // dedup below.
+            if has_hot && has_cold {
+                seed_hot_flushed_from_cold(state, topic).await;
+            }
+
+            // A topic still needs a de-duplicating view when the same
+            // (_partition, _offset) can appear more than once. With the seed
+            // above, that is now only genuinely overlapping cold Parquet segments
+            // — e.g. legacy data written before the indexer became idempotent —
+            // and the transient window before the seed takes effect. A clean
+            // topic keeps the cheap plain-UNION view.
             let cold_dedup = has_cold
                 && (cold_segments_overlap(state.metadata_store.as_ref(), topic).await
                     || (has_hot && hot_cold_overlap(state, topic).await));
