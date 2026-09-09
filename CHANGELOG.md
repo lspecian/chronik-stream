@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.13.3] - 2026-09-09
+
+### Fixed
+
+- **Root-cause fix for the #41 over-count: the columnar layer no longer *writes*
+  or *serves* duplicate offsets.** v2.13.2 de-duplicated at read time; this stops
+  the duplicates being produced in the first place, so the read-side dedup stays
+  dormant (and clean clusters never trip it).
+
+  1. **Idempotent cold flush.** The WalIndexer now trims each Parquet flush to
+     offsets strictly above the partition's durable cold high-water mark (from
+     the metadata store), so re-reading a sealed WAL segment it has already
+     flushed — which happens after a restart, when the in-memory "already
+     indexed" guard is empty, and when a follower re-pulls a partition — writes
+     no second, overlapping segment. A fully-covered re-flush is a no-op that
+     still reports its high offset so the hot buffer can evict.
+  2. **Hot buffer seeded from cold on restart.** `HotDataBuffer.flushed_offsets`
+     lives only in memory, so after a restart it reset to 0 and the buffer
+     (rebuilt from the WAL trailing window) re-served offsets already in cold.
+     It is now seeded from the cold high-water mark when it is wired up, so it
+     serves only what cold does not — no `hot UNION ALL cold` double-count, even
+     for a static topic that never flushes again.
+
+  Both are contained to the columnar/SQL path and do not touch the Kafka
+  produce/fetch/WAL-recovery path; WAL-segment deletion is unaffected (an
+  idempotent skip is a success, and the data is already durable in cold).
+
 ## [2.13.2] - 2026-09-09
 
 ### Fixed

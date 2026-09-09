@@ -457,8 +457,60 @@ impl WalIndexer {
     /// v2.4.1: Set the HotDataBuffer reference for flushed offset notifications.
     /// Called from main.rs after both WalIndexer and HotDataBuffer are created.
     pub async fn set_hot_buffer(&self, buffer: Arc<HotDataBuffer>) {
+        // #41: seed the buffer's per-partition flushed offset from what cold
+        // already holds, BEFORE it serves anything. `flushed_offsets` lives only
+        // in memory, so after a restart it starts at 0 and the buffer — rebuilt
+        // from the WAL trailing window — re-serves offsets already flushed to
+        // cold, which `hot UNION ALL cold` then double-counts. An actively
+        // produced topic self-corrects on its next flush, but a static one never
+        // does. Seeding from the durable cold high-water mark restores the
+        // invariant (hot serves only what cold does not) immediately.
+        self.seed_hot_flushed_offsets(&buffer).await;
         *self.hot_buffer.write().await = Some(buffer);
         info!("HotDataBuffer wired to WalIndexer for flushed offset notifications");
+    }
+
+    /// Seed a hot buffer's per-partition `flushed_offset` from the cold Parquet
+    /// high-water mark, so it never re-serves already-flushed offsets after a
+    /// restart. Advances only; never lowers a watermark the buffer already has.
+    async fn seed_hot_flushed_offsets(&self, buffer: &Arc<HotDataBuffer>) {
+        let topics = match self.metadata_store.list_topics().await {
+            Ok(topics) => topics,
+            Err(e) => {
+                debug!(error = %e, "Could not list topics to seed hot flushed offsets");
+                return;
+            }
+        };
+        let mut seeded = 0usize;
+        for topic in &topics {
+            let segments = match self
+                .metadata_store
+                .list_parquet_segments(&topic.name, None)
+                .await
+            {
+                Ok(segments) => segments,
+                Err(_) => continue,
+            };
+            let mut cold_max: HashMap<i32, i64> = HashMap::new();
+            for seg in segments {
+                let entry = cold_max.entry(seg.partition).or_insert(i64::MIN);
+                if seg.max_offset > *entry {
+                    *entry = seg.max_offset;
+                }
+            }
+            for (partition, max) in cold_max {
+                if buffer.get_flushed_offset(&topic.name, partition) < max {
+                    buffer.set_flushed_offset(&topic.name, partition, max);
+                    seeded += 1;
+                }
+            }
+        }
+        if seeded > 0 {
+            info!(
+                partitions = seeded,
+                "Seeded hot buffer flushed offsets from cold on startup (#41)"
+            );
+        }
     }
 
     /// HP-1.4/HP-2.6: Attach a cold-flush listener. Multiple calls append
@@ -995,6 +1047,24 @@ impl WalIndexer {
     /// pass would lose the data from BOTH the WAL and the object store.
     fn may_delete_wal_segment(delete_after_index: bool, errors_at_start: usize, errors_now: usize) -> bool {
         delete_after_index && errors_now == errors_at_start
+    }
+
+    /// Highest offset already written to a cold Parquet segment for this
+    /// partition, or `None` if it has no cold segments yet.
+    ///
+    /// This is the durable, restart-surviving record of what cold already holds,
+    /// used to keep Parquet flushing idempotent (a segment is never written for
+    /// offsets a prior one covers). `None` vs `Some(-1)` do not need
+    /// distinguishing here — both mean "nothing to skip".
+    async fn cold_high_water_mark(
+        metadata_store: &Arc<dyn MetadataStore>,
+        tp: &TopicPartition,
+    ) -> Option<i64> {
+        let segments = metadata_store
+            .list_parquet_segments(&tp.topic, Some(tp.partition))
+            .await
+            .ok()?;
+        segments.iter().map(|s| s.max_offset).max()
     }
 
     /// Which of this pass's missing topics may actually have their WAL deleted.
@@ -1705,7 +1775,7 @@ impl WalIndexer {
         // Convert CanonicalRecords to KafkaRecords for the converter
         // Note: Embeddings are generated asynchronously and populated later
         // when vector search is enabled for this topic
-        let kafka_records: Vec<KafkaRecord> = canonical_records
+        let mut kafka_records: Vec<KafkaRecord> = canonical_records
             .iter()
             .flat_map(|cr| {
                 cr.records.iter().map(|entry| KafkaRecord {
@@ -1734,6 +1804,41 @@ impl WalIndexer {
                 "No records to write to Parquet"
             );
             return Ok((0, -1));
+        }
+
+        // Idempotent flush (#41): never re-write offsets that are already in a
+        // cold segment. The in-memory "already indexed" guard is empty after a
+        // restart, so the indexer re-reads sealed WAL segments it has already
+        // flushed; a follower that re-pulled a partition re-seals overlapping
+        // ranges. Writing those again created a *second* Parquet segment covering
+        // offsets an older one already held, and the cold scan counted each
+        // offset once per copy. The cold high-water mark lives in the metadata
+        // store (it survives restarts), so trim to offsets strictly above it.
+        //
+        // `highest_offset` (before trimming) is still returned so the hot buffer
+        // evicts up to it: those rows are in cold either way, whether this pass
+        // wrote them or a previous one did.
+        let highest_offset = kafka_records.iter().map(|r| r.offset).max().unwrap_or(0);
+        let cold_watermark = Self::cold_high_water_mark(metadata_store, tp).await;
+        if let Some(wm) = cold_watermark {
+            let before = kafka_records.len();
+            kafka_records.retain(|r| r.offset > wm);
+            let dropped = before - kafka_records.len();
+            if dropped > 0 {
+                debug!(
+                    topic = %tp.topic,
+                    partition = tp.partition,
+                    cold_watermark = wm,
+                    dropped,
+                    remaining = kafka_records.len(),
+                    "Skipping offsets already present in cold Parquet (idempotent flush)"
+                );
+            }
+            if kafka_records.is_empty() {
+                // Everything here is already in cold. Nothing to write, but the
+                // data is durable in cold, so report the high offset for eviction.
+                return Ok((0, highest_offset));
+            }
         }
 
         // Calculate offset and timestamp ranges for naming
@@ -3020,6 +3125,114 @@ mod tests {
         let metadata = reader.read_metadata(&parquet_path).unwrap();
         let total_rows: i64 = metadata.row_groups().iter().map(|rg| rg.num_rows()).sum();
         assert_eq!(total_rows, 3, "Expected 3 rows in Parquet file");
+    }
+
+    /// #41: re-flushing a range already in cold must not write a second,
+    /// overlapping Parquet segment. This is the restart case — the in-memory
+    /// "already indexed" guard is gone, so the indexer re-reads sealed WAL
+    /// segments it has already flushed. The durable cold high-water mark makes
+    /// the re-flush a no-op, and genuinely new offsets still get written.
+    #[tokio::test]
+    async fn re_flushing_already_flushed_offsets_writes_no_duplicate_segment() {
+        use crate::object_store::{LocalBackend, ObjectStoreConfig, StorageBackend, ObjectStore};
+        use chronik_common::metadata::{InMemoryMetadataStore, TopicConfig};
+        use tempfile::tempdir;
+        use std::collections::HashMap;
+
+        let temp_dir = tempdir().unwrap();
+        let base = temp_dir.path().join("parquet");
+        std::fs::create_dir_all(&base).unwrap();
+        let object_store: Arc<dyn ObjectStore> = Arc::new(
+            LocalBackend::new(ObjectStoreConfig {
+                backend: StorageBackend::Local { path: base.to_string_lossy().to_string() },
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
+        );
+        let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+        let mut cfg = HashMap::new();
+        cfg.insert("columnar.enabled".to_string(), "true".to_string());
+        metadata_store
+            .create_topic(
+                "reflush",
+                TopicConfig {
+                    partition_count: 1,
+                    replication_factor: 1,
+                    retention_ms: None,
+                    segment_bytes: 1 << 30,
+                    config: cfg,
+                },
+            )
+            .await
+            .unwrap();
+        let segment_index = Arc::new(SegmentIndex::new());
+        let indexer_config = WalIndexerConfig {
+            columnar_base_path: base.to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        let tp = TopicPartition::new("reflush".to_string(), 0);
+
+        // A canonical batch covering [first_off, first_off+n).
+        let batch = |first_off: i64, n: i64| -> Vec<CanonicalRecord> {
+            vec![CanonicalRecord {
+                base_offset: first_off,
+                partition_leader_epoch: 0,
+                producer_id: -1,
+                producer_epoch: -1,
+                base_sequence: -1,
+                is_transactional: false,
+                is_control: false,
+                compression: crate::canonical_record::CompressionType::None,
+                timestamp_type: TimestampType::CreateTime,
+                base_timestamp: 1000,
+                max_timestamp: 1000 + n,
+                records: (0..n)
+                    .map(|i| CanonicalRecordEntry {
+                        offset: first_off + i,
+                        timestamp: 1000 + i,
+                        key: None,
+                        value: Some(format!("v{}", first_off + i).into_bytes()),
+                        headers: vec![],
+                        attributes: 0,
+                    })
+                    .collect(),
+                compressed_records_wire_bytes: None,
+                original_v1_wire_format: None,
+                original_v2_wire_format: None,
+            }]
+        };
+
+        let seg_count = |ms: &Arc<dyn MetadataStore>| {
+            let ms = ms.clone();
+            async move { ms.list_parquet_segments("reflush", Some(0)).await.unwrap().len() }
+        };
+
+        // First flush of [0,3): writes and registers one segment.
+        let (b1, m1) = WalIndexer::create_parquet_segment(
+            &indexer_config, &object_store, &metadata_store, &segment_index, &tp, batch(0, 3),
+        ).await.unwrap();
+        assert!(b1 > 0, "first flush should write bytes");
+        assert_eq!(m1, 2, "highest offset is 2");
+        assert_eq!(seg_count(&metadata_store).await, 1);
+
+        // Re-flush of the SAME [0,3) (restart re-index): no new segment, but it
+        // still reports the high offset so the hot buffer can evict.
+        let (b2, m2) = WalIndexer::create_parquet_segment(
+            &indexer_config, &object_store, &metadata_store, &segment_index, &tp, batch(0, 3),
+        ).await.unwrap();
+        assert_eq!(b2, 0, "re-flush must write nothing");
+        assert_eq!(m2, 2, "re-flush still reports the high offset for eviction");
+        assert_eq!(seg_count(&metadata_store).await, 1, "no duplicate segment");
+
+        // A batch that overlaps the tail AND extends past it: only the new
+        // offsets [3,5) are written, as one non-overlapping segment.
+        let (b3, m3) = WalIndexer::create_parquet_segment(
+            &indexer_config, &object_store, &metadata_store, &segment_index, &tp, batch(2, 3),
+        ).await.unwrap();
+        assert!(b3 > 0, "the new tail should be written");
+        assert_eq!(m3, 4, "highest offset is now 4");
+        assert_eq!(seg_count(&metadata_store).await, 2, "one more, non-overlapping segment");
     }
 
     // v2.2.22: Vector text extraction tests
