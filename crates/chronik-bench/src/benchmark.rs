@@ -48,6 +48,22 @@ impl BenchmarkRunner {
             .set("api.version.fallback.ms", "0")
             .set("socket.keepalive.enable", "true");
 
+        // Security. Applied to the shared config so producer and consumer both
+        // inherit it; a benchmark that silently fell back to PLAINTEXT against a
+        // secured broker would report the cost of being rejected, not served.
+        if let Some(protocol) = &args.security_protocol {
+            config.set("security.protocol", protocol);
+        }
+        if let Some(mechanism) = &args.sasl_mechanism {
+            config.set("sasl.mechanism", mechanism);
+        }
+        if let Some(username) = &args.sasl_username {
+            config.set("sasl.username", username);
+        }
+        if let Some(password) = &args.sasl_password {
+            config.set("sasl.password", password);
+        }
+
         // Create producer for produce/round-trip modes
         let producer = if matches!(
             args.mode,

@@ -20,6 +20,25 @@ pub struct Args {
     )]
     pub bootstrap_servers: String,
 
+    /// Security protocol: PLAINTEXT (default), SASL_PLAINTEXT, SSL, SASL_SSL.
+    ///
+    /// Needed to benchmark a broker with authentication enabled - without it
+    /// the cost of SASL and ACLs cannot be measured, only guessed.
+    #[arg(long, env = "KAFKA_SECURITY_PROTOCOL")]
+    pub security_protocol: Option<String>,
+
+    /// SASL mechanism: PLAIN, SCRAM-SHA-256, SCRAM-SHA-512.
+    #[arg(long, env = "KAFKA_SASL_MECHANISM")]
+    pub sasl_mechanism: Option<String>,
+
+    /// SASL username.
+    #[arg(long, env = "KAFKA_SASL_USERNAME")]
+    pub sasl_username: Option<String>,
+
+    /// SASL password.
+    #[arg(long, env = "KAFKA_SASL_PASSWORD")]
+    pub sasl_password: Option<String>,
+
     /// Topic to produce/consume from
     #[arg(short = 't', long, env = "KAFKA_TOPIC", default_value = "chronik-bench")]
     pub topic: String,

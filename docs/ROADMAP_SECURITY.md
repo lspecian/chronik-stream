@@ -463,3 +463,72 @@ afternoon at the end of a long change.
    read when ACLs are disabled, but the enabled path has not been measured — and per the
    standing rule, measure with **bytes-landed**: a denied request returns faster than a served
    one, so msg/s alone would read a broken authorizer as a speedup.
+
+---
+
+## 8. Performance (2026-09-10)
+
+### The measurement that counts
+
+`cargo test --release --bin chronik-server acl_check_cost -- --ignored --nocapture`
+
+```
+ACL check per produce request (100 topics in policy):
+  disabled :     27 ns
+  enabled  :    429 ns
+  delta    :    402 ns
+```
+
+**402 ns per Produce/Fetch request** — per request, not per message. A Produce
+request carries a batch, so at 100 messages per batch and 230K msg/s (~2,300
+requests/s) that is under 0.1% of one core. The 9.25% figure the test also
+prints is the degenerate case of one message per request.
+
+Most of the 402 ns is the mutex acquired to read the connection's principal, not
+the ACL lookup itself. If it ever matters, cache the principal on the connection
+rather than re-reading it — but at this cost there is nothing to optimise.
+
+### End-to-end, acks=1 (true bytes-landed)
+
+| Configuration | msg/s | Failed | p50 | p99 |
+|---|---|---|---|---|
+| baseline | 12,244 | 0 | 2.28 ms | 3.23 ms |
+| SASL (SCRAM-SHA-256) | 12,255 | 0 | 2.28 ms | 3.24 ms |
+| SASL + ACLs | 12,208 | 0 | 2.28 ms | 3.64 ms |
+
+Zero failures in all three, so these are genuinely landed bytes. No measurable
+throughput cost. The p99 moves 3.23 → 3.64 ms with ACLs on, which is within this
+machine's run-to-run spread rather than a demonstrated regression.
+
+This run is **fsync-bound** — 12K msg/s against a recorded single-node acks=1
+baseline of 230K — so it does not isolate CPU cost. That is what the
+microbenchmark above is for.
+
+### acks=0 results: measured, then discarded
+
+Repeated interleaved runs at acks=0 gave:
+
+```
+baseline  194,513 / 194,799 / 243,892
+sasl      248,734 / 247,836 / 246,571
+sasl_acl  225,487 / 170,042 / 181,104
+```
+
+Non-monotonic: SASL consistently *faster* than no security at all, which cannot
+be true. Two reasons not to report a delta from these:
+
+1. Variance (±25%) is larger than any plausible effect.
+2. **acks=0 is not bytes-landed.** librdkafka's delivery report fires when the
+   message reaches the socket, not when the broker accepts it — so a "faster"
+   acks=0 number can mean less data landed, which is precisely the trap that once
+   turned a failing broker into an apparent 17x win.
+
+Use acks=1 for any security perf claim, and the microbenchmark for the check
+itself.
+
+### Caveats
+
+Single-node, single machine (16 cores), local disk, default WAL profile. Nothing
+here has run on a multi-node cluster, and the ACL policy was 100 rules — a very
+large policy has not been measured, though lookup is a HashMap keyed by
+(resource type, name) rather than a scan.

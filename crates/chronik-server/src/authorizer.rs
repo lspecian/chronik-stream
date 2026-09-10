@@ -365,3 +365,82 @@ mod tests {
         assert!(denied.is_empty());
     }
 }
+
+/// Timing for the authorization check on the produce/fetch hot path.
+///
+/// An end-to-end broker benchmark cannot answer "what does the ACL check cost":
+/// at acks=1 the run is fsync-bound (12K msg/s here, against a recorded 230K),
+/// and at acks=0 librdkafka's delivery report fires when the message reaches the
+/// socket rather than when the broker accepts it — so acks=0 is not
+/// bytes-landed and a faster number there may mean less data landed, not more.
+/// Repeated end-to-end runs came out non-monotonic (SASL faster than no
+/// security), i.e. machine variance larger than the effect.
+///
+/// So measure the thing directly. Run with:
+///
+/// ```text
+/// cargo test --release --bin chronik-server acl_check_cost -- --ignored --nocapture
+/// ```
+#[cfg(test)]
+mod perf {
+    use super::*;
+    use crate::acl::{AclBinding, AclStore};
+    use chronik_protocol::describe_acls_types::{AclPermissionType, PatternType};
+    use std::time::Instant;
+
+    const ITERATIONS: u32 = 200_000;
+
+    fn allow(topic: &str) -> AclBinding {
+        AclBinding {
+            resource_type: ResourceType::Topic,
+            resource_name: topic.to_string(),
+            pattern_type: PatternType::Literal,
+            principal: "User:alice".to_string(),
+            host: "*".to_string(),
+            operation: AclOperation::Write,
+            permission_type: AclPermissionType::Allow,
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "timing benchmark; run explicitly with --ignored --release"]
+    async fn acl_check_cost() {
+        // A policy with enough rules that lookup is not trivially one entry.
+        let store = Arc::new(AclStore::with_config(true, false, Vec::new()));
+        for i in 0..100 {
+            store.create_acl(allow(&format!("topic-{}", i))).await.unwrap();
+        }
+
+        let authorizer = Authorizer::new(store.clone());
+        let disabled = Authorizer::new(Arc::new(AclStore::with_config(false, true, Vec::new())));
+        let ctx = ConnectionContext::internal();
+        let topics = vec!["topic-42".to_string()];
+
+        // Disabled: the path every existing deployment is on today.
+        let start = Instant::now();
+        for _ in 0..ITERATIONS {
+            let _ = disabled.partition_topics(&ctx, &topics, AclOperation::Write).await;
+        }
+        let disabled_ns = start.elapsed().as_nanos() / ITERATIONS as u128;
+
+        // Enabled, allowed: the steady-state cost of authorization.
+        let start = Instant::now();
+        for _ in 0..ITERATIONS {
+            let _ = authorizer.partition_topics(&ctx, &topics, AclOperation::Write).await;
+        }
+        let enabled_ns = start.elapsed().as_nanos() / ITERATIONS as u128;
+
+        println!("ACL check per produce request ({} topics in policy):", 100);
+        println!("  disabled : {:>6} ns", disabled_ns);
+        println!("  enabled  : {:>6} ns", enabled_ns);
+        println!("  delta    : {:>6} ns", enabled_ns.saturating_sub(disabled_ns));
+        println!(
+            "  at 230,000 msg/s that is {:.2}% of a core if every message were its own request",
+            (enabled_ns.saturating_sub(disabled_ns) as f64 * 230_000.0) / 1e9 * 100.0
+        );
+
+        // Not an assertion on absolute time - CI hardware varies and a hard
+        // threshold here would flake exactly like the WAL rotation p99 test.
+        // The number is printed for a human to read.
+    }
+}
