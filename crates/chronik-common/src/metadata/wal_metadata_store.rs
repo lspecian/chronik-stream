@@ -1256,6 +1256,11 @@ impl MetadataStore for WalMetadataStore {
         Ok(groups.get(group_id).cloned())
     }
 
+    async fn list_consumer_groups(&self) -> Result<Vec<ConsumerGroupMetadata>> {
+        let groups = self.state.consumer_groups.read().await;
+        Ok(groups.values().cloned().collect())
+    }
+
     async fn update_consumer_group(&self, group: ConsumerGroupMetadata) -> Result<()> {
         let event = MetadataEvent::new_with_node(
             MetadataEventPayload::ConsumerGroupUpdated {

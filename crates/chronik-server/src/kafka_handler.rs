@@ -203,6 +203,7 @@ impl KafkaProtocolHandler {
             ApiKey::DeleteGroups => self.handle_delete_groups_request(header, buf).await,
             ApiKey::OffsetDelete => self.handle_offset_delete_request(header, buf).await,
             ApiKey::ListGroups => self.handle_list_groups_request(header, buf).await,
+            ApiKey::DescribeGroups => self.handle_describe_groups_request(ctx, header, buf).await,
             ApiKey::EndTxn => self.handle_end_txn_request(header, buf).await,
             ApiKey::OffsetForLeaderEpoch => self.handle_offset_for_leader_epoch_request(header, buf).await,
             _ => self.handle_default_request(request_bytes, header.api_key, header.api_version).await,
@@ -1948,6 +1949,118 @@ impl KafkaProtocolHandler {
         })
     }
 
+
+    /// Handle DescribeGroups API request (key 15).
+    ///
+    /// Reads from the live GroupManager, for the same reason ListGroups does.
+    /// This API used to be answered by the protocol handler's own
+    /// `consumer_groups` map, which nothing on the server path ever writes to, so
+    /// every describe returned GROUP_ID_NOT_FOUND — including for a group that
+    /// ListGroups was returning in the same second. That cost
+    /// `kafka-consumer-groups --describe` and every Kafka UI their view of group
+    /// membership and, with it, consumer lag.
+    ///
+    /// Denials are shaped: DescribeGroups carries a per-group error code, so an
+    /// unauthorized group is reported as GROUP_AUTHORIZATION_FAILED in an
+    /// otherwise well-formed response. Returning a bare error instead would hand
+    /// the client a body that does not match the schema and kill its I/O thread.
+    async fn handle_describe_groups_request(
+        &self,
+        ctx: &ConnectionContext,
+        header: chronik_protocol::parser::RequestHeader,
+        mut buf: Bytes,
+    ) -> Result<Response> {
+        use chronik_protocol::consumer_group_types::{
+            DescribeGroupsRequest, DescribeGroupsResponse, DescribedGroup, GroupMember,
+            error_codes,
+        };
+
+        /// Kafka's GROUP_AUTHORIZATION_FAILED. Not in `error_codes`, which only
+        /// carries the coordinator errors this module needed before.
+        const GROUP_AUTHORIZATION_FAILED: i16 = 30;
+        /// Kafka sends this when authorized operations were not requested.
+        const NO_AUTHORIZED_OPERATIONS: i32 = i32::MIN;
+
+        let request = DescribeGroupsRequest::parse(&mut buf, header.api_version)?;
+        tracing::debug!(
+            "DescribeGroups v{} for {:?}",
+            header.api_version,
+            request.group_ids
+        );
+
+        let mut groups = Vec::with_capacity(request.group_ids.len());
+        for group_id in request.group_ids {
+            if !self
+                .authorizer
+                .authorize_group(ctx, &group_id, AclOperation::Describe)
+                .await
+            {
+                groups.push(DescribedGroup {
+                    error_code: GROUP_AUTHORIZATION_FAILED,
+                    group_id,
+                    group_state: String::new(),
+                    protocol_type: String::new(),
+                    protocol_data: String::new(),
+                    members: Vec::new(),
+                    authorized_operations: NO_AUTHORIZED_OPERATIONS,
+                });
+                continue;
+            }
+
+            match self.group_manager.describe_group(&group_id).await {
+                Some(description) => {
+                    let members = description
+                        .members
+                        .into_iter()
+                        .map(|member| GroupMember {
+                            member_id: member.member_id,
+                            group_instance_id: member.group_instance_id,
+                            client_id: member.client_id,
+                            client_host: member.client_host,
+                            member_metadata: member.metadata,
+                            member_assignment: member.assignment,
+                        })
+                        .collect();
+                    groups.push(DescribedGroup {
+                        error_code: error_codes::NONE,
+                        group_id,
+                        group_state: description.state,
+                        protocol_type: description.protocol_type,
+                        protocol_data: description.protocol,
+                        members,
+                        authorized_operations: NO_AUTHORIZED_OPERATIONS,
+                    });
+                }
+                None => {
+                    groups.push(DescribedGroup {
+                        error_code: error_codes::GROUP_ID_NOT_FOUND,
+                        group_id,
+                        group_state: String::new(),
+                        protocol_type: String::new(),
+                        protocol_data: String::new(),
+                        members: Vec::new(),
+                        authorized_operations: NO_AUTHORIZED_OPERATIONS,
+                    });
+                }
+            }
+        }
+
+        let response = DescribeGroupsResponse {
+            throttle_time_ms: 0,
+            groups,
+        };
+        let body = response.encode(header.api_version);
+
+        Ok(Response {
+            header: ResponseHeader {
+                correlation_id: header.correlation_id,
+            },
+            body,
+            is_flexible: header.api_version >= 5,
+            api_key: ApiKey::DescribeGroups,
+            throttle_time_ms: None,
+        })
+    }
     /// Handle DeleteGroups API request (key 42).
     ///
     /// Backs the Kafka UI / AdminClient "delete consumer group". Operates on the

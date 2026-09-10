@@ -569,6 +569,21 @@ pub trait MetadataStore: Send + Sync {
         Ok(log_start_offset)
     }
 
+
+    /// Every consumer group that has been persisted, including groups whose last
+    /// member has left.
+    ///
+    /// A group with no live members is `Empty`, not gone: Kafka keeps it — and its
+    /// committed offsets — until DeleteGroups or offset expiry removes it. Without
+    /// this, `ListGroups` can only report groups that happen to be resident in
+    /// memory, so a group vanishes from admin tooling the moment its last consumer
+    /// disconnects, and reappears when one connects again.
+    ///
+    /// Default impl returns nothing, for stores that don't persist groups.
+    async fn list_consumer_groups(&self) -> Result<Vec<ConsumerGroupMetadata>> {
+        Ok(Vec::new())
+    }
+
     /// Delete a consumer group and all of its committed offsets (Kafka DeleteGroups API).
     /// Default impl is a no-op for stores that don't persist consumer groups.
     async fn delete_consumer_group(&self, _group_id: &str) -> Result<()> {

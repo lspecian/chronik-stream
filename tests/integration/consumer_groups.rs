@@ -647,3 +647,129 @@ async fn test_consumer_group_incremental_rebalance() -> Result<()> {
     
     Ok(())
 }
+
+
+/// Set up a topic with records and one live consumer in `group`.
+///
+/// Returns the consumer, still joined, so the caller decides when it leaves.
+async fn one_live_consumer(
+    bootstrap_servers: &str,
+    topic: &str,
+    group: &str,
+) -> StreamConsumer {
+    let admin: AdminClient<_> = ClientConfig::new()
+        .set("bootstrap.servers", bootstrap_servers)
+        .create()
+        .expect("Failed to create admin client");
+    admin
+        .create_topics(
+            &[NewTopic::new(topic, 1, TopicReplication::Fixed(1))],
+            &AdminOptions::new(),
+        )
+        .await
+        .expect("Failed to create topics")[0]
+        .as_ref()
+        .expect("Failed to create topic");
+
+    let producer = create_test_producer(bootstrap_servers);
+    for i in 0..10 {
+        producer
+            .send(
+                FutureRecord::to(topic).key(&format!("k{}", i)).payload(&format!("v{}", i)),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("produce failed");
+    }
+
+    let consumer = create_test_consumer(bootstrap_servers, group);
+    consumer.subscribe(&[topic]).expect("subscribe failed");
+    let _ = timeout(Duration::from_secs(30), consumer.recv()).await;
+    assert!(
+        !assigned_partitions(&consumer).is_empty(),
+        "consumer never received an assignment; the test would be vacuous"
+    );
+    consumer
+}
+
+/// DescribeGroups must see the same groups ListGroups does.
+///
+/// `kafka-consumer-groups.sh --describe` returned `GROUP_ID_NOT_FOUND` for a
+/// group `--list` was returning in the same second: DescribeGroups was answered
+/// from a map on the protocol handler that nothing on the server path writes to,
+/// while ListGroups read the live GroupManager. Admin tooling could therefore
+/// show no membership for any group, and so no consumer lag.
+///
+/// This asserts on `state()` rather than `members()` deliberately: rdkafka
+/// 0.36.2's `GroupInfo::members` calls `slice::from_raw_parts` on the raw member
+/// pointer unconditionally, and librdkafka passes NULL with a count of 0 for a
+/// group with no members — undefined behaviour that aborts the test process
+/// instead of failing an assertion. Membership content is covered by the unit
+/// test `consumer_group::tests::describe_sees_a_live_group_with_its_members`.
+#[tokio::test]
+async fn describe_groups_agrees_with_list_groups() -> Result<()> {
+    test_setup::init();
+    let _serial = common::exclusive().await;
+
+    let cluster = TestCluster::start(TestClusterConfig::default()).await?;
+    let bootstrap_servers = cluster.bootstrap_servers();
+    let group = "describe-agrees-group";
+    let consumer = one_live_consumer(&bootstrap_servers, "describe-agrees", group).await;
+
+    let listed = consumer
+        .fetch_group_list(Some(group), Duration::from_secs(15))
+        .expect("fetch_group_list failed while a member was connected");
+    let described = listed
+        .groups()
+        .iter()
+        .find(|g| g.name() == group)
+        .expect("the group is not listed even though a member is connected");
+
+    // A group DescribeGroups could not find comes back with an empty state, which
+    // is how the disagreement surfaces here.
+    assert!(
+        !described.state().is_empty() && described.state() != "Dead",
+        "DescribeGroups gave state {:?} for a group with a live consumer that \
+         ListGroups is returning — the two APIs disagree",
+        described.state()
+    );
+
+    Ok(())
+}
+
+/// A group whose last member left must stay visible.
+///
+/// It is `Empty`, not gone: its committed offsets survive and a restarting
+/// consumer resumes from them. `list_groups` read only the in-memory registry,
+/// which `leave_group` clears, so the group vanished from
+/// `kafka-consumer-groups.sh --list` and from Kafka UI the moment the last
+/// consumer disconnected — while its offsets were still stored.
+#[tokio::test]
+async fn an_empty_group_is_still_visible() -> Result<()> {
+    test_setup::init();
+    let _serial = common::exclusive().await;
+
+    let cluster = TestCluster::start(TestClusterConfig::default()).await?;
+    let bootstrap_servers = cluster.bootstrap_servers();
+    let group = "empty-visible-group";
+    let consumer = one_live_consumer(&bootstrap_servers, "empty-visible", group).await;
+
+    drop(consumer);
+    sleep(Duration::from_secs(3)).await;
+
+    // A second client, so this reads the broker's state rather than the departed
+    // consumer's own cached view.
+    let observer = create_test_consumer(&bootstrap_servers, "observer-group");
+    let after = observer
+        .fetch_group_list(Some(group), Duration::from_secs(15))
+        .expect("fetch_group_list failed after the last member left");
+
+    assert!(
+        after.groups().iter().any(|g| g.name() == group),
+        "the group disappeared when its last member left. Its committed offsets \
+         are still stored and a restarting consumer resumes from them, so admin \
+         tooling must still see it — Kafka reports it as Empty."
+    );
+
+    Ok(())
+}

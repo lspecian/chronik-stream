@@ -1624,6 +1624,11 @@ impl ProtocolHandler {
             ApiKey::Heartbeat => self.handle_heartbeat(header, &mut buf).await,
             ApiKey::LeaveGroup => self.handle_leave_group(header, &mut buf).await,
             ApiKey::SyncGroup => self.handle_sync_group(header, &mut buf).await,
+            // NOTE: chronik-server intercepts DescribeGroups before this and answers
+            // it from the live GroupManager. This arm reads `self.consumer_groups`,
+            // which nothing on the server path writes to, so it only serves callers
+            // that drive ProtocolHandler directly (tests, embedded use). Fix the
+            // authoritative one in `kafka_handler::handle_describe_groups_request`.
             ApiKey::DescribeGroups => self.handle_describe_groups(header, &mut buf).await,
             ApiKey::ListGroups => self.handle_list_groups(header, &mut buf).await,
             
