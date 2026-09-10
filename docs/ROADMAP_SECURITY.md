@@ -597,3 +597,68 @@ client (`apache/kafka:3.7.0`): AdminClient created a topic at RF=3 with
   are covered; local files are not.
 - **Re-authentication (KIP-368)** and **inter-broker authentication**.
 - **Transactional-id ACLs.**
+
+## 10. Re-rolled onto Thunderbird (2026-09-10)
+
+§9's roll shipped `chronik-server:v2.14.0-sec`, which was built **before** the
+last three commits (APIs 50/51, Metadata filtering, `/_sql` authz). The cluster
+therefore did not match the branch. Re-rolled as **`chronik-server:v2.14.0-sec2`**
+from `2b46389`. Rollback: `chronik-server:v2.13.3`.
+
+All security env vars are unset on the ChronikCluster CRD, so every control is
+off and this roll is code-only — which is the point: the branch must be inert
+until someone opts in.
+
+### Choosing a signal that can actually fail
+
+`/health` reports `2.13.3` on **both** images, because it echoes the Cargo.toml
+version and that has not been bumped. A roll "verified" against it would have
+passed without deploying anything.
+
+The signal used instead was `kafka-broker-api-versions.sh` on APIs 50/51, which
+landed in `a7e56d6`:
+
+```
+before:  DescribeUserScramCredentials(50): UNSUPPORTED
+after:   DescribeUserScramCredentials(50): 0 [usable: 0]
+```
+
+Distinct before and after, and read by the real Java AdminClient, which also
+proves the advertised response still parses.
+
+### Result
+
+3/3 pods on the new image, 0 restarts, ~46s blip. End offsets identical across
+the roll — 4863 partitions, none missing, none backwards. Java round-trip: topic
+at RF=3 with `Isr: [1,2,3]` on every partition, 500 produced at `acks=all`, 500
+consumed. Replica-fetcher traffic on all three brokers.
+
+### A measurement that lied
+
+`kubectl run -i` races its attach and silently drops output produced before it
+connects. Three runs of the same offsets command returned 4863, 982 and **0**
+partitions against a healthy cluster; the missing entries were the alphabetical
+head, i.e. the start of the stream. Read literally, that is a deploy that
+destroyed data.
+
+Use `--restart=Never`, poll for `Succeeded`, then `kubectl logs` — the kubelet
+captures from PID 1 and loses nothing. Re-measured that way: 4863, matching the
+baseline exactly.
+
+### Found while verifying — pre-existing, not from this branch
+
+Two consumer-group gaps, both **visibility only**:
+
+- `DescribeGroups` returns `GROUP_ID_NOT_FOUND` for a group that `ListGroups` is
+  returning in the same second.
+- A group disappears from `ListGroups` once its last member leaves; Kafka retains
+  it as `Empty`.
+
+Committed offsets are **correct** — verified with the Java client: consume 100
+with auto-commit, leave, rejoin without `--from-beginning` → 0 re-read; produce
+20 more → exactly 20. Consumers resume properly; only the admin view is wrong,
+which costs `kafka-consumer-groups.sh --describe` and any UI its **lag** display.
+
+Not from this work: `git diff 51c9212..HEAD` touches neither
+`handle_describe_groups` (handler.rs:5390) nor the `ListGroups` dispatch — the
+security changes in that file sit at lines 1924-2542. Tracked as its own fix.
