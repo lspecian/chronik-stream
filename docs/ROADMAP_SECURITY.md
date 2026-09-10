@@ -6,10 +6,10 @@
 |-------|-------|
 | §2 Immediate hazards | ✅ DONE |
 | 0 — Connection context + SASL enforcement | ✅ DONE |
-| 1 — SASL production (SCRAM) | 🟡 **PARTIAL** — real SCRAM-SHA-256/512 done; credential store, APIs 50/51 and mTLS principal NOT done |
+| 1 — SASL production (SCRAM) | ✅ **DONE** — real SCRAM-SHA-256/512, replicated credential store, APIs 50/51, mTLS principal. Re-auth (KIP-368) and inter-broker auth remain |
 | 2 — Listener model | 🟡 **PARTIAL** — staged-rollout mode (`optional`) done; multi-listener NOT done |
-| 3 — ACLs | 🟡 **PARTIAL** — enforced on the data plane and consumer groups; Metadata filtering, OffsetCommit/Fetch, txn ids and persistence NOT done |
-| 4 — Unified API | 🟡 **PARTIAL** — authentication + HTTPS done; per-topic authorization NOT done |
+| 3 — ACLs | ✅ **DONE** — data plane, consumer groups, offsets, Metadata filtering, persistence + replication, Kafka operation implication. Transactional ids remain |
+| 4 — Unified API | ✅ **DONE** — authentication, HTTPS, and per-topic authorization on /_sql |
 | 5 — Encryption at rest | 🟡 **PARTIAL** — object-store SSE done; WAL/segment/index encryption NOT done |
 
 Read the per-phase sections for exactly what is and is not covered. Nothing below
@@ -532,3 +532,68 @@ Single-node, single machine (16 cores), local disk, default WAL profile. Nothing
 here has run on a multi-node cluster, and the ACL policy was 100 rules — a very
 large policy has not been measured, though lookup is a HashMap keyed by
 (resource type, name) rather than a scan.
+
+---
+
+## 9. Closing the remainder (2026-09-10)
+
+Three items were left open in §7 and have since been closed. Two of them turned
+out to be much smaller than the original assessment claimed, and saying so is
+part of the record.
+
+### Now done
+
+**Replicated credential store + APIs 50/51.** `kafka-configs.sh --entity-type
+users` works. Credentials are cluster state in the metadata log, not per-broker
+configuration. `AlterUserScramCredentials` carries a salt and a *salted*
+password, so the plaintext never reaches the broker.
+
+**Metadata topic filtering.** Explicitly requested unauthorized topics return
+`TOPIC_AUTHORIZATION_FAILED`; all-topics requests omit them.
+
+**Per-topic authorization on `/_sql`.** I had called this "real design work". It
+was not: `datafusion::catalog_common::resolve_table_references` resolves the
+tables a statement reads, handling CTE shadowing and subqueries. The actual
+difficulty was elsewhere — the topic→table sanitiser is **lossy**, so the map has
+to be built forward from the live topic list, and an ambiguous table name
+requires authorization on *every* candidate topic. Ambiguity denies.
+
+**ACL persistence and replication**, **OffsetCommit/OffsetFetch**, **mTLS
+principal**, and **Kafka's operation implication** (Read implies Describe) were
+closed alongside.
+
+### Two more bugs, same family
+
+7. **`Group,g,Read` did not permit `OffsetFetch`.** Kafka implies Describe from
+   Read; without that rule a consumer authorized to read was refused mid-session,
+   and every policy would have needed redundant grants `kafka-acls.sh` never
+   emits.
+8. **A malformed denial segfaulted librdkafka.** I routed the OffsetFetch denial
+   through the generic error path *after documenting, in that same function,*
+   that it is only safe for APIs whose error response can carry a bare error
+   code. OffsetFetch v7 cannot: the reply was unparseable and crashed the client.
+   A malformed denial is worse than no denial.
+
+And the duplicate-entry-point trap fired for a **third** time: `main.rs` builds
+`UnifiedApiState` in both cluster and single-node paths, and the authorizer was
+wired into only one. Previously it was two Unified API start functions (TLS), and
+before that three separate hardcoded SASL mechanism lists. When this codebase has
+two ways in, assume both are live and check.
+
+### Verified on a real cluster
+
+Rolled onto the 3-node Thunderbird cluster as `chronik-server:v2.14.0-sec`
+(rollback: `chronik-server:v2.13.3`). Zero restarts. Verified with the **Java**
+client (`apache/kafka:3.7.0`): AdminClient created a topic at RF=3 with
+`Isr: [1,2,3]` on every partition, producer sent 500, consumer read back 500.
+`/health`, `/_sql` and `/_search` all served.
+
+### Still open
+
+- **Phase 2 multi-listener** — `PLAINTEXT://` and `SASL_SSL://` side by side, and
+  a separate inter-broker listener. `CHRONIK_SASL_ENABLED=optional` covers the
+  staged-rollout need.
+- **Phase 5 WAL/segment/index encryption at rest.** Object-store SSE and backups
+  are covered; local files are not.
+- **Re-authentication (KIP-368)** and **inter-broker authentication**.
+- **Transactional-id ACLs.**
