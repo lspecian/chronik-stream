@@ -661,4 +661,76 @@ which costs `kafka-consumer-groups.sh --describe` and any UI its **lag** display
 
 Not from this work: `git diff 51c9212..HEAD` touches neither
 `handle_describe_groups` (handler.rs:5390) nor the `ListGroups` dispatch — the
-security changes in that file sit at lines 1924-2542. Tracked as its own fix.
+security changes in that file sit at lines 1924-2542.
+
+**Both are now FIXED** in `cb1e1ff` and rolled as `chronik-server:v2.14.0-sec3`.
+See §11.
+
+## 11. Consumer-group visibility, fixed (2026-09-11)
+
+The two gaps §10 found are closed. Neither was a security defect; both were
+found by the security roll's verification, which is the only reason they
+surfaced at all.
+
+### DescribeGroups read a store nothing writes to
+
+ListGroups was moved to the live `GroupManager` when the Kafka UI admin APIs
+landed. DescribeGroups was left reading `ProtocolHandler::consumer_groups`, a map
+on the protocol handler that no server path writes to — so every describe missed,
+including for a group ListGroups was returning in the same second.
+
+This is the **duplicate-entry-point trap for the fourth time** on this branch,
+after three hardcoded SASL mechanism lists, two Unified API start functions with
+TLS on the dead one, and `UnifiedApiState` built in two places with the
+authorizer wired into one. The rule earned four times over: when this codebase
+has two ways in, both are live until proven otherwise, and the one you are
+reading is not necessarily the one that runs.
+
+DescribeGroups now dispatches in `kafka_handler` against the `GroupManager` and
+is authorized (`Group`/`Describe`, already present in `required_access`). The
+denial is **shaped** — `GROUP_AUTHORIZATION_FAILED` inside a well-formed
+response — not routed through the bare-error path, which is the mistake that
+segfaulted librdkafka in §9. The protocol handler's arm is kept for callers that
+drive it directly and labelled so the next person fixes the live one.
+
+### An empty group vanished
+
+`leave_group` already did the right thing — records the group `Empty`, keeps its
+offsets — but drops the in-memory entry, and `list_groups` read only memory. A
+`TODO` in that function had said exactly this. So a group disappeared from admin
+tooling the moment its last consumer disconnected, while its committed offsets
+were still stored and a restarting consumer would resume from them.
+
+`MetadataStore` grows `list_consumer_groups` (default impl returns nothing);
+`list_groups` unions it with memory and excludes `Dead`, so DeleteGroups is not
+undone. The expiration path now records `Empty` too, so a group whose members
+timed out behaves like one whose members left cleanly.
+
+### Proof
+
+Each fix has an integration test that **fails against the pre-fix binary** and
+passes against the fixed one — run with `CHRONIK_TEST_BIN` pointed at the old
+build, so the control is the real broker, not a mock:
+
+```
+describe_groups_agrees_with_list_groups  pre-fix: DescribeGroups gave state ""
+                                                 for a group ListGroups returns
+an_empty_group_is_still_visible          pre-fix: the group disappeared when its
+                                                 last member left
+```
+
+Then on Thunderbird with the Java client that reported it — `--describe` now
+prints members, partitions, `Stable`, and the LAG columns; node 1 lists 12 groups
+where it listed 0. Checked across all three brokers and all three ways a consumer
+can go away: clean exit, SIGTERM, and SIGKILL, sampled repeatedly to 90s. The
+group stays listed in every case and settles to `Empty`.
+
+One caveat recorded honestly: the very first Java run, minutes after the roll,
+showed the group briefly absent from `--list` at a single sample. Three later
+runs across all three exit paths, sampled repeatedly, never reproduced it. A
+single-point check is not evidence of steady state — that is the same lesson §10
+paid for with `kubectl run -i`.
+
+DeleteGroups was re-checked, because reading persisted groups could have
+resurrected deleted ones: listed 1 → delete → listed 0, describe
+`GROUP_ID_NOT_FOUND`. A unit test pins it.
