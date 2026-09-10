@@ -174,6 +174,11 @@ impl IntegratedKafkaServer {
         self.hot_vector_batcher_slot.clone()
     }
 
+    /// The Kafka protocol handler, so the HTTP surface can share its authorizer.
+    pub fn kafka_handler(&self) -> &Arc<KafkaProtocolHandler> {
+        &self.kafka_handler
+    }
+
     /// Get reference to the WAL indexer for search integration
     pub fn get_wal_indexer(&self) -> Arc<WalIndexer> {
         self.wal_indexer.clone()

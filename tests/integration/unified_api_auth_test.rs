@@ -267,3 +267,166 @@ async fn plain_http_is_refused_when_tls_is_enabled() -> Result<()> {
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Per-topic authorization on /_sql (Security Phase 4)
+//
+// The API key authenticates the caller; these prove it does not authorize
+// everything. A key holder may only read topics the configured principal holds
+// Read on, so /_sql stops being a way around the ACLs enforced on :9092.
+// ---------------------------------------------------------------------------
+
+const SQL_PRINCIPAL: &str = "User:sqlreader";
+
+fn sql_acl_config() -> TestClusterConfig {
+    TestClusterConfig {
+        num_servers: 1,
+        object_storage: ObjectStorageType::Local,
+        enable_acls: true,
+        acl_allow_if_no_acl: false,
+        // The HTTP principal may read exactly one topic. ANONYMOUS (the Kafka
+        // side, where SASL is off) may create and write both, so the test can
+        // bring the topics into existence - an absent topic would make the
+        // query fail as "table not found" and prove nothing about authorization.
+        acl_bindings: format!(
+            "{principal},Topic,sqlallowed,Read,Allow;\
+             User:ANONYMOUS,Topic,sqlallowed,Write,Allow;\
+             User:ANONYMOUS,Topic,sqldenied,Write,Allow",
+            principal = SQL_PRINCIPAL
+        ),
+        ..Default::default()
+    }
+}
+
+fn sql_env() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("CHRONIK_API_KEY", API_KEY),
+        ("CHRONIK_API_PRINCIPAL", SQL_PRINCIPAL),
+    ]
+}
+
+/// Bring the topics into existence so a query against them is authorized
+/// rather than failing as "table not found".
+async fn seed_topics(cluster: &TestCluster) -> Result<()> {
+    use rdkafka::producer::{FutureProducer, FutureRecord};
+    let producer: FutureProducer = rdkafka::config::ClientConfig::new()
+        .set("bootstrap.servers", &cluster.bootstrap_servers())
+        .set("message.timeout.ms", "8000")
+        .create()?;
+    for topic in ["sqlallowed", "sqldenied"] {
+        let record: FutureRecord<str, str> = FutureRecord::to(topic).payload("seed");
+        let _ = producer.send(record, Duration::from_secs(10)).await;
+    }
+    Ok(())
+}
+
+async fn run_sql(cluster: &TestCluster, query: &str) -> Result<(reqwest::StatusCode, String)> {
+    let response = client()
+        .post(format!("{}/_sql", cluster.search_endpoint()))
+        .header("X-API-Key", API_KEY)
+        .json(&serde_json::json!({ "query": query }))
+        .send()
+        .await?;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    Ok((status, body))
+}
+
+/// THE test: a query against a topic the principal cannot read is refused.
+#[tokio::test]
+async fn sql_query_on_unauthorized_topic_is_forbidden() -> Result<()> {
+    let _guard = exclusive().await;
+    let cluster = TestCluster::start_with_env(sql_acl_config(), &sql_env()).await?;
+    seed_topics(&cluster).await?;
+
+    let (status, body) = run_sql(&cluster, "SELECT * FROM sqldenied").await?;
+
+    assert_eq!(
+        status,
+        reqwest::StatusCode::FORBIDDEN,
+        "/_sql answered {} for a topic the principal may not read - the HTTP \
+         surface is still a way around the ACLs. Body: {}",
+        status,
+        body
+    );
+    Ok(())
+}
+
+/// A query that touches BOTH an allowed and a denied topic must be refused —
+/// authorizing only the first table would leak the second through a join.
+#[tokio::test]
+async fn sql_join_touching_an_unauthorized_topic_is_forbidden() -> Result<()> {
+    let _guard = exclusive().await;
+    let cluster = TestCluster::start_with_env(sql_acl_config(), &sql_env()).await?;
+    seed_topics(&cluster).await?;
+
+    let (status, body) = run_sql(
+        &cluster,
+        "SELECT * FROM sqlallowed a JOIN sqldenied d ON a._offset = d._offset",
+    )
+    .await?;
+
+    assert_eq!(
+        status,
+        reqwest::StatusCode::FORBIDDEN,
+        "a join reaching an unauthorized topic was allowed ({}). Body: {}",
+        status,
+        body
+    );
+    Ok(())
+}
+
+/// Unparseable SQL must be rejected, not run. A statement whose tables cannot be
+/// determined cannot be authorized, and letting it through would authorize
+/// nothing at all.
+#[tokio::test]
+async fn unparseable_sql_is_rejected_rather_than_run() -> Result<()> {
+    let _guard = exclusive().await;
+    let cluster = TestCluster::start_with_env(sql_acl_config(), &sql_env()).await?;
+
+    let (status, _) = run_sql(&cluster, "SELECT FROM WHERE ((").await?;
+
+    assert!(
+        status == reqwest::StatusCode::BAD_REQUEST || status == reqwest::StatusCode::FORBIDDEN,
+        "unparseable SQL returned {} - it must be refused, because a query whose \
+         tables cannot be resolved cannot be authorized",
+        status
+    );
+    Ok(())
+}
+
+/// A query touching no topic at all needs no authorization.
+#[tokio::test]
+async fn a_query_touching_no_topic_is_allowed() -> Result<()> {
+    let _guard = exclusive().await;
+    let cluster = TestCluster::start_with_env(sql_acl_config(), &sql_env()).await?;
+
+    let (status, body) = run_sql(&cluster, "SELECT 1").await?;
+
+    assert_ne!(
+        status,
+        reqwest::StatusCode::FORBIDDEN,
+        "a query reading no topic was refused ({}) - the filter is too strict. \
+         Body: {}",
+        status,
+        body
+    );
+    Ok(())
+}
+
+/// With ACLs off, /_sql keeps working for any topic (the default path).
+#[tokio::test]
+async fn sql_authorization_is_off_by_default() -> Result<()> {
+    let _guard = exclusive().await;
+    let cluster =
+        TestCluster::start_with_env(base_config(), &[("CHRONIK_API_KEY", API_KEY)]).await?;
+
+    let (status, _) = run_sql(&cluster, "SELECT * FROM anything").await?;
+
+    assert_ne!(
+        status,
+        reqwest::StatusCode::FORBIDDEN,
+        "a query was refused with ACLs disabled - the default path has regressed"
+    );
+    Ok(())
+}

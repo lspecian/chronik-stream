@@ -326,3 +326,53 @@ async fn offset_commit_on_an_unauthorized_group_is_denied() -> Result<()> {
 
     Ok(())
 }
+
+/// Metadata must not list topics the principal cannot Describe.
+///
+/// An all-topics Metadata request that named every topic on the cluster would
+/// leak the topic inventory to a principal with no rights to any of it.
+#[tokio::test]
+async fn metadata_omits_unauthorized_topics() -> Result<()> {
+    let _guard = exclusive().await;
+    let cluster = TestCluster::start(acl_cluster_config()).await?;
+
+    // Bring both topics into existence: the allowed one directly, and the
+    // unreadable one through the write-only grant.
+    let producer = producer(&cluster.bootstrap_servers())?;
+    try_produce(&producer, ALLOWED_TOPIC).await.expect("allowed write");
+    try_produce(&producer, NO_READ_TOPIC).await.expect("write-only write");
+
+    // alice has Describe on both of those, and on nothing else. Fetching all
+    // metadata must return exactly the topics she may describe.
+    let consumer: StreamConsumer = ClientConfig::new()
+        .set("bootstrap.servers", &cluster.bootstrap_servers())
+        .set("security.protocol", "SASL_PLAINTEXT")
+        .set("sasl.mechanism", "SCRAM-SHA-256")
+        .set("sasl.username", USER)
+        .set("sasl.password", PASSWORD)
+        .set("group.id", "acl-group")
+        .create()?;
+
+    let metadata = consumer.fetch_metadata(None, Duration::from_secs(15))?;
+    let listed: Vec<String> = metadata
+        .topics()
+        .iter()
+        .map(|t| t.name().to_string())
+        .collect();
+
+    // Whatever else exists on the broker, a topic alice has no ACL for must not
+    // appear. DENIED_TOPIC has no binding at all.
+    assert!(
+        !listed.contains(&DENIED_TOPIC.to_string()),
+        "metadata listed a topic the principal may not describe: {:?}",
+        listed
+    );
+    // And the authorized ones are still visible, or the filter is too strict.
+    assert!(
+        listed.contains(&ALLOWED_TOPIC.to_string()),
+        "metadata omitted an AUTHORIZED topic: {:?}",
+        listed
+    );
+
+    Ok(())
+}

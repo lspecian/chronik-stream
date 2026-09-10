@@ -110,6 +110,11 @@ impl KafkaProtocolHandler {
         &self.produce_handler
     }
 
+    /// The ACL authorizer, so the HTTP surface can enforce the same policy.
+    pub fn authorizer(&self) -> &Authorizer {
+        &self.authorizer
+    }
+
     /// Get reference to the WAL produce handler for shutdown
     pub fn get_wal_handler(&self) -> &Arc<WalProduceHandler> {
         &self.wal_handler
@@ -174,7 +179,7 @@ impl KafkaProtocolHandler {
 
         // Route to specific handler methods (all extracted for maintainability)
         match header.api_key {
-            ApiKey::Metadata => self.handle_metadata_request(header, buf).await,
+            ApiKey::Metadata => self.handle_metadata_request(ctx, header, buf).await,
             ApiKey::Produce => self.handle_produce_request(ctx, header, buf).await,
             ApiKey::Fetch => self.handle_fetch_request(ctx, header, buf).await,
             ApiKey::ListOffsets => self.handle_list_offsets_request(header, buf).await,
@@ -300,6 +305,7 @@ impl KafkaProtocolHandler {
     #[instrument(skip(self, buf))]
     async fn handle_metadata_request(
         &self,
+        ctx: &ConnectionContext,
         header: chronik_protocol::parser::RequestHeader,
         mut buf: Bytes,
     ) -> Result<Response> {
@@ -394,8 +400,40 @@ impl KafkaProtocolHandler {
             }
         }
 
+        // Authorization: Metadata requires Describe on each topic.
+        //
+        // The set is computed here, where the connection (and so the principal)
+        // is known, and passed down; the protocol handler owns the response
+        // shape and applies the filter to it.
+        //
+        // For an all-topics request the candidate list has to come from the
+        // metadata store, because the request names nothing to check.
+        let authorized = if self.authorizer.is_enabled() {
+            let candidates: Vec<String> = match &topics {
+                Some(requested) => requested.clone(),
+                None => self
+                    .metadata_store
+                    .list_topics()
+                    .await
+                    .map(|topics| topics.into_iter().map(|t| t.name).collect())
+                    .unwrap_or_default(),
+            };
+            let (allowed, denied) = self
+                .authorizer
+                .partition_topics(ctx, &candidates, AclOperation::Describe)
+                .await;
+            if !denied.is_empty() {
+                tracing::debug!("Metadata: withholding {} unauthorized topic(s)", denied.len());
+            }
+            Some(allowed.into_iter().collect::<std::collections::HashSet<_>>())
+        } else {
+            None
+        };
+
         // Now delegate to protocol handler for the actual metadata response
-        self.protocol_handler.handle_metadata(header, &mut buf).await
+        self.protocol_handler
+            .handle_metadata_filtered(header, &mut buf, authorized.as_ref())
+            .await
     }
 
     /// Handle Produce API request

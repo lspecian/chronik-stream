@@ -109,6 +109,9 @@ socket2 = "0.5"
 tokio-rustls = { workspace = true }
 rustls = { workspace = true }
 subtle = { workspace = true }
+# SQL per-table authorization resolves the tables a statement reads with
+# DataFusion's own resolver rather than a regex (unified_api::sql_authz).
+datafusion = "44"
 rustls-pemfile = { workspace = true }
 
 # Force vendored OpenSSL for musl builds

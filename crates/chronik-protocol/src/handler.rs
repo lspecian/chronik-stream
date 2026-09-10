@@ -1925,6 +1925,28 @@ impl ProtocolHandler {
         header: RequestHeader,
         body: &mut Bytes,
     ) -> Result<Response> {
+        self.handle_metadata_filtered(header, body, None).await
+    }
+
+    /// Handle a Metadata request, optionally restricting the topics reported.
+    ///
+    /// `authorized` is `None` when authorization is disabled (every topic is
+    /// reported, which is the default and the pre-existing behaviour). When
+    /// `Some`, it names the topics the caller may Describe, and this follows
+    /// Kafka:
+    ///
+    /// - a topic the caller explicitly asked for but may not Describe is
+    ///   returned with `TOPIC_AUTHORIZATION_FAILED`, so the client is told it
+    ///   was refused rather than that the topic does not exist;
+    /// - on an all-topics request, unauthorized topics are simply **omitted** —
+    ///   listing them would leak the cluster's topic names to a principal with
+    ///   no rights to them.
+    pub async fn handle_metadata_filtered(
+        &self,
+        header: RequestHeader,
+        body: &mut Bytes,
+        authorized: Option<&std::collections::HashSet<String>>,
+    ) -> Result<Response> {
         use crate::handlers::metadata::{MetadataRequestParser, BrokerRetriever, BrokerValidator, MetadataResponseBuilder};
 
         tracing::debug!("handle_metadata called with v{}", header.api_version);
@@ -1951,9 +1973,39 @@ impl ProtocolHandler {
             }
         };
 
+        // Phase 3b: Authorization filter.
+        //
+        // Applied before the default-topic fallback below, so that fallback
+        // cannot reintroduce a topic the caller may not see.
+        if let Some(authorized) = authorized {
+            let explicitly_requested = request.topics.is_some();
+            topics = topics
+                .into_iter()
+                .filter_map(|mut topic| {
+                    if authorized.contains(&topic.name) {
+                        Some(topic)
+                    } else if explicitly_requested {
+                        // Asked for by name: say it was refused. Reporting
+                        // UNKNOWN_TOPIC instead would be a lie that sends the
+                        // client into topic auto-creation.
+                        topic.error_code = crate::error_codes::TOPIC_AUTHORIZATION_FAILED;
+                        topic.partitions.clear();
+                        Some(topic)
+                    } else {
+                        // All-topics request: omit, so the topic name does not
+                        // leak to a principal with no rights to it.
+                        None
+                    }
+                })
+                .collect();
+        }
+
         // Phase 4: Ensure at least one topic exists for client compatibility
         // CRITICAL FIX: Kafka clients require at least one topic in metadata responses
-        if topics.is_empty() && request.allow_auto_topic_creation {
+        //
+        // Skipped when an authorization filter is in force: inventing a topic to
+        // satisfy a client would hand it a name the filter just withheld.
+        if topics.is_empty() && request.allow_auto_topic_creation && authorized.is_none() {
             topics = self.ensure_default_topic_exists(&request.topics).await?;
         }
 

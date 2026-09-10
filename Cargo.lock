@@ -2171,6 +2171,7 @@ dependencies = [
  "crc32fast",
  "crossbeam",
  "dashmap 5.5.3",
+ "datafusion",
  "futures",
  "hyper 0.14.32",
  "murmur2",

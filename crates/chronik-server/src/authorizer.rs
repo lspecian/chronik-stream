@@ -119,6 +119,35 @@ impl Authorizer {
         allowed
     }
 
+    /// Authorize a named principal directly, with no connection.
+    ///
+    /// The HTTP surface has no Kafka connection and therefore no per-connection
+    /// principal - it authenticates with a shared API key that names one
+    /// configured principal for every holder. Same ACL store, same rules.
+    pub async fn authorize_principal(
+        &self,
+        principal: &str,
+        host: &str,
+        resource_type: ResourceType,
+        resource_name: &str,
+        operation: AclOperation,
+    ) -> bool {
+        if !self.acls.is_enabled() {
+            return true;
+        }
+        let allowed = self
+            .acls
+            .authorize(principal, host, resource_type, resource_name, operation)
+            .await;
+        if !allowed {
+            warn!(
+                "DENIED {} {:?} on {:?} '{}'",
+                principal, operation, resource_type, resource_name
+            );
+        }
+        allowed
+    }
+
     /// Partition a list of topics into (allowed, denied).
     ///
     /// Kafka authorizes per topic and reports per topic, so a request naming

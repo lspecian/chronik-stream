@@ -19,6 +19,7 @@
 //! ```
 
 pub mod data_auth;
+pub mod sql_authz;
 pub mod sql_handler;
 pub mod vector_handler;
 pub mod admin_handler;
@@ -167,6 +168,18 @@ pub struct UnifiedApiState {
     /// unified `{topic}` view is currently built from so it can be rebuilt when
     /// a topic gains cold Parquet data, and throttles the probe for it.
     pub sql_tables: Arc<sql_handler::SqlTableRegistry>,
+    /// Security Phase 4: per-topic authorization for /_sql.
+    ///
+    /// `None` when ACLs are disabled, which is the default. When present, a SQL
+    /// statement may only read topics [`Self::api_principal`] holds Read on.
+    pub authorizer: Option<crate::authorizer::Authorizer>,
+    /// The principal HTTP callers authorize as.
+    ///
+    /// The HTTP surface authenticates with a shared API key, which names no
+    /// user, so one principal stands for every key holder. `CHRONIK_API_PRINCIPAL`
+    /// sets it; without it there is nothing to write ACLs against and the
+    /// anonymous principal is used.
+    pub api_principal: String,
 
     // ───────────────────────── AM-1.7: Agent Memory ─────────────────────────
     // Present only under the `memory` feature. See the `chronik-memory` note in
@@ -279,6 +292,8 @@ impl UnifiedApiState {
             query_router: None,
             hot_vector_index: None,
             sql_tables: Arc::new(sql_handler::SqlTableRegistry::new()),
+            authorizer: None,
+            api_principal: crate::authorizer::ANONYMOUS_PRINCIPAL.to_string(),
             #[cfg(feature = "memory")]
             memory_registry: None,
             #[cfg(feature = "memory")]
@@ -504,6 +519,20 @@ impl UnifiedApiState {
     ///
     /// The hot buffer enables sub-second SQL queries by reading recent data
     /// directly from WAL before it's written to Parquet files.
+    /// Security Phase 4: enable per-topic authorization on /_sql.
+    pub fn with_authorizer(mut self, authorizer: crate::authorizer::Authorizer) -> Self {
+        if authorizer.is_enabled() {
+            self.api_principal = std::env::var("CHRONIK_API_PRINCIPAL")
+                .unwrap_or_else(|_| crate::authorizer::ANONYMOUS_PRINCIPAL.to_string());
+            info!(
+                "Unified API SQL queries authorize as {} (set CHRONIK_API_PRINCIPAL to change)",
+                self.api_principal
+            );
+            self.authorizer = Some(authorizer);
+        }
+        self
+    }
+
     pub fn with_hot_buffer(mut self, buffer: Arc<HotDataBuffer>) -> Self {
         self.hot_buffer = Some(buffer);
         self

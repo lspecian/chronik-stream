@@ -1512,6 +1512,14 @@ async fn run_cluster_mode(
     // Distributed query router for cluster-mode scatter-gather fan-out
     let query_router = Arc::new(unified_api::query_router::QueryRouter::new(&init_config.cluster_config));
     unified_state = unified_state.with_query_router(query_router.clone());
+
+    // Security Phase 4: the HTTP surface enforces the same ACL policy as the
+    // Kafka port, so /_sql cannot be used to read topics the caller has no
+    // Read on. Sharing the store (rather than a second one) means a rule
+    // created through CreateAcls applies to both surfaces at once.
+    unified_state = unified_state.with_authorizer(
+        server.kafka_handler().authorizer().clone(),
+    );
     info!("✓ QueryRouter initialized for distributed query fan-out ({} peers)", init_config.cluster_config.peers.len() - 1);
     // v2.4.0: Wire SearchApi into state for query orchestrator text search
     #[cfg(feature = "search")]
@@ -1804,6 +1812,14 @@ async fn run_single_node_mode(
 
         // v2.5.2: single-node admin router. `raft_cluster: None` signals to
         // mutation handlers (add-node / remove-node / rebalance) that they
+        // Security Phase 4: same ACL policy on the HTTP surface as on the Kafka
+        // port. Wired in BOTH modes - single-node builds its own state, and
+        // wiring only the cluster path would leave /_sql unauthorized here,
+        // which is exactly how the Unified API TLS change silently did nothing.
+        unified_state = unified_state.with_authorizer(
+            server.kafka_handler().authorizer().clone(),
+        );
+
         // should return a 501-ish JSON body explaining why. `/admin/health`
         // and Schema Registry routes work unchanged — they don't need Raft.
         let schema_registry_single = Arc::new(schema_registry::SchemaRegistry::new(
