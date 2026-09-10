@@ -86,6 +86,50 @@ impl ScramCredential {
         Self::derive_with_salt(password, mechanism, iterations, salt)
     }
 
+    /// Build a credential from a client-supplied salt and *salted password*.
+    ///
+    /// This is what `AlterUserScramCredentials` (API 51) carries: the client
+    /// runs `Hi(password, salt, iterations)` itself and sends the result, so the
+    /// plaintext password never crosses the wire and the broker never sees it.
+    /// The broker only needs the two derived keys.
+    ///
+    /// Note there is deliberately no verification possible here — the broker
+    /// cannot check that the salted password corresponds to any particular
+    /// password, which is the whole point. It stores what it is given.
+    pub fn from_salted_password(
+        salt: Vec<u8>,
+        salted_password: &[u8],
+        mechanism: SaslMechanism,
+        iterations: u32,
+    ) -> Result<Self, SaslError> {
+        if iterations < MIN_ITERATIONS {
+            return Err(SaslError::InternalError(format!(
+                "SCRAM iteration count {} is below the minimum {}",
+                iterations, MIN_ITERATIONS
+            )));
+        }
+        if salted_password.len() != digest_len(mechanism) {
+            return Err(SaslError::InternalError(format!(
+                "salted password is {} bytes, expected {} for {}",
+                salted_password.len(),
+                digest_len(mechanism),
+                mechanism.as_str()
+            )));
+        }
+
+        let client_key = hmac(salted_password, CLIENT_KEY_LABEL, mechanism)?;
+        let stored_key = hash(&client_key, mechanism);
+        let server_key = hmac(salted_password, SERVER_KEY_LABEL, mechanism)?;
+
+        Ok(Self {
+            mechanism,
+            salt,
+            stored_key,
+            server_key,
+            iterations,
+        })
+    }
+
     /// Derive a credential using a caller-supplied salt (used by tests and by
     /// credential import, where the salt must be reproduced exactly).
     pub fn derive_with_salt(
@@ -703,5 +747,56 @@ mod tests {
             exchange.finish(forged.as_bytes()),
             Err(SaslError::ProtocolError(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod salted_password_tests {
+    use super::*;
+
+    /// A credential built from a client-supplied salted password must accept the
+    /// password that produced it. This is the whole AlterUserScramCredentials
+    /// path: the client computes Hi(password, salt, i) and sends only that.
+    #[test]
+    fn a_credential_from_a_salted_password_authenticates() {
+        let mechanism = SaslMechanism::ScramSha256;
+        let salt = vec![9u8; 16];
+        let iterations = DEFAULT_ITERATIONS;
+
+        // What kafka-configs.sh does client-side.
+        let salted = hi(b"hunter2", &salt, iterations, mechanism).unwrap();
+        let credential =
+            ScramCredential::from_salted_password(salt.clone(), &salted, mechanism, iterations)
+                .unwrap();
+
+        // It must be identical to deriving from the password directly.
+        let direct =
+            ScramCredential::derive_with_salt("hunter2", mechanism, iterations, salt).unwrap();
+        assert_eq!(credential.stored_key, direct.stored_key);
+        assert_eq!(credential.server_key, direct.server_key);
+    }
+
+    /// A salted password of the wrong length is refused rather than stored,
+    /// which would create a user nobody can ever authenticate as.
+    #[test]
+    fn a_wrong_length_salted_password_is_refused() {
+        let result = ScramCredential::from_salted_password(
+            vec![1u8; 16],
+            &[0u8; 16], // SHA-256 needs 32
+            SaslMechanism::ScramSha256,
+            DEFAULT_ITERATIONS,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn iterations_below_the_floor_are_refused() {
+        let result = ScramCredential::from_salted_password(
+            vec![1u8; 16],
+            &[0u8; 32],
+            SaslMechanism::ScramSha256,
+            1000,
+        );
+        assert!(result.is_err());
     }
 }

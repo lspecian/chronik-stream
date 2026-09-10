@@ -186,6 +186,8 @@ impl KafkaProtocolHandler {
             ApiKey::OffsetCommit => self.handle_offset_commit_request(ctx, header, buf).await,
             ApiKey::OffsetFetch => self.handle_offset_fetch_request(ctx, header, buf).await,
             ApiKey::CreateTopics => self.handle_create_topics_request(header, buf, request_bytes).await,
+            ApiKey::DescribeUserScramCredentials => self.handle_describe_user_scram_credentials(ctx, header, buf).await,
+            ApiKey::AlterUserScramCredentials => self.handle_alter_user_scram_credentials(ctx, header, buf).await,
             ApiKey::DescribeAcls => self.handle_describe_acls_request(ctx, header, buf).await,
             ApiKey::CreateAcls => self.handle_create_acls_request(ctx, header, buf).await,
             ApiKey::DeleteAcls => self.handle_delete_acls_request(ctx, header, buf).await,
@@ -472,6 +474,256 @@ impl KafkaProtocolHandler {
             body: body_buf.freeze(),
             is_flexible: header.api_version >= 9,  // v9+ uses flexible/compact encoding
             api_key: ApiKey::Produce,
+            throttle_time_ms: None,
+        })
+    }
+
+    // ========================================================================
+    // SCRAM credential administration (Security Phase 1)
+    //
+    // What `kafka-configs.sh --entity-type users` drives. Credentials go through
+    // the metadata log, so a user created on one broker authenticates against
+    // every broker and survives a restart — unlike CHRONIK_SASL_USERS, which is
+    // per-broker configuration requiring a redeploy to change.
+    // ========================================================================
+
+    /// Handle DescribeUserScramCredentials (API 50).
+    async fn handle_describe_user_scram_credentials(
+        &self,
+        ctx: &ConnectionContext,
+        header: chronik_protocol::parser::RequestHeader,
+        mut buf: Bytes,
+    ) -> Result<Response> {
+        use chronik_protocol::scram_credentials_types::*;
+
+        let mut decoder = chronik_protocol::parser::Decoder::new(&mut buf);
+        let request = parse_describe_user_scram_credentials_request(&mut decoder)?;
+
+        // Kafka requires Describe on the cluster to list users.
+        if !self
+            .authorizer
+            .authorize_cluster(ctx, AclOperation::Describe)
+            .await
+        {
+            return self.scram_response(
+                &header,
+                encode_describe_user_scram_credentials_response(
+                    &DescribeUserScramCredentialsResponse {
+                        throttle_time_ms: 0,
+                        error_code: crate::authorizer::ERROR_CLUSTER_AUTHORIZATION_FAILED,
+                        error_message: Some("Not authorized to describe users".to_string()),
+                        results: Vec::new(),
+                    },
+                ),
+                ApiKey::DescribeUserScramCredentials,
+            );
+        }
+
+        let stored = self
+            .metadata_store
+            .list_scram_credentials()
+            .await
+            .map_err(|e| Error::Internal(format!("Failed to list credentials: {:?}", e)))?;
+
+        // Group by user. A user may hold one credential per mechanism.
+        let mut by_user: std::collections::BTreeMap<String, Vec<CredentialInfo>> =
+            std::collections::BTreeMap::new();
+        for record in stored {
+            by_user
+                .entry(record.username.clone())
+                .or_default()
+                .push(CredentialInfo {
+                    mechanism: record.mechanism,
+                    iterations: record.iterations as i32,
+                });
+        }
+
+        let results = match &request.users {
+            // Named users: report each, including RESOURCE_NOT_FOUND for one
+            // that does not exist, which is what kafka-configs.sh expects.
+            Some(users) => users
+                .iter()
+                .map(|u| match by_user.get(&u.name) {
+                    Some(infos) => DescribeUserScramCredentialsResult {
+                        user: u.name.clone(),
+                        error_code: 0,
+                        error_message: None,
+                        credential_infos: infos.clone(),
+                    },
+                    None => DescribeUserScramCredentialsResult {
+                        user: u.name.clone(),
+                        error_code: 89, // RESOURCE_NOT_FOUND
+                        error_message: Some("User not found".to_string()),
+                        credential_infos: Vec::new(),
+                    },
+                })
+                .collect(),
+            // All users.
+            None => by_user
+                .into_iter()
+                .map(|(user, credential_infos)| DescribeUserScramCredentialsResult {
+                    user,
+                    error_code: 0,
+                    error_message: None,
+                    credential_infos,
+                })
+                .collect(),
+        };
+
+        self.scram_response(
+            &header,
+            encode_describe_user_scram_credentials_response(
+                &DescribeUserScramCredentialsResponse {
+                    throttle_time_ms: 0,
+                    error_code: 0,
+                    error_message: None,
+                    results,
+                },
+            ),
+            ApiKey::DescribeUserScramCredentials,
+        )
+    }
+
+    /// Handle AlterUserScramCredentials (API 51).
+    async fn handle_alter_user_scram_credentials(
+        &self,
+        ctx: &ConnectionContext,
+        header: chronik_protocol::parser::RequestHeader,
+        mut buf: Bytes,
+    ) -> Result<Response> {
+        use chronik_common::metadata::traits::ScramCredentialRecord;
+        use chronik_protocol::sasl::SaslMechanism;
+        use chronik_protocol::scram::ScramCredential;
+        use chronik_protocol::scram_credentials_types::*;
+
+        let mut decoder = chronik_protocol::parser::Decoder::new(&mut buf);
+        let request = parse_alter_user_scram_credentials_request(&mut decoder)?;
+
+        // Altering users is a privileged cluster operation.
+        if !self
+            .authorizer
+            .authorize_cluster(ctx, AclOperation::Alter)
+            .await
+        {
+            let results = request
+                .deletions
+                .iter()
+                .map(|d| d.name.clone())
+                .chain(request.upsertions.iter().map(|u| u.name.clone()))
+                .map(|user| AlterUserScramCredentialsResult {
+                    user,
+                    error_code: crate::authorizer::ERROR_CLUSTER_AUTHORIZATION_FAILED,
+                    error_message: Some("Not authorized to alter users".to_string()),
+                })
+                .collect();
+            return self.scram_response(
+                &header,
+                encode_alter_user_scram_credentials_response(
+                    &AlterUserScramCredentialsResponse {
+                        throttle_time_ms: 0,
+                        results,
+                    },
+                ),
+                ApiKey::AlterUserScramCredentials,
+            );
+        }
+
+        let mut results = Vec::new();
+
+        for deletion in &request.deletions {
+            let outcome = self
+                .metadata_store
+                .delete_scram_credential(&deletion.name, deletion.mechanism)
+                .await;
+            results.push(AlterUserScramCredentialsResult {
+                user: deletion.name.clone(),
+                error_code: if outcome.is_ok() { 0 } else { 42 },
+                error_message: outcome.err().map(|e| format!("{:?}", e)),
+            });
+        }
+
+        for upsertion in &request.upsertions {
+            let mechanism = match upsertion.mechanism {
+                MECHANISM_SCRAM_SHA_256 => SaslMechanism::ScramSha256,
+                MECHANISM_SCRAM_SHA_512 => SaslMechanism::ScramSha512,
+                other => {
+                    results.push(AlterUserScramCredentialsResult {
+                        user: upsertion.name.clone(),
+                        error_code: 37, // UNSUPPORTED_SASL_MECHANISM
+                        error_message: Some(format!("Unknown SCRAM mechanism code {}", other)),
+                    });
+                    continue;
+                }
+            };
+
+            // Derive the stored keys from the salted password the client sent.
+            // The password itself never reaches the broker.
+            let credential = match ScramCredential::from_salted_password(
+                upsertion.salt.clone(),
+                &upsertion.salted_password,
+                mechanism,
+                upsertion.iterations.max(0) as u32,
+            ) {
+                Ok(credential) => credential,
+                Err(e) => {
+                    results.push(AlterUserScramCredentialsResult {
+                        user: upsertion.name.clone(),
+                        error_code: 42, // INVALID_REQUEST
+                        error_message: Some(e.to_string()),
+                    });
+                    continue;
+                }
+            };
+
+            let record = ScramCredentialRecord {
+                username: upsertion.name.clone(),
+                mechanism: upsertion.mechanism,
+                iterations: credential.iterations,
+                salt: credential.salt.clone(),
+                stored_key: credential.stored_key.clone(),
+                server_key: credential.server_key.clone(),
+            };
+
+            let outcome = self.metadata_store.upsert_scram_credential(record).await;
+            if outcome.is_ok() {
+                tracing::info!(
+                    "SCRAM credential set for user '{}' ({})",
+                    upsertion.name,
+                    mechanism.as_str()
+                );
+            }
+            results.push(AlterUserScramCredentialsResult {
+                user: upsertion.name.clone(),
+                error_code: if outcome.is_ok() { 0 } else { 42 },
+                error_message: outcome.err().map(|e| format!("{:?}", e)),
+            });
+        }
+
+        self.scram_response(
+            &header,
+            encode_alter_user_scram_credentials_response(&AlterUserScramCredentialsResponse {
+                throttle_time_ms: 0,
+                results,
+            }),
+            ApiKey::AlterUserScramCredentials,
+        )
+    }
+
+    /// Wrap an encoded SCRAM-credential response body.
+    fn scram_response(
+        &self,
+        header: &chronik_protocol::parser::RequestHeader,
+        body: BytesMut,
+        api_key: ApiKey,
+    ) -> Result<Response> {
+        Ok(Response {
+            header: ResponseHeader {
+                correlation_id: header.correlation_id,
+            },
+            body: body.freeze(),
+            // Both APIs are flexible at every version.
+            is_flexible: true,
+            api_key,
             throttle_time_ms: None,
         })
     }

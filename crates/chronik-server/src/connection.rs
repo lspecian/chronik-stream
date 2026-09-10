@@ -36,6 +36,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use chronik_protocol::sasl::{
+    SaslUser,
     SaslAuthenticateResponse, SaslAuthenticator, SaslError, SaslHandshakeResponse,
 };
 
@@ -98,6 +99,15 @@ pub struct SaslConfig {
     mode: SaslMode,
     /// `username -> password`, from `CHRONIK_SASL_USERS`.
     users: Vec<(String, String)>,
+    /// Users whose credentials come from the metadata store
+    /// (AlterUserScramCredentials). Replicated cluster state, unlike `users`.
+    ///
+    /// Shared and refreshable: a user created through API 51 must be able to
+    /// authenticate on the NEXT connection, not only after a broker restart.
+    /// A plain snapshot taken at listener start made new credentials invisible
+    /// until the process was replaced, which defeats the point of managing them
+    /// at runtime.
+    stored_users: Arc<std::sync::RwLock<Vec<(String, SaslUser)>>>,
 }
 
 impl SaslConfig {
@@ -154,7 +164,11 @@ impl SaslConfig {
             }
         }
 
-        Self { mode, users }
+        Self {
+            mode,
+            users,
+            stored_users: Arc::new(std::sync::RwLock::new(Vec::new())),
+        }
     }
 
     /// A configuration with authentication disabled — the default, and what
@@ -163,6 +177,7 @@ impl SaslConfig {
         Self {
             mode: SaslMode::Disabled,
             users: Vec::new(),
+            stored_users: Arc::new(std::sync::RwLock::new(Vec::new())),
         }
     }
 
@@ -171,6 +186,7 @@ impl SaslConfig {
         Self {
             mode: SaslMode::Required,
             users,
+            stored_users: Arc::new(std::sync::RwLock::new(Vec::new())),
         }
     }
 
@@ -179,6 +195,7 @@ impl SaslConfig {
         Self {
             mode: SaslMode::Optional,
             users,
+            stored_users: Arc::new(std::sync::RwLock::new(Vec::new())),
         }
     }
 
@@ -202,7 +219,42 @@ impl SaslConfig {
         for (user, pass) in &self.users {
             authenticator.add_user(user.clone(), pass.clone());
         }
+        // Credentials managed through AlterUserScramCredentials are layered on
+        // top of the configured ones. A stored credential for a user that also
+        // appears in CHRONIK_SASL_USERS replaces that mechanism, so
+        // `kafka-configs.sh` can rotate a password without a redeploy.
+        let stored = match self.stored_users.read() {
+            Ok(guard) => guard.clone(),
+            // A poisoned lock means a writer panicked. Authenticating with only
+            // the configured users is the safe failure: it denies rather than
+            // admits.
+            Err(_) => Vec::new(),
+        };
+        for (username, user) in &stored {
+            match authenticator.user_mut(username) {
+                Some(existing) => {
+                    for mechanism in user.available_mechanisms() {
+                        if let Some(credential) = user.credential(mechanism) {
+                            existing.set_scram_credential(credential.clone());
+                        }
+                    }
+                }
+                None => authenticator.add_user_with_credentials(username.clone(), user.clone()),
+            }
+        }
         authenticator
+    }
+
+    /// Replace the credentials loaded from the metadata store.
+    ///
+    /// Called at startup and whenever `AlterUserScramCredentials` changes them.
+    /// Existing connections keep the authenticator they were created with, which
+    /// is correct: revoking a credential does not retroactively unauthenticate a
+    /// session, exactly as in Kafka.
+    pub fn set_stored_users(&self, users: Vec<(String, SaslUser)>) {
+        if let Ok(mut guard) = self.stored_users.write() {
+            *guard = users;
+        }
     }
 }
 
@@ -723,5 +775,68 @@ mod migration_mode_tests {
             assert_eq!(config.mode(), expected, "for CHRONIK_SASL_ENABLED={}", value);
         }
         std::env::remove_var("CHRONIK_SASL_ENABLED");
+    }
+}
+
+impl SaslConfig {
+    /// Load SCRAM credentials from the metadata store into this configuration.
+    ///
+    /// Consuming and returning `Self` keeps the shared `Arc<SaslConfig>`
+    /// immutable after construction: every connection then reads a snapshot that
+    /// cannot change underneath it mid-handshake.
+    ///
+    /// A credential that cannot be turned into a usable user is skipped with a
+    /// warning rather than aborting the load — one malformed record must not
+    /// lock out every other user.
+    pub async fn refresh_stored_credentials(
+        &self,
+        store: &dyn chronik_common::metadata::traits::MetadataStore,
+    ) {
+        if !self.is_enabled() {
+            return;
+        }
+
+        let records = match store.list_scram_credentials().await {
+            Ok(records) => records,
+            Err(e) => {
+                warn!(
+                    "Failed to load SCRAM credentials from metadata: {} - only \
+                     CHRONIK_SASL_USERS will be able to authenticate",
+                    e
+                );
+                return;
+            }
+        };
+
+        let mut users: std::collections::HashMap<String, SaslUser> =
+            std::collections::HashMap::new();
+        for record in records {
+            let mechanism = match record.mechanism {
+                2 => chronik_protocol::sasl::SaslMechanism::ScramSha512,
+                1 => chronik_protocol::sasl::SaslMechanism::ScramSha256,
+                other => {
+                    warn!(
+                        "Skipping stored credential for '{}': unknown mechanism code {}",
+                        record.username, other
+                    );
+                    continue;
+                }
+            };
+
+            let credential = chronik_protocol::scram::ScramCredential {
+                mechanism,
+                salt: record.salt,
+                stored_key: record.stored_key,
+                server_key: record.server_key,
+                iterations: record.iterations,
+            };
+
+            users
+                .entry(record.username.clone())
+                .and_modify(|u| u.set_scram_credential(credential.clone()))
+                .or_insert_with(|| SaslUser::from_scram_credential(credential));
+        }
+
+        self.set_stored_users(users.into_iter().collect());
     }
 }

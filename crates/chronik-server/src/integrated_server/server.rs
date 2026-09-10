@@ -694,7 +694,13 @@ impl IntegratedKafkaServer {
 
         let (produce_semaphore, control_semaphore) = Self::setup_connection_semaphores();
         // Resolved once; every connection shares it and gets its own auth state.
+        // Credentials managed through AlterUserScramCredentials live in the
+        // metadata log; load them so users created on any broker can
+        // authenticate here. Configured CHRONIK_SASL_USERS remain the base.
         let sasl_config = Arc::new(SaslConfig::from_env());
+        sasl_config
+            .refresh_stored_credentials(self.metadata_store.as_ref())
+            .await;
 
         trace!("Entering accept loop - ready to accept connections");
         loop {
@@ -715,6 +721,16 @@ impl IntegratedKafkaServer {
                     // Per-connection identity + auth state. Shared by every request
                     // task on this connection so that authenticating once unlocks
                     // the connection, and only this connection.
+                    //
+                    // Credentials are re-read here rather than only at startup:
+                    // a user created through AlterUserScramCredentials must be
+                    // able to authenticate on the NEXT connection, not after a
+                    // restart. It is a read-lock and a clone of a small map, on
+                    // the connection path rather than the request path, and only
+                    // when SASL is enabled at all.
+                    sasl_config
+                        .refresh_stored_credentials(self.metadata_store.as_ref())
+                        .await;
                     let conn_ctx = Arc::new(ConnectionContext::new(addr, false, sasl_config.clone()));
 
                     // v2.2.14: Removed diagnostic logs from hot path
@@ -836,7 +852,13 @@ impl IntegratedKafkaServer {
 
         let (produce_semaphore, control_semaphore) = Self::setup_connection_semaphores();
         // Resolved once; every connection shares it and gets its own auth state.
+        // Credentials managed through AlterUserScramCredentials live in the
+        // metadata log; load them so users created on any broker can
+        // authenticate here. Configured CHRONIK_SASL_USERS remain the base.
         let sasl_config = Arc::new(SaslConfig::from_env());
+        sasl_config
+            .refresh_stored_credentials(self.metadata_store.as_ref())
+            .await;
 
         loop {
             match acceptor.accept().await {
@@ -865,6 +887,9 @@ impl IntegratedKafkaServer {
                     // Per-connection identity + auth state; records whether this
                     // connection is encrypted, which Phase 1 needs to derive an
                     // mTLS principal from the peer certificate.
+                    sasl_config
+                        .refresh_stored_credentials(self.metadata_store.as_ref())
+                        .await;
                     let conn_ctx = Arc::new(ConnectionContext::with_certificate_principal(
                         addr,
                         is_tls,

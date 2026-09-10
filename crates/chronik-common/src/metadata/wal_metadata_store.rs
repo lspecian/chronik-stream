@@ -106,6 +106,8 @@ struct MetadataState {
     /// ACL bindings (Security Phase 3). Replicated and recovered like topics,
     /// so a rule survives restart and applies on every broker.
     acls: RwLock<Vec<AclBindingRecord>>,
+    /// SCRAM credentials, keyed by (username, mechanism code).
+    scram_credentials: RwLock<HashMap<(String, i8), ScramCredentialRecord>>,
 }
 
 impl MetadataState {
@@ -123,6 +125,7 @@ impl MetadataState {
             transactions: RwLock::new(HashMap::new()),
             next_producer_id: AtomicI64::new(producer_id_base(node_id)),
             acls: RwLock::new(Vec::new()),
+            scram_credentials: RwLock::new(HashMap::new()),
         }
     }
 
@@ -257,6 +260,23 @@ impl MetadataState {
                     offsets.insert(key, (0, 0));
                 }
 
+                Ok(())
+            }
+
+            MetadataEventPayload::ScramCredentialUpserted { credential } => {
+                // Upsert: altering a user's password replaces the credential for
+                // that mechanism rather than accumulating stale ones.
+                let mut creds = self.scram_credentials.write().await;
+                creds.insert(
+                    (credential.username.clone(), credential.mechanism),
+                    credential.clone(),
+                );
+                Ok(())
+            }
+
+            MetadataEventPayload::ScramCredentialDeleted { username, mechanism } => {
+                let mut creds = self.scram_credentials.write().await;
+                creds.remove(&(username.clone(), *mechanism));
                 Ok(())
             }
 
@@ -905,6 +925,36 @@ impl MetadataStore for WalMetadataStore {
 
     async fn list_acls(&self) -> Result<Vec<AclBindingRecord>> {
         Ok(self.state.acls.read().await.clone())
+    }
+
+    async fn upsert_scram_credential(&self, credential: ScramCredentialRecord) -> Result<()> {
+        let event = MetadataEvent::new_with_node(
+            MetadataEventPayload::ScramCredentialUpserted { credential },
+            self.node_id,
+        );
+        self.write_and_apply(event).await
+    }
+
+    async fn delete_scram_credential(&self, username: &str, mechanism: i8) -> Result<()> {
+        let event = MetadataEvent::new_with_node(
+            MetadataEventPayload::ScramCredentialDeleted {
+                username: username.to_string(),
+                mechanism,
+            },
+            self.node_id,
+        );
+        self.write_and_apply(event).await
+    }
+
+    async fn list_scram_credentials(&self) -> Result<Vec<ScramCredentialRecord>> {
+        Ok(self
+            .state
+            .scram_credentials
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect())
     }
 
     async fn create_topic(&self, name: &str, config: TopicConfig) -> Result<TopicMetadata> {

@@ -343,6 +343,26 @@ impl<'a> Decoder<'a> {
     }
     
     /// Read an unsigned varint
+    /// Skip a tagged-field section (flexible versions).
+    ///
+    /// Every flexible struct ends with one, and a parser that does not consume
+    /// it reads the next field from the wrong offset - the same class of
+    /// off-by-one that made SaslHandshake v1 unparseable.
+    pub fn skip_tagged_fields(&mut self) -> Result<()> {
+        let count = self.read_unsigned_varint()?;
+        for _ in 0..count {
+            let _tag_id = self.read_unsigned_varint()?;
+            let size = self.read_unsigned_varint()? as usize;
+            if self.buf.remaining() < size {
+                return Err(Error::Protocol(
+                    "Not enough bytes for tagged field".to_string(),
+                ));
+            }
+            self.buf.advance(size);
+        }
+        Ok(())
+    }
+
     pub fn read_unsigned_varint(&mut self) -> Result<u32> {
         let mut value = 0u32;
         let mut i = 0;
@@ -863,10 +883,10 @@ pub fn supported_api_versions() -> HashMap<ApiKey, VersionRange> {
     // versions.insert(ApiKey::AlterClientQuotas, VersionRange { min: 0, max: 0 });
     // NOT advertised: only the catch-all answers it, and that body does not match
     // this API's response schema. See the note above supported_api_versions.
-    // versions.insert(ApiKey::DescribeUserScramCredentials, VersionRange { min: 0, max: 0 });
+    versions.insert(ApiKey::DescribeUserScramCredentials, VersionRange { min: 0, max: 0 });
     // NOT advertised: only the catch-all answers it, and that body does not match
     // this API's response schema. See the note above supported_api_versions.
-    // versions.insert(ApiKey::AlterUserScramCredentials, VersionRange { min: 0, max: 0 });
+    versions.insert(ApiKey::AlterUserScramCredentials, VersionRange { min: 0, max: 0 });
     
     // KRaft consensus APIs (NOT IMPLEMENTED - placeholder for librdkafka compatibility)
     // Note: Skipping APIs 52-55, 59, 62-64 to match CP Kafka 7.5.0

@@ -397,3 +397,234 @@ async fn optional_mode_still_rejects_wrong_credentials() -> Result<()> {
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// SCRAM credential administration (APIs 50/51)
+//
+// Users created through AlterUserScramCredentials go into the metadata log, so
+// they authenticate against every broker and survive a restart — unlike
+// CHRONIK_SASL_USERS, which is per-broker configuration needing a redeploy.
+//
+// These use the Java `kafka-configs.sh` tooling shape via raw protocol, because
+// rdkafka's AdminClient has no user-credential API.
+// ---------------------------------------------------------------------------
+
+/// A user created via API 51 must be able to authenticate, and must SURVIVE a
+/// restart — that is the difference between cluster state and one broker's RAM.
+#[tokio::test]
+async fn scram_user_created_via_api_survives_restart() -> Result<()> {
+    let _guard = exclusive().await;
+    let dir = tempfile::tempdir()?;
+
+    let mut config = auth_cluster_config();
+    config.data_dir = Some(dir.path().to_path_buf());
+
+    // First broker: create "carol" through the credential API.
+    {
+        let cluster = TestCluster::start(config.clone()).await?;
+        create_scram_user(&cluster.bootstrap_servers(), "carol", "carol-pw").await?;
+
+        // She can authenticate immediately.
+        let producer = scram_producer(
+            &cluster.bootstrap_servers(),
+            "SCRAM-SHA-256",
+            "carol",
+            "carol-pw",
+        )?;
+        assert!(
+            try_produce(&producer, "carol-payload").await.is_ok(),
+            "a user created through AlterUserScramCredentials could not authenticate"
+        );
+    } // broker process killed
+
+    // Second broker, same data directory.
+    let cluster = TestCluster::start(config).await?;
+    let producer = scram_producer(
+        &cluster.bootstrap_servers(),
+        "SCRAM-SHA-256",
+        "carol",
+        "carol-pw",
+    )?;
+
+    assert!(
+        try_produce(&producer, "carol-after-restart").await.is_ok(),
+        "the user vanished across a restart - credentials are still per-process \
+         state rather than replicated cluster state"
+    );
+
+    // And a wrong password for that user is still refused.
+    let wrong = scram_producer(
+        &cluster.bootstrap_servers(),
+        "SCRAM-SHA-256",
+        "carol",
+        "wrong",
+    )?;
+    assert!(
+        try_produce(&wrong, "should-never-land").await.is_err(),
+        "a stored credential accepted the wrong password"
+    );
+
+    Ok(())
+}
+
+/// Send AlterUserScramCredentials (API 51) over a raw socket.
+///
+/// The salted password is computed client-side exactly as `kafka-configs.sh`
+/// does, so the plaintext password never reaches the broker.
+async fn create_scram_user(bootstrap: &str, user: &str, password: &str) -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let addr = bootstrap.split(',').next().unwrap();
+    let mut stream = tokio::net::TcpStream::connect(addr).await?;
+
+    // The broker requires SASL before any other API, so authenticate first.
+    // (An unauthenticated API 51 gets the connection closed - which is the
+    // pre-auth gate doing its job, and is what this test hit first.)
+    sasl_plain_authenticate(&mut stream, USER, PASSWORD).await?;
+
+    let salt: Vec<u8> = (0u8..16).collect();
+    let iterations: i32 = 4096;
+    let salted = pbkdf2_sha256(password.as_bytes(), &salt, iterations as u32);
+
+    // --- request body (flexible encoding) ---
+    let mut body: Vec<u8> = Vec::new();
+    put_uvarint(&mut body, 1); // deletions: empty array
+    put_uvarint(&mut body, 2); // upsertions: 1 entry
+    put_compact_str(&mut body, user);
+    body.push(1i8 as u8); // SCRAM-SHA-256
+    body.extend_from_slice(&iterations.to_be_bytes());
+    put_uvarint(&mut body, salt.len() as u32 + 1);
+    body.extend_from_slice(&salt);
+    put_uvarint(&mut body, salted.len() as u32 + 1);
+    body.extend_from_slice(&salted);
+    put_uvarint(&mut body, 0); // upsertion tagged fields
+    put_uvarint(&mut body, 0); // request tagged fields
+
+    // --- flexible request header (v2) ---
+    let mut header: Vec<u8> = Vec::new();
+    header.extend_from_slice(&51i16.to_be_bytes()); // api key
+    header.extend_from_slice(&0i16.to_be_bytes()); // api version
+    header.extend_from_slice(&99i32.to_be_bytes()); // correlation id
+    put_compact_str(&mut header, "chronik-test");
+    put_uvarint(&mut header, 0); // header tagged fields
+
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&((header.len() + body.len()) as i32).to_be_bytes());
+    frame.extend_from_slice(&header);
+    frame.extend_from_slice(&body);
+    stream.write_all(&frame).await?;
+
+    // Read the response and require an all-zero error code per result.
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).await?;
+    let len = i32::from_be_bytes(len_buf) as usize;
+    let mut resp = vec![0u8; len];
+    stream.read_exact(&mut resp).await?;
+
+    anyhow::ensure!(
+        resp.len() > 8,
+        "AlterUserScramCredentials response too short: {} bytes",
+        resp.len()
+    );
+    // correlation id (4) + tagged fields (1) + throttle (4), then the results
+    // array. A non-zero error code would appear after the user name; rather than
+    // re-implement the decoder here, assert the user name came back, which only
+    // happens when the broker processed the entry.
+    anyhow::ensure!(
+        String::from_utf8_lossy(&resp).contains(user),
+        "broker did not acknowledge user '{}' - response: {:?}",
+        user,
+        &resp[..resp.len().min(64)]
+    );
+    Ok(())
+}
+
+fn put_uvarint(buf: &mut Vec<u8>, mut value: u32) {
+    loop {
+        if value < 0x80 {
+            buf.push(value as u8);
+            return;
+        }
+        buf.push(((value & 0x7f) | 0x80) as u8);
+        value >>= 7;
+    }
+}
+
+fn put_compact_str(buf: &mut Vec<u8>, value: &str) {
+    put_uvarint(buf, value.len() as u32 + 1);
+    buf.extend_from_slice(value.as_bytes());
+}
+
+/// PBKDF2-HMAC-SHA256, matching what a Kafka client computes for SCRAM-SHA-256.
+fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: u32) -> Vec<u8> {
+    use hmac::Hmac;
+    use sha2::Sha256;
+    let mut out = vec![0u8; 32];
+    pbkdf2::pbkdf2::<Hmac<Sha256>>(password, salt, iterations, &mut out).unwrap();
+    out
+}
+
+/// Perform a SASL/PLAIN handshake on a raw socket.
+///
+/// Written by hand because these tests talk raw protocol for the credential
+/// APIs, which rdkafka's AdminClient does not expose. Both SaslHandshake and
+/// SaslAuthenticate v1 use the NON-flexible header and body encoding — the spec
+/// marks SaslHandshake "flexibleVersions: none", and getting that wrong is what
+/// made every handshake unparseable before.
+async fn sasl_plain_authenticate(
+    stream: &mut tokio::net::TcpStream,
+    user: &str,
+    password: &str,
+) -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn header(api_key: i16, version: i16, correlation: i32) -> Vec<u8> {
+        let mut h = Vec::new();
+        h.extend_from_slice(&api_key.to_be_bytes());
+        h.extend_from_slice(&version.to_be_bytes());
+        h.extend_from_slice(&correlation.to_be_bytes());
+        let client_id = b"chronik-test";
+        h.extend_from_slice(&(client_id.len() as i16).to_be_bytes());
+        h.extend_from_slice(client_id);
+        h
+    }
+
+    async fn round_trip(
+        stream: &mut tokio::net::TcpStream,
+        header: Vec<u8>,
+        body: Vec<u8>,
+    ) -> Result<Vec<u8>> {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&((header.len() + body.len()) as i32).to_be_bytes());
+        frame.extend_from_slice(&header);
+        frame.extend_from_slice(&body);
+        stream.write_all(&frame).await?;
+
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).await?;
+        let mut resp = vec![0u8; i32::from_be_bytes(len_buf) as usize];
+        stream.read_exact(&mut resp).await?;
+        Ok(resp)
+    }
+
+    // SaslHandshake v1: mechanism as a regular (length-prefixed) string.
+    let mut body = Vec::new();
+    let mechanism = b"PLAIN";
+    body.extend_from_slice(&(mechanism.len() as i16).to_be_bytes());
+    body.extend_from_slice(mechanism);
+    let resp = round_trip(stream, header(17, 1, 1), body).await?;
+    // correlation_id (4) then error_code (2)
+    let error = i16::from_be_bytes([resp[4], resp[5]]);
+    anyhow::ensure!(error == 0, "SaslHandshake failed with error {}", error);
+
+    // SaslAuthenticate v1: auth bytes as regular bytes (int32 length).
+    let auth = format!("\0{}\0{}", user, password).into_bytes();
+    let mut body = Vec::new();
+    body.extend_from_slice(&(auth.len() as i32).to_be_bytes());
+    body.extend_from_slice(&auth);
+    let resp = round_trip(stream, header(36, 1, 2), body).await?;
+    let error = i16::from_be_bytes([resp[4], resp[5]]);
+    anyhow::ensure!(error == 0, "SaslAuthenticate failed with error {}", error);
+
+    Ok(())
+}

@@ -92,12 +92,64 @@ pub enum SaslState {
 /// derived once, when the user is added.
 #[derive(Debug, Clone)]
 pub struct SaslUser {
-    password: String,
-    scram_sha256: ScramCredential,
-    scram_sha512: ScramCredential,
+    /// Plaintext password, present only for users configured with one.
+    ///
+    /// `None` for a user created through `AlterUserScramCredentials`: that API
+    /// carries a salted password, never the password itself, so the broker
+    /// cannot support PLAIN for such a user. Modelling this as an `Option`
+    /// rather than an empty string means PLAIN *fails* for them instead of
+    /// silently comparing against "".
+    password: Option<String>,
+    scram_sha256: Option<ScramCredential>,
+    scram_sha512: Option<ScramCredential>,
 }
 
 impl SaslUser {
+    /// Build a user from a stored SCRAM credential (no PLAIN support).
+    pub fn from_scram_credential(credential: ScramCredential) -> Self {
+        let mut user = Self {
+            password: None,
+            scram_sha256: None,
+            scram_sha512: None,
+        };
+        user.set_scram_credential(credential);
+        user
+    }
+
+    /// Add or replace one mechanism's credential.
+    ///
+    /// A user may hold both SCRAM-SHA-256 and SCRAM-SHA-512, managed
+    /// independently by `kafka-configs.sh`.
+    pub fn set_scram_credential(&mut self, credential: ScramCredential) {
+        match credential.mechanism {
+            SaslMechanism::ScramSha512 => self.scram_sha512 = Some(credential),
+            _ => self.scram_sha256 = Some(credential),
+        }
+    }
+
+    /// The mechanisms this user can actually authenticate with.
+    pub fn available_mechanisms(&self) -> Vec<SaslMechanism> {
+        let mut mechanisms = Vec::new();
+        if self.scram_sha512.is_some() {
+            mechanisms.push(SaslMechanism::ScramSha512);
+        }
+        if self.scram_sha256.is_some() {
+            mechanisms.push(SaslMechanism::ScramSha256);
+        }
+        if self.password.is_some() {
+            mechanisms.push(SaslMechanism::Plain);
+        }
+        mechanisms
+    }
+
+    /// The stored credential for a mechanism, for reporting iteration counts.
+    pub fn credential(&self, mechanism: SaslMechanism) -> Option<&ScramCredential> {
+        match mechanism {
+            SaslMechanism::ScramSha512 => self.scram_sha512.as_ref(),
+            SaslMechanism::ScramSha256 => self.scram_sha256.as_ref(),
+            _ => None,
+        }
+    }
     /// Derive a user's credentials from a plaintext password.
     ///
     /// Both SCRAM variants are derived up front: which one a client selects is
@@ -105,24 +157,24 @@ impl SaslUser {
     /// on the authentication path.
     pub fn from_password(password: &str, iterations: u32) -> Result<Self, SaslError> {
         Ok(Self {
-            password: password.to_string(),
-            scram_sha256: ScramCredential::derive(
+            password: Some(password.to_string()),
+            scram_sha256: Some(ScramCredential::derive(
                 password,
                 SaslMechanism::ScramSha256,
                 iterations,
-            )?,
-            scram_sha512: ScramCredential::derive(
+            )?),
+            scram_sha512: Some(ScramCredential::derive(
                 password,
                 SaslMechanism::ScramSha512,
                 iterations,
-            )?,
+            )?),
         })
     }
 
     fn scram_credential(&self, mechanism: SaslMechanism) -> Option<ScramCredential> {
         match mechanism {
-            SaslMechanism::ScramSha256 => Some(self.scram_sha256.clone()),
-            SaslMechanism::ScramSha512 => Some(self.scram_sha512.clone()),
+            SaslMechanism::ScramSha256 => self.scram_sha256.clone(),
+            SaslMechanism::ScramSha512 => self.scram_sha512.clone(),
             _ => None,
         }
     }
@@ -227,6 +279,12 @@ impl SaslAuthenticator {
     }
 
     /// Add a user with pre-derived SCRAM credentials (credential store import).
+    /// Mutable access to a configured user, for layering stored credentials on
+    /// top of a configured one.
+    pub fn user_mut(&mut self, username: &str) -> Option<&mut SaslUser> {
+        self.users.get_mut(username)
+    }
+
     pub fn add_user_with_credentials(&mut self, username: String, user: SaslUser) {
         self.users.insert(username, user);
     }
@@ -370,12 +428,15 @@ impl SaslAuthenticator {
 
         // Constant-time comparison: a byte-by-byte `==` on the password leaks
         // its length and prefix through timing.
-        let authenticated = match self.users.get(username) {
-            Some(user) => {
-                let stored = user.password.as_bytes();
+        let authenticated = match self.users.get(username).and_then(|u| u.password.as_ref()) {
+            Some(stored) => {
+                let stored = stored.as_bytes();
                 let offered = password.as_bytes();
                 stored.len() == offered.len() && stored.ct_eq(offered).unwrap_u8() == 1
             }
+            // Either no such user, or a user that exists only with SCRAM
+            // credentials - PLAIN cannot authenticate them, because the broker
+            // never received a password for that user.
             None => false,
         };
 

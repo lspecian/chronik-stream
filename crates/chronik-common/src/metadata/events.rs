@@ -7,6 +7,7 @@ use uuid::Uuid;
 use super::{
     TopicConfig, SegmentMetadata, ParquetSegmentMetadata, BrokerMetadata, BrokerStatus,
     PartitionAssignment, ConsumerGroupMetadata, ConsumerOffset, AclBindingRecord,
+    ScramCredentialRecord,
 };
 
 /// Version for metadata event schema
@@ -155,6 +156,18 @@ pub enum MetadataEventPayload {
     },
     AclDeleted {
         binding: AclBindingRecord,
+    },
+
+    // SCRAM credential events (Security Phase 1). Replicated so a user created
+    // through AlterUserScramCredentials on one broker can authenticate against
+    // any of them, and survives a restart.
+    ScramCredentialUpserted {
+        credential: ScramCredentialRecord,
+    },
+    ScramCredentialDeleted {
+        username: String,
+        /// Kafka mechanism code; a user may hold one credential per mechanism.
+        mechanism: i8,
     },
 
     // Segment events (Tantivy indexes)

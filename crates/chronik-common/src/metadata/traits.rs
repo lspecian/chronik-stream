@@ -608,6 +608,28 @@ pub trait MetadataStore: Send + Sync {
         Ok(Vec::new())
     }
 
+    // ---- SCRAM credentials (Security Phase 1) ----
+
+    /// Create or replace a user's credential for one mechanism.
+    async fn upsert_scram_credential(&self, _credential: ScramCredentialRecord) -> Result<()> {
+        Err(MetadataError::NotFound(
+            "SCRAM credential storage is not supported by this metadata store".to_string(),
+        ))
+    }
+
+    /// Remove a user's credential for one mechanism.
+    async fn delete_scram_credential(&self, _username: &str, _mechanism: i8) -> Result<()> {
+        Err(MetadataError::NotFound(
+            "SCRAM credential storage is not supported by this metadata store".to_string(),
+        ))
+    }
+
+    /// Every persisted credential, for describing users and for loading the
+    /// authenticator at startup.
+    async fn list_scram_credentials(&self) -> Result<Vec<ScramCredentialRecord>> {
+        Ok(Vec::new())
+    }
+
     // System initialization
     async fn init_system_state(&self) -> Result<()>;
     
@@ -658,4 +680,31 @@ pub struct AclBindingRecord {
     pub host: String,
     pub operation: i8,
     pub permission_type: i8,
+}
+
+/// A persisted SCRAM credential.
+///
+/// Holds only derived key material — never a password, and never anything a
+/// password could be recovered from cheaply. `stored_key` is
+/// `H(HMAC(SaltedPassword, "Client Key"))`; an attacker who reads it cannot
+/// produce a valid client proof without `ClientKey`, which requires the
+/// password.
+///
+/// `mechanism` is the Kafka wire code (1 = SCRAM-SHA-256, 2 = SCRAM-SHA-512),
+/// for the same reason [`AclBindingRecord`] uses wire values: `chronik-common`
+/// does not depend on `chronik-protocol`.
+///
+/// This exists so credentials are cluster state rather than per-broker
+/// configuration. With users coming only from `CHRONIK_SASL_USERS`, every broker
+/// had to be redeployed to add one, and `kafka-configs.sh` could not manage
+/// them at all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScramCredentialRecord {
+    pub username: String,
+    /// 1 = SCRAM-SHA-256, 2 = SCRAM-SHA-512 (Kafka's ScramMechanism codes).
+    pub mechanism: i8,
+    pub iterations: u32,
+    pub salt: Vec<u8>,
+    pub stored_key: Vec<u8>,
+    pub server_key: Vec<u8>,
 }
