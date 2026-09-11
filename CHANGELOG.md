@@ -7,6 +7,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.14.0] - 2026-09-11
+
+Security controls that are actually enforced, plus two consumer-group fixes.
+
+**Everything in the security half is OFF by default.** With none of the new
+environment variables set, behaviour is identical to 2.13.3.
+
+### Added
+
+- **SASL authentication on the Kafka port** (`CHRONIK_SASL_ENABLED`), offering
+  **SCRAM-SHA-512, SCRAM-SHA-256 and PLAIN** (strongest first; PLAIN is only safe
+  under TLS). SCRAM is real RFC 5802 — PBKDF2-derived salted passwords, server
+  proof verification, constant-time comparison, and a dummy credential for
+  unknown users so failures do not enumerate accounts. `optional` mode verifies
+  credentials when offered but still serves — and logs — unauthenticated
+  clients, so a rollout can be staged before switching to `true`.
+- **Kafka ACL authorization** (`CHRONIK_ACL_ENABLED`) on Produce, Fetch,
+  consumer-group APIs, Metadata and the ACL admin APIs, with deny-over-allow,
+  prefixed patterns, super-users, and Kafka's operation implication (Read implies
+  Describe). ACLs persist through the event-sourced metadata log, so they survive
+  restarts and replicate. `CHRONIK_ACL_BINDINGS` bootstraps the first rules,
+  because an empty store either permits everything or locks out the client that
+  would write rule one.
+- **DescribeUserScramCredentials / AlterUserScramCredentials (APIs 50/51)**, so
+  `kafka-configs.sh --entity-type users` can manage SCRAM credentials at runtime.
+  Credentials are replicated and a user created through the API can authenticate
+  without a restart.
+- **Authentication and TLS for the Unified API** (`CHRONIK_API_KEY`,
+  `CHRONIK_API_TLS_CERT`/`_KEY`). Port 6092 reads topic data, so leaving it open
+  bypassed Kafka-port SASL and ACLs entirely. `/health` stays open.
+- **Per-topic authorization for `/_sql`**, with tables resolved from the query
+  plan via DataFusion rather than by string matching, so CTEs and subqueries are
+  handled the way the planner handles them. The topic→table sanitiser is lossy,
+  so the map is built forward from the live topic list and an ambiguous name
+  requires authorization on *every* candidate — ambiguity denies.
+- **Metadata topic filtering**, so a principal is not told the names of topics it
+  cannot describe.
+- **Server-side encryption for S3 object storage** (`CHRONIK_S3_SSE`,
+  `CHRONIK_S3_SSE_KMS_KEY_ID`), covering segments, Tantivy indexes, Parquet files
+  and metadata DR uploads.
+- `MetadataStore::list_consumer_groups`, with a default implementation returning
+  nothing.
+
+### Fixed
+
+- **SaslHandshake was encoded as a flexible response at v1**, which it is not.
+  librdkafka read the mechanism array length out of the tagged-field bytes and
+  reported `Invalid MechanismCount 553648128`, so no client could complete a
+  handshake.
+- **SaslAuthenticate v1 omitted the mandatory `SessionLifetimeMs`**, giving
+  clients a buffer underflow after a successful authentication.
+- **rustls 0.23 panicked selecting a crypto provider** when both `ring` and
+  `aws-lc-rs` were present. This would have killed the Kafka listener on the
+  first TLS connection, not just the admin API.
+- **SCRAM nonce check relaxed to `ends_with`** to accommodate librdkafka before
+  v2.6, which prepends its client nonce a second time (librdkafka #4895). Apache
+  Kafka made the same accommodation in 3.8.1.
+- **DescribeGroups returned `GROUP_ID_NOT_FOUND` for a group `ListGroups` was
+  returning in the same second.** The two APIs read different stores:
+  DescribeGroups was answered from a map on the protocol handler that no server
+  path writes to. Admin tooling could therefore show no group membership, and so
+  no consumer lag. It now reads the live `GroupManager`, is authorized
+  (Group/Describe), and shapes its denial as `GROUP_AUTHORIZATION_FAILED` inside
+  a well-formed response.
+- **A consumer group disappeared from `ListGroups` once its last member left.**
+  The group is `Empty`, not gone — its committed offsets remain and a restarting
+  consumer resumes from them — but `list_groups` read only the in-memory
+  registry, which `leave_group` clears. It now unions the persisted groups,
+  excluding `Dead` so DeleteGroups is not undone, and the member-expiry path
+  records `Empty` as the clean-leave path already did.
+
+### Notes
+
+- Authorization costs **402 ns per request** when enabled, measured directly:
+  end-to-end broker benchmarks are fsync-bound at `acks=1` and could not resolve
+  it.
+- Not included, deliberately: multi-listener support (`PLAINTEXT://` and
+  `SASL_SSL://` side by side) and a separate inter-broker listener; encryption at
+  rest for WAL, segments and indexes on local disk; re-authentication (KIP-368);
+  inter-broker authentication; transactional-id ACLs. See
+  `docs/ROADMAP_SECURITY.md`, which states the status of every phase.
+
+
 ## [2.13.3] - 2026-09-09
 
 ### Fixed

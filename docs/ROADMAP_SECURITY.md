@@ -611,9 +611,11 @@ until someone opts in.
 
 ### Choosing a signal that can actually fail
 
-`/health` reports `2.13.3` on **both** images, because it echoes the Cargo.toml
-version and that has not been bumped. A roll "verified" against it would have
-passed without deploying anything.
+`/health` reported `2.13.3` on **both** images, because it echoes the Cargo.toml
+version and that had not been bumped. A roll "verified" against it would have
+passed without deploying anything. (The version is 2.14.0 as of the release
+commit, so `/health` now distinguishes a 2.14.0 build from a 2.13.3 one — but it
+still cannot tell two 2.14.0 builds apart, which is the general point.)
 
 The signal used instead was `kafka-broker-api-versions.sh` on APIs 50/51, which
 landed in `a7e56d6`:
