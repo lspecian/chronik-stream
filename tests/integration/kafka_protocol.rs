@@ -19,6 +19,7 @@ use std::time::Duration;
 use tokio::time::timeout;
 
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn test_kafka_metadata_api() -> Result<()> {
     test_setup::init();
     let _serial = common::exclusive().await;
@@ -54,6 +55,7 @@ async fn test_kafka_metadata_api() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn test_kafka_topic_management() -> Result<()> {
     test_setup::init();
     let _serial = common::exclusive().await;
@@ -125,6 +127,7 @@ async fn test_kafka_topic_management() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn test_kafka_produce_consume() -> Result<()> {
     test_setup::init();
     let _serial = common::exclusive().await;
@@ -224,6 +227,7 @@ async fn test_kafka_produce_consume() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn test_kafka_consumer_groups() -> Result<()> {
     test_setup::init();
     let _serial = common::exclusive().await;
@@ -316,6 +320,7 @@ async fn test_kafka_consumer_groups() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn test_kafka_offset_management() -> Result<()> {
     test_setup::init();
     let _serial = common::exclusive().await;

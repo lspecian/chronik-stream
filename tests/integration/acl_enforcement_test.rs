@@ -79,6 +79,7 @@ async fn try_produce(producer: &FutureProducer, topic: &str) -> Result<(), Strin
 
 /// THE test: a principal with no ACL for a topic must not be able to write it.
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn produce_to_unauthorized_topic_is_denied() -> Result<()> {
     let _guard = exclusive().await;
     let cluster = TestCluster::start(acl_cluster_config()).await?;
@@ -97,6 +98,7 @@ async fn produce_to_unauthorized_topic_is_denied() -> Result<()> {
 /// The positive control. Without it the test above could pass because the
 /// broker is simply broken.
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn produce_to_authorized_topic_is_allowed() -> Result<()> {
     let _guard = exclusive().await;
     let cluster = TestCluster::start(acl_cluster_config()).await?;
@@ -118,6 +120,7 @@ async fn produce_to_authorized_topic_is_allowed() -> Result<()> {
 /// This is the Fetch half of the "empty success" trap: a consumer that receives
 /// an empty result set concludes the topic has no records and polls forever.
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn fetch_from_unauthorized_topic_is_denied() -> Result<()> {
     let _guard = exclusive().await;
     let cluster = TestCluster::start(acl_cluster_config()).await?;
@@ -170,6 +173,7 @@ async fn fetch_from_unauthorized_topic_is_denied() -> Result<()> {
 /// A super user bypasses ACLs, which is how an operator recovers a cluster that
 /// has been locked out by its own policy.
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn super_user_bypasses_acls() -> Result<()> {
     let _guard = exclusive().await;
     let mut config = acl_cluster_config();
@@ -195,6 +199,7 @@ async fn super_user_bypasses_acls() -> Result<()> {
 
 /// With ACLs disabled (the default) nothing is checked.
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn acls_disabled_by_default_allows_everything() -> Result<()> {
     let _guard = exclusive().await;
     let cluster = TestCluster::start(TestClusterConfig {
@@ -234,6 +239,7 @@ async fn acls_disabled_by_default_allows_everything() -> Result<()> {
 /// A policy expressed in configuration must still apply after a restart, and the
 /// data written under it must still be there.
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn acl_policy_survives_a_restart() -> Result<()> {
     let _guard = exclusive().await;
     let dir = tempfile::tempdir()?;
@@ -277,6 +283,7 @@ async fn acl_policy_survives_a_restart() -> Result<()> {
 /// Read could still advance the group's committed offsets - it could not read
 /// the data, but it could disrupt every consumer that can.
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn offset_commit_on_an_unauthorized_group_is_denied() -> Result<()> {
     let _guard = exclusive().await;
     let cluster = TestCluster::start(acl_cluster_config()).await?;
@@ -332,6 +339,7 @@ async fn offset_commit_on_an_unauthorized_group_is_denied() -> Result<()> {
 /// An all-topics Metadata request that named every topic on the cluster would
 /// leak the topic inventory to a principal with no rights to any of it.
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn metadata_omits_unauthorized_topics() -> Result<()> {
     let _guard = exclusive().await;
     let cluster = TestCluster::start(acl_cluster_config()).await?;

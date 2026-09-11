@@ -17,6 +17,7 @@ use std::time::Duration;
 use tokio::time::sleep;
 
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn test_search_query_types() -> Result<()> {
     test_setup::init();
     
@@ -150,6 +151,7 @@ async fn test_search_query_types() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn test_search_aggregations() -> Result<()> {
     test_setup::init();
     
@@ -293,6 +295,7 @@ async fn test_search_aggregations() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn test_search_pagination_sorting() -> Result<()> {
     test_setup::init();
     
@@ -398,6 +401,7 @@ async fn test_search_pagination_sorting() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn test_search_highlighting() -> Result<()> {
     test_setup::init();
     

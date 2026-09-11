@@ -74,6 +74,7 @@ async fn try_produce(producer: &FutureProducer, payload: &str) -> Result<(), Str
 /// THE test: with SASL required, a client that never authenticates must not be
 /// able to produce.
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn unauthenticated_client_cannot_produce() -> Result<()> {
     let _guard = exclusive().await;
     let cluster = TestCluster::start(auth_cluster_config()).await?;
@@ -94,6 +95,7 @@ async fn unauthenticated_client_cannot_produce() -> Result<()> {
 /// The positive control: correct credentials do work. Without this, the test
 /// above could pass because the broker is simply broken.
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn authenticated_client_can_produce() -> Result<()> {
     let _guard = exclusive().await;
     let cluster = TestCluster::start(auth_cluster_config()).await?;
@@ -114,6 +116,7 @@ async fn authenticated_client_can_produce() -> Result<()> {
 
 /// Wrong password must be refused. This is the case a stubbed verifier passes.
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn wrong_password_cannot_produce() -> Result<()> {
     let _guard = exclusive().await;
     let cluster = TestCluster::start(auth_cluster_config()).await?;
@@ -132,6 +135,7 @@ async fn wrong_password_cannot_produce() -> Result<()> {
 
 /// An unknown principal must be refused even with a well-formed exchange.
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn unknown_user_cannot_produce() -> Result<()> {
     let _guard = exclusive().await;
     let cluster = TestCluster::start(auth_cluster_config()).await?;
@@ -163,6 +167,7 @@ async fn unknown_user_cannot_produce() -> Result<()> {
 /// No regression for the default configuration: with SASL disabled (the default)
 /// an ordinary client works exactly as before Phase 0.
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn sasl_disabled_by_default_does_not_break_plain_clients() -> Result<()> {
     let _guard = exclusive().await;
     let cluster = TestCluster::start(TestClusterConfig {
@@ -215,6 +220,7 @@ fn scram_producer(
 }
 
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn scram_sha256_authenticates_with_correct_password() -> Result<()> {
     let _guard = exclusive().await;
     let cluster = TestCluster::start(auth_cluster_config()).await?;
@@ -236,6 +242,7 @@ async fn scram_sha256_authenticates_with_correct_password() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn scram_sha512_authenticates_with_correct_password() -> Result<()> {
     let _guard = exclusive().await;
     let cluster = TestCluster::start(auth_cluster_config()).await?;
@@ -257,6 +264,7 @@ async fn scram_sha512_authenticates_with_correct_password() -> Result<()> {
 
 /// THE regression test for the old stub, which accepted any client-final message.
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn scram_sha256_rejects_wrong_password() -> Result<()> {
     let _guard = exclusive().await;
     let cluster = TestCluster::start(auth_cluster_config()).await?;
@@ -277,6 +285,7 @@ async fn scram_sha256_rejects_wrong_password() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn scram_sha512_rejects_wrong_password() -> Result<()> {
     let _guard = exclusive().await;
     let cluster = TestCluster::start(auth_cluster_config()).await?;
@@ -296,6 +305,7 @@ async fn scram_sha512_rejects_wrong_password() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn scram_rejects_unknown_user() -> Result<()> {
     let _guard = exclusive().await;
     let cluster = TestCluster::start(auth_cluster_config()).await?;
@@ -335,6 +345,7 @@ fn optional_auth_config() -> TestClusterConfig {
 }
 
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn optional_mode_serves_unauthenticated_clients() -> Result<()> {
     let _guard = exclusive().await;
     let cluster = TestCluster::start_with_env(
@@ -357,6 +368,7 @@ async fn optional_mode_serves_unauthenticated_clients() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn optional_mode_still_accepts_valid_credentials() -> Result<()> {
     let _guard = exclusive().await;
     let cluster = TestCluster::start_with_env(
@@ -379,6 +391,7 @@ async fn optional_mode_still_accepts_valid_credentials() -> Result<()> {
 /// Optional must not degrade into "any password works" - it is a migration
 /// step, not a weakening. A wrong password still fails the exchange.
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn optional_mode_still_rejects_wrong_credentials() -> Result<()> {
     let _guard = exclusive().await;
     let cluster = TestCluster::start_with_env(
@@ -412,6 +425,7 @@ async fn optional_mode_still_rejects_wrong_credentials() -> Result<()> {
 /// A user created via API 51 must be able to authenticate, and must SURVIVE a
 /// restart — that is the difference between cluster state and one broker's RAM.
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn scram_user_created_via_api_survives_restart() -> Result<()> {
     let _guard = exclusive().await;
     let dir = tempfile::tempdir()?;

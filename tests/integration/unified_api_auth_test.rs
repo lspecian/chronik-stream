@@ -35,6 +35,7 @@ fn client() -> reqwest::Client {
 
 /// THE test: without the key, a SQL query must be refused.
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn sql_without_api_key_is_rejected() -> Result<()> {
     let _guard = exclusive().await;
     let cluster =
@@ -58,6 +59,7 @@ async fn sql_without_api_key_is_rejected() -> Result<()> {
 
 /// A wrong key must be refused too - not just a missing one.
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn sql_with_wrong_api_key_is_rejected() -> Result<()> {
     let _guard = exclusive().await;
     let cluster =
@@ -79,6 +81,7 @@ async fn sql_with_wrong_api_key_is_rejected() -> Result<()> {
 /// Any status other than 401 proves the middleware let the request through to
 /// the handler; whether that query then succeeds is not what this test is about.
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn sql_with_correct_api_key_is_allowed() -> Result<()> {
     let _guard = exclusive().await;
     let cluster =
@@ -103,6 +106,7 @@ async fn sql_with_correct_api_key_is_allowed() -> Result<()> {
 /// `/_search` reads topic data too, and is merged from a separate router. A
 /// layer applied before that merge would silently miss it.
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn search_without_api_key_is_rejected() -> Result<()> {
     let _guard = exclusive().await;
     let cluster =
@@ -126,6 +130,7 @@ async fn search_without_api_key_is_rejected() -> Result<()> {
 
 /// Health probes must not need credentials, or enabling auth reads as an outage.
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn health_stays_open_without_a_key() -> Result<()> {
     let _guard = exclusive().await;
     let cluster =
@@ -148,6 +153,7 @@ async fn health_stays_open_without_a_key() -> Result<()> {
 /// Unset key means the endpoints stay open: enabling this by default would break
 /// every existing dashboard in one step.
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn no_api_key_configured_leaves_endpoints_open() -> Result<()> {
     let _guard = exclusive().await;
     let cluster = TestCluster::start(base_config()).await?;
@@ -199,6 +205,7 @@ fn generate_test_cert(dir: &std::path::Path) -> Result<(String, String)> {
 }
 
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn unified_api_serves_https_when_configured() -> Result<()> {
     let _guard = exclusive().await;
     let dir = tempfile::tempdir()?;
@@ -239,6 +246,7 @@ async fn unified_api_serves_https_when_configured() -> Result<()> {
 /// Without this, a server that ignored the TLS configuration and kept serving
 /// HTTP would still pass the test above if the client were lenient.
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn plain_http_is_refused_when_tls_is_enabled() -> Result<()> {
     let _guard = exclusive().await;
     let dir = tempfile::tempdir()?;
@@ -334,6 +342,7 @@ async fn run_sql(cluster: &TestCluster, query: &str) -> Result<(reqwest::StatusC
 
 /// THE test: a query against a topic the principal cannot read is refused.
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn sql_query_on_unauthorized_topic_is_forbidden() -> Result<()> {
     let _guard = exclusive().await;
     let cluster = TestCluster::start_with_env(sql_acl_config(), &sql_env()).await?;
@@ -355,6 +364,7 @@ async fn sql_query_on_unauthorized_topic_is_forbidden() -> Result<()> {
 /// A query that touches BOTH an allowed and a denied topic must be refused —
 /// authorizing only the first table would leak the second through a join.
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn sql_join_touching_an_unauthorized_topic_is_forbidden() -> Result<()> {
     let _guard = exclusive().await;
     let cluster = TestCluster::start_with_env(sql_acl_config(), &sql_env()).await?;
@@ -380,6 +390,7 @@ async fn sql_join_touching_an_unauthorized_topic_is_forbidden() -> Result<()> {
 /// determined cannot be authorized, and letting it through would authorize
 /// nothing at all.
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn unparseable_sql_is_rejected_rather_than_run() -> Result<()> {
     let _guard = exclusive().await;
     let cluster = TestCluster::start_with_env(sql_acl_config(), &sql_env()).await?;
@@ -397,6 +408,7 @@ async fn unparseable_sql_is_rejected_rather_than_run() -> Result<()> {
 
 /// A query touching no topic at all needs no authorization.
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn a_query_touching_no_topic_is_allowed() -> Result<()> {
     let _guard = exclusive().await;
     let cluster = TestCluster::start_with_env(sql_acl_config(), &sql_env()).await?;
@@ -416,6 +428,7 @@ async fn a_query_touching_no_topic_is_allowed() -> Result<()> {
 
 /// With ACLs off, /_sql keeps working for any topic (the default path).
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn sql_authorization_is_off_by_default() -> Result<()> {
     let _guard = exclusive().await;
     let cluster =

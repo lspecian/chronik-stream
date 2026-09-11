@@ -76,6 +76,7 @@ async fn await_stable_assignment(
 }
 
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn test_consumer_group_rebalance() -> Result<()> {
     test_setup::init();
     let _serial = common::exclusive().await;
@@ -231,6 +232,7 @@ async fn test_consumer_group_rebalance() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn test_consumer_group_offset_commit() -> Result<()> {
     test_setup::init();
     let _serial = common::exclusive().await;
@@ -381,6 +383,7 @@ async fn test_consumer_group_offset_commit() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn test_consumer_group_failure_handling() -> Result<()> {
     test_setup::init();
     let _serial = common::exclusive().await;
@@ -535,6 +538,7 @@ async fn test_consumer_group_failure_handling() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn test_consumer_group_incremental_rebalance() -> Result<()> {
     test_setup::init();
     let _serial = common::exclusive().await;
@@ -707,6 +711,7 @@ async fn one_live_consumer(
 /// instead of failing an assertion. Membership content is covered by the unit
 /// test `consumer_group::tests::describe_sees_a_live_group_with_its_members`.
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn describe_groups_agrees_with_list_groups() -> Result<()> {
     test_setup::init();
     let _serial = common::exclusive().await;
@@ -745,6 +750,7 @@ async fn describe_groups_agrees_with_list_groups() -> Result<()> {
 /// `kafka-consumer-groups.sh --list` and from Kafka UI the moment the last
 /// consumer disconnected — while its offsets were still stored.
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn an_empty_group_is_still_visible() -> Result<()> {
     test_setup::init();
     let _serial = common::exclusive().await;
