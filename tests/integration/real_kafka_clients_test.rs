@@ -595,6 +595,7 @@ async fn test_client_error_handling() -> Result<()> {
 
 /// Helper function to check if Chronik Stream properly handles Kafka protocol versions
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn test_protocol_version_negotiation() -> Result<()> {
     let test_env = TestEnvironment::new().await?;
     test_env.create_bucket("chronik-test").await?;
