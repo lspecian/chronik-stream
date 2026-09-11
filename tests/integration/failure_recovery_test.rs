@@ -11,6 +11,7 @@ use tokio::time::sleep;
 use crate::testcontainers_setup::{TestEnvironment, ChronikCluster};
 
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn test_node_failure_recovery() -> Result<()> {
     let test_env = TestEnvironment::new().await?;
     test_env.create_bucket("chronik-test").await?;
@@ -143,6 +144,7 @@ async fn test_node_failure_recovery() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn test_network_partition() -> Result<()> {
     let test_env = TestEnvironment::new().await?;
     test_env.create_bucket("chronik-test").await?;
@@ -203,6 +205,7 @@ async fn test_network_partition() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn test_consumer_group_coordinator_failover() -> Result<()> {
     let test_env = TestEnvironment::new().await?;
     test_env.create_bucket("chronik-test").await?;
@@ -302,6 +305,7 @@ async fn test_consumer_group_coordinator_failover() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn test_data_consistency_during_failures() -> Result<()> {
     let test_env = TestEnvironment::new().await?;
     test_env.create_bucket("chronik-test").await?;

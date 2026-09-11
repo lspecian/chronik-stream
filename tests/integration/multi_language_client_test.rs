@@ -9,6 +9,7 @@ use tempfile::TempDir;
 use crate::testcontainers_setup::{TestEnvironment, ChronikCluster};
 
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn test_java_kafka_client() -> Result<()> {
     let test_env = TestEnvironment::new().await?;
     test_env.create_bucket("chronik-test").await?;
@@ -127,6 +128,7 @@ public class KafkaTest {{
 }
 
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn test_python_kafka_client() -> Result<()> {
     let test_env = TestEnvironment::new().await?;
     test_env.create_bucket("chronik-test").await?;
@@ -234,6 +236,7 @@ else:
 }
 
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn test_nodejs_kafka_client() -> Result<()> {
     let test_env = TestEnvironment::new().await?;
     test_env.create_bucket("chronik-test").await?;
@@ -365,6 +368,7 @@ test().catch(console.error);
 }
 
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn test_cross_language_compatibility() -> Result<()> {
     let test_env = TestEnvironment::new().await?;
     test_env.create_bucket("chronik-test").await?;

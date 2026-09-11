@@ -16,7 +16,17 @@ pub struct TestClusterConfig {
     pub data_dir: Option<PathBuf>,
     pub object_storage: ObjectStorageType,
     pub enable_tls: bool,
+    /// Require SASL authentication (sets `CHRONIK_SASL_ENABLED`).
     pub enable_auth: bool,
+    /// `(username, password)` pairs the broker will accept, passed as
+    /// `CHRONIK_SASL_USERS`. Only meaningful with `enable_auth`.
+    pub sasl_users: Vec<(String, String)>,
+    /// Require ACL authorization (sets `CHRONIK_ACL_ENABLED`).
+    pub enable_acls: bool,
+    /// Bootstrap ACL bindings, passed as `CHRONIK_ACL_BINDINGS`.
+    pub acl_bindings: String,
+    /// Whether an operation with no matching ACL is allowed.
+    pub acl_allow_if_no_acl: bool,
     pub enable_wal_metadata: bool,
 }
 
@@ -28,6 +38,10 @@ impl Default for TestClusterConfig {
             object_storage: ObjectStorageType::Local,
             enable_tls: false,
             enable_auth: false,
+            sasl_users: Vec::new(),
+            enable_acls: false,
+            acl_bindings: String::new(),
+            acl_allow_if_no_acl: true,
             enable_wal_metadata: true,
         }
     }
@@ -74,6 +88,9 @@ pub struct TestCluster {
     /// run on one host without colliding on the default.
     api_addrs: Vec<SocketAddr>,
     processes: Vec<Child>,
+    /// Whether the Unified API was configured for TLS, which decides how
+    /// readiness is probed.
+    tls_env_set: bool,
 }
 
 /// Locate the `chronik-server` binary under test.
@@ -97,6 +114,17 @@ pub fn server_binary() -> PathBuf {
 impl TestCluster {
     /// Create and start a new test cluster
     pub async fn start(config: TestClusterConfig) -> Result<Self> {
+        Self::start_with_env(config, &[]).await
+    }
+
+    /// Start a cluster with extra environment variables on each broker.
+    ///
+    /// An escape hatch for settings that have no field on `TestClusterConfig`,
+    /// so a test can exercise one without the struct growing a field per knob.
+    pub async fn start_with_env(
+        config: TestClusterConfig,
+        extra_env: &[(&str, &str)],
+    ) -> Result<Self> {
         info!("Starting test cluster with config: {:?}", config);
 
         // Create temporary directory if not provided
@@ -112,17 +140,22 @@ impl TestCluster {
         let server_addrs = allocate_ports(config.num_servers)?;
         let api_addrs = allocate_ports(config.num_servers)?;
 
+        let tls_env_set = extra_env
+            .iter()
+            .any(|(k, _)| *k == "CHRONIK_API_TLS_CERT" || *k == "CHRONIK_TLS_CERT");
+
         let mut cluster = Self {
             config: config.clone(),
             _temp_dir,
             server_addrs: server_addrs.clone(),
             api_addrs,
             processes: Vec::new(),
+            tls_env_set,
         };
 
         // Start servers
         for (i, addr) in server_addrs.iter().enumerate() {
-            cluster.start_server(i, *addr, &data_dir).await?;
+            cluster.start_server(i, *addr, &data_dir, extra_env).await?;
         }
 
         // Wait for servers to be ready
@@ -163,7 +196,13 @@ impl TestCluster {
         format!("http://{}", self.api_addrs[0])
     }
 
-    async fn start_server(&mut self, id: usize, addr: SocketAddr, data_dir: &PathBuf) -> Result<()> {
+    async fn start_server(
+        &mut self,
+        id: usize,
+        addr: SocketAddr,
+        data_dir: &PathBuf,
+        extra_env: &[(&str, &str)],
+    ) -> Result<()> {
         let node_data_dir = data_dir.join(format!("server-{}", id));
         std::fs::create_dir_all(&node_data_dir)?;
 
@@ -189,6 +228,30 @@ impl TestCluster {
             .arg("--kafka-port").arg(addr.port().to_string())
             .arg("--data-dir").arg(node_data_dir.to_str().unwrap());
 
+        // SASL authentication. Off unless a test asks for it, matching the
+        // broker default - enabling auth locks out every unconfigured client.
+        if self.config.enable_auth {
+            let users = self
+                .config
+                .sasl_users
+                .iter()
+                .map(|(u, p)| format!("{}:{}", u, p))
+                .collect::<Vec<_>>()
+                .join(",");
+            cmd.env("CHRONIK_SASL_ENABLED", "true")
+                .env("CHRONIK_SASL_USERS", users);
+        }
+
+        // ACL authorization.
+        if self.config.enable_acls {
+            cmd.env("CHRONIK_ACL_ENABLED", "true")
+                .env(
+                    "CHRONIK_ACL_ALLOW_IF_NO_ACL",
+                    if self.config.acl_allow_if_no_acl { "true" } else { "false" },
+                )
+                .env("CHRONIK_ACL_BINDINGS", &self.config.acl_bindings);
+        }
+
         // Configure object storage
         match &self.config.object_storage {
             ObjectStorageType::Local => {
@@ -209,6 +272,10 @@ impl TestCluster {
             }
         }
 
+        for (key, value) in extra_env {
+            cmd.env(key, value);
+        }
+
         info!("Starting server {} with command: {:?}", id, cmd);
         let child = cmd.spawn()?;
         self.processes.push(child);
@@ -227,8 +294,19 @@ impl TestCluster {
         // And to serve the Unified API. A test that queries /_search or /admin
         // right after the Kafka port opens would otherwise race the HTTP
         // listener, which starts later in the builder.
+        //
+        // When the API is configured for TLS an `http://` probe can never
+        // succeed, so fall back to waiting for the socket. Probing HTTP only
+        // would make every HTTPS test fail in the harness rather than in the
+        // product, which reads as a broken feature.
+        let api_is_https = self.tls_env_set;
         for addr in &self.api_addrs {
-            wait_for_http_endpoint(&format!("http://{}/health", addr), Duration::from_secs(30)).await?;
+            if api_is_https {
+                wait_for_tcp_endpoint(addr, Duration::from_secs(30)).await?;
+            } else {
+                wait_for_http_endpoint(&format!("http://{}/health", addr), Duration::from_secs(30))
+                    .await?;
+            }
         }
 
         Ok(())

@@ -556,7 +556,8 @@ The codebase has significant dead code that should be cleaned up first:
 | Feature | Status | Location |
 |---------|--------|----------|
 | WAL Replication | ✅ **Working** | `chronik-server/src/wal_replication.rs` |
-| SASL Auth (PLAIN, SCRAM) | ✅ **Working** | `chronik-protocol/src/sasl.rs` |
+| SASL Auth (PLAIN) | ✅ **Working + enforced** (this release) | `chronik-protocol/src/sasl.rs`, `chronik-server/src/connection.rs` |
+| SASL Auth (SCRAM) | ❌ **Not implemented** — no longer advertised | Phase 1, `docs/ROADMAP_SECURITY.md` |
 | Kafka Protocol Handler | ✅ **Working** | `chronik-server/src/kafka_handler.rs` |
 | Transaction Coordinator | ❌ **Dead Code** | `chronik-protocol/src/transaction_coordinator.rs` |
 | ACL Manager | ❌ **Dead Code** | `chronik-protocol/src/acl_manager.rs` |

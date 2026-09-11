@@ -13,6 +13,10 @@ use crate::produce_handler::ProduceHandler;
 use crate::consumer_group::GroupManager;
 use crate::fetch_handler::FetchHandler;
 use crate::wal_integration::WalProduceHandler;
+use crate::connection::ConnectionContext;
+use crate::acl::AclStore;
+use crate::authorizer::{Authorizer, ERROR_TOPIC_AUTHORIZATION_FAILED, ERROR_GROUP_AUTHORIZATION_FAILED};
+use chronik_protocol::describe_acls_types::{AclOperation, ResourceType};
 use bytes::{Bytes, BytesMut, BufMut, Buf};
 use tokio::sync::RwLock;
 use tracing::{debug, error, instrument};
@@ -43,6 +47,8 @@ pub struct KafkaProtocolHandler {
     expected_topics: Arc<RwLock<HashSet<String>>>,
     /// Default number of partitions for auto-created topics
     default_num_partitions: u32,
+    /// ACL authorization (Security Phase 3). Disabled unless CHRONIK_ACL_ENABLED.
+    authorizer: Authorizer,
 }
 
 impl KafkaProtocolHandler {
@@ -62,7 +68,21 @@ impl KafkaProtocolHandler {
     ) -> Result<Self> {
         let group_manager = Arc::new(GroupManager::new(metadata_store.clone()));
         group_manager.clone().start_expiration_checker();
-        
+
+        // Authorization. Disabled unless CHRONIK_ACL_ENABLED; bootstrap rules
+        // come from CHRONIK_ACL_BINDINGS so a deployment can start closed
+        // instead of having to admit an unauthenticated client to write the
+        // first rule.
+        let acl_store = Arc::new(AclStore::new());
+        // Persisted rules first, then config bindings on top. Rules created via
+        // CreateAcls now survive restart and reach every broker through the
+        // metadata log; bootstrap bindings remain additive.
+        acl_store.load_persisted(metadata_store.as_ref()).await;
+        if let Ok(spec) = std::env::var("CHRONIK_ACL_BINDINGS") {
+            let loaded = acl_store.load_bootstrap_acls(&spec).await;
+            tracing::info!("Loaded {} bootstrap ACL binding(s)", loaded);
+        }
+
         Ok(Self {
             protocol_handler: ProtocolHandler::with_full_config(
                 metadata_store.clone(),
@@ -81,6 +101,7 @@ impl KafkaProtocolHandler {
             port,
             expected_topics: Arc::new(RwLock::new(HashSet::new())),
             default_num_partitions,
+            authorizer: Authorizer::new(acl_store),
         })
     }
 
@@ -89,54 +110,100 @@ impl KafkaProtocolHandler {
         &self.produce_handler
     }
 
+    /// The ACL authorizer, so the HTTP surface can enforce the same policy.
+    pub fn authorizer(&self) -> &Authorizer {
+        &self.authorizer
+    }
+
     /// Get reference to the WAL produce handler for shutdown
     pub fn get_wal_handler(&self) -> &Arc<WalProduceHandler> {
         &self.wal_handler
     }
 
-    /// Handle a Kafka protocol request
-    #[instrument(skip(self, request_bytes))]
+    /// Handle a Kafka protocol request without a connection context.
+    ///
+    /// Equivalent to [`Self::handle_request_with_context`] on a connection where
+    /// authentication is disabled. Retained for in-process callers and tests;
+    /// the server's accept loops always pass a real context so that the
+    /// pre-authentication gate applies.
     pub async fn handle_request(&self, request_bytes: &[u8]) -> Result<Response> {
+        let ctx = ConnectionContext::internal();
+        self.handle_request_with_context(&ctx, request_bytes).await
+    }
+
+    /// Handle a Kafka protocol request on behalf of a specific connection.
+    ///
+    /// The connection context carries the authentication state. Requests are
+    /// gated on it *before* routing: when SASL is enabled and the connection has
+    /// not authenticated, only `ApiVersions`, `SaslHandshake` and
+    /// `SaslAuthenticate` reach a handler.
+    #[instrument(skip(self, request_bytes))]
+    pub async fn handle_request_with_context(
+        &self,
+        ctx: &ConnectionContext,
+        request_bytes: &[u8],
+    ) -> Result<Response> {
         // Helper to detect if we should pre-create a test topic for kafka-python clients
         self.infer_expected_topics_from_context().await;
         debug!("Handling request of {} bytes", request_bytes.len());
-        
+
         // Log first few bytes to identify request type
         if request_bytes.len() >= 4 {
             let api_key = i16::from_be_bytes([request_bytes[0], request_bytes[1]]);
             let api_version = i16::from_be_bytes([request_bytes[2], request_bytes[3]]);
             tracing::info!("Request: API key={}, version={}", api_key, api_version);
         }
-        
-        
+
+
         // Parse the request header to determine which API is being called
         let mut buf = bytes::Bytes::from(request_bytes.to_vec());
         let header = parse_request_header(&mut buf)?;
+
+        // Pre-authentication gate. Runs before routing so that no handler can be
+        // reached by an unauthenticated client. Without this, SASL is advisory:
+        // credentials are checked and the answer is discarded.
+        //
+        // The rejection travels as an error so the connection's error path
+        // encodes a correctly-shaped response for whichever API was attempted;
+        // `AUTH_REQUIRED_MARKER` makes it come out as ILLEGAL_SASL_STATE.
+        if let Err(rejection) = ctx.check_request_allowed(header.api_key as i16).await {
+            return Err(Error::Unauthorized(format!(
+                "{}: {}",
+                crate::error_handler::AUTH_REQUIRED_MARKER,
+                rejection.message
+            )));
+        }
 
         // Save a copy of the buffer for metadata processing
         let _buf_copy = buf.clone();
 
         // Route to specific handler methods (all extracted for maintainability)
         match header.api_key {
-            ApiKey::Metadata => self.handle_metadata_request(header, buf).await,
-            ApiKey::Produce => self.handle_produce_request(header, buf).await,
-            ApiKey::Fetch => self.handle_fetch_request(header, buf).await,
+            ApiKey::Metadata => self.handle_metadata_request(ctx, header, buf).await,
+            ApiKey::Produce => self.handle_produce_request(ctx, header, buf).await,
+            ApiKey::Fetch => self.handle_fetch_request(ctx, header, buf).await,
             ApiKey::ListOffsets => self.handle_list_offsets_request(header, buf).await,
             ApiKey::FindCoordinator => self.handle_find_coordinator_request(header, buf).await,
-            ApiKey::JoinGroup => self.handle_join_group_request(header, buf).await,
-            ApiKey::SyncGroup => self.handle_sync_group_request(header, buf).await,
-            ApiKey::Heartbeat => self.handle_heartbeat_request(header, buf).await,
-            ApiKey::LeaveGroup => self.handle_leave_group_request(header, buf).await,
-            ApiKey::OffsetCommit => self.handle_offset_commit_request(header, buf).await,
-            ApiKey::OffsetFetch => self.handle_offset_fetch_request(header, buf).await,
+            ApiKey::JoinGroup => self.handle_join_group_request(ctx, header, buf).await,
+            ApiKey::SyncGroup => self.handle_sync_group_request(ctx, header, buf).await,
+            ApiKey::Heartbeat => self.handle_heartbeat_request(ctx, header, buf).await,
+            ApiKey::LeaveGroup => self.handle_leave_group_request(ctx, header, buf).await,
+            ApiKey::OffsetCommit => self.handle_offset_commit_request(ctx, header, buf).await,
+            ApiKey::OffsetFetch => self.handle_offset_fetch_request(ctx, header, buf).await,
             ApiKey::CreateTopics => self.handle_create_topics_request(header, buf, request_bytes).await,
-            ApiKey::SaslHandshake => self.handle_sasl_handshake_request(header, buf).await,
-            ApiKey::SaslAuthenticate => self.handle_sasl_authenticate_request(header, buf).await,
+            ApiKey::DescribeUserScramCredentials => self.handle_describe_user_scram_credentials(ctx, header, buf).await,
+            ApiKey::AlterUserScramCredentials => self.handle_alter_user_scram_credentials(ctx, header, buf).await,
+            ApiKey::DescribeAcls => self.handle_describe_acls_request(ctx, header, buf).await,
+            ApiKey::CreateAcls => self.handle_create_acls_request(ctx, header, buf).await,
+            ApiKey::DeleteAcls => self.handle_delete_acls_request(ctx, header, buf).await,
+            ApiKey::SaslHandshake => self.handle_sasl_handshake_request(ctx, header, buf).await,
+            ApiKey::SaslAuthenticate => self.handle_sasl_authenticate_request(ctx, header, buf).await,
             ApiKey::DeleteTopics => self.handle_delete_topics_request(request_bytes).await,
             ApiKey::DeleteRecords => self.handle_delete_records_request(header, buf).await,
             ApiKey::DeleteGroups => self.handle_delete_groups_request(header, buf).await,
             ApiKey::OffsetDelete => self.handle_offset_delete_request(header, buf).await,
             ApiKey::ListGroups => self.handle_list_groups_request(header, buf).await,
+            ApiKey::DescribeGroups => self.handle_describe_groups_request(ctx, header, buf).await,
             ApiKey::EndTxn => self.handle_end_txn_request(header, buf).await,
             ApiKey::OffsetForLeaderEpoch => self.handle_offset_for_leader_epoch_request(header, buf).await,
             _ => self.handle_default_request(request_bytes, header.api_key, header.api_version).await,
@@ -239,6 +306,7 @@ impl KafkaProtocolHandler {
     #[instrument(skip(self, buf))]
     async fn handle_metadata_request(
         &self,
+        ctx: &ConnectionContext,
         header: chronik_protocol::parser::RequestHeader,
         mut buf: Bytes,
     ) -> Result<Response> {
@@ -333,8 +401,40 @@ impl KafkaProtocolHandler {
             }
         }
 
+        // Authorization: Metadata requires Describe on each topic.
+        //
+        // The set is computed here, where the connection (and so the principal)
+        // is known, and passed down; the protocol handler owns the response
+        // shape and applies the filter to it.
+        //
+        // For an all-topics request the candidate list has to come from the
+        // metadata store, because the request names nothing to check.
+        let authorized = if self.authorizer.is_enabled() {
+            let candidates: Vec<String> = match &topics {
+                Some(requested) => requested.clone(),
+                None => self
+                    .metadata_store
+                    .list_topics()
+                    .await
+                    .map(|topics| topics.into_iter().map(|t| t.name).collect())
+                    .unwrap_or_default(),
+            };
+            let (allowed, denied) = self
+                .authorizer
+                .partition_topics(ctx, &candidates, AclOperation::Describe)
+                .await;
+            if !denied.is_empty() {
+                tracing::debug!("Metadata: withholding {} unauthorized topic(s)", denied.len());
+            }
+            Some(allowed.into_iter().collect::<std::collections::HashSet<_>>())
+        } else {
+            None
+        };
+
         // Now delegate to protocol handler for the actual metadata response
-        self.protocol_handler.handle_metadata(header, &mut buf).await
+        self.protocol_handler
+            .handle_metadata_filtered(header, &mut buf, authorized.as_ref())
+            .await
     }
 
     /// Handle Produce API request
@@ -344,6 +444,7 @@ impl KafkaProtocolHandler {
     #[instrument(skip(self, buf))]
     async fn handle_produce_request(
         &self,
+        ctx: &ConnectionContext,
         header: chronik_protocol::parser::RequestHeader,
         mut buf: Bytes,
     ) -> Result<Response> {
@@ -358,6 +459,19 @@ impl KafkaProtocolHandler {
         let topic_names: Vec<String> = request.topics.iter()
             .map(|t| t.name.clone())
             .collect();
+
+        // Authorization (Write on each topic). Checked BEFORE auto-creation:
+        // otherwise an unauthorized producer could still create topics, which is
+        // a write to cluster state even when no record is ever stored.
+        if self.authorizer.is_enabled() {
+            let (_, denied) = self
+                .authorizer
+                .partition_topics(ctx, &topic_names, AclOperation::Write)
+                .await;
+            if !denied.is_empty() {
+                return self.produce_authorization_denied(&header, &request, &denied);
+            }
+        }
 
         if !topic_names.is_empty() {
             tracing::trace!("Produce request for topics: {:?}", topic_names);
@@ -398,6 +512,840 @@ impl KafkaProtocolHandler {
             },
             body: body_buf.freeze(),
             is_flexible: header.api_version >= 9,  // v9+ uses flexible/compact encoding
+            api_key: ApiKey::Produce,
+            throttle_time_ms: None,
+        })
+    }
+
+    // ========================================================================
+    // SCRAM credential administration (Security Phase 1)
+    //
+    // What `kafka-configs.sh --entity-type users` drives. Credentials go through
+    // the metadata log, so a user created on one broker authenticates against
+    // every broker and survives a restart — unlike CHRONIK_SASL_USERS, which is
+    // per-broker configuration requiring a redeploy to change.
+    // ========================================================================
+
+    /// Handle DescribeUserScramCredentials (API 50).
+    async fn handle_describe_user_scram_credentials(
+        &self,
+        ctx: &ConnectionContext,
+        header: chronik_protocol::parser::RequestHeader,
+        mut buf: Bytes,
+    ) -> Result<Response> {
+        use chronik_protocol::scram_credentials_types::*;
+
+        let mut decoder = chronik_protocol::parser::Decoder::new(&mut buf);
+        let request = parse_describe_user_scram_credentials_request(&mut decoder)?;
+
+        // Kafka requires Describe on the cluster to list users.
+        if !self
+            .authorizer
+            .authorize_cluster(ctx, AclOperation::Describe)
+            .await
+        {
+            return self.scram_response(
+                &header,
+                encode_describe_user_scram_credentials_response(
+                    &DescribeUserScramCredentialsResponse {
+                        throttle_time_ms: 0,
+                        error_code: crate::authorizer::ERROR_CLUSTER_AUTHORIZATION_FAILED,
+                        error_message: Some("Not authorized to describe users".to_string()),
+                        results: Vec::new(),
+                    },
+                ),
+                ApiKey::DescribeUserScramCredentials,
+            );
+        }
+
+        let stored = self
+            .metadata_store
+            .list_scram_credentials()
+            .await
+            .map_err(|e| Error::Internal(format!("Failed to list credentials: {:?}", e)))?;
+
+        // Group by user. A user may hold one credential per mechanism.
+        let mut by_user: std::collections::BTreeMap<String, Vec<CredentialInfo>> =
+            std::collections::BTreeMap::new();
+        for record in stored {
+            by_user
+                .entry(record.username.clone())
+                .or_default()
+                .push(CredentialInfo {
+                    mechanism: record.mechanism,
+                    iterations: record.iterations as i32,
+                });
+        }
+
+        let results = match &request.users {
+            // Named users: report each, including RESOURCE_NOT_FOUND for one
+            // that does not exist, which is what kafka-configs.sh expects.
+            Some(users) => users
+                .iter()
+                .map(|u| match by_user.get(&u.name) {
+                    Some(infos) => DescribeUserScramCredentialsResult {
+                        user: u.name.clone(),
+                        error_code: 0,
+                        error_message: None,
+                        credential_infos: infos.clone(),
+                    },
+                    None => DescribeUserScramCredentialsResult {
+                        user: u.name.clone(),
+                        error_code: 89, // RESOURCE_NOT_FOUND
+                        error_message: Some("User not found".to_string()),
+                        credential_infos: Vec::new(),
+                    },
+                })
+                .collect(),
+            // All users.
+            None => by_user
+                .into_iter()
+                .map(|(user, credential_infos)| DescribeUserScramCredentialsResult {
+                    user,
+                    error_code: 0,
+                    error_message: None,
+                    credential_infos,
+                })
+                .collect(),
+        };
+
+        self.scram_response(
+            &header,
+            encode_describe_user_scram_credentials_response(
+                &DescribeUserScramCredentialsResponse {
+                    throttle_time_ms: 0,
+                    error_code: 0,
+                    error_message: None,
+                    results,
+                },
+            ),
+            ApiKey::DescribeUserScramCredentials,
+        )
+    }
+
+    /// Handle AlterUserScramCredentials (API 51).
+    async fn handle_alter_user_scram_credentials(
+        &self,
+        ctx: &ConnectionContext,
+        header: chronik_protocol::parser::RequestHeader,
+        mut buf: Bytes,
+    ) -> Result<Response> {
+        use chronik_common::metadata::traits::ScramCredentialRecord;
+        use chronik_protocol::sasl::SaslMechanism;
+        use chronik_protocol::scram::ScramCredential;
+        use chronik_protocol::scram_credentials_types::*;
+
+        let mut decoder = chronik_protocol::parser::Decoder::new(&mut buf);
+        let request = parse_alter_user_scram_credentials_request(&mut decoder)?;
+
+        // Altering users is a privileged cluster operation.
+        if !self
+            .authorizer
+            .authorize_cluster(ctx, AclOperation::Alter)
+            .await
+        {
+            let results = request
+                .deletions
+                .iter()
+                .map(|d| d.name.clone())
+                .chain(request.upsertions.iter().map(|u| u.name.clone()))
+                .map(|user| AlterUserScramCredentialsResult {
+                    user,
+                    error_code: crate::authorizer::ERROR_CLUSTER_AUTHORIZATION_FAILED,
+                    error_message: Some("Not authorized to alter users".to_string()),
+                })
+                .collect();
+            return self.scram_response(
+                &header,
+                encode_alter_user_scram_credentials_response(
+                    &AlterUserScramCredentialsResponse {
+                        throttle_time_ms: 0,
+                        results,
+                    },
+                ),
+                ApiKey::AlterUserScramCredentials,
+            );
+        }
+
+        let mut results = Vec::new();
+
+        for deletion in &request.deletions {
+            let outcome = self
+                .metadata_store
+                .delete_scram_credential(&deletion.name, deletion.mechanism)
+                .await;
+            results.push(AlterUserScramCredentialsResult {
+                user: deletion.name.clone(),
+                error_code: if outcome.is_ok() { 0 } else { 42 },
+                error_message: outcome.err().map(|e| format!("{:?}", e)),
+            });
+        }
+
+        for upsertion in &request.upsertions {
+            let mechanism = match upsertion.mechanism {
+                MECHANISM_SCRAM_SHA_256 => SaslMechanism::ScramSha256,
+                MECHANISM_SCRAM_SHA_512 => SaslMechanism::ScramSha512,
+                other => {
+                    results.push(AlterUserScramCredentialsResult {
+                        user: upsertion.name.clone(),
+                        error_code: 37, // UNSUPPORTED_SASL_MECHANISM
+                        error_message: Some(format!("Unknown SCRAM mechanism code {}", other)),
+                    });
+                    continue;
+                }
+            };
+
+            // Derive the stored keys from the salted password the client sent.
+            // The password itself never reaches the broker.
+            let credential = match ScramCredential::from_salted_password(
+                upsertion.salt.clone(),
+                &upsertion.salted_password,
+                mechanism,
+                upsertion.iterations.max(0) as u32,
+            ) {
+                Ok(credential) => credential,
+                Err(e) => {
+                    results.push(AlterUserScramCredentialsResult {
+                        user: upsertion.name.clone(),
+                        error_code: 42, // INVALID_REQUEST
+                        error_message: Some(e.to_string()),
+                    });
+                    continue;
+                }
+            };
+
+            let record = ScramCredentialRecord {
+                username: upsertion.name.clone(),
+                mechanism: upsertion.mechanism,
+                iterations: credential.iterations,
+                salt: credential.salt.clone(),
+                stored_key: credential.stored_key.clone(),
+                server_key: credential.server_key.clone(),
+            };
+
+            let outcome = self.metadata_store.upsert_scram_credential(record).await;
+            if outcome.is_ok() {
+                tracing::info!(
+                    "SCRAM credential set for user '{}' ({})",
+                    upsertion.name,
+                    mechanism.as_str()
+                );
+            }
+            results.push(AlterUserScramCredentialsResult {
+                user: upsertion.name.clone(),
+                error_code: if outcome.is_ok() { 0 } else { 42 },
+                error_message: outcome.err().map(|e| format!("{:?}", e)),
+            });
+        }
+
+        self.scram_response(
+            &header,
+            encode_alter_user_scram_credentials_response(&AlterUserScramCredentialsResponse {
+                throttle_time_ms: 0,
+                results,
+            }),
+            ApiKey::AlterUserScramCredentials,
+        )
+    }
+
+    /// Wrap an encoded SCRAM-credential response body.
+    fn scram_response(
+        &self,
+        header: &chronik_protocol::parser::RequestHeader,
+        body: BytesMut,
+        api_key: ApiKey,
+    ) -> Result<Response> {
+        Ok(Response {
+            header: ResponseHeader {
+                correlation_id: header.correlation_id,
+            },
+            body: body.freeze(),
+            // Both APIs are flexible at every version.
+            is_flexible: true,
+            api_key,
+            throttle_time_ms: None,
+        })
+    }
+
+    // ========================================================================
+    // ACL administration (Security Phase 3)
+    //
+    // These previously answered SECURITY_DISABLED from the protocol handler,
+    // because no authorizer was wired in. Without them ACLs are unusable: the
+    // store starts empty, so enabling authorization either allows everything
+    // (allow_if_no_acl=true) or denies everything, with no way to write a rule.
+    // They are backed by the same AclStore the request path consults.
+    // ========================================================================
+
+    /// Handle CreateAcls (API 30).
+    async fn handle_create_acls_request(
+        &self,
+        ctx: &ConnectionContext,
+        header: chronik_protocol::parser::RequestHeader,
+        mut buf: Bytes,
+    ) -> Result<Response> {
+        use chronik_protocol::create_acls_types::{
+            encode_create_acls_response, parse_create_acls_request, AclCreationResult,
+            CreateAclsResponse,
+        };
+        use chronik_protocol::describe_acls_types::{AclPermissionType, PatternType};
+        use crate::acl::AclBinding;
+
+        let mut decoder = chronik_protocol::parser::Decoder::new(&mut buf);
+        let request = parse_create_acls_request(&mut decoder, header.api_version)?;
+
+        // Altering ACLs is itself a privileged cluster operation.
+        if !self
+            .authorizer
+            .authorize_cluster(ctx, AclOperation::Alter)
+            .await
+        {
+            let results = request
+                .creations
+                .iter()
+                .map(|_| AclCreationResult {
+                    error_code: crate::authorizer::ERROR_CLUSTER_AUTHORIZATION_FAILED,
+                    error_message: Some("Not authorized to alter ACLs".to_string()),
+                })
+                .collect();
+            return self.acl_response(
+                &header,
+                encode_create_acls_response(&CreateAclsResponse {
+                    throttle_time_ms: 0,
+                    results,
+                }),
+                ApiKey::CreateAcls,
+            );
+        }
+
+        let mut results = Vec::with_capacity(request.creations.len());
+        for creation in &request.creations {
+            let binding = AclBinding {
+                resource_type: ResourceType::from_i8(creation.resource_type),
+                resource_name: creation.resource_name.clone(),
+                pattern_type: PatternType::from_i8(creation.resource_pattern_type),
+                principal: creation.principal.clone(),
+                host: creation.host.clone(),
+                operation: AclOperation::from_i8(creation.operation),
+                permission_type: AclPermissionType::from_i8(creation.permission_type),
+            };
+            match self
+                .authorizer
+                .store()
+                .create_acl_durable(binding, self.metadata_store.as_ref())
+                .await
+            {
+                Ok(()) => results.push(AclCreationResult {
+                    error_code: 0,
+                    error_message: None,
+                }),
+                Err(e) => results.push(AclCreationResult {
+                    error_code: 42, // INVALID_REQUEST
+                    error_message: Some(e.to_string()),
+                }),
+            }
+        }
+
+        self.acl_response(
+            &header,
+            encode_create_acls_response(&CreateAclsResponse {
+                throttle_time_ms: 0,
+                results,
+            }),
+            ApiKey::CreateAcls,
+        )
+    }
+
+    /// Handle DeleteAcls (API 31).
+    async fn handle_delete_acls_request(
+        &self,
+        ctx: &ConnectionContext,
+        header: chronik_protocol::parser::RequestHeader,
+        mut buf: Bytes,
+    ) -> Result<Response> {
+        use chronik_protocol::delete_acls_types::{
+            encode_delete_acls_response, parse_delete_acls_request, DeleteAclsResponse,
+            FilterResult, MatchingAcl,
+        };
+        use chronik_protocol::describe_acls_types::PatternType;
+        use crate::acl::AclFilter;
+
+        let mut decoder = chronik_protocol::parser::Decoder::new(&mut buf);
+        let request = parse_delete_acls_request(&mut decoder, header.api_version)?;
+
+        if !self
+            .authorizer
+            .authorize_cluster(ctx, AclOperation::Alter)
+            .await
+        {
+            let filter_results = request
+                .filters
+                .iter()
+                .map(|_| FilterResult {
+                    error_code: crate::authorizer::ERROR_CLUSTER_AUTHORIZATION_FAILED,
+                    error_message: Some("Not authorized to alter ACLs".to_string()),
+                    matching_acls: Vec::new(),
+                })
+                .collect();
+            return self.acl_response(
+                &header,
+                encode_delete_acls_response(
+                    &DeleteAclsResponse {
+                        throttle_time_ms: 0,
+                        filter_results,
+                    },
+                    header.api_version,
+                ),
+                ApiKey::DeleteAcls,
+            );
+        }
+
+        let mut filter_results = Vec::with_capacity(request.filters.len());
+        for f in &request.filters {
+            let mut filter = AclFilter::new();
+            let resource_type = ResourceType::from_i8(f.resource_type);
+            if resource_type != ResourceType::Any {
+                filter.resource_type = Some(resource_type);
+            }
+            filter.resource_name = f.resource_name.clone();
+            filter.principal = f.principal.clone();
+            filter.host = f.host.clone();
+            let operation = AclOperation::from_i8(f.operation);
+            if operation != AclOperation::Any {
+                filter.operation = Some(operation);
+            }
+
+            let removed = self
+                .authorizer
+                .store()
+                .delete_acls_durable(&filter, self.metadata_store.as_ref())
+                .await;
+            filter_results.push(FilterResult {
+                error_code: 0,
+                error_message: None,
+                matching_acls: removed
+                    .into_iter()
+                    .map(|b| MatchingAcl {
+                        error_code: 0,
+                        error_message: None,
+                        resource_type: b.resource_type as i8,
+                        resource_name: b.resource_name,
+                        resource_pattern_type: b.pattern_type as i8,
+                        principal: b.principal,
+                        host: b.host,
+                        operation: b.operation as i8,
+                        permission_type: b.permission_type as i8,
+                    })
+                    .collect(),
+            });
+        }
+
+        self.acl_response(
+            &header,
+            encode_delete_acls_response(
+                &DeleteAclsResponse {
+                    throttle_time_ms: 0,
+                    filter_results,
+                },
+                header.api_version,
+            ),
+            ApiKey::DeleteAcls,
+        )
+    }
+
+    /// Handle DescribeAcls (API 29).
+    async fn handle_describe_acls_request(
+        &self,
+        ctx: &ConnectionContext,
+        header: chronik_protocol::parser::RequestHeader,
+        mut buf: Bytes,
+    ) -> Result<Response> {
+        use chronik_protocol::describe_acls_types::{
+            encode_describe_acls_response, DescribeAclsResponse,
+        };
+        use crate::acl::AclFilter;
+
+        // DescribeAcls request body: resource_type(i8), resource_name(nullable
+        // string), [v1+] pattern_type(i8), principal, host, operation(i8),
+        // permission_type(i8). Parsed inline because chronik-protocol only ships
+        // an encoder for this API.
+        let mut decoder = chronik_protocol::parser::Decoder::new(&mut buf);
+        let resource_type = decoder.read_i8()?;
+        let resource_name = decoder.read_string()?;
+        let _pattern_type = if header.api_version >= 1 {
+            decoder.read_i8()?
+        } else {
+            3 // Literal
+        };
+        let principal = decoder.read_string()?;
+        let host = decoder.read_string()?;
+        let operation = decoder.read_i8()?;
+        let _permission_type = decoder.read_i8()?;
+
+        if !self
+            .authorizer
+            .authorize_cluster(ctx, AclOperation::Describe)
+            .await
+        {
+            return self.acl_response(
+                &header,
+                encode_describe_acls_response(
+                    &DescribeAclsResponse {
+                        throttle_time_ms: 0,
+                        error_code: crate::authorizer::ERROR_CLUSTER_AUTHORIZATION_FAILED,
+                        error_message: Some("Not authorized to describe ACLs".to_string()),
+                        resources: Vec::new(),
+                    },
+                    header.api_version,
+                ),
+                ApiKey::DescribeAcls,
+            );
+        }
+
+        let mut filter = AclFilter::new();
+        let rt = ResourceType::from_i8(resource_type);
+        if rt != ResourceType::Any {
+            filter.resource_type = Some(rt);
+        }
+        filter.resource_name = resource_name;
+        filter.principal = principal;
+        filter.host = host;
+        let op = AclOperation::from_i8(operation);
+        if op != AclOperation::Any {
+            filter.operation = Some(op);
+        }
+
+        let resources = self.authorizer.store().describe_acls(&filter).await;
+
+        self.acl_response(
+            &header,
+            encode_describe_acls_response(
+                &DescribeAclsResponse {
+                    throttle_time_ms: 0,
+                    error_code: 0,
+                    error_message: None,
+                    resources,
+                },
+                header.api_version,
+            ),
+            ApiKey::DescribeAcls,
+        )
+    }
+
+    /// Wrap an encoded ACL-API body in a `Response`.
+    fn acl_response(
+        &self,
+        header: &chronik_protocol::parser::RequestHeader,
+        body: BytesMut,
+        api_key: ApiKey,
+    ) -> Result<Response> {
+        Ok(Response {
+            header: ResponseHeader {
+                correlation_id: header.correlation_id,
+            },
+            body: body.freeze(),
+            is_flexible: chronik_protocol::parser::is_flexible_version(
+                api_key,
+                header.api_version,
+            ),
+            api_key,
+            throttle_time_ms: None,
+        })
+    }
+
+    /// Authorize a consumer-group operation, or fail the request.
+    ///
+    /// Reporting through `Err` is safe for the group APIs that use it
+    /// (JoinGroup, SyncGroup, Heartbeat, LeaveGroup): their entries in
+    /// `build_error_response()` do write the error code, so the client receives
+    /// a real `GROUP_AUTHORIZATION_FAILED` rather than an empty success. Do not
+    /// reuse this for Produce/Fetch/Metadata/CreateTopics — see the denial
+    /// builders above for why.
+    async fn authorize_group_access(
+        &self,
+        ctx: &ConnectionContext,
+        group_id: &str,
+        operation: AclOperation,
+    ) -> Result<()> {
+        if !self.authorizer.is_enabled() {
+            return Ok(());
+        }
+        if self
+            .authorizer
+            .authorize_group(ctx, group_id, operation)
+            .await
+        {
+            return Ok(());
+        }
+        Err(Error::Unauthorized(format!(
+            "{}: group '{}'",
+            crate::error_handler::GROUP_AUTH_DENIED_MARKER,
+            group_id
+        )))
+    }
+
+    /// Build an OffsetCommit response denying the whole request.
+    ///
+    /// Every requested partition carries `GROUP_AUTHORIZATION_FAILED`, which is
+    /// what Kafka returns and what clients surface as
+    /// `GroupAuthorizationException`.
+    fn offset_commit_authorization_denied(
+        &self,
+        header: &chronik_protocol::parser::RequestHeader,
+        request: &chronik_protocol::OffsetCommitRequest,
+    ) -> Result<Response> {
+        use chronik_protocol::{
+            OffsetCommitResponse, OffsetCommitResponsePartition, OffsetCommitResponseTopic,
+        };
+
+        tracing::warn!(
+            "OffsetCommit DENIED for group '{}' (correlation_id={})",
+            request.group_id,
+            header.correlation_id
+        );
+
+        let topics = request
+            .topics
+            .iter()
+            .map(|topic| OffsetCommitResponseTopic {
+                name: topic.name.clone(),
+                partitions: topic
+                    .partitions
+                    .iter()
+                    .map(|p| OffsetCommitResponsePartition {
+                        partition_index: p.partition_index,
+                        error_code: ERROR_GROUP_AUTHORIZATION_FAILED,
+                    })
+                    .collect(),
+            })
+            .collect();
+
+        let response = OffsetCommitResponse {
+            header: ResponseHeader {
+                correlation_id: header.correlation_id,
+            },
+            throttle_time_ms: 0,
+            topics,
+        };
+
+        let mut body_buf = BytesMut::new();
+        self.protocol_handler
+            .encode_offset_commit_response(&mut body_buf, &response, header.api_version)?;
+
+        Ok(Response {
+            header: ResponseHeader {
+                correlation_id: header.correlation_id,
+            },
+            body: body_buf.freeze(),
+            is_flexible: header.api_version >= 8,
+            api_key: ApiKey::OffsetCommit,
+            throttle_time_ms: None,
+        })
+    }
+
+    /// Build an OffsetFetch response denying the whole request.
+    ///
+    /// This one is load-bearing beyond correctness: reporting the denial through
+    /// the generic error path produced a v7 body librdkafka could not parse
+    /// ("Protocol read buffer underflow for OffsetFetch v7 ... expected 4 bytes
+    /// > 1 remaining bytes") and then **segfaulted the client**. A malformed
+    /// denial is worse than no denial.
+    ///
+    /// `topics: None` in the request means "all topics for this group". There is
+    /// nothing to enumerate in that case, so the response is an empty topics
+    /// array; the client still learns nothing, which is the correct outcome for
+    /// a principal that may not describe the group.
+    fn offset_fetch_authorization_denied(
+        &self,
+        header: &chronik_protocol::parser::RequestHeader,
+        request: &chronik_protocol::OffsetFetchRequest,
+    ) -> Result<Response> {
+        use chronik_protocol::{
+            OffsetFetchResponse, OffsetFetchResponsePartition, OffsetFetchResponseTopic,
+        };
+
+        tracing::warn!(
+            "OffsetFetch DENIED for group '{}' (correlation_id={})",
+            request.group_id,
+            header.correlation_id
+        );
+
+        let topics = request
+            .topics
+            .as_ref()
+            .map(|topics| {
+                topics
+                    .iter()
+                    .map(|topic| OffsetFetchResponseTopic {
+                        name: topic.name.clone(),
+                        partitions: topic
+                            .partitions
+                            .iter()
+                            .map(|index| OffsetFetchResponsePartition {
+                                partition_index: *index,
+                                committed_offset: -1,
+                                metadata: None,
+                                error_code: ERROR_GROUP_AUTHORIZATION_FAILED,
+                            })
+                            .collect(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let response = OffsetFetchResponse {
+            header: ResponseHeader {
+                correlation_id: header.correlation_id,
+            },
+            throttle_time_ms: 0,
+            topics,
+            group_id: Some(request.group_id.clone()),
+        };
+
+        let mut body_buf = BytesMut::new();
+        self.protocol_handler
+            .encode_offset_fetch_response(&mut body_buf, &response, header.api_version)?;
+
+        Ok(Response {
+            header: ResponseHeader {
+                correlation_id: header.correlation_id,
+            },
+            body: body_buf.freeze(),
+            is_flexible: header.api_version >= 6,
+            api_key: ApiKey::OffsetFetch,
+            throttle_time_ms: None,
+        })
+    }
+
+    /// Build a Fetch response denying the whole request.
+    ///
+    /// Same reasoning as the Produce denial: `build_error_response()` drops the
+    /// error code for Fetch and returns an empty topics array, which a consumer
+    /// reads as "no records available" rather than "you are not allowed". An
+    /// unauthorized consumer would poll forever seeing an empty, healthy topic.
+    fn fetch_authorization_denied(
+        &self,
+        header: &chronik_protocol::parser::RequestHeader,
+        request: &chronik_protocol::FetchRequest,
+        denied: &[String],
+    ) -> Result<Response> {
+        use chronik_protocol::{FetchResponse, FetchResponsePartition, FetchResponseTopic};
+
+        tracing::warn!(
+            "Fetch DENIED for topics {:?} (correlation_id={})",
+            denied,
+            header.correlation_id
+        );
+
+        let topics = request
+            .topics
+            .iter()
+            .map(|topic| FetchResponseTopic {
+                name: topic.name.clone(),
+                partitions: topic
+                    .partitions
+                    .iter()
+                    .map(|p| FetchResponsePartition {
+                        partition: p.partition,
+                        error_code: ERROR_TOPIC_AUTHORIZATION_FAILED,
+                        high_watermark: -1,
+                        last_stable_offset: -1,
+                        log_start_offset: -1,
+                        aborted: None,
+                        preferred_read_replica: -1,
+                        records: Vec::new(),
+                    })
+                    .collect(),
+            })
+            .collect();
+
+        let response = FetchResponse {
+            header: ResponseHeader {
+                correlation_id: header.correlation_id,
+            },
+            throttle_time_ms: 0,
+            error_code: 0,
+            session_id: 0,
+            topics,
+        };
+
+        let mut body_buf = BytesMut::new();
+        self.protocol_handler
+            .encode_fetch_response(&mut body_buf, &response, header.api_version)?;
+
+        Ok(Response {
+            header: ResponseHeader {
+                correlation_id: header.correlation_id,
+            },
+            body: body_buf.freeze(),
+            is_flexible: header.api_version >= 12,
+            api_key: ApiKey::Fetch,
+            throttle_time_ms: None,
+        })
+    }
+
+    /// Build a Produce response denying the whole request.
+    ///
+    /// Every partition of every requested topic carries
+    /// `TOPIC_AUTHORIZATION_FAILED`, which is how Kafka reports this and what
+    /// clients surface as `TopicAuthorizationException`.
+    ///
+    /// The alternative — returning `Err` and letting the connection's error path
+    /// encode it — does NOT work here: `build_error_response()` ignores the error
+    /// code for Produce and emits an empty topics array, i.e. a *success* with no
+    /// results. A denied write would look accepted and the records would vanish
+    /// silently. The response has to be built from the parsed request.
+    fn produce_authorization_denied(
+        &self,
+        header: &chronik_protocol::parser::RequestHeader,
+        request: &chronik_protocol::ProduceRequest,
+        denied: &[String],
+    ) -> Result<Response> {
+        use chronik_protocol::{ProduceResponse, ProduceResponsePartition, ProduceResponseTopic};
+
+        tracing::warn!(
+            "Produce DENIED for topics {:?} (correlation_id={})",
+            denied,
+            header.correlation_id
+        );
+
+        let topics = request
+            .topics
+            .iter()
+            .map(|topic| ProduceResponseTopic {
+                name: topic.name.clone(),
+                partitions: topic
+                    .partitions
+                    .iter()
+                    .map(|p| ProduceResponsePartition {
+                        index: p.index,
+                        error_code: ERROR_TOPIC_AUTHORIZATION_FAILED,
+                        base_offset: -1,
+                        log_append_time: -1,
+                        log_start_offset: -1,
+                    })
+                    .collect(),
+            })
+            .collect();
+
+        let response = ProduceResponse {
+            header: ResponseHeader {
+                correlation_id: header.correlation_id,
+            },
+            throttle_time_ms: 0,
+            topics,
+        };
+
+        let mut body_buf = BytesMut::new();
+        self.protocol_handler
+            .encode_produce_response(&mut body_buf, &response, header.api_version)?;
+
+        Ok(Response {
+            header: ResponseHeader {
+                correlation_id: header.correlation_id,
+            },
+            body: body_buf.freeze(),
+            is_flexible: header.api_version >= 9,
             api_key: ApiKey::Produce,
             throttle_time_ms: None,
         })
@@ -525,11 +1473,26 @@ impl KafkaProtocolHandler {
     #[instrument(skip(self, buf))]
     async fn handle_fetch_request(
         &self,
+        ctx: &ConnectionContext,
         header: chronik_protocol::parser::RequestHeader,
         mut buf: Bytes,
     ) -> Result<Response> {
         // Parse the fetch request
         let request = self.protocol_handler.parse_fetch_request(&header, &mut buf)?;
+
+        // Authorization: Fetch requires Read on each topic (not Describe - a
+        // Describe-only principal must not be able to read records).
+        if self.authorizer.is_enabled() {
+            let topic_names: Vec<String> =
+                request.topics.iter().map(|t| t.name.clone()).collect();
+            let (_, denied) = self
+                .authorizer
+                .partition_topics(ctx, &topic_names, AclOperation::Read)
+                .await;
+            if !denied.is_empty() {
+                return self.fetch_authorization_denied(&header, &request, &denied);
+            }
+        }
 
         // Use our fetch handler to process the request
         let response = self.fetch_handler.handle_fetch(request, header.correlation_id).await?;
@@ -570,12 +1533,14 @@ impl KafkaProtocolHandler {
     #[instrument(skip(self, buf))]
     async fn handle_join_group_request(
         &self,
+        ctx: &ConnectionContext,
         header: chronik_protocol::parser::RequestHeader,
         mut buf: Bytes,
     ) -> Result<Response> {
         debug!("Processing JoinGroup request");
         // Parse the join group request
         let request = self.protocol_handler.parse_join_group_request(&header, &mut buf)?;
+        self.authorize_group_access(ctx, &request.group_id, AclOperation::Read).await?;
 
         // Handle the join group request, passing the client_id from the request header
         // This ensures each consumer gets a unique member_id based on its actual client_id
@@ -610,11 +1575,13 @@ impl KafkaProtocolHandler {
     #[instrument(skip(self, buf))]
     async fn handle_sync_group_request(
         &self,
+        ctx: &ConnectionContext,
         header: chronik_protocol::parser::RequestHeader,
         mut buf: Bytes,
     ) -> Result<Response> {
         debug!("Processing SyncGroup request");
         let request = self.protocol_handler.parse_sync_group_request(&header, &mut buf)?;
+        self.authorize_group_access(ctx, &request.group_id, AclOperation::Read).await?;
         let response = self.group_manager.handle_sync_group(request).await?;
 
         let mut body_buf = BytesMut::new();
@@ -638,11 +1605,13 @@ impl KafkaProtocolHandler {
     #[instrument(skip(self, buf))]
     async fn handle_heartbeat_request(
         &self,
+        ctx: &ConnectionContext,
         header: chronik_protocol::parser::RequestHeader,
         mut buf: Bytes,
     ) -> Result<Response> {
         debug!("Processing Heartbeat request");
         let request = self.protocol_handler.parse_heartbeat_request(&header, &mut buf)?;
+        self.authorize_group_access(ctx, &request.group_id, AclOperation::Read).await?;
         let response = self.group_manager.handle_heartbeat(request).await?;
 
         let mut body_buf = BytesMut::new();
@@ -666,11 +1635,13 @@ impl KafkaProtocolHandler {
     #[instrument(skip(self, buf))]
     async fn handle_leave_group_request(
         &self,
+        ctx: &ConnectionContext,
         header: chronik_protocol::parser::RequestHeader,
         mut buf: Bytes,
     ) -> Result<Response> {
         debug!("Processing LeaveGroup request");
         let request = self.protocol_handler.parse_leave_group_request(&header, &mut buf)?;
+        self.authorize_group_access(ctx, &request.group_id, AclOperation::Read).await?;
         let response = self.group_manager.handle_leave_group(request).await?;
 
         let mut body_buf = BytesMut::new();
@@ -694,11 +1665,27 @@ impl KafkaProtocolHandler {
     #[instrument(skip(self, buf))]
     async fn handle_offset_commit_request(
         &self,
+        ctx: &ConnectionContext,
         header: chronik_protocol::parser::RequestHeader,
         mut buf: Bytes,
     ) -> Result<Response> {
         debug!("Processing OffsetCommit v{} request", header.api_version);
         let request = self.protocol_handler.parse_offset_commit_request(&header, &mut buf)?;
+        // Kafka: OffsetCommit requires Read on the group. Without this a consumer
+        // denied Read could still advance the group's committed offsets.
+        //
+        // The denial is BUILT from the parsed request, not reported through
+        // authorize_group_access(): OffsetCommit's response is topics[] with
+        // per-partition error codes, so the bare error code that
+        // build_error_response() emits for it is not valid on the wire.
+        if self.authorizer.is_enabled()
+            && !self
+                .authorizer
+                .authorize_group(ctx, &request.group_id, AclOperation::Read)
+                .await
+        {
+            return self.offset_commit_authorization_denied(&header, &request);
+        }
         let response = self.group_manager.handle_offset_commit(request).await?;
 
         let mut body_buf = BytesMut::new();
@@ -722,11 +1709,26 @@ impl KafkaProtocolHandler {
     #[instrument(skip(self, buf))]
     async fn handle_offset_fetch_request(
         &self,
+        ctx: &ConnectionContext,
         header: chronik_protocol::parser::RequestHeader,
         mut buf: Bytes,
     ) -> Result<Response> {
         debug!("Processing OffsetFetch request");
         let request = self.protocol_handler.parse_offset_fetch_request(&header, &mut buf)?;
+        // Kafka: OffsetFetch requires Describe on the group (implied by Read).
+        //
+        // Same reasoning as OffsetCommit - and this one was not theoretical:
+        // routing the denial through the generic error path produced a v7
+        // response librdkafka could not parse ("read buffer underflow ...
+        // expected 4 bytes > 1 remaining"), and then SEGFAULTED the client.
+        if self.authorizer.is_enabled()
+            && !self
+                .authorizer
+                .authorize_group(ctx, &request.group_id, AclOperation::Describe)
+                .await
+        {
+            return self.offset_fetch_authorization_denied(&header, &request);
+        }
         let response = self.group_manager.handle_offset_fetch(request).await?;
 
         let mut body_buf = BytesMut::new();
@@ -947,6 +1949,118 @@ impl KafkaProtocolHandler {
         })
     }
 
+
+    /// Handle DescribeGroups API request (key 15).
+    ///
+    /// Reads from the live GroupManager, for the same reason ListGroups does.
+    /// This API used to be answered by the protocol handler's own
+    /// `consumer_groups` map, which nothing on the server path ever writes to, so
+    /// every describe returned GROUP_ID_NOT_FOUND — including for a group that
+    /// ListGroups was returning in the same second. That cost
+    /// `kafka-consumer-groups --describe` and every Kafka UI their view of group
+    /// membership and, with it, consumer lag.
+    ///
+    /// Denials are shaped: DescribeGroups carries a per-group error code, so an
+    /// unauthorized group is reported as GROUP_AUTHORIZATION_FAILED in an
+    /// otherwise well-formed response. Returning a bare error instead would hand
+    /// the client a body that does not match the schema and kill its I/O thread.
+    async fn handle_describe_groups_request(
+        &self,
+        ctx: &ConnectionContext,
+        header: chronik_protocol::parser::RequestHeader,
+        mut buf: Bytes,
+    ) -> Result<Response> {
+        use chronik_protocol::consumer_group_types::{
+            DescribeGroupsRequest, DescribeGroupsResponse, DescribedGroup, GroupMember,
+            error_codes,
+        };
+
+        /// Kafka's GROUP_AUTHORIZATION_FAILED. Not in `error_codes`, which only
+        /// carries the coordinator errors this module needed before.
+        const GROUP_AUTHORIZATION_FAILED: i16 = 30;
+        /// Kafka sends this when authorized operations were not requested.
+        const NO_AUTHORIZED_OPERATIONS: i32 = i32::MIN;
+
+        let request = DescribeGroupsRequest::parse(&mut buf, header.api_version)?;
+        tracing::debug!(
+            "DescribeGroups v{} for {:?}",
+            header.api_version,
+            request.group_ids
+        );
+
+        let mut groups = Vec::with_capacity(request.group_ids.len());
+        for group_id in request.group_ids {
+            if !self
+                .authorizer
+                .authorize_group(ctx, &group_id, AclOperation::Describe)
+                .await
+            {
+                groups.push(DescribedGroup {
+                    error_code: GROUP_AUTHORIZATION_FAILED,
+                    group_id,
+                    group_state: String::new(),
+                    protocol_type: String::new(),
+                    protocol_data: String::new(),
+                    members: Vec::new(),
+                    authorized_operations: NO_AUTHORIZED_OPERATIONS,
+                });
+                continue;
+            }
+
+            match self.group_manager.describe_group(&group_id).await {
+                Some(description) => {
+                    let members = description
+                        .members
+                        .into_iter()
+                        .map(|member| GroupMember {
+                            member_id: member.member_id,
+                            group_instance_id: member.group_instance_id,
+                            client_id: member.client_id,
+                            client_host: member.client_host,
+                            member_metadata: member.metadata,
+                            member_assignment: member.assignment,
+                        })
+                        .collect();
+                    groups.push(DescribedGroup {
+                        error_code: error_codes::NONE,
+                        group_id,
+                        group_state: description.state,
+                        protocol_type: description.protocol_type,
+                        protocol_data: description.protocol,
+                        members,
+                        authorized_operations: NO_AUTHORIZED_OPERATIONS,
+                    });
+                }
+                None => {
+                    groups.push(DescribedGroup {
+                        error_code: error_codes::GROUP_ID_NOT_FOUND,
+                        group_id,
+                        group_state: String::new(),
+                        protocol_type: String::new(),
+                        protocol_data: String::new(),
+                        members: Vec::new(),
+                        authorized_operations: NO_AUTHORIZED_OPERATIONS,
+                    });
+                }
+            }
+        }
+
+        let response = DescribeGroupsResponse {
+            throttle_time_ms: 0,
+            groups,
+        };
+        let body = response.encode(header.api_version);
+
+        Ok(Response {
+            header: ResponseHeader {
+                correlation_id: header.correlation_id,
+            },
+            body,
+            is_flexible: header.api_version >= 5,
+            api_key: ApiKey::DescribeGroups,
+            throttle_time_ms: None,
+        })
+    }
     /// Handle DeleteGroups API request (key 42).
     ///
     /// Backs the Kafka UI / AdminClient "delete consumer group". Operates on the
@@ -1728,61 +2842,69 @@ impl KafkaProtocolHandler {
 
     /// Handle SaslHandshake API request (API key 17)
     ///
-    /// This is the first step in SASL authentication. The client sends the
-    /// mechanism it wants to use, and we respond with supported mechanisms.
-    #[instrument(skip(self, buf))]
+    /// First step of SASL authentication: the client names the mechanism it
+    /// wants and the broker answers with the mechanisms it actually accepts.
+    ///
+    /// The negotiated mechanism is recorded on the connection, so a subsequent
+    /// `SaslAuthenticate` is interpreted in the right state. Previously this
+    /// handler advertised a hardcoded list including SCRAM-SHA-256/512 whose
+    /// verification was a stub, and accepted any mechanism that merely parsed.
+    /// The advertised set now comes from the connection's authenticator, so
+    /// there is one source of truth.
+    #[instrument(skip(self, ctx, buf))]
     async fn handle_sasl_handshake_request(
         &self,
+        ctx: &ConnectionContext,
         header: chronik_protocol::parser::RequestHeader,
         mut buf: Bytes,
     ) -> Result<Response> {
         use chronik_protocol::parser::{Decoder, ResponseHeader};
-        use chronik_protocol::sasl::{SaslMechanism, encode_sasl_handshake_response, SaslHandshakeResponse};
+        use chronik_protocol::sasl::{encode_sasl_handshake_response, SaslHandshakeResponse};
 
         tracing::info!("SaslHandshake v{} request received", header.api_version);
 
-        // Parse the requested mechanism
+        // SaslHandshake is "flexibleVersions: none" in the Kafka spec: the
+        // mechanism is a regular (length-prefixed) string at every version, not
+        // a compact one. See is_flexible_version() in parser.rs.
         let mut decoder = Decoder::new(&mut buf);
-        let mechanism = if header.api_version >= 1 {
-            // v1+ uses compact strings
-            decoder.read_compact_string()?.unwrap_or_default()
-        } else {
-            // v0 uses regular strings
-            decoder.read_string()?.unwrap_or_default()
-        };
+        let mechanism = decoder.read_string()?.unwrap_or_default();
 
         tracing::info!("Client requested SASL mechanism: {}", mechanism);
 
-        // Check if we support this mechanism
-        let supported_mechanisms = vec![
-            "PLAIN".to_string(),
-            "SCRAM-SHA-256".to_string(),
-            "SCRAM-SHA-512".to_string(),
-        ];
-
-        let error_code = if SaslMechanism::from_str(&mechanism).is_some() {
-            0 // Success
-        } else {
-            33 // UNSUPPORTED_SASL_MECHANISM
-        };
-
-        // Build response
-        let response = SaslHandshakeResponse {
-            error_code,
-            enabled_mechanisms: supported_mechanisms,
+        // Delegate to the connection's authenticator: it decides whether the
+        // mechanism is enabled and moves the connection into the right state.
+        let enabled_mechanisms = ctx.enabled_mechanisms().await;
+        let response = match ctx.sasl_handshake(header.api_version, &[mechanism.clone()]).await {
+            Ok(mut resp) => {
+                resp.enabled_mechanisms = enabled_mechanisms;
+                resp
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Refusing SASL mechanism '{}' from {}: {}",
+                    mechanism,
+                    ctx.peer_addr(),
+                    e
+                );
+                SaslHandshakeResponse {
+                    error_code: 33, // UNSUPPORTED_SASL_MECHANISM
+                    enabled_mechanisms,
+                }
+            }
         };
 
         let body = encode_sasl_handshake_response(&response);
 
         tracing::info!("SaslHandshake response: error_code={}, mechanisms={:?}",
-            error_code, response.enabled_mechanisms);
+            response.error_code, response.enabled_mechanisms);
 
         Ok(Response {
             header: ResponseHeader {
                 correlation_id: header.correlation_id,
             },
             body,
-            is_flexible: header.api_version >= 1,
+            // Never flexible - see the mechanism-parse note above.
+            is_flexible: false,
             api_key: ApiKey::SaslHandshake,
             throttle_time_ms: None,
         })
@@ -1790,16 +2912,24 @@ impl KafkaProtocolHandler {
 
     /// Handle SaslAuthenticate API request (API key 36)
     ///
-    /// This is the second step in SASL authentication. The client sends
-    /// authentication credentials based on the chosen mechanism.
-    #[instrument(skip(self, buf))]
+    /// Second step of SASL authentication: the client sends credentials for the
+    /// mechanism negotiated by `SaslHandshake`.
+    ///
+    /// The credentials are verified against the **connection's** authenticator
+    /// and success is recorded on the connection, which is what makes the
+    /// pre-authentication gate in `handle_request_with_context` meaningful.
+    /// Previously this built a throwaway authenticator per request, forced it
+    /// into the PLAIN handshake state, and discarded the outcome — so
+    /// authenticating and not authenticating led to exactly the same access.
+    #[instrument(skip(self, ctx, buf))]
     async fn handle_sasl_authenticate_request(
         &self,
+        ctx: &ConnectionContext,
         header: chronik_protocol::parser::RequestHeader,
         mut buf: Bytes,
     ) -> Result<Response> {
         use chronik_protocol::parser::{Decoder, ResponseHeader};
-        use chronik_protocol::sasl::{SaslAuthenticator, encode_sasl_authenticate_response, SaslAuthenticateResponse};
+        use chronik_protocol::sasl::{encode_sasl_authenticate_response, SaslAuthenticateResponse};
 
         tracing::info!("SaslAuthenticate v{} request received", header.api_version);
 
@@ -1816,25 +2946,19 @@ impl KafkaProtocolHandler {
         let auth_bytes = auth_bytes_opt.unwrap_or_default();
         tracing::debug!("SaslAuthenticate auth_bytes len: {}", auth_bytes.len());
 
-        // Create a temporary authenticator for this request
-        // NOTE: In a full implementation, this would be per-connection state
-        // tracked in the connection handler. For now, we create a new one per request.
-        let mut authenticator = SaslAuthenticator::new();
-
-        // Force the authenticator into HandshakeComplete state for PLAIN
-        // (since we're stateless, we assume PLAIN was negotiated)
-        let _ = authenticator.handle_handshake(header.api_version, &["PLAIN".to_string()]);
-
-        // Attempt authentication
-        let response = match authenticator.handle_authenticate(&auth_bytes) {
-            Ok(auth_response) => {
-                tracing::info!("SASL authentication successful for user: {:?}", authenticator.username());
-                auth_response
-            }
+        let response = match ctx.sasl_authenticate(&auth_bytes).await {
+            Ok(auth_response) => auth_response,
             Err(e) => {
-                tracing::warn!("SASL authentication failed: {}", e);
+                tracing::warn!(
+                    "SASL authentication failed for {} ({}): {}",
+                    ctx.id(),
+                    ctx.peer_addr(),
+                    e
+                );
                 SaslAuthenticateResponse {
-                    error_code: 31, // SASL_AUTHENTICATION_FAILED
+                    // Previously 31 (CLUSTER_AUTHORIZATION_FAILED) behind a
+                    // comment claiming it was SASL_AUTHENTICATION_FAILED.
+                    error_code: crate::connection::ERROR_SASL_AUTHENTICATION_FAILED,
                     error_message: Some(format!("{}", e)),
                     auth_bytes: None,
                     session_lifetime_ms: None,
@@ -1842,7 +2966,7 @@ impl KafkaProtocolHandler {
             }
         };
 
-        let body = encode_sasl_authenticate_response(&response);
+        let body = encode_sasl_authenticate_response(&response, header.api_version);
 
         tracing::info!("SaslAuthenticate response: error_code={}", response.error_code);
 

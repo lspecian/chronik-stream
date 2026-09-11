@@ -6,7 +6,7 @@ use aws_credential_types::Credentials;
 use aws_sdk_s3::{
     config::Builder as S3ConfigBuilder,
     primitives::ByteStream,
-    types::{CompletedPart, CompletedMultipartUpload},
+    types::{CompletedPart, CompletedMultipartUpload, ServerSideEncryption},
     Client as S3Client,
     Error as S3Error,
 };
@@ -19,7 +19,7 @@ use tracing::{debug, info, instrument, warn};
 
 use crate::object_store::{
     auth::{AuthConfig, S3Credentials},
-    config::{ObjectStoreConfig, StorageBackend},
+    config::{EncryptionType, ObjectStoreConfig, StorageBackend},
     errors::{ObjectStoreError, ObjectStoreResult},
     storage::{
         GetOptions, ListOptions, MultipartUpload, MultipartUploadPart, ObjectMetadata,
@@ -175,6 +175,59 @@ impl S3Backend {
             }
         }
     }
+
+    /// Resolve the server-side encryption to apply to a write.
+    ///
+    /// Returns `(algorithm, kms_key_id)`. `None` means write unencrypted.
+    ///
+    /// Previously the configured `EncryptionConfig` was parsed and stored but
+    /// never reached the wire — every PUT went out unencrypted regardless of
+    /// configuration. Applying it here is the single place all write paths share.
+    ///
+    /// SSE-C (`EncryptionType::CustomerKey`) is deliberately rejected rather than
+    /// half-applied: it also requires the customer key on every GET/HEAD, and a
+    /// write-only implementation would produce objects this backend cannot read
+    /// back. Configuring it fails loudly at write time instead.
+    fn resolve_encryption(
+        &self,
+        override_algorithm: Option<&str>,
+    ) -> ObjectStoreResult<Option<(ServerSideEncryption, Option<String>)>> {
+        // A per-request override (PutOptions::encryption) wins over the store config.
+        if let Some(algorithm) = override_algorithm {
+            return match algorithm {
+                "AES256" | "aes256" => Ok(Some((ServerSideEncryption::Aes256, None))),
+                "aws:kms" => Ok(Some((ServerSideEncryption::AwsKms, None))),
+                other => Err(ObjectStoreError::InvalidConfiguration {
+                    message: format!(
+                        "Unsupported server-side encryption algorithm: {}. \
+                         Supported: AES256, aws:kms",
+                        other
+                    ),
+                }),
+            };
+        }
+
+        let Some(encryption) = &self.config.encryption else {
+            return Ok(None);
+        };
+
+        match encryption.encryption_type {
+            EncryptionType::Aes256 => Ok(Some((ServerSideEncryption::Aes256, None))),
+            EncryptionType::AwsKms => {
+                // A KMS key id is optional: without one S3 uses the bucket's default
+                // aws/s3 managed key, which is still SSE-KMS.
+                Ok(Some((
+                    ServerSideEncryption::AwsKms,
+                    encryption.kms_key_id.clone(),
+                )))
+            }
+            EncryptionType::CustomerKey => Err(ObjectStoreError::InvalidConfiguration {
+                message: "SSE-C (customer-provided keys) is not supported by this backend. \
+                          Use AES256 (SSE-S3) or aws:kms (SSE-KMS)."
+                    .to_string(),
+            }),
+        }
+    }
 }
 
 #[async_trait]
@@ -225,6 +278,15 @@ impl ObjectStore for S3Backend {
 
         if let Some(checksum) = options.checksum {
             request = request.content_md5(checksum);
+        }
+
+        if let Some((algorithm, kms_key_id)) =
+            self.resolve_encryption(options.encryption.as_deref())?
+        {
+            request = request.server_side_encryption(algorithm);
+            if let Some(key_id) = kms_key_id {
+                request = request.ssekms_key_id(key_id);
+            }
         }
 
         request
@@ -449,11 +511,23 @@ impl ObjectStore for S3Backend {
     async fn start_multipart_upload(&self, key: &str) -> ObjectStoreResult<MultipartUpload> {
         let full_key = self.build_key(key);
 
-        let response = self
+        let mut request = self
             .client
             .create_multipart_upload()
             .bucket(&self.bucket)
-            .key(&full_key)
+            .key(&full_key);
+
+        // SSE is declared when the upload is initiated; the individual UploadPart
+        // calls inherit it. Omitting it here would silently write large objects
+        // (the segment/snapshot path) unencrypted while small ones were encrypted.
+        if let Some((algorithm, kms_key_id)) = self.resolve_encryption(None)? {
+            request = request.server_side_encryption(algorithm);
+            if let Some(key_id) = kms_key_id {
+                request = request.ssekms_key_id(key_id);
+            }
+        }
+
+        let response = request
             .send()
             .await
             .map_err(|e| self.convert_error(e.into(), key))?;

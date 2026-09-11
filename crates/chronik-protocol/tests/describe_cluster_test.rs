@@ -136,8 +136,11 @@ fn unimplemented_apis_are_not_advertised() {
         ApiKey::AlterReplicaLogDirs,
         ApiKey::DescribeClientQuotas,
         ApiKey::AlterClientQuotas,
-        ApiKey::DescribeUserScramCredentials,
-        ApiKey::AlterUserScramCredentials,
+        // DescribeUserScramCredentials / AlterUserScramCredentials were on this
+        // list and have been REMOVED because they are now genuinely
+        // implemented — see `unimplemented_apis_are_not_advertised`'s companion
+        // below. They are handled in `chronik-server`'s `kafka_handler`, which
+        // matches them explicitly and so never reaches this crate's catch-all.
         ApiKey::AlterPartition,
         ApiKey::UpdateFeatures,
         ApiKey::Envelope,
@@ -193,6 +196,39 @@ fn the_apis_clients_depend_on_are_still_advertised() {
         assert!(
             advertised.contains_key(&api),
             "{:?} must stay advertised: clients require it",
+            api
+        );
+    }
+}
+
+/// The SCRAM credential APIs must stay advertised, because they now have a real
+/// implementation.
+///
+/// The rule this crate enforces is "advertise only what is implemented", in both
+/// directions. Withdrawing these would silently disable `kafka-configs.sh
+/// --entity-type users`, which is the only way to manage SCRAM credentials at
+/// runtime; a client told the API is unsupported reports that the broker cannot
+/// manage users at all.
+///
+/// The implementation lives in `chronik-server`'s `kafka_handler`, which matches
+/// API 50 and 51 explicitly before the fall-through to this crate's catch-all,
+/// so the malformed-response hazard that motivated the list above does not apply
+/// to them. If that routing is ever removed, this test keeps passing while the
+/// server regresses — so the end-to-end proof is
+/// `tests/integration/sasl_enforcement_test.rs::scram_user_created_via_api_survives_restart`,
+/// which drives the real wire protocol.
+#[test]
+fn implemented_scram_credential_apis_stay_advertised() {
+    let advertised = supported_api_versions();
+
+    for api in [
+        ApiKey::DescribeUserScramCredentials,
+        ApiKey::AlterUserScramCredentials,
+    ] {
+        assert!(
+            advertised.contains_key(&api),
+            "{:?} is implemented but not advertised — clients will report that \
+             this broker cannot manage SCRAM users",
             api
         );
     }

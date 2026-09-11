@@ -8,6 +8,21 @@ use std::io;
 use tracing::{error, warn, info, debug};
 use thiserror::Error;
 
+/// Stable marker identifying a pre-authentication rejection as it travels
+/// through `chronik_common::Error` (which erases the type) back to
+/// [`ErrorHandler::from_anyhow`]. Changing this string decouples the gate from
+/// its wire error code, so keep it in sync with `connection.rs`.
+pub const AUTH_REQUIRED_MARKER: &str = "SASL authentication required";
+
+/// Marker for an ACL denial on a consumer group, carried the same way.
+///
+/// Only usable for APIs whose error response can actually express an error code
+/// (JoinGroup, SyncGroup, Heartbeat, LeaveGroup and the generic fallback).
+/// Produce, Fetch, Metadata and CreateTopics drop the code in
+/// [`ErrorHandler::build_error_response`] and emit an empty *success* body, so
+/// those handlers build their own denial from the parsed request instead.
+pub const GROUP_AUTH_DENIED_MARKER: &str = "group authorization failed";
+
 /// Comprehensive error type for the integrated server
 #[derive(Error, Debug)]
 pub enum ServerError {
@@ -37,7 +52,16 @@ pub enum ServerError {
     
     #[error("Authorization failed: {0}")]
     AuthorizationFailed(String),
-    
+
+    /// A request arrived on a connection that has not completed SASL
+    /// authentication, on a server where authentication is required.
+    #[error("{}: {0}", AUTH_REQUIRED_MARKER)]
+    AuthenticationRequired(String),
+
+    /// An ACL denied the principal access to a consumer group.
+    #[error("{}: {0}", GROUP_AUTH_DENIED_MARKER)]
+    GroupAuthorizationFailed(String),
+
     #[error("Rate limit exceeded")]
     RateLimitExceeded,
     
@@ -229,6 +253,14 @@ impl ErrorHandler {
                 warn!("Authorization failed in {}: {}", context, msg);
                 ErrorRecovery::ReturnError(ErrorCode::TopicAuthorizationFailed)
             }
+            ServerError::AuthenticationRequired(msg) => {
+                warn!("Rejected unauthenticated request in {}: {}", context, msg);
+                ErrorRecovery::ReturnError(ErrorCode::IllegalSaslState)
+            }
+            ServerError::GroupAuthorizationFailed(msg) => {
+                warn!("Rejected unauthorized group access in {}: {}", context, msg);
+                ErrorRecovery::ReturnError(ErrorCode::GroupAuthorizationFailed)
+            }
             ServerError::Internal(msg) => {
                 error!("Internal server error in {}: {}", context, msg);
                 ErrorRecovery::ReturnError(ErrorCode::KafkaStorageError)
@@ -246,9 +278,21 @@ impl ErrorHandler {
         if let Some(io_error) = error.downcast_ref::<io::Error>() {
             return ServerError::Io(io::Error::new(io_error.kind(), error.to_string()));
         }
-        
+
         // Check for chronik-specific errors
         let error_string = error.to_string();
+
+        // The pre-authentication gate reports through chronik_common::Error, which
+        // reaches here only as a string. Match the marker first so an
+        // unauthenticated request yields ILLEGAL_SASL_STATE rather than being
+        // swallowed by the generic Internal fallback below.
+        if error_string.contains(AUTH_REQUIRED_MARKER) {
+            return ServerError::AuthenticationRequired(error_string);
+        }
+        if error_string.contains(GROUP_AUTH_DENIED_MARKER) {
+            return ServerError::GroupAuthorizationFailed(error_string);
+        }
+
         if error_string.contains("topic") || error_string.contains("Topic") {
             if error_string.contains("not found") || error_string.contains("does not exist") {
                 return ServerError::TopicNotFound { 

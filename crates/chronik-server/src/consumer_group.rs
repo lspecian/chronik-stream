@@ -166,6 +166,30 @@ impl AssignmentStrategy {
     }
 }
 
+/// One member, as the DescribeGroups API reports it.
+///
+/// `metadata` and `assignment` are the raw Kafka protocol bytes, not the decoded
+/// forms held in memory, because that is what the API carries and what admin
+/// clients decode to show a group's partition assignment and lag.
+#[derive(Debug, Clone)]
+pub struct DescribedMember {
+    pub member_id: String,
+    pub group_instance_id: Option<String>,
+    pub client_id: String,
+    pub client_host: String,
+    pub metadata: Vec<u8>,
+    pub assignment: Vec<u8>,
+}
+
+/// A consumer group as the DescribeGroups API reports it.
+#[derive(Debug, Clone)]
+pub struct GroupDescription {
+    pub state: String,
+    pub protocol_type: String,
+    pub protocol: String,
+    pub members: Vec<DescribedMember>,
+}
+
 /// Consumer group with KIP-848 support
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ConsumerGroup {
@@ -709,62 +733,114 @@ impl GroupManager {
         Ok(offsets)
     }
     
-    /// Get group metadata
-    pub async fn describe_group(&self, group_id: String) -> Result<Option<ConsumerGroup>> {
-        let groups = self.groups.read().await;
-        
-        if let Some(group) = groups.get(&group_id) {
-            // Return a cloned version to avoid holding the lock
-            Ok(Some(ConsumerGroup {
-                group_id: group.group_id.clone(),
-                state: group.state,
-                generation_id: group.generation_id,
-                protocol_type: group.protocol_type.clone(),
-                protocol: group.protocol.clone(),
-                leader_id: group.leader_id.clone(),
-                members: group.members.clone(),
-                group_epoch: group.group_epoch,
-                assignment_strategy: group.assignment_strategy,
-                pending_members: group.pending_members.clone(),
-                rebalance_start_time: group.rebalance_start_time,
-                expected_members_count: group.expected_members_count,
-                previous_member_count: group.previous_member_count,
-                static_members: group.static_members.clone(),
-                last_persisted: group.last_persisted,
-                pending_join_futures: Arc::new(Mutex::new(HashMap::new())),
-                pending_sync_futures: Arc::new(Mutex::new(HashMap::new())),
-                completed_assignments: group.completed_assignments.clone(),
-                completed_generation: group.completed_generation,
-            }))
-        } else {
-            // Try to load from metadata store
-            if let Some(metadata) = self.metadata_store.get_consumer_group(&group_id).await
-                .map_err(|e| Error::Storage(format!("Failed to load group metadata: {}", e)))? {
-                
-                let mut group = ConsumerGroup::new(group_id, metadata.protocol_type);
-                group.state = GroupState::from_str(&metadata.state).unwrap_or(GroupState::Empty);
-                group.generation_id = metadata.generation_id;
-                group.protocol = Some(metadata.protocol);
-                group.leader_id = metadata.leader_id;
-                
-                Ok(Some(group))
-            } else {
-                Ok(None)
+    /// Every consumer group the broker knows about.
+    ///
+    /// Unions the in-memory registry with the persisted groups, because a group
+    /// with no live members is dropped from memory (see `leave_group`) while
+    /// remaining `Empty` and keeping its committed offsets. Reading only memory
+    /// made a group disappear from `kafka-consumer-groups --list` and from Kafka
+    /// UI the moment its last consumer disconnected, even though its offsets were
+    /// still there and a restarting consumer would resume from them.
+    ///
+    /// `Dead` groups are excluded: that state means deleted, and Kafka does not
+    /// list them.
+    pub async fn list_groups(&self) -> Result<Vec<String>> {
+        let mut group_ids: Vec<String> = {
+            let groups = self.groups.read().await;
+            groups.keys().cloned().collect()
+        };
+
+        // Persisted groups that are not resident. A failure here must not hide
+        // the groups we do know about, so it degrades to the in-memory view.
+        match self.metadata_store.list_consumer_groups().await {
+            Ok(persisted) => {
+                for group in persisted {
+                    if group.state != GroupState::Dead.as_str() {
+                        group_ids.push(group.group_id);
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "ListGroups: could not read persisted consumer groups");
             }
         }
-    }
-    
-    /// List all consumer groups
-    pub async fn list_groups(&self) -> Result<Vec<String>> {
-        let groups = self.groups.read().await;
-        let mut group_ids: Vec<String> = groups.keys().cloned().collect();
-        
-        // Also include groups from metadata store that aren't in memory
-        // This would require extending the MetadataStore trait with a list_consumer_groups method
-        
+
         group_ids.sort();
         group_ids.dedup();
         Ok(group_ids)
+    }
+
+    /// Describe one consumer group for the DescribeGroups API.
+    ///
+    /// Returns `None` only when the group is genuinely unknown, so the caller can
+    /// answer GROUP_ID_NOT_FOUND. A group that exists but has no live members is
+    /// `Empty` with an empty member list — not "not found".
+    pub async fn describe_group(&self, group_id: &str) -> Option<GroupDescription> {
+        {
+            let groups = self.groups.read().await;
+            if let Some(group) = groups.get(group_id) {
+                // static_member_id -> member_id, reversed so each member can
+                // report the group.instance.id a static member joined with.
+                let instance_ids: HashMap<&String, &String> = group
+                    .static_members
+                    .iter()
+                    .map(|(instance_id, member_id)| (member_id, instance_id))
+                    .collect();
+
+                let members = group
+                    .members
+                    .values()
+                    .map(|member| DescribedMember {
+                        member_id: member.member_id.clone(),
+                        group_instance_id: instance_ids
+                            .get(&member.member_id)
+                            .map(|id| (*id).clone()),
+                        client_id: member.client_id.clone(),
+                        client_host: member.client_host.clone(),
+                        // The subscription bytes the member sent for the protocol
+                        // the group settled on; falling back to its first protocol
+                        // keeps a member describable mid-rebalance.
+                        metadata: group
+                            .protocol
+                            .as_ref()
+                            .and_then(|selected| {
+                                member
+                                    .protocols
+                                    .iter()
+                                    .find(|(name, _)| name == selected)
+                                    .map(|(_, meta)| meta.clone())
+                            })
+                            .or_else(|| member.protocols.first().map(|(_, meta)| meta.clone()))
+                            .unwrap_or_default(),
+                        assignment: crate::consumer_group::assignment::encode_assignment(
+                            &member.assignment,
+                        ),
+                    })
+                    .collect();
+
+                return Some(GroupDescription {
+                    state: group.state.as_str().to_string(),
+                    protocol_type: group.protocol_type.clone(),
+                    protocol: group.protocol.clone().unwrap_or_default(),
+                    members,
+                });
+            }
+        }
+
+        // Not resident. It may still be persisted with committed offsets, in
+        // which case it is Empty — whatever members the stored record lists are
+        // stale, since nothing is connected.
+        match self.metadata_store.get_consumer_group(group_id).await {
+            Ok(Some(stored)) if stored.state != GroupState::Dead.as_str() => {
+                Some(GroupDescription {
+                    state: GroupState::Empty.as_str().to_string(),
+                    protocol_type: stored.protocol_type,
+                    protocol: String::new(),
+                    members: Vec::new(),
+                })
+            }
+            _ => None,
+        }
     }
 
     /// Return the status of a consumer group for admin operations:
@@ -1757,23 +1833,53 @@ impl GroupManager {
             let mut interval = tokio::time::interval(Duration::from_secs(1));
             loop {
                 interval.tick().await;
-                
-                let mut groups = self.groups.write().await;
+
                 let mut empty_groups = Vec::new();
-                
-                for (group_id, group) in groups.iter_mut() {
-                    let expired = group.check_expired_members();
-                    if !expired.is_empty() {
-                        tracing::info!("Expired members in group {}: {:?}", group_id, expired);
-                        if group.members.is_empty() {
-                            empty_groups.push(group_id.clone());
+                {
+                    let mut groups = self.groups.write().await;
+                    for (group_id, group) in groups.iter_mut() {
+                        let expired = group.check_expired_members();
+                        if !expired.is_empty() {
+                            tracing::info!("Expired members in group {}: {:?}", group_id, expired);
+                            if group.members.is_empty() {
+                                empty_groups.push((group_id.clone(), group.protocol_type.clone()));
+                            }
                         }
                     }
+
+                    for (group_id, _) in &empty_groups {
+                        groups.remove(group_id);
+                    }
                 }
-                
-                // Remove empty groups
-                for group_id in empty_groups {
-                    groups.remove(&group_id);
+
+                // A group whose members timed out is in exactly the state as one
+                // whose members left cleanly: Empty, with its committed offsets
+                // intact. Record that, so it is still listed and describable and
+                // its stored state does not stay stale at `Stable` with members
+                // that are gone. Done outside the write lock — persisting is I/O.
+                for (group_id, protocol_type) in empty_groups {
+                    if let Err(e) = self
+                        .metadata_store
+                        .update_consumer_group(ConsumerGroupMetadata {
+                            group_id: group_id.clone(),
+                            state: GroupState::Empty.as_str().to_string(),
+                            protocol: String::new(),
+                            protocol_type,
+                            generation_id: 0,
+                            leader_id: None,
+                            leader: String::new(),
+                            members: Vec::new(),
+                            created_at: chrono::Utc::now(),
+                            updated_at: chrono::Utc::now(),
+                        })
+                        .await
+                    {
+                        warn!(
+                            group_id = %group_id,
+                            error = %e,
+                            "Failed to mark expired group as empty in metadata store"
+                        );
+                    }
                 }
             }
         });
@@ -2805,6 +2911,147 @@ mod tests {
         assert!(!rejoined.is_empty(), "a restarted consumer could not rejoin its own group");
     }
     
+
+    /// A group whose last member left must stay listed.
+    ///
+    /// It is `Empty`, not gone: its committed offsets survive and a restarting
+    /// consumer resumes from them. Listing only the in-memory registry made it
+    /// vanish from `kafka-consumer-groups --list` and Kafka UI the moment the
+    /// last consumer disconnected.
+    #[tokio::test]
+    async fn an_empty_group_is_still_listed() {
+        let metadata_store = Arc::new(InMemoryMetadataStore::new());
+        let manager = Arc::new(GroupManager::new(metadata_store));
+
+        let member = join_one(&manager, "g-empty", "c1").await;
+        assert!(
+            manager.list_groups().await.unwrap().contains(&"g-empty".to_string()),
+            "a group with a live member must be listed"
+        );
+
+        manager.leave_group("g-empty".to_string(), member).await.unwrap();
+
+        assert!(
+            manager.list_groups().await.unwrap().contains(&"g-empty".to_string()),
+            "the group disappeared when its last member left, but its offsets are \
+             still there and a consumer restarting would resume from them"
+        );
+    }
+
+    /// The counterpart: a deleted group must NOT come back from the metadata
+    /// store. Listing everything persisted would resurrect deleted groups.
+    #[tokio::test]
+    async fn a_dead_group_is_not_listed() {
+        let metadata_store = Arc::new(InMemoryMetadataStore::new());
+        metadata_store
+            .update_consumer_group(ConsumerGroupMetadata {
+                group_id: "g-dead".to_string(),
+                state: GroupState::Dead.as_str().to_string(),
+                protocol: String::new(),
+                protocol_type: "consumer".to_string(),
+                generation_id: 0,
+                leader_id: None,
+                leader: String::new(),
+                members: Vec::new(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        let manager = Arc::new(GroupManager::new(metadata_store));
+
+        assert!(
+            !manager.list_groups().await.unwrap().contains(&"g-dead".to_string()),
+            "Dead means deleted; listing it would resurrect a group the operator removed"
+        );
+    }
+
+    /// DescribeGroups must see the same groups ListGroups does.
+    ///
+    /// The two disagreed: describe was answered from a map nothing writes to, so
+    /// it returned GROUP_ID_NOT_FOUND for a group being listed in the same
+    /// second, and admin tooling could show no membership and therefore no lag.
+    #[tokio::test]
+    async fn describe_sees_a_live_group_with_its_members() {
+        let metadata_store = Arc::new(InMemoryMetadataStore::new());
+        let manager = Arc::new(GroupManager::new(metadata_store));
+
+        join_one(&manager, "g-live", "c1").await;
+
+        let described = manager
+            .describe_group("g-live")
+            .await
+            .expect("a group that ListGroups returns must be describable");
+        assert_eq!(described.protocol_type, "consumer");
+        assert_eq!(described.members.len(), 1, "the live member must be reported");
+        assert_eq!(described.members[0].client_id, "c1");
+        assert!(
+            !described.members[0].metadata.is_empty(),
+            "member metadata carries the subscription clients decode to show topics"
+        );
+    }
+
+    /// An empty group describes as `Empty` with no members — not as not-found.
+    #[tokio::test]
+    async fn describe_reports_an_empty_group_as_empty() {
+        let metadata_store = Arc::new(InMemoryMetadataStore::new());
+        let manager = Arc::new(GroupManager::new(metadata_store));
+
+        let member = join_one(&manager, "g-gone", "c1").await;
+        manager.leave_group("g-gone".to_string(), member).await.unwrap();
+
+        let described = manager
+            .describe_group("g-gone")
+            .await
+            .expect("an empty group exists and must be describable, not 'not found'");
+        assert_eq!(described.state, GroupState::Empty.as_str());
+        assert!(
+            described.members.is_empty(),
+            "nothing is connected, so no member may be reported as live"
+        );
+    }
+
+    /// A group that was never created is genuinely not found, so the API can
+    /// still answer GROUP_ID_NOT_FOUND. Reporting Empty for everything would
+    /// make every typo look like a real group.
+    #[tokio::test]
+    async fn describe_reports_an_unknown_group_as_not_found() {
+        let metadata_store = Arc::new(InMemoryMetadataStore::new());
+        let manager = Arc::new(GroupManager::new(metadata_store));
+
+        assert!(manager.describe_group("never-existed").await.is_none());
+    }
+
+    /// Listing persisted groups must not resurrect a deleted one.
+    ///
+    /// `list_groups` now reads the metadata store as well as memory, so a
+    /// DeleteGroups that left the stored record behind would make the group
+    /// reappear in admin tooling after an operator removed it.
+    #[tokio::test]
+    async fn a_deleted_group_does_not_come_back_from_the_store() {
+        let metadata_store = Arc::new(InMemoryMetadataStore::new());
+        let manager = Arc::new(GroupManager::new(metadata_store.clone()));
+
+        let member = join_one(&manager, "g-delete", "c1").await;
+        manager.leave_group("g-delete".to_string(), member).await.unwrap();
+        assert!(
+            manager.list_groups().await.unwrap().contains(&"g-delete".to_string()),
+            "precondition: the empty group is listed"
+        );
+
+        // What DeleteGroups does: drop it from memory, then durably.
+        manager.remove_group_in_memory("g-delete").await;
+        metadata_store.delete_consumer_group("g-delete").await.unwrap();
+
+        assert!(
+            !manager.list_groups().await.unwrap().contains(&"g-delete".to_string()),
+            "a deleted group came back from the metadata store"
+        );
+        assert!(
+            manager.describe_group("g-delete").await.is_none(),
+            "a deleted group must describe as not-found"
+        );
+    }
     #[test]
     fn test_assignment_encoding_decoding() {
         use crate::consumer_group::assignment::{encode_assignment, decode_assignment};

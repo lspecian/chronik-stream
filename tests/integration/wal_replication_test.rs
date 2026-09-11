@@ -31,6 +31,7 @@ const REPLICATION_TEST_TOPIC: &str = "replication-test-topic";
 const MESSAGE_COUNT: usize = 100;
 
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn test_wal_replication_basic() -> Result<()> {
     super::test_setup::init();
 
@@ -136,6 +137,7 @@ async fn test_wal_replication_basic() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn test_wal_replication_follower_recovery() -> Result<()> {
     super::test_setup::init();
 
@@ -236,6 +238,7 @@ async fn test_wal_replication_follower_recovery() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn test_wal_replication_metadata_sync() -> Result<()> {
     super::test_setup::init();
 
@@ -299,6 +302,7 @@ async fn test_wal_replication_metadata_sync() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn test_wal_replication_heartbeat_timeout() -> Result<()> {
     super::test_setup::init();
 

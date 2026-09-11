@@ -118,3 +118,37 @@ Tests run automatically on:
 - Release branches for full validation
 
 See `.github/workflows/integration-tests.yml` for configuration.
+## Tests that need a live broker
+
+Suites that call `TestCluster::start` spawn a real `chronik-server` and are
+`#[ignore]`-gated, so `cargo test --workspace --tests` (what CI runs) stays
+hermetic. CI does not build the broker binary for that job, so without the gate
+they fail with `No such file or directory (os error 2)` — which reads like a
+broken test rather than a missing binary.
+
+Run them explicitly:
+
+```bash
+cargo build --bin chronik-server          # the harness looks for target/debug/
+cargo test --test acl_enforcement -- --ignored --test-threads=1
+cargo test --test sasl_enforcement -- --ignored --test-threads=1
+cargo test --test unified_api_auth -- --ignored --test-threads=1
+cargo test --test consumer_groups -- --ignored --test-threads=1
+```
+
+`--test-threads=1` matters: these bind real ports and serialize on
+`common::exclusive()`.
+
+**Build the binary first, every time.** A stale `target/debug/chronik-server`
+makes these tests fail against code you are not running, which has cost real
+debugging time on this project.
+
+To run a suite against a *different* build — for example to prove a regression
+test actually fails on the code before a fix — point `CHRONIK_TEST_BIN` at it:
+
+```bash
+CHRONIK_TEST_BIN=$PWD/target/release/chronik-server \
+  cargo test --test consumer_groups -- --ignored --test-threads=1
+```
+
+A test that has never failed proves nothing; this is how to check that it does.

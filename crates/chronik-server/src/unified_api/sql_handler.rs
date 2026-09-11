@@ -1009,6 +1009,15 @@ pub async fn execute_sql(
     };
     info!(query = %request.query, limit = row_limit, "Executing SQL query");
 
+    // Security Phase 4: per-topic authorization.
+    //
+    // The API key authenticates the caller; this decides which topics that
+    // caller may read. Without it a key holder could SELECT from any topic,
+    // bypassing the ACLs enforced on the Kafka port.
+    if let Some(denied) = authorize_sql_query(&state, &request.query).await {
+        return denied;
+    }
+
     // Check if SQL engine is available before executing
     if state.query_engine.is_none() {
         let error_response = SqlErrorResponse {
@@ -1678,4 +1687,101 @@ mod cold_overlap_tests {
         let store = InMemoryMetadataStore::new();
         assert!(!cold_segments_overlap(&store, "t").await);
     }
+}
+
+/// Authorize the topics a SQL statement reads.
+///
+/// Returns `Some(response)` when the query must be refused, `None` when it may
+/// proceed. Refusal is 403 with the offending topics named, so an operator can
+/// see which ACL is missing rather than guessing.
+///
+/// Unparseable SQL is refused rather than passed through: a statement whose
+/// tables cannot be determined cannot be authorized, and running it would mean
+/// authorizing nothing.
+async fn authorize_sql_query(
+    state: &UnifiedApiState,
+    query: &str,
+) -> Option<axum::response::Response> {
+    use axum::response::IntoResponse;
+    use chronik_protocol::describe_acls_types::{AclOperation, ResourceType};
+
+    let authorizer = state.authorizer.as_ref()?;
+    if !authorizer.is_enabled() {
+        return None;
+    }
+
+    // The table -> topic map is built forward from the live topic list, because
+    // the topic -> table sanitiser is lossy and cannot be inverted safely.
+    let topics: Vec<String> = match state.metadata_store.list_topics().await {
+        Ok(topics) => topics.into_iter().map(|t| t.name).collect(),
+        Err(e) => {
+            error!("SQL authorization could not list topics: {:?}", e);
+            return Some(
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(SqlErrorResponse {
+                        error: "authorization unavailable".to_string(),
+                        error_type: "internal_error".to_string(),
+                    }),
+                )
+                    .into_response(),
+            );
+        }
+    };
+
+    let map = super::sql_authz::TableTopicMap::from_topics(topics);
+    let required = match super::sql_authz::required_topics(query, &map) {
+        Ok(required) => required,
+        Err(e) => {
+            return Some(
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(SqlErrorResponse {
+                        error: format!("could not determine the tables this query reads: {}", e),
+                        error_type: "invalid_query".to_string(),
+                    }),
+                )
+                    .into_response(),
+            );
+        }
+    };
+
+    let mut denied = Vec::new();
+    for topic in &required {
+        let allowed = authorizer
+            .authorize_principal(
+                &state.api_principal,
+                "*",
+                ResourceType::Topic,
+                topic,
+                AclOperation::Read,
+            )
+            .await;
+        if !allowed {
+            denied.push(topic.clone());
+        }
+    }
+
+    if denied.is_empty() {
+        return None;
+    }
+
+    warn!(
+        "SQL query DENIED for {}: no Read on {:?}",
+        state.api_principal, denied
+    );
+    Some(
+        (
+            StatusCode::FORBIDDEN,
+            Json(SqlErrorResponse {
+                error: format!(
+                    "{} is not authorized to read: {}",
+                    state.api_principal,
+                    denied.join(", ")
+                ),
+                error_type: "authorization_failed".to_string(),
+            }),
+        )
+            .into_response(),
+    )
 }

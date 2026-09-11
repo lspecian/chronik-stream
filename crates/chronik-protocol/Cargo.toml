@@ -35,7 +35,12 @@ tracing = { workspace = true }
 
 # Utils
 uuid = { version = "1.10", features = ["v4"] }
-base64 = "0.21"
+base64 = { workspace = true }
+sha2 = { workspace = true }
+hmac = { workspace = true }
+pbkdf2 = { workspace = true }
+rand = { workspace = true }
+subtle = { workspace = true }
 
 [dev-dependencies]
 tokio-test = "0.4"

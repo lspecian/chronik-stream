@@ -23,7 +23,7 @@ pub mod chronik_integration;
 
 pub use auth::{AuthConfig, S3Credentials, GcsCredentials, AzureCredentials};
 pub use backends::{S3Backend, GcsBackend, AzureBackend, LocalBackend};
-pub use config::{ObjectStoreConfig, StorageBackend, ConnectionConfig, PerformanceConfig};
+pub use config::{ObjectStoreConfig, StorageBackend, ConnectionConfig, PerformanceConfig, EncryptionConfig, EncryptionType};
 pub use errors::{ObjectStoreError, ObjectStoreResult};
 pub use metrics::{ObjectStoreMetrics, OperationMetrics};
 pub use retry::{RetryConfig, ExponentialBackoff};

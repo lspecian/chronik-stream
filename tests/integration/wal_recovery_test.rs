@@ -257,6 +257,7 @@ struct WalInspectionResult {
 
 /// Main WAL recovery test
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn test_wal_recovery_after_crash() -> Result<()> {
     let _serial = common::exclusive().await;
     // Initialize logging
@@ -573,6 +574,7 @@ struct RecoveryTestStats {
 
 // Additional test for multiple crash/recovery cycles
 #[tokio::test]
+#[ignore = "starts a real broker; run with: cargo test --test <target> -- --ignored"]
 async fn test_multiple_crash_recovery_cycles() -> Result<()> {
     let _serial = common::exclusive().await;
     info!("Starting multiple crash/recovery cycles test");

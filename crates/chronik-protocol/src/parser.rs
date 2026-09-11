@@ -343,6 +343,26 @@ impl<'a> Decoder<'a> {
     }
     
     /// Read an unsigned varint
+    /// Skip a tagged-field section (flexible versions).
+    ///
+    /// Every flexible struct ends with one, and a parser that does not consume
+    /// it reads the next field from the wrong offset - the same class of
+    /// off-by-one that made SaslHandshake v1 unparseable.
+    pub fn skip_tagged_fields(&mut self) -> Result<()> {
+        let count = self.read_unsigned_varint()?;
+        for _ in 0..count {
+            let _tag_id = self.read_unsigned_varint()?;
+            let size = self.read_unsigned_varint()? as usize;
+            if self.buf.remaining() < size {
+                return Err(Error::Protocol(
+                    "Not enough bytes for tagged field".to_string(),
+                ));
+            }
+            self.buf.advance(size);
+        }
+        Ok(())
+    }
+
     pub fn read_unsigned_varint(&mut self) -> Result<u32> {
         let mut value = 0u32;
         let mut i = 0;
@@ -682,11 +702,17 @@ pub fn is_flexible_version(api_key: ApiKey, api_version: i16) -> bool {
         ApiKey::SyncGroup => api_version >= 4,
         ApiKey::DescribeGroups => api_version >= 5,
         ApiKey::ListGroups => api_version >= 3,
-        // NOTE: the Kafka spec marks SaslHandshake "flexibleVersions": "none".
-        // Left as-is rather than corrected because there is no SASL client in
-        // the test bed to prove the change, and the current form is what
-        // existing deployments have negotiated against.
-        ApiKey::SaslHandshake => api_version >= 1,
+        // SaslHandshake is "flexibleVersions": "none" in the Kafka spec - neither
+        // v0 nor v1 uses compact encoding or tagged fields.
+        //
+        // This previously returned `api_version >= 1`, which put a tagged-fields
+        // byte after the response header and shifted the body by one: librdkafka
+        // reported `Protocol parse failure for SaslHandshake v1` /
+        // `Invalid MechanismCount 553648128` (0x21000000) and every SASL
+        // handshake failed. The old comment left it uncorrected for want of a
+        // SASL client to prove the change; tests/integration/sasl_enforcement_test.rs
+        // is that client, and it fails with the old value.
+        ApiKey::SaslHandshake => false,
         ApiKey::SaslAuthenticate => api_version >= 2,  // v2+ uses flexible encoding
         ApiKey::ApiVersions => api_version >= 3,
         ApiKey::CreateTopics => api_version >= 5,
@@ -857,10 +883,10 @@ pub fn supported_api_versions() -> HashMap<ApiKey, VersionRange> {
     // versions.insert(ApiKey::AlterClientQuotas, VersionRange { min: 0, max: 0 });
     // NOT advertised: only the catch-all answers it, and that body does not match
     // this API's response schema. See the note above supported_api_versions.
-    // versions.insert(ApiKey::DescribeUserScramCredentials, VersionRange { min: 0, max: 0 });
+    versions.insert(ApiKey::DescribeUserScramCredentials, VersionRange { min: 0, max: 0 });
     // NOT advertised: only the catch-all answers it, and that body does not match
     // this API's response schema. See the note above supported_api_versions.
-    // versions.insert(ApiKey::AlterUserScramCredentials, VersionRange { min: 0, max: 0 });
+    versions.insert(ApiKey::AlterUserScramCredentials, VersionRange { min: 0, max: 0 });
     
     // KRaft consensus APIs (NOT IMPLEMENTED - placeholder for librdkafka compatibility)
     // Note: Skipping APIs 52-55, 59, 62-64 to match CP Kafka 7.5.0

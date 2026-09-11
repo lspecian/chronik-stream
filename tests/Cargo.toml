@@ -39,6 +39,11 @@ parking_lot = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
+# SCRAM credential tests compute the salted password client-side, exactly as
+# kafka-configs.sh does, so the password never reaches the broker.
+pbkdf2 = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
@@ -95,3 +100,15 @@ path = "integration/wal_lifecycle_test.rs"
 name = "data_flow"
 path = "integration/data_flow.rs"
 
+
+[[test]]
+name = "sasl_enforcement"
+path = "integration/sasl_enforcement_test.rs"
+
+[[test]]
+name = "acl_enforcement"
+path = "integration/acl_enforcement_test.rs"
+
+[[test]]
+name = "unified_api_auth"
+path = "integration/unified_api_auth_test.rs"

@@ -261,6 +261,12 @@ impl MetadataStore for InMemoryMetadataStore {
         Ok(groups.get(group_id).cloned())
     }
     
+
+    async fn list_consumer_groups(&self) -> Result<Vec<ConsumerGroupMetadata>> {
+        let groups = self.consumer_groups.read().await;
+        Ok(groups.values().cloned().collect())
+    }
+
     async fn update_consumer_group(&self, group: ConsumerGroupMetadata) -> Result<()> {
         let mut groups = self.consumer_groups.write().await;
         groups.insert(group.group_id.clone(), group);

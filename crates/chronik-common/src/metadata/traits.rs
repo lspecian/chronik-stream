@@ -569,6 +569,21 @@ pub trait MetadataStore: Send + Sync {
         Ok(log_start_offset)
     }
 
+
+    /// Every consumer group that has been persisted, including groups whose last
+    /// member has left.
+    ///
+    /// A group with no live members is `Empty`, not gone: Kafka keeps it — and its
+    /// committed offsets — until DeleteGroups or offset expiry removes it. Without
+    /// this, `ListGroups` can only report groups that happen to be resident in
+    /// memory, so a group vanishes from admin tooling the moment its last consumer
+    /// disconnects, and reappears when one connects again.
+    ///
+    /// Default impl returns nothing, for stores that don't persist groups.
+    async fn list_consumer_groups(&self) -> Result<Vec<ConsumerGroupMetadata>> {
+        Ok(Vec::new())
+    }
+
     /// Delete a consumer group and all of its committed offsets (Kafka DeleteGroups API).
     /// Default impl is a no-op for stores that don't persist consumer groups.
     async fn delete_consumer_group(&self, _group_id: &str) -> Result<()> {
@@ -585,6 +600,50 @@ pub trait MetadataStore: Send + Sync {
     // Replicated event application (for followers receiving from leader)
     // v2.2.9 Phase 7: Apply replicated metadata events WITHOUT writing to WAL
     async fn apply_replicated_event(&self, event: super::events::MetadataEvent) -> Result<()>;
+
+    // ---- ACLs (Security Phase 3) ----
+    //
+    // Default implementations make ACLs a no-op for stores that do not persist
+    // them (the in-memory test store, for instance) rather than forcing every
+    // implementor to change. `WalMetadataStore` overrides all three, which is
+    // the store every real deployment uses.
+
+    /// Persist and replicate an ACL binding.
+    async fn create_acl(&self, _binding: AclBindingRecord) -> Result<()> {
+        Ok(())
+    }
+
+    /// Remove a persisted ACL binding.
+    async fn delete_acl(&self, _binding: AclBindingRecord) -> Result<()> {
+        Ok(())
+    }
+
+    /// Every persisted ACL binding, for rebuilding the in-memory index at startup.
+    async fn list_acls(&self) -> Result<Vec<AclBindingRecord>> {
+        Ok(Vec::new())
+    }
+
+    // ---- SCRAM credentials (Security Phase 1) ----
+
+    /// Create or replace a user's credential for one mechanism.
+    async fn upsert_scram_credential(&self, _credential: ScramCredentialRecord) -> Result<()> {
+        Err(MetadataError::NotFound(
+            "SCRAM credential storage is not supported by this metadata store".to_string(),
+        ))
+    }
+
+    /// Remove a user's credential for one mechanism.
+    async fn delete_scram_credential(&self, _username: &str, _mechanism: i8) -> Result<()> {
+        Err(MetadataError::NotFound(
+            "SCRAM credential storage is not supported by this metadata store".to_string(),
+        ))
+    }
+
+    /// Every persisted credential, for describing users and for loading the
+    /// authenticator at startup.
+    async fn list_scram_credentials(&self) -> Result<Vec<ScramCredentialRecord>> {
+        Ok(Vec::new())
+    }
 
     // System initialization
     async fn init_system_state(&self) -> Result<()>;
@@ -611,4 +670,56 @@ pub trait MetadataStore: Send + Sync {
     ) -> Result<TopicMetadata> {
         self.create_topic_with_assignments(topic_name, config, assignments, offsets).await
     }
+}
+/// A persisted ACL binding.
+///
+/// Fields are Kafka **wire values** (the `i8` codes for resource type, pattern
+/// type, operation and permission) rather than the enums from
+/// `chronik-protocol`, because `chronik-common` does not depend on that crate
+/// and must not: the dependency runs the other way. The wire encoding is the
+/// stable interchange format here anyway — it is what `CreateAcls` carries and
+/// what `kafka-acls.sh` writes — so storing it verbatim avoids a translation
+/// table that could drift from the protocol.
+///
+/// Persisting these at all is the point: before this existed, an ACL created
+/// through `CreateAcls` lived only in one broker's memory. It answered success,
+/// then vanished on restart and was never visible to any other node — a control
+/// that reported success while doing nothing, which is the failure mode this
+/// whole security effort exists to remove.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct AclBindingRecord {
+    pub resource_type: i8,
+    pub resource_name: String,
+    pub pattern_type: i8,
+    pub principal: String,
+    pub host: String,
+    pub operation: i8,
+    pub permission_type: i8,
+}
+
+/// A persisted SCRAM credential.
+///
+/// Holds only derived key material — never a password, and never anything a
+/// password could be recovered from cheaply. `stored_key` is
+/// `H(HMAC(SaltedPassword, "Client Key"))`; an attacker who reads it cannot
+/// produce a valid client proof without `ClientKey`, which requires the
+/// password.
+///
+/// `mechanism` is the Kafka wire code (1 = SCRAM-SHA-256, 2 = SCRAM-SHA-512),
+/// for the same reason [`AclBindingRecord`] uses wire values: `chronik-common`
+/// does not depend on `chronik-protocol`.
+///
+/// This exists so credentials are cluster state rather than per-broker
+/// configuration. With users coming only from `CHRONIK_SASL_USERS`, every broker
+/// had to be redeployed to add one, and `kafka-configs.sh` could not manage
+/// them at all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScramCredentialRecord {
+    pub username: String,
+    /// 1 = SCRAM-SHA-256, 2 = SCRAM-SHA-512 (Kafka's ScramMechanism codes).
+    pub mechanism: i8,
+    pub iterations: u32,
+    pub salt: Vec<u8>,
+    pub stored_key: Vec<u8>,
+    pub server_key: Vec<u8>,
 }

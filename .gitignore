@@ -83,8 +83,11 @@ tests/python/*.log
 tests/python/*.out
 benchmarks/results/
 
-# Data directories - runtime data should not be committed
-data*
+# Data directories - runtime data should not be committed.
+# The trailing slash matters: a bare `data*` also matches SOURCE FILES whose
+# names begin with "data", and silently kept data_auth.rs out of the repo — the
+# build worked for everyone who had it on disk and failed for a fresh clone.
+data*/
 *.segment
 *.db
 *.idx

@@ -115,6 +115,20 @@ impl AclStore {
             info!("ACL authorization disabled (set CHRONIK_ACL_ENABLED=true to enable)");
         }
 
+        Self::with_config(enabled, allow_if_no_acl, super_users)
+    }
+
+    /// Construct a store from explicit settings rather than the environment.
+    ///
+    /// `new()` reads process-wide environment variables, which makes it unusable
+    /// from tests that run in parallel: one test setting `CHRONIK_ACL_ENABLED`
+    /// changes what another observes. Configuration is passed explicitly here so
+    /// behaviour is a function of arguments.
+    pub fn with_config(
+        enabled: bool,
+        allow_if_no_acl: bool,
+        super_users: Vec<String>,
+    ) -> Self {
         Self {
             acls: RwLock::new(HashMap::new()),
             enabled,
@@ -126,6 +140,59 @@ impl AclStore {
     /// Check if authorization is enabled
     pub fn is_enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// Whether an operation with no matching ACL is allowed.
+    pub fn allows_if_no_acl(&self) -> bool {
+        self.allow_if_no_acl
+    }
+
+    /// Load bootstrap ACLs from `CHRONIK_ACL_BINDINGS`.
+    ///
+    /// ACLs have a bootstrapping problem: the store starts empty, so enabling
+    /// authorization either permits everything (`allow_if_no_acl=true`) or locks
+    /// out every client including the one that would create the first rule.
+    /// Kafka solves it with a super-user list plus an external admin tool; this
+    /// adds the declarative half, so a deployment can express its policy in
+    /// configuration and start closed.
+    ///
+    /// Format: bindings separated by `;`, fields within a binding by `,`:
+    ///
+    /// ```text
+    /// <principal>,<resource_type>,<resource_name>,<operation>,<permission>[,<host>]
+    /// User:alice,Topic,orders,Read,Allow;User:bob,Group,analytics,Read,Allow
+    /// ```
+    ///
+    /// `resource_name` may end with `*` for a prefixed pattern
+    /// (`Topic,app-*` matches `app-orders`). `host` defaults to `*`.
+    pub async fn load_bootstrap_acls(&self, spec: &str) -> usize {
+        let mut loaded = 0;
+        for entry in spec.split(';') {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            match parse_acl_binding(entry) {
+                Ok(binding) => {
+                    let description = format!(
+                        "{} {:?} {:?} on {:?} '{}'",
+                        binding.principal,
+                        binding.permission_type,
+                        binding.operation,
+                        binding.resource_type,
+                        binding.resource_name
+                    );
+                    if let Err(e) = self.create_acl(binding).await {
+                        warn!("Bootstrap ACL '{}' rejected: {}", entry, e);
+                    } else {
+                        info!("Bootstrap ACL: {}", description);
+                        loaded += 1;
+                    }
+                }
+                Err(e) => warn!("Ignoring malformed bootstrap ACL '{}': {}", entry, e),
+            }
+        }
+        loaded
     }
 
     /// Create a new ACL binding
@@ -372,12 +439,39 @@ impl AclStore {
         // Check host
         let host_matches = entry.host == "*" || entry.host == host;
 
-        // Check operation
+        // Check operation, honouring Kafka's implication rules.
         let operation_matches = entry.operation == AclOperation::All
             || entry.operation == AclOperation::Any
-            || entry.operation == operation;
+            || entry.operation == operation
+            || implies(entry.operation, operation);
 
         principal_matches && host_matches && operation_matches
+    }
+}
+
+/// Whether a granted operation implies a requested one.
+///
+/// Kafka's authorizer does not require every operation to be granted
+/// explicitly: `Describe` is implied by `Read`, `Write`, `Delete` and `Alter`,
+/// and `DescribeConfigs` is implied by `AlterConfigs`
+/// (`AclOperation.describe()`/`describeConfigs()` upstream).
+///
+/// Without this, an ordinary policy silently fails. `User:alice,Group,g,Read`
+/// let alice join the group but not `OffsetFetch` it, because OffsetFetch needs
+/// Describe — so a consumer authorized to read was refused mid-session. Every
+/// real policy would have needed redundant Describe grants that no operator
+/// writes and `kafka-acls.sh` does not emit.
+fn implies(granted: AclOperation, requested: AclOperation) -> bool {
+    match requested {
+        AclOperation::Describe => matches!(
+            granted,
+            AclOperation::Read
+                | AclOperation::Write
+                | AclOperation::Delete
+                | AclOperation::Alter
+        ),
+        AclOperation::DescribeConfigs => granted == AclOperation::AlterConfigs,
+        _ => false,
     }
 }
 
@@ -466,6 +560,10 @@ impl AclFilter {
 pub enum AclError {
     #[error("Duplicate ACL entry")]
     DuplicateAcl,
+
+    /// The rule could not be written to the metadata log, so it was not applied.
+    #[error("ACL storage error: {0}")]
+    StorageError(String),
 
     #[error("Invalid resource type")]
     InvalidResourceType,
@@ -641,5 +739,386 @@ mod tests {
 
         std::env::remove_var("CHRONIK_ACL_ENABLED");
         std::env::remove_var("CHRONIK_ACL_ALLOW_IF_NO_ACL");
+    }
+}
+
+/// Parse one `CHRONIK_ACL_BINDINGS` entry.
+///
+/// `<principal>,<resource_type>,<resource_name>,<operation>,<permission>[,<host>]`
+fn parse_acl_binding(entry: &str) -> std::result::Result<AclBinding, String> {
+    let fields: Vec<&str> = entry.split(',').map(|f| f.trim()).collect();
+    if fields.len() < 5 {
+        return Err(format!(
+            "expected at least 5 comma-separated fields \
+             (principal,resource_type,resource_name,operation,permission), got {}",
+            fields.len()
+        ));
+    }
+
+    let principal = fields[0].to_string();
+    if principal.is_empty() {
+        return Err("principal is empty".to_string());
+    }
+    // Kafka principals are "User:name". Accept a bare name and qualify it, so a
+    // config that says `alice` behaves the way its author expects rather than
+    // silently matching nothing.
+    let principal = if principal.contains(':') || principal == "*" {
+        principal
+    } else {
+        format!("User:{}", principal)
+    };
+
+    let resource_type = match fields[1].to_ascii_lowercase().as_str() {
+        "topic" => ResourceType::Topic,
+        "group" => ResourceType::Group,
+        "cluster" => ResourceType::Cluster,
+        "transactionalid" | "transactional_id" => ResourceType::TransactionalId,
+        "delegationtoken" | "delegation_token" => ResourceType::DelegationToken,
+        other => return Err(format!("unknown resource type '{}'", other)),
+    };
+
+    // A trailing '*' means a prefixed pattern, matching kafka-acls.sh usage.
+    let raw_name = fields[2];
+    let (resource_name, pattern_type) = if raw_name.len() > 1 && raw_name.ends_with('*') {
+        (raw_name[..raw_name.len() - 1].to_string(), PatternType::Prefixed)
+    } else {
+        (raw_name.to_string(), PatternType::Literal)
+    };
+
+    let operation = match fields[3].to_ascii_lowercase().as_str() {
+        "all" => AclOperation::All,
+        "read" => AclOperation::Read,
+        "write" => AclOperation::Write,
+        "create" => AclOperation::Create,
+        "delete" => AclOperation::Delete,
+        "alter" => AclOperation::Alter,
+        "describe" => AclOperation::Describe,
+        "clusteraction" | "cluster_action" => AclOperation::ClusterAction,
+        "describeconfigs" | "describe_configs" => AclOperation::DescribeConfigs,
+        "alterconfigs" | "alter_configs" => AclOperation::AlterConfigs,
+        "idempotentwrite" | "idempotent_write" => AclOperation::IdempotentWrite,
+        other => return Err(format!("unknown operation '{}'", other)),
+    };
+
+    let permission_type = match fields[4].to_ascii_lowercase().as_str() {
+        "allow" => AclPermissionType::Allow,
+        "deny" => AclPermissionType::Deny,
+        other => return Err(format!("unknown permission '{}' (expected Allow or Deny)", other)),
+    };
+
+    let host = fields.get(5).map(|h| h.to_string()).unwrap_or_else(|| "*".to_string());
+
+    Ok(AclBinding {
+        resource_type,
+        resource_name,
+        pattern_type,
+        principal,
+        host,
+        operation,
+        permission_type,
+    })
+}
+
+#[cfg(test)]
+mod bootstrap_tests {
+    use super::*;
+
+    #[test]
+    fn parses_a_literal_binding() {
+        let b = parse_acl_binding("User:alice,Topic,orders,Read,Allow").unwrap();
+        assert_eq!(b.principal, "User:alice");
+        assert_eq!(b.resource_type, ResourceType::Topic);
+        assert_eq!(b.resource_name, "orders");
+        assert_eq!(b.pattern_type, PatternType::Literal);
+        assert_eq!(b.operation, AclOperation::Read);
+        assert_eq!(b.permission_type, AclPermissionType::Allow);
+        assert_eq!(b.host, "*");
+    }
+
+    /// A trailing '*' is a prefix pattern, not a literal topic called "app-*".
+    #[test]
+    fn parses_a_prefixed_binding() {
+        let b = parse_acl_binding("User:alice,Topic,app-*,Write,Allow").unwrap();
+        assert_eq!(b.resource_name, "app-");
+        assert_eq!(b.pattern_type, PatternType::Prefixed);
+    }
+
+    /// A bare name is qualified rather than silently matching nothing.
+    #[test]
+    fn bare_principal_is_qualified() {
+        let b = parse_acl_binding("alice,Topic,orders,Read,Allow").unwrap();
+        assert_eq!(b.principal, "User:alice");
+    }
+
+    #[test]
+    fn host_is_optional() {
+        let b = parse_acl_binding("User:alice,Topic,orders,Read,Allow,10.0.0.1").unwrap();
+        assert_eq!(b.host, "10.0.0.1");
+    }
+
+    #[test]
+    fn malformed_entries_are_errors_not_silent_allows() {
+        assert!(parse_acl_binding("User:alice,Topic,orders").is_err());
+        assert!(parse_acl_binding("User:alice,Nonsense,orders,Read,Allow").is_err());
+        assert!(parse_acl_binding("User:alice,Topic,orders,Fly,Allow").is_err());
+        assert!(parse_acl_binding("User:alice,Topic,orders,Read,Maybe").is_err());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_acls_are_enforced() {
+        let store = AclStore::with_config(true, false, Vec::new());
+        let loaded = store
+            .load_bootstrap_acls(
+                "User:alice,Topic,orders,Read,Allow;User:bob,Topic,secrets,Read,Allow",
+            )
+            .await;
+        assert_eq!(loaded, 2);
+
+        assert!(
+            store
+                .authorize("User:alice", "1.2.3.4", ResourceType::Topic, "orders", AclOperation::Read)
+                .await
+        );
+        // alice has no rule for 'secrets'
+        assert!(
+            !store
+                .authorize("User:alice", "1.2.3.4", ResourceType::Topic, "secrets", AclOperation::Read)
+                .await
+        );
+        // and no Write on 'orders'
+        assert!(
+            !store
+                .authorize("User:alice", "1.2.3.4", ResourceType::Topic, "orders", AclOperation::Write)
+                .await
+        );
+    }
+
+    /// Malformed entries must not abort the whole policy, but must be counted
+    /// out - a typo should lose one rule, not silently grant everything.
+    #[tokio::test]
+    async fn malformed_bootstrap_entries_are_skipped() {
+        let store = AclStore::with_config(true, false, Vec::new());
+        let loaded = store
+            .load_bootstrap_acls("User:alice,Topic,orders,Read,Allow;garbage;;User:bob,Bad,x,Read,Allow")
+            .await;
+        assert_eq!(loaded, 1);
+    }
+}
+
+// ============================================================================
+// Persistence (Security Phase 3 follow-up)
+//
+// The in-memory index above is the hot path: an authorization check must not
+// touch the metadata store. Durability is layered on top of it — writes go to
+// the event log (which replicates and is replayed on recovery), and the index is
+// rebuilt from that log at startup.
+//
+// Without this, `CreateAcls` answered success and the rule lived in one broker's
+// memory until the next restart, invisible to every other node. That is the same
+// "reports success while doing nothing" shape as the SASL handshake that
+// verified credentials and discarded the answer.
+// ============================================================================
+
+use chronik_common::metadata::traits::{AclBindingRecord, MetadataStore};
+
+impl AclBinding {
+    /// Convert to the wire-valued form the metadata log stores.
+    pub fn to_record(&self) -> AclBindingRecord {
+        AclBindingRecord {
+            resource_type: self.resource_type as i8,
+            resource_name: self.resource_name.clone(),
+            pattern_type: self.pattern_type as i8,
+            principal: self.principal.clone(),
+            host: self.host.clone(),
+            operation: self.operation as i8,
+            permission_type: self.permission_type as i8,
+        }
+    }
+
+    /// Rebuild from the persisted form.
+    pub fn from_record(record: &AclBindingRecord) -> Self {
+        Self {
+            resource_type: ResourceType::from_i8(record.resource_type),
+            resource_name: record.resource_name.clone(),
+            pattern_type: PatternType::from_i8(record.pattern_type),
+            principal: record.principal.clone(),
+            host: record.host.clone(),
+            operation: AclOperation::from_i8(record.operation),
+            permission_type: AclPermissionType::from_i8(record.permission_type),
+        }
+    }
+}
+
+impl AclStore {
+    /// Load every persisted ACL into the in-memory index.
+    ///
+    /// Called once at startup, after the metadata store has recovered its log.
+    /// Bootstrap bindings from `CHRONIK_ACL_BINDINGS` are applied separately and
+    /// are additive: configuration and persisted rules coexist, so an operator
+    /// can express a baseline policy in config and still manage rules at runtime.
+    pub async fn load_persisted(&self, store: &dyn MetadataStore) -> usize {
+        if !self.enabled {
+            return 0;
+        }
+
+        let records = match store.list_acls().await {
+            Ok(records) => records,
+            Err(e) => {
+                // Failing to read the policy must be loud. Continuing with an
+                // empty index would either deny everything or - worse, with
+                // allow_if_no_acl - permit everything.
+                warn!("Failed to load persisted ACLs: {} - the in-memory policy may be incomplete", e);
+                return 0;
+            }
+        };
+
+        let mut loaded = 0;
+        let mut acls = self.acls.write().await;
+        for record in &records {
+            let binding = AclBinding::from_record(record);
+            let key = (binding.resource_type, binding.resource_name.clone());
+            let entries = acls.entry(key).or_insert_with(Vec::new);
+            if !entries.iter().any(|e| e == &binding) {
+                entries.push(binding);
+                loaded += 1;
+            }
+        }
+
+        if loaded > 0 {
+            info!("Loaded {} persisted ACL binding(s)", loaded);
+        }
+        loaded
+    }
+
+    /// Create an ACL and persist it.
+    ///
+    /// Persistence happens FIRST: if the event log write fails, the rule must not
+    /// appear to exist in memory, or a broker would enforce a policy no other
+    /// broker knows about and which would vanish on restart.
+    pub async fn create_acl_durable(
+        &self,
+        binding: AclBinding,
+        store: &dyn MetadataStore,
+    ) -> Result<(), AclError> {
+        if !self.enabled {
+            debug!("ACL creation ignored (ACLs disabled)");
+            return Ok(());
+        }
+
+        {
+            let acls = self.acls.read().await;
+            let key = (binding.resource_type, binding.resource_name.clone());
+            if let Some(entries) = acls.get(&key) {
+                if entries.iter().any(|e| e == &binding) {
+                    return Err(AclError::DuplicateAcl);
+                }
+            }
+        }
+
+        store
+            .create_acl(binding.to_record())
+            .await
+            .map_err(|e| AclError::StorageError(e.to_string()))?;
+
+        self.create_acl(binding).await
+    }
+
+    /// Delete ACLs matching a filter, removing them from the log as well.
+    pub async fn delete_acls_durable(
+        &self,
+        filter: &AclFilter,
+        store: &dyn MetadataStore,
+    ) -> Vec<AclBinding> {
+        let removed = self.delete_acls(filter).await;
+        for binding in &removed {
+            if let Err(e) = store.delete_acl(binding.to_record()).await {
+                // The in-memory removal already happened, so this broker has
+                // stopped honouring the rule. Say so rather than let the two
+                // views diverge silently.
+                warn!(
+                    "ACL removed from memory but NOT from the metadata log ({}): it will \
+                     return on restart",
+                    e
+                );
+            }
+        }
+        removed
+    }
+}
+
+#[cfg(test)]
+mod implication_tests {
+    use super::*;
+
+    fn read_on_group(principal: &str, group: &str) -> AclBinding {
+        AclBinding {
+            resource_type: ResourceType::Group,
+            resource_name: group.to_string(),
+            pattern_type: PatternType::Literal,
+            principal: principal.to_string(),
+            host: "*".to_string(),
+            operation: AclOperation::Read,
+            permission_type: AclPermissionType::Allow,
+        }
+    }
+
+    /// The bug this fixes, exactly: `Group,g,Read` let a consumer join the group
+    /// but not OffsetFetch it, because OffsetFetch requires Describe. Kafka
+    /// implies Describe from Read, so every real policy depended on it.
+    #[tokio::test]
+    async fn read_implies_describe() {
+        let store = AclStore::with_config(true, false, Vec::new());
+        store.create_acl(read_on_group("User:alice", "g")).await.unwrap();
+
+        assert!(
+            store
+                .authorize("User:alice", "1.2.3.4", ResourceType::Group, "g", AclOperation::Read)
+                .await
+        );
+        assert!(
+            store
+                .authorize("User:alice", "1.2.3.4", ResourceType::Group, "g", AclOperation::Describe)
+                .await,
+            "Read must imply Describe, or a consumer authorized to read cannot fetch its offsets"
+        );
+    }
+
+    /// Implication must not leak the other way: Describe does not grant Read.
+    #[tokio::test]
+    async fn describe_does_not_imply_read() {
+        let store = AclStore::with_config(true, false, Vec::new());
+        let mut binding = read_on_group("User:alice", "g");
+        binding.operation = AclOperation::Describe;
+        store.create_acl(binding).await.unwrap();
+
+        assert!(
+            store
+                .authorize("User:alice", "1.2.3.4", ResourceType::Group, "g", AclOperation::Describe)
+                .await
+        );
+        assert!(
+            !store
+                .authorize("User:alice", "1.2.3.4", ResourceType::Group, "g", AclOperation::Read)
+                .await,
+            "Describe must NOT grant Read - that would make a read-only grant a full one"
+        );
+    }
+
+    /// Write, Delete and Alter imply Describe too; Read does not imply Write.
+    #[tokio::test]
+    async fn implication_table_matches_kafka() {
+        for granted in [
+            AclOperation::Read,
+            AclOperation::Write,
+            AclOperation::Delete,
+            AclOperation::Alter,
+        ] {
+            assert!(implies(granted, AclOperation::Describe), "{:?} should imply Describe", granted);
+        }
+        assert!(implies(AclOperation::AlterConfigs, AclOperation::DescribeConfigs));
+
+        assert!(!implies(AclOperation::Read, AclOperation::Write));
+        assert!(!implies(AclOperation::Describe, AclOperation::Read));
+        assert!(!implies(AclOperation::DescribeConfigs, AclOperation::AlterConfigs));
     }
 }

@@ -1624,6 +1624,11 @@ impl ProtocolHandler {
             ApiKey::Heartbeat => self.handle_heartbeat(header, &mut buf).await,
             ApiKey::LeaveGroup => self.handle_leave_group(header, &mut buf).await,
             ApiKey::SyncGroup => self.handle_sync_group(header, &mut buf).await,
+            // NOTE: chronik-server intercepts DescribeGroups before this and answers
+            // it from the live GroupManager. This arm reads `self.consumer_groups`,
+            // which nothing on the server path writes to, so it only serves callers
+            // that drive ProtocolHandler directly (tests, embedded use). Fix the
+            // authoritative one in `kafka_handler::handle_describe_groups_request`.
             ApiKey::DescribeGroups => self.handle_describe_groups(header, &mut buf).await,
             ApiKey::ListGroups => self.handle_list_groups(header, &mut buf).await,
             
@@ -1925,6 +1930,28 @@ impl ProtocolHandler {
         header: RequestHeader,
         body: &mut Bytes,
     ) -> Result<Response> {
+        self.handle_metadata_filtered(header, body, None).await
+    }
+
+    /// Handle a Metadata request, optionally restricting the topics reported.
+    ///
+    /// `authorized` is `None` when authorization is disabled (every topic is
+    /// reported, which is the default and the pre-existing behaviour). When
+    /// `Some`, it names the topics the caller may Describe, and this follows
+    /// Kafka:
+    ///
+    /// - a topic the caller explicitly asked for but may not Describe is
+    ///   returned with `TOPIC_AUTHORIZATION_FAILED`, so the client is told it
+    ///   was refused rather than that the topic does not exist;
+    /// - on an all-topics request, unauthorized topics are simply **omitted** —
+    ///   listing them would leak the cluster's topic names to a principal with
+    ///   no rights to them.
+    pub async fn handle_metadata_filtered(
+        &self,
+        header: RequestHeader,
+        body: &mut Bytes,
+        authorized: Option<&std::collections::HashSet<String>>,
+    ) -> Result<Response> {
         use crate::handlers::metadata::{MetadataRequestParser, BrokerRetriever, BrokerValidator, MetadataResponseBuilder};
 
         tracing::debug!("handle_metadata called with v{}", header.api_version);
@@ -1951,9 +1978,39 @@ impl ProtocolHandler {
             }
         };
 
+        // Phase 3b: Authorization filter.
+        //
+        // Applied before the default-topic fallback below, so that fallback
+        // cannot reintroduce a topic the caller may not see.
+        if let Some(authorized) = authorized {
+            let explicitly_requested = request.topics.is_some();
+            topics = topics
+                .into_iter()
+                .filter_map(|mut topic| {
+                    if authorized.contains(&topic.name) {
+                        Some(topic)
+                    } else if explicitly_requested {
+                        // Asked for by name: say it was refused. Reporting
+                        // UNKNOWN_TOPIC instead would be a lie that sends the
+                        // client into topic auto-creation.
+                        topic.error_code = crate::error_codes::TOPIC_AUTHORIZATION_FAILED;
+                        topic.partitions.clear();
+                        Some(topic)
+                    } else {
+                        // All-topics request: omit, so the topic name does not
+                        // leak to a principal with no rights to it.
+                        None
+                    }
+                })
+                .collect();
+        }
+
         // Phase 4: Ensure at least one topic exists for client compatibility
         // CRITICAL FIX: Kafka clients require at least one topic in metadata responses
-        if topics.is_empty() && request.allow_auto_topic_creation {
+        //
+        // Skipped when an authorization filter is in force: inventing a topic to
+        // satisfy a client would hand it a name the filter just withheld.
+        if topics.is_empty() && request.allow_auto_topic_creation && authorized.is_none() {
             topics = self.ensure_default_topic_exists(&request.topics).await?;
         }
 
@@ -2396,12 +2453,17 @@ impl ProtocolHandler {
             Err(e) => {
                 tracing::warn!("SASL handshake failed for mechanism '{}': {:?}", mechanism, e);
                 SaslHandshakeResponse {
-                    error_code: 33, // SASL_AUTHENTICATION_FAILED
-                    mechanisms: vec![
-                        "PLAIN".to_string(),
-                        "SCRAM-SHA-256".to_string(),
-                        "SCRAM-SHA-512".to_string(),
-                    ],
+                    error_code: 33, // UNSUPPORTED_SASL_MECHANISM
+                    // Report what the authenticator actually accepts. This used
+                    // to be a hardcoded list including SCRAM-SHA-256/512, whose
+                    // verification was a stub that accepted any password - so a
+                    // client steered by this list would pick an unverified
+                    // mechanism. Never hardcode the advertised set.
+                    mechanisms: sasl
+                        .supported_mechanisms()
+                        .iter()
+                        .map(|m| m.as_str().to_string())
+                        .collect(),
                 }
             }
         };
@@ -2485,8 +2547,11 @@ impl ProtocolHandler {
             Some(&response.auth_bytes)
         });
 
-        // Session lifetime ms
-        encoder.write_i64(response.session_lifetime_ms);
+        // SessionLifetimeMs exists only from v1; writing it on a v0 response
+        // appends eight bytes the client does not expect.
+        if header.api_version >= 1 {
+            encoder.write_i64(response.session_lifetime_ms);
+        }
 
         Ok(Self::make_response(&header, ApiKey::SaslAuthenticate, body_buf.freeze()))
     }

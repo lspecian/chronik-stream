@@ -1097,8 +1097,17 @@ Key environment variables:
 - `CHRONIK_REPLICA_LAG_TIME_MAX_MS` - How long a replica may stay measurably behind before leaving ISR (default: 10000). Kafka's `replica.lag.time.max.ms` equivalent; Kafka defaults to 30s, this is deliberately tighter so under-replication surfaces sooner. Cluster mode only.
 - `CHRONIK_REPLICA_LAG_MAX_ENTRIES` - Secondary record-count bound on follower lag (default: 10000). Time is the primary bound.
 - `CHRONIK_ADMIN_API_KEY` - API key for admin API authentication (Priority 2, **REQUIRED for production**)
-- `CHRONIK_ADMIN_TLS_CERT` - Path to TLS certificate for admin API (Priority 2, optional)
-- `CHRONIK_ADMIN_TLS_KEY` - Path to TLS private key for admin API (Priority 2, optional)
+- `CHRONIK_ADMIN_TLS_CERT` / `CHRONIK_ADMIN_TLS_KEY` - **NOT IMPLEMENTED.** Setting either logs a warning ("axum-server crate not available") and the admin API still serves plain **HTTP**. The whole Unified API (6092) is plaintext; there is no HTTPS anywhere yet. Tracked as Phase 4 in [docs/ROADMAP_SECURITY.md](docs/ROADMAP_SECURITY.md).
+- `CHRONIK_SASL_ENABLED` - SASL authentication on the Kafka port (default: `false`). `true`/`required` refuses unauthenticated connections (they may send only ApiVersions/SaslHandshake/SaslAuthenticate; anything else closes the connection). `optional` verifies credentials when offered but still serves — and logs — unauthenticated clients: use it to stage a rollout, watch for "unauthenticated requests" warnings, then switch to `true`. Mechanisms offered: **SCRAM-SHA-512, SCRAM-SHA-256, PLAIN** (strongest first; PLAIN sends the password in the clear and is only safe under TLS).
+- `CHRONIK_SASL_USERS` - `user1:pass1,user2:pass2`. There are **no default users**; with SASL enabled and this unset, every client is rejected.
+- `CHRONIK_ACL_ENABLED` - Require ACL authorization (default: `false`). Enforced on Produce (Write), Fetch (Read), consumer-group APIs (Read on group), and the ACL admin APIs (Alter on cluster).
+- `CHRONIK_ACL_ALLOW_IF_NO_ACL` - Whether an operation with no matching rule is allowed (default: `true`). Set `false` to start closed.
+- `CHRONIK_ACL_SUPER_USERS` - `User:admin,User:ops` — bypass all ACL checks. Keep one, or a mis-configured policy is unrecoverable.
+- `CHRONIK_ACL_BINDINGS` - Bootstrap rules, `;`-separated: `User:alice,Topic,orders,Read,Allow;User:bob,Topic,app-*,Write,Allow`. Fields are `principal,resource_type,resource_name,operation,permission[,host]`. A trailing `*` on the name is a prefix pattern. Needed because the store starts empty: without it, enabling ACLs either permits everything or locks out the client that would write the first rule.
+- `CHRONIK_API_KEY` - Require `X-API-Key` on the Unified API data plane (`/_sql`, `/_search`, `/_vector`, `/_query`). Unset = **open**, and these endpoints read topic data, so anyone reaching port 6092 bypasses Kafka-port SASL and ACLs entirely. `/health` stays open.
+- `CHRONIK_API_TLS_CERT` / `CHRONIK_API_TLS_KEY` - HTTPS for the Unified API. Falls back to `CHRONIK_TLS_CERT`/`_KEY`.
+- `CHRONIK_S3_SSE` - Server-side encryption for objects written to S3-compatible storage: `AES256` (SSE-S3) or `aws:kms` (SSE-KMS). Unset = objects written unencrypted (the default). Applies to segments, Tantivy indexes, Parquet files and metadata DR uploads. GCS/Azure/local backends ignore it.
+- `CHRONIK_S3_SSE_KMS_KEY_ID` - KMS key for `CHRONIK_S3_SSE=aws:kms`. Optional; without it S3 uses the bucket's default managed key.
 - `CHRONIK_SCHEMA_REGISTRY_AUTH_ENABLED` - Enable HTTP Basic Auth for Schema Registry (default: `false`)
 - `CHRONIK_SCHEMA_REGISTRY_USERS` - Comma-separated `user:pass` pairs for Schema Registry auth
 - `CHRONIK_UNIFIED_API_PORT` - Unified API port (default: 6092)
