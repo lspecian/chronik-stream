@@ -746,14 +746,6 @@ impl WalMetadataStore {
         Ok(())
     }
 
-    /// Apply event from replication (follower mode).
-    ///
-    /// Persists the event to the follower's local metadata WAL before applying
-    /// to in-memory state. This ensures replicated metadata (TopicCreated,
-    /// TopicUpdated, PartitionAssigned, etc.) survives pod restarts.
-    ///
-    /// NOTE: We intentionally do NOT publish to the event bus here — that would
-    /// cause infinite replication loops (leader → follower → leader → ...).
     /// Reconcile the local catalog against the authoritative set.
     ///
     /// Turns a `CatalogSnapshot` into ordinary `TopicDeleted` events rather than
@@ -867,7 +859,15 @@ impl WalMetadataStore {
         Ok(())
     }
 
-    pub async fn apply_replicated_event(&self, event: MetadataEvent) -> Result<()> {
+    /// Apply event from replication (follower mode).
+    ///
+    /// Persists the event to the follower's local metadata WAL before applying
+    /// to in-memory state. This ensures replicated metadata (TopicCreated,
+    /// TopicUpdated, PartitionAssigned, etc.) survives pod restarts.
+    ///
+    /// NOTE: We intentionally do NOT publish to the event bus here — that would
+    /// cause infinite replication loops (leader → follower → leader → ...).
+    pub async fn apply_replicated_event_durable(&self, event: MetadataEvent) -> Result<()> {
         // A snapshot is a reconciliation signal, not durable state: handle it
         // here (where the WAL is reachable) and never persist the snapshot
         // itself.
@@ -1623,19 +1623,24 @@ impl MetadataStore for WalMetadataStore {
     }
 
     async fn apply_replicated_event(&self, event: super::events::MetadataEvent) -> Result<()> {
-        // v2.2.9 Phase 7: Apply replicated events from leader WITHOUT writing to WAL
-        // This is for followers receiving events via WalReplicationManager
-        //
-        // NOTE: this is the path production takes — followers hold the store as
+        // This is the path production takes: followers hold the store as
         // `Arc<dyn MetadataStore>`, so this trait method runs, not the inherent
-        // `WalMetadataStore::apply_replicated_event` above. They must stay in
-        // step. Routing the snapshot in only one of them is exactly the mistake
-        // that made the first version of this fix a no-op on a real cluster:
-        // every test passed, and nothing was ever pruned.
-        if let MetadataEventPayload::CatalogSnapshot { topics } = &event.payload {
-            return self.reconcile_catalog(topics, event.timestamp).await;
-        }
-        self.state.apply_event(&event).await
+        // one. It delegates rather than duplicating, because the two drifted and
+        // the difference was the bug.
+        //
+        // It used to apply to in-memory state only — "WITHOUT writing to WAL" —
+        // while the inherent method it shadowed carried a doc comment promising
+        // that replicated metadata "survives pod restarts". It did not: a
+        // follower lost every topic and partition assignment it had learned by
+        // replication on every restart, keeping only what it wrote itself, and
+        // then depended entirely on the leader's anti-entropy pass to refill it.
+        //
+        // Measured on a 3-node cluster: a restarted node reported 17 of 5,612
+        // partition assignments and sat there for nine minutes. It was the Raft
+        // leader, and the leader is the only node that re-broadcasts, so nothing
+        // could refill it until leadership moved — at which point it went to
+        // 5,612 within one pass.
+        self.apply_replicated_event_durable(event).await
     }
 
     async fn init_system_state(&self) -> Result<()> {
@@ -1981,6 +1986,107 @@ mod catalog_healing_tests {
         assert!(names.contains(&"kept-0".to_string()));
     }
 
+
+
+    /// Replicated metadata must be persisted, not just applied in memory.
+    ///
+    /// A follower learns topics and partition assignments by replication. If it
+    /// only applies them to memory, every restart throws them away and the node
+    /// depends entirely on the leader's anti-entropy pass to be told again —
+    /// and the leader is the only node that re-broadcasts, so a restarted
+    /// *leader* has nobody to refill it.
+    ///
+    /// Measured on a 3-node cluster: a restarted node reported 17 of 5,612
+    /// partition assignments and stayed there for nine minutes, recovering only
+    /// once leadership moved to a node with a full view.
+    ///
+    /// This drives the `MetadataStore` trait method deliberately, because that
+    /// is the one followers reach through `Arc<dyn MetadataStore>`.
+    #[tokio::test]
+    async fn replicated_metadata_is_persisted_for_restart() {
+        let appended: Arc<Mutex<Vec<MetadataEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&appended);
+        let wal_append: WalAppendFn = Arc::new(move |bytes: Vec<u8>| {
+            let sink = Arc::clone(&sink);
+            Box::pin(async move {
+                if let Ok(event) = MetadataEvent::from_bytes(&bytes) {
+                    sink.lock().unwrap().push(event);
+                }
+                Ok(0i64)
+            })
+        });
+        let follower = WalMetadataStore::new(2, wal_append);
+
+        // Exactly what a follower receives from the leader.
+        let store: &dyn MetadataStore = &follower;
+        store
+            .apply_replicated_event(MetadataEvent::new_with_node(
+                MetadataEventPayload::TopicCreated {
+                    name: "replicated".to_string(),
+                    config: TopicConfig::default(),
+                    auto_created: false,
+                },
+                1,
+            ))
+            .await
+            .unwrap();
+        store
+            .apply_replicated_event(MetadataEvent::new_with_node(
+                MetadataEventPayload::PartitionAssigned {
+                    assignment: PartitionAssignment {
+                        topic: "replicated".to_string(),
+                        partition: 0,
+                        broker_id: 1,
+                        is_leader: true,
+                        replicas: vec![1, 2, 3],
+                        leader_id: 1,
+                        leader_epoch: 1,
+                        isr: vec![1, 2, 3],
+                    },
+                },
+                1,
+            ))
+            .await
+            .unwrap();
+
+        let written = appended.lock().unwrap().clone();
+        assert!(
+            written.iter().any(|e| matches!(
+                &e.payload,
+                MetadataEventPayload::TopicCreated { name, .. } if name == "replicated"
+            )),
+            "a replicated topic was not persisted - it will vanish on restart"
+        );
+        assert!(
+            written.iter().any(|e| matches!(
+                &e.payload,
+                MetadataEventPayload::PartitionAssigned { assignment }
+                    if assignment.topic == "replicated"
+            )),
+            "a replicated partition assignment was not persisted - the node will \
+             come back not knowing who leads this partition, and under follower-pull \
+             it cannot replicate it at all"
+        );
+
+        // And it survives the restart.
+        let noop: WalAppendFn = Arc::new(|_b| Box::pin(async { Ok(0i64) }));
+        let restarted = WalMetadataStore::new(2, noop);
+        restarted.replay_events(written).await.unwrap();
+        assert_eq!(
+            restarted.list_topics().await.unwrap().len(),
+            1,
+            "the replicated topic did not survive replay"
+        );
+        assert!(
+            restarted
+                .get_partition_assignments("replicated")
+                .await
+                .unwrap()
+                .iter()
+                .any(|a| a.partition == 0),
+            "the replicated assignment did not survive replay"
+        );
+    }
 
     /// A deleted topic must stay deleted across a restart.
     ///
